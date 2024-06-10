@@ -1,0 +1,9 @@
+{
+    "seed": 55,
+    "env": "CartPole-v1",
+    "trials": 1,
+    "configs": ["DQNCartGOOD", "DQNCartBEST"],
+    "device": "cpu",
+    "total_steps": 100000,
+    "episodes": 5000
+}
