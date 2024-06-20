@@ -4,7 +4,7 @@ import seaborn as sns
 import pandas as pd
 
 import gymnasium as gym
-from RL.baselines import get_baseline_model
+from RL.baselines import get_baseline_model, TrajectoryLoggerCallback
 
 
 if __name__ == '__main__':
@@ -14,6 +14,7 @@ if __name__ == '__main__':
 
     with open(config) as f:
         experiment_params = json.load(f)
+        experiment_name = config.split('/')[-1][:-5] #cut out everything before the / and the extension .json
     print(experiment_params)
 
 
@@ -51,7 +52,10 @@ if __name__ == '__main__':
             e = 0
             all_data = np.zeros((experiment_params["episodes"],))
 
-            model.learn(total_timesteps=run_params["total_steps"])
+            log_dir = f'./logs/{experiment_name}/{alg_config}_{i}'
+            callback = TrajectoryLoggerCallback(log_dir)
+            model.learn(total_timesteps=run_params["total_steps"],callback=callback)
+
 
 
 

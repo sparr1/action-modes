@@ -4,6 +4,6 @@
     "trials": 1,
     "configs": ["DQNCartGOOD", "DQNCartBEST"],
     "device": "cpu",
-    "total_steps": 100000,
+    "total_steps": 200000,
     "episodes": 5000
 }
