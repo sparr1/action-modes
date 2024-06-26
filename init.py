@@ -1,11 +1,16 @@
 import gymnasium as gym
 from stable_baselines3 import PPO
-from RL.baselines import get_baseline_model
+# import dmc2gym
+
+from RL.baselines import Baseline
+# env = dmc2gym.make()
 env = gym.make("AntMaze_UMazeDense-v4", render_mode="human")
 # env = gym.make("PointMaze_UMazeDense-v3", render_mode="human")
+
+print(env.step())
 print(type(env.observation_space))
-model = get_baseline_model("PPO", env)
-# model = PPO("MlpPolicy", env, verbose=1)
+# model = get_baseline_model("PPO", env)
+model = PPO("MlpPolicy", env, verbose=1)
 model.learn(total_timesteps=1000000)
 vec_env = model.get_env()
 observation, info = env.reset(seed=42)
