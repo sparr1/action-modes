@@ -18,7 +18,7 @@ if __name__=="__main__":
     Rotate(-1.0)
 
     maze = gym.make("AntMaze_UMazeDense-v4",max_episode_steps=300)
-    env = Subtask(maze, Rotate(-1))
+    env = Subtask(maze, Rotate(-0.1))
     baseline = Baseline("PPO", env) #does not yet support baseline.learn() etc. 
     model = baseline.get_model() #extract the actual stable baselines model from the Baseline object
 

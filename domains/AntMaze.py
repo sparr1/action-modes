@@ -11,11 +11,22 @@ from domains.tasks import EternalTask
 #hypothesis: coordinate system is local
 #TODO check hypotheses 
 class Move(EternalTask):
-    def __init__(self, desired_velocity = None, direction = None):
+    def __init__(self, desired_velocity = None, direction = "X", metric = "L2"):
         super().__init__()
-        self.direction = direction #TODO: figure out which direction is forwards :)
+        # self.direction = direction #TODO: figure out which direction is forwards :)
         #hypothesis: take in a quaternion in the format (w,x,y,z) and convert to yaw angle?
         #hypothesis: the answer is simply "x_velocity". Courtesy of Rafa
+        if direction == "X":
+            self.direction = np.array((1,0,0), dtype = float)
+        elif direction == "Y":
+            self.direction = np.array((0,1,0), dtype = float)
+        elif direction == "Z":
+            self.direction = np.array((0,0,1), dtype = float)
+        else:
+            direction = self.direction #better be a (3,) array!
+
+        self.metric = metric
+
         if desired_velocity and type(desired_velocity) == list and len(desired_velocity) == 2:
             self.desired_velocity = rnd.uniform(self.desired_velocity[0], self.desired_velocity[1])
         elif  type(desired_velocity) == list and len(desired_velocity) > 2:
@@ -28,20 +39,32 @@ class Move(EternalTask):
     #checking state feature for velocity in the desired direction. if direction is None, we'll simply take the magnitude of the velocity vector in any direction.
     def get_reward(self, state):
         obs = state["observation"]
-        velocity = np.array((obs[13], obs[14], obs[15])) #only really going to work for AntMaze for now
-        if not self.direction:
-            achieved_velocity = velocity
-        else:
-            pass #TODO: project velocity vector onto self.direction and set achieved velocity to that
-        achieved_velocity = np.sqrt(np.dot(achieved_velocity,achieved_velocity)) #for now, we take the magnitude
-        reward = -(np.sum(np.abs(achieved_velocity - self.desired_velocity))) #do we want a margin?
+        velocity = np.array((obs[13], obs[14], obs[15]),dtype = float) 
+        achieved_velocity = np.dot(velocity, self.direction) #for now, this just selects one of the three axes. 
+
+        discrepancy = np.abs(self.desired_velocity - achieved_velocity)
+        if self.metric == "L2":
+            reward = -0.5*discrepancy**2 #do we want a margin?
+        elif self.metric == "L1":
+            reward = -1*discrepancy
 
         return reward
 
 #Rotation subtask. specify an angular velocity (negative or positive scalar) and we try to match it.
 class Rotate(EternalTask):
-    def __init__(self, desired_velocity = None):
+    def __init__(self, desired_velocity = None, direction = "Z", metric = "L2"):
         super().__init__()
+
+        if direction == "X":
+            self.direction = np.array((1,0,0), dtype = float)
+        elif direction == "Y":
+            self.direction = np.array((0,1,0), dtype = float)
+        elif direction == "Z":
+            self.direction = np.array((0,0,1), dtype = float)
+        else:
+            direction = self.direction #better be a (3,) array!
+
+        self.metric = metric
         if desired_velocity and type(desired_velocity) == list and len(desired_velocity) == 2:
             self.desired_velocity = rnd.uniform(self.desired_velocity[0], self.desired_velocity[1])
         elif  type(desired_velocity) == list and len(desired_velocity) > 2:
@@ -53,7 +76,13 @@ class Rotate(EternalTask):
 
     def get_reward(self, state):
         obs = state["observation"]
-        achieved_angular_velocity = obs[18] #only really going to work for AntMaze for now
-        reward = -np.abs(achieved_angular_velocity- self.desired_velocity) #do we want a margin?
+        angular_velocity = np.array((obs[16], obs[17], obs[18]),dtype = float) #only really going to work for AntMaze for now
+        achieved_angular_velocity = np.dot(angular_velocity, self.direction) 
+        discrepancy = np.abs(self.desired_velocity - achieved_angular_velocity)
+        if self.metric == "L2":
+            reward = -0.5*discrepancy**2
+        elif self.metric == "L1":
+            reward = -discrepancy
+            
         return reward
     
