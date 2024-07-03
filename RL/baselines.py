@@ -67,21 +67,16 @@ class TrajectoryLoggerCallback(BaseCallback):
         self.train_episodes_dir = os.path.join(log_dir, 'train_episodes')
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.train_episodes_dir, exist_ok=True)
-
+        self.step_count = 0
+        self.rollout_count = 0
+        self.training_count = 0 #surely this should end up 1.
         self.episode_count = 0
+        self.episode_step_count = 0
+        print("episode", self.episode_count, "with total timesteps", self.step_count)
 
-    def _on_step(self) -> bool:
-        # print('rewards', type(self.locals['rewards']), self.locals['rewards'].shape)
-        # print('new_obs', type(self.locals['new_obs']), self.locals['new_obs'].shape)
-        # print('actions', type(self.locals['actions']), self.locals['actions'].shape)
-        # print(self.locals['rewards'])
-        # print(self.locals['rewards'].tolist())
-        self.episode_rewards.extend(self.locals['rewards'].tolist())
-        self.episode_observations.extend(self.locals['new_obs'].tolist())
-        self.episode_actions.extend(self.locals['actions'].tolist())
-        return True
+    def _on_episode(self) -> None:
+        self.episode_count += 1
 
-    def _on_rollout_end(self) -> None:
         trajectory = {
             "rewards": self.episode_rewards,
             "observations": self.episode_observations,
@@ -91,9 +86,9 @@ class TrajectoryLoggerCallback(BaseCallback):
             json.dump(trajectory, f)
 
         # Calculate high-level summary
-        print(self.episode_rewards)
+        # print(self.episode_rewards)
         total_reward = sum(self.episode_rewards)
-        print(total_reward)
+        # print(total_reward)
         avg_reward = np.mean(self.episode_rewards)
         num_steps = len(self.episode_rewards)
 
@@ -104,4 +99,23 @@ class TrajectoryLoggerCallback(BaseCallback):
         self.episode_rewards = []
         self.episode_observations = []
         self.episode_actions = []
-        self.episode_count += 1
+        self.episode_step_count = 0
+
+    def _on_step(self) -> bool:
+        # Check that the `dones` local variable is defined
+        assert "dones" in self.locals, "`dones` variable is not defined, please check your code next to `callback.on_step()`"
+        self.step_count += 1
+        self.episode_step_count += 1
+        self.episode_rewards.extend(self.locals['rewards'].tolist())
+        self.episode_observations.extend(self.locals['new_obs'].tolist())
+        self.episode_actions.extend(self.locals['actions'].tolist())
+        if np.sum(self.locals["dones"]).item() > 0:
+          self._on_episode()
+
+        return True
+
+    def _on_rollout_end(self) -> None:
+        self.rollout_count += 1
+    
+    def _on_training_end(self) -> None:
+        self.training_count+=1
