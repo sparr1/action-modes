@@ -3,6 +3,11 @@ import random as rnd
 
 from domains.tasks import EternalTask
 
+
+#the solution to each of these "Eternal" tasks is simply the projection function which takes a real-valued variable (desired_velocity, usually) to a high dimensional policy 
+#whose aim is to maintain some "fitness" indefinitely. you could think concretely of this fitness as a linear or nonlinear function of state. High fitness is finding a cycle which 
+#has a high average reward as integrated over that cycle. 
+
 #re-implementing move task
 
 #for now, we will not specify direction, just to get the infrastructure for custom tasks finished first
@@ -10,6 +15,7 @@ from domains.tasks import EternalTask
 #hypothesis: we don't care about tolerance right now (check with group on thursday)
 #hypothesis: coordinate system is local
 #TODO check hypotheses 
+
 class Move(EternalTask):
     def __init__(self, desired_velocity = None, direction = "X", metric = "L2"):
         super().__init__()

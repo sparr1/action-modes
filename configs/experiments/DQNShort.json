@@ -1,0 +1,11 @@
+{
+    "seed": 55,
+    "env": "CartPole-v1",
+    "trials": 15,
+    "configs": ["DQNCartSHORT", "DQNCartSHORT2"],
+    "device": "cpu",
+    "total_steps": 1000,
+    "episodes": 10,
+    "logs": "overwrite",
+    "save": "first"
+}

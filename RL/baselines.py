@@ -2,26 +2,19 @@ import numpy as np
 import gymnasium as gym
 import importlib, json, os
 from stable_baselines3.common.callbacks import BaseCallback
-
+from RL.alg import Algorithm
 #from stable_baselines3 import PPO, DQN, TD3, SAC, DDPG, A2C
 module_name = "stable_baselines3" #for dynamic importing
 
 #wrapper on stable baselines
-class Baseline():
+class Baseline(Algorithm):
     def __init__(self, name, env, params = None):
-        self.name = name
-        self.env = env
-        self.custom_params = params
-        self.model = self._get_baseline_model(name, env, params)
+        super().__init__(name, env, custom_params=params)
+        self.model = self._get_baseline_model(self.name, self.env, self.custom_params)
     
     def get_model(self):
         return self.model
-    def learn(self):
-        pass
-    def predict(self):
-        pass
-    def vec_env(self):
-        pass
+
 
     def _get_baseline_model(self, name, env, params = None):
         p = {}
@@ -53,12 +46,18 @@ class Baseline():
             
         except (ModuleNotFoundError, AttributeError) as e:
             raise ValueError(f"Could not find model class '{name}' in module '{module_name}': {e}")
-    import json
-
+        
+#we will have a few different settings for logs: "none", "overwrite", "warn", and "timestamp"
+#the first just does not save logs, the second will ALWAYS delete any folders under the name of the experiment prior to running, the third will refuse to run if there are folders, 
+#and the fourth will prepend a timestamp in order to always create new folders each time it has run repeatedly. For serious experiments, I recommend "warn" or "timestamp".
+#The default is "warn", since this will let you know that some configuration is required to get the behavior you want.
+#For less serious experiments, testing, etc., I recommend "none" or "overwrite", depending on whether you are testing a capability that uses the logs or not.
 class TrajectoryLoggerCallback(BaseCallback):
 
-    def __init__(self, log_dir, verbose=0):
+    def __init__(self, log_dir, log_setting = "warn", verbose=0):
         super(TrajectoryLoggerCallback, self).__init__(verbose)
+        if log_setting not in ["overwrite", "warn", "timestamp"]:
+            raise Exception("unsupported logging setting. Try none, overwrite, warn, or timestamp.")
         self.episode_rewards = []
         self.episode_observations = []
         self.episode_actions = []
@@ -107,7 +106,12 @@ class TrajectoryLoggerCallback(BaseCallback):
         self.step_count += 1
         self.episode_step_count += 1
         self.episode_rewards.extend(self.locals['rewards'].tolist())
-        self.episode_observations.extend(self.locals['new_obs'].tolist())
+        # print(type(self.locals['new_obs']))
+        if type(self.locals['new_obs']) != np.ndarray:
+            obs = [list(self.locals['new_obs'].items()),]
+        else:
+            obs = self.locals['new_obs'].tolist()
+        self.episode_observations.extend(obs)
         self.episode_actions.extend(self.locals['actions'].tolist())
         if np.sum(self.locals["dones"]).item() > 0:
           self._on_episode()
