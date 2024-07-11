@@ -106,9 +106,10 @@ class TrajectoryLoggerCallback(BaseCallback):
         self.step_count += 1
         self.episode_step_count += 1
         self.episode_rewards.extend(self.locals['rewards'].tolist())
-        # print(type(self.locals['new_obs']))
-        if type(self.locals['new_obs']) != np.ndarray:
-            obs = [list(self.locals['new_obs'].items()),]
+        # print(self.locals['new_obs'])
+        if isinstance(self.locals['new_obs'], dict): #to handle ordered and unordered dicts
+            obs = [{k:v.tolist() for k,v in self.locals['new_obs'].items()},]
+            # obs = json.dumps(self.locals['new_obs'])
         else:
             obs = self.locals['new_obs'].tolist()
         self.episode_observations.extend(obs)

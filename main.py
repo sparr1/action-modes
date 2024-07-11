@@ -32,7 +32,7 @@ if __name__ == '__main__':
     #what's the MVP for saving models? I'm nervous about saving "best" as is usual in ML, because RL has no easy validation set from which to make an unbiased selection. 
     #furthermore, there are some difficulties involved in model selection within each trial, and across trials! I want to run a lot of trials, but I don't want to save a lot of models...
     #my solution for this for now is to simply save models from only the first trial... 
-    
+
     num_algs = len(experiment_params["configs"])
 
     # seed = experiment_params["seed"]
@@ -73,11 +73,13 @@ if __name__ == '__main__':
             if "baselines" in run_params["alg"]: #currently all that is supported. TODO support non-baselines also
                 alg_name = run_params["alg"].split('/')[-1]
             print(alg_name)
-            model = Baseline(alg_name, domain, run_params["alg_params"]).get_model()
-            # alg_state = {}      
-            steps = 0
-            e = 0
-            all_data = np.zeros((experiment_params["episodes"],))
+
+            try:
+                model = Baseline(alg_name, domain, run_params["alg_params"]).get_model()
+            except Exception as e:
+                print(e)
+                break #if we cannot run this baseline, we just try another.
+
             if log_setting == "none":
                 model.learn(total_timesteps=run_params["total_steps"]) #simply don't log anything
             else:

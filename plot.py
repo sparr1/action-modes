@@ -82,10 +82,15 @@ def graph_rewards(results, title):
     plt.xlabel('episodes')
     plt.ylabel('total reward')
     plt.legend()
-
+    save_graph(title)
     plt.show()
 
-
+def save_graph(name):
+    plt.savefig('./graphs/'+name+'.png')
 if __name__ == "__main__":
-    results = compute_rewards("DQNShort")
-    graph_rewards(results, "short DQN null comparison, n = 30")
+
+    # results = compute_rewards("DQNShort_old")
+    # graph_rewards(results, "short DQN null comparison, n = 30")
+
+    results = compute_rewards("AntMazeBaselines_2024-07-10_19-34-12")
+    graph_rewards(results, "long baselines, n = 5")
