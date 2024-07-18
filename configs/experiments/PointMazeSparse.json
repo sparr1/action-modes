@@ -1,0 +1,14 @@
+{
+    "overrides_alg":{
+        "seed": 55,
+        "device":"cuda",
+        "env":"PointMaze_UMaze-v3", 
+        "total_steps": 1e3,
+        "episodes": null
+},
+    "env_params": {"max_episode_steps": 300, "render_mode": null},
+    "trials": 5,
+    "configs": ["AntA2C","AntDDPG","AntSAC","AntTRPO", "AntTD3","AntPPO"],
+    "logs": "timestamp",
+    "save": "first"
+}

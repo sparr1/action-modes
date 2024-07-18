@@ -1,11 +1,15 @@
 {
-    "seed": 55,
-    "env": "CartPole-v1",
-    "trials": 15,
+    "overrides_alg":{
+        "seed": 55,
+        "device":"cuda",
+        "env":"CartPole-v1", 
+        "total_steps": 1e3,
+        "episodes": null,
+        "num_saves": 10,
+        "save_strat": "best" 
+},
+    "trials": 5,
     "configs": ["DQNCartSHORT", "DQNCartSHORT2"],
-    "device": "cpu",
-    "total_steps": 1000,
-    "episodes": 10,
     "logs": "overwrite",
-    "save": "first"
+    "save_trials": "best"
 }

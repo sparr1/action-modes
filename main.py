@@ -1,4 +1,4 @@
-import random, time, argparse, json, os, shutil
+import random, time, argparse, json, os, shutil, math
 
 import numpy as np
 import seaborn as sns
@@ -7,7 +7,7 @@ import pandas as pd
 import gymnasium as gym
 
 from RL.baselines import Baseline, TrajectoryLoggerCallback
-from utils import datetime_stamp
+from utils import datetime_stamp, handle_trial
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="action mode learning experiments")
@@ -19,21 +19,40 @@ if __name__ == '__main__':
         experiment_name = config.split('/')[-1][:-5] #cut out everything before the / and the extension .json
     # print(experiment_params)
 
+    #TODO: make a default configuration so I can cut all this code!
     if "logs" in experiment_params:
         log_setting = experiment_params["logs"]
     else:
         log_setting = "warn" #just manually enforcing an annoying default because I love my users and I don't want them deleting their logs or causing clutter by default :)
 
-    if "save" in experiment_params:
-        save_setting = experiment_params["save"]
+    if "save_trials" in experiment_params:
+        save_trials_setting = experiment_params["save_trials"]
     else:
-        save_setting = "first" #again, not the best setting, but one which causes little harm. For a small number of trials, I recommend "every". For large, I recommend "best".
-    #these save settings involve choosing which models to save for any given trial or run. In general, we have a lot of options, and the code is not the most straightforward thing in the world
-    #what's the MVP for saving models? I'm nervous about saving "best" as is usual in ML, because RL has no easy validation set from which to make an unbiased selection. 
-    #furthermore, there are some difficulties involved in model selection within each trial, and across trials! I want to run a lot of trials, but I don't want to save a lot of models...
-    #my solution for this for now is to simply save models from only the first trial... 
+        save_trials_setting = "first"
+           
+    #there are three save settings: save_num---which denotes the number of model saves during a trial,
+    #save_strat---which denotes the behavior within a trial as to which saves (out of the total save_num) are kept around: do we keep none, all, last, or best?
+    #and save_trials---which denotes the saving behavior across trials: none, first, all, or best?
+    #TODO: implement save_num and save_strat. for now we will just save after the end of the trial, and worry about save_trial behavior.
 
     num_algs = len(experiment_params["configs"])
+    runtime_params = [dict() for _ in range(num_algs)]
+    print("Experiment testing")
+    for i, alg_config in enumerate(experiment_params["configs"]):
+        print("---------")
+        print(alg_config)
+        runtime_params[i]["name"] = alg_config
+        print("verifying config exists and is proper:")
+        with open("configs/algs/"+alg_config+".json") as f:
+            run_default_params = json.load(f)
+        runtime_params[i].update(run_default_params.copy())
+        print("config found. Replacing settings based on experiment configs.")
+        for override_key, override_value in experiment_params["overrides_alg"].items():
+            print("setting of",override_key,"currently at",run_default_params[override_key], "overriden to", override_value)
+            runtime_params[i][override_key] = override_value
+        print("full runtime alg configuration settings:")
+        print(runtime_params[i])
+        print("----------")
 
     # seed = experiment_params["seed"]
 
@@ -54,28 +73,34 @@ if __name__ == '__main__':
             with open(experiment_log_dir+"settings.json", "w") as f:
                 json.dump(experiment_params, f, indent=2) #put the experiment json params next to the data which resulted from a run with those parameters
 
+            if experiment_params["save_trials"] != None:
+                model_save_dir = experiment_log_dir +"models/"
+                if not os.path.exists(model_save_dir):
+                    os.mkdir(model_save_dir)
 
-    for i, alg_config in enumerate(experiment_params["configs"]):
-        with open("configs/algs/"+alg_config+".json") as f:
-            run_params = json.load(f)
+    for i, run_params in enumerate(runtime_params):
+        alg_config = run_params["name"]
         print(run_params)
         
-        random.seed(experiment_params['seed']) #is it really correct to do this in the loop with the outer experiment seed?
-        np.random.seed(experiment_params['seed'])
-        
-        if(run_params['env'] != experiment_params['env']):
-            raise Exception(f"Mismatch of algorithm and experiment environment configurations: algorithm expects {run_params['env']} while experiment expects {experiment_params['env']}")
-        
-        domain = gym.make(run_params['env'])
+        random.seed(run_params['seed']) #is it really correct to do this in the loop with the outer experiment seed?
+        np.random.seed(run_params['seed'])
+        if "env_params" in experiment_params.keys():
+            domain = gym.make(run_params['env'], **experiment_params["env_params"])
+        else:
+            domain = gym.make(run_params['env']) #often overriden by experiment for consistency
         alg_name = run_params["alg"]
         
+        if save_trials_setting == "best": #this won't take into account old saved models if you're running "best".
+            best_trial = -1
+            best_score = -math.inf
+
         for t in range(experiment_params["trials"]):
             if "baselines" in run_params["alg"]: #currently all that is supported. TODO support non-baselines also
                 alg_name = run_params["alg"].split('/')[-1]
             print(alg_name)
 
             try:
-                model = Baseline(alg_name, domain, run_params["alg_params"]).get_model()
+                model = Baseline(alg_name, domain, run_params["alg_params"])
             except Exception as e:
                 print(e)
                 break #if we cannot run this baseline, we just try another.
@@ -91,6 +116,29 @@ if __name__ == '__main__':
 
                 callback = TrajectoryLoggerCallback(trial_log_dir, log_setting=log_setting) #the logger will handle log settings. duh!
                 model.learn(total_timesteps=run_params["total_steps"],callback=callback)
+
+                if t == 0 and save_trials_setting == "first":
+                    model.save(model_save_dir,f'model:{alg_config}_{t}')
+                elif save_trials_setting == "all":
+                    model.save(model_save_dir,f'model:{alg_config}_{t}')
+                elif save_trials_setting == "best":
+                    _ , rewards = handle_trial(trial_log_dir)
+                    score = np.average(rewards) #take a simple average over the whole trial!
+                    old_best_score = best_score
+                    old_best_trial = best_trial
+                    best_score = best_score if score < best_score else score
+                    if best_score != old_best_score:
+                        model.save(model_save_dir, f'model:{alg_config}_{t}') #save the new model
+                        os.system(f'rm -f {model_save_dir}/model:{alg_config}_{old_best_trial}*') #delete the old saved model (but only after the new one is saved)
+                        best_trial = t
+                        
+                    with open(model_save_dir+"/scores.txt", "a") as f:
+                        f.write(f'{alg_config}_{t}'+ ":" + str(score) + '\n')
+                    
+                    # with open(best_trial_score,"r") as f:
+                    #     old_best_score = int(f.read())
+                    #TODO: finish best trial score implementation
+
                 print("training count", callback.training_count)
                 print("episode count", callback.episode_count)
                 print("rollout count", callback.rollout_count)

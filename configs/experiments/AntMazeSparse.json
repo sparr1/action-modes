@@ -1,0 +1,14 @@
+{
+    "overrides_alg":{
+        "seed": 55,
+        "device":"cuda",
+        "env":"AntMaze_UMaze-v4", 
+        "total_steps": 1e3,
+        "episodes": null
+},
+    "env_params": {"max_episode_steps": 300, "render_mode": null},
+    "trials": 1,
+    "configs": ["AntSAC", "AntTD3", "AntPPO"],
+    "logs": "timestamp",
+    "save": "first"
+}

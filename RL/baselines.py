@@ -6,17 +6,30 @@ from RL.alg import Algorithm
 #from stable_baselines3 import PPO, DQN, TD3, SAC, DDPG, A2C
 module_name = "stable_baselines3" #for dynamic importing
 
+#TODO: I'm using params everywhere to refer to _input_ parameters. but in a machine learning context, 
+# theres a hash collision on "params", since it usually refers to tunable parameters of the model itself...
 #wrapper on stable baselines
 class Baseline(Algorithm):
     def __init__(self, name, env, params = None):
         super().__init__(name, env, custom_params=params)
-        self.model = self._get_baseline_model(self.name, self.env, self.custom_params)
+        self.model = self.get_baseline_model(self.name, self.env, self.custom_params)
     
     def get_model(self):
         return self.model
 
+    def learn(self, **kwargs):
+        return self.model.learn(**kwargs)
+    
+    def save(self, path, name):
+        self.model.save(os.path.join(path, name))
 
-    def _get_baseline_model(self, name, env, params = None):
+    def delete_model(self): #requires retrieving a baseline model before loading
+        del self.model
+
+    def load_model(self, path):
+        pass
+
+    def get_baseline_model(self, name, env, params = None):
         p = {}
 
         model = None
