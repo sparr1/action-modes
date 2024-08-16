@@ -8,9 +8,14 @@ class Task():
         pass
     def get_termination(self, observation) -> bool:
         pass
+    def reset(self, seed = 32) -> None:
+        pass
+    def get_goal(self) -> float:
+        pass
 
+#TODO: this should be refactored to be an _average reward_ task. To handle this correctly, I need to do some reading...
 class EternalTask(Task):
-    def __init__(self):
+    def __init__(self): 
         super().__init__()
     
     def get_termination(self, observation):
@@ -21,9 +26,15 @@ class Subtask(gym.Wrapper):
     def __init__(self, env, task):
         super().__init__(env)
         self._task = task # if None, just use the reward which comes from the environment
+        # self.observation_space = 
     
+    def reset(self, seed = 32): #TODO actually implement seeding properly
+        self._task.reset() #also reset the task. this will resample a new subgoal.
+        return super().reset()
+
     def step(self, action):
         observation, reward, terminated, truncated, info = super().step(action)
+        # observation["desired_goal"].append(self._task.get_goal())
         info.update({"old_reward": reward, "old_termination": terminated})
         return observation, self.reward(observation), False, truncated, info
 

@@ -1,4 +1,4 @@
-import random, time, argparse, json, os, shutil, math
+import random, time, argparse, json, os, shutil, math, importlib
 
 import numpy as np
 import seaborn as sns
@@ -7,6 +7,7 @@ import pandas as pd
 import gymnasium as gym
 
 from RL.baselines import Baseline, TrajectoryLoggerCallback
+from domains.tasks import Subtask
 from utils import datetime_stamp, handle_trial
 
 if __name__ == '__main__':
@@ -48,7 +49,10 @@ if __name__ == '__main__':
         runtime_params[i].update(run_default_params.copy())
         print("config found. Replacing settings based on experiment configs.")
         for override_key, override_value in experiment_params["overrides_alg"].items():
-            print("setting of",override_key,"currently at",run_default_params[override_key], "overriden to", override_value)
+            if override_key in run_default_params:
+                print("setting of",override_key,"currently at",run_default_params[override_key], "overriden to", override_value,".")
+            else:
+                print("override key of", override_key, "not found in run params, setting it to value", override_value, "anyway.")
             runtime_params[i][override_key] = override_value
         print("full runtime alg configuration settings:")
         print(runtime_params[i])
@@ -88,6 +92,26 @@ if __name__ == '__main__':
             domain = gym.make(run_params['env'], **experiment_params["env_params"])
         else:
             domain = gym.make(run_params['env']) #often overriden by experiment for consistency
+
+        #handle custom wrappers:
+        if "env_wrapper" in run_params:
+            if 'name' not in run_params['env_wrapper'] or run_params['env_wrapper']['name'] != "Subtask":
+                raise Exception("wrapper misconfigured, or otherwise not currently supported")
+            wrapper_params = run_params['env_wrapper']["wrapper_params"]
+
+        try:
+            print(wrapper_params["task"])
+            module_name,task_name = wrapper_params["task"].split(':') 
+            # print(module)
+            module = importlib.import_module(module_name)
+            task_class = getattr(module,task_name) #grab the specific task
+            p = wrapper_params["task_params"]
+            task = task_class(**wrapper_params["task_params"])  
+            domain = Subtask(domain, task) #replace the reward function and termination conditions based on task, then return the new wrapped domain.
+            
+        except (ModuleNotFoundError, AttributeError) as e:
+            raise ValueError(f"Could not find model class '{task_name}' in module '{module_name}': {e}")
+
         alg_name = run_params["alg"]
         
         if save_trials_setting == "best": #this won't take into account old saved models if you're running "best".
@@ -122,7 +146,8 @@ if __name__ == '__main__':
                 elif save_trials_setting == "all":
                     model.save(model_save_dir,f'model:{alg_config}_{t}')
                 elif save_trials_setting == "best":
-                    _ , rewards = handle_trial(trial_log_dir)
+                    _ , trial_contents = handle_trial(trial_log_dir)
+                    rewards = trial_contents["rewards"]
                     score = np.average(rewards) #take a simple average over the whole trial!
                     old_best_score = best_score
                     old_best_trial = best_trial
