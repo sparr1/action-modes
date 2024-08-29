@@ -1,4 +1,6 @@
 import gymnasium as gym
+import numpy as np
+import math
 #A task in this case can essentially be thought of as a reward function
 
 class Task():
@@ -25,21 +27,40 @@ class EternalTask(Task):
 class Subtask(gym.Wrapper):
     def __init__(self, env, task):
         super().__init__(env)
+        self.last_action = None
+        self.reward_info = None
         self._task = task # if None, just use the reward which comes from the environment
-        # self.observation_space = 
-    
+        goal_length = self._task.get_goal_length()
+        self.observation_space.spaces['desired_goal'] = gym.spaces.Box(-math.inf, math.inf, (goal_length,), np.float64)
+
     def reset(self, seed = 32): #TODO actually implement seeding properly
         self._task.reset() #also reset the task. this will resample a new subgoal.
-        return super().reset()
+        old_return = super().reset()
+        return (self.observation(old_return[0]),old_return[1])
+    
+    def observation(self, obs):
+        new_obs = obs.copy()
+        new_obs['desired_goal'] = np.array([self._task.get_goal()])
+        # print(new_obs)
+        return new_obs
+
+
 
     def step(self, action):
         observation, reward, terminated, truncated, info = super().step(action)
-        # observation["desired_goal"].append(self._task.get_goal())
-        info.update({"old_reward": reward, "old_termination": terminated})
-        return observation, self.reward(observation), False, truncated, info
+        self.last_action = action
+        self.contact_forces = self.env.unwrapped.ant_env.contact_forces
+        desired_goal = observation['desired_goal']
+        new_observation = self.observation(observation)
+        new_reward = self.reward(observation)
+        new_termination = self.termination(observation)
+        info.update({"reward_info":self.reward_info, "old_reward": reward, "old_termination": terminated, "old_goal":desired_goal})
+        
+        return new_observation, new_reward, new_termination, truncated, info
 
     def reward(self, observation):
-        return self._task.get_reward(observation)
+        reward, self.reward_info = self._task.get_reward(observation, self.last_action, self.contact_forces)
+        return reward
     
     def termination(self, observation):
         return self._task.get_termination(observation)

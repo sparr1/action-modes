@@ -99,18 +99,18 @@ if __name__ == '__main__':
                 raise Exception("wrapper misconfigured, or otherwise not currently supported")
             wrapper_params = run_params['env_wrapper']["wrapper_params"]
 
-        try:
-            print(wrapper_params["task"])
-            module_name,task_name = wrapper_params["task"].split(':') 
-            # print(module)
-            module = importlib.import_module(module_name)
-            task_class = getattr(module,task_name) #grab the specific task
-            p = wrapper_params["task_params"]
-            task = task_class(**wrapper_params["task_params"])  
-            domain = Subtask(domain, task) #replace the reward function and termination conditions based on task, then return the new wrapped domain.
-            
-        except (ModuleNotFoundError, AttributeError) as e:
-            raise ValueError(f"Could not find model class '{task_name}' in module '{module_name}': {e}")
+            try:
+                print(wrapper_params["task"])
+                module_name,task_name = wrapper_params["task"].split(':') 
+                # print(module)
+                module = importlib.import_module(module_name)
+                task_class = getattr(module,task_name) #grab the specific task
+                p = wrapper_params["task_params"]
+                task = task_class(**wrapper_params["task_params"])  
+                domain = Subtask(domain, task) #replace the reward function and termination conditions based on task, then return the new wrapped domain.
+                
+            except (ModuleNotFoundError, AttributeError) as e:
+                raise ValueError(f"Could not find model class '{task_name}' in module '{module_name}': {e}")
 
         alg_name = run_params["alg"]
         

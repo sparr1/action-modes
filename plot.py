@@ -47,8 +47,11 @@ if __name__ == "__main__":
     # results = compute_rewards("AntMove_2024-08-09_20-37-51")
     # graph_rewards(results, "AntMove 1M timesteps, n= 5")
 
-    results = compute_rewards("AntMove_2024-08-15_11-33-14")
-    graph_rewards(results, "AntMove 1M timesteps L1, n=5")
+    # results = compute_rewards("AntMove_2024-08-16_11-58-22")
+    # graph_rewards(results, "AntMove 10M timesteps L1, n=3")
 
     # results = compute_rewards("AntRotate_2024-08-12_21-38-51")
     # graph_rewards(results, "AntRotate 1M timesteps, n= 5")
+
+    results = compute_rewards("Ant_2024-08-20_21-35-53")
+    graph_rewards(results, "Ant (no maze) 1M timesteps, n=5")
