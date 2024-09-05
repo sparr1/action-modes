@@ -3,10 +3,10 @@
         "seed": 55,
         "device":"cuda",
         "env":"Ant-v4", 
-        "total_steps": 5e5,
+        "total_steps": 1e6,
         "episodes": null
 },
-    "env_params": {"render_mode": null},
+    "env_params": {"render_mode": null, "exclude_current_positions_from_observation":false},
     "trials": 5,
     "configs": ["AntSAC", "AntTD3", "AntPPO"],
     "logs": "timestamp",

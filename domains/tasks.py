@@ -31,7 +31,10 @@ class Subtask(gym.Wrapper):
         self.reward_info = None
         self._task = task # if None, just use the reward which comes from the environment
         goal_length = self._task.get_goal_length()
-        self.observation_space.spaces['desired_goal'] = gym.spaces.Box(-math.inf, math.inf, (goal_length,), np.float64)
+        spaces = {'desired_goal': gym.spaces.Box(-math.inf, math.inf, (goal_length,), np.float64),
+                  'observation': self.observation_space}
+        #self.observation_space.spaces['desired_goal'] = gym.spaces.Box(-math.inf, math.inf, (goal_length,), np.float64)
+        self.observation_space = gym.spaces.Dict(spaces)
 
     def reset(self, seed = 32): #TODO actually implement seeding properly
         self._task.reset() #also reset the task. this will resample a new subgoal.
@@ -39,7 +42,8 @@ class Subtask(gym.Wrapper):
         return (self.observation(old_return[0]),old_return[1])
     
     def observation(self, obs):
-        new_obs = obs.copy()
+        new_obs = {'observation': obs.copy()}
+
         new_obs['desired_goal'] = np.array([self._task.get_goal()])
         # print(new_obs)
         return new_obs
@@ -49,13 +53,15 @@ class Subtask(gym.Wrapper):
     def step(self, action):
         observation, reward, terminated, truncated, info = super().step(action)
         self.last_action = action
-        self.contact_forces = self.env.unwrapped.ant_env.contact_forces
-        desired_goal = observation['desired_goal']
+        self.contact_forces = self.env.unwrapped.contact_forces
+        #self.contact_forces = self.env.unwrapped.ant_env.contact_forces
+        # desired_goal = observation['desired_goal']
         new_observation = self.observation(observation)
         new_reward = self.reward(observation)
         new_termination = self.termination(observation)
-        info.update({"reward_info":self.reward_info, "old_reward": reward, "old_termination": terminated, "old_goal":desired_goal})
-        
+        # info.update({"reward_info":self.reward_info, "old_reward": reward, "old_termination": terminated, "old_goal":desired_goal})
+        info.update({"reward_info":self.reward_info, "old_reward": reward, "old_termination": terminated})
+
         return new_observation, new_reward, new_termination, truncated, info
 
     def reward(self, observation):

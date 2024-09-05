@@ -2,7 +2,7 @@ import numpy as np
 import random as rnd
 import math
 
-from domains.tasks import EternalTask
+from domains.tasks import EternalTask, Task
 
 
 #the solution to each of these "Eternal" tasks is simply the projection function which takes a real-valued variable (desired_velocity, usually) to a high dimensional policy 
@@ -17,16 +17,16 @@ from domains.tasks import EternalTask
 #hypothesis: coordinate system is local
 #TODO check hypotheses 
 #If you would like to avoid randomly sampling, just set minimum = maximum
-class Move(EternalTask):
-    def __init__(self,desired_velocity_minimum = -1.0,
-                 desired_velocity_maximum = 1.0,
+class Move(Task):
+    def __init__(self,desired_velocity_minimum = -10.0,
+                 desired_velocity_maximum = 10.0,
                  ctrl_cost = True,
                  contact_cost = True,
-                 healthy_z_range = (0.3,1.0),
-                 survival_bonus = 1.0,
+                 healthy_z_range = (0.3,10.0),
+                 survival_bonus = 10.0,
                  modify_obs = True,
                  direction = "X", 
-                 metric = "L2"):
+                 metric = "L1"):
         super().__init__()
         self.desired_velocity_minimum = desired_velocity_minimum #TODO refactor to range so as to have consistent API
         self.desired_velocity_maximum = desired_velocity_maximum
@@ -79,7 +79,8 @@ class Move(EternalTask):
             return 0.0
     
     def healthy(self, obs):
-        return 1.0 if (self.min_z <= obs[0] <= self.max_z) else 0.0
+        # print(obs)
+        return 1.0 if (self.min_z <= obs[2] <= self.max_z) else 0.0
 
     #checking state feature for velocity in the desired direction. if direction is None, we'll simply take the magnitude of the velocity vector in any direction.
     def get_reward(self, observation, last_action, contact_forces):
@@ -87,7 +88,7 @@ class Move(EternalTask):
             obs = observation["observation"]
         else:
             obs = observation #does this make sense? TODO check
-        velocity = np.array((obs[13], obs[14], obs[15]), dtype = float) 
+        velocity = np.array((obs[15], obs[16], obs[17]), dtype = float) 
         achieved_velocity = np.dot(velocity, self.direction) #for now, this just selects one of the three axes. 
         if not self.maximize:
             discrepancy = np.abs(self.desired_velocity - achieved_velocity)
@@ -98,15 +99,19 @@ class Move(EternalTask):
         else:
             base_reward = self.achieved_velocity #for now, just linear in velocity.
         healthy = self.healthy(obs)
-        unhealthy_cost = (1.0 - healthy)*self.survival_bonus
+        healthy_bonus = healthy*self.survival_bonus
         ctrl_cost = self.control_cost(last_action)
         contact_cost = self.contact_cost(contact_forces)
-        total_cost = unhealthy_cost + ctrl_cost + contact_cost
-        reward = base_reward - total_cost  #bonus is simply zero if this is not desired
+        total_cost = ctrl_cost + contact_cost
+        reward = base_reward + healthy_bonus - total_cost  #bonus is simply zero if this is not desired
         #TODO ctrl cost, contact cost, and termination for healthy z range....
-        reward_info = {'base': base_reward, 'unhealthy cost': -unhealthy_cost, 'control cost': -ctrl_cost, 'contact cost': -contact_cost}
+        reward_info = {'desired_velocity': self.desired_velocity, 'achieved_velocity': achieved_velocity, 'base': base_reward, 'healthy_bonus': healthy_bonus, 'control cost': -ctrl_cost, 'contact cost': -contact_cost}
         # print(reward_info)
-        return reward, reward_info #TODO how to do average reward?
+        return reward/1000, reward_info #TODO how to do average reward?
+    
+    def get_termination(self, obs):
+        return self.healthy(obs) == 0.0
+  
     
     def get_goal(self):
         return self.desired_velocity
