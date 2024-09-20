@@ -18,13 +18,15 @@ from domains.tasks import EternalTask, Task
 #TODO check hypotheses 
 #If you would like to avoid randomly sampling, just set minimum = maximum
 class Move(Task):
-    def __init__(self,desired_velocity_minimum = -10.0,
-                 desired_velocity_maximum = 10.0,
-                 ctrl_cost = True,
-                 contact_cost = True,
-                 healthy_z_range = (0.3,10.0),
-                 survival_bonus = 10.0,
+    def __init__(self,desired_velocity_minimum = -3.0,
+                 desired_velocity_maximum = 3.0,
+                 ctrl_cost = False,
+                 contact_cost = False,
+                 healthy_z_range = (0.3,2.5),
+                 survival_bonus = 1.0,
+                 include_xy = True,
                  modify_obs = True,
+                 margin = 1.5,
                  direction = "X", 
                  metric = "L1"):
         super().__init__()
@@ -49,18 +51,16 @@ class Move(Task):
         else:
             self.min_z = -math.inf
             self.max_z = math.inf
-
+        self.include_xy = include_xy #boolean
         self.modify_obs = modify_obs #boolean
-
-        if direction == "X":
-            self.direction = np.array((1,0,0), dtype = float)
-        elif direction == "Y":
-            self.direction = np.array((0,1,0), dtype = float)
-        elif direction == "Z":
-            self.direction = np.array((0,0,1), dtype = float)
+        directions = ["X", "Y", "Z", "XR", "YR", "ZR"]
+        self.direction = np.zeros(6,dtype = float)
+        if direction in directions:
+            self.direction[directions.index(direction)] = 1.0
         else:
-            direction = self.direction #better be a (3,) array!
-
+            direction = self.direction #better be a (6,) array!
+        print(self.direction)
+        self.margin = margin
         self.metric = metric
         self.reset() #to sample the desired velocity from between the minimum and maximum
     
@@ -68,19 +68,20 @@ class Move(Task):
     
     def control_cost(self, action):
         if self.ctrl_cost:
-            return .25*np.sum(np.square(action)) #hardcoded a param at .25
+            return .1*np.sqrt(np.sum(np.square(action))) #hardcoded a param at .25
         else: 
             return 0.0
         
     def contact_cost(self, contact_forces):
         if self.cnt_cost:
-            return 5e-4 * np.sum(np.square(contact_forces))
+            return .05*np.sqrt(np.sum(np.square(contact_forces)))
         else:
             return 0.0
     
     def healthy(self, obs):
-        # print(obs)
-        return 1.0 if (self.min_z <= obs[2] <= self.max_z) else 0.0
+        z_coord = obs[2] if self.include_xy else obs[0]
+        return 1.0 if (self.min_z <= z_coord <= self.max_z) else 0.0
+
 
     #checking state feature for velocity in the desired direction. if direction is None, we'll simply take the magnitude of the velocity vector in any direction.
     def get_reward(self, observation, last_action, contact_forces):
@@ -88,14 +89,19 @@ class Move(Task):
             obs = observation["observation"]
         else:
             obs = observation #does this make sense? TODO check
-        velocity = np.array((obs[15], obs[16], obs[17]), dtype = float) 
-        achieved_velocity = np.dot(velocity, self.direction) #for now, this just selects one of the three axes. 
+         
+        velocity_vec = obs[15:21] if self.include_xy else obs[13:19]
+        # print(velocity_vec)
+        achieved_velocity = np.dot(velocity_vec, self.direction) #for now, this just selects one of the three axes. 
         if not self.maximize:
-            discrepancy = np.abs(self.desired_velocity - achieved_velocity)
             if self.metric == "L2":
-                base_reward = -0.5*discrepancy**2 #do we want a margin? TODO add margin. pretty convinced we do, because the velocities for a walking ant have a wide variation.
+                dist_to_vec = np.sqrt(np.sum((velocity_vec - self.direction*self.desired_velocity)**2)) #do we want a margin? TODO add margin. pretty convinced we do, because the velocities for a walking ant have a wide variation.
+                if dist_to_vec < self.margin:
+                    base_reward = 0.0
+                else:
+                    base_reward = max(self.margin - dist_to_vec,-self.survival_bonus+0.001) #0 at (or within) margin, less than 0 outside of it
             elif self.metric == "L1":
-                base_reward = -1*discrepancy
+                base_reward = -1*np.sum(np.abs(velocity_vec - self.direction*self.desired_velocity))
         else:
             base_reward = self.achieved_velocity #for now, just linear in velocity.
         healthy = self.healthy(obs)
@@ -107,8 +113,9 @@ class Move(Task):
         #TODO ctrl cost, contact cost, and termination for healthy z range....
         reward_info = {'desired_velocity': self.desired_velocity, 'achieved_velocity': achieved_velocity, 'base': base_reward, 'healthy_bonus': healthy_bonus, 'control cost': -ctrl_cost, 'contact cost': -contact_cost}
         # print(reward_info)
-        return reward/1000, reward_info #TODO how to do average reward?
+        return reward, reward_info #TODO how to do average reward?
     
+    # def distance_lo
     def get_termination(self, obs):
         return self.healthy(obs) == 0.0
   

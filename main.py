@@ -5,8 +5,9 @@ import seaborn as sns
 import pandas as pd
 
 import gymnasium as gym
-
+# from RL.alg import *
 from RL.baselines import Baseline, TrajectoryLoggerCallback
+from log import TrainingLogger
 from domains.tasks import Subtask
 from utils import datetime_stamp, handle_trial
 
@@ -61,26 +62,31 @@ if __name__ == '__main__':
     # seed = experiment_params["seed"]
 
     if log_setting != "none":
-            experiment_log_dir = f'./logs/{experiment_name}/'
-            if log_setting == "warn":
-                if os.path.exists(experiment_log_dir):
-                    print("WARNING: experiment has been run before. Check the files, and delete or change setting from \'warn\'.")
-                    quit()
-            elif log_setting == "overwrite":
-                if(os.path.exists(experiment_log_dir)):
-                    shutil.rmtree(experiment_log_dir) #delete the old experiment! be careful with this setting. 
-            elif log_setting =="timestamp":
-                experiment_log_dir=experiment_log_dir[:-1]+'_'+datetime_stamp()+'/'
-            else:
-                pass #do nothing on none
-            os.mkdir(experiment_log_dir)
-            with open(experiment_log_dir+"settings.json", "w") as f:
-                json.dump(experiment_params, f, indent=2) #put the experiment json params next to the data which resulted from a run with those parameters
+        experiment_log_dir = f'./logs/{experiment_name}/'
+        if log_setting == "warn":
+            if os.path.exists(experiment_log_dir):
+                print("WARNING: experiment has been run before. Check the files, and delete or change setting from \'warn\'.")
+                quit()
+        elif log_setting == "overwrite":
+            if(os.path.exists(experiment_log_dir)):
+                shutil.rmtree(experiment_log_dir) #delete the old experiment! be careful with this setting. 
+        elif log_setting =="timestamp":
+            experiment_log_dir=experiment_log_dir[:-1]+'_'+datetime_stamp()+'/'
 
-            if experiment_params["save_trials"] != None:
-                model_save_dir = experiment_log_dir +"models/"
-                if not os.path.exists(model_save_dir):
-                    os.mkdir(model_save_dir)
+        os.mkdir(experiment_log_dir)
+        with open(experiment_log_dir+"settings.json", "w") as f:
+            json.dump(experiment_params, f, indent=2) #put the experiment json params next to the data which resulted from a run with those parameters
+
+        if experiment_params["save_trials"] != None:
+            model_save_dir = experiment_log_dir +"models/"
+            if not os.path.exists(model_save_dir):
+                os.mkdir(model_save_dir)
+
+        if log_setting not in ["overwrite", "warn", "timestamp"]:
+            raise Exception("unsupported logging setting. Try none, overwrite, warn, or timestamp.")
+        training_logger = TrainingLogger()
+        
+
 
     for i, run_params in enumerate(runtime_params):
         alg_config = run_params["name"]
@@ -121,14 +127,24 @@ if __name__ == '__main__':
         for t in range(experiment_params["trials"]):
             if "baselines" in run_params["alg"]: #currently all that is supported. TODO support non-baselines also
                 alg_name = run_params["alg"].split('/')[-1]
+                try:
+                    model = Baseline(alg_name, domain, run_params["alg_params"])
+
+                except Exception as e:
+                    print(e)
+                    break #if we cannot run this baseline, we just try another.
+
+            else:
+                try:
+                    module = importlib.import_module("RL.alg")
+                    alg_class = getattr(module, alg_name)
+                    model = alg_class(alg_name,domain, run_params["alg_params"])
+                except Exception as e:
+                    print(e)
+                    break #if we cannot run this baseline, we just try another.
             print(alg_name)
 
-            try:
-                model = Baseline(alg_name, domain, run_params["alg_params"])
-            except Exception as e:
-                print(e)
-                break #if we cannot run this baseline, we just try another.
-
+           
             if log_setting == "none":
                 model.learn(total_timesteps=run_params["total_steps"]) #simply don't log anything
             else:
@@ -137,9 +153,9 @@ if __name__ == '__main__':
                     os.mkdir(trial_log_dir)
                 with open(trial_log_dir+"/alg_settings.json", "w") as f:
                     json.dump(run_params, f, indent=2) #put the algorithm parameters next to the data which resulted from a trial using those params
-
-                callback = TrajectoryLoggerCallback(trial_log_dir, log_setting=log_setting) #the logger will handle log settings. duh!
-                model.learn(total_timesteps=run_params["total_steps"],callback=callback)
+                training_logger.set_log_dir(trial_log_dir)
+                model.set_logger(training_logger)
+                model.learn(total_timesteps=run_params["total_steps"])
 
                 if t == 0 and save_trials_setting == "first":
                     model.save(model_save_dir,f'model:{alg_config}_{t}')
@@ -163,12 +179,13 @@ if __name__ == '__main__':
                     # with open(best_trial_score,"r") as f:
                     #     old_best_score = int(f.read())
                     #TODO: finish best trial score implementation
+                    training_logger.reset()
 
-                print("training count", callback.training_count)
-                print("episode count", callback.episode_count)
-                print("rollout count", callback.rollout_count)
-                print("n_calls", callback.n_calls)
-                print("num_timesteps", callback.num_timesteps)
+                # print("training count", callback.training_count)
+                # print("episode count", callback.episode_count)
+                # print("rollout count", callback.rollout_count)
+                # print("n_calls", callback.n_calls)
+                # print("num_timesteps", callback.num_timesteps)
 
 
 

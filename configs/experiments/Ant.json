@@ -6,9 +6,9 @@
         "total_steps": 1e6,
         "episodes": null
 },
-    "env_params": {"render_mode": null, "exclude_current_positions_from_observation":false},
+    "env_params": {"render_mode": "human", "exclude_current_positions_from_observation":false},
     "trials": 5,
-    "configs": ["AntSAC", "AntTD3", "AntPPO"],
+    "configs": ["AntPPO", "AntSAC", "AntTD3"],
     "logs": "timestamp",
     "save_trials": "best"
 }

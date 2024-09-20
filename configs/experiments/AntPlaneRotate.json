@@ -1,0 +1,15 @@
+{
+    "overrides_alg":{
+        "seed": 55,
+        "device":"cuda",
+        "env":"Ant-v4", 
+        "env_wrapper": {"name": "Subtask", "wrapper_params": {"task":"domains.AntMaze:Move", "task_params": {"direction": "ZR", "desired_velocity_minimum":-10.0, "desired_velocity_maximum":10.0, "survival_bonus":4.0, "metric": "L1"}}},
+        "total_steps": 1e6,
+        "episodes": null
+},
+    "env_params": {"max_episode_steps": 1000,"render_mode":null, "exclude_current_positions_from_observation":false},
+    "trials": 5,
+    "configs": ["AntSAC"],
+    "logs": "timestamp",
+    "save_trials": "best"
+}
