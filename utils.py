@@ -1,6 +1,6 @@
 import datetime
 import numpy as np
-import glob, os, json, sys
+import glob, os, json, sys, math
 
 
 def datetime_stamp():
@@ -35,7 +35,10 @@ def handle_settings(path): #processes the settings.json file
         contents = json.load(f)
     print(contents) 
 
-def handle_trial(path, incl_reward = True, incl_obs = False, incl_act = False, incl_base = False, max_steps = 1e6): #processes a trial directory
+def handle_stats_line(line_segments, keyword):
+    return [x for x in line_segments if keyword in x][0].split(' ')[-1]
+
+def handle_trial(path, incl_reward = True, incl_obs = False, incl_act = False, incl_base = False, incl_goal = False, max_steps = 1e6): #processes a trial directory
     alg_name = os.path.basename(path).split('_')[0]
 
     if not (incl_reward or incl_obs or incl_act or incl_base):
@@ -47,6 +50,7 @@ def handle_trial(path, incl_reward = True, incl_obs = False, incl_act = False, i
     observations = []
     actions = []
     steps = []
+    goals = [] #for use only with stats for now
     files = get_files(path)
     dirs = get_dirs(path)
     print("reading files", files)
@@ -60,27 +64,23 @@ def handle_trial(path, incl_reward = True, incl_obs = False, incl_act = False, i
                     for l in content:
                         ep_name, stats = l.split(':')
                         ep_number = int(ep_name.split('_')[1])
-                        episodes.append(ep_number) #TODO: have we verified this is happening in order?\
+                        episodes.append(ep_number) #TODO: have we verified this is happening in order?
                         segments = stats.split(',')
-                        steps_segment = [x for x in segments if 'Steps' in x][0]
-                        # print(steps_segment)
-                        timesteps = steps_segment.split(' ')[-1]
-                        steps.append(int(timesteps))
+                        
+                        steps.append(int(handle_stats_line(segments, 'Steps')))
+
                         if incl_reward:
-                            total_reward_segment = [x for x in segments if 'Total Reward' in x][0] 
-                            # print(total_reward_segment)
-                            total_reward = total_reward_segment.split(' ')[-1]
-                            rewards.append(float(total_reward))
+                            rewards.append(float(handle_stats_line(segments, 'Total Reward')))
 
                         if incl_base:
-                            base_reward_segment = [x for x in segments if 'Total Base' in x][0]
-                            print(base_reward_segment)
-                            base_reward = base_reward_segment.split(' ')[-1]
-                            base_rewards.append(float(base_reward))
+                            base_rewards.append(float(handle_stats_line(segments, 'Total Base')))
+
+                        if incl_goal:
+                            goals.append(float(handle_stats_line(segments, 'Goal')))
 
         print(len(episodes), episodes[-1], len(rewards), len(base_rewards))
         
-        return alg_name, {'rewards': np.array(rewards), 'base rewards': np.array(base_rewards), 'timesteps': np.array(steps)}
+        return alg_name, {'rewards': np.array(rewards), 'base rewards': np.array(base_rewards), 'timesteps': np.array(steps), 'goals': np.array(goals)}
     else: 
         for dir in dirs:
             steps = 0 #we use max_steps here because we are reading the actual logs. it can get very expensive
@@ -111,19 +111,46 @@ def handle_trial(path, incl_reward = True, incl_obs = False, incl_act = False, i
             trial_contents['actions'] = actions
         return alg_name, trial_contents
 
-def convert_dict_obs_to_arr(obs):
-    coll_obs = []
-    coll_keys = []
-    for k,v in obs.items():
-        coll_keys.append(k)
-        # print(type(v))
-        coll_obs.append(np.array(v))
-        # print(coll_keys)
-    # for o in coll_obs:
-    #     print(o.shape)
-    return coll_keys, np.concatenate(coll_obs, axis = None)
+def retrieve_trial(alg_name, trial_data, keyword, stat_dict):
+    if alg_name not in stat_dict:
+        stat_dict[alg_name] = []
+    stat_dict[alg_name].append(trial_data[keyword])
 
-def _compute_stats(experiment_name, rewards = True, observations = True, actions = True, base_rewards = False, max_steps = 1e6):
+def compute_stat(alg, stat_trials_data, stat_results_dict, goal_range = (-math.inf,math.inf), goal_trials_data = None):
+
+    if not goal_trials_data:
+        avg, std, smax, smin = tolerant_stats(stat_trials_data) 
+        stat_results_dict[alg] = {"means": avg, "stds": std, "max": smax, "min": smin}
+    else:
+        goal_aggr_stat_trials_data = []
+        goal_aggr_indices = []
+        # print(len(goal_trials_data))
+        for i, trial in enumerate(goal_trials_data):
+            print("trial length", len(trial))
+            trial_goal_aggr_stat_data = []
+            trial_goal_aggr_indices = []
+            # print("stat_trials_data length", len(stat_trials_data))
+            for j, goal in enumerate(trial):
+                # print(goal)
+                if goal_range[0] <= goal <= goal_range[1]: #this relies on goal not changing during the episode! be careful
+                    trial_goal_aggr_stat_data.append(stat_trials_data[i][j])
+                    trial_goal_aggr_indices.append(j)
+            goal_aggr_stat_trials_data.append(np.array(trial_goal_aggr_stat_data))
+            goal_aggr_indices.append(trial_goal_aggr_indices)
+
+        for aggr in goal_aggr_stat_trials_data:
+            print(aggr.size)
+        avg, std, smax, smin = tolerant_stats(goal_aggr_stat_trials_data)
+        # print(stat_results_dict.keys())
+        if alg not in stat_results_dict:
+            stat_results_dict[alg] = {}
+        stat_results_dict[alg][str(goal_range)] = {"means": avg, "stds": std, "max": smax, "min": smin}
+
+            
+
+
+
+def _compute_stats(experiment_name, rewards = True, observations = True, actions = True, base_rewards = False, num_goal_buckets = 2, max_steps = 1e6):
     experiment_dir = f'./logs/{experiment_name}'
     
     files = get_files(experiment_dir)
@@ -141,114 +168,114 @@ def _compute_stats(experiment_name, rewards = True, observations = True, actions
     trial_rewards = {}
     trial_base_rewards = {}
     trial_base_steps = {}
+    trial_goals = {}
     trial_observations = {}
     trial_actions = {}
-
+    goals = True if num_goal_buckets else False
     for item in dirs:
         if "_" not in os.path.basename(item):
             continue
         print(f"processing trial: {item}")
         try:
-            alg_name, trial_data = (handle_trial(item,incl_reward=rewards, incl_obs=observations, incl_act=actions, incl_base=base_rewards))
+            alg_name, trial_data = (handle_trial(item,incl_reward=rewards, incl_obs=observations, incl_act=actions, incl_base=base_rewards, incl_goal = goals))
             print(alg_name, len(trial_data))
             num_trials+=1
 
             if rewards:
-                if alg_name not in trial_rewards:
-                    trial_rewards[alg_name] = []
-                trial_rewards[alg_name].append(trial_data['rewards'])
+                retrieve_trial(alg_name, trial_data, 'rewards', trial_rewards)
             if base_rewards:
-                if alg_name not in trial_base_rewards:
-                    trial_base_rewards[alg_name] = []
-                    trial_base_steps[alg_name] = []
-                trial_base_rewards[alg_name].append(trial_data['base rewards'])
-                trial_base_steps[alg_name].append(trial_data['timesteps'])
+                retrieve_trial(alg_name, trial_data, 'base rewards', trial_base_rewards)
+                retrieve_trial(alg_name, trial_data, 'timesteps', trial_base_steps)
+            if goals:
+                retrieve_trial(alg_name, trial_data, 'goals', trial_goals)
+                # print(trial_goals)
             if observations:
-                if alg_name not in trial_observations:
-                    trial_observations[alg_name] = []
-                trial_observations[alg_name].append(trial_data['observations'])
+                retrieve_trial(alg_name, trial_data, 'observations', trial_observations)
             if actions:
-                if alg_name not in trial_actions:
-                    trial_actions[alg_name] = []
-                trial_actions[alg_name].append(trial_data['actions'])
+                retrieve_trial(alg_name, trial_data, 'actions', trial_actions)
+
 
         except:
             print(f"unexpected issue handling file/directory: {item}") 
     results = {}
+    goal_stats = {}
+    goal_buckets = [(-math.inf, math.inf)]
 
-    #handle rewards
-    if rewards:
-        # print(len(trial_rewards.keys()))
-        # print({key:len(value) for key,value in trial_rewards.items()})
-        reward_results = {}
-        for alg, trials in trial_rewards.items():
-            reward_avg, reward_std, reward_max, reward_min = tolerant_stats(trials)
-            print(alg, len(reward_avg), len(reward_std))
-            reward_results[alg] = {"means": reward_avg, "stds": reward_std, "max": reward_max, "min": reward_min}
-        results["rewards"] = reward_results
+    if goals:
+        for alg, goal_trials in trial_goals.items():
+            compute_stat(alg, goal_trials, goal_stats)
+        goal_min = min(goal_stats[alg]["min"])
+        goal_max = max(goal_stats[alg]["max"])
+        goal_range = goal_max - goal_min
+        goal_bucket_size = goal_range/num_goal_buckets
+        for i in range(num_goal_buckets):
+            goal_bucket_lower = goal_min + i*goal_bucket_size
+            goal_bucket_upper = goal_min + (i+1)*goal_bucket_size
+            # print(goal_bucket_lower, goal_bucket_upper)
+            goal_buckets.append((goal_bucket_lower, goal_bucket_upper))
+        print("goal buckets", goal_buckets)
 
-    if base_rewards:
-        # print(len(trial_rewards.keys()))
-        # print({key:len(value) for key,value in trial_rewards.items()})
-        base_reward_results = {}
-        steps_results = {}
-        base_avg_results = {}
-        for alg in trial_base_rewards.keys():
-            base_reward_trials = trial_base_rewards[alg]
-            steps_trials = trial_base_steps[alg]
+    reward_results = {}
+    base_reward_results = {}
+    steps_results = {}
+    base_avg_results = {}
+    observation_results = {}
 
-            base_avg_trials = [(trial_base_rewards[alg][i] / trial_base_steps[alg][i]).tolist() for i in range(len(base_reward_trials))]
-            # base_avg_trials = (np.array(trial_base_rewards[alg]) / np.array(trial_base_steps[alg])).tolist()
+    for bucket in goal_buckets:
+        print("HANDLING BUCKET", bucket)
+        #handle rewards
+        if rewards:
+            # print(len(trial_rewards.keys()))
+            # print({key:len(value) for key,value in trial_rewards.items()})
+            for alg, trials in trial_rewards.items():
+                print("alg", alg)
+                print("trials", len(trials))
+                goals_trials = trial_goals[alg]
+                # print(trials)
+                compute_stat(alg, trials, reward_results, goal_range = bucket, goal_trials_data = goals_trials)
+            results["rewards"] = reward_results
 
-            reward_avg, reward_std, reward_max, reward_min = tolerant_stats(base_reward_trials)
-            print(alg, 'base reward lengths:',len(reward_avg), len(reward_std))
-            base_reward_results[alg] = {"means": reward_avg, "stds": reward_std, "max": reward_max, "min": reward_min}
+        if base_rewards:
+            # print(len(trial_rewards.keys()))
+            # print({key:len(value) for key,value in trial_rewards.items()})
             
-            steps_avg, steps_std, steps_max, steps_min = tolerant_stats(steps_trials)
-            print(alg, 'step lengths:', len(steps_avg), len(steps_std))
-            steps_results[alg] = {"means": steps_avg, "stds": steps_std, "max": steps_max, "min": steps_min}
+            for alg in trial_base_rewards.keys():
+                goals_trials = trial_goals[alg]
+                base_reward_trials = trial_base_rewards[alg]
+                steps_trials = trial_base_steps[alg]
+                base_avg_trials = [(trial_base_rewards[alg][i] / trial_base_steps[alg][i]).tolist() for i in range(len(base_reward_trials))]
+                # base_avg_trials = (np.array(trial_base_rewards[alg]) / np.array(trial_base_steps[alg])).tolist()
 
-            base_avg_avg, base_avg_std, base_avg_max, base_avg_min = tolerant_stats(base_avg_trials)
-            print(alg, "base avg lengths:", len(base_avg_avg), len(base_avg_std))
-            base_avg_results[alg] =  {"means": base_avg_avg, "stds": base_avg_std, "max": base_avg_max, "min": base_avg_min}
+                compute_stat(alg, base_reward_trials, base_reward_results, goal_range = bucket, goal_trials_data = goals_trials)
+                compute_stat(alg, steps_trials, steps_results, goal_range = bucket, goal_trials_data = goals_trials)
+                compute_stat(alg, base_avg_trials, base_avg_results, goal_range = bucket, goal_trials_data = goals_trials)
 
-        results["base rewards"] = base_reward_results            
-        results["steps"] = steps_results
-        results["base average"] = base_avg_results
+            results["base rewards"] = base_reward_results            
+            results["steps"] = steps_results
+            results["base average"] = base_avg_results
 
-    
-    #TODO handle observations (is this done? TODO test)
-    if observations:
-        print(len(trial_observations.keys()))
-        # print({key:len(value) for key,value in trial_observations.items()})
-        observation_results = {}
-        for alg, trials in trial_observations.items():
-            # observation_results[alg] = {}
-            # print(type(trials))
-            # print(type(trials[0]))
-            # #sometimes, "trials" is a list of list of lists...
-            # for trial in trials:
-            #     for episode in trial:
-            #         for timestep in episode:
-            #             print(type(timestep))
-            collect_obs = []
-            coll_keys = None
-            for trial in trials:
-                for episode in trial:
-                    for obs in episode:
-                        # if type(obs) == dict:
-                        coll_keys, obs = convert_dict_obs_to_arr(obs)
-                        collect_obs.append(obs)
-            obs_matrix = np.stack(collect_obs,axis = 0)
+        
+        #TODO handle observations (is this done? TODO test)
+        if observations:
+            print(len(trial_observations.keys()))
+            for alg, trials in trial_observations.items():
+                collect_obs = []
+                coll_keys = None
+                for trial in trials:
+                    for episode in trial:
+                        for obs in episode:
+                            coll_keys, obs = convert_dict_obs_to_arr(obs)
+                            collect_obs.append(obs)
+                obs_matrix = np.stack(collect_obs,axis = 0)
 
-            obs_avg = np.mean(obs_matrix,axis = 0)
-            obs_std = np.std(obs_matrix,axis = 0)
-            obs_max = np.max(obs_matrix,axis = 0)
-            obs_min = np.min(obs_matrix,axis = 0)
+                obs_avg = np.mean(obs_matrix,axis = 0)
+                obs_std = np.std(obs_matrix,axis = 0)
+                obs_max = np.max(obs_matrix,axis = 0)
+                obs_min = np.min(obs_matrix,axis = 0)
 
-            observation_results[alg] = {"means": obs_avg, "stds": obs_std, "max": obs_max, "min": obs_min}
-        print("observation key order (if applicable):", coll_keys)
-        results["observations"] = observation_results
+                observation_results[alg] = {"means": obs_avg, "stds": obs_std, "max": obs_max, "min": obs_min}
+            print("observation key order (if applicable):", coll_keys)
+            results["observations"] = observation_results
 
     #TODO handle actions
     # if actions:
@@ -261,12 +288,23 @@ def _compute_stats(experiment_name, rewards = True, observations = True, actions
     #         reward_results[alg] = {"means": reward_avg, "stds": reward_std, "max": reward_max, "min": reward_min}
     #     results["rewards"] = reward_results
 
-    
     return results
 
+def convert_dict_obs_to_arr(obs):
+    coll_obs = []
+    coll_keys = []
+    for k,v in obs.items():
+        coll_keys.append(k)
+        # print(type(v))
+        coll_obs.append(np.array(v))
+        # print(coll_keys)
+    # for o in coll_obs:
+    #     print(o.shape)
+    return coll_keys, np.concatenate(coll_obs, axis = None)
 
-def compute_rewards(experiment_name, base = False):
-    return _compute_stats(experiment_name, True, False, False, base_rewards=base)
+
+def compute_rewards(experiment_name, base = False, num_goal_buckets = None):
+    return _compute_stats(experiment_name, True, False, False, base_rewards=base, num_goal_buckets = num_goal_buckets)
 
 def compute_observations(experiment_name):
     return _compute_stats(experiment_name,False, True, False)['observations']
@@ -305,7 +343,7 @@ def load_episode_log(path):
 
 if __name__ == "__main__":
 
-    # results = compute_rewards("DQNShort_old")
+    # results = compute_rewards("DQNShort_old")['rewards']
     # print(results.keys())
     # DQNCartSHORT2 = results['DQNCartSHORT2']
     # DQNCartSHORT = results['DQNCartSHORT']

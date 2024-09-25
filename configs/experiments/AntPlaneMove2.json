@@ -8,7 +8,7 @@
         "episodes": null
 },
     "env_params": {"max_episode_steps": 1000,"render_mode":null, "exclude_current_positions_from_observation":false},
-    "trials": 5,
+    "trials": 1,
     "configs": ["AntRandom","AntStationary","AntSAC"],
     "logs": "timestamp",
     "save_trials": "best"

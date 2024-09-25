@@ -26,18 +26,27 @@ class Move(Task):
                  survival_bonus = 1.0,
                  include_xy = True,
                  modify_obs = True,
+                 adaptive_margin = False,
+                 categorical = False,
                  margin = 1.5,
+                 slope = 1.0,
                  direction = "X", 
                  metric = "L1"):
         super().__init__()
         self.desired_velocity_minimum = desired_velocity_minimum #TODO refactor to range so as to have consistent API
         self.desired_velocity_maximum = desired_velocity_maximum
+
         #hypothesis: forwards is simply "x_velocity". Courtesy of Rafa
         if self.desired_velocity_maximum == math.inf: #not supporting this simultaneously with range for now
             self.maximize = True
         else:
             self.maximize = False
-
+        self.max_desired_speed = max(abs(self.desired_velocity_minimum), abs(self.desired_velocity_maximum))
+        self.min_norm_reward = 0.1
+        self.adaptive_margin_minimum = 0.1
+        self.adaptive_margin_maximum = margin
+        self.adaptive_margin_setting = adaptive_margin
+        self.adaptive_margin = None
         if survival_bonus:
             self.survival_bonus = survival_bonus #float
         else:
@@ -45,7 +54,7 @@ class Move(Task):
 
         self.ctrl_cost = ctrl_cost #just boolean flags
         self.cnt_cost = contact_cost #not currently implemented
-
+        self.categorical = categorical
         if healthy_z_range: #this should be a range
             self.min_z, self.max_z = healthy_z_range
         else:
@@ -61,6 +70,7 @@ class Move(Task):
             direction = self.direction #better be a (6,) array!
         print(self.direction)
         self.margin = margin
+        self.slope = slope
         self.metric = metric
         self.reset() #to sample the desired velocity from between the minimum and maximum
     
@@ -85,6 +95,7 @@ class Move(Task):
 
     #checking state feature for velocity in the desired direction. if direction is None, we'll simply take the magnitude of the velocity vector in any direction.
     def get_reward(self, observation, last_action, contact_forces):
+        # print(self.desired_velocity, type(self.desired_velocity))
         if type(observation)==dict:
             obs = observation["observation"]
         else:
@@ -99,7 +110,9 @@ class Move(Task):
                 if dist_to_vec < self.margin:
                     base_reward = 0.0
                 else:
-                    base_reward = max(self.margin - dist_to_vec,-self.survival_bonus+0.001) #0 at (or within) margin, less than 0 outside of it
+                    dist_to_ball = dist_to_vec - self.margin
+
+                    base_reward =  -min(dist_to_ball*self.slope,self.survival_bonus) #0 at (or within) margin, less than 0 outside of it, never less than survival bonus
             elif self.metric == "L1":
                 base_reward = -1*np.sum(np.abs(velocity_vec - self.direction*self.desired_velocity))
         else:
@@ -109,7 +122,11 @@ class Move(Task):
         ctrl_cost = self.control_cost(last_action)
         contact_cost = self.contact_cost(contact_forces)
         total_cost = ctrl_cost + contact_cost
-        reward = base_reward + healthy_bonus - total_cost  #bonus is simply zero if this is not desired
+        # min_norm = max(self.min_norm_reward, abs(self.desired_velocity))
+        # min_norm = self.max_desired_speed
+        velocity_bonus = base_reward + healthy_bonus + 0.001
+        
+        reward = velocity_bonus - total_cost  #bonus is simply zero if this is not desired
         #TODO ctrl cost, contact cost, and termination for healthy z range....
         reward_info = {'desired_velocity': self.desired_velocity, 'achieved_velocity': achieved_velocity, 'base': base_reward, 'healthy_bonus': healthy_bonus, 'control cost': -ctrl_cost, 'contact cost': -contact_cost}
         # print(reward_info)
@@ -130,7 +147,17 @@ class Move(Task):
         if self.desired_velocity_maximum == self.desired_velocity_minimum:
             self.desired_velocity = self.desired_velocity_minimum
         else:
-            self.desired_velocity = rnd.uniform(self.desired_velocity_minimum, self.desired_velocity_maximum)
+            if self.categorical:
+                self.desired_velocity = rnd.sample([self.desired_velocity_minimum, self.desired_velocity_maximum],k=1)[0]
+            else:
+                self.desired_velocity = rnd.uniform(self.desired_velocity_minimum, self.desired_velocity_maximum)
+            # print(self.desired_velocity, type(self.desired_velocity))
+        
+        if self.adaptive_margin_setting:
+            hardness = abs(self.desired_velocity)/self.max_desired_speed
+            self.adaptive_margin = max(self.adaptive_margin_minimum, self.adaptive_margin_maximum*hardness)
+            self.margin = self.adaptive_margin
+
         # parent_return = super().reset()
         # print(parent_return)
         return super().reset()
@@ -170,4 +197,5 @@ class Rotate(EternalTask):
             self.desired_velocity = self.desired_velocity_minimum
         else:
             self.desired_velocity = rnd.uniform(self.desired_velocity_minimum, self.desired_velocity_maximum)
+
         return super().reset()

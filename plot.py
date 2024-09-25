@@ -9,27 +9,42 @@ from utils import compute_rewards
 #TODO we will need some kind of plotting settings
 
 #we parsed out all the trial data and averaged it correctly. now all that's left to do is actually graphing it...
-def graph_rewards(results, title, base = False):
+def graph_rewards(results, keyword, title, buckets = True, base = False):
     plt.figure(figsize=(10,6))
-
-    for algorithm, values in results.items():
-        means = values["means"]
-        stds = values["stds"]
-        if not base:
-            means = np.maximum(-5,means)
-            stds = np.minimum(10, stds)
-        else:
-            means = np.maximum(-10000,means)
-            stds = np.minimum(5000, stds)
-        x = np.arange(len(means))
-        plt.plot(x,means,label = algorithm)
-        plt.fill_between(x, means-stds, means+stds, alpha=0.2)
-    plt.title(title)
-    plt.xlabel('episodes')
-    plt.ylabel('total reward')
-    plt.legend()
-    save_graph(title)
-    plt.show()
+    print("results keys", results.keys())
+    bucket_first = {}
+    for algorithm in results[keyword]:
+        print(algorithm)
+        for bucket, values in results[keyword][algorithm].items():
+            print(bucket)
+            if bucket not in bucket_first:
+                bucket_first[bucket] = {}
+            bucket_first[bucket][algorithm] = values
+    print("REVERSE")    
+    for bucket in bucket_first:
+        print(bucket)
+        for algorithm, values in bucket_first[bucket].items():
+            print(algorithm)
+            # print("alg results keys", alg_results.keys())
+            # print(values.keys())
+            means = values["means"]
+            stds = values["stds"]
+            if not base:
+                means = np.maximum(-5,means)
+                stds = np.minimum(10, stds)
+            else:
+                means = np.maximum(-10000,means)
+                stds = np.minimum(5000, stds)
+            x = np.arange(len(means))
+            plt.plot(x,means,label = algorithm+bucket)
+            plt.fill_between(x, means-stds, means+stds, alpha=0.2)
+        new_title = title+" "+bucket
+        plt.title(new_title)
+        plt.xlabel('episodes')
+        plt.ylabel('total reward')
+        plt.legend()
+        save_graph(new_title)
+        plt.show()
 
 def save_graph(name):
     plt.savefig('./graphs/'+name+'.png')
@@ -67,11 +82,12 @@ if __name__ == "__main__":
 
     # results = compute_rewards("AntPlaneMove_2024-09-11_18-06-07")
     # graph_rewards(results, "AntPlaneMove 1M (full vec vel reward, reduced action-cost) n=5")
+    # results = compute_rewards("AntPlaneMove_2024-09-23_15-55-54", base = True)
+    # results = compute_rewards("AntPlaneMove_2024-09-23_14-47-18", base = True)
+    results = compute_rewards("AntPlaneMove_2024-09-25_14-46-13", base = True, num_goal_buckets = 2)
+    # print(results.keys())
 
-    results = compute_rewards("AntPlaneMove_2024-09-19_14-19-54", base = True)
-    print(results.keys())
-
-
-    graph_rewards(results["base rewards"], "AntPlaneMove 1M (base reward) n=5", base = True)
-    graph_rewards(results["base average"], "AntPlaneMove 1M (base average) n=5", base = True)
-    graph_rewards(results["rewards"], "AntPlaneMove 1M (total reward) n=5")
+    # print(results["base rewards"].keys())
+    graph_rewards(results, "base rewards", "AntPlaneMove T=2M {3.0, 4.0} m=2.0, s=0.5 (base reward) n=1", base = True)
+    graph_rewards(results, "base average", "AntPlaneMove T=2M {3.0, 4.0} m=2.0, s=0.5 (base average) n=1", base = True)
+    graph_rewards(results, "rewards", "AntPlaneMove T=2M {3.0, 4.0} m=2.0, s=0.5 (total reward) n=1")
