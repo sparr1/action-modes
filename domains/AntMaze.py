@@ -26,9 +26,11 @@ class Move(Task):
                  survival_bonus = 1.0,
                  include_xy = True,
                  modify_obs = True,
-                 adaptive_margin = False,
+                 adaptive_margin = True,
+                 adaptive_margin_minimum = 0.25,
                  categorical = False,
-                 margin = 1.5,
+                 margin = 2.0,
+                 loss_at_margin = 1/3,
                  slope = 1.0,
                  direction = "X", 
                  metric = "L1"):
@@ -42,11 +44,12 @@ class Move(Task):
         else:
             self.maximize = False
         self.max_desired_speed = max(abs(self.desired_velocity_minimum), abs(self.desired_velocity_maximum))
-        self.min_norm_reward = 0.1
-        self.adaptive_margin_minimum = 0.1
-        self.adaptive_margin_maximum = margin
+        # self.min_norm_reward = 0.1
+        self.adaptive_margin_minimum = 0.25
         self.adaptive_margin_setting = adaptive_margin
-        self.adaptive_margin = None
+        # self.adaptive_margin = None
+        self.loss_at_margin = loss_at_margin
+        # self.value_at_margin = 0.5
         if survival_bonus:
             self.survival_bonus = survival_bonus #float
         else:
@@ -104,9 +107,9 @@ class Move(Task):
         velocity_vec = obs[15:21] if self.include_xy else obs[13:19]
         # print(velocity_vec)
         achieved_velocity = np.dot(velocity_vec, self.direction) #for now, this just selects one of the three axes. 
+        dist_to_vec = np.sqrt(np.sum((velocity_vec - self.direction*self.desired_velocity)**2))
         if not self.maximize:
             if self.metric == "L2":
-                dist_to_vec = np.sqrt(np.sum((velocity_vec - self.direction*self.desired_velocity)**2)) #do we want a margin? TODO add margin. pretty convinced we do, because the velocities for a walking ant have a wide variation.
                 if dist_to_vec < self.margin:
                     base_reward = 0.0
                 else:
@@ -115,6 +118,13 @@ class Move(Task):
                     base_reward =  -min(dist_to_ball*self.slope,self.survival_bonus) #0 at (or within) margin, less than 0 outside of it, never less than survival bonus
             elif self.metric == "L1":
                 base_reward = -1*np.sum(np.abs(velocity_vec - self.direction*self.desired_velocity))
+            elif self.metric == "huber":
+                if dist_to_vec < self.margin:
+                    base_reward = -self.loss_at_margin*(dist_to_vec/self.margin)**2 #normalized quadratic region
+                else:
+                    base_reward =  2*self.loss_at_margin*(dist_to_vec/self.margin) - self.loss_at_margin #normalized linear region
+                    base_reward = -min(base_reward, self.survival_bonus)
+
         else:
             base_reward = self.achieved_velocity #for now, just linear in velocity.
         healthy = self.healthy(obs)
@@ -154,9 +164,7 @@ class Move(Task):
             # print(self.desired_velocity, type(self.desired_velocity))
         
         if self.adaptive_margin_setting:
-            hardness = abs(self.desired_velocity)/self.max_desired_speed
-            self.adaptive_margin = max(self.adaptive_margin_minimum, self.adaptive_margin_maximum*hardness)
-            self.margin = self.adaptive_margin
+           self.margin = max(self.adaptive_margin_minimum, (abs(self.desired_velocity) / 2))
 
         # parent_return = super().reset()
         # print(parent_return)

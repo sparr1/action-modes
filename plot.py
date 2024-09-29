@@ -12,38 +12,55 @@ from utils import compute_rewards
 def graph_rewards(results, keyword, title, buckets = True, base = False):
     plt.figure(figsize=(10,6))
     print("results keys", results.keys())
-    bucket_first = {}
-    for algorithm in results[keyword]:
-        print(algorithm)
-        for bucket, values in results[keyword][algorithm].items():
-            print(bucket)
-            if bucket not in bucket_first:
-                bucket_first[bucket] = {}
-            bucket_first[bucket][algorithm] = values
-    print("REVERSE")    
-    for bucket in bucket_first:
-        print(bucket)
-        for algorithm, values in bucket_first[bucket].items():
+    if buckets:
+        bucket_first = {}
+        for algorithm in results[keyword]:
             print(algorithm)
-            # print("alg results keys", alg_results.keys())
-            # print(values.keys())
+            for bucket, values in results[keyword][algorithm].items():
+                print(bucket)
+                if bucket not in bucket_first:
+                    bucket_first[bucket] = {}
+                bucket_first[bucket][algorithm] = values
+        print("REVERSE")    
+        for bucket in bucket_first:
+            print(bucket)
+            for algorithm, values in bucket_first[bucket].items():
+                print(algorithm)
+                # print("alg results keys", alg_results.keys())
+                # print(values.keys())
+                means = values["means"]
+                stds = values["stds"]
+                # if not base:
+                #     means = np.maximum(-5,means)
+                #     stds = np.minimum(10, stds)
+                # else:
+                #     means = np.maximum(-10000,means)
+                #     stds = np.minimum(5000, stds)
+                x = np.arange(len(means))
+                plt.plot(x,means,label = algorithm+bucket)
+                plt.fill_between(x, means-stds, means+stds, alpha=0.2)
+            new_title = title+" "+bucket
+            plt.title(new_title)
+            plt.xlabel('episodes')
+            plt.ylabel('total reward')
+            plt.legend()
+            save_graph(new_title)
+            plt.show()
+    else:
+        for algorithm, values in results[keyword].items():
+            print(algorithm)
             means = values["means"]
             stds = values["stds"]
-            if not base:
-                means = np.maximum(-5,means)
-                stds = np.minimum(10, stds)
-            else:
-                means = np.maximum(-10000,means)
-                stds = np.minimum(5000, stds)
+            # means = np.maximum(-10000,means)
+            # stds = np.minimum(5000, stds)
             x = np.arange(len(means))
-            plt.plot(x,means,label = algorithm+bucket)
+            plt.plot(x,means,label = algorithm)
             plt.fill_between(x, means-stds, means+stds, alpha=0.2)
-        new_title = title+" "+bucket
-        plt.title(new_title)
+        plt.title(title)
         plt.xlabel('episodes')
         plt.ylabel('total reward')
         plt.legend()
-        save_graph(new_title)
+        save_graph(title)
         plt.show()
 
 def save_graph(name):
@@ -84,10 +101,11 @@ if __name__ == "__main__":
     # graph_rewards(results, "AntPlaneMove 1M (full vec vel reward, reduced action-cost) n=5")
     # results = compute_rewards("AntPlaneMove_2024-09-23_15-55-54", base = True)
     # results = compute_rewards("AntPlaneMove_2024-09-23_14-47-18", base = True)
-    results = compute_rewards("AntPlaneMove_2024-09-25_14-46-13", base = True, num_goal_buckets = 2)
+    num_goal_buckets = 2
+    results = compute_rewards("AntPlaneMoveNew_2024-09-29_13-23-35", base = True, num_goal_buckets = num_goal_buckets)
     # print(results.keys())
-
+    buckets = True if num_goal_buckets else False
     # print(results["base rewards"].keys())
-    graph_rewards(results, "base rewards", "AntPlaneMove T=2M {3.0, 4.0} m=2.0, s=0.5 (base reward) n=1", base = True)
-    graph_rewards(results, "base average", "AntPlaneMove T=2M {3.0, 4.0} m=2.0, s=0.5 (base average) n=1", base = True)
-    graph_rewards(results, "rewards", "AntPlaneMove T=2M {3.0, 4.0} m=2.0, s=0.5 (total reward) n=1")
+    graph_rewards(results, "base rewards", "AntPlaneMove T=2M {1.0, 4.0} m=0.5*v, l_m=0.333 (base reward) n=1", base = True, buckets = buckets)
+    graph_rewards(results, "base average", "AntPlaneMove T=2M {4.0} m=0.5*v, l_m=0.333 (base average) n=1", base = True, buckets = buckets)
+    graph_rewards(results, "rewards", "AntPlaneMove T=2M {4.0} m=0.5*v, l_m=0.333 (total reward) n=1", buckets = buckets)

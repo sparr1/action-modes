@@ -188,7 +188,6 @@ def _compute_stats(experiment_name, rewards = True, observations = True, actions
                 retrieve_trial(alg_name, trial_data, 'timesteps', trial_base_steps)
             if goals:
                 retrieve_trial(alg_name, trial_data, 'goals', trial_goals)
-                # print(trial_goals)
             if observations:
                 retrieve_trial(alg_name, trial_data, 'observations', trial_observations)
             if actions:
@@ -198,10 +197,10 @@ def _compute_stats(experiment_name, rewards = True, observations = True, actions
         except:
             print(f"unexpected issue handling file/directory: {item}") 
     results = {}
-    goal_stats = {}
-    goal_buckets = [(-math.inf, math.inf)]
-
+    goal_buckets = [(-math.inf, math.inf)] #even in the case of no goals or goal-bucketing, using this in some places makes the code shorter
     if goals:
+        goal_stats = {}
+
         for alg, goal_trials in trial_goals.items():
             compute_stat(alg, goal_trials, goal_stats)
         goal_min = min(goal_stats[alg]["min"])
@@ -230,9 +229,14 @@ def _compute_stats(experiment_name, rewards = True, observations = True, actions
             for alg, trials in trial_rewards.items():
                 print("alg", alg)
                 print("trials", len(trials))
-                goals_trials = trial_goals[alg]
-                # print(trials)
+                if goals:
+                    goals_trials = trial_goals[alg]
+                    goal_range = bucket
+                else:
+                    goals_trials = goal_range = None
+                    # print(trials)
                 compute_stat(alg, trials, reward_results, goal_range = bucket, goal_trials_data = goals_trials)
+
             results["rewards"] = reward_results
 
         if base_rewards:
@@ -240,12 +244,16 @@ def _compute_stats(experiment_name, rewards = True, observations = True, actions
             # print({key:len(value) for key,value in trial_rewards.items()})
             
             for alg in trial_base_rewards.keys():
-                goals_trials = trial_goals[alg]
+                # goals_trials = trial_goals[alg]
                 base_reward_trials = trial_base_rewards[alg]
                 steps_trials = trial_base_steps[alg]
                 base_avg_trials = [(trial_base_rewards[alg][i] / trial_base_steps[alg][i]).tolist() for i in range(len(base_reward_trials))]
                 # base_avg_trials = (np.array(trial_base_rewards[alg]) / np.array(trial_base_steps[alg])).tolist()
-
+                if goals:
+                    goals_trials = trial_goals[alg]
+                    goal_range = bucket
+                else:
+                    goals_trials = goal_range = None
                 compute_stat(alg, base_reward_trials, base_reward_results, goal_range = bucket, goal_trials_data = goals_trials)
                 compute_stat(alg, steps_trials, steps_results, goal_range = bucket, goal_trials_data = goals_trials)
                 compute_stat(alg, base_avg_trials, base_avg_results, goal_range = bucket, goal_trials_data = goals_trials)
@@ -255,7 +263,7 @@ def _compute_stats(experiment_name, rewards = True, observations = True, actions
             results["base average"] = base_avg_results
 
         
-        #TODO handle observations (is this done? TODO test)
+        #TODO handle observations (is this done? TODO test) not implemented with buckets
         if observations:
             print(len(trial_observations.keys()))
             for alg, trials in trial_observations.items():
