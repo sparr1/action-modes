@@ -13,15 +13,18 @@ domains = \
 
 selected_domain = domains["ant"]
 max_episode_steps = 1000 #TODO: figure out why we're rendering 5x the number of episode step frames
-categorical = True
-des_vel_min = 1.0
-des_vel_max = 4.0
+categorical = False
+des_vel_min = -2.0
+des_vel_max = 2.0
 survival_bonus = 1.0
 loss_at_margin = 1/3
-margin = 0.5
-metric = "huber"
+margin = 2
+slope = 0.5
+metric = "L2"
 render_train = True
 render_test = True
+adaptive_margin = True
+adaptive_margin_minimum = 0.01
 direction = "X"
 if render_train:
     train_mode = "human"
@@ -32,28 +35,28 @@ if render_test:
 else:
     test_mode = None
 train_env = gym.make(selected_domain,exclude_current_positions_from_observation=False, max_episode_steps=max_episode_steps, render_mode = train_mode) #do not render training steps. god
-objective = Move(desired_velocity_minimum=des_vel_min, desired_velocity_maximum=des_vel_max, survival_bonus=survival_bonus, direction=direction,loss_at_margin=loss_at_margin, margin=margin, categorical = categorical, metric=metric)
+objective = Move(desired_velocity_minimum=des_vel_min, desired_velocity_maximum=des_vel_max, survival_bonus=survival_bonus, direction=direction,loss_at_margin=loss_at_margin, margin=margin, adaptive_margin = adaptive_margin,adaptive_margin_minimum = adaptive_margin_minimum, slope = slope, categorical = categorical, metric=metric)
 train_env = Subtask(train_env, objective)
 print(train_env.observation_space)
-# params={"learning_rate":3e-4, "gamma":1.0}
-model = Baseline("SAC", train_env)
+params={"learning_starts":int(1e5), "buffer_size":int(5e5)}
+model = Baseline("SAC", train_env, params = params)
 # # model = Random("random", train_env)
 # # model = Stationary("stationary", train_env)
 # model = model.load("logs/AntPlaneRotate_2024-09-18_12-23-13/models/model:AntPPO_0")
 # model.load("logs/AntPlaneMove_2024-09-12_20-21-21/models/model:AntSAC_4")
 
-model.learn(total_timesteps=100000)
+model.learn(total_timesteps=1500000)
 # model.save("./", "test")
 # vec_env = model.get_env()
 train_env.reset()
 train_env.close()
 #switch to test_env
 test_env = gym.make(selected_domain, exclude_current_positions_from_observation=False, max_episode_steps=max_episode_steps, render_mode=test_mode) #please render the test steps!
-objective = Move(desired_velocity_minimum=des_vel_min, desired_velocity_maximum=des_vel_max, survival_bonus=survival_bonus, direction=direction,loss_at_margin=loss_at_margin, margin=margin, categorical = categorical, metric=metric)
+objective = Move(desired_velocity_minimum=des_vel_min, desired_velocity_maximum=des_vel_max, survival_bonus=survival_bonus, direction=direction,loss_at_margin=loss_at_margin, margin=margin,adaptive_margin = adaptive_margin, adaptive_margin_minimum = adaptive_margin_minimum, slope = slope, categorical = categorical, metric=metric)
 test_env = Subtask(test_env, objective)
 # model
 # model = Baseline("SAC", test_env)
-# model.load("logs/AntPlaneMoveNew_2024-09-27_12-18-34/models/model:AntSAC_0")
+# model.load("logs/AntPlaneMove2_2024-10-01_13-06-09/models/model:AntSAC_0")
 observation, info = test_env.reset(seed=42)
 # desired_vel = info['reward_info']['desired_velocity']
 # labels = ["x velocity", "y velocity", "z velocity", "x angular velocty", "y angular velocity", "z angular velocity"]

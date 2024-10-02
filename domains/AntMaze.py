@@ -45,8 +45,10 @@ class Move(Task):
             self.maximize = False
         self.max_desired_speed = max(abs(self.desired_velocity_minimum), abs(self.desired_velocity_maximum))
         # self.min_norm_reward = 0.1
-        self.adaptive_margin_minimum = 0.25
+        self.adaptive_margin_minimum = adaptive_margin_minimum
         self.adaptive_margin_setting = adaptive_margin
+        self.adaptive_slope_maximum = 1 / self.adaptive_margin_minimum
+        self.adaptive_slope_setting = self.adaptive_margin_setting
         # self.adaptive_margin = None
         self.loss_at_margin = loss_at_margin
         # self.value_at_margin = 0.5
@@ -66,12 +68,17 @@ class Move(Task):
         self.include_xy = include_xy #boolean
         self.modify_obs = modify_obs #boolean
         directions = ["X", "Y", "Z", "XR", "YR", "ZR"]
+        starting_weights = np.array([1.0,1.0,1.0,0.4,0.4,0.4])
+
         self.direction = np.zeros(6,dtype = float)
         if direction in directions:
             self.direction[directions.index(direction)] = 1.0
         else:
             direction = self.direction #better be a (6,) array!
         print(self.direction)
+        self.tuned_weights = 0.5*self.direction*starting_weights + 0.5*starting_weights
+        print(self.tuned_weights)
+
         self.margin = margin
         self.slope = slope
         self.metric = metric
@@ -107,7 +114,7 @@ class Move(Task):
         velocity_vec = obs[15:21] if self.include_xy else obs[13:19]
         # print(velocity_vec)
         achieved_velocity = np.dot(velocity_vec, self.direction) #for now, this just selects one of the three axes. 
-        dist_to_vec = np.sqrt(np.sum((velocity_vec - self.direction*self.desired_velocity)**2))
+        dist_to_vec = np.sqrt(np.dot(self.tuned_weights,(velocity_vec - self.direction*self.desired_velocity)**2))
         if not self.maximize:
             if self.metric == "L2":
                 if dist_to_vec < self.margin:
@@ -165,6 +172,7 @@ class Move(Task):
         
         if self.adaptive_margin_setting:
            self.margin = max(self.adaptive_margin_minimum, (abs(self.desired_velocity) / 2))
+           self.slope = 1/self.margin
 
         # parent_return = super().reset()
         # print(parent_return)

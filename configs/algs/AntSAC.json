@@ -4,7 +4,9 @@
     "alg": "baselines/SAC",
     "device": "cpu",
     "alg_params": {
-        "verbose": 1
+        "verbose": 1,
+        "buffer_size":5e5,
+        "learning_starts":1e5
     },
     "total_steps": 1000000,
     "episodes": 10
