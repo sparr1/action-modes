@@ -101,11 +101,11 @@ if __name__ == "__main__":
     # graph_rewards(results, "AntPlaneMove 1M (full vec vel reward, reduced action-cost) n=5")
     # results = compute_rewards("AntPlaneMove_2024-09-23_15-55-54", base = True)
     # results = compute_rewards("AntPlaneMove_2024-09-23_14-47-18", base = True)
-    num_goal_buckets = 5
-    results = compute_rewards("AntPlaneMoveNew_2024-09-30_17-42-11", base = True, num_goal_buckets = num_goal_buckets)
+    num_goal_buckets = 7
+    results = compute_rewards("AntPlaneRotateNew_2024-10-10_16-22-19", base = True, num_goal_buckets = num_goal_buckets)
     # print(results.keys())
     buckets = True if num_goal_buckets else False
     # print(results["base rewards"].keys())
-    graph_rewards(results, "base rewards", "AntPlaneMove T=2M (-2.0, 2.0) m=0.666*v, l_m=0.333 adapt_min = 0.1 L=huber (base reward) n=3", base = True, buckets = buckets)
-    graph_rewards(results, "base average", "AntPlaneMove T=2M (-2.0, 2.0) m=0.666*v, l_m=0.333 adapt_min = 0.1 L=huber (base average) n=3", base = True, buckets = buckets)
-    graph_rewards(results, "rewards", "AntPlaneMove T=2M (-2.0, 2.0) m=0.666*v, l_m=0.333 adapt_min = 0.1 L = huber (total reward) n=3", buckets = buckets)
+    graph_rewards(results, "base rewards", "AntPlaneRotate T=3.5M v=(-6.0, 6.0) adapt_min = 0.01 L=L2 (base reward) n=5", base = True, buckets = buckets)
+    graph_rewards(results, "base average", "AntPlaneRotate T=3.5M v=(-6.0, 6.0) adapt_min = 0.01 L=L2 (base average) n=5", base = True, buckets = buckets)
+    graph_rewards(results, "rewards", "AntPlaneRotate T=3.5M v=(-6.0, 6.0) adapt_min = 0.01 L=L2 (total reward) n=5", buckets = buckets)

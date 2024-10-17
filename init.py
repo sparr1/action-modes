@@ -12,19 +12,19 @@ domains = \
 "point_sparse": "PointMaze_UMaze-v3"}
 
 selected_domain = domains["ant"]
-max_episode_steps = 1000 #TODO: figure out why we're rendering 5x the number of episode step frames
+max_episode_steps = 500 #TODO: figure out why we're rendering 5x the number of episode step frames
 categorical = False
-des_vel_min = -2.0
-des_vel_max = 2.0
+des_vel_min = -0.5
+des_vel_max = 0.5
 survival_bonus = 1.0
-loss_at_margin = 1/3
+loss_at_margin = 1.0
 margin = 2
 slope = 0.5
 metric = "L2"
 render_train = True
 render_test = True
 adaptive_margin = True
-adaptive_margin_minimum = 0.01
+adaptive_margin_minimum = 1e-5
 direction = "X"
 if render_train:
     train_mode = "human"
@@ -42,10 +42,13 @@ params={"learning_starts":int(1e5), "buffer_size":int(5e5)}
 model = Baseline("SAC", train_env, params = params)
 # # model = Random("random", train_env)
 # # model = Stationary("stationary", train_env)
-# model = model.load("logs/AntPlaneRotate_2024-09-18_12-23-13/models/model:AntPPO_0")
-# model.load("logs/AntPlaneMove_2024-09-12_20-21-21/models/model:AntSAC_4")
+# model.load("logs/AntPlaneRotateNew_2024-10-09_12-24-24/models/model:AntSAC_1")
+# model.load("logs/AntPlaneMoveNew6.0_2024-10-03_09-30-15/models/model:AntSAC_2")
+model.load("logs/AntPlaneMove5_2024-10-11_21-28-31/models/model:AntSAC_0")
 
-model.learn(total_timesteps=1500000)
+# model.load("logs/AntPlaneRotateNew_2024-10-10_16-22-19/models/model:AntSAC_0")
+
+# model.learn(total_timesteps=1500000)
 # model.save("./", "test")
 # vec_env = model.get_env()
 train_env.reset()
@@ -60,7 +63,7 @@ test_env = Subtask(test_env, objective)
 observation, info = test_env.reset(seed=42)
 # desired_vel = info['reward_info']['desired_velocity']
 # labels = ["x velocity", "y velocity", "z velocity", "x angular velocty", "y angular velocity", "z angular velocity"]
-for _ in range(100000):
+for _ in range(150000):
    action, _states = model.predict(observation)
    print(np.sum(action))
    observation, reward, terminated, truncated, info = test_env.step(action)
