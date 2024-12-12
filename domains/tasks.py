@@ -37,8 +37,8 @@ class Subtask(gym.Wrapper):
         self.observation_space = gym.spaces.Dict(spaces)
 
     def reset(self, seed = 32): #TODO actually implement seeding properly
-        self._task.reset() #also reset the task. this will resample a new subgoal.
-        old_return = super().reset()
+        self._task.reset(seed=seed) #also reset the task. this will resample a new subgoal.
+        old_return = super().reset(seed=seed)
         return (self.observation(old_return[0]),old_return[1])
     
     def observation(self, obs):

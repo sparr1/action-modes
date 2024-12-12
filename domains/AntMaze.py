@@ -3,7 +3,7 @@ import random as rnd
 import math
 
 from domains.tasks import EternalTask, Task
-
+from utils import q_rotate
 
 #the solution to each of these "Eternal" tasks is simply the projection function which takes a real-valued variable (desired_velocity, usually) to a high dimensional policy 
 #whose aim is to maintain some "fitness" indefinitely. you could think concretely of this fitness as a linear or nonlinear function of state. High fitness is finding a cycle which 
@@ -29,6 +29,7 @@ class Move(Task):
                  adaptive_margin = True,
                  adaptive_margin_minimum = 0.25,
                  categorical = False,
+                 rotation_starting_weight=0.4,
                  margin = 2.0,
                  loss_at_margin = 1/3,
                  slope = 1.0,
@@ -51,6 +52,7 @@ class Move(Task):
         self.adaptive_slope_setting = self.adaptive_margin_setting
         # self.adaptive_margin = None
         self.loss_at_margin = loss_at_margin
+    
         # self.value_at_margin = 0.5
         if survival_bonus:
             self.survival_bonus = survival_bonus #float
@@ -68,12 +70,21 @@ class Move(Task):
         self.include_xy = include_xy #boolean
         self.modify_obs = modify_obs #boolean
         directions = ["X", "Y", "Z", "XR", "YR", "ZR"]
-        self.starting_weights = np.array([1.0,1.0,1.0,0.4,0.4,0.4])
-
+        self.rotation_starting_weight = rotation_starting_weight
+        starting_rotation_weights = np.array([self.rotation_starting_weight]*3)
+        self.starting_weights = np.concatenate(np.ones(shape=(3,)), np.full(starting_rotation_weights, shape=(3,)))
+        if direction == "F":
+            self.relative = True
+            self.relative_direction_start = np.array([1,0,0]) #X,Y,Z, forwards starts at X.
+        else:
+            self.relative = False
+        
         self.direction = np.zeros(6,dtype = float)
         if direction in directions:
             self.direction[directions.index(direction)] = 1.0
             self.starting_weights[directions.index(direction)] = 1.0
+        elif direction == 'F':
+            pass
         else:
             direction = self.direction #better be a (6,) array!
 
@@ -112,10 +123,22 @@ class Move(Task):
             obs = observation["observation"]
         else:
             obs = observation #does this make sense? TODO check
-         
-        velocity_vec = obs[15:21] if self.include_xy else obs[13:19]
+        offset = 0 if not self.include_xy else 2
+        velocity_vec = obs[13+offset:19+offset]
+        if self.relative:
+            # print(self.relative_direction_start)
+            q_rot = obs[1+offset:5+offset]
+            # print(q_rot) #W is first
+            self.direction = q_rotate(self.relative_direction_start, q_rot)
+            # print(self.direction)
+            self.direction = np.concatenate((self.direction, [0.0, 0.0, 0.0]),axis = 0)
+            # print(self.direction)
+
         # print(velocity_vec)
-        achieved_velocity = np.dot(velocity_vec, self.direction) #for now, this just selects one of the three axes. 
+        achieved_velocity = np.dot(velocity_vec, self.direction)/np.dot(self.direction, self.direction) #project onto the desired direction 
+        # print("achieved forwards velocity", achieved_velocity)
+        # print("X,Y,Z velocity", velocity_vec[:3])
+        # print("rotation quaternion", q_rot)
         deviation = np.sum(self.tuned_weights*((velocity_vec - self.direction*self.desired_velocity))**2)
         # dist_to_vec = np.sqrt(deviation) if deviation > 1 else deviation
         dist_to_vec = np.sqrt(deviation)
@@ -176,13 +199,14 @@ class Move(Task):
             # print(self.desired_velocity, type(self.desired_velocity))
         
         if self.adaptive_margin_setting:
-           self.margin = max(self.adaptive_margin_minimum, (abs(self.desired_velocity) / 2))
+            self.margin = max(self.adaptive_margin_minimum, (abs(self.desired_velocity) / 2))
         #    self.margin = abs(self.desired_velocity)
-           self.slope = 1/self.margin
+            self.slope = 1/self.margin
         #    self.tuning_margin_correction = min(self.margin/10, 0.5)
-           self.tuning_margin_correction = 0.5
-           self.tuned_weights = (1 - self.tuning_margin_correction)*self.direction*self.starting_weights + self.tuning_margin_correction*self.starting_weights
-           self.squared_margin = self.margin**2
+        #    self.tuning_margin_correction = 0.5
+        #    self.tuned_weights = (1 - self.tuning_margin_correction)*self.direction*self.starting_weights + self.tuning_margin_correction*self.starting_weights
+        #    self.squared_margin = self.margin**2
+            self.tuned_weights = self.starting_weights
         #    print("margin", self.margin)
         #    print("slope", self.slope)
         #    print("tuning_margin_correction", self.tuning_margin_correction)

@@ -1,7 +1,10 @@
 import datetime
 import numpy as np
-import glob, os, json, sys, math
-
+import glob, os, json, sys, math, importlib
+from domains.tasks import Subtask
+from domains.AntPlane import AntPlane
+SUPPORTED_WRAPPERS = ("Subtask", "AntPlane")
+SUPPORTED_LOG_SETTINGS = ("overwrite", "warn", "timestamp")
 
 def datetime_stamp():
     now = datetime.datetime.now()
@@ -34,6 +37,24 @@ def handle_settings(path): #processes the settings.json file
     with open(path) as f:
         contents = json.load(f)
     print(contents) 
+
+def setup_wrapper(domain, wrapper_name, wrapper_params):
+    if wrapper_name == 'Subtask':      
+        try:
+            print(wrapper_params["task"])
+            module_name,task_name = wrapper_params["task"].split(':') 
+            # print(module)
+            module = importlib.import_module(module_name)
+            task_class = getattr(module,task_name) #grab the specific task
+            p = wrapper_params["task_params"]
+            task = task_class(**wrapper_params["task_params"])  
+            domain = Subtask(domain, task) #replace the reward function and termination conditions based on task, then return the new wrapped domain.
+        except (ModuleNotFoundError, AttributeError) as e:
+            raise ValueError(f"Could not find model class '{task_name}' in module '{module_name}': {e}")
+    elif wrapper_name == 'AntPlane':
+        domain = AntPlane(domain, **wrapper_params)
+    return domain
+
 
 def handle_stats_line(line_segments, keyword):
     return [x for x in line_segments if keyword in x][0].split(' ')[-1]
@@ -145,9 +166,6 @@ def compute_stat(alg, stat_trials_data, stat_results_dict, goal_range = (-math.i
         if alg not in stat_results_dict:
             stat_results_dict[alg] = {}
         stat_results_dict[alg][str(goal_range)] = {"means": avg, "stds": std, "max": smax, "min": smin}
-
-            
-
 
 
 def _compute_stats(experiment_name, rewards = True, observations = True, actions = True, base_rewards = False, num_goal_buckets = 2, max_steps = 1e6):
@@ -348,6 +366,22 @@ def load_episode_log(path):
     if 'info' in logs:
         logs['info'] = contents['info']
     return logs
+
+def q_prod(q1, q2):
+    q3 = np.array([0.0,0.0,0.0,0.0])
+    q3[0] = q1[0]*q2[0] - q1[1]*q2[1] - q1[2]*q2[2] - q1[3]*q2[3]
+    q3[1] = q1[0]*q2[1] + q1[1]*q2[0] + q1[2]*q2[3] - q1[3]*q2[2]
+    q3[2] = q1[0]*q2[2] - q1[1]*q2[3] + q1[2]*q2[0] + q1[3]*q2[1]
+    q3[3] = q1[0]*q2[3] + q1[1]*q2[2] - q1[2]*q2[1] + q1[3]*q2[0]
+    return q3
+
+def q_conj(q):
+    q2 = -q.copy()
+    q2[0] = q[0]
+    return q2
+
+def q_rotate(d, q):
+    return q_prod(q_prod(q, np.append(0, d)), q_conj(q))[1:]
 
 if __name__ == "__main__":
 

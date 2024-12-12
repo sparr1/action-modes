@@ -9,9 +9,9 @@ import gymnasium as gym
 from RL.baselines import Baseline, TrajectoryLoggerCallback
 from log import TrainingLogger
 from domains.tasks import Subtask
-from utils import datetime_stamp, handle_trial
-
-if __name__ == '__main__':
+from domains.AntPlane import AntPlane
+from utils import *
+def main():
     parser = argparse.ArgumentParser(description="action mode learning experiments")
     parser.add_argument('-r', '--run', help='config file for a run', required=True)
     config = vars(parser.parse_args())['run']
@@ -82,7 +82,7 @@ if __name__ == '__main__':
             if not os.path.exists(model_save_dir):
                 os.mkdir(model_save_dir)
 
-        if log_setting not in ["overwrite", "warn", "timestamp"]:
+        if log_setting not in SUPPORTED_LOG_SETTINGS:
             raise Exception("unsupported logging setting. Try none, overwrite, warn, or timestamp.")
         training_logger = TrainingLogger()
         
@@ -100,23 +100,27 @@ if __name__ == '__main__':
             domain = gym.make(run_params['env']) #often overriden by experiment for consistency
 
         #handle custom wrappers:
-        if "env_wrapper" in run_params:
-            if 'name' not in run_params['env_wrapper'] or run_params['env_wrapper']['name'] != "Subtask":
-                raise Exception("wrapper misconfigured, or otherwise not currently supported")
-            wrapper_params = run_params['env_wrapper']["wrapper_params"]
-
-            try:
-                print(wrapper_params["task"])
-                module_name,task_name = wrapper_params["task"].split(':') 
-                # print(module)
-                module = importlib.import_module(module_name)
-                task_class = getattr(module,task_name) #grab the specific task
-                p = wrapper_params["task_params"]
-                task = task_class(**wrapper_params["task_params"])  
-                domain = Subtask(domain, task) #replace the reward function and termination conditions based on task, then return the new wrapped domain.
+        if "env_wrappers" in run_params:
+            for env_wrapper in run_params["env_wrappers"]: #wrappers will be applied first to last in the order of the list
+                if 'name' not in env_wrapper or env_wrapper['name'] not in SUPPORTED_WRAPPERS:
+                    raise Exception("wrappers misconfigured, or otherwise not currently supported")
+                wrapper_name = env_wrapper['name']
+                wrapper_params = env_wrapper['wrapper_params']
+                try:
+                    domain = setup_wrapper(domain, wrapper_name, wrapper_params)
+                except Exception as e:
+                    continue
                 
-            except (ModuleNotFoundError, AttributeError) as e:
-                raise ValueError(f"Could not find model class '{task_name}' in module '{module_name}': {e}")
+        if "env_wrapper" in run_params:
+            if 'name' not in run_params['env_wrapper'] or run_params['env_wrapper']['name'] not in SUPPORTED_WRAPPERS:
+                raise Exception("wrapper misconfigured, or otherwise not currently supported")
+            wrapper_name = run_params['env_wrapper']['name']
+            wrapper_params = run_params['env_wrapper']["wrapper_params"]
+        
+            try:
+                domain = setup_wrapper(domain, wrapper_name, wrapper_params)
+            except Exception as e:
+                continue
 
         alg_name = run_params["alg"]
         
@@ -186,11 +190,6 @@ if __name__ == '__main__':
                 # print("rollout count", callback.rollout_count)
                 # print("n_calls", callback.n_calls)
                 # print("num_timesteps", callback.num_timesteps)
-
-
-
-
-
-
-        
-        
+    
+if __name__ == '__main__':
+   main()

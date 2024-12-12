@@ -4,47 +4,57 @@ from RL.baselines import Baseline
 from RL.alg import Random, Stationary
 from domains.tasks import Subtask
 from domains.AntMaze import Move, Rotate
-domains = \
-{"ant": "Ant-v4",
-"ant_dense": "AntMaze_UMazeDense-v4",
-"ant_sparse": "AntMaze_UMaze-v4",
-"point_dense": "PointMaze_UMazeDense-v3",
-"point_sparse": "PointMaze_UMaze-v3"}
+from domains.AntPlane import AntPlane
+domains = {
+            "ant_plane": "ant_plane",
+            "ant": "Ant-v4",
+            "ant_dense": "AntMaze_UMazeDense-v4",
+            "ant_sparse": "AntMaze_UMaze-v4",
+            "point_dense": "PointMaze_UMazeDense-v3",
+            "point_sparse": "PointMaze_UMaze-v3"
+}
 
-selected_domain = domains["ant"]
-max_episode_steps = 500 #TODO: figure out why we're rendering 5x the number of episode step frames
-categorical = False
-des_vel_min = -0.5
-des_vel_max = 0.5
-survival_bonus = 1.0
-loss_at_margin = 1.0
-margin = 2
-slope = 0.5
-metric = "L2"
-render_train = True
-render_test = True
-adaptive_margin = True
-adaptive_margin_minimum = 1e-5
-direction = "X"
-if render_train:
-    train_mode = "human"
+train_env_params = {
+                    "id": domains["ant_plane"],
+                    "exclude_current_positions_from_observation":False,
+                    "max_episode_steps":500,
+                    "render_mode": "human"
+                    }
+
+train_objective_params = {
+                    "direction": "F",
+                    "desired_velocity_minimum":-6.0,
+                    "desired_velocity_maximum": 6.0,
+                    "survival_bonus": 1.0,
+                    "adaptive_margin":True,
+                    "adaptive_margin_minimum":0.01,
+                    "categorical":False,
+                    "metric": "L2"
+                    }
+
+test_env_params = train_env_params.copy()
+test_objective_params = train_objective_params.copy()
+test_env_params["render_mode"] = "human"
+
+if train_env_params["id"] == "ant_plane":
+    train_env_params["id"] = domains["ant"]
+    train_base_domain = AntPlane(gym.make(**train_env_params))
 else:
-    train_mode = None
-if render_test:
-    test_mode = "human"
-else:
-    test_mode = None
-train_env = gym.make(selected_domain,exclude_current_positions_from_observation=False, max_episode_steps=max_episode_steps, render_mode = train_mode) #do not render training steps. god
-objective = Move(desired_velocity_minimum=des_vel_min, desired_velocity_maximum=des_vel_max, survival_bonus=survival_bonus, direction=direction,loss_at_margin=loss_at_margin, margin=margin, adaptive_margin = adaptive_margin,adaptive_margin_minimum = adaptive_margin_minimum, slope = slope, categorical = categorical, metric=metric)
-train_env = Subtask(train_env, objective)
+    train_base_domain = gym.make(**train_env_params)
+    
+
+train_env = Subtask(train_base_domain, Move(**train_objective_params))
+
+
 print(train_env.observation_space)
-params={"learning_starts":int(1e5), "buffer_size":int(5e5)}
+params={"learning_starts":int(1e4), "buffer_size":int(1e6)}
 model = Baseline("SAC", train_env, params = params)
-# # model = Random("random", train_env)
+# model = Random("random", train_env)
 # # model = Stationary("stationary", train_env)
+model.load("logs/AntPlaneMoveFinal_2024-11-13_10-22-56/models/model:AntSAC_1")
 # model.load("logs/AntPlaneRotateNew_2024-10-09_12-24-24/models/model:AntSAC_1")
 # model.load("logs/AntPlaneMoveNew6.0_2024-10-03_09-30-15/models/model:AntSAC_2")
-model.load("logs/AntPlaneMove5_2024-10-11_21-28-31/models/model:AntSAC_0")
+# model.load("logs/AntPlaneMove5_2024-10-11_21-28-31/models/model:AntSAC_0")
 
 # model.load("logs/AntPlaneRotateNew_2024-10-10_16-22-19/models/model:AntSAC_0")
 
@@ -54,9 +64,13 @@ model.load("logs/AntPlaneMove5_2024-10-11_21-28-31/models/model:AntSAC_0")
 train_env.reset()
 train_env.close()
 #switch to test_env
-test_env = gym.make(selected_domain, exclude_current_positions_from_observation=False, max_episode_steps=max_episode_steps, render_mode=test_mode) #please render the test steps!
-objective = Move(desired_velocity_minimum=des_vel_min, desired_velocity_maximum=des_vel_max, survival_bonus=survival_bonus, direction=direction,loss_at_margin=loss_at_margin, margin=margin,adaptive_margin = adaptive_margin, adaptive_margin_minimum = adaptive_margin_minimum, slope = slope, categorical = categorical, metric=metric)
-test_env = Subtask(test_env, objective)
+if test_env_params["id"] == "ant_plane":
+    test_env_params["id"] = domains["ant"]
+    test_base_domain = AntPlane(gym.make(**test_env_params))
+else:
+    test_base_domain = gym.make(**test_env_params)
+# test_base_domain = gym.make(**test_env_params)
+test_env = Subtask(test_base_domain, Move(**test_objective_params))
 # model
 # model = Baseline("SAC", test_env)
 # model.load("logs/AntPlaneMove2_2024-10-01_13-06-09/models/model:AntSAC_0")
