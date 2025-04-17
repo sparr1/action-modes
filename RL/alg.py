@@ -8,6 +8,9 @@ class Algorithm():
         self.custom_params = custom_params
         self.alg_logger = None
 
+    def get_env(self):
+        return self.env
+    
     def learn(self, **kwargs):
         pass
     def predict(self, observation):
@@ -53,9 +56,11 @@ class Random(SimpleAlgorithm):
         super().__init__(name, env, custom_params)
 
     def predict(self, observation):
+        # print(self.env.action_space)
+        sample = self.env.action_space.sample()
+        # print(type(sample))
+        # print(sample)
         return self.env.action_space.sample(), None
-
-    
     
 #just return all zeros for the action... 
 class Stationary(SimpleAlgorithm):

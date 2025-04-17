@@ -3,7 +3,7 @@ import numpy as np
 import glob, os, json, sys, math, importlib
 from domains.tasks import Subtask
 from domains.AntPlane import AntPlane
-SUPPORTED_WRAPPERS = ("Subtask", "AntPlane")
+SUPPORTED_WRAPPERS = ("Subtask", "AntPlane", "ScaledStateWrapper", "PlatformFlattenedActionWrapper", "ScaledParameterisedActionWrapper")
 SUPPORTED_LOG_SETTINGS = ("overwrite", "warn", "timestamp")
 
 def datetime_stamp():
@@ -47,12 +47,22 @@ def setup_wrapper(domain, wrapper_name, wrapper_params):
             module = importlib.import_module(module_name)
             task_class = getattr(module,task_name) #grab the specific task
             p = wrapper_params["task_params"]
-            task = task_class(**wrapper_params["task_params"])  
+            task = task_class(**p)  
             domain = Subtask(domain, task) #replace the reward function and termination conditions based on task, then return the new wrapped domain.
         except (ModuleNotFoundError, AttributeError) as e:
             raise ValueError(f"Could not find model class '{task_name}' in module '{module_name}': {e}")
     elif wrapper_name == 'AntPlane':
         domain = AntPlane(domain, **wrapper_params)
+    else:
+        print("setting up default wrapper ", wrapper_name, "with params", wrapper_params)
+        module_name,raw_wrapper_name = wrapper_name.split(':') #this is likely to error out
+        module = importlib.import_module(module_name)
+        wrapper_class = getattr(module, raw_wrapper_name)
+        domain = wrapper_class(domain, **wrapper_params)
+        print("wrapping appears to have been successful.")
+
+
+
     return domain
 
 
@@ -341,22 +351,39 @@ def compute_actions(experiment_name):
 def compute_all(experiment_name):
     return _compute_stats(experiment_name)
 
+def listify(obj, wrap = True):
+    if isinstance(obj, int) or \
+       isinstance(obj, bool) or \
+       isinstance(obj, float) or \
+       isinstance(obj, complex) or \
+       isinstance(obj, str):
+         return [obj,] if wrap else obj
+    elif isinstance(obj,np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict): #to handle ordered and unordered dicts
+        return [{k:listify(v, False) for k,v in obj.items()},]
+    elif isinstance(obj, set) or isinstance(obj, tuple) or isinstance(obj, list):
+        return [listify(x, False) for x in obj]
+    elif isinstance(obj,np.generic):
+        return [obj.tolist(),] if wrap else obj.tolist()
+
 def setup_logs(reward, obs, action, dones, info = None):
     data = {}
-    if type(reward) is np.ndarray:
-        data['rewards'] = reward.tolist()
-    else:
-        data['rewards'] = [reward,]
-    if isinstance(obs, dict): #to handle ordered and unordered dicts
-        new_obs = [{k:v.tolist() for k,v in obs.items()},]
-        # obs = json.dumps(self.locals['new_obs'])
-    else:
-        new_obs = obs.tolist()
-    data["obs"] = new_obs
-    data["actions"] = action.tolist()
+    # print(reward)
+    # print(type(reward))
+    # new_rewards = listify(reward)
+    # print(new_rewards)
+    # print(type(new_rewards))
+    data['rewards'] = listify(reward)
+    data["obs"]     = listify(obs)
+    data["actions"] = listify(action)
+
     data["dones"] = dones
-    if info:
+    # print(info)
+    if info and "reward_info" in info[0]:
         data["infos"] = info[0]["reward_info"]
+    else:
+        data["infos"] = info
     return data
 
 def load_episode_log(path):

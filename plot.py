@@ -71,6 +71,9 @@ if __name__ == "__main__":
     # results = compute_rewards("DQNShort_old")
     # graph_rewards(results, "old DQN config override test, n = 15")
 
+    results = compute_rewards("PlatformTest_2025-01-11_20-05-32")
+    graph_rewards(results, "rewards", "Platform RandomPAMDP test, n = 3", buckets=False)
+
     # results = compute_rewards("AntMazeDense700_2024-07-16_21-05-37")
     # graph_rewards(results, "long baselines AntMazeDense 10M timesteps, n = 5")
 
@@ -101,11 +104,11 @@ if __name__ == "__main__":
     # graph_rewards(results, "AntPlaneMove 1M (full vec vel reward, reduced action-cost) n=5")
     # results = compute_rewards("AntPlaneMove_2024-09-23_15-55-54", base = True)
     # results = compute_rewards("AntPlaneMove_2024-09-23_14-47-18", base = True)
-    num_goal_buckets = 7
-    results = compute_rewards("AntPlaneMoveFinal_2024-11-11_21-03-38", base = True, num_goal_buckets = num_goal_buckets)
-    # print(results.keys())
-    buckets = True if num_goal_buckets else False
-    # print(results["base rewards"].keys())
-    graph_rewards(results, "base rewards", "AntPlaneMoveFinal T=3.5M v=(-6.0, 6.0) adapt_min = 0.01 L=L2 (base reward) n=5", base = True, buckets = buckets)
-    graph_rewards(results, "base average", "AntPlaneMoveFinal T=3.5M v=(-6.0, 6.0) adapt_min = 0.01 L=L2 (base average) n=5", base = True, buckets = buckets)
-    graph_rewards(results, "rewards", "AntPlaneMoveFinal T=3.5M v=(-6.0, 6.0) adapt_min = 0.01 L=L2 (total reward) n=5", buckets = buckets)
+    # num_goal_buckets = 7
+    # results = compute_rewards("AntPlaneMoveFinal_2024-11-11_21-03-38", base = True, num_goal_buckets = num_goal_buckets)
+    # # print(results.keys())
+    # buckets = True if num_goal_buckets else False
+    # # print(results["base rewards"].keys())
+    # graph_rewards(results, "base rewards", "AntPlaneMoveFinal T=3.5M v=(-6.0, 6.0) adapt_min = 0.01 L=L2 (base reward) n=5", base = True, buckets = buckets)
+    # graph_rewards(results, "base average", "AntPlaneMoveFinal T=3.5M v=(-6.0, 6.0) adapt_min = 0.01 L=L2 (base average) n=5", base = True, buckets = buckets)
+    # graph_rewards(results, "rewards", "AntPlaneMoveFinal T=3.5M v=(-6.0, 6.0) adapt_min = 0.01 L=L2 (total reward) n=5", buckets = buckets)

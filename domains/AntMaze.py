@@ -72,7 +72,7 @@ class Move(Task):
         directions = ["X", "Y", "Z", "XR", "YR", "ZR"]
         self.rotation_starting_weight = rotation_starting_weight
         starting_rotation_weights = np.array([self.rotation_starting_weight]*3)
-        self.starting_weights = np.concatenate(np.ones(shape=(3,)), np.full(starting_rotation_weights, shape=(3,)))
+        self.starting_weights = np.concatenate((np.ones(shape=(3,)), starting_rotation_weights))
         if direction == "F":
             self.relative = True
             self.relative_direction_start = np.array([1,0,0]) #X,Y,Z, forwards starts at X.

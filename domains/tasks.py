@@ -53,7 +53,10 @@ class Subtask(gym.Wrapper):
     def step(self, action):
         observation, reward, terminated, truncated, info = super().step(action)
         self.last_action = action
-        self.contact_forces = self.env.unwrapped.contact_forces
+        try:
+            self.contact_forces = self.env.unwrapped.contact_forces
+        except:
+            self.contact_forces = None
         #self.contact_forces = self.env.unwrapped.ant_env.contact_forces
         # desired_goal = observation['desired_goal']
         new_observation = self.observation(observation)
