@@ -39,7 +39,7 @@ class SimpleAlgorithm(Algorithm):
             while not (terminated or truncated):
                 action, _ = self.predict(observation)
                 observation, reward, terminated, truncated, info = self.env.step(action)
-                data = setup_logs(reward, observation, action, [terminated, truncated], [info,])
+                # data = setup_logs(reward, observation, action, [terminated, truncated], [info,])
                 # print(data)
                 if self.alg_logger:
                     self.alg_logger.on_step(data)

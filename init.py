@@ -1,7 +1,9 @@
 import gymnasium as gym
 import numpy as np
+import traceback, glfw
 from RL.baselines import Baseline
 from RL.alg import Random, Stationary
+from domains.ant_variable_legs import AntVariableLegsEnv
 from domains.tasks import Subtask
 from domains.AntMaze import Move, Rotate
 from domains.AntPlane import AntPlane
@@ -12,10 +14,11 @@ domains = {
             "ant_sparse": "AntMaze_UMaze-v4",
             "point_dense": "PointMaze_UMazeDense-v3",
             "point_sparse": "PointMaze_UMaze-v3"
+
 }
 
 train_env_params = {
-                    "id": domains["ant_plane"],
+                    "id": "variable_ant",
                     "exclude_current_positions_from_observation":False,
                     "max_episode_steps":500,
                     "render_mode": "human"
@@ -39,26 +42,34 @@ test_env_params["render_mode"] = "human"
 if train_env_params["id"] == "ant_plane":
     train_env_params["id"] = domains["ant"]
     train_base_domain = AntPlane(gym.make(**train_env_params))
+elif train_env_params["id"] == "variable_ant":
+    train_base_domain = AntVariableLegsEnv(exclude_current_positions_from_observation=False,num_legs = 20, render_mode = "human")
 else:
+    
     train_base_domain = gym.make(**train_env_params)
     
-
-train_env = Subtask(train_base_domain, Move(**train_objective_params))
+train_env = train_base_domain
+#train_env = Subtask(train_base_domain, Move(**train_objective_params))
 
 
 print(train_env.observation_space)
+print(train_env.action_space)
 params={"learning_starts":int(1e4), "buffer_size":int(1e6)}
 model = Baseline("SAC", train_env, params = params)
 # model = Random("random", train_env)
 # # model = Stationary("stationary", train_env)
-model.load("logs/AntPlaneMoveFinal_2024-11-13_10-22-56/models/model:AntSAC_1")
+#model.load("logs/AntPlaneMoveFinal_2024-11-13_10-22-56/models/model:AntSAC_1")
 # model.load("logs/AntPlaneRotateNew_2024-10-09_12-24-24/models/model:AntSAC_1")
 # model.load("logs/AntPlaneMoveNew6.0_2024-10-03_09-30-15/models/model:AntSAC_2")
 # model.load("logs/AntPlaneMove5_2024-10-11_21-28-31/models/model:AntSAC_0")
 
 # model.load("logs/AntPlaneRotateNew_2024-10-10_16-22-19/models/model:AntSAC_0")
-
-# model.learn(total_timesteps=1500000)
+try:
+    model.learn(total_timesteps=1500000)
+except Exception as e:
+    print("GLFW initialized? ", glfw._initialized)
+    traceback.print_exc()    # ← shows you the file & line triggering the error
+    raise
 # model.save("./", "test")
 # vec_env = model.get_env()
 train_env.reset()
