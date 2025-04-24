@@ -1,0 +1,11 @@
+{
+    "seed": 55,
+    "env": "Platform-v0",
+    "alg": "RandomPAMDP",
+    "device": "cpu",
+    "alg_params": {
+        "verbose": 1
+    },
+    "total_steps": 1e5,
+    "episodes": 10
+}

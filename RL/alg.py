@@ -8,6 +8,9 @@ class Algorithm():
         self.custom_params = custom_params
         self.alg_logger = None
 
+    def get_env(self):
+        return self.env
+    
     def learn(self, **kwargs):
         pass
     def predict(self, observation):
@@ -39,9 +42,9 @@ class SimpleAlgorithm(Algorithm):
             while not (terminated or truncated):
                 action, _ = self.predict(observation)
                 observation, reward, terminated, truncated, info = self.env.step(action)
-                # data = setup_logs(reward, observation, action, [terminated, truncated], [info,])
-                # print(data)
                 if self.alg_logger:
+                    data = setup_logs(reward, observation, action, [terminated, truncated], [info,])
+                    # print(data)
                     self.alg_logger.on_step(data)
                 t+=1
     
@@ -53,9 +56,11 @@ class Random(SimpleAlgorithm):
         super().__init__(name, env, custom_params)
 
     def predict(self, observation):
+        # print(self.env.action_space)
+        sample = self.env.action_space.sample()
+        # print(type(sample))
+        # print(sample)
         return self.env.action_space.sample(), None
-
-    
     
 #just return all zeros for the action... 
 class Stationary(SimpleAlgorithm):

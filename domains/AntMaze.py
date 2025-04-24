@@ -38,7 +38,8 @@ class Move(Task):
         super().__init__()
         self.desired_velocity_minimum = desired_velocity_minimum #TODO refactor to range so as to have consistent API
         self.desired_velocity_maximum = desired_velocity_maximum
-
+        self.info = None
+        self.velocity_coords = None
         #hypothesis: forwards is simply "x_velocity". Courtesy of Rafa
         if self.desired_velocity_maximum == math.inf: #not supporting this simultaneously with range for now
             self.maximize = True
@@ -115,6 +116,8 @@ class Move(Task):
         z_coord = obs[2] if self.include_xy else obs[0]
         return 1.0 if (self.min_z <= z_coord <= self.max_z) else 0.0
 
+    def set_velocity_coords(self, senv):
+        self.velocity_coords = env.get_velocity_coords()
 
     #checking state feature for velocity in the desired direction. if direction is None, we'll simply take the magnitude of the velocity vector in any direction.
     def get_reward(self, observation, last_action, contact_forces):
@@ -185,6 +188,10 @@ class Move(Task):
     def get_goal(self):
         return self.desired_velocity
     
+    def set_info(self, info):
+        self.info = info
+        self.velocity_coords = info["velocity_coords"]
+
     def get_goal_length(self):
         return 1
 

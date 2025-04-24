@@ -8,8 +8,14 @@ import gymnasium as gym
 # from RL.alg import *
 from RL.baselines import Baseline, TrajectoryLoggerCallback
 from log import TrainingLogger
-from domains.tasks import Subtask
-from domains.AntPlane import AntPlane
+from domains.tasks import *
+from domains.AntPlane import *
+from domains.mpqdn_goal_domain import *
+from domains.mpqdn_platform_domain import *
+from domains.mpqdn_wrappers import *
+import gymnasium_goal
+import gymnasium_platform
+
 from utils import *
 def main():
     parser = argparse.ArgumentParser(description="action mode learning experiments")
@@ -31,6 +37,11 @@ def main():
         save_trials_setting = experiment_params["save_trials"]
     else:
         save_trials_setting = "first"
+
+    if "log_info" in experiment_params:
+        log_info_setting = experiment_params["log_info"]
+    else:
+        log_info_setting = True #backwards compatibility
            
     #there are three save settings: save_num---which denotes the number of model saves during a trial,
     #save_strat---which denotes the behavior within a trial as to which saves (out of the total save_num) are kept around: do we keep none, all, last, or best?
@@ -84,7 +95,7 @@ def main():
 
         if log_setting not in SUPPORTED_LOG_SETTINGS:
             raise Exception("unsupported logging setting. Try none, overwrite, warn, or timestamp.")
-        training_logger = TrainingLogger()
+        training_logger = TrainingLogger(log_info=log_info_setting)
         
 
 
@@ -102,25 +113,21 @@ def main():
         #handle custom wrappers:
         if "env_wrappers" in run_params:
             for env_wrapper in run_params["env_wrappers"]: #wrappers will be applied first to last in the order of the list
-                if 'name' not in env_wrapper or env_wrapper['name'] not in SUPPORTED_WRAPPERS:
+                if 'name' not in env_wrapper or env_wrapper['name'].split(':')[-1] not in SUPPORTED_WRAPPERS:
                     raise Exception("wrappers misconfigured, or otherwise not currently supported")
                 wrapper_name = env_wrapper['name']
                 wrapper_params = env_wrapper['wrapper_params']
-                try:
-                    domain = setup_wrapper(domain, wrapper_name, wrapper_params)
-                except Exception as e:
-                    continue
+                domain = setup_wrapper(domain, wrapper_name, wrapper_params)
+                
                 
         if "env_wrapper" in run_params:
-            if 'name' not in run_params['env_wrapper'] or run_params['env_wrapper']['name'] not in SUPPORTED_WRAPPERS:
+            if 'name' not in run_params['env_wrapper'] or run_params['env_wrapper']['name'].split(':')[-1] not in SUPPORTED_WRAPPERS:
                 raise Exception("wrapper misconfigured, or otherwise not currently supported")
             wrapper_name = run_params['env_wrapper']['name']
             wrapper_params = run_params['env_wrapper']["wrapper_params"]
         
-            try:
-                domain = setup_wrapper(domain, wrapper_name, wrapper_params)
-            except Exception as e:
-                continue
+            domain = setup_wrapper(domain, wrapper_name, wrapper_params)
+            
 
         alg_name = run_params["alg"]
         

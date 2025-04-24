@@ -25,11 +25,13 @@ class EternalTask(Task):
     
 #this takes an object of type Task and wraps an env with the conditions from the task.
 class Subtask(gym.Wrapper):
-    def __init__(self, env, task):
+    def __init__(self, env, task, task_info = {}):
         super().__init__(env)
         self.last_action = None
         self.reward_info = None
         self._task = task # if None, just use the reward which comes from the environment
+        if task_info:
+            task.set_info(task_info)
         goal_length = self._task.get_goal_length()
         spaces = {'desired_goal': gym.spaces.Box(-math.inf, math.inf, (goal_length,), np.float64),
                   'observation': self.observation_space}
@@ -53,7 +55,10 @@ class Subtask(gym.Wrapper):
     def step(self, action):
         observation, reward, terminated, truncated, info = super().step(action)
         self.last_action = action
-        self.contact_forces = self.env.unwrapped.contact_forces
+        try:
+            self.contact_forces = self.env.unwrapped.contact_forces
+        except:
+            self.contact_forces = None
         #self.contact_forces = self.env.unwrapped.ant_env.contact_forces
         # desired_goal = observation['desired_goal']
         new_observation = self.observation(observation)

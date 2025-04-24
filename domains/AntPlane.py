@@ -1,6 +1,7 @@
 import gymnasium as gym
 import numpy as np
 import random, math
+# from utils import q_rotate
 #
 # Code heavily adapted to match the random resetting in Gymnasium-Robotics and Antv4 as closely as possible for transfer
 # https://github.com/Farama-Foundation/Gymnasium-Robotics/blob/main/gymnasium_robotics/envs/maze/maze_v4.py
@@ -19,7 +20,7 @@ class AntPlane(gym.Wrapper):
         self.y_map_center = self._map_length / 2 * self._map_scaling
         self.position_noise_range = position_noise_range
         self.base_env.reset_model = self.reset_model #monkey patch the reset function to include randomly initialized position
-
+        self.include_xy = not self.env.exclude_current_positions_from_observation
 
     def reset_model(self):
         noise_low = -self.base_env._reset_noise_scale
@@ -51,7 +52,6 @@ class AntPlane(gym.Wrapper):
         observation = self.env.unwrapped._get_obs()
 
         return observation
-
 
     
     def cell_rowcol_to_xy(self, rowcol_pos: tuple) -> np.ndarray:
@@ -91,3 +91,10 @@ class AntPlane(gym.Wrapper):
             xy_pos[1] += noise_y
 
             return xy_pos
+    
+    #TODO move relative velocity calculations here?
+    def get_info(self, incl_xy = True):
+        offset = 2 if incl_xy else 0
+        return 13+offset, 19+offset
+        
+        
