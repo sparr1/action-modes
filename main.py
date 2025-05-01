@@ -20,7 +20,12 @@ from utils import *
 def main():
     parser = argparse.ArgumentParser(description="action mode learning experiments")
     parser.add_argument('-r', '--run', help='config file for a run', required=True)
-    config = vars(parser.parse_args())['run']
+    parser.add_argument('--alg-dir', help='location of alg configs', default = os.path.join("configs","algs", ""))
+    parser.add_argument('--log-dir', help='desired location for logging', default = os.path.join(".","logs", ""))
+    args = vars(parser.parse_args())
+    print(args)
+    config, alg_dir, log_dir = args['run'], args['alg_dir'], args['log_dir']
+
 
     with open(config) as f:
         experiment_params = json.load(f)
@@ -61,7 +66,7 @@ def main():
         print(alg_config)
         runtime_params[i]["name"] = alg_config
         print("verifying config exists and is proper:")
-        with open("configs/algs/"+alg_config+".json") as f:
+        with open(os.path.join(alg_dir,alg_config+".json")) as f:
             run_default_params = json.load(f)
         runtime_params[i].update(run_default_params.copy())
         print("config found. Replacing settings based on experiment configs.")
@@ -78,7 +83,7 @@ def main():
     # seed = experiment_params["seed"]
 
     if log_setting != "none":
-        experiment_log_dir = f'./logs/{experiment_name}/'
+        experiment_log_dir = os.path.join(log_dir, f'{experiment_name}', '')
         if log_setting == "warn":
             if os.path.exists(experiment_log_dir):
                 print("WARNING: experiment has been run before. Check the files, and delete or change setting from \'warn\'.")
@@ -87,14 +92,14 @@ def main():
             if(os.path.exists(experiment_log_dir)):
                 shutil.rmtree(experiment_log_dir) #delete the old experiment! be careful with this setting. 
         elif log_setting =="timestamp":
-            experiment_log_dir=experiment_log_dir[:-1]+'_'+datetime_stamp()+'/'
+            experiment_log_dir=os.path.join(experiment_log_dir[:-1]+'_'+datetime_stamp(),"") #is there a way to do this with os path?
 
         os.mkdir(experiment_log_dir)
         with open(experiment_log_dir+"settings.json", "w") as f:
             json.dump(experiment_params, f, indent=2) #put the experiment json params next to the data which resulted from a run with those parameters
 
         if experiment_params["save_trials"] != None:
-            model_save_dir = experiment_log_dir +"models/"
+            model_save_dir = os.path.join(experiment_log_dir, "models", "")
             if not os.path.exists(model_save_dir):
                 os.mkdir(model_save_dir)
 
@@ -184,7 +189,7 @@ def main():
                 trial_log_dir = experiment_log_dir + f'{alg_config}_{t}'
                 if not os.path.exists(trial_log_dir):
                     os.mkdir(trial_log_dir)
-                with open(trial_log_dir+"/alg_settings.json", "w") as f:
+                with open(os.path.join(trial_log_dir,"alg_settings.json"), "w") as f:
                     json.dump(run_params, f, indent=2) #put the algorithm parameters next to the data which resulted from a trial using those params
                 training_logger.set_log_dir(trial_log_dir)
                 model.set_logger(training_logger)
@@ -203,10 +208,11 @@ def main():
                     best_score = best_score if score < best_score else score
                     if best_score != old_best_score:
                         model.save(model_save_dir, f'model:{alg_config}_{t}') #save the new model
-                        os.system(f'rm -f {model_save_dir}/model:{alg_config}_{old_best_trial}*') #delete the old saved model (but only after the new one is saved)
+                        old_model_filename = os.path.join(model_save_dir,f'model:{alg_config}_{old_best_trial}*')
+                        os.system(f'rm -f {old_model_filename}') #delete the old saved model (but only after the new one is saved)
                         best_trial = t
                         
-                    with open(model_save_dir+"/scores.txt", "a") as f:
+                    with open(os.path.join(model_save_dir,"scores.txt"), "a") as f:
                         f.write(f'{alg_config}_{t}'+ ":" + str(score) + '\n')
                     
                     # with open(best_trial_score,"r") as f:
