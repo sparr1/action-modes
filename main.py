@@ -10,11 +10,11 @@ from RL.baselines import Baseline, TrajectoryLoggerCallback
 from log import TrainingLogger
 from domains.tasks import *
 from domains.AntPlane import *
-from domains.mpqdn_goal_domain import *
-from domains.mpqdn_platform_domain import *
-from domains.mpqdn_wrappers import *
-import gymnasium_goal
-import gymnasium_platform
+#from domains.mpqdn_goal_domain import *
+#from domains.mpqdn_platform_domain import *
+#from domains.mpqdn_wrappers import *
+#import gymnasium_goal
+#import gymnasium_platform
 
 from utils import *
 def main():

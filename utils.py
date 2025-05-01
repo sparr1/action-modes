@@ -3,8 +3,9 @@ import numpy as np
 import glob, os, json, sys, math, importlib
 from domains.tasks import Subtask
 from domains.AntPlane import AntPlane
-SUPPORTED_WRAPPERS = ("Subtask", "AntPlane", "ScaledStateWrapper", "PlatformFlattenedActionWrapper", "ScaledParameterisedActionWrapper")
-SUPPORTED_LOG_SETTINGS = ("overwrite", "warn", "timestamp", "overwrite-safe")
+from domains.HumanoidPlane import HumanoidPlane
+SUPPORTED_WRAPPERS = ("Subtask", "AntPlane", "HumanoidPlane", "ScaledStateWrapper", "PlatformFlattenedActionWrapper", "ScaledParameterisedActionWrapper")
+SUPPORTED_LOG_SETTINGS = ("overwrite", "warn", "timestamp, overwrite-safe")
 SUPPORTED_LOG_TYPES = ("detailed", "summary")
 
 def datetime_stamp():
@@ -54,6 +55,8 @@ def setup_wrapper(domain, wrapper_name, wrapper_params):
             raise ValueError(f"Could not find model class '{task_name}' in module '{module_name}': {e}")
     elif wrapper_name == 'AntPlane':
         domain = AntPlane(domain, **wrapper_params)
+    elif wrapper_name == 'HumanoidPlane':
+        domain = HumanoidPlane(domain, **wrapper_params)
     else:
         print("setting up default wrapper ", wrapper_name, "with params", wrapper_params)
         module_name,raw_wrapper_name = wrapper_name.split(':') #this is likely to error out
