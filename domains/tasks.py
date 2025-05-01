@@ -1,6 +1,7 @@
 import gymnasium as gym
 import numpy as np
 import math
+import traceback, sys
 #A task in this case can essentially be thought of as a reward function
 
 class Task():
@@ -31,7 +32,18 @@ class Subtask(gym.Wrapper):
         self.reward_info = None
         self._task = task # if None, just use the reward which comes from the environment
         if task_info:
-            task.set_info(task_info)
+            task.set_task_info(task_info)
+        else:
+            try:
+                task.set_task_info(env.get_task_info())
+            except Exception as e:
+                print("Exception Message:")
+                print(e)
+                print()
+                print("\nStack Trace:")
+                traceback.print_exc(file=sys.stdout)
+                print("Have you implemented get_task_info for the domain?")
+
         goal_length = self._task.get_goal_length()
         spaces = {'desired_goal': gym.spaces.Box(-math.inf, math.inf, (goal_length,), np.float64),
                   'observation': self.observation_space}

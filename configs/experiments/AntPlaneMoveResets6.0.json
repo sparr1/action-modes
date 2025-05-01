@@ -9,7 +9,7 @@
                                                                  "position_noise_range":0.25
                                                                 }
                          },
-                         {"name": "Subtask", "wrapper_params":  {"task":"domains.AntMaze:Move",
+                         {"name": "Subtask", "wrapper_params":  {"task":"domains.Maze:Move",
                                                                  "task_params": {"categorical":false, 
                                                                                 "desired_velocity_minimum":-6.0,
                                                                                 "desired_velocity_maximum":6.0,
@@ -28,5 +28,6 @@
     "trials": 3,
     "configs": ["AntRandom", "AntStationary", "AntSAC", "AntPPO"],
     "logs": "timestamp",
+    "log_type": "summary",
     "save_trials": "best"
 }

@@ -38,8 +38,9 @@ class Move(Task):
         super().__init__()
         self.desired_velocity_minimum = desired_velocity_minimum #TODO refactor to range so as to have consistent API
         self.desired_velocity_maximum = desired_velocity_maximum
-        self.info = None
+        self.task_info = None
         self.velocity_coords = None
+        self.dir_coords = None
         #hypothesis: forwards is simply "x_velocity". Courtesy of Rafa
         if self.desired_velocity_maximum == math.inf: #not supporting this simultaneously with range for now
             self.maximize = True
@@ -72,8 +73,8 @@ class Move(Task):
         self.modify_obs = modify_obs #boolean
         directions = ["X", "Y", "Z", "XR", "YR", "ZR"]
         self.rotation_starting_weight = rotation_starting_weight
-        starting_rotation_weights = np.array([self.rotation_starting_weight]*3)
-        self.starting_weights = np.concatenate(np.ones(shape=(3,)), np.full(starting_rotation_weights, shape=(3,)))
+        # starting_rotation_weights = np.array([self.rotation_starting_weight]*3)
+        self.starting_weights = np.concatenate((np.ones(shape=(3,)), np.full(shape=(3,), fill_value = rotation_starting_weight)))
         if direction == "F":
             self.relative = True
             self.relative_direction_start = np.array([1,0,0]) #X,Y,Z, forwards starts at X.
@@ -116,7 +117,7 @@ class Move(Task):
         z_coord = obs[2] if self.include_xy else obs[0]
         return 1.0 if (self.min_z <= z_coord <= self.max_z) else 0.0
 
-    def set_velocity_coords(self, senv):
+    def set_velocity_coords(self, env):
         self.velocity_coords = env.get_velocity_coords()
 
     #checking state feature for velocity in the desired direction. if direction is None, we'll simply take the magnitude of the velocity vector in any direction.
@@ -126,11 +127,10 @@ class Move(Task):
             obs = observation["observation"]
         else:
             obs = observation #does this make sense? TODO check
-        offset = 0 if not self.include_xy else 2
-        velocity_vec = obs[13+offset:19+offset]
+        velocity_vec = obs[self.velocity_coords[0]:self.velocity_coords[1]]
         if self.relative:
             # print(self.relative_direction_start)
-            q_rot = obs[1+offset:5+offset]
+            q_rot = obs[self.dir_coords[0]:self.dir_coords[1]]
             # print(q_rot) #W is first
             self.direction = q_rotate(self.relative_direction_start, q_rot)
             # print(self.direction)
@@ -188,9 +188,10 @@ class Move(Task):
     def get_goal(self):
         return self.desired_velocity
     
-    def set_info(self, info):
-        self.info = info
-        self.velocity_coords = info["velocity_coords"]
+    def set_task_info(self, task_info):
+        self.task_info = task_info
+        self.velocity_coords = task_info["velocity_coords"]
+        self.dir_coords = task_info["dir_coords"]
 
     def get_goal_length(self):
         return 1

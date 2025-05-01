@@ -5,7 +5,7 @@ from RL.baselines import Baseline
 from RL.alg import Random, Stationary
 from domains.ant_variable_legs import AntVariableLegsEnv
 from domains.tasks import Subtask
-from domains.AntMaze import Move, Rotate
+from domains.Maze import Move, Rotate
 from domains.AntPlane import AntPlane
 from domains.HumanoidPlane import HumanoidPlane
 domains = {
@@ -27,10 +27,10 @@ train_env_params = {
                     }
 
 train_objective_params = {
-                    "direction": "F",
-                    "desired_velocity_minimum":-6.0,
-                    "desired_velocity_maximum": 6.0,
-                    "survival_bonus": 1.0,
+                    "direction": "X",
+                    "desired_velocity_minimum":-2.0,
+                    "desired_velocity_maximum": 2.0,
+                    "survival_bonus": 2.0,
                     "adaptive_margin":True,
                     "adaptive_margin_minimum":0.01,
                     "categorical":False,
@@ -82,8 +82,8 @@ model = Baseline("SAC", train_env, params = params)
 model.learn(total_timesteps=1500000)
 # model.save("./", "test")
 # vec_env = model.get_env()
-train_env.reset()
-train_env.close()
+# train_env.reset()
+# train_env.close()
 #switch to test_env
 # if test_env_params["id"] == "ant_plane":
 #     test_env_params["id"] = domains["ant"]
@@ -98,33 +98,35 @@ train_env.close()
 # # model
 # # model = Baseline("SAC", test_env)
 # # model.load("logs/AntPlaneMove2_2024-10-01_13-06-09/models/model:AntSAC_0")
-# observation, info = test_env.reset(seed=42)
-# # desired_vel = info['reward_info']['desired_velocity']
-# # labels = ["x velocity", "y velocity", "z velocity", "x angular velocty", "y angular velocity", "z angular velocity"]
-# ep_step_count = 0
-# for _ in range(150000):
-#     if ep_step_count % 2 == 0:
-#         model = model_rotate
-#     else:
-#         model = model_move
-#     action, _states = model.predict(observation)
-#     print(np.sum(action))
-#     observation, reward, terminated, truncated, info = test_env.step(action)
-#     ep_step_count+=1
-#     print(observation)
-#     desired_vel = info['reward_info']['desired_velocity']
-#     achieved_vel = info['reward_info']['achieved_velocity']
-#     print('----------')
-#     #    print("info", info)
-#     print('achieved velocity: ',achieved_vel, 'desired velocity: ', desired_vel)
-#     #    print("target velocity:", test_env._task.desired_velocity)
-#     #    for i,label in enumerate(labels):
-#     #        print(label+":", observation["observation"][13+i])
-#     #    vec_env.render() not needed for render_mode = human
-#     print('----------')
-#     if terminated or truncated:
-#         observation, info = test_env.reset()
-#         ep_step_count = 0
-#         #    desired_vel = info['reward_info']['desired_velocity']
-#         print("EPISODE RESET")
-# test_env.close()
+test_env = train_env
+observation, info = test_env.reset(seed=42)
+print(info)
+# desired_vel = info['reward_info']['desired_velocity']
+labels = ["x velocity", "y velocity", "z velocity", "x angular velocty", "y angular velocity", "z angular velocity"]
+ep_step_count = 0
+for _ in range(150000):
+    # if ep_step_count % 2 == 0:
+    #     model = model_rotate
+    # else:
+    #     model = model_move
+    action, _states = model.predict(observation)
+    print(np.sum(action))
+    observation, reward, terminated, truncated, info = test_env.step(action)
+    ep_step_count+=1
+    print(observation)
+    desired_vel = info['reward_info']['desired_velocity']
+    achieved_vel = info['reward_info']['achieved_velocity']
+    print('----------')
+    print("info", info)
+    print('achieved velocity: ',achieved_vel, 'desired velocity: ', desired_vel)
+    print("target velocity:", test_env._task.desired_velocity)
+    for i,label in enumerate(labels):
+        print(label+":", observation["observation"][24+i])
+    #    vec_env.render() not needed for render_mode = human
+    print('----------')
+    if terminated or truncated:
+        observation, info = test_env.reset()
+        ep_step_count = 0
+        #    desired_vel = info['reward_info']['desired_velocity']
+        print("EPISODE RESET")
+test_env.close()

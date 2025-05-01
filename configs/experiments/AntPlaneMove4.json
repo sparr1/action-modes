@@ -3,7 +3,7 @@
         "seed": 55,
         "device":"cuda",
         "env":"Ant-v4", 
-        "env_wrapper": {"name": "Subtask", "wrapper_params": {"task":"domains.AntMaze:Move",
+        "env_wrapper": {"name": "Subtask", "wrapper_params": {"task":"domains.Maze:Move",
                                                               "task_params": {"categorical":true, 
                                                                               "desired_velocity_minimum":3.0,
                                                                               "desired_velocity_maximum":4.0,

@@ -8,9 +8,10 @@ import numpy as np
 #For less serious experiments, testing, etc., I recommend "none" or "overwrite", depending on whether you are testing a capability that uses the logs or not.
 class TrainingLogger():
 
-    def __init__(self, log_dir = None, log_info = True):
+    def __init__(self, log_dir = None, log_info = True, log_type = 'detailed'):
 
         self._log_info = log_info
+        self._log_type = log_type
         if log_dir: #if not, should set_log_dir before calling on episode or on step.
             self.set_log_dir(log_dir) 
         
@@ -46,8 +47,9 @@ class TrainingLogger():
             "actions": self.episode_actions,
             "info": self.episode_info
         }
-        with open(os.path.join(self.train_episodes_dir, f"episode_{self.episode_count}.json"), 'w') as f:
-            json.dump(trajectory, f)
+        if self._log_type == 'detailed':
+            with open(os.path.join(self.train_episodes_dir, f"episode_{self.episode_count}.json"), 'w') as f:
+                json.dump(trajectory, f)
 
         # Calculate high-level summary
         # print(self.episode_rewards)

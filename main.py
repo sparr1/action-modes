@@ -42,6 +42,11 @@ def main():
         log_info_setting = experiment_params["log_info"]
     else:
         log_info_setting = True #backwards compatibility
+
+    if "log_type" in experiment_params:
+        log_type_setting = experiment_params["log_type"]
+    else:
+        log_type_setting = "detailed" #backwards compatibility
            
     #there are three save settings: save_num---which denotes the number of model saves during a trial,
     #save_strat---which denotes the behavior within a trial as to which saves (out of the total save_num) are kept around: do we keep none, all, last, or best?
@@ -95,7 +100,7 @@ def main():
 
         if log_setting not in SUPPORTED_LOG_SETTINGS:
             raise Exception("unsupported logging setting. Try none, overwrite, warn, or timestamp.")
-        training_logger = TrainingLogger(log_info=log_info_setting)
+        training_logger = TrainingLogger(log_info=log_info_setting, log_type = log_type_setting)
         
 
 
@@ -136,15 +141,32 @@ def main():
             best_score = -math.inf
 
         for t in range(experiment_params["trials"]):
-            if "baselines" in run_params["alg"]: #currently all that is supported. TODO support non-baselines also
-                alg_name = run_params["alg"].split('/')[-1]
-                try:
-                    model = Baseline(alg_name, domain, run_params["alg_params"])
-
-                except Exception as e:
-                    print(e)
-                    break #if we cannot run this baseline, we just try another.
-
+            if '/' in run_params["alg"]:
+                file_name, alg_name = "".join(run_params["alg"].split('/')[:-1]), run_params["alg"].split('/')[-1]
+                print(file_name)
+                print(alg_name)
+                if "baselines" in file_name: #currently all that is supported. TODO support non-baselines also
+                    try:
+                        model = Baseline(alg_name, domain, run_params["alg_params"])
+                    except Exception as e:
+                        print(e)
+                        break #if we cannot run this baseline, we just try another
+                elif file_name == "PAMDP":
+                    try: 
+                        module = importlib.import_module("RL.PAMDP")
+                        alg_class = getattr(module, alg_name)
+                        model = alg_class(alg_name,domain, run_params["alg_params"])
+                    except Exception as e:
+                        print(e)
+                        break #if we cannot run this baseline, we just try another.
+                else:
+                    try:
+                        module = importlib.import_module("RL."+file_name.replace('/','.')) #last ditch, just try to load it!
+                        alg_class = getattr(module, alg_name)
+                        model = alg_class(alg_name,domain, run_params["alg_params"])
+                    except Exception as e:
+                        print(e)
+                        break #if we cannot run this baseline, we just try another.
             else:
                 try:
                     module = importlib.import_module("RL.alg")

@@ -3,7 +3,7 @@
         "seed": 55,
         "device":"cuda",
         "env":"AntMaze_UMaze-v4", 
-        "env_wrapper": {"name": "Subtask", "wrapper_params": {"task":"domains.AntMaze:Rotate", "task_params": {"desired_velocity_minimum":1.0, "desired_velocity_maximum":1.0}}},
+        "env_wrapper": {"name": "Subtask", "wrapper_params": {"task":"domains.Maze:Rotate", "task_params": {"desired_velocity_minimum":1.0, "desired_velocity_maximum":1.0}}},
         "total_steps": 1e6,
         "episodes": null
 },
