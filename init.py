@@ -61,6 +61,7 @@ print(train_env.observation_space)
 print(train_env.action_space)
 params={"learning_starts":int(1e4), "buffer_size":int(1e6)}
 model = Baseline("SAC", train_env, params = params)
+model.set_checkpointing(10000, ".", name_prefix="init-test")
 # model = Random("random", train_env)
 # # model = Stationary("stationary", train_env)
 #model.load("logs/AntPlaneMoveFinal_2024-11-13_10-22-56/models/model:AntSAC_1")
@@ -73,7 +74,7 @@ model = Baseline("SAC", train_env, params = params)
 
 # model.load("logs/AntPlaneRotateNew_2024-10-10_16-22-19/models/model:AntSAC_0")
 # try:
-#     model.learn(total_timesteps=1500000)
+model.learn(total_timesteps=1500000)
 # except Exception as e:
 #     print("GLFW initialized? ", glfw._initialized)
 #     traceback.print_exc()    # ← shows you the file & line triggering the error

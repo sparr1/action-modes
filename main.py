@@ -19,12 +19,15 @@ import gymnasium_platform
 from utils import *
 def main():
     parser = argparse.ArgumentParser(description="action mode learning experiments")
-    parser.add_argument('-r', '--run', help='config file for a run', required=True)
+    parser.add_argument('-r', '--run', help='config file for a run', required=True,)
     parser.add_argument('--alg-dir', help='location of alg configs', default = os.path.join("configs","algs", ""))
     parser.add_argument('--log-dir', help='desired location for logging', default = os.path.join(".","logs", ""))
+    parser.add_argument('--num-runs', help='number of consecutive trials to run', default = -1, type = int)
+    parser.add_argument('--alg-index', help='which algorithm to start running first',default = 0, type=int)
+    parser.add_argument('--trial-index', help='which trial index to start from', default = 0, type = int)
     args = vars(parser.parse_args())
     print(args)
-    config, alg_dir, log_dir = args['run'], args['alg_dir'], args['log_dir']
+    config, alg_dir, log_dir, num_runs, alg_ind, trial_ind = args['run'], args['alg_dir'], args['log_dir'], args['num_runs'], args['alg_index'], args['trial_index']
 
 
     with open(config) as f:
@@ -52,7 +55,12 @@ def main():
         log_type_setting = experiment_params["log_type"]
     else:
         log_type_setting = "detailed" #backwards compatibility
-           
+
+    if "checkpoint_every" in experiment_params:
+        checkpoint_every = experiment_params["checkpoint_every"]
+    else:
+        checkpoint_every = None #unfortunately, this is the backwards compatible default!
+
     #there are three save settings: save_num---which denotes the number of model saves during a trial,
     #save_strat---which denotes the behavior within a trial as to which saves (out of the total save_num) are kept around: do we keep none, all, last, or best?
     #and save_trials---which denotes the saving behavior across trials: none, first, all, or best?
@@ -91,12 +99,29 @@ def main():
         elif log_setting == "overwrite":
             if(os.path.exists(experiment_log_dir)):
                 shutil.rmtree(experiment_log_dir) #delete the old experiment! be careful with this setting. 
+            skip = False
         elif log_setting =="timestamp":
             experiment_log_dir=os.path.join(experiment_log_dir[:-1]+'_'+datetime_stamp(),"") #is there a way to do this with os path?
-
-        os.mkdir(experiment_log_dir)
-        with open(experiment_log_dir+"settings.json", "w") as f:
-            json.dump(experiment_params, f, indent=2) #put the experiment json params next to the data which resulted from a run with those parameters
+            skip = False
+        elif log_setting == "overwrite-safe":
+            print("this run started at", datetime_stamp())
+            if os.path.exists(experiment_log_dir):
+                print("Experiment folder already exists. Trials will only proceed if not run before.")
+                skip = True
+            else:
+                skip = False
+        if not skip:
+            os.mkdir(experiment_log_dir)
+            with open(experiment_log_dir+"settings.json", "w") as f:
+                json.dump(experiment_params, f, indent=2) #put the experiment json params next to the data which resulted from a run with those parameters
+        else:
+            try: 
+                with open(experiment_log_dir+"settings.json", "r") as f:
+                    existing_settings = json.load(f)
+                    print("Found existing settings:", existing_settings)
+            except:
+                print("WARNING: experiment folder existed, but there was an issue reading the settings file. Proceeding with caution under the current settings.")
+                
 
         if experiment_params["save_trials"] != None:
             model_save_dir = os.path.join(experiment_log_dir, "models", "")
@@ -106,10 +131,11 @@ def main():
         if log_setting not in SUPPORTED_LOG_SETTINGS:
             raise Exception("unsupported logging setting. Try none, overwrite, warn, or timestamp.")
         training_logger = TrainingLogger(log_info=log_info_setting, log_type = log_type_setting)
-        
+    
+    i
+    ran_so_far = 0
 
-
-    for i, run_params in enumerate(runtime_params):
+    for i, run_params in enumerate(runtime_params, start = alg_ind):
         alg_config = run_params["name"]
         print(run_params)
         
@@ -145,12 +171,17 @@ def main():
             best_trial = -1
             best_score = -math.inf
 
-        for t in range(experiment_params["trials"]):
+        for t in range(trial_ind, experiment_params["trials"]):
+            if ran_so_far == num_runs:
+                print("completed running", num_runs, "trials!")
+                quit()
+            baseline = False
             if '/' in run_params["alg"]:
                 file_name, alg_name = "".join(run_params["alg"].split('/')[:-1]), run_params["alg"].split('/')[-1]
                 print(file_name)
                 print(alg_name)
                 if "baselines" in file_name: #currently all that is supported. TODO support non-baselines also
+                    baseline = True
                     try:
                         model = Baseline(alg_name, domain, run_params["alg_params"])
                     except Exception as e:
@@ -187,12 +218,19 @@ def main():
                 model.learn(total_timesteps=run_params["total_steps"]) #simply don't log anything
             else:
                 trial_log_dir = experiment_log_dir + f'{alg_config}_{t}'
-                if not os.path.exists(trial_log_dir):
+                if os.path.exists(trial_log_dir):
+                    print("WARNING: trial log dir already existed!")
+                    if log_setting == "overwrite-safe":
+                        print("quitting, as to continue would risk an overwrite.")
+                        quit()
+                else:
                     os.mkdir(trial_log_dir)
                 with open(os.path.join(trial_log_dir,"alg_settings.json"), "w") as f:
                     json.dump(run_params, f, indent=2) #put the algorithm parameters next to the data which resulted from a trial using those params
                 training_logger.set_log_dir(trial_log_dir)
                 model.set_logger(training_logger)
+                if checkpoint_every and baseline: #for now, we are only supporting checkpointing the baselines...
+                    model.set_checkpointing(save_freq=checkpoint_every, save_path=model_save_dir, name_prefix=f'model:{alg_config}_{t}')
                 model.learn(total_timesteps=run_params["total_steps"])
 
                 if t == 0 and save_trials_setting == "first":
@@ -219,6 +257,7 @@ def main():
                     #     old_best_score = int(f.read())
                     #TODO: finish best trial score implementation
                     training_logger.reset()
+                ran_so_far  += 1
 
                 # print("training count", callback.training_count)
                 # print("episode count", callback.episode_count)

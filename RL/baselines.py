@@ -2,6 +2,7 @@ import numpy as np
 import gymnasium as gym
 import importlib, json, os
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import CheckpointCallback as BaselineCheckpointCallback
 from RL.alg import Algorithm
 from utils import setup_logs
 #from stable_baselines3 import PPO, DQN, TD3, SAC, DDPG, A2C
@@ -14,7 +15,7 @@ class Baseline(Algorithm):
     def __init__(self, name, env, params = None):
         super().__init__(name, env, custom_params=params)
         self.model = self.get_baseline_model(self.name, self.env, self.custom_params)
-        self.callback = None
+        self.callback = []
 
     def learn(self, **kwargs):
         return self.model.learn(callback = self.callback, **kwargs)
@@ -30,7 +31,10 @@ class Baseline(Algorithm):
 
     def set_logger(self, logger):
         super().set_logger(logger)
-        self.callback = TrajectoryLoggerCallback(self.alg_logger)
+        self.callback.append(TrajectoryLoggerCallback(self.alg_logger))
+    
+    def set_checkpointing(self, save_freq, save_path, name_prefix):
+        self.callback.append(BaselineCheckpointCallback(save_freq, save_path, name_prefix, False, False, 2))
         
     def delete_model(self): 
         del self.model
@@ -92,3 +96,4 @@ class TrajectoryLoggerCallback(BaseCallback):
         
         self.traj_logger.on_step(data = data)
         return True
+    

@@ -4,7 +4,7 @@ import glob, os, json, sys, math, importlib
 from domains.tasks import Subtask
 from domains.AntPlane import AntPlane
 SUPPORTED_WRAPPERS = ("Subtask", "AntPlane", "ScaledStateWrapper", "PlatformFlattenedActionWrapper", "ScaledParameterisedActionWrapper")
-SUPPORTED_LOG_SETTINGS = ("overwrite", "warn", "timestamp")
+SUPPORTED_LOG_SETTINGS = ("overwrite", "warn", "timestamp", "overwrite-safe")
 SUPPORTED_LOG_TYPES = ("detailed", "summary")
 
 def datetime_stamp():
