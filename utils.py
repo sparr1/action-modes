@@ -411,6 +411,21 @@ def q_conj(q):
 def q_rotate(d, q):
     return q_prod(q_prod(q, np.append(0, d)), q_conj(q))[1:]
 
+
+def make_manifest(abs_path_python, abs_path_main, abs_path_experiment_config, abs_path_manifest):
+    with open(abs_path_experiment_config, "r") as f:
+        experiment_params = json.load(f)
+    
+    with open(abs_path_manifest, "a") as g:
+        for i, alg in enumerate(experiment_params["configs"]):
+            for j in range(experiment_params["trials"]):
+                g.write(abs_path_python, abs_path_main, '-r', abs_path_experiment_config, '--alg-index', str(i), '--trial-index', str(j), '--num-runs 1')
+            
+
+    
+    # example: "python main.py -r configs/experiments/AntPlaneMoveResets6.0.json --alg-index 0 --trial-index 1 --num-runs 1"
+
+
 if __name__ == "__main__":
 
     # results = compute_rewards("DQNShort_old")['rewards']
@@ -421,13 +436,18 @@ if __name__ == "__main__":
     # print(np.min(mins))
     # print(np.max(maxes))
 
-    results = compute_observations("AntMazeSparse_2024-07-23_16-51-17")
-    np.set_printoptions(threshold=sys.maxsize)
-    labels = ["x velocity", "y velocity", "z velocity", "x angular velocty", "y angular velocity", "z angular velocity"]
-    for alg, stats in results.items():
-        print(alg)
+    # results = compute_observations("AntMazeSparse_2024-07-23_16-51-17")
+    # np.set_printoptions(threshold=sys.maxsize)
+    # labels = ["x velocity", "y velocity", "z velocity", "x angular velocty", "y angular velocity", "z angular velocity"]
+    # for alg, stats in results.items():
+    #     print(alg)
         
-        for k,v in stats.items():
-            print(k+":")
-            for i, label in enumerate(labels):
-                print(label+":",v[17+i])
+    #     for k,v in stats.items():
+    #         print(k+":")
+    #         for i, label in enumerate(labels):
+    #             print(label+":",v[17+i])
+    PYTHON = sys.executable()
+    MAIN = ...
+    CONFIG = ...
+    MANIFEST = ...
+    make_manifest(PYTHON, MAIN, CONFIG, MANIFEST)
