@@ -5,7 +5,7 @@ from RL.baselines import Baseline
 from RL.alg import Random, Stationary
 from domains.ant_variable_legs import AntVariableLegsEnv
 from domains.tasks import Subtask
-from domains.Maze import Move, Rotate
+from domains.Maze import Move
 from domains.AntPlane import AntPlane
 from domains.HumanoidPlane import HumanoidPlane
 domains = {
@@ -22,15 +22,15 @@ domains = {
 train_env_params = {
                     "id": domains["humanoid_plane"],
                     "exclude_current_positions_from_observation":False,
-                    "max_episode_steps":500,
+                    "max_episode_steps":400,
                     "render_mode": "human"
                     }
 
 train_objective_params = {
                     "direction": "X",
-                    "desired_velocity_minimum":-2.0,
-                    "desired_velocity_maximum": 2.0,
-                    "survival_bonus": 2.0,
+                    "desired_velocity_minimum":-3.0,
+                    "desired_velocity_maximum": 3.0,
+                    "survival_bonus": 5.0,
                     "adaptive_margin":True,
                     "adaptive_margin_minimum":0.01,
                     "categorical":False,
@@ -61,7 +61,7 @@ print(train_env.observation_space)
 print(train_env.action_space)
 params={"learning_starts":int(1e4), "buffer_size":int(1e6)}
 model = Baseline("SAC", train_env, params = params)
-model.set_checkpointing(10000, ".", name_prefix="init-test")
+# model.set_checkpointing(10000, ".", name_prefix="init-test")
 # model = Random("random", train_env)
 # # model = Stationary("stationary", train_env)
 #model.load("logs/AntPlaneMoveFinal_2024-11-13_10-22-56/models/model:AntSAC_1")
@@ -73,14 +73,18 @@ model.set_checkpointing(10000, ".", name_prefix="init-test")
 # model.load("logs/AntPlaneMove5_2024-10-11_21-28-31/models/model:AntSAC_0")
 
 # model.load("logs/AntPlaneRotateNew_2024-10-10_16-22-19/models/model:AntSAC_0")
+# model.load("models/HumanoidMoveResets5xSR1.0/model:HumanoidSAC-B1M_0")
+model.load("models/HumanoidMoveResets1.75xTR3.0/model:HumanoidSAC-B1M_0")
+# model.load("models/HumanoidBasic/model:HumanoidSAC-B2M_0")
+# model.load("model:HumanoidSAC-B1M_0")
 # try:
-model.learn(total_timesteps=1500000)
+# model.learn(total_timesteps=1500000)
 # except Exception as e:
 #     print("GLFW initialized? ", glfw._initialized)
 #     traceback.print_exc()    # ← shows you the file & line triggering the error
 #     raise
 
-model.learn(total_timesteps=1500000)
+# model.learn(total_timesteps=1500000)
 # model.save("./", "test")
 # vec_env = model.get_env()
 # train_env.reset()
@@ -104,6 +108,7 @@ observation, info = test_env.reset(seed=42)
 print(info)
 # desired_vel = info['reward_info']['desired_velocity']
 labels = ["x velocity", "y velocity", "z velocity", "x angular velocty", "y angular velocity", "z angular velocity"]
+start_vel_coords, _ = train_env.get_wrapper_attr("get_task_info")()["velocity_coords"]
 ep_step_count = 0
 for _ in range(150000):
     # if ep_step_count % 2 == 0:
@@ -115,19 +120,21 @@ for _ in range(150000):
     observation, reward, terminated, truncated, info = test_env.step(action)
     ep_step_count+=1
     print(observation)
-    desired_vel = info['reward_info']['desired_velocity']
-    achieved_vel = info['reward_info']['achieved_velocity']
-    print('----------')
-    print("info", info)
-    print('achieved velocity: ',achieved_vel, 'desired velocity: ', desired_vel)
-    print("target velocity:", test_env._task.desired_velocity)
+    # desired_vel = info['reward_info']['desired_velocity']
+    # achieved_vel = info['reward_info']['achieved_velocity']
+    # print('----------')
+    # print("info", info)
+    # print('achieved velocity: ',achieved_vel, 'desired velocity: ', desired_vel)
+    # print("target velocity:", test_env._task.desired_velocity)
     for i,label in enumerate(labels):
-        print(label+":", observation["observation"][24+i])
+        print(label+":", observation["observation"][start_vel_coords+i])
+        # print(label+":", observation[start_vel_ceoords+i])
+
     #    vec_env.render() not needed for render_mode = human
     print('----------')
     if terminated or truncated:
         observation, info = test_env.reset()
         ep_step_count = 0
-        #    desired_vel = info['reward_info']['desired_velocity']
+        # desired_vel = info['reward_info']['desired_velocity']
         print("EPISODE RESET")
 test_env.close()

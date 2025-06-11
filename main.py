@@ -172,6 +172,7 @@ def main():
             best_score = -math.inf
 
         for t in range(trial_ind, experiment_params["trials"]):
+            print()
             if ran_so_far == num_runs:
                 print("completed running", num_runs, "trials!")
                 quit()

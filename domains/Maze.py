@@ -2,21 +2,9 @@ import numpy as np
 import random as rnd
 import math
 
-from domains.tasks import EternalTask, Task
+from domains.tasks import Task
 from utils import q_rotate
 
-#the solution to each of these "Eternal" tasks is simply the projection function which takes a real-valued variable (desired_velocity, usually) to a high dimensional policy 
-#whose aim is to maintain some "fitness" indefinitely. you could think concretely of this fitness as a linear or nonlinear function of state. High fitness is finding a cycle which 
-#has a high average reward as integrated over that cycle. 
-
-#re-implementing move task
-
-#for now, we will not specify direction, just to get the infrastructure for custom tasks finished first
-#desired speed should be either a single value in m/s, or a range to sample from.
-#hypothesis: we don't care about tolerance right now (check with group on thursday)
-#hypothesis: coordinate system is local
-#TODO check hypotheses 
-#If you would like to avoid randomly sampling, just set minimum = maximum
 class Move(Task):
     def __init__(self,desired_velocity_minimum = -3.0,
                  desired_velocity_maximum = 3.0,
@@ -38,11 +26,12 @@ class Move(Task):
         super().__init__()
         self.desired_velocity_minimum = desired_velocity_minimum #TODO refactor to range so as to have consistent API
         self.desired_velocity_maximum = desired_velocity_maximum
+        #If you would like to avoid randomly sampling, just set minimum = maximum
         self.task_info = None
         self.velocity_coords = None
         self.dir_coords = None
-        #hypothesis: forwards is simply "x_velocity". Courtesy of Rafa
-        if self.desired_velocity_maximum == math.inf: #not supporting this simultaneously with range for now
+        #hypothesis: forwards is simply "x_velocity"
+        if self.desired_velocity_maximum == math.inf:
             self.maximize = True
         else:
             self.maximize = False
@@ -61,7 +50,7 @@ class Move(Task):
         else:
             self.survival_bonus = 0.0
 
-        self.ctrl_cost = ctrl_cost #just boolean flags
+        self.ctrl_cost = ctrl_cost
         self.cnt_cost = contact_cost #not currently implemented
         self.categorical = categorical
         if healthy_z_range: #this should be a range
@@ -69,11 +58,10 @@ class Move(Task):
         else:
             self.min_z = -math.inf
             self.max_z = math.inf
-        self.include_xy = include_xy #boolean
-        self.modify_obs = modify_obs #boolean
+        self.include_xy = include_xy
+        self.modify_obs = modify_obs
         directions = ["X", "Y", "Z", "XR", "YR", "ZR"]
         self.rotation_starting_weight = rotation_starting_weight
-        # starting_rotation_weights = np.array([self.rotation_starting_weight]*3)
         self.starting_weights = np.concatenate((np.ones(shape=(3,)), np.full(shape=(3,), fill_value = rotation_starting_weight)))
         if direction == "F":
             self.relative = True
@@ -224,42 +212,4 @@ class Move(Task):
 
         # parent_return = super().reset()
         # print(parent_return)
-        return super().reset()
-        
-
-#Rotation subtask. specify an angular velocity (negative or positive scalar) and we try to match it.
-class Rotate(EternalTask):
-    def __init__(self, desired_velocity_minimum = -1.0, desired_velocity_maximum = 1.0, direction = "Z", metric = "L2"):
-        super().__init__()
-        self.desired_velocity_minimum = desired_velocity_minimum
-        self.desired_velocity_maximum = desired_velocity_maximum
-        if direction == "X":
-            self.direction = np.array((1,0,0), dtype = float)
-        elif direction == "Y":
-            self.direction = np.array((0,1,0), dtype = float)
-        elif direction == "Z":
-            self.direction = np.array((0,0,1), dtype = float)
-        else:
-            direction = self.direction #better be a (3,) array!
-
-        self.metric = metric
-
-    def get_reward(self, state):
-        obs = state["observation"]
-        angular_velocity = np.array((obs[16], obs[17], obs[18]),dtype = float) #only really going to work for AntMaze for now
-        achieved_angular_velocity = np.dot(angular_velocity, self.direction) 
-        discrepancy = np.abs(self.desired_velocity - achieved_angular_velocity)
-        if self.metric == "L2":
-            reward = -0.5*discrepancy**2
-        elif self.metric == "L1":
-            reward = -discrepancy
-            
-        return reward
-    
-    def reset(self, seed = 32):
-        if self.desired_velocity_maximum == self.desired_velocity_minimum:
-            self.desired_velocity = self.desired_velocity_minimum
-        else:
-            self.desired_velocity = rnd.uniform(self.desired_velocity_minimum, self.desired_velocity_maximum)
-
         return super().reset()
