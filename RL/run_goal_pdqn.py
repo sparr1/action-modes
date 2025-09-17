@@ -2,17 +2,19 @@ import os
 import click
 import time
 import numpy as np
-import gym
-import gym_goal
-from gym_goal.envs.config import GOAL_WIDTH, PITCH_LENGTH, PITCH_WIDTH
+import gymnasium as gym
+import gymnasium_goal as gym_goal
+from gymnasium_goal.envs.config import GOAL_WIDTH, PITCH_LENGTH, PITCH_WIDTH
+import mpdqn
+
 # from gym.wrappers import Monitor
-from common import ClickPythonLiteralOption
-from common.wrappers import ScaledParameterisedActionWrapper
-from common.goal_domain import GoalFlattenedActionWrapper, GoalObservationWrapper
-from common.wrappers import ScaledStateWrapper
-from agents.pdqn import PDQNAgent
-from agents.pdqn_split import SplitPDQNAgent
-from agents.pdqn_multipass import MultiPassPDQNAgent
+from mpdqn.common import ClickPythonLiteralOption
+from mpdqn.common.wrappers import ScaledParameterisedActionWrapper
+from mpdqn.common.goal_domain import GoalFlattenedActionWrapper, GoalObservationWrapper
+from mpdqn.common.wrappers import ScaledStateWrapper
+from mpdqn.agents.pdqn import PDQNAgent
+from mpdqn.agents.pdqn_split import SplitPDQNAgent
+from mpdqn.agents.pdqn_multipass import MultiPassPDQNAgent
 
 
 def pad_action(act, act_param):

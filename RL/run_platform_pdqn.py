@@ -1,15 +1,15 @@
 import os
 import click
 import time
-import gym
-import gym_platform
+import gymnasium as gym
+import gymnasium_platform as gym_platform
 # from gym.wrappers import Monitor
-from common import ClickPythonLiteralOption
-from common.platform_domain import PlatformFlattenedActionWrapper
+from mpdqn.common import ClickPythonLiteralOption
+from mpdqn.common.platform_domain import PlatformFlattenedActionWrapper
 
 import numpy as np
 
-from common.wrappers import ScaledStateWrapper, ScaledParameterisedActionWrapper
+from mpdqn.common.wrappers import ScaledStateWrapper, ScaledParameterisedActionWrapper
 
 
 def pad_action(act, act_param):
@@ -102,12 +102,19 @@ def run(seed, episodes, evaluation_episodes, batch_size, gamma, inverting_gradie
         for a in range(env.action_space.spaces[0].n):
             initial_params_[a] = 2. * (initial_params_[a] - env.action_space.spaces[1].spaces[a].low) / (
                         env.action_space.spaces[1].spaces[a].high - env.action_space.spaces[1].spaces[a].low) - 1.
-
+    print("pre-wrapper obs space", env.observation_space)
+    print("pre-wrapper act space", env.action_space)
     env = ScaledStateWrapper(env)
+    print("post-scale wrapper obs space", env.observation_space)
+    print("post-scale wrapper act space", env.action_space)
     env = PlatformFlattenedActionWrapper(env)
+    print("post-flattened action wrapper obs", env.observation_space)
+    print("post-flattened action wrapper act", env.action_space)
     if scale_actions:
         env = ScaledParameterisedActionWrapper(env)
-
+    print("post-scale action wrapper obs", env.observation_space)
+    print("post-scale action wrapper act", env.action_space)
+    # quit()
     dir = os.path.join(save_dir,title)
     # env = Monitor(env, directory=os.path.join(dir,str(seed)), video_callable=False, write_upon_reset=False, force=True)
     env.seed(seed)
@@ -116,9 +123,9 @@ def run(seed, episodes, evaluation_episodes, batch_size, gamma, inverting_gradie
     print("obs space", env.observation_space)
     print("act space", env.action_space)
 
-    from agents.pdqn import PDQNAgent
-    from agents.pdqn_split import SplitPDQNAgent
-    from agents.pdqn_multipass import MultiPassPDQNAgent
+    from mpdqn.agents.pdqn import PDQNAgent
+    from mpdqn.agents.pdqn_split import SplitPDQNAgent
+    from mpdqn.agents.pdqn_multipass import MultiPassPDQNAgent
     assert not (split and multipass)
     agent_class = PDQNAgent
     if split:
@@ -196,7 +203,7 @@ def run(seed, episodes, evaluation_episodes, batch_size, gamma, inverting_gradie
                 (next_state, steps), reward, terminal, _, _ = ret
             elif(len(ret)==4):
                 (next_state, steps), reward, terminal, _ = ret
-
+            # print("steps", steps)
             # (next_state, steps), reward, terminal, _, _ = ret
             # next_state = np.array(next_state, dtype=np.float32, copy=False)
             next_state = np.asarray(state, dtype = np.float32)
