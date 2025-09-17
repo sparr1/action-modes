@@ -1,16 +1,9 @@
-import datetime
 import numpy as np
-import glob, os, json, sys, math, importlib
-from domains.tasks import Subtask
-from domains.AntPlane import AntPlane
-SUPPORTED_WRAPPERS = ("Subtask", "AntPlane", "ScaledStateWrapper", "PlatformFlattenedActionWrapper", "ScaledParameterisedActionWrapper")
-SUPPORTED_LOG_SETTINGS = ("overwrite", "warn", "timestamp", "overwrite-safe")
-SUPPORTED_LOG_TYPES = ("detailed", "summary")
+import os, json, glob
+from utils.utils import get_files, get_dirs, load_episode_log, convert_dict_obs_to_arr
+from utils.core import handle_settings
+import math
 
-def datetime_stamp():
-    now = datetime.datetime.now()
-    datetime_stamp = now.strftime("%Y-%m-%d_%H-%M-%S")
-    return datetime_stamp
 
 def tolerant_stats(arrs): #averaging performance values between trials of varying lengths: [np.arr(1..n),...,np.arr(1..m)]
     lens = [len(i) for i in arrs]
@@ -19,53 +12,6 @@ def tolerant_stats(arrs): #averaging performance values between trials of varyin
     for idx, l in enumerate(arrs):
         arr[:len(l),idx] = l
     return np.array(arr.mean(axis = -1)), np.array(arr.std(axis=-1)), np.array(arr.max(axis=-1)), np.array(arr.min(axis=-1))
-
-# def bound_observations(arrs):
-
-def get_files(dir): #get the names of all the files in a directory
-    items = glob.glob(os.path.join(dir, '*'))
-    return [item for item in items if os.path.isfile(item)]
-
-def get_dirs(dir): #get the names of all the subdirectories in a directory
-    items = glob.glob(os.path.join(dir, '*'))
-    return [item for item in items if os.path.isdir(item)]
-
-#An experiment directory consists of a settings.json file, and a series of directories labeled "algname_n" for the nth run of algname
-
-
-#TODO: currently does nothing. either add functionality or delete
-def handle_settings(path): #processes the settings.json file
-    with open(path) as f:
-        contents = json.load(f)
-    print(contents) 
-
-def setup_wrapper(domain, wrapper_name, wrapper_params):
-    if wrapper_name == 'Subtask':      
-        try:
-            print(wrapper_params["task"])
-            module_name,task_name = wrapper_params["task"].split(':') 
-            # print(module)
-            module = importlib.import_module(module_name)
-            task_class = getattr(module,task_name) #grab the specific task
-            p = wrapper_params["task_params"]
-            task = task_class(**p)  
-            domain = Subtask(domain, task) #replace the reward function and termination conditions based on task, then return the new wrapped domain.
-        except (ModuleNotFoundError, AttributeError) as e:
-            raise ValueError(f"Could not find model class '{task_name}' in module '{module_name}': {e}")
-    elif wrapper_name == 'AntPlane':
-        domain = AntPlane(domain, **wrapper_params)
-    else:
-        print("setting up default wrapper ", wrapper_name, "with params", wrapper_params)
-        module_name,raw_wrapper_name = wrapper_name.split(':') #this is likely to error out
-        module = importlib.import_module(module_name)
-        wrapper_class = getattr(module, raw_wrapper_name)
-        domain = wrapper_class(domain, **wrapper_params)
-        print("wrapping appears to have been successful.")
-
-
-
-    return domain
-
 
 def handle_stats_line(line_segments, keyword):
     return [x for x in line_segments if keyword in x][0].split(' ')[-1]
@@ -314,7 +260,7 @@ def _compute_stats(experiment_name, rewards = True, observations = True, actions
             print("observation key order (if applicable):", coll_keys)
             results["observations"] = observation_results
 
-    #TODO handle actions
+        #TODO handle actions
     # if actions:
     #     print(len(trial_rewards.keys()))
     #     print({key:len(value) for key,value in trial_rewards.items()})
@@ -327,19 +273,6 @@ def _compute_stats(experiment_name, rewards = True, observations = True, actions
 
     return results
 
-def convert_dict_obs_to_arr(obs):
-    coll_obs = []
-    coll_keys = []
-    for k,v in obs.items():
-        coll_keys.append(k)
-        # print(type(v))
-        coll_obs.append(np.array(v))
-        # print(coll_keys)
-    # for o in coll_obs:
-    #     print(o.shape)
-    return coll_keys, np.concatenate(coll_obs, axis = None)
-
-
 def compute_rewards(experiment_name, base = False, num_goal_buckets = None):
     return _compute_stats(experiment_name, True, False, False, base_rewards=base, num_goal_buckets = num_goal_buckets)
 
@@ -351,103 +284,3 @@ def compute_actions(experiment_name):
 
 def compute_all(experiment_name):
     return _compute_stats(experiment_name)
-
-def listify(obj, wrap = True):
-    if isinstance(obj, int) or \
-       isinstance(obj, bool) or \
-       isinstance(obj, float) or \
-       isinstance(obj, complex) or \
-       isinstance(obj, str):
-         return [obj,] if wrap else obj
-    elif isinstance(obj,np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, dict): #to handle ordered and unordered dicts
-        return [{k:listify(v, False) for k,v in obj.items()},]
-    elif isinstance(obj, set) or isinstance(obj, tuple) or isinstance(obj, list):
-        return [listify(x, False) for x in obj]
-    elif isinstance(obj,np.generic):
-        return [obj.tolist(),] if wrap else obj.tolist()
-
-def setup_logs(reward, obs, action, dones, info = None):
-    data = {}
-    # print(reward)
-    # print(type(reward))
-    # new_rewards = listify(reward)
-    # print(new_rewards)
-    # print(type(new_rewards))
-    data['rewards'] = listify(reward)
-    data["obs"]     = listify(obs)
-    data["actions"] = listify(action)
-
-    data["dones"] = dones
-    # print(info)
-    if info and "reward_info" in info[0]:
-        data["infos"] = info[0]["reward_info"]
-    else:
-        data["infos"] = info
-    return data
-
-def load_episode_log(path):
-    with open(path) as f:
-        contents = json.load(f)
-    logs = {'rewards': contents['rewards'], 'observations':contents['observations'], 'actions': contents['actions']}
-    if 'info' in logs:
-        logs['info'] = contents['info']
-    return logs
-
-def q_prod(q1, q2):
-    q3 = np.array([0.0,0.0,0.0,0.0])
-    q3[0] = q1[0]*q2[0] - q1[1]*q2[1] - q1[2]*q2[2] - q1[3]*q2[3]
-    q3[1] = q1[0]*q2[1] + q1[1]*q2[0] + q1[2]*q2[3] - q1[3]*q2[2]
-    q3[2] = q1[0]*q2[2] - q1[1]*q2[3] + q1[2]*q2[0] + q1[3]*q2[1]
-    q3[3] = q1[0]*q2[3] + q1[1]*q2[2] - q1[2]*q2[1] + q1[3]*q2[0]
-    return q3
-
-def q_conj(q):
-    q2 = -q.copy()
-    q2[0] = q[0]
-    return q2
-
-def q_rotate(d, q):
-    return q_prod(q_prod(q, np.append(0, d)), q_conj(q))[1:]
-
-
-def make_manifest(abs_path_python, abs_path_main, abs_path_experiment_config, abs_path_manifest):
-    with open(abs_path_experiment_config, "r") as f:
-        experiment_params = json.load(f)
-    
-    with open(abs_path_manifest, "a") as g:
-        for i, alg in enumerate(experiment_params["configs"]):
-            for j in range(experiment_params["trials"]):
-                g.write(abs_path_python, abs_path_main, '-r', abs_path_experiment_config, '--alg-index', str(i), '--trial-index', str(j), '--num-runs 1')
-            
-
-    
-    # example: "python main.py -r configs/experiments/AntPlaneMoveResets6.0.json --alg-index 0 --trial-index 1 --num-runs 1"
-
-
-if __name__ == "__main__":
-
-    # results = compute_rewards("DQNShort_old")['rewards']
-    # print(results.keys())
-    # DQNCartSHORT2 = results['DQNCartSHORT2']
-    # DQNCartSHORT = results['DQNCartSHORT']
-    # means, stds, maxes, mins = DQNCartSHORT['means'],DQNCartSHORT['stds'], DQNCartSHORT['max'], DQNCartSHORT['min']
-    # print(np.min(mins))
-    # print(np.max(maxes))
-
-    # results = compute_observations("AntMazeSparse_2024-07-23_16-51-17")
-    # np.set_printoptions(threshold=sys.maxsize)
-    # labels = ["x velocity", "y velocity", "z velocity", "x angular velocty", "y angular velocity", "z angular velocity"]
-    # for alg, stats in results.items():
-    #     print(alg)
-        
-    #     for k,v in stats.items():
-    #         print(k+":")
-    #         for i, label in enumerate(labels):
-    #             print(label+":",v[17+i])
-    PYTHON = sys.executable()
-    MAIN = ...
-    CONFIG = ...
-    MANIFEST = ...
-    make_manifest(PYTHON, MAIN, CONFIG, MANIFEST)

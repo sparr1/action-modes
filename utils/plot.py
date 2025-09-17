@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import os, glob, json
-from utils import compute_rewards
+from utils.utils import compute_rewards
 
 #we'll proceed first by graphing the reward for a simple experiment. We first grab some key info from the settings.json, such as names of the algorithms, labels for graphs, etc.
 #then we load everything into numpy, averaging and computing std over the trials if applicable and plot it using matplotlib.

@@ -1,0 +1,22 @@
+{
+    "seed": 55,
+    "name": "AntWalker",
+    "alg_config_path": "configs/algs/AntSAC.json",
+    "model_path":"models/controllers_v1/model:AntWalker",
+    "env_wrapper": {"name": "Subtask", "wrapper_params":  {"task":"domains.Maze:Move",
+    "task_params": {"direction":"F",
+                    "categorical":false, 
+                   "desired_velocity_minimum":-6.0,
+                   "desired_velocity_maximum":6.0,
+                   "adaptive_margin": true,
+                   "adaptive_margin_minimum": 1e-05,
+                   "survival_bonus":1.0,
+                   "metric": "L2"
+                   }
+   }
+},
+    "base_observation_space":"Box(-inf, inf, (29,), float64)",
+    "base_action_space": "Box(-1, 1, (8,), float32)",
+    "modal_action_space": "Box(-1, 1, (1,), float32)"
+
+}

@@ -2,8 +2,8 @@ import numpy as np
 import random as rnd
 import math
 
-from domains.tasks import Task
-from utils import q_rotate
+from modes.tasks import Task
+from utils.utils import q_rotate
 
 class Move(Task):
     def __init__(self,desired_velocity_minimum = -3.0,
@@ -171,10 +171,13 @@ class Move(Task):
     # def distance_lo
     def get_termination(self, obs):
         return self.healthy(obs) == 0.0
-  
     
     def get_goal(self):
         return self.desired_velocity
+    
+    def set_goal(self, new_goal):
+        self.desired_velocity = new_goal
+    
     
     def set_task_info(self, task_info):
         self.task_info = task_info

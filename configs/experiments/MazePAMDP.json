@@ -1,0 +1,19 @@
+{
+    "overrides_alg":{
+        "seed": 55,
+        "device":"cuda",
+        "env":"AntMaze_UMazeDense-v4", 
+        "env_wrappers": [{"name": "domains.mpqdn_wrappers:ScaledStateWrapper", "wrapper_params": {}},
+                         {"name": "domains.mpqdn_platform_domain:PlatformFlattenedActionWrapper", "wrapper_params":  {}},
+                         {"name": "domains.mpqdn_wrappers:ScaledParameterisedActionWrapper", "wrapper_params": {}}
+                        ],
+        "total_steps": 1e5,
+        "episodes": null
+},
+    "env_params": {"max_episode_steps": 1000,"render_mode":null},
+    "trials": 3,
+    "configs": ["PlatformMPDQN", "PlatformRandom"],
+    "logs": "timestamp",
+    "save_trials": "best",
+    "log_info": false
+}

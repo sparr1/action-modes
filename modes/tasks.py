@@ -2,7 +2,8 @@ import gymnasium as gym
 import numpy as np
 import math
 import traceback, sys
-#A task in this case can essentially be thought of as a reward function
+#A task in this case is a specification which includes a reward function. 
+#the policy derived from optimizing this reward function will become a modal controller once paired with a support classifier.
 
 class Task():
     def __init__(self):
@@ -13,7 +14,9 @@ class Task():
         pass
     def reset(self, seed = 32) -> None:
         pass
-    def get_goal(self) -> float:
+    def get_goal(self) -> float: #in theory, this should be greater than 1-d
+        pass
+    def set_goal(self) -> float:
         pass
 
 #TODO: this should be refactored to be an _average reward_ task. To handle this correctly, I need to do some reading...
@@ -35,7 +38,8 @@ class Subtask(gym.Wrapper):
             task.set_task_info(task_info)
         else:
             try:
-                task.set_task_info(env.get_task_info())
+                # task.set_task_info(env.get_task_info())
+                task.set_task_info(env.get_wrapper_attr('get_task_info')())
             except Exception as e:
                 print("Exception Message:")
                 print(e)
@@ -62,8 +66,6 @@ class Subtask(gym.Wrapper):
         # print(new_obs)
         return new_obs
 
-
-
     def step(self, action):
         observation, reward, terminated, truncated, info = super().step(action)
         self.last_action = action
@@ -88,22 +90,5 @@ class Subtask(gym.Wrapper):
     def termination(self, observation):
         return self._task.get_termination(observation)
     
-
-#we will take an initial task with an action space of Box(-1, 1, (8,), float32), 
-#combine it with a few (initially just 2) different lower dimensional controllers action space of Box(-1, 1, (1,), float32),
-#and then the new action space will be Dict(Discrete(2), Box(-1, 1, (1,), float32), Box(-1, 1, (1,), float32)), where the discrete action just switches which lower dimensional action space we use.
-#In general, we will have M possible modes, which we will winnow into k supported modes for any given state, then project the latent "within-mode" actions to the original high-dimensional state space.
-
-#for now, we will forget about the initial winnowing, and just assume the support of each mode covers the state space. 
-class ModalTask(gym.Wrapper):
-    def __init__(self, env, mode_controllers):
-        #each mode_controller is going to turn a latent "action-within-mode" z into a base action in env. 
-        self.num_modes = len(mode_controllers)
-        #need to set up a discrete action space corresponding to the controllers
-        self.base_action_space = self.action_space
-        self.controllers = mode_controllers
-        self.action_space = gym.spaces.Discrete(self.num_new_actions)
-    def step(self, action):
-        print(action)
-
-#I believe I need to create some kind of "AbstractTask", which takes a collection of lower level controllers, and wraps the original environment, using the controllers as actions
+    def set_goal(self, new_goal):
+        self._task.set_goal(new_goal)

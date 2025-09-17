@@ -4,7 +4,7 @@ import importlib, json, os
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.callbacks import CheckpointCallback as BaselineCheckpointCallback
 from RL.alg import Algorithm
-from utils import setup_logs
+from utils.utils import setup_logs
 #from stable_baselines3 import PPO, DQN, TD3, SAC, DDPG, A2C
 module_name = "stable_baselines3" #for dynamic importing
 

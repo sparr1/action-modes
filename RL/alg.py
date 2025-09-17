@@ -1,4 +1,4 @@
-from utils import setup_logs
+from utils.utils import setup_logs
 import numpy as np
 #the goal here is to wrap the baselines AND our own custom algorithms to a common interface. a little ambitious, maybe.
 class Algorithm():
@@ -51,6 +51,9 @@ class SimpleAlgorithm(Algorithm):
     def predict(self,observation):
         pass
 
+    def set_checkpointing(self, save_freq, save_path, name_prefix):
+        pass
+
 class Random(SimpleAlgorithm):
     def __init__(self, name, env, custom_params = None):
         super().__init__(name, env, custom_params)
@@ -69,4 +72,3 @@ class Stationary(SimpleAlgorithm):
 
     def predict(self, observation):
         return np.zeros(self.env.action_space.shape), None
-

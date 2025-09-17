@@ -9,6 +9,75 @@ import numpy as np
 from gymnasium.spaces import Tuple, Box
 
 
+class OrchestralWrapper(gym.ActionWrapper):
+    def __init__(self, env, orchestral_action_space):
+        super().__init__(env)
+        self.action_space = orchestral_action_space
+
+class ModalWrapper(gym.ObservationWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        #simply remove desired_goal
+        self.observation_space = gym.spaces.Dict({'achieved_goal': env.observation_space['desired_goal'], 'observation':env.observation_space['observation']})
+    def observation(self, obs):
+        return {'achieved_goal':obs['achieved_goal'], 'observation': obs['observation']}
+
+class FlattenStateWrapper(gym.ObservationWrapper):
+    """
+    Flattens the observation space to a Box
+    """
+
+    def __init__(self, env):
+        super(FlattenStateWrapper, self).__init__(env)
+        obs = env.observation_space
+        if isinstance(obs, gym.spaces.Box):
+            concatenated_obs_space = obs
+        elif isinstance(obs, Tuple):
+            for i in obs:
+                assert(isinstance(i, gym.spaces.Box))
+            concatenated_low = np.concatenate([x.low for x in obs])
+            concatenated_high = np.concatenate([x.high for x in obs])
+
+            # Calculate the new shape
+            # Assuming concatenation along the last axis (for 1D vectors, it's simply summing the dimensions)
+            new_shape = sum(x.shape[-1] for x in obs)
+
+            # Create the new concatenated Box observation space
+            concatenated_obs_space = gym.spaces.Box(
+                low = concatenated_low,
+                high = concatenated_high,
+                shape = new_shape,
+                dtype = np.float64 # Ensure consistent or appropriate dtype
+            )
+        elif isinstance(obs, gym.spaces.Dict):
+            for i in obs.values():
+                assert(isinstance(i, gym.spaces.Box))
+            concatenated_low = np.concatenate([x.low for x in obs.values()])
+            concatenated_high = np.concatenate([x.high for x in obs.values()])
+
+            # Calculate the new shape
+            # Assuming concatenation along the last axis (for 1D vectors, it's simply summing the dimensions)
+            new_shape = sum(x.shape[-1] for x in obs.values())
+
+            # Create the new concatenated Box observation space
+            concatenated_obs_space = gym.spaces.Box(
+                low = concatenated_low,
+                high = concatenated_high,
+                shape = (new_shape,),
+                dtype = np.float64 # Ensure consistent or appropriate dtype
+            )
+        self.observation_space = concatenated_obs_space
+
+    def observation(self, obs):
+        if isinstance(obs, dict):
+            return np.concatenate(list(obs.values())
+                                  )
+        elif isinstance(obs, tuple):
+            return np.concatenate(obs)
+        else:
+            raise Exception("not implemented") #TODO handle others
+
+
 class ScaledStateWrapper(gym.ObservationWrapper):
     """
     Scales the observation space to [-1,1]
@@ -62,10 +131,13 @@ class TimestepWrapper(gym.Wrapper):
     """
     Adds a timestep return to an environment for compatibility reasons.
     """
+    def __init__(self, env, max_steps):
+        super(TimestepWrapper, self).__init__(env)
+        self.observation_space = gym.spaces.Tuple([env.observation_space, gym.spaces.Discrete(max_steps)])
 
     def reset(self, **kwargs):
         state = self.env.reset(**kwargs)
-        return state, 0
+        return state, 1 #changed from 0
 
     def step(self, action):
         state, reward, terminal, info = self.env.step(action)

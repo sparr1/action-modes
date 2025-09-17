@@ -1,6 +1,7 @@
 import gymnasium as gym
 import numpy as np
 import random, math
+# from modes.modes import ModalWrapper
 # from utils import q_rotate
 #
 # Code heavily adapted to match the random resetting in Gymnasium-Robotics and Antv4 as closely as possible for transfer
@@ -8,7 +9,7 @@ import random, math
 # https://github.com/openai/gym/blob/master/gym/envs/mujoco/ant_v4.py
 
 class AntPlane(gym.Wrapper):
-    def __init__(self, env, random_resets = True, reset_map=[[1]*5]*5, map_scale = 4, position_noise_range = 0.25, num_legs = 4):
+    def __init__(self, env, random_resets = False, reset_map=[[1]*5]*5, map_scale = 4, position_noise_range = 0.25, num_legs = 4):
         super().__init__(env)
         self.base_env = self.env.unwrapped
         self.random_resets = random_resets #boolean for macro-level randomness on the map level
@@ -98,5 +99,11 @@ class AntPlane(gym.Wrapper):
         offset = 2 if incl_xy else 0
         return {"velocity_coords": (13+offset, 19+offset),
                 "dir_coords": (1+offset, 5+offset)}
+
+    #probably not going to need this! keeping it here for posterity
         
-        
+    # class AntPlaneModalWrapper(ModalWrapper):
+    #     def __init__(self, env, walking_controller, rotating_controller):
+    #         super().__init__(env, [walking_controller, rotating_controller])
+    #         self.walking_controller = walking_controller
+    #         self.rotating_controller = rotating_controller

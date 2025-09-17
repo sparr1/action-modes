@@ -1,22 +1,24 @@
-import random, time, argparse, json, os, shutil, math, importlib
+import random, time, argparse, json, os, shutil, math
 
 import numpy as np
-import seaborn as sns
-import pandas as pd
 
 import gymnasium as gym
 # from RL.alg import *
-from RL.baselines import Baseline, TrajectoryLoggerCallback
+#from RL.baselines import Baseline, TrajectoryLoggerCallback
+from utils.core import *
+from utils.stats import handle_trial
+from utils.utils import datetime_stamp
 from log import TrainingLogger
-from domains.tasks import *
-from domains.AntPlane import *
-from domains.mpqdn_goal_domain import *
-from domains.mpqdn_platform_domain import *
-from domains.mpqdn_wrappers import *
-import gymnasium_goal
-import gymnasium_platform
+#from modes.tasks import *
+# from domains.AntPlane import *
+# from domains.mpqdn_goal_domain import *
+# from domains.mpqdn_platform_domain import *
+# from domains.mpqdn_wrappers import *
+# import gymnasium_goal
+# import gymnasium_platform
 
-from utils import *
+# from utils.utils import *
+
 def main():
     parser = argparse.ArgumentParser(description="action mode learning experiments")
     parser.add_argument('-r', '--run', help='config file for a run', required=True,)
@@ -176,44 +178,8 @@ def main():
             if ran_so_far == num_runs:
                 print("completed running", num_runs, "trials!")
                 quit()
-            baseline = False
-            if '/' in run_params["alg"]:
-                file_name, alg_name = "".join(run_params["alg"].split('/')[:-1]), run_params["alg"].split('/')[-1]
-                print(file_name)
-                print(alg_name)
-                if "baselines" in file_name: #currently all that is supported. TODO support non-baselines also
-                    baseline = True
-                    try:
-                        model = Baseline(alg_name, domain, run_params["alg_params"])
-                    except Exception as e:
-                        print(e)
-                        break #if we cannot run this baseline, we just try another
-                elif file_name == "PAMDP":
-                    try: 
-                        module = importlib.import_module("RL.PAMDP")
-                        alg_class = getattr(module, alg_name)
-                        model = alg_class(alg_name,domain, run_params["alg_params"])
-                    except Exception as e:
-                        print(e)
-                        break #if we cannot run this baseline, we just try another.
-                else:
-                    try:
-                        module = importlib.import_module("RL."+file_name.replace('/','.')) #last ditch, just try to load it!
-                        alg_class = getattr(module, alg_name)
-                        model = alg_class(alg_name,domain, run_params["alg_params"])
-                    except Exception as e:
-                        print(e)
-                        break #if we cannot run this baseline, we just try another.
-            else:
-                try:
-                    module = importlib.import_module("RL.alg")
-                    alg_class = getattr(module, alg_name)
-                    model = alg_class(alg_name,domain, run_params["alg_params"])
-                except Exception as e:
-                    print(e)
-                    break #if we cannot run this baseline, we just try another.
-            print(alg_name)
-
+            model, baseline, alg_name = initialize_alg(run_params["alg"], run_params["alg_params"], domain)
+            print(alg_name, "initialized.")
            
             if log_setting == "none":
                 model.learn(total_timesteps=run_params["total_steps"]) #simply don't log anything
