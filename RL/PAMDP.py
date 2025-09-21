@@ -179,7 +179,7 @@ class PAMDP(Algorithm):
         return self.model.act(observation)
     
     def save(self, path, name):
-        self.model.save(os.path.join(path, name))
+        self.model.save_models(os.path.join(path, name))
 
     def get_model(self):
         return self.model

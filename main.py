@@ -156,8 +156,8 @@ def main():
                 wrapper_name = env_wrapper['name']
                 wrapper_params = env_wrapper['wrapper_params']
                 domain = setup_wrapper(domain, wrapper_name, wrapper_params)
-                
-                
+        
+        
         if "env_wrapper" in run_params:
             if 'name' not in run_params['env_wrapper'] or run_params['env_wrapper']['name'].split(':')[-1] not in SUPPORTED_WRAPPERS:
                 raise Exception("wrapper misconfigured, or otherwise not currently supported")

@@ -5,13 +5,57 @@ from utils.core import handle_settings
 import math
 
 
-def tolerant_stats(arrs): #averaging performance values between trials of varying lengths: [np.arr(1..n),...,np.arr(1..m)]
+def tolerant_stats(arrs, rolling_window = 1): #averaging performance values between trials of varying lengths: [np.arr(1..n),...,np.arr(1..m)]
+    # lens = [len(i) for i in arrs]
+    # arr = np.ma.empty((np.max(lens),len(arrs)))
+    # arr.mask = True
+    # for idx, l in enumerate(arrs):
+    #     arr[:len(l),idx] = l
+    arr = tolerant_rolling_average(arrs, window_size=rolling_window)
+    return np.array(arr.mean(axis = -1)), np.array(arr.std(axis=-1)), np.array(arr.max(axis=-1)), np.array(arr.min(axis=-1))
+
+def tolerant_rolling_average(arrs, window_size = 1):
     lens = [len(i) for i in arrs]
+    n_cols = len(arrs)
+    max_len = np.max(lens)
     arr = np.ma.empty((np.max(lens),len(arrs)))
     arr.mask = True
     for idx, l in enumerate(arrs):
         arr[:len(l),idx] = l
-    return np.array(arr.mean(axis = -1)), np.array(arr.std(axis=-1)), np.array(arr.max(axis=-1)), np.array(arr.min(axis=-1))
+
+    data = arr.filled(0.0)
+    valid = (np.invert(arr.mask)).astype(np.int64)
+
+    # Cumulative sums to get sliding window sums/counts in O(n)
+    # Prepend a zero row to make window [i-w+1, i] as diff of cumsums
+    pad0 = np.zeros((1, n_cols), dtype=data.dtype)
+    pad0i = np.zeros((1, n_cols), dtype=np.int64)
+
+    csum = np.vstack([pad0, np.cumsum(data, axis=0)])
+    cval = np.vstack([pad0i, np.cumsum(valid, axis=0)])
+
+    # For each row i, window sum/count over last `window_size` rows
+    # Indices in cumsum space: end = i+1, start = i+1-window_size
+    end_idx = np.arange(window_size, max_len + 1)  # cumsum indices with full window
+    start_idx = end_idx - window_size
+
+    w_sum = csum[end_idx, :] - csum[start_idx, :]
+    w_cnt = cval[end_idx, :] - cval[start_idx, :]
+
+    # Rows where EVERY column has a full window of valid entries
+    full_rows = np.all(w_cnt == window_size, axis=1)  # length max_len - window_size + 1
+
+    # Prepare output (fully masked by default)
+    out = np.ma.empty((max_len, n_cols), dtype=float)
+    out.mask = True
+
+    # Map the valid means back to the correct output rows: i = window_size-1 ... max_len-1
+    row_indices = np.arange(window_size - 1, max_len)
+    emit_rows = row_indices[full_rows]
+    if emit_rows.size:
+        means = w_sum[full_rows, :] / float(window_size)
+        out[emit_rows, :] = means
+    return out
 
 def handle_stats_line(line_segments, keyword):
     return [x for x in line_segments if keyword in x][0].split(' ')[-1]
@@ -94,10 +138,10 @@ def retrieve_trial(alg_name, trial_data, keyword, stat_dict):
         stat_dict[alg_name] = []
     stat_dict[alg_name].append(trial_data[keyword])
 
-def compute_stat(alg, stat_trials_data, stat_results_dict, goal_range = (-math.inf,math.inf), goal_trials_data = None):
+def compute_stat(alg, stat_trials_data, stat_results_dict, goal_range = (-math.inf,math.inf), goal_trials_data = None, rolling_window = 50):
 
     if not goal_trials_data:
-        avg, std, smax, smin = tolerant_stats(stat_trials_data) 
+        avg, std, smax, smin = tolerant_stats(stat_trials_data, rolling_window=rolling_window) 
         stat_results_dict[alg] = {"means": avg, "stds": std, "max": smax, "min": smin}
     else:
         goal_aggr_stat_trials_data = []

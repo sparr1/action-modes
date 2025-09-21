@@ -1,0 +1,14 @@
+{
+    "seed": 55,
+    "env": "AntMaze_UMazeDense-v4",
+    "alg": "modes/ModalAlg",
+    "device": "cpu",
+    "alg_params": {
+        "num_modes": 2,
+        "orchestrator_config": "configs/controllers/AntOrchestrator.json",
+        "mode_configs": ["configs/controllers/AntRotator.json", "configs/controllers/AntWalker.json"]
+    },
+    "total_steps": 1000000,
+    "episodes": 10
+}
+

@@ -9,7 +9,7 @@ import gymnasium_platform
 from domains.mpqdn_wrappers import *
 from domains.mpqdn_ant_domain import *
 
-from modes.modes import *
+from RL.modes import *
 from modes.controller import *
 from modes.tasks import *
 
@@ -31,7 +31,7 @@ if __name__=="__main__":
                         "maze_map": [
                                 [1, 1, 1, 1, 1, 1, 1],
                                 [1, 0, 0, 0, 0, 0, 1],
-                                [1, 0, 'R', 0, 'G', 0, 1],
+                                [1, 0,'R', 0,'G', 0, 1],
                                 [1, 0, 0, 0, 0, 0, 1],
                                 [1, 1, 1, 1, 1, 1, 1],
                                 ]
@@ -51,16 +51,14 @@ if __name__=="__main__":
     run_params = {"reset_options": reset_options}
     # model = PAMDP("MP_DQN", env, params=params)
 
-    num_modes = 2
-
-    cont_action_spaces = [gym.spaces.Box(low=-1.0, high=1.0, shape = (1,), dtype=np.float32) for i in range(num_modes)]
-    orchestrator_action_space =  gym.spaces.Tuple([gym.spaces.Discrete(num_modes), gym.spaces.Tuple(cont_action_spaces)])
-
-    orchestrator_config = "configs/controllers/AntOrchestrator.json"
-    rotator_config = "configs/controllers/AntRotator.json"
-    walker_config = "configs/controllers/AntWalker.json"
-
-    model = ModalAlg("modes", env, orchestrator_config, orchestrator_action_space, [rotator_config, walker_config],cont_action_spaces)
+    modal_alg_params = { 
+                         "num_modes": 2,
+                         "orchestrator_config": "configs/controllers/AntOrchestrator.json",
+                         "mode_configs": ["configs/controllers/AntRotator.json",
+                                          "configs/controllers/AntWalker.json"]
+                        }
+    
+    model = ModalAlg("modes", env, **modal_alg_params)
 
     # maze = gym.make("Ant-v4",exclude_current_positions_from_observation=False, max_episode_steps=1000)
     # env = Subtask(maze, move)

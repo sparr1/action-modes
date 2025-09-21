@@ -22,6 +22,28 @@ class ModalWrapper(gym.ObservationWrapper):
     def observation(self, obs):
         return {'achieved_goal':obs['achieved_goal'], 'observation': obs['observation']}
 
+class FlattenedActionWrapper(gym.ActionWrapper):
+    """
+    Changes the format of the parameterised action space to conform to that of Goal-v0 and Platform-v0
+    """
+    def __init__(self, env):
+        super(FlattenedActionWrapper, self).__init__(env)
+        # print("FLATTENED ACTION WRAPPER")
+        old_as = env.action_space
+        num_actions = old_as.spaces[0].n
+        # print("old action space", old_as)
+        # print(num_actions)
+        self.action_space = gym.spaces.Tuple((
+            old_as.spaces[0],  # actions
+            *(gym.spaces.Box(old_as.spaces[1].spaces[i].low, old_as.spaces[1].spaces[i].high, dtype=np.float32)
+              for i in range(0, num_actions))
+        ))
+        # print("new action space", self.action_space)
+
+    def action(self, action):
+        return action
+
+
 class FlattenStateWrapper(gym.ObservationWrapper):
     """
     Flattens the observation space to a Box

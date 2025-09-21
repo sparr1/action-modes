@@ -24,15 +24,23 @@ def initialize_alg(alg_string, alg_params, domain, custom_action_space = None):
             try: 
                 module = importlib.import_module("RL.PAMDP")
                 alg_class = getattr(module, alg_name)
-                model = alg_class(alg_name,domain, alg_params, custom_action_space = custom_action_space)
+                model = alg_class(alg_name, domain, alg_params, custom_action_space = custom_action_space)
             except Exception as e:
                 print(e)
                 return #if we cannot run this baseline, we just try another.
+        elif file_name == "modes":
+            try:
+                module = importlib.import_module("RL.modes")
+                alg_class = getattr(module, alg_name)
+                model = alg_class(alg_name, domain, **alg_params)
+            except Exception as e:
+                print(e)
+                return
         else:
             try:
                 module = importlib.import_module("RL."+file_name.replace('/','.')) #last ditch, just try to load it!
                 alg_class = getattr(module, alg_name)
-                model = alg_class(alg_name,domain, alg_params)
+                model = alg_class(alg_name, domain, alg_params)
             except Exception as e:
                 print(e)
                 return #if we cannot run this baseline, we just try another.

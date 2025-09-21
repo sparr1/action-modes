@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import os, glob, json
-from utils.utils import compute_rewards
+from utils.stats import compute_rewards
 
 #we'll proceed first by graphing the reward for a simple experiment. We first grab some key info from the settings.json, such as names of the algorithms, labels for graphs, etc.
 #then we load everything into numpy, averaging and computing std over the trials if applicable and plot it using matplotlib.
@@ -71,9 +71,11 @@ if __name__ == "__main__":
     # results = compute_rewards("DQNShort_old")
     # graph_rewards(results, "old DQN config override test, n = 15")
 
-    results = compute_rewards("PlatformTest_2025-01-11_20-05-32")
-    graph_rewards(results, "rewards", "Platform RandomPAMDP test, n = 3", buckets=False)
+    # results = compute_rewards("PlatformTest_2025-01-11_20-05-32")
+    # graph_rewards(results, "rewards", "Platform RandomPAMDP test, n = 3", buckets=False)
 
+    results = compute_rewards("MazeModes_2025-09-20_22-54-11")
+    graph_rewards(results, "rewards", "Maze Modes test, n = 1, t = 1e7", buckets=False)
     # results = compute_rewards("AntMazeDense700_2024-07-16_21-05-37")
     # graph_rewards(results, "long baselines AntMazeDense 10M timesteps, n = 5")
 

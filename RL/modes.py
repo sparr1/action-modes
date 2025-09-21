@@ -4,6 +4,8 @@ from RL.alg import Algorithm
 from modes.controller import OrchestralController, ModalController
 import os, time, math
 import random
+
+from utils.utils import setup_logs
 #we will take an initial task with an action space of Box(-1, 1, (8,), float32), 
 #combine it with a few (initially just 2) different lower dimensional controllers action space of Box(-1, 1, (1,), float32),
 #and then the new action space will be Dict(Discrete(2), Box(-1, 1, (1,), float32), Box(-1, 1, (1,), float32)), where the discrete action just switches which lower dimensional action space we use.
@@ -13,8 +15,11 @@ import random
 
 #one wrinkle is that the mode_controllers expect the environment to be wrapped with a task wrapper. 
 class ModalAlg(Algorithm):
-    def __init__(self, name, env, orchestrator_config, orchestrator_action_space, mode_configs, mode_action_spaces):
+    def __init__(self, name, env, orchestrator_config, mode_configs, num_modes):
         super().__init__(name, env)
+        mode_action_spaces = [gym.spaces.Box(low=-1.0, high=1.0, shape = (1,), dtype=np.float32) for i in range(num_modes)]
+        orchestrator_action_space =  gym.spaces.Tuple([gym.spaces.Discrete(num_modes), gym.spaces.Tuple(mode_action_spaces)])
+
         self.base_env = self.env.unwrapped
         #each mode_controller is going to turn a latent "action-within-mode" z into a base action in env. 
         self.num_modes = len(mode_configs)
@@ -23,7 +28,6 @@ class ModalAlg(Algorithm):
         self.orchestrator = OrchestralController(orchestrator_config, self.env, orchestrator_action_space)
         self.controllers  = [ModalController(c, self.env, mode_action_spaces[i]) for i,c in enumerate(mode_configs)]
         self.orchestrator.add_controllers(self.controllers)
-    
     
     def predict(self, observation, modulus = 0, old_orch_act = None):
         if modulus != 0 and old_orch_act:
@@ -141,6 +145,7 @@ class ModalAlg(Algorithm):
 
             for j in range(max_steps):
                 t_so_far+=1
+                
                 env_ret = env.step(base_action) #which comes from the controllers now
                 # if(len(ret)==5):
                 #     (next_state, steps), reward, terminal, _, _ = ret
@@ -180,7 +185,10 @@ class ModalAlg(Algorithm):
                 episode_reward += reward
                 # if visualise and i % render_freq == 0:
                 #     env.render()
-
+                if self.alg_logger:
+                    data = setup_logs(reward, state, [act, act_param], [terminal, truncated], [info,])
+                    # print(data)
+                    self.alg_logger.on_step(data)
                 if terminal or truncated:
                     break
             i+=1
