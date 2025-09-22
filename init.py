@@ -3,12 +3,14 @@ import numpy as np
 import traceback, glfw
 from RL.baselines import Baseline
 from RL.alg import Random, Stationary
-from domains.ant_variable_legs import AntVariableLegsEnv
+# from domains.ant_variable_legs import AntVariableLegsEnv
 from modes.tasks import Subtask
 from domains.Maze import Move
 from domains.AntPlane import AntPlane
 from domains.HumanoidPlane import HumanoidPlane
-domains = {
+import domains
+
+my_domains = {
             "ant_plane": "ant_plane",
             "ant": "Ant-v4",
             "ant_dense": "AntMaze_UMazeDense-v4",
@@ -16,11 +18,13 @@ domains = {
             "point_dense": "PointMaze_UMazeDense-v3",
             "point_sparse": "PointMaze_UMaze-v3",
             "humanoid_plane": "humanoid_plane",
-            "humanoid": "Humanoid-v4"
+            "humanoid": "Humanoid-v4",
+            "variable_ant": "VarLegsAnt-v0",
+            "variable_ant_plane": "variable_ant_plane"
 }
 
 train_env_params = {
-                    "id": domains["ant_plane"],
+                    "id": my_domains["variable_ant_plane"],
                     "exclude_current_positions_from_observation":False,
                     "max_episode_steps":400,
                     "render_mode": "human"
@@ -42,15 +46,16 @@ test_objective_params = train_objective_params.copy()
 test_env_params["render_mode"] = "human"
 
 if train_env_params["id"] == "ant_plane":
-    train_env_params["id"] = domains["ant"]
+    train_env_params["id"] = my_domains["ant"]
     train_base_domain = AntPlane(gym.make(**train_env_params))
-elif train_env_params["id"] == "variable_ant":
-    train_base_domain = AntVariableLegsEnv(exclude_current_positions_from_observation=False,num_legs = 6, contact_cost_weight=0.0, render_mode = "human")
+elif train_env_params["id"] == "variable_ant_plane":
+    train_env_params["id"] = my_domains["variable_ant"]
+    train_base_domain = AntPlane(gym.make(**train_env_params))
+    # train_base_domain = AntVariableLegsEnv(exclude_current_positions_from_observation=False,num_legs = 6, contact_cost_weight=0.0, render_mode = "human")
 elif train_env_params["id"] == "humanoid_plane":
-    train_env_params["id"] = domains["humanoid"]
+    train_env_params["id"] = my_domains["humanoid"]
     train_base_domain = HumanoidPlane(gym.make(**train_env_params))
 else:
-    
     train_base_domain = gym.make(**train_env_params)
     
 train_env = train_base_domain
@@ -68,7 +73,7 @@ model = Baseline("SAC", train_env, params = params)
 # model_move.load("logs/AntPlaneMoveFinal_2024-11-13_10-22-56/models/model:AntSAC_1")
 #model_rotate = Baseline("SAC", train_env, params = params)
 # model.load("logs/AntPlaneRotateNew_2024-10-10_16-22-19/models/model:AntSAC_0")
-model.load("models/controllers_v0/model:AntWalker")
+# model.load("models/controllers_v0/model:AntWalker")
 # model.load("logs/AntPlaneRotateNew_2024-10-09_12-24-24/models/model:AntSAC_1")
 # model.load("logs/AntPlaneMoveNew6.0_2024-10-03_09-30-15/models/model:AntSAC_2")
 # model.load("logs/AntPlaneMove5_2024-10-11_21-28-31/models/model:AntSAC_0")
