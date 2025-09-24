@@ -27,13 +27,14 @@ train_env_params = {
                     "id": my_domains["variable_ant_plane"],
                     "exclude_current_positions_from_observation":False,
                     "max_episode_steps":400,
-                    "render_mode": "human"
+                    "render_mode": "human",
+                    "num_legs":8
                     }
 
 train_objective_params = {
-                    "direction": "X",
-                    "desired_velocity_minimum":-1.0,
-                    "desired_velocity_maximum": 1.0,
+                    "direction": "ZR",
+                    "desired_velocity_minimum":-5.0,
+                    "desired_velocity_maximum": 5.0,
                     "survival_bonus": 6.25,
                     "adaptive_margin":True,
                     "adaptive_margin_minimum":0.01,
@@ -69,7 +70,8 @@ model = Baseline("SAC", train_env, params = params)
 # model.set_checkpointing(10000, ".", name_prefix="init-test")
 # model = Random("random", train_env)
 # # model = Stationary("stationary", train_env)
-#model.load("logs/AntPlaneMoveFinal_2024-11-13_10-22-56/models/model:AntSAC_1")
+# model.load("logs/AntPlaneRotateFinal/models/model:AntSAC_0_2000000_steps")
+model.load("logs/AntPlane8LRotateFinal/models/model:AntSAC8L_0_500000_steps")
 # model_move.load("logs/AntPlaneMoveFinal_2024-11-13_10-22-56/models/model:AntSAC_1")
 #model_rotate = Baseline("SAC", train_env, params = params)
 # model.load("logs/AntPlaneRotateNew_2024-10-10_16-22-19/models/model:AntSAC_0")

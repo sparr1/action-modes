@@ -9,7 +9,7 @@ import random, math
 # https://github.com/openai/gym/blob/master/gym/envs/mujoco/ant_v4.py
 
 class AntPlane(gym.Wrapper):
-    def __init__(self, env, random_resets = False, reset_map=[[1]*5]*5, map_scale = 4, position_noise_range = 0.25, num_legs = 4):
+    def __init__(self, env, random_resets = True, random_rotation = True, include_xy = True, reset_map=[[1]*5]*5, map_scale = 4, position_noise_range = 0.25, num_legs = 4):
         super().__init__(env)
         self.base_env = self.env.unwrapped
         self.random_resets = random_resets #boolean for macro-level randomness on the map level
@@ -21,9 +21,13 @@ class AntPlane(gym.Wrapper):
         self.y_map_center = self._map_length / 2 * self._map_scaling
         self.position_noise_range = position_noise_range
         self.base_env.reset_model = self.reset_model #monkey patch the reset function to include randomly initialized position
-        self.include_xy = True
+        self.include_xy = include_xy
+        self.random_rotation = random_rotation
         self.num_legs = num_legs
-
+        
+        self.pos_offset = 2 if self.include_xy else 0
+        self.vel_offset = self.pos_offset + (self.num_legs - 4)*2
+    
     def reset_model(self):
         noise_low = -self.base_env._reset_noise_scale
         noise_high = self.base_env._reset_noise_scale
@@ -49,7 +53,10 @@ class AntPlane(gym.Wrapper):
             re_init_pos[:2] = self.reset_pos
             # print("re_init_pos", re_init_pos)
             qpos = re_init_pos
-
+        if self.random_rotation:
+            random_rot = self.generate_random_rotation()
+                qpos[1+self.pos_offset:4+self.pos_offset] = random_rot
+            
         self.env.unwrapped.set_state(qpos, qvel)
         observation = self.env.unwrapped._get_obs()
 
@@ -94,11 +101,15 @@ class AntPlane(gym.Wrapper):
 
             return xy_pos
     
+    def generate_random_rotation(self) -> np.ndarray:
+        angle = self.np_random.uniform(0, 2*math.pi)
+        return (math.cos(angle/2.0), 0, 0, math.sin(angle/2.0))
+    
     #TODO move relative velocity calculations here?
     def get_task_info(self, incl_xy = True):
-        offset = 2 if incl_xy else 0
-        return {"velocity_coords": (13+offset, 19+offset),
-                "dir_coords": (1+offset, 5+offset)}
+        
+        return {"velocity_coords": (13+vel_offset, 19+vel_offset),
+                "dir_coords": (1+pos_offset, 5+pos_offset)}
 
     #probably not going to need this! keeping it here for posterity
         

@@ -1,0 +1,25 @@
+{
+    "overrides_alg":{
+        "seed": 55,
+        "device":"cuda",
+        "env":"AntMaze_UMazeDense-v4", 
+        "env_wrappers": [{"name": "AntPlane", "wrapper_params": {"random_resets": true,
+                            "reset_map":[[0, 0, 0, 0, 0],
+                                         [0, 1, 1, 1, 0],
+                                         [0, 0, 0, 1, 0],
+                                         [0, 1, 1, 1, 0],
+                                         [0, 0, 0, 0, 0]],
+        "map_scale":4,
+        "position_noise_range":0.25}
+       }
+        ],
+        "total_steps": 2e6,
+        "episodes": null
+    },
+    "env_params": {"max_episode_steps": 750,"render_mode":"human"},
+    "trials": 5,
+    "configs": ["AntModes", "AntSAC"],
+    "logs": "timestamp",
+    "save_trials": "best",
+    "log_info": false
+}

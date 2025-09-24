@@ -7,7 +7,8 @@ def make_manifest(abs_path_python, abs_path_main, abs_path_experiment_config, ab
     with open(abs_path_manifest, "a") as g:
         for i, alg in enumerate(experiment_params["configs"]):
             for j in range(experiment_params["trials"]):
-                g.write(abs_path_python, abs_path_main, '-r', abs_path_experiment_config, '--alg-index', str(i), '--trial-index', str(j), '--num-runs 1')
+                line = " ".join([abs_path_python, abs_path_main, '-r', abs_path_experiment_config, '--alg-index', str(i), '--trial-index', str(j), '--num-runs 1\n'])
+                g.write(line)
             
 
     
@@ -15,8 +16,8 @@ def make_manifest(abs_path_python, abs_path_main, abs_path_experiment_config, ab
 
 
 if __name__ == "__main__":
-    PYTHON = sys.executable()
-    MAIN = ...
-    CONFIG = ...
-    MANIFEST = ...
+    PYTHON = sys.executable
+    MAIN = "/home/sparr/projects/action_modes/main.py"
+    CONFIG = "/home/sparr/projects/action_modes/configs/experiments/AntPlaneRotateFinal.json"
+    MANIFEST = "/home/sparr/projects/action_modes/manifest.txt"
     make_manifest(PYTHON, MAIN, CONFIG, MANIFEST)

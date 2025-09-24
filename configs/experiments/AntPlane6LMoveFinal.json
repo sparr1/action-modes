@@ -1,0 +1,36 @@
+{
+    "overrides_alg":{
+        "seed": 55,
+        "device":"cuda",
+        "env":"VarLegsAnt-v0", 
+        "env_wrappers": [{"name": "AntPlane", "wrapper_params": {"random_resets": true,
+                                                                 "reset_map":[[1,1,1,1,1],[1,1,1,1,1],[1,1,1,1,1],[1,1,1,1,1],[1,1,1,1,1]],
+                                                                 "map_scale":4,
+                                                                 "position_noise_range":0.25,
+                                                                 "num_legs":6
+                                                                }
+                         },
+                         {"name": "Subtask", "wrapper_params":  {"task":"domains.Maze:Move",
+                                                                 "task_params": {"direction":"F",
+                                                                                "categorical":false, 
+                                                                                "desired_velocity_minimum":-6.0,
+                                                                                "desired_velocity_maximum":6.0,
+                                                                                "adaptive_margin": true,
+                                                                                "adaptive_margin_minimum": 1e-5,
+                                                                                "survival_bonus":1.0,
+                                                                                "metric": "L2"
+                                                                                }
+                                                                }
+                         }
+                        ],
+        "total_steps": 3.5e6,
+        "episodes": null
+},
+    "env_params": {"max_episode_steps": 1000,"render_mode":null, "exclude_current_positions_from_observation":false, "num_legs":6},
+    "trials": 1,
+    "configs": ["AntSAC"],
+    "checkpoint_every":500000,
+    "logs": "overwrite-safe",
+    "log_type": "summary",
+    "save_trials": "best"
+}

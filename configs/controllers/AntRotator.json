@@ -2,7 +2,7 @@
     "seed": 55,
     "name": "AntRotator",
     "alg_config_path": "configs/algs/AntSAC.json",
-    "model_path":"models/controllers_v1/model:AntRotator",
+    "model_path":"models/controllers_v2/model:AntRotator",
     "env_wrapper": {"name": "Subtask", "wrapper_params": {"task":"domains.Maze:Move",
     "task_params": {"categorical":false, 
                     "desired_velocity_minimum":-5.0,

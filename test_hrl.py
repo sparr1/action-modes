@@ -54,7 +54,7 @@ if __name__=="__main__":
     modal_alg_params = { 
                          "num_modes": 2,
                          "orchestrator_config": "configs/controllers/AntOrchestrator.json",
-                         "mode_configs": ["configs/controllers/AntRotator.json",
+                         "mode_configs": ["configs/controllers/AntWalker.json",
                                           "configs/controllers/AntWalker.json"]
                         }
     

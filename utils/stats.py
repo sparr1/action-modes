@@ -138,7 +138,7 @@ def retrieve_trial(alg_name, trial_data, keyword, stat_dict):
         stat_dict[alg_name] = []
     stat_dict[alg_name].append(trial_data[keyword])
 
-def compute_stat(alg, stat_trials_data, stat_results_dict, goal_range = (-math.inf,math.inf), goal_trials_data = None, rolling_window = 50):
+def compute_stat(alg, stat_trials_data, stat_results_dict, goal_range = (-math.inf,math.inf), goal_trials_data = None, rolling_window = 30):
 
     if not goal_trials_data:
         avg, std, smax, smin = tolerant_stats(stat_trials_data, rolling_window=rolling_window) 
