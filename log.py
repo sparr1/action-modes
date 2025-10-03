@@ -59,7 +59,8 @@ class TrainingLogger():
         # print(total_reward)
         # avg_reward = np.mean(self.episode_rewards)
         if self._log_info:
-            goal = self.episode_info[0]["desired_velocity"]
+            goal_key = [k for k in list(self.episode_info[0].keys()) if "desired" in k][0]
+            goal = self.episode_info[0][goal_key]
             base_reward = sum([item["base"] for item in self.episode_info])
             healthy_bonus = sum([item["healthy_bonus"] for item in self.episode_info])
             control_cost = sum([item["control cost"] for item in self.episode_info])

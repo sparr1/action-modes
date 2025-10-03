@@ -3,6 +3,7 @@ import random as rnd
 import math
 
 from modes.tasks import Task
+from modes.classifier import SupportClassifier
 from utils.utils import q_rotate
 
 class Move(Task):
@@ -216,3 +217,206 @@ class Move(Task):
         # parent_return = super().reset()
         # print(parent_return)
         return super().reset()
+    
+
+class Change(Task):
+    def __init__(self, desired_coord_minimum = 0.3,
+                desired_coord_maximum = 2.5,
+                ctrl_cost = False,
+                contact_cost = False,
+                healthy_z_range = (0.3,2.5),
+                survival_bonus = 1.0,
+                modify_obs = True,
+                categorical = False,
+                margin = 0.25,
+                loss_at_margin = 1/3,
+                slope = 1.0,
+                target_coords = "X",
+                metric = "L1"):
+        super().__init__()
+        self.include_xy = True
+        self.desired_coord_minimum = desired_coord_minimum #TODO refactor to range so as to have consistent API
+        self.desired_coord_maximum = desired_coord_maximum
+        #If you would like to avoid randomly sampling, just set minimum = maximum
+        self.task_info = None
+        self.velocity_coords = None
+        self.dir_coords = None
+
+        # self.min_norm_reward = 0.1
+        # self.adaptive_margin = None
+        self.loss_at_margin = loss_at_margin
+    
+        # self.value_at_margin = 0.5
+        if survival_bonus:
+            self.survival_bonus = survival_bonus #float
+        else:
+            self.survival_bonus = 0.0
+
+        self.ctrl_cost = ctrl_cost
+        self.cnt_cost = contact_cost #not currently implemented
+        self.categorical = categorical
+        if healthy_z_range: #this should be a range
+            self.min_z, self.max_z = healthy_z_range
+        else:
+            self.min_z = -math.inf
+            self.max_z = math.inf
+
+        self.modify_obs = modify_obs
+        coords = ["X", "Y", "Z"]
+        self.target_coord_inds = [coords.index(letter) for letter in target_coords]
+        self.num_target_coords = len(self.target_coord_inds)
+
+        self.margin = margin
+        self.slope = slope
+        self.metric = metric
+        self.reset() #to sample the desired velocity from between the minimum and maximum
+
+#from the Gymnasium robotics AntEnv codebase
+
+    def control_cost(self, action):
+        if self.ctrl_cost:
+            return .1*np.sqrt(np.sum(np.square(action))) #hardcoded a param at .25
+        else: 
+            return 0.0
+        
+    def contact_cost(self, contact_forces):
+        if self.cnt_cost:
+            return .05*np.sqrt(np.sum(np.square(contact_forces)))
+        else:
+            return 0.0
+    
+    def healthy(self, obs):
+        z_coord = obs[2] if self.include_xy else obs[0]
+        return 1.0 if (self.min_z <= z_coord <= self.max_z) else 0.0
+
+    def set_position_coords(self, env):
+        self.position_coords = env.get_position_coords()
+
+    #checking state feature for velocity in the desired direction. if direction is None, we'll simply take the magnitude of the velocity vector in any direction.
+    def get_reward(self, observation, last_action, contact_forces):
+        if type(observation)==dict:
+            obs = observation["observation"]
+        else:
+            obs = observation #does this make sense? TODO check
+        position_vec = obs[self.position_coords[0]:self.position_coords[1]]
+
+        achieved_position = obs[self.position_coords[0]:self.position_coords[1]]
+        target_position =  achieved_position.copy() #in theory, this could be set in a more advanced manner. 
+        for i,t in enumerate(self.target_coord_inds):
+            target_position[t] = self.desired_coords[i] 
+
+        deviation = np.sum((position_vec - target_position)**2)
+        # dist_to_vec = np.sqrt(deviation) if deviation > 1 else deviation
+        dist_to_vec = np.sqrt(deviation)
+
+        if self.metric == "L2":
+            if dist_to_vec < self.margin:
+                base_reward = 0.0
+            else:
+                dist_to_ball = dist_to_vec - self.margin
+
+                base_reward =  -min(dist_to_ball*self.slope,self.survival_bonus) #0 at (or within) margin, less than 0 outside of it, never less than survival bonus
+        elif self.metric == "L1":
+            base_reward = -1*np.sum(np.abs(position_vec - target_position))
+        elif self.metric == "huber":
+            if dist_to_vec < self.margin:
+                base_reward = -self.loss_at_margin*(dist_to_vec/self.margin)**2 #normalized quadratic region
+            else:
+                base_reward =  2*self.loss_at_margin*(dist_to_vec/self.margin) - self.loss_at_margin #normalized linear region
+                base_reward = -min(base_reward, self.survival_bonus)
+
+        healthy = self.healthy(obs)
+        healthy_bonus = healthy*self.survival_bonus
+        ctrl_cost = self.control_cost(last_action)
+        contact_cost = self.contact_cost(contact_forces)
+        total_cost = ctrl_cost + contact_cost
+        # min_norm = max(self.min_norm_reward, abs(self.desired_velocity))
+        # min_norm = self.max_desired_speed
+        position_bonus = base_reward + healthy_bonus + 0.001
+        
+        reward = position_bonus - total_cost  #bonus is simply zero if this is not desired
+        #TODO ctrl cost, contact cost, and termination for healthy z range....
+        reward_info = {'desired_position': self.desired_coords, 'achieved_position': achieved_position, 'base': base_reward, 'healthy_bonus': healthy_bonus, 'control cost': -ctrl_cost, 'contact cost': -contact_cost}
+        # print(reward_info)
+        return reward, reward_info #TODO how to do average reward?
+    
+    # def distance_lo
+    def get_termination(self, obs):
+        return self.healthy(obs) == 0.0
+    
+    def get_goal(self):
+        return self.desired_coords
+    
+    def set_goal(self, new_goal):
+        self.desired_coords = new_goal
+    
+    
+    def set_task_info(self, task_info):
+        self.task_info = task_info
+        self.position_coords = task_info["position_coords"]
+
+    def get_goal_length(self):
+        return 1
+
+    def reset(self, seed = 32):
+        if self.desired_coord_minimum == self.desired_coord_maximum:
+            self.desired_coords = [self.desired_coord_minimum,]*self.num_target_coords
+        else:
+            if self.categorical:
+                self.desired_coords = rnd.sample([self.desired_coord_minimum, self.desired_coord_maximum],k=self.num_target_coords)
+            else:
+                self.desired_coords = [rnd.uniform(self.desired_coord_minimum, self.desired_coord_maximum) for _ in range(self.num_target_coords)]
+            # print(self.desired_coords)
+
+        # parent_return = super().reset()
+        # print(parent_return)
+        return super().reset()
+    
+def check_range(value, range):
+    return range[0] < value < range[1]
+
+def get_speed(observation, vel_offset):
+    return np.sqrt(np.sum(observation[13 + vel_offset:19+vel_offset]**2))
+
+def get_z(observation, pos_offset):
+    return observation[pos_offset]
+
+def check_z_range(observation, z_range, pos_offset):
+    return check_range(get_z(observation, pos_offset), z_range)
+
+def check_speed(observation, speed_range, vel_offset):
+    return check_range(get_speed(observation, vel_offset), speed_range)
+    
+class MoveForwardSupportClassifier(SupportClassifier):
+    def __init__(self, z_range_minimum = 0.3, z_range_maximum = 1.0, num_legs = 4, include_xy = True):
+        self.z_range = [z_range_minimum, z_range_maximum]
+        self.num_legs = num_legs
+        self.include_xy = include_xy
+        self.pos_offset = 2 if self.include_xy else 0
+        self.vel_offset = self.pos_offset + (self.num_legs - 4)*2
+        
+    def rule(self, observation):
+        return check_range(observation[self.pos_offset], self.z_range)
+
+class MoveRotateSupportClassifier(SupportClassifier):
+    def __init__(self, z_range_minimum = 0.45, z_range_maximum = 0.65, speed_minimum = -1.0, speed_maximum=1.5, num_legs = 4, include_xy = True):
+        self.z_range = [z_range_minimum, z_range_maximum]
+        self.speed_range = [speed_minimum, speed_maximum]
+        self.num_legs = num_legs
+        self.include_xy = include_xy
+        self.pos_offset = 2 if self.include_xy else 0
+        self.vel_offset = self.pos_offset + (self.num_legs - 4)*2
+
+    def rule(self, observation):        
+        return check_z_range(observation, self.z_range, self.pos_offset) and check_speed(observation, self.speed_range, self.vel_offset)
+
+class ChangeZSupportClassifier(SupportClassifier):
+    def __init__(self, speed_minimum = -1.0, speed_maximum = 1.0, num_legs = 4, include_xy = True):
+        self.speed_range = [speed_minimum, speed_maximum]
+        self.num_legs = num_legs
+        self.include_xy = include_xy
+        self.pos_offset = 2 if self.include_xy else 0
+        self.vel_offset = self.pos_offset + (self.num_legs - 4)*2
+
+    def rule(self, observation):
+        return check_speed(observation, self.speed_range)

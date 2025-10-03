@@ -2,6 +2,7 @@ import gymnasium as gym
 import numpy as np
 import math
 import traceback, sys
+from utils.utils import listify
 #A task in this case is a specification which includes a reward function. 
 #the policy derived from optimizing this reward function will become a modal controller once paired with a support classifier.
 
@@ -49,6 +50,7 @@ class Subtask(gym.Wrapper):
                 print("Have you implemented get_task_info for the domain?")
 
         goal_length = self._task.get_goal_length()
+        
         spaces = {'desired_goal': gym.spaces.Box(-math.inf, math.inf, (goal_length,), np.float64),
                   'observation': self.observation_space}
         #self.observation_space.spaces['desired_goal'] = gym.spaces.Box(-math.inf, math.inf, (goal_length,), np.float64)
@@ -62,7 +64,7 @@ class Subtask(gym.Wrapper):
     def observation(self, obs):
         new_obs = {'observation': obs.copy()}
 
-        new_obs['desired_goal'] = np.array([self._task.get_goal()])
+        new_obs['desired_goal'] = np.array(listify(self._task.get_goal()))
         # print(new_obs)
         return new_obs
 

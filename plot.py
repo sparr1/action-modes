@@ -21,7 +21,7 @@ def graph_rewards(results, keyword, title, buckets = True, base = False):
                 if bucket not in bucket_first:
                     bucket_first[bucket] = {}
                 bucket_first[bucket][algorithm] = values
-        print("REVERSE")    
+        print("REVERSE")
         for bucket in bucket_first:
             print(bucket)
             for algorithm, values in bucket_first[bucket].items():

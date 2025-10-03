@@ -1,0 +1,37 @@
+{
+    "overrides_alg":{
+        "seed": 55,
+        "device":"cuda",
+        "env":"Ant-v4", 
+        "env_wrappers": [{"name": "AntPlane", "wrapper_params": {"random_resets": true,
+                                                                 "reset_map":[[1,1,1,1,1],[1,1,1,1,1],[1,1,1,1,1],[1,1,1,1,1],[1,1,1,1,1]],
+                                                                 "map_scale":4,
+                                                                 "position_noise_range":0.25
+                                                                }
+                         },
+                         {"name": "Subtask", "wrapper_params":  {
+                                                                 "task":"domains.Maze:Change",
+                                                                 "task_params":{
+                                                                    "target_coords": "Z",
+                                                                    "desired_coord_minimum":0.3,
+                                                                    "desired_coord_maximum": 0.9,
+                                                                    "survival_bonus": 1.0,
+                                                                    "margin":0.025,
+                                                                    "slope":3.0,
+                                                                    "categorical":false,
+                                                                    "metric": "L2"
+                                                                    }
+                                                                }
+                         }
+                        ],
+        "total_steps": 7.5e5,
+        "episodes": null
+},
+    "env_params": {"max_episode_steps": 1000,"render_mode":null, "exclude_current_positions_from_observation":false},
+    "trials": 1,
+    "checkpoint_every":500000,
+    "configs": ["AntSAC"],
+    "logs": "overwrite-safe",
+    "log_type": "summary",
+    "save_trials": "best"
+}

@@ -55,8 +55,8 @@ class AntPlane(gym.Wrapper):
             qpos = re_init_pos
         if self.random_rotation:
             random_rot = self.generate_random_rotation()
-                qpos[1+self.pos_offset:4+self.pos_offset] = random_rot
-            
+            qpos[1+self.pos_offset:5+self.pos_offset] = random_rot
+        
         self.env.unwrapped.set_state(qpos, qvel)
         observation = self.env.unwrapped._get_obs()
 
@@ -106,11 +106,18 @@ class AntPlane(gym.Wrapper):
         return (math.cos(angle/2.0), 0, 0, math.sin(angle/2.0))
     
     #TODO move relative velocity calculations here?
-    def get_task_info(self, incl_xy = True):
+    def get_task_info(self):
         
-        return {"velocity_coords": (13+vel_offset, 19+vel_offset),
-                "dir_coords": (1+pos_offset, 5+pos_offset)}
+        return {"velocity_coords": (13+self.vel_offset, 19+self.vel_offset),
+                "dir_coords": (1+self.pos_offset, 5+self.pos_offset),
+                "position_coords": (0,3)}
+    
 
+    def get_velocity_coords(self):
+        return self.get_task_info()["velocity_coords"]
+    
+    def get_position_coords(self):
+        return self.get_task_info()["position_coords"]
     #probably not going to need this! keeping it here for posterity
         
     # class AntPlaneModalWrapper(ModalWrapper):
