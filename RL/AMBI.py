@@ -1,7 +1,12 @@
-import torch, copy, time
-import torch.nn as nn
+import copy, time
 import numpy as np
+import torch.nn as nn
 from RL.alg import Algorithm
+from RL.lora import (
+    apply_lora_to_model,
+    get_lora_parameters,
+    replace_optimizer_params_with_lora,
+)
 from utils import core as utils_core
 from utils.utils import setup_logs
 
@@ -47,175 +52,94 @@ def _restore_env_state(env, state):
     return False
 
 
-class LoRALayer(nn.Module):
-    def __init__(self, original_layer, rank=4, alpha=1.0):
-        super().__init__()
-        self.original_layer = original_layer
-        self.rank = rank
-        self.alpha = alpha
-        for param in self.original_layer.parameters():
-            param.requires_grad = False
-        if isinstance(original_layer, nn.Linear):
-            self.lora_A = nn.Parameter(
-                torch.randn(original_layer.in_features, rank) * 0.01
-            )
-            self.lora_B = nn.Parameter(torch.zeros(rank, original_layer.out_features))
-        else:
-            self.lora_A = None
-            self.lora_B = None
-
-    def forward(self, x):
-        original_output = self.original_layer(x)
-        if self.lora_A is not None and self.lora_B is not None:
-            lora_output = (x @ self.lora_A) @ self.lora_B * (self.alpha / self.rank)
-            return original_output + lora_output
-        return original_output
-
-
-def apply_lora_to_model(model, rank=4, alpha=1.0, target_modules=None):
-    if target_modules is None:
-        target_modules = [""]
-
-    def should_apply_lora(name):
-        if not target_modules:
-            return True
-        return any(pattern in name for pattern in target_modules)
-
-    for name, module in list(model.named_modules()):
-        if isinstance(module, nn.Linear) and should_apply_lora(name):
-            *parent_path, attr_name = name.split(".")
-            parent = model
-            for part in parent_path:
-                parent = getattr(parent, part)
-            lora_layer = LoRALayer(module, rank=rank, alpha=alpha)
-            setattr(parent, attr_name, lora_layer)
-    return model
-
-
-def get_lora_parameters(model):
-    lora_params = []
-    for module in model.modules():
-        if isinstance(module, LoRALayer):
-            if module.lora_A is not None:
-                lora_params.append(module.lora_A)
-            if module.lora_B is not None:
-                lora_params.append(module.lora_B)
-    return lora_params
-
-
-def get_all_optimizers(agent):
-    optimizers = []
-    optimizers_attrs = [
-        "optimizer",
-        "optimizers",
-        "actor_optimizer",
-        "critic_optimizer",
-        "policy_optimizer",
-        "q_optimizer",
-        "value_optimizer",
-    ]
-    for attr in optimizers_attrs:
-        if hasattr(agent, attr):
-            opt = getattr(agent, attr)
-            if opt is not None:
-                if isinstance(opt, (list, tuple)):
-                    optimizers.extend(opt)
-                else:
-                    optimizers.append(opt)
-    if hasattr(agent, "policy"):
-        for attr in optimizers_attrs:
-            if hasattr(agent.policy, attr):
-                opt = getattr(agent.policy, attr)
-                if opt is not None:
-                    if isinstance(opt, (list, tuple)):
-                        optimizers.extend(opt)
-                    else:
-                        optimizers.append(opt)
-    if hasattr(agent, "model"):
-        for attr in optimizers_attrs:
-            if hasattr(agent.model, attr):
-                opt = getattr(agent.model, attr)
-                if opt is not None:
-                    if isinstance(opt, (list, tuple)):
-                        optimizers.extend(opt)
-                    else:
-                        optimizers.append(opt)
-    return list(set(optimizers))
-
-
-def replace_optimizer_params_with_lora(agent, lora_params, base_lr=3e-4):
-    if not lora_params:
-        return False
-    optimizers = get_all_optimizers(agent)
-    replaced_any = False
-    for opt in optimizers:
-        try:
-            lr = opt.defaults.get("lr", base_lr)
-            new_optimizer = torch.optim.Adam(lora_params, lr=lr)
-            for attr in dir(agent):
-                if getattr(agent, attr, None) is opt:
-                    setattr(agent, attr, new_optimizer)
-                    replaced_any = True
-                    break
-            if hasattr(agent, "policy"):
-                for attr in dir(agent.policy):
-                    if getattr(agent.policy, attr, None) is opt:
-                        setattr(agent.policy, attr, new_optimizer)
-                        replaced_any = True
-                        break
-            if hasattr(agent, "model"):
-                for attr in dir(agent.model):
-                    if getattr(agent.model, attr, None) is opt:
-                        setattr(agent.model, attr, new_optimizer)
-                        replaced_any = True
-                        break
-        except Exception:
-            continue
-    return replaced_any
-
-
 class AMBI(Algorithm):
     def __init__(self, name, env, custom_params=None):
         super().__init__(name, env, custom_params=custom_params)
         cp = custom_params or {}
 
+        # Outer and inner algorithm configuration
         self.outer_alg_str = cp.get("outer_alg", cp.get("alg", None))
         self.outer_alg_params = cp.get("outer_alg_params", {})
         self.inner_alg_str = cp.get("inner_alg", self.outer_alg_str)
         self.inner_alg_params = cp.get("inner_alg_params", {})
 
+        # LoRA configuration for efficient inner agent adaptation
         self.use_lora = bool(cp.get("use_lora", True))
         self.lora_rank = int(cp.get("lora_rank", 4))
         self.lora_alpha = float(cp.get("lora_alpha", 1.0))
         self.lora_target_modules = cp.get("lora_target_modules", None)
 
+        # Inner loop: imagined rollouts from current state
         self.inner_rollouts = int(cp.get("inner_rollouts", 6))
         self.inner_horizon = int(cp.get("inner_horizon", 32))
         self.inner_reinit_every_step = bool(cp.get("inner_reinit_every_step", True))
         self.inner_updates_per_rollout = int(cp.get("inner_updates_per_rollout", 1))
 
+        # Outer loop: real environment interaction
         self.max_episode_steps = int(cp.get("max_episode_steps", 250))
-        self.outer_update_frequency = int(cp.get("outer_update_frequency", 1000))
+        self.seed_episodes = int(cp.get("seed_episodes", 0))
+        self.outer_update_frequency = int(cp.get("outer_update_frequency", 1))
         self.render = bool(cp.get("render", False))
 
         if self.outer_alg_str is None:
             raise ValueError("AMBI requires 'outer_alg' string in custom_params")
 
-        _outer = utils_core.initialize_alg(
-            self.outer_alg_str, self.outer_alg_params, env
-        )
-
-        if isinstance(_outer, tuple) or isinstance(_outer, list):
-            try:
-                self.outer_agent = _outer[0]
-            except Exception:
-                self.outer_agent = _outer
-        else:
-            self.outer_agent = _outer
+        self.outer_agent = self.get_outer_model(self.outer_alg_str, env, self.outer_alg_params)
+        
+        # Replay buffers: outer for real experience, inner for imagined experience
         self.outer_buffer = []
         self.inner_buffer = []
+        
+        if self.seed_episodes > 0:
+            self._initialize_seed_episodes()
+        
         self.alg_logger = None
         self._persistent_inner = None
+
+    def get_model(self):
+        return self.outer_agent.get_model() if hasattr(self.outer_agent, 'get_model') else self.outer_agent
+
+    def get_outer_model(self, alg_str, env, alg_params):
+        _outer = utils_core.initialize_alg(alg_str, alg_params, env)
+        if isinstance(_outer, tuple) or isinstance(_outer, list):
+            try:
+                return _outer[0]
+            except Exception:
+                return _outer
+        else:
+            return _outer
+
+    def get_inner_model(self, alg_str, env, alg_params):
+        _inner = utils_core.initialize_alg(alg_str, alg_params, env)
+        if isinstance(_inner, tuple) or isinstance(_inner, list):
+            try:
+                return _inner[0]
+            except Exception:
+                return _inner
+        else:
+            return _inner
+
+    def _initialize_seed_episodes(self):
+        print(f"Initializing {self.seed_episodes} seed episodes for outer buffer...")
+        for _ in range(self.seed_episodes):
+            obs = self.env.reset()
+            if isinstance(obs, tuple):
+                obs, _ = obs
+            episode_data = []
+            for _ in range(self.max_episode_steps):
+                action = self.env.action_space.sample()
+                ret = self.env.step(action)
+                if len(ret) == 5:
+                    obs_next, reward, terminated, truncated, info = ret
+                    done = bool(terminated or truncated)
+                else:
+                    obs_next, reward, done, info = ret
+                episode_data.append((obs, action, reward, obs_next, done))
+                obs = obs_next
+                if done:
+                    break
+            self.outer_buffer.extend(episode_data)
+        print(f"Initialized outer buffer with {len(self.outer_buffer)} transitions from {self.seed_episodes} seed episodes.")
 
     def set_logger(self, logger):
         self.alg_logger = logger
@@ -305,25 +229,19 @@ class AMBI(Algorithm):
         return False
 
     def _build_inner_agent(self, agent_env):
-        # Create inner agent bound to the provided agent_env (should be a model/copy env)
-        _inner = utils_core.initialize_alg(
-            self.inner_alg_str, self.inner_alg_params, agent_env
+        # Initialize inner agent with same architecture as outer agent
+        inner_agent = self.get_inner_model(
+            self.inner_alg_str, agent_env, self.inner_alg_params
         )
-        if isinstance(_inner, tuple) or isinstance(_inner, list):
-            try:
-                inner_agent = _inner[0]
-            except Exception:
-                inner_agent = _inner
-        else:
-            inner_agent = _inner
 
+        # Copy weights from outer agent to initialize inner agent
         weights_copied = self._copy_model_weights(self.outer_agent, inner_agent)
 
+        # Optionally apply LoRA for parameter-efficient fine-tuning
         if self.use_lora:
             inner_model = self._get_model_from_agent(inner_agent)
 
             if inner_model is not None and isinstance(inner_model, nn.Module):
-                # Apply LoRA to the model
                 inner_model = apply_lora_to_model(
                     inner_model,
                     rank=self.lora_rank,
@@ -334,7 +252,7 @@ class AMBI(Algorithm):
                 lora_params = get_lora_parameters(inner_model)
 
                 if lora_params:
-                    # Replace optimizers to only train LoRA params
+                    # Configure optimizer to train only LoRA parameters
                     replaced = replace_optimizer_params_with_lora(
                         inner_agent,
                         lora_params,
@@ -343,22 +261,14 @@ class AMBI(Algorithm):
         return inner_agent
 
     def _update_inner_agent(self, inner_agent):
-        """
-        Update inner agent using imagined experience.
-
-        This method tries multiple update strategies to work with any algorithm:
-        1. Direct update() method with buffer
-        2. Learn() method with small timesteps
-        3. Step-by-step updates
-        4. Replay buffer population + training
-        """
         if not self.inner_buffer:
             return False
 
         updated = False
 
         for _ in range(self.inner_updates_per_rollout):
-            # Strategy 1: Direct update with buffer (custom implementations)
+            # Try multiple update strategies for compatibility with different RL frameworks
+            # Strategy 1: Direct update() method (custom implementations)
             try:
                 if hasattr(inner_agent, "update") and callable(inner_agent.update):
                     inner_agent.update(self.inner_buffer)
@@ -367,38 +277,33 @@ class AMBI(Algorithm):
             except Exception:
                 pass
 
-            # Strategy 2: Use learn() method (stable-baselines3 style)
+            # Strategy 2: learn() method (stable-baselines3 style)
             try:
                 if hasattr(inner_agent, "learn") and callable(inner_agent.learn):
-                    # Small number of gradient steps
                     inner_agent.learn(total_timesteps=len(self.inner_buffer))
                     updated = True
                     break
             except Exception:
                 pass
 
-            # Strategy 3: Populate replay buffer and train (stable-baselines3)
+            # Strategy 3: Replay buffer + train() (stable-baselines3)
             try:
                 if hasattr(inner_agent, "replay_buffer") and hasattr(
                     inner_agent, "train"
                 ):
-                    # Add transitions to replay buffer
                     for obs, action, reward, next_obs, done in self.inner_buffer:
                         try:
-                            # Try stable-baselines3 style add
                             inner_agent.replay_buffer.add(
                                 obs, next_obs, action, reward, done, [{}]
                             )
                         except Exception:
                             try:
-                                # Try simpler add signature
                                 inner_agent.replay_buffer.add(
                                     obs, action, reward, next_obs, done
                                 )
                             except Exception:
                                 pass
 
-                    # Train on the buffer
                     if len(inner_agent.replay_buffer) > 0:
                         inner_agent.train(gradient_steps=self.inner_updates_per_rollout)
                         updated = True
@@ -429,6 +334,62 @@ class AMBI(Algorithm):
 
         return updated
 
+    def _update_outer_agent(self):
+        if not self.outer_buffer:
+            return False
+
+        updated = False
+
+        # Try multiple update strategies for compatibility with different RL frameworks
+        # Strategy 1: Direct update() method
+        try:
+            if hasattr(self.outer_agent, "update") and callable(self.outer_agent.update):
+                self.outer_agent.update(self.outer_buffer)
+                updated = True
+        except Exception:
+            pass
+
+        # Strategy 2: learn() method (stable-baselines3 style)
+        if not updated:
+            try:
+                if hasattr(self.outer_agent, "learn") and callable(self.outer_agent.learn):
+                    self.outer_agent.learn(total_timesteps=0)
+                    updated = True
+            except Exception:
+                pass
+
+        # Strategy 3: Replay buffer + train() (stable-baselines3)
+        if not updated:
+            try:
+                if hasattr(self.outer_agent, "replay_buffer") and hasattr(
+                    self.outer_agent, "train"
+                ):
+                    for obs, action, reward, next_obs, done in self.outer_buffer:
+                        try:
+                            self.outer_agent.replay_buffer.add(
+                                obs, next_obs, action, reward, done, [{}]
+                            )
+                        except Exception:
+                            try:
+                                self.outer_agent.replay_buffer.add(
+                                    obs, action, reward, next_obs, done
+                                )
+                            except Exception:
+                                pass
+
+                    if len(self.outer_agent.replay_buffer) > 0:
+                        self.outer_agent.train(gradient_steps=len(self.outer_buffer))
+                        updated = True
+            except Exception:
+                pass
+
+        if not updated:
+            print(
+                "  Warning: Could not update outer agent - no compatible update method found"
+            )
+
+        return updated
+
     def _make_model_env_copy(self):
         try:
             env_copy = copy.deepcopy(self.env)
@@ -440,23 +401,35 @@ class AMBI(Algorithm):
     def learn(self, total_timesteps=10000):
         t = 0
         episodes = 0
-        outer_obs = None
+        episode_buffer = []
+        
+        # Initialize environment and get initial observation
         reset_return = self.env.reset()
         if isinstance(reset_return, tuple):
             outer_obs, _info = reset_return
         else:
             outer_obs = reset_return
+        
         start_time = time.time()
+        
         while t < total_timesteps:
+            # Create environment copy for inner imagined rollouts
             env_model_copy, uses_snapshot, snapshot = self._make_model_env_copy()
+            
+            # Initialize or reuse inner agent (reinitializes each step by default)
             if self.inner_reinit_every_step:
                 inner_agent = self._build_inner_agent(env_model_copy)
             else:
                 if self._persistent_inner is None:
                     self._persistent_inner = self._build_inner_agent(env_model_copy)
                 inner_agent = self._persistent_inner
+            
+            # Clear inner buffer for new imagined rollouts
             self.inner_buffer = []
+            
+            # Run multiple imagined rollouts from current state
             for b in range(self.inner_rollouts):
+                # Reset inner environment to current outer environment state
                 if uses_snapshot:
                     _restore_env_state(env_model_copy, snapshot)
                     reset_return = env_model_copy.reset()
@@ -467,6 +440,7 @@ class AMBI(Algorithm):
                     obs_model = outer_obs
                 else:
                     try:
+                        # Snapshot current outer env state and restore in inner env
                         outer_snapshot = _snapshot_env_state(self.env)
                         if outer_snapshot is not None:
                             _restore_env_state(env_model_copy, outer_snapshot)
@@ -480,21 +454,31 @@ class AMBI(Algorithm):
                             obs_model = outer_obs
                     except Exception:
                         obs_model = outer_obs
+                
+                # Run imagined rollout and collect experience
                 final_obs, cum = self._run_inner_rollout_once(
                     env_model_copy, inner_agent, obs_model
                 )
+                
+                # Update inner agent on imagined experience
                 self._update_inner_agent(inner_agent)
-
+            
+            # Use inner agent to select action for real environment
             try:
                 real_action, _ = inner_agent.predict(outer_obs)
             except Exception:
+                # Fallback to outer agent if inner agent fails
                 real_action, _ = self.outer_agent.predict(outer_obs)
+            
+            # Execute action in real environment
             ret = self.env.step(real_action)
             if len(ret) == 5:
                 outer_obs_next, reward, terminated, truncated, info = ret
                 done = bool(terminated or truncated)
             else:
                 outer_obs_next, reward, done, info = ret
+            
+            # Log step data if logger is configured
             if self.alg_logger:
                 data = setup_logs(
                     reward,
@@ -504,31 +488,50 @@ class AMBI(Algorithm):
                     [info],
                 )
                 self.alg_logger.on_step(data)
-            self.outer_buffer.append(
-                (outer_obs, real_action, reward, outer_obs_next, done)
-            )
+            
+            # Store transition in episode buffer
+            episode_buffer.append((outer_obs, real_action, reward, outer_obs_next, done))
+            
             t += 1
             outer_obs = outer_obs_next
+            
+            # Handle episode termination
             if done:
                 episodes += 1
+                
+                # Add episode transitions to outer buffer
+                self.outer_buffer.extend(episode_buffer)
+                episode_buffer = []
+                
+                # Update outer agent periodically
+                if episodes % self.outer_update_frequency == 0:
+                    self._update_outer_agent()
+                
+                # Reset environment for next episode
                 reset_return = self.env.reset()
                 if isinstance(reset_return, tuple):
                     outer_obs, _info = reset_return
                 else:
                     outer_obs = reset_return
-            if t % self.outer_update_frequency == 0 or t >= total_timesteps:
-                try:
-                    self.outer_agent.update(self.outer_buffer)
-                except Exception:
-                    try:
-                        self.outer_agent.learn(total_timesteps=0)
-                    except Exception:
-                        pass
+            
+            # Periodic outer updates during long episodes
+            if t % (self.outer_update_frequency * self.max_episode_steps) == 0:
+                if episode_buffer:
+                    self.outer_buffer.extend(episode_buffer)
+                    episode_buffer = []
+                self._update_outer_agent()
+            
             if self.render:
                 try:
                     self.env.render()
                 except Exception:
                     pass
+        
+        # Final update with any remaining data
+        if episode_buffer:
+            self.outer_buffer.extend(episode_buffer)
+            self._update_outer_agent()
+        
         total_time = time.time() - start_time
         print(
             f"AMBI Training completed in {total_time:.2f} seconds over {episodes} episodes and {t} timesteps."
