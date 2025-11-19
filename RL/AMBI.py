@@ -2,11 +2,6 @@ import copy, time
 import numpy as np
 import torch.nn as nn
 from RL.alg import Algorithm
-from RL.lora import (
-    apply_lora_to_model,
-    get_lora_parameters,
-    replace_optimizer_params_with_lora,
-)
 from utils import core as utils_core
 from utils.utils import setup_logs
 
@@ -16,7 +11,7 @@ def _snapshot_env_state(env):
         sim = getattr(env, "sim", None)
         if sim is not None:
             return sim.get_state()
-    except Exception:
+    except Exception: # handle these exceptions
         pass
     for fn in ("get_state", "_get_state", "state_vector"):
         if hasattr(env, fn):
@@ -63,12 +58,6 @@ class AMBI(Algorithm):
         self.inner_alg_str = cp.get("inner_alg", self.outer_alg_str)
         self.inner_alg_params = cp.get("inner_alg_params", {})
 
-        # LoRA configuration for efficient inner agent adaptation
-        self.use_lora = bool(cp.get("use_lora", True))
-        self.lora_rank = int(cp.get("lora_rank", 4))
-        self.lora_alpha = float(cp.get("lora_alpha", 1.0))
-        self.lora_target_modules = cp.get("lora_target_modules", None)
-
         # Inner loop: imagined rollouts from current state
         self.inner_rollouts = int(cp.get("inner_rollouts", 6))
         self.inner_horizon = int(cp.get("inner_horizon", 32))
@@ -86,8 +75,7 @@ class AMBI(Algorithm):
 
         self.outer_agent = self.get_outer_model(self.outer_alg_str, env, self.outer_alg_params)
         
-        # Replay buffers: outer for real experience, inner for imagined experience
-        self.outer_buffer = []
+        # Inner buffer for imagined experience (outer agent manages its own replay buffer)
         self.inner_buffer = []
         
         if self.seed_episodes > 0:
@@ -120,26 +108,29 @@ class AMBI(Algorithm):
             return _inner
 
     def _initialize_seed_episodes(self):
-        print(f"Initializing {self.seed_episodes} seed episodes for outer buffer...")
+        print(f"Initializing {self.seed_episodes} seed episodes for outer agent replay buffer...")
+        total_transitions = 0
         for _ in range(self.seed_episodes):
             obs = self.env.reset()
             if isinstance(obs, tuple):
                 obs, _ = obs
-            episode_data = []
             for _ in range(self.max_episode_steps):
                 action = self.env.action_space.sample()
                 ret = self.env.step(action)
-                if len(ret) == 5:
+                if len(ret) == 5: # remove, since older library didn't handle this. Gym should handle this now.
                     obs_next, reward, terminated, truncated, info = ret
                     done = bool(terminated or truncated)
                 else:
                     obs_next, reward, done, info = ret
-                episode_data.append((obs, action, reward, obs_next, done))
+                
+                # Add directly to agent's replay buffer if it exists
+                self._add_to_replay_buffer(self.outer_agent, obs, action, reward, obs_next, done)
+                total_transitions += 1
+                
                 obs = obs_next
                 if done:
                     break
-            self.outer_buffer.extend(episode_data)
-        print(f"Initialized outer buffer with {len(self.outer_buffer)} transitions from {self.seed_episodes} seed episodes.")
+        print(f"Initialized outer agent replay buffer with {total_transitions} transitions from {self.seed_episodes} seed episodes.")
 
     def set_logger(self, logger):
         self.alg_logger = logger
@@ -170,7 +161,7 @@ class AMBI(Algorithm):
         for step in range(self.inner_horizon):
             action, _ = inner_agent.predict(obs)
             ret = env_copy.step(action)
-            if len(ret) == 5:
+            if len(ret) == 5: # same thing here where DQN requires this but we can remove
                 obs_next, reward, terminated, truncated, info = ret
                 done = bool(terminated or truncated)
             else:
@@ -237,27 +228,6 @@ class AMBI(Algorithm):
         # Copy weights from outer agent to initialize inner agent
         weights_copied = self._copy_model_weights(self.outer_agent, inner_agent)
 
-        # Optionally apply LoRA for parameter-efficient fine-tuning
-        if self.use_lora:
-            inner_model = self._get_model_from_agent(inner_agent)
-
-            if inner_model is not None and isinstance(inner_model, nn.Module):
-                inner_model = apply_lora_to_model(
-                    inner_model,
-                    rank=self.lora_rank,
-                    alpha=self.lora_alpha,
-                    target_modules=self.lora_target_modules,
-                )
-
-                lora_params = get_lora_parameters(inner_model)
-
-                if lora_params:
-                    # Configure optimizer to train only LoRA parameters
-                    replaced = replace_optimizer_params_with_lora(
-                        inner_agent,
-                        lora_params,
-                        base_lr=self.inner_alg_params.get("learning_rate", 3e-4),
-                    )
         return inner_agent
 
     def _update_inner_agent(self, inner_agent):
@@ -334,17 +304,29 @@ class AMBI(Algorithm):
 
         return updated
 
-    def _update_outer_agent(self):
-        if not self.outer_buffer:
-            return False
+    def _add_to_replay_buffer(self, agent, obs, action, reward, next_obs, done):
+        """Add a transition directly to the agent's replay buffer if it exists."""
+        if hasattr(agent, "replay_buffer"):
+            try:
+                try:
+                    agent.replay_buffer.add(obs, next_obs, action, reward, done, [{}])
+                except Exception:
+                    try:
+                        agent.replay_buffer.add(obs, action, reward, next_obs, done)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
+    def _update_outer_agent(self):
         updated = False
 
         # Try multiple update strategies for compatibility with different RL frameworks
-        # Strategy 1: Direct update() method
+        # Strategy 1: Direct update() method (for custom implementations that need explicit data)
         try:
             if hasattr(self.outer_agent, "update") and callable(self.outer_agent.update):
-                self.outer_agent.update(self.outer_buffer)
+                # Some implementations might need explicit data, but most will use replay buffer
+                self.outer_agent.update([])
                 updated = True
         except Exception:
             pass
@@ -364,21 +346,10 @@ class AMBI(Algorithm):
                 if hasattr(self.outer_agent, "replay_buffer") and hasattr(
                     self.outer_agent, "train"
                 ):
-                    for obs, action, reward, next_obs, done in self.outer_buffer:
-                        try:
-                            self.outer_agent.replay_buffer.add(
-                                obs, next_obs, action, reward, done, [{}]
-                            )
-                        except Exception:
-                            try:
-                                self.outer_agent.replay_buffer.add(
-                                    obs, action, reward, next_obs, done
-                                )
-                            except Exception:
-                                pass
-
                     if len(self.outer_agent.replay_buffer) > 0:
-                        self.outer_agent.train(gradient_steps=len(self.outer_buffer))
+                        # Use a reasonable number of gradient steps based on buffer size
+                        gradient_steps = min(50, len(self.outer_agent.replay_buffer))
+                        self.outer_agent.train(gradient_steps=gradient_steps)
                         updated = True
             except Exception:
                 pass
@@ -401,7 +372,6 @@ class AMBI(Algorithm):
     def learn(self, total_timesteps=10000):
         t = 0
         episodes = 0
-        episode_buffer = []
         
         # Initialize environment and get initial observation
         reset_return = self.env.reset()
@@ -489,8 +459,8 @@ class AMBI(Algorithm):
                 )
                 self.alg_logger.on_step(data)
             
-            # Store transition in episode buffer
-            episode_buffer.append((outer_obs, real_action, reward, outer_obs_next, done))
+            # Add transition directly to outer agent's replay buffer
+            self._add_to_replay_buffer(self.outer_agent, outer_obs, real_action, reward, outer_obs_next, done)
             
             t += 1
             outer_obs = outer_obs_next
@@ -498,10 +468,6 @@ class AMBI(Algorithm):
             # Handle episode termination
             if done:
                 episodes += 1
-                
-                # Add episode transitions to outer buffer
-                self.outer_buffer.extend(episode_buffer)
-                episode_buffer = []
                 
                 # Update outer agent periodically
                 if episodes % self.outer_update_frequency == 0:
@@ -516,9 +482,6 @@ class AMBI(Algorithm):
             
             # Periodic outer updates during long episodes
             if t % (self.outer_update_frequency * self.max_episode_steps) == 0:
-                if episode_buffer:
-                    self.outer_buffer.extend(episode_buffer)
-                    episode_buffer = []
                 self._update_outer_agent()
             
             if self.render:
@@ -527,10 +490,8 @@ class AMBI(Algorithm):
                 except Exception:
                     pass
         
-        # Final update with any remaining data
-        if episode_buffer:
-            self.outer_buffer.extend(episode_buffer)
-            self._update_outer_agent()
+        # Final update
+        self._update_outer_agent()
         
         total_time = time.time() - start_time
         print(
