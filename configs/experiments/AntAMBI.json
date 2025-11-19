@@ -1,0 +1,18 @@
+{
+    "overrides_alg": {
+        "seed": 55,
+        "device": "cuda",
+        "env": "Ant-v4",
+        "total_steps": 1000000,
+        "episodes": null
+    },
+    "env_params": {
+        "render_mode": null,
+        "exclude_current_positions_from_observation": false
+    },
+    "trials": 3,
+    "configs": ["AntAMBI"],
+    "logs": "timestamp",
+    "save_trials": "best"
+}
+

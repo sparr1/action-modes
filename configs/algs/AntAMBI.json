@@ -1,0 +1,41 @@
+{
+    "seed": 55,
+    "env": "Ant-v4",
+    "alg": "AMBI/AMBI",
+    "device": "cuda",
+    "alg_params": {
+        "outer_alg": "baselines/SAC",
+        "outer_alg_params": {
+            "verbose": 1,
+            "buffer_size": 1000000,
+            "learning_starts": 10000,
+            "batch_size": 128,
+            "gradient_steps": 50,
+            "train_freq": 50,
+            "learning_rate": 0.00005,
+            "device": "cuda"
+        },
+        "inner_alg": "baselines/SAC",
+        "inner_alg_params": {
+            "verbose": 0,
+            "buffer_size": 100000,
+            "learning_starts": 0,
+            "batch_size": 64,
+            "gradient_steps": 10,
+            "train_freq": 1,
+            "learning_rate": 0.0001,
+            "device": "cuda"
+        },
+        "inner_rollouts": 6,
+        "inner_horizon": 32,
+        "inner_reinit_every_step": true,
+        "inner_updates_per_rollout": 1,
+        "max_episode_steps": 250,
+        "seed_episodes": 0,
+        "outer_update_frequency": 1,
+        "render": false
+    },
+    "total_steps": 1000000,
+    "episodes": null
+}
+
