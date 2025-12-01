@@ -26,19 +26,26 @@ if __name__=="__main__":
     train_env_params = {
                         "id": "AntMaze_UMazeDense-v4",
                         # "exclude_current_positions_from_observation":False,
-                        "max_episode_steps":200,
+                        "max_episode_steps":600,
                         "render_mode": "human",
                         "maze_map": [
-                                [1, 1, 1, 1, 1, 1, 1],
-                                [1, 0, 0, 0, 0, 0, 1],
-                                [1, 0,'R', 0,'G', 0, 1],
-                                [1, 0, 0, 0, 0, 0, 1],
-                                [1, 1, 1, 1, 1, 1, 1],
+                                [1, 1, 1, 1, 1],
+                                [1, 0, 0, 0, 1],
+                                [1, 0, 0, 0, 1],
+                                [1, 0, 0, 0, 1],
+                                [1, 1, 1, 1, 1],
                                 ]
                         }
     
     env = gym.make(**train_env_params)
-    env = AntPlane(env)
+    env = AntPlane(env, random_resets= True,
+                            reset_map = [[0, 0, 0, 0, 0],
+                                         [0, 1, 1, 1, 0],
+                                         [0, 1, 1, 1, 0],
+                                         [0, 1, 1, 1, 0],
+                                         [0, 0, 0, 0, 0]],                
+        map_scale = 4,
+        position_noise_range = 0.25)
     # print("test")
     # # print(gym.envs.registry.keys())
     # env = gym.make("Platform-v0")
@@ -46,16 +53,16 @@ if __name__=="__main__":
     # # rotate = Rotate(desired_velocity_maximum = -1.0, desired_velocity_minimum = -1.0)
     # model = RandomPAMDP("rand", env)
 
-    reset_options={"goal_cell": np.array((2,2)), "reset_cell": np.array((2, 3))}
+#     reset_options={"goal_cell": np.array((3,1)), "reset_cell": np.array((1, 1))}
 
-    run_params = {"reset_options": reset_options}
+#     run_params = {"reset_options": reset_options}
     # model = PAMDP("MP_DQN", env, params=params)
 
     modal_alg_params = { 
                          "num_modes": 2,
                          "orchestrator_config": "configs/controllers/AntOrchestrator.json",
                          "mode_configs": ["configs/controllers/AntWalker.json",
-                                          "configs/controllers/AntWalker.json"]
+                                          "configs/controllers/AntRotator.json"]
                         }
     
     model = ModalAlg("modes", env, **modal_alg_params)
@@ -65,7 +72,8 @@ if __name__=="__main__":
     # baseline = Baseline("SAC", env) #does not yet support baseline.learn() etc. 
     # model = baseline.get_model() #extract the actual stable baselines model from the Baseline object
 
-    model.learn(total_timesteps=4000000, run_params = run_params)
+#     model.learn(total_timesteps=4000000, run_params = run_params)
+    model.learn(total_timesteps=4000000)
     # model.save()
     # test_env = gym.make(**train_env_params)
     # test_env = AntPlane(test_env)

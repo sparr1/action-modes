@@ -5,6 +5,8 @@ from utils.core import initialize_alg
 from utils.core import setup_wrapper
 from domains.mpqdn_wrappers import *
 from domains.mpqdn_ant_domain import *
+from modes.classifier import UniversalSupport
+import importlib
 
 class Controller():
     def __init__(self, config, domain):
@@ -52,6 +54,10 @@ class ModalController(Controller):
         # self.domain.action_space = self.modal_action_space
 
         model, is_baseline, name = self.load_model(self.alg_config, self.domain, self.model_path, custom_action_space=self.modal_action_space)
+        if "support_classifier_path" in self.controller_settings:
+            self.support_func = self.load_classifier(self.controller_settings["support_classifier_path"])()
+        else:
+            self.support_func = UniversalSupport()
         self.model = model
         self.alg_name = name
         self.is_baseline = is_baseline
@@ -64,6 +70,16 @@ class ModalController(Controller):
         initial_model.load(model_path)
 
         return initial_model, alg_name, is_baseline
+
+    def load_classifier(self, classifier_path):
+        module_name, classifier_name = classifier_path.split(':')
+        try:
+            module = importlib.import_module(module_name)
+            classifier_func = getattr(module, classifier_name)
+        except:
+            pass
+        return classifier_func
+
 
     def load_task_wrapper(self, env, task_wrapper_settings):
         wrapper_name = task_wrapper_settings['name']
@@ -96,6 +112,7 @@ class OrchestralController(Controller):
     def __init__(self, controller_config, domain, orchestral_action_space, sub_controllers = []):
         super().__init__(controller_config, domain)
         self.sub_controllers = sub_controllers
+        self.supports = [c.support_func for c in sub_controllers]
         self.orchestral_action_space = orchestral_action_space
         # self.base_action_space = self.controller_settings["base_action_space"]
         # self.base_observation_space = self.controller_settings["base_observation_space"]
@@ -143,6 +160,7 @@ class OrchestralController(Controller):
     
     def add_controllers(self, controllers):
         self.sub_controllers.extend(controllers)
+        self.supports.extend([c.support_func for c in controllers])
 
     def process_obs(self, observation):
         obs = observation
@@ -155,7 +173,9 @@ class OrchestralController(Controller):
     #     pass
 
     def predict(self, observation):
-        action, action_parameters, all_action_parameters = self.model.predict(observation[0])
+        mask = np.array([sup(observation[0]) for sup in self.supports],dtype = int)
+
+        action, action_parameters, all_action_parameters = self.model.predict(observation[0], mask=mask)
         return (action, all_action_parameters), None
     
     class OrchestralWrapper(gym.ActionWrapper):

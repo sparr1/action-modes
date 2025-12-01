@@ -1,7 +1,7 @@
 {
     "seed": 55,
     "name": "AntOrchestrator",
-    "alg_config_path": "configs/algs/AntMPDQN.json",
+    "alg_config_path": "configs/algs/AntMaskedMPDQN.json",
     "model_path":null,
     "base_observation_space":"Box(-inf, inf, (29,), float64)",
     "base_action_space": "Box(-1, 1, (8,), float32)",

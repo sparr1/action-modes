@@ -123,7 +123,14 @@ class Move(Task):
             # print(q_rot) #W is first
             self.direction = q_rotate(self.relative_direction_start, q_rot)
             # print(self.direction)
-            self.direction = np.concatenate((self.direction, [0.0, 0.0, 0.0]),axis = 0)
+            self.planar_direction = self.direction[:2]
+            self.max_heading = np.argmax(np.abs(self.planar_direction))
+            self.max_heading_sign = self.planar_direction[self.max_heading]/np.abs(self.planar_direction[self.max_heading])
+            new_direction = np.zeros_like(self.direction)
+            new_direction[self.max_heading] = self.max_heading_sign
+            self.direction = np.concatenate((new_direction, [0.0, 0.0, 0.0]),axis=0)
+            # self.direction = np.zeros_like(self.direction)[self.max_heading] = self.max_heading_sign
+            # self.direction = np.concatenate((self.direction, [0.0, 0.0, 0.0]),axis = 0)
             # print(self.direction)
 
         # print(velocity_vec)
@@ -378,37 +385,54 @@ def check_range(value, range):
 def get_speed(observation, vel_offset):
     return np.sqrt(np.sum(observation[13 + vel_offset:19+vel_offset]**2))
 
-def get_z(observation, pos_offset):
-    return observation[pos_offset]
-
-def check_z_range(observation, z_range, pos_offset):
-    return check_range(get_z(observation, pos_offset), z_range)
+def check_z_range(observation, z_range, z_coord):
+    return check_range(observation[z_coord], z_range)
 
 def check_speed(observation, speed_range, vel_offset):
     return check_range(get_speed(observation, vel_offset), speed_range)
     
 class MoveForwardSupportClassifier(SupportClassifier):
-    def __init__(self, z_range_minimum = 0.3, z_range_maximum = 1.0, num_legs = 4, include_xy = True):
+    def __init__(self, z_range_minimum = 0.3, z_range_maximum = 1.0, num_legs = 4, include_xy = False, include_target = False):
         self.z_range = [z_range_minimum, z_range_maximum]
         self.num_legs = num_legs
         self.include_xy = include_xy
+        self.include_target = include_target
+
         self.pos_offset = 2 if self.include_xy else 0
-        self.vel_offset = self.pos_offset + (self.num_legs - 4)*2
-        
+        self.target_offset = 2 if self.include_target else 0
+        self.z_coord = self.pos_offset+self.target_offset
+    
+        self.vel_offset = self.target_offset+self.pos_offset + (self.num_legs - 4)*2
+
     def rule(self, observation):
         return check_range(observation[self.pos_offset], self.z_range)
 
 class MoveRotateSupportClassifier(SupportClassifier):
-    def __init__(self, z_range_minimum = 0.45, z_range_maximum = 0.65, speed_minimum = -1.0, speed_maximum=1.5, num_legs = 4, include_xy = True):
+    def __init__(self, z_range_minimum = 0.3, z_range_maximum = 0.65, speed_minimum = -1.0, speed_maximum=2.0, num_legs = 4, include_xy = False, include_target = False):
         self.z_range = [z_range_minimum, z_range_maximum]
         self.speed_range = [speed_minimum, speed_maximum]
         self.num_legs = num_legs
         self.include_xy = include_xy
-        self.pos_offset = 2 if self.include_xy else 0
-        self.vel_offset = self.pos_offset + (self.num_legs - 4)*2
+        self.include_target = include_target
 
-    def rule(self, observation):        
-        return check_z_range(observation, self.z_range, self.pos_offset) and check_speed(observation, self.speed_range, self.vel_offset)
+        self.pos_offset = 2 if self.include_xy else 0
+        self.target_offset = 2 if self.include_target else 0
+        self.z_coord = self.pos_offset+self.target_offset
+    
+        self.vel_offset = self.target_offset+self.pos_offset + (self.num_legs - 4)*2
+
+    def rule(self, observation):
+        valid_z = check_z_range(observation, self.z_range, self.z_coord)
+        valid_speed = check_speed(observation, self.speed_range, self.vel_offset)
+        print("xyz",observation[-4:-2], observation[0])
+        print("goal",observation[-2:])
+        print("valid_z", valid_z)
+        print("speed", get_speed(observation, self.vel_offset))
+        print("valid_speed", valid_speed)
+        print(len(observation))
+        print(np.sum(observation))
+        print(observation)
+        return valid_z and valid_speed 
 
 class ChangeZSupportClassifier(SupportClassifier):
     def __init__(self, speed_minimum = -1.0, speed_maximum = 1.0, num_legs = 4, include_xy = True):

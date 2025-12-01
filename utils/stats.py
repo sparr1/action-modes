@@ -55,7 +55,7 @@ def tolerant_rolling_average(arrs, window_size = 1):
     if emit_rows.size:
         means = w_sum[full_rows, :] / float(window_size)
         out[emit_rows, :] = means
-    return out
+    return out[window_size:,:]
 
 def handle_stats_line(line_segments, keyword):
     return [x for x in line_segments if keyword in x][0].split(' ')[-1]
@@ -138,7 +138,7 @@ def retrieve_trial(alg_name, trial_data, keyword, stat_dict):
         stat_dict[alg_name] = []
     stat_dict[alg_name].append(trial_data[keyword])
 
-def compute_stat(alg, stat_trials_data, stat_results_dict, goal_range = (-math.inf,math.inf), goal_trials_data = None, rolling_window = 30):
+def compute_stat(alg, stat_trials_data, stat_results_dict, goal_range = (-math.inf,math.inf), goal_trials_data = None, rolling_window = 1):
 
     if not goal_trials_data:
         avg, std, smax, smin = tolerant_stats(stat_trials_data, rolling_window=rolling_window) 
@@ -169,7 +169,7 @@ def compute_stat(alg, stat_trials_data, stat_results_dict, goal_range = (-math.i
         stat_results_dict[alg][str(goal_range)] = {"means": avg, "stds": std, "max": smax, "min": smin}
 
 
-def _compute_stats(experiment_name, rewards = True, observations = True, actions = True, base_rewards = False, num_goal_buckets = 2, max_steps = 1e6):
+def _compute_stats(experiment_name, rewards = True, observations = True, actions = True, base_rewards = False, num_goal_buckets = 2, max_steps = 1e6, rolling_window = 1):
     experiment_dir = f'./logs/{experiment_name}'
     
     files = get_files(experiment_dir)
@@ -221,7 +221,7 @@ def _compute_stats(experiment_name, rewards = True, observations = True, actions
         goal_stats = {}
 
         for alg, goal_trials in trial_goals.items():
-            compute_stat(alg, goal_trials, goal_stats)
+            compute_stat(alg, goal_trials, goal_stats, rolling_window=rolling_window)
         goal_min = min(goal_stats[alg]["min"])
         goal_max = max(goal_stats[alg]["max"])
         goal_range = goal_max - goal_min
@@ -254,7 +254,7 @@ def _compute_stats(experiment_name, rewards = True, observations = True, actions
                 else:
                     goals_trials = goal_range = None
                     # print(trials)
-                compute_stat(alg, trials, reward_results, goal_range = bucket, goal_trials_data = goals_trials)
+                compute_stat(alg, trials, reward_results, goal_range = bucket, goal_trials_data = goals_trials, rolling_window=rolling_window)
 
             results["rewards"] = reward_results
 
@@ -317,8 +317,8 @@ def _compute_stats(experiment_name, rewards = True, observations = True, actions
 
     return results
 
-def compute_rewards(experiment_name, base = False, num_goal_buckets = None):
-    return _compute_stats(experiment_name, True, False, False, base_rewards=base, num_goal_buckets = num_goal_buckets)
+def compute_rewards(experiment_name, base = False, num_goal_buckets = None, rolling_window = 1):
+    return _compute_stats(experiment_name, True, False, False, base_rewards=base, num_goal_buckets=num_goal_buckets, rolling_window=rolling_window)
 
 def compute_observations(experiment_name):
     return _compute_stats(experiment_name,False, True, False)['observations']

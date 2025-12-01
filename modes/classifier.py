@@ -1,8 +1,8 @@
 class SupportClassifier():
     def __init__(self, rule):
         self.rule = rule
-
-    def is_supported(self, obs):
+    
+    def __call__(self, obs):
         return self.rule(obs)
 
 

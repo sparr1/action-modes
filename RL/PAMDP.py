@@ -29,7 +29,7 @@ class PAMDP(Algorithm):
             total_timesteps = kwargs["total_timesteps"]
         else:
             total_timesteps = -1
-
+        # IF
         save_freq = self.custom_params["save_freq"]
         save_dir = self.custom_params["save_dir"]
         visualise = self.custom_params["visualise"]
@@ -166,8 +166,8 @@ class PAMDP(Algorithm):
         # return np.column_stack((returns, timesteps))
         return np.array(returns)
 
-    def step(self, state, action, reward, next_state, next_action, terminal, steps):
-        self.model.step(state, action, reward, next_state, next_action, terminal, steps)
+    def step(self, state, action, reward, next_state, next_action, terminal, mask = None, steps=1):
+        self.model.step(state, action, reward, next_state, next_action, terminal, mask, steps)
 
     def start_episode(self):
         self.model.start_episode()
@@ -175,8 +175,8 @@ class PAMDP(Algorithm):
     def end_episode(self):
         self.model.end_episode()
 
-    def predict(self, observation):
-        return self.model.act(observation)
+    def predict(self, observation, mask = None):
+        return self.model.act(observation, mask=mask)
     
     def save(self, path, name):
         self.model.save_models(os.path.join(path, name))
@@ -210,7 +210,6 @@ class PAMDP(Algorithm):
 
         if 'Goal' in env_name:
             from gym_goal.envs.config import GOAL_WIDTH, PITCH_LENGTH, PITCH_WIDTH
-
 
             # if params['scale_actions']:
             #     kickto_weights = np.array([[-0.375, 0.5, 0, 0.0625, 0],
@@ -356,7 +355,7 @@ class PAMDP(Algorithm):
             #     agent.set_action_parameter_passthrough_weights(initial_weights, initial_bias)
             # print(agent)
         elif 'Ant' in env_name: 
-            initial_params_ = [0., 0.]
+            initial_params_ = [2., 2.]
             # unwrapped_env = env.unwrapped
             # action_space = custom_action_space #The ant environment only provides the base action space. so we will always be using custom actions
 

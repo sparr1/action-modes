@@ -24,7 +24,7 @@ my_domains = {
 }
 
 train_env_params = {
-                    "id": my_domains["ant_plane"],
+                    "id": my_domains["ant"],
                     "exclude_current_positions_from_observation":False,
                     "max_episode_steps":400,
                     # "render_mode": "human",
@@ -32,7 +32,7 @@ train_env_params = {
                     }
 
 move_objective_params = {
-                    "direction": "ZR",
+                    "direction": "F",
                     "desired_velocity_minimum":-5.0,
                     "desired_velocity_maximum": 5.0,
                     "survival_bonus": 6.25,
@@ -53,7 +53,7 @@ change_objective_params = {
                     "metric": "L2"
                     }
 
-def prepare_env(env_params, objective_name, objective_params):
+def prepare_env(env_params, objective_name=None, objective_params=None):
     if env_params["id"] == "ant_plane":
         env_params["id"] = my_domains["ant"]
         base_domain = AntPlane(gym.make(**env_params))
@@ -70,7 +70,7 @@ def prepare_env(env_params, objective_name, objective_params):
     env = base_domain
     # train_env = Subtask(train_base_domain, Move(**train_objective_params))
     if objective_name:
-        if objective_name ==" move":
+        if objective_name =="move":
             env = Subtask(base_domain, Move(**objective_params))
         elif objective_name=="change":
             env = Subtask(base_domain, Change(**objective_params))
@@ -83,10 +83,11 @@ test_env_params = train_env_params.copy()
 # test_objective_params = change_objective_params.copy()
 test_env_params["render_mode"] = "human"
 
-train_env = prepare_env(train_env_params, "change", change_objective_params)
-test_env = prepare_env(test_env_params, "change", change_objective_params)
+train_env = prepare_env(train_env_params, "move", move_objective_params)
+test_env = prepare_env(test_env_params, "move", move_objective_params)
 
-
+# train_env = prepare_env(train_env_params)
+# test_env = prepare_env(test_env_params)
 
 print(train_env.observation_space)
 print(train_env.action_space)
@@ -97,11 +98,13 @@ model = Baseline("SAC", train_env, params = params)
 # # model = Stationary("stationary", train_env)
 # model.load("logs/AntPlaneRotateFinal/models/model:AntSAC_0_2000000_steps")
 # model.load("logs/AntPlane8LMoveFinal/models/model:AntSAC_0")
-model.load("logs/AntPlaneChangeZFinal/models/model:AntSAC_0")
-# model_move.load("logs/AntPlaneMoveFinal_2024-11-13_10-22-56/models/model:AntSAC_1")
+# model.load("logs/AntPlaneChangeZFinal/models/model:AntSAC_0")
+# model.load("logs/AntPlaneMoveFinal_2024-11-13_10-22-56/models/model:AntSAC_1")
+# model.load("/home/sparr/projects/action_modes/models/controllers_v2/model:AntRotator")
+# model.load("/home/sparr/projects/action_modes/logs/Ant_2025-10-09_11-56-13/models/model:AntSAC_0")
 #model_rotate = Baseline("SAC", train_env, params = params)
 # model.load("logs/AntPlaneRotateNew_2024-10-10_16-22-19/models/model:AntSAC_0")
-# model.load("models/controllers_v0/model:AntWalker")
+# model.load("models/controllers_v2/model:AntWalker")
 # model.load("logs/AntPlaneRotateNew_2024-10-09_12-24-24/models/model:AntSAC_1")
 # model.load("logs/AntPlaneMoveNew6.0_2024-10-03_09-30-15/models/model:AntSAC_2")
 # model.load("logs/AntPlaneMove5_2024-10-11_21-28-31/models/model:AntSAC_0")
@@ -114,7 +117,7 @@ model.load("logs/AntPlaneChangeZFinal/models/model:AntSAC_0")
 # model.load("models/HumanoidBasic/model:HumanoidSAC-B2M_0")
 # model.load("model:HumanoidSAC-B1M_0")
 # try:
-# model.learn(total_timesteps=1500000)
+model.learn(total_timesteps=1500000)
 # except Exception as e:
 #     print("GLFW initialized? ", glfw._initialized)
 #     traceback.print_exc()    # ← shows you the file & line triggering the error
@@ -148,11 +151,15 @@ for _ in range(150000):
     ep_step_count+=1
     # print(observation)
     # test_env.render()
-    desired_pos = info['reward_info']['desired_position']
-    achieved_pos = info['reward_info']['achieved_position']
+    # desired_pos = info['reward_info']['desired_position']
+    # achieved_pos = info['reward_info']['achieved_position']
+    # desired_pos = info['reward_info']['desired_velocity']
+    # achieved_pos = info['reward_info']['achieved_velocity']
     print('----------')
     print("info", info)
-    print('achieved position: ',achieved_pos, 'desired position: ', desired_pos)
+    # print('achieved position: ',achieved_pos, 'desired position: ', desired_pos)
+    # print('achieved velocity: ',achieved_pos, 'desired velocity: ', desired_pos)
+
     # print("target position:", test_env._task.desired_position)
     print(reward)
     # for i,label in enumerate(labels):

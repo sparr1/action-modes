@@ -74,10 +74,12 @@ if __name__ == "__main__":
     # results = compute_rewards("PlatformTest_2025-01-11_20-05-32")
     # graph_rewards(results, "rewards", "Platform RandomPAMDP test, n = 3", buckets=False)
 
-    results = compute_rewards("MazeModes_2025-09-20_22-54-11")
-    graph_rewards(results, "rewards", "Maze Modes test, n = 1, t = 1e7", buckets=False)
+    # results = compute_rewards("MazeModes", rolling_window=25)
+    # graph_rewards(results, "rewards", "Maze Modes with universal support, n = 5, t = 2e6", buckets=False)
+    
+    
     # results = compute_rewards("AntMazeDense700_2024-07-16_21-05-37")
-    # graph_rewards(results, "long baselines AntMazeDense 10M timesteps, n = 5")
+    # graph_rewards(results, "long baselines AntMazeDense 10M timessteps, n = 5")
 
     # results = compute_rewards("PointMazeSparse_2024-07-14_13-54-38")
     # graph_rewards(results, "long baselines PointMazeSparse, n = 5")
@@ -96,8 +98,11 @@ if __name__ == "__main__":
     # results = compute_rewards("AntRotate_2024-08-12_21-38-51")
     # graph_rewards(results, "AntRotate 1M timesteps, n= 5")
 
-    # results = compute_rewards("Ant_2024-08-20_21-35-53")
-    # graph_rewards(results, "Ant (no maze) 1M timesteps, n=5")
+    # results = compute_rewards("Ant_2025-10-09_11-56-13", rolling_window=1)
+    # graph_rewards(results, "rewards", "Ant (no maze) 1M timesteps, n=5", buckets = False)
+
+    results = compute_rewards("MazeModesv2_2025-11-07_14-43-56", rolling_window=25)
+    graph_rewards(results, "rewards", "Ant (no maze) 1M timesteps, n=5", buckets = False)
 
     # results = compute_rewards("AntPlaneMove_2024-09-10_12-12-12")
     # graph_rewards(results, "AntPlaneMove 1M (full vec vel reward, reduced action-cost) n=5")

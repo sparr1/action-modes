@@ -11,8 +11,6 @@ from utils.utils import setup_logs
 #and then the new action space will be Dict(Discrete(2), Box(-1, 1, (1,), float32), Box(-1, 1, (1,), float32)), where the discrete action just switches which lower dimensional action space we use.
 #In general, we will have M possible modes, which we will winnow into k supported modes for any given state, then project the latent "within-mode" actions to the original high-dimensional state space.
 
-#for now, we will forget about the initial winnowing, and just assume the support of each mode covers the state space. 
-
 #one wrinkle is that the mode_controllers expect the environment to be wrapped with a task wrapper. 
 class ModalAlg(Algorithm):
     def __init__(self, name, env, orchestrator_config, mode_configs, num_modes):
@@ -27,6 +25,7 @@ class ModalAlg(Algorithm):
         # self.base_action_space = self.action_space
         self.orchestrator = OrchestralController(orchestrator_config, self.env, orchestrator_action_space)
         self.controllers  = [ModalController(c, self.env, mode_action_spaces[i]) for i,c in enumerate(mode_configs)]
+        # self.masking = [c.support_func for c in self.controllers] #TODO: use self.masking to mask during action-taking!
         self.orchestrator.add_controllers(self.controllers)
     
     def predict(self, observation, modulus = 0, old_orch_act = None):
@@ -42,14 +41,15 @@ class ModalAlg(Algorithm):
             # print(orchestral_action)
             # orchestral_action = orch_action_space.sample()
             cont_action = np.concatenate(orchestral_action[1:])
-            cont_action = np.clip(cont_action, a_min = -2.0, a_max = 2.0)
+            # cont_action = np.clip(cont_action, a_min = -2.0, a_max = 2.0) #TODO sus
             orchestral_action = orchestral_action[0], cont_action
+            
             # orchestral_action[1] = orchestral_action[1]*5.0
             # orchestral_action[2] = orchestral_action[2]*5.0
             # print(orchestral_action)
         # print(orchestral_action)
         ind, params = orchestral_action
-        controller_action_param = params[ind]
+        controller_action_param = params[ind]*5.0
         # print(controller_action_param)
         selected_controller = self.controllers[ind]
         # print(selected_controller.name)
@@ -96,6 +96,11 @@ class ModalAlg(Algorithm):
         #     vidir = os.path.join(save_dir, "frames")
         #     os.makedirs(vidir, exist_ok=True)
 
+        if "masked" in custom_params:
+            masked = custom_params["masked"]
+        else:
+            masked = False
+            
         max_steps = 10000 #TODO this needs to be bigger than environment max steps
         total_reward = 0.
         returns = []
@@ -130,6 +135,8 @@ class ModalAlg(Algorithm):
 
             # if visualise and i % render_freq == 0:
             #     env.render()
+
+
             predict_ret = self.predict(raw_state)
             # act, act_param, all_action_parameters = agent.act(state)
             base_action, action_data = predict_ret

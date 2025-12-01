@@ -12,7 +12,7 @@
                     "survival_bonus":1.0,
                     "direction": "ZR",
                     "metric": "L2"}}},
-    "support_classifier_path": "TBD",
+    "support_classifier_path": "domains.Maze:MoveRotateSupportClassifier",
     "base_observation_space":"Box(-inf, inf, (29,), float64)",
     "base_action_space": "Box(-1, 1, (8,), float32)",
     "modal_action_space": "Box(-1, 1, (1,), float32)"
