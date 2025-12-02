@@ -66,7 +66,7 @@ class Move(Task):
         self.starting_weights = np.concatenate((np.ones(shape=(3,)), np.full(shape=(3,), fill_value = rotation_starting_weight)))
         if direction == "F":
             self.relative = True
-            self.relative_direction_start = np.array([1,0,0]) #X,Y,Z, forwards starts at X.
+            self.relative_direction_start = None
         else:
             self.relative = False
         
@@ -109,6 +109,9 @@ class Move(Task):
     def set_velocity_coords(self, env):
         self.velocity_coords = env.get_velocity_coords()
 
+    def set_relative_start(self, obs):
+        self.relative_direction_start = obs[self.velocity_coords[0]:self.velocity_coords[1]]
+
     #checking state feature for velocity in the desired direction. if direction is None, we'll simply take the magnitude of the velocity vector in any direction.
     def get_reward(self, observation, last_action, contact_forces):
         # print(self.desired_velocity, type(self.desired_velocity))
@@ -121,6 +124,8 @@ class Move(Task):
             # print(self.relative_direction_start)
             q_rot = obs[self.dir_coords[0]:self.dir_coords[1]]
             # print(q_rot) #W is first
+            if self.relative_direction_start is None:
+                self.set_relative_start(obs)
             self.direction = q_rotate(self.relative_direction_start, q_rot)
             # print(self.direction)
             self.planar_direction = self.direction[:2]

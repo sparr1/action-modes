@@ -24,7 +24,7 @@ my_domains = {
 }
 
 train_env_params = {
-                    "id": my_domains["ant"],
+                    "id": my_domains["ant_plane"],
                     "exclude_current_positions_from_observation":False,
                     "max_episode_steps":400,
                     # "render_mode": "human",
@@ -33,8 +33,8 @@ train_env_params = {
 
 move_objective_params = {
                     "direction": "F",
-                    "desired_velocity_minimum":-5.0,
-                    "desired_velocity_maximum": 5.0,
+                    "desired_velocity_minimum":-6.0,
+                    "desired_velocity_maximum": 6.0,
                     "survival_bonus": 6.25,
                     "adaptive_margin":True,
                     "adaptive_margin_minimum":0.01,
@@ -110,6 +110,7 @@ model = Baseline("SAC", train_env, params = params)
 # model.load("logs/AntPlaneMove5_2024-10-11_21-28-31/models/model:AntSAC_0")
 
 # model.load("logs/AntPlaneRotateNew_2024-10-10_16-22-19/models/model:AntSAC_0")
+model.load("models/AntPlaneMoveFinalNew/model:AntSAC_4")
 # model.load("models/HumanoidMoveResets5xSR1.0/model:HumanoidSAC-B1M_0")
 # model.load("models/HumanoidMoveResets0.75xTR1.0/model:HumanoidSAC-2x_0_9000000_steps")
 # model.load("models/HMR1.25xTR+1.0/model:HumanoidSAC-halflr_0")
@@ -117,7 +118,7 @@ model = Baseline("SAC", train_env, params = params)
 # model.load("models/HumanoidBasic/model:HumanoidSAC-B2M_0")
 # model.load("model:HumanoidSAC-B1M_0")
 # try:
-model.learn(total_timesteps=1500000)
+# model.learn(total_timesteps=1500000)
 # except Exception as e:
 #     print("GLFW initialized? ", glfw._initialized)
 #     traceback.print_exc()    # ← shows you the file & line triggering the error
