@@ -62,6 +62,7 @@ class Move(Task):
         self.include_xy = include_xy
         self.modify_obs = modify_obs
         directions = ["X", "Y", "Z", "XR", "YR", "ZR"]
+        neg_directions = ["-X", "-Y", "-Z", "-XR", "-YR", "-ZR"]
         self.rotation_starting_weight = rotation_starting_weight
         self.starting_weights = np.concatenate((np.ones(shape=(3,)), np.full(shape=(3,), fill_value = rotation_starting_weight)))
         if direction == "F":
@@ -74,6 +75,9 @@ class Move(Task):
         if direction in directions:
             self.direction[directions.index(direction)] = 1.0
             self.starting_weights[directions.index(direction)] = 1.0
+        elif direction in neg_directions:
+            self.direction[neg_directions.index(direction)] = -1.0
+            self.starting_weights[neg_directions.index(direction)] = 1.0
         elif direction == 'F':
             pass
         else:

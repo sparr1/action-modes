@@ -110,7 +110,7 @@ model = Baseline("SAC", train_env, params = params)
 # model.load("logs/AntPlaneMove5_2024-10-11_21-28-31/models/model:AntSAC_0")
 
 # model.load("logs/AntPlaneRotateNew_2024-10-10_16-22-19/models/model:AntSAC_0")
-model.load("models/AntPlaneMoveFinalNew/model:AntSAC_4")
+model.load("models/AntPlaneMoveFinalNew3/model:AntSAC_1")
 # model.load("models/HumanoidMoveResets5xSR1.0/model:HumanoidSAC-B1M_0")
 # model.load("models/HumanoidMoveResets0.75xTR1.0/model:HumanoidSAC-2x_0_9000000_steps")
 # model.load("models/HMR1.25xTR+1.0/model:HumanoidSAC-halflr_0")
