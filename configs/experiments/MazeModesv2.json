@@ -18,7 +18,7 @@
     },
     "env_params": {"max_episode_steps": 750,"render_mode":"human"},
     "trials": 5,
-    "configs": ["AntModes", "AntSAC"],
+    "configs": ["AntModes", "AntModesXY", "AntSAC"],
     "logs": "timestamp",
     "save_trials": "best",
     "log_info": false

@@ -32,10 +32,10 @@ train_env_params = {
                     }
 
 move_objective_params = {
-                    "direction": "F",
-                    "desired_velocity_minimum":-6.0,
-                    "desired_velocity_maximum": 6.0,
-                    "survival_bonus": 6.25,
+                    "direction": "X",
+                    "desired_velocity_minimum":-4.0,
+                    "desired_velocity_maximum": 4.0,
+                    "survival_bonus": 1.0,
                     "adaptive_margin":True,
                     "adaptive_margin_minimum":0.01,
                     "categorical":False,
@@ -110,7 +110,9 @@ model = Baseline("SAC", train_env, params = params)
 # model.load("logs/AntPlaneMove5_2024-10-11_21-28-31/models/model:AntSAC_0")
 
 # model.load("logs/AntPlaneRotateNew_2024-10-10_16-22-19/models/model:AntSAC_0")
-model.load("models/AntPlaneMoveFinalNew3/model:AntSAC_1")
+# model.load("models/AntPlaneMoveFinalNew3/model:AntSAC_1")
+model.load("models/AntPlaneMoveY/model:AntSAC_2")
+
 # model.load("models/HumanoidMoveResets5xSR1.0/model:HumanoidSAC-B1M_0")
 # model.load("models/HumanoidMoveResets0.75xTR1.0/model:HumanoidSAC-2x_0_9000000_steps")
 # model.load("models/HMR1.25xTR+1.0/model:HumanoidSAC-halflr_0")
