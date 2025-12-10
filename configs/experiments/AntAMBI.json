@@ -10,7 +10,7 @@
         "render_mode": null,
         "exclude_current_positions_from_observation": false
     },
-    "trials": 3,
+    "trials": 5,
     "configs": ["AntAMBI"],
     "logs": "timestamp",
     "save_trials": "best"

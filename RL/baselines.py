@@ -18,7 +18,7 @@ class Baseline(Algorithm):
         self.callback = []
 
     def learn(self, **kwargs):
-        return self.model.learn(callback = self.callback, **kwargs)
+        return self.model.learn(callback = self.callback, **kwargs) # pass this env into ambi
     
     def predict(self, observation):
         return self.model.predict(observation)

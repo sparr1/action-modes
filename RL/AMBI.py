@@ -7,22 +7,23 @@ from utils.utils import setup_logs
 
 
 def _snapshot_env_state(env):
+    """Capture the current state of the environment for later restoration."""
     try:
         sim = getattr(env, "sim", None)
         if sim is not None:
             return sim.get_state()
-    except Exception: # handle these exceptions
+    except (AttributeError, RuntimeError):
         pass
     for fn in ("get_state", "_get_state", "state_vector"):
         if hasattr(env, fn):
             try:
                 return getattr(env, fn)()
-            except Exception:
+            except (AttributeError, RuntimeError):
                 pass
     return None
 
-
 def _restore_env_state(env, state):
+    """Restore environment to a previously captured state."""
     if state is None:
         return False
     try:
@@ -32,22 +33,40 @@ def _restore_env_state(env, state):
             if hasattr(sim, "forward"):
                 try:
                     sim.forward()
-                except Exception:
+                except (AttributeError, RuntimeError):
                     pass
             return True
-    except Exception:
+    except (AttributeError, RuntimeError):
         pass
     for fn in ("set_state", "_set_state", "set_state_vector"):
         if hasattr(env, fn):
             try:
                 getattr(env, fn)(state)
                 return True
-            except Exception:
+            except (AttributeError, RuntimeError):
                 pass
     return False
 
 
 class AMBI(Algorithm):
+    """
+    Adaptive Model-Based Imagined trajectories (AMBI) Algorithm.
+
+    AMBI uses a two-loop structure:
+    - Inner loop: Runs imagined rollouts from the current state to improve action selection
+    - Outer loop: Takes real actions in the environment and updates the policy
+
+    Args:
+        name: Algorithm name
+        env: Gym environment
+        custom_params: Dictionary of hyperparameters including:
+            - outer_alg: Algorithm for outer agent (e.g., "baselines/SAC")
+            - inner_alg: Algorithm for inner agent (defaults to outer_alg)
+            - inner_rollouts: Number of imagined rollouts per step (default: 6)
+            - inner_reinit_every_step: Whether to reinitialize inner agent each step (default: True)
+            - max_episode_steps: Maximum steps per episode (default: 250)
+            - seed_episodes: Number of random episodes to initialize buffer (default: 0)
+    """
     def __init__(self, name, env, custom_params=None):
         super().__init__(name, env, custom_params=custom_params)
         cp = custom_params or {}
@@ -60,27 +79,25 @@ class AMBI(Algorithm):
 
         # Inner loop: imagined rollouts from current state
         self.inner_rollouts = int(cp.get("inner_rollouts", 6))
-        self.inner_horizon = int(cp.get("inner_horizon", 32))
         self.inner_reinit_every_step = bool(cp.get("inner_reinit_every_step", True))
         self.inner_updates_per_rollout = int(cp.get("inner_updates_per_rollout", 1))
 
         # Outer loop: real environment interaction
         self.max_episode_steps = int(cp.get("max_episode_steps", 250))
         self.seed_episodes = int(cp.get("seed_episodes", 0))
-        self.outer_update_frequency = int(cp.get("outer_update_frequency", 1))
         self.render = bool(cp.get("render", False))
 
         if self.outer_alg_str is None:
             raise ValueError("AMBI requires 'outer_alg' string in custom_params")
 
         self.outer_agent = self.get_outer_model(self.outer_alg_str, env, self.outer_alg_params)
-        
+
         # Inner buffer for imagined experience (outer agent manages its own replay buffer)
         self.inner_buffer = []
-        
+
         if self.seed_episodes > 0:
             self._initialize_seed_episodes()
-        
+
         self.alg_logger = None
         self._persistent_inner = None
 
@@ -108,7 +125,8 @@ class AMBI(Algorithm):
             return _inner
 
     def _initialize_seed_episodes(self):
-        print(f"Initializing {self.seed_episodes} seed episodes for outer agent replay buffer...")
+        """Initialize outer agent replay buffer with random exploration."""
+        print(f"Initializing {self.seed_episodes} seed episodes...")
         total_transitions = 0
         for _ in range(self.seed_episodes):
             obs = self.env.reset()
@@ -117,64 +135,63 @@ class AMBI(Algorithm):
             for _ in range(self.max_episode_steps):
                 action = self.env.action_space.sample()
                 ret = self.env.step(action)
-                if len(ret) == 5: # remove, since older library didn't handle this. Gym should handle this now.
-                    obs_next, reward, terminated, truncated, info = ret
+                if len(ret) == 5:
+                    obs_next, reward, terminated, truncated, _ = ret
                     done = bool(terminated or truncated)
                 else:
-                    obs_next, reward, done, info = ret
-                
-                # Add directly to agent's replay buffer if it exists
+                    obs_next, reward, done, _ = ret
+
                 self._add_to_replay_buffer(self.outer_agent, obs, action, reward, obs_next, done)
                 total_transitions += 1
-                
+
                 obs = obs_next
                 if done:
                     break
-        print(f"Initialized outer agent replay buffer with {total_transitions} transitions from {self.seed_episodes} seed episodes.")
+        print(f"✓ Buffer initialized with {total_transitions} transitions")
 
     def set_logger(self, logger):
         self.alg_logger = logger
-        try:
+        if hasattr(self.outer_agent, 'set_logger'):
             self.outer_agent.set_logger(logger)
-        except Exception:
-            pass
 
     def predict(self, obs):
         return self.outer_agent.predict(obs)
 
     def save(self, save_path, name):
-        try:
+        if hasattr(self.outer_agent, 'save'):
             self.outer_agent.save(save_path, name)
-        except Exception:
-            pass
 
     def load(self, load_path):
-        try:
+        if hasattr(self.outer_agent, 'load'):
             self.outer_agent.load(load_path)
-        except Exception:
-            pass
 
-    def _run_inner_rollout_once(self, env_copy, inner_agent, init_obs):
+    def _run_inner_rollout_once(self, env_copy, inner_agent, init_obs, current_step):
+        """Run imagined rollout from current step to end of episode (T).
+
+        Args:
+            env_copy: Copy of the environment for imagination
+            inner_agent: Inner agent to use for predictions
+            init_obs: Initial observation (current outer observation)
+            current_step: Current timestep in outer episode (t)
+        """
         obs = init_obs
         cum_reward = 0.0
-        rollout_data = []
-        for step in range(self.inner_horizon):
+        # Run from current step t to end of episode T
+        steps_remaining = self.max_episode_steps - current_step
+        for step in range(steps_remaining):
             action, _ = inner_agent.predict(obs)
             ret = env_copy.step(action)
-            if len(ret) == 5: # same thing here where DQN requires this but we can remove
-                obs_next, reward, terminated, truncated, info = ret
+            if len(ret) == 5:
+                obs_next, reward, terminated, truncated, _ = ret
                 done = bool(terminated or truncated)
             else:
-                obs_next, reward, done, info = ret
+                obs_next, reward, done, _ = ret
             self.inner_buffer.append((obs, action, reward, obs_next, done))
             obs = obs_next
             cum_reward += float(reward)
             if done:
-                ret_reset = env_copy.reset()
-                if isinstance(ret_reset, tuple):
-                    obs = ret_reset[0]
-                else:
-                    obs = ret_reset
+                # Episode ended early in imagination
+                break
         return obs, cum_reward
 
     def _get_model_from_agent(self, agent):
@@ -231,157 +248,115 @@ class AMBI(Algorithm):
         return inner_agent
 
     def _update_inner_agent(self, inner_agent):
+        """Update inner agent using collected imagined experience."""
         if not self.inner_buffer:
             return False
 
-        updated = False
-
         for _ in range(self.inner_updates_per_rollout):
-            # Try multiple update strategies for compatibility with different RL frameworks
-            # Strategy 1: Direct update() method (custom implementations)
-            try:
-                if hasattr(inner_agent, "update") and callable(inner_agent.update):
-                    inner_agent.update(self.inner_buffer)
-                    updated = True
-                    break
-            except Exception:
-                pass
+            # Strategy 1: Replay buffer + train() (stable-baselines3)
+            if hasattr(inner_agent, "replay_buffer") and hasattr(inner_agent, "train"):
+                for obs, action, reward, next_obs, done in self.inner_buffer:
+                    try:
+                        inner_agent.replay_buffer.add(obs, next_obs, action, reward, done, [{}])
+                    except (TypeError, ValueError):
+                        inner_agent.replay_buffer.add(obs, action, reward, next_obs, done)
 
-            # Strategy 2: learn() method (stable-baselines3 style)
-            try:
-                if hasattr(inner_agent, "learn") and callable(inner_agent.learn):
-                    inner_agent.learn(total_timesteps=len(self.inner_buffer))
-                    updated = True
-                    break
-            except Exception:
-                pass
+                if len(inner_agent.replay_buffer) > 0:
+                    inner_agent.train(gradient_steps=self.inner_updates_per_rollout)
+                    return True
 
-            # Strategy 3: Replay buffer + train() (stable-baselines3)
-            try:
-                if hasattr(inner_agent, "replay_buffer") and hasattr(
-                    inner_agent, "train"
-                ):
-                    for obs, action, reward, next_obs, done in self.inner_buffer:
-                        try:
-                            inner_agent.replay_buffer.add(
-                                obs, next_obs, action, reward, done, [{}]
-                            )
-                        except Exception:
-                            try:
-                                inner_agent.replay_buffer.add(
-                                    obs, action, reward, next_obs, done
-                                )
-                            except Exception:
-                                pass
+            # Strategy 2: Direct update() method (custom implementations)
+            if hasattr(inner_agent, "update") and callable(inner_agent.update):
+                inner_agent.update(self.inner_buffer)
+                return True
 
-                    if len(inner_agent.replay_buffer) > 0:
-                        inner_agent.train(gradient_steps=self.inner_updates_per_rollout)
-                        updated = True
-                        break
-            except Exception:
-                pass
+            # Strategy 3: Step-by-step updates (custom implementations)
+            if hasattr(inner_agent, "step") and callable(inner_agent.step):
+                for obs, action, reward, next_obs, done in self.inner_buffer:
+                    try:
+                        inner_agent.step(obs, action, reward, next_obs, None, done)
+                    except TypeError:
+                        inner_agent.step(obs, action, reward, next_obs, done)
+                return True
 
-            # Strategy 4: Step-by-step updates (custom implementations)
-            try:
-                if hasattr(inner_agent, "step") and callable(inner_agent.step):
-                    for obs, action, reward, next_obs, done in self.inner_buffer:
-                        try:
-                            inner_agent.step(obs, action, reward, next_obs, None, done)
-                        except Exception:
-                            try:
-                                inner_agent.step(obs, action, reward, next_obs, done)
-                            except Exception:
-                                pass
-                    updated = True
-                    break
-            except Exception:
-                pass
-
-        if not updated:
-            print(
-                "  Warning: Could not update inner agent - no compatible update method found"
-            )
-
-        return updated
+        print("Warning: Could not update inner agent - no compatible update method found")
+        return False
 
     def _add_to_replay_buffer(self, agent, obs, action, reward, next_obs, done):
         """Add a transition directly to the agent's replay buffer if it exists."""
         if hasattr(agent, "replay_buffer"):
             try:
-                try:
-                    agent.replay_buffer.add(obs, next_obs, action, reward, done, [{}])
-                except Exception:
-                    try:
-                        agent.replay_buffer.add(obs, action, reward, next_obs, done)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                agent.replay_buffer.add(obs, next_obs, action, reward, done, [{}])
+            except (TypeError, ValueError):
+                agent.replay_buffer.add(obs, action, reward, next_obs, done)
 
     def _update_outer_agent(self):
-        updated = False
+        """Update outer agent using real environment experience from replay buffer."""
+        # Strategy 1: Replay buffer + train() (stable-baselines3)
+        if hasattr(self.outer_agent, "replay_buffer") and hasattr(self.outer_agent, "train"):
+            if len(self.outer_agent.replay_buffer) > 0:
+                gradient_steps = min(50, len(self.outer_agent.replay_buffer))
+                self.outer_agent.train(gradient_steps=gradient_steps)
+                return True
 
-        # Try multiple update strategies for compatibility with different RL frameworks
-        # Strategy 1: Direct update() method (for custom implementations that need explicit data)
-        try:
-            if hasattr(self.outer_agent, "update") and callable(self.outer_agent.update):
-                # Some implementations might need explicit data, but most will use replay buffer
-                self.outer_agent.update([])
-                updated = True
-        except Exception:
-            pass
+        # Strategy 2: Direct update() method (custom implementations)
+        if hasattr(self.outer_agent, "update") and callable(self.outer_agent.update):
+            self.outer_agent.update([])
+            return True
 
-        # Strategy 2: learn() method (stable-baselines3 style)
-        if not updated:
-            try:
-                if hasattr(self.outer_agent, "learn") and callable(self.outer_agent.learn):
-                    self.outer_agent.learn(total_timesteps=0)
-                    updated = True
-            except Exception:
-                pass
-
-        # Strategy 3: Replay buffer + train() (stable-baselines3)
-        if not updated:
-            try:
-                if hasattr(self.outer_agent, "replay_buffer") and hasattr(
-                    self.outer_agent, "train"
-                ):
-                    if len(self.outer_agent.replay_buffer) > 0:
-                        # Use a reasonable number of gradient steps based on buffer size
-                        gradient_steps = min(50, len(self.outer_agent.replay_buffer))
-                        self.outer_agent.train(gradient_steps=gradient_steps)
-                        updated = True
-            except Exception:
-                pass
-
-        if not updated:
-            print(
-                "  Warning: Could not update outer agent - no compatible update method found"
-            )
-
-        return updated
+        print("Warning: Could not update outer agent - no compatible update method found")
+        return False
 
     def _make_model_env_copy(self):
+        """Create a copy of the environment for imagined rollouts."""
         try:
             env_copy = copy.deepcopy(self.env)
+            # Disable rendering for imagined rollouts
+            if hasattr(env_copy, 'render_mode'):
+                env_copy.render_mode = None
+            # Handle wrapped environments
+            unwrapped = env_copy
+            while hasattr(unwrapped, 'env'):
+                if hasattr(unwrapped, 'render_mode'):
+                    unwrapped.render_mode = None
+                unwrapped = unwrapped.env
+            if hasattr(unwrapped, 'render_mode'):
+                unwrapped.render_mode = None
             return env_copy, False, None
-        except Exception:
+        except (TypeError, AttributeError):
+            # Fallback: use snapshot/restore if deepcopy fails
             snapshot = _snapshot_env_state(self.env)
             return self.env, True, snapshot
 
     def learn(self, total_timesteps=10000):
+        """
+        Train the AMBI agent.
+
+        Uses inner loop imagination to improve action selection and outer loop
+        real experience to train the policy.
+
+        Args:
+            total_timesteps: Total number of timesteps to train for
+        """
         t = 0
         episodes = 0
-        
+        episode_step = 0
+        episode_reward = 0.0
+
+        print(f"\n{'='*60}")
+        print("AMBI TRAINING")
+        print(f"Timesteps: {total_timesteps:,} | Inner rollouts: {self.inner_rollouts} | Max episode steps: {self.max_episode_steps}")
+        print(f"{'='*60}\n")
+
         # Initialize environment and get initial observation
         reset_return = self.env.reset()
         if isinstance(reset_return, tuple):
             outer_obs, _info = reset_return
         else:
             outer_obs = reset_return
-        
+
         start_time = time.time()
-        
+
         while t < total_timesteps:
             # Create environment copy for inner imagined rollouts
             env_model_copy, uses_snapshot, snapshot = self._make_model_env_copy()
@@ -424,13 +399,14 @@ class AMBI(Algorithm):
                             obs_model = outer_obs
                     except Exception:
                         obs_model = outer_obs
-                
+
                 # Run imagined rollout and collect experience
                 final_obs, cum = self._run_inner_rollout_once(
-                    env_model_copy, inner_agent, obs_model
+                    env_model_copy, inner_agent, obs_model, episode_step
                 )
-                
-                # Update inner agent on imagined experience
+
+                # Update inner agent on imagined experience AFTER EACH ROLLOUT
+                # This allows the inner agent to improve across rollouts b=1..B
                 self._update_inner_agent(inner_agent)
             
             # Use inner agent to select action for real environment
@@ -455,46 +431,53 @@ class AMBI(Algorithm):
                     outer_obs,
                     real_action,
                     [terminated if "terminated" in locals() else False, done],
-                    [info],
+                    info,
                 )
                 self.alg_logger.on_step(data)
             
             # Add transition directly to outer agent's replay buffer
             self._add_to_replay_buffer(self.outer_agent, outer_obs, real_action, reward, outer_obs_next, done)
-            
+
             t += 1
+            episode_step += 1
+            episode_reward += reward
+
+            # Print progress every 100 timesteps
+            if t % 100 == 0:
+                elapsed = time.time() - start_time
+                steps_per_sec = t / elapsed if elapsed > 0 else 0
+                progress = 100 * t / total_timesteps
+                eta_min = (total_timesteps - t) / steps_per_sec / 60 if steps_per_sec > 0 else 0
+                print(f"[{t:,}/{total_timesteps:,}] {progress:.1f}% | Episodes: {episodes} | {steps_per_sec:.1f} steps/s | ETA: {eta_min:.1f}m")
+
             outer_obs = outer_obs_next
-            
+
             # Handle episode termination
             if done:
                 episodes += 1
-                
-                # Update outer agent periodically
-                if episodes % self.outer_update_frequency == 0:
-                    self._update_outer_agent()
-                
+                print(f"Episode {episodes} complete | Steps: {episode_step} | Return: {episode_reward:.2f} | Timestep: {t:,}")
+
+                episode_step = 0
+                episode_reward = 0.0
+
+                # Update outer agent after each episode
+                self._update_outer_agent()
+
                 # Reset environment for next episode
                 reset_return = self.env.reset()
                 if isinstance(reset_return, tuple):
                     outer_obs, _info = reset_return
                 else:
                     outer_obs = reset_return
-            
-            # Periodic outer updates during long episodes
-            if t % (self.outer_update_frequency * self.max_episode_steps) == 0:
-                self._update_outer_agent()
-            
+
             if self.render:
-                try:
-                    self.env.render()
-                except Exception:
-                    pass
-        
+                self.env.render()
+
         # Final update
         self._update_outer_agent()
-        
+
         total_time = time.time() - start_time
-        print(
-            f"AMBI Training completed in {total_time:.2f} seconds over {episodes} episodes and {t} timesteps."
-        )
+        print(f"\n{'='*60}")
+        print(f"Training complete | {total_time:.1f}s | {episodes} episodes | {t:,} timesteps")
+        print(f"{'='*60}\n")
         return self.outer_agent
