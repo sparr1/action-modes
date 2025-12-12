@@ -50,7 +50,7 @@ echo ""
 
 # Run the training script
 echo "Starting AMBI training..."
-python train_ambi_experiment.py
+python main.py --run configs/experiments/AntAMBI.json
 if [ $? -ne 0 ]; then
     echo "ERROR: Training script failed"
     exit 1

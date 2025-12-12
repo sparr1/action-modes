@@ -22,6 +22,7 @@ def _snapshot_env_state(env):
                 pass
     return None
 
+
 def _restore_env_state(env, state):
     """Restore environment to a previously captured state."""
     if state is None:
@@ -29,21 +30,31 @@ def _restore_env_state(env, state):
     try:
         sim = getattr(env, "sim", None)
         if sim is not None:
-            sim.set_state(state)
+            if hasattr(state, "qpos") and hasattr(state, "qvel"):
+                sim.set_state(state.qpos, state.qvel)
+            else:
+                sim.set_state(state)
             if hasattr(sim, "forward"):
                 try:
                     sim.forward()
                 except (AttributeError, RuntimeError):
                     pass
             return True
-    except (AttributeError, RuntimeError):
+    except (AttributeError, RuntimeError, TypeError):
         pass
     for fn in ("set_state", "_set_state", "set_state_vector"):
         if hasattr(env, fn):
             try:
-                getattr(env, fn)(state)
+                if (
+                    fn == "set_state"
+                    and hasattr(state, "qpos")
+                    and hasattr(state, "qvel")
+                ):
+                    getattr(env, fn)(state.qpos, state.qvel)
+                else:
+                    getattr(env, fn)(state)
                 return True
-            except (AttributeError, RuntimeError):
+            except (AttributeError, RuntimeError, TypeError):
                 pass
     return False
 
@@ -67,6 +78,7 @@ class AMBI(Algorithm):
             - max_episode_steps: Maximum steps per episode (default: 250)
             - seed_episodes: Number of random episodes to initialize buffer (default: 0)
     """
+
     def __init__(self, name, env, custom_params=None):
         super().__init__(name, env, custom_params=custom_params)
         cp = custom_params or {}
@@ -90,7 +102,9 @@ class AMBI(Algorithm):
         if self.outer_alg_str is None:
             raise ValueError("AMBI requires 'outer_alg' string in custom_params")
 
-        self.outer_agent = self.get_outer_model(self.outer_alg_str, env, self.outer_alg_params)
+        self.outer_agent = self.get_outer_model(
+            self.outer_alg_str, env, self.outer_alg_params
+        )
 
         # Inner buffer for imagined experience (outer agent manages its own replay buffer)
         self.inner_buffer = []
@@ -102,7 +116,11 @@ class AMBI(Algorithm):
         self._persistent_inner = None
 
     def get_model(self):
-        return self.outer_agent.get_model() if hasattr(self.outer_agent, 'get_model') else self.outer_agent
+        return (
+            self.outer_agent.get_model()
+            if hasattr(self.outer_agent, "get_model")
+            else self.outer_agent
+        )
 
     def get_outer_model(self, alg_str, env, alg_params):
         _outer = utils_core.initialize_alg(alg_str, alg_params, env)
@@ -141,7 +159,9 @@ class AMBI(Algorithm):
                 else:
                     obs_next, reward, done, _ = ret
 
-                self._add_to_replay_buffer(self.outer_agent, obs, action, reward, obs_next, done)
+                self._add_to_replay_buffer(
+                    self.outer_agent, obs, action, reward, obs_next, done
+                )
                 total_transitions += 1
 
                 obs = obs_next
@@ -151,18 +171,18 @@ class AMBI(Algorithm):
 
     def set_logger(self, logger):
         self.alg_logger = logger
-        if hasattr(self.outer_agent, 'set_logger'):
+        if hasattr(self.outer_agent, "set_logger"):
             self.outer_agent.set_logger(logger)
 
     def predict(self, obs):
         return self.outer_agent.predict(obs)
 
     def save(self, save_path, name):
-        if hasattr(self.outer_agent, 'save'):
+        if hasattr(self.outer_agent, "save"):
             self.outer_agent.save(save_path, name)
 
     def load(self, load_path):
-        if hasattr(self.outer_agent, 'load'):
+        if hasattr(self.outer_agent, "load"):
             self.outer_agent.load(load_path)
 
     def _run_inner_rollout_once(self, env_copy, inner_agent, init_obs, current_step):
@@ -252,17 +272,25 @@ class AMBI(Algorithm):
         if not self.inner_buffer:
             return False
 
+        model = inner_agent.model if hasattr(inner_agent, "model") else inner_agent
+
         for _ in range(self.inner_updates_per_rollout):
             # Strategy 1: Replay buffer + train() (stable-baselines3)
-            if hasattr(inner_agent, "replay_buffer") and hasattr(inner_agent, "train"):
+            if hasattr(model, "replay_buffer") and hasattr(model, "train"):
                 for obs, action, reward, next_obs, done in self.inner_buffer:
                     try:
-                        inner_agent.replay_buffer.add(obs, next_obs, action, reward, done, [{}])
+                        model.replay_buffer.add(
+                            obs, next_obs, action, reward, done, [{}]
+                        )
                     except (TypeError, ValueError):
-                        inner_agent.replay_buffer.add(obs, action, reward, next_obs, done)
+                        model.replay_buffer.add(obs, action, reward, next_obs, done)
 
-                if len(inner_agent.replay_buffer) > 0:
-                    inner_agent.train(gradient_steps=self.inner_updates_per_rollout)
+                if model.replay_buffer.size() > 0:
+                    if not hasattr(model, "_logger"):
+                        from stable_baselines3.common.logger import configure
+
+                        model._logger = configure(folder=None, format_strings=[])
+                    model.train(gradient_steps=self.inner_updates_per_rollout)
                     return True
 
             # Strategy 2: Direct update() method (custom implementations)
@@ -279,7 +307,9 @@ class AMBI(Algorithm):
                         inner_agent.step(obs, action, reward, next_obs, done)
                 return True
 
-        print("Warning: Could not update inner agent - no compatible update method found")
+        print(
+            "Warning: Could not update inner agent - no compatible update method found"
+        )
         return False
 
     def _add_to_replay_buffer(self, agent, obs, action, reward, next_obs, done):
@@ -293,10 +323,19 @@ class AMBI(Algorithm):
     def _update_outer_agent(self):
         """Update outer agent using real environment experience from replay buffer."""
         # Strategy 1: Replay buffer + train() (stable-baselines3)
-        if hasattr(self.outer_agent, "replay_buffer") and hasattr(self.outer_agent, "train"):
-            if len(self.outer_agent.replay_buffer) > 0:
-                gradient_steps = min(50, len(self.outer_agent.replay_buffer))
-                self.outer_agent.train(gradient_steps=gradient_steps)
+        model = (
+            self.outer_agent.model
+            if hasattr(self.outer_agent, "model")
+            else self.outer_agent
+        )
+        if hasattr(model, "replay_buffer") and hasattr(model, "train"):
+            if model.replay_buffer.size() > 0:
+                gradient_steps = min(50, model.replay_buffer.size())
+                if not hasattr(model, "_logger"):
+                    from stable_baselines3.common.logger import configure
+
+                    model._logger = configure(folder=None, format_strings=[])
+                model.train(gradient_steps=gradient_steps)
                 return True
 
         # Strategy 2: Direct update() method (custom implementations)
@@ -304,7 +343,9 @@ class AMBI(Algorithm):
             self.outer_agent.update([])
             return True
 
-        print("Warning: Could not update outer agent - no compatible update method found")
+        print(
+            "Warning: Could not update outer agent - no compatible update method found"
+        )
         return False
 
     def _make_model_env_copy(self):
@@ -312,15 +353,15 @@ class AMBI(Algorithm):
         try:
             env_copy = copy.deepcopy(self.env)
             # Disable rendering for imagined rollouts
-            if hasattr(env_copy, 'render_mode'):
+            if hasattr(env_copy, "render_mode"):
                 env_copy.render_mode = None
             # Handle wrapped environments
             unwrapped = env_copy
-            while hasattr(unwrapped, 'env'):
-                if hasattr(unwrapped, 'render_mode'):
+            while hasattr(unwrapped, "env"):
+                if hasattr(unwrapped, "render_mode"):
                     unwrapped.render_mode = None
                 unwrapped = unwrapped.env
-            if hasattr(unwrapped, 'render_mode'):
+            if hasattr(unwrapped, "render_mode"):
                 unwrapped.render_mode = None
             return env_copy, False, None
         except (TypeError, AttributeError):
@@ -345,7 +386,9 @@ class AMBI(Algorithm):
 
         print(f"\n{'='*60}")
         print("AMBI TRAINING")
-        print(f"Timesteps: {total_timesteps:,} | Inner rollouts: {self.inner_rollouts} | Max episode steps: {self.max_episode_steps}")
+        print(
+            f"Timesteps: {total_timesteps:,} | Inner rollouts: {self.inner_rollouts} | Max episode steps: {self.max_episode_steps}"
+        )
         print(f"{'='*60}\n")
 
         # Initialize environment and get initial observation
@@ -360,7 +403,7 @@ class AMBI(Algorithm):
         while t < total_timesteps:
             # Create environment copy for inner imagined rollouts
             env_model_copy, uses_snapshot, snapshot = self._make_model_env_copy()
-            
+
             # Initialize or reuse inner agent (reinitializes each step by default)
             if self.inner_reinit_every_step:
                 inner_agent = self._build_inner_agent(env_model_copy)
@@ -368,10 +411,10 @@ class AMBI(Algorithm):
                 if self._persistent_inner is None:
                     self._persistent_inner = self._build_inner_agent(env_model_copy)
                 inner_agent = self._persistent_inner
-            
+
             # Clear inner buffer for new imagined rollouts
             self.inner_buffer = []
-            
+
             # Run multiple imagined rollouts from current state
             for b in range(self.inner_rollouts):
                 # Reset inner environment to current outer environment state
@@ -408,14 +451,14 @@ class AMBI(Algorithm):
                 # Update inner agent on imagined experience AFTER EACH ROLLOUT
                 # This allows the inner agent to improve across rollouts b=1..B
                 self._update_inner_agent(inner_agent)
-            
+
             # Use inner agent to select action for real environment
             try:
                 real_action, _ = inner_agent.predict(outer_obs)
             except Exception:
                 # Fallback to outer agent if inner agent fails
                 real_action, _ = self.outer_agent.predict(outer_obs)
-            
+
             # Execute action in real environment
             ret = self.env.step(real_action)
             if len(ret) == 5:
@@ -423,7 +466,7 @@ class AMBI(Algorithm):
                 done = bool(terminated or truncated)
             else:
                 outer_obs_next, reward, done, info = ret
-            
+
             # Log step data if logger is configured
             if self.alg_logger:
                 data = setup_logs(
@@ -434,9 +477,11 @@ class AMBI(Algorithm):
                     info,
                 )
                 self.alg_logger.on_step(data)
-            
+
             # Add transition directly to outer agent's replay buffer
-            self._add_to_replay_buffer(self.outer_agent, outer_obs, real_action, reward, outer_obs_next, done)
+            self._add_to_replay_buffer(
+                self.outer_agent, outer_obs, real_action, reward, outer_obs_next, done
+            )
 
             t += 1
             episode_step += 1
@@ -447,15 +492,23 @@ class AMBI(Algorithm):
                 elapsed = time.time() - start_time
                 steps_per_sec = t / elapsed if elapsed > 0 else 0
                 progress = 100 * t / total_timesteps
-                eta_min = (total_timesteps - t) / steps_per_sec / 60 if steps_per_sec > 0 else 0
-                print(f"[{t:,}/{total_timesteps:,}] {progress:.1f}% | Episodes: {episodes} | {steps_per_sec:.1f} steps/s | ETA: {eta_min:.1f}m")
+                eta_min = (
+                    (total_timesteps - t) / steps_per_sec / 60
+                    if steps_per_sec > 0
+                    else 0
+                )
+                print(
+                    f"[{t:,}/{total_timesteps:,}] {progress:.1f}% | Episodes: {episodes} | {steps_per_sec:.1f} steps/s | ETA: {eta_min:.1f}m"
+                )
 
             outer_obs = outer_obs_next
 
             # Handle episode termination
             if done:
                 episodes += 1
-                print(f"Episode {episodes} complete | Steps: {episode_step} | Return: {episode_reward:.2f} | Timestep: {t:,}")
+                print(
+                    f"Episode {episodes} complete | Steps: {episode_step} | Return: {episode_reward:.2f} | Timestep: {t:,}"
+                )
 
                 episode_step = 0
                 episode_reward = 0.0
@@ -478,6 +531,8 @@ class AMBI(Algorithm):
 
         total_time = time.time() - start_time
         print(f"\n{'='*60}")
-        print(f"Training complete | {total_time:.1f}s | {episodes} episodes | {t:,} timesteps")
+        print(
+            f"Training complete | {total_time:.1f}s | {episodes} episodes | {t:,} timesteps"
+        )
         print(f"{'='*60}\n")
         return self.outer_agent
