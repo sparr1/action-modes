@@ -20,12 +20,21 @@ my_domains = {
             "humanoid_plane": "humanoid_plane",
             "humanoid": "Humanoid-v4",
             "variable_ant": "VarLegsAnt-v0",
-            "variable_ant_plane": "variable_ant_plane"
+            "variable_ant_plane": "variable_ant_plane",
+            "2ant": "2AntMaze-v0",
+            "4ant": "4AntMaze-v0",
+            "6ant": "6AntMaze-v0",
+            "8ant": "8AntMaze-v0",
+            "my_ant":"MyAntMaze-v0",
+            "2ant_dense": "2AntMazeDense-v0",
+            "4ant_dense": "4AntMazeDense-v0",
+            "6ant_dense": "6AntMazeDense-v0",
+            "8ant_dense": "8AntMazeDense-v0"
 }
 
 train_env_params = {
-                    "id": my_domains["ant_plane"],
-                    "exclude_current_positions_from_observation":False,
+                    "id": my_domains["ant_dense"],
+                    # "exclude_current_positions_from_observation":False,
                     "max_episode_steps":400,
                     # "render_mode": "human",
                     # "num_legs":8
@@ -83,11 +92,11 @@ test_env_params = train_env_params.copy()
 # test_objective_params = change_objective_params.copy()
 test_env_params["render_mode"] = "human"
 
-train_env = prepare_env(train_env_params, "move", move_objective_params)
-test_env = prepare_env(test_env_params, "move", move_objective_params)
+# train_env = prepare_env(train_env_params, "move", move_objective_params)
+# test_env = prepare_env(test_env_params, "move", move_objective_params)
 
-# train_env = prepare_env(train_env_params)
-# test_env = prepare_env(test_env_params)
+train_env = prepare_env(train_env_params)
+test_env = prepare_env(test_env_params)
 
 print(train_env.observation_space)
 print(train_env.action_space)
@@ -111,7 +120,7 @@ model = Baseline("SAC", train_env, params = params)
 
 # model.load("logs/AntPlaneRotateNew_2024-10-10_16-22-19/models/model:AntSAC_0")
 # model.load("models/AntPlaneMoveFinalNew3/model:AntSAC_1")
-model.load("models/AntPlaneMoveY/model:AntSAC_2")
+# model.load("models/AntPlaneMoveY/model:AntSAC_2")
 
 # model.load("models/HumanoidMoveResets5xSR1.0/model:HumanoidSAC-B1M_0")
 # model.load("models/HumanoidMoveResets0.75xTR1.0/model:HumanoidSAC-2x_0_9000000_steps")

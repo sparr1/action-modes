@@ -221,5 +221,10 @@ class ModalAlg(Algorithm):
 
         # np.save(os.path.join(dir, title + "{}".format(str(seed))),returns)
         # self.orchestrator.model.learn(**kwargs)
+
+    #TODO expand the ModalAlg save and load functions to store and retrieve the ModalControllers as well.
     def save(self, path, name):
         self.orchestrator.model.save(path, name)
+
+    def load(self, path):
+        self.orchestrator.model.load(path)

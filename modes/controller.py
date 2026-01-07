@@ -109,10 +109,10 @@ class ModalController(Controller):
             return {'achieved_goal':obs['achieved_goal'], 'observation': obs['observation']}
 
 class OrchestralController(Controller):
-    def __init__(self, controller_config, domain, orchestral_action_space, sub_controllers = []):
+    def __init__(self, controller_config, domain, orchestral_action_space):
         super().__init__(controller_config, domain)
-        self.sub_controllers = sub_controllers
-        self.supports = [c.support_func for c in sub_controllers]
+        self.sub_controllers = []
+        self.supports = []
         self.orchestral_action_space = orchestral_action_space
         # self.base_action_space = self.controller_settings["base_action_space"]
         # self.base_observation_space = self.controller_settings["base_observation_space"]

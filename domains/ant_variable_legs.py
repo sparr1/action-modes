@@ -11,107 +11,12 @@ DEFAULT_CAMERA_CONFIG = {
     "distance": 4.0,
 }
 
-
-class AntVariableLegsEnv(MujocoEnv, utils.EzPickle):
-    metadata = {
-        "render_modes": [
-            "human",
-            "rgb_array",
-            "depth_array",
-        ],
-        "render_fps": 20,
-    }
-
-    def __init__(
-        self,
-        xml_file="ant_variable_legs.xml",
-        ctrl_cost_weight=0.5,
-        contact_cost_weight=5e-4,
-        healthy_reward=1.0,
-        terminate_when_unhealthy=True,
-        healthy_z_range=(0.3,2.5),
-        contact_force_range=(-1.0, 1.0),
-        reset_noise_scale=0.1,
-        exclude_current_positions_from_observation=True,
-        num_legs=4,
-        **kwargs
-    ):
-        utils.EzPickle.__init__(
-            self,
-            xml_file,
-            ctrl_cost_weight,
-            contact_cost_weight,
-            healthy_reward,
-            terminate_when_unhealthy,
-            healthy_z_range,
-            contact_force_range,
-            reset_noise_scale,
-            exclude_current_positions_from_observation,
-            num_legs,
-            **kwargs
-        )
-
-        self.num_legs = num_legs
-        
-        # Adjust control cost weight based on number of legs
-        # For the original ant with 4 legs, keep the same control cost weight
-        # For more legs, scale it down to balance the increased action space
-        if num_legs > 4:
-            self._ctrl_cost_weight = ctrl_cost_weight * 4 / num_legs
-        else:
-            self._ctrl_cost_weight = ctrl_cost_weight
-            
-        self._contact_cost_weight = contact_cost_weight
-
-        self._healthy_reward = healthy_reward
-        self._terminate_when_unhealthy = terminate_when_unhealthy
-        self._healthy_z_range = healthy_z_range
-
-        self._contact_force_range = contact_force_range
-
-        self._reset_noise_scale = reset_noise_scale
-
-        self._exclude_current_positions_from_observation = (
-            exclude_current_positions_from_observation
-        )
-        
-        # Store paths for XML files
-        self.xml_template = os.path.join(os.path.dirname(__file__), "assets", "ant_variable_legs_template.xml")
-        self.xml_file = os.path.join(os.path.dirname(__file__), "assets", xml_file)
-        
-        # Create template if it doesn't exist
-        if not os.path.exists(self.xml_template):
-            shutil.copy2(self.xml_file, self.xml_template)
-        
-        # Set up the environment with the specified number of legs
-        self._set_num_legs(num_legs)
-        
-        observation_space = Box(
-            low=-np.inf, high=np.inf, shape=(self._get_obs_dim(),), dtype=np.float64
-        )
-        
-        MujocoEnv.__init__(
-            self,
-            self.xml_file,
-            5,
-            observation_space=observation_space,
-            default_camera_config=DEFAULT_CAMERA_CONFIG,
-            **kwargs
-        )
-
-    def _get_obs_dim(self):
-        # 27 base dimensions + additional dimensions for each leg beyond 4
-        if self._exclude_current_positions_from_observation:
-            return 27 + (self.num_legs - 4) * 4
-        else:
-            return 29 + (self.num_legs - 4) * 4
-
-    def _set_num_legs(self, num_legs):
+def set_num_legs(xml_template, xml_file, num_legs):
         # Reset XML file from template
-        shutil.copy2(self.xml_template, self.xml_file)
+        shutil.copy2(xml_template, xml_file)
         
         # Parse the XML
-        tree = ET.parse(self.xml_file)
+        tree = ET.parse(xml_file)
         root = tree.getroot()
         
         # Update number of legs in custom data
@@ -210,7 +115,102 @@ class AntVariableLegsEnv(MujocoEnv, utils.EzPickle):
             actuators.append(ankle_motor)
         
         # Save the modified XML
-        tree.write(self.xml_file)
+        tree.write(xml_file)
+
+class AntVariableLegsEnv(MujocoEnv, utils.EzPickle):
+    metadata = {
+        "render_modes": [
+            "human",
+            "rgb_array",
+            "depth_array",
+        ],
+        "render_fps": 20,
+    }
+
+    def __init__(
+        self,
+        xml_file="ant_variable_legs.xml",
+        ctrl_cost_weight=0.5,
+        contact_cost_weight=5e-4,
+        healthy_reward=1.0,
+        terminate_when_unhealthy=True,
+        healthy_z_range=(0.3,2.5),
+        contact_force_range=(-1.0, 1.0),
+        reset_noise_scale=0.1,
+        exclude_current_positions_from_observation=True,
+        num_legs=4,
+        **kwargs
+    ):
+        utils.EzPickle.__init__(
+            self,
+            xml_file,
+            ctrl_cost_weight,
+            contact_cost_weight,
+            healthy_reward,
+            terminate_when_unhealthy,
+            healthy_z_range,
+            contact_force_range,
+            reset_noise_scale,
+            exclude_current_positions_from_observation,
+            num_legs,
+            **kwargs
+        )
+
+        self.num_legs = num_legs
+        
+        # Adjust control cost weight based on number of legs
+        # For the original ant with 4 legs, keep the same control cost weight
+        # For more legs, scale it down to balance the increased action space
+        if num_legs > 4:
+            self._ctrl_cost_weight = ctrl_cost_weight * 4 / num_legs
+        else:
+            self._ctrl_cost_weight = ctrl_cost_weight
+            
+        self._contact_cost_weight = contact_cost_weight
+
+        self._healthy_reward = healthy_reward
+        self._terminate_when_unhealthy = terminate_when_unhealthy
+        self._healthy_z_range = healthy_z_range
+
+        self._contact_force_range = contact_force_range
+
+        self._reset_noise_scale = reset_noise_scale
+
+        self._exclude_current_positions_from_observation = (
+            exclude_current_positions_from_observation
+        )
+        
+        # Store paths for XML files
+        # self.xml_template = os.path.join(os.path.dirname(__file__), "assets", "ant_variable_legs_template.xml")
+        self.xml_file = os.path.join(os.path.dirname(__file__), "assets", xml_file)
+        
+        # Create template if it doesn't exist
+        # if not os.path.exists(self.xml_template):
+        #     shutil.copy2(self.xml_file, self.xml_template)
+        
+        # Set up the environment with the specified number of legs
+        # self._set_num_legs(num_legs)
+        
+        observation_space = Box(
+            low=-np.inf, high=np.inf, shape=(self._get_obs_dim(),), dtype=np.float64
+        )
+        
+        MujocoEnv.__init__(
+            self,
+            self.xml_file,
+            5,
+            observation_space=observation_space,
+            default_camera_config=DEFAULT_CAMERA_CONFIG,
+            **kwargs
+        )
+
+    def _get_obs_dim(self):
+        # 27 base dimensions + additional dimensions for each leg beyond 4
+        if self._exclude_current_positions_from_observation:
+            return 27 + (self.num_legs - 4) * 4
+        else:
+            return 29 + (self.num_legs - 4) * 4
+
 
     def control_cost(self, action):
         control_cost = self._ctrl_cost_weight * np.sum(np.square(action))

@@ -433,14 +433,14 @@ class MoveRotateSupportClassifier(SupportClassifier):
     def rule(self, observation):
         valid_z = check_z_range(observation, self.z_range, self.z_coord)
         valid_speed = check_speed(observation, self.speed_range, self.vel_offset)
-        print("xyz",observation[-4:-2], observation[0])
-        print("goal",observation[-2:])
-        print("valid_z", valid_z)
-        print("speed", get_speed(observation, self.vel_offset))
-        print("valid_speed", valid_speed)
-        print(len(observation))
-        print(np.sum(observation))
-        print(observation)
+        # print("xyz",observation[-4:-2], observation[0])
+        # print("goal",observation[-2:])
+        # print("valid_z", valid_z)
+        # print("speed", get_speed(observation, self.vel_offset))
+        # print("valid_speed", valid_speed)
+        # print(len(observation))
+        # print(np.sum(observation))
+        # print(observation)
         return valid_z and valid_speed 
 
 class ChangeZSupportClassifier(SupportClassifier):
@@ -453,3 +453,7 @@ class ChangeZSupportClassifier(SupportClassifier):
 
     def rule(self, observation):
         return check_speed(observation, self.speed_range)
+    
+
+
+

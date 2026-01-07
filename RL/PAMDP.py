@@ -192,7 +192,7 @@ class PAMDP(Algorithm):
         del self.model
 
     def load(self, path):#requires retrieving the correct baseline model before loading weights
-        self.model = self.model.load(path)
+        self.model = self.model.load_models(path)
 
 
 #

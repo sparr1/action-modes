@@ -101,8 +101,8 @@ if __name__ == "__main__":
     # results = compute_rewards("Ant_2025-10-09_11-56-13", rolling_window=1)
     # graph_rewards(results, "rewards", "Ant (no maze) 1M timesteps, n=5", buckets = False)
 
-    results = compute_rewards("MazeModesv2_2025-11-07_14-43-56", rolling_window=25)
-    graph_rewards(results, "rewards", "Ant (no maze) 1M timesteps, n=5", buckets = False)
+    results = compute_rewards("MazeModesv2_2025-12-09_14-35-38", rolling_window=25)
+    graph_rewards(results, "rewards", "AntMaze 2M timesteps, n=5", buckets = False)
 
     # results = compute_rewards("AntPlaneMove_2024-09-10_12-12-12")
     # graph_rewards(results, "AntPlaneMove 1M (full vec vel reward, reduced action-cost) n=5")
