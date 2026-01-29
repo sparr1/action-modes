@@ -24,7 +24,7 @@ def _snapshot_env_state(env):
 
 
 def _restore_env_state(env, state):
-    """Restore environment to a previously captured state."""
+    """Restore environment to a previously captured state.""" #TODO restore_env_state is not restoring env state
     if state is None:
         return False
     try:
@@ -425,7 +425,7 @@ class AMBI(Algorithm):
                         obs_model = reset_return[0]
                     else:
                         obs_model = reset_return
-                    obs_model = outer_obs
+                    obs_model = outer_obs #TODO incorrect
                 else:
                     try:
                         # Snapshot current outer env state and restore in inner env
