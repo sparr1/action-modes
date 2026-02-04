@@ -2,6 +2,7 @@ import copy, time
 from RL.alg import Algorithm
 from utils import core as utils_core
 from utils.utils import setup_logs
+from stable_baselines3.common.utils import configure_logger
 
 
 def _snapshot_env_state(env):
@@ -66,6 +67,13 @@ def _get_sb3_model(agent):
     return agent.model if hasattr(agent, "model") else agent
 
 
+def _setup_sb3_logger(agent):
+    """Set up SB3 logger on agent so .train() can be called directly."""
+    model = _get_sb3_model(agent)
+    if not hasattr(model, '_logger') or model._logger is None:
+        model.set_logger(configure_logger(verbose=0))
+
+
 class AMBI(Algorithm):
     """Adaptive Model-Based Imagined trajectories (AMBI).
     Implements Algorithm 2: Anytime model-based pi-improvement w/ env as model."""
@@ -92,6 +100,7 @@ class AMBI(Algorithm):
 
         # Alg line 6: RL_alg_o <- SAC.init()
         self.outer_agent = self._init_agent(self.outer_alg_str, env, self.outer_alg_params)
+        _setup_sb3_logger(self.outer_agent)
 
         # Alg line 4: Initialize inner env env_i (deepcopy once, re-synced per episode)
         self.env_i = copy.deepcopy(self.env)
@@ -259,6 +268,7 @@ class AMBI(Algorithm):
                 self._inner_agent = self._init_agent(
                     self.inner_alg_str, self.env_i, self.inner_alg_params
                 )
+                _setup_sb3_logger(self._inner_agent)
 
             episode_reward = 0.
             episode_transitions = []
