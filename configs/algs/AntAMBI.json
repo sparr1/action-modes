@@ -1,7 +1,7 @@
 {
     "seed": 55,
     "env": "Ant-v4",
-    "alg": "AMBI/AMBI",
+    "alg": "AMBIMujoco/AMBI",
     "device": "cuda",
     "alg_params": {
         "outer_alg": "baselines/SAC",
