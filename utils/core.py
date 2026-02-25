@@ -7,7 +7,7 @@ SUPPORTED_WRAPPERS = ("Subtask", "AntPlane", "ScaledStateWrapper", "PlatformFlat
 SUPPORTED_LOG_SETTINGS = ("overwrite", "warn", "timestamp", "overwrite-safe")
 SUPPORTED_LOG_TYPES = ("detailed", "summary")
 
-def initialize_alg(alg_string, alg_params, domain, custom_action_space = None):
+def initialize_alg(alg_string, alg_params, domain, custom_action_space = None, full_run_params=None, experiment_params=None):
     baseline = False
     if '/' in alg_string:
         file_name, alg_name = "".join(alg_string.split('/')[:-1]), alg_string.split('/')[-1]
@@ -37,13 +37,13 @@ def initialize_alg(alg_string, alg_params, domain, custom_action_space = None):
                 print(e)
                 return
         else:
-            try:
-                module = importlib.import_module("RL."+file_name.replace('/','.')) #last ditch, just try to load it!
-                alg_class = getattr(module, alg_name)
-                model = alg_class(alg_name, domain, alg_params)
-            except Exception as e:
-                print(e)
-                return #if we cannot run this baseline, we just try another.
+            # try:
+            module = importlib.import_module("RL."+file_name.replace('/','.')) #last ditch, just try to load it!
+            alg_class = getattr(module, alg_name)
+            model = alg_class(alg_name, domain, alg_params, full_run_params, experiment_params)
+            # except Exception as e:
+                # print(e)
+                # return #if we cannot run this baseline, we just try another.
     else:
         try:
             module = importlib.import_module("RL.alg")

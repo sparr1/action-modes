@@ -13,6 +13,7 @@
     "trials": 5,
     "configs": ["AntAMBI"],
     "logs": "timestamp",
-    "save_trials": "best"
+    "save_trials": "best",
+    "log_info": false
 }
 

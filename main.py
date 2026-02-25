@@ -178,7 +178,7 @@ def main():
             if ran_so_far == num_runs:
                 print("completed running", num_runs, "trials!")
                 quit()
-            model, baseline, alg_name = initialize_alg(run_params["alg"], run_params["alg_params"], domain)
+            model, baseline, alg_name = initialize_alg(run_params["alg"], run_params["alg_params"], domain, full_run_params=run_params, experiment_params=experiment_params)
             print(alg_name, "initialized.")
            
             if log_setting == "none":
@@ -186,7 +186,7 @@ def main():
             else:
                 trial_log_dir = experiment_log_dir + f'{alg_config}_{t}'
                 if os.path.exists(trial_log_dir):
-                    print("WARNING: trial log dir already existed!")
+                    print("WARNING: trial log dir alredy existed!")
                     if log_setting == "overwrite-safe":
                         print("quitting, as to continue would risk an overwrite.")
                         quit()

@@ -1,11 +1,277 @@
 import copy, time
 import numpy as np
+from stable_baselines3.common.logger import configure
+
 import torch.nn as nn
 from RL.alg import Algorithm
 from utils import core as utils_core
 from utils.utils import setup_logs
+from utils.core import *
+import torch
 import mujoco
+import gymnasium as gym
+import random
 
+######################################################## Testing code ########################################################
+
+def assert_sb3_weights_copied(
+    outer_agent,
+    inner_agent,
+    obs_sample=None,
+    *,
+    check_action=False,
+    deterministic=True,
+    atol=0.0,
+    rtol=0.0,
+):
+    def _unwrap_sb3_algo(agent):
+        # Handles your Baseline wrapper and raw SB3 objects
+        return agent.model if hasattr(agent, "model") else agent
+
+    def _get_policy(agent):
+        algo = _unwrap_sb3_algo(agent)
+        if not hasattr(algo, "policy"):
+            raise TypeError(
+                f"Expected an SB3 algorithm with `.policy`, got: {type(algo)}"
+            )
+        return algo.policy
+
+    outer_algo = _unwrap_sb3_algo(outer_agent)
+    inner_algo = _unwrap_sb3_algo(inner_agent)
+    outer_policy = _get_policy(outer_agent)
+    inner_policy = _get_policy(inner_agent)
+
+    errs = []
+
+    # 1) Compare policy state_dict keys
+    sd_out = outer_policy.state_dict()
+    sd_in = inner_policy.state_dict()
+
+    keys_out = list(sd_out.keys())
+    keys_in = list(sd_in.keys())
+
+    if keys_out != keys_in:
+        missing_in = [k for k in keys_out if k not in sd_in]
+        extra_in = [k for k in keys_in if k not in sd_out]
+        raise AssertionError(
+            "Policy state_dict key mismatch.\n"
+            f"Missing in inner: {missing_in[:20]}\n"
+            f"Extra in inner: {extra_in[:20]}"
+        )
+
+    # 2) Compare each tensor/buffer
+    for k in keys_out:
+        a = sd_out[k].detach().cpu()
+        b = sd_in[k].detach().cpu()
+
+        if a.shape != b.shape:
+            errs.append(f"{k}: shape mismatch {tuple(a.shape)} vs {tuple(b.shape)}")
+            continue
+
+        if not torch.allclose(a, b, atol=atol, rtol=rtol):
+            diff = (a - b).abs()
+            max_diff = diff.max().item()
+            idx = int(diff.view(-1).argmax().item())
+            av = a.view(-1)[idx].item()
+            bv = b.view(-1)[idx].item()
+            errs.append(
+                f"{k}: max_abs_diff={max_diff:.3e} at flat_idx={idx} "
+                f"(outer={av:.9g}, inner={bv:.9g})"
+            )
+
+    # 3) Optional: compare predicted actions on same obs
+    if check_action:
+        if obs_sample is None:
+            raise ValueError("obs_sample must be provided when check_action=True")
+
+        # convert torch obs to numpy if needed
+        if torch.is_tensor(obs_sample):
+            obs_np = obs_sample.detach().cpu().numpy()
+        else:
+            obs_np = np.array(obs_sample, copy=False)
+
+        # IMPORTANT: call predict on the SB3 algo object, not your wrapper (wrapper may not accept kwargs)
+        act_out, _ = outer_algo.predict(obs_np, deterministic=deterministic)
+        act_in, _ = inner_algo.predict(obs_np, deterministic=deterministic)
+
+        if not np.allclose(act_out, act_in, atol=max(atol, 1e-7), rtol=max(rtol, 1e-6)):
+            d = np.abs(act_out - act_in)
+            idx = int(np.argmax(d))
+            errs.append(
+                "predict() action mismatch: "
+                f"max_abs_diff={d.flat[idx]:.3e} at flat_idx={idx} "
+                f"(outer={act_out.flat[idx]:.9g}, inner={act_in.flat[idx]:.9g})"
+            )
+
+    if errs:
+        raise AssertionError(
+            "Outer/inner SB3 weights do NOT match after copy:\n- " + "\n- ".join(errs[:50])
+        )
+
+    return True
+
+def _debug_wrapper_type_chain(env):
+    """Return wrapper -> ... -> base env type names."""
+    types = []
+    cur = env
+    seen = set()
+    while True:
+        types.append(type(cur).__name__)
+        if not hasattr(cur, "env"):
+            break
+        nxt = cur.env
+        if id(nxt) in seen:  # just in case of a weird cycle
+            types.append("<cycle>")
+            break
+        seen.add(id(nxt))
+        cur = nxt
+    return types
+
+
+def _debug_get_wrapper_attr(env, name, default=None):
+    try:
+        if hasattr(env, "get_wrapper_attr"):
+            return env.get_wrapper_attr(name)
+    except Exception:
+        pass
+    return default
+
+
+def _debug_get_full_mujoco_state(env):
+    """Flattened MuJoCo FULLPHYSICS state as float64."""
+    uw = env.unwrapped
+    model, data = uw.model, uw.data
+    spec = mujoco.mjtState.mjSTATE_FULLPHYSICS
+    n = mujoco.mj_stateSize(model, spec)
+    x = np.empty(n, dtype=np.float64)
+    mujoco.mj_getState(model, data, x, spec)
+    return x
+
+
+def assert_envs_match_after_copy(
+    outer_env,
+    inner_env,
+    outer_obs=None,
+    *,
+    check_wrapper_stack=False,
+    check_outer_obs_vs_inner_raw=False,
+    atol=1e-6,
+    rtol=1e-5,
+):
+    errs = []
+
+    if check_wrapper_stack:
+        outer_chain = _debug_wrapper_type_chain(outer_env)
+        inner_chain = _debug_wrapper_type_chain(inner_env)
+        if outer_chain != inner_chain:
+            errs.append(
+                "Wrapper stack mismatch:\n"
+                f"  outer={outer_chain}\n"
+                f"  inner={inner_chain}"
+            )
+
+    try:
+        if outer_env.observation_space.shape != inner_env.observation_space.shape:
+            errs.append(
+                f"Observation space shape mismatch: "
+                f"{outer_env.observation_space.shape} vs {inner_env.observation_space.shape}"
+            )
+    except Exception as e:
+        errs.append(f"Could not compare observation spaces: {e}")
+
+    try:
+        if outer_env.action_space.shape != inner_env.action_space.shape:
+            errs.append(
+                f"Action space shape mismatch: "
+                f"{outer_env.action_space.shape} vs {inner_env.action_space.shape}"
+            )
+    except Exception as e:
+        errs.append(f"Could not compare action spaces: {e}")
+
+    try:
+        s_outer = _debug_get_full_mujoco_state(outer_env)
+        s_inner = _debug_get_full_mujoco_state(inner_env)
+        if s_outer.shape != s_inner.shape:
+            errs.append(f"MuJoCo state shape mismatch: {s_outer.shape} vs {s_inner.shape}")
+        else:
+            if not np.allclose(s_outer, s_inner, atol=atol, rtol=rtol):
+                diff = np.abs(s_outer - s_inner)
+                idx = int(np.argmax(diff))
+                errs.append(
+                    "MuJoCo FULLPHYSICS mismatch: "
+                    f"max_abs_diff={diff[idx]:.3e} at index {idx} "
+                    f"(outer={s_outer[idx]:.9g}, inner={s_inner[idx]:.9g})"
+                )
+    except Exception as e:
+        errs.append(f"Could not compare MuJoCo full state: {e}")
+
+    try:
+        qo = np.array(outer_env.unwrapped.data.qpos, copy=True)
+        qi = np.array(inner_env.unwrapped.data.qpos, copy=True)
+        if not np.allclose(qo, qi, atol=atol, rtol=rtol):
+            d = np.abs(qo - qi)
+            idx = int(np.argmax(d))
+            errs.append(
+                f"qpos mismatch: max_abs_diff={d[idx]:.3e} at index {idx} "
+                f"(outer={qo[idx]:.9g}, inner={qi[idx]:.9g})"
+            )
+    except Exception as e:
+        errs.append(f"Could not compare qpos: {e}")
+
+    try:
+        vo = np.array(outer_env.unwrapped.data.qvel, copy=True)
+        vi = np.array(inner_env.unwrapped.data.qvel, copy=True)
+        if not np.allclose(vo, vi, atol=atol, rtol=rtol):
+            d = np.abs(vo - vi)
+            idx = int(np.argmax(d))
+            errs.append(
+                f"qvel mismatch: max_abs_diff={d[idx]:.3e} at index {idx} "
+                f"(outer={vo[idx]:.9g}, inner={vi[idx]:.9g})"
+            )
+    except Exception as e:
+        errs.append(f"Could not compare qvel: {e}")
+
+    for k in ("_elapsed_steps", "_has_reset", "checked_step", "checked_reset", "checked_render"):
+        ov = _debug_get_wrapper_attr(outer_env, k, default="<missing>")
+        iv = _debug_get_wrapper_attr(inner_env, k, default="<missing>")
+        if ov != iv:
+            errs.append(f"Wrapper attr mismatch for {k}: outer={ov!r}, inner={iv!r}")
+
+    try:
+        if hasattr(outer_env.unwrapped, "_get_obs") and hasattr(inner_env.unwrapped, "_get_obs"):
+            raw_outer = np.array(outer_env.unwrapped._get_obs(), copy=True)
+            raw_inner = np.array(inner_env.unwrapped._get_obs(), copy=True)
+            if raw_outer.shape != raw_inner.shape:
+                errs.append(f"raw _get_obs shape mismatch: {raw_outer.shape} vs {raw_inner.shape}")
+            elif not np.allclose(raw_outer, raw_inner, atol=atol, rtol=rtol):
+                d = np.abs(raw_outer - raw_inner)
+                idx = int(np.argmax(d))
+                errs.append(
+                    f"raw _get_obs mismatch: max_abs_diff={d[idx]:.3e} at index {idx} "
+                    f"(outer={raw_outer[idx]:.9g}, inner={raw_inner[idx]:.9g})"
+                )
+
+            if outer_obs is not None and check_outer_obs_vs_inner_raw:
+                outer_obs_arr = np.array(outer_obs, copy=False)
+                if outer_obs_arr.shape != raw_inner.shape:
+                    errs.append(
+                        f"outer_obs vs inner raw obs shape mismatch: "
+                        f"{outer_obs_arr.shape} vs {raw_inner.shape}"
+                    )
+                elif not np.allclose(outer_obs_arr, raw_inner, atol=atol, rtol=rtol):
+                    d = np.abs(outer_obs_arr - raw_inner)
+                    idx = int(np.argmax(d))
+                    errs.append(
+                        f"outer_obs vs inner raw obs mismatch: max_abs_diff={d[idx]:.3e} at index {idx} "
+                        f"(outer_obs={outer_obs_arr[idx]:.9g}, inner_raw={raw_inner[idx]:.9g})"
+                    )
+    except Exception as e:
+        errs.append(f"Could not compare raw observations: {e}")
+
+    if errs:
+        raise AssertionError("Env copy mismatch after _set_env_state:\n- " + "\n- ".join(errs))
+
+######################################################## End testing code ########################################################
 
 def _snapshot_env_state(env):
     """Capture the current state of the environment for later restoration."""
@@ -27,7 +293,7 @@ def _snapshot_env_state(env):
     # PassiveEnvChecker flags are optional; mainly for overhead :contentReference[oaicite:8]{index=8}
     checked_step  = env.get_wrapper_attr("checked_step")  if hasattr(env, "get_wrapper_attr") else True
     checked_reset = env.get_wrapper_attr("checked_reset") if hasattr(env, "get_wrapper_attr") else True
-    checked_render= env.get_wrapper_attr("checked_render")if hasattr(env, "get_wrapper_attr") else True
+    checked_render= env.get_wrapper_attr("checked_render") if hasattr(env, "get_wrapper_attr") else True
 
     return {
         "mujoco": (mujoco_state, full_physics_spec),
@@ -41,8 +307,8 @@ def _snapshot_env_state(env):
     }
 
 
-def _restore_env_state(env, state):
-    """Restore environment to a previously captured state.""" #TODO restore_env_state is not restoring env state
+def _set_env_state(env, state):
+    """Set environment to a previously captured state."""
     unwrapped = env.unwrapped
     model, data = unwrapped.model, unwrapped.data
 
@@ -51,23 +317,44 @@ def _restore_env_state(env, state):
     mujoco.mj_forward(model, data)
 
     # Restore wrappers
-    if hasattr(env, "set_wrapper_attr"):
-        w = state["wrappers"]
-        if w.get("_elapsed_steps", None) is not None:
-            env.set_wrapper_attr("_elapsed_steps", int(w["_elapsed_steps"]))
-        if w.get("_has_reset", None) is not None:
-            env.set_wrapper_attr("_has_reset", bool(w["_has_reset"]))
+    w = state["wrappers"]
 
-        # Optional: avoid first-call checker overhead
-        for k in ("checked_step", "checked_reset", "checked_render"):
-            if k in w:
-                env.set_wrapper_attr(k, bool(w[k]))
+    if w.get("_elapsed_steps", None) is not None:
+        ok = _set_first_wrapper_attr_direct(env, "_elapsed_steps", int(w["_elapsed_steps"]))
+        if not ok:
+            raise RuntimeError("Could not restore _elapsed_steps on inner env wrapper chain")
 
+    if w.get("_has_reset", None) is not None:
+        _set_first_wrapper_attr_direct(env, "_has_reset", bool(w["_has_reset"]))
+
+    for k in ("checked_step", "checked_reset", "checked_render"):
+        if k in w:
+            _set_first_wrapper_attr_direct(env, k, bool(w[k]))
+
+
+def _set_first_wrapper_attr_direct(env, name, value):
+    """
+    Walk wrapper chain and set `name` on the first wrapper/object that has it.
+    Returns True if set, False otherwise.
+    """
+    cur = env
+    seen = set()
+    while True:
+        if hasattr(cur, name):
+            setattr(cur, name, value)
+            return True
+        if not hasattr(cur, "env"):
+            return False
+        nxt = cur.env
+        if id(nxt) in seen:
+            return False
+        seen.add(id(nxt))
+        cur = nxt
 
 
 class AMBI(Algorithm):
     """
-    Adaptive Model-Based Imagined trajectories (AMBI) Algorithm.
+    AMBI Algorithm.
 
     AMBI uses a two-loop structure:
     - Inner loop: Runs imagined rollouts from the current state to improve action selection
@@ -85,7 +372,7 @@ class AMBI(Algorithm):
             - seed_episodes: Number of random episodes to initialize buffer (default: 0)
     """
 
-    def __init__(self, name, env, custom_params=None):
+    def __init__(self, name, env, custom_params=None, run_params=None, experiment_params=None):
         super().__init__(name, env, custom_params=custom_params)
         cp = custom_params or {}
 
@@ -108,21 +395,43 @@ class AMBI(Algorithm):
         if self.outer_alg_str is None:
             raise ValueError("AMBI requires 'outer_alg' string in custom_params")
 
-        self.outer_agent = self.get_outer_model(
-            self.outer_alg_str, env, self.outer_alg_params
-        )
+        self.outer_agent, _, _ = utils_core.initialize_alg(self.outer_alg_str, self.outer_alg_params, env)
 
-        # Inner buffer for imagined experience (outer agent manages its own replay buffer)
-        self.inner_buffer = []
+        if not hasattr(self.outer_agent.model, "_logger"):
+            self.outer_agent.model._logger = configure(folder=None, format_strings=[])
+
+        # initialize inner env according to the outer env based on main.py
+        print("Initializing AMBI inner env")
+        alg_config = run_params["name"]        
+        random.seed(run_params['seed']) #is it really correct to do this in the loop with the outer experiment seed?
+        np.random.seed(run_params['seed'])
+        if "env_params" in experiment_params.keys():
+            self.inner_env = gym.make(run_params['env'], **experiment_params["env_params"])
+        else:
+            self.inner_env = gym.make(run_params['env']) #often overriden by experiment for consistency
+
+        # handle custom wrappers:
+        if "env_wrappers" in run_params:
+            for env_wrapper in run_params["env_wrappers"]: #wrappers will be applied first to last in the order of the list
+                if 'name' not in env_wrapper or env_wrapper['name'].split(':')[-1] not in SUPPORTED_WRAPPERS:
+                    raise Exception("wrappers misconfigured, or otherwise not currently supported")
+                wrapper_name = env_wrapper['name']
+                wrapper_params = env_wrapper['wrapper_params']
+                self.inner_env = setup_wrapper(self.inner_env, wrapper_name, wrapper_params)
+        
+        if "env_wrapper" in run_params:
+            if 'name' not in run_params['env_wrapper'] or run_params['env_wrapper']['name'].split(':')[-1] not in SUPPORTED_WRAPPERS:
+                raise Exception("wrapper misconfigured, or otherwise not currently supported")
+            wrapper_name = run_params['env_wrapper']['name']
+            wrapper_params = run_params['env_wrapper']["wrapper_params"]
+        
+            self.inner_env = setup_wrapper(self.inner_env, wrapper_name, wrapper_params)
+        self.inner_env.reset()
 
         if self.seed_episodes > 0:
             self._initialize_seed_episodes()
 
         self.alg_logger = None
-        self._persistent_inner = None
-
-        print(self.env)
-
 
     def get_model(self):
         return (
@@ -131,52 +440,21 @@ class AMBI(Algorithm):
             else self.outer_agent
         )
 
-    def get_outer_model(self, alg_str, env, alg_params):
-        _outer = utils_core.initialize_alg(alg_str, alg_params, env)
-        if isinstance(_outer, tuple) or isinstance(_outer, list):
-            try:
-                return _outer[0]
-            except Exception:
-                return _outer
-        else:
-            return _outer
-
-    def get_inner_model(self, alg_str, env, alg_params):
-        _inner = utils_core.initialize_alg(alg_str, alg_params, env)
-        if isinstance(_inner, tuple) or isinstance(_inner, list):
-            try:
-                return _inner[0]
-            except Exception:
-                return _inner
-        else:
-            return _inner
-
     def _initialize_seed_episodes(self):
         """Initialize outer agent replay buffer with random exploration."""
         print(f"Initializing {self.seed_episodes} seed episodes...")
         total_transitions = 0
         for _ in range(self.seed_episodes):
-            obs = self.env.reset()
-            if isinstance(obs, tuple):
-                obs, _ = obs
-            for _ in range(self.max_episode_steps):
-                action = self.env.action_space.sample()
-                ret = self.env.step(action)
-                if len(ret) == 5:
-                    obs_next, reward, terminated, truncated, _ = ret
-                    done = bool(terminated or truncated)
-                else:
-                    obs_next, reward, done, _ = ret
-
-                self._add_to_replay_buffer(
-                    self.outer_agent, obs, action, reward, obs_next, done
-                )
+            obs, _ = self.env.reset()
+            terminated = truncated = False
+            while not (terminated or truncated):
+                action, _ = self.outer_agent.predict(obs)
+                next_obs, reward, terminated, truncated, info = self.env.step(action)
+                done = bool(terminated or truncated)
+                self.outer_agent.model.replay_buffer.add(obs, next_obs, action, reward, done, [info])
+                obs = next_obs
                 total_transitions += 1
-
-                obs = obs_next
-                if done:
-                    break
-        print(f"✓ Buffer initialized with {total_transitions} transitions")
+        print(f"Buffer initialized with {total_transitions} transitions")
 
     def set_logger(self, logger):
         self.alg_logger = logger
@@ -194,203 +472,40 @@ class AMBI(Algorithm):
         if hasattr(self.outer_agent, "load"):
             self.outer_agent.load(load_path)
 
-    def _run_inner_rollout_once(self, env_copy, inner_agent, init_obs, current_step):
-        """Run imagined rollout from current step to end of episode (T).
-
-        Args:
-            env_copy: Copy of the environment for imagination
-            inner_agent: Inner agent to use for predictions
-            init_obs: Initial observation (current outer observation)
-            current_step: Current timestep in outer episode (t)
-        """
+    def _collect_inner_rollout(self, init_obs):
         obs = init_obs
         cum_reward = 0.0
-        # Run from current step t to end of episode T
-        steps_remaining = self.max_episode_steps - current_step
-        for step in range(steps_remaining):
-            action, _ = inner_agent.predict(obs)
-            ret = env_copy.step(action)
-            if len(ret) == 5:
-                obs_next, reward, terminated, truncated, _ = ret
-                done = bool(terminated or truncated)
-            else:
-                obs_next, reward, done, _ = ret
-            self.inner_buffer.append((obs, action, reward, obs_next, done))
-            obs = obs_next
+        terminated = truncated = False
+        counter = 0
+        while not (terminated or truncated):
+            action, _ = self.inner_agent.predict(obs)            
+            next_obs, reward, terminated, truncated, info = self.inner_env.step(action)
+            done = bool(terminated or truncated)
+            self.inner_agent.model.replay_buffer.add(
+                obs, 
+                next_obs, 
+                action, 
+                reward, 
+                done, 
+                [info]
+            )
             cum_reward += float(reward)
-            if done:
-                # Episode ended early in imagination
-                break
+            obs = next_obs
+        
         return obs, cum_reward
 
-    def _get_model_from_agent(self, agent):
-        if hasattr(agent, "model"):
-            return agent.model
-        if hasattr(agent, "policy"):
-            return agent.policy
-        if hasattr(agent, "actor"):
-            return agent.actor
-        if hasattr(agent, "q_network") or hasattr(agent, "qf"):
-            return getattr(agent, "q_network", None) or agent.qf
-        if hasattr(agent, "network"):
-            return agent.network
-        if hasattr(agent, "get_model"):
-            try:
-                return agent.get_model()
-            except Exception:
-                pass
-        return agent
+    def _initialize_inner_agent(self):
+        inner_agent, _, _ = utils_core.initialize_alg(self.inner_alg_str, self.inner_alg_params, self.inner_env)
+        inner_agent.model.policy.load_state_dict(self.outer_agent.model.policy.state_dict())
 
-    def _copy_model_weights(self, source_agent, target_agent):
-        source_model = self._get_model_from_agent(source_agent)
-        target_model = self._get_model_from_agent(target_agent)
-        if source_model is None or target_model is None:
-            return False
-        try:
-            if hasattr(source_model, "state_dict") and hasattr(
-                target_model, "load_state_dict"
-            ):
-                target_model.load_state_dict(source_model.state_dict())
-                return True
-        except Exception:
-            pass
-        try:
-            source_params = dict(source_model.named_parameters())
-            target_params = dict(target_model.named_parameters())
-            for name, param in target_params.items():
-                if name in source_params:
-                    param.data.copy_(source_params[name].data)
-            return True
-        except Exception:
-            pass
-        return False
+        if not hasattr(inner_agent.model, "_logger"):
+            inner_agent.model._logger = configure(folder=None, format_strings=[])
 
-    def _build_inner_agent(self, agent_env):
-        # Initialize inner agent with same architecture as outer agent
-        inner_agent = self.get_inner_model(
-            self.inner_alg_str, agent_env, self.inner_alg_params
-        )
-
-        # Copy weights from outer agent to initialize inner agent
-        weights_copied = self._copy_model_weights(self.outer_agent, inner_agent)
+        # for debugging
+        # assert_sb3_weights_copied(self.outer_agent, inner_agent)
 
         return inner_agent
 
-    def _update_inner_agent(self, inner_agent):
-        """Update inner agent using collected imagined experience."""
-        if not self.inner_buffer:
-            return False
-
-        model = inner_agent.model if hasattr(inner_agent, "model") else inner_agent
-
-        for _ in range(self.inner_updates_per_rollout):
-            # Strategy 1: Replay buffer + train() (stable-baselines3)
-            if hasattr(model, "replay_buffer") and hasattr(model, "train"):
-                for obs, action, reward, next_obs, done in self.inner_buffer:
-                    try:
-                        model.replay_buffer.add(
-                            obs, next_obs, action, reward, done, [{}]
-                        )
-                    except (TypeError, ValueError):
-                        model.replay_buffer.add(obs, action, reward, next_obs, done)
-
-                if model.replay_buffer.size() > 0:
-                    if not hasattr(model, "_logger"):
-                        from stable_baselines3.common.logger import configure
-
-                        model._logger = configure(folder=None, format_strings=[])
-                    model.train(gradient_steps=self.inner_updates_per_rollout)
-                    return True
-
-            # Strategy 2: Direct update() method (custom implementations)
-            if hasattr(inner_agent, "update") and callable(inner_agent.update):
-                inner_agent.update(self.inner_buffer)
-                return True
-
-            # Strategy 3: Step-by-step updates (custom implementations)
-            if hasattr(inner_agent, "step") and callable(inner_agent.step):
-                for obs, action, reward, next_obs, done in self.inner_buffer:
-                    try:
-                        inner_agent.step(obs, action, reward, next_obs, None, done)
-                    except TypeError:
-                        inner_agent.step(obs, action, reward, next_obs, done)
-                return True
-
-        print(
-            "Warning: Could not update inner agent - no compatible update method found"
-        )
-        return False
-
-    def _sb3_model(self, agent):
-        return agent.model if hasattr(agent, "model") else agent
-
-
-    def _add_to_replay_buffer(self, agent, obs, action, reward, next_obs, done):
-        model = self._sb3_model(agent)
-        if hasattr(model, "replay_buffer"):
-            try:
-                model.replay_buffer.add(obs, next_obs, action, reward, done, infos=[{}])
-            except (TypeError, ValueError):
-                model.replay_buffer.add(obs, action, reward, next_obs, done)
-
-    def _update_outer_agent(self):
-        """Update outer agent using real environment experience from replay buffer."""
-        # Strategy 1: Replay buffer + train() (stable-baselines3)
-        model = (
-            self.outer_agent.model
-            if hasattr(self.outer_agent, "model")
-            else self.outer_agent
-        )
-        if hasattr(model, "replay_buffer") and hasattr(model, "train"):
-            if model.replay_buffer.size() > 0:
-                gradient_steps = min(50, model.replay_buffer.size())
-                if not hasattr(model, "_logger"):
-                    from stable_baselines3.common.logger import configure
-
-                    model._logger = configure(folder=None, format_strings=[])
-                model.train(gradient_steps=gradient_steps)
-                return True
-
-        # Strategy 2: Direct update() method (custom implementations)
-        if hasattr(self.outer_agent, "update") and callable(self.outer_agent.update):
-            self.outer_agent.update([])
-            return True
-
-        print(
-            "Warning: Could not update outer agent - no compatible update method found"
-        )
-        return False
-
-    def _make_model_env_copy(self):
-        # snapshot the real env, but run rollouts in a separate env instance
-        snapshot = _snapshot_env_state(self.env)
-
-        # reuse single planning env (cheap + avoids recreating MuJoCo each step)
-        env_copy = getattr(self, "_planning_env_copy", None)
-        if env_copy is None:
-            import gymnasium as gym
-
-            spec = getattr(self.env, "spec", None) or getattr(self.env.unwrapped, "spec", None)
-            if spec is None or getattr(spec, "id", None) is None:
-                raise RuntimeError(
-                    "Could not deepcopy env and env.spec.id is unavailable to recreate it. "
-                    "Pass an env factory (e.g., custom_params['env_fn']) and use that here."
-                )
-
-            kwargs = dict(getattr(spec, "kwargs", {}) or {})
-            # no rendering for planning env
-            kwargs.pop("render_mode", None)
-
-            # recreate env with the same ID and kwargs so gym will apply the same default wrappers
-            env_copy = gym.make(spec.id, render_mode=None, **kwargs)
-
-            # OrderEnforcing requires reset before step; do it once at creation time
-            env_copy.reset()
-
-            # cache it for reuse
-            self._planning_env_copy = env_copy
-
-        return env_copy, True, snapshot
 
     def learn(self, total_timesteps=10000):
         """
@@ -402,11 +517,6 @@ class AMBI(Algorithm):
         Args:
             total_timesteps: Total number of timesteps to train for
         """
-        t = 0
-        episodes = 0
-        episode_step = 0
-        episode_reward = 0.0
-
         print(f"\n{'='*60}")
         print("AMBI TRAINING")
         print(
@@ -414,144 +524,102 @@ class AMBI(Algorithm):
         )
         print(f"{'='*60}\n")
 
-        # Initialize environment and get initial observation
-        reset_return = self.env.reset()
-        if isinstance(reset_return, tuple):
-            outer_obs, _info = reset_return
-        else:
-            outer_obs = reset_return
+        iter = 0
+        episodes = 0
+        episode_reward = 0.0
 
         start_time = time.time()
+        # while not converged
+        while iter < total_timesteps:
+            terminated = truncated = False
+            outer_obs, outer_info = self.env.reset()
 
-        while t < total_timesteps:
-            # Create environment copy for inner imagined rollouts
-            env_model_copy, uses_snapshot, snapshot = self._make_model_env_copy()
+            # outer loop t = 1...T
+            t = 0
+            while not (terminated or truncated):
+                # get outer env state
+                outer_snapshot = _snapshot_env_state(self.env)
 
-            # Initialize or reuse inner agent (reinitializes each step by default)
-            if self.inner_reinit_every_step:
-                inner_agent = self._build_inner_agent(env_model_copy)
-            else:
-                if self._persistent_inner is None:
-                    self._persistent_inner = self._build_inner_agent(env_model_copy)
-                inner_agent = self._persistent_inner
+                # initialize inner agent
+                self.inner_agent = self._initialize_inner_agent()
 
-            # Clear inner buffer for new imagined rollouts
-            self.inner_buffer = []
+                # Run multiple imagined rollouts from current state
+                for b in range(self.inner_rollouts):
+                    # set inner env to the outer env state
+                    _set_env_state(self.inner_env, outer_snapshot)
 
-            # Run multiple imagined rollouts from current state
-            for b in range(self.inner_rollouts):
-                # Reset inner environment to current outer environment state
-                if uses_snapshot:
-                    _restore_env_state(env_model_copy, snapshot)
-                    reset_return = env_model_copy.reset()
-                    if isinstance(reset_return, tuple):
-                        obs_model = reset_return[0]
-                    else:
-                        obs_model = reset_return
-                    obs_model = outer_obs #TODO incorrect
-                else:
-                    try:
-                        # Snapshot current outer env state and restore in inner env
-                        outer_snapshot = _snapshot_env_state(self.env)
-                        if outer_snapshot is not None:
-                            _restore_env_state(env_model_copy, outer_snapshot)
-                            reset_return = env_model_copy.reset()
-                            if isinstance(reset_return, tuple):
-                                obs_model = reset_return[0]
-                            else:
-                                obs_model = reset_return
-                            obs_model = outer_obs
-                        else:
-                            obs_model = outer_obs
-                    except Exception:
-                        obs_model = outer_obs
+                    # for debugging
+                    # assert_envs_match_after_copy(
+                    #     self.env,
+                    #     self.inner_env,
+                    #     outer_obs=outer_obs,
+                    #     check_wrapper_stack=(t == 0 and b == 0),
+                    #     check_outer_obs_vs_inner_raw=True,               
+                    # )
 
-                # Run imagined rollout and collect experience
-                final_obs, cum = self._run_inner_rollout_once(
-                    env_model_copy, inner_agent, obs_model, episode_step
-                )
+                    # this should match outer obs, using inner for safety
+                    inner_obs0 = self.inner_env.unwrapped._get_obs().copy()
 
-                # Update inner agent on imagined experience AFTER EACH ROLLOUT
-                # This allows the inner agent to improve across rollouts b=1..B
-                self._update_inner_agent(inner_agent)
+                    # Run imagined rollout and collect experience
+                    final_obs, cum_reward = self._collect_inner_rollout(inner_obs0)
 
-            # Use inner agent to select action for real environment
-            try:
-                real_action, _ = inner_agent.predict(outer_obs)
-            except Exception:
-                # Fallback to outer agent if inner agent fails
-                real_action, _ = self.outer_agent.predict(outer_obs)
+                    # Update inner agent on imagined experience 
+                    gradient_steps = self.inner_alg_params.get("gradient_steps", 1)
+                    batch_size = self.inner_alg_params.get("batch_size", 64)
+                    self.inner_agent.model.train(gradient_steps=gradient_steps, batch_size=batch_size)
 
-            # Execute action in real environment
-            ret = self.env.step(real_action)
-            if len(ret) == 5:
-                outer_obs_next, reward, terminated, truncated, info = ret
+                # take action in outer env
+                outer_action, _ = self.inner_agent.predict(outer_obs)
+                next_outer_obs, reward, terminated, truncated, info = self.env.step(outer_action)
                 done = bool(terminated or truncated)
-            else:
-                outer_obs_next, reward, done, info = ret
+                self.outer_agent.model.replay_buffer.add(outer_obs, next_outer_obs, outer_action, reward, done, [info])
 
-            # Log step data if logger is configured
-            # if self.alg_logger:
-            #     data = setup_logs(
-            #         reward,
-            #         outer_obs,
-            #         real_action,
-            #         [terminated if "terminated" in locals() else False, done],
-            #         info,
-            #     )
+                # log step data
+                if self.alg_logger:
+                    data = setup_logs(
+                        reward,
+                        outer_obs,
+                        outer_action,
+                        [done],
+                        [info,],
+                    )
 
-            #     self.alg_logger.on_step(data)
+                    self.alg_logger.on_step(data)
 
-            # Add transition directly to outer agent's replay buffer
-            self._add_to_replay_buffer(
-                self.outer_agent, outer_obs, real_action, reward, outer_obs_next, done
+                # Print progress every 100 timesteps
+                if iter % 100 == 0:
+                    elapsed = time.time() - start_time
+                    steps_per_sec = iter / elapsed if elapsed > 0 else 0
+                    progress = 100 * iter / total_timesteps
+                    eta_min = (
+                        (total_timesteps - iter) / steps_per_sec / 60
+                        if steps_per_sec > 0
+                        else 0
+                    )
+                    print(
+                        f"[{iter:,}/{total_timesteps:,}] {progress:.1f}% | Episodes: {episodes} | {steps_per_sec:.1f} steps/s | ETA: {eta_min:.1f}m"
+                    )
+
+                iter += 1
+                t += 1
+                episode_reward += reward
+                outer_obs = next_outer_obs
+
+            # update outer agent
+            gradient_steps = self.outer_alg_params.get("gradient_steps", 1)
+            batch_size = self.outer_alg_params.get("batch_size", 64)
+            self.outer_agent.model.train(gradient_steps=gradient_steps, batch_size=batch_size)
+
+            print(
+                f"Episode {episodes} complete | Steps: {iter} | Return: {episode_reward:.2f} | Timestep: {iter:,}"
             )
 
-            t += 1
-            episode_step += 1
-            episode_reward += reward
-
-            # Print progress every 100 timesteps
-            if t % 100 == 0:
-                elapsed = time.time() - start_time
-                steps_per_sec = t / elapsed if elapsed > 0 else 0
-                progress = 100 * t / total_timesteps
-                eta_min = (
-                    (total_timesteps - t) / steps_per_sec / 60
-                    if steps_per_sec > 0
-                    else 0
-                )
-                print(
-                    f"[{t:,}/{total_timesteps:,}] {progress:.1f}% | Episodes: {episodes} | {steps_per_sec:.1f} steps/s | ETA: {eta_min:.1f}m"
-                )
-
-            outer_obs = outer_obs_next
-
-            # Handle episode termination
-            if done:
-                episodes += 1
-                print(
-                    f"Episode {episodes} complete | Steps: {episode_step} | Return: {episode_reward:.2f} | Timestep: {t:,}"
-                )
-
-                episode_step = 0
-                episode_reward = 0.0
-
-                # Update outer agent after each episode
-                self._update_outer_agent()
-
-                # Reset environment for next episode
-                reset_return = self.env.reset()
-                if isinstance(reset_return, tuple):
-                    outer_obs, _info = reset_return
-                else:
-                    outer_obs = reset_return
+            episodes += 1
+            episode_reward = 0.0
 
             if self.render:
                 self.env.render()
 
-        # Final update
-        self._update_outer_agent()
 
         total_time = time.time() - start_time
         print(f"\n{'='*60}")
