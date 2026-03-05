@@ -1,18 +1,55 @@
-import copy, time
+import copy, time, json, os, random
 import numpy as np
-from stable_baselines3.common.logger import configure
+from typing import Any, Mapping, Iterable
 
-import torch.nn as nn
+from RL.lora import lorafy
 from RL.alg import Algorithm
 from utils import core as utils_core
 from utils.utils import setup_logs
 from utils.core import *
+
+import torch.nn as nn
 import torch
 import mujoco
 import gymnasium as gym
-import random
+import wandb
+from stable_baselines3.common.logger import configure
+
 
 ######################################################## Testing code ########################################################
+
+def state_dicts_equal(
+    a: Mapping[str, Any],
+    b: Mapping[str, Any],
+    *,
+    rtol: float = 1e-5,
+    atol: float = 1e-8,
+    exact: bool = False,
+    ignore_keys: Iterable[str] = (),
+) -> bool:
+    ignore = set(ignore_keys)
+    a_keys = set(a.keys()) - ignore
+    b_keys = set(b.keys()) - ignore
+    if a_keys != b_keys:
+        return False
+
+    for k in a_keys:
+        va, vb = a[k], b[k]
+        if torch.is_tensor(va) and torch.is_tensor(vb):
+            xa = va.detach()
+            xb = vb.detach()
+            if xa.shape != xb.shape or xa.dtype != xb.dtype:
+                return False
+            if exact:
+                if not torch.equal(xa, xb):
+                    return False
+            else:
+                if not torch.allclose(xa, xb, rtol=rtol, atol=atol, equal_nan=True):
+                    return False
+        else:
+            if va != vb:
+                return False
+    return True
 
 def assert_sb3_weights_copied(
     outer_agent,
@@ -273,13 +310,15 @@ def assert_envs_match_after_copy(
 
 ######################################################## End testing code ########################################################
 
+
+
 def _snapshot_env_state(env):
     """Capture the current state of the environment for later restoration."""
     unwrapped = env.unwrapped
     model, data = unwrapped.model, unwrapped.data
 
     # Get the full physics state of the environment (qpos, qvel, etc.)
-    full_physics_spec = mujoco.mjtState.mjSTATE_FULLPHYSICS
+    full_physics_spec = int(mujoco.mjtState.mjSTATE_FULLPHYSICS)
     n = mujoco.mj_stateSize(model, full_physics_spec)
     x = np.empty(n, dtype=np.float64)
     mujoco.mj_getState(model, data, x, full_physics_spec)
@@ -313,7 +352,7 @@ def _set_env_state(env, state):
     model, data = unwrapped.model, unwrapped.data
 
     mujoco_state, full_physics_spec = state["mujoco"]
-    mujoco.mj_setState(model, data, mujoco_state, full_physics_spec)
+    mujoco.mj_setState(model, data, mujoco_state, int(full_physics_spec))
     mujoco.mj_forward(model, data)
 
     # Restore wrappers
@@ -352,6 +391,83 @@ def _set_first_wrapper_attr_direct(env, name, value):
         cur = nxt
 
 
+def wandb_setup(cfg: dict, project="ambi", run_name=None):
+    run = wandb.init(
+        project=project,
+        name=run_name,
+        config=cfg,
+    )
+
+    # Make outer timestep the shared x-axis
+    wandb.define_metric("outer/step")
+    wandb.define_metric("outer/*", step_metric="outer/step")
+    wandb.define_metric("inner/*", step_metric="outer/step")
+    wandb.define_metric("time/*",  step_metric="outer/step")
+    return run
+
+
+def log_outer_step(t, reward, done, info=None, every=50, *, outer_step_sec=None):
+    if t % every != 0 and not done:
+        return
+
+    payload = {
+        "outer/step": t,
+        "outer/reward": float(reward),
+        "outer/done": int(done),
+    }
+
+    if outer_step_sec is not None:
+        payload["time/outer_step_sec"] = float(outer_step_sec)
+        if outer_step_sec > 0:
+            payload["time/outer_steps_per_sec"] = float(1.0 / outer_step_sec)
+
+    # Ant reward terms
+    if isinstance(info, dict):
+        for k, v in info.items():
+            if isinstance(v, (int, float, np.number)) and str(k).startswith("reward_"):
+                payload[f"outer/{k}"] = float(v)
+
+    wandb.log(payload, step=t)
+
+
+def log_outer_episode(t, ep_idx, ep_return, ep_len, *, episode_sec=None):
+    payload = {
+        "outer/step": t,
+        "outer/episode": ep_idx,
+        "outer/episode_return": float(ep_return),
+        "outer/episode_len": int(ep_len),
+    }
+    if episode_sec is not None:
+        payload["time/episode_sec"] = float(episode_sec)
+    wandb.log(payload, step=t)
+
+
+def log_inner_summary(t, rollout_returns, rollout_lengths=None, *, inner_time_sec=None):
+    r = np.asarray(rollout_returns, dtype=np.float64)
+    payload = {
+        "outer/step": t,
+        "inner/rollouts": int(len(r)),
+        "inner/return_mean": float(r.mean()) if len(r) else 0.0,
+        "inner/return_std": float(r.std()) if len(r) else 0.0,
+        "inner/return_max": float(r.max()) if len(r) else 0.0,
+        "inner/return_min": float(r.min()) if len(r) else 0.0,
+    }
+
+    if rollout_lengths is not None and len(rollout_lengths):
+        L = np.asarray(rollout_lengths, dtype=np.float64)
+        payload["inner/len_mean"] = float(L.mean())
+        payload["inner/len_max"] = float(L.max())
+        payload["inner/sim_steps"] = int(L.sum())
+        if inner_time_sec is not None and inner_time_sec > 0:
+            payload["time/inner_sec"] = float(inner_time_sec)
+            payload["time/inner_steps_per_sec"] = float(L.sum() / inner_time_sec)
+
+    elif inner_time_sec is not None:
+        payload["time/inner_sec"] = float(inner_time_sec)
+
+    wandb.log(payload, step=t)
+
+
 class AMBI(Algorithm):
     """
     AMBI Algorithm.
@@ -386,17 +502,20 @@ class AMBI(Algorithm):
         self.inner_rollouts = int(cp.get("inner_rollouts", 6))
         self.inner_reinit_every_step = bool(cp.get("inner_reinit_every_step", True))
         self.inner_updates_per_rollout = int(cp.get("inner_updates_per_rollout", 1))
+        self.use_lora = bool(cp.get("use_lora", False))
+        self.lora_params = cp.get("lora_params", {})
 
         # Outer loop: real environment interaction
         self.max_episode_steps = int(cp.get("max_episode_steps", 250))
-        self.seed_episodes = int(cp.get("seed_episodes", 0))
+        self.outer_learning_starts = self.outer_alg_params.get("learning_starts", 0)
+        self.inner_learning_starts = self.inner_alg_params.get("learning_starts", 0)
         self.render = bool(cp.get("render", False))
 
         if self.outer_alg_str is None:
             raise ValueError("AMBI requires 'outer_alg' string in custom_params")
 
+        # initialize outer agent
         self.outer_agent, _, _ = utils_core.initialize_alg(self.outer_alg_str, self.outer_alg_params, env)
-
         if not hasattr(self.outer_agent.model, "_logger"):
             self.outer_agent.model._logger = configure(folder=None, format_strings=[])
 
@@ -426,12 +545,14 @@ class AMBI(Algorithm):
             wrapper_params = run_params['env_wrapper']["wrapper_params"]
         
             self.inner_env = setup_wrapper(self.inner_env, wrapper_name, wrapper_params)
+
+        # reset inner and outer envs
         self.inner_env.reset()
-
-        if self.seed_episodes > 0:
-            self._initialize_seed_episodes()
-
+        self.env.reset()
+        
         self.alg_logger = None
+
+        self.run = wandb_setup(custom_params, project="ambi_ant", run_name=f"AntAMBI-seed{custom_params.get('seed', 'NA')}")
 
     def get_model(self):
         return (
@@ -439,22 +560,6 @@ class AMBI(Algorithm):
             if hasattr(self.outer_agent, "get_model")
             else self.outer_agent
         )
-
-    def _initialize_seed_episodes(self):
-        """Initialize outer agent replay buffer with random exploration."""
-        print(f"Initializing {self.seed_episodes} seed episodes...")
-        total_transitions = 0
-        for _ in range(self.seed_episodes):
-            obs, _ = self.env.reset()
-            terminated = truncated = False
-            while not (terminated or truncated):
-                action, _ = self.outer_agent.predict(obs)
-                next_obs, reward, terminated, truncated, info = self.env.step(action)
-                done = bool(terminated or truncated)
-                self.outer_agent.model.replay_buffer.add(obs, next_obs, action, reward, done, [info])
-                obs = next_obs
-                total_transitions += 1
-        print(f"Buffer initialized with {total_transitions} transitions")
 
     def set_logger(self, logger):
         self.alg_logger = logger
@@ -472,31 +577,66 @@ class AMBI(Algorithm):
         if hasattr(self.outer_agent, "load"):
             self.outer_agent.load(load_path)
 
+    @property
+    def outer_env(self):
+        return self.env
+
+    def _initialize_learning_starts(self, layer="inner", random_actions=False):
+        """Initialize replay buffer of the given layer with exploration."""
+        assert layer in ["outer", "inner"], "Layer must be either 'outer' or 'inner'"
+
+        agent = getattr(self, f"{layer}_agent")
+        env = getattr(self, f"{layer}_env")
+        total_steps = getattr(self, f"{layer}_learning_starts")
+        env_snapshot = _snapshot_env_state(env)
+
+        steps = 0
+        while steps < total_steps:
+            _set_env_state(env, env_snapshot)
+            obs = env.unwrapped._get_obs().copy()
+            terminated = truncated = False
+            while not (terminated or truncated) and steps < total_steps:
+                if random_actions:
+                    action = env.action_space.sample()
+                else:
+                    action, _ = agent.predict(obs)
+
+                next_obs, reward, terminated, truncated, info = env.step(action)
+                done = bool(terminated or truncated)
+                rew = np.array([reward], dtype=np.float32)
+                dn = np.array([done], dtype=bool)
+                agent.model.replay_buffer.add(obs, next_obs, action, rew, dn, [info])
+                obs = next_obs
+                steps += 1
+        # restore env state
+        _set_env_state(env, env_snapshot)
+
     def _collect_inner_rollout(self, init_obs):
         obs = init_obs
         cum_reward = 0.0
         terminated = truncated = False
-        counter = 0
+        steps = 0
+
         while not (terminated or truncated):
             action, _ = self.inner_agent.predict(obs)            
             next_obs, reward, terminated, truncated, info = self.inner_env.step(action)
             done = bool(terminated or truncated)
-            self.inner_agent.model.replay_buffer.add(
-                obs, 
-                next_obs, 
-                action, 
-                reward, 
-                done, 
-                [info]
-            )
+            rew = np.array([reward], dtype=np.float32)
+            dn  = np.array([done], dtype=bool)
+            self.inner_agent.model.replay_buffer.add(obs, next_obs, action, rew, dn, [info])
             cum_reward += float(reward)
             obs = next_obs
-        
-        return obs, cum_reward
+            steps += 1
+        return obs, cum_reward, steps
 
     def _initialize_inner_agent(self):
         inner_agent, _, _ = utils_core.initialize_alg(self.inner_alg_str, self.inner_alg_params, self.inner_env)
         inner_agent.model.policy.load_state_dict(self.outer_agent.model.policy.state_dict())
+        if hasattr(inner_agent.model, "log_ent_coef") and hasattr(self.outer_agent.model, "log_ent_coef"):
+            inner_agent.model.log_ent_coef.data.copy_(self.outer_agent.model.log_ent_coef.data)
+
+        if self.use_lora:
+            lorafy(inner_agent.model, **self.lora_params)
 
         if not hasattr(inner_agent.model, "_logger"):
             inner_agent.model._logger = configure(folder=None, format_strings=[])
@@ -507,124 +647,156 @@ class AMBI(Algorithm):
         return inner_agent
 
 
-    def learn(self, total_timesteps=10000):
-        """
-        Train the AMBI agent.
-
-        Uses inner loop imagination to improve action selection and outer loop
-        real experience to train the policy.
-
-        Args:
-            total_timesteps: Total number of timesteps to train for
-        """
+    def learn(self, total_timesteps: int = 10000):
         print(f"\n{'='*60}")
         print("AMBI TRAINING")
         print(
             f"Timesteps: {total_timesteps:,} | Inner rollouts: {self.inner_rollouts} | Max episode steps: {self.max_episode_steps}"
         )
         print(f"{'='*60}\n")
+        print(f"Outer agent device: {self.outer_agent.model.device}")
 
-        iter = 0
-        episodes = 0
-        episode_reward = 0.0
+        # wandb logging intervals
+        wandb_step_every = int(self.outer_alg_params.get("wandb_step_every", 1)) if isinstance(self.outer_alg_params, dict) else 1
+        wandb_inner_every = int(self.inner_alg_params.get("wandb_inner_every", wandb_step_every)) if isinstance(self.inner_alg_params, dict) else wandb_step_every
 
         start_time = time.time()
-        # while not converged
-        while iter < total_timesteps:
+        it = episodes = 0
+
+        # prepopulate outer replay buffer
+        self._initialize_learning_starts("outer", random_actions=True)
+
+        while it < total_timesteps:
+            # start new outer episode
             terminated = truncated = False
             outer_obs, outer_info = self.env.reset()
+            episode_reward = 0.0
+            episode_len = 0
+            episode_start = time.time()
 
-            # outer loop t = 1...T
-            t = 0
-            while not (terminated or truncated):
-                # get outer env state
+            # outer loop within episode
+            while not (terminated or truncated) and it < total_timesteps:
+                outer_step_start = time.time()
+
+                # snapshot outer env at current real state
                 outer_snapshot = _snapshot_env_state(self.env)
 
-                # initialize inner agent
+                # initialize inner agent and learning starts
                 self.inner_agent = self._initialize_inner_agent()
+                _set_env_state(self.inner_env, outer_snapshot) # need to set here so learning starts collects from correct time step
+                self._initialize_learning_starts("inner", random_actions=(it == 0))
+
+                # logging purposes
+                inner_returns = []
+                inner_steps = []
+                inner_total_start = time.time()
+                inner_train_sec = 0.0
 
                 # Run multiple imagined rollouts from current state
                 for b in range(self.inner_rollouts):
-                    # set inner env to the outer env state
+                    # reset inner env to the outer env state
                     _set_env_state(self.inner_env, outer_snapshot)
 
-                    # for debugging
-                    # assert_envs_match_after_copy(
-                    #     self.env,
-                    #     self.inner_env,
-                    #     outer_obs=outer_obs,
-                    #     check_wrapper_stack=(t == 0 and b == 0),
-                    #     check_outer_obs_vs_inner_raw=True,               
-                    # )
-
-                    # this should match outer obs, using inner for safety
+                    # use inner obs readout from restored state
                     inner_obs0 = self.inner_env.unwrapped._get_obs().copy()
 
-                    # Run imagined rollout and collect experience
-                    final_obs, cum_reward = self._collect_inner_rollout(inner_obs0)
+                    # collect imagined rollout into inner replay buffer
+                    _, cum_reward, steps = self._collect_inner_rollout(inner_obs0)
 
-                    # Update inner agent on imagined experience 
-                    gradient_steps = self.inner_alg_params.get("gradient_steps", 1)
-                    batch_size = self.inner_alg_params.get("batch_size", 64)
-                    self.inner_agent.model.train(gradient_steps=gradient_steps, batch_size=batch_size)
+                    inner_returns.append(float(cum_reward))
+                    inner_steps.append(int(steps))
 
-                # take action in outer env
+                    # train inner after each rollout 
+                    gradient_steps = int(self.inner_alg_params.get("gradient_steps", 1))
+                    batch_size = int(self.inner_alg_params.get("batch_size", 64))
+
+                    ts = time.time()
+                    self.inner_agent.model.train(
+                        gradient_steps=gradient_steps,
+                        batch_size=batch_size,
+                    )
+                    inner_train_sec += (time.time() - ts)
+
+                inner_total_sec = time.time() - inner_total_start
+                inner_sim_steps = int(sum(inner_steps))
+
+                # choose action for real env from inner policy
                 outer_action, _ = self.inner_agent.predict(outer_obs)
                 next_outer_obs, reward, terminated, truncated, info = self.env.step(outer_action)
                 done = bool(terminated or truncated)
-                self.outer_agent.model.replay_buffer.add(outer_obs, next_outer_obs, outer_action, reward, done, [info])
+                rew = np.array([reward], dtype=np.float32)
+                dn  = np.array([done], dtype=bool)
+                # store real transition into outer replay buffer
+                self.outer_agent.model.replay_buffer.add(
+                    outer_obs, next_outer_obs, outer_action, rew, dn, [info]
+                )
 
-                # log step data
+                # optional existing logger hook
                 if self.alg_logger:
                     data = setup_logs(
                         reward,
                         outer_obs,
                         outer_action,
                         [done],
-                        [info,],
+                        [info],
+                        inner_steps=[inner_steps]
                     )
-
                     self.alg_logger.on_step(data)
 
-                # Print progress every 100 timesteps
-                if iter % 100 == 0:
+                # wandb logging
+                log_now_outer = (it % wandb_step_every == 0) or done
+                log_now_inner = (it % wandb_inner_every == 0) or done
+                if log_now_inner:
+                    log_inner_summary(it, inner_returns, inner_steps if len(inner_steps) else None, inner_time_sec=inner_total_sec)
+
+                if log_now_outer:
+                    outer_step_sec = time.time() - outer_step_start
+                    log_outer_step(it, reward, done, info=info, every=1, outer_step_sec=outer_step_sec)  # we control cadence above
+
+                # progress print + global throughput
+                if it % 100 == 0 and it > 0:
                     elapsed = time.time() - start_time
-                    steps_per_sec = iter / elapsed if elapsed > 0 else 0
-                    progress = 100 * iter / total_timesteps
-                    eta_min = (
-                        (total_timesteps - iter) / steps_per_sec / 60
-                        if steps_per_sec > 0
-                        else 0
-                    )
+                    steps_per_sec = it / elapsed if elapsed > 0 else 0.0
+                    progress = 100.0 * it / float(total_timesteps)
+                    eta_min = ((total_timesteps - it) / steps_per_sec / 60.0) if steps_per_sec > 0 else 0.0
                     print(
-                        f"[{iter:,}/{total_timesteps:,}] {progress:.1f}% | Episodes: {episodes} | {steps_per_sec:.1f} steps/s | ETA: {eta_min:.1f}m"
+                        f"[{it:,}/{total_timesteps:,}] {progress:.1f}% | Episodes: {episodes} | "
+                        f"{steps_per_sec:.1f} steps/s | ETA: {eta_min:.1f}m"
                     )
 
-                iter += 1
-                t += 1
-                episode_reward += reward
+                # advance outer loop
+                it += 1
+                episode_len += 1
+                episode_reward += float(reward)
                 outer_obs = next_outer_obs
 
-            # update outer agent
-            gradient_steps = self.outer_alg_params.get("gradient_steps", 1)
-            batch_size = self.outer_alg_params.get("batch_size", 64)
-            self.outer_agent.model.train(gradient_steps=gradient_steps, batch_size=batch_size)
+            # end of outer episode, train outer agent
+            outer_train_start = time.time()
+            outer_gradient_steps = int(self.outer_alg_params.get("gradient_steps", 1))
+            outer_batch_size = int(self.outer_alg_params.get("batch_size", 64))
+
+            self.outer_agent.model.train(
+                gradient_steps=outer_gradient_steps,
+                batch_size=outer_batch_size,
+            )
+            outer_train_sec = time.time() - outer_train_start
+            episode_sec = time.time() - episode_start
+
+            # episode-level logging
+            log_outer_episode(it, episodes, episode_reward, episode_len, episode_sec=episode_sec)
 
             print(
-                f"Episode {episodes} complete | Steps: {iter} | Return: {episode_reward:.2f} | Timestep: {iter:,}"
+                f"Episode {episodes} complete | Steps: {episode_len} | Return: {episode_reward:.2f} | Timestep: {it:,}"
             )
 
             episodes += 1
-            episode_reward = 0.0
 
             if self.render:
                 self.env.render()
 
-
-        total_time = time.time() - start_time
         print(f"\n{'='*60}")
-        print(
-            f"Training complete | {total_time:.1f}s | {episodes} episodes | {t:,} timesteps"
-        )
+        print(f"Training complete | {episodes} episodes | {it:,} timesteps")
         print(f"{'='*60}\n")
+
+        wandb.finish()
         return self.outer_agent

@@ -8,7 +8,7 @@ import gymnasium as gym
 from utils.core import *
 from utils.stats import handle_trial
 from utils.utils import datetime_stamp
-from log import TrainingLogger
+from log import TrainingLogger, AMBITrainingLogger
 #from modes.tasks import *
 # from domains.AntPlane import *
 # from domains.mpqdn_goal_domain import *
@@ -132,7 +132,12 @@ def main():
 
         if log_setting not in SUPPORTED_LOG_SETTINGS:
             raise Exception("unsupported logging setting. Try none, overwrite, warn, or timestamp.")
-        training_logger = TrainingLogger(log_info=log_info_setting, log_type = log_type_setting)
+
+        if "AMBI" in experiment_name:
+            print("Using AMBI training logger")
+            training_logger = AMBITrainingLogger(log_info=log_info_setting, log_type = log_type_setting)
+        else:
+            training_logger = TrainingLogger(log_info=log_info_setting, log_type = log_type_setting)
     
     i
     ran_so_far = 0

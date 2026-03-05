@@ -1,234 +1,156 @@
-"""
-LoRA (Low-Rank Adaptation) utilities for parameter-efficient fine-tuning.
-
-This module provides functionality to apply LoRA to PyTorch models, allowing
-efficient adaptation of large models by training only small low-rank matrices
-instead of all parameters.
-"""
+import math
+from typing import Iterable, Optional, Sequence, List
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class LoRALayer(nn.Module):
-    """
-    LoRA (Low-Rank Adaptation) layer wrapper.
-    
-    Wraps a linear layer to add trainable low-rank adaptation matrices.
-    The original layer weights are frozen, and only the LoRA matrices are trained.
-    
-    Args:
-        original_layer: The original nn.Linear layer to wrap
-        rank: Rank of the low-rank matrices (default: 4)
-        alpha: Scaling factor for LoRA output (default: 1.0)
-    
-    The forward pass computes: original_output + (x @ lora_A @ lora_B) * (alpha / rank)
-    """
-    def __init__(self, original_layer, rank=4, alpha=1.0):
-        super().__init__()
-        self.original_layer = original_layer
-        self.rank = rank
-        self.alpha = alpha
-        
-        # Freeze original layer parameters
-        for param in self.original_layer.parameters():
-            param.requires_grad = False
-        
-        # Initialize LoRA matrices only for Linear layers
-        if isinstance(original_layer, nn.Linear):
-            # lora_A: (in_features, rank) - initialized with small random values
-            self.lora_A = nn.Parameter(
-                torch.randn(original_layer.in_features, rank) * 0.01
-            )
-            # lora_B: (rank, out_features) - initialized to zeros
-            self.lora_B = nn.Parameter(torch.zeros(rank, original_layer.out_features))
-        else:
-            self.lora_A = None
-            self.lora_B = None
+def lorafy(
+    model,
+    r: int = 8,
+    lora_alpha: float = 8.0,
+    lora_dropout: float = 0.0,
+    actor_targets=("latent_pi",),
+    critic_targets=("qf",),        # match qf0, qf1, ...
+):
+    policy = model.policy
 
-    def forward(self, x):
-        """Forward pass: original output + LoRA adaptation."""
-        original_output = self.original_layer(x)
-        if self.lora_A is not None and self.lora_B is not None:
-            lora_output = (x @ self.lora_A) @ self.lora_B * (self.alpha / self.rank)
-            return original_output + lora_output
-        return original_output
+    # wrap selected linears
+    apply_lora_to_module(policy.actor, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, target_modules=actor_targets)
+    apply_lora_to_module(policy.critic, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, target_modules=critic_targets)
 
+    # wrap critic_targetso Polyak update sees matching module structure
+    if hasattr(policy, "critic_target") and policy.critic_target is not None:
+        apply_lora_to_module(policy.critic_target, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, target_modules=critic_targets)
+        for p in policy.critic_target.parameters():
+            p.requires_grad_(False)
 
-def apply_lora_to_model(model, rank=4, alpha=1.0, target_modules=None):
-    """
-    Apply LoRA to specified linear layers in a model.
-    
-    Args:
-        model: PyTorch model to apply LoRA to
-        rank: Rank of LoRA matrices (default: 4)
-        alpha: Scaling factor for LoRA output (default: 1.0)
-        target_modules: List of module name patterns to apply LoRA to.
-                       If None or empty list, applies to all Linear layers.
-    
-    Returns:
-        The model with LoRA layers applied (modified in-place)
-    """
-    if target_modules is None:
-        target_modules = [""]
+    # rebuild the optimizers (base linear layer frozen from LoRALinear)
+    actor_trainables = [p for p in policy.actor.parameters() if p.requires_grad]
+    critic_trainables = [p for p in policy.critic.parameters() if p.requires_grad]
 
-    def should_apply_lora(name):
-        """Check if LoRA should be applied to a module based on its name."""
-        if not target_modules:
-            return True
-        return any(pattern in name for pattern in target_modules)
+    policy.actor.optimizer = _clone_optimizer(policy.actor.optimizer, actor_trainables)
+    policy.critic.optimizer = _clone_optimizer(policy.critic.optimizer, critic_trainables)
 
-    # Iterate through all modules and wrap matching Linear layers
-    for name, module in list(model.named_modules()):
-        if isinstance(module, nn.Linear) and should_apply_lora(name):
-            # Navigate to the parent module to replace the layer
-            *parent_path, attr_name = name.split(".")
-            parent = model
-            for part in parent_path:
-                parent = getattr(parent, part)
-            
-            # Replace the original layer with LoRALayer wrapper
-            lora_layer = LoRALayer(module, rank=rank, alpha=alpha)
-            setattr(parent, attr_name, lora_layer)
-    
+    # leave ent_coef_optimizer alone
     return model
 
 
-def get_lora_parameters(model):
+def _clone_optimizer(old_opt: torch.optim.Optimizer, params: Iterable[nn.Parameter]) -> torch.optim.Optimizer:
     """
-    Extract all LoRA parameters from a model.
-    
-    Args:
-        model: PyTorch model containing LoRALayer modules
-    
-    Returns:
-        List of LoRA parameter tensors (lora_A and lora_B from all LoRALayers)
+    rebuild optimizer with new params
     """
-    lora_params = []
-    for module in model.modules():
-        if isinstance(module, LoRALayer):
-            if module.lora_A is not None:
-                lora_params.append(module.lora_A)
-            if module.lora_B is not None:
-                lora_params.append(module.lora_B)
-    return lora_params
+    opt_cls = type(old_opt)
+    defaults = dict(old_opt.defaults)
+    defaults.pop("params", None)
+    return opt_cls(list(params), **defaults)
 
 
-def get_all_optimizers(agent):
+def apply_lora_to_module(
+    module: nn.Module,
+    r: int = 8,
+    lora_alpha: float = 8.0,
+    lora_dropout: float = 0.0,
+    target_modules: Optional[Sequence[str]] = None,
+) -> nn.Module:
     """
-    Find all optimizers in an agent object.
-    
-    Searches for optimizers in common locations:
-    - Direct attributes (optimizer, actor_optimizer, etc.)
-    - agent.policy attributes
-    - agent.model attributes
-    
-    Args:
-        agent: Agent object that may contain optimizers
-    
-    Returns:
-        List of unique optimizer objects found
+    Recursively replaces nn.Linear layers with LoRALinear.
     """
-    optimizers = []
-    optimizers_attrs = [
-        "optimizer",
-        "optimizers",
-        "actor_optimizer",
-        "critic_optimizer",
-        "policy_optimizer",
-        "q_optimizer",
-        "value_optimizer",
-    ]
-    
-    # Search in agent itself
-    for attr in optimizers_attrs:
-        if hasattr(agent, attr):
-            opt = getattr(agent, attr)
-            if opt is not None:
-                if isinstance(opt, (list, tuple)):
-                    optimizers.extend(opt)
-                else:
-                    optimizers.append(opt)
-    
-    # Search in agent.policy
-    if hasattr(agent, "policy"):
-        for attr in optimizers_attrs:
-            if hasattr(agent.policy, attr):
-                opt = getattr(agent.policy, attr)
-                if opt is not None:
-                    if isinstance(opt, (list, tuple)):
-                        optimizers.extend(opt)
-                    else:
-                        optimizers.append(opt)
-    
-    # Search in agent.model
-    if hasattr(agent, "model"):
-        for attr in optimizers_attrs:
-            if hasattr(agent.model, attr):
-                opt = getattr(agent.model, attr)
-                if opt is not None:
-                    if isinstance(opt, (list, tuple)):
-                        optimizers.extend(opt)
-                    else:
-                        optimizers.append(opt)
-    
-    return list(set(optimizers))
+    patterns = list(target_modules) if target_modules else []
+
+    def should_apply(path: str) -> bool:
+        if not patterns:
+            return True
+        return any(p in path for p in patterns)
+
+    def check_rank(child: nn.Linear, r: int) -> bool:
+        # skip if r > current layer rank
+        if min(child.in_features, child.out_features) <= r or r <= 0:
+            return False
+        return True
+
+    def _recurse(parent: nn.Module, prefix: str = "") -> None:
+        for child_name, child in list(parent.named_children()):
+            full_name = f"{prefix}.{child_name}" if prefix else child_name
+
+            # avoid double-wrapping
+            if isinstance(child, LoRALinear):
+                continue
+
+            if isinstance(child, nn.Linear) and should_apply(full_name) and check_rank(child, r):
+                setattr(
+                    parent,
+                    child_name,
+                    LoRALinear(
+                        base=child,
+                        r=r,
+                        lora_alpha=lora_alpha,
+                        lora_dropout=lora_dropout,
+                    ),
+                )
+            else:
+                _recurse(child, full_name)
+
+    _recurse(module)
+    return module
 
 
-def replace_optimizer_params_with_lora(agent, lora_params, base_lr=3e-4):
+class LoRALinear(nn.Module):
     """
-    Replace optimizer parameters to train only LoRA parameters.
-    
-    Finds existing optimizers in the agent and replaces them with new optimizers
-    that only train the LoRA parameters.
-    
-    Args:
-        agent: Agent object containing optimizers
-        lora_params: List of LoRA parameter tensors to optimize
-        base_lr: Base learning rate if original optimizer doesn't have one
-    
-    Returns:
-        True if any optimizer was replaced, False otherwise
-    """
-    if not lora_params:
-        return False
-    
-    optimizers = get_all_optimizers(agent)
-    replaced_any = False
-    
-    for opt in optimizers:
-        try:
-            # Get learning rate from existing optimizer
-            lr = opt.defaults.get("lr", base_lr)
-            
-            # Create new optimizer with only LoRA parameters
-            new_optimizer = torch.optim.Adam(lora_params, lr=lr)
-            
-            # Find and replace optimizer references in agent
-            # Search in agent itself
-            for attr in dir(agent):
-                if getattr(agent, attr, None) is opt:
-                    setattr(agent, attr, new_optimizer)
-                    replaced_any = True
-                    break
-            
-            # Search in agent.policy
-            if hasattr(agent, "policy"):
-                for attr in dir(agent.policy):
-                    if getattr(agent.policy, attr, None) is opt:
-                        setattr(agent.policy, attr, new_optimizer)
-                        replaced_any = True
-                        break
-            
-            # Search in agent.model
-            if hasattr(agent, "model"):
-                for attr in dir(agent.model):
-                    if getattr(agent.model, attr, None) is opt:
-                        setattr(agent.model, attr, new_optimizer)
-                        replaced_any = True
-                        break
-        except Exception:
-            continue
-    
-    return replaced_any
+    Wraps an existing nn.Linear with a LoRA adapter:
+        y = base(x) + (alpha/r) * B(A(dropout(x)))
 
+    - Freezes the base linear layer params.
+    - Learns only A (r x in) and B (out x r).
+    """
+    def __init__(
+        self,
+        base: nn.Linear,
+        r: int = 8,
+        lora_alpha: float = 8.0,
+        lora_dropout: float = 0.0,
+    ):
+        super().__init__()
+        if not isinstance(base, nn.Linear):
+            raise TypeError(f"Expected nn.Linear, got {type(base)}")
+
+        if r < 0:
+            raise ValueError("r must be >= 0")
+
+        self.base = base
+        self.in_features = base.in_features
+        self.out_features = base.out_features
+
+        # Freeze base layer
+        self.base.weight.requires_grad_(False)
+        if self.base.bias is not None:
+            self.base.bias.requires_grad_(False)
+
+        self.r = r
+        self.lora_alpha = float(lora_alpha)
+        self.scaling = (self.lora_alpha / self.r) if self.r > 0 else 0.0
+        self.dropout = nn.Dropout(p=float(lora_dropout)) if lora_dropout > 0 else nn.Identity()
+
+        if self.r > 0:
+            # Match dtype/device of base weight
+            w = self.base.weight
+            self.lora_A = nn.Parameter(w.new_zeros((self.r, self.in_features)))   # (r, in)
+            self.lora_B = nn.Parameter(w.new_zeros((self.out_features, self.r))) # (out, r)
+
+            # Common init: A ~ Kaiming, B = 0 so initial adapter is a no-op
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B)
+        else:
+            self.register_parameter("lora_A", None)
+            self.register_parameter("lora_B", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.base(x)
+        if self.r == 0:
+            return out
+
+        x_d = self.dropout(x)
+        # F.linear: y = x @ W^T + b, with W shaped (out, in)
+        lora_out = F.linear(F.linear(x_d, self.lora_A), self.lora_B)  # (..., out)
+        return out + lora_out * self.scaling

@@ -11,8 +11,8 @@ def initialize_alg(alg_string, alg_params, domain, custom_action_space = None, f
     baseline = False
     if '/' in alg_string:
         file_name, alg_name = "".join(alg_string.split('/')[:-1]), alg_string.split('/')[-1]
-        print(file_name)
-        print(alg_name)
+        # print(file_name)
+        # print(alg_name)
         if "baselines" in file_name:
             baseline = True
             try:

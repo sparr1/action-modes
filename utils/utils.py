@@ -82,7 +82,7 @@ def _convert_arrays_recursively(obj):
         return obj
 
 
-def setup_logs(reward, obs, action, dones, info=None):
+def setup_logs(reward, obs, action, dones, info=None, inner_steps=None):
     data = {}
     # print(reward)
     # print(type(reward))
@@ -92,9 +92,12 @@ def setup_logs(reward, obs, action, dones, info=None):
     data["rewards"] = listify(reward)
     data["obs"] = listify(obs)
     data["actions"] = listify(action)
-
     data["dones"] = _convert_arrays_recursively(dones)
-    # print(info)
+
+    # for AMBI
+    if inner_steps is not None:
+        data["inner_steps"] = _convert_arrays_recursively(inner_steps)
+
     if (
         isinstance(info, (list, tuple))
         and len(info) > 0

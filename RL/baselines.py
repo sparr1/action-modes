@@ -53,7 +53,7 @@ class Baseline(Algorithm):
                 p["policy"] = "MultiInputPolicy"
             else:
                 p["policy"] = "MlpPolicy" #just a guess.
-                print("Trying MlpPolicy as none given.")
+                # print("Trying MlpPolicy as none given.")
 
         p["env"] = env
 
