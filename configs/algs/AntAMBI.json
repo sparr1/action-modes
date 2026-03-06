@@ -9,13 +9,13 @@
             "verbose": 1,
             "buffer_size": 1000000,
             "learning_starts": {
-                "steps": 0,
+                "steps": 100,
                 "random_actions": true,
-                "use_action_noise": false,
+                "use_action_noise": true,
                 "action_noise_type": "normal",
                 "action_noise_params": {
                     "sigma": 0.1,
-                    "theta": 0.15
+                    "mean": 0
                 }
             },
             "batch_size": 128,
@@ -34,13 +34,13 @@
             "learning_rate": 0.001,
             "device": "cuda",
             "learning_starts": {
-                "steps": 0,
+                "steps": 100,
                 "random_actions": false,
                 "use_action_noise": true,
                 "action_noise_type": "normal",
                 "action_noise_params": {
                     "sigma": 0.1,
-                    "theta": 0.15
+                    "mean": 0
                 }
             }
         },

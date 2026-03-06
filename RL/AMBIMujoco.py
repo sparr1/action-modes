@@ -509,6 +509,7 @@ class AMBI(Algorithm):
         self.lora_params = cp.get("lora_params", {})
         # learning starts for inner agent
         self.inner_learning_starts = self.inner_alg_params.get("learning_starts")
+        self.inner_learning_starts_steps = self.inner_learning_starts.get("steps")
         self.inner_random_actions = bool(self.inner_learning_starts.get("random_actions", False))
         self.inner_use_action_noise = bool(self.inner_learning_starts.get("use_action_noise", False))
         self.inner_action_noise_type = self.inner_learning_starts.get("action_noise_type", "normal")
@@ -518,6 +519,7 @@ class AMBI(Algorithm):
         self.max_episode_steps = int(cp.get("max_episode_steps", 250))
         # learning starts for outer agent
         self.outer_learning_starts = self.outer_alg_params.get("learning_starts")
+        self.outer_learning_starts_steps = self.outer_learning_starts.get("steps")
         self.outer_random_actions = bool(self.outer_learning_starts.get("random_actions", False))
         self.outer_use_action_noise = bool(self.outer_learning_starts.get("use_action_noise", False))
         self.outer_action_noise_type = self.outer_learning_starts.get("action_noise_type", "normal")
@@ -596,7 +598,7 @@ class AMBI(Algorithm):
 
         agent = getattr(self, f"{layer}_agent")
         env = getattr(self, f"{layer}_env")
-        total_steps = getattr(self, f"{layer}_learning_starts")
+        total_steps = getattr(self, f"{layer}_learning_starts_steps")
         env_snapshot = _snapshot_env_state(env)
 
         # action parameters
@@ -606,6 +608,9 @@ class AMBI(Algorithm):
         action_noise_params = getattr(self, f"{layer}_action_noise_params")
 
         if use_action_noise:
+            action_dim = env.action_space.shape[0]
+            action_noise_params["mean"] = np.full(action_dim, action_noise_params["mean"])
+            action_noise_params["sigma"] = np.full(action_dim, action_noise_params["sigma"])
             if action_noise_type == "normal":
                 action_noise = NormalActionNoise(**action_noise_params)
             elif action_noise_type == "ornstein_uhlenbeck":
@@ -697,7 +702,7 @@ class AMBI(Algorithm):
         it = episodes = 0
 
         # prepopulate outer replay buffer
-        self._initialize_learning_starts("outer", random_actions=True)
+        self._initialize_learning_starts("outer")
 
         while it < total_timesteps:
             # start new outer episode
@@ -717,7 +722,7 @@ class AMBI(Algorithm):
                 # initialize inner agent and learning starts
                 self.inner_agent = self._initialize_inner_agent()
                 _set_env_state(self.inner_env, outer_snapshot) # need to set here so learning starts collects from correct time step
-                self._initialize_learning_starts("inner", random_actions=(it == 0))
+                self._initialize_learning_starts("inner")
 
                 # logging purposes
                 inner_returns = []
