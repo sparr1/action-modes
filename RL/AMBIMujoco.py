@@ -14,6 +14,7 @@ import mujoco
 import gymnasium as gym
 import wandb
 from stable_baselines3.common.logger import configure
+from stable_baselines3.common.noise import NormalActionNoise, OrnsteinUhlenbeckActionNoise
 
 
 ######################################################## Testing code ########################################################
@@ -332,7 +333,7 @@ def _snapshot_env_state(env):
     # PassiveEnvChecker flags are optional; mainly for overhead :contentReference[oaicite:8]{index=8}
     checked_step  = env.get_wrapper_attr("checked_step")  if hasattr(env, "get_wrapper_attr") else True
     checked_reset = env.get_wrapper_attr("checked_reset") if hasattr(env, "get_wrapper_attr") else True
-    checked_render= env.get_wrapper_attr("checked_render") if hasattr(env, "get_wrapper_attr") else True
+    checked_render = env.get_wrapper_attr("checked_render") if hasattr(env, "get_wrapper_attr") else True
 
     return {
         "mujoco": (mujoco_state, full_physics_spec),
@@ -498,21 +499,30 @@ class AMBI(Algorithm):
         self.inner_alg_str = cp.get("inner_alg", self.outer_alg_str)
         self.inner_alg_params = cp.get("inner_alg_params", {})
 
+        assert self.outer_alg_str is not None, "AMBI requires 'outer_alg' string in custom_params"
+
         # Inner loop: imagined rollouts from current state
         self.inner_rollouts = int(cp.get("inner_rollouts", 6))
         self.inner_reinit_every_step = bool(cp.get("inner_reinit_every_step", True))
         self.inner_updates_per_rollout = int(cp.get("inner_updates_per_rollout", 1))
         self.use_lora = bool(cp.get("use_lora", False))
         self.lora_params = cp.get("lora_params", {})
+        # learning starts for inner agent
+        self.inner_learning_starts = self.inner_alg_params.get("learning_starts")
+        self.inner_random_actions = bool(self.inner_learning_starts.get("random_actions", False))
+        self.inner_use_action_noise = bool(self.inner_learning_starts.get("use_action_noise", False))
+        self.inner_action_noise_type = self.inner_learning_starts.get("action_noise_type", "normal")
+        self.inner_action_noise_params = self.inner_learning_starts.get("action_noise_params", {})
 
         # Outer loop: real environment interaction
         self.max_episode_steps = int(cp.get("max_episode_steps", 250))
-        self.outer_learning_starts = self.outer_alg_params.get("learning_starts", 0)
-        self.inner_learning_starts = self.inner_alg_params.get("learning_starts", 0)
+        # learning starts for outer agent
+        self.outer_learning_starts = self.outer_alg_params.get("learning_starts")
+        self.outer_random_actions = bool(self.outer_learning_starts.get("random_actions", False))
+        self.outer_use_action_noise = bool(self.outer_learning_starts.get("use_action_noise", False))
+        self.outer_action_noise_type = self.outer_learning_starts.get("action_noise_type", "normal")
+        self.outer_action_noise_params = self.outer_learning_starts.get("action_noise_params", {})
         self.render = bool(cp.get("render", False))
-
-        if self.outer_alg_str is None:
-            raise ValueError("AMBI requires 'outer_alg' string in custom_params")
 
         # initialize outer agent
         self.outer_agent, _, _ = utils_core.initialize_alg(self.outer_alg_str, self.outer_alg_params, env)
@@ -551,7 +561,6 @@ class AMBI(Algorithm):
         self.env.reset()
         
         self.alg_logger = None
-
         self.run = wandb_setup(custom_params, project="ambi_ant", run_name=f"AntAMBI-seed{custom_params.get('seed', 'NA')}")
 
     def get_model(self):
@@ -581,7 +590,7 @@ class AMBI(Algorithm):
     def outer_env(self):
         return self.env
 
-    def _initialize_learning_starts(self, layer="inner", random_actions=False):
+    def _initialize_learning_starts(self, layer="inner"):
         """Initialize replay buffer of the given layer with exploration."""
         assert layer in ["outer", "inner"], "Layer must be either 'outer' or 'inner'"
 
@@ -590,9 +599,27 @@ class AMBI(Algorithm):
         total_steps = getattr(self, f"{layer}_learning_starts")
         env_snapshot = _snapshot_env_state(env)
 
+        # action parameters
+        random_actions = getattr(self, f"{layer}_random_actions")
+        use_action_noise = getattr(self, f"{layer}_use_action_noise")
+        action_noise_type = getattr(self, f"{layer}_action_noise_type")
+        action_noise_params = getattr(self, f"{layer}_action_noise_params")
+
+        if use_action_noise:
+            if action_noise_type == "normal":
+                action_noise = NormalActionNoise(**action_noise_params)
+            elif action_noise_type == "ornstein_uhlenbeck":
+                action_noise = OrnsteinUhlenbeckActionNoise(**action_noise_params)
+            else:
+                raise ValueError(f"Invalid action noise type: {action_noise_type}")
+        else:
+            action_noise = None
+
         steps = 0
         while steps < total_steps:
             _set_env_state(env, env_snapshot)
+            if action_noise is not None:
+                action_noise.reset()
             obs = env.unwrapped._get_obs().copy()
             terminated = truncated = False
             while not (terminated or truncated) and steps < total_steps:
@@ -601,11 +628,16 @@ class AMBI(Algorithm):
                 else:
                     action, _ = agent.predict(obs)
 
+                scaled_action = agent.model.policy.scale_action(action)
+                if action_noise is not None:
+                    scaled_action = np.clip(scaled_action + action_noise(), -1, 1)
+                    action = agent.model.policy.unscale_action(scaled_action)
+
                 next_obs, reward, terminated, truncated, info = env.step(action)
                 done = bool(terminated or truncated)
                 rew = np.array([reward], dtype=np.float32)
                 dn = np.array([done], dtype=bool)
-                agent.model.replay_buffer.add(obs, next_obs, action, rew, dn, [info])
+                agent.model.replay_buffer.add(obs, next_obs, scaled_action, rew, dn, [info]) # important to add scaled action to replay buffer
                 obs = next_obs
                 steps += 1
         # restore env state
@@ -623,7 +655,8 @@ class AMBI(Algorithm):
             done = bool(terminated or truncated)
             rew = np.array([reward], dtype=np.float32)
             dn  = np.array([done], dtype=bool)
-            self.inner_agent.model.replay_buffer.add(obs, next_obs, action, rew, dn, [info])
+            buffer_action = self.inner_agent.model.policy.scale_action(action)
+            self.inner_agent.model.replay_buffer.add(obs, next_obs, buffer_action, rew, dn, [info]) # important to add scaled action to replay buffer
             cum_reward += float(reward)
             obs = next_obs
             steps += 1

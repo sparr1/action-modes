@@ -8,7 +8,16 @@
         "outer_alg_params": {
             "verbose": 1,
             "buffer_size": 1000000,
-            "learning_starts": 0,
+            "learning_starts": {
+                "steps": 0,
+                "random_actions": true,
+                "use_action_noise": false,
+                "action_noise_type": "normal",
+                "action_noise_params": {
+                    "sigma": 0.1,
+                    "theta": 0.15
+                }
+            },
             "batch_size": 128,
             "gradient_steps": 50,
             "train_freq": 1,
@@ -19,12 +28,21 @@
         "inner_alg_params": {
             "verbose": 0,
             "buffer_size": 100000,
-            "learning_starts": 0,
             "batch_size": 64,
             "gradient_steps": 10,
             "train_freq": 1,
             "learning_rate": 0.001,
-            "device": "cuda"
+            "device": "cuda",
+            "learning_starts": {
+                "steps": 0,
+                "random_actions": false,
+                "use_action_noise": true,
+                "action_noise_type": "normal",
+                "action_noise_params": {
+                    "sigma": 0.1,
+                    "theta": 0.15
+                }
+            }
         },
         "use_lora": true,
         "lora_params": {
@@ -41,4 +59,3 @@
     "total_steps": 1000000,
     "episodes": null
 }
-
