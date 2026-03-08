@@ -1,4 +1,5 @@
 #!/bin/bash
+set -o pipefail
 #SBATCH --job-name=ambi_ant
 #SBATCH --output=logs/ambi_ant_%j.out
 #SBATCH --error=logs/ambi_ant_%j.err
@@ -17,8 +18,8 @@ echo "Start time: $(date)"
 echo "Working directory: $(pwd)"
 
 # Load modules
-module load python/3.11.0s-ixrhc3q
-module load cuda/12.1.1
+module load python/3.11.11-5e66
+module load cuda/12.9.0-cinr
 
 # Create logs directory if it doesn't exist
 mkdir -p logs
