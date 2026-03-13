@@ -427,9 +427,12 @@ class AMBI(Algorithm):
                 outer_snapshot = _snapshot_env_state(self.env)
 
                 # initialize inner agent and learning starts
-                self.inner_agent = self._initialize_inner_agent()
-                _set_env_state(self.inner_env, outer_snapshot) # need to set here so learning starts collects from correct time step
-                self._initialize_learning_starts("inner")
+                if self.inner_rollouts > 0:
+                    self.inner_agent = self._initialize_inner_agent()
+                    _set_env_state(self.inner_env, outer_snapshot) # need to set here so learning starts collects from correct time step
+                    self._initialize_learning_starts("inner")
+                else:
+                    self.inner_agent = None
 
                 # logging purposes
                 inner_returns = []
@@ -488,7 +491,10 @@ class AMBI(Algorithm):
                 inner_sim_steps = int(sum(inner_steps))
 
                 # choose action for real env from inner policy
-                outer_action, _ = self.inner_agent.predict(outer_obs)
+                if self.inner_rollouts > 0:
+                    outer_action, _ = self.inner_agent.predict(outer_obs)
+                else:
+                    outer_action, _ = self.outer_agent.predict(outer_obs)
                 next_outer_obs, reward, terminated, truncated, info = self.env.step(outer_action)
                 done = bool(terminated or truncated)
                 rew = np.array([reward], dtype=np.float32)
