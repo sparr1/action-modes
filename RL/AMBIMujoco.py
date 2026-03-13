@@ -458,7 +458,6 @@ class AMBI(Algorithm):
 
                         # train inner
                         if inner_step_counter % self.inner_train_freq == 0:
-                            print(f"Training inner agent at step {inner_step_counter}")
                             gradient_steps = int(self.inner_alg_params.get("gradient_steps", 1))
                             batch_size = int(self.inner_alg_params.get("batch_size", 64))
                             self.inner_agent.model.train(
@@ -466,8 +465,6 @@ class AMBI(Algorithm):
                                 batch_size=batch_size,
                             )
                             inner_step_counter = 0
-                    print(f"done with rollout {b}")
-                    print(f"inner step counter post rollout {inner_step_counter}")
 
                     inner_returns.append(rollout_return)
                     inner_steps.append(rollout_steps)
@@ -542,7 +539,6 @@ class AMBI(Algorithm):
                 outer_obs = next_outer_obs
 
                 if it % self.outer_train_freq == 0:
-                    print(f"Training outer agent at step {it}")
                     outer_gradient_steps = int(self.outer_alg_params.get("gradient_steps", 1))
                     outer_batch_size = int(self.outer_alg_params.get("batch_size", 64))
                     self.outer_agent.model.train(
