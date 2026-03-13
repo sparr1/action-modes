@@ -9,7 +9,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=6
-#SBATCH --constraint=geforce3090
+#SBATCH --constraint=geforce3090 
 
 # Print job information
 echo "Job ID: $SLURM_JOB_ID"
@@ -20,8 +20,10 @@ echo "Working directory: $(pwd)"
 # Create logs directory if it doesn't exist
 mkdir -p logs
 
-# Activate uv venv
-source venv_ccv/bin/activate
+module load miniforge3/25.3.0-3
+source ${MAMBA_ROOT_PREFIX}/etc/profile.d/conda.sh
+conda activate ambi
+
 
 # Run the training script
 echo "Starting AMBI training..."
