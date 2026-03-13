@@ -539,8 +539,8 @@ class AMBI(Algorithm):
                 outer_obs = next_outer_obs
 
                 if it % self.outer_train_freq == 0:
-                    outer_gradient_steps = int(self.outer_alg_params.get("gradient_steps", 1))
-                    outer_batch_size = int(self.outer_alg_params.get("batch_size", 64))
+                    outer_gradient_steps = int(self.outer_alg_params.get("gradient_steps"))
+                    outer_batch_size = int(self.outer_alg_params.get("batch_size"))
                     self.outer_agent.model.train(
                         gradient_steps=outer_gradient_steps,
                         batch_size=outer_batch_size,
