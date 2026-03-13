@@ -9,7 +9,7 @@
             "verbose": 1,
             "buffer_size": 1000000,
             "learning_starts": {
-                "steps": 100,
+                "steps": 0,
                 "random_actions": true,
                 "use_action_noise": true,
                 "action_noise_type": "normal",
@@ -18,8 +18,8 @@
                     "mean": 0
                 }
             },
-            "batch_size": 128,
-            "gradient_steps": 50,
+            "batch_size": 64,
+            "gradient_steps": 1,
             "train_freq": 1,
             "learning_rate": 0.001,
             "device": "cuda"
@@ -29,12 +29,12 @@
             "verbose": 0,
             "buffer_size": 100000,
             "batch_size": 64,
-            "gradient_steps": 10,
-            "train_freq": 1,
+            "gradient_steps": 50,
+            "train_freq": 50,
             "learning_rate": 0.001,
             "device": "cuda",
             "learning_starts": {
-                "steps": 100,
+                "steps": 0,
                 "random_actions": false,
                 "use_action_noise": true,
                 "action_noise_type": "normal",
@@ -46,14 +46,15 @@
         },
         "use_lora": true,
         "lora_params": {
-            "r": 64,
-            "lora_alpha": 128.0,
-            "lora_dropout": 0.0
+            "r": 32,
+            "lora_alpha": 64.0,
+            "lora_dropout": 0.0,
+            "actor_targets": ["latent_pi", "mu", "log_std"],
+            "critic_targets": ["qf"]
         },
         "inner_rollouts": 4,
         "inner_reinit_every_step": true,
         "max_episode_steps": 1000,
-        "seed_episodes": 0,
         "render": false
     },
     "total_steps": 1000000,

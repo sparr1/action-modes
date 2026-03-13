@@ -7,6 +7,7 @@ from RL.alg import Algorithm
 from utils import core as utils_core
 from utils.utils import setup_logs
 from utils.core import *
+import utils.ambi_debug as utils_ambi_debug
 
 import torch.nn as nn
 import torch
@@ -15,302 +16,6 @@ import gymnasium as gym
 import wandb
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.noise import NormalActionNoise, OrnsteinUhlenbeckActionNoise
-
-
-######################################################## Testing code ########################################################
-
-def state_dicts_equal(
-    a: Mapping[str, Any],
-    b: Mapping[str, Any],
-    *,
-    rtol: float = 1e-5,
-    atol: float = 1e-8,
-    exact: bool = False,
-    ignore_keys: Iterable[str] = (),
-) -> bool:
-    ignore = set(ignore_keys)
-    a_keys = set(a.keys()) - ignore
-    b_keys = set(b.keys()) - ignore
-    if a_keys != b_keys:
-        return False
-
-    for k in a_keys:
-        va, vb = a[k], b[k]
-        if torch.is_tensor(va) and torch.is_tensor(vb):
-            xa = va.detach()
-            xb = vb.detach()
-            if xa.shape != xb.shape or xa.dtype != xb.dtype:
-                return False
-            if exact:
-                if not torch.equal(xa, xb):
-                    return False
-            else:
-                if not torch.allclose(xa, xb, rtol=rtol, atol=atol, equal_nan=True):
-                    return False
-        else:
-            if va != vb:
-                return False
-    return True
-
-def assert_sb3_weights_copied(
-    outer_agent,
-    inner_agent,
-    obs_sample=None,
-    *,
-    check_action=False,
-    deterministic=True,
-    atol=0.0,
-    rtol=0.0,
-):
-    def _unwrap_sb3_algo(agent):
-        # Handles your Baseline wrapper and raw SB3 objects
-        return agent.model if hasattr(agent, "model") else agent
-
-    def _get_policy(agent):
-        algo = _unwrap_sb3_algo(agent)
-        if not hasattr(algo, "policy"):
-            raise TypeError(
-                f"Expected an SB3 algorithm with `.policy`, got: {type(algo)}"
-            )
-        return algo.policy
-
-    outer_algo = _unwrap_sb3_algo(outer_agent)
-    inner_algo = _unwrap_sb3_algo(inner_agent)
-    outer_policy = _get_policy(outer_agent)
-    inner_policy = _get_policy(inner_agent)
-
-    errs = []
-
-    # 1) Compare policy state_dict keys
-    sd_out = outer_policy.state_dict()
-    sd_in = inner_policy.state_dict()
-
-    keys_out = list(sd_out.keys())
-    keys_in = list(sd_in.keys())
-
-    if keys_out != keys_in:
-        missing_in = [k for k in keys_out if k not in sd_in]
-        extra_in = [k for k in keys_in if k not in sd_out]
-        raise AssertionError(
-            "Policy state_dict key mismatch.\n"
-            f"Missing in inner: {missing_in[:20]}\n"
-            f"Extra in inner: {extra_in[:20]}"
-        )
-
-    # 2) Compare each tensor/buffer
-    for k in keys_out:
-        a = sd_out[k].detach().cpu()
-        b = sd_in[k].detach().cpu()
-
-        if a.shape != b.shape:
-            errs.append(f"{k}: shape mismatch {tuple(a.shape)} vs {tuple(b.shape)}")
-            continue
-
-        if not torch.allclose(a, b, atol=atol, rtol=rtol):
-            diff = (a - b).abs()
-            max_diff = diff.max().item()
-            idx = int(diff.view(-1).argmax().item())
-            av = a.view(-1)[idx].item()
-            bv = b.view(-1)[idx].item()
-            errs.append(
-                f"{k}: max_abs_diff={max_diff:.3e} at flat_idx={idx} "
-                f"(outer={av:.9g}, inner={bv:.9g})"
-            )
-
-    # 3) Optional: compare predicted actions on same obs
-    if check_action:
-        if obs_sample is None:
-            raise ValueError("obs_sample must be provided when check_action=True")
-
-        # convert torch obs to numpy if needed
-        if torch.is_tensor(obs_sample):
-            obs_np = obs_sample.detach().cpu().numpy()
-        else:
-            obs_np = np.array(obs_sample, copy=False)
-
-        # IMPORTANT: call predict on the SB3 algo object, not your wrapper (wrapper may not accept kwargs)
-        act_out, _ = outer_algo.predict(obs_np, deterministic=deterministic)
-        act_in, _ = inner_algo.predict(obs_np, deterministic=deterministic)
-
-        if not np.allclose(act_out, act_in, atol=max(atol, 1e-7), rtol=max(rtol, 1e-6)):
-            d = np.abs(act_out - act_in)
-            idx = int(np.argmax(d))
-            errs.append(
-                "predict() action mismatch: "
-                f"max_abs_diff={d.flat[idx]:.3e} at flat_idx={idx} "
-                f"(outer={act_out.flat[idx]:.9g}, inner={act_in.flat[idx]:.9g})"
-            )
-
-    if errs:
-        raise AssertionError(
-            "Outer/inner SB3 weights do NOT match after copy:\n- " + "\n- ".join(errs[:50])
-        )
-
-    return True
-
-def _debug_wrapper_type_chain(env):
-    """Return wrapper -> ... -> base env type names."""
-    types = []
-    cur = env
-    seen = set()
-    while True:
-        types.append(type(cur).__name__)
-        if not hasattr(cur, "env"):
-            break
-        nxt = cur.env
-        if id(nxt) in seen:  # just in case of a weird cycle
-            types.append("<cycle>")
-            break
-        seen.add(id(nxt))
-        cur = nxt
-    return types
-
-
-def _debug_get_wrapper_attr(env, name, default=None):
-    try:
-        if hasattr(env, "get_wrapper_attr"):
-            return env.get_wrapper_attr(name)
-    except Exception:
-        pass
-    return default
-
-
-def _debug_get_full_mujoco_state(env):
-    """Flattened MuJoCo FULLPHYSICS state as float64."""
-    uw = env.unwrapped
-    model, data = uw.model, uw.data
-    spec = mujoco.mjtState.mjSTATE_FULLPHYSICS
-    n = mujoco.mj_stateSize(model, spec)
-    x = np.empty(n, dtype=np.float64)
-    mujoco.mj_getState(model, data, x, spec)
-    return x
-
-
-def assert_envs_match_after_copy(
-    outer_env,
-    inner_env,
-    outer_obs=None,
-    *,
-    check_wrapper_stack=False,
-    check_outer_obs_vs_inner_raw=False,
-    atol=1e-6,
-    rtol=1e-5,
-):
-    errs = []
-
-    if check_wrapper_stack:
-        outer_chain = _debug_wrapper_type_chain(outer_env)
-        inner_chain = _debug_wrapper_type_chain(inner_env)
-        if outer_chain != inner_chain:
-            errs.append(
-                "Wrapper stack mismatch:\n"
-                f"  outer={outer_chain}\n"
-                f"  inner={inner_chain}"
-            )
-
-    try:
-        if outer_env.observation_space.shape != inner_env.observation_space.shape:
-            errs.append(
-                f"Observation space shape mismatch: "
-                f"{outer_env.observation_space.shape} vs {inner_env.observation_space.shape}"
-            )
-    except Exception as e:
-        errs.append(f"Could not compare observation spaces: {e}")
-
-    try:
-        if outer_env.action_space.shape != inner_env.action_space.shape:
-            errs.append(
-                f"Action space shape mismatch: "
-                f"{outer_env.action_space.shape} vs {inner_env.action_space.shape}"
-            )
-    except Exception as e:
-        errs.append(f"Could not compare action spaces: {e}")
-
-    try:
-        s_outer = _debug_get_full_mujoco_state(outer_env)
-        s_inner = _debug_get_full_mujoco_state(inner_env)
-        if s_outer.shape != s_inner.shape:
-            errs.append(f"MuJoCo state shape mismatch: {s_outer.shape} vs {s_inner.shape}")
-        else:
-            if not np.allclose(s_outer, s_inner, atol=atol, rtol=rtol):
-                diff = np.abs(s_outer - s_inner)
-                idx = int(np.argmax(diff))
-                errs.append(
-                    "MuJoCo FULLPHYSICS mismatch: "
-                    f"max_abs_diff={diff[idx]:.3e} at index {idx} "
-                    f"(outer={s_outer[idx]:.9g}, inner={s_inner[idx]:.9g})"
-                )
-    except Exception as e:
-        errs.append(f"Could not compare MuJoCo full state: {e}")
-
-    try:
-        qo = np.array(outer_env.unwrapped.data.qpos, copy=True)
-        qi = np.array(inner_env.unwrapped.data.qpos, copy=True)
-        if not np.allclose(qo, qi, atol=atol, rtol=rtol):
-            d = np.abs(qo - qi)
-            idx = int(np.argmax(d))
-            errs.append(
-                f"qpos mismatch: max_abs_diff={d[idx]:.3e} at index {idx} "
-                f"(outer={qo[idx]:.9g}, inner={qi[idx]:.9g})"
-            )
-    except Exception as e:
-        errs.append(f"Could not compare qpos: {e}")
-
-    try:
-        vo = np.array(outer_env.unwrapped.data.qvel, copy=True)
-        vi = np.array(inner_env.unwrapped.data.qvel, copy=True)
-        if not np.allclose(vo, vi, atol=atol, rtol=rtol):
-            d = np.abs(vo - vi)
-            idx = int(np.argmax(d))
-            errs.append(
-                f"qvel mismatch: max_abs_diff={d[idx]:.3e} at index {idx} "
-                f"(outer={vo[idx]:.9g}, inner={vi[idx]:.9g})"
-            )
-    except Exception as e:
-        errs.append(f"Could not compare qvel: {e}")
-
-    for k in ("_elapsed_steps", "_has_reset", "checked_step", "checked_reset", "checked_render"):
-        ov = _debug_get_wrapper_attr(outer_env, k, default="<missing>")
-        iv = _debug_get_wrapper_attr(inner_env, k, default="<missing>")
-        if ov != iv:
-            errs.append(f"Wrapper attr mismatch for {k}: outer={ov!r}, inner={iv!r}")
-
-    try:
-        if hasattr(outer_env.unwrapped, "_get_obs") and hasattr(inner_env.unwrapped, "_get_obs"):
-            raw_outer = np.array(outer_env.unwrapped._get_obs(), copy=True)
-            raw_inner = np.array(inner_env.unwrapped._get_obs(), copy=True)
-            if raw_outer.shape != raw_inner.shape:
-                errs.append(f"raw _get_obs shape mismatch: {raw_outer.shape} vs {raw_inner.shape}")
-            elif not np.allclose(raw_outer, raw_inner, atol=atol, rtol=rtol):
-                d = np.abs(raw_outer - raw_inner)
-                idx = int(np.argmax(d))
-                errs.append(
-                    f"raw _get_obs mismatch: max_abs_diff={d[idx]:.3e} at index {idx} "
-                    f"(outer={raw_outer[idx]:.9g}, inner={raw_inner[idx]:.9g})"
-                )
-
-            if outer_obs is not None and check_outer_obs_vs_inner_raw:
-                outer_obs_arr = np.array(outer_obs, copy=False)
-                if outer_obs_arr.shape != raw_inner.shape:
-                    errs.append(
-                        f"outer_obs vs inner raw obs shape mismatch: "
-                        f"{outer_obs_arr.shape} vs {raw_inner.shape}"
-                    )
-                elif not np.allclose(outer_obs_arr, raw_inner, atol=atol, rtol=rtol):
-                    d = np.abs(outer_obs_arr - raw_inner)
-                    idx = int(np.argmax(d))
-                    errs.append(
-                        f"outer_obs vs inner raw obs mismatch: max_abs_diff={d[idx]:.3e} at index {idx} "
-                        f"(outer_obs={outer_obs_arr[idx]:.9g}, inner_raw={raw_inner[idx]:.9g})"
-                    )
-    except Exception as e:
-        errs.append(f"Could not compare raw observations: {e}")
-
-    if errs:
-        raise AssertionError("Env copy mismatch after _set_env_state:\n- " + "\n- ".join(errs))
-
-######################################################## End testing code ########################################################
-
 
 
 def _snapshot_env_state(env):
@@ -486,7 +191,6 @@ class AMBI(Algorithm):
             - inner_rollouts: Number of imagined rollouts per step (default: 6)
             - inner_reinit_every_step: Whether to reinitialize inner agent each step (default: True)
             - max_episode_steps: Maximum steps per episode (default: 250)
-            - seed_episodes: Number of random episodes to initialize buffer (default: 0)
     """
 
     def __init__(self, name, env, custom_params=None, run_params=None, experiment_params=None):
@@ -504,6 +208,7 @@ class AMBI(Algorithm):
         # Inner loop: imagined rollouts from current state
         self.inner_rollouts = int(cp.get("inner_rollouts", 6))
         self.inner_reinit_every_step = bool(cp.get("inner_reinit_every_step", True))
+        self.inner_train_freq = int(self.inner_alg_params.get("train_freq"))
         self.inner_updates_per_rollout = int(cp.get("inner_updates_per_rollout", 1))
         self.use_lora = bool(cp.get("use_lora", False))
         self.lora_params = cp.get("lora_params", {})
@@ -517,6 +222,7 @@ class AMBI(Algorithm):
 
         # Outer loop: real environment interaction
         self.max_episode_steps = int(cp.get("max_episode_steps", 250))
+        self.outer_train_freq = int(self.outer_alg_params.get("train_freq"))
         # learning starts for outer agent
         self.outer_learning_starts = self.outer_alg_params.get("learning_starts")
         self.outer_learning_starts_steps = self.outer_learning_starts.get("steps")
@@ -648,13 +354,13 @@ class AMBI(Algorithm):
         # restore env state
         _set_env_state(env, env_snapshot)
 
-    def _collect_inner_rollout(self, init_obs):
+    def _collect_inner_rollout(self, init_obs, max_steps):
         obs = init_obs
         cum_reward = 0.0
         terminated = truncated = False
         steps = 0
 
-        while not (terminated or truncated):
+        while not (terminated or truncated) and steps < max_steps:
             action, _ = self.inner_agent.predict(obs)            
             next_obs, reward, terminated, truncated, info = self.inner_env.step(action)
             done = bool(terminated or truncated)
@@ -665,7 +371,8 @@ class AMBI(Algorithm):
             cum_reward += float(reward)
             obs = next_obs
             steps += 1
-        return obs, cum_reward, steps
+
+        return obs, cum_reward, steps, (terminated or truncated)
 
     def _initialize_inner_agent(self):
         inner_agent, _, _ = utils_core.initialize_alg(self.inner_alg_str, self.inner_alg_params, self.inner_env)
@@ -731,29 +438,54 @@ class AMBI(Algorithm):
                 inner_train_sec = 0.0
 
                 # Run multiple imagined rollouts from current state
+                inner_step_counter = 0 # counter for train_freq (needs to carry over across rollouts)
                 for b in range(self.inner_rollouts):
                     # reset inner env to the outer env state
                     _set_env_state(self.inner_env, outer_snapshot)
 
-                    # use inner obs readout from restored state
-                    inner_obs0 = self.inner_env.unwrapped._get_obs().copy()
-
                     # collect imagined rollout into inner replay buffer
-                    _, cum_reward, steps = self._collect_inner_rollout(inner_obs0)
+                    rollout_return = 0.0
+                    rollout_steps = 0
+                    done = False
+                    inner_obs = self.inner_env.unwrapped._get_obs().copy() # use inner obs readout from restored state
 
-                    inner_returns.append(float(cum_reward))
-                    inner_steps.append(int(steps))
+                    while not done: # finish one full rollout
+                        step_to_collect = self.inner_train_freq - inner_step_counter
+                        inner_obs, cum_reward, steps, done = self._collect_inner_rollout(inner_obs, max_steps=step_to_collect)
+                        inner_step_counter += steps
+                        rollout_return += float(cum_reward)
+                        rollout_steps += int(steps)
 
-                    # train inner after each rollout 
-                    gradient_steps = int(self.inner_alg_params.get("gradient_steps", 1))
-                    batch_size = int(self.inner_alg_params.get("batch_size", 64))
+                        # train inner
+                        if inner_step_counter % self.inner_train_freq == 0:
+                            print(f"Training inner agent at step {inner_step_counter}")
+                            gradient_steps = int(self.inner_alg_params.get("gradient_steps", 1))
+                            batch_size = int(self.inner_alg_params.get("batch_size", 64))
+                            self.inner_agent.model.train(
+                                gradient_steps=gradient_steps,
+                                batch_size=batch_size,
+                            )
+                            inner_step_counter = 0
+                    print(f"done with rollout {b}")
+                    print(f"inner step counter post rollout {inner_step_counter}")
+
+                    inner_returns.append(rollout_return)
+                    inner_steps.append(rollout_steps)
+
+                    # for debugging
+                    # before_train = utils_ambi_debug._snapshot_policy_tensors(self.inner_agent.model.policy)
 
                     ts = time.time()
-                    self.inner_agent.model.train(
-                        gradient_steps=gradient_steps,
-                        batch_size=batch_size,
-                    )
                     inner_train_sec += (time.time() - ts)
+
+                    # utils_ambi_debug.print_policy_update_report(
+                    #     self.inner_agent.model.policy,
+                    #     before_train,
+                    #     tag=f"outer_it={it} rollout={b} gradient_steps={gradient_steps}",
+                    #     atol=0.0,
+                    #     rtol=0.0,
+                    #     ignore_prefixes=(),
+                    # )
 
                 inner_total_sec = time.time() - inner_total_start
                 inner_sim_steps = int(sum(inner_steps))
@@ -764,9 +496,10 @@ class AMBI(Algorithm):
                 done = bool(terminated or truncated)
                 rew = np.array([reward], dtype=np.float32)
                 dn  = np.array([done], dtype=bool)
+                buffer_action = self.outer_agent.model.policy.scale_action(outer_action)
                 # store real transition into outer replay buffer
                 self.outer_agent.model.replay_buffer.add(
-                    outer_obs, next_outer_obs, outer_action, rew, dn, [info]
+                    outer_obs, next_outer_obs, buffer_action, rew, dn, [info]
                 )
 
                 # optional existing logger hook
@@ -808,16 +541,15 @@ class AMBI(Algorithm):
                 episode_reward += float(reward)
                 outer_obs = next_outer_obs
 
-            # end of outer episode, train outer agent
-            outer_train_start = time.time()
-            outer_gradient_steps = int(self.outer_alg_params.get("gradient_steps", 1))
-            outer_batch_size = int(self.outer_alg_params.get("batch_size", 64))
-
-            self.outer_agent.model.train(
-                gradient_steps=outer_gradient_steps,
-                batch_size=outer_batch_size,
-            )
-            outer_train_sec = time.time() - outer_train_start
+                if it % self.outer_train_freq == 0:
+                    print(f"Training outer agent at step {it}")
+                    outer_gradient_steps = int(self.outer_alg_params.get("gradient_steps", 1))
+                    outer_batch_size = int(self.outer_alg_params.get("batch_size", 64))
+                    self.outer_agent.model.train(
+                        gradient_steps=outer_gradient_steps,
+                        batch_size=outer_batch_size,
+                    )
+                
             episode_sec = time.time() - episode_start
 
             # episode-level logging
