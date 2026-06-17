@@ -1,0 +1,19 @@
+{
+    "overrides_alg": {
+        "seed": 55,
+        "device": "cuda",
+        "env": "Ant3LegDeadStump-v0",
+        "total_steps": 1000000,
+        "episodes": null
+    },
+    "env_params": {
+        "render_mode": null,
+        "exclude_current_positions_from_observation": false
+    },
+    "trials": 1,
+    "configs": ["AntDeadStumpAMBI"],
+    "logs": "timestamp",
+    "save_trials": "best",
+    "checkpoint_every": 10000,
+    "log_info": false
+}

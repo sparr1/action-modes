@@ -3,6 +3,7 @@ import random, time, argparse, json, os, shutil, math
 import numpy as np
 
 import gymnasium as gym
+import domains  # registers custom envs (VarLegsAnt, Ant3LegDeadStump, LegAdaptAnt, ...)
 # from RL.alg import *
 #from RL.baselines import Baseline, TrajectoryLoggerCallback
 from utils.core import *
