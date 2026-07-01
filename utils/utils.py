@@ -121,7 +121,7 @@ def load_episode_log(path):
         "observations": contents["observations"],
         "actions": contents["actions"],
     }
-    if "info" in logs:
+    if "info" in contents:
         logs["info"] = contents["info"]
     return logs
 

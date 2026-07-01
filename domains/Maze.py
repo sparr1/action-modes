@@ -153,7 +153,7 @@ class Move(Task):
                     base_reward = -min(base_reward, self.survival_bonus)
 
         else:
-            base_reward = self.achieved_velocity #for now, just linear in velocity.
+            base_reward = achieved_velocity #for now, just linear in velocity.
         healthy = self.healthy(obs)
         healthy_bonus = healthy*self.survival_bonus
         ctrl_cost = self.control_cost(last_action)
@@ -188,7 +188,9 @@ class Move(Task):
     def get_goal_length(self):
         return 1
 
-    def reset(self, seed = 32):
+    def reset(self, seed = None):
+        if seed is not None:
+            rnd.seed(seed)
         if self.desired_velocity_maximum == self.desired_velocity_minimum:
             self.desired_velocity = self.desired_velocity_minimum
         else:
@@ -356,9 +358,11 @@ class Change(Task):
         self.position_coords = task_info["position_coords"]
 
     def get_goal_length(self):
-        return 1
+        return self.num_target_coords
 
-    def reset(self, seed = 32):
+    def reset(self, seed = None):
+        if seed is not None:
+            rnd.seed(seed)
         if self.desired_coord_minimum == self.desired_coord_maximum:
             self.desired_coords = [self.desired_coord_minimum,]*self.num_target_coords
         else:
@@ -419,4 +423,4 @@ class ChangeZSupportClassifier(SupportClassifier):
         self.vel_offset = self.pos_offset + (self.num_legs - 4)*2
 
     def rule(self, observation):
-        return check_speed(observation, self.speed_range)
+        return check_speed(observation, self.speed_range, self.vel_offset)

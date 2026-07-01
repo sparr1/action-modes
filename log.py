@@ -2,10 +2,48 @@ import os, json
 import numpy as np
 
 #we will have a few different settings for logs: "none", "overwrite", "warn", and "timestamp"
-#the first just does not save logs, the second will ALWAYS delete any folders under the name of the experiment prior to running, the third will refuse to run if there are folders, 
+#the first just does not save logs, the second will ALWAYS delete any folders under the name of the experiment prior to running, the third will refuse to run if there are folders,
 #and the fourth will prepend a timestamp in order to always create new folders each time it has run repeatedly. For serious experiments, I recommend "warn" or "timestamp".
 #The default is "warn", since this will let you know that some configuration is required to get the behavior you want.
 #For less serious experiments, testing, etc., I recommend "none" or "overwrite", depending on whether you are testing a capability that uses the logs or not.
+
+
+def _info_dict(item):
+    if isinstance(item, list) and item and isinstance(item[0], dict):
+        return item[0]
+    if isinstance(item, dict):
+        return item
+    return {}
+
+
+def _write_basic_summary(summary_file, episode_count, total_reward, num_steps, inner_steps=None):
+    with open(summary_file, 'a') as f:
+        line = (f"episode_{episode_count}: "
+                f"Total Reward = {total_reward}, "
+                f"Steps = {num_steps}")
+        if inner_steps is not None:
+            line += f", Inner Steps = {inner_steps}"
+        f.write(line + ",\n")
+
+
+def _write_reward_info_summary(summary_file, episode_count, total_reward, num_steps, episode_info):
+    first_info = _info_dict(episode_info[0])
+    goal_key = [k for k in list(first_info.keys()) if "desired" in k][0]
+    goal = first_info[goal_key]
+    base_reward = sum([_info_dict(item)["base"] for item in episode_info])
+    healthy_bonus = sum([_info_dict(item)["healthy_bonus"] for item in episode_info])
+    control_cost = sum([_info_dict(item)["control cost"] for item in episode_info])
+    contact_cost = sum([_info_dict(item)["contact cost"] for item in episode_info])
+    with open(summary_file, 'a') as f:
+        f.write(f"episode_{episode_count}: "
+                f"Total Reward = {total_reward}, "
+                f"Total Base = {base_reward}, "
+                f"Total Healthy = {healthy_bonus}, "
+                f"Total Control = {control_cost}, "
+                f"Total Contact = {contact_cost}, "
+                f"Goal = {goal}, Steps = {num_steps},\n")
+
+
 class TrainingLogger():
 
     def __init__(self, log_dir = None, log_info = True, log_type = 'detailed'):
@@ -13,8 +51,8 @@ class TrainingLogger():
         self._log_info = log_info
         self._log_type = log_type
         if log_dir: #if not, should set_log_dir before calling on episode or on step.
-            self.set_log_dir(log_dir) 
-        
+            self.set_log_dir(log_dir)
+
         self.reset()
 
     def reset(self):
@@ -37,7 +75,6 @@ class TrainingLogger():
         os.makedirs(self.train_episodes_dir, exist_ok=True)
         print("log directory set to ", log_dir)
 
-        
     def on_episode(self) -> None:
         self.episode_count += 1
 
@@ -58,27 +95,13 @@ class TrainingLogger():
 
         # print(total_reward)
         # avg_reward = np.mean(self.episode_rewards)
-        if self._log_info:
-            goal_key = [k for k in list(self.episode_info[0].keys()) if "desired" in k][0]
-            goal = self.episode_info[0][goal_key]
-            base_reward = sum([item["base"] for item in self.episode_info])
-            healthy_bonus = sum([item["healthy_bonus"] for item in self.episode_info])
-            control_cost = sum([item["control cost"] for item in self.episode_info])
-            contact_cost = sum([item["contact cost"] for item in self.episode_info])
-            # Write summary to a file
-            with open(self.summary_file, 'a') as f:
-                f.write(f"episode_{self.episode_count}: "
-                        f"Total Reward = {total_reward}, "
-                        f"Total Base = {base_reward}, "
-                        f"Total Healthy = {healthy_bonus}, "
-                        f"Total Control = {control_cost}, "
-                        f"Total Contact = {contact_cost}, "
-                        f"Goal = {goal}, Steps = {num_steps},\n")
+        if self._log_info and self.episode_info:
+            try:
+                _write_reward_info_summary(self.summary_file, self.episode_count, total_reward, num_steps, self.episode_info)
+            except (IndexError, KeyError, TypeError, AttributeError):
+                _write_basic_summary(self.summary_file, self.episode_count, total_reward, num_steps)
         else:
-             with open(self.summary_file, 'a') as f:
-                f.write(f"episode_{self.episode_count}: "
-                        f"Total Reward = {total_reward}, "
-                        f"Steps = {num_steps},\n")
+            _write_basic_summary(self.summary_file, self.episode_count, total_reward, num_steps)
         self.reset_episode()
 
     def on_step(self, data) -> bool:
@@ -90,7 +113,7 @@ class TrainingLogger():
         # print(self.locals['new_obs'])
         self.episode_observations.extend(data['obs'])
         self.episode_actions.extend(data['actions'])
-        if self._log_info:
+        if self._log_info and "infos" in data and data["infos"] is not None:
             self.episode_info.append(data['infos'])
         if np.sum(data["dones"]).item() > 0:
             self.on_episode()
@@ -103,8 +126,8 @@ class AMBITrainingLogger():
         self._log_info = log_info
         self._log_type = log_type
         if log_dir: #if not, should set_log_dir before calling on episode or on step.
-            self.set_log_dir(log_dir) 
-        
+            self.set_log_dir(log_dir)
+
         self.reset()
 
     def reset(self):
@@ -130,7 +153,6 @@ class AMBITrainingLogger():
         os.makedirs(self.train_episodes_dir, exist_ok=True)
         print("log directory set to ", log_dir)
 
-        
     def on_episode(self) -> None:
         self.episode_count += 1
 
@@ -150,7 +172,6 @@ class AMBITrainingLogger():
         total_reward = sum(self.episode_rewards)
         num_steps = len(self.episode_rewards)
 
-
         if len(self.episode_inner_steps) > 0:
             num_inner_steps = sum([sum(inner_steps) for inner_steps in self.episode_inner_steps])
         else:
@@ -158,27 +179,13 @@ class AMBITrainingLogger():
 
         # print(total_reward)
         # avg_reward = np.mean(self.episode_rewards)
-        if self._log_info:
-            goal_key = [k for k in list(self.episode_info[0].keys()) if "desired" in k][0]
-            goal = self.episode_info[0][goal_key]
-            base_reward = sum([item["base"] for item in self.episode_info])
-            healthy_bonus = sum([item["healthy_bonus"] for item in self.episode_info])
-            control_cost = sum([item["control cost"] for item in self.episode_info])
-            contact_cost = sum([item["contact cost"] for item in self.episode_info])
-            # Write summary to a file
-            with open(self.summary_file, 'a') as f:
-                f.write(f"episode_{self.episode_count}: "
-                        f"Total Reward = {total_reward}, "
-                        f"Total Base = {base_reward}, "
-                        f"Total Healthy = {healthy_bonus}, "
-                        f"Total Control = {control_cost}, "
-                        f"Total Contact = {contact_cost}, "
-                        f"Goal = {goal}, Steps = {num_steps},\n")
+        if self._log_info and self.episode_info:
+            try:
+                _write_reward_info_summary(self.summary_file, self.episode_count, total_reward, num_steps, self.episode_info)
+            except (IndexError, KeyError, TypeError, AttributeError):
+                _write_basic_summary(self.summary_file, self.episode_count, total_reward, num_steps, num_inner_steps)
         else:
-             with open(self.summary_file, 'a') as f:
-                f.write(f"episode_{self.episode_count}: "
-                        f"Total Reward = {total_reward}, "
-                        f"Steps = {num_steps}, Inner Steps = {num_inner_steps},\n")
+            _write_basic_summary(self.summary_file, self.episode_count, total_reward, num_steps, num_inner_steps)
         self.reset_episode()
 
     def on_step(self, data) -> bool:
@@ -190,8 +197,8 @@ class AMBITrainingLogger():
         # print(self.locals['new_obs'])
         self.episode_observations.extend(data['obs'])
         self.episode_actions.extend(data['actions'])
-        self.episode_inner_steps.extend(data['inner_steps'])
-        if self._log_info:
+        self.episode_inner_steps.extend(data.get('inner_steps', []))
+        if self._log_info and "infos" in data and data["infos"] is not None:
             self.episode_info.append(data['infos'])
         if np.sum(data["dones"]).item() > 0:
             self.on_episode()

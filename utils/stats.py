@@ -100,7 +100,10 @@ def handle_trial(path, incl_reward = True, incl_obs = False, incl_act = False, i
                         if incl_goal:
                             goals.append(float(handle_stats_line(segments, 'Goal')))
 
-        print(len(episodes), episodes[-1], len(rewards), len(base_rewards))
+        if episodes:
+            print(len(episodes), episodes[-1], len(rewards), len(base_rewards))
+        else:
+            print("No episodes found in stats.txt for trial", path)
         
         return alg_name, {'rewards': np.array(rewards), 'base rewards': np.array(base_rewards), 'timesteps': np.array(steps), 'goals': np.array(goals)}
     else: 

@@ -1,6 +1,11 @@
-import random, time, argparse, json, os, shutil, math
+import random, time, argparse, json, os, shutil, math, copy
 
 import numpy as np
+
+try:
+    import torch
+except ImportError:  # Allows non-torch utility usage to keep importing this file.
+    torch = None
 
 import gymnasium as gym
 import domains  # registers custom envs (VarLegsAnt, Ant3LegDeadStump, LegAdaptAnt, ...)
@@ -19,6 +24,23 @@ from log import TrainingLogger, AMBITrainingLogger
 # import gymnasium_platform
 
 # from utils.utils import *
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    if torch is not None:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+
+def seed_env_spaces(env, seed):
+    if hasattr(env.action_space, "seed"):
+        env.action_space.seed(seed)
+    if hasattr(env.observation_space, "seed"):
+        env.observation_space.seed(seed)
+
 
 def main():
     parser = argparse.ArgumentParser(description="action mode learning experiments")
@@ -43,6 +65,9 @@ def main():
         log_setting = experiment_params["logs"]
     else:
         log_setting = "warn" #just manually enforcing an annoying default because I love my users and I don't want them deleting their logs or causing clutter by default :)
+
+    if log_setting not in SUPPORTED_LOG_SETTINGS:
+        raise Exception("unsupported logging setting. Try none, overwrite, warn, overwrite-safe, or timestamp.")
 
     if "save_trials" in experiment_params:
         save_trials_setting = experiment_params["save_trials"]
@@ -81,7 +106,7 @@ def main():
             run_default_params = json.load(f)
         runtime_params[i].update(run_default_params.copy())
         print("config found. Replacing settings based on experiment configs.")
-        for override_key, override_value in experiment_params["overrides_alg"].items():
+        for override_key, override_value in experiment_params.get("overrides_alg", {}).items():
             if override_key in run_default_params:
                 print("setting of",override_key,"currently at",run_default_params[override_key], "overriden to", override_value,".")
             else:
@@ -93,88 +118,54 @@ def main():
 
     # seed = experiment_params["seed"]
 
+    experiment_log_dir = None
+    model_save_dir = None
     if log_setting != "none":
         experiment_log_dir = os.path.join(log_dir, f'{experiment_name}', '')
+        skip = False
         if log_setting == "warn":
             if os.path.exists(experiment_log_dir):
                 print("WARNING: experiment has been run before. Check the files, and delete or change setting from \'warn\'.")
                 quit()
         elif log_setting == "overwrite":
             if(os.path.exists(experiment_log_dir)):
-                shutil.rmtree(experiment_log_dir) #delete the old experiment! be careful with this setting. 
-            skip = False
+                shutil.rmtree(experiment_log_dir) #delete the old experiment! be careful with this setting.
         elif log_setting =="timestamp":
             experiment_log_dir=os.path.join(experiment_log_dir[:-1]+'_'+datetime_stamp(),"") #is there a way to do this with os path?
-            skip = False
         elif log_setting == "overwrite-safe":
             print("this run started at", datetime_stamp())
             if os.path.exists(experiment_log_dir):
                 print("Experiment folder already exists. Trials will only proceed if not run before.")
                 skip = True
-            else:
-                skip = False
+
         if not skip:
-            os.mkdir(experiment_log_dir)
+            os.makedirs(experiment_log_dir, exist_ok=True)
             with open(experiment_log_dir+"settings.json", "w") as f:
                 json.dump(experiment_params, f, indent=2) #put the experiment json params next to the data which resulted from a run with those parameters
         else:
-            try: 
+            try:
                 with open(experiment_log_dir+"settings.json", "r") as f:
                     existing_settings = json.load(f)
                     print("Found existing settings:", existing_settings)
             except:
                 print("WARNING: experiment folder existed, but there was an issue reading the settings file. Proceeding with caution under the current settings.")
-                
 
-        if experiment_params["save_trials"] != None:
+        if save_trials_setting not in (None, "none") or checkpoint_every:
             model_save_dir = os.path.join(experiment_log_dir, "models", "")
-            if not os.path.exists(model_save_dir):
-                os.mkdir(model_save_dir)
-
-        if log_setting not in SUPPORTED_LOG_SETTINGS:
-            raise Exception("unsupported logging setting. Try none, overwrite, warn, or timestamp.")
+            os.makedirs(model_save_dir, exist_ok=True)
 
         if "AMBI" in experiment_name:
             print("Using AMBI training logger")
             training_logger = AMBITrainingLogger(log_info=log_info_setting, log_type = log_type_setting)
         else:
             training_logger = TrainingLogger(log_info=log_info_setting, log_type = log_type_setting)
-    
-    i
+
     ran_so_far = 0
 
-    for i, run_params in enumerate(runtime_params, start = alg_ind):
+    for i, run_params in enumerate(runtime_params[alg_ind:], start = alg_ind):
         alg_config = run_params["name"]
         print(run_params)
-        
-        random.seed(run_params['seed']) #is it really correct to do this in the loop with the outer experiment seed?
-        np.random.seed(run_params['seed'])
-        if "env_params" in experiment_params.keys():
-            domain = gym.make(run_params['env'], **experiment_params["env_params"])
-        else:
-            domain = gym.make(run_params['env']) #often overriden by experiment for consistency
 
-        #handle custom wrappers:
-        if "env_wrappers" in run_params:
-            for env_wrapper in run_params["env_wrappers"]: #wrappers will be applied first to last in the order of the list
-                if 'name' not in env_wrapper or env_wrapper['name'].split(':')[-1] not in SUPPORTED_WRAPPERS:
-                    raise Exception("wrappers misconfigured, or otherwise not currently supported")
-                wrapper_name = env_wrapper['name']
-                wrapper_params = env_wrapper['wrapper_params']
-                domain = setup_wrapper(domain, wrapper_name, wrapper_params)
-        
-        
-        if "env_wrapper" in run_params:
-            if 'name' not in run_params['env_wrapper'] or run_params['env_wrapper']['name'].split(':')[-1] not in SUPPORTED_WRAPPERS:
-                raise Exception("wrapper misconfigured, or otherwise not currently supported")
-            wrapper_name = run_params['env_wrapper']['name']
-            wrapper_params = run_params['env_wrapper']["wrapper_params"]
-        
-            domain = setup_wrapper(domain, wrapper_name, wrapper_params)
-            
-
-        alg_name = run_params["alg"]
-        
         if save_trials_setting == "best": #this won't take into account old saved models if you're running "best".
             best_trial = -1
             best_score = -math.inf
@@ -184,11 +175,45 @@ def main():
             if ran_so_far == num_runs:
                 print("completed running", num_runs, "trials!")
                 quit()
-            model, baseline, alg_name = initialize_alg(run_params["alg"], run_params["alg_params"], domain, full_run_params=run_params, experiment_params=experiment_params)
+
+            trial_run_params = copy.deepcopy(run_params)
+            trial_seed = int(trial_run_params.get("seed", 0)) + t
+            trial_run_params["seed"] = trial_seed
+            if "baselines/" in trial_run_params["alg"]:
+                trial_run_params.setdefault("alg_params", {})["seed"] = trial_seed
+
+            seed_everything(trial_seed)
+
+            if "env_params" in experiment_params.keys():
+                domain = gym.make(trial_run_params['env'], **experiment_params["env_params"])
+            else:
+                domain = gym.make(trial_run_params['env']) #often overriden by experiment for consistency
+
+            #handle custom wrappers:
+            if "env_wrappers" in trial_run_params:
+                for env_wrapper in trial_run_params["env_wrappers"]: #wrappers will be applied first to last in the order of the list
+                    if 'name' not in env_wrapper or env_wrapper['name'].split(':')[-1] not in SUPPORTED_WRAPPERS:
+                        raise Exception("wrappers misconfigured, or otherwise not currently supported")
+                    wrapper_name = env_wrapper['name']
+                    wrapper_params = env_wrapper['wrapper_params']
+                    domain = setup_wrapper(domain, wrapper_name, wrapper_params)
+
+            if "env_wrapper" in trial_run_params:
+                if 'name' not in trial_run_params['env_wrapper'] or trial_run_params['env_wrapper']['name'].split(':')[-1] not in SUPPORTED_WRAPPERS:
+                    raise Exception("wrapper misconfigured, or otherwise not currently supported")
+                wrapper_name = trial_run_params['env_wrapper']['name']
+                wrapper_params = trial_run_params['env_wrapper']["wrapper_params"]
+
+                domain = setup_wrapper(domain, wrapper_name, wrapper_params)
+
+            seed_env_spaces(domain, trial_seed)
+            domain.reset(seed=trial_seed)
+
+            model, baseline, alg_name = initialize_alg(trial_run_params["alg"], trial_run_params["alg_params"], domain, full_run_params=trial_run_params, experiment_params=experiment_params)
             print(alg_name, "initialized.")
-           
+
             if log_setting == "none":
-                model.learn(total_timesteps=run_params["total_steps"]) #simply don't log anything
+                model.learn(total_timesteps=trial_run_params["total_steps"]) #simply don't log anything
             else:
                 trial_log_dir = experiment_log_dir + f'{alg_config}_{t}'
                 if os.path.exists(trial_log_dir):
@@ -197,14 +222,15 @@ def main():
                         print("quitting, as to continue would risk an overwrite.")
                         quit()
                 else:
-                    os.mkdir(trial_log_dir)
+                    os.makedirs(trial_log_dir, exist_ok=True)
                 with open(os.path.join(trial_log_dir,"alg_settings.json"), "w") as f:
-                    json.dump(run_params, f, indent=2) #put the algorithm parameters next to the data which resulted from a trial using those params
+                    json.dump(trial_run_params, f, indent=2) #put the algorithm parameters next to the data which resulted from a trial using those params
+                training_logger.reset()
                 training_logger.set_log_dir(trial_log_dir)
                 model.set_logger(training_logger)
-                if checkpoint_every and baseline: #for now, we are only supporting checkpointing the baselines...
+                if checkpoint_every and hasattr(model, "set_checkpointing"):
                     model.set_checkpointing(save_freq=checkpoint_every, save_path=model_save_dir, name_prefix=f'model:{alg_config}_{t}')
-                model.learn(total_timesteps=run_params["total_steps"])
+                model.learn(total_timesteps=trial_run_params["total_steps"])
 
                 if t == 0 and save_trials_setting == "first":
                     model.save(model_save_dir,f'model:{alg_config}_{t}')
@@ -213,30 +239,31 @@ def main():
                 elif save_trials_setting == "best":
                     _ , trial_contents = handle_trial(trial_log_dir)
                     rewards = trial_contents["rewards"]
-                    score = np.average(rewards) #take a simple average over the whole trial!
+                    score = np.average(rewards) if rewards.size > 0 else -math.inf #take a simple average over the whole trial!
                     old_best_score = best_score
                     old_best_trial = best_trial
                     best_score = best_score if score < best_score else score
                     if best_score != old_best_score:
                         model.save(model_save_dir, f'model:{alg_config}_{t}') #save the new model
-                        old_model_filename = os.path.join(model_save_dir,f'model:{alg_config}_{old_best_trial}*')
-                        os.system(f'rm -f {old_model_filename}') #delete the old saved model (but only after the new one is saved)
+                        if old_best_trial >= 0:
+                            old_model_filename = os.path.join(model_save_dir,f'model:{alg_config}_{old_best_trial}*')
+                            os.system(f'rm -f {old_model_filename}') #delete the old saved model (but only after the new one is saved)
                         best_trial = t
-                        
+
                     with open(os.path.join(model_save_dir,"scores.txt"), "a") as f:
                         f.write(f'{alg_config}_{t}'+ ":" + str(score) + '\n')
-                    
+
                     # with open(best_trial_score,"r") as f:
                     #     old_best_score = int(f.read())
                     #TODO: finish best trial score implementation
-                    training_logger.reset()
-                ran_so_far  += 1
+            ran_so_far  += 1
+            domain.close()
 
-                # print("training count", callback.training_count)
-                # print("episode count", callback.episode_count)
-                # print("rollout count", callback.rollout_count)
-                # print("n_calls", callback.n_calls)
-                # print("num_timesteps", callback.num_timesteps)
-    
+            # print("training count", callback.training_count)
+            # print("episode count", callback.episode_count)
+            # print("rollout count", callback.rollout_count)
+            # print("n_calls", callback.n_calls)
+            # print("num_timesteps", callback.num_timesteps)
+
 if __name__ == '__main__':
    main()

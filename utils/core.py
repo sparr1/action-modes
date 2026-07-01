@@ -4,13 +4,14 @@ from domains.AntPlane import AntPlane
 import importlib, json
 
 SUPPORTED_WRAPPERS = ("Subtask", "AntPlane", "ScaledStateWrapper", "PlatformFlattenedActionWrapper", "ScaledParameterisedActionWrapper")
-SUPPORTED_LOG_SETTINGS = ("overwrite", "warn", "timestamp", "overwrite-safe")
+SUPPORTED_LOG_SETTINGS = ("none", "overwrite", "warn", "timestamp", "overwrite-safe")
 SUPPORTED_LOG_TYPES = ("detailed", "summary")
 
 def initialize_alg(alg_string, alg_params, domain, custom_action_space = None, full_run_params=None, experiment_params=None):
     baseline = False
     if '/' in alg_string:
-        file_name, alg_name = "".join(alg_string.split('/')[:-1]), alg_string.split('/')[-1]
+        parts = alg_string.split('/')
+        file_name, alg_name = "/".join(parts[:-1]), parts[-1]
         # print(file_name)
         # print(alg_name)
         if "baselines" in file_name:
@@ -18,32 +19,25 @@ def initialize_alg(alg_string, alg_params, domain, custom_action_space = None, f
             try:
                 model = Baseline(alg_name, domain, alg_params)
             except Exception as e:
-                print(e)
-                return #if we cannot run this baseline, we just try another
+                raise RuntimeError(f"Failed to initialize baseline algorithm '{alg_string}'.") from e
         elif file_name == "PAMDP":
-            try: 
+            try:
                 module = importlib.import_module("RL.PAMDP")
                 alg_class = getattr(module, alg_name)
                 model = alg_class(alg_name, domain, alg_params, custom_action_space = custom_action_space)
             except Exception as e:
-                print(e)
-                return #if we cannot run this baseline, we just try another.
+                raise RuntimeError(f"Failed to initialize PAMDP algorithm '{alg_string}'.") from e
         elif file_name == "modes":
             try:
                 module = importlib.import_module("RL.modes")
                 alg_class = getattr(module, alg_name)
                 model = alg_class(alg_name, domain, **alg_params)
             except Exception as e:
-                print(e)
-                return
+                raise RuntimeError(f"Failed to initialize modes algorithm '{alg_string}'.") from e
         else:
-            # try:
             module = importlib.import_module("RL."+file_name.replace('/','.')) #last ditch, just try to load it!
             alg_class = getattr(module, alg_name)
             model = alg_class(alg_name, domain, alg_params, full_run_params, experiment_params)
-            # except Exception as e:
-                # print(e)
-                # return #if we cannot run this baseline, we just try another.
     else:
         try:
             module = importlib.import_module("RL.alg")
@@ -51,8 +45,7 @@ def initialize_alg(alg_string, alg_params, domain, custom_action_space = None, f
             model = alg_class(alg_string, domain, alg_params)
             alg_name = alg_string
         except Exception as e:
-            print(e)
-            return #if we cannot run this baseline, we just try another.
+            raise RuntimeError(f"Failed to initialize algorithm '{alg_string}'.") from e
     return model, baseline, alg_name
 
 #TODO: currently does nothing. either add functionality or delete

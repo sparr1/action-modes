@@ -1,6 +1,6 @@
 import gymnasium as gym
 import numpy as np
-import random, math
+import math
 # from modes.modes import ModalWrapper
 # from utils import q_rotate
 #
@@ -55,7 +55,7 @@ class AntPlane(gym.Wrapper):
             qpos = re_init_pos
         if self.random_rotation:
             random_rot = self.generate_random_rotation()
-            qpos[1+self.pos_offset:5+self.pos_offset] = random_rot
+            qpos[3:7] = random_rot
         
         self.env.unwrapped.set_state(qpos, qvel)
         observation = self.env.unwrapped._get_obs()
@@ -81,7 +81,8 @@ class AntPlane(gym.Wrapper):
         self.reset_locations = [(i,j) for i in range(len(self.reset_map)) for j in range(len(self.reset_map[i])) if self.reset_map[i][j]]
 
     def generate_reset_pos(self):
-        return random.choice(self.reset_locations)
+        idx = int(self.base_env.np_random.integers(len(self.reset_locations)))
+        return self.reset_locations[idx]
 
     def add_xy_position_noise(self, xy_pos: np.ndarray) -> np.ndarray:
             noise_x = (

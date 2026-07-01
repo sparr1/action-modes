@@ -1,0 +1,25 @@
+{
+    "seed": 55,
+    "env": "Ant-v4",
+    "alg": "TDMPC2/TDMPC2Baseline",
+    "device": "cuda",
+    "alg_params": {
+        "model_size": 5,
+        "episodic": true,
+        "discount": 0.99,
+        "seed_steps": 10000,
+        "pretrain_steps": 10000,
+        "buffer_size": 1000000,
+        "batch_size": 256,
+        "utd": 1,
+        "horizon": 3,
+        "iterations": 6,
+        "num_samples": 512,
+        "num_elites": 64,
+        "num_pi_trajs": 24,
+        "compile": false,
+        "mpc": true
+    },
+    "total_steps": 1000000,
+    "episodes": null
+}

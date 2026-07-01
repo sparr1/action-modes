@@ -1,6 +1,6 @@
 import gymnasium as gym
 import numpy as np
-import random, math
+import math
 
 class HumanoidPlane(gym.Wrapper):
     def __init__(self, env, random_resets = True, reset_map=[[1]*5]*5, map_scale = 4, position_noise_range = 0.25):
@@ -68,7 +68,8 @@ class HumanoidPlane(gym.Wrapper):
         self.reset_locations = [(i,j) for i in range(len(self.reset_map)) for j in range(len(self.reset_map[i])) if self.reset_map[i][j]]
 
     def generate_reset_pos(self):
-        return random.choice(self.reset_locations)
+        idx = int(self.base_env.np_random.integers(len(self.reset_locations)))
+        return self.reset_locations[idx]
 
     def add_xy_position_noise(self, xy_pos: np.ndarray) -> np.ndarray:
             noise_x = (

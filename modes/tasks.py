@@ -13,7 +13,7 @@ class Task():
         pass
     def get_termination(self, observation) -> bool:
         pass
-    def reset(self, seed = 32) -> None:
+    def reset(self, seed = None) -> None:
         pass
     def get_goal(self) -> float: #in theory, this should be greater than 1-d
         pass
@@ -56,9 +56,9 @@ class Subtask(gym.Wrapper):
         #self.observation_space.spaces['desired_goal'] = gym.spaces.Box(-math.inf, math.inf, (goal_length,), np.float64)
         self.observation_space = gym.spaces.Dict(spaces)
 
-    def reset(self, seed = 32): #TODO actually implement seeding properly
+    def reset(self, seed = None, options = None):
         self._task.reset(seed=seed) #also reset the task. this will resample a new subgoal.
-        old_return = super().reset(seed=seed)
+        old_return = super().reset(seed=seed, options=options)
         return (self.observation(old_return[0]),old_return[1])
     
     def observation(self, obs):
@@ -83,7 +83,7 @@ class Subtask(gym.Wrapper):
         # info.update({"reward_info":self.reward_info, "old_reward": reward, "old_termination": terminated, "old_goal":desired_goal})
         info.update({"reward_info":self.reward_info, "old_reward": reward, "old_termination": terminated})
 
-        return new_observation, new_reward, new_termination, truncated, info
+        return new_observation, new_reward, bool(terminated or new_termination), truncated, info
 
     def reward(self, observation):
         reward, self.reward_info = self._task.get_reward(observation, self.last_action, self.contact_forces)
