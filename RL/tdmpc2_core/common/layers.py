@@ -1,36 +1,47 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tensordict import from_modules
-from copy import deepcopy
 
 
 class Ensemble(nn.Module):
 	"""
-	Vectorized ensemble of modules.
+	Q-function ensemble.
+
+	The official TD-MPC2 code vectorizes this with newer tensordict helpers.
+	AMBI keeps the same ensemble semantics with a plain ModuleList so the
+	vendored core works on older torch/tensordict stacks.
 	"""
 
 	def __init__(self, modules, **kwargs):
 		super().__init__()
-		# combine_state_for_ensemble causes graph breaks
-		self.params = from_modules(*modules, as_module=True)
-		with self.params[0].data.to("meta").to_module(modules[0]):
-			self.module = deepcopy(modules[0])
+		self.modules_list = nn.ModuleList(modules)
 		self._repr = str(modules[0])
-		self._n = len(modules)
 
 	def __len__(self):
-		return self._n
+		return len(self.modules_list)
 
-	def _call(self, params, *args, **kwargs):
-		with params.to_module(self.module):
-			return self.module(*args, **kwargs)
+	def __iter__(self):
+		return iter(self.modules_list)
+
+	def __getitem__(self, idx):
+		return self.modules_list[idx]
 
 	def forward(self, *args, **kwargs):
-		return torch.vmap(self._call, (0, None), randomness="different")(self.params, *args, **kwargs)
+		return torch.stack([m(*args, **kwargs) for m in self.modules_list], dim=0)
+
+	def forward_detached(self, *args, **kwargs):
+		"""Evaluate Qs with frozen Q parameters while preserving input gradients."""
+		requires_grad = [p.requires_grad for p in self.parameters()]
+		for p in self.parameters():
+			p.requires_grad_(False)
+		try:
+			return self.forward(*args, **kwargs)
+		finally:
+			for p, req_grad in zip(self.parameters(), requires_grad):
+				p.requires_grad_(req_grad)
 
 	def __repr__(self):
-		return f'Vectorized {len(self)}x ' + self._repr
+		return f'{len(self)}x ' + self._repr
 
 
 class ShiftAug(nn.Module):
@@ -165,57 +176,11 @@ def enc(cfg, out={}):
 
 
 def api_model_conversion(target_state_dict, source_state_dict):
+	"""Return checkpoint state dict unchanged.
+
+	The official implementation used this helper to migrate between two
+	vectorized-ensemble checkpoint formats. AMBI's compatibility ensemble uses
+	ordinary PyTorch ModuleLists, so current AMBI checkpoints already match the
+	model. Official vectorized TD-MPC2 checkpoints are not converted here.
 	"""
-	Converts a checkpoint from our old API to the new torch.compile compatible API.
-	"""
-	# check whether checkpoint is already in the new format
-	if "_detach_Qs_params.0.weight" in source_state_dict:
-		return source_state_dict
-
-	name_map = ['weight', 'bias', 'ln.weight', 'ln.bias']
-	new_state_dict = dict()
-
-	# rename keys
-	for key, val in list(source_state_dict.items()):
-		if key.startswith('_Qs.'):
-			num = key[len('_Qs.params.'):]
-			new_key = str(int(num) // 4) + "." + name_map[int(num) % 4]
-			new_total_key = "_Qs.params." + new_key
-			del source_state_dict[key]
-			new_state_dict[new_total_key] = val
-			new_total_key = "_detach_Qs_params." + new_key
-			new_state_dict[new_total_key] = val
-		elif key.startswith('_target_Qs.'):
-			num = key[len('_target_Qs.params.'):]
-			new_key = str(int(num) // 4) + "." + name_map[int(num) % 4]
-			new_total_key = "_target_Qs_params." + new_key
-			del source_state_dict[key]
-			new_state_dict[new_total_key] = val
-
-	# add batch_size and device from target_state_dict to new_state_dict
-	for prefix in ('_Qs.', '_detach_Qs_', '_target_Qs_'):
-		for key in ('__batch_size', '__device'):
-			new_key = prefix + 'params.' + key
-			new_state_dict[new_key] = target_state_dict[new_key]
-
-	# check that every key in new_state_dict is in target_state_dict
-	for key in new_state_dict.keys():
-		assert key in target_state_dict, f"key {key} not in target_state_dict"
-	# check that all Qs keys in target_state_dict are in new_state_dict
-	for key in target_state_dict.keys():
-		if 'Qs' in key:
-			assert key in new_state_dict, f"key {key} not in new_state_dict"
-	# check that source_state_dict contains no Qs keys
-	for key in source_state_dict.keys():
-		assert 'Qs' not in key, f"key {key} contains 'Qs'"
-
-	# copy log_std_min and log_std_max from target_state_dict to new_state_dict
-	new_state_dict['log_std_min'] = target_state_dict['log_std_min']
-	new_state_dict['log_std_dif'] = target_state_dict['log_std_dif']
-	if '_action_masks' in target_state_dict:
-		new_state_dict['_action_masks'] = target_state_dict['_action_masks']
-
-	# copy new_state_dict to source_state_dict
-	source_state_dict.update(new_state_dict)
-
 	return source_state_dict

@@ -7,7 +7,10 @@ import gymnasium as gym
 import numpy as np
 import torch
 from gymnasium.spaces.utils import flatdim, flatten
-from tensordict import TensorDict
+try:
+    from tensordict import TensorDict
+except ImportError:  # tensordict<newer API compatibility
+    from tensordict.tensordict import TensorDict
 
 from RL.alg import Algorithm
 from RL.tdmpc2_core.agent import TDMPC2
@@ -80,7 +83,7 @@ _DEFAULTS = {
     "episodic": True,
     "compile": False,
     "seed": 1,
-    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "device": "auto",
 }
 
 
@@ -121,7 +124,9 @@ class TDMPC2Baseline(Algorithm):
         run_device = self.run_params.get("device", None)
         if "device" not in params and run_device is not None:
             cfg["device"] = run_device
-        if str(cfg["device"]).startswith("cuda") and not torch.cuda.is_available():
+        if cfg["device"] == "auto":
+            cfg["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+        elif str(cfg["device"]).startswith("cuda") and not torch.cuda.is_available():
             print("CUDA requested for TD-MPC2, but CUDA is unavailable. Falling back to CPU.")
             cfg["device"] = "cpu"
 

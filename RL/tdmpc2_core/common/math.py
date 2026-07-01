@@ -1,6 +1,9 @@
 import torch
 import torch.nn.functional as F
-from tensordict import TensorDict
+try:
+	from tensordict import TensorDict
+except ImportError:  # tensordict<newer API compatibility
+	from tensordict.tensordict import TensorDict
 
 
 def soft_ce(pred, target, cfg):

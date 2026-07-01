@@ -5,7 +5,10 @@ from .common import math
 from .common.scale import RunningScale
 from .common.world_model import WorldModel
 from .common.layers import api_model_conversion
-from tensordict import TensorDict
+try:
+	from tensordict import TensorDict
+except ImportError:  # tensordict<newer API compatibility
+	from tensordict.tensordict import TensorDict
 
 
 class TDMPC2(torch.nn.Module):
