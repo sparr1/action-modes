@@ -1,5 +1,4 @@
 import torch
-from torch.nn import Buffer
 
 
 class RunningScale(torch.nn.Module):
@@ -9,8 +8,8 @@ class RunningScale(torch.nn.Module):
 		super().__init__()
 		self.cfg = cfg
 		device = torch.device(getattr(cfg, 'device', None) or ('cuda:0' if torch.cuda.is_available() else 'cpu'))
-		self.value = Buffer(torch.ones(1, dtype=torch.float32, device=device))
-		self._percentiles = Buffer(torch.tensor([5, 95], dtype=torch.float32, device=device))
+		self.register_buffer('value', torch.ones(1, dtype=torch.float32, device=device))
+		self.register_buffer('_percentiles', torch.tensor([5, 95], dtype=torch.float32, device=device))
 
 	def state_dict(self):
 		return dict(value=self.value, percentiles=self._percentiles)

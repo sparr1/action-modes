@@ -1,15 +1,30 @@
-#!/bin/bash
-#SBATCH --job-name=ambi_ant
-#SBATCH --output=logs/ambi_ant_%j.out
-#SBATCH --error=logs/ambi_ant_%j.err
-#SBATCH --time=96:00:00
-#SBATCH --mem=32G
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
+#!/usr/bin/env bash
+#SBATCH --job-name=ambi_ant_richard
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=6
-#SBATCH --constraint=geforce3090 
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --partition=gpus
+#SBATCH --gres=gpu:1
+#SBATCH --mem=64G
+#SBATCH --time=48:00:00
+#SBATCH --output=slurm/logs/%x-%j.out
+#SBATCH --error=slurm/logs/%x-%j.err
+#SBATCH --nodelist=gpu[2301]
+
+# Add cluster-specific directives here, for example:
+# #SBATCH --partition=<gpu-partition>
+# #SBATCH --account=<account>
+# #SBATCH --constraint=<gpu-constraint>
+
+
+set -Eeuo pipefail
+
+# Submit this file from the repository root:
+#   sbatch slurm/run.sbatch
+PROJECT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
+cd "$PROJECT_DIR"
+
+
 
 # Print job information
 echo "Job ID: $SLURM_JOB_ID"
@@ -20,14 +35,15 @@ echo "Working directory: $(pwd)"
 # Create logs directory if it doesn't exist
 mkdir -p logs
 
-module load miniforge3/25.3.0-3
-source ${MAMBA_ROOT_PREFIX}/etc/profile.d/conda.sh
+
+source ~/miniforge3/etc/profile.d/conda.sh
 conda activate ambi
 
 
 # Run the training script
 echo "Starting AMBI training..."
-python main.py --run configs/experiments/AntAMBI.json
+# python main.py --run configs/experiments/AntAMBI.json
+python main.py -r configs/experiments/AntTDMPC2Debug.json --num-runs 1
 if [ $? -ne 0 ]; then
     echo "ERROR: Training script failed"
 fi
