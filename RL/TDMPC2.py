@@ -15,6 +15,7 @@ except ImportError:  # tensordict<newer API compatibility
 from RL.alg import Algorithm
 from RL.tdmpc2_core.agent import TDMPC2
 from RL.tdmpc2_core.common.buffer import Buffer
+from RL.tdmpc2_core.common.device import resolve_device
 from utils.utils import setup_logs
 
 
@@ -124,11 +125,7 @@ class TDMPC2Baseline(Algorithm):
         run_device = self.run_params.get("device", None)
         if "device" not in params and run_device is not None:
             cfg["device"] = run_device
-        if cfg["device"] == "auto":
-            cfg["device"] = "cuda" if torch.cuda.is_available() else "cpu"
-        elif str(cfg["device"]).startswith("cuda") and not torch.cuda.is_available():
-            print("CUDA requested for TD-MPC2, but CUDA is unavailable. Falling back to CPU.")
-            cfg["device"] = "cpu"
+        cfg["device"] = str(resolve_device(cfg["device"]))
 
         cfg["seed"] = int(self.run_params.get("seed", cfg.get("seed", 1)))
         cfg["steps"] = int(float(self.run_params.get("total_steps", cfg.get("steps", 1_000_000))))
@@ -202,7 +199,7 @@ class TDMPC2Baseline(Algorithm):
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        if torch.cuda.is_available():
+        if str(self.cfg.device).startswith("cuda"):
             torch.cuda.manual_seed_all(seed)
         try:
             self.env.action_space.seed(seed)

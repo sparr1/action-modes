@@ -9,12 +9,7 @@
 #SBATCH --time=48:00:00
 #SBATCH --output=slurm/logs/%x-%j.out
 #SBATCH --error=slurm/logs/%x-%j.err
-#SBATCH --nodelist=gpu[2301]
-
-# Add cluster-specific directives here, for example:
-# #SBATCH --partition=<gpu-partition>
-# #SBATCH --account=<account>
-# #SBATCH --constraint=<gpu-constraint>
+#SBATCH --nodelist=gpu[2201]
 
 
 set -Eeuo pipefail
@@ -42,8 +37,11 @@ conda activate ambi
 
 # Run the training script
 echo "Starting AMBI training..."
+
 # python main.py --run configs/experiments/AntAMBI.json
-python main.py -r configs/experiments/AntTDMPC2Debug.json --num-runs 1
+# python main.py -r configs/experiments/AntTDMPC2Debug.json --num-runs 1
+
+python main.py -r configs/experiments/AntTDMPC2.json
 if [ $? -ne 0 ]; then
     echo "ERROR: Training script failed"
 fi

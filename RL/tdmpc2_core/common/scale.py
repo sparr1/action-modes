@@ -1,4 +1,5 @@
 import torch
+from .device import resolve_device
 
 
 class RunningScale(torch.nn.Module):
@@ -7,7 +8,7 @@ class RunningScale(torch.nn.Module):
 	def __init__(self, cfg):
 		super().__init__()
 		self.cfg = cfg
-		device = torch.device(getattr(cfg, 'device', None) or ('cuda:0' if torch.cuda.is_available() else 'cpu'))
+		device = resolve_device(getattr(cfg, 'device', None), warn=False)
 		self.register_buffer('value', torch.ones(1, dtype=torch.float32, device=device))
 		self.register_buffer('_percentiles', torch.tensor([5, 95], dtype=torch.float32, device=device))
 

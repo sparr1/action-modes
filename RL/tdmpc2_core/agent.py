@@ -5,6 +5,7 @@ from .common import math
 from .common.scale import RunningScale
 from .common.world_model import WorldModel
 from .common.layers import api_model_conversion
+from .common.device import resolve_device
 try:
 	from tensordict import TensorDict
 except ImportError:  # tensordict<newer API compatibility
@@ -21,8 +22,8 @@ class TDMPC2(torch.nn.Module):
 	def __init__(self, cfg):
 		super().__init__()
 		self.cfg = cfg
-		device = getattr(cfg, 'device', None) or ('cuda:0' if torch.cuda.is_available() else 'cpu')
-		self.device = torch.device(device)
+		self.device = resolve_device(getattr(cfg, 'device', None))
+		self.cfg.device = str(self.device)
 		self.model = WorldModel(cfg).to(self.device)
 		self.optim = torch.optim.Adam([
 			{'params': self.model._encoder.parameters(), 'lr': self.cfg.lr*self.cfg.enc_lr_scale},
