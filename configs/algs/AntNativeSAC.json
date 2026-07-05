@@ -1,0 +1,23 @@
+{
+    "seed": 55,
+    "env": "Ant-v4",
+    "alg": "SAC/SAC",
+    "device": "cuda",
+    "alg_params": {
+        "verbose": 1,
+        "buffer_size": 1000000,
+        "learning_starts": 10000,
+        "batch_size": 128,
+        "gradient_steps": 50,
+        "train_freq": 50,
+        "learning_rate": 0.00005,
+        "gamma": 0.99,
+        "tau": 0.005,
+        "ent_coef": "auto",
+        "target_entropy": "auto",
+        "target_update_interval": 1,
+        "net_arch": [256, 256]
+    },
+    "total_steps": 1000000,
+    "episodes": null
+}
