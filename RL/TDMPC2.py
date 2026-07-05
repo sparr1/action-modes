@@ -122,7 +122,7 @@ class TDMPC2Baseline(Algorithm):
         self._wandb_every = int((custom_params or {}).get("wandb_step_every", 1000))
         self._wandb_run = init_wandb(
             custom_params or {},
-            default_project="ambi_tdmpc2",
+            default_project="ambi",
             run_name=f"TDMPC2-{self.run_params.get('env', 'env')}-seed{self.cfg.seed}",
             config={"run_params": self.run_params, "alg_params": custom_params or {}, "config": vars(self.cfg)},
         )

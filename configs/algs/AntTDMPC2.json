@@ -19,9 +19,10 @@
         "num_pi_trajs": 24,
         "compile": false,
         "mpc": true,
-        "wandb": false,
-        "wandb_project": "ambi_tdmpc2",
-        "wandb_step_every": 1000
+        "wandb": true,
+        "wandb_project": "ambi",
+        "wandb_step_every": 1000,
+        "wandb_entity": "rwgao_b-brown-university"
     },
     "total_steps": 1000000,
     "episodes": null

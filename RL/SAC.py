@@ -53,7 +53,7 @@ class SAC(Algorithm):
         self._wandb_every = int(self.params.get("wandb_step_every", 1000))
         self._wandb_run = init_wandb(
             self.params,
-            default_project="ambi_native_sac",
+            default_project="ambi",
             run_name=f"NativeSAC-{self.run_params.get('env', 'env')}-seed{self.seed}",
             config={"run_params": self.run_params, "alg_params": self.params, "config": asdict(self.cfg)},
         )

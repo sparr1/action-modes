@@ -20,9 +20,10 @@
             256,
             256
         ],
-        "wandb": false,
-        "wandb_project": "ambi_native_sac",
-        "wandb_step_every": 1000
+        "wandb": true,
+        "wandb_project": "ambi",
+        "wandb_step_every": 1000,
+        "wandb_entity": "rwgao_b-brown-university"
     },
     "total_steps": 1000000,
     "episodes": null

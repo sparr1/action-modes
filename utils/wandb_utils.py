@@ -7,6 +7,10 @@ explicitly enabled with `wandb: true` in an algorithm config.
 from __future__ import annotations
 
 
+DEFAULT_WANDB_ENTITY = "rwgao_b-brown-university"
+DEFAULT_WANDB_PROJECT = "ambi"
+
+
 def wandb_enabled(params: dict | None) -> bool:
     return bool(params and params.get("wandb", False))
 
@@ -19,12 +23,13 @@ def init_wandb(params: dict | None, *, default_project: str, run_name: str | Non
     except ImportError as exc:
         raise RuntimeError("wandb=True but the wandb package is not installed. Run `pip install wandb` or set wandb=false.") from exc
 
-    project = params.get("wandb_project", default_project)
+    project = params.get("wandb_project", default_project or DEFAULT_WANDB_PROJECT)
+    entity = params.get("wandb_entity", DEFAULT_WANDB_ENTITY)
     name = params.get("wandb_run_name", run_name)
     mode = params.get("wandb_mode", None)
     tags = params.get("wandb_tags", None)
 
-    kwargs = {"project": project, "name": name, "config": config or {}}
+    kwargs = {"project": project, "entity": entity, "name": name, "config": config or {}}
     if mode:
         kwargs["mode"] = mode
     if tags:
