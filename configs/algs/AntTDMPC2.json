@@ -18,7 +18,10 @@
         "num_elites": 64,
         "num_pi_trajs": 24,
         "compile": false,
-        "mpc": true
+        "mpc": true,
+        "wandb": false,
+        "wandb_project": "ambi_tdmpc2",
+        "wandb_step_every": 1000
     },
     "total_steps": 1000000,
     "episodes": null

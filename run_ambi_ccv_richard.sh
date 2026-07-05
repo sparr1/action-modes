@@ -6,10 +6,10 @@
 #SBATCH --partition=gpus
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
-#SBATCH --time=48:00:00
+#SBATCH --time=96:00:00
 #SBATCH --output=slurm/logs/%x-%j.out
 #SBATCH --error=slurm/logs/%x-%j.err
-#SBATCH --nodelist=gpu[2201]
+#SBATCH --nodelist=gpu[2501]
 
 
 set -Eeuo pipefail
@@ -41,7 +41,9 @@ echo "Starting AMBI training..."
 # python main.py --run configs/experiments/AntAMBI.json
 # python main.py -r configs/experiments/AntTDMPC2Debug.json --num-runs 1
 
-python main.py -r configs/experiments/AntTDMPC2.json
+# python main.py -r configs/experiments/AntTDMPC2.json
+
+python main.py -r configs/experiments/AntNativeSACDebug.json --num-runs 1
 if [ $? -ne 0 ]; then
     echo "ERROR: Training script failed"
 fi

@@ -17,6 +17,7 @@ from RL.tdmpc2_core.agent import TDMPC2
 from RL.tdmpc2_core.common.buffer import Buffer
 from RL.tdmpc2_core.common.device import resolve_device
 from utils.utils import setup_logs
+from utils.wandb_utils import finish_wandb, init_wandb, log_wandb
 
 
 _MODEL_SIZE = {
@@ -114,7 +115,17 @@ class TDMPC2Baseline(Algorithm):
         self._checkpointing = None
         self._global_step = 0
         self._episode_idx = 0
+        self._episode_return = 0.0
+        self._episode_len = 0
         self._pretrained = False
+        self._last_train_metrics = None
+        self._wandb_every = int((custom_params or {}).get("wandb_step_every", 1000))
+        self._wandb_run = init_wandb(
+            custom_params or {},
+            default_project="ambi_tdmpc2",
+            run_name=f"TDMPC2-{self.run_params.get('env', 'env')}-seed{self.cfg.seed}",
+            config={"run_params": self.run_params, "alg_params": custom_params or {}, "config": vars(self.cfg)},
+        )
 
         print("Architecture:", self.agent.model)
 
@@ -268,11 +279,53 @@ class TDMPC2Baseline(Algorithm):
         obs_for_log = obs if isinstance(obs, dict) else np.asarray(obs)[None, ...]
         action_for_log = np.asarray(action)[None, ...]
 
-        if getattr(self.alg_logger, "_log_info", False):
-            data = setup_logs(reward, obs_for_log, action_for_log, [done], [info_for_log])
-        else:
-            data = setup_logs(reward, obs_for_log, action_for_log, [done])
+        data = setup_logs(reward, obs_for_log, action_for_log, [done], [info_for_log])
         self.alg_logger.on_step(data)
+
+    def _metrics_to_floats(self, metrics):
+        if metrics is None:
+            return {}
+        out = {}
+        for key, value in metrics.items():
+            if torch.is_tensor(value):
+                out[key] = float(value.detach().cpu().mean())
+            else:
+                try:
+                    out[key] = float(value)
+                except (TypeError, ValueError):
+                    pass
+        return out
+
+    def _log_wandb_step(self, reward, terminated, truncated, metrics=None):
+        if self._wandb_run is None:
+            return
+        done = bool(terminated or truncated)
+        if (self._global_step % self._wandb_every != 0) and not done and not metrics:
+            return
+        payload = {
+            "train/reward": float(reward),
+            "train/done": int(done),
+            "train/terminated": int(bool(terminated)),
+            "train/truncated": int(bool(truncated)),
+            "train/buffer_episodes": int(self.buffer.num_eps),
+            "episode/current_return": float(self._episode_return),
+            "episode/current_len": int(self._episode_len),
+        }
+        payload.update({f"train/{key}": value for key, value in self._metrics_to_floats(metrics).items()})
+        log_wandb(self._wandb_run, payload, step=self._global_step)
+
+    def _log_wandb_episode(self):
+        if self._wandb_run is None:
+            return
+        log_wandb(
+            self._wandb_run,
+            {
+                "episode/index": int(self._episode_idx),
+                "episode/return": float(self._episode_return),
+                "episode/len": int(self._episode_len),
+            },
+            step=self._global_step,
+        )
 
     def _maybe_checkpoint(self):
         if not self._checkpointing:
@@ -304,13 +357,18 @@ class TDMPC2Baseline(Algorithm):
             episode_tds.append(self._to_td(next_obs, action_norm, reward, true_terminated))
             self._global_step += 1
             episode_step += 1
+            self._episode_return += float(reward)
+            self._episode_len += 1
             self._log_step(reward, next_obs, action_env, terminated, truncated, info)
 
             if done:
                 if true_terminated and not self.cfg.episodic:
                     raise ValueError("TD-MPC2 saw terminated=True while episodic=False. Set alg_params.episodic=true or disable true terminations in the env.")
                 self.buffer.add(torch.cat(episode_tds))
+                self._log_wandb_episode()
                 self._episode_idx += 1
+                self._episode_return = 0.0
+                self._episode_len = 0
                 obs, _ = self._reset_env()
                 episode_tds = [self._to_td(obs)]
                 episode_step = 0
@@ -327,8 +385,10 @@ class TDMPC2Baseline(Algorithm):
                     train_metrics = self.agent.update(self.buffer)
                 self._last_train_metrics = train_metrics
 
+            self._log_wandb_step(reward, terminated, truncated, self._last_train_metrics)
             self._maybe_checkpoint()
 
+        finish_wandb(self._wandb_run)
         return self
 
     def predict(self, observation, deterministic=True):

@@ -4,25 +4,25 @@
     "alg": "TDMPC2/TDMPC2Baseline",
     "device": "cuda",
     "alg_params": {
-      "model_size": 1,
-      "episodic": true,
-      "discount": 0.99,
-  
-      "seed_steps": 500,
-      "pretrain_steps": 10,
-      "buffer_size": 50000,
-      "batch_size": 32,
-      "utd": 1,
-  
-      "horizon": 3,
-      "iterations": 2,
-      "num_samples": 64,
-      "num_elites": 8,
-      "num_pi_trajs": 4,
-  
-      "compile": false,
-      "mpc": true
+        "model_size": 1,
+        "episodic": true,
+        "discount": 0.99,
+        "seed_steps": 500,
+        "pretrain_steps": 10,
+        "buffer_size": 50000,
+        "batch_size": 32,
+        "utd": 1,
+        "horizon": 3,
+        "iterations": 2,
+        "num_samples": 64,
+        "num_elites": 8,
+        "num_pi_trajs": 4,
+        "compile": false,
+        "mpc": true,
+        "wandb": false,
+        "wandb_project": "ambi_tdmpc2_debug",
+        "wandb_step_every": 100
     },
-    "total_steps": 250,
+    "total_steps": 2000,
     "episodes": null
-  }
+}

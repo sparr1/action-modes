@@ -9,9 +9,14 @@ from utils.stats import compute_rewards
 #TODO we will need some kind of plotting settings
 
 #we parsed out all the trial data and averaged it correctly. now all that's left to do is actually graphing it...
-def graph_rewards(results, keyword, title, buckets = True, base = False):
+def graph_rewards(results, keyword, title, buckets = True, base = False, stepwise = False):
     plt.figure(figsize=(10,6))
     print("results keys", results.keys())
+    if stepwise:
+        stepwise_keyword = keyword + " vs steps"
+        if stepwise_keyword in results:
+            keyword = stepwise_keyword
+            buckets = False
     if buckets:
         bucket_first = {}
         for algorithm in results[keyword]:
@@ -36,12 +41,12 @@ def graph_rewards(results, keyword, title, buckets = True, base = False):
                 # else:
                 #     means = np.maximum(-10000,means)
                 #     stds = np.minimum(5000, stds)
-                x = np.arange(len(means))
+                x = values.get("steps", np.arange(len(means)))
                 plt.plot(x,means,label = algorithm+bucket)
                 plt.fill_between(x, means-stds, means+stds, alpha=0.2)
             new_title = title+" "+bucket
             plt.title(new_title)
-            plt.xlabel('episodes')
+            plt.xlabel('environment steps' if stepwise else 'episodes')
             plt.ylabel('total reward')
             plt.legend()
             save_graph(new_title)
@@ -53,11 +58,11 @@ def graph_rewards(results, keyword, title, buckets = True, base = False):
             stds = values["stds"]
             # means = np.maximum(-10000,means)
             # stds = np.minimum(5000, stds)
-            x = np.arange(len(means))
+            x = values.get("steps", np.arange(len(means)))
             plt.plot(x,means,label = algorithm)
             plt.fill_between(x, means-stds, means+stds, alpha=0.2)
         plt.title(title)
-        plt.xlabel('episodes')
+        plt.xlabel('environment steps' if stepwise else 'episodes')
         plt.ylabel('total reward')
         plt.legend()
         save_graph(title)
