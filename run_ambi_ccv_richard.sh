@@ -41,11 +41,13 @@ echo "Starting AMBI training..."
 # python main.py --run configs/experiments/AntAMBI.json
 # python main.py -r configs/experiments/AntTDMPC2Debug.json --num-runs 1
 
-# python main.py -r configs/experiments/AntTDMPC2.json
+python main.py -r configs/experiments/AntTDMPC2.json
 
 # python main.py -r configs/experiments/AntNativeSACDebug.json --num-runs 1
 
-python main.py -r configs/experiments/AntSAC.json
+# python main.py -r configs/experiments/AntNativeSAC.json
+
+
 if [ $? -ne 0 ]; then
     echo "ERROR: Training script failed"
 fi

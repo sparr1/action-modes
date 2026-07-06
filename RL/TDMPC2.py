@@ -119,7 +119,7 @@ class TDMPC2Baseline(Algorithm):
         self._episode_len = 0
         self._pretrained = False
         self._last_train_metrics = None
-        self._wandb_every = int((custom_params or {}).get("wandb_step_every", 1000))
+        self._wandb_every = max(1, int((custom_params or {}).get("wandb_step_every", 1000)))
         self._wandb_run = init_wandb(
             custom_params or {},
             default_project="ambi",
@@ -300,8 +300,10 @@ class TDMPC2Baseline(Algorithm):
         if self._wandb_run is None:
             return
         done = bool(terminated or truncated)
-        if (self._global_step % self._wandb_every != 0) and not done and not metrics:
+        if (self._global_step % self._wandb_every != 0) and not done:
             return
+
+        metrics_floats = self._metrics_to_floats(metrics)
         payload = {
             "train/reward": float(reward),
             "train/done": int(done),
@@ -311,7 +313,7 @@ class TDMPC2Baseline(Algorithm):
             "episode/current_return": float(self._episode_return),
             "episode/current_len": int(self._episode_len),
         }
-        payload.update({f"train/{key}": value for key, value in self._metrics_to_floats(metrics).items()})
+        payload.update({f"train/{key}": value for key, value in metrics_floats.items()})
         log_wandb(self._wandb_run, payload, step=self._global_step)
 
     def _log_wandb_episode(self):
