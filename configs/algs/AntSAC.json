@@ -10,7 +10,11 @@
         "batch_size": 128,
         "gradient_steps": 50,
         "train_freq": 50,
-        "learning_rate": 5e-05
+        "learning_rate": 5e-05,
+        "wandb": true,
+        "wandb_project": "ambi",
+        "wandb_step_every": 1000,
+        "wandb_entity": "rwgao_b-brown-university"
     },
     "total_steps": 1000000,
     "episodes": null

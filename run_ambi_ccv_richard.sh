@@ -9,7 +9,7 @@
 #SBATCH --time=96:00:00
 #SBATCH --output=slurm/logs/%x-%j.out
 #SBATCH --error=slurm/logs/%x-%j.err
-#SBATCH --nodelist=gpu[2501]
+#SBATCH --nodelist=gpu[2201]
 
 
 set -Eeuo pipefail
@@ -41,7 +41,8 @@ echo "Starting AMBI training..."
 # python main.py --run configs/experiments/AntAMBI.json
 # python main.py -r configs/experiments/AntTDMPC2Debug.json --num-runs 1
 
-python main.py -r configs/experiments/AntTDMPC2.json
+# python main.py -r configs/experiments/AntTDMPC2.json
+python main.py -r configs/experiments/AntSAC.json
 
 # python main.py -r configs/experiments/AntNativeSACDebug.json --num-runs 1
 

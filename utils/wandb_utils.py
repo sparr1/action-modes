@@ -38,6 +38,7 @@ def init_wandb(params: dict | None, *, default_project: str, run_name: str | Non
     run = wandb.init(**kwargs)
     wandb.define_metric("env_step")
     wandb.define_metric("train/*", step_metric="env_step")
+    wandb.define_metric("rollout/*", step_metric="env_step")
     wandb.define_metric("episode/*", step_metric="env_step")
     wandb.define_metric("time/*", step_metric="env_step")
     return run
