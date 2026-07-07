@@ -8,8 +8,9 @@
     },
     "env_params": {
         "render_mode": null,
-        "exclude_current_positions_from_observation": false,
-        "max_episode_steps": 1000
+        "exclude_current_positions_from_observation": true,
+        "max_episode_steps": 1000,
+        "terminate_when_unhealthy": false
     },
     "trials": 3,
     "configs": [

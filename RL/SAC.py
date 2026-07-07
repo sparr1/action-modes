@@ -50,7 +50,7 @@ class SAC(Algorithm):
         self._episode_idx = 0
         self._episode_return = 0.0
         self._episode_len = 0
-        self._wandb_every = int(self.params.get("wandb_step_every", 1000))
+        self._wandb_every = max(1, int(self.params.get("wandb_step_every", 1000)))
         self._wandb_run = init_wandb(
             self.params,
             default_project="ambi",
@@ -145,18 +145,25 @@ class SAC(Algorithm):
         if self._wandb_run is None:
             return
         done = bool(terminated or truncated)
-        if (self.num_timesteps % self._wandb_every != 0) and not done and not metrics:
+        metrics = metrics or {}
+        regular_log = done or self.num_timesteps % self._wandb_every == 0
+        metrics_log = bool(metrics)
+        if not regular_log and not metrics_log:
             return
+
         payload = {
-            "train/reward": float(reward),
-            "train/done": int(done),
-            "train/terminated": int(bool(terminated)),
-            "train/truncated": int(bool(truncated)),
             "train/replay_size": int(self.replay_buffer.size),
-            "episode/current_return": float(self._episode_return),
-            "episode/current_len": int(self._episode_len),
         }
-        if metrics:
+        if regular_log:
+            payload.update({
+                "train/reward": float(reward),
+                "train/done": int(done),
+                "train/terminated": int(bool(terminated)),
+                "train/truncated": int(bool(truncated)),
+                "episode/current_return": float(self._episode_return),
+                "episode/current_len": int(self._episode_len),
+            })
+        if metrics_log:
             payload.update({f"train/{key}": float(value) for key, value in metrics.items()})
         log_wandb(self._wandb_run, payload, step=self.num_timesteps)
 

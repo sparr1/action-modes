@@ -37,7 +37,7 @@ _DEFAULTS = {
     "value_coef": 0.1,
     "termination_coef": 1.0,
     "consistency_coef": 20.0,
-    "rho": 0.5,
+    "rho": 0.7,
     "lr": 3e-4,
     "enc_lr_scale": 0.3,
     "grad_clip_norm": 20.0,
@@ -82,7 +82,7 @@ _DEFAULTS = {
 
     # misc
     "obs": "state",
-    "episodic": True,
+    "episodic": False,
     "compile": False,
     "seed": 1,
     "device": "auto",
@@ -345,7 +345,7 @@ class TDMPC2Baseline(Algorithm):
         episode_step = 0
 
         while self._global_step < total_timesteps:
-            if self._global_step < self.cfg.seed_steps or self.buffer.num_eps == 0:
+            if self._global_step <= self.cfg.seed_steps or self.buffer.num_eps == 0:
                 action_norm = self._random_action_norm()
             else:
                 obs_t = self._obs_to_tensor(obs)
@@ -377,7 +377,7 @@ class TDMPC2Baseline(Algorithm):
             else:
                 obs = next_obs
 
-            if self._global_step >= self.cfg.seed_steps and self.buffer.num_eps > 0:
+            if self._global_step > self.cfg.seed_steps and self.buffer.num_eps > 0:
                 num_updates = self.cfg.pretrain_steps if not self._pretrained else self.cfg.utd
                 if not self._pretrained:
                     print("Pretraining TD-MPC2 on seed data...")

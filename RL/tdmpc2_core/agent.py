@@ -305,7 +305,7 @@ class TDMPC2(torch.nn.Module):
 		if self.cfg.episodic:
 			termination_loss = F.binary_cross_entropy_with_logits(termination_pred, terminated)
 		else:
-			termination_loss = 0.
+			termination_loss = torch.zeros((), device=self.device)
 		value_loss = value_loss / (self.cfg.horizon * self.cfg.num_q)
 		total_loss = (
 			self.cfg.consistency_coef * consistency_loss +

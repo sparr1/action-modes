@@ -4,12 +4,12 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --partition=gpus
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:nvidia_l40:1
 #SBATCH --mem=64G
 #SBATCH --time=96:00:00
 #SBATCH --output=slurm/logs/%x-%j.out
 #SBATCH --error=slurm/logs/%x-%j.err
-#SBATCH --nodelist=gpu[2201]
+# SBATCH --nodelist=gpu[2201]
 
 
 set -Eeuo pipefail

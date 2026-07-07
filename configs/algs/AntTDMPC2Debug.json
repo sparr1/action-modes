@@ -5,7 +5,7 @@
     "device": "cuda",
     "alg_params": {
         "model_size": 1,
-        "episodic": true,
+        "episodic": false,
         "discount": 0.99,
         "seed_steps": 500,
         "pretrain_steps": 10,
@@ -22,7 +22,8 @@
         "wandb": false,
         "wandb_project": "ambi",
         "wandb_step_every": 100,
-        "wandb_entity": "rwgao_b-brown-university"
+        "wandb_entity": "rwgao_b-brown-university",
+        "rho": 0.7
     },
     "total_steps": 2000,
     "episodes": null
