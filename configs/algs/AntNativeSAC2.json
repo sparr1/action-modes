@@ -23,7 +23,13 @@
         "wandb": true,
         "wandb_project": "ambi",
         "wandb_step_every": 1000,
-        "wandb_entity": "rwgao_b-brown-university"
+        "wandb_entity": "rwgao_b-brown-university",
+        "wandb_run_name": "NativeSAC2-Ant-v4",
+        "wandb_tags": [
+            "sac2",
+            "fixed_horizon",
+            "tdmpc2_setting"
+        ]
     },
     "total_steps": 1000000,
     "episodes": null

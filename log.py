@@ -1,3 +1,4 @@
+import csv
 import os, json
 import numpy as np
 
@@ -6,6 +7,60 @@ import numpy as np
 #and the fourth will prepend a timestamp in order to always create new folders each time it has run repeatedly. For serious experiments, I recommend "warn" or "timestamp".
 #The default is "warn", since this will let you know that some configuration is required to get the behavior you want.
 #For less serious experiments, testing, etc., I recommend "none" or "overwrite", depending on whether you are testing a capability that uses the logs or not.
+
+_STEP_FIELDS = [
+    "global_step", "episode", "episode_step", "reward", "episode_return",
+    "done", "terminated", "truncated", "inner_steps",
+]
+
+
+def _as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def _as_float(value, default=0.0):
+    if isinstance(value, (list, tuple, np.ndarray)):
+        values = _as_list(value)
+        return _as_float(values[0], default) if values else default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _done_value(dones):
+    dones = _as_list(dones)
+    if not dones:
+        return False
+    return bool(np.sum(dones).item() if hasattr(np.sum(dones), "item") else np.sum(dones))
+
+
+def _append_step_row(step_file, row):
+    need_header = not os.path.exists(step_file)
+    with open(step_file, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_STEP_FIELDS)
+        if need_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _sum_numeric(value):
+    total = 0.0
+    for item in _as_list(value):
+        if isinstance(item, (list, tuple, np.ndarray)):
+            total += _sum_numeric(item)
+        else:
+            try:
+                total += float(item)
+            except (TypeError, ValueError):
+                pass
+    return total
 
 
 def _info_dict(item):
@@ -16,17 +71,19 @@ def _info_dict(item):
     return {}
 
 
-def _write_basic_summary(summary_file, episode_count, total_reward, num_steps, inner_steps=None):
+def _write_basic_summary(summary_file, episode_count, total_reward, num_steps, inner_steps=None, cumulative_steps=None):
     with open(summary_file, 'a') as f:
         line = (f"episode_{episode_count}: "
                 f"Total Reward = {total_reward}, "
                 f"Steps = {num_steps}")
+        if cumulative_steps is not None:
+            line += f", Cumulative Steps = {cumulative_steps}"
         if inner_steps is not None:
             line += f", Inner Steps = {inner_steps}"
         f.write(line + ",\n")
 
 
-def _write_reward_info_summary(summary_file, episode_count, total_reward, num_steps, episode_info):
+def _write_reward_info_summary(summary_file, episode_count, total_reward, num_steps, episode_info, cumulative_steps=None):
     first_info = _info_dict(episode_info[0])
     goal_key = [k for k in list(first_info.keys()) if "desired" in k][0]
     goal = first_info[goal_key]
@@ -41,7 +98,8 @@ def _write_reward_info_summary(summary_file, episode_count, total_reward, num_st
                 f"Total Healthy = {healthy_bonus}, "
                 f"Total Control = {control_cost}, "
                 f"Total Contact = {contact_cost}, "
-                f"Goal = {goal}, Steps = {num_steps},\n")
+                f"Goal = {goal}, Steps = {num_steps}"
+                f"{', Cumulative Steps = ' + str(cumulative_steps) if cumulative_steps is not None else ''},\n")
 
 
 class TrainingLogger():
@@ -70,6 +128,7 @@ class TrainingLogger():
     def set_log_dir(self, log_dir):
         self.log_dir = log_dir
         self.summary_file = os.path.join(log_dir, 'stats.txt')
+        self.step_file = os.path.join(log_dir, 'step_stats.csv')
         self.train_episodes_dir = os.path.join(log_dir, 'train_episodes')
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.train_episodes_dir, exist_ok=True)
@@ -82,7 +141,8 @@ class TrainingLogger():
             "rewards": self.episode_rewards,
             "observations": self.episode_observations,
             "actions": self.episode_actions,
-            "info": self.episode_info
+            "info": self.episode_info,
+            "cumulative_step": self.step_count
         }
         if self._log_type == 'detailed':
             with open(os.path.join(self.train_episodes_dir, f"episode_{self.episode_count}.json"), 'w') as f:
@@ -97,11 +157,11 @@ class TrainingLogger():
         # avg_reward = np.mean(self.episode_rewards)
         if self._log_info and self.episode_info:
             try:
-                _write_reward_info_summary(self.summary_file, self.episode_count, total_reward, num_steps, self.episode_info)
+                _write_reward_info_summary(self.summary_file, self.episode_count, total_reward, num_steps, self.episode_info, cumulative_steps=self.step_count)
             except (IndexError, KeyError, TypeError, AttributeError):
-                _write_basic_summary(self.summary_file, self.episode_count, total_reward, num_steps)
+                _write_basic_summary(self.summary_file, self.episode_count, total_reward, num_steps, cumulative_steps=self.step_count)
         else:
-            _write_basic_summary(self.summary_file, self.episode_count, total_reward, num_steps)
+            _write_basic_summary(self.summary_file, self.episode_count, total_reward, num_steps, cumulative_steps=self.step_count)
         self.reset_episode()
 
     def on_step(self, data) -> bool:
@@ -115,7 +175,21 @@ class TrainingLogger():
         self.episode_actions.extend(data['actions'])
         if self._log_info and "infos" in data and data["infos"] is not None:
             self.episode_info.append(data['infos'])
-        if np.sum(data["dones"]).item() > 0:
+        done = _done_value(data["dones"])
+        info = _info_dict(_as_list(data.get("infos"))[0]) if data.get("infos") else {}
+        if hasattr(self, "step_file"):
+            _append_step_row(self.step_file, {
+                "global_step": self.step_count,
+                "episode": self.episode_count + 1,
+                "episode_step": self.episode_step_count,
+                "reward": _as_float(data['rewards']),
+                "episode_return": sum(self.episode_rewards),
+                "done": int(done),
+                "terminated": int(bool(info.get("terminated", done))),
+                "truncated": int(bool(info.get("truncated", info.get("TimeLimit.truncated", False)))),
+                "inner_steps": "",
+            })
+        if done:
             self.on_episode()
 
 
@@ -148,6 +222,7 @@ class AMBITrainingLogger():
     def set_log_dir(self, log_dir):
         self.log_dir = log_dir
         self.summary_file = os.path.join(log_dir, 'stats.txt')
+        self.step_file = os.path.join(log_dir, 'step_stats.csv')
         self.train_episodes_dir = os.path.join(log_dir, 'train_episodes')
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.train_episodes_dir, exist_ok=True)
@@ -161,7 +236,8 @@ class AMBITrainingLogger():
             "observations": self.episode_observations,
             "actions": self.episode_actions,
             "info": self.episode_info,
-            "inner_steps": self.episode_inner_steps
+            "inner_steps": self.episode_inner_steps,
+            "cumulative_step": self.step_count
         }
         if self._log_type == 'detailed':
             with open(os.path.join(self.train_episodes_dir, f"episode_{self.episode_count}.json"), 'w') as f:
@@ -181,11 +257,11 @@ class AMBITrainingLogger():
         # avg_reward = np.mean(self.episode_rewards)
         if self._log_info and self.episode_info:
             try:
-                _write_reward_info_summary(self.summary_file, self.episode_count, total_reward, num_steps, self.episode_info)
+                _write_reward_info_summary(self.summary_file, self.episode_count, total_reward, num_steps, self.episode_info, cumulative_steps=self.step_count)
             except (IndexError, KeyError, TypeError, AttributeError):
-                _write_basic_summary(self.summary_file, self.episode_count, total_reward, num_steps, num_inner_steps)
+                _write_basic_summary(self.summary_file, self.episode_count, total_reward, num_steps, num_inner_steps, cumulative_steps=self.step_count)
         else:
-            _write_basic_summary(self.summary_file, self.episode_count, total_reward, num_steps, num_inner_steps)
+            _write_basic_summary(self.summary_file, self.episode_count, total_reward, num_steps, num_inner_steps, cumulative_steps=self.step_count)
         self.reset_episode()
 
     def on_step(self, data) -> bool:
@@ -200,5 +276,20 @@ class AMBITrainingLogger():
         self.episode_inner_steps.extend(data.get('inner_steps', []))
         if self._log_info and "infos" in data and data["infos"] is not None:
             self.episode_info.append(data['infos'])
-        if np.sum(data["dones"]).item() > 0:
+        done = _done_value(data["dones"])
+        info = _info_dict(_as_list(data.get("infos"))[0]) if data.get("infos") else {}
+        inner_step_sum = _sum_numeric(data.get("inner_steps", []))
+        if hasattr(self, "step_file"):
+            _append_step_row(self.step_file, {
+                "global_step": self.step_count,
+                "episode": self.episode_count + 1,
+                "episode_step": self.episode_step_count,
+                "reward": _as_float(data['rewards']),
+                "episode_return": sum(self.episode_rewards),
+                "done": int(done),
+                "terminated": int(bool(info.get("terminated", done))),
+                "truncated": int(bool(info.get("truncated", info.get("TimeLimit.truncated", False)))),
+                "inner_steps": inner_step_sum,
+            })
+        if done:
             self.on_episode()

@@ -14,10 +14,12 @@
     },
     "trials": 3,
     "configs": [
+        "AntSAC2",
+        "AntNativeSAC2",
         "AntTDMPC2"
     ],
     "logs": "timestamp",
-    "save_trials": "none",
-    "checkpoint_every": null,
-    "log_info": false
+    "save_trials": "all",
+    "log_info": false,
+    "checkpoint_every": 100000
 }

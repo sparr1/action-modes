@@ -12,12 +12,12 @@
         "max_episode_steps": 1000,
         "terminate_when_unhealthy": false
     },
-    "trials": 3,
+    "trials": 1,
     "configs": [
-        "AntTDMPC2"
+        "AntNativeSAC2"
     ],
     "logs": "timestamp",
     "save_trials": "none",
-    "checkpoint_every": null,
-    "log_info": false
+    "log_info": false,
+    "checkpoint_every": null
 }

@@ -98,11 +98,21 @@ def _set_first_wrapper_attr_direct(env, name, value):
 
 
 def wandb_setup(cfg: dict, project="ambi", run_name=None):
-    run = wandb.init(
-        project=project,
-        name=run_name,
-        config=cfg,
-    )
+    entity = cfg.get("wandb_entity", "rwgao_b-brown-university") if isinstance(cfg, dict) else "rwgao_b-brown-university"
+    project = cfg.get("wandb_project", project) if isinstance(cfg, dict) else project
+    mode = cfg.get("wandb_mode", None) if isinstance(cfg, dict) else None
+    tags = cfg.get("wandb_tags", None) if isinstance(cfg, dict) else None
+    kwargs = {
+        "entity": entity,
+        "project": project,
+        "name": run_name,
+        "config": cfg,
+    }
+    if mode:
+        kwargs["mode"] = mode
+    if tags:
+        kwargs["tags"] = tags
+    run = wandb.init(**kwargs)
 
     # Make outer timestep the shared x-axis
     wandb.define_metric("outer/step")
@@ -269,7 +279,7 @@ class AMBI(Algorithm):
         self.env.reset()
         
         self.alg_logger = None
-        self.run = wandb_setup(custom_params, project="ambi_ant", run_name=f"AntAMBI-seed{custom_params.get('seed', 'NA')}")
+        self.run = wandb_setup(custom_params, project="ambi", run_name=f"AntAMBI-seed{custom_params.get('seed', 'NA')}")
 
     def get_model(self):
         return (

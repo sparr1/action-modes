@@ -57,8 +57,61 @@ def tolerant_rolling_average(arrs, window_size = 1):
         out[emit_rows, :] = means
     return out
 
-def handle_stats_line(line_segments, keyword):
-    return [x for x in line_segments if keyword in x][0].split(' ')[-1]
+def handle_stats_line(line_segments, keyword, default=None):
+    matches = [x for x in line_segments if keyword in x]
+    if not matches:
+        return default
+    return matches[0].split(' ')[-1]
+
+
+def _rolling_1d(values, window_size):
+    values = np.asarray(values, dtype=float)
+    if window_size <= 1 or len(values) < window_size:
+        return values
+    kernel = np.ones(window_size, dtype=float) / float(window_size)
+    return np.convolve(values, kernel, mode='valid')
+
+
+def compute_step_stat(alg, step_trials_data, stat_trials_data, stat_results_dict, rolling_window=30, grid_size=1000):
+    """Aggregate episode-return curves on a shared cumulative-env-step x-axis."""
+    cleaned = []
+    for steps, values in zip(step_trials_data, stat_trials_data):
+        x = np.asarray(steps, dtype=float)
+        y = np.asarray(values, dtype=float)
+        if len(x) == 0 or len(y) == 0:
+            continue
+        n = min(len(x), len(y))
+        x, y = x[:n], y[:n]
+        order = np.argsort(x)
+        x, y = x[order], y[order]
+        unique_x, unique_idx = np.unique(x, return_index=True)
+        x, y = unique_x, y[unique_idx]
+        if rolling_window > 1 and len(y) >= rolling_window:
+            y = _rolling_1d(y, rolling_window)
+            x = x[rolling_window - 1:]
+        if len(x) > 0:
+            cleaned.append((x, y))
+
+    if not cleaned:
+        stat_results_dict[alg] = {"steps": np.array([]), "means": np.array([]), "stds": np.array([]), "max": np.array([]), "min": np.array([])}
+        return
+
+    start = max(x[0] for x, _ in cleaned)
+    end = min(x[-1] for x, _ in cleaned)
+    if end < start:
+        stat_results_dict[alg] = {"steps": np.array([]), "means": np.array([]), "stds": np.array([]), "max": np.array([]), "min": np.array([])}
+        return
+
+    num_points = int(min(grid_size, max(2, end - start + 1)))
+    grid = np.linspace(start, end, num_points)
+    interpolated = np.vstack([np.interp(grid, x, y) for x, y in cleaned])
+    stat_results_dict[alg] = {
+        "steps": grid,
+        "means": interpolated.mean(axis=0),
+        "stds": interpolated.std(axis=0),
+        "max": interpolated.max(axis=0),
+        "min": interpolated.min(axis=0),
+    }
 
 def handle_trial(path, incl_reward = True, incl_obs = False, incl_act = False, incl_base = False, incl_goal = False, max_steps = 1e6): #processes a trial directory
     alg_name = os.path.basename(path).split('_')[0]
@@ -72,6 +125,7 @@ def handle_trial(path, incl_reward = True, incl_obs = False, incl_act = False, i
     observations = []
     actions = []
     steps = []
+    cumulative_steps = []
     goals = [] #for use only with stats for now
     files = get_files(path)
     dirs = get_dirs(path)
@@ -89,7 +143,13 @@ def handle_trial(path, incl_reward = True, incl_obs = False, incl_act = False, i
                         episodes.append(ep_number) #TODO: have we verified this is happening in order?
                         segments = stats.split(',')
                         
-                        steps.append(int(handle_stats_line(segments, 'Steps')))
+                        step_value = int(float(handle_stats_line(segments, 'Steps')))
+                        steps.append(step_value)
+                        cumulative_value = handle_stats_line(segments, 'Cumulative Steps', default=None)
+                        if cumulative_value is None:
+                            cumulative_steps.append(int(np.sum(steps)))
+                        else:
+                            cumulative_steps.append(int(float(cumulative_value)))
 
                         if incl_reward:
                             rewards.append(float(handle_stats_line(segments, 'Total Reward')))
@@ -105,7 +165,7 @@ def handle_trial(path, incl_reward = True, incl_obs = False, incl_act = False, i
         else:
             print("No episodes found in stats.txt for trial", path)
         
-        return alg_name, {'rewards': np.array(rewards), 'base rewards': np.array(base_rewards), 'timesteps': np.array(steps), 'goals': np.array(goals)}
+        return alg_name, {'rewards': np.array(rewards), 'base rewards': np.array(base_rewards), 'timesteps': np.array(steps), 'cumulative timesteps': np.array(cumulative_steps), 'goals': np.array(goals)}
     else: 
         for dir in dirs:
             steps = 0 #we use max_steps here because we are reading the actual logs. it can get very expensive
@@ -188,6 +248,7 @@ def _compute_stats(experiment_name, rewards = True, observations = True, actions
     num_trials = 0
 
     trial_rewards = {}
+    trial_reward_steps = {}
     trial_base_rewards = {}
     trial_base_steps = {}
     trial_goals = {}
@@ -205,6 +266,8 @@ def _compute_stats(experiment_name, rewards = True, observations = True, actions
 
             if rewards:
                 retrieve_trial(alg_name, trial_data, 'rewards', trial_rewards)
+                if 'cumulative timesteps' in trial_data:
+                    retrieve_trial(alg_name, trial_data, 'cumulative timesteps', trial_reward_steps)
             if base_rewards:
                 retrieve_trial(alg_name, trial_data, 'base rewards', trial_base_rewards)
                 retrieve_trial(alg_name, trial_data, 'timesteps', trial_base_steps)
@@ -237,6 +300,7 @@ def _compute_stats(experiment_name, rewards = True, observations = True, actions
         print("goal buckets", goal_buckets)
 
     reward_results = {}
+    step_reward_results = {}
     base_reward_results = {}
     steps_results = {}
     base_avg_results = {}
@@ -260,6 +324,10 @@ def _compute_stats(experiment_name, rewards = True, observations = True, actions
                 compute_stat(alg, trials, reward_results, goal_range = bucket, goal_trials_data = goals_trials)
 
             results["rewards"] = reward_results
+            for alg, trials in trial_rewards.items():
+                if alg in trial_reward_steps:
+                    compute_step_stat(alg, trial_reward_steps[alg], trials, step_reward_results, rolling_window=30)
+            results["rewards vs steps"] = step_reward_results
 
         if base_rewards:
             # print(len(trial_rewards.keys()))
