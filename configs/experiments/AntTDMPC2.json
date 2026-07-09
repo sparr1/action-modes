@@ -17,7 +17,7 @@
         "AntTDMPC2"
     ],
     "logs": "timestamp",
-    "save_trials": "all",
-    "checkpoint_every": 100000,
+    "save_trials": "none",
+    "checkpoint_every": null,
     "log_info": false
 }

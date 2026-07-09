@@ -4,12 +4,12 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --partition=gpus
-#SBATCH --gres=gpu:nvidia_l40:1
-#SBATCH --mem=64G
+#SBATCH --gres=gpu:1
+#SBATCH --mem=32G
 #SBATCH --time=96:00:00
 #SBATCH --output=slurm/logs/%x-%j.out
 #SBATCH --error=slurm/logs/%x-%j.err
-# SBATCH --nodelist=gpu[2201]
+#SBATCH --nodelist=gpu[1907]
 
 
 set -Eeuo pipefail
@@ -41,12 +41,12 @@ echo "Starting AMBI training..."
 # python main.py --run configs/experiments/AntAMBI.json
 # python main.py -r configs/experiments/AntTDMPC2Debug.json --num-runs 1
 
-# python main.py -r configs/experiments/AntTDMPC2.json
-python main.py -r configs/experiments/AntSAC.json
+python main.py -r configs/experiments/AntTDMPC2.json
+# python main.py -r configs/experiments/AntNativeSAC2.json
+# python main.py -r configs/experiments/AntSAC2.json
 
 # python main.py -r configs/experiments/AntNativeSACDebug.json --num-runs 1
 
-# python main.py -r configs/experiments/AntNativeSAC.json
 
 
 if [ $? -ne 0 ]; then
