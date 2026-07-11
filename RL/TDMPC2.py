@@ -110,7 +110,7 @@ class TDMPC2Baseline(Algorithm):
         self.cfg = self._build_cfg(custom_params or {})
 
         self._set_seed(self.cfg.seed)
-        self.agent = TDMPC2(self.cfg)
+        self.agent = self._make_agent(self.cfg)
         self.buffer = Buffer(self.cfg)
         self._checkpointing = None
         self._global_step = 0
@@ -123,11 +123,18 @@ class TDMPC2Baseline(Algorithm):
         self._wandb_run = init_wandb(
             custom_params or {},
             default_project="ambi",
-            run_name=f"TDMPC2-{self.run_params.get('env', 'env')}-seed{self.cfg.seed}",
+            run_name=self._wandb_run_name(),
             config={"run_params": self.run_params, "alg_params": custom_params or {}, "config": vars(self.cfg)},
         )
 
         print("Architecture:", self.agent.model)
+
+    def _make_agent(self, cfg):
+        """Factory hook used by TD-MPC2-derived algorithms."""
+        return TDMPC2(cfg)
+
+    def _wandb_run_name(self):
+        return f"TDMPC2-{self.run_params.get('env', 'env')}-seed{self.cfg.seed}"
 
     def _build_cfg(self, params):
         cfg = copy.deepcopy(_DEFAULTS)
@@ -263,7 +270,10 @@ class TDMPC2Baseline(Algorithm):
             obs, info = self.env.reset()
         else:
             obs, info = self.env.reset(seed=seed)
-        self.agent._prev_mean.zero_()
+        if hasattr(self.agent, "reset"):
+            self.agent.reset()
+        elif hasattr(self.agent, "_prev_mean"):
+            self.agent._prev_mean.zero_()
         return obs, info
 
     def _log_step(self, reward, obs, action, terminated, truncated, info):

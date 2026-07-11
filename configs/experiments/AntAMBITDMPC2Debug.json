@@ -1,0 +1,22 @@
+{
+    "overrides_alg": {
+        "seed": 55,
+        "device": "cuda",
+        "env": "Ant-v4",
+        "total_steps": 2000,
+        "episodes": null
+    },
+    "env_params": {
+        "render_mode": null,
+        "exclude_current_positions_from_observation": true,
+        "max_episode_steps": 100,
+        "terminate_when_unhealthy": false
+    },
+    "trials": 1,
+    "configs": [
+        "AntAMBITDMPC2Debug"
+    ],
+    "logs": "overwrite",
+    "save_trials": "first",
+    "log_info": false
+}

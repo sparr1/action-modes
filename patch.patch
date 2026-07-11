@@ -1,0 +1,1271 @@
+diff --git a/RL/AMBITDMPC2.py b/RL/AMBITDMPC2.py
+new file mode 100644
+index 0000000..add8b14
+--- /dev/null
++++ b/RL/AMBITDMPC2.py
+@@ -0,0 +1,139 @@
++"""AMBI with a TD-MPC2 world model and per-state latent SAC improvement."""
++
++import numpy as np
++
++from RL.TDMPC2 import TDMPC2Baseline
++from RL.tdmpc2_core.ambi_agent import AMBITDMPC2Agent
++from utils.utils import setup_logs
++
++
++_AMBI_DEFAULTS = {
++    # Outer latent SAC. TD-MPC2's encoder/dynamics/reward losses are retained,
++    # but its distributional Q/policy-prior control head is replaced by SAC.
++    "mpc": False,
++    "num_q": 2,
++    "critic_coef": 1.0,
++    "actor_lr": 3e-4,
++    "critic_lr": 3e-4,
++    "ent_coef": "auto",
++    "ent_coef_lr": 3e-4,
++    "target_entropy": "auto",
++    "tau": 0.005,
++    "target_update_interval": 1,
++
++    # Per-state inner SAC. A fresh inner learner is initialized from the outer
++    # actor/critic for every real action, then trained only on latent rollouts.
++    "inner_adaptation": "clone",
++    "inner_iterations": 1,
++    "inner_rollouts": 32,
++    "inner_horizon": None,
++    "inner_updates_per_iteration": 1,
++    "inner_batch_size": 256,
++    "inner_buffer_size": None,
++    "inner_actor_lr": 3e-4,
++    "inner_critic_lr": 3e-4,
++    "inner_tau": 0.005,
++    "inner_target_update_interval": 1,
++    "inner_grad_clip_norm": 20.0,
++    "inner_termination_threshold": 0.5,
++
++    # Optional low-rank inner adaptation. ``clone`` is the simplest reference
++    # implementation; ``lora`` freezes copied outer weights and updates only
++    # these adapters.
++    "lora_rank": 8,
++    "lora_alpha": 8.0,
++    "lora_dropout": 0.0,
++}
++
++
++class AMBITDMPC2(TDMPC2Baseline):
++    """AMBI algorithm using TD-MPC2 representation learning and latent SAC."""
++
++    def _build_cfg(self, params):
++        if "num_q" in params and int(params["num_q"]) != 2:
++            raise ValueError("AMBI-TD-MPC2 uses exactly two SAC critics; num_q must be 2.")
++        if bool(params.get("mpc", False)):
++            raise ValueError("AMBI-TD-MPC2 replaces MPPI; mpc must be false.")
++
++        merged = dict(_AMBI_DEFAULTS)
++        merged.update(params)
++        cfg = super()._build_cfg(merged)
++
++        # ``model_size`` sets TD-MPC2's original Q-ensemble size. AMBI uses
++        # standard SAC twin critics regardless of model width.
++        cfg.num_q = 2
++        cfg.mpc = False
++
++        if cfg.inner_horizon is None:
++            cfg.inner_horizon = cfg.horizon
++
++        integer_positive = (
++            "inner_rollouts",
++            "inner_horizon",
++            "inner_batch_size",
++            "inner_target_update_interval",
++            "target_update_interval",
++        )
++        for key in integer_positive:
++            value = int(getattr(cfg, key))
++            if value <= 0:
++                raise ValueError(f"{key} must be positive, got {value}.")
++            setattr(cfg, key, value)
++
++        for key in ("inner_iterations", "inner_updates_per_iteration"):
++            value = int(getattr(cfg, key))
++            if value < 0:
++                raise ValueError(f"{key} must be non-negative, got {value}.")
++            setattr(cfg, key, value)
++
++        if cfg.inner_buffer_size is not None:
++            cfg.inner_buffer_size = int(cfg.inner_buffer_size)
++            if cfg.inner_buffer_size <= 0:
++                raise ValueError("inner_buffer_size must be positive or null.")
++
++        cfg.inner_adaptation = str(cfg.inner_adaptation).lower()
++        if cfg.inner_adaptation not in {"clone", "lora"}:
++            raise ValueError("inner_adaptation must be 'clone' or 'lora'.")
++        if cfg.inner_adaptation == "lora" and int(cfg.lora_rank) <= 0:
++            raise ValueError("lora_rank must be positive.")
++        if not 0.0 <= float(cfg.inner_termination_threshold) <= 1.0:
++            raise ValueError("inner_termination_threshold must be in [0, 1].")
++        if not 0.0 < float(cfg.tau) <= 1.0:
++            raise ValueError("tau must be in (0, 1].")
++        if not 0.0 < float(cfg.inner_tau) <= 1.0:
++            raise ValueError("inner_tau must be in (0, 1].")
++
++        return cfg
++
++    def _make_agent(self, cfg):
++        return AMBITDMPC2Agent(cfg)
++
++    def _wandb_run_name(self):
++        return f"AMBITDMPC2-{self.run_params.get('env', 'env')}-seed{self.cfg.seed}"
++
++    def _log_step(self, reward, obs, action, terminated, truncated, info):
++        """Use the existing logger while exposing imagined-step accounting."""
++        if not self.alg_logger:
++            return
++
++        done = bool(terminated or truncated)
++        info_for_log = dict(info or {})
++        info_for_log.setdefault("terminated", bool(terminated))
++        info_for_log.setdefault("truncated", bool(truncated))
++        obs_for_log = obs if isinstance(obs, dict) else np.asarray(obs)[None, ...]
++        action_for_log = np.asarray(action)[None, ...]
++        data = setup_logs(
++            reward,
++            obs_for_log,
++            action_for_log,
++            [done],
++            [info_for_log],
++            # AMBITrainingLogger stores one rollout-length list per real step.
++            inner_steps=[list(self.agent.last_inner_rollout_lengths)],
++        )
++        self.alg_logger.on_step(data)
++
++    def _log_wandb_step(self, reward, terminated, truncated, metrics=None):
++        combined = dict(metrics or {})
++        combined.update(self.agent.last_inner_metrics)
++        super()._log_wandb_step(reward, terminated, truncated, combined)
+diff --git a/RL/TDMPC2.py b/RL/TDMPC2.py
+index 727e9a0..34abf94 100644
+--- a/RL/TDMPC2.py
++++ b/RL/TDMPC2.py
+@@ -110,7 +110,7 @@ class TDMPC2Baseline(Algorithm):
+         self.cfg = self._build_cfg(custom_params or {})
+ 
+         self._set_seed(self.cfg.seed)
+-        self.agent = TDMPC2(self.cfg)
++        self.agent = self._make_agent(self.cfg)
+         self.buffer = Buffer(self.cfg)
+         self._checkpointing = None
+         self._global_step = 0
+@@ -123,12 +123,19 @@ class TDMPC2Baseline(Algorithm):
+         self._wandb_run = init_wandb(
+             custom_params or {},
+             default_project="ambi",
+-            run_name=f"TDMPC2-{self.run_params.get('env', 'env')}-seed{self.cfg.seed}",
++            run_name=self._wandb_run_name(),
+             config={"run_params": self.run_params, "alg_params": custom_params or {}, "config": vars(self.cfg)},
+         )
+ 
+         print("Architecture:", self.agent.model)
+ 
++    def _make_agent(self, cfg):
++        """Factory hook used by TD-MPC2-derived algorithms."""
++        return TDMPC2(cfg)
++
++    def _wandb_run_name(self):
++        return f"TDMPC2-{self.run_params.get('env', 'env')}-seed{self.cfg.seed}"
++
+     def _build_cfg(self, params):
+         cfg = copy.deepcopy(_DEFAULTS)
+         cfg.update(copy.deepcopy(params))
+@@ -263,7 +270,10 @@ class TDMPC2Baseline(Algorithm):
+             obs, info = self.env.reset()
+         else:
+             obs, info = self.env.reset(seed=seed)
+-        self.agent._prev_mean.zero_()
++        if hasattr(self.agent, "reset"):
++            self.agent.reset()
++        elif hasattr(self.agent, "_prev_mean"):
++            self.agent._prev_mean.zero_()
+         return obs, info
+ 
+     def _log_step(self, reward, obs, action, terminated, truncated, info):
+diff --git a/RL/tdmpc2_core/agent.py b/RL/tdmpc2_core/agent.py
+index 41820cc..0279a25 100755
+--- a/RL/tdmpc2_core/agent.py
++++ b/RL/tdmpc2_core/agent.py
+@@ -80,6 +80,11 @@ class TDMPC2(torch.nn.Module):
+ 		frac = episode_length/self.cfg.discount_denom
+ 		return min(max((frac-1)/(frac), self.cfg.discount_min), self.cfg.discount_max)
+ 
++	@torch.no_grad()
++	def reset(self):
++		"""Reset episode-local planning state."""
++		self._prev_mean.zero_()
++
+ 	def save(self, fp):
+ 		"""
+ 		Save state dict of the agent to filepath.
+diff --git a/RL/tdmpc2_core/ambi_agent.py b/RL/tdmpc2_core/ambi_agent.py
+new file mode 100644
+index 0000000..7a32f27
+--- /dev/null
++++ b/RL/tdmpc2_core/ambi_agent.py
+@@ -0,0 +1,533 @@
++"""AMBI agent built from TD-MPC2 world-model updates and latent SAC control."""
++
++from copy import deepcopy
++
++import torch
++import torch.nn.functional as F
++
++from .common import math as td_math
++from .common.device import resolve_device
++from .common.latent_buffer import LatentReplayBuffer
++from .common.lora import lorafy_copy, trainable_parameters
++from .common.soft_world_model import SoftWorldModel
++
++
++@torch.no_grad()
++def _polyak_update(source, target, tau):
++    tau = float(tau)
++    for source_param, target_param in zip(source.parameters(), target.parameters()):
++        target_param.data.lerp_(source_param.data, tau)
++    for source_buffer, target_buffer in zip(source.buffers(), target.buffers()):
++        target_buffer.data.copy_(source_buffer.data)
++
++
++class AMBITDMPC2Agent(torch.nn.Module):
++    """TD-MPC2-style online learner whose MPPI call is replaced by inner SAC."""
++
++    def __init__(self, cfg):
++        super().__init__()
++        self.cfg = cfg
++        self.device = resolve_device(getattr(cfg, "device", None))
++        self.cfg.device = str(self.device)
++        if getattr(cfg, "compile", False):
++            raise ValueError("AMBI-TD-MPC2 does not support compile=True because it creates an inner learner per action.")
++
++        self.model = SoftWorldModel(cfg).to(self.device)
++        self._world_critic_params = (
++            list(self.model._encoder.parameters())
++            + list(self.model._dynamics.parameters())
++            + list(self.model._reward.parameters())
++            + (list(self.model._termination.parameters()) if cfg.episodic else [])
++            + list(self.model._Qs.parameters())
++        )
++        optim_groups = [
++            {
++                "params": self.model._encoder.parameters(),
++                "lr": float(cfg.lr) * float(cfg.enc_lr_scale),
++            },
++            {"params": self.model._dynamics.parameters()},
++            {"params": self.model._reward.parameters()},
++            {
++                "params": self.model._Qs.parameters(),
++                "lr": float(getattr(cfg, "critic_lr", cfg.lr)),
++            },
++        ]
++        if cfg.episodic:
++            optim_groups.append({"params": self.model._termination.parameters()})
++        self.optim = torch.optim.Adam(
++            optim_groups,
++            lr=float(cfg.lr),
++            capturable=self.device.type == "cuda",
++        )
++        self.pi_optim = torch.optim.Adam(
++            self.model._pi.parameters(),
++            lr=float(getattr(cfg, "actor_lr", cfg.lr)),
++            eps=1e-5,
++            capturable=self.device.type == "cuda",
++        )
++
++        self.target_entropy = self._target_entropy(getattr(cfg, "target_entropy", "auto"))
++        self.log_ent_coef = None
++        self.ent_coef_optim = None
++        ent_coef = getattr(cfg, "ent_coef", "auto")
++        if isinstance(ent_coef, str) and ent_coef.startswith("auto"):
++            initial = 1.0
++            if "_" in ent_coef:
++                initial = float(ent_coef.split("_", 1)[1])
++            if initial <= 0:
++                raise ValueError("Initial automatic entropy coefficient must be positive.")
++            self.log_ent_coef = torch.nn.Parameter(
++                torch.log(torch.tensor([initial], dtype=torch.float32, device=self.device))
++            )
++            self.ent_coef_optim = torch.optim.Adam(
++                [self.log_ent_coef],
++                lr=float(getattr(cfg, "ent_coef_lr", getattr(cfg, "actor_lr", cfg.lr))),
++                eps=1e-5,
++                capturable=self.device.type == "cuda",
++            )
++            self.register_buffer("fixed_ent_coef", torch.tensor(float("nan"), device=self.device))
++        else:
++            fixed = float(ent_coef)
++            if fixed <= 0:
++                raise ValueError("Entropy coefficient must be positive.")
++            self.register_buffer("fixed_ent_coef", torch.tensor(fixed, device=self.device))
++
++        self.discount = self._get_discount(cfg.episode_length)
++        self.num_updates = 0
++        self.last_inner_metrics = {}
++        self.last_inner_rollout_lengths = []
++        self.model.eval()
++
++        print("Episode length:", cfg.episode_length)
++        print("Discount factor:", self.discount)
++        print("Inner adaptation:", cfg.inner_adaptation)
++
++    def _get_discount(self, episode_length):
++        frac = float(episode_length) / float(self.cfg.discount_denom)
++        return min(max((frac - 1.0) / frac, self.cfg.discount_min), self.cfg.discount_max)
++
++    def _target_entropy(self, target_entropy):
++        if target_entropy == "auto":
++            return float(-self.cfg.action_dim)
++        return float(target_entropy)
++
++    @property
++    def alpha(self):
++        if self.log_ent_coef is not None:
++            return self.log_ent_coef.exp()
++        return self.fixed_ent_coef
++
++    def reset(self):
++        self.last_inner_metrics = {}
++        self.last_inner_rollout_lengths = []
++
++    def save(self, fp):
++        state = {
++            "model": self.model.state_dict(),
++            "optim": self.optim.state_dict(),
++            "pi_optim": self.pi_optim.state_dict(),
++            "num_updates": self.num_updates,
++        }
++        if self.log_ent_coef is not None:
++            state["log_ent_coef"] = self.log_ent_coef.detach().cpu()
++            state["ent_coef_optim"] = self.ent_coef_optim.state_dict()
++        else:
++            state["fixed_ent_coef"] = self.fixed_ent_coef.detach().cpu()
++        torch.save(state, fp)
++
++    def load(self, fp):
++        state = fp if isinstance(fp, dict) else torch.load(fp, map_location=self.device, weights_only=False)
++        self.model.load_state_dict(state["model"] if "model" in state else state)
++        if "optim" in state:
++            self.optim.load_state_dict(state["optim"])
++        if "pi_optim" in state:
++            self.pi_optim.load_state_dict(state["pi_optim"])
++        self.num_updates = int(state.get("num_updates", 0))
++        if self.log_ent_coef is not None and "log_ent_coef" in state:
++            self.log_ent_coef.data.copy_(state["log_ent_coef"].to(self.device))
++            if "ent_coef_optim" in state:
++                self.ent_coef_optim.load_state_dict(state["ent_coef_optim"])
++        elif "fixed_ent_coef" in state:
++            self.fixed_ent_coef.copy_(state["fixed_ent_coef"].to(self.device))
++        self.model.eval()
++        return self
++
++    def act(self, obs, t0=False, eval_mode=False, task=None):
++        del t0
++        if task is not None:
++            raise ValueError("AMBI-TD-MPC2 currently supports single-task training only.")
++        obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
++        self.model.eval()
++        with torch.no_grad():
++            root_z = self.model.encode(obs).detach()
++
++        if int(self.cfg.inner_iterations) <= 0:
++            self.last_inner_metrics = {"inner_steps": 0.0, "inner_updates": 0.0}
++            self.last_inner_rollout_lengths = []
++            with torch.no_grad():
++                action, _ = self.model.pi(root_z, deterministic=eval_mode)
++            return action[0].cpu()
++
++        return self._inner_improve(root_z, eval_mode=eval_mode).cpu()
++
++    def _make_inner_modules(self):
++        mode = str(self.cfg.inner_adaptation).lower()
++        if mode == "clone":
++            actor = deepcopy(self.model._pi).to(self.device)
++            critic = deepcopy(self.model._Qs).to(self.device)
++            actor.requires_grad_(True)
++            critic.requires_grad_(True)
++        elif mode == "lora":
++            actor = lorafy_copy(
++                self.model._pi,
++                rank=self.cfg.lora_rank,
++                alpha=self.cfg.lora_alpha,
++                dropout=self.cfg.lora_dropout,
++            ).to(self.device)
++            critic = lorafy_copy(
++                self.model._Qs,
++                rank=self.cfg.lora_rank,
++                alpha=self.cfg.lora_alpha,
++                dropout=self.cfg.lora_dropout,
++            ).to(self.device)
++        else:
++            raise ValueError("inner_adaptation must be either 'clone' or 'lora'.")
++
++        # A standard SAC target critic starts as an exact copy of the current
++        # inner critic. The outer target critic belongs to the outer learner and
++        # must not seed a different local Bellman operator.
++        critic_target = deepcopy(critic).to(self.device)
++        critic_target.requires_grad_(False)
++        actor.train()
++        critic.train()
++        critic_target.eval()
++
++        actor_params = trainable_parameters(actor)
++        critic_params = trainable_parameters(critic)
++        if not actor_params or not critic_params:
++            raise RuntimeError("Inner adaptation produced no trainable actor or critic parameters.")
++        actor_optim = torch.optim.Adam(
++            actor_params,
++            lr=float(self.cfg.inner_actor_lr),
++            eps=1e-5,
++            capturable=self.device.type == "cuda",
++        )
++        critic_optim = torch.optim.Adam(
++            critic_params,
++            lr=float(self.cfg.inner_critic_lr),
++            eps=1e-5,
++            capturable=self.device.type == "cuda",
++        )
++        return actor, critic, critic_target, actor_optim, critic_optim, actor_params, critic_params
++
++    @torch.no_grad()
++    def _collect_imagined_rollouts(self, root_z, actor, replay):
++        num_rollouts = int(self.cfg.inner_rollouts)
++        horizon = int(self.cfg.inner_horizon)
++        z = root_z.expand(num_rollouts, -1).clone()
++        alive = torch.ones(num_rollouts, dtype=torch.bool, device=self.device)
++        lengths = torch.zeros(num_rollouts, dtype=torch.long, device=self.device)
++
++        self.model.eval()
++        actor.eval()
++        for _ in range(horizon):
++            active_idx = torch.nonzero(alive, as_tuple=False).squeeze(-1)
++            if active_idx.numel() == 0:
++                break
++            active_z = z[active_idx]
++            action, _ = self.model.pi(active_z, policy=actor)
++            reward = td_math.two_hot_inv(self.model.reward(active_z, action), self.cfg)
++            next_z = self.model.next(active_z, action)
++            if self.cfg.episodic:
++                terminated = (
++                    self.model.termination(next_z) > float(self.cfg.inner_termination_threshold)
++                ).float()
++            else:
++                terminated = torch.zeros(active_idx.numel(), 1, device=self.device)
++
++            replay.add_batch(active_z, action, reward, next_z, terminated)
++            lengths[active_idx] += 1
++            z[active_idx] = next_z
++            alive[active_idx] = terminated.squeeze(-1) < 0.5
++
++        actor.train()
++        return lengths.tolist()
++
++    def _inner_sac_update(
++        self,
++        replay,
++        actor,
++        critic,
++        critic_target,
++        actor_optim,
++        critic_optim,
++        actor_params,
++        critic_params,
++        update_index,
++    ):
++        """Run one standard SAC update on detached imagined transitions."""
++        batch = replay.sample(self.cfg.inner_batch_size)
++        alpha = self.alpha.detach()
++
++        with torch.no_grad():
++            next_action, next_info = self.model.pi(batch["next_z"], policy=actor)
++            next_q = self.model.Q(
++                batch["next_z"],
++                next_action,
++                qs=critic_target,
++                return_type="min",
++            )
++            target_q = batch["reward"] + self.discount * (1.0 - batch["terminated"]) * (
++                next_q - alpha * next_info["log_prob"]
++            )
++
++        current_q = self.model.Q(
++            batch["z"],
++            batch["action"],
++            qs=critic,
++            return_type="all",
++        )
++        critic_loss = 0.5 * (
++            F.mse_loss(current_q[0], target_q) + F.mse_loss(current_q[1], target_q)
++        )
++        critic_optim.zero_grad(set_to_none=True)
++        critic_loss.backward()
++        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
++            critic_params, float(self.cfg.inner_grad_clip_norm)
++        )
++        critic_optim.step()
++        critic_optim.zero_grad(set_to_none=True)
++
++        action_pi, pi_info = self.model.pi(batch["z"], policy=actor)
++        current_requires_grad = [p.requires_grad for p in critic.parameters()]
++        for param in critic.parameters():
++            param.requires_grad_(False)
++        try:
++            q_pi = self.model.Q(batch["z"], action_pi, qs=critic, return_type="min")
++            actor_loss = (alpha * pi_info["log_prob"] - q_pi).mean()
++        finally:
++            for param, requires_grad in zip(critic.parameters(), current_requires_grad):
++                param.requires_grad_(requires_grad)
++
++        actor_optim.zero_grad(set_to_none=True)
++        actor_loss.backward()
++        actor_grad_norm = torch.nn.utils.clip_grad_norm_(
++            actor_params, float(self.cfg.inner_grad_clip_norm)
++        )
++        actor_optim.step()
++
++        if update_index % int(self.cfg.inner_target_update_interval) == 0:
++            _polyak_update(critic, critic_target, self.cfg.inner_tau)
++
++        return {
++            "critic_loss": float(critic_loss.detach().cpu()),
++            "actor_loss": float(actor_loss.detach().cpu()),
++            "critic_grad_norm": float(torch.as_tensor(critic_grad_norm).detach().cpu()),
++            "actor_grad_norm": float(torch.as_tensor(actor_grad_norm).detach().cpu()),
++        }
++
++    def _inner_improve(self, root_z, eval_mode=False):
++        (
++            actor,
++            critic,
++            critic_target,
++            actor_optim,
++            critic_optim,
++            actor_params,
++            critic_params,
++        ) = self._make_inner_modules()
++
++        default_capacity = (
++            int(self.cfg.inner_iterations)
++            * int(self.cfg.inner_rollouts)
++            * int(self.cfg.inner_horizon)
++        )
++        capacity = int(self.cfg.inner_buffer_size or default_capacity)
++        replay = LatentReplayBuffer(
++            capacity=capacity,
++            latent_dim=self.cfg.latent_dim,
++            action_dim=self.cfg.action_dim,
++            device=self.device,
++        )
++
++        rollout_lengths = []
++        metric_history = []
++        update_index = 0
++        for _ in range(int(self.cfg.inner_iterations)):
++            rollout_lengths.extend(self._collect_imagined_rollouts(root_z, actor, replay))
++            for _ in range(int(self.cfg.inner_updates_per_iteration)):
++                metric_history.append(
++                    self._inner_sac_update(
++                        replay,
++                        actor,
++                        critic,
++                        critic_target,
++                        actor_optim,
++                        critic_optim,
++                        actor_params,
++                        critic_params,
++                        update_index,
++                    )
++                )
++                update_index += 1
++
++        actor.eval()
++        with torch.no_grad():
++            action, _ = self.model.pi(root_z, policy=actor, deterministic=eval_mode)
++
++        self.last_inner_rollout_lengths = rollout_lengths
++        self.last_inner_metrics = {
++            "inner_steps": float(sum(rollout_lengths)),
++            "inner_updates": float(update_index),
++            "inner_buffer_size": float(replay.size),
++            "inner_alpha": float(self.alpha.detach().cpu()),
++        }
++        if metric_history:
++            for key in metric_history[0]:
++                self.last_inner_metrics[f"inner_{key}"] = sum(m[key] for m in metric_history) / len(metric_history)
++        return action[0]
++
++    @torch.no_grad()
++    def _soft_td_target(self, next_z, reward, terminated):
++        next_action, next_info = self.model.pi(next_z)
++        next_q = self.model.Q(next_z, next_action, target=True, return_type="min")
++        return reward + self.discount * (1.0 - terminated) * (
++            next_q - self.alpha.detach() * next_info["log_prob"]
++        )
++
++    def _update_actor(self, zs):
++        action, pi_info = self.model.pi(zs)
++        alpha = self.alpha.detach()
++
++        ent_coef_loss = torch.zeros((), device=self.device)
++        if self.ent_coef_optim is not None:
++            ent_coef_loss = -(
++                self.log_ent_coef * (pi_info["log_prob"] + self.target_entropy).detach()
++            ).mean()
++            self.ent_coef_optim.zero_grad(set_to_none=True)
++            ent_coef_loss.backward()
++            self.ent_coef_optim.step()
++
++        q_pi = self.model.Q(zs, action, return_type="min", detach=True)
++        rho = torch.pow(
++            torch.tensor(float(self.cfg.rho), device=self.device),
++            torch.arange(zs.shape[0], device=self.device),
++        )
++        actor_per_t = (alpha * pi_info["log_prob"] - q_pi).mean(dim=(1, 2))
++        actor_loss = (actor_per_t * rho).mean()
++
++        self.pi_optim.zero_grad(set_to_none=True)
++        actor_loss.backward()
++        actor_grad_norm = torch.nn.utils.clip_grad_norm_(
++            self.model._pi.parameters(), float(self.cfg.grad_clip_norm)
++        )
++        self.pi_optim.step()
++
++        return {
++            "actor_loss": actor_loss.detach(),
++            "actor_grad_norm": torch.as_tensor(actor_grad_norm).detach(),
++            "actor_entropy": pi_info["entropy"].detach().mean(),
++            "ent_coef": alpha.detach(),
++            "ent_coef_loss": ent_coef_loss.detach(),
++        }
++
++    def _update(self, obs, action, reward, terminated):
++        """One TD-MPC2-style model update with scalar soft-Q regression."""
++        # TD targets and latent consistency targets never receive gradients.
++        with torch.no_grad():
++            next_z_targets = self.model.encode(obs[1:])
++            td_targets = self._soft_td_target(next_z_targets, reward, terminated)
++
++        self.model.train()
++        z = self.model.encode(obs[0])
++        zs = [z]
++        consistency_loss = torch.zeros((), device=self.device)
++        for t, (recorded_action, next_z_target) in enumerate(
++            zip(action.unbind(0), next_z_targets.unbind(0))
++        ):
++            z = self.model.next(z, recorded_action)
++            consistency_loss = consistency_loss + F.mse_loss(z, next_z_target) * self.cfg.rho ** t
++            zs.append(z)
++        zs = torch.stack(zs, dim=0)
++
++        rollout_zs = zs[:-1]
++        reward_preds = self.model.reward(rollout_zs, action)
++        qs = self.model.Q(rollout_zs, action, return_type="all")
++        termination_pred = (
++            self.model.termination(zs[1:], unnormalized=True)
++            if self.cfg.episodic
++            else None
++        )
++
++        reward_loss = torch.zeros((), device=self.device)
++        critic_loss = torch.zeros((), device=self.device)
++        for t in range(self.cfg.horizon):
++            weight = self.cfg.rho ** t
++            reward_loss = reward_loss + td_math.soft_ce(
++                reward_preds[t], reward[t], self.cfg
++            ).mean() * weight
++            critic_loss = critic_loss + 0.5 * (
++                F.mse_loss(qs[0, t], td_targets[t])
++                + F.mse_loss(qs[1, t], td_targets[t])
++            ) * weight
++
++        consistency_loss = consistency_loss / self.cfg.horizon
++        reward_loss = reward_loss / self.cfg.horizon
++        critic_loss = critic_loss / self.cfg.horizon
++        if self.cfg.episodic:
++            termination_loss = F.binary_cross_entropy_with_logits(termination_pred, terminated)
++        else:
++            termination_loss = torch.zeros((), device=self.device)
++
++        total_loss = (
++            self.cfg.consistency_coef * consistency_loss
++            + self.cfg.reward_coef * reward_loss
++            + self.cfg.termination_coef * termination_loss
++            + self.cfg.critic_coef * critic_loss
++        )
++
++        self.optim.zero_grad(set_to_none=True)
++        total_loss.backward()
++        grad_norm = torch.nn.utils.clip_grad_norm_(
++            self._world_critic_params, float(self.cfg.grad_clip_norm)
++        )
++        self.optim.step()
++        # Clear world-model/critic gradients before the actor pass. This is not
++        # needed for the optimizer step itself, but makes the stop-gradient
++        # boundary explicit and prevents stale critic gradients from lingering.
++        self.optim.zero_grad(set_to_none=True)
++
++        # SAC actor/temperature updates do not backpropagate into the world model.
++        actor_info = self._update_actor(zs.detach())
++
++        # Match the usual SAC schedule: update the target on the first critic
++        # update, then every target_update_interval updates thereafter.
++        if self.num_updates % int(self.cfg.target_update_interval) == 0:
++            self.model.soft_update_target_Q()
++        self.num_updates += 1
++
++        self.model.eval()
++        info = {
++            "consistency_loss": consistency_loss.detach(),
++            "reward_loss": reward_loss.detach(),
++            "critic_loss": critic_loss.detach(),
++            "termination_loss": termination_loss.detach(),
++            "total_loss": total_loss.detach(),
++            "grad_norm": torch.as_tensor(grad_norm).detach(),
++            "q_target_mean": td_targets.detach().mean(),
++            "q_mean": qs.detach().mean(),
++        }
++        info.update(actor_info)
++        return info
++
++    def update(self, buffer):
++        obs, action, reward, terminated, task = buffer.sample()
++        if task is not None:
++            raise NotImplementedError("AMBI-TD-MPC2 currently supports single-task training only.")
++        if (
++            self.device.type == "cuda"
++            and hasattr(torch, "compiler")
++            and hasattr(torch.compiler, "cudagraph_mark_step_begin")
++        ):
++            torch.compiler.cudagraph_mark_step_begin()
++        return self._update(obs, action, reward, terminated)
+diff --git a/RL/tdmpc2_core/common/latent_buffer.py b/RL/tdmpc2_core/common/latent_buffer.py
+new file mode 100644
+index 0000000..12a97ef
+--- /dev/null
++++ b/RL/tdmpc2_core/common/latent_buffer.py
+@@ -0,0 +1,70 @@
++"""Small device-resident replay buffer used by AMBI's per-state inner SAC."""
++
++import torch
++
++
++class LatentReplayBuffer:
++    def __init__(self, capacity, latent_dim, action_dim, device):
++        self.capacity = max(1, int(capacity))
++        self.device = torch.device(device)
++        self.z = torch.empty(self.capacity, latent_dim, device=self.device)
++        self.action = torch.empty(self.capacity, action_dim, device=self.device)
++        self.reward = torch.empty(self.capacity, 1, device=self.device)
++        self.next_z = torch.empty(self.capacity, latent_dim, device=self.device)
++        self.terminated = torch.empty(self.capacity, 1, device=self.device)
++        self.pos = 0
++        self.full = False
++
++    @property
++    def size(self):
++        return self.capacity if self.full else self.pos
++
++    def add_batch(self, z, action, reward, next_z, terminated):
++        z = z.detach().reshape(-1, self.z.shape[-1])
++        action = action.detach().reshape(-1, self.action.shape[-1])
++        reward = reward.detach().reshape(-1, 1)
++        next_z = next_z.detach().reshape(-1, self.next_z.shape[-1])
++        terminated = terminated.detach().reshape(-1, 1)
++        n = z.shape[0]
++        if not (action.shape[0] == reward.shape[0] == next_z.shape[0] == terminated.shape[0] == n):
++            raise ValueError("Latent replay batch fields must have the same leading dimension.")
++        if n == 0:
++            return
++
++        if n >= self.capacity:
++            z = z[-self.capacity:]
++            action = action[-self.capacity:]
++            reward = reward[-self.capacity:]
++            next_z = next_z[-self.capacity:]
++            terminated = terminated[-self.capacity:]
++            n = self.capacity
++
++        old_pos = self.pos
++        first = min(n, self.capacity - old_pos)
++        second = n - first
++        fields = (
++            (self.z, z),
++            (self.action, action),
++            (self.reward, reward),
++            (self.next_z, next_z),
++            (self.terminated, terminated),
++        )
++        for storage, values in fields:
++            storage[old_pos:old_pos + first].copy_(values[:first])
++            if second:
++                storage[:second].copy_(values[first:])
++
++        self.pos = (old_pos + n) % self.capacity
++        self.full = self.full or (old_pos + n >= self.capacity)
++
++    def sample(self, batch_size):
++        if self.size == 0:
++            raise ValueError("Cannot sample from an empty latent replay buffer.")
++        indices = torch.randint(self.size, (int(batch_size),), device=self.device)
++        return {
++            "z": self.z[indices],
++            "action": self.action[indices],
++            "reward": self.reward[indices],
++            "next_z": self.next_z[indices],
++            "terminated": self.terminated[indices],
++        }
+diff --git a/RL/tdmpc2_core/common/lora.py b/RL/tdmpc2_core/common/lora.py
+new file mode 100644
+index 0000000..42d3d79
+--- /dev/null
++++ b/RL/tdmpc2_core/common/lora.py
+@@ -0,0 +1,97 @@
++"""LoRA adapters that preserve TD-MPC2's NormedLinear computation order."""
++
++from copy import deepcopy
++import math
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++from .layers import NormedLinear
++
++
++class LoRALinear(nn.Module):
++    """LoRA around a plain Linear layer: base(x) + scale * B(A(x))."""
++
++    def __init__(self, base, rank, alpha, dropout=0.0):
++        super().__init__()
++        if not isinstance(base, nn.Linear):
++            raise TypeError(f"Expected nn.Linear, got {type(base)}")
++        self.base = base
++        self.base.requires_grad_(False)
++        requested_rank = int(rank)
++        self.rank = max(1, min(requested_rank, base.in_features, base.out_features))
++        # Keep the user-selected alpha/r scaling even when a narrow output
++        # layer forces the effective matrix rank below r.
++        self.scaling = float(alpha) / float(requested_rank)
++        self.dropout = nn.Dropout(float(dropout)) if dropout > 0 else nn.Identity()
++
++        self.lora_A = nn.Parameter(base.weight.new_empty(self.rank, base.in_features))
++        self.lora_B = nn.Parameter(base.weight.new_zeros(base.out_features, self.rank))
++        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
++
++    def forward(self, x):
++        delta = F.linear(F.linear(self.dropout(x), self.lora_A), self.lora_B)
++        return self.base(x) + self.scaling * delta
++
++
++class LoRANormedLinear(nn.Module):
++    """LoRA inserted before TD-MPC2's dropout -> LayerNorm -> activation."""
++
++    def __init__(self, base, rank, alpha, dropout=0.0):
++        super().__init__()
++        if not isinstance(base, NormedLinear):
++            raise TypeError(f"Expected NormedLinear, got {type(base)}")
++        self.base = base
++        self.base.requires_grad_(False)
++        requested_rank = int(rank)
++        self.rank = max(1, min(requested_rank, base.in_features, base.out_features))
++        # Keep the user-selected alpha/r scaling even when a narrow output
++        # layer forces the effective matrix rank below r.
++        self.scaling = float(alpha) / float(requested_rank)
++        self.lora_dropout = nn.Dropout(float(dropout)) if dropout > 0 else nn.Identity()
++
++        self.lora_A = nn.Parameter(base.weight.new_empty(self.rank, base.in_features))
++        self.lora_B = nn.Parameter(base.weight.new_zeros(base.out_features, self.rank))
++        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
++
++    def forward(self, x):
++        linear = F.linear(x, self.base.weight, self.base.bias)
++        delta = F.linear(F.linear(self.lora_dropout(x), self.lora_A), self.lora_B)
++        out = linear + self.scaling * delta
++        if self.base.dropout is not None:
++            out = self.base.dropout(out)
++        return self.base.act(self.base.ln(out))
++
++
++def lorafy_copy(module, rank=8, alpha=8.0, dropout=0.0):
++    """Deep-copy a module, freeze its base weights, and add trainable LoRA adapters."""
++    rank = int(rank)
++    if rank <= 0:
++        raise ValueError("LoRA rank must be positive.")
++
++    clone = deepcopy(module)
++    clone.requires_grad_(False)
++    adapted = 0
++
++    def recurse(parent):
++        nonlocal adapted
++        for name, child in list(parent.named_children()):
++            if isinstance(child, NormedLinear):
++                setattr(parent, name, LoRANormedLinear(child, rank, alpha, dropout))
++                adapted += 1
++            elif isinstance(child, nn.Linear):
++                setattr(parent, name, LoRALinear(child, rank, alpha, dropout))
++                adapted += 1
++            else:
++                recurse(child)
++
++    recurse(clone)
++    if adapted == 0:
++        raise ValueError("No Linear layers were found for LoRA adaptation.")
++    return clone
++
++
++def trainable_parameters(module):
++    """Return only parameters that an inner optimizer is allowed to update."""
++    return [p for p in module.parameters() if p.requires_grad]
+diff --git a/RL/tdmpc2_core/common/soft_world_model.py b/RL/tdmpc2_core/common/soft_world_model.py
+new file mode 100644
+index 0000000..55b2f9d
+--- /dev/null
++++ b/RL/tdmpc2_core/common/soft_world_model.py
+@@ -0,0 +1,189 @@
++"""TD-MPC2 world model with SAC-style scalar twin critics.
++
++The encoder, latent dynamics, reward, termination, policy architecture, SimNorm,
++and initialization follow the vendored TD-MPC2 implementation. The only control
++head change is replacing TD-MPC2's distributional Q ensemble with two scalar
++soft Q-functions suitable for SAC.
++"""
++
++from copy import deepcopy
++
++import torch
++import torch.nn as nn
++
++from . import init, layers, math
++
++
++class SoftWorldModel(nn.Module):
++    """Single-task TD-MPC2 world model with a squashed-Gaussian SAC actor."""
++
++    def __init__(self, cfg):
++        super().__init__()
++        if cfg.multitask:
++            raise NotImplementedError("AMBI-TD-MPC2 currently supports single-task training only.")
++        if int(cfg.num_q) != 2:
++            raise ValueError("SAC requires exactly two Q-functions; set num_q=2.")
++
++        self.cfg = cfg
++        self._encoder = layers.enc(cfg)
++        self._dynamics = layers.mlp(
++            cfg.latent_dim + cfg.action_dim,
++            2 * [cfg.mlp_dim],
++            cfg.latent_dim,
++            act=layers.SimNorm(cfg),
++        )
++        self._reward = layers.mlp(
++            cfg.latent_dim + cfg.action_dim,
++            2 * [cfg.mlp_dim],
++            max(cfg.num_bins, 1),
++        )
++        self._termination = (
++            layers.mlp(cfg.latent_dim, 2 * [cfg.mlp_dim], 1)
++            if cfg.episodic
++            else None
++        )
++        self._pi = layers.mlp(cfg.latent_dim, 2 * [cfg.mlp_dim], 2 * cfg.action_dim)
++        self._Qs = layers.Ensemble(
++            [
++                layers.mlp(
++                    cfg.latent_dim + cfg.action_dim,
++                    2 * [cfg.mlp_dim],
++                    1,
++                    dropout=cfg.dropout,
++                )
++                for _ in range(2)
++            ]
++        )
++
++        self.apply(init.weight_init)
++        init.zero_([self._reward[-1].weight] + [q[-1].weight for q in self._Qs])
++
++        self.register_buffer("log_std_min", torch.tensor(float(cfg.log_std_min)))
++        self.register_buffer(
++            "log_std_dif",
++            torch.tensor(float(cfg.log_std_max) - float(cfg.log_std_min)),
++        )
++        self.init()
++
++    def init(self):
++        """Create a frozen EMA target critic."""
++        self._target_Qs = deepcopy(self._Qs)
++        self._target_Qs.requires_grad_(False)
++        self._target_Qs.train(False)
++
++    def __repr__(self):
++        result = "AMBI TD-MPC2 Soft World Model\n"
++        modules = [
++            ("Encoder", self._encoder),
++            ("Dynamics", self._dynamics),
++            ("Reward", self._reward),
++            ("Termination", self._termination),
++            ("SAC actor", self._pi),
++            ("Twin soft Q-functions", self._Qs),
++        ]
++        for name, module in modules:
++            if module is not None:
++                result += f"{name}: {module}\n"
++        result += "Learnable parameters: {:,}".format(self.total_params)
++        return result
++
++    @property
++    def total_params(self):
++        return sum(p.numel() for p in self.parameters() if p.requires_grad)
++
++    def to(self, *args, **kwargs):
++        super().to(*args, **kwargs)
++        # Rebuild targets from the now-moved online critic, matching WorldModel.
++        self.init()
++        return self
++
++    def train(self, mode=True):
++        super().train(mode)
++        self._target_Qs.train(False)
++        return self
++
++    @torch.no_grad()
++    def soft_update_target_Q(self, tau=None):
++        tau = float(self.cfg.tau if tau is None else tau)
++        for target_param, param in zip(self._target_Qs.parameters(), self._Qs.parameters()):
++            target_param.data.lerp_(param.data, tau)
++        for target_buffer, buffer in zip(self._target_Qs.buffers(), self._Qs.buffers()):
++            target_buffer.data.copy_(buffer.data)
++
++    def encode(self, obs, task=None):
++        if task is not None:
++            raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
++        return self._encoder[self.cfg.obs](obs)
++
++    def next(self, z, a, task=None):
++        if task is not None:
++            raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
++        return self._dynamics(torch.cat([z, a], dim=-1))
++
++    def reward(self, z, a, task=None):
++        if task is not None:
++            raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
++        return self._reward(torch.cat([z, a], dim=-1))
++
++    def termination(self, z, task=None, unnormalized=False):
++        if task is not None:
++            raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
++        if self._termination is None:
++            raise RuntimeError("Termination model is disabled because episodic=False.")
++        logits = self._termination(z)
++        return logits if unnormalized else torch.sigmoid(logits)
++
++    def pi(self, z, task=None, *, policy=None, deterministic=False):
++        """Sample a tanh-squashed action and return its corrected log-probability."""
++        if task is not None:
++            raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
++        policy = self._pi if policy is None else policy
++
++        mean_raw, log_std = policy(z).chunk(2, dim=-1)
++        log_std = math.log_std(log_std, self.log_std_min, self.log_std_dif)
++        eps = torch.zeros_like(mean_raw) if deterministic else torch.randn_like(mean_raw)
++        log_prob = math.gaussian_logprob(eps, log_std)
++
++        pre_tanh_action = mean_raw + eps * log_std.exp()
++        mean, action, log_prob = math.squash(mean_raw, pre_tanh_action, log_prob)
++        return action, {
++            "mean": mean,
++            "log_std": log_std,
++            "log_prob": log_prob,
++            "entropy": -log_prob,
++        }
++
++    def Q(
++        self,
++        z,
++        a,
++        task=None,
++        *,
++        return_type="min",
++        target=False,
++        detach=False,
++        qs=None,
++    ):
++        """Evaluate online, target, detached, or explicitly supplied twin critics."""
++        if task is not None:
++            raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
++        if return_type not in {"min", "avg", "all"}:
++            raise ValueError(f"Unknown Q return_type: {return_type}")
++        if target and (detach or qs is not None):
++            raise ValueError("target=True cannot be combined with detach=True or an explicit critic.")
++
++        q_input = torch.cat([z, a], dim=-1)
++        if qs is not None:
++            out = qs.forward_detached(q_input) if detach else qs(q_input)
++        elif target:
++            out = self._target_Qs(q_input)
++        elif detach:
++            out = self._Qs.forward_detached(q_input)
++        else:
++            out = self._Qs(q_input)
++
++        if return_type == "all":
++            return out
++        if return_type == "min":
++            return out.min(dim=0).values
++        return out.mean(dim=0)
+diff --git a/configs/algs/AntAMBITDMPC2.json b/configs/algs/AntAMBITDMPC2.json
+new file mode 100644
+index 0000000..580a67a
+--- /dev/null
++++ b/configs/algs/AntAMBITDMPC2.json
+@@ -0,0 +1,43 @@
++{
++    "seed": 55,
++    "env": "Ant-v4",
++    "alg": "AMBITDMPC2/AMBITDMPC2",
++    "device": "cuda",
++    "alg_params": {
++        "model_size": 5,
++        "episodic": false,
++        "discount": 0.99,
++        "buffer_size": 1000000,
++        "batch_size": 256,
++        "utd": 1,
++        "horizon": 3,
++        "rho": 0.7,
++        "compile": false,
++        "actor_lr": 0.0003,
++        "critic_lr": 0.0003,
++        "critic_coef": 1.0,
++        "ent_coef": "auto",
++        "target_entropy": "auto",
++        "tau": 0.005,
++        "target_update_interval": 1,
++        "inner_adaptation": "lora",
++        "inner_iterations": 2,
++        "inner_rollouts": 32,
++        "inner_horizon": 3,
++        "inner_updates_per_iteration": 2,
++        "inner_batch_size": 256,
++        "inner_actor_lr": 0.0003,
++        "inner_critic_lr": 0.0003,
++        "inner_tau": 0.005,
++        "inner_target_update_interval": 1,
++        "lora_rank": 8,
++        "lora_alpha": 8.0,
++        "lora_dropout": 0.0,
++        "wandb": true,
++        "wandb_project": "ambi",
++        "wandb_step_every": 1000,
++        "wandb_entity": "rwgao_b-brown-university"
++    },
++    "total_steps": 1000000,
++    "episodes": null
++}
+diff --git a/configs/algs/AntAMBITDMPC2Debug.json b/configs/algs/AntAMBITDMPC2Debug.json
+new file mode 100644
+index 0000000..da256b8
+--- /dev/null
++++ b/configs/algs/AntAMBITDMPC2Debug.json
+@@ -0,0 +1,39 @@
++{
++    "seed": 55,
++    "env": "Ant-v4",
++    "alg": "AMBITDMPC2/AMBITDMPC2",
++    "device": "cuda",
++    "alg_params": {
++        "model_size": 1,
++        "episodic": false,
++        "discount": 0.99,
++        "seed_steps": 500,
++        "pretrain_steps": 10,
++        "buffer_size": 50000,
++        "batch_size": 32,
++        "utd": 1,
++        "horizon": 3,
++        "rho": 0.7,
++        "compile": false,
++        "actor_lr": 0.0003,
++        "critic_lr": 0.0003,
++        "critic_coef": 1.0,
++        "ent_coef": "auto",
++        "target_entropy": "auto",
++        "tau": 0.005,
++        "target_update_interval": 1,
++        "inner_adaptation": "clone",
++        "inner_iterations": 1,
++        "inner_rollouts": 8,
++        "inner_horizon": 3,
++        "inner_updates_per_iteration": 1,
++        "inner_batch_size": 32,
++        "inner_actor_lr": 0.0003,
++        "inner_critic_lr": 0.0003,
++        "inner_tau": 0.005,
++        "inner_target_update_interval": 1,
++        "wandb": false
++    },
++    "total_steps": 2000,
++    "episodes": null
++}
+diff --git a/configs/experiments/AntAMBITDMPC2.json b/configs/experiments/AntAMBITDMPC2.json
+new file mode 100644
+index 0000000..fac016a
+--- /dev/null
++++ b/configs/experiments/AntAMBITDMPC2.json
+@@ -0,0 +1,23 @@
++{
++    "overrides_alg": {
++        "seed": 55,
++        "device": "cuda",
++        "env": "Ant-v4",
++        "total_steps": 1000000,
++        "episodes": null
++    },
++    "env_params": {
++        "render_mode": null,
++        "exclude_current_positions_from_observation": true,
++        "max_episode_steps": 1000,
++        "terminate_when_unhealthy": false
++    },
++    "trials": 3,
++    "configs": [
++        "AntAMBITDMPC2"
++    ],
++    "logs": "timestamp",
++    "save_trials": "all",
++    "checkpoint_every": 100000,
++    "log_info": false
++}
+diff --git a/configs/experiments/AntAMBITDMPC2Debug.json b/configs/experiments/AntAMBITDMPC2Debug.json
+new file mode 100644
+index 0000000..3ec6972
+--- /dev/null
++++ b/configs/experiments/AntAMBITDMPC2Debug.json
+@@ -0,0 +1,22 @@
++{
++    "overrides_alg": {
++        "seed": 55,
++        "device": "cuda",
++        "env": "Ant-v4",
++        "total_steps": 2000,
++        "episodes": null
++    },
++    "env_params": {
++        "render_mode": null,
++        "exclude_current_positions_from_observation": true,
++        "max_episode_steps": 100,
++        "terminate_when_unhealthy": false
++    },
++    "trials": 1,
++    "configs": [
++        "AntAMBITDMPC2Debug"
++    ],
++    "logs": "overwrite",
++    "save_trials": "first",
++    "log_info": false
++}

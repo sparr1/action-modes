@@ -80,6 +80,11 @@ class TDMPC2(torch.nn.Module):
 		frac = episode_length/self.cfg.discount_denom
 		return min(max((frac-1)/(frac), self.cfg.discount_min), self.cfg.discount_max)
 
+	@torch.no_grad()
+	def reset(self):
+		"""Reset episode-local planning state."""
+		self._prev_mean.zero_()
+
 	def save(self, fp):
 		"""
 		Save state dict of the agent to filepath.
