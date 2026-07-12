@@ -8,7 +8,7 @@
         "num_saves": 10,
         "save_strat": "best" 
 },
-    "trials": 5,
+    "trials": 1,
     "configs": ["DQNCartSHORT", "DQNCartSHORT2"],
     "logs": "overwrite",
     "save_trials": "best"

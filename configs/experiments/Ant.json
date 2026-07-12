@@ -7,7 +7,7 @@
         "episodes": null
 },
     "env_params": {"render_mode": "human", "exclude_current_positions_from_observation":false},
-    "trials": 5,
+    "trials": 1,
     "configs": ["AntPPO", "AntSAC", "AntTD3"],
     "logs": "timestamp",
     "save_trials": "best"

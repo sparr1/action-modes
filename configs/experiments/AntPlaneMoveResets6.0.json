@@ -25,7 +25,7 @@
         "episodes": null
 },
     "env_params": {"max_episode_steps": 1000,"render_mode":null, "exclude_current_positions_from_observation":false},
-    "trials": 3,
+    "trials": 1,
     "configs": ["AntRandom", "AntStationary", "AntSAC", "AntPPO"],
     "checkpoint_every": 1000,
     "logs": "overwrite-safe",

@@ -11,7 +11,7 @@
         "episodes": null
 },
     "env_params": {"max_episode_steps": 1000,"render_mode":null},
-    "trials": 3,
+    "trials": 1,
     "configs": ["PlatformMPDQN", "PlatformRandom"],
     "logs": "timestamp",
     "save_trials": "best",

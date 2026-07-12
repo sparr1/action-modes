@@ -11,7 +11,7 @@
         "exclude_current_positions_from_observation": false,
         "max_episode_steps": 1000
     },
-    "trials": 3,
+    "trials": 1,
     "configs": [
         "AntSAC"
     ],

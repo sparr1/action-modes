@@ -8,7 +8,7 @@
         "episodes": null
 },
     "env_params": {"max_episode_steps": 400, "render_mode": null},
-    "trials": 5,
+    "trials": 1,
     "configs": ["AntSAC", "AntTD3", "AntPPO"],
     "logs": "timestamp",
     "save_trials": "best"

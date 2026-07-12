@@ -10,11 +10,10 @@
         "render_mode": null,
         "exclude_current_positions_from_observation": false
     },
-    "trials": 2,
+    "trials": 1,
     "configs": ["AntAMBI"],
     "logs": "timestamp",
     "save_trials": "best",
     "checkpoint_every":10000,
     "log_info": false
 }
-
