@@ -1,6 +1,9 @@
 import datetime
+import glob
+import json
+import os
+
 import numpy as np
-import glob, os, json
 
 
 def datetime_stamp():
@@ -104,9 +107,17 @@ def setup_logs(reward, obs, action, dones, info=None, inner_steps=None):
         and isinstance(info[0], dict)
         and "reward_info" in info[0]
     ):
-        data["infos"] = _convert_arrays_recursively(info[0]["reward_info"])
+        payload = dict(info[0]["reward_info"])
+        for key in ("terminated", "truncated", "TimeLimit.truncated"):
+            if key in info[0]:
+                payload[key] = info[0][key]
+        data["infos"] = _convert_arrays_recursively(payload)
     elif isinstance(info, dict) and "reward_info" in info:
-        data["infos"] = _convert_arrays_recursively(info["reward_info"])
+        payload = dict(info["reward_info"])
+        for key in ("terminated", "truncated", "TimeLimit.truncated"):
+            if key in info:
+                payload[key] = info[key]
+        data["infos"] = _convert_arrays_recursively(payload)
     else:
         data["infos"] = _convert_arrays_recursively(info) if info is not None else None
     # Final recursive cleanup of entire data dict to catch any remaining arrays

@@ -1,4 +1,10 @@
-import random, time, argparse, json, os, shutil, math, copy
+import argparse
+import copy
+import json
+import math
+import os
+import random
+import shutil
 
 import numpy as np
 
@@ -8,10 +14,10 @@ except ImportError:  # Allows non-torch utility usage to keep importing this fil
     torch = None
 
 import gymnasium as gym
-import domains  # registers custom envs (VarLegsAnt, Ant3LegDeadStump, LegAdaptAnt, ...)
+import domains  # noqa: F401  # registers custom environments through import side effects
 # from RL.alg import *
 #from RL.baselines import Baseline, TrajectoryLoggerCallback
-from utils.core import *
+from utils.core import SUPPORTED_LOG_SETTINGS, SUPPORTED_WRAPPERS, initialize_alg, setup_wrapper
 from utils.stats import handle_trial
 from utils.utils import datetime_stamp
 from log import TrainingLogger, AMBITrainingLogger
@@ -147,18 +153,12 @@ def main():
                 with open(experiment_log_dir+"settings.json", "r") as f:
                     existing_settings = json.load(f)
                     print("Found existing settings:", existing_settings)
-            except:
+            except (OSError, json.JSONDecodeError):
                 print("WARNING: experiment folder existed, but there was an issue reading the settings file. Proceeding with caution under the current settings.")
 
         if save_trials_setting not in (None, "none") or checkpoint_every:
             model_save_dir = os.path.join(experiment_log_dir, "models", "")
             os.makedirs(model_save_dir, exist_ok=True)
-
-        if "AMBI" in experiment_name:
-            print("Using AMBI training logger")
-            training_logger = AMBITrainingLogger(log_info=log_info_setting, log_type = log_type_setting)
-        else:
-            training_logger = TrainingLogger(log_info=log_info_setting, log_type = log_type_setting)
 
     ran_so_far = 0
 
@@ -225,6 +225,13 @@ def main():
                     os.makedirs(trial_log_dir, exist_ok=True)
                 with open(os.path.join(trial_log_dir,"alg_settings.json"), "w") as f:
                     json.dump(trial_run_params, f, indent=2) #put the algorithm parameters next to the data which resulted from a trial using those params
+                is_ambi = "AMBI" in alg_config.upper() or (
+                    hasattr(model, "agent") and hasattr(model.agent, "last_inner_rollout_lengths")
+                )
+                logger_class = AMBITrainingLogger if is_ambi else TrainingLogger
+                training_logger = logger_class(log_info=log_info_setting, log_type=log_type_setting)
+                if is_ambi:
+                    print("Using AMBI training logger")
                 training_logger.reset()
                 training_logger.set_log_dir(trial_log_dir)
                 model.set_logger(training_logger)

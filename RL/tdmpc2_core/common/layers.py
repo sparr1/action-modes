@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections import OrderedDict
 
 
 class Ensemble(nn.Module):
@@ -178,11 +179,63 @@ def enc(cfg, out=None):
 
 
 def api_model_conversion(target_state_dict, source_state_dict):
-	"""Return checkpoint state dict unchanged.
+    """Convert official vectorized TD-MPC2 critic keys to this port's modules.
 
-	The official implementation used this helper to migrate between two
-	vectorized-ensemble checkpoint formats. AMBI's compatibility ensemble uses
-	ordinary PyTorch ModuleLists, so current AMBI checkpoints already match the
-	model. Official vectorized TD-MPC2 checkpoints are not converted here.
-	"""
-	return source_state_dict
+    Current port checkpoints already use ``modules_list`` and pass through.
+    Official checkpoints stack each critic parameter along dimension zero under
+    ``_Qs.params`` / ``_target_Qs_params``; the compatibility ensemble stores
+    one ordinary module per critic instead.
+    """
+    if any(key.startswith("_Qs.modules_list.") for key in source_state_dict):
+        return source_state_dict
+    if not any(key.startswith("_Qs.params.") for key in source_state_dict):
+        return source_state_dict
+
+    converted = OrderedDict()
+    official_prefixes = ("_Qs.params.", "_detach_Qs_params.", "_target_Qs_params.")
+    for key, value in source_state_dict.items():
+        if not key.startswith(official_prefixes):
+            converted[key] = value
+
+    def unpack(source_prefix, target_prefix):
+        found = False
+        for key, value in source_state_dict.items():
+            if not key.startswith(source_prefix):
+                continue
+            remainder = key[len(source_prefix):]
+            if remainder.startswith("__"):
+                continue
+            if not torch.is_tensor(value) or "." not in remainder:
+                continue
+            layer, field = remainder.split(".", 1)
+            for critic_index in range(value.shape[0]):
+                target_key = f"{target_prefix}.modules_list.{critic_index}.{layer}.{field}"
+                if target_key not in target_state_dict:
+                    raise ValueError(
+                        f"Official TD-MPC2 checkpoint critic key {key!r} cannot map to {target_key!r}."
+                    )
+                if target_state_dict[target_key].shape != value[critic_index].shape:
+                    raise ValueError(
+                        f"Checkpoint shape mismatch for {target_key}: "
+                        f"expected {tuple(target_state_dict[target_key].shape)}, "
+                        f"got {tuple(value[critic_index].shape)}."
+                    )
+                converted[target_key] = value[critic_index]
+            found = True
+        return found
+
+    unpack("_Qs.params.", "_Qs")
+    has_target = unpack("_target_Qs_params.", "_target_Qs")
+    if not has_target:
+        for key, value in list(converted.items()):
+            if key.startswith("_Qs.modules_list."):
+                converted[key.replace("_Qs.modules_list.", "_target_Qs.modules_list.", 1)] = value
+
+    missing = [key for key in target_state_dict if key not in converted]
+    unexpected = [key for key in converted if key not in target_state_dict]
+    if missing or unexpected:
+        raise ValueError(
+            "Converted TD-MPC2 checkpoint does not match this model. "
+            f"Missing keys: {missing[:8]}; unexpected keys: {unexpected[:8]}."
+        )
+    return converted

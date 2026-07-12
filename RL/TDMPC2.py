@@ -112,6 +112,7 @@ class TDMPC2Baseline(Algorithm):
         self._set_seed(self.cfg.seed)
         self.agent = self._make_agent(self.cfg)
         self.buffer = Buffer(self.cfg)
+        self._predict_t0 = True
         self._checkpointing = None
         self._global_step = 0
         self._episode_idx = 0
@@ -150,8 +151,22 @@ class TDMPC2Baseline(Algorithm):
 
         self._obs_space = self.env.observation_space
         if isinstance(self._obs_space, gym.spaces.Dict):
+            image_like = [
+                key for key, space in self._obs_space.spaces.items()
+                if isinstance(space, gym.spaces.Box) and len(space.shape) > 1
+            ]
+            if image_like:
+                raise NotImplementedError(
+                    "This TD-MPC2 wrapper supports vector state observations only; "
+                    f"image-like Dict entries are not supported: {image_like}."
+                )
             obs_dim = flatdim(self._obs_space)
         elif isinstance(self._obs_space, gym.spaces.Box):
+            if len(self._obs_space.shape) != 1:
+                raise NotImplementedError(
+                    "This TD-MPC2 wrapper supports vector state observations only; "
+                    f"got observation shape {self._obs_space.shape}."
+                )
             obs_dim = int(np.prod(self._obs_space.shape))
         else:
             raise NotImplementedError("TD-MPC2Baseline only supports Box or Dict observation spaces.")
@@ -274,7 +289,16 @@ class TDMPC2Baseline(Algorithm):
             self.agent.reset()
         elif hasattr(self.agent, "_prev_mean"):
             self.agent._prev_mean.zero_()
+        self._predict_t0 = True
         return obs, info
+
+    def reset(self):
+        """Reset episode-local controller state before external evaluation."""
+        if hasattr(self.agent, "reset"):
+            self.agent.reset()
+        elif hasattr(self.agent, "_prev_mean"):
+            self.agent._prev_mean.zero_()
+        self._predict_t0 = True
 
     def _log_step(self, reward, obs, action, terminated, truncated, info):
         if not self.alg_logger:
@@ -348,6 +372,16 @@ class TDMPC2Baseline(Algorithm):
 
     def learn(self, total_timesteps=10000):
         total_timesteps = int(float(total_timesteps))
+        if total_timesteps < 0:
+            raise ValueError("total_timesteps must be non-negative.")
+        if total_timesteps != int(self.cfg.steps):
+            if self._global_step != 0 or self.buffer.num_eps != 0:
+                raise ValueError(
+                    "Cannot change total_timesteps after TD-MPC2 replay collection has started; "
+                    "construct a new learner with the intended step budget."
+                )
+            self.cfg.steps = total_timesteps
+            self.buffer = Buffer(self.cfg)
         self.cfg.steps = total_timesteps
 
         obs, _ = self._reset_env(seed=self.cfg.seed)
@@ -403,9 +437,13 @@ class TDMPC2Baseline(Algorithm):
         finish_wandb(self._wandb_run)
         return self
 
-    def predict(self, observation, deterministic=True):
+    def predict(self, observation, deterministic=True, episode_start=None):
+        t0 = self._predict_t0 if episode_start is None else bool(episode_start)
+        if t0 and hasattr(self.agent, "reset"):
+            self.agent.reset()
         obs_t = self._obs_to_tensor(observation)
-        action_norm = self.agent.act(obs_t, t0=False, eval_mode=deterministic).numpy()
+        action_norm = self.agent.act(obs_t, t0=t0, eval_mode=deterministic).numpy()
+        self._predict_t0 = False
         return self._unscale_action(action_norm), None
 
     def save(self, path, name):

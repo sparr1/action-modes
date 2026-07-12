@@ -15,6 +15,9 @@ _AMBI_DEFAULTS = {
     "critic_coef": 1.0,
     "actor_lr": 3e-4,
     "critic_lr": 3e-4,
+    "adam_eps": 1e-8,
+    "log_std_min": -20,
+    "log_std_max": 2,
     "ent_coef": "auto",
     "ent_coef_lr": 3e-4,
     "target_entropy": "auto",
@@ -32,10 +35,15 @@ _AMBI_DEFAULTS = {
     "inner_buffer_size": None,
     "inner_actor_lr": 3e-4,
     "inner_critic_lr": 3e-4,
-    "inner_tau": 0.005,
+    "inner_adam_eps": 1e-8,
+    # The inner learner is discarded after only a handful of updates. A hard
+    # target sync lets later local updates bootstrap through earlier ones;
+    # long-run SAC's usual tau=0.005 would leave the target almost fully outer.
+    "inner_tau": 1.0,
     "inner_target_update_interval": 1,
     "inner_grad_clip_norm": 20.0,
     "inner_termination_threshold": 0.5,
+    "allow_long_inner_horizon": False,
 
     # Optional low-rank inner adaptation. ``clone`` is the simplest reference
     # implementation; ``lora`` freezes copied outer weights and updates only
@@ -66,6 +74,11 @@ class AMBITDMPC2(TDMPC2Baseline):
 
         if cfg.inner_horizon is None:
             cfg.inner_horizon = cfg.horizon
+        if int(cfg.inner_horizon) > int(cfg.horizon) and not bool(cfg.allow_long_inner_horizon):
+            raise ValueError(
+                "inner_horizon exceeds the horizon used to train the world model. "
+                "Increase both horizons or set allow_long_inner_horizon=true for an explicit ablation."
+            )
 
         integer_positive = (
             "inner_rollouts",
@@ -102,6 +115,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             raise ValueError("tau must be in (0, 1].")
         if not 0.0 < float(cfg.inner_tau) <= 1.0:
             raise ValueError("inner_tau must be in (0, 1].")
+        if float(cfg.adam_eps) <= 0.0 or float(cfg.inner_adam_eps) <= 0.0:
+            raise ValueError("adam_eps and inner_adam_eps must be positive.")
 
         return cfg
 

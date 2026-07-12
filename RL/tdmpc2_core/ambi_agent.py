@@ -57,12 +57,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self.optim = torch.optim.Adam(
             optim_groups,
             lr=float(cfg.lr),
+            eps=float(getattr(cfg, "adam_eps", 1e-8)),
             capturable=self.device.type == "cuda",
         )
         self.pi_optim = torch.optim.Adam(
             self.model._pi.parameters(),
             lr=float(getattr(cfg, "actor_lr", cfg.lr)),
-            eps=1e-5,
+            eps=float(getattr(cfg, "adam_eps", 1e-8)),
             capturable=self.device.type == "cuda",
         )
 
@@ -82,7 +83,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             self.ent_coef_optim = torch.optim.Adam(
                 [self.log_ent_coef],
                 lr=float(getattr(cfg, "ent_coef_lr", getattr(cfg, "actor_lr", cfg.lr))),
-                eps=1e-5,
+                eps=float(getattr(cfg, "adam_eps", 1e-8)),
                 capturable=self.device.type == "cuda",
             )
             self.register_buffer("fixed_ent_coef", torch.tensor(float("nan"), device=self.device))
@@ -209,13 +210,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
         actor_optim = torch.optim.Adam(
             actor_params,
             lr=float(self.cfg.inner_actor_lr),
-            eps=1e-5,
+            eps=float(getattr(self.cfg, "inner_adam_eps", 1e-8)),
             capturable=self.device.type == "cuda",
         )
         critic_optim = torch.optim.Adam(
             critic_params,
             lr=float(self.cfg.inner_critic_lr),
-            eps=1e-5,
+            eps=float(getattr(self.cfg, "inner_adam_eps", 1e-8)),
             capturable=self.device.type == "cuda",
         )
         return actor, critic, critic_target, actor_optim, critic_optim, actor_params, critic_params

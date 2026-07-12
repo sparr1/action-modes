@@ -58,7 +58,7 @@ def polyak_update(source: nn.Module, target: nn.Module, tau: float) -> None:
     with torch.no_grad():
         for source_param, target_param in zip(source.parameters(), target.parameters()):
             target_param.data.mul_(1.0 - tau)
-            target_param.data.add_(tau * source_param.data)
+            torch.add(target_param.data, source_param.data, alpha=tau, out=target_param.data)
 
 
 @dataclass
@@ -75,6 +75,9 @@ class SACConfig:
     target_entropy: str | float = "auto"
     target_update_interval: int = 1
     net_arch: Tuple[int, ...] = (256, 256)
+    actor_net_arch: Optional[Tuple[int, ...]] = None
+    critic_net_arch: Optional[Tuple[int, ...]] = None
+    adam_eps: float = 1e-8
     seed: Optional[int] = None
     device: str = "auto"
     verbose: int = 1
@@ -88,7 +91,13 @@ class ReplayBuffer:
     """
 
     def __init__(self, obs_dim: int, action_dim: int, capacity: int):
+        if int(capacity) <= 0:
+            raise ValueError(f"Replay buffer capacity must be positive, got {capacity}.")
+        if int(obs_dim) <= 0 or int(action_dim) <= 0:
+            raise ValueError("Replay buffer observation and action dimensions must be positive.")
         self.capacity = int(capacity)
+        self.obs_dim = int(obs_dim)
+        self.action_dim = int(action_dim)
         self.obs = np.zeros((self.capacity, obs_dim), dtype=np.float32)
         self.next_obs = np.zeros((self.capacity, obs_dim), dtype=np.float32)
         self.actions = np.zeros((self.capacity, action_dim), dtype=np.float32)
@@ -103,18 +112,28 @@ class ReplayBuffer:
         return self.capacity if self.full else self.pos
 
     def add(self, obs, action, reward, next_obs, terminated, truncated) -> None:
-        self.obs[self.pos] = np.asarray(obs, dtype=np.float32)
-        self.actions[self.pos] = np.asarray(action, dtype=np.float32)
-        self.rewards[self.pos] = float(reward)
-        self.next_obs[self.pos] = np.asarray(next_obs, dtype=np.float32)
+        obs = self._validated_vector("obs", obs, self.obs_dim)
+        action = self._validated_vector("action", action, self.action_dim)
+        next_obs = self._validated_vector("next_obs", next_obs, self.obs_dim)
+        reward = np.asarray(reward, dtype=np.float32)
+        if reward.size != 1 or not np.isfinite(reward).all():
+            raise ValueError("Replay reward must be one finite scalar.")
+
+        self.obs[self.pos] = obs
+        self.actions[self.pos] = action
+        self.rewards[self.pos] = float(reward.reshape(-1)[0])
+        self.next_obs[self.pos] = next_obs
         self.terminated[self.pos] = float(terminated)
         self.truncated[self.pos] = float(truncated)
         self.pos = (self.pos + 1) % self.capacity
         self.full = self.full or self.pos == 0
 
     def sample(self, batch_size: int, device: torch.device) -> Dict[str, torch.Tensor]:
-        if self.size < batch_size:
-            raise ValueError(f"Replay buffer has only {self.size} transitions, cannot sample batch_size={batch_size}.")
+        if self.size == 0:
+            raise ValueError("Cannot sample from an empty replay buffer.")
+        if int(batch_size) <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}.")
+        # Match SB3: sample with replacement, including when size < batch_size.
         indices = np.random.randint(0, self.size, size=batch_size)
         return {
             "obs": torch.as_tensor(self.obs[indices], device=device),
@@ -125,6 +144,15 @@ class ReplayBuffer:
             # With Gymnasium, terminated is the true bootstrap mask and truncated is a timeout.
             "dones": torch.as_tensor(self.terminated[indices], device=device),
         }
+
+    @staticmethod
+    def _validated_vector(name: str, value, expected_size: int) -> np.ndarray:
+        value = np.asarray(value, dtype=np.float32).reshape(-1)
+        if value.size != expected_size:
+            raise ValueError(f"Replay {name} must contain {expected_size} values, got shape {value.shape}.")
+        if not np.isfinite(value).all():
+            raise ValueError(f"Replay {name} must contain only finite values.")
+        return value
 
 
 class SquashedGaussianActor(nn.Module):
@@ -180,18 +208,34 @@ class SACAgent:
         self.config = config
         self.device = resolve_device(config.device)
 
+        if not 0.0 < float(config.gamma) <= 1.0:
+            raise ValueError(f"gamma must be in (0, 1], got {config.gamma}.")
+        if not 0.0 < float(config.tau) <= 1.0:
+            raise ValueError(f"tau must be in (0, 1], got {config.tau}.")
+        if int(config.target_update_interval) <= 0:
+            raise ValueError("target_update_interval must be positive.")
+        if float(config.adam_eps) <= 0.0:
+            raise ValueError("adam_eps must be positive.")
+
         if config.seed is not None:
             torch.manual_seed(config.seed)
             np.random.seed(config.seed)
 
-        self.actor = SquashedGaussianActor(obs_dim, action_dim, config.net_arch).to(self.device)
-        self.critic = ContinuousCritic(obs_dim, action_dim, config.net_arch).to(self.device)
-        self.critic_target = ContinuousCritic(obs_dim, action_dim, config.net_arch).to(self.device)
+        actor_arch = config.actor_net_arch if config.actor_net_arch is not None else config.net_arch
+        critic_arch = config.critic_net_arch if config.critic_net_arch is not None else config.net_arch
+        self.actor = SquashedGaussianActor(obs_dim, action_dim, actor_arch).to(self.device)
+        self.critic = ContinuousCritic(obs_dim, action_dim, critic_arch).to(self.device)
+        self.critic_target = ContinuousCritic(obs_dim, action_dim, critic_arch).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_target.eval()
+        self.critic_target.requires_grad_(False)
 
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=config.learning_rate, eps=1e-5)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=config.learning_rate, eps=1e-5)
+        self.actor_optimizer = torch.optim.Adam(
+            self.actor.parameters(), lr=config.learning_rate, eps=config.adam_eps
+        )
+        self.critic_optimizer = torch.optim.Adam(
+            self.critic.parameters(), lr=config.learning_rate, eps=config.adam_eps
+        )
 
         self.target_entropy = self._make_target_entropy(config.target_entropy)
         self.ent_coef_optimizer = None
@@ -203,10 +247,15 @@ class SACAgent:
                 if init_value <= 0:
                     raise ValueError("Initial entropy coefficient must be > 0.")
             self.log_ent_coef = torch.log(torch.ones(1, device=self.device) * init_value).requires_grad_(True)
-            self.ent_coef_optimizer = torch.optim.Adam([self.log_ent_coef], lr=config.learning_rate, eps=1e-5)
+            self.ent_coef_optimizer = torch.optim.Adam(
+                [self.log_ent_coef], lr=config.learning_rate, eps=config.adam_eps
+            )
             self.ent_coef_tensor = None
         else:
-            self.ent_coef_tensor = torch.tensor(float(config.ent_coef), device=self.device)
+            fixed_ent_coef = float(config.ent_coef)
+            if fixed_ent_coef <= 0.0:
+                raise ValueError("Fixed entropy coefficient must be positive.")
+            self.ent_coef_tensor = torch.tensor(fixed_ent_coef, device=self.device)
 
         self.num_updates = 0
 
@@ -306,8 +355,12 @@ class SACAgent:
         self.actor_optimizer.load_state_dict(state["actor_optimizer"])
         self.critic_optimizer.load_state_dict(state["critic_optimizer"])
         self.num_updates = int(state.get("num_updates", 0))
-        if self.ent_coef_optimizer is not None and self.log_ent_coef is not None and "log_ent_coef" in state:
+        if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
+            if "log_ent_coef" not in state or "ent_coef_optimizer" not in state:
+                raise ValueError("Checkpoint uses a fixed entropy coefficient, but this agent uses automatic entropy tuning.")
             self.log_ent_coef.data.copy_(state["log_ent_coef"].to(self.device))
             self.ent_coef_optimizer.load_state_dict(state["ent_coef_optimizer"])
-        elif "ent_coef_tensor" in state:
+        else:
+            if "ent_coef_tensor" not in state:
+                raise ValueError("Checkpoint uses automatic entropy tuning, but this agent uses a fixed coefficient.")
             self.ent_coef_tensor = state["ent_coef_tensor"].to(self.device)

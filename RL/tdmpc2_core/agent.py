@@ -22,6 +22,11 @@ class TDMPC2(torch.nn.Module):
 	def __init__(self, cfg):
 		super().__init__()
 		self.cfg = cfg
+		if getattr(cfg, 'compile', False):
+			raise ValueError(
+				"compile=True is not supported by the compatibility TD-MPC2 ensemble; "
+				"use compile=False."
+			)
 		self.device = resolve_device(getattr(cfg, 'device', None))
 		self.cfg.device = str(self.device)
 		self.model = WorldModel(cfg).to(self.device)
@@ -49,19 +54,13 @@ class TDMPC2(torch.nn.Module):
 		print('Episode length:', cfg.episode_length)
 		print('Discount factor:', self.discount)
 		self.register_buffer('_prev_mean', torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device))
-		if cfg.compile:
-			print('Compiling update function with torch.compile...')
-			self._update = torch.compile(self._update, mode="reduce-overhead")
 
 	@property
 	def plan(self):
 		_plan_val = getattr(self, "_plan_val", None)
 		if _plan_val is not None:
 			return _plan_val
-		if self.cfg.compile:
-			plan = torch.compile(self._plan, mode="reduce-overhead")
-		else:
-			plan = self._plan
+		plan = self._plan
 		self._plan_val = plan
 		return self._plan_val
 

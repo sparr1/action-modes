@@ -140,7 +140,15 @@ class SoftWorldModel(nn.Module):
         policy = self._pi if policy is None else policy
 
         mean_raw, log_std = policy(z).chunk(2, dim=-1)
-        log_std = math.log_std(log_std, self.log_std_min, self.log_std_dif)
+        # SAC/SB3 clamp the predicted log standard deviation directly. TD-MPC2's
+        # policy prior instead interpolates tanh(log_std) across its bounds; with
+        # SAC's [-20, 2] bounds that would initialize near log_std=-9 and almost
+        # eliminate exploration.
+        log_std = torch.clamp(
+            log_std,
+            min=self.log_std_min,
+            max=self.log_std_min + self.log_std_dif,
+        )
         eps = torch.zeros_like(mean_raw) if deterministic else torch.randn_like(mean_raw)
         log_prob = math.gaussian_logprob(eps, log_std)
 

@@ -39,13 +39,10 @@ conda activate ambi
 # Run the training script
 echo "Starting AMBI training..."
 
-# python main.py --run configs/experiments/AntAMBI.json
-# python main.py -r configs/experiments/AntTDMPC2Debug.json --num-runs 1
+# Legacy exact-environment AMBI: configs/experiments/AntAMBI.json
+# python main.py -r configs/experiments/AntAMBITDMPC2Debug.json --num-runs 1
 
-python main.py -r configs/experiments/AntTDMPC2.json
-if [ $? -ne 0 ]; then
-    echo "ERROR: Training script failed"
-fi
+python main.py -r configs/experiments/AntAMBITDMPC2.json
 
 echo "End time: $(date)"
 echo "Job completed!"
