@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import random
+import time
 from dataclasses import asdict
 from numbers import Integral, Real
 from typing import Tuple
@@ -21,7 +22,13 @@ from gymnasium.spaces import utils as space_utils
 from RL.alg import Algorithm
 from RL.sac_core import ReplayBuffer, SACAgent, SACConfig
 from utils.utils import setup_logs
-from utils.wandb_utils import finish_wandb, init_wandb, log_wandb
+from utils.wandb_utils import (
+    WandbAccumulator,
+    extract_reward_components,
+    finish_wandb,
+    init_wandb,
+    log_wandb,
+)
 
 
 class SAC(Algorithm):
@@ -56,7 +63,19 @@ class SAC(Algorithm):
         self._rng_seeded = False
         self._env_seeded = False
         self._wandb_every = max(1, int(self.params.get("wandb_step_every", 1000)))
-        self._wandb_run = self._init_wandb()
+        self._wandb_run = None
+        self._wandb_train_window = WandbAccumulator()
+        self._wandb_reward_window = WandbAccumulator()
+        self._wandb_start_time = None
+        self._wandb_window_start_time = None
+        self._wandb_window_start_step = 0
+        self._wandb_train_seconds = 0.0
+        self._wandb_last_updates = 0
+        self._last_wandb_step = None
+        self._last_reward = 0.0
+        self._last_terminated = False
+        self._last_truncated = False
+        self._last_info = {}
 
     def _init_wandb(self):
         return init_wandb(
@@ -176,43 +195,92 @@ class SAC(Algorithm):
         data = setup_logs(reward, obs_for_log, action_for_log, [done], [info_for_log])
         self.alg_logger.on_step(data)
 
-    def _log_wandb_step(self, reward, terminated, truncated, metrics=None):
+    def _reset_wandb_window(self):
+        self._wandb_train_window.clear()
+        self._wandb_reward_window.clear()
+        now = time.perf_counter()
+        self._wandb_start_time = now
+        self._wandb_window_start_time = now
+        self._wandb_window_start_step = int(self.num_timesteps)
+        self._wandb_train_seconds = 0.0
+        self._wandb_last_updates = int(self.agent.num_updates)
+        self._last_wandb_step = None
+
+    def _replay_wandb_payload(self):
+        size = int(self.replay_buffer.size)
+        capacity = int(self.replay_buffer.capacity)
+        return {
+            "train/replay_size": size,
+            "train/replay_capacity": capacity,
+            "train/replay_fill_ratio": float(size / capacity) if capacity > 0 else 0.0,
+        }
+
+    def _timing_wandb_payload(self, updates_since_log):
+        now = time.perf_counter()
+        start = self._wandb_start_time if self._wandb_start_time is not None else now
+        window_start = self._wandb_window_start_time if self._wandb_window_start_time is not None else now
+        window_seconds = max(0.0, now - window_start)
+        window_steps = max(0, int(self.num_timesteps) - int(self._wandb_window_start_step))
+        payload = {
+            "time/window_seconds": float(window_seconds),
+            "time/time_elapsed": float(max(0.0, now - start)),
+            "time/total_timesteps": int(self.num_timesteps),
+            "time/fps": float(window_steps / window_seconds) if window_seconds > 0 else 0.0,
+            "time/train_seconds": float(self._wandb_train_seconds),
+            "time/updates_per_second": (
+                float(updates_since_log / self._wandb_train_seconds)
+                if self._wandb_train_seconds > 0 else 0.0
+            ),
+        }
+        self._wandb_window_start_time = now
+        self._wandb_window_start_step = int(self.num_timesteps)
+        self._wandb_train_seconds = 0.0
+        return payload
+
+    def _log_wandb_step(self, reward, terminated, truncated, info=None, *, completed_episode=False, force=False):
         if self._wandb_run is None:
             return
         done = bool(terminated or truncated)
-        metrics = metrics or {}
-        regular_log = done or self.num_timesteps % self._wandb_every == 0
-        if not regular_log:
+        if not force and not done and self.num_timesteps % self._wandb_every != 0:
+            return
+        if (
+            force
+            and not self._wandb_train_window
+            and not self._wandb_reward_window
+            and (
+                self._last_wandb_step == self.num_timesteps
+                or self.num_timesteps == self._wandb_window_start_step
+            )
+        ):
             return
 
+        updates_since_log = int(self.agent.num_updates - self._wandb_last_updates)
         payload = {
-            "train/replay_size": int(self.replay_buffer.size),
+            "train/reward": float(reward),
+            "train/done": int(done),
+            "train/terminated": int(bool(terminated)),
+            "train/truncated": int(bool(truncated)),
+            "train/learning_started": int(self.num_timesteps > self.cfg.learning_starts),
+            "train/learning_rate": float(self.cfg.learning_rate),
+            "train/n_updates": int(self.agent.num_updates),
+            "train/updates_since_log": updates_since_log,
+            "episode/current_return": float(self._episode_return),
+            "episode/current_len": int(self._episode_len),
         }
-        if regular_log:
+        payload.update(self._replay_wandb_payload())
+        payload.update(self._wandb_reward_window.pop())
+        payload.update(self._wandb_train_window.pop())
+        payload.update(extract_reward_components(info or {}))
+        payload.update(self._timing_wandb_payload(updates_since_log))
+        if completed_episode:
             payload.update({
-                "train/reward": float(reward),
-                "train/done": int(done),
-                "train/terminated": int(bool(terminated)),
-                "train/truncated": int(bool(truncated)),
-                "episode/current_return": float(self._episode_return),
-                "episode/current_len": int(self._episode_len),
-            })
-        if metrics:
-            payload.update({f"train/{key}": float(value) for key, value in metrics.items()})
-        log_wandb(self._wandb_run, payload, step=self.num_timesteps)
-
-    def _log_wandb_episode(self):
-        if self._wandb_run is None:
-            return
-        log_wandb(
-            self._wandb_run,
-            {
                 "episode/index": int(self._episode_idx),
                 "episode/return": float(self._episode_return),
                 "episode/len": int(self._episode_len),
-            },
-            step=self.num_timesteps,
-        )
+            })
+        log_wandb(self._wandb_run, payload, step=self.num_timesteps)
+        self._last_wandb_step = int(self.num_timesteps)
+        self._wandb_last_updates = int(self.agent.num_updates)
 
     def _maybe_train(self, episode_done: bool = False):
         train_freq, train_unit = self._parse_train_freq(self.params.get("train_freq", 1))
@@ -238,7 +306,12 @@ class SAC(Algorithm):
             gradient_steps = collected_steps
         if gradient_steps <= 0:
             return None
+        train_start = time.perf_counter()
         self._last_metrics = self.agent.update(self.replay_buffer, gradient_steps, self.cfg.batch_size)
+        self._wandb_train_seconds += time.perf_counter() - train_start
+        if self._wandb_run is not None:
+            for key, value in self._last_metrics.items():
+                self._wandb_train_window.add_weighted(f"train/{key}", value, weight=gradient_steps)
         if self.verbose >= 2:
             print(f"Native SAC update @ step {self.num_timesteps}: {self._last_metrics}")
         return self._last_metrics
@@ -269,75 +342,100 @@ class SAC(Algorithm):
 
     def learn(self, total_timesteps=10000, reset_num_timesteps=True):
         self._seed_once()
-        if self._wandb_run is None:
-            self._wandb_run = self._init_wandb()
         total_timesteps = int(float(total_timesteps))
         if total_timesteps < 0:
             raise ValueError("total_timesteps must be non-negative.")
+        if self._wandb_run is None:
+            self._wandb_run = self._init_wandb()
 
-        if reset_num_timesteps:
-            self.num_timesteps = 0
-            self._episode_idx = 0
-            self._episode_return = 0.0
-            self._episode_len = 0
-            self._collected_steps = 0
-            self._collected_episodes = 0
-            self._last_metrics = {}
-            reset_seed = self.seed if not self._env_seeded else None
-            obs = self._reset_env(seed=reset_seed)
-            self._env_seeded = True
-            target_timesteps = total_timesteps
-        else:
-            target_timesteps = self.num_timesteps + total_timesteps
-            if self._last_obs is None:
+        try:
+            if reset_num_timesteps:
+                self.num_timesteps = 0
+                self._episode_idx = 0
+                self._episode_return = 0.0
+                self._episode_len = 0
+                self._collected_steps = 0
+                self._collected_episodes = 0
+                self._last_metrics = {}
                 reset_seed = self.seed if not self._env_seeded else None
                 obs = self._reset_env(seed=reset_seed)
                 self._env_seeded = True
+                target_timesteps = total_timesteps
             else:
-                obs = self._last_obs
-        self._last_obs = obs
-
-        # Match SB3's rollout-chunk semantics: once a train-frequency chunk has
-        # started, finish it even if that slightly overshoots total_timesteps.
-        while (
-            self.num_timesteps < target_timesteps
-            or self._collected_steps > 0
-            or self._collected_episodes > 0
-        ):
-            obs_flat = self._flatten_obs(obs)
-            if self.num_timesteps < self.cfg.learning_starts:
-                action_env = self.env.action_space.sample()
-                action_norm = self._scale_action(action_env)
-            else:
-                action_norm = self.agent.act(obs_flat, deterministic=False)
-                action_env = self._unscale_action(action_norm)
-
-            next_obs, reward, terminated, truncated, info = self.env.step(action_env)
-            done = bool(terminated or truncated)
-            next_obs_flat = self._flatten_obs(next_obs)
-            self.replay_buffer.add(obs_flat, action_norm, reward, next_obs_flat, terminated, truncated)
-            self.num_timesteps += 1
-            self._episode_return += float(reward)
-            self._episode_len += 1
-            self._log_step(next_obs, reward, action_env, terminated, truncated, info)
-
-            self._maybe_train(episode_done=done)
-            self._log_wandb_step(reward, terminated, truncated, self._last_metrics)
-            self._maybe_checkpoint()
-
-            if done:
-                self._log_wandb_episode()
-                self._episode_idx += 1
-                self._episode_return = 0.0
-                self._episode_len = 0
-                obs = self._reset_env()
-            else:
-                obs = next_obs
+                target_timesteps = self.num_timesteps + total_timesteps
+                if self._last_obs is None:
+                    reset_seed = self.seed if not self._env_seeded else None
+                    obs = self._reset_env(seed=reset_seed)
+                    self._env_seeded = True
+                else:
+                    obs = self._last_obs
             self._last_obs = obs
+            self._reset_wandb_window()
+        except Exception:
+            finish_wandb(self._wandb_run)
+            self._wandb_run = None
+            raise
 
-        finish_wandb(self._wandb_run)
-        self._wandb_run = None
-        return self
+        try:
+            # Match SB3's rollout-chunk semantics: once a train-frequency chunk has
+            # started, finish it even if that slightly overshoots total_timesteps.
+            while (
+                self.num_timesteps < target_timesteps
+                or self._collected_steps > 0
+                or self._collected_episodes > 0
+            ):
+                obs_flat = self._flatten_obs(obs)
+                if self.num_timesteps < self.cfg.learning_starts:
+                    action_env = self.env.action_space.sample()
+                    action_norm = self._scale_action(action_env)
+                else:
+                    action_norm = self.agent.act(obs_flat, deterministic=False)
+                    action_env = self._unscale_action(action_norm)
+
+                next_obs, reward, terminated, truncated, info = self.env.step(action_env)
+                done = bool(terminated or truncated)
+                next_obs_flat = self._flatten_obs(next_obs)
+                self.replay_buffer.add(obs_flat, action_norm, reward, next_obs_flat, terminated, truncated)
+                self.num_timesteps += 1
+                self._episode_return += float(reward)
+                self._episode_len += 1
+                self._last_reward = float(reward)
+                self._last_terminated = bool(terminated)
+                self._last_truncated = bool(truncated)
+                self._last_info = dict(info or {})
+                self._wandb_reward_window.add_stats("rollout/reward", [reward])
+                self._log_step(next_obs, reward, action_env, terminated, truncated, info)
+
+                self._maybe_train(episode_done=done)
+                self._log_wandb_step(
+                    reward,
+                    terminated,
+                    truncated,
+                    info,
+                    completed_episode=done,
+                )
+                self._maybe_checkpoint()
+
+                if done:
+                    self._episode_idx += 1
+                    self._episode_return = 0.0
+                    self._episode_len = 0
+                    obs = self._reset_env()
+                else:
+                    obs = next_obs
+                self._last_obs = obs
+            return self
+        finally:
+            if self._wandb_run is not None:
+                self._log_wandb_step(
+                    self._last_reward,
+                    self._last_terminated,
+                    self._last_truncated,
+                    self._last_info,
+                    force=True,
+                )
+                finish_wandb(self._wandb_run)
+                self._wandb_run = None
 
     def predict(self, observation, deterministic=False):
         obs_flat = self._flatten_obs(observation)

@@ -1,6 +1,7 @@
 """AMBI agent built from TD-MPC2 world-model updates and latent SAC control."""
 
 from copy import deepcopy
+import time
 
 import torch
 import torch.nn.functional as F
@@ -163,10 +164,32 @@ class AMBITDMPC2Agent(torch.nn.Module):
             root_z = self.model.encode(obs).detach()
 
         if int(self.cfg.inner_iterations) <= 0:
-            self.last_inner_metrics = {"inner_steps": 0.0, "inner_updates": 0.0}
+            action_start = time.perf_counter()
             self.last_inner_rollout_lengths = []
             with torch.no_grad():
                 action, _ = self.model.pi(root_z, deterministic=eval_mode)
+            self.last_inner_metrics = {
+                "inner_active": 0.0,
+                "inner_actions": 1.0,
+                "inner_iterations": 0.0,
+                "inner_rollouts": 0.0,
+                "inner_steps": 0.0,
+                "inner_updates": 0.0,
+                "inner_buffer_size": 0.0,
+                "inner_buffer_capacity": 0.0,
+                "inner_buffer_fill_ratio": 0.0,
+                "inner_return_mean": 0.0,
+                "inner_return_std": 0.0,
+                "inner_return_min": 0.0,
+                "inner_return_max": 0.0,
+                "inner_rollout_len_mean": 0.0,
+                "inner_rollout_len_std": 0.0,
+                "inner_rollout_len_min": 0.0,
+                "inner_rollout_len_max": 0.0,
+                "inner_termination_rate": 0.0,
+                "inner_alpha": float(self.alpha.detach().cpu()),
+                "inner_action_seconds": time.perf_counter() - action_start,
+            }
             return action[0].cpu()
 
         return self._inner_improve(root_z, eval_mode=eval_mode).cpu()
@@ -222,12 +245,14 @@ class AMBITDMPC2Agent(torch.nn.Module):
         return actor, critic, critic_target, actor_optim, critic_optim, actor_params, critic_params
 
     @torch.no_grad()
-    def _collect_imagined_rollouts(self, root_z, actor, replay):
+    def _collect_imagined_rollouts(self, root_z, actor, replay, *, return_stats=False):
         num_rollouts = int(self.cfg.inner_rollouts)
         horizon = int(self.cfg.inner_horizon)
         z = root_z.expand(num_rollouts, -1).clone()
         alive = torch.ones(num_rollouts, dtype=torch.bool, device=self.device)
         lengths = torch.zeros(num_rollouts, dtype=torch.long, device=self.device)
+        returns = torch.zeros(num_rollouts, dtype=torch.float32, device=self.device)
+        rollout_terminated = torch.zeros(num_rollouts, dtype=torch.bool, device=self.device)
 
         self.model.eval()
         actor.eval()
@@ -248,11 +273,21 @@ class AMBITDMPC2Agent(torch.nn.Module):
 
             replay.add_batch(active_z, action, reward, next_z, terminated)
             lengths[active_idx] += 1
+            returns[active_idx] += reward.squeeze(-1)
             z[active_idx] = next_z
-            alive[active_idx] = terminated.squeeze(-1) < 0.5
+            just_terminated = terminated.squeeze(-1) >= 0.5
+            rollout_terminated[active_idx] |= just_terminated
+            alive[active_idx] = ~just_terminated
 
         actor.train()
-        return lengths.tolist()
+        lengths = lengths.tolist()
+        if not return_stats:
+            return lengths
+        return {
+            "lengths": lengths,
+            "returns": returns.tolist(),
+            "terminated": rollout_terminated.tolist(),
+        }
 
     def _inner_sac_update(
         self,
@@ -325,9 +360,18 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "actor_loss": float(actor_loss.detach().cpu()),
             "critic_grad_norm": float(torch.as_tensor(critic_grad_norm).detach().cpu()),
             "actor_grad_norm": float(torch.as_tensor(actor_grad_norm).detach().cpu()),
+            "q_mean": float(current_q.detach().mean().cpu()),
+            "q_target_mean": float(target_q.detach().mean().cpu()),
+            "actor_q_mean": float(q_pi.detach().mean().cpu()),
+            "actor_entropy": float(pi_info["entropy"].detach().mean().cpu()),
+            "td_error_abs_mean": float(
+                (current_q.detach() - target_q.detach().unsqueeze(0)).abs().mean().cpu()
+            ),
         }
 
     def _inner_improve(self, root_z, eval_mode=False):
+        inner_start = time.perf_counter()
+        setup_start = time.perf_counter()
         (
             actor,
             critic,
@@ -350,13 +394,26 @@ class AMBITDMPC2Agent(torch.nn.Module):
             action_dim=self.cfg.action_dim,
             device=self.device,
         )
+        setup_seconds = time.perf_counter() - setup_start
 
         rollout_lengths = []
+        rollout_returns = []
+        rollout_terminated = []
         metric_history = []
         update_index = 0
+        rollout_seconds = 0.0
+        update_seconds = 0.0
         for _ in range(int(self.cfg.inner_iterations)):
-            rollout_lengths.extend(self._collect_imagined_rollouts(root_z, actor, replay))
+            rollout_start = time.perf_counter()
+            rollout_stats = self._collect_imagined_rollouts(
+                root_z, actor, replay, return_stats=True
+            )
+            rollout_seconds += time.perf_counter() - rollout_start
+            rollout_lengths.extend(rollout_stats["lengths"])
+            rollout_returns.extend(rollout_stats["returns"])
+            rollout_terminated.extend(rollout_stats["terminated"])
             for _ in range(int(self.cfg.inner_updates_per_iteration)):
+                update_start = time.perf_counter()
                 metric_history.append(
                     self._inner_sac_update(
                         replay,
@@ -370,22 +427,76 @@ class AMBITDMPC2Agent(torch.nn.Module):
                         update_index,
                     )
                 )
+                update_seconds += time.perf_counter() - update_start
                 update_index += 1
 
         actor.eval()
+        policy_eval_start = time.perf_counter()
         with torch.no_grad():
-            action, _ = self.model.pi(root_z, policy=actor, deterministic=eval_mode)
+            outer_action, _ = self.model.pi(root_z, deterministic=True)
+            improved_action, _ = self.model.pi(root_z, policy=actor, deterministic=True)
+            outer_q = self.model.Q(root_z, outer_action, return_type="min")
+            improved_outer_q = self.model.Q(root_z, improved_action, return_type="min")
+            policy_mean_delta_l2 = torch.linalg.vector_norm(
+                improved_action - outer_action, dim=-1
+            ).mean()
+            outer_q_gain = (improved_outer_q - outer_q).mean()
+            if eval_mode:
+                action = improved_action
+            else:
+                action, _ = self.model.pi(root_z, policy=actor)
+        policy_eval_seconds = time.perf_counter() - policy_eval_start
+
+        def _stats(values):
+            if not values:
+                return 0.0, 0.0, 0.0, 0.0
+            tensor = torch.as_tensor(values, dtype=torch.float64)
+            return (
+                float(tensor.mean()),
+                float(tensor.std(unbiased=False)),
+                float(tensor.min()),
+                float(tensor.max()),
+            )
+
+        return_mean, return_std, return_min, return_max = _stats(rollout_returns)
+        len_mean, len_std, len_min, len_max = _stats(rollout_lengths)
 
         self.last_inner_rollout_lengths = rollout_lengths
         self.last_inner_metrics = {
+            "inner_active": 1.0,
+            "inner_actions": 1.0,
+            "inner_iterations": float(self.cfg.inner_iterations),
+            "inner_rollouts": float(len(rollout_lengths)),
             "inner_steps": float(sum(rollout_lengths)),
             "inner_updates": float(update_index),
             "inner_buffer_size": float(replay.size),
+            "inner_buffer_capacity": float(replay.capacity),
+            "inner_buffer_fill_ratio": float(replay.size / replay.capacity),
+            "inner_return_mean": return_mean,
+            "inner_return_std": return_std,
+            "inner_return_min": return_min,
+            "inner_return_max": return_max,
+            "inner_rollout_len_mean": len_mean,
+            "inner_rollout_len_std": len_std,
+            "inner_rollout_len_min": len_min,
+            "inner_rollout_len_max": len_max,
+            "inner_termination_rate": (
+                float(sum(rollout_terminated) / len(rollout_terminated))
+                if rollout_terminated
+                else 0.0
+            ),
             "inner_alpha": float(self.alpha.detach().cpu()),
+            "inner_policy_mean_delta_l2": float(policy_mean_delta_l2.cpu()),
+            "inner_outer_q_gain": float(outer_q_gain.cpu()),
+            "inner_setup_seconds": setup_seconds,
+            "inner_rollout_seconds": rollout_seconds,
+            "inner_update_seconds": update_seconds,
+            "inner_policy_eval_seconds": policy_eval_seconds,
         }
         if metric_history:
             for key in metric_history[0]:
                 self.last_inner_metrics[f"inner_{key}"] = sum(m[key] for m in metric_history) / len(metric_history)
+        self.last_inner_metrics["inner_action_seconds"] = time.perf_counter() - inner_start
         return action[0]
 
     @torch.no_grad()
@@ -428,6 +539,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "actor_loss": actor_loss.detach(),
             "actor_grad_norm": torch.as_tensor(actor_grad_norm).detach(),
             "actor_entropy": pi_info["entropy"].detach().mean(),
+            "actor_q_mean": q_pi.detach().mean(),
             "ent_coef": alpha.detach(),
             "ent_coef_loss": ent_coef_loss.detach(),
         }
@@ -508,6 +620,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self.num_updates += 1
 
         self.model.eval()
+        reward_values = td_math.two_hot_inv(reward_preds.detach(), self.cfg)
         info = {
             "consistency_loss": consistency_loss.detach(),
             "reward_loss": reward_loss.detach(),
@@ -517,7 +630,20 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "grad_norm": torch.as_tensor(grad_norm).detach(),
             "q_target_mean": td_targets.detach().mean(),
             "q_mean": qs.detach().mean(),
+            "td_error_abs_mean": (
+                qs.detach() - td_targets.detach().unsqueeze(0)
+            ).abs().mean(),
+            "reward_pred_mean": reward_values.mean(),
+            "reward_target_mean": reward.detach().mean(),
+            "num_updates": torch.tensor(float(self.num_updates), device=self.device),
         }
+        if self.cfg.episodic:
+            info.update(
+                td_math.termination_statistics(
+                    torch.sigmoid(termination_pred[-1]).detach(),
+                    terminated[-1].detach(),
+                )
+            )
         info.update(actor_info)
         return info
 

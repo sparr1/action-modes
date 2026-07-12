@@ -1,11 +1,19 @@
 import numpy as np
 import gymnasium as gym
-import importlib, json, os
+import importlib, json, os, time
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.callbacks import CheckpointCallback as BaselineCheckpointCallback
+from stable_baselines3.common.logger import KVWriter
 from RL.alg import Algorithm
 from utils.utils import setup_logs
-from utils.wandb_utils import finish_wandb, init_wandb, log_wandb, wandb_enabled
+from utils.wandb_utils import (
+    WandbAccumulator,
+    extract_reward_components,
+    finish_wandb,
+    init_wandb,
+    log_wandb,
+    wandb_enabled,
+)
 #from stable_baselines3 import PPO, DQN, TD3, SAC, DDPG, A2C
 module_name = "stable_baselines3" #for dynamic importing
 
@@ -68,7 +76,14 @@ class Baseline(Algorithm):
             self.callback.append(WandbBaselineCallback(self.name, self.params, env))
 
     def learn(self, **kwargs):
-        return self.model.learn(callback = self.callback, **kwargs) # pass this env into ambi
+        try:
+            return self.model.learn(callback=self.callback, **kwargs)  # pass this env into ambi
+        finally:
+            # SB3 does not call ``on_training_end`` when learning raises. Keep W&B
+            # lifecycle cleanup idempotent so failed runs are not left open.
+            for callback in self.callback:
+                if isinstance(callback, WandbBaselineCallback):
+                    callback.finish()
 
     def predict(self, observation):
         return self.model.predict(observation)
@@ -148,6 +163,31 @@ class TrajectoryLoggerCallback(BaseCallback):
         return True
 
 
+class _WandbKVWriter(KVWriter):
+    """Capture scalar values at SB3's logger-dump boundary before it clears them."""
+
+    def __init__(self, callback):
+        self.callback = callback
+
+    def write(self, key_values, key_excluded, step=0):
+        del key_excluded
+        payload = {}
+        for key, value in key_values.items():
+            if not isinstance(key, str) or not key.startswith(("rollout/", "time/")):
+                continue
+            try:
+                scalar = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(scalar):
+                payload[key] = scalar
+        if payload:
+            self.callback._log_dump_payload(payload, int(step))
+
+    def close(self):
+        return None
+
+
 class WandbBaselineCallback(BaseCallback):
     """Optional W&B logging for Stable-Baselines3 baselines.
 
@@ -161,13 +201,39 @@ class WandbBaselineCallback(BaseCallback):
         self.params = params or {}
         self.env_id = getattr(getattr(env, "spec", None), "id", "env")
         self.seed = self.params.get("seed", None)
-        self._wandb_every = int(self.params.get("wandb_step_every", 1000))
+        self._wandb_every = max(1, int(self.params.get("wandb_step_every", 1000)))
         self._wandb_run = None
         self._episode_idx = 0
         self._episode_return = 0.0
         self._episode_len = 0
+        self._train_window = WandbAccumulator()
+        self._reward_window = WandbAccumulator()
+        self._last_seen_updates = 0
+        self._last_log_step = None
+        self._last_reward = 0.0
+        self._last_done = False
+        self._last_terminated = False
+        self._last_truncated = False
+        self._last_info = {}
+        self._start_time = None
+        self._window_start_time = None
+        self._window_start_step = 0
+        self._kv_writer = None
 
     def _on_training_start(self) -> None:
+        if int(getattr(self.model, "n_envs", 1)) != 1:
+            raise ValueError("W&B baseline logging currently requires exactly one SB3 environment.")
+        if bool(self.locals.get("reset_num_timesteps", True)):
+            self._episode_idx = 0
+            self._episode_return = 0.0
+            self._episode_len = 0
+        self._train_window.clear()
+        self._reward_window.clear()
+        self._last_seen_updates = int(getattr(self.model, "_n_updates", 0))
+        self._last_log_step = None
+        self._start_time = time.perf_counter()
+        self._window_start_time = self._start_time
+        self._window_start_step = int(self.num_timesteps)
         run_name = f"SB3{self.alg_name}-{self.env_id}"
         if self.seed is not None:
             run_name += f"-seed{self.seed}"
@@ -181,18 +247,106 @@ class WandbBaselineCallback(BaseCallback):
                 "sb3_params": _wandb_clean_params(self.params),
             },
         )
+        self._kv_writer = _WandbKVWriter(self)
+        self.model.logger.output_formats.append(self._kv_writer)
 
-    def _logger_payload(self):
-        payload = {}
+    def _on_rollout_start(self) -> None:
+        self._capture_train_metrics()
+        # If optimization happened immediately after an already-logged rollout
+        # boundary, append it to that same explicit W&B step.
+        step = int(self.num_timesteps)
+        if self._wandb_run is not None and self._last_log_step == step and self._train_window:
+            payload = self._train_window.pop()
+            payload.update(self._replay_payload())
+            payload["train/n_updates"] = int(getattr(self.model, "_n_updates", 0))
+            log_wandb(self._wandb_run, payload, step=step)
+
+    def _capture_train_metrics(self):
         values = getattr(getattr(self.model, "logger", None), "name_to_value", {})
+        current_updates = int(values.get("train/n_updates", getattr(self.model, "_n_updates", 0)))
+        delta_updates = current_updates - self._last_seen_updates
+        if delta_updates <= 0:
+            return
         for key, value in values.items():
-            if not isinstance(key, str) or not key.startswith(("train/", "rollout/", "time/")):
+            if not isinstance(key, str) or not key.startswith("train/") or key == "train/n_updates":
                 continue
             try:
-                payload[key] = float(value)
+                scalar = float(value)
             except (TypeError, ValueError):
-                pass
+                continue
+            if np.isfinite(scalar):
+                self._train_window.add_weighted(key, scalar, weight=delta_updates)
+        self._train_window.add_sum("train/updates_since_log", delta_updates)
+        self._last_seen_updates = current_updates
+
+    def _replay_payload(self):
+        replay = getattr(self.model, "replay_buffer", None)
+        if replay is None:
+            return {}
+        n_envs = int(getattr(replay, "n_envs", 1))
+        try:
+            size = int(replay.size()) * n_envs
+        except (AttributeError, TypeError):
+            return {}
+        capacity = int(getattr(replay, "buffer_size", 0)) * n_envs
+        return {
+            "train/replay_size": size,
+            "train/replay_capacity": capacity,
+            "train/replay_fill_ratio": float(size / capacity) if capacity > 0 else 0.0,
+        }
+
+    def _timing_payload(self, step):
+        now = time.perf_counter()
+        start = self._start_time if self._start_time is not None else now
+        window_start = self._window_start_time if self._window_start_time is not None else now
+        window_seconds = max(0.0, now - window_start)
+        window_steps = max(0, int(step) - int(self._window_start_step))
+        payload = {
+            "time/window_seconds": float(window_seconds),
+            "time/time_elapsed": float(max(0.0, now - start)),
+            "time/total_timesteps": int(step),
+            "time/fps": float(window_steps / window_seconds) if window_seconds > 0 else 0.0,
+        }
+        self._window_start_time = now
+        self._window_start_step = int(step)
         return payload
+
+    def _log_dump_payload(self, payload, step):
+        if self._wandb_run is not None:
+            log_wandb(self._wandb_run, payload, step=int(step))
+
+    def _emit(self, step, *, completed_episode=False, force=False):
+        if self._wandb_run is None:
+            return
+        if not force and not completed_episode and step % self._wandb_every != 0:
+            return
+
+        payload = {
+            "train/reward": float(self._last_reward),
+            "train/done": int(self._last_done),
+            "train/terminated": int(self._last_terminated),
+            "train/truncated": int(self._last_truncated),
+            "train/learning_started": int(step > int(getattr(self.model, "learning_starts", 0))),
+            "train/n_updates": int(getattr(self.model, "_n_updates", 0)),
+            "episode/current_return": float(self._episode_return),
+            "episode/current_len": int(self._episode_len),
+        }
+        payload.setdefault("train/updates_since_log", 0)
+        payload.update(self._reward_window.pop())
+        train_payload = self._train_window.pop()
+        if train_payload:
+            payload.update(train_payload)
+        payload.update(self._replay_payload())
+        payload.update(extract_reward_components(self._last_info))
+        payload.update(self._timing_payload(step))
+        if completed_episode:
+            payload.update({
+                "episode/index": int(self._episode_idx),
+                "episode/return": float(self._episode_return),
+                "episode/len": int(self._episode_len),
+            })
+        log_wandb(self._wandb_run, payload, step=step)
+        self._last_log_step = int(step)
 
     def _on_step(self) -> bool:
         reward = _as_float(self.locals.get("rewards", 0.0))
@@ -203,36 +357,44 @@ class WandbBaselineCallback(BaseCallback):
 
         self._episode_return += reward
         self._episode_len += 1
+        self._last_reward = reward
+        self._last_done = done
+        self._last_terminated = terminated
+        self._last_truncated = truncated
+        self._last_info = info
+        self._reward_window.add_stats("rollout/reward", [reward])
 
         step = int(self.num_timesteps)
-        if self._wandb_run is not None and (done or self._wandb_every <= 1 or step % self._wandb_every == 0):
-            payload = {
-                "train/reward": reward,
-                "train/done": int(done),
-                "train/terminated": int(terminated),
-                "train/truncated": int(truncated),
-                "episode/current_return": float(self._episode_return),
-                "episode/current_len": int(self._episode_len),
-            }
-            payload.update(self._logger_payload())
-            log_wandb(self._wandb_run, payload, step=step)
-
+        self._emit(step, completed_episode=done)
         if done:
-            if self._wandb_run is not None:
-                log_wandb(
-                    self._wandb_run,
-                    {
-                        "episode/index": int(self._episode_idx),
-                        "episode/return": float(self._episode_return),
-                        "episode/len": int(self._episode_len),
-                    },
-                    step=step,
-                )
             self._episode_idx += 1
             self._episode_return = 0.0
             self._episode_len = 0
         return True
 
     def _on_training_end(self) -> None:
-        finish_wandb(self._wandb_run)
-        self._wandb_run = None
+        self._capture_train_metrics()
+        step = int(self.num_timesteps)
+        if self._wandb_run is not None:
+            if self._last_log_step == step and self._train_window:
+                payload = self._train_window.pop()
+                payload.update(self._replay_payload())
+                payload["train/n_updates"] = int(getattr(self.model, "_n_updates", 0))
+                log_wandb(self._wandb_run, payload, step=step)
+            elif (
+                step != self._window_start_step
+                or self._train_window
+                or self._reward_window
+            ):
+                self._emit(step, force=True)
+        self.finish()
+
+    def finish(self):
+        if self._kv_writer is not None and getattr(self, "model", None) is not None:
+            output_formats = getattr(getattr(self.model, "logger", None), "output_formats", [])
+            if self._kv_writer in output_formats:
+                output_formats.remove(self._kv_writer)
+            self._kv_writer = None
+        if self._wandb_run is not None:
+            finish_wandb(self._wandb_run)
+            self._wandb_run = None

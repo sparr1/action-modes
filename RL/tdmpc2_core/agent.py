@@ -1,3 +1,5 @@
+import time
+
 import torch
 import torch.nn.functional as F
 
@@ -51,6 +53,8 @@ class TDMPC2(torch.nn.Module):
 		self.discount = torch.tensor(
 			[self._get_discount(ep_len) for ep_len in cfg.episode_lengths], device=self.device
 		) if self.cfg.multitask else self._get_discount(cfg.episode_length)
+		self.num_updates = 0
+		self.last_plan_metrics = {}
 		print('Episode length:', cfg.episode_length)
 		print('Discount factor:', self.discount)
 		self.register_buffer('_prev_mean', torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device))
@@ -83,6 +87,7 @@ class TDMPC2(torch.nn.Module):
 	def reset(self):
 		"""Reset episode-local planning state."""
 		self._prev_mean.zero_()
+		self.last_plan_metrics = {}
 
 	def save(self, fp):
 		"""
@@ -91,7 +96,10 @@ class TDMPC2(torch.nn.Module):
 		Args:
 			fp (str): Filepath to save state dict to.
 		"""
-		torch.save({"model": self.model.state_dict()}, fp)
+		torch.save({
+			"model": self.model.state_dict(),
+			"num_updates": self.num_updates,
+		}, fp)
 
 	def load(self, fp):
 		"""
@@ -101,10 +109,11 @@ class TDMPC2(torch.nn.Module):
 			fp (str or dict): Filepath or state dict to load.
 		"""
 		if isinstance(fp, dict):
-			state_dict = fp
+			state = fp
 		else:
-			state_dict = torch.load(fp, map_location=self.device, weights_only=False)
-		state_dict = state_dict["model"] if "model" in state_dict else state_dict
+			state = torch.load(fp, map_location=self.device, weights_only=False)
+		self.num_updates = int(state.get("num_updates", 0))
+		state_dict = state["model"] if "model" in state else state
 		state_dict = api_model_conversion(self.model.state_dict(), state_dict)
 		self.model.load_state_dict(state_dict)
 		return
@@ -128,6 +137,7 @@ class TDMPC2(torch.nn.Module):
 			task = torch.tensor([task], device=self.device)
 		if self.cfg.mpc:
 			return self.plan(obs, t0=t0, eval_mode=eval_mode, task=task).cpu()
+		self.last_plan_metrics = {}
 		z = self.model.encode(obs, task)
 		action, info = self.model.pi(z, task)
 		if eval_mode:
@@ -164,6 +174,8 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			torch.Tensor: Action to take in the environment.
 		"""
+		plan_start = time.perf_counter()
+
 		# Sample policy trajectories
 		z = self.model.encode(obs, task)
 		if self.cfg.num_pi_trajs > 0:
@@ -214,11 +226,28 @@ class TDMPC2(torch.nn.Module):
 		# Select action
 		rand_idx = math.gumbel_softmax_sample(score.squeeze(1))
 		actions = torch.index_select(elite_actions, 1, rand_idx).squeeze(1)
-		a, std = actions[0], std[0]
+		a, action_std = actions[0], std[0]
 		if not eval_mode:
-			a = a + std * torch.randn(self.cfg.action_dim, device=std.device)
+			a = a + action_std * torch.randn(self.cfg.action_dim, device=action_std.device)
 		self._prev_mean.copy_(mean)
-		return a.clamp(-1, 1)
+		a = a.clamp(-1, 1)
+
+		# Reuse the final MPPI iteration. These diagnostics intentionally do not
+		# perform another value estimate or any other model forward pass.
+		self.last_plan_metrics = {
+			"planner_value_mean": float(value.mean().cpu()),
+			"planner_value_std": float(value.std(unbiased=False).cpu()),
+			"planner_value_max": float(value.max().cpu()),
+			"planner_elite_value_mean": float(elite_value.mean().cpu()),
+			"planner_elite_value_std": float(elite_value.std(unbiased=False).cpu()),
+			"planner_elite_value_max": float(elite_value.max().cpu()),
+			"planner_std_mean": float(std.mean().cpu()),
+			"planner_std_min": float(std.min().cpu()),
+			"planner_std_max": float(std.max().cpu()),
+			"planner_action_l2": float(torch.linalg.vector_norm(a).cpu()),
+		}
+		self.last_plan_metrics["planner_seconds"] = time.perf_counter() - plan_start
+		return a
 
 	def update_pi(self, zs, task):
 		"""
@@ -233,6 +262,7 @@ class TDMPC2(torch.nn.Module):
 		"""
 		action, info = self.model.pi(zs, task)
 		qs = self.model.Q(zs, action, task, return_type='avg', detach=True)
+		pi_q_mean = qs.detach().mean()
 		self.scale.update(qs[0])
 		qs = self.scale(qs)
 
@@ -250,6 +280,7 @@ class TDMPC2(torch.nn.Module):
 			"pi_entropy": info["entropy"],
 			"pi_scaled_entropy": info["scaled_entropy"],
 			"pi_scale": self.scale.value,
+			"pi_q_mean": pi_q_mean,
 		})
 		return info
 
@@ -329,9 +360,12 @@ class TDMPC2(torch.nn.Module):
 
 		# Update target Q-functions
 		self.model.soft_update_target_Q()
+		self.num_updates += 1
 
 		# Return training statistics
 		self.model.eval()
+		q_values = math.two_hot_inv(qs.detach(), self.cfg)
+		reward_values = math.two_hot_inv(reward_preds.detach(), self.cfg)
 		info = TensorDict({
 			"consistency_loss": consistency_loss,
 			"reward_loss": reward_loss,
@@ -339,6 +373,14 @@ class TDMPC2(torch.nn.Module):
 			"termination_loss": termination_loss,
 			"total_loss": total_loss,
 			"grad_norm": grad_norm,
+			"q_mean": q_values.mean(),
+			"q_target_mean": td_targets.detach().mean(),
+			"td_error_abs_mean": (
+				q_values - td_targets.detach().unsqueeze(0)
+			).abs().mean(),
+			"reward_pred_mean": reward_values.mean(),
+			"reward_target_mean": reward.detach().mean(),
+			"num_updates": torch.tensor(float(self.num_updates), device=self.device),
 		})
 		if self.cfg.episodic:
 			info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]))

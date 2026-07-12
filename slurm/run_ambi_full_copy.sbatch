@@ -6,16 +6,16 @@
 #SBATCH --partition=gpus
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
-#SBATCH --time=96:00:00
+#SBATCH --time=192:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
-#SBATCH --nodelist=gpu[1907]
+#SBATCH --nodelist=gpu[2201]
 
 
 set -Eeuo pipefail
 
 # Submit this file from the repository root:
-#   sbatch slurm/run.sbatch
+#   sbatch slurm/run_ambi_full_copy.sbatch
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 cd "$PROJECT_DIR"
 
@@ -41,7 +41,7 @@ echo "Starting AMBI training..."
 # Legacy exact-environment AMBI: configs/experiments/AntAMBI.json
 # python main.py -r configs/experiments/AntAMBITDMPC2Debug.json --num-runs 1
 
-python main.py -r configs/experiments/AntAMBITDMPC2.json
+python main.py -r configs/experiments/AntAMBITDMPC2FullCopy.json
 # python main.py -r configs/experiments/AntNativeSAC2.json
 # python main.py -r configs/experiments/AntSAC2.json
 

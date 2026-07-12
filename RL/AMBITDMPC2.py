@@ -57,6 +57,14 @@ _AMBI_DEFAULTS = {
 class AMBITDMPC2(TDMPC2Baseline):
     """AMBI algorithm using TD-MPC2 representation learning and latent SAC."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._inner_steps_total = 0
+        self._inner_updates_total = 0
+        self._wandb_inner_seconds = 0.0
+        self._wandb_inner_actions = 0
+        self._wandb_inner_steps = 0
+
     def _build_cfg(self, params):
         if "num_q" in params and int(params["num_q"]) != 2:
             raise ValueError("AMBI-TD-MPC2 uses exactly two SAC critics; num_q must be 2.")
@@ -148,7 +156,123 @@ class AMBITDMPC2(TDMPC2Baseline):
         )
         self.alg_logger.on_step(data)
 
-    def _log_wandb_step(self, reward, terminated, truncated, metrics=None):
-        combined = dict(metrics or {})
-        combined.update(self.agent.last_inner_metrics)
-        super()._log_wandb_step(reward, terminated, truncated, combined)
+    def _reset_wandb_window(self):
+        super()._reset_wandb_window()
+        self._wandb_inner_seconds = 0.0
+        self._wandb_inner_actions = 0
+        self._wandb_inner_steps = 0
+
+    def _record_action_metrics(self, *, planned, action_seconds):
+        # AMBI replaces MPPI, so action selection time is inner-adaptation time.
+        if not planned:
+            self._wandb_train_window.add_weighted("train/inner_active", 0.0)
+            self._wandb_train_window.update_sums({
+                "train/inner_actions": 0,
+                "train/inner_rollouts": 0,
+                "train/inner_steps": 0,
+                "train/inner_updates": 0,
+            })
+            return
+
+        metrics = self._metrics_to_floats(dict(self.agent.last_inner_metrics or {}))
+        self._wandb_train_window.add_weighted(
+            "train/inner_active",
+            metrics.get("inner_active", 1.0),
+        )
+        rollout_count = int(metrics.get(
+            "inner_rollouts",
+            metrics.get("inner_rollout_count", len(self.agent.last_inner_rollout_lengths)),
+        ))
+        inner_steps = int(metrics.get("inner_steps", sum(self.agent.last_inner_rollout_lengths)))
+        inner_updates = int(metrics.get("inner_updates", 0))
+
+        self._wandb_train_window.update_sums({
+            "train/inner_actions": 1,
+            "train/inner_rollouts": rollout_count,
+            "train/inner_steps": inner_steps,
+            "train/inner_updates": inner_updates,
+        })
+        self._inner_steps_total += inner_steps
+        self._inner_updates_total += inner_updates
+        self._wandb_inner_seconds += float(action_seconds)
+        self._wandb_inner_actions += 1
+        self._wandb_inner_steps += inner_steps
+
+        for source, target in (
+            ("inner_return", "train/inner_return"),
+            ("inner_rollout_len", "train/inner_rollout_len"),
+        ):
+            mean = metrics.get(f"{source}_mean")
+            if rollout_count > 0 and mean is not None:
+                self._wandb_train_window.add_stats(
+                    target,
+                    count=rollout_count,
+                    mean=mean,
+                    std=metrics.get(f"{source}_std", 0.0),
+                    min_value=metrics.get(f"{source}_min", mean),
+                    max_value=metrics.get(f"{source}_max", mean),
+                )
+
+        aliases = {
+            "inner_buffer_fill_fraction": "inner_buffer_fill_ratio",
+            "inner_rollout_termination_rate": "inner_termination_rate",
+            "inner_policy_action_delta_l2": "inner_policy_mean_delta_l2",
+        }
+        excluded = {
+            "inner_active", "inner_actions", "inner_iterations",
+            "inner_rollouts", "inner_rollout_count", "inner_steps", "inner_updates",
+            "inner_return_mean", "inner_return_std", "inner_return_min", "inner_return_max",
+            "inner_rollout_len_mean", "inner_rollout_len_std",
+            "inner_rollout_len_min", "inner_rollout_len_max",
+            "inner_termination_rate", "inner_rollout_termination_rate",
+        }
+        termination_rate = metrics.get(
+            "inner_termination_rate",
+            metrics.get("inner_rollout_termination_rate"),
+        )
+        if termination_rate is not None:
+            self._wandb_train_window.add_weighted(
+                "train/inner_termination_rate",
+                termination_rate,
+                weight=max(1, rollout_count),
+            )
+        for key, value in metrics.items():
+            if key in excluded or key.endswith("_total") or "_time_" in key or key.endswith("_seconds"):
+                continue
+            key = aliases.get(key, key)
+            update_metric = any(
+                token in key
+                for token in ("loss", "grad_norm", "_q_", "entropy", "td_error")
+            )
+            if key in {"inner_outer_q_gain", "inner_policy_mean_delta_l2"}:
+                update_metric = False
+            weight = max(1, inner_updates) if update_metric else 1
+            self._wandb_train_window.add_weighted(f"train/{key}", value, weight=weight)
+
+    def _timing_wandb_payload(self, updates_since_log):
+        outer_update_seconds = float(self._wandb_train_seconds)
+        inner_seconds = float(self._wandb_inner_seconds)
+        inner_actions = int(self._wandb_inner_actions)
+        inner_steps = int(self._wandb_inner_steps)
+        payload = super()._timing_wandb_payload(updates_since_log)
+        payload.update({
+            "time/outer_update_seconds": outer_update_seconds,
+            "time/inner_action_seconds": inner_seconds,
+            "time/inner_seconds_per_action": (
+                float(inner_seconds / inner_actions) if inner_actions > 0 else 0.0
+            ),
+            "time/inner_steps_per_second": (
+                float(inner_steps / inner_seconds) if inner_seconds > 0 else 0.0
+            ),
+        })
+        self._wandb_inner_seconds = 0.0
+        self._wandb_inner_actions = 0
+        self._wandb_inner_steps = 0
+        return payload
+
+    def _extra_wandb_payload(self, updates_since_log):
+        del updates_since_log
+        return {
+            "train/inner_steps_total": int(self._inner_steps_total),
+            "train/inner_updates_total": int(self._inner_updates_total),
+        }

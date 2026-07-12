@@ -61,6 +61,14 @@ def polyak_update(source: nn.Module, target: nn.Module, tau: float) -> None:
             torch.add(target_param.data, source_param.data, alpha=tau, out=target_param.data)
 
 
+def _grad_norm(parameters: Iterable[nn.Parameter]) -> torch.Tensor:
+    """Return the global L2 gradient norm without modifying gradients."""
+    norms = [parameter.grad.detach().norm(2) for parameter in parameters if parameter.grad is not None]
+    if not norms:
+        return torch.zeros((), dtype=torch.float32)
+    return torch.stack(norms).norm(2)
+
+
 @dataclass
 class SACConfig:
     learning_rate: float = 3e-4
@@ -284,7 +292,23 @@ class SACAgent:
     def update(self, replay_buffer: ReplayBuffer, gradient_steps: int, batch_size: int) -> Dict[str, float]:
         self.actor.train()
         self.critic.train()
-        metrics = {"actor_loss": [], "critic_loss": [], "ent_coef": [], "ent_coef_loss": []}
+        metrics = {
+            "actor_loss": [],
+            "critic_loss": [],
+            "ent_coef": [],
+            "ent_coef_loss": [],
+            "policy_log_prob": [],
+            "policy_entropy": [],
+            "q1_mean": [],
+            "q2_mean": [],
+            "q_target_mean": [],
+            "q_policy_mean": [],
+            "q_disagreement_mean": [],
+            "td_error_abs_mean": [],
+            "actor_grad_norm": [],
+            "critic_grad_norm": [],
+            "ent_coef_grad_norm": [],
+        }
 
         for gradient_step in range(int(gradient_steps)):
             batch = replay_buffer.sample(batch_size, self.device)
@@ -297,9 +321,11 @@ class SACAgent:
                 ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
                 self.ent_coef_optimizer.zero_grad()
                 ent_coef_loss.backward()
+                ent_coef_grad_norm = _grad_norm([self.log_ent_coef])
                 self.ent_coef_optimizer.step()
             else:
                 ent_coef = self.ent_coef_tensor
+                ent_coef_grad_norm = None
 
             with torch.no_grad():
                 next_actions, next_log_prob = self.actor.action_log_prob(batch["next_obs"])
@@ -311,6 +337,7 @@ class SACAgent:
             critic_loss = 0.5 * (F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q))
             self.critic_optimizer.zero_grad()
             critic_loss.backward()
+            critic_grad_norm = _grad_norm(self.critic.parameters())
             self.critic_optimizer.step()
 
             q1_pi, q2_pi = self.critic(batch["obs"], actions_pi)
@@ -318,6 +345,7 @@ class SACAgent:
             actor_loss = (ent_coef * log_prob - min_q_pi).mean()
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
+            actor_grad_norm = _grad_norm(self.actor.parameters())
             self.actor_optimizer.step()
 
             if gradient_step % self.config.target_update_interval == 0:
@@ -327,8 +355,34 @@ class SACAgent:
             metrics["actor_loss"].append(float(actor_loss.detach().cpu()))
             metrics["critic_loss"].append(float(critic_loss.detach().cpu()))
             metrics["ent_coef"].append(float(ent_coef.detach().cpu()))
+            metrics["policy_log_prob"].append(float(log_prob.detach().mean().cpu()))
+            metrics["policy_entropy"].append(float(-log_prob.detach().mean().cpu()))
+            metrics["q1_mean"].append(float(current_q1.detach().mean().cpu()))
+            metrics["q2_mean"].append(float(current_q2.detach().mean().cpu()))
+            metrics["q_target_mean"].append(float(target_q.detach().mean().cpu()))
+            metrics["q_policy_mean"].append(float(min_q_pi.detach().mean().cpu()))
+            metrics["q_disagreement_mean"].append(
+                float((current_q1.detach() - current_q2.detach()).abs().mean().cpu())
+            )
+            metrics["td_error_abs_mean"].append(
+                float(
+                    (
+                        0.5
+                        * (
+                            (current_q1.detach() - target_q).abs()
+                            + (current_q2.detach() - target_q).abs()
+                        )
+                    )
+                    .mean()
+                    .cpu()
+                )
+            )
+            metrics["actor_grad_norm"].append(float(actor_grad_norm.detach().cpu()))
+            metrics["critic_grad_norm"].append(float(critic_grad_norm.detach().cpu()))
             if ent_coef_loss is not None:
                 metrics["ent_coef_loss"].append(float(ent_coef_loss.detach().cpu()))
+            if ent_coef_grad_norm is not None:
+                metrics["ent_coef_grad_norm"].append(float(ent_coef_grad_norm.detach().cpu()))
 
         return {key: float(np.mean(values)) for key, values in metrics.items() if values}
 

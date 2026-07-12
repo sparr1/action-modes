@@ -1,3 +1,5 @@
+from collections import deque
+
 import torch
 from tensordict.tensordict import TensorDict
 from .device import cuda_mem_get_info, resolve_device
@@ -26,6 +28,10 @@ class Buffer():
 		)
 		self._batch_size = cfg.batch_size * (cfg.horizon+1)
 		self._num_eps = 0
+		self._num_transitions = 0
+		self._total_transitions = 0
+		self._resident_episode_rows = deque()
+		self._resident_rows = 0
 
 	@property
 	def capacity(self):
@@ -36,6 +42,54 @@ class Buffer():
 	def num_eps(self):
 		"""Return the number of episodes in the buffer."""
 		return self._num_eps
+
+	@property
+	def num_transitions(self):
+		"""Return real transitions currently resident in replay storage."""
+		return self._num_transitions
+
+	@property
+	def total_transitions(self):
+		"""Return the cumulative number of real transitions submitted."""
+		return self._total_transitions
+
+	@property
+	def size(self):
+		"""Return the number of TensorDict rows currently resident in storage."""
+		if self._num_eps == 0:
+			return 0
+		return len(self._buffer)
+
+	@property
+	def fill_fraction(self):
+		"""Return the fraction of replay storage currently occupied."""
+		return self.size / self._capacity if self._capacity else 0.0
+
+	def _track_episode_rows(self, num_rows):
+		"""Mirror FIFO storage eviction while excluding each episode's initial row."""
+		num_rows = max(0, int(num_rows))
+		transitions = max(0, num_rows - 1)
+		self._resident_episode_rows.append([num_rows, 1 if num_rows else 0, transitions])
+		self._resident_rows += num_rows
+		self._num_transitions += transitions
+		self._total_transitions += transitions
+
+		overflow = max(0, self._resident_rows - self._capacity)
+		while overflow > 0 and self._resident_episode_rows:
+			rows, initial_rows, resident_transitions = self._resident_episode_rows[0]
+			removed = min(rows, overflow)
+			removed_initial = min(initial_rows, removed)
+			removed_transitions = removed - removed_initial
+			rows -= removed
+			initial_rows -= removed_initial
+			resident_transitions -= removed_transitions
+			self._num_transitions -= removed_transitions
+			self._resident_rows -= removed
+			overflow -= removed
+			if rows == 0:
+				self._resident_episode_rows.popleft()
+			else:
+				self._resident_episode_rows[0] = [rows, initial_rows, resident_transitions]
 
 	def _reserve_buffer(self, storage):
 		"""
@@ -74,6 +128,7 @@ class Buffer():
 		and is more efficient than adding episodes one by one.
 		"""
 		num_new_eps = len(td)
+		rows_per_episode = int(td.shape[1])
 		episode_idx = torch.arange(self._num_eps, self._num_eps+num_new_eps, dtype=torch.int64)
 		td['episode'] = episode_idx.unsqueeze(-1).expand(-1, td['reward'].shape[1])
 		if self._num_eps == 0:
@@ -81,6 +136,8 @@ class Buffer():
 		td = td.reshape(td.shape[0]*td.shape[1])
 		self._buffer.extend(td)
 		self._num_eps += num_new_eps
+		for _ in range(num_new_eps):
+			self._track_episode_rows(rows_per_episode)
 		return self._num_eps
 
 	def add(self, td):
@@ -90,6 +147,7 @@ class Buffer():
 			self._buffer = self._init(td)
 		self._buffer.extend(td)
 		self._num_eps += 1
+		self._track_episode_rows(len(td))
 		return self._num_eps
 
 	def _prepare_batch(self, td):
