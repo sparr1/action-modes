@@ -39,10 +39,9 @@ conda activate ambi
 echo "Starting AMBI training..."
 
 python3 main.py \
-  --run configs/experiments/AntNativeDistributionalSACDebug.json \
+  --run configs/experiments/AntNativeSACQRepresentation.json \
   --alg-dir configs/algs
 
-# python main.py -r configs/experiments/AntNativeSACDebug.json --num-runs 1
 
 echo "End time: $(date)"
 echo "Job completed!"
