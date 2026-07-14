@@ -112,6 +112,14 @@ class SAC(Algorithm):
         else:
             actor_arch = critic_arch = self._validated_net_arch(net_arch, "net_arch")
 
+        num_q = int(self.params.get("num_q", 2))
+        q_pair_size = int(self.params.get("q_pair_size", 2))
+        if num_q != 2 or q_pair_size != 2:
+            raise ValueError(
+                "Native SAC keeps exactly two critics for a clean scalar-versus-"
+                "distributional comparison; num_q and q_pair_size must both be 2."
+            )
+
         device = self.run_params.get("device", self.params.get("device", "auto"))
         return SACConfig(
             learning_rate=float(self.params.get("learning_rate", 3e-4)),
@@ -128,6 +136,10 @@ class SAC(Algorithm):
             net_arch=actor_arch,
             actor_net_arch=actor_arch,
             critic_net_arch=critic_arch,
+            q_representation=str(self.params.get("q_representation", "scalar")).lower(),
+            q_num_bins=int(self.params.get("q_num_bins", 101)),
+            q_vmin=float(self.params.get("q_vmin", -10.0)),
+            q_vmax=float(self.params.get("q_vmax", 10.0)),
             adam_eps=float(self.params.get("adam_eps", 1e-8)),
             seed=self.seed,
             device=device,
@@ -458,6 +470,7 @@ class SAC(Algorithm):
         fp = os.path.join(path, name if name.endswith(".pt") else name + ".pt")
         torch.save(
             {
+                "checkpoint_version": 2,
                 "agent": self.agent.state_dict(),
                 "config": asdict(self.cfg),
                 "obs_dim": self.obs_dim,
@@ -473,6 +486,12 @@ class SAC(Algorithm):
 
     def load(self, path, *, resume=False, strict_config=True):
         checkpoint = torch.load(path, map_location=self.agent.device, weights_only=False)
+        checkpoint_version = int(checkpoint.get("checkpoint_version", 1))
+        if checkpoint_version not in {1, 2}:
+            raise ValueError(
+                f"Unsupported native SAC checkpoint_version={checkpoint_version}; "
+                "supported versions are 1 and 2."
+            )
         if int(checkpoint.get("obs_dim", self.obs_dim)) != self.obs_dim:
             raise ValueError("Checkpoint observation dimension does not match this environment.")
         if int(checkpoint.get("action_dim", self.action_dim)) != self.action_dim:
@@ -489,14 +508,26 @@ class SAC(Algorithm):
         if strict_config and "config" in checkpoint:
             current = asdict(self.cfg)
             saved = checkpoint["config"]
-            critical_keys = (
+            critical_keys = [
                 "learning_rate", "tau", "gamma", "ent_coef", "target_entropy",
                 "target_update_interval", "actor_net_arch", "critic_net_arch", "adam_eps",
-            )
+            ]
+            saved_representation = str(saved.get("q_representation", "scalar")).lower()
+            current_representation = str(current["q_representation"]).lower()
+            critical_keys.append("q_representation")
+            if "distributional" in {saved_representation, current_representation}:
+                critical_keys.extend(("q_num_bins", "q_vmin", "q_vmax"))
+
+            legacy_defaults = {
+                "q_representation": "scalar",
+                "q_num_bins": 101,
+                "q_vmin": -10.0,
+                "q_vmax": 10.0,
+            }
             mismatches = {
-                key: (saved.get(key), current.get(key))
+                key: (saved.get(key, legacy_defaults.get(key)), current.get(key))
                 for key in critical_keys
-                if saved.get(key) != current.get(key)
+                if saved.get(key, legacy_defaults.get(key)) != current.get(key)
             }
             if mismatches:
                 raise ValueError(f"Checkpoint SAC configuration mismatch: {mismatches}")

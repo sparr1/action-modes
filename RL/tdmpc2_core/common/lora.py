@@ -63,11 +63,21 @@ class LoRANormedLinear(nn.Module):
         return self.base.act(self.base.ln(out))
 
 
-def lorafy_copy(module, rank=8, alpha=8.0, dropout=0.0):
-    """Deep-copy a module, freeze its base weights, and add trainable LoRA adapters."""
+def lorafy_copy(module, rank=8, alpha=8.0, dropout=0.0, *, scale=None):
+    """Deep-copy a module and add trainable LoRA adapters.
+
+    ``alpha`` retains the legacy ``alpha / requested_rank`` convention. New
+    callers should pass ``scale`` to specify the actual multiplier directly,
+    keeping update magnitude independent from adapter rank.
+    """
     rank = int(rank)
     if rank <= 0:
         raise ValueError("LoRA rank must be positive.")
+    if scale is not None:
+        scale = float(scale)
+        if scale <= 0:
+            raise ValueError("LoRA scale must be positive.")
+        alpha = scale * rank
 
     clone = deepcopy(module)
     clone.requires_grad_(False)

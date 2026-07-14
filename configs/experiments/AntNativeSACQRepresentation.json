@@ -1,0 +1,24 @@
+{
+    "overrides_alg": {
+        "seed": 55,
+        "device": "cuda",
+        "env": "Ant-v4",
+        "total_steps": 1000000,
+        "episodes": null
+    },
+    "env_params": {
+        "render_mode": null,
+        "exclude_current_positions_from_observation": true,
+        "max_episode_steps": 1000,
+        "terminate_when_unhealthy": false
+    },
+    "trials": 5,
+    "configs": [
+        "AntNativeSAC2",
+        "AntNativeDistributionalSAC2"
+    ],
+    "logs": "timestamp",
+    "save_trials": "all",
+    "log_info": false,
+    "checkpoint_every": 100000
+}

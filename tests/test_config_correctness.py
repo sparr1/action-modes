@@ -32,13 +32,16 @@ def test_ambi_tdmpc2_configs_preserve_continuing_task_and_inner_target_semantics
         config = _load_json_strict(ROOT / "configs/algs" / name)
         assert config["alg"] == "AMBITDMPC2/AMBITDMPC2"
         assert config["alg_params"]["episodic"] is False
-        assert config["alg_params"]["inner_tau"] == 1.0
-        assert config["alg_params"]["inner_horizon"] <= config["alg_params"]["horizon"]
+        assert config["alg_params"]["inner_critic_target_tau"] == 1.0
+        assert (
+            config["alg_params"]["inner_rollout_horizon"]
+            <= config["alg_params"]["horizon"]
+        )
 
 
 def test_ambi_launchers_run_the_learned_model_experiment():
     expected = "configs/experiments/AntAMBITDMPC2.json"
-    for name in ("run_ambi_ccv.sh", "run_ambi_ccv_richard.sh", "run_ambi_oscar.sh"):
+    for name in ("run_ambi_ccv.sh", "run_ambi_oscar.sh"):
         active_commands = [
             line.strip()
             for line in (ROOT / name).read_text().splitlines()

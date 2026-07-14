@@ -1,9 +1,9 @@
-"""TD-MPC2 world model with SAC-style scalar twin critics.
+"""TD-MPC2 world model with SAC-style scalar or distributional critics.
 
 The encoder, latent dynamics, reward, termination, policy architecture, SimNorm,
-and initialization follow the vendored TD-MPC2 implementation. The only control
-head change is replacing TD-MPC2's distributional Q ensemble with two scalar
-soft Q-functions suitable for SAC.
+and initialization follow the vendored TD-MPC2 implementation. Its control head
+supports either scalar twin critics or a TD-MPC2-style categorical Q ensemble
+while retaining the same soft SAC Bellman semantics.
 """
 
 from copy import deepcopy
@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 
 from . import init, layers, math
+from .q_representation import QRepresentation
 
 
 class SoftWorldModel(nn.Module):
@@ -21,10 +22,9 @@ class SoftWorldModel(nn.Module):
         super().__init__()
         if cfg.multitask:
             raise NotImplementedError("AMBI-TD-MPC2 currently supports single-task training only.")
-        if int(cfg.num_q) != 2:
-            raise ValueError("SAC requires exactly two Q-functions; set num_q=2.")
 
         self.cfg = cfg
+        self.q_backend = QRepresentation.from_config(cfg)
         self._encoder = layers.enc(cfg)
         self._dynamics = layers.mlp(
             cfg.latent_dim + cfg.action_dim,
@@ -48,10 +48,10 @@ class SoftWorldModel(nn.Module):
                 layers.mlp(
                     cfg.latent_dim + cfg.action_dim,
                     2 * [cfg.mlp_dim],
-                    1,
+                    self.q_backend.output_dim,
                     dropout=cfg.dropout,
                 )
-                for _ in range(2)
+                for _ in range(self.q_backend.num_q)
             ]
         )
 
@@ -73,13 +73,18 @@ class SoftWorldModel(nn.Module):
 
     def __repr__(self):
         result = "AMBI TD-MPC2 Soft World Model\n"
+        q_label = (
+            "Twin soft Q-functions"
+            if self.q_backend.representation == "scalar"
+            else "Distributional soft Q ensemble"
+        )
         modules = [
             ("Encoder", self._encoder),
             ("Dynamics", self._dynamics),
             ("Reward", self._reward),
             ("Termination", self._termination),
             ("SAC actor", self._pi),
-            ("Twin soft Q-functions", self._Qs),
+            (q_label, self._Qs),
         ]
         for name, module in modules:
             if module is not None:
@@ -133,50 +138,99 @@ class SoftWorldModel(nn.Module):
         logits = self._termination(z)
         return logits if unnormalized else torch.sigmoid(logits)
 
-    def pi(self, z, task=None, *, policy=None, deterministic=False):
+    def pi(
+        self,
+        z,
+        task=None,
+        *,
+        policy=None,
+        deterministic=False,
+        generator=None,
+        std_scale=1.0,
+        log_std_min=None,
+        log_std_max=None,
+    ):
         """Sample a tanh-squashed action and return its corrected log-probability."""
         if task is not None:
             raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
         policy = self._pi if policy is None else policy
+
+        std_scale = float(std_scale)
+        if not 0.0 < std_scale < float("inf"):
+            raise ValueError(f"std_scale must be positive, got {std_scale}.")
 
         mean_raw, log_std = policy(z).chunk(2, dim=-1)
         # SAC/SB3 clamp the predicted log standard deviation directly. TD-MPC2's
         # policy prior instead interpolates tanh(log_std) across its bounds; with
         # SAC's [-20, 2] bounds that would initialize near log_std=-9 and almost
         # eliminate exploration.
-        log_std = torch.clamp(
-            log_std,
-            min=self.log_std_min,
-            max=self.log_std_min + self.log_std_dif,
+        lower_bound = (
+            float(self.log_std_min.item())
+            if log_std_min is None
+            else float(log_std_min)
         )
-        eps = torch.zeros_like(mean_raw) if deterministic else torch.randn_like(mean_raw)
+        upper_bound = (
+            float((self.log_std_min + self.log_std_dif).item())
+            if log_std_max is None
+            else float(log_std_max)
+        )
+        if not (
+            float("-inf") < lower_bound < upper_bound < float("inf")
+        ):
+            raise ValueError(
+                "log_std_min must be smaller than log_std_max, "
+                f"got {lower_bound} >= {upper_bound}."
+            )
+        log_std = torch.clamp(log_std, min=lower_bound, max=upper_bound)
+        if std_scale != 1.0:
+            log_std = log_std + torch.log(log_std.new_tensor(std_scale))
+
+        if deterministic:
+            eps = torch.zeros_like(mean_raw)
+        elif generator is None:
+            eps = torch.randn_like(mean_raw)
+        else:
+            eps = torch.randn(
+                mean_raw.shape,
+                dtype=mean_raw.dtype,
+                device=mean_raw.device,
+                generator=generator,
+            )
         log_prob = math.gaussian_logprob(eps, log_std)
 
         pre_tanh_action = mean_raw + eps * log_std.exp()
         mean, action, log_prob = math.squash(mean_raw, pre_tanh_action, log_prob)
         return action, {
             "mean": mean,
+            "pre_tanh_mean": mean_raw,
             "log_std": log_std,
             "log_prob": log_prob,
             "entropy": -log_prob,
         }
 
-    def Q(
+    @property
+    def critic_signature(self):
+        """Serializable critic architecture metadata for checkpoint preflight."""
+        return self.q_backend.signature.as_dict()
+
+    def q_predictions(
         self,
         z,
         a,
         task=None,
         *,
-        return_type="min",
         target=False,
         detach=False,
         qs=None,
     ):
-        """Evaluate online, target, detached, or explicitly supplied twin critics."""
+        """Return raw predictions from every selected critic head.
+
+        Scalar critics return values with shape ``[num_q, ..., 1]``;
+        distributional critics return logits with shape
+        ``[num_q, ..., q_num_bins]``.
+        """
         if task is not None:
             raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
-        if return_type not in {"min", "avg", "all"}:
-            raise ValueError(f"Unknown Q return_type: {return_type}")
         if target and (detach or qs is not None):
             raise ValueError("target=True cannot be combined with detach=True or an explicit critic.")
 
@@ -189,9 +243,58 @@ class SoftWorldModel(nn.Module):
             out = self._Qs.forward_detached(q_input)
         else:
             out = self._Qs(q_input)
+        return out
 
-        if return_type == "all":
-            return out
-        if return_type == "min":
-            return out.min(dim=0).values
-        return out.mean(dim=0)
+    def q_values(self, z, a, task=None, *, target=False, detach=False, qs=None):
+        """Return decoded scalar values from every selected critic head."""
+        predictions = self.q_predictions(
+            z,
+            a,
+            task,
+            target=target,
+            detach=detach,
+            qs=qs,
+        )
+        return self.q_backend.decode(predictions)
+
+    def critic_loss(self, predictions, scalar_target, *, reduction="mean"):
+        """Compute MSE or two-hot cross entropy against one scalar target."""
+        return self.q_backend.loss(predictions, scalar_target, reduction=reduction)
+
+    def Q(
+        self,
+        z,
+        a,
+        task=None,
+        *,
+        return_type=None,
+        reduction=None,
+        target=False,
+        detach=False,
+        qs=None,
+        pair_indices=None,
+        generator=None,
+    ):
+        """Evaluate critics and return decoded scalar Q-values.
+
+        ``return_type`` retains the legacy ``min``/``avg``/``all`` API. New
+        callers should use explicit ``*_pair`` or ``*_all`` reductions.
+        """
+        if reduction is not None and return_type is not None:
+            raise ValueError("Specify either return_type or reduction, not both.")
+        if reduction is None:
+            reduction = "min_pair" if return_type is None else return_type
+        values = self.q_values(
+            z,
+            a,
+            task,
+            target=target,
+            detach=detach,
+            qs=qs,
+        )
+        return self.q_backend.reduce(
+            values,
+            reduction,
+            pair_indices=pair_indices,
+            generator=generator,
+        )

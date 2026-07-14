@@ -16,6 +16,8 @@ from torch import nn
 from torch.nn import functional as F
 from torch.distributions import Normal
 
+from RL.tdmpc2_core.common.q_representation import QRepresentation
+
 
 LOG_STD_MIN = -20
 LOG_STD_MAX = 2
@@ -85,6 +87,10 @@ class SACConfig:
     net_arch: Tuple[int, ...] = (256, 256)
     actor_net_arch: Optional[Tuple[int, ...]] = None
     critic_net_arch: Optional[Tuple[int, ...]] = None
+    q_representation: str = "scalar"
+    q_num_bins: int = 101
+    q_vmin: float = -10.0
+    q_vmax: float = 10.0
     adam_eps: float = 1e-8
     seed: Optional[int] = None
     device: str = "auto"
@@ -196,11 +202,17 @@ class SquashedGaussianActor(nn.Module):
 
 
 class ContinuousCritic(nn.Module):
-    def __init__(self, obs_dim: int, action_dim: int, net_arch: Tuple[int, ...]):
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        net_arch: Tuple[int, ...],
+        output_dim: int = 1,
+    ):
         super().__init__()
         input_dim = obs_dim + action_dim
-        self.qf1 = make_mlp(input_dim, net_arch, 1)
-        self.qf2 = make_mlp(input_dim, net_arch, 1)
+        self.qf1 = make_mlp(input_dim, net_arch, output_dim)
+        self.qf2 = make_mlp(input_dim, net_arch, output_dim)
 
     def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         q_input = torch.cat([obs, actions], dim=1)
@@ -231,9 +243,22 @@ class SACAgent:
 
         actor_arch = config.actor_net_arch if config.actor_net_arch is not None else config.net_arch
         critic_arch = config.critic_net_arch if config.critic_net_arch is not None else config.net_arch
+        config.q_representation = str(config.q_representation).lower()
+        self.q_backend = QRepresentation(
+            config.q_representation,
+            num_q=2,
+            pair_size=2,
+            num_bins=config.q_num_bins,
+            vmin=config.q_vmin,
+            vmax=config.q_vmax,
+        )
         self.actor = SquashedGaussianActor(obs_dim, action_dim, actor_arch).to(self.device)
-        self.critic = ContinuousCritic(obs_dim, action_dim, critic_arch).to(self.device)
-        self.critic_target = ContinuousCritic(obs_dim, action_dim, critic_arch).to(self.device)
+        self.critic = ContinuousCritic(
+            obs_dim, action_dim, critic_arch, output_dim=self.q_backend.output_dim
+        ).to(self.device)
+        self.critic_target = ContinuousCritic(
+            obs_dim, action_dim, critic_arch, output_dim=self.q_backend.output_dim
+        ).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_target.eval()
         self.critic_target.requires_grad_(False)
@@ -272,6 +297,24 @@ class SACAgent:
             return float(-self.action_dim)
         return float(target_entropy)
 
+    @property
+    def critic_signature(self) -> Dict[str, object]:
+        """Return the semantic critic layout required for safe checkpoint loads."""
+        return self.q_backend.signature.as_dict()
+
+    def _decode_q_predictions(
+        self, predictions: Tuple[torch.Tensor, torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.q_backend.representation == "scalar":
+            return predictions
+        values = self.q_backend.decode(torch.stack(predictions, dim=0))
+        return values[0], values[1]
+
+    @staticmethod
+    def _as_batch_tensor(value, device: torch.device) -> torch.Tensor:
+        tensor = torch.as_tensor(value, dtype=torch.float32, device=device)
+        return tensor.unsqueeze(0) if tensor.ndim == 1 else tensor
+
     @torch.no_grad()
     def act(self, obs, deterministic: bool = False) -> np.ndarray:
         self.actor.eval()
@@ -279,15 +322,15 @@ class SACAgent:
         action = self.actor(obs_t, deterministic=deterministic)
         return action.cpu().numpy()[0]
 
-    def q_values(self, obs, actions) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Expose current SAC Q-values for later AMBI/TOLD integration."""
-        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-        act_t = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
-        if obs_t.ndim == 1:
-            obs_t = obs_t.unsqueeze(0)
-        if act_t.ndim == 1:
-            act_t = act_t.unsqueeze(0)
+    def q_predictions(self, obs, actions) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return raw scalar predictions or categorical logits from both critics."""
+        obs_t = self._as_batch_tensor(obs, self.device)
+        act_t = self._as_batch_tensor(actions, self.device)
         return self.critic(obs_t, act_t)
+
+    def q_values(self, obs, actions) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Expose decoded scalar Q-values from both native SAC critics."""
+        return self._decode_q_predictions(self.q_predictions(obs, actions))
 
     def update(self, replay_buffer: ReplayBuffer, gradient_steps: int, batch_size: int) -> Dict[str, float]:
         self.actor.train()
@@ -329,18 +372,30 @@ class SACAgent:
 
             with torch.no_grad():
                 next_actions, next_log_prob = self.actor.action_log_prob(batch["next_obs"])
-                next_q1, next_q2 = self.critic_target(batch["next_obs"], next_actions)
+                next_predictions = self.critic_target(batch["next_obs"], next_actions)
+                next_q1, next_q2 = self._decode_q_predictions(next_predictions)
                 next_q = torch.min(next_q1, next_q2) - ent_coef * next_log_prob
                 target_q = batch["rewards"] + (1.0 - batch["dones"]) * self.config.gamma * next_q
 
-            current_q1, current_q2 = self.critic(batch["obs"], batch["actions"])
-            critic_loss = 0.5 * (F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q))
+            current_predictions = self.critic(batch["obs"], batch["actions"])
+            current_q1, current_q2 = self._decode_q_predictions(current_predictions)
+            if self.q_backend.representation == "scalar":
+                # Preserve the established reduction order for exact SB3 parity.
+                critic_loss = 0.5 * (
+                    F.mse_loss(current_q1, target_q)
+                    + F.mse_loss(current_q2, target_q)
+                )
+            else:
+                critic_loss = self.q_backend.loss(
+                    torch.stack(current_predictions, dim=0), target_q
+                )
             self.critic_optimizer.zero_grad()
             critic_loss.backward()
             critic_grad_norm = _grad_norm(self.critic.parameters())
             self.critic_optimizer.step()
 
-            q1_pi, q2_pi = self.critic(batch["obs"], actions_pi)
+            policy_predictions = self.critic(batch["obs"], actions_pi)
+            q1_pi, q2_pi = self._decode_q_predictions(policy_predictions)
             min_q_pi = torch.min(q1_pi, q2_pi)
             actor_loss = (ent_coef * log_prob - min_q_pi).mean()
             self.actor_optimizer.zero_grad()
@@ -377,6 +432,32 @@ class SACAgent:
                     .cpu()
                 )
             )
+            if self.q_backend.representation == "distributional":
+                symlog_target = torch.sign(target_q) * torch.log1p(target_q.abs())
+                current_logits = torch.stack(current_predictions, dim=0).detach()
+                current_log_probs = F.log_softmax(current_logits, dim=-1)
+                current_probs = current_log_probs.exp()
+                metrics.setdefault("q_target_clip_fraction", []).append(
+                    float(
+                        (
+                            (symlog_target <= float(self.q_backend.vmin))
+                            | (symlog_target >= float(self.q_backend.vmax))
+                        )
+                        .float()
+                        .mean()
+                        .cpu()
+                    )
+                )
+                metrics.setdefault("q_distribution_entropy", []).append(
+                    float(
+                        (-(current_probs * current_log_probs).sum(dim=-1))
+                        .mean()
+                        .cpu()
+                    )
+                )
+                metrics.setdefault("q_distribution_max_probability", []).append(
+                    float(current_probs.max(dim=-1).values.mean().cpu())
+                )
             metrics["actor_grad_norm"].append(float(actor_grad_norm.detach().cpu()))
             metrics["critic_grad_norm"].append(float(critic_grad_norm.detach().cpu()))
             if ent_coef_loss is not None:
@@ -388,6 +469,7 @@ class SACAgent:
 
     def state_dict(self) -> Dict[str, object]:
         state = {
+            "critic_spec": self.critic_signature,
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
             "critic_target": self.critic_target.state_dict(),
@@ -403,6 +485,19 @@ class SACAgent:
         return state
 
     def load_state_dict(self, state: Dict[str, object]) -> None:
+        legacy_scalar_spec = {
+            "q_representation": "scalar",
+            "num_q": 2,
+            "q_num_bins": 1,
+            "q_vmin": None,
+            "q_vmax": None,
+        }
+        saved_spec = state.get("critic_spec", legacy_scalar_spec)
+        if saved_spec != self.critic_signature:
+            raise ValueError(
+                "Checkpoint critic specification does not match this SAC agent: "
+                f"checkpoint={saved_spec}, configured={self.critic_signature}."
+            )
         self.actor.load_state_dict(state["actor"])
         self.critic.load_state_dict(state["critic"])
         self.critic_target.load_state_dict(state["critic_target"])

@@ -1,0 +1,21 @@
+{
+    "overrides_alg": {
+        "seed": 55,
+        "device": "cuda",
+        "env": "Ant-v4",
+        "total_steps": 2000,
+        "episodes": null
+    },
+    "env_params": {
+        "render_mode": null,
+        "exclude_current_positions_from_observation": false,
+        "max_episode_steps": 200
+    },
+    "trials": 1,
+    "configs": [
+        "AntNativeDistributionalSACDebug"
+    ],
+    "logs": "overwrite",
+    "save_trials": "first",
+    "log_info": false
+}

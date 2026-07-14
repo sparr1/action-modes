@@ -1,0 +1,757 @@
+import math
+from collections import OrderedDict
+from copy import deepcopy
+
+import gymnasium as gym
+import pytest
+import torch
+
+from RL.AMBITDMPC2 import AMBITDMPC2
+
+
+def _params(**overrides):
+    params = {
+        "device": "cpu",
+        "model_size": None,
+        "enc_dim": 32,
+        "mlp_dim": 32,
+        "latent_dim": 16,
+        "num_enc_layers": 2,
+        "simnorm_dim": 8,
+        "num_bins": 11,
+        "vmin": -5,
+        "vmax": 5,
+        "batch_size": 4,
+        "horizon": 2,
+        "buffer_size": 100,
+        "seed_steps": 4,
+        "pretrain_steps": 1,
+        "utd": 1,
+        "compile": False,
+        "episodic": False,
+        "discount": 0.99,
+        "wandb": False,
+        "dropout": 0.0,
+        "q_representation": "scalar",
+        "num_q": 2,
+        "q_num_bins": 11,
+        "q_vmin": -5,
+        "q_vmax": 5,
+        "inner_operator": "sac",
+        "inner_model_step_budget": 16,
+        "inner_rounds": 2,
+        "inner_rollout_horizon": 2,
+        "inner_critic_updates_per_action": 2,
+        "inner_actor_updates_per_action": 2,
+        "inner_temperature_updates_per_action": 0,
+        "inner_batch_size": 8,
+        "inner_replay_capacity": 32,
+        "inner_actor_adaptation": "clone",
+        "inner_critic_adaptation": "clone",
+        "inner_temperature_mode": "inherit_outer",
+        "inner_critic_target_tau": 1.0,
+        "inner_critic_target_update_interval": 1,
+        "inner_diagnostic_rollouts": 0,
+        "inner_mppi_num_elites": 2,
+        "inner_mppi_num_pi_trajs": 0,
+    }
+    params.update(overrides)
+    return params
+
+
+def _model(**overrides):
+    env = gym.make("Pendulum-v1", max_episode_steps=5)
+    return AMBITDMPC2(
+        "AMBITDMPC2",
+        env,
+        _params(**overrides),
+        {"seed": 13, "device": "cpu", "env": "test", "total_steps": 10},
+        {},
+    )
+
+
+def _assert_finite(metrics):
+    for value in metrics.values():
+        if isinstance(value, (int, float)):
+            assert math.isfinite(float(value))
+
+
+def _clone_tree(value):
+    if torch.is_tensor(value):
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {key: _clone_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_tree(item) for item in value)
+    return deepcopy(value)
+
+
+def _assert_tree_equal(actual, expected):
+    if torch.is_tensor(expected):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    elif isinstance(expected, dict):
+        assert actual.keys() == expected.keys()
+        for key in expected:
+            _assert_tree_equal(actual[key], expected[key])
+    elif isinstance(expected, (list, tuple)):
+        assert len(actual) == len(expected)
+        for actual_item, expected_item in zip(actual, expected):
+            _assert_tree_equal(actual_item, expected_item)
+    else:
+        assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("representation", "num_q"),
+    [("scalar", 2), ("distributional", 5)],
+)
+def test_sac_inner_and_outer_updates_support_both_q_representations(
+    representation, num_q
+):
+    model = _model(q_representation=representation, num_q=num_q)
+    agent = model.agent
+    outer_before = {
+        key: value.detach().clone() for key, value in agent.model.state_dict().items()
+    }
+    optim_before = _clone_tree(agent.optim.state_dict())
+    pi_optim_before = _clone_tree(agent.pi_optim.state_dict())
+    entropy_optim_before = _clone_tree(agent.ent_coef_optim.state_dict())
+    alpha_before = agent.alpha.detach().clone()
+    updates_before = (agent.num_updates, agent.outer_version)
+    rng_before = torch.random.get_rng_state().clone()
+    action = agent.act(torch.zeros(model.cfg.obs_shape["state"]), eval_mode=False)
+
+    assert action.shape == (model.cfg.action_dim,)
+    assert agent.last_inner_metrics["inner_model_steps_budget"] == 16
+    assert agent.last_inner_metrics["inner_model_steps"] == 16
+    assert agent.last_inner_metrics["inner_critic_optimizer_steps"] == 2
+    assert agent.last_inner_metrics["inner_actor_optimizer_steps"] == 2
+    torch.testing.assert_close(torch.random.get_rng_state(), rng_before, rtol=0, atol=0)
+    for key, value in agent.model.state_dict().items():
+        torch.testing.assert_close(value, outer_before[key], rtol=0, atol=0)
+    _assert_tree_equal(agent.optim.state_dict(), optim_before)
+    _assert_tree_equal(agent.pi_optim.state_dict(), pi_optim_before)
+    _assert_tree_equal(agent.ent_coef_optim.state_dict(), entropy_optim_before)
+    torch.testing.assert_close(agent.alpha, alpha_before, rtol=0, atol=0)
+    assert (agent.num_updates, agent.outer_version) == updates_before
+    _assert_finite(agent.last_inner_metrics)
+
+    obs = torch.randn(model.cfg.horizon + 1, model.cfg.batch_size, 3)
+    actions = torch.randn(model.cfg.horizon, model.cfg.batch_size, 1).tanh()
+    rewards = torch.randn(model.cfg.horizon, model.cfg.batch_size, 1)
+    update = agent._update(obs, actions, rewards, torch.zeros_like(rewards))
+    _assert_finite(update)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        (
+            {
+                "inner_actor_adaptation": "frozen",
+                "inner_actor_updates_per_action": 0,
+            },
+            (2, 0, 0),
+        ),
+        (
+            {
+                "inner_critic_adaptation": "frozen",
+                "inner_critic_updates_per_action": 0,
+            },
+            (0, 2, 0),
+        ),
+        (
+            {
+                "inner_actor_adaptation": "frozen",
+                "inner_critic_adaptation": "frozen",
+                "inner_actor_updates_per_action": 0,
+                "inner_critic_updates_per_action": 0,
+                "inner_temperature_mode": "auto",
+                "inner_temperature_updates_per_action": 2,
+            },
+            (0, 0, 2),
+        ),
+        (
+            {
+                "inner_actor_adaptation": "frozen",
+                "inner_critic_adaptation": "frozen",
+                "inner_actor_updates_per_action": 0,
+                "inner_critic_updates_per_action": 0,
+            },
+            (0, 0, 0),
+        ),
+    ],
+)
+def test_component_toggles_have_independent_step_counts(overrides, expected):
+    model = _model(**overrides)
+    model.agent.act(torch.zeros(3), eval_mode=False)
+    metrics = model.agent.last_inner_metrics
+    critic, actor, temperature = expected
+    assert metrics["inner_critic_optimizer_steps"] == critic
+    assert metrics["inner_actor_optimizer_steps"] == actor
+    assert metrics["inner_temperature_optimizer_steps"] == temperature
+
+
+def test_td3_and_mppi_and_none_share_the_action_contract():
+    variants = (
+        _model(
+            inner_operator="none",
+            inner_model_step_budget=0,
+            inner_rounds=0,
+            inner_critic_updates_per_action=0,
+            inner_actor_updates_per_action=0,
+            inner_temperature_updates_per_action=0,
+        ),
+        _model(inner_operator="td3", inner_temperature_mode="inherit_outer"),
+        _model(
+            inner_operator="mppi",
+            inner_critic_updates_per_action=0,
+            inner_actor_updates_per_action=0,
+            inner_temperature_updates_per_action=0,
+        ),
+    )
+    for model in variants:
+        action = model.agent.act(torch.zeros(3), t0=True, eval_mode=True)
+        assert action.shape == (1,)
+        assert torch.isfinite(action).all()
+        assert (action.abs() <= 1).all()
+        _assert_finite(model.agent.last_inner_metrics)
+    assert variants[0].agent.last_inner_metrics["inner_model_steps"] == 0
+    assert variants[1].agent.last_inner_metrics["inner_critic_optimizer_steps"] == 2
+    assert variants[2].agent.last_inner_metrics["inner_model_steps"] == 16
+
+
+def test_episode_scoped_replay_persists_but_is_invalidated_after_outer_update():
+    model = _model(
+        inner_actor_scope="episode",
+        inner_critic_scope="episode",
+        inner_actor_optimizer_scope="episode",
+        inner_critic_optimizer_scope="episode",
+        inner_replay_scope="episode",
+        inner_model_step_budget=8,
+        inner_replay_capacity=32,
+    )
+    agent = model.agent
+    agent.act(torch.zeros(3), t0=True)
+    actor_id = id(agent.inner_engine.state.actor)
+    assert agent.inner_engine.state.replay.size == 8
+    agent.act(torch.zeros(3), t0=False)
+    assert id(agent.inner_engine.state.actor) == actor_id
+    assert agent.inner_engine.state.replay.size == 16
+
+    obs = torch.randn(model.cfg.horizon + 1, model.cfg.batch_size, 3)
+    actions = torch.randn(model.cfg.horizon, model.cfg.batch_size, 1).tanh()
+    rewards = torch.randn(model.cfg.horizon, model.cfg.batch_size, 1)
+    agent._update(obs, actions, rewards, torch.zeros_like(rewards))
+    agent.act(torch.zeros(3), t0=False)
+    assert id(agent.inner_engine.state.actor) == actor_id
+    assert agent.inner_engine.state.replay.size == 8
+
+    agent.act(torch.zeros(3), t0=True)
+    assert id(agent.inner_engine.state.actor) != actor_id
+
+
+def test_checkpoint_preflight_rejects_q_architecture_mismatch(tmp_path):
+    scalar = _model()
+    checkpoint = tmp_path / "scalar.pt"
+    scalar.agent.save(checkpoint)
+    restored = _model()
+    restored.agent.load(checkpoint)
+    assert restored.agent.model.critic_signature == scalar.agent.model.critic_signature
+
+    distributional = _model(q_representation="distributional", num_q=5)
+    with pytest.raises(ValueError, match="critic specification"):
+        distributional.agent.load(checkpoint)
+
+
+def test_persistent_target_intervals_count_optimizer_steps_across_actions():
+    model = _model(
+        inner_rounds=1,
+        inner_model_step_budget=8,
+        inner_actor_adaptation="frozen",
+        inner_actor_updates_per_action=0,
+        inner_critic_updates_per_action=1,
+        inner_critic_target_update_interval=2,
+        inner_critic_target_tau=1.0,
+        inner_actor_scope="run",
+        inner_critic_scope="run",
+        inner_actor_optimizer_scope="run",
+        inner_critic_optimizer_scope="run",
+        inner_replay_scope="run",
+    )
+    agent = model.agent
+    agent.act(torch.zeros(3), t0=True)
+    state = agent.inner_engine.state
+    assert state.critic_lifetime_steps == 1
+    assert agent.last_inner_metrics["inner_critic_target_updates"] == 0
+
+    agent.act(torch.zeros(3), t0=False)
+    assert state.critic_lifetime_steps == 2
+    assert agent.last_inner_metrics["inner_critic_target_updates"] == 1
+    for online, target in zip(state.critic.parameters(), state.critic_target.parameters()):
+        torch.testing.assert_close(online, target, rtol=0, atol=0)
+
+
+def test_td3_actor_target_has_independent_step_cadence():
+    model = _model(
+        inner_operator="td3",
+        inner_temperature_mode="inherit_outer",
+        inner_rounds=1,
+        inner_model_step_budget=8,
+        inner_critic_adaptation="frozen",
+        inner_critic_updates_per_action=0,
+        inner_actor_updates_per_action=1,
+        inner_actor_target_update_interval=2,
+        inner_actor_target_tau=1.0,
+        inner_actor_scope="run",
+        inner_critic_scope="run",
+        inner_actor_optimizer_scope="run",
+        inner_critic_optimizer_scope="run",
+        inner_replay_scope="run",
+    )
+    agent = model.agent
+    agent.act(torch.zeros(3), t0=True)
+    state = agent.inner_engine.state
+    assert state.actor_lifetime_steps == 1
+    assert agent.last_inner_metrics["inner_actor_target_updates"] == 0
+    agent.act(torch.zeros(3), t0=False)
+    assert state.actor_lifetime_steps == 2
+    assert agent.last_inner_metrics["inner_actor_target_updates"] == 1
+    for online, target in zip(state.actor.parameters(), state.actor_target.parameters()):
+        torch.testing.assert_close(online, target, rtol=0, atol=0)
+
+
+def test_persistent_clone_rebase_preserves_online_target_lag():
+    model = _model(
+        inner_model_step_budget=0,
+        inner_actor_adaptation="frozen",
+        inner_critic_adaptation="clone",
+        inner_actor_updates_per_action=0,
+        inner_critic_updates_per_action=0,
+        inner_actor_scope="run",
+        inner_critic_scope="run",
+        inner_actor_optimizer_scope="run",
+        inner_critic_optimizer_scope="run",
+        inner_replay_scope="run",
+    )
+    agent = model.agent
+    agent.act(torch.zeros(3), t0=True)
+    state = agent.inner_engine.state
+    with torch.no_grad():
+        for parameter in state.critic.parameters():
+            parameter.add_(0.3)
+        for parameter in state.critic_target.parameters():
+            parameter.add_(0.1)
+        lag_before = [
+            online.detach().clone() - target.detach().clone()
+            for online, target in zip(
+                state.critic.parameters(), state.critic_target.parameters()
+            )
+        ]
+        for parameter in agent.model._Qs.parameters():
+            parameter.add_(0.5)
+    agent.outer_version += 1
+    with agent.inner_engine.rng.fork("initialization"):
+        agent.inner_engine._prepare_workspace(t0=False)
+    for online, target, expected_lag in zip(
+        state.critic.parameters(), state.critic_target.parameters(), lag_before
+    ):
+        torch.testing.assert_close(online - target, expected_lag, rtol=0, atol=1e-7)
+
+
+def test_diagnostics_and_unrelated_inner_compute_have_independent_rng_streams():
+    no_diagnostics = _model(inner_diagnostic_rollouts=0)
+    with_diagnostics = _model(inner_diagnostic_rollouts=3)
+    first = no_diagnostics.agent.act(torch.zeros(3), eval_mode=False)
+    second = with_diagnostics.agent.act(torch.zeros(3), eval_mode=False)
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+
+    collect_only = _model(
+        inner_actor_adaptation="frozen",
+        inner_actor_updates_per_action=0,
+        inner_critic_updates_per_action=0,
+    )
+    critic_only = _model(
+        inner_actor_adaptation="frozen",
+        inner_actor_updates_per_action=0,
+        inner_critic_updates_per_action=2,
+    )
+    collect_action = collect_only.agent.act(torch.zeros(3), eval_mode=False)
+    critic_action = critic_only.agent.act(torch.zeros(3), eval_mode=False)
+    torch.testing.assert_close(collect_action, critic_action, rtol=0, atol=0)
+
+
+def test_lora_dropout_diagnostics_leave_cpu_rng_bitwise_unchanged():
+    model = _model(
+        q_representation="distributional",
+        num_q=5,
+        dropout=0.2,
+        inner_actor_adaptation="lora",
+        inner_critic_adaptation="lora",
+        inner_actor_lora_dropout=0.3,
+        inner_critic_lora_dropout=0.3,
+        inner_diagnostic_rollouts=2,
+    )
+    before = torch.random.get_rng_state().clone()
+    model.agent.act(torch.zeros(3), eval_mode=False)
+    torch.testing.assert_close(torch.random.get_rng_state(), before, rtol=0, atol=0)
+
+
+def test_act_restores_outer_model_training_mode():
+    model = _model()
+    model.agent.model.train()
+    assert model.agent.model.training
+    assert not model.agent.model._target_Qs.training
+    model.agent.act(torch.zeros(3))
+    assert model.agent.model.training
+    assert not model.agent.model._target_Qs.training
+
+
+def test_checkpoint_load_resets_discarded_inner_rng_state(tmp_path):
+    source = _model()
+    checkpoint = tmp_path / "source.pt"
+    source.agent.save(checkpoint)
+
+    used = _model()
+    fresh = _model()
+    used.agent.act(torch.zeros(3), eval_mode=False)
+    used.agent.load(checkpoint)
+    fresh.agent.load(checkpoint)
+    used_action = used.agent.act(torch.zeros(3), eval_mode=False)
+    fresh_action = fresh.agent.act(torch.zeros(3), eval_mode=False)
+    torch.testing.assert_close(used_action, fresh_action, rtol=0, atol=0)
+
+
+def test_checkpoint_preflight_rejects_entropy_mode_before_mutation(tmp_path):
+    automatic = _model(ent_coef="auto_0.7")
+    checkpoint = tmp_path / "automatic.pt"
+    automatic.agent.save(checkpoint)
+    fixed = _model(ent_coef=0.123)
+    before = _clone_tree(fixed.agent.model.state_dict())
+    with pytest.raises(ValueError, match="entropy"):
+        fixed.agent.load(checkpoint)
+    _assert_tree_equal(fixed.agent.model.state_dict(), before)
+
+
+@pytest.mark.parametrize(
+    ("representation", "num_q"),
+    [("scalar", 2), ("distributional", 5)],
+)
+def test_native_checkpoint_roundtrips_all_outer_training_state(
+    tmp_path, representation, num_q
+):
+    source = _model(q_representation=representation, num_q=num_q)
+    obs = torch.randn(source.cfg.horizon + 1, source.cfg.batch_size, 3)
+    actions = torch.randn(source.cfg.horizon, source.cfg.batch_size, 1).tanh()
+    rewards = torch.randn(source.cfg.horizon, source.cfg.batch_size, 1)
+    source.agent._update(obs, actions, rewards, torch.zeros_like(rewards))
+    checkpoint = tmp_path / f"{representation}.pt"
+    source.agent.save(checkpoint)
+
+    restored = _model(q_representation=representation, num_q=num_q)
+    restored.agent.act(torch.zeros(3))
+    assert restored.agent.inner_engine.state.outer_version >= 0
+    restored.agent.load(checkpoint)
+    _assert_tree_equal(
+        restored.agent.model.state_dict(), source.agent.model.state_dict()
+    )
+    _assert_tree_equal(restored.agent.optim.state_dict(), source.agent.optim.state_dict())
+    _assert_tree_equal(
+        restored.agent.pi_optim.state_dict(), source.agent.pi_optim.state_dict()
+    )
+    _assert_tree_equal(
+        restored.agent.ent_coef_optim.state_dict(),
+        source.agent.ent_coef_optim.state_dict(),
+    )
+    torch.testing.assert_close(restored.agent.alpha, source.agent.alpha, rtol=0, atol=0)
+    assert restored.agent.num_updates == source.agent.num_updates
+    assert restored.agent.outer_version == source.agent.outer_version
+    assert restored.agent.inner_engine.state.outer_version == -1
+
+
+def test_legacy_scalar_checkpoint_and_vectorized_distributional_model_import():
+    scalar = _model()
+    legacy = {
+        "model": _clone_tree(scalar.agent.model.state_dict()),
+        "optim": _clone_tree(scalar.agent.optim.state_dict()),
+        "pi_optim": _clone_tree(scalar.agent.pi_optim.state_dict()),
+        "num_updates": 0,
+        "log_ent_coef": scalar.agent.log_ent_coef.detach().cpu().clone(),
+        "ent_coef_optim": _clone_tree(scalar.agent.ent_coef_optim.state_dict()),
+    }
+    restored_scalar = _model()
+    restored_scalar.agent.load(legacy)
+    _assert_tree_equal(
+        restored_scalar.agent.model.state_dict(), scalar.agent.model.state_dict()
+    )
+
+    distributional = _model(q_representation="distributional", num_q=5)
+    port_state = distributional.agent.model.state_dict()
+    official = OrderedDict()
+    prefixes = ("_Qs.modules_list.", "_target_Qs.modules_list.")
+    for key, value in port_state.items():
+        if not key.startswith(prefixes):
+            official[key] = value.clone()
+
+    def pack(port_prefix, official_prefix):
+        grouped = {}
+        for key, value in port_state.items():
+            if not key.startswith(port_prefix):
+                continue
+            remainder = key[len(port_prefix):]
+            critic_index, layer_and_field = remainder.split(".", 1)
+            grouped.setdefault(layer_and_field, {})[int(critic_index)] = value
+        for layer_and_field, values in grouped.items():
+            official[official_prefix + layer_and_field] = torch.stack(
+                [values[index] for index in sorted(values)], dim=0
+            )
+
+    pack("_Qs.modules_list.", "_Qs.params.")
+    pack("_Qs.modules_list.", "_detach_Qs_params.")
+    pack("_target_Qs.modules_list.", "_target_Qs_params.")
+    imported = _model(q_representation="distributional", num_q=5)
+    imported.agent.load(official)
+    _assert_tree_equal(imported.agent.model.state_dict(), port_state)
+
+
+def test_unknown_checkpoint_version_fails_without_partial_mutation():
+    model = _model()
+    before = _clone_tree(model.agent.model.state_dict())
+    invalid = {
+        "checkpoint_version": 999,
+        "model": _clone_tree(model.agent.model.state_dict()),
+    }
+    with pytest.raises(ValueError, match="Unsupported"):
+        model.agent.load(invalid)
+    _assert_tree_equal(model.agent.model.state_dict(), before)
+
+
+@pytest.mark.parametrize(
+    ("representation", "num_q", "adaptation"),
+    [
+        ("scalar", 2, "frozen"),
+        ("scalar", 2, "clone"),
+        ("scalar", 2, "lora"),
+        ("distributional", 5, "frozen"),
+        ("distributional", 5, "clone"),
+        ("distributional", 5, "lora"),
+    ],
+)
+def test_tiny_pendulum_end_to_end_across_q_and_adaptation_modes(
+    representation, num_q, adaptation
+):
+    update_count = 0 if adaptation == "frozen" else 2
+    model = _model(
+        q_representation=representation,
+        num_q=num_q,
+        inner_actor_adaptation=adaptation,
+        inner_critic_adaptation=adaptation,
+        inner_actor_updates_per_action=update_count,
+        inner_critic_updates_per_action=update_count,
+    )
+    model.learn(total_timesteps=6)
+    assert model._global_step == 6
+    assert model.agent.num_updates > 0
+    assert model.agent.last_inner_metrics["inner_model_steps"] == 16
+    _assert_finite(model.agent.last_inner_metrics)
+    _assert_finite(model._last_train_metrics)
+
+
+def test_predicted_termination_reports_realized_compute_and_strict_underfill():
+    model = _model(episodic=True)
+
+    def terminate_immediately(z, task=None, unnormalized=False):
+        del task
+        value = torch.ones(z.shape[0], 1, device=z.device)
+        return value if not unnormalized else torch.full_like(value, 20.0)
+
+    model.agent.model.termination = terminate_immediately
+    model.agent.act(torch.zeros(3))
+    metrics = model.agent.last_inner_metrics
+    assert metrics["inner_model_steps_budget"] == 16
+    assert metrics["inner_model_steps"] == 8
+    assert metrics["inner_requested_rollouts"] == 8
+    assert metrics["inner_rollouts"] == 8
+    assert metrics["inner_termination_rate"] == 1.0
+    assert model.agent.last_inner_rollout_lengths == [1] * 8
+
+    strict = _model(episodic=True, inner_replay_sampling="without_replacement")
+    strict.agent.model.termination = terminate_immediately
+    with pytest.raises(ValueError, match="without replacement"):
+        strict.agent.act(torch.zeros(3))
+
+
+def _toy_policy(z, task=None, *, policy=None, deterministic=False, **kwargs):
+    del task, deterministic, kwargs
+    raw = policy(z)
+    mean, log_std = raw.chunk(2, dim=-1)
+    action = mean.tanh()
+    log_prob = mean.sum(dim=-1, keepdim=True) * 0.0 - 0.5
+    return action, {
+        "mean": action,
+        "pre_tanh_mean": mean,
+        "log_std": log_std * 0.0,
+        "log_prob": log_prob,
+        "entropy": -log_prob,
+    }
+
+
+def test_sac_inner_target_and_actor_objective_match_hand_computation(monkeypatch):
+    model = _model(inner_rounds=1, inner_model_step_budget=8)
+    engine = model.agent.inner_engine
+    with engine.rng.fork("initialization"):
+        engine._prepare_workspace(t0=True)
+    batch = {
+        "z": torch.zeros(4, model.cfg.latent_dim),
+        "action": torch.zeros(4, model.cfg.action_dim),
+        "reward": torch.full((4, 1), 3.0),
+        "next_z": torch.zeros(4, model.cfg.latent_dim),
+        "terminated": torch.tensor([[0.0], [1.0], [0.0], [1.0]]),
+    }
+    monkeypatch.setattr(model.agent.model, "pi", _toy_policy)
+    monkeypatch.setattr(
+        engine,
+        "_bootstrap_q",
+        lambda z, action: torch.full((z.shape[0], 1), 5.0),
+    )
+    captured = {}
+    original_loss = model.agent.model.critic_loss
+
+    def capture_loss(predictions, scalar_target, **kwargs):
+        captured["target"] = scalar_target.detach().clone()
+        return original_loss(predictions, scalar_target, **kwargs)
+
+    monkeypatch.setattr(model.agent.model, "critic_loss", capture_loss)
+    alpha = torch.tensor(0.25)
+    with engine.rng.fork("bootstrap"):
+        engine._sac_critic_step(batch, alpha)
+    expected_target = batch["reward"] + model.agent.discount * (
+        1.0 - batch["terminated"]
+    ) * (5.0 + 0.5 * alpha)
+    torch.testing.assert_close(captured["target"], expected_target)
+
+    monkeypatch.setattr(
+        model.agent.model,
+        "Q",
+        lambda z, action, **kwargs: action.sum(dim=-1, keepdim=True) * 0.0 + 2.0,
+    )
+    actor_metrics = engine._sac_policy_step(
+        batch,
+        update_temperature=False,
+        update_actor=True,
+        alpha=alpha,
+    )
+    assert actor_metrics["actor_loss"] == pytest.approx(-2.125)
+
+
+def test_td3_inner_target_and_actor_objective_match_hand_computation(monkeypatch):
+    model = _model(
+        inner_operator="td3",
+        inner_temperature_mode="inherit_outer",
+        inner_rounds=1,
+        inner_model_step_budget=8,
+        inner_td3_target_noise_std=0.0,
+    )
+    engine = model.agent.inner_engine
+    with engine.rng.fork("initialization"):
+        engine._prepare_workspace(t0=True)
+    batch = {
+        "z": torch.zeros(4, model.cfg.latent_dim),
+        "action": torch.zeros(4, model.cfg.action_dim),
+        "reward": torch.full((4, 1), 1.5),
+        "next_z": torch.zeros(4, model.cfg.latent_dim),
+        "terminated": torch.tensor([[0.0], [1.0], [0.0], [1.0]]),
+    }
+    monkeypatch.setattr(model.agent.model, "pi", _toy_policy)
+    monkeypatch.setattr(
+        engine,
+        "_bootstrap_q",
+        lambda z, action: torch.full((z.shape[0], 1), 4.0),
+    )
+    captured = {}
+    original_loss = model.agent.model.critic_loss
+
+    def capture_loss(predictions, scalar_target, **kwargs):
+        captured["target"] = scalar_target.detach().clone()
+        return original_loss(predictions, scalar_target, **kwargs)
+
+    monkeypatch.setattr(model.agent.model, "critic_loss", capture_loss)
+    with engine.rng.fork("bootstrap"):
+        engine._td3_critic_step(batch)
+    expected_target = batch["reward"] + model.agent.discount * (
+        1.0 - batch["terminated"]
+    ) * 4.0
+    torch.testing.assert_close(captured["target"], expected_target)
+
+    monkeypatch.setattr(
+        model.agent.model,
+        "Q",
+        lambda z, action, **kwargs: action.sum(dim=-1, keepdim=True) * 0.0 + 3.0,
+    )
+    with engine.rng.fork("gradient_policy"):
+        actor_metrics = engine._td3_actor_step(batch)
+    assert actor_metrics["actor_loss"] == pytest.approx(-3.0)
+
+
+def test_outer_scalar_soft_target_and_optimizer_partition_are_preserved(monkeypatch):
+    model = _model(q_representation="scalar", num_q=2)
+    agent = model.agent
+
+    def outer_policy(z, *args, **kwargs):
+        action = z.new_zeros(z.shape[0], model.cfg.action_dim)
+        return action, {"log_prob": z.new_full((z.shape[0], 1), -0.4)}
+
+    monkeypatch.setattr(agent.model, "pi", outer_policy)
+    monkeypatch.setattr(
+        agent.model,
+        "Q",
+        lambda z, action, **kwargs: z.new_full((z.shape[0], 1), 6.0),
+    )
+    reward = torch.tensor([[2.0], [2.0]])
+    terminated = torch.tensor([[0.0], [1.0]])
+    target = agent._soft_td_target(
+        torch.zeros(2, model.cfg.latent_dim), reward, terminated
+    )
+    expected = reward + agent.discount * (1.0 - terminated) * (
+        6.0 + 0.4 * agent.alpha.detach()
+    )
+    torch.testing.assert_close(target, expected)
+
+    groups = agent.optim.param_groups
+    assert len(groups) == 4
+    assert groups[0]["lr"] == pytest.approx(model.cfg.lr * model.cfg.enc_lr_scale)
+    assert groups[-1]["lr"] == pytest.approx(model.cfg.critic_lr)
+    critic_ids = {id(parameter) for parameter in agent.model._Qs.parameters()}
+    actor_ids = {id(parameter) for parameter in agent.model._pi.parameters()}
+    assert {id(parameter) for parameter in groups[-1]["params"]} == critic_ids
+    assert not actor_ids.intersection(
+        id(parameter)
+        for group in groups
+        for parameter in group["params"]
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_act_preserves_all_global_rng_streams_and_outer_state():
+    model = _model(
+        device="cuda",
+        q_representation="distributional",
+        num_q=5,
+        dropout=0.1,
+        inner_actor_adaptation="lora",
+        inner_critic_adaptation="lora",
+        inner_actor_lora_dropout=0.2,
+        inner_critic_lora_dropout=0.2,
+        inner_diagnostic_rollouts=2,
+    )
+    agent = model.agent
+    outer_before = _clone_tree(agent.model.state_dict())
+    cpu_rng_before = torch.random.get_rng_state().clone()
+    cuda_rng_before = [state.clone() for state in torch.cuda.get_rng_state_all()]
+    agent.act(torch.zeros(3))
+    _assert_tree_equal(agent.model.state_dict(), outer_before)
+    torch.testing.assert_close(torch.random.get_rng_state(), cpu_rng_before, rtol=0, atol=0)
+    for actual, expected in zip(torch.cuda.get_rng_state_all(), cuda_rng_before):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

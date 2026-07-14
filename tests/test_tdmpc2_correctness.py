@@ -61,6 +61,74 @@ def make_model(cls, env, params=None, total_steps=12):
     )
 
 
+class OneStepTruncationEnv(gym.Env):
+    metadata = {}
+
+    def __init__(self, events):
+        self.events = events
+        self.observation_space = gym.spaces.Box(
+            -1.0, 1.0, shape=(3,), dtype=np.float32
+        )
+        self.action_space = gym.spaces.Box(
+            -1.0, 1.0, shape=(1,), dtype=np.float32
+        )
+        self.spec = None
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        return np.zeros(3, dtype=np.float32), {}
+
+    def step(self, action):
+        self.events.append("env_step")
+        return np.zeros(3, dtype=np.float32), 0.0, False, True, {}
+
+
+def test_ambi_preserves_the_exact_tdmpc2_training_loop_and_ordering():
+    assert AMBITDMPC2.learn is TDMPC2Baseline.learn
+    events = []
+    env = OneStepTruncationEnv(events)
+    params = tiny_params(
+        seed_steps=0,
+        pretrain_steps=1,
+        utd=1,
+        horizon=1,
+        batch_size=1,
+        episode_length=1,
+        inner_iterations=0,
+        inner_horizon=1,
+        inner_updates_per_iteration=0,
+    )
+    model = make_model(AMBITDMPC2, env, params, total_steps=2)
+    original_add = model.buffer.add
+
+    def record_add(episode):
+        events.append("replay_add")
+        return original_add(episode)
+
+    def record_update(buffer):
+        events.append("update")
+        return {"num_updates": torch.tensor(1.0)}
+
+    def record_act(obs, *, t0=False, eval_mode=False, task=None):
+        events.append("act")
+        return torch.zeros(model.cfg.action_dim)
+
+    model.buffer.add = record_add
+    model.agent.update = record_update
+    model.agent.act = record_act
+    model.learn(total_timesteps=2)
+    assert events == [
+        "env_step",
+        "replay_add",
+        "update",
+        "act",
+        "env_step",
+        "replay_add",
+        "update",
+    ]
+    assert model._num_updates == 2
+
+
 @pytest.mark.parametrize("algorithm", [TDMPC2Baseline, AMBITDMPC2])
 def test_small_end_to_end_training_and_truncation_bootstrap(algorithm):
     env = gym.make("Pendulum-v1", max_episode_steps=5)
@@ -110,8 +178,11 @@ def test_soft_sac_actor_uses_direct_log_std_clamping():
 
 def test_unsafe_or_unsupported_configs_fail_early():
     env = gym.make("Pendulum-v1", max_episode_steps=5)
-    with pytest.raises(ValueError, match="inner_horizon exceeds"):
-        make_model(AMBITDMPC2, env, tiny_params(inner_horizon=3, horizon=2))
+    with pytest.warns(UserWarning, match="model-bias risk"):
+        long_horizon = make_model(
+            AMBITDMPC2, env, tiny_params(inner_horizon=3, horizon=2)
+        )
+    assert long_horizon.cfg.inner_horizon_ratio == pytest.approx(1.5)
     with pytest.raises(ValueError, match="compile=True is not supported"):
         make_model(TDMPC2Baseline, env, tiny_params(compile=True))
 
