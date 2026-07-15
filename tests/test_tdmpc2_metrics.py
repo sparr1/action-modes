@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from RL.AMBITDMPC2 import AMBITDMPC2
-from RL.TDMPC2 import TDMPC2Baseline
+from RL.TDMPC2 import TDMPC2Baseline, _DeviceMeanAccumulator
 
 
 def _tiny_params(**overrides):
@@ -62,6 +62,136 @@ def _make_model(cls, params=None, total_steps=20):
 
 def _assert_finite_metrics(metrics):
     assert all(math.isfinite(float(torch.as_tensor(value).mean())) for value in metrics.values())
+
+
+def test_device_metric_window_emits_legacy_mean_and_complete_moments():
+    metrics = _DeviceMeanAccumulator()
+    metrics.update(
+        {"loss": torch.tensor(1.0), "num_updates": torch.tensor(1.0)},
+        prefix="train/",
+        skip=("num_updates",),
+    )
+    metrics.update(
+        {"loss": torch.tensor(3.0), "num_updates": torch.tensor(2.0)},
+        prefix="train/",
+        skip=("num_updates",),
+    )
+    metrics.update(
+        {"loss": torch.tensor(float("nan"))},
+        prefix="train/",
+        skip=("num_updates",),
+    )
+
+    payload = metrics.pop_floats(include_stats=True)
+
+    assert payload["train/loss"] == pytest.approx(2.0)
+    assert payload["train/loss_count"] == pytest.approx(2.0)
+    assert payload["train/loss_mean"] == pytest.approx(2.0)
+    assert payload["train/loss_std"] == pytest.approx(1.0)
+    assert payload["train/loss_min"] == pytest.approx(1.0)
+    assert payload["train/loss_max"] == pytest.approx(3.0)
+    assert "train/num_updates" not in payload
+    assert not metrics
+
+
+def test_device_metric_window_batches_one_scalar_mapping_and_filters_per_key():
+    metrics = _DeviceMeanAccumulator()
+    metrics.update(
+        {
+            "actor_loss": torch.tensor(1.5),
+            "critic_loss": torch.tensor(2.5),
+            "ignored_nan": torch.tensor(float("nan")),
+        },
+        prefix="train/",
+    )
+
+    # Scalar tensors with the same device/dtype share one vector of moments,
+    # so a metric mapping is updated as one packed operation rather than one
+    # CUDA operation sequence per key.
+    assert len(metrics._tensor_groups) == 1
+    group = next(iter(metrics._tensor_groups.values()))
+    assert group["keys"] == [
+        "train/actor_loss",
+        "train/critic_loss",
+        "train/ignored_nan",
+    ]
+    assert group["count"].tolist() == [1, 1, 0]
+
+    payload = metrics.pop_floats(include_stats=True)
+    assert payload["train/actor_loss"] == pytest.approx(1.5)
+    assert payload["train/critic_loss"] == pytest.approx(2.5)
+    assert "train/ignored_nan" not in payload
+
+
+def test_device_metric_window_uses_stable_welford_variance():
+    tensor_metrics = _DeviceMeanAccumulator()
+    python_metrics = _DeviceMeanAccumulator()
+    large_python_metrics = _DeviceMeanAccumulator()
+    for value in (10_000.0, 10_001.0):
+        tensor_metrics.update({"offset": torch.tensor(value)})
+        python_metrics.update({"offset": value})
+    for value in (1_000_000_000_000.0, 1_000_000_000_001.0):
+        large_python_metrics.update({"offset": value})
+
+    tensor_payload = tensor_metrics.pop_floats(include_stats=True)
+    python_payload = python_metrics.pop_floats(include_stats=True)
+    large_python_payload = large_python_metrics.pop_floats(include_stats=True)
+
+    assert tensor_payload["offset_mean"] == pytest.approx(10_000.5)
+    assert tensor_payload["offset_std"] == pytest.approx(0.5)
+    assert python_payload["offset_mean"] == pytest.approx(10_000.5)
+    assert python_payload["offset_std"] == pytest.approx(0.5)
+    assert large_python_payload["offset_std"] == pytest.approx(0.5)
+
+
+def test_tdmpc_custom_logger_receives_historical_materialized_payload():
+    class CustomLogger:
+        # Even a custom logger that advertises no trajectory retention must opt
+        # in explicitly before the trainer passes native/omitted values.
+        retains_trajectories = False
+
+        def on_step(self, payload):
+            self.payload = payload
+
+    learner = object.__new__(TDMPC2Baseline)
+    learner.alg_logger = CustomLogger()
+    learner._log_step(
+        1.25,
+        np.array([1.0, 2.0], dtype=np.float32),
+        np.array([0.25, -0.25], dtype=np.float32),
+        False,
+        False,
+        {},
+    )
+
+    payload = learner.alg_logger.payload
+    assert payload["obs"] == [[1.0, 2.0]]
+    assert payload["actions"] == [[0.25, -0.25]]
+    assert payload["rewards"] == [1.25]
+    assert payload["dones"] == [False]
+
+
+def test_tdmpc_native_logger_capability_enables_summary_fast_path():
+    class NativeSummaryLogger:
+        accepts_native_step_payload = True
+        retains_trajectories = False
+
+        def on_step(self, payload):
+            self.payload = payload
+
+    learner = object.__new__(TDMPC2Baseline)
+    learner.alg_logger = NativeSummaryLogger()
+    learner._log_step(
+        1.25,
+        np.array([1.0, 2.0], dtype=np.float32),
+        np.array([0.25, -0.25], dtype=np.float32),
+        False,
+        False,
+        {},
+    )
+
+    assert learner.alg_logger.payload["obs"] is None
+    assert learner.alg_logger.payload["actions"] is None
 
 
 def test_tdmpc_update_and_final_plan_diagnostics(monkeypatch):

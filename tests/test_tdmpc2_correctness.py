@@ -109,7 +109,15 @@ def test_ambi_preserves_the_exact_tdmpc2_training_loop_and_ordering():
         events.append("update")
         return {"num_updates": torch.tensor(1.0)}
 
-    def record_act(obs, *, t0=False, eval_mode=False, task=None):
+    def record_act(
+        obs,
+        *,
+        t0=False,
+        eval_mode=False,
+        task=None,
+        collect_diagnostics=True,
+    ):
+        del collect_diagnostics
         events.append("act")
         return torch.zeros(model.cfg.action_dim)
 

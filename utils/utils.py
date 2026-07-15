@@ -85,7 +85,23 @@ def _convert_arrays_recursively(obj):
         return obj
 
 
-def setup_logs(reward, obs, action, dones, info=None, inner_steps=None):
+def setup_logs(
+    reward,
+    obs,
+    action,
+    dones,
+    info=None,
+    inner_steps=None,
+    *,
+    materialize=True,
+):
+    """Build one logger payload.
+
+    The default preserves the historical, JSON-compatible contract by
+    recursively converting numpy values to Python containers. Built-in summary
+    loggers may pass ``materialize=False`` to keep trajectory-only values in
+    their native form and avoid work they will immediately discard.
+    """
     data = {}
     # print(reward)
     # print(type(reward))
@@ -93,13 +109,17 @@ def setup_logs(reward, obs, action, dones, info=None, inner_steps=None):
     # print(new_rewards)
     # print(type(new_rewards))
     data["rewards"] = listify(reward)
-    data["obs"] = listify(obs)
-    data["actions"] = listify(action)
+    data["obs"] = listify(obs) if materialize else obs
+    data["actions"] = listify(action) if materialize else action
     data["dones"] = _convert_arrays_recursively(dones)
 
     # for AMBI
     if inner_steps is not None:
-        data["inner_steps"] = _convert_arrays_recursively(inner_steps)
+        data["inner_steps"] = (
+            _convert_arrays_recursively(inner_steps)
+            if materialize
+            else inner_steps
+        )
 
     if (
         isinstance(info, (list, tuple))
@@ -120,8 +140,7 @@ def setup_logs(reward, obs, action, dones, info=None, inner_steps=None):
         data["infos"] = _convert_arrays_recursively(payload)
     else:
         data["infos"] = _convert_arrays_recursively(info) if info is not None else None
-    # Final recursive cleanup of entire data dict to catch any remaining arrays
-    return _convert_arrays_recursively(data)
+    return _convert_arrays_recursively(data) if materialize else data
 
 
 def load_episode_log(path):

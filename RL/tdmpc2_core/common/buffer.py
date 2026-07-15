@@ -32,6 +32,7 @@ class Buffer():
 		self._total_transitions = 0
 		self._resident_episode_rows = deque()
 		self._resident_rows = 0
+		self._pin_memory = False
 
 	@property
 	def capacity(self):
@@ -98,9 +99,20 @@ class Buffer():
 		return ReplayBuffer(
 			storage=storage,
 			sampler=self._sampler,
-			pin_memory=False,
+			# TorchRL pins the sampled TensorDict, providing the staging memory
+			# required for the non-blocking CPU-to-CUDA transfer below. Pinning
+			# CUDA storage (or CPU-only training) has no benefit and is unsafe.
+			pin_memory=self._pin_memory,
 			prefetch=0,
 			batch_size=self._batch_size,
+		)
+
+	@staticmethod
+	def _uses_pinned_staging(storage_device, target_device):
+		"""Whether sampled CPU rows need pinning for an asynchronous transfer."""
+		return (
+			torch.device(storage_device).type == 'cpu'
+			and torch.device(target_device).type == 'cuda'
 		)
 
 	def _init(self, tds):
@@ -118,6 +130,9 @@ class Buffer():
 		storage_device = str(self._device) if self._device.type == 'cuda' and 2.5*total_bytes < mem_free else 'cpu'
 		print(f'Using {storage_device.upper()} memory for storage.')
 		self._storage_device = torch.device(storage_device)
+		self._pin_memory = self._uses_pinned_staging(
+			self._storage_device, self._device
+		)
 		return self._reserve_buffer(
 			LazyTensorStorage(self._capacity, device=self._storage_device)
 		)

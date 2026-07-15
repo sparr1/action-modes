@@ -105,6 +105,10 @@ class QRepresentation:
         self.num_bins = num_bins
         self.vmin = vmin
         self.vmax = vmax
+        # QRepresentation intentionally is not an nn.Module, so this cache does
+        # not add checkpoint entries. A model normally uses one device/dtype;
+        # retaining the uncommon alternatives keeps device moves correct too.
+        self._support_cache = {}
 
     @classmethod
     def from_config(cls, cfg):
@@ -180,20 +184,38 @@ class QRepresentation:
         encoded.scatter_add_(-1, upper, upper_weight)
         return encoded
 
+    def _target_bin_weights(self, scalar_target):
+        """Return the two occupied bins and their interpolation weights."""
+        symlog_target = _symlog(scalar_target).clamp(self.vmin, self.vmax)
+        position = (symlog_target - self.vmin) / (self.vmax - self.vmin)
+        position = position * (self.num_bins - 1)
+        lower = position.floor().long()
+        upper = (lower + 1).clamp(max=self.num_bins - 1)
+        upper_weight = position - lower.to(position.dtype)
+        return lower, upper, 1.0 - upper_weight, upper_weight
+
+    def _support(self, reference):
+        """Return a cached categorical support matching ``reference``."""
+        key = (reference.device, reference.dtype)
+        support = self._support_cache.get(key)
+        if support is None:
+            support = torch.linspace(
+                self.vmin,
+                self.vmax,
+                self.num_bins,
+                device=reference.device,
+                dtype=reference.dtype,
+            )
+            self._support_cache[key] = support
+        return support
+
     def decode(self, predictions):
         """Decode every critic head to a scalar Q expectation."""
         self._validate_predictions(predictions)
         if self.representation == "scalar":
             return predictions
 
-        bins = torch.linspace(
-            self.vmin,
-            self.vmax,
-            self.num_bins,
-            device=predictions.device,
-            dtype=predictions.dtype,
-        )
-        symlog_value = (F.softmax(predictions, dim=-1) * bins).sum(
+        symlog_value = (F.softmax(predictions, dim=-1) * self._support(predictions)).sum(
             dim=-1, keepdim=True
         )
         return _symexp(symlog_value)
@@ -212,10 +234,19 @@ class QRepresentation:
         if self.representation == "scalar":
             losses = (predictions - scalar_target) ** 2
         else:
-            encoded_target = self.encode_target(scalar_target)
+            lower, upper, lower_weight, upper_weight = self._target_bin_weights(
+                scalar_target
+            )
+            index_shape = predictions.shape[:-1] + (1,)
+            lower = torch.broadcast_to(lower, index_shape)
+            upper = torch.broadcast_to(upper, index_shape)
+            lower_weight = torch.broadcast_to(lower_weight, index_shape)
+            upper_weight = torch.broadcast_to(upper_weight, index_shape)
+            log_probabilities = F.log_softmax(predictions, dim=-1)
             losses = -(
-                encoded_target * F.log_softmax(predictions, dim=-1)
-            ).sum(dim=-1, keepdim=True)
+                lower_weight * log_probabilities.gather(-1, lower)
+                + upper_weight * log_probabilities.gather(-1, upper)
+            )
 
         if reduction == "none":
             return losses
@@ -225,7 +256,15 @@ class QRepresentation:
             return losses.sum()
         raise ValueError(f"Unknown critic loss reduction: {reduction!r}.")
 
-    def reduce(self, values, reduction, *, pair_indices=None, generator=None):
+    def reduce(
+        self,
+        values,
+        reduction,
+        *,
+        pair_indices=None,
+        generator=None,
+        trusted_pair_indices=False,
+    ):
         """Reduce decoded scalar values across the ensemble dimension."""
         if values.ndim < 2 or values.shape[0] != self.num_q or values.shape[-1] != 1:
             raise ValueError(
@@ -250,20 +289,44 @@ class QRepresentation:
                 )
             selected = values
         else:
-            selected = values.index_select(
-                0,
-                self._pair_indices(
-                    values.device,
-                    pair_indices=pair_indices,
-                    generator=generator,
-                ),
-            )
+            # The default pair is the whole ensemble for scalar twin critics
+            # (and for full-size distributional pairs), so selecting an arange
+            # would only launch an extra gather kernel.
+            if pair_indices is None and self.pair_size == self.num_q:
+                selected = values
+            else:
+                selected = values.index_select(
+                    0,
+                    self._pair_indices(
+                        values.device,
+                        pair_indices=pair_indices,
+                        generator=generator,
+                        trusted=trusted_pair_indices,
+                    ),
+                )
 
         if reduction.startswith("min_"):
             return selected.min(dim=0).values
         return selected.mean(dim=0)
 
-    def _pair_indices(self, device, *, pair_indices=None, generator=None):
+    def sample_pair_indices(self, device, *, generator=None):
+        """Sample an explicit critic pair, or return ``None`` for identity pairs.
+
+        Sampling before entering a compiled region keeps generator objects out
+        of the graph while preserving the configured without-replacement law.
+        """
+        if self.pair_size == self.num_q:
+            return None
+        return self._pair_indices(device, generator=generator)
+
+    def _pair_indices(
+        self,
+        device,
+        *,
+        pair_indices=None,
+        generator=None,
+        trusted=False,
+    ):
         if pair_indices is None:
             if self.pair_size == self.num_q:
                 return torch.arange(self.num_q, device=device)
@@ -274,6 +337,11 @@ class QRepresentation:
             )[: self.pair_size]
 
         indices = torch.as_tensor(pair_indices, device=device, dtype=torch.long).flatten()
+        if trusted:
+            # Only internally sampled randperm prefixes use this path. They are
+            # already unique/in-range, so avoid unique()/any() scalar reads in
+            # compiled critic and actor regions.
+            return indices
         if indices.numel() != self.pair_size:
             raise ValueError(
                 f"Expected {self.pair_size} pair indices, got {indices.numel()}."

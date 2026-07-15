@@ -42,6 +42,7 @@ def test_accumulator_pools_raw_and_precomputed_population_moments():
     )
 
     payload = metrics.snapshot(clear=True)
+    assert payload["rollout/reward_count"] == 4.0
     assert payload["rollout/reward_mean"] == pytest.approx(4.0)
     assert payload["rollout/reward_std"] == pytest.approx(math.sqrt(6.5))
     assert payload["rollout/reward_min"] == 1.0

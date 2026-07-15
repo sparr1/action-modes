@@ -7,6 +7,8 @@ import pytest
 import torch
 
 from RL.AMBITDMPC2 import AMBITDMPC2
+from RL.tdmpc2_core.common.inner_utils import lora_uses_shared_bases
+from RL.tdmpc2_core.common.lora import LoRALinear, LoRANormedLinear
 
 
 def _params(**overrides):
@@ -755,3 +757,93 @@ def test_cuda_act_preserves_all_global_rng_streams_and_outer_state():
     torch.testing.assert_close(torch.random.get_rng_state(), cpu_rng_before, rtol=0, atol=0)
     for actual, expected in zip(torch.cuda.get_rng_state_all(), cuda_rng_before):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_action_lora_workspace_reuses_adapters_and_shares_outer_bases():
+    model = _model(
+        inner_actor_adaptation="lora",
+        inner_critic_adaptation="lora",
+        inner_actor_updates_per_action=0,
+        inner_critic_updates_per_action=0,
+    )
+    engine = model.agent.inner_engine
+    outer = model.agent.model
+    outer_keys = tuple(outer.state_dict())
+    outer_parameter_ids = {id(parameter) for parameter in outer.parameters()}
+    outer_modes = {
+        name: module.training for name, module in outer.named_modules()
+    }
+
+    with engine.rng.fork("initialization"):
+        engine._prepare_workspace(t0=True)
+    actor = engine.state.actor
+    critic = engine.state.critic
+    critic_target = engine.state.critic_target
+    assert lora_uses_shared_bases(actor)
+    assert lora_uses_shared_bases(critic)
+    assert lora_uses_shared_bases(critic_target)
+    assert engine.state.actor_anchor is None
+    assert engine.state.critic_anchor is None
+    assert outer_parameter_ids.isdisjoint(id(parameter) for parameter in actor.parameters())
+    assert outer_parameter_ids.isdisjoint(id(parameter) for parameter in critic.parameters())
+
+    for component, source in ((actor, outer._pi), (critic, outer._Qs)):
+        for path, adapter in component.named_modules():
+            if isinstance(adapter, (LoRALinear, LoRANormedLinear)):
+                assert adapter.base is source.get_submodule(path)
+
+    engine._clear_expired(t0=False, include_action=True)
+    with engine.rng.fork("initialization"):
+        engine._prepare_workspace(t0=False)
+    assert engine.state.actor is actor
+    assert engine.state.critic is critic
+    assert tuple(outer.state_dict()) == outer_keys
+    assert {
+        name: module.training for name, module in outer.named_modules()
+    } == outer_modes
+    assert all(parameter.requires_grad for parameter in outer._pi.parameters())
+    assert all(parameter.requires_grad for parameter in outer._Qs.parameters())
+
+
+@pytest.mark.parametrize("rebase", [False, True])
+def test_persistent_lora_shares_only_when_live_rebasing_preserves_semantics(rebase):
+    model = _model(
+        inner_actor_adaptation="lora",
+        inner_critic_adaptation="lora",
+        inner_actor_updates_per_action=0,
+        inner_critic_updates_per_action=0,
+        inner_actor_scope="run",
+        inner_critic_scope="run",
+        inner_actor_optimizer_scope="run",
+        inner_critic_optimizer_scope="run",
+        inner_rebase_persistent=rebase,
+    )
+    engine = model.agent.inner_engine
+    with engine.rng.fork("initialization"):
+        engine._prepare_workspace(t0=True)
+
+    assert lora_uses_shared_bases(engine.state.actor) is rebase
+    assert lora_uses_shared_bases(engine.state.critic) is rebase
+    assert lora_uses_shared_bases(engine.state.critic_target) is rebase
+    if rebase:
+        assert engine.state.actor_anchor is None
+        assert engine.state.critic_anchor is None
+    else:
+        assert engine.state.actor_anchor is not None
+        assert engine.state.critic_anchor is not None
+
+
+def test_shared_lora_outer_regularizer_cannot_accumulate_outer_gradients():
+    model = _model(
+        inner_actor_adaptation="lora",
+        inner_critic_adaptation="lora",
+        inner_outer_policy_kl_coef=0.3,
+    )
+    outer = model.agent.model
+    before = _clone_tree(outer.state_dict())
+    assert all(parameter.grad is None for parameter in outer.parameters())
+
+    model.agent.act(torch.zeros(3), collect_diagnostics=False)
+
+    assert all(parameter.grad is None for parameter in outer.parameters())
+    _assert_tree_equal(outer.state_dict(), before)

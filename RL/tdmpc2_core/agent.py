@@ -8,6 +8,7 @@ from .common.scale import RunningScale
 from .common.world_model import WorldModel
 from .common.layers import api_model_conversion
 from .common.device import resolve_device
+from .common.checkpoint import save_checkpoint
 try:
 	from tensordict import TensorDict
 except ImportError:  # tensordict<newer API compatibility
@@ -89,6 +90,13 @@ class TDMPC2(torch.nn.Module):
 		self._prev_mean.zero_()
 		self.last_plan_metrics = {}
 
+	def checkpoint_state(self):
+		"""Return the checkpoint-native state without copying live tensors."""
+		return {
+			"model": self.model.state_dict(),
+			"num_updates": self.num_updates,
+		}
+
 	def save(self, fp):
 		"""
 		Save state dict of the agent to filepath.
@@ -96,10 +104,7 @@ class TDMPC2(torch.nn.Module):
 		Args:
 			fp (str): Filepath to save state dict to.
 		"""
-		torch.save({
-			"model": self.model.state_dict(),
-			"num_updates": self.num_updates,
-		}, fp)
+		save_checkpoint(self.checkpoint_state(), fp)
 
 	def load(self, fp):
 		"""

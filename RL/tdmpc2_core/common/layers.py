@@ -1,7 +1,14 @@
+from collections import OrderedDict
+import warnings
+import weakref
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from collections import OrderedDict
+from torch.func import functional_call
+
+
+_DETACHED_PARAMETER_VIEWS = weakref.WeakKeyDictionary()
 
 
 class Ensemble(nn.Module):
@@ -17,6 +24,37 @@ class Ensemble(nn.Module):
 		super().__init__()
 		self.modules_list = nn.ModuleList(modules)
 		self._repr = str(modules[0])
+		self._compile_enabled = False
+		self._compile_strict = False
+		self._compile_failed = False
+		self._detached_compile_failed = False
+		# Compiled wrappers close over bound methods and therefore over ``self``.
+		# Keeping them in a global weak-key mapping would still root the key through
+		# the mapping's strong value. Runtime-only instance attributes form an
+		# ordinary collectable cycle and are reset across deepcopy/pickle.
+		self._compiled_forward = None
+		self._compiled_detached_forward = None
+
+	def __getstate__(self):
+		state = super().__getstate__()
+		state["_compiled_forward"] = None
+		state["_compiled_detached_forward"] = None
+		return state
+
+	def __setstate__(self, state):
+		super().__setstate__(state)
+		# Compiled callables are process- and object-identity-specific. Older
+		# checkpoints also do not contain these non-persistent runtime fields.
+		object.__setattr__(self, "_compiled_forward", None)
+		object.__setattr__(self, "_compiled_detached_forward", None)
+		for name, default in (
+			("_compile_enabled", False),
+			("_compile_strict", False),
+			("_compile_failed", False),
+			("_detached_compile_failed", False),
+		):
+			if not hasattr(self, name):
+				object.__setattr__(self, name, default)
 
 	def __len__(self):
 		return len(self.modules_list)
@@ -27,19 +65,202 @@ class Ensemble(nn.Module):
 	def __getitem__(self, idx):
 		return self.modules_list[idx]
 
-	def forward(self, *args, **kwargs):
+	def _apply(self, fn, recurse=True):
+		result = super()._apply(fn, recurse=recurse)
+		# Module._apply may replace Parameter objects or their backing storage.
+		# Recreate cached detached aliases before the next actor-gradient pass.
+		for module in self.modules_list:
+			_DETACHED_PARAMETER_VIEWS.pop(module, None)
+		return result
+
+	def _forward_eager(self, *args, **kwargs):
 		return torch.stack([m(*args, **kwargs) for m in self.modules_list], dim=0)
 
-	def forward_detached(self, *args, **kwargs):
-		"""Evaluate Qs with frozen Q parameters while preserving input gradients."""
-		requires_grad = [p.requires_grad for p in self.parameters()]
-		for p in self.parameters():
-			p.requires_grad_(False)
+	def enable_compile(self, *, strict=False):
+		"""Compile the fixed ensemble forward while retaining state-dict keys."""
+		strict = bool(strict)
+		if strict != self._compile_strict:
+			# Compiled wrappers encode the fullgraph policy used to create them.
+			# A deliberate mode change starts a fresh compile attempt, including
+			# after a sticky non-strict fallback.
+			object.__setattr__(self, "_compiled_forward", None)
+			object.__setattr__(self, "_compiled_detached_forward", None)
+			self._compile_failed = False
+			self._detached_compile_failed = False
+		self._compile_strict = strict
+		# A backend failure is sticky for this module. Re-enabling on every action
+		# would retry the same unsupported graph, repeat warnings, and recompile.
+		if self._compile_failed:
+			self._compile_enabled = False
+			return self
+		self._compile_enabled = hasattr(torch, "compile")
+		if not self._compile_enabled and self._compile_strict:
+			raise RuntimeError("torch.compile is unavailable in this PyTorch build.")
+		return self
+
+	@property
+	def compile_failed(self):
+		return self._compile_failed
+
+	def _rng_snapshot(self, args, kwargs):
+		"""Capture default and explicit RNGs relevant to one compiled call."""
+		cuda_devices = set()
+		generators = {}
+
+		def visit(value):
+			if torch.is_tensor(value):
+				if value.device.type == "cuda":
+					cuda_devices.add(
+						value.device.index
+						if value.device.index is not None
+						else torch.cuda.current_device()
+					)
+				return
+			if isinstance(value, torch.Generator):
+				generators[id(value)] = (value, value.get_state())
+				device = torch.device(value.device)
+				if device.type == "cuda":
+					cuda_devices.add(
+						device.index
+						if device.index is not None
+						else torch.cuda.current_device()
+					)
+				return
+			if isinstance(value, dict):
+				for item in value.values():
+					visit(item)
+			elif isinstance(value, (tuple, list)):
+				for item in value:
+					visit(item)
+
+		# Critic calls always carry tensor inputs on the critic device. Discovering
+		# devices from call arguments avoids walking the full parameter/buffer tree
+		# on every compiled invocation while retaining complete RNG rollback.
+		visit(args)
+		visit(kwargs)
+		cuda_states = {
+			device: torch.cuda.get_rng_state(device)
+			for device in cuda_devices
+		}
+		return torch.random.get_rng_state(), cuda_states, generators
+
+	@staticmethod
+	def _restore_rng_snapshot(snapshot):
+		cpu_state, cuda_states, generators = snapshot
+		torch.random.set_rng_state(cpu_state)
+		for device, state in cuda_states.items():
+			torch.cuda.set_rng_state(state, device)
+		for generator, state in generators.values():
+			generator.set_state(state)
+
+	def _disable_compilation(self, exc, *, detached):
+		# Compilation is sticky-disabled for this ensemble, so release both
+		# process-local wrappers immediately.
+		object.__setattr__(self, "_compiled_forward", None)
+		object.__setattr__(self, "_compiled_detached_forward", None)
+		self._compile_failed = True
+		if detached:
+			self._detached_compile_failed = True
+		self._compile_enabled = False
+		label = "detached critic ensemble" if detached else "critic ensemble"
+		warnings.warn(
+			f"Falling back to eager {label} after compile failure: {exc}",
+			RuntimeWarning,
+			stacklevel=3,
+		)
+
+	def forward(self, *args, **kwargs):
+		# A larger compiled region owns this Python ModuleList loop when Dynamo is
+		# already tracing. Starting a nested torch.compile here would graph-break
+		# (or fail in strict mode) and create a second compilation cache.
+		if not self._compile_enabled or (
+			hasattr(torch, "compiler")
+			and hasattr(torch.compiler, "is_compiling")
+			and torch.compiler.is_compiling()
+		):
+			return self._forward_eager(*args, **kwargs)
+		rng_snapshot = (
+			self._rng_snapshot(args, kwargs) if not self._compile_strict else None
+		)
+		compiled = self._compiled_forward
+		if compiled is None:
+			try:
+				compiled = torch.compile(
+					self._forward_eager,
+					fullgraph=self._compile_strict,
+					dynamic=False,
+				)
+			except Exception as exc:
+				if self._compile_strict:
+					raise
+				self._restore_rng_snapshot(rng_snapshot)
+				self._disable_compilation(exc, detached=False)
+				return self._forward_eager(*args, **kwargs)
+			object.__setattr__(self, "_compiled_forward", compiled)
 		try:
-			return self.forward(*args, **kwargs)
-		finally:
-			for p, req_grad in zip(self.parameters(), requires_grad):
-				p.requires_grad_(req_grad)
+			result = compiled(*args, **kwargs)
+		except Exception as exc:
+			if self._compile_strict:
+				raise
+			self._restore_rng_snapshot(rng_snapshot)
+			self._disable_compilation(exc, detached=False)
+			return self._forward_eager(*args, **kwargs)
+		return result
+
+	def _forward_detached_eager(self, *args, **kwargs):
+		"""Evaluate Qs with frozen Q parameters while preserving input gradients."""
+		outputs = []
+		for module in self.modules_list:
+			detached_parameters = _DETACHED_PARAMETER_VIEWS.get(module)
+			if detached_parameters is None:
+				detached_parameters = {
+					name: parameter.detach()
+					for name, parameter in module.named_parameters()
+				}
+				_DETACHED_PARAMETER_VIEWS[module] = detached_parameters
+			outputs.append(
+				functional_call(module, detached_parameters, args, kwargs)
+			)
+		return torch.stack(outputs, dim=0)
+
+	def forward_detached(self, *args, **kwargs):
+		if (
+			not self._compile_enabled
+			or self._detached_compile_failed
+			or (
+				hasattr(torch, "compiler")
+				and hasattr(torch.compiler, "is_compiling")
+				and torch.compiler.is_compiling()
+			)
+		):
+			return self._forward_detached_eager(*args, **kwargs)
+		rng_snapshot = (
+			self._rng_snapshot(args, kwargs) if not self._compile_strict else None
+		)
+		compiled = self._compiled_detached_forward
+		if compiled is None:
+			try:
+				compiled = torch.compile(
+					self._forward_detached_eager,
+					fullgraph=self._compile_strict,
+					dynamic=False,
+				)
+			except Exception as exc:
+				if self._compile_strict:
+					raise
+				self._restore_rng_snapshot(rng_snapshot)
+				self._disable_compilation(exc, detached=True)
+				return self._forward_detached_eager(*args, **kwargs)
+			object.__setattr__(self, "_compiled_detached_forward", compiled)
+		try:
+			result = compiled(*args, **kwargs)
+		except Exception as exc:
+			if self._compile_strict:
+				raise
+			self._restore_rng_snapshot(rng_snapshot)
+			self._disable_compilation(exc, detached=True)
+			return self._forward_detached_eager(*args, **kwargs)
+		return result
 
 	def __repr__(self):
 		return f'{len(self)}x ' + self._repr

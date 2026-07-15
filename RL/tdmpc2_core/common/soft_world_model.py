@@ -58,16 +58,21 @@ class SoftWorldModel(nn.Module):
         self.apply(init.weight_init)
         init.zero_([self._reward[-1].weight] + [q[-1].weight for q in self._Qs])
 
-        self.register_buffer("log_std_min", torch.tensor(float(cfg.log_std_min)))
+        self._log_std_min_value = float(cfg.log_std_min)
+        self._log_std_max_value = float(cfg.log_std_max)
+        self.register_buffer("log_std_min", torch.tensor(self._log_std_min_value))
         self.register_buffer(
             "log_std_dif",
-            torch.tensor(float(cfg.log_std_max) - float(cfg.log_std_min)),
+            torch.tensor(self._log_std_max_value - self._log_std_min_value),
         )
         self.init()
 
     def init(self):
         """Create a frozen EMA target critic."""
-        self._target_Qs = deepcopy(self._Qs)
+        if hasattr(self, "_target_Qs"):
+            self.soft_update_target_Q(tau=1.0)
+        else:
+            self._target_Qs = deepcopy(self._Qs)
         self._target_Qs.requires_grad_(False)
         self._target_Qs.train(False)
 
@@ -96,11 +101,31 @@ class SoftWorldModel(nn.Module):
     def total_params(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-    def to(self, *args, **kwargs):
-        super().to(*args, **kwargs)
-        # Rebuild targets from the now-moved online critic, matching WorldModel.
-        self.init()
-        return self
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        # Checkpoints retain the legacy buffers. Refresh the Python scalars once
+        # at load time so pi()/pi_action() never read a device scalar per call.
+        self._log_std_min_value = float(self.log_std_min.item())
+        self._log_std_max_value = self._log_std_min_value + float(
+            self.log_std_dif.item()
+        )
 
     def train(self, mode=True):
         super().train(mode)
@@ -110,25 +135,42 @@ class SoftWorldModel(nn.Module):
     @torch.no_grad()
     def soft_update_target_Q(self, tau=None):
         tau = float(self.cfg.tau if tau is None else tau)
-        for target_param, param in zip(self._target_Qs.parameters(), self._Qs.parameters()):
-            target_param.data.lerp_(param.data, tau)
+        target_parameters = tuple(self._target_Qs.parameters())
+        online_parameters = tuple(self._Qs.parameters())
+        if tau == 1.0:
+            torch._foreach_copy_(target_parameters, online_parameters)
+        elif tau != 0.0:
+            torch._foreach_lerp_(target_parameters, online_parameters, tau)
         for target_buffer, buffer in zip(self._target_Qs.buffers(), self._Qs.buffers()):
-            target_buffer.data.copy_(buffer.data)
+            target_buffer.copy_(buffer)
 
     def encode(self, obs, task=None):
         if task is not None:
             raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
         return self._encoder[self.cfg.obs](obs)
 
+    @staticmethod
+    def joint_input(z, a):
+        """Pack a latent/action pair once for all transition and value heads."""
+        return torch.cat((z, a), dim=-1)
+
+    def next_from_joint(self, joint):
+        """Predict the next latent from a prepacked latent/action tensor."""
+        return self._dynamics(joint)
+
+    def reward_from_joint(self, joint):
+        """Predict reward logits from a prepacked latent/action tensor."""
+        return self._reward(joint)
+
     def next(self, z, a, task=None):
         if task is not None:
             raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
-        return self._dynamics(torch.cat([z, a], dim=-1))
+        return self.next_from_joint(self.joint_input(z, a))
 
     def reward(self, z, a, task=None):
         if task is not None:
             raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
-        return self._reward(torch.cat([z, a], dim=-1))
+        return self.reward_from_joint(self.joint_input(z, a))
 
     def termination(self, z, task=None, unnormalized=False):
         if task is not None:
@@ -138,7 +180,7 @@ class SoftWorldModel(nn.Module):
         logits = self._termination(z)
         return logits if unnormalized else torch.sigmoid(logits)
 
-    def pi(
+    def _policy_sample(
         self,
         z,
         task=None,
@@ -146,11 +188,12 @@ class SoftWorldModel(nn.Module):
         policy=None,
         deterministic=False,
         generator=None,
+        noise=None,
         std_scale=1.0,
         log_std_min=None,
         log_std_max=None,
     ):
-        """Sample a tanh-squashed action and return its corrected log-probability."""
+        """Return policy parameters and one isolated standard-normal sample."""
         if task is not None:
             raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
         policy = self._pi if policy is None else policy
@@ -165,12 +208,12 @@ class SoftWorldModel(nn.Module):
         # SAC's [-20, 2] bounds that would initialize near log_std=-9 and almost
         # eliminate exploration.
         lower_bound = (
-            float(self.log_std_min.item())
+            self._log_std_min_value
             if log_std_min is None
             else float(log_std_min)
         )
         upper_bound = (
-            float((self.log_std_min + self.log_std_dif).item())
+            self._log_std_max_value
             if log_std_max is None
             else float(log_std_max)
         )
@@ -185,8 +228,17 @@ class SoftWorldModel(nn.Module):
         if std_scale != 1.0:
             log_std = log_std + torch.log(log_std.new_tensor(std_scale))
 
+        if noise is not None and generator is not None:
+            raise ValueError("Specify either policy noise or a generator, not both.")
+        if noise is not None and noise.shape != mean_raw.shape:
+            raise ValueError(
+                "Policy noise must match the action-parameter shape, "
+                f"got {tuple(noise.shape)} != {tuple(mean_raw.shape)}."
+            )
         if deterministic:
             eps = torch.zeros_like(mean_raw)
+        elif noise is not None:
+            eps = noise.to(device=mean_raw.device, dtype=mean_raw.dtype)
         elif generator is None:
             eps = torch.randn_like(mean_raw)
         else:
@@ -196,6 +248,60 @@ class SoftWorldModel(nn.Module):
                 device=mean_raw.device,
                 generator=generator,
             )
+        return mean_raw, log_std, eps
+
+    def pi_action(
+        self,
+        z,
+        task=None,
+        *,
+        policy=None,
+        deterministic=False,
+        generator=None,
+        noise=None,
+        std_scale=1.0,
+        log_std_min=None,
+        log_std_max=None,
+    ):
+        """Sample only an action, omitting policy statistics and log-probability."""
+        mean_raw, log_std, eps = self._policy_sample(
+            z,
+            task,
+            policy=policy,
+            deterministic=deterministic,
+            generator=generator,
+            noise=noise,
+            std_scale=std_scale,
+            log_std_min=log_std_min,
+            log_std_max=log_std_max,
+        )
+        return torch.tanh(mean_raw + eps * log_std.exp())
+
+    def pi(
+        self,
+        z,
+        task=None,
+        *,
+        policy=None,
+        deterministic=False,
+        generator=None,
+        noise=None,
+        std_scale=1.0,
+        log_std_min=None,
+        log_std_max=None,
+    ):
+        """Sample a tanh-squashed action and return its corrected log-probability."""
+        mean_raw, log_std, eps = self._policy_sample(
+            z,
+            task,
+            policy=policy,
+            deterministic=deterministic,
+            generator=generator,
+            noise=noise,
+            std_scale=std_scale,
+            log_std_min=log_std_min,
+            log_std_max=log_std_max,
+        )
         log_prob = math.gaussian_logprob(eps, log_std)
 
         pre_tanh_action = mean_raw + eps * log_std.exp()
@@ -234,7 +340,25 @@ class SoftWorldModel(nn.Module):
         if target and (detach or qs is not None):
             raise ValueError("target=True cannot be combined with detach=True or an explicit critic.")
 
-        q_input = torch.cat([z, a], dim=-1)
+        q_input = self.joint_input(z, a)
+        return self.q_predictions_from_joint(
+            q_input,
+            target=target,
+            detach=detach,
+            qs=qs,
+        )
+
+    def q_predictions_from_joint(
+        self,
+        q_input,
+        *,
+        target=False,
+        detach=False,
+        qs=None,
+    ):
+        """Run critics on an already packed latent/action tensor."""
+        if target and (detach or qs is not None):
+            raise ValueError("target=True cannot be combined with detach=True or an explicit critic.")
         if qs is not None:
             out = qs.forward_detached(q_input) if detach else qs(q_input)
         elif target:
@@ -274,6 +398,7 @@ class SoftWorldModel(nn.Module):
         qs=None,
         pair_indices=None,
         generator=None,
+        trusted_pair_indices=False,
     ):
         """Evaluate critics and return decoded scalar Q-values.
 
@@ -297,4 +422,5 @@ class SoftWorldModel(nn.Module):
             reduction,
             pair_indices=pair_indices,
             generator=generator,
+            trusted_pair_indices=trusted_pair_indices,
         )

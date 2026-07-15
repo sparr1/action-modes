@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 
 from .common import math as td_math
+from .common.compile_regions import CompileRegion
+from .common.checkpoint import save_checkpoint
 from .common.device import resolve_device
 from .common.layers import api_model_conversion
 from .common.soft_world_model import SoftWorldModel
@@ -26,13 +28,26 @@ class AMBITDMPC2Agent(torch.nn.Module):
             raise NotImplementedError(
                 "AMBI inner-loop RNG isolation currently supports CPU and CUDA devices only."
             )
-        if getattr(cfg, "compile", False):
-            raise ValueError(
-                "AMBI-TD-MPC2 does not support compile=True because inner workspaces "
-                "are created according to configurable lifecycles."
-            )
-
         self.model = SoftWorldModel(cfg).to(self.device)
+        if bool(getattr(cfg, "compile", False)):
+            strict = bool(getattr(cfg, "compile_strict", False))
+            self.model._Qs.enable_compile(strict=strict)
+            self.model._target_Qs.enable_compile(strict=strict)
+        self._outer_update_region = CompileRegion(
+            "outer update",
+            self._outer_update_kernel,
+            enabled=bool(getattr(cfg, "compile", False)),
+            strict=bool(getattr(cfg, "compile_strict", False)),
+        )
+        rho_base = torch.tensor(float(cfg.rho), device=self.device)
+        self.register_buffer(
+            "_rho_weights",
+            torch.pow(
+                rho_base,
+                torch.arange(int(cfg.horizon) + 1, device=self.device),
+            ),
+            persistent=False,
+        )
         self._world_critic_params = (
             list(self.model._encoder.parameters())
             + list(self.model._dynamics.parameters())
@@ -59,12 +74,14 @@ class AMBITDMPC2Agent(torch.nn.Module):
             lr=float(cfg.lr),
             eps=float(getattr(cfg, "adam_eps", 1e-8)),
             capturable=self.device.type == "cuda",
+            foreach=self.device.type == "cuda",
         )
         self.pi_optim = torch.optim.Adam(
             self.model._pi.parameters(),
             lr=float(getattr(cfg, "actor_lr", cfg.lr)),
             eps=float(getattr(cfg, "adam_eps", 1e-8)),
             capturable=self.device.type == "cuda",
+            foreach=self.device.type == "cuda",
         )
 
         self.target_entropy = self._target_entropy(
@@ -87,6 +104,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 lr=float(getattr(cfg, "ent_coef_lr", getattr(cfg, "actor_lr", cfg.lr))),
                 eps=float(getattr(cfg, "adam_eps", 1e-8)),
                 capturable=self.device.type == "cuda",
+                foreach=self.device.type == "cuda",
             )
             self.register_buffer(
                 "fixed_ent_coef", torch.tensor(float("nan"), device=self.device)
@@ -134,7 +152,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self.last_inner_rollout_lengths = []
         self.inner_engine.reset_episode()
 
-    def save(self, fp):
+    def checkpoint_state(self):
+        """Return the version-2 checkpoint structure over live outer state."""
         state = {
             "checkpoint_version": 2,
             "critic_spec": self.model.critic_signature,
@@ -153,11 +172,14 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "outer_version": self.outer_version,
         }
         if self.log_ent_coef is not None:
-            state["log_ent_coef"] = self.log_ent_coef.detach().cpu()
+            state["log_ent_coef"] = self.log_ent_coef.detach()
             state["ent_coef_optim"] = self.ent_coef_optim.state_dict()
         else:
-            state["fixed_ent_coef"] = self.fixed_ent_coef.detach().cpu()
-        torch.save(state, fp)
+            state["fixed_ent_coef"] = self.fixed_ent_coef.detach()
+        return state
+
+    def save(self, fp):
+        save_checkpoint(self.checkpoint_state(), fp)
 
     @staticmethod
     def _optimizer_layout(optimizer_state):
@@ -279,7 +301,50 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self.model.eval()
         return self
 
-    def act(self, obs, t0=False, eval_mode=False, task=None):
+    @staticmethod
+    def _materialize_action_metrics(action, metrics, rollout_lengths):
+        """Copy action, scalar metrics, and lengths to the host together."""
+        tensor_items = [
+            (key, value)
+            for key, value in metrics.items()
+            if torch.is_tensor(value)
+        ]
+        pieces = [action.reshape(-1)]
+        pieces.extend(
+            value.detach().to(device=action.device, dtype=action.dtype).reshape(1)
+            for _, value in tensor_items
+        )
+        tensor_lengths = (
+            rollout_lengths.detach().reshape(-1)
+            if torch.is_tensor(rollout_lengths)
+            else None
+        )
+        if tensor_lengths is not None:
+            pieces.append(
+                tensor_lengths.to(device=action.device, dtype=action.dtype)
+            )
+        packed = torch.cat(pieces).detach().cpu()
+        action_size = int(action.numel())
+        cpu_action = packed[:action_size].reshape(action.shape)
+        materialized = dict(metrics)
+        for offset, (key, _) in enumerate(tensor_items, start=action_size):
+            materialized[key] = float(packed[offset])
+        if tensor_lengths is not None:
+            lengths_start = action_size + len(tensor_items)
+            rollout_lengths = [
+                int(value) for value in packed[lengths_start:].tolist()
+            ]
+        return cpu_action, materialized, rollout_lengths
+
+    def act(
+        self,
+        obs,
+        t0=False,
+        eval_mode=False,
+        task=None,
+        *,
+        collect_diagnostics=True,
+    ):
         if task is not None:
             raise ValueError("AMBI-TD-MPC2 currently supports single-task training only.")
         obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
@@ -289,13 +354,20 @@ class AMBITDMPC2Agent(torch.nn.Module):
             with torch.no_grad():
                 root_z = self.model.encode(obs).detach()
             action, metrics, lengths = self.inner_engine.act(
-                root_z, t0=t0, eval_mode=eval_mode
+                root_z,
+                t0=t0,
+                eval_mode=eval_mode,
+                collect_diagnostics=collect_diagnostics,
             )
         finally:
             self.model.train(was_training)
+        action, metrics, lengths = self._materialize_action_metrics(
+            action, metrics, lengths
+        )
+        metrics = self.inner_engine.finalize_timing_metrics(metrics)
         self.last_inner_metrics = metrics
         self.last_inner_rollout_lengths = lengths
-        return action.cpu()
+        return action
 
     def _make_inner_modules(self):
         """Compatibility hook used by existing target-sync/isolation tests."""
@@ -336,14 +408,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
             reduction=self.cfg.outer_q_actor_reduction,
             detach=True,
         )
-        rho = torch.pow(
-            torch.tensor(float(self.cfg.rho), device=self.device),
-            torch.arange(zs.shape[0], device=self.device),
-        )
         actor_per_time = (alpha * policy_info["log_prob"] - q_policy).mean(
             dim=(1, 2)
         )
-        actor_loss = (actor_per_time * rho).mean()
+        actor_loss = (actor_per_time * self._rho_weights[: zs.shape[0]]).mean()
 
         self.pi_optim.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -360,14 +428,17 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "ent_coef_loss": entropy_coefficient_loss.detach(),
         }
 
-    def _update(self, obs, action, reward, terminated):
-        """One TD-MPC2-style model update with backend-neutral soft-Q regression."""
-        with torch.no_grad():
-            next_z_targets = self.model.encode(obs[1:])
-            td_targets = self._soft_td_target(next_z_targets, reward, terminated)
-
-        self.model.train()
-        z = self.model.encode(obs[0])
+    def _outer_update_kernel(
+        self,
+        initial_obs,
+        action,
+        reward,
+        terminated,
+        next_z_targets,
+        td_targets,
+    ):
+        """Pure fixed-horizon world/critic loss region."""
+        z = self.model.encode(initial_obs)
         latent_states = [z]
         consistency_loss = torch.zeros((), device=self.device)
         for time_index, (recorded_action, next_z_target) in enumerate(
@@ -381,24 +452,30 @@ class AMBITDMPC2Agent(torch.nn.Module):
         latent_states = torch.stack(latent_states, dim=0)
 
         rollout_states = latent_states[:-1]
-        reward_predictions = self.model.reward(rollout_states, action)
-        q_predictions = self.model.q_predictions(rollout_states, action)
+        rollout_joint = self.model.joint_input(rollout_states, action)
+        reward_predictions = self.model.reward_from_joint(rollout_joint)
+        q_predictions = self.model.q_predictions_from_joint(rollout_joint)
         termination_prediction = (
             self.model.termination(latent_states[1:], unnormalized=True)
             if self.cfg.episodic
             else None
         )
 
-        reward_loss = torch.zeros((), device=self.device)
-        critic_loss = torch.zeros((), device=self.device)
-        for time_index in range(self.cfg.horizon):
-            weight = self.cfg.rho**time_index
-            reward_loss = reward_loss + td_math.soft_ce(
-                reward_predictions[time_index], reward[time_index], self.cfg
-            ).mean() * weight
-            critic_loss = critic_loss + self.model.critic_loss(
-                q_predictions[:, time_index], td_targets[time_index]
-            ) * weight
+        horizon_weights = self._rho_weights[: int(self.cfg.horizon)]
+        reward_per_sample = td_math.soft_ce(
+            reward_predictions, reward, self.cfg
+        )
+        reward_per_time = reward_per_sample.mean(
+            dim=tuple(range(1, reward_per_sample.ndim))
+        )
+        reward_loss = (reward_per_time * horizon_weights).sum()
+        critic_per_sample = self.model.critic_loss(
+            q_predictions, td_targets, reduction="none"
+        )
+        critic_per_time = critic_per_sample.mean(
+            dim=(0,) + tuple(range(2, critic_per_sample.ndim))
+        )
+        critic_loss = (critic_per_time * horizon_weights).sum()
 
         consistency_loss = consistency_loss / self.cfg.horizon
         reward_loss = reward_loss / self.cfg.horizon
@@ -415,6 +492,43 @@ class AMBITDMPC2Agent(torch.nn.Module):
             + self.cfg.termination_coef * termination_loss
             + self.cfg.critic_coef * critic_loss
         )
+        return (
+            latent_states,
+            reward_predictions,
+            q_predictions,
+            termination_prediction,
+            consistency_loss,
+            reward_loss,
+            critic_loss,
+            termination_loss,
+            total_loss,
+        )
+
+    def _update(self, obs, action, reward, terminated):
+        """One TD-MPC2-style model update with backend-neutral soft-Q regression."""
+        with torch.no_grad():
+            next_z_targets = self.model.encode(obs[1:])
+            td_targets = self._soft_td_target(next_z_targets, reward, terminated)
+
+        self.model.train()
+        (
+            latent_states,
+            reward_predictions,
+            q_predictions,
+            termination_prediction,
+            consistency_loss,
+            reward_loss,
+            critic_loss,
+            termination_loss,
+            total_loss,
+        ) = self._outer_update_region(
+            obs[0],
+            action,
+            reward,
+            terminated,
+            next_z_targets,
+            td_targets,
+        )
 
         self.optim.zero_grad(set_to_none=True)
         total_loss.backward()
@@ -422,7 +536,6 @@ class AMBITDMPC2Agent(torch.nn.Module):
             self._world_critic_params, float(self.cfg.grad_clip_norm)
         )
         self.optim.step()
-        self.optim.zero_grad(set_to_none=True)
 
         actor_info = self._update_actor(latent_states.detach())
         if self.num_updates % int(self.cfg.target_update_interval) == 0:
@@ -460,7 +573,15 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "reward_pred_mean": reward_values.mean(),
             "reward_target_mean": reward.detach().mean(),
             "reward_abs_mean": reward.detach().abs().mean(),
-            "num_updates": torch.tensor(float(self.num_updates), device=self.device),
+            "num_updates": float(self.num_updates),
+            "compile_fallback": float(
+                self.model._Qs.compile_failed
+                or self.model._target_Qs.compile_failed
+                or self._outer_update_region.failed
+            ),
+            "compile_outer_update_fallback": float(
+                self._outer_update_region.failed
+            ),
         }
         if self.cfg.episodic:
             info.update(
@@ -479,7 +600,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 "AMBI-TD-MPC2 currently supports single-task training only."
             )
         if (
-            self.device.type == "cuda"
+            bool(getattr(self.cfg, "compile", False))
+            and self.device.type == "cuda"
             and hasattr(torch, "compiler")
             and hasattr(torch.compiler, "cudagraph_mark_step_begin")
         ):

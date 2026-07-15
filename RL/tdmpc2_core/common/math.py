@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import torch
 import torch.nn.functional as F
 try:
@@ -8,9 +10,16 @@ except ImportError:  # tensordict<newer API compatibility
 
 def soft_ce(pred, target, cfg):
 	"""Computes the cross entropy loss between predictions and soft targets."""
-	pred = F.log_softmax(pred, dim=-1)
-	target = two_hot(target, cfg)
-	return -(target * pred).sum(-1, keepdim=True)
+	log_probabilities = F.log_softmax(pred, dim=-1)
+	if cfg.num_bins <= 1:
+		target = two_hot(target, cfg)
+		return -(target * log_probabilities).sum(-1, keepdim=True)
+
+	lower, upper, lower_weight, upper_weight = _two_hot_bin_weights(target, cfg)
+	return -(
+		lower_weight * log_probabilities.gather(-1, lower)
+		+ upper_weight * log_probabilities.gather(-1, upper)
+	)
 
 
 def log_std(x, low, dif):
@@ -59,29 +68,58 @@ def symexp(x):
 	return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
 
 
+def _two_hot_bin_weights(x, cfg):
+	"""Return the two occupied discrete-regression bins and their weights."""
+	x = torch.clamp(symlog(x), cfg.vmin, cfg.vmax)
+	position = (x - cfg.vmin) / cfg.bin_size
+	lower = torch.floor(position)
+	upper_weight = position - lower
+	lower = lower.long()
+	upper = (lower + 1) % cfg.num_bins
+	return lower, upper, 1 - upper_weight, upper_weight
+
+
+@lru_cache(maxsize=64)
+def _cached_categorical_support(vmin, vmax, num_bins, device, dtype):
+	"""Build one immutable categorical support per value/device/dtype tuple."""
+	return torch.linspace(vmin, vmax, num_bins, device=device, dtype=dtype)
+
+
+def categorical_support(reference, cfg):
+	"""Return the cached reward support outside compiled tensor regions."""
+	if cfg.num_bins <= 1:
+		return reference.new_empty(0)
+	return _cached_categorical_support(
+		float(cfg.vmin),
+		float(cfg.vmax),
+		int(cfg.num_bins),
+		reference.device,
+		reference.dtype,
+	)
+
+
 def two_hot(x, cfg):
 	"""Converts a batch of scalars to soft two-hot encoded targets for discrete regression."""
 	if cfg.num_bins == 0:
 		return x
 	elif cfg.num_bins == 1:
 		return symlog(x)
-	x = torch.clamp(symlog(x), cfg.vmin, cfg.vmax).squeeze(1)
-	bin_idx = torch.floor((x - cfg.vmin) / cfg.bin_size)
-	bin_offset = ((x - cfg.vmin) / cfg.bin_size - bin_idx).unsqueeze(-1)
-	soft_two_hot = torch.zeros(x.shape[0], cfg.num_bins, device=x.device, dtype=x.dtype)
-	bin_idx = bin_idx.long()
-	soft_two_hot = soft_two_hot.scatter(1, bin_idx.unsqueeze(1), 1 - bin_offset)
-	soft_two_hot = soft_two_hot.scatter(1, (bin_idx.unsqueeze(1) + 1) % cfg.num_bins, bin_offset)
+	lower, upper, lower_weight, upper_weight = _two_hot_bin_weights(x, cfg)
+	soft_two_hot = torch.zeros(
+		*x.shape[:-1], cfg.num_bins, device=x.device, dtype=x.dtype
+	)
+	soft_two_hot.scatter_add_(-1, lower, lower_weight)
+	soft_two_hot.scatter_add_(-1, upper, upper_weight)
 	return soft_two_hot
 
 
-def two_hot_inv(x, cfg):
+def two_hot_inv(x, cfg, support=None):
 	"""Converts a batch of soft two-hot encoded vectors to scalars."""
 	if cfg.num_bins == 0:
 		return x
 	elif cfg.num_bins == 1:
 		return symexp(x)
-	dreg_bins = torch.linspace(cfg.vmin, cfg.vmax, cfg.num_bins, device=x.device, dtype=x.dtype)
+	dreg_bins = categorical_support(x, cfg) if support is None else support
 	x = F.softmax(x, dim=-1)
 	x = torch.sum(x * dreg_bins, dim=-1, keepdim=True)
 	return symexp(x)

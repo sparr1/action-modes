@@ -40,6 +40,45 @@ class ConstantEpisodeEnv(gym.Env):
         return np.zeros(3, dtype=np.float32), 1.0, False, truncated, info
 
 
+class VaryingRewardComponentsEnv(ConstantEpisodeEnv):
+    def step(self, action):
+        obs, reward, terminated, truncated, _info = super().step(action)
+        value = float(self.total_steps)
+        info = {
+            "reward_forward": value,
+            "reward_info": {"control cost": -value},
+        }
+        return obs, reward, terminated, truncated, info
+
+
+class ReservedRewardComponentEnv(ConstantEpisodeEnv):
+    def step(self, action):
+        obs, reward, terminated, truncated, _info = super().step(action)
+        return obs, reward, terminated, truncated, {
+            "reward_mean": float(self.total_steps),
+        }
+
+
+class OverlappingRewardComponentsEnv(ConstantEpisodeEnv):
+    def step(self, action):
+        obs, reward, terminated, truncated, _info = super().step(action)
+        value = float(self.total_steps)
+        return obs, reward, terminated, truncated, {
+            "reward_forward": value,
+            "reward_forward_mean": 10.0 * value,
+        }
+
+
+class StaggeredOverlappingRewardComponentsEnv(ConstantEpisodeEnv):
+    def step(self, action):
+        obs, reward, terminated, truncated, _info = super().step(action)
+        value = float(self.total_steps)
+        info = {"reward_forward_mean": 10.0 * value}
+        if self.total_steps > 1:
+            info["reward_forward"] = value
+        return obs, reward, terminated, truncated, info
+
+
 class FakeRun:
     def __init__(self):
         self.history = defaultdict(dict)
@@ -210,6 +249,154 @@ def test_tdmpc_terminal_payload_precedes_reset_and_pretrain_is_averaged(monkeypa
     assert payload["episode/return"] == 3.0
     assert payload["episode/len"] == 3
     assert finished == [run]
+
+
+def test_tdmpc_metric_window_crosses_episode_boundaries_until_cadence(monkeypatch):
+    td_module = importlib.import_module("RL.TDMPC2")
+    run, _finished = _install_fake_wandb(monkeypatch, td_module)
+    model = TDMPC2Baseline(
+        "TDMPC2Baseline",
+        ConstantEpisodeEnv(episode_length=2),
+        _tiny_td_params(
+            seed_steps=0,
+            pretrain_steps=1,
+            utd=1,
+            wandb_step_every=5,
+        ),
+        {"seed": 3, "device": "cpu", "env": "constant", "total_steps": 5},
+        {},
+    )
+    values = iter((1.0, 2.0, 3.0, 4.0))
+    model.agent.update = lambda _buffer: {"total_loss": next(values)}
+
+    model.learn(total_timesteps=5)
+
+    assert set(run.history) == {2, 4, 5}
+    assert run.history[2]["episode/return"] == 2.0
+    assert run.history[4]["episode/return"] == 2.0
+    assert "train/total_loss" not in run.history[2]
+    assert "train/total_loss" not in run.history[4]
+    payload = run.history[5]
+    assert payload["train/total_loss"] == pytest.approx(2.5)
+    assert payload["train/total_loss_count"] == 4.0
+    assert payload["train/total_loss_min"] == 1.0
+    assert payload["train/total_loss_max"] == 4.0
+
+
+def test_tdmpc_reward_components_pool_over_the_logging_window(monkeypatch):
+    td_module = importlib.import_module("RL.TDMPC2")
+    run, _finished = _install_fake_wandb(monkeypatch, td_module)
+    model = TDMPC2Baseline(
+        "TDMPC2Baseline",
+        VaryingRewardComponentsEnv(episode_length=10),
+        _tiny_td_params(seed_steps=100, wandb_step_every=10),
+        {"seed": 3, "device": "cpu", "env": "varying", "total_steps": 4},
+        {},
+    )
+
+    model.learn(total_timesteps=4)
+
+    payload = run.history[4]
+    assert payload["rollout/reward_forward"] == pytest.approx(2.5)
+    assert payload["rollout/reward_forward_count"] == 4.0
+    assert payload["rollout/reward_forward_mean"] == pytest.approx(2.5)
+    assert payload["rollout/reward_forward_std"] == pytest.approx(np.sqrt(1.25))
+    assert payload["rollout/reward_forward_min"] == 1.0
+    assert payload["rollout/reward_forward_max"] == 4.0
+    assert payload["rollout/reward_control_cost"] == pytest.approx(-2.5)
+    assert payload["rollout/reward_control_cost_count"] == 4.0
+    assert payload["rollout/reward_control_cost_min"] == -4.0
+    assert payload["rollout/reward_control_cost_max"] == -1.0
+
+
+def test_tdmpc_episode_events_do_not_mix_raw_and_windowed_reward_components(
+    monkeypatch,
+):
+    td_module = importlib.import_module("RL.TDMPC2")
+    run, _finished = _install_fake_wandb(monkeypatch, td_module)
+    model = TDMPC2Baseline(
+        "TDMPC2Baseline",
+        VaryingRewardComponentsEnv(episode_length=2),
+        _tiny_td_params(seed_steps=100, wandb_step_every=5),
+        {"seed": 3, "device": "cpu", "env": "varying", "total_steps": 5},
+        {},
+    )
+
+    model.learn(total_timesteps=5)
+
+    assert "rollout/reward_forward" not in run.history[2]
+    assert "rollout/reward_forward" not in run.history[4]
+    assert run.history[5]["rollout/reward_forward"] == pytest.approx(3.0)
+    assert run.history[5]["rollout/reward_forward_count"] == 5.0
+
+
+def test_tdmpc_reward_component_colliding_with_total_stats_is_aliased(monkeypatch):
+    td_module = importlib.import_module("RL.TDMPC2")
+    run, _finished = _install_fake_wandb(monkeypatch, td_module)
+    model = TDMPC2Baseline(
+        "TDMPC2Baseline",
+        ReservedRewardComponentEnv(episode_length=10),
+        _tiny_td_params(seed_steps=100, wandb_step_every=10),
+        {"seed": 3, "device": "cpu", "env": "reserved", "total_steps": 4},
+        {},
+    )
+
+    model.learn(total_timesteps=4)
+
+    payload = run.history[4]
+    assert payload["rollout/reward_mean"] == pytest.approx(1.0)
+    assert payload["rollout/reward_mean_component"] == pytest.approx(2.5)
+    assert payload["rollout/reward_mean_component_count"] == 4.0
+    assert payload["rollout/reward_mean_component_mean"] == pytest.approx(2.5)
+
+
+def test_tdmpc_overlapping_component_families_keep_one_persistent_alias(monkeypatch):
+    td_module = importlib.import_module("RL.TDMPC2")
+    run, _finished = _install_fake_wandb(monkeypatch, td_module)
+    model = TDMPC2Baseline(
+        "TDMPC2Baseline",
+        OverlappingRewardComponentsEnv(episode_length=10),
+        _tiny_td_params(seed_steps=100, wandb_step_every=2),
+        {"seed": 3, "device": "cpu", "env": "overlap", "total_steps": 4},
+        {},
+    )
+
+    model.learn(total_timesteps=4)
+
+    first, second = run.history[2], run.history[4]
+    assert first["rollout/reward_forward"] == pytest.approx(1.5)
+    assert first["rollout/reward_forward_mean"] == pytest.approx(1.5)
+    assert first["rollout/reward_forward_mean_component"] == pytest.approx(15.0)
+    assert first["rollout/reward_forward_mean_component_mean"] == pytest.approx(15.0)
+    assert second["rollout/reward_forward"] == pytest.approx(3.5)
+    assert second["rollout/reward_forward_mean"] == pytest.approx(3.5)
+    assert second["rollout/reward_forward_mean_component"] == pytest.approx(35.0)
+    assert second["rollout/reward_forward_mean_component_mean"] == pytest.approx(35.0)
+    assert model._reward_component_aliases["rollout/reward_forward_mean"] == (
+        "rollout/reward_forward_mean_component"
+    )
+
+
+def test_tdmpc_component_aliases_do_not_depend_on_first_seen_order(monkeypatch):
+    td_module = importlib.import_module("RL.TDMPC2")
+    run, _finished = _install_fake_wandb(monkeypatch, td_module)
+    model = TDMPC2Baseline(
+        "TDMPC2Baseline",
+        StaggeredOverlappingRewardComponentsEnv(episode_length=10),
+        _tiny_td_params(seed_steps=100, wandb_step_every=2),
+        {"seed": 3, "device": "cpu", "env": "staggered", "total_steps": 2},
+        {},
+    )
+
+    model.learn(total_timesteps=2)
+
+    payload = run.history[2]
+    assert payload["rollout/reward_forward"] == pytest.approx(2.0)
+    assert payload["rollout/reward_forward_mean_component"] == pytest.approx(15.0)
+    assert model._reward_component_aliases == {
+        "rollout/reward_forward": "rollout/reward_forward",
+        "rollout/reward_forward_mean": "rollout/reward_forward_mean_component",
+    }
 
 
 def test_ambi_inner_metrics_survive_matching_episode_and_wandb_boundaries(monkeypatch):

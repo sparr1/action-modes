@@ -75,6 +75,7 @@ def test_mppi_supports_both_q_backends_without_mutating_model_or_global_rng(
         generator=torch.Generator().manual_seed(17),
         t0=True,
         eval_mode=True,
+        materialize_metrics=False,
     )
 
     assert result.action.shape == (model.cfg.action_dim,)
@@ -82,6 +83,8 @@ def test_mppi_supports_both_q_backends_without_mutating_model_or_global_rng(
     torch.testing.assert_close(result.action, result.next_mean[0].clamp(-1.0, 1.0))
     assert result.model_steps == 1 * (2 - 1) + 2 * 6 * 2
     assert result.metrics["planner_model_steps"] == result.model_steps
+    assert torch.is_tensor(result.metrics["planner_value_mean"])
+    assert result.metrics["planner_value_mean"].device == root_z.device
     assert all(
         torch.isfinite(torch.as_tensor(value))
         for value in result.metrics.values()

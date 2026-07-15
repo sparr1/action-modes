@@ -42,6 +42,7 @@ _AMBI_DEFAULTS = {
     "target_entropy": "auto",
     "tau": 0.005,
     "target_update_interval": 1,
+    "compile_strict": False,
 
     # Inner operator and explicit model/optimizer compute budgets. ``None`` for
     # the model budget preserves AMBI's historical 32 rollouts per round.
@@ -124,6 +125,7 @@ _AMBI_DEFAULTS = {
     # Diagnostics-only paired model rollouts; excluded from the optimization
     # model-step budget. Zero preserves legacy runtime.
     "inner_diagnostic_rollouts": 0,
+    "inner_diagnostics_every": 1,
 }
 
 
@@ -697,6 +699,10 @@ class AMBITDMPC2(TDMPC2Baseline):
         cfg.inner_diagnostic_rollouts = int(cfg.inner_diagnostic_rollouts)
         if cfg.inner_diagnostic_rollouts < 0:
             raise ValueError("inner_diagnostic_rollouts must be non-negative.")
+        cfg.inner_diagnostics_every = int(cfg.inner_diagnostics_every)
+        if cfg.inner_diagnostics_every <= 0:
+            raise ValueError("inner_diagnostics_every must be positive.")
+        cfg.compile_strict = bool(cfg.compile_strict)
 
         cfg.inner_termination_threshold = _finite_float(
             cfg.inner_termination_threshold, "inner_termination_threshold"
@@ -789,6 +795,55 @@ class AMBITDMPC2(TDMPC2Baseline):
     def _make_agent(self, cfg):
         return AMBITDMPC2Agent(cfg)
 
+    def _act_agent(self, obs_t, *, t0, eval_mode):
+        # W&B records the resulting environment step, while action selection
+        # happens immediately before that step.
+        sampling_step = int(self._global_step) + 1
+        collect_diagnostics = (
+            sampling_step % int(self.cfg.inner_diagnostics_every) == 0
+        )
+        action = self.agent.act(
+            obs_t,
+            t0=t0,
+            eval_mode=eval_mode,
+            collect_diagnostics=collect_diagnostics,
+        )
+        # The engine's action index is useful to direct callers, but training
+        # telemetry must use the real environment step (including seed/random
+        # actions) that researchers see on the W&B x-axis.
+        if collect_diagnostics and "inner_diagnostics_step" in self.agent.last_inner_metrics:
+            self.agent.last_inner_metrics["inner_diagnostics_step"] = float(
+                sampling_step
+            )
+        return action
+
+    def predict(
+        self,
+        observation,
+        deterministic=True,
+        episode_start=None,
+        *,
+        collect_diagnostics=True,
+    ):
+        """Select a direct-call action with full diagnostics by default.
+
+        Training uses ``inner_diagnostics_every`` through ``_act_agent``;
+        callers of the public prediction API keep the complete historical
+        metric contract unless they explicitly opt out.
+        """
+        t0 = self._predict_t0 if episode_start is None else bool(episode_start)
+        if t0 and hasattr(self.agent, "reset"):
+            self.agent.reset()
+        obs_t = self._obs_to_tensor(observation)
+        action_norm = self.agent.act(
+            obs_t,
+            t0=t0,
+            eval_mode=deterministic,
+            collect_diagnostics=collect_diagnostics,
+        ).numpy()
+        self._predict_t0 = False
+        return self._unscale_action(action_norm), None
+
     def _wandb_run_name(self):
         return f"AMBITDMPC2-{self.run_params.get('env', 'env')}-seed{self.cfg.seed}"
 
@@ -801,8 +856,18 @@ class AMBITDMPC2(TDMPC2Baseline):
         info_for_log = dict(info or {})
         info_for_log.setdefault("terminated", bool(terminated))
         info_for_log.setdefault("truncated", bool(truncated))
-        obs_for_log = obs if isinstance(obs, dict) else np.asarray(obs)[None, ...]
-        action_for_log = np.asarray(action)[None, ...]
+        accepts_native_payload = bool(
+            getattr(self.alg_logger, "accepts_native_step_payload", False)
+        )
+        if (
+            not accepts_native_payload
+            or getattr(self.alg_logger, "retains_trajectories", True)
+        ):
+            obs_for_log = obs if isinstance(obs, dict) else np.asarray(obs)[None, ...]
+            action_for_log = np.asarray(action)[None, ...]
+        else:
+            obs_for_log = None
+            action_for_log = None
         data = setup_logs(
             reward,
             obs_for_log,
@@ -810,7 +875,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             [done],
             [info_for_log],
             # AMBITrainingLogger stores one rollout-length list per real step.
-            inner_steps=[list(self.agent.last_inner_rollout_lengths)],
+            inner_steps=[self.agent.last_inner_rollout_lengths],
+            materialize=not accepts_native_payload,
         )
         self.alg_logger.on_step(data)
 
@@ -913,6 +979,7 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_q_evaluations",
             "inner_replay_draws",
             "inner_diagnostic_model_steps",
+            "inner_diagnostics_sample_count",
             "planner_policy_model_steps",
             "planner_candidate_model_steps",
             "planner_model_steps",
@@ -939,11 +1006,23 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_termination_rate",
             metrics.get("inner_rollout_termination_rate"),
         )
-        if termination_rate is not None:
+        if termination_rate is not None and rollout_count > 0:
             self._wandb_train_window.add_weighted(
                 "train/inner_termination_rate",
                 termination_rate,
-                weight=max(1, rollout_count),
+                weight=rollout_count,
+            )
+            self._wandb_train_window.add_stats(
+                "train/inner_termination_rate",
+                count=rollout_count,
+                mean=termination_rate,
+                std=metrics.get("inner_termination_rate_std", 0.0),
+                min_value=metrics.get(
+                    "inner_termination_rate_min", termination_rate
+                ),
+                max_value=metrics.get(
+                    "inner_termination_rate_max", termination_rate
+                ),
             )
 
         critic_metrics = {
@@ -988,6 +1067,13 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_fixed_target_q_improved",
             "inner_fixed_target_q_abs_mean",
             "inner_fixed_evaluator_alpha",
+            "inner_diagnostics_sampled",
+            "inner_distributional_q_entropy",
+            "inner_distributional_q_edge_mass",
+            "inner_compile_rollout_fallback",
+            "inner_compile_critic_fallback",
+            "inner_compile_actor_fallback",
+            "inner_compile_fallback",
             "inner_predicted_j_outer",
             "inner_predicted_j_improved",
             "inner_predicted_j_gain",
@@ -1027,6 +1113,22 @@ class AMBITDMPC2(TDMPC2Baseline):
                     self._wandb_train_window.add_weighted(
                         f"train/{key}", metrics[key], weight=weight
                     )
+                    self._wandb_train_window.add_stats(
+                        f"train/{key}",
+                        count=weight,
+                        mean=metrics[key],
+                        std=metrics.get(f"{key}_std", 0.0),
+                        min_value=metrics.get(f"{key}_min", metrics[key]),
+                        max_value=metrics.get(f"{key}_max", metrics[key]),
+                    )
+
+        # A sampling step is an event marker, not a continuous gauge.  Keep
+        # the most recent sampled step so pooled windows never emit an average
+        # step that did not actually occur.
+        if "inner_diagnostics_step" in metrics:
+            self._wandb_train_window.set_last(
+                "train/inner_diagnostics_step", metrics["inner_diagnostics_step"]
+            )
 
     def _timing_wandb_payload(self, updates_since_log):
         outer_update_seconds = float(self._wandb_train_seconds)

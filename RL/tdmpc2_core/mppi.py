@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import isfinite
+from numbers import Real
 from typing import Any, Callable, Mapping, Optional
 
 import torch
@@ -37,6 +38,7 @@ class MPPIModelCallbacks:
         policy(z, *, generator) -> action | (action, info)
         terminal_q(z, action, *, reduction, generator) -> scalar_q
         termination(z) -> probability  # optional
+        transition(z, action) -> (next_z, scalar_reward)  # optional fused path
     """
 
     action_dim: int
@@ -45,6 +47,7 @@ class MPPIModelCallbacks:
     policy: Callable[..., Any]
     terminal_q: Callable[..., torch.Tensor]
     termination: Optional[Callable[..., torch.Tensor]] = None
+    transition: Optional[Callable[..., tuple[torch.Tensor, torch.Tensor]]] = None
 
 
 @dataclass(frozen=True)
@@ -53,7 +56,7 @@ class MPPIResult:
 
     action: torch.Tensor
     next_mean: torch.Tensor
-    metrics: Mapping[str, float | int]
+    metrics: Mapping[str, float | int | torch.Tensor]
     model_steps: int
 
 
@@ -67,7 +70,20 @@ def _model_callbacks(model, task=None):
         prediction = model.reward(z, action, task)
         return td_math.two_hot_inv(prediction, model.cfg)
 
+    def transition(z, action):
+        # Reward and dynamics consume the same latent/action pair. Pack it once
+        # for the dense candidate population rather than launching two cats at
+        # every horizon step.
+        joint = model.joint_input(z, action)
+        prediction = model.reward_from_joint(joint)
+        return (
+            model.next_from_joint(joint),
+            td_math.two_hot_inv(prediction, model.cfg),
+        )
+
     def policy(z, *, generator):
+        if hasattr(model, "pi_action"):
+            return model.pi_action(z, task, generator=generator)
         return model.pi(z, task, generator=generator)
 
     def terminal_q(z, action, *, reduction, generator):
@@ -91,6 +107,7 @@ def _model_callbacks(model, task=None):
         policy=policy,
         terminal_q=terminal_q,
         termination=termination,
+        transition=transition,
     )
 
 
@@ -192,12 +209,28 @@ def _validate_inputs(
     if min_std > max_std:
         raise ValueError("min_std cannot exceed max_std.")
 
-    discount_tensor = torch.as_tensor(discount, device=root_z.device, dtype=root_z.dtype)
-    if discount_tensor.numel() != 1:
-        raise ValueError("discount must be scalar for a single MPPI root state.")
-    discount_tensor = discount_tensor.reshape(())
-    if not bool(torch.isfinite(discount_tensor)) or not 0.0 <= float(discount_tensor) <= 1.0:
-        raise ValueError("discount must be finite and in [0, 1].")
+    # AMBI supplies the configured Python scalar. Validate it before creating
+    # the device tensor so planning never performs a scalar GPU read merely to
+    # check a constant hyperparameter.
+    if isinstance(discount, Real):
+        discount_value = float(discount)
+        if not isfinite(discount_value) or not 0.0 <= discount_value <= 1.0:
+            raise ValueError("discount must be finite and in [0, 1].")
+        discount_tensor = root_z.new_tensor(discount_value)
+    else:
+        # Preserve the public helper's historical scalar-tensor support. This
+        # branch may synchronize a caller-supplied accelerator scalar for input
+        # validation; AMBI's hot path always takes the Python-scalar branch.
+        discount_tensor = torch.as_tensor(
+            discount, device=root_z.device, dtype=root_z.dtype
+        )
+        if discount_tensor.numel() != 1:
+            raise ValueError("discount must be scalar for a single MPPI root state.")
+        discount_tensor = discount_tensor.reshape(())
+        if not bool(torch.isfinite(discount_tensor)) or not 0.0 <= float(
+            discount_tensor
+        ) <= 1.0:
+            raise ValueError("discount must be finite and in [0, 1].")
 
     q_reduction = str(q_reduction).lower()
     if q_reduction not in _Q_REDUCTIONS:
@@ -260,7 +293,11 @@ def _estimate_value(
     discount_power = root_z.new_ones(())
 
     for step in range(horizon):
-        reward = callbacks.reward(z, actions[step])
+        if callbacks.transition is None:
+            reward = callbacks.reward(z, actions[step])
+            next_z = callbacks.dynamics(z, actions[step])
+        else:
+            next_z, reward = callbacks.transition(z, actions[step])
         reward = _as_scalar_column(
             reward,
             num_samples,
@@ -268,7 +305,7 @@ def _estimate_value(
             like=root_z,
         )
         value = value + discount_power * continuation * reward
-        z = callbacks.dynamics(z, actions[step])
+        z = next_z
         if not torch.is_tensor(z) or tuple(z.shape) != (num_samples, root_z.shape[-1]):
             actual = tuple(z.shape) if torch.is_tensor(z) else type(z).__name__
             raise ValueError(
@@ -324,6 +361,7 @@ def mppi_plan(
     t0=False,
     eval_mode=False,
     task=None,
+    materialize_metrics=True,
 ):
     """Plan one action with model-predictive path integral control.
 
@@ -340,6 +378,8 @@ def mppi_plan(
     does not prune the batched model rollout, keeping compute exact and stable.
     ``previous_mean`` is only read, and only when ``t0`` is false. The caller
     may persist the returned ``next_mean`` without any planner-owned state.
+    Set ``materialize_metrics=False`` to keep diagnostic scalars on-device for
+    packing with another boundary transfer; the default preserves float metrics.
     """
     if (model is None) == (callbacks is None):
         raise ValueError("Supply exactly one of model or callbacks to MPPI.")
@@ -477,16 +517,18 @@ def mppi_plan(
     candidate_model_steps = iterations * num_samples * horizon
     model_steps = policy_model_steps + candidate_model_steps
     metrics = {
-        "planner_value_mean": float(candidate_value.mean().cpu()),
-        "planner_value_std": float(candidate_value.std(unbiased=False).cpu()),
-        "planner_value_max": float(candidate_value.max().cpu()),
-        "planner_elite_value_mean": float(elite_value.mean().cpu()),
-        "planner_elite_value_std": float(elite_value.std(unbiased=False).cpu()),
-        "planner_elite_value_max": float(elite_value.max().cpu()),
-        "planner_std_mean": float(std.mean().cpu()),
-        "planner_std_min": float(std.min().cpu()),
-        "planner_std_max": float(std.max().cpu()),
-        "planner_action_l2": float(torch.linalg.vector_norm(action).cpu()),
+        # Keep scalar diagnostics on-device. AMBI packs them with the selected
+        # action for its single host transfer at the action boundary.
+        "planner_value_mean": candidate_value.mean().detach(),
+        "planner_value_std": candidate_value.std(unbiased=False).detach(),
+        "planner_value_max": candidate_value.max().detach(),
+        "planner_elite_value_mean": elite_value.mean().detach(),
+        "planner_elite_value_std": elite_value.std(unbiased=False).detach(),
+        "planner_elite_value_max": elite_value.max().detach(),
+        "planner_std_mean": std.mean().detach(),
+        "planner_std_min": std.min().detach(),
+        "planner_std_max": std.max().detach(),
+        "planner_action_l2": torch.linalg.vector_norm(action).detach(),
         "planner_num_samples": num_samples,
         "planner_num_elites": num_elites,
         "planner_num_pi_trajs": num_pi_trajs,
@@ -497,6 +539,16 @@ def mppi_plan(
         "planner_policy_evaluations": num_pi_trajs * horizon + iterations * num_samples,
         "planner_q_evaluations": iterations * num_samples,
     }
+    if materialize_metrics:
+        tensor_metrics = [
+            (key, value) for key, value in metrics.items() if torch.is_tensor(value)
+        ]
+        if tensor_metrics:
+            packed_metrics = torch.stack(
+                [value.reshape(()) for _, value in tensor_metrics]
+            ).cpu().tolist()
+            for (key, _), value in zip(tensor_metrics, packed_metrics):
+                metrics[key] = float(value)
     return MPPIResult(
         action=action,
         next_mean=mean.clone(),

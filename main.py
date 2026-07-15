@@ -17,7 +17,13 @@ import gymnasium as gym
 import domains  # noqa: F401  # registers custom environments through import side effects
 # from RL.alg import *
 #from RL.baselines import Baseline, TrajectoryLoggerCallback
-from utils.core import SUPPORTED_LOG_SETTINGS, SUPPORTED_WRAPPERS, initialize_alg, setup_wrapper
+from utils.core import (
+    SUPPORTED_LOG_SETTINGS,
+    SUPPORTED_LOG_TYPES,
+    SUPPORTED_WRAPPERS,
+    initialize_alg,
+    setup_wrapper,
+)
 from utils.stats import handle_trial
 from utils.utils import datetime_stamp
 from log import TrainingLogger, AMBITrainingLogger
@@ -46,6 +52,22 @@ def seed_env_spaces(env, seed):
         env.action_space.seed(seed)
     if hasattr(env.observation_space, "seed"):
         env.observation_space.seed(seed)
+
+
+_SEEDED_LEARN_RESET_ALGORITHMS = {
+    "TDMPC2/TDMPC2Baseline",
+    "AMBITDMPC2/AMBITDMPC2",
+}
+
+
+def _learn_resets_env_with_seed(alg_path):
+    """Whether learn() performs the authoritative first reset with its seed.
+
+    Only algorithms whose training loop explicitly calls ``reset(seed=seed)``
+    are listed. Legacy algorithms retain the historical pre-initialization
+    reset because some of them subsequently reset without a seed.
+    """
+    return alg_path in _SEEDED_LEARN_RESET_ALGORITHMS
 
 
 def main():
@@ -89,6 +111,10 @@ def main():
         log_type_setting = experiment_params["log_type"]
     else:
         log_type_setting = "detailed" #backwards compatibility
+    if log_type_setting not in SUPPORTED_LOG_TYPES:
+        raise ValueError(
+            f"unsupported log_type {log_type_setting!r}; expected one of {SUPPORTED_LOG_TYPES}."
+        )
 
     if "checkpoint_every" in experiment_params:
         checkpoint_every = experiment_params["checkpoint_every"]
@@ -207,7 +233,11 @@ def main():
                 domain = setup_wrapper(domain, wrapper_name, wrapper_params)
 
             seed_env_spaces(domain, trial_seed)
-            domain.reset(seed=trial_seed)
+            # TD-MPC2 performs the same seeded reset at the start of learn().
+            # Avoid a discarded environment transition there while retaining
+            # the legacy reset semantics for algorithms that reset unseeded.
+            if not _learn_resets_env_with_seed(trial_run_params["alg"]):
+                domain.reset(seed=trial_seed)
 
             model, baseline, alg_name = initialize_alg(trial_run_params["alg"], trial_run_params["alg_params"], domain, full_run_params=trial_run_params, experiment_params=experiment_params)
             print(alg_name, "initialized.")
@@ -237,28 +267,36 @@ def main():
                 model.set_logger(training_logger)
                 if checkpoint_every and hasattr(model, "set_checkpointing"):
                     model.set_checkpointing(save_freq=checkpoint_every, save_path=model_save_dir, name_prefix=f'model:{alg_config}_{t}')
-                model.learn(total_timesteps=trial_run_params["total_steps"])
+                try:
+                    model.learn(total_timesteps=trial_run_params["total_steps"])
 
-                if t == 0 and save_trials_setting == "first":
-                    model.save(model_save_dir,f'model:{alg_config}_{t}')
-                elif save_trials_setting == "all":
-                    model.save(model_save_dir,f'model:{alg_config}_{t}')
-                elif save_trials_setting == "best":
-                    _ , trial_contents = handle_trial(trial_log_dir)
-                    rewards = trial_contents["rewards"]
-                    score = np.average(rewards) if rewards.size > 0 else -math.inf #take a simple average over the whole trial!
-                    old_best_score = best_score
-                    old_best_trial = best_trial
-                    best_score = best_score if score < best_score else score
-                    if best_score != old_best_score:
-                        model.save(model_save_dir, f'model:{alg_config}_{t}') #save the new model
-                        if old_best_trial >= 0:
-                            old_model_filename = os.path.join(model_save_dir,f'model:{alg_config}_{old_best_trial}*')
-                            os.system(f'rm -f {old_model_filename}') #delete the old saved model (but only after the new one is saved)
-                        best_trial = t
+                    if t == 0 and save_trials_setting == "first":
+                        training_logger.flush()
+                        model.save(model_save_dir,f'model:{alg_config}_{t}')
+                    elif save_trials_setting == "all":
+                        training_logger.flush()
+                        model.save(model_save_dir,f'model:{alg_config}_{t}')
+                    elif save_trials_setting == "best":
+                        training_logger.flush()
+                        _ , trial_contents = handle_trial(trial_log_dir)
+                        rewards = trial_contents["rewards"]
+                        score = np.average(rewards) if rewards.size > 0 else -math.inf #take a simple average over the whole trial!
+                        old_best_score = best_score
+                        old_best_trial = best_trial
+                        best_score = best_score if score < best_score else score
+                        if best_score != old_best_score:
+                            model.save(model_save_dir, f'model:{alg_config}_{t}') #save the new model
+                            if old_best_trial >= 0:
+                                old_model_filename = os.path.join(model_save_dir,f'model:{alg_config}_{old_best_trial}*')
+                                os.system(f'rm -f {old_model_filename}') #delete the old saved model (but only after the new one is saved)
+                            best_trial = t
 
-                    with open(os.path.join(model_save_dir,"scores.txt"), "a") as f:
-                        f.write(f'{alg_config}_{t}'+ ":" + str(score) + '\n')
+                        with open(os.path.join(model_save_dir,"scores.txt"), "a") as f:
+                            f.write(f'{alg_config}_{t}'+ ":" + str(score) + '\n')
+                finally:
+                    # Makes buffered CSV rows and queued detailed trajectories
+                    # durable on normal completion and training exceptions.
+                    training_logger.close()
 
                     # with open(best_trial_score,"r") as f:
                     #     old_best_score = int(f.read())

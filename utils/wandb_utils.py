@@ -53,8 +53,8 @@ class WandbAccumulator:
     * :meth:`add_weighted` computes a weighted arithmetic mean.
     * :meth:`add_sum` sums interval work counters.
     * :meth:`set_last` retains the latest gauge or cumulative counter.
-    * :meth:`add_stats` pools population moments and emits ``_mean``, ``_std``,
-      ``_min``, and ``_max`` keys for a metric prefix.
+    * :meth:`add_stats` pools population moments and emits ``_count``,
+      ``_mean``, ``_std``, ``_min``, and ``_max`` keys for a metric prefix.
 
     Non-finite or non-scalar observations are ignored. A zero sum is retained,
     which lets callers explicitly report meaningful zero-work intervals.
@@ -225,7 +225,10 @@ class WandbAccumulator:
         if incoming is None:
             return
 
-        output_keys = tuple(f"{prefix}_{suffix}" for suffix in ("mean", "std", "min", "max"))
+        output_keys = tuple(
+            f"{prefix}_{suffix}"
+            for suffix in ("count", "mean", "std", "min", "max")
+        )
         self._claim(output_keys, "pooled statistics")
         current = self._stats.get(prefix)
         if current is None:
@@ -261,6 +264,7 @@ class WandbAccumulator:
             variance = max(0.0, metric.m2 / metric.count)
             payload.update(
                 {
+                    f"{prefix}_count": metric.count,
                     f"{prefix}_mean": metric.mean,
                     f"{prefix}_std": math.sqrt(variance),
                     f"{prefix}_min": metric.minimum,
