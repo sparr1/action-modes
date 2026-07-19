@@ -32,11 +32,24 @@ def test_ambi_tdmpc2_configs_preserve_continuing_task_and_inner_target_semantics
         config = _load_json_strict(ROOT / "configs/algs" / name)
         assert config["alg"] == "AMBITDMPC2/AMBITDMPC2"
         assert config["alg_params"]["episodic"] is False
-        assert config["alg_params"]["inner_critic_target_tau"] == 1.0
+        assert config["alg_params"]["inner_critic_target_tau"] == 0.005
         assert (
             config["alg_params"]["inner_rollout_horizon"]
             <= config["alg_params"]["horizon"]
         )
+
+
+def test_native_sac_q_representation_ablation_is_matched_across_five_seeds():
+    experiment = _load_json_strict(
+        ROOT / "configs/experiments/AntNativeSACQRepresentation.json"
+    )
+
+    assert experiment["configs"] == [
+        "AntNativeSAC2",
+        "AntNativeDistributionalSAC2",
+    ]
+    assert experiment["overrides_alg"]["seed"] == 55
+    assert experiment["trials"] == 5
 
 
 def test_ambi_launchers_run_the_learned_model_experiment():

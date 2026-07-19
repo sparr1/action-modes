@@ -38,9 +38,11 @@ training equations. The compatibility layer deliberately differs in these ways:
 `common/soft_world_model.py` and `ambi_agent.py` are AMBI extensions, not
 upstream TD-MPC2. They retain the encoder, latent dynamics, reward model,
 SimNorm representation, and multi-step consistency/reward training, but replace
-TD-MPC2's distributional critic ensemble and policy prior with a squashed-Gaussian
-SAC actor and scalar twin soft critics. MPPI is then replaced by per-root inner
-SAC adaptation.
+TD-MPC2's policy prior with a squashed-Gaussian SAC actor and soft Bellman
+objectives. The reference AMBI model uses TD-MPC2's model-size-driven
+distributional ensemble (five Q heads at model size 5); scalar twin critics
+remain an explicit ablation. AMBI defaults to per-root inner SAC adaptation and
+retains a matched MPPI inner operator for comparison.
 
 Model saves are suitable for evaluation and weight transfer. They do not include
 replay, environment state, or all trainer counters, so they are not exact

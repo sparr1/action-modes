@@ -14,6 +14,7 @@
     },
     "trials": 5,
     "configs": [
+        "AntNativeSAC2",
         "AntNativeDistributionalSAC2"
     ],
     "logs": "timestamp",

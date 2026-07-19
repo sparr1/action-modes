@@ -128,6 +128,42 @@ class AMBITDMPC2Agent(torch.nn.Module):
         print("Episode length:", cfg.episode_length)
         print("Discount factor:", self.discount)
         print("Inner operator:", cfg.inner_operator)
+        critic_spec = self.model.critic_signature
+        if critic_spec["q_representation"] == "distributional":
+            critic_detail = (
+                f"heads={critic_spec['num_q']}, bins={critic_spec['q_num_bins']}, "
+                f"support=[{critic_spec['q_vmin']:g}, {critic_spec['q_vmax']:g}], "
+                f"pair={cfg.q_pair_size}"
+            )
+        else:
+            critic_detail = (
+                f"heads={critic_spec['num_q']}, scalar, pair={cfg.q_pair_size}"
+            )
+        print(
+            "Q critic:",
+            f"{critic_spec['q_representation']} ({critic_detail})",
+        )
+        if cfg.inner_operator in {"sac", "td3"}:
+            nominal_steps = (
+                int(cfg.inner_rounds)
+                * int(cfg.inner_rollouts_per_round)
+                * int(cfg.inner_rollout_horizon)
+            )
+            print(
+                "Inner schedule:",
+                f"J={cfg.inner_rounds}, N={cfg.inner_rollouts_per_round}, "
+                f"H={cfg.inner_rollout_horizon}, G={cfg.inner_updates_per_round}, "
+                f"nominal_transitions={nominal_steps}, "
+                f"expected_update_slots={cfg.inner_expected_update_slots}, "
+                f"critic_utd={cfg.inner_nominal_critic_utd:g}",
+            )
+        elif cfg.inner_operator == "mppi":
+            print(
+                "Inner MPPI:",
+                f"iterations={cfg.inner_mppi_iterations}, "
+                f"samples={cfg.inner_mppi_num_samples}, "
+                f"H={cfg.inner_rollout_horizon}",
+            )
 
     def _get_discount(self, episode_length):
         fraction = float(episode_length) / float(self.cfg.discount_denom)

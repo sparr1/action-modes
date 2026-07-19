@@ -20,6 +20,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 
+from RL.tdmpc2_core import MODEL_SIZE
 from utils.ambi_research import (
     PresetMatrixError,
     load_preset_matrix,
@@ -303,18 +304,35 @@ def _attach_paired_return_deltas(results):
 
 def _critic_architecture_key(resolved):
     params = resolved["algorithm_config"]["alg_params"]
-    representation = str(params.get("q_representation", "scalar")).lower()
+    representation = str(params.get("q_representation", "distributional")).lower()
     num_q = params.get("num_q")
     if num_q is None:
-        num_q = f"model_size:{params.get('model_size')}"
+        if representation == "scalar":
+            # AMBI deliberately keeps scalar SAC as a twin-Q ablation,
+            # independent of the TD-MPC2 model-size ensemble.
+            num_q = 2
+        else:
+            model_size = params.get("model_size", 5)
+            model_size = 5 if model_size is None else int(model_size)
+            try:
+                num_q = MODEL_SIZE[model_size]["num_q"]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Cannot resolve critic architecture for model_size={model_size}; "
+                    f"expected one of {list(MODEL_SIZE)}."
+                ) from exc
+    num_q = int(num_q)
     if representation == "scalar":
         return representation, num_q, 1, None, None
+    q_num_bins = params.get("q_num_bins")
+    q_vmin = params.get("q_vmin")
+    q_vmax = params.get("q_vmax")
     return (
         representation,
         num_q,
-        params.get("q_num_bins", params.get("num_bins", 101)),
-        params.get("q_vmin", params.get("vmin", -10)),
-        params.get("q_vmax", params.get("vmax", 10)),
+        int(params.get("num_bins", 101) if q_num_bins is None else q_num_bins),
+        float(params.get("vmin", -10) if q_vmin is None else q_vmin),
+        float(params.get("vmax", 10) if q_vmax is None else q_vmax),
     )
 
 

@@ -27,57 +27,49 @@
   },
   "comparisons": {
     "inner_operator": {
-      "description": "Compare no improvement, SAC, TD3, and MPPI from the same outer checkpoint. Active operators receive 192 imagined model steps per real action.",
+      "description": "Compare no improvement, SAC, TD3, and MPPI from the same outer checkpoint. Active operators receive 768 imagined model steps per real action.",
       "reference": "sac",
       "variants": {
         "none": {
           "description": "Outer-policy control with no imagined work.",
           "alg_params": {
             "inner_operator": "none",
-            "inner_model_step_budget": 0,
-            "inner_rounds": 0,
-            "inner_critic_updates_per_action": 0,
-            "inner_actor_updates_per_action": 0,
-            "inner_temperature_updates_per_action": 0
+            "inner_rounds": null,
+            "inner_rollouts_per_round": null,
+            "inner_rollout_horizon": null,
+            "inner_updates_per_round": null
           }
         },
         "sac": {
-          "description": "LoRA SAC improvement using the historical AMBI-equivalent compute budget.",
+          "description": "Full-copy SAC improvement with four collect/train rounds and UTD one.",
           "alg_params": {
-            "inner_operator": "sac",
-            "inner_model_step_budget": 192,
-            "inner_rounds": 2,
-            "inner_rollout_horizon": 3,
-            "inner_critic_updates_per_action": 4,
-            "inner_actor_updates_per_action": 4,
-            "inner_temperature_updates_per_action": 0
+            "inner_operator": "sac"
           }
         },
         "td3": {
           "description": "Deterministic TD3 improvement with Gaussian imagined behavior exploration.",
           "alg_params": {
             "inner_operator": "td3",
-            "inner_model_step_budget": 192,
-            "inner_rounds": 2,
+            "inner_rounds": 4,
+            "inner_rollouts_per_round": 64,
             "inner_rollout_horizon": 3,
-            "inner_critic_updates_per_action": 4,
-            "inner_actor_updates_per_action": 4,
-            "inner_temperature_updates_per_action": 0,
+            "inner_updates_per_round": "auto",
+            "inner_temperature_mode": "inherit_outer",
             "inner_behavior_action": "mean_plus_gaussian",
             "inner_behavior_noise_std": 0.1,
             "inner_execution_action": "mean"
           }
         },
         "mppi": {
-          "description": "MPPI with 32 candidates, 8 elites, two iterations, and no policy-prior trajectories.",
+          "description": "MPPI with 128 candidates, 8 elites, two iterations, and no policy-prior trajectories.",
           "alg_params": {
             "inner_operator": "mppi",
-            "inner_model_step_budget": 192,
-            "inner_rounds": 2,
+            "inner_rounds": null,
+            "inner_rollouts_per_round": null,
+            "inner_updates_per_round": null,
+            "inner_model_step_budget": 768,
+            "inner_mppi_iterations": 2,
             "inner_rollout_horizon": 3,
-            "inner_critic_updates_per_action": 0,
-            "inner_actor_updates_per_action": 0,
-            "inner_temperature_updates_per_action": 0,
             "inner_mppi_num_elites": 8,
             "inner_mppi_num_pi_trajs": 0,
             "inner_mppi_temperature": 0.5
@@ -87,7 +79,7 @@
     },
     "q_representation": {
       "description": "Change only critic representation while retaining the same soft-SAC Bellman objective. Each variant requires a checkpoint trained with the matching architecture.",
-      "reference": "scalar_twin",
+      "reference": "distributional_five",
       "variants": {
         "scalar_twin": {
           "description": "Two scalar soft-Q heads.",
@@ -115,36 +107,27 @@
       "reference": "actor_critic",
       "variants": {
         "actor_critic": {
-          "description": "Adapt both actor and critic; inherit the frozen outer alpha.",
+          "description": "Adapt full actor and critic copies; inherit the frozen outer alpha.",
           "alg_params": {
-            "inner_actor_adaptation": "lora",
-            "inner_critic_adaptation": "lora",
-            "inner_temperature_mode": "inherit_outer",
-            "inner_actor_updates_per_action": 4,
-            "inner_critic_updates_per_action": 4,
-            "inner_temperature_updates_per_action": 0
+            "inner_actor_adaptation": "clone",
+            "inner_critic_adaptation": "clone",
+            "inner_temperature_mode": "inherit_outer"
           }
         },
         "actor_only": {
           "description": "Adapt the actor against a frozen critic snapshot.",
           "alg_params": {
-            "inner_actor_adaptation": "lora",
+            "inner_actor_adaptation": "clone",
             "inner_critic_adaptation": "frozen",
-            "inner_temperature_mode": "inherit_outer",
-            "inner_actor_updates_per_action": 4,
-            "inner_critic_updates_per_action": 0,
-            "inner_temperature_updates_per_action": 0
+            "inner_temperature_mode": "inherit_outer"
           }
         },
         "critic_only": {
           "description": "Adapt the critic while returning the frozen outer-policy action.",
           "alg_params": {
             "inner_actor_adaptation": "frozen",
-            "inner_critic_adaptation": "lora",
-            "inner_temperature_mode": "inherit_outer",
-            "inner_actor_updates_per_action": 0,
-            "inner_critic_updates_per_action": 4,
-            "inner_temperature_updates_per_action": 0
+            "inner_critic_adaptation": "clone",
+            "inner_temperature_mode": "inherit_outer"
           }
         },
         "temperature_only": {
@@ -153,9 +136,8 @@
             "inner_actor_adaptation": "frozen",
             "inner_critic_adaptation": "frozen",
             "inner_temperature_mode": "auto",
-            "inner_actor_updates_per_action": 0,
-            "inner_critic_updates_per_action": 0,
-            "inner_temperature_updates_per_action": 4
+            "inner_temperature_initialization": "inherit_outer",
+            "inner_target_entropy": "inherit_outer"
           }
         },
         "all_frozen": {
@@ -163,10 +145,7 @@
           "alg_params": {
             "inner_actor_adaptation": "frozen",
             "inner_critic_adaptation": "frozen",
-            "inner_temperature_mode": "inherit_outer",
-            "inner_actor_updates_per_action": 0,
-            "inner_critic_updates_per_action": 0,
-            "inner_temperature_updates_per_action": 0
+            "inner_temperature_mode": "inherit_outer"
           }
         }
       }
@@ -178,33 +157,29 @@
         "inherit_outer": {
           "description": "Snapshot the outer alpha once per action.",
           "alg_params": {
-            "inner_temperature_mode": "inherit_outer",
-            "inner_temperature_updates_per_action": 0
+            "inner_temperature_mode": "inherit_outer"
           }
         },
         "fixed_low": {
           "description": "Use a fixed local alpha of 0.1.",
           "alg_params": {
             "inner_temperature_mode": "fixed",
-            "inner_temperature": 0.1,
-            "inner_temperature_updates_per_action": 0
+            "inner_temperature": 0.1
           }
         },
         "fixed_high": {
           "description": "Use a fixed local alpha of 1.0.",
           "alg_params": {
             "inner_temperature_mode": "fixed",
-            "inner_temperature": 1.0,
-            "inner_temperature_updates_per_action": 0
+            "inner_temperature": 1.0
           }
         },
         "auto_local": {
-          "description": "Adapt a local alpha for four optimizer steps per action.",
+          "description": "Adapt a root-local alpha in every joint SAC update slot.",
           "alg_params": {
             "inner_temperature_mode": "auto",
-            "inner_temperature": 1.0,
-            "inner_target_entropy": "auto",
-            "inner_temperature_updates_per_action": 4
+            "inner_temperature_initialization": "inherit_outer",
+            "inner_target_entropy": "inherit_outer"
           }
         }
       }
@@ -288,62 +263,73 @@
       }
     },
     "model_compute": {
-      "description": "Vary imagined model steps while holding optimizer steps and replay capacity fixed.",
+      "description": "Vary imagined model steps by changing N while holding four total joint update slots and replay capacity fixed.",
       "reference": "steps_192",
       "variants": {
         "steps_96": {
-          "description": "96 model steps: 16 rollouts per round at H=3 and two rounds.",
+          "description": "96 model steps: 8 rollouts per round at H=3 and four rounds.",
           "alg_params": {
-            "inner_model_step_budget": 96,
+            "inner_rollouts_per_round": 8,
+            "inner_updates_per_round": 1,
             "inner_replay_capacity": 384
           }
         },
         "steps_192": {
-          "description": "192 model steps: 32 rollouts per round at H=3 and two rounds.",
+          "description": "192 model steps: 16 rollouts per round at H=3 and four rounds.",
           "alg_params": {
-            "inner_model_step_budget": 192,
+            "inner_rollouts_per_round": 16,
+            "inner_updates_per_round": 1,
             "inner_replay_capacity": 384
           }
         },
         "steps_384": {
-          "description": "384 model steps: 64 rollouts per round at H=3 and two rounds.",
+          "description": "384 model steps: 32 rollouts per round at H=3 and four rounds.",
           "alg_params": {
-            "inner_model_step_budget": 384,
+            "inner_rollouts_per_round": 32,
+            "inner_updates_per_round": 1,
             "inner_replay_capacity": 384
           }
         }
       }
     },
     "optimizer_compute": {
-      "description": "Vary actor and critic optimizer steps while holding imagined model steps fixed at 192.",
+      "description": "Vary joint SAC update slots while holding imagined model steps fixed at 192 over two rounds.",
       "reference": "updates_4",
       "variants": {
         "updates_0": {
           "description": "Collect-only control with no gradient updates.",
           "alg_params": {
-            "inner_critic_updates_per_action": 0,
-            "inner_actor_updates_per_action": 0
+            "inner_rounds": 2,
+            "inner_rollouts_per_round": 32,
+            "inner_updates_per_round": 0,
+            "inner_replay_capacity": 192
           }
         },
         "updates_2": {
           "description": "Two actor and two critic steps per action.",
           "alg_params": {
-            "inner_critic_updates_per_action": 2,
-            "inner_actor_updates_per_action": 2
+            "inner_rounds": 2,
+            "inner_rollouts_per_round": 32,
+            "inner_updates_per_round": 1,
+            "inner_replay_capacity": 192
           }
         },
         "updates_4": {
           "description": "Four actor and four critic steps per action.",
           "alg_params": {
-            "inner_critic_updates_per_action": 4,
-            "inner_actor_updates_per_action": 4
+            "inner_rounds": 2,
+            "inner_rollouts_per_round": 32,
+            "inner_updates_per_round": 2,
+            "inner_replay_capacity": 192
           }
         },
         "updates_8": {
           "description": "Eight actor and eight critic steps per action.",
           "alg_params": {
-            "inner_critic_updates_per_action": 8,
-            "inner_actor_updates_per_action": 8
+            "inner_rounds": 2,
+            "inner_rollouts_per_round": 32,
+            "inner_updates_per_round": 4,
+            "inner_replay_capacity": 192
           }
         }
       }
@@ -440,13 +426,13 @@
       }
     },
     "control_horizon": {
-      "description": "Vary inner control horizon at a common 180-model-step budget. H=5 intentionally exceeds the H=3 model-training horizon and emits a model-bias warning.",
+      "description": "Vary inner control horizon while changing N inversely to hold the total at 180 model steps. H=5 intentionally exceeds the H=3 model-training horizon and emits a model-bias warning.",
       "reference": "horizon_3",
       "variants": {
         "horizon_1": {
           "description": "One-step imagined rollouts.",
           "alg_params": {
-            "inner_model_step_budget": 180,
+            "inner_rollouts_per_round": 45,
             "inner_rollout_horizon": 1,
             "inner_replay_capacity": 180
           }
@@ -454,7 +440,7 @@
         "horizon_3": {
           "description": "Three-step imagined rollouts matching outer model training.",
           "alg_params": {
-            "inner_model_step_budget": 180,
+            "inner_rollouts_per_round": 15,
             "inner_rollout_horizon": 3,
             "inner_replay_capacity": 180
           }
@@ -462,7 +448,7 @@
         "horizon_5": {
           "description": "Five-step imagined rollouts for explicit model-bias measurement.",
           "alg_params": {
-            "inner_model_step_budget": 180,
+            "inner_rollouts_per_round": 9,
             "inner_rollout_horizon": 5,
             "inner_replay_capacity": 180
           }
@@ -471,7 +457,7 @@
     },
     "adaptation_mechanism": {
       "description": "Compare full cloned modules with LoRA while keeping the adaptation algorithm and optimizer counts fixed.",
-      "reference": "lora",
+      "reference": "clone",
       "variants": {
         "clone": {
           "description": "Adapt full actor and critic copies.",
@@ -500,6 +486,8 @@
         "rank_4": {
           "description": "Rank-four actor and critic adapters at scale one.",
           "alg_params": {
+            "inner_actor_adaptation": "lora",
+            "inner_critic_adaptation": "lora",
             "inner_actor_lora_rank": 4,
             "inner_critic_lora_rank": 4,
             "inner_actor_lora_scale": 1.0,
@@ -509,6 +497,8 @@
         "rank_8": {
           "description": "Rank-eight actor and critic adapters at scale one.",
           "alg_params": {
+            "inner_actor_adaptation": "lora",
+            "inner_critic_adaptation": "lora",
             "inner_actor_lora_rank": 8,
             "inner_critic_lora_rank": 8,
             "inner_actor_lora_scale": 1.0,
@@ -518,6 +508,8 @@
         "rank_16": {
           "description": "Rank-sixteen actor and critic adapters at scale one.",
           "alg_params": {
+            "inner_actor_adaptation": "lora",
+            "inner_critic_adaptation": "lora",
             "inner_actor_lora_rank": 16,
             "inner_critic_lora_rank": 16,
             "inner_actor_lora_scale": 1.0,

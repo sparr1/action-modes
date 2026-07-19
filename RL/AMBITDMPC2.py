@@ -21,7 +21,7 @@ _AMBI_DEFAULTS = {
     # Outer latent SAC. Q representation and ensemble reduction are independent
     # of the soft Bellman objective.
     "mpc": False,
-    "q_representation": "scalar",
+    "q_representation": "distributional",
     "q_num_bins": None,
     "q_vmin": None,
     "q_vmax": None,
@@ -44,31 +44,42 @@ _AMBI_DEFAULTS = {
     "target_update_interval": 1,
     "compile_strict": False,
 
-    # Inner operator and explicit model/optimizer compute budgets. ``None`` for
-    # the model budget preserves AMBI's historical 32 rollouts per round.
+    # Canonical root-local training schedule. Each round collects N rollouts of
+    # length H, appends them to the root-local replay, then runs G joint update
+    # slots. ``auto`` keeps critic UTD at one by matching the transitions that
+    # were actually generated in that round.
     "inner_operator": "sac",
-    "inner_model_step_budget": None,
-    "inner_rounds": 1,
+    "inner_rounds": 4,
+    "inner_rollouts_per_round": 64,
     "inner_rollout_horizon": None,
-    "inner_critic_updates_per_action": 1,
-    "inner_actor_updates_per_action": 1,
-    "inner_temperature_updates_per_action": 0,
-    "inner_batch_size": 256,
+    "inner_updates_per_round": "auto",
+
+    # Deprecated total-budget controls. These remain accepted on an isolated
+    # legacy schedule path for one release and are resolved to nominal totals
+    # for canonical configurations.
+    "inner_model_step_budget": None,
+    "inner_critic_updates_per_action": None,
+    "inner_actor_updates_per_action": None,
+    "inner_temperature_updates_per_action": None,
+    "inner_batch_size": 128,
     "inner_replay_capacity": None,
     "inner_replay_sampling": "with_replacement",
 
     # Independently adaptable inner components.
     "inner_actor_adaptation": "clone",
     "inner_critic_adaptation": "clone",
-    "inner_temperature_mode": "inherit_outer",
+    # ``None`` is resolved by operator: learned/root-local for SAC and disabled
+    # for operators without an entropy objective.
+    "inner_temperature_mode": None,
+    "inner_temperature_initialization": "inherit_outer",
     "inner_temperature": 1.0,
-    "inner_target_entropy": "auto",
+    "inner_target_entropy": "inherit_outer",
     "inner_bootstrap_source": "inner_target",
-    "inner_actor_lr": 3e-4,
-    "inner_critic_lr": 3e-4,
-    "inner_temperature_lr": 3e-4,
+    "inner_actor_lr": 5e-5,
+    "inner_critic_lr": 5e-5,
+    "inner_temperature_lr": 5e-5,
     "inner_adam_eps": 1e-8,
-    "inner_critic_target_tau": 1.0,
+    "inner_critic_target_tau": 0.005,
     "inner_critic_target_update_interval": 1,
     "inner_actor_target_tau": None,
     "inner_actor_target_update_interval": None,
@@ -115,6 +126,7 @@ _AMBI_DEFAULTS = {
 
     # AMBI MPPI controls. Candidate count is derived from the common model-step
     # budget, including the one-time policy-prior trajectory cost.
+    "inner_mppi_iterations": 1,
     "inner_mppi_num_elites": 8,
     "inner_mppi_num_pi_trajs": 0,
     "inner_mppi_temperature": 0.5,
@@ -129,19 +141,39 @@ _AMBI_DEFAULTS = {
 }
 
 
-_LEGACY_COMPUTE_KEYS = {
+_V1_SCHEDULE_KEYS = {
     "inner_iterations",
     "inner_rollouts",
     "inner_horizon",
     "inner_updates_per_iteration",
 }
-_CANONICAL_COMPUTE_KEYS = {
-    "inner_model_step_budget",
+_CANONICAL_SCHEDULE_KEYS = {
     "inner_rounds",
+    "inner_rollouts_per_round",
     "inner_rollout_horizon",
+    "inner_updates_per_round",
+}
+_TOTAL_SCHEDULE_KEYS = {
+    "inner_model_step_budget",
     "inner_critic_updates_per_action",
     "inner_actor_updates_per_action",
     "inner_temperature_updates_per_action",
+}
+
+_LEGACY_SCHEDULE_DEFAULTS = {
+    "inner_rounds": 1,
+    "inner_rollout_horizon": None,
+    "inner_model_step_budget": None,
+    "inner_critic_updates_per_action": 1,
+    "inner_actor_updates_per_action": 1,
+    "inner_temperature_updates_per_action": 0,
+    "inner_batch_size": 256,
+    "inner_actor_lr": 3e-4,
+    "inner_critic_lr": 3e-4,
+    "inner_temperature_lr": 3e-4,
+    "inner_critic_target_tau": 1.0,
+    "inner_temperature_mode": "inherit_outer",
+    "inner_target_entropy": "auto",
 }
 
 
@@ -154,15 +186,6 @@ def _legacy_warning(keys):
     )
 
 
-def _reject_mixed(params, legacy_keys, canonical_keys, label):
-    old = sorted(set(params) & set(legacy_keys))
-    new = sorted(set(params) & set(canonical_keys))
-    if old and new:
-        raise ValueError(
-            f"Cannot mix legacy and canonical {label} keys: legacy={old}, canonical={new}."
-        )
-
-
 def _finite_float(value, key):
     value = float(value)
     if not math.isfinite(value):
@@ -171,27 +194,90 @@ def _finite_float(value, key):
 
 
 def _normalize_legacy_params(params):
-    """Return canonical parameters while retaining no ambiguous legacy input."""
+    """Normalize schedule aliases and identify canonical versus total scheduling."""
     params = copy.deepcopy(params)
 
-    _reject_mixed(params, _LEGACY_COMPUTE_KEYS, _CANONICAL_COMPUTE_KEYS, "compute")
-    legacy_compute = sorted(set(params) & _LEGACY_COMPUTE_KEYS)
-    if legacy_compute:
-        _legacy_warning(legacy_compute)
+    requested_operator = str(
+        params.get("inner_operator", _AMBI_DEFAULTS["inner_operator"])
+    ).lower()
+    v1_schedule = sorted(set(params) & _V1_SCHEDULE_KEYS)
+    if v1_schedule:
+        conflicts = sorted(
+            set(params)
+            & (_CANONICAL_SCHEDULE_KEYS | _TOTAL_SCHEDULE_KEYS | {"inner_mppi_iterations"})
+        )
+        if conflicts:
+            raise ValueError(
+                "Cannot mix legacy and canonical compute keys: "
+                f"legacy={v1_schedule}, canonical={conflicts}."
+            )
+        _legacy_warning(v1_schedule)
         rounds = int(params.pop("inner_iterations", 1))
         rollouts = int(params.pop("inner_rollouts", 32))
         rollout_horizon = params.pop("inner_horizon", None)
         if rollout_horizon is None:
             rollout_horizon = params.get("horizon", 3)
-        updates_per_round = int(params.pop("inner_updates_per_iteration", 1))
-        params.update({
-            "inner_rounds": rounds,
-            "inner_rollout_horizon": rollout_horizon,
-            "inner_model_step_budget": rounds * rollouts * int(rollout_horizon),
-            "inner_critic_updates_per_action": rounds * updates_per_round,
-            "inner_actor_updates_per_action": rounds * updates_per_round,
-            "inner_temperature_updates_per_action": 0,
-        })
+        updates_per_round = params.pop("inner_updates_per_iteration", 1)
+        if requested_operator == "mppi":
+            if int(updates_per_round) not in {0, 1}:
+                raise ValueError(
+                    "Legacy MPPI inner_updates_per_iteration is not an MPPI control."
+                )
+            params.update(
+                inner_mppi_iterations=rounds,
+                inner_rollout_horizon=rollout_horizon,
+                inner_model_step_budget=rounds * rollouts * int(rollout_horizon),
+            )
+        else:
+            params.update(
+                inner_rounds=rounds,
+                inner_rollouts_per_round=rollouts,
+                inner_rollout_horizon=rollout_horizon,
+                inner_updates_per_round=int(updates_per_round),
+            )
+            # The historical alias did not learn a local temperature.
+            params.setdefault("inner_temperature_mode", "inherit_outer")
+
+    if requested_operator in {"sac", "td3"}:
+        new_unique = sorted(
+            set(params) & {"inner_rollouts_per_round", "inner_updates_per_round"}
+        )
+        totals = sorted(set(params) & _TOTAL_SCHEDULE_KEYS)
+        if new_unique and totals:
+            raise ValueError(
+                "Cannot mix canonical J/N/H/G controls with deprecated total-budget "
+                f"controls: canonical={new_unique}, deprecated={totals}."
+            )
+        schedule_mode = "legacy" if totals else "canonical"
+        if totals:
+            _legacy_warning(totals)
+    elif requested_operator == "mppi":
+        invalid = sorted(
+            set(params) & {"inner_rollouts_per_round", "inner_updates_per_round"}
+        )
+        if invalid:
+            raise ValueError(f"MPPI does not use SAC/TD3 schedule controls: {invalid}.")
+        if "inner_rounds" in params:
+            if "inner_mppi_iterations" in params:
+                raise ValueError(
+                    "Cannot specify both inner_rounds and inner_mppi_iterations for MPPI."
+                )
+            _legacy_warning(["inner_rounds"])
+            params["inner_mppi_iterations"] = params.pop("inner_rounds")
+        schedule_mode = "legacy" if v1_schedule else "canonical"
+    else:
+        schedule_mode = "canonical"
+
+    # Preserve the old learned-temperature initialization only for an explicit
+    # pre-migration ``auto`` request. New/default SAC configurations inherit the
+    # current outer alpha at every real root.
+    if (
+        (schedule_mode == "legacy" or bool(v1_schedule))
+        and str(params.get("inner_temperature_mode", "")).lower() == "auto"
+        and "inner_temperature_initialization" not in params
+    ):
+        _legacy_warning(["inner_temperature_mode=auto without initialization"])
+        params["inner_temperature_initialization"] = "fixed"
 
     direct_groups = (
         ("inner_buffer_size", ("inner_replay_capacity",), lambda value, _: value),
@@ -251,7 +337,7 @@ def _normalize_legacy_params(params):
         # being gated by an unsafe-override switch.
         params.pop("allow_long_inner_horizon")
 
-    return params
+    return params, schedule_mode
 
 
 class AMBITDMPC2(TDMPC2Baseline):
@@ -266,11 +352,15 @@ class AMBITDMPC2(TDMPC2Baseline):
         self._wandb_inner_steps = 0
 
     def _build_cfg(self, params):
-        params = _normalize_legacy_params(params)
+        params, schedule_mode = _normalize_legacy_params(params)
         explicit_num_q = params.get("num_q", None)
         requested_operator = str(
             params.get("inner_operator", _AMBI_DEFAULTS["inner_operator"])
         ).lower()
+        if requested_operator not in {"none", "sac", "td3", "mppi"}:
+            raise ValueError(
+                "inner_operator must be one of 'none', 'sac', 'td3', or 'mppi'."
+            )
         if requested_operator in {"none", "mppi"}:
             forbidden_updates = {
                 key: int(params[key])
@@ -289,8 +379,15 @@ class AMBITDMPC2(TDMPC2Baseline):
         if requested_operator == "none":
             conflicting_compute = {
                 key: params[key]
-                for key in ("inner_model_step_budget", "inner_rounds")
-                if key in params and int(params[key] or 0) != 0
+                for key in (
+                    "inner_model_step_budget",
+                    "inner_rounds",
+                    "inner_rollouts_per_round",
+                    "inner_updates_per_round",
+                    "inner_mppi_iterations",
+                )
+                if key in params
+                and params[key] not in {None, 0, "0"}
             }
             if conflicting_compute:
                 raise ValueError(
@@ -305,22 +402,37 @@ class AMBITDMPC2(TDMPC2Baseline):
             )
 
         merged = dict(_AMBI_DEFAULTS)
+        if schedule_mode == "legacy" and requested_operator in {"sac", "td3"}:
+            merged.update(_LEGACY_SCHEDULE_DEFAULTS)
         merged.update(params)
+        if merged["inner_temperature_mode"] is None:
+            merged["inner_temperature_mode"] = (
+                "auto" if requested_operator == "sac" else "inherit_outer"
+            )
         if requested_operator == "none":
             merged.update(
                 inner_model_step_budget=0,
                 inner_rounds=0,
+                inner_rollouts_per_round=0,
+                inner_updates_per_round=0,
+                inner_mppi_iterations=0,
                 inner_critic_updates_per_action=0,
                 inner_actor_updates_per_action=0,
                 inner_temperature_updates_per_action=0,
+                inner_temperature_mode="inherit_outer",
             )
         elif requested_operator == "mppi":
             merged.update(
+                inner_rounds=0,
+                inner_rollouts_per_round=0,
+                inner_updates_per_round=0,
                 inner_critic_updates_per_action=0,
                 inner_actor_updates_per_action=0,
                 inner_temperature_updates_per_action=0,
+                inner_temperature_mode="inherit_outer",
             )
         cfg = super()._build_cfg(merged)
+        cfg.inner_schedule_mode = schedule_mode
 
         # ``model_size`` expands architecture defaults inside TD-MPC2. Restore
         # an explicit ensemble size afterwards; scalar SAC remains twin-Q while
@@ -388,42 +500,168 @@ class AMBITDMPC2(TDMPC2Baseline):
                 stacklevel=2,
             )
 
-        cfg.inner_rounds = int(cfg.inner_rounds)
-        if cfg.inner_rounds < 0:
-            raise ValueError("inner_rounds must be non-negative.")
-        if cfg.inner_model_step_budget is None:
-            cfg.inner_model_step_budget = (
-                cfg.inner_rounds * 32 * cfg.inner_rollout_horizon
-            )
+        cfg.inner_mppi_iterations = int(cfg.inner_mppi_iterations)
+        if cfg.inner_mppi_iterations < 0:
+            raise ValueError("inner_mppi_iterations must be non-negative.")
+
+        if cfg.inner_operator in {"sac", "td3"}:
+            cfg.inner_rounds = int(cfg.inner_rounds)
+            if cfg.inner_rounds < 0:
+                raise ValueError("inner_rounds must be non-negative.")
+
+            if cfg.inner_schedule_mode == "canonical":
+                cfg.inner_rollouts_per_round = int(cfg.inner_rollouts_per_round)
+                if cfg.inner_rollouts_per_round < 0:
+                    raise ValueError("inner_rollouts_per_round must be non-negative.")
+                if isinstance(cfg.inner_updates_per_round, str):
+                    cfg.inner_updates_per_round = cfg.inner_updates_per_round.lower()
+                    if cfg.inner_updates_per_round != "auto":
+                        raise ValueError(
+                            "inner_updates_per_round must be a non-negative integer or 'auto'."
+                        )
+                    nominal_updates_per_round = (
+                        cfg.inner_rollouts_per_round * cfg.inner_rollout_horizon
+                    )
+                else:
+                    cfg.inner_updates_per_round = int(cfg.inner_updates_per_round)
+                    if cfg.inner_updates_per_round < 0:
+                        raise ValueError("inner_updates_per_round must be non-negative.")
+                    nominal_updates_per_round = cfg.inner_updates_per_round
+
+                cfg.inner_model_step_budget = (
+                    cfg.inner_rounds
+                    * cfg.inner_rollouts_per_round
+                    * cfg.inner_rollout_horizon
+                )
+                nominal_total = cfg.inner_rounds * nominal_updates_per_round
+                actor_enabled = str(cfg.inner_actor_adaptation).lower() != "frozen"
+                critic_enabled = str(cfg.inner_critic_adaptation).lower() != "frozen"
+                temperature_enabled = (
+                    cfg.inner_operator == "sac"
+                    and str(cfg.inner_temperature_mode).lower() == "auto"
+                )
+                cfg.inner_critic_updates_per_action = (
+                    nominal_total if critic_enabled else 0
+                )
+                cfg.inner_actor_updates_per_action = (
+                    nominal_total if actor_enabled else 0
+                )
+                cfg.inner_temperature_updates_per_action = (
+                    nominal_total if temperature_enabled else 0
+                )
+            else:
+                cfg.inner_updates_per_round = None
+                if cfg.inner_model_step_budget is None:
+                    cfg.inner_model_step_budget = (
+                        cfg.inner_rounds * 32 * cfg.inner_rollout_horizon
+                    )
+                cfg.inner_model_step_budget = int(cfg.inner_model_step_budget)
+                if cfg.inner_model_step_budget < 0:
+                    raise ValueError("inner_model_step_budget must be non-negative.")
+                if cfg.inner_rounds == 0:
+                    if cfg.inner_model_step_budget != 0:
+                        raise ValueError(
+                            "A positive inner_model_step_budget requires inner_rounds>0."
+                        )
+                    cfg.inner_rollouts_per_round = 0
+                else:
+                    denominator = cfg.inner_rounds * cfg.inner_rollout_horizon
+                    if cfg.inner_model_step_budget % denominator:
+                        raise ValueError(
+                            "inner_model_step_budget must be divisible by "
+                            "inner_rounds * inner_rollout_horizon."
+                        )
+                    cfg.inner_rollouts_per_round = (
+                        cfg.inner_model_step_budget // denominator
+                    )
+                for key in (
+                    "inner_critic_updates_per_action",
+                    "inner_actor_updates_per_action",
+                    "inner_temperature_updates_per_action",
+                ):
+                    value = int(getattr(cfg, key))
+                    if value < 0:
+                        raise ValueError(f"{key} must be non-negative, got {value}.")
+                    setattr(cfg, key, value)
+
+            if cfg.inner_rounds == 0 and cfg.inner_model_step_budget != 0:
+                raise ValueError(
+                    "A positive inner model-step budget requires inner_rounds>0."
+                )
+            if (
+                cfg.inner_rounds > 0
+                and cfg.inner_rollouts_per_round == 0
+                and cfg.inner_model_step_budget != 0
+            ):
+                raise ValueError("Positive model compute requires rollouts per round.")
+        elif cfg.inner_operator == "mppi":
+            cfg.inner_rounds = 0
+            cfg.inner_rollouts_per_round = 0
+            cfg.inner_updates_per_round = 0
+            if cfg.inner_mppi_iterations <= 0:
+                raise ValueError("MPPI requires inner_mppi_iterations>0.")
+            if cfg.inner_model_step_budget is None:
+                policy_prior_steps = int(cfg.inner_mppi_num_pi_trajs) * max(
+                    0, cfg.inner_rollout_horizon - 1
+                )
+                cfg.inner_model_step_budget = (
+                    policy_prior_steps
+                    + cfg.inner_mppi_iterations * 32 * cfg.inner_rollout_horizon
+                )
+            cfg.inner_model_step_budget = int(cfg.inner_model_step_budget)
+            for key in (
+                "inner_critic_updates_per_action",
+                "inner_actor_updates_per_action",
+                "inner_temperature_updates_per_action",
+            ):
+                setattr(cfg, key, 0)
+        else:
+            cfg.inner_rounds = 0
+            cfg.inner_rollouts_per_round = 0
+            cfg.inner_updates_per_round = 0
+            cfg.inner_mppi_iterations = 0
+            cfg.inner_model_step_budget = 0
+            cfg.inner_critic_updates_per_action = 0
+            cfg.inner_actor_updates_per_action = 0
+            cfg.inner_temperature_updates_per_action = 0
+
         cfg.inner_model_step_budget = int(cfg.inner_model_step_budget)
         if cfg.inner_model_step_budget < 0:
             raise ValueError("inner_model_step_budget must be non-negative.")
-        if cfg.inner_rounds == 0:
-            if cfg.inner_model_step_budget != 0 and cfg.inner_operator != "none":
-                raise ValueError("A positive inner_model_step_budget requires inner_rounds>0.")
-            cfg.inner_rollouts_per_round = 0
-        elif cfg.inner_operator == "mppi":
-            # MPPI accounts for policy-prior trajectory generation separately
-            # below, so its common budget need not divide rounds*horizon.
-            cfg.inner_rollouts_per_round = 0
-        else:
-            denominator = cfg.inner_rounds * cfg.inner_rollout_horizon
-            if cfg.inner_model_step_budget % denominator:
-                raise ValueError(
-                    "inner_model_step_budget must be divisible by "
-                    "inner_rounds * inner_rollout_horizon."
+        nominal_transitions_per_round = (
+            cfg.inner_rollouts_per_round * cfg.inner_rollout_horizon
+        )
+        if cfg.inner_operator in {"sac", "td3"}:
+            if cfg.inner_schedule_mode == "canonical":
+                cfg.inner_nominal_updates_per_round = (
+                    nominal_transitions_per_round
+                    if cfg.inner_updates_per_round == "auto"
+                    else int(cfg.inner_updates_per_round)
                 )
-            cfg.inner_rollouts_per_round = cfg.inner_model_step_budget // denominator
-
-        for key in (
-            "inner_critic_updates_per_action",
-            "inner_actor_updates_per_action",
-            "inner_temperature_updates_per_action",
-        ):
-            value = int(getattr(cfg, key))
-            if value < 0:
-                raise ValueError(f"{key} must be non-negative, got {value}.")
-            setattr(cfg, key, value)
+            else:
+                cfg.inner_nominal_updates_per_round = (
+                    max(
+                        cfg.inner_critic_updates_per_action,
+                        cfg.inner_actor_updates_per_action,
+                        cfg.inner_temperature_updates_per_action,
+                    )
+                    / cfg.inner_rounds
+                    if cfg.inner_rounds > 0
+                    else 0.0
+                )
+        else:
+            cfg.inner_nominal_updates_per_round = 0
+        cfg.inner_nominal_transitions_per_round = nominal_transitions_per_round
+        cfg.inner_expected_update_slots = max(
+            cfg.inner_critic_updates_per_action,
+            cfg.inner_actor_updates_per_action,
+            cfg.inner_temperature_updates_per_action,
+        )
+        cfg.inner_nominal_critic_utd = (
+            cfg.inner_critic_updates_per_action / cfg.inner_model_step_budget
+            if cfg.inner_model_step_budget > 0
+            else 0.0
+        )
 
         if (
             cfg.inner_operator in {"sac", "td3"}
@@ -530,6 +768,17 @@ class AMBITDMPC2(TDMPC2Baseline):
                 raise ValueError("Temperature updates require inner_temperature_mode='auto'.")
         if cfg.inner_operator == "td3" and cfg.inner_temperature_mode != "inherit_outer":
             raise ValueError("TD3 has no entropy temperature; use inherit_outer.")
+        if cfg.inner_operator in {"none", "mppi"} and cfg.inner_temperature_mode != "inherit_outer":
+            raise ValueError(
+                f"{cfg.inner_operator} has no learned entropy temperature; use inherit_outer."
+            )
+        cfg.inner_temperature_initialization = str(
+            cfg.inner_temperature_initialization
+        ).lower()
+        if cfg.inner_temperature_initialization not in {"inherit_outer", "fixed"}:
+            raise ValueError(
+                "inner_temperature_initialization must be 'inherit_outer' or 'fixed'."
+            )
         cfg.inner_temperature = _finite_float(
             cfg.inner_temperature, "inner_temperature"
         )
@@ -537,7 +786,7 @@ class AMBITDMPC2(TDMPC2Baseline):
             raise ValueError("inner_temperature must be positive.")
         if isinstance(cfg.inner_target_entropy, str):
             cfg.inner_target_entropy = cfg.inner_target_entropy.lower()
-        if cfg.inner_target_entropy != "auto":
+        if cfg.inner_target_entropy not in {"auto", "inherit_outer"}:
             cfg.inner_target_entropy = _finite_float(
                 cfg.inner_target_entropy, "inner_target_entropy"
             )
@@ -676,19 +925,20 @@ class AMBITDMPC2(TDMPC2Baseline):
             raise ValueError("inner_mppi_min_std cannot exceed inner_mppi_max_std.")
         cfg.inner_mppi_num_samples = 0
         if cfg.inner_operator == "mppi":
-            if cfg.inner_rounds <= 0:
-                raise ValueError("MPPI requires inner_rounds>0.")
+            if cfg.inner_mppi_iterations <= 0:
+                raise ValueError("MPPI requires inner_mppi_iterations>0.")
             # Policy-prior generation advances the model H-1 times. Candidate
-            # evaluation then advances every candidate H times in every round.
+            # evaluation then advances every candidate H times in every MPPI
+            # iteration. SAC's collection rounds do not participate here.
             policy_prior_steps = (
                 cfg.inner_mppi_num_pi_trajs * max(0, cfg.inner_rollout_horizon - 1)
             )
             optim_budget = cfg.inner_model_step_budget - policy_prior_steps
-            denominator = cfg.inner_rounds * cfg.inner_rollout_horizon
+            denominator = cfg.inner_mppi_iterations * cfg.inner_rollout_horizon
             if optim_budget <= 0 or optim_budget % denominator:
                 raise ValueError(
                     "MPPI model-step budget, after policy-prior trajectory overhead, must "
-                    "divide evenly across inner_rounds * inner_rollout_horizon."
+                    "divide evenly across inner_mppi_iterations * inner_rollout_horizon."
                 )
             cfg.inner_mppi_num_samples = optim_budget // denominator
             if cfg.inner_mppi_num_pi_trajs > cfg.inner_mppi_num_samples:
@@ -762,7 +1012,11 @@ class AMBITDMPC2(TDMPC2Baseline):
 
         # Read-only aliases keep legacy integrations working for one release.
         # Canonical agent code must not use these for scheduling mixed updates.
-        cfg.inner_iterations = cfg.inner_rounds
+        cfg.inner_iterations = (
+            cfg.inner_mppi_iterations
+            if cfg.inner_operator == "mppi"
+            else cfg.inner_rounds
+        )
         cfg.inner_rollouts = cfg.inner_rollouts_per_round
         cfg.inner_horizon = cfg.inner_rollout_horizon
         cfg.inner_buffer_size = cfg.inner_replay_capacity
@@ -779,7 +1033,9 @@ class AMBITDMPC2(TDMPC2Baseline):
         cfg.inner_grad_clip_norm = max(
             cfg.inner_actor_grad_clip_norm, cfg.inner_critic_grad_clip_norm
         )
-        if (
+        if cfg.inner_schedule_mode == "canonical":
+            cfg.inner_updates_per_iteration = cfg.inner_nominal_updates_per_round
+        elif (
             cfg.inner_rounds > 0
             and cfg.inner_actor_updates_per_action == cfg.inner_critic_updates_per_action
             and cfg.inner_actor_updates_per_action % cfg.inner_rounds == 0
@@ -897,9 +1153,12 @@ class AMBITDMPC2(TDMPC2Baseline):
                 "train/inner_steps": 0,
                 "train/inner_updates": 0,
                 "train/inner_model_steps_budget": 0,
+                "train/inner_nominal_model_steps": 0,
+                "train/inner_realized_model_steps": 0,
                 "train/inner_model_steps": 0,
                 "train/inner_total_model_steps": 0,
                 "train/inner_update_slots": 0,
+                "train/inner_requested_update_slots": 0,
                 "train/inner_critic_optimizer_steps": 0,
                 "train/inner_actor_optimizer_steps": 0,
                 "train/inner_temperature_optimizer_steps": 0,
@@ -965,10 +1224,13 @@ class AMBITDMPC2(TDMPC2Baseline):
         # by planned actions. New metrics must be deliberately classified here.
         counter_metrics = {
             "inner_model_steps_budget",
+            "inner_nominal_model_steps",
+            "inner_realized_model_steps",
             "inner_requested_rollouts",
             "inner_model_steps",
             "inner_total_model_steps",
             "inner_update_slots",
+            "inner_requested_update_slots",
             "inner_critic_optimizer_steps",
             "inner_actor_optimizer_steps",
             "inner_temperature_optimizer_steps",
@@ -1057,8 +1319,21 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_critic_trainable_params",
             "inner_temperature_trainable_params",
             "inner_rounds",
+            "inner_mppi_iterations",
+            "inner_rollouts_per_round",
             "inner_rollout_horizon",
             "inner_horizon_ratio",
+            "inner_nominal_transitions_per_round",
+            "inner_nominal_updates_per_round",
+            "inner_updates_per_round_realized",
+            "inner_nominal_critic_utd",
+            "inner_critic_utd",
+            "inner_actor_utd",
+            "inner_temperature_utd",
+            "inner_alpha_initial",
+            "inner_alpha_final",
+            "inner_alpha_delta",
+            "inner_target_entropy",
             "inner_policy_mean_delta_l2",
             "inner_proposal_mean_delta_l2",
             "inner_fixed_target_q_action_gain",

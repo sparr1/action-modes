@@ -134,6 +134,72 @@ class InnerImprovementEngine:
             return self.state.alpha_fixed
         return self.agent.alpha.detach()
 
+    @property
+    def _uses_canonical_schedule(self):
+        return (
+            str(getattr(self.cfg, "inner_schedule_mode", "legacy"))
+            == "canonical"
+        )
+
+    @property
+    def _mppi_iterations(self):
+        return int(
+            getattr(self.cfg, "inner_mppi_iterations", self.cfg.inner_rounds)
+        )
+
+    def _canonical_schedule_has_updates(self):
+        if not self._uses_canonical_schedule:
+            return False
+        updates = getattr(self.cfg, "inner_updates_per_round", 0)
+        return updates == "auto" or int(updates) > 0
+
+    def _component_has_updates(self, component):
+        """Whether an optimizer is needed for this action's resolved schedule."""
+        cfg = self.cfg
+        if self._uses_canonical_schedule:
+            if not self._canonical_schedule_has_updates():
+                return False
+            if component == "temperature":
+                return (
+                    cfg.inner_operator == "sac"
+                    and str(cfg.inner_temperature_mode) == "auto"
+                )
+            return str(getattr(cfg, f"inner_{component}_adaptation")) != "frozen"
+        return int(getattr(cfg, f"inner_{component}_updates_per_action")) > 0
+
+    def _resolved_inner_target_entropy(self):
+        value = getattr(self.cfg, "inner_target_entropy", "auto")
+        if value == "inherit_outer":
+            if hasattr(self.agent, "target_entropy"):
+                return float(self.agent.target_entropy)
+            value = getattr(self.cfg, "target_entropy", "auto")
+        if value == "auto":
+            return -float(self.cfg.action_dim)
+        return float(value)
+
+    def _initial_inner_alpha(self):
+        initialization = str(
+            getattr(self.cfg, "inner_temperature_initialization", "fixed")
+        )
+        if initialization == "inherit_outer":
+            initial_alpha = self.agent.alpha.detach().reshape(-1)[0]
+        elif initialization == "fixed":
+            initial_alpha = torch.as_tensor(
+                float(self.cfg.inner_temperature), device=self.device
+            )
+        else:
+            raise ValueError(
+                "inner_temperature_initialization must be 'inherit_outer' or "
+                f"'fixed', got {initialization!r}."
+            )
+        valid = torch.isfinite(initial_alpha) & (initial_alpha > 0)
+        if not bool(valid.item()):
+            raise ValueError(
+                "The initial inner entropy coefficient must be finite and positive, "
+                f"got {float(initial_alpha.detach().item())}."
+            )
+        return initial_alpha
+
     def clear_all(self):
         self.state = InnerWorkspace()
         self._action_pool = InnerWorkspace()
@@ -290,9 +356,11 @@ class InnerImprovementEngine:
             return
         optimizer.zero_grad(set_to_none=True)
         for parameter_state in optimizer.state.values():
-            for value in parameter_state.values():
+            for key, value in parameter_state.items():
                 if torch.is_tensor(value):
                     value.zero_()
+                elif isinstance(value, (int, float)):
+                    parameter_state[key] = type(value)(0)
 
     def _reset_action_component(self, component, module, outer):
         mode = str(getattr(self.cfg, f"inner_{component}_adaptation"))
@@ -511,13 +579,13 @@ class InnerImprovementEngine:
         if (
             state.actor_optim is None
             and cfg.inner_actor_adaptation != "frozen"
-            and cfg.inner_actor_updates_per_action > 0
+            and self._component_has_updates("actor")
         ):
             state.actor_optim = self._new_optimizer(state.actor, "actor")
         if (
             state.critic_optim is None
             and cfg.inner_critic_adaptation != "frozen"
-            and cfg.inner_critic_updates_per_action > 0
+            and self._component_has_updates("critic")
         ):
             state.critic_optim = self._new_optimizer(state.critic, "critic")
 
@@ -548,26 +616,26 @@ class InnerImprovementEngine:
                 )
         elif cfg.inner_operator == "sac":
             if state.log_alpha is None:
+                initial_alpha = self._initial_inner_alpha()
                 if (
                     str(cfg.inner_temperature_scope) == "action"
                     and self._action_pool.log_alpha is not None
                 ):
                     state.log_alpha = self._action_pool.log_alpha
                     self._action_pool.log_alpha = None
-                    state.log_alpha.data.fill_(float(cfg.inner_temperature)).log_()
+                    with torch.no_grad():
+                        state.log_alpha.copy_(initial_alpha.log())
                     state.temperature_optim = self._action_pool.temperature_optim
                     self._action_pool.temperature_optim = None
                     self._reset_optimizer(state.temperature_optim)
                 else:
                     state.log_alpha = torch.nn.Parameter(
-                        torch.log(
-                            torch.tensor(float(cfg.inner_temperature), device=self.device)
-                        )
+                        initial_alpha.log().clone()
                     )
             state.alpha_fixed = None
             if (
                 state.temperature_optim is None
-                and cfg.inner_temperature_updates_per_action > 0
+                and self._component_has_updates("temperature")
             ):
                 state.temperature_optim = torch.optim.Adam(
                     [state.log_alpha],
@@ -708,6 +776,7 @@ class InnerImprovementEngine:
                 "reward_sums": empty,
                 "discounted_rewards": empty,
                 "terminated": empty.to(dtype=torch.bool),
+                "transition_count": 0,
             }
 
         if not cfg.episodic:
@@ -724,11 +793,13 @@ class InnerImprovementEngine:
         state.actor.eval()
         self.model.eval()
         transition_fields = ([], [], [], [], [])
+        transition_count = 0
         with self.rng.fork("collection") as generator:
             for _ in range(horizon):
                 active = torch.nonzero(alive, as_tuple=False).squeeze(-1)
                 if active.numel() == 0:
                     break
+                transition_count += int(active.numel())
                 active_z = z[active]
                 std_scale = float(cfg.inner_behavior_std_scale)
                 behavior_mode = str(cfg.inner_behavior_action)
@@ -778,6 +849,7 @@ class InnerImprovementEngine:
             "reward_sums": reward_sums,
             "discounted_rewards": discounted_rewards,
             "terminated": terminated_rollout,
+            "transition_count": transition_count,
         }
 
     @torch.no_grad()
@@ -881,6 +953,7 @@ class InnerImprovementEngine:
             "reward_sums": rollout[1],
             "discounted_rewards": rollout[2],
             "terminated": torch.zeros(count, dtype=torch.bool, device=self.device),
+            "transition_count": count * horizon,
         }
 
     def _sample_batch(self, indices=None):
@@ -1119,29 +1192,6 @@ class InnerImprovementEngine:
             state.policy_evaluations += batch_size
 
             metrics = {}
-            if update_temperature:
-                target_entropy = (
-                    -float(cfg.action_dim)
-                    if cfg.inner_target_entropy == "auto"
-                    else float(cfg.inner_target_entropy)
-                )
-                temperature_loss = -(
-                    state.log_alpha * (log_prob + target_entropy).detach()
-                ).mean()
-                state.temperature_optim.zero_grad(set_to_none=True)
-                temperature_loss.backward()
-                temperature_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    [state.log_alpha], float(cfg.inner_temperature_grad_clip_norm)
-                )
-                state.temperature_optim.step()
-                state.temperature_steps += 1
-                metrics.update(
-                    temperature_loss=temperature_loss.detach(),
-                    temperature_grad_norm=torch.as_tensor(
-                        temperature_grad_norm
-                    ).detach(),
-                )
-
             if update_actor:
                 state.q_evaluations += batch_size
                 if float(cfg.inner_outer_policy_kl_coef) > 0.0:
@@ -1161,6 +1211,24 @@ class InnerImprovementEngine:
                     actor_q_mean=q_mean.detach(),
                     actor_entropy=entropy.detach().mean(),
                     outer_policy_kl=kl_mean.detach(),
+                )
+            if update_temperature:
+                target_entropy = self._resolved_inner_target_entropy()
+                temperature_loss = -(
+                    state.log_alpha * (log_prob + target_entropy).detach()
+                ).mean()
+                state.temperature_optim.zero_grad(set_to_none=True)
+                temperature_loss.backward()
+                temperature_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    [state.log_alpha], float(cfg.inner_temperature_grad_clip_norm)
+                )
+                state.temperature_optim.step()
+                state.temperature_steps += 1
+                metrics.update(
+                    temperature_loss=temperature_loss.detach(),
+                    temperature_grad_norm=torch.as_tensor(
+                        temperature_grad_norm
+                    ).detach(),
                 )
             return metrics
 
@@ -1354,6 +1422,13 @@ class InnerImprovementEngine:
         critic_count = allocations["critic"][round_index]
         actor_count = allocations["actor"][round_index]
         temperature_count = allocations["temperature"][round_index]
+        return self._run_update_counts(
+            critic_count=critic_count,
+            actor_count=actor_count,
+            temperature_count=temperature_count,
+        )
+
+    def _run_update_counts(self, *, critic_count, actor_count, temperature_count):
         slots = max(critic_count, actor_count, temperature_count)
         metrics = []
         replay_indices = None
@@ -1692,14 +1767,34 @@ class InnerImprovementEngine:
             "inner_steps": 0.0,
             "inner_model_steps": 0.0,
             "inner_total_model_steps": 0.0,
+            "inner_nominal_model_steps": 0.0,
+            "inner_realized_model_steps": 0.0,
             "inner_rounds": 0.0,
             "inner_iterations": 0.0,
+            "inner_mppi_iterations": 0.0,
             "inner_rollout_horizon": float(self.cfg.inner_rollout_horizon),
+            "inner_rollouts_per_round": float(
+                getattr(self.cfg, "inner_rollouts_per_round", 0)
+            ),
+            "inner_nominal_transitions_per_round": float(
+                getattr(self.cfg, "inner_nominal_transitions_per_round", 0)
+            ),
+            "inner_nominal_updates_per_round": float(
+                getattr(self.cfg, "inner_nominal_updates_per_round", 0)
+            ),
+            "inner_nominal_critic_utd": float(
+                getattr(self.cfg, "inner_nominal_critic_utd", 0.0)
+            ),
             "inner_horizon_ratio": float(self.cfg.inner_horizon_ratio),
             "inner_requested_rollouts": 0.0,
             "inner_rollouts": 0.0,
             "inner_updates": 0.0,
             "inner_update_slots": 0.0,
+            "inner_requested_update_slots": 0.0,
+            "inner_updates_per_round_realized": 0.0,
+            "inner_critic_utd": 0.0,
+            "inner_actor_utd": 0.0,
+            "inner_temperature_utd": 0.0,
             "inner_critic_optimizer_steps": 0.0,
             "inner_actor_optimizer_steps": 0.0,
             "inner_temperature_optimizer_steps": 0.0,
@@ -1724,6 +1819,14 @@ class InnerImprovementEngine:
             "inner_rollout_len_max": 0.0,
             "inner_termination_rate": 0.0,
             "inner_alpha": self.agent.alpha.detach().mean(),
+            "inner_alpha_initial": self.agent.alpha.detach().mean(),
+            "inner_alpha_final": self.agent.alpha.detach().mean(),
+            "inner_alpha_delta": 0.0,
+            "inner_target_entropy": (
+                float(self._resolved_inner_target_entropy())
+                if self.cfg.inner_operator == "sac"
+                else 0.0
+            ),
             "inner_action_seconds": float(action_seconds),
             "inner_diagnostics_sampled": 0.0,
             "inner_diagnostics_sample_count": 0.0,
@@ -1746,20 +1849,24 @@ class InnerImprovementEngine:
         with self.rng.fork("initialization"):
             self._prepare_workspace(t0=t0)
         self._timer_stop("inner_setup_seconds", setup_start)
-        allocations = {
-            "critic": allocate_across_rounds(
-                cfg.inner_critic_updates_per_action, cfg.inner_rounds
-            ),
-            "actor": allocate_across_rounds(
-                cfg.inner_actor_updates_per_action, cfg.inner_rounds
-            ),
-            "temperature": allocate_across_rounds(
-                cfg.inner_temperature_updates_per_action, cfg.inner_rounds
-            ),
-        }
+        alpha_initial = self.alpha.detach().clone()
+        allocations = None
+        if not self._uses_canonical_schedule:
+            allocations = {
+                "critic": allocate_across_rounds(
+                    cfg.inner_critic_updates_per_action, cfg.inner_rounds
+                ),
+                "actor": allocate_across_rounds(
+                    cfg.inner_actor_updates_per_action, cfg.inner_rounds
+                ),
+                "temperature": allocate_across_rounds(
+                    cfg.inner_temperature_updates_per_action, cfg.inner_rounds
+                ),
+            }
         all_lengths, reward_sums, discounted_rewards, terminated = [], [], [], []
         update_history = []
         update_slots = 0
+        requested_update_slots = 0
         for round_index in range(int(cfg.inner_rounds)):
             rollout_start = self._timer_start()
             rollout = self._collect_round(root_z)
@@ -1770,7 +1877,40 @@ class InnerImprovementEngine:
             terminated.append(rollout["terminated"])
 
             update_start = self._timer_start()
-            round_metrics = self._run_updates(round_index, allocations)
+            if self._uses_canonical_schedule:
+                configured_updates = cfg.inner_updates_per_round
+                if configured_updates == "auto":
+                    # Episodic branches may terminate before H; UTD=1 tracks
+                    # transitions actually appended during this collection.
+                    round_updates = int(rollout["transition_count"])
+                else:
+                    round_updates = int(configured_updates)
+                round_metrics = self._run_update_counts(
+                    critic_count=(
+                        round_updates
+                        if cfg.inner_critic_adaptation != "frozen"
+                        else 0
+                    ),
+                    actor_count=(
+                        round_updates
+                        if cfg.inner_actor_adaptation != "frozen"
+                        else 0
+                    ),
+                    temperature_count=(
+                        round_updates
+                        if cfg.inner_operator == "sac"
+                        and cfg.inner_temperature_mode == "auto"
+                        else 0
+                    ),
+                )
+                requested_update_slots += round_updates
+            else:
+                round_metrics = self._run_updates(round_index, allocations)
+                requested_update_slots += max(
+                    allocations["critic"][round_index],
+                    allocations["actor"][round_index],
+                    allocations["temperature"][round_index],
+                )
             self._timer_stop("inner_update_seconds", update_start)
             update_history.extend(round_metrics)
             update_slots += len(round_metrics)
@@ -1794,6 +1934,14 @@ class InnerImprovementEngine:
         )
         termination_stats = self._stats(terminated_values.float())
         rollout_count = int(length_values.numel())
+        realized_model_steps = length_values.sum()
+        nominal_model_steps = float(
+            cfg.inner_rounds
+            * cfg.inner_rollouts_per_round
+            * cfg.inner_rollout_horizon
+        )
+        utd_denominator = realized_model_steps.clamp_min(1)
+        alpha_final = self.alpha.detach().clone()
         metrics = self._base_metrics(active=True)
         metrics.update(
             inner_rounds=float(cfg.inner_rounds),
@@ -1803,10 +1951,30 @@ class InnerImprovementEngine:
                 cfg.inner_rounds * cfg.inner_rollouts_per_round
             ),
             inner_rollout_count=float(rollout_count),
-            inner_steps=length_values.sum(),
-            inner_model_steps=length_values.sum(),
+            inner_steps=realized_model_steps,
+            inner_model_steps=realized_model_steps,
+            inner_nominal_model_steps=nominal_model_steps,
+            inner_realized_model_steps=realized_model_steps,
             inner_updates=float(update_slots),
             inner_update_slots=float(update_slots),
+            inner_requested_update_slots=float(requested_update_slots),
+            inner_updates_per_round_realized=(
+                float(update_slots) / float(cfg.inner_rounds)
+                if cfg.inner_rounds
+                else 0.0
+            ),
+            inner_critic_utd=(
+                torch.as_tensor(float(state.critic_steps), device=self.device)
+                / utd_denominator
+            ),
+            inner_actor_utd=(
+                torch.as_tensor(float(state.actor_steps), device=self.device)
+                / utd_denominator
+            ),
+            inner_temperature_utd=(
+                torch.as_tensor(float(state.temperature_steps), device=self.device)
+                / utd_denominator
+            ),
             inner_critic_optimizer_steps=float(state.critic_steps),
             inner_actor_optimizer_steps=float(state.actor_steps),
             inner_temperature_optimizer_steps=float(state.temperature_steps),
@@ -1841,7 +2009,10 @@ class InnerImprovementEngine:
             inner_termination_rate_std=termination_stats[1],
             inner_termination_rate_min=termination_stats[2],
             inner_termination_rate_max=termination_stats[3],
-            inner_alpha=self.alpha.detach().mean(),
+            inner_alpha=alpha_final.mean(),
+            inner_alpha_initial=alpha_initial.mean(),
+            inner_alpha_final=alpha_final.mean(),
+            inner_alpha_delta=(alpha_final - alpha_initial).mean(),
             inner_actor_trainable_params=float(state.actor_trainable_count),
             inner_critic_trainable_params=float(state.critic_trainable_count),
             inner_temperature_trainable_params=float(
@@ -1889,6 +2060,7 @@ class InnerImprovementEngine:
     def _act_mppi(self, root_z, *, t0, eval_mode, start):
         from .mppi import mppi_plan
 
+        iterations = self._mppi_iterations
         scope = str(self.cfg.inner_mppi_warm_start_scope)
         if scope == "action" or (scope == "episode" and t0):
             previous_mean = None
@@ -1900,7 +2072,7 @@ class InnerImprovementEngine:
                 model=self.model,
                 root_z=root_z,
                 horizon=self.cfg.inner_rollout_horizon,
-                iterations=self.cfg.inner_rounds,
+                iterations=iterations,
                 num_samples=self.cfg.inner_mppi_num_samples,
                 num_elites=self.cfg.inner_mppi_num_elites,
                 num_pi_trajs=self.cfg.inner_mppi_num_pi_trajs,
@@ -1921,14 +2093,17 @@ class InnerImprovementEngine:
         metrics = self._base_metrics(active=True)
         metrics.update(result.metrics)
         metrics.update(
-            inner_rounds=float(self.cfg.inner_rounds),
-            inner_iterations=float(self.cfg.inner_rounds),
+            # ``inner_rounds`` remains a metric alias for one compatibility
+            # release; MPPI execution is controlled only by the dedicated key.
+            inner_rounds=float(iterations),
+            inner_iterations=float(iterations),
+            inner_mppi_iterations=float(iterations),
             inner_rollouts=float(
-                self.cfg.inner_rounds * self.cfg.inner_mppi_num_samples
+                iterations * self.cfg.inner_mppi_num_samples
                 + self.cfg.inner_mppi_num_pi_trajs
             ),
             inner_requested_rollouts=float(
-                self.cfg.inner_rounds * self.cfg.inner_mppi_num_samples
+                iterations * self.cfg.inner_mppi_num_samples
                 + self.cfg.inner_mppi_num_pi_trajs
             ),
             inner_steps=float(result.model_steps),
@@ -1996,7 +2171,7 @@ class InnerImprovementEngine:
             metrics["inner_diagnostics_step"] = float(self.action_index)
             self._timer_stop("inner_diagnostic_seconds", diagnostic_start)
         candidate_lengths = [int(self.cfg.inner_rollout_horizon)] * int(
-            self.cfg.inner_rounds * self.cfg.inner_mppi_num_samples
+            iterations * self.cfg.inner_mppi_num_samples
         )
         policy_lengths = [max(0, int(self.cfg.inner_rollout_horizon) - 1)] * int(
             self.cfg.inner_mppi_num_pi_trajs
@@ -2010,7 +2185,14 @@ class InnerImprovementEngine:
         self._collect_diagnostics = bool(collect_diagnostics)
         with self.rng.action_fork():
             operator = str(self.cfg.inner_operator)
-            if operator == "none" or self.cfg.inner_rounds == 0:
+            inactive = operator == "none" or (
+                operator == "mppi"
+                and self._mppi_iterations == 0
+            ) or (
+                operator in {"sac", "td3"}
+                and int(self.cfg.inner_rounds) == 0
+            )
+            if inactive:
                 action, metrics, lengths = self._act_none(
                     root_z, eval_mode=eval_mode, start=start
                 )

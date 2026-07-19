@@ -15,6 +15,7 @@ except ImportError:  # tensordict<newer API compatibility
     from tensordict.tensordict import TensorDict
 
 from RL.alg import Algorithm
+from RL.tdmpc2_core import MODEL_SIZE
 from RL.tdmpc2_core.agent import TDMPC2
 from RL.tdmpc2_core.common.buffer import Buffer
 from RL.tdmpc2_core.common.checkpoint import AsyncCheckpointWriter
@@ -27,15 +28,6 @@ from utils.wandb_utils import (
     init_wandb,
     log_wandb,
 )
-
-
-_MODEL_SIZE = {
-    1: {"enc_dim": 256, "mlp_dim": 384, "latent_dim": 128, "num_enc_layers": 2, "num_q": 2},
-    5: {"enc_dim": 256, "mlp_dim": 512, "latent_dim": 512, "num_enc_layers": 2, "num_q": 5},
-    19: {"enc_dim": 1024, "mlp_dim": 1024, "latent_dim": 768, "num_enc_layers": 3, "num_q": 5},
-    48: {"enc_dim": 1792, "mlp_dim": 1792, "latent_dim": 768, "num_enc_layers": 4, "num_q": 5},
-    317: {"enc_dim": 4096, "mlp_dim": 4096, "latent_dim": 1376, "num_enc_layers": 5, "num_q": 8},
-}
 
 
 _DEFAULTS = {
@@ -79,13 +71,9 @@ _DEFAULTS = {
 
     # architecture, 5M single-task default
     "model_size": 5,
-    "num_enc_layers": 2,
-    "enc_dim": 256,
+    **MODEL_SIZE[5],
     "num_channels": 32,
-    "mlp_dim": 512,
-    "latent_dim": 512,
     "task_dim": 0,
-    "num_q": 5,
     "dropout": 0.01,
     "simnorm_dim": 8,
 
@@ -591,9 +579,9 @@ class TDMPC2Baseline(Algorithm):
         model_size = cfg.get("model_size", None)
         if model_size is not None:
             model_size = int(model_size)
-            if model_size not in _MODEL_SIZE:
-                raise ValueError(f"Invalid TD-MPC2 model_size={model_size}. Expected one of {list(_MODEL_SIZE)}.")
-            cfg.update(copy.deepcopy(_MODEL_SIZE[model_size]))
+            if model_size not in MODEL_SIZE:
+                raise ValueError(f"Invalid TD-MPC2 model_size={model_size}. Expected one of {list(MODEL_SIZE)}.")
+            cfg.update(copy.deepcopy(MODEL_SIZE[model_size]))
             cfg["model_size"] = model_size
 
         episode_length = cfg.get("episode_length", None) or self._infer_episode_length()

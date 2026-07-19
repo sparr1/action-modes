@@ -353,7 +353,7 @@ class SACAgent:
             "ent_coef_grad_norm": [],
         }
 
-        for gradient_step in range(int(gradient_steps)):
+        for _ in range(int(gradient_steps)):
             batch = replay_buffer.sample(batch_size, self.device)
 
             actions_pi, log_prob = self.actor.action_log_prob(batch["obs"])
@@ -403,7 +403,11 @@ class SACAgent:
             actor_grad_norm = _grad_norm(self.actor.parameters())
             self.actor_optimizer.step()
 
-            if gradient_step % self.config.target_update_interval == 0:
+            # Keep the target-update phase continuous across separate update()
+            # calls. This preserves the existing zero-based schedule (update on
+            # steps 0, interval, 2 * interval, ...) without restarting it for
+            # every rollout/train chunk.
+            if self.num_updates % int(self.config.target_update_interval) == 0:
                 polyak_update(self.critic, self.critic_target, self.config.tau)
 
             self.num_updates += 1

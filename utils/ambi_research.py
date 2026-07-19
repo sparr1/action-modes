@@ -248,7 +248,15 @@ def resolve_preset(matrix_path, selector, matrix=None):
         algorithm_config.get("alg_params"), f"{base_path}.alg_params"
     )
     alg_params.update(copy.deepcopy(matrix.get("shared_alg_params", {})))
-    alg_params.update(copy.deepcopy(variant.get("alg_params", {})))
+    # A preset normally overlays a small set of values onto the base config.
+    # ``null`` is the explicit deletion marker for operator-specific controls:
+    # for example, an MPPI variant must remove the SAC-only J/N/G schedule it
+    # inherited from the reference AMBI config rather than silently ignore it.
+    for key, value in copy.deepcopy(variant.get("alg_params", {})).items():
+        if value is None:
+            alg_params.pop(key, None)
+        else:
+            alg_params[key] = value
     algorithm_config.update(copy.deepcopy(variant.get("run_params", {})))
 
     return {
