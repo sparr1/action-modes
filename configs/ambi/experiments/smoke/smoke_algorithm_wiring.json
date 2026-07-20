@@ -5,7 +5,7 @@
   "env_params": {"render_mode": null, "exclude_current_positions_from_observation": true, "max_episode_steps": 16, "terminate_when_unhealthy": false},
   "trials": 1,
   "configs": [
-    "smoke_native_sac_twin_q",
+    "smoke_native_sac_distributional_five_q",
     "smoke_tdmpc2_train6_plan3",
     "smoke_ambi_train6_inner3"
   ],

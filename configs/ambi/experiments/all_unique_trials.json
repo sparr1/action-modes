@@ -5,7 +5,7 @@
   "env_params": {"render_mode": null, "exclude_current_positions_from_observation": true, "max_episode_steps": 1000, "terminate_when_unhealthy": false},
   "trials": 1,
   "configs": [
-    "native_sac_distributional_twin_q",
+    "native_sac_distributional_five_q",
     "tdmpc2_baseline",
     "ambi_anchor",
     "ambi_horizon_train6_inner3",

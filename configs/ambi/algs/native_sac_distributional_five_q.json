@@ -18,7 +18,7 @@
     "target_update_interval": 1,
     "net_arch": [256, 256],
     "q_representation": "distributional",
-    "num_q": 2,
+    "num_q": 5,
     "q_pair_size": 2,
     "q_target_reduction": "min_pair",
     "q_actor_reduction": "min_pair",
@@ -29,12 +29,12 @@
     "wandb_project": "ambi",
     "wandb_step_every": 1000,
     "wandb_entity": "rwgao_b-brown-university",
-    "wandb_run_name": "native-sac-distributional-twin-q-ant-v4",
+    "wandb_run_name": "native-sac-distributional-five-q-ant-v4",
     "wandb_tags": [
       "canonical",
       "native_sac",
       "distributional_q",
-      "twin_q",
+      "five_q",
       "tdmpc2_comparator"
     ]
   },

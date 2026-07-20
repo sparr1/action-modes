@@ -21,6 +21,7 @@
             256
         ],
         "q_representation": "distributional",
+        "num_q": 2,
         "q_num_bins": 101,
         "q_vmin": -10,
         "q_vmax": 10,

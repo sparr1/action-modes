@@ -1,19 +1,19 @@
 # Native SAC distributional-Q notes
 
 The active comparator is
-`configs/ambi/algs/native_sac_distributional_twin_q.json`.
+`configs/ambi/algs/native_sac_distributional_five_q.json`.
 
-The native SAC implementation supports a distributional Q ensemble. This
-comparator deliberately retains standard SAC's twin-critic structure while
-changing the Q representation to categorical symlog bins. It applies the
-clipped twin-Q minimum to the Bellman target and actor objective.
+The native SAC implementation supports a distributional Q ensemble. The active
+comparator uses five heads to match the size-5 TD-MPC2 and AMBI critics. A
+random pair of two heads is selected per Q query, and `min_pair` is applied to
+the Bellman target and actor objective.
 
 The distributional critic is selected with:
 
 ```json
 {
   "q_representation": "distributional",
-  "num_q": 2,
+  "num_q": 5,
   "q_pair_size": 2,
   "q_target_reduction": "min_pair",
   "q_actor_reduction": "min_pair",
@@ -47,9 +47,8 @@ python3 main.py \
 
 This checked-in run uses seed 55 only and is labeled exploratory in its
 manifest. The older scalar-versus-twin-distributional ablation remains under
-`configs/experiments/` for historical use. AMBI and TD-MPC2 use five heads;
-Native SAC remains twin-Q so distributional representation is not conflated
-with ensemble size.
+`configs/experiments/` for historical use and explicitly pins `num_q=2`; it is
+not the active five-head comparator.
 
 This is a categorical/two-hot Q parameterization trained from the usual scalar
 soft-SAC target. It should not be interpreted as a calibrated distribution over

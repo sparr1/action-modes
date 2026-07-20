@@ -4,6 +4,7 @@ from pathlib import Path
 import gymnasium as gym
 
 from RL.TDMPC2 import TDMPC2Baseline
+from RL.tdmpc2_core import MODEL_SIZE
 from utils.ambi_end_to_end import load_suite, render_condition_configs
 
 
@@ -52,7 +53,7 @@ def test_baseline_comparison_is_explicit_single_seed_three_way_with_checkpoints(
     }
     assert experiment["trials"] == 1
     assert experiment["configs"] == [
-        "native_sac_distributional_twin_q",
+        "native_sac_distributional_five_q",
         "tdmpc2_baseline",
         "ambi_anchor",
     ]
@@ -63,11 +64,11 @@ def test_baseline_comparison_is_explicit_single_seed_three_way_with_checkpoints(
 
 
 def test_baseline_algorithms_make_q_and_horizon_contracts_visible():
-    native = _load_json_strict(AMBI_ALGS / "native_sac_distributional_twin_q.json")
+    native = _load_json_strict(AMBI_ALGS / "native_sac_distributional_five_q.json")
     native_params = native["alg_params"]
     assert native["alg"] == "SAC/SAC"
     assert native_params["q_representation"] == "distributional"
-    assert native_params["num_q"] == 2
+    assert native_params["num_q"] == 5
     assert native_params["q_pair_size"] == 2
     assert native_params["q_target_reduction"] == "min_pair"
     assert native_params["q_actor_reduction"] == "min_pair"
@@ -80,6 +81,7 @@ def test_baseline_algorithms_make_q_and_horizon_contracts_visible():
     tdmpc = _load_json_strict(AMBI_ALGS / "tdmpc2_baseline.json")["alg_params"]
     assert tdmpc["model_size"] == 5
     assert "num_q" not in tdmpc
+    assert MODEL_SIZE[tdmpc["model_size"]]["num_q"] == 5
     assert tdmpc["q_pair_size"] == 2
     assert tdmpc["train_unroll_horizon"] == 3
     assert tdmpc["outer_planning_horizon"] == 3
@@ -94,6 +96,7 @@ def test_baseline_algorithms_make_q_and_horizon_contracts_visible():
     assert ambi["mpc"] is False
     assert ambi["model_size"] == 5
     assert "num_q" not in ambi
+    assert MODEL_SIZE[ambi["model_size"]]["num_q"] == 5
     assert ambi["q_pair_size"] == 2
     assert ambi["outer_q_target_reduction"] == "min_pair"
     assert ambi["outer_q_actor_reduction"] == "min_pair"

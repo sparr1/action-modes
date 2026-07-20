@@ -16,7 +16,7 @@
   },
   "trials": 1,
   "configs": [
-    "native_sac_distributional_twin_q",
+    "native_sac_distributional_five_q",
     "tdmpc2_baseline",
     "ambi_anchor"
   ],

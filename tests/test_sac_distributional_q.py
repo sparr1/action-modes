@@ -33,6 +33,7 @@ def distributional_config(**overrides):
     values = {
         "net_arch": (16,),
         "q_representation": "distributional",
+        "num_q": 2,
         "q_num_bins": 11,
         "q_vmin": -5.0,
         "q_vmax": 5.0,
@@ -41,6 +42,11 @@ def distributional_config(**overrides):
     }
     values.update(overrides)
     return SACConfig(**values)
+
+
+def test_distributional_config_defaults_to_five_heads_but_scalar_stays_twin_q():
+    assert SACConfig(q_representation="distributional").num_q == 5
+    assert SACConfig(q_representation="scalar").num_q == 2
 
 
 def test_distributional_critics_expose_logits_but_public_q_api_decodes_values():
@@ -164,13 +170,12 @@ def test_legacy_checkpoint_without_critic_spec_loads_only_into_scalar_sac():
         distributional.load_state_dict(legacy_state)
 
 
-def test_native_sac_wrapper_plumbs_five_head_distributional_config():
+def test_native_sac_wrapper_defaults_distributional_q_to_five_heads():
     env = gym.make("Pendulum-v1")
     params = {
         "device": "cpu",
         "net_arch": [8],
         "q_representation": "distributional",
-        "num_q": 5,
         "q_pair_size": 2,
         "q_target_reduction": "min_pair",
         "q_actor_reduction": "min_pair",
@@ -191,6 +196,30 @@ def test_native_sac_wrapper_plumbs_five_head_distributional_config():
     }
     assert len(model.agent.critic.q_networks) == 5
     assert model.agent.critic.qf5[-1].out_features == 17
+    env.close()
+
+
+def test_native_sac_wrapper_preserves_explicit_twin_q_ablation():
+    env = gym.make("Pendulum-v1")
+    model = SAC(
+        "SAC",
+        env,
+        {
+            "device": "cpu",
+            "net_arch": [8],
+            "q_representation": "distributional",
+            "num_q": 2,
+            "q_pair_size": 2,
+            "q_num_bins": 17,
+            "wandb": False,
+        },
+        {"device": "cpu"},
+        {},
+    )
+
+    assert model.cfg.num_q == 2
+    assert len(model.agent.critic.q_networks) == 2
+    assert not hasattr(model.agent.critic, "qf3")
     env.close()
 
 
@@ -423,7 +452,6 @@ def test_native_distributional_sac_runs_end_to_end_training_loop():
             "buffer_size": 32,
             "net_arch": [8],
             "q_representation": "distributional",
-            "num_q": 5,
             "q_pair_size": 2,
             "q_target_reduction": "min_pair",
             "q_actor_reduction": "min_pair",

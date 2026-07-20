@@ -16,7 +16,8 @@ python main.py \
 
 It starts three independent one-million-step runs from seed 55:
 
-- native distributional SAC with the deliberately retained twin-Q critic;
+- native distributional SAC with five Q heads, matching the size-5 TD-MPC2
+  and AMBI critics;
 - standard TD-MPC2 with train horizon 3 and planning horizon 3;
 - full-copy AMBI TD-MPC2 with train/plan/inner horizons 3/3/3.
 

@@ -15,7 +15,7 @@
     "terminate_when_unhealthy": false
   },
   "trials": 1,
-  "configs": ["native_sac_distributional_twin_q"],
+  "configs": ["native_sac_distributional_five_q"],
   "logs": "timestamp",
   "save_trials": "none",
   "checkpoint_every": 100000,

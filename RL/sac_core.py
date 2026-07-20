@@ -89,7 +89,7 @@ class SACConfig:
     actor_net_arch: Optional[Tuple[int, ...]] = None
     critic_net_arch: Optional[Tuple[int, ...]] = None
     q_representation: str = "scalar"
-    num_q: int = 2
+    num_q: Optional[int] = None
     q_pair_size: int = 2
     q_target_reduction: str = "min_pair"
     q_actor_reduction: str = "min_pair"
@@ -100,6 +100,11 @@ class SACConfig:
     seed: Optional[int] = None
     device: str = "auto"
     verbose: int = 1
+
+    def __post_init__(self):
+        self.q_representation = str(self.q_representation).lower()
+        if self.num_q is None:
+            self.num_q = 5 if self.q_representation == "distributional" else 2
 
 
 class ReplayBuffer:

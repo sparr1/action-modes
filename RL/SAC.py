@@ -121,6 +121,9 @@ class SAC(Algorithm):
             actor_arch = critic_arch = self._validated_net_arch(net_arch, "net_arch")
 
         device = self.run_params.get("device", self.params.get("device", "auto"))
+        q_representation = str(
+            self.params.get("q_representation", "scalar")
+        ).lower()
         return SACConfig(
             learning_rate=float(self.params.get("learning_rate", 3e-4)),
             buffer_size=int(float(self.params.get("buffer_size", 1_000_000))),
@@ -136,8 +139,8 @@ class SAC(Algorithm):
             net_arch=actor_arch,
             actor_net_arch=actor_arch,
             critic_net_arch=critic_arch,
-            q_representation=str(self.params.get("q_representation", "scalar")).lower(),
-            num_q=self.params.get("num_q", 2),
+            q_representation=q_representation,
+            num_q=self.params.get("num_q"),
             q_pair_size=self.params.get("q_pair_size", 2),
             q_target_reduction=str(
                 self.params.get("q_target_reduction", "min_pair")
