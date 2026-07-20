@@ -9,7 +9,7 @@
 #SBATCH --time=192:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
-#SBATCH --nodelist=gpu[1907]
+#SBATCH --nodelist=gpu[2001]
 
 
 set -Eeuo pipefail
