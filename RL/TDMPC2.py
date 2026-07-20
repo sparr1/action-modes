@@ -20,6 +20,10 @@ from RL.tdmpc2_core.agent import TDMPC2
 from RL.tdmpc2_core.common.buffer import Buffer
 from RL.tdmpc2_core.common.checkpoint import AsyncCheckpointWriter
 from RL.tdmpc2_core.common.device import resolve_device
+from utils.checkpointing import (
+    CheckpointTracker,
+    explicit_checkpoint_target,
+)
 from utils.utils import setup_logs
 from utils.wandb_utils import (
     WandbAccumulator,
@@ -449,6 +453,8 @@ class TDMPC2Baseline(Algorithm):
     only adapts the stepping / logging / save interface around the official
     TD-MPC2 agent, world model, and replay buffer.
     """
+
+    supports_composable_checkpointing = True
 
     def __init__(self, name, env, custom_params=None, run_params=None, experiment_params=None):
         super().__init__(name, env, custom_params)
@@ -1015,8 +1021,10 @@ class TDMPC2Baseline(Algorithm):
     def _maybe_checkpoint(self):
         if not self._checkpointing:
             return
-        save_freq, save_path, name_prefix = self._checkpointing
-        if self._global_step > 0 and self._global_step % save_freq == 0:
+        if isinstance(self._checkpointing, tuple):
+            save_freq, save_path, name_prefix = self._checkpointing
+            if not (self._global_step > 0 and self._global_step % save_freq == 0):
+                return
             if self.alg_logger is not None and hasattr(self.alg_logger, "flush"):
                 self.alg_logger.flush()
             os.makedirs(save_path, exist_ok=True)
@@ -1025,6 +1033,32 @@ class TDMPC2Baseline(Algorithm):
                 os.path.join(save_path, f"{name_prefix}_{self._global_step}"),
                 signature=self._checkpoint_signature(),
             )
+            return
+
+        targets = self._checkpointing.targets(self._global_step)
+        if not targets:
+            return
+        if self.alg_logger is not None and hasattr(self.alg_logger, "flush"):
+            self.alg_logger.flush()
+        self._checkpoint_writer.enqueue_many(
+            self.agent.checkpoint_state(),
+            targets,
+            signature=self._checkpoint_signature(),
+        )
+
+    def _final_checkpoint(self):
+        if not isinstance(self._checkpointing, CheckpointTracker):
+            return ()
+        targets = self._checkpointing.targets(self._global_step, final=True)
+        if not targets:
+            return ()
+        if self.alg_logger is not None and hasattr(self.alg_logger, "flush"):
+            self.alg_logger.flush()
+        return self._checkpoint_writer.save_many(
+            self.agent.checkpoint_state(),
+            targets,
+            signature=self._checkpoint_signature(),
+        )
 
     def learn(self, total_timesteps=10000):
         total_timesteps = int(float(total_timesteps))
@@ -1120,6 +1154,8 @@ class TDMPC2Baseline(Algorithm):
                     info,
                     completed_episode=done,
                 )
+                if done and isinstance(self._checkpointing, CheckpointTracker):
+                    self._checkpointing.record_episode_return(self._episode_return)
                 self._maybe_checkpoint()
 
                 if done:
@@ -1133,6 +1169,7 @@ class TDMPC2Baseline(Algorithm):
                 else:
                     obs = next_obs
                     obs_t = next_obs_t
+            self._final_checkpoint()
             return self
         finally:
             try:
@@ -1171,11 +1208,27 @@ class TDMPC2Baseline(Algorithm):
 
     def save(self, path, name):
         os.makedirs(path, exist_ok=True)
-        self._checkpoint_writer.save(
+        checkpoint_path = os.path.join(path, name)
+        tracker = getattr(self, "_checkpointing", None)
+        if isinstance(tracker, CheckpointTracker):
+            target = tracker.explicit_target(
+                checkpoint_path,
+                step=self._global_step,
+                episode=getattr(self, "_episode_idx", tracker.episode_count),
+            )
+        else:
+            target = explicit_checkpoint_target(
+                checkpoint_path,
+                step=self._global_step,
+                episode=getattr(self, "_episode_idx", 0),
+                trial_run_params=getattr(self, "run_params", {}),
+                experiment_params=getattr(self, "experiment_params", {}),
+            )
+        return self._checkpoint_writer.save_many(
             self.agent.checkpoint_state(),
-            os.path.join(path, name),
+            (target,),
             signature=self._checkpoint_signature(),
-        )
+        )[0]
 
     def _checkpoint_signature(self):
         """Version the exact outer state represented by native checkpoints."""
@@ -1196,8 +1249,26 @@ class TDMPC2Baseline(Algorithm):
         self._num_updates = int(getattr(self.agent, "num_updates", self._num_updates))
         return self
 
-    def set_checkpointing(self, save_freq, save_path, name_prefix):
-        save_freq = int(save_freq)
-        if save_freq <= 0:
-            raise ValueError("save_freq must be positive.")
-        self._checkpointing = (save_freq, save_path, name_prefix)
+    def set_checkpointing(
+        self,
+        save_freq,
+        save_path,
+        name_prefix,
+        save_strat="all",
+        checkpoint_best_window=100,
+        trial_run_params=None,
+        experiment_params=None,
+    ):
+        self._checkpointing = CheckpointTracker(
+            save_freq,
+            save_path,
+            name_prefix,
+            save_strat=save_strat,
+            best_window=checkpoint_best_window,
+            periodic_step_suffix="",
+            trial_run_params=self.run_params if trial_run_params is None else trial_run_params,
+            experiment_params=(
+                self.experiment_params if experiment_params is None else experiment_params
+            ),
+        )
+        return self._checkpointing

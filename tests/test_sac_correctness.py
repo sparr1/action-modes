@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -240,6 +243,11 @@ def test_checkpoint_load_validates_configuration_and_is_not_fake_resume(tmp_path
     source.learn(total_timesteps=4)
     source.save(tmp_path, "native")
     checkpoint = tmp_path / "native.pt"
+    metadata = json.loads((tmp_path / "native.pt.metadata.json").read_text())
+    assert metadata["schema_version"] == 1
+    assert metadata["checkpoint"]["kind"] == "trial_final"
+    assert metadata["checkpoint"]["step"] == 4
+    assert metadata["trial_run_params"]["seed"] == 3
 
     restored = build()
     restored.load(checkpoint)
@@ -250,6 +258,84 @@ def test_checkpoint_load_validates_configuration_and_is_not_fake_resume(tmp_path
         restored.load(checkpoint, resume=True)
     with pytest.raises(ValueError, match="configuration mismatch"):
         build(gamma=0.5).load(checkpoint)
+
+
+def test_native_sac_composes_best_and_latest_without_numbered_checkpoints(tmp_path):
+    env = ShortEpisodeEnv(episode_length=2)
+    run_params = {"seed": 8, "device": "cpu", "env": "ShortEpisodeEnv"}
+    experiment_params = {"trials": 1, "save_strat": ["best", "latest"]}
+    model = SAC(
+        "SAC",
+        env,
+        {
+            "device": "cpu",
+            "seed": 8,
+            "learning_starts": 100,
+            "buffer_size": 32,
+            "net_arch": [8],
+            "wandb": False,
+        },
+        run_params,
+        experiment_params,
+    )
+    model.set_checkpointing(
+        2,
+        tmp_path,
+        "model:native_0",
+        save_strat=["best", "latest"],
+        checkpoint_best_window=2,
+    )
+    model.learn(total_timesteps=4)
+
+    best = tmp_path / "model:native_0_best.pt"
+    latest = tmp_path / "model:native_0_latest.pt"
+    assert best.is_file()
+    assert latest.is_file()
+    assert not list(tmp_path.glob("model:native_0_*_steps.pt"))
+    latest_metadata = json.loads(Path(f"{latest}.metadata.json").read_text())
+    assert latest_metadata["checkpoint"]["kind"] == "latest"
+    assert latest_metadata["checkpoint"]["step"] == 4
+    assert latest_metadata["checkpoint"]["episode"] == 2
+    assert latest_metadata["trial_run_params"] == run_params
+    assert latest_metadata["experiment_params"] == experiment_params
+
+
+def test_native_sac_exception_does_not_publish_a_false_final_latest(tmp_path):
+    class FailingEnv(ShortEpisodeEnv):
+        def step(self, action):
+            if self.total_steps == 2:
+                raise RuntimeError("environment failed")
+            return super().step(action)
+
+    model = SAC(
+        "SAC",
+        FailingEnv(episode_length=2),
+        {
+            "device": "cpu",
+            "seed": 4,
+            "learning_starts": 100,
+            "buffer_size": 16,
+            "net_arch": [8],
+            "wandb": False,
+        },
+        {"seed": 4, "device": "cpu", "env": "FailingEnv"},
+        {},
+    )
+    model.set_checkpointing(
+        2,
+        tmp_path,
+        "model:native_0",
+        save_strat="latest",
+    )
+
+    with pytest.raises(RuntimeError, match="environment failed"):
+        model.learn(total_timesteps=4)
+
+    latest = tmp_path / "model:native_0_latest.pt"
+    metadata = json.loads(Path(f"{latest}.metadata.json").read_text())
+    assert metadata["checkpoint"]["step"] == 2
+    assert metadata["checkpoint"]["episode"] == 1
+    assert model.num_timesteps == 2
 
 
 def test_native_sac_one_step_matches_sb3_232():

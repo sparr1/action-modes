@@ -1,10 +1,17 @@
+import importlib
+import time
+from pathlib import Path
+
 import numpy as np
 import gymnasium as gym
-import importlib, json, os, time
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.callbacks import CheckpointCallback as BaselineCheckpointCallback
 from stable_baselines3.common.logger import KVWriter
 from RL.alg import Algorithm
+from utils.checkpointing import (
+    CheckpointTracker,
+    explicit_checkpoint_target,
+    publish_checkpoint,
+)
 from utils.utils import setup_logs
 from utils.wandb_utils import (
     WandbAccumulator,
@@ -67,11 +74,23 @@ def _wandb_clean_params(params):
 # theres a hash collision on "params", since it usually refers to tunable parameters of the model itself...
 #wrapper on stable baselines
 class Baseline(Algorithm):
-    def __init__(self, name, env, params = None):
+    supports_composable_checkpointing = True
+
+    def __init__(
+        self,
+        name,
+        env,
+        params=None,
+        run_params=None,
+        experiment_params=None,
+    ):
         super().__init__(name, env, custom_params=params)
         self.params = params or {}
+        self.run_params = run_params or {}
+        self.experiment_params = experiment_params or {}
         self.model = self.get_baseline_model(self.name, self.env, self.params)
         self.callback = []
+        self._checkpoint_callback = None
         if wandb_enabled(self.params):
             self.callback.append(WandbBaselineCallback(self.name, self.params, env))
 
@@ -89,7 +108,30 @@ class Baseline(Algorithm):
         return self.model.predict(observation)
 
     def save(self, path, name):
-        self.model.save(os.path.join(path, name))
+        step = int(getattr(self.model, "num_timesteps", 0))
+        episode = int(getattr(self.model, "_episode_num", 0))
+        target_path = Path(path) / name
+        if self._checkpoint_callback is not None:
+            tracker = self._checkpoint_callback.tracker
+            target = tracker.explicit_target(
+                target_path,
+                step=step,
+                episode=tracker.episode_count,
+            )
+        else:
+            target = explicit_checkpoint_target(
+                target_path,
+                step=step,
+                episode=episode,
+                trial_run_params=self.run_params,
+                experiment_params=self.experiment_params,
+            )
+        published = publish_checkpoint(
+            (target,),
+            lambda staging: self.model.save(staging),
+            extension=".zip",
+        )
+        return published[0]
 
     def get_model(self):
         return self.model
@@ -98,8 +140,35 @@ class Baseline(Algorithm):
         super().set_logger(logger)
         self.callback.append(TrajectoryLoggerCallback(self.alg_logger))
 
-    def set_checkpointing(self, save_freq, save_path, name_prefix):
-        self.callback.append(BaselineCheckpointCallback(save_freq, save_path, name_prefix, False, False, 2))
+    def set_checkpointing(
+        self,
+        save_freq,
+        save_path,
+        name_prefix,
+        save_strat="all",
+        checkpoint_best_window=100,
+        trial_run_params=None,
+        experiment_params=None,
+    ):
+        if self._checkpoint_callback is not None:
+            try:
+                self.callback.remove(self._checkpoint_callback)
+            except ValueError:
+                pass
+        tracker = CheckpointTracker(
+            save_freq,
+            save_path,
+            name_prefix,
+            save_strat=save_strat,
+            best_window=checkpoint_best_window,
+            trial_run_params=self.run_params if trial_run_params is None else trial_run_params,
+            experiment_params=(
+                self.experiment_params if experiment_params is None else experiment_params
+            ),
+        )
+        self._checkpoint_callback = ComposableCheckpointCallback(tracker)
+        self.callback.append(self._checkpoint_callback)
+        return tracker
 
     def delete_model(self):
         del self.model
@@ -161,6 +230,55 @@ class TrajectoryLoggerCallback(BaseCallback):
 
         self.traj_logger.on_step(data = data)
         return True
+
+
+class ComposableCheckpointCallback(BaseCallback):
+    """SB3 callback for numbered, rolling-best, and latest aliases."""
+
+    def __init__(self, tracker, verbose=0):
+        super().__init__(verbose)
+        self.tracker = tracker
+        self._episode_returns = None
+
+    def _on_training_start(self) -> None:
+        n_envs = int(getattr(self.model, "n_envs", 1))
+        if n_envs <= 0:
+            raise ValueError("SB3 checkpointing requires at least one environment.")
+        reset = bool(self.locals.get("reset_num_timesteps", True))
+        if reset:
+            self.tracker.reset()
+        if self._episode_returns is None or reset or len(self._episode_returns) != n_envs:
+            self._episode_returns = np.zeros(n_envs, dtype=np.float64)
+
+    def _publish(self, targets):
+        targets = tuple(targets)
+        if not targets:
+            return ()
+        return publish_checkpoint(
+            targets,
+            lambda staging: self.model.save(staging),
+            extension=".zip",
+        )
+
+    def _on_step(self) -> bool:
+        rewards = np.asarray(self.locals.get("rewards", 0.0), dtype=np.float64).reshape(-1)
+        dones = np.asarray(self.locals.get("dones", False), dtype=bool).reshape(-1)
+        if self._episode_returns is None:
+            self._episode_returns = np.zeros(len(rewards), dtype=np.float64)
+        if len(rewards) != len(self._episode_returns) or len(dones) != len(rewards):
+            raise ValueError("SB3 checkpoint callback received inconsistent vector-env outputs.")
+        self._episode_returns += rewards
+        for index in np.flatnonzero(dones):
+            self.tracker.record_episode_return(self._episode_returns[index])
+            self._episode_returns[index] = 0.0
+        self._publish(self.tracker.targets(int(self.num_timesteps)))
+        return True
+
+    def _on_training_end(self) -> None:
+        # SB3 only invokes this hook after a clean learn() completion. Exceptions
+        # therefore retain the last cadence save without publishing a false final
+        # "latest" alias.
+        self._publish(self.tracker.targets(int(self.num_timesteps), final=True))
 
 
 class _WandbKVWriter(KVWriter):

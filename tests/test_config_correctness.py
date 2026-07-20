@@ -27,6 +27,10 @@ def test_ambi_tdmpc2_configs_preserve_continuing_task_and_inner_target_semantics
     experiment = _load_json_strict(ROOT / "configs/experiments/AntAMBITDMPC2.json")
     assert experiment["env_params"]["terminate_when_unhealthy"] is False
     assert experiment["configs"] == ["AntAMBITDMPC2"]
+    assert experiment["checkpoint_every"] == 100000
+    assert experiment["save_strat"] == ["best", "latest"]
+    assert experiment["checkpoint_best_window"] == 100
+    assert experiment["save_trials"] == "none"
 
     for name in ("AntAMBITDMPC2.json", "AntAMBITDMPC2Debug.json"):
         config = _load_json_strict(ROOT / "configs/algs" / name)

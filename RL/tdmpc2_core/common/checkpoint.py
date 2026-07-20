@@ -19,6 +19,8 @@ from typing import Any
 
 import torch
 
+from utils.checkpointing import CheckpointTarget, write_metadata_atomic
+
 
 class FrozenCheckpoint:
     """CPU-owned checkpoint state plus any outstanding device-copy events."""
@@ -193,6 +195,35 @@ class AsyncCheckpointWriter:
     def _write(snapshot, path):
         return _atomic_torch_save(snapshot.wait(), path)
 
+    @staticmethod
+    def _normalize_publications(publications):
+        normalized = []
+        for publication in publications:
+            if isinstance(publication, CheckpointTarget):
+                path = publication.path
+                metadata = publication.metadata
+            elif isinstance(publication, (tuple, list)) and len(publication) == 2:
+                path, metadata = publication
+            else:
+                path, metadata = publication, None
+            normalized.append((os.fspath(path), copy.deepcopy(metadata)))
+        if not normalized:
+            raise ValueError("At least one checkpoint publication target is required.")
+        return tuple(normalized)
+
+    @staticmethod
+    def _write_many(snapshot, publications):
+        state = snapshot.wait()
+        first, _ = publications[0]
+        _atomic_torch_save(state, first)
+        paths = [str(first)]
+        for path, _ in publications[1:]:
+            paths.append(_atomic_clone(first, path))
+        for path, metadata in publications:
+            if metadata is not None:
+                write_metadata_atomic(path, metadata)
+        return tuple(paths)
+
     def enqueue(self, state, path, *, signature=None):
         """Queue one periodic save after making its exact-state snapshot."""
 
@@ -204,6 +235,16 @@ class AsyncCheckpointWriter:
         self._pending_signature = signature
         self._future = self._executor.submit(self._write, snapshot, path)
 
+    def enqueue_many(self, state, publications, *, signature=None):
+        """Queue one exact snapshot for several atomically published aliases."""
+
+        self.flush()
+        normalized = self._normalize_publications(publications)
+        snapshot = freeze_checkpoint(state)
+        self._ensure_executor()
+        self._pending_signature = signature
+        self._future = self._executor.submit(self._write_many, snapshot, normalized)
+
     def flush(self):
         """Wait until the most recently queued periodic checkpoint is durable."""
 
@@ -213,7 +254,8 @@ class AsyncCheckpointWriter:
         signature = self._pending_signature
         self._future = None
         self._pending_signature = None
-        path = future.result()
+        result = future.result()
+        path = result[0] if isinstance(result, (tuple, list)) else result
         self._last_path = os.path.abspath(os.fspath(path))
         self._last_signature = signature
         return path
@@ -226,23 +268,37 @@ class AsyncCheckpointWriter:
         serializing the same tensors again.
         """
 
+        return self.save_many(state, (path,), signature=signature)[0]
+
+    def save_many(self, state, publications, *, signature=None):
+        """Synchronously publish one exact state under one or more names."""
+
         self.flush()
-        target = os.path.abspath(os.fspath(path))
+        normalized = self._normalize_publications(publications)
+        targets = tuple(os.path.abspath(os.fspath(path)) for path, _ in normalized)
         if (
             signature is not None
             and signature == self._last_signature
             and self._last_path is not None
             and os.path.exists(self._last_path)
         ):
-            if target != self._last_path:
-                _atomic_clone(self._last_path, target)
-            self._last_path = target
-            return target
+            for target in targets:
+                if target != self._last_path:
+                    _atomic_clone(self._last_path, target)
+            for target, (_, metadata) in zip(targets, normalized):
+                if metadata is not None:
+                    write_metadata_atomic(target, metadata)
+            self._last_path = targets[0]
+            return targets
 
-        result = save_checkpoint(state, target)
-        self._last_path = target
+        absolute_publications = tuple(
+            (target, metadata)
+            for target, (_, metadata) in zip(targets, normalized)
+        )
+        result = self._write_many(freeze_checkpoint(state), absolute_publications)
+        self._last_path = targets[0]
         self._last_signature = signature
-        return result
+        return tuple(result)
 
     def invalidate(self):
         """Forget snapshot-reuse metadata after live state is replaced.

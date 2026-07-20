@@ -1,10 +1,12 @@
 import os
+import json
 
 import pytest
 import torch
 
 from RL.TDMPC2 import TDMPC2Baseline
 from RL.tdmpc2_core.common import checkpoint as checkpoint_io
+from utils.checkpointing import CheckpointTracker
 
 
 def test_async_snapshot_is_immutable_and_atomically_published(tmp_path):
@@ -19,6 +21,44 @@ def test_async_snapshot_is_immutable_and_atomically_published(tmp_path):
     saved = torch.load(target, weights_only=False)
     torch.testing.assert_close(saved["model"]["weight"], torch.tensor([1.0, 2.0]))
     assert not list(tmp_path.glob(".periodic.pt.*.tmp"))
+    writer.shutdown()
+
+
+def test_async_multi_alias_checkpoint_freezes_once_and_writes_sidecars(
+    tmp_path, monkeypatch
+):
+    tracker = CheckpointTracker(
+        5,
+        tmp_path,
+        "model",
+        save_strat=["best", "latest"],
+        periodic_step_suffix="",
+        trial_run_params={"seed": 7},
+        experiment_params={"trials": 1},
+    )
+    tracker.record_episode_return(4.0)
+    targets = tracker.targets(5)
+    live = torch.tensor([2.0])
+    original_freeze = checkpoint_io.freeze_checkpoint
+    freeze_calls = []
+
+    def counted_freeze(state):
+        freeze_calls.append(state)
+        return original_freeze(state)
+
+    monkeypatch.setattr(checkpoint_io, "freeze_checkpoint", counted_freeze)
+    writer = checkpoint_io.AsyncCheckpointWriter()
+    writer.enqueue_many({"model": {"weight": live}}, targets, signature=(5, 1, 1))
+    live.fill_(9.0)
+    writer.flush()
+
+    assert len(freeze_calls) == 1
+    for target in targets:
+        saved = torch.load(target.path, weights_only=False)
+        torch.testing.assert_close(saved["model"]["weight"], torch.tensor([2.0]))
+        sidecar = json.loads((tmp_path / f"{target.path.name}.metadata.json").read_text())
+        assert sidecar["checkpoint"]["kind"] == target.kind
+        assert sidecar["trial_run_params"] == {"seed": 7}
     writer.shutdown()
 
 

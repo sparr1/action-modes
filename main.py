@@ -5,6 +5,7 @@ import math
 import os
 import random
 import shutil
+from pathlib import Path
 
 import numpy as np
 
@@ -13,16 +14,18 @@ try:
 except ImportError:  # Allows non-torch utility usage to keep importing this file.
     torch = None
 
-import gymnasium as gym
 import domains  # noqa: F401  # registers custom environments through import side effects
 # from RL.alg import *
 #from RL.baselines import Baseline, TrajectoryLoggerCallback
 from utils.core import (
     SUPPORTED_LOG_SETTINGS,
     SUPPORTED_LOG_TYPES,
-    SUPPORTED_WRAPPERS,
+    build_env,
     initialize_alg,
-    setup_wrapper,
+)
+from utils.checkpointing import (
+    resolve_checkpoint_config,
+    supports_composable_checkpointing,
 )
 from utils.stats import handle_trial
 from utils.utils import datetime_stamp
@@ -70,6 +73,19 @@ def _learn_resets_env_with_seed(alg_path):
     return alg_path in _SEEDED_LEARN_RESET_ALGORITHMS
 
 
+def _remove_saved_checkpoint(checkpoint_path):
+    """Remove one superseded cross-trial save and its matching sidecar only."""
+
+    if not checkpoint_path:
+        return
+    checkpoint = Path(checkpoint_path)
+    for artifact in (checkpoint, Path(f"{checkpoint}.metadata.json")):
+        try:
+            artifact.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def main():
     parser = argparse.ArgumentParser(description="action mode learning experiments")
     parser.add_argument('-r', '--run', help='config file for a run', required=True,)
@@ -101,6 +117,11 @@ def main():
         save_trials_setting = experiment_params["save_trials"]
     else:
         save_trials_setting = "first"
+    if log_setting == "none" and save_trials_setting == "best":
+        raise ValueError(
+            "save_trials='best' requires trajectory logging so trials can be "
+            "scored; choose logs other than 'none'."
+        )
 
     if "log_info" in experiment_params:
         log_info_setting = experiment_params["log_info"]
@@ -115,16 +136,6 @@ def main():
         raise ValueError(
             f"unsupported log_type {log_type_setting!r}; expected one of {SUPPORTED_LOG_TYPES}."
         )
-
-    if "checkpoint_every" in experiment_params:
-        checkpoint_every = experiment_params["checkpoint_every"]
-    else:
-        checkpoint_every = None #unfortunately, this is the backwards compatible default!
-
-    #there are three save settings: save_num---which denotes the number of model saves during a trial,
-    #save_strat---which denotes the behavior within a trial as to which saves (out of the total save_num) are kept around: do we keep none, all, last, or best?
-    #and save_trials---which denotes the saving behavior across trials: none, first, all, or best?
-    #TODO: implement save_num and save_strat. for now we will just save after the end of the trial, and worry about save_trial behavior.
 
     num_algs = len(experiment_params["configs"])
     runtime_params = [dict() for _ in range(num_algs)]
@@ -147,6 +158,15 @@ def main():
         print("full runtime alg configuration settings:")
         print(runtime_params[i])
         print("----------")
+
+    # Resolve checkpoint settings after all per-algorithm overrides have been
+    # applied. A key in the algorithm config wins over the experiment value,
+    # including an explicit null cadence.
+    checkpoint_configs = [
+        resolve_checkpoint_config(run_params, experiment_params)
+        for run_params in runtime_params
+    ]
+    checkpointing_requested = any(config.enabled for config in checkpoint_configs)
 
     # seed = experiment_params["seed"]
 
@@ -182,19 +202,42 @@ def main():
             except (OSError, json.JSONDecodeError):
                 print("WARNING: experiment folder existed, but there was an issue reading the settings file. Proceeding with caution under the current settings.")
 
-        if save_trials_setting not in (None, "none") or checkpoint_every:
+        if save_trials_setting not in (None, "none") or checkpointing_requested:
             model_save_dir = os.path.join(experiment_log_dir, "models", "")
             os.makedirs(model_save_dir, exist_ok=True)
+    elif save_trials_setting not in (None, "none") or checkpointing_requested:
+        # ``logs: none`` disables trajectory logging, not requested model
+        # artifacts. Use a collision-safe run folder so numbered checkpoints
+        # and fixed aliases from earlier runs cannot be overwritten silently.
+        experiment_log_dir = os.path.join(
+            log_dir,
+            f"{experiment_name}_{datetime_stamp()}",
+            "",
+        )
+        suffix = 1
+        base_experiment_log_dir = experiment_log_dir
+        while os.path.exists(experiment_log_dir):
+            experiment_log_dir = os.path.join(
+                f"{base_experiment_log_dir.rstrip(os.sep)}_{suffix}", ""
+            )
+            suffix += 1
+        os.makedirs(experiment_log_dir, exist_ok=False)
+        with open(os.path.join(experiment_log_dir, "settings.json"), "w") as f:
+            json.dump(experiment_params, f, indent=2)
+        model_save_dir = os.path.join(experiment_log_dir, "models", "")
+        os.makedirs(model_save_dir, exist_ok=True)
+        print("Trajectory logging disabled; model artifacts will be saved to", model_save_dir)
 
     ran_so_far = 0
 
     for i, run_params in enumerate(runtime_params[alg_ind:], start = alg_ind):
         alg_config = run_params["name"]
+        checkpoint_config = checkpoint_configs[i]
         print(run_params)
 
         if save_trials_setting == "best": #this won't take into account old saved models if you're running "best".
-            best_trial = -1
             best_score = -math.inf
+            best_trial_checkpoint = None
 
         for t in range(trial_ind, experiment_params["trials"]):
             print()
@@ -210,27 +253,7 @@ def main():
 
             seed_everything(trial_seed)
 
-            if "env_params" in experiment_params.keys():
-                domain = gym.make(trial_run_params['env'], **experiment_params["env_params"])
-            else:
-                domain = gym.make(trial_run_params['env']) #often overriden by experiment for consistency
-
-            #handle custom wrappers:
-            if "env_wrappers" in trial_run_params:
-                for env_wrapper in trial_run_params["env_wrappers"]: #wrappers will be applied first to last in the order of the list
-                    if 'name' not in env_wrapper or env_wrapper['name'].split(':')[-1] not in SUPPORTED_WRAPPERS:
-                        raise Exception("wrappers misconfigured, or otherwise not currently supported")
-                    wrapper_name = env_wrapper['name']
-                    wrapper_params = env_wrapper['wrapper_params']
-                    domain = setup_wrapper(domain, wrapper_name, wrapper_params)
-
-            if "env_wrapper" in trial_run_params:
-                if 'name' not in trial_run_params['env_wrapper'] or trial_run_params['env_wrapper']['name'].split(':')[-1] not in SUPPORTED_WRAPPERS:
-                    raise Exception("wrapper misconfigured, or otherwise not currently supported")
-                wrapper_name = trial_run_params['env_wrapper']['name']
-                wrapper_params = trial_run_params['env_wrapper']["wrapper_params"]
-
-                domain = setup_wrapper(domain, wrapper_name, wrapper_params)
+            domain = build_env(trial_run_params, experiment_params)
 
             seed_env_spaces(domain, trial_seed)
             # TD-MPC2 performs the same seeded reset at the start of learn().
@@ -242,67 +265,83 @@ def main():
             model, baseline, alg_name = initialize_alg(trial_run_params["alg"], trial_run_params["alg_params"], domain, full_run_params=trial_run_params, experiment_params=experiment_params)
             print(alg_name, "initialized.")
 
-            if log_setting == "none":
-                model.learn(total_timesteps=trial_run_params["total_steps"]) #simply don't log anything
-            else:
-                trial_log_dir = experiment_log_dir + f'{alg_config}_{t}'
-                if os.path.exists(trial_log_dir):
-                    print("WARNING: trial log dir alredy existed!")
-                    if log_setting == "overwrite-safe":
-                        print("quitting, as to continue would risk an overwrite.")
-                        quit()
-                else:
-                    os.makedirs(trial_log_dir, exist_ok=True)
-                with open(os.path.join(trial_log_dir,"alg_settings.json"), "w") as f:
-                    json.dump(trial_run_params, f, indent=2) #put the algorithm parameters next to the data which resulted from a trial using those params
-                is_ambi = "AMBI" in alg_config.upper() or (
-                    hasattr(model, "agent") and hasattr(model.agent, "last_inner_rollout_lengths")
+            if checkpoint_config.enabled:
+                if not supports_composable_checkpointing(model):
+                    domain.close()
+                    raise ValueError(
+                        f"Algorithm {trial_run_params['alg']!r} does not support "
+                        "checkpoint_every/save_strat. Supported algorithms are SB3 "
+                        "baselines, native SAC, TD-MPC2, and AMBI-TD-MPC2."
+                    )
+                model.set_checkpointing(
+                    save_freq=checkpoint_config.every,
+                    save_path=model_save_dir,
+                    name_prefix=f'model:{alg_config}_{t}',
+                    save_strat=checkpoint_config.strategies,
+                    checkpoint_best_window=checkpoint_config.best_window,
+                    trial_run_params=trial_run_params,
+                    experiment_params=experiment_params,
                 )
-                logger_class = AMBITrainingLogger if is_ambi else TrainingLogger
-                training_logger = logger_class(log_info=log_info_setting, log_type=log_type_setting)
-                if is_ambi:
-                    print("Using AMBI training logger")
-                training_logger.reset()
-                training_logger.set_log_dir(trial_log_dir)
-                model.set_logger(training_logger)
-                if checkpoint_every and hasattr(model, "set_checkpointing"):
-                    model.set_checkpointing(save_freq=checkpoint_every, save_path=model_save_dir, name_prefix=f'model:{alg_config}_{t}')
-                try:
-                    model.learn(total_timesteps=trial_run_params["total_steps"])
 
-                    if t == 0 and save_trials_setting == "first":
-                        training_logger.flush()
-                        model.save(model_save_dir,f'model:{alg_config}_{t}')
-                    elif save_trials_setting == "all":
-                        training_logger.flush()
-                        model.save(model_save_dir,f'model:{alg_config}_{t}')
-                    elif save_trials_setting == "best":
-                        training_logger.flush()
-                        _ , trial_contents = handle_trial(trial_log_dir)
-                        rewards = trial_contents["rewards"]
-                        score = np.average(rewards) if rewards.size > 0 else -math.inf #take a simple average over the whole trial!
-                        old_best_score = best_score
-                        old_best_trial = best_trial
-                        best_score = best_score if score < best_score else score
-                        if best_score != old_best_score:
-                            model.save(model_save_dir, f'model:{alg_config}_{t}') #save the new model
-                            if old_best_trial >= 0:
-                                old_model_filename = os.path.join(model_save_dir,f'model:{alg_config}_{old_best_trial}*')
-                                os.system(f'rm -f {old_model_filename}') #delete the old saved model (but only after the new one is saved)
-                            best_trial = t
+            training_logger = None
+            trial_log_dir = None
+            try:
+                if log_setting != "none":
+                    trial_log_dir = experiment_log_dir + f'{alg_config}_{t}'
+                    if os.path.exists(trial_log_dir):
+                        print("WARNING: trial log dir alredy existed!")
+                        if log_setting == "overwrite-safe":
+                            print("quitting, as to continue would risk an overwrite.")
+                            quit()
+                    else:
+                        os.makedirs(trial_log_dir, exist_ok=True)
+                    with open(os.path.join(trial_log_dir,"alg_settings.json"), "w") as f:
+                        json.dump(trial_run_params, f, indent=2) #put the algorithm parameters next to the data which resulted from a trial using those params
+                    is_ambi = "AMBI" in alg_config.upper() or (
+                        hasattr(model, "agent") and hasattr(model.agent, "last_inner_rollout_lengths")
+                    )
+                    logger_class = AMBITrainingLogger if is_ambi else TrainingLogger
+                    training_logger = logger_class(log_info=log_info_setting, log_type=log_type_setting)
+                    if is_ambi:
+                        print("Using AMBI training logger")
+                    training_logger.reset()
+                    training_logger.set_log_dir(trial_log_dir)
+                    model.set_logger(training_logger)
 
-                        with open(os.path.join(model_save_dir,"scores.txt"), "a") as f:
-                            f.write(f'{alg_config}_{t}'+ ":" + str(score) + '\n')
-                finally:
+                model.learn(total_timesteps=trial_run_params["total_steps"])
+
+                # Cross-trial saves remain separate from the within-trial
+                # checkpoint strategy and therefore run even with logs disabled.
+                if t == 0 and save_trials_setting == "first":
+                    if training_logger is not None:
+                        training_logger.flush()
+                    model.save(model_save_dir, f'model:{alg_config}_{t}')
+                elif save_trials_setting == "all":
+                    if training_logger is not None:
+                        training_logger.flush()
+                    model.save(model_save_dir, f'model:{alg_config}_{t}')
+                elif save_trials_setting == "best":
+                    training_logger.flush()
+                    _ , trial_contents = handle_trial(trial_log_dir)
+                    rewards = trial_contents["rewards"]
+                    score = np.average(rewards) if rewards.size > 0 else -math.inf #take a simple average over the whole trial!
+                    if not np.isfinite(score):
+                        score = -math.inf
+                    if score > best_score:
+                        new_checkpoint = model.save(model_save_dir, f'model:{alg_config}_{t}')
+                        _remove_saved_checkpoint(best_trial_checkpoint)
+                        best_score = score
+                        best_trial_checkpoint = new_checkpoint
+
+                    with open(os.path.join(model_save_dir,"scores.txt"), "a") as f:
+                        f.write(f'{alg_config}_{t}'+ ":" + str(score) + '\n')
+            finally:
+                if training_logger is not None:
                     # Makes buffered CSV rows and queued detailed trajectories
                     # durable on normal completion and training exceptions.
                     training_logger.close()
-
-                    # with open(best_trial_score,"r") as f:
-                    #     old_best_score = int(f.read())
-                    #TODO: finish best trial score implementation
+                domain.close()
             ran_so_far  += 1
-            domain.close()
 
             # print("training count", callback.training_count)
             # print("episode count", callback.episode_count)

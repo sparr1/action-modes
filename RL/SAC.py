@@ -12,6 +12,7 @@ import random
 import time
 from dataclasses import asdict
 from numbers import Integral, Real
+from pathlib import Path
 from typing import Tuple
 
 import numpy as np
@@ -21,6 +22,11 @@ from gymnasium.spaces import utils as space_utils
 
 from RL.alg import Algorithm
 from RL.sac_core import ReplayBuffer, SACAgent, SACConfig
+from utils.checkpointing import (
+    CheckpointTracker,
+    explicit_checkpoint_target,
+    publish_checkpoint,
+)
 from utils.utils import setup_logs
 from utils.wandb_utils import (
     WandbAccumulator,
@@ -32,6 +38,8 @@ from utils.wandb_utils import (
 
 
 class SAC(Algorithm):
+    supports_composable_checkpointing = True
+
     def __init__(self, name, env, custom_params=None, run_params=None, experiment_params=None):
         super().__init__(name, env, custom_params=custom_params)
         self.params = custom_params or {}
@@ -331,9 +339,45 @@ class SAC(Algorithm):
     def _maybe_checkpoint(self):
         if self._checkpoint is None:
             return
-        save_freq, save_path, name_prefix = self._checkpoint
-        if save_freq > 0 and self.num_timesteps > 0 and self.num_timesteps % save_freq == 0:
-            self.save(save_path, f"{name_prefix}_{self.num_timesteps}_steps")
+        # Preserve the legacy tuple shape for callers/tests which configure the
+        # wrapper by assigning its old private field directly.
+        if isinstance(self._checkpoint, tuple):
+            save_freq, save_path, name_prefix = self._checkpoint
+            if save_freq > 0 and self.num_timesteps > 0 and self.num_timesteps % save_freq == 0:
+                self.save(save_path, f"{name_prefix}_{self.num_timesteps}_steps")
+            return
+        self._publish_checkpoint_targets(self._checkpoint.targets(self.num_timesteps))
+
+    def _final_checkpoint(self):
+        if isinstance(self._checkpoint, CheckpointTracker):
+            self._publish_checkpoint_targets(
+                self._checkpoint.targets(self.num_timesteps, final=True)
+            )
+
+    def _checkpoint_state(self):
+        return {
+            "checkpoint_version": 2,
+            "agent": self.agent.state_dict(),
+            "config": asdict(self.cfg),
+            "obs_dim": self.obs_dim,
+            "action_dim": self.action_dim,
+            "action_low": np.asarray(self.env.action_space.low, dtype=np.float32),
+            "action_high": np.asarray(self.env.action_space.high, dtype=np.float32),
+            "num_timesteps": self.num_timesteps,
+            "metrics": self._last_metrics,
+            "checkpoint_type": "weights_and_optimizers_without_replay",
+        }
+
+    def _publish_checkpoint_targets(self, targets):
+        targets = tuple(targets)
+        if not targets:
+            return ()
+        state = self._checkpoint_state()
+        return publish_checkpoint(
+            targets,
+            lambda path: torch.save(state, path),
+            extension=".pt",
+        )
 
     def _seed_once(self):
         if self._rng_seeded:
@@ -369,6 +413,8 @@ class SAC(Algorithm):
                 self._collected_steps = 0
                 self._collected_episodes = 0
                 self._last_metrics = {}
+                if isinstance(self._checkpoint, CheckpointTracker):
+                    self._checkpoint.reset()
                 reset_seed = self.seed if not self._env_seeded else None
                 obs = self._reset_env(seed=reset_seed)
                 self._env_seeded = True
@@ -426,6 +472,8 @@ class SAC(Algorithm):
                     info,
                     completed_episode=done,
                 )
+                if done and isinstance(self._checkpoint, CheckpointTracker):
+                    self._checkpoint.record_episode_return(self._episode_return)
                 self._maybe_checkpoint()
 
                 if done:
@@ -436,6 +484,7 @@ class SAC(Algorithm):
                 else:
                     obs = next_obs
                 self._last_obs = obs
+            self._final_checkpoint()
             return self
         finally:
             if self._wandb_run is not None:
@@ -462,27 +511,48 @@ class SAC(Algorithm):
         action_norm = self._scale_action(action)
         return self.agent.q_values(obs_flat, action_norm)
 
-    def set_checkpointing(self, save_freq, save_path, name_prefix):
-        self._checkpoint = (int(save_freq), save_path, name_prefix)
+    def set_checkpointing(
+        self,
+        save_freq,
+        save_path,
+        name_prefix,
+        save_strat="all",
+        checkpoint_best_window=100,
+        trial_run_params=None,
+        experiment_params=None,
+    ):
+        self._checkpoint = CheckpointTracker(
+            save_freq,
+            save_path,
+            name_prefix,
+            save_strat=save_strat,
+            best_window=checkpoint_best_window,
+            trial_run_params=self.run_params if trial_run_params is None else trial_run_params,
+            experiment_params=(
+                self.experiment_params if experiment_params is None else experiment_params
+            ),
+        )
+        return self._checkpoint
 
     def save(self, path, name):
         os.makedirs(path, exist_ok=True)
-        fp = os.path.join(path, name if name.endswith(".pt") else name + ".pt")
-        torch.save(
-            {
-                "checkpoint_version": 2,
-                "agent": self.agent.state_dict(),
-                "config": asdict(self.cfg),
-                "obs_dim": self.obs_dim,
-                "action_dim": self.action_dim,
-                "action_low": np.asarray(self.env.action_space.low, dtype=np.float32),
-                "action_high": np.asarray(self.env.action_space.high, dtype=np.float32),
-                "num_timesteps": self.num_timesteps,
-                "metrics": self._last_metrics,
-                "checkpoint_type": "weights_and_optimizers_without_replay",
-            },
-            fp,
-        )
+        fp = Path(path) / name
+        if isinstance(self._checkpoint, CheckpointTracker):
+            target = self._checkpoint.explicit_target(
+                fp,
+                step=self.num_timesteps,
+                episode=self._episode_idx,
+            )
+        else:
+            target = explicit_checkpoint_target(
+                fp,
+                step=self.num_timesteps,
+                episode=self._episode_idx,
+                trial_run_params=self.run_params,
+                experiment_params=self.experiment_params,
+            )
+        published = self._publish_checkpoint_targets((target,))
+        return published[0]
 
     def load(self, path, *, resume=False, strict_config=True):
         checkpoint = torch.load(path, map_location=self.agent.device, weights_only=False)

@@ -17,8 +17,13 @@
         "AntAMBITDMPC2"
     ],
     "logs": "timestamp",
-    "save_trials": "all",
+    "save_trials": "none",
     "checkpoint_every": 100000,
+    "save_strat": [
+        "best",
+        "latest"
+    ],
+    "checkpoint_best_window": 100,
     "log_info": false,
     "log_type": "summary"
 }

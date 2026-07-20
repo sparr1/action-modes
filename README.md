@@ -22,3 +22,50 @@ So now that we know how to use modes, that's great! But how did we get these pro
 There may be many ways to get all kinds of different modes, but not all of the modes you end up with are going to be particularly useful. Right now, in order to learn modes, our current thinking is that it suffices to learn parameterized skills which solve average reward tasks on a restriction of the state space and a low-dimensional compression of the action space. These skills will become our projection functions. There will be some special auxillary losses which help these skills become useful.
 
 The mode actions then become interpretable as saying "if I execute this mode, and this particular mode action, I will eventually settle in the high-dimensional base space, into a pattern of behavior which is high reward under this task. For instance, walking forwards, or rotating, etc. 
+
+## Training checkpoints
+
+Within-run checkpoint retention is configured independently from end-of-trial
+model saving:
+
+```json
+{
+  "checkpoint_every": 100000,
+  "save_strat": ["best", "latest"],
+  "checkpoint_best_window": 100,
+  "save_trials": "none"
+}
+```
+
+`save_strat` accepts `all`, `best`, and `latest`, either as one string or as a
+list. `all` keeps the existing step-numbered checkpoints. `latest` continually
+replaces one alias and is also updated after a clean training completion.
+`best` replaces one alias when the rolling mean completed-episode return
+improves. A partial initial window is allowed. `last` is accepted as an alias
+for `latest`; `none` must be used alone. If `save_strat` is omitted, a positive
+`checkpoint_every` retains the backwards-compatible `all` behavior. Set
+`checkpoint_every` to `null` to disable within-run checkpointing.
+
+`save_trials` remains a separate policy for final models across trials.
+Checkpoint files are model snapshots and do not universally contain replay or
+environment state for full training resume.
+
+## Rendering a checkpoint
+
+Use the dedicated renderer instead of `init.py`:
+
+```bash
+python render_checkpoint.py /path/to/checkpoint --display
+python render_checkpoint.py /path/to/checkpoint --video-dir videos
+```
+
+The renderer runs one complete deterministic episode by default. Use
+`--episodes`, `--seed`, `--device`, `--max-steps`, or `--stochastic` to change
+the rollout. Video mode writes one MP4 per episode and refuses to replace an
+existing output unless `--overwrite` is supplied.
+
+New checkpoints include an adjacent `.metadata.json` file containing the exact
+environment, wrapper, and algorithm settings. Existing checkpoints in their
+original `logs/<run>/models` directory are supported through the run's
+`settings.json` and per-trial `alg_settings.json`. For copied legacy files, pass
+`--trial-settings` and `--experiment-settings` explicitly.
