@@ -23,7 +23,8 @@ def _tiny_params(**overrides):
         "vmin": -5,
         "vmax": 5,
         "batch_size": 4,
-        "horizon": 2,
+        "train_unroll_horizon": 2,
+        "outer_planning_horizon": 2,
         "buffer_size": 100,
         "seed_steps": 4,
         "pretrain_steps": 2,
@@ -224,9 +225,9 @@ def test_tdmpc_update_and_final_plan_diagnostics(monkeypatch):
     }
     _assert_finite_metrics(agent.last_plan_metrics)
 
-    obs = torch.randn(model.cfg.horizon + 1, model.cfg.batch_size, model.cfg.obs_shape["state"][0])
-    action = torch.randn(model.cfg.horizon, model.cfg.batch_size, model.cfg.action_dim).tanh()
-    reward = torch.randn(model.cfg.horizon, model.cfg.batch_size, 1)
+    obs = torch.randn(model.cfg.train_unroll_horizon + 1, model.cfg.batch_size, model.cfg.obs_shape["state"][0])
+    action = torch.randn(model.cfg.train_unroll_horizon, model.cfg.batch_size, model.cfg.action_dim).tanh()
+    reward = torch.randn(model.cfg.train_unroll_horizon, model.cfg.batch_size, 1)
     terminated = torch.zeros_like(reward)
     metrics = agent._update(obs, action, reward, terminated)
     assert {
@@ -238,6 +239,13 @@ def test_tdmpc_update_and_final_plan_diagnostics(monkeypatch):
         "pi_q_mean",
         "num_updates",
     } <= set(metrics.keys())
+    for depth in range(1, model.cfg.train_unroll_horizon + 1):
+        assert {
+            f"consistency_error_depth_{depth}",
+            f"reward_error_depth_{depth}",
+            f"q_error_depth_{depth}",
+            f"q_head_disagreement_depth_{depth}",
+        } <= set(metrics.keys())
     assert agent.num_updates == 1
     _assert_finite_metrics(metrics)
 
@@ -285,9 +293,9 @@ def test_ambi_outer_and_inner_diagnostics_are_complete():
     assert agent.last_inner_metrics["inner_updates"] == 4
     _assert_finite_metrics(agent.last_inner_metrics)
 
-    obs = torch.randn(model.cfg.horizon + 1, model.cfg.batch_size, model.cfg.obs_shape["state"][0])
-    action = torch.randn(model.cfg.horizon, model.cfg.batch_size, model.cfg.action_dim).tanh()
-    reward = torch.randn(model.cfg.horizon, model.cfg.batch_size, 1)
+    obs = torch.randn(model.cfg.train_unroll_horizon + 1, model.cfg.batch_size, model.cfg.obs_shape["state"][0])
+    action = torch.randn(model.cfg.train_unroll_horizon, model.cfg.batch_size, model.cfg.action_dim).tanh()
+    reward = torch.randn(model.cfg.train_unroll_horizon, model.cfg.batch_size, 1)
     metrics = agent._update(obs, action, reward, torch.zeros_like(reward))
     assert {
         "q_mean",
@@ -298,6 +306,13 @@ def test_ambi_outer_and_inner_diagnostics_are_complete():
         "actor_q_mean",
         "num_updates",
     } <= set(metrics)
+    for depth in range(1, model.cfg.train_unroll_horizon + 1):
+        assert {
+            f"consistency_error_depth_{depth}",
+            f"reward_error_depth_{depth}",
+            f"q_error_depth_{depth}",
+            f"q_head_disagreement_depth_{depth}",
+        } <= set(metrics)
     _assert_finite_metrics(metrics)
 
 

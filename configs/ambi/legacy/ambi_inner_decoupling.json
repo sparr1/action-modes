@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "description": "One-axis-at-a-time AMBI inner-loop comparisons. Materialize these presets for training, or evaluate checkpoint-compatible presets with evaluate_ambi_checkpoint.py.",
-  "base_alg_config": "../algs/AntAMBITDMPC2.json",
+  "base_alg_config": "../../algs/AntAMBITDMPC2.json",
   "shared_alg_params": {
     "inner_diagnostic_rollouts": 8
   },
@@ -544,3 +544,4 @@
     }
   }
 }
+

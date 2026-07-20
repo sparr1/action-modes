@@ -25,7 +25,8 @@ def tiny_params(**overrides):
         "vmin": -5,
         "vmax": 5,
         "batch_size": 4,
-        "horizon": 2,
+        "train_unroll_horizon": 2,
+        "outer_planning_horizon": 2,
         "buffer_size": 100,
         "seed_steps": 4,
         "pretrain_steps": 2,
@@ -91,7 +92,8 @@ def test_ambi_preserves_the_exact_tdmpc2_training_loop_and_ordering():
         seed_steps=0,
         pretrain_steps=1,
         utd=1,
-        horizon=1,
+        train_unroll_horizon=1,
+        outer_planning_horizon=1,
         batch_size=1,
         episode_length=1,
         inner_iterations=0,
@@ -188,7 +190,13 @@ def test_unsafe_or_unsupported_configs_fail_early():
     env = gym.make("Pendulum-v1", max_episode_steps=5)
     with pytest.warns(UserWarning, match="model-bias risk"):
         long_horizon = make_model(
-            AMBITDMPC2, env, tiny_params(inner_horizon=3, horizon=2)
+            AMBITDMPC2,
+            env,
+            tiny_params(
+                inner_horizon=3,
+                train_unroll_horizon=2,
+                outer_planning_horizon=2,
+            ),
         )
     assert long_horizon.cfg.inner_horizon_ratio == pytest.approx(1.5)
     with pytest.raises(ValueError, match="compile=True is not supported"):
@@ -264,7 +272,13 @@ class TrueTerminationEnv(gym.Env):
 
 def test_true_termination_requires_episdodic_mode():
     env = TrueTerminationEnv()
-    params = tiny_params(seed_steps=2, episode_length=3, horizon=2, batch_size=2)
+    params = tiny_params(
+        seed_steps=2,
+        episode_length=3,
+        train_unroll_horizon=2,
+        outer_planning_horizon=2,
+        batch_size=2,
+    )
     model = make_model(TDMPC2Baseline, env, params, total_steps=3)
     with pytest.raises(ValueError, match="episodic=true"):
         model.learn(total_timesteps=3)
@@ -276,7 +290,8 @@ def test_true_termination_trains_when_episodic_enabled():
         seed_steps=3,
         pretrain_steps=1,
         episode_length=3,
-        horizon=2,
+        train_unroll_horizon=2,
+        outer_planning_horizon=2,
         batch_size=2,
         episodic=True,
     )

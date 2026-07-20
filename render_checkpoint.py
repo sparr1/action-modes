@@ -1,4 +1,4 @@
-"""Render a saved model checkpoint in a window or to per-episode MP4 files.
+"""Evaluate a saved model checkpoint in a window, MP4 files, or JSON.
 
 Checkpoint sidecars written by the training runner are the preferred source of
 the resolved algorithm and environment configuration.  Older run directories
@@ -72,6 +72,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Stream one complete MP4 into this directory per episode.",
     )
+    output.add_argument(
+        "--results-json",
+        type=Path,
+        help="Run without rendering and atomically write rollout results as JSON.",
+    )
     parser.add_argument(
         "--episodes", type=int, default=1, help="Number of episodes (default: 1)."
     )
@@ -113,7 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Atomically replace calculated video output files that already exist.",
+        help="Atomically replace calculated video or JSON outputs that already exist.",
     )
     return parser
 
@@ -843,11 +848,130 @@ def _close_quietly(*resources: Any) -> None:
             pass
 
 
+def _preflight_results_output(path: Path, *, overwrite: bool) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RenderCheckpointError(
+            f"Could not create results output directory {path.parent}: {exc}"
+        ) from exc
+    if path.exists() and not overwrite:
+        raise RenderCheckpointError(
+            f"Results JSON already exists: {path}. Pass --overwrite to replace it."
+        )
+    if path.exists() and not path.is_file():
+        raise RenderCheckpointError(f"Results JSON target is not a file: {path}.")
+
+
+def _results_payload(
+    *,
+    checkpoint: Path,
+    context: RenderContext,
+    backend: str,
+    deterministic: bool,
+    max_steps: int | None,
+    results: Sequence[EpisodeResult],
+) -> dict[str, Any]:
+    returns = [float(result.episode_return) for result in results]
+    lengths = [int(result.length) for result in results]
+    mean_return = sum(returns) / len(returns)
+    mean_length = sum(lengths) / len(lengths)
+    return_std = math.sqrt(
+        sum((value - mean_return) ** 2 for value in returns) / len(returns)
+    )
+    payload = {
+        "schema_version": 1,
+        "checkpoint": str(checkpoint),
+        "configuration_source": str(context.source),
+        "algorithm": context.trial_run_params["alg"],
+        "environment": context.trial_run_params["env"],
+        "backend": backend,
+        "deterministic": bool(deterministic),
+        "max_steps": max_steps,
+        "seeds": [int(result.seed) for result in results],
+        "summary": {
+            "episodes": len(results),
+            "return_mean": mean_return,
+            "return_std": return_std,
+            "return_min": min(returns),
+            "return_max": max(returns),
+            "length_mean": mean_length,
+            "length_min": min(lengths),
+            "length_max": max(lengths),
+            "capped_episodes": sum(bool(result.capped) for result in results),
+        },
+        "episodes": [
+            {
+                "episode": int(result.episode),
+                "seed": int(result.seed),
+                "return": float(result.episode_return),
+                "length": int(result.length),
+                "capped": bool(result.capped),
+            }
+            for result in results
+        ],
+    }
+    resolved_runtime = context.trial_run_params.get("resolved_runtime")
+    if isinstance(resolved_runtime, Mapping):
+        payload["resolved_runtime"] = copy.deepcopy(dict(resolved_runtime))
+    if context.metadata is not None:
+        payload["checkpoint_metadata"] = copy.deepcopy(
+            context.metadata.get("checkpoint", {})
+        )
+    return payload
+
+
+def _write_results_json(path: Path, payload: Mapping[str, Any], *, overwrite: bool) -> None:
+    _preflight_results_output(path, overwrite=overwrite)
+    serialized = json.dumps(
+        payload, indent=2, sort_keys=True, allow_nan=False
+    ) + "\n"
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if overwrite:
+            os.replace(temporary_path, path)
+        else:
+            try:
+                os.link(temporary_path, path)
+            except FileExistsError as exc:
+                raise RenderCheckpointError(
+                    f"Results JSON already exists: {path}. "
+                    "Pass --overwrite to replace it."
+                ) from exc
+            temporary_path.unlink()
+        temporary_path = None
+    except RenderCheckpointError:
+        raise
+    except OSError as exc:
+        raise RenderCheckpointError(
+            f"Could not atomically publish results JSON {path}: {exc}"
+        ) from exc
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def render_checkpoint(
     checkpoint: Path,
     *,
     display: bool = False,
     video_dir: Path | None = None,
+    results_json: Path | None = None,
     episodes: int = 1,
     seed: int | None = None,
     device: str = "auto",
@@ -858,10 +982,13 @@ def render_checkpoint(
     experiment_settings: Path | None = None,
     overwrite: bool = False,
 ) -> list[EpisodeResult]:
-    """Load one checkpoint and render the requested complete rollouts."""
-    if bool(display) == (video_dir is not None):
+    """Load one checkpoint and run complete deterministic or sampled rollouts."""
+    output_modes = int(bool(display)) + int(video_dir is not None) + int(
+        results_json is not None
+    )
+    if output_modes != 1:
         raise RenderCheckpointError(
-            "Choose exactly one output mode: --display or --video-dir."
+            "Choose exactly one output mode: --display, --video-dir, or --results-json."
         )
     checkpoint = resolve_checkpoint_path(checkpoint)
     context = resolve_render_context(
@@ -884,6 +1011,9 @@ def render_checkpoint(
     resolved_video_dir = (
         None if video_dir is None else Path(video_dir).expanduser().resolve()
     )
+    resolved_results_json = (
+        None if results_json is None else Path(results_json).expanduser().resolve()
+    )
     if resolved_video_dir is not None:
         _preflight_video_outputs(
             resolved_video_dir,
@@ -892,6 +1022,8 @@ def render_checkpoint(
             first_seed=int(first_seed),
             overwrite=overwrite,
         )
+    if resolved_results_json is not None:
+        _preflight_results_output(resolved_results_json, overwrite=overwrite)
 
     # Seed model/controller construction as well as environment resets.  Each
     # backend also consumes the overridden seed in its own constructor.
@@ -906,7 +1038,9 @@ def render_checkpoint(
         rollout_env = build_env(
             run_params,
             experiment_params,
-            render_mode="human" if display else "rgb_array",
+            render_mode=(
+                "human" if display else "rgb_array" if resolved_video_dir else None
+            ),
         )
         model = _initialize_model(
             checkpoint,
@@ -915,7 +1049,7 @@ def render_checkpoint(
             model_env,
             backend,
         )
-        return _rollout(
+        results = _rollout(
             model,
             rollout_env,
             checkpoint=checkpoint,
@@ -927,6 +1061,21 @@ def render_checkpoint(
             video_dir=resolved_video_dir,
             overwrite=overwrite,
         )
+        if resolved_results_json is not None:
+            _write_results_json(
+                resolved_results_json,
+                _results_payload(
+                    checkpoint=checkpoint,
+                    context=context,
+                    backend=backend,
+                    deterministic=not stochastic,
+                    max_steps=max_steps,
+                    results=results,
+                ),
+                overwrite=overwrite,
+            )
+            print(f"Wrote {resolved_results_json}")
+        return results
     finally:
         _close_quietly(rollout_env, model_env)
 
@@ -939,6 +1088,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.checkpoint,
             display=args.display,
             video_dir=args.video_dir,
+            results_json=args.results_json,
             episodes=args.episodes,
             seed=args.seed,
             device=args.device,

@@ -1,6 +1,13 @@
-# AMBI inner-loop research presets
+# Legacy AMBI research location
 
-`ambi_inner_decoupling.json` is a compact matrix of one-axis-at-a-time
+The active end-to-end suite is now documented in `configs/ambi/README.md`.
+The frozen-checkpoint matrix moved to
+`configs/ambi/legacy/ambi_inner_decoupling.json` so it cannot be confused with
+the primary independently trained comparisons.
+
+# Frozen-checkpoint preset workflow
+
+`../ambi/legacy/ambi_inner_decoupling.json` is a compact matrix of one-axis-at-a-time
 overrides based on `configs/algs/AntAMBITDMPC2.json`. It covers:
 
 - none, SAC, TD3, and compute-matched MPPI inner operators;

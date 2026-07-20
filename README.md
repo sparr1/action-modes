@@ -50,6 +50,11 @@ for `latest`; `none` must be used alone. If `save_strat` is omitted, a positive
 Checkpoint files are model snapshots and do not universally contain replay or
 environment state for full training resume.
 
+The consolidated Native SAC, TD-MPC2, AMBI TD-MPC2, and end-to-end research
+configs are documented in `configs/ambi/README.md`. The canonical entry point
+is `configs/ambi/experiments/canonical/baseline_comparison.json`, used
+with `--alg-dir configs/ambi/algs`.
+
 ## Rendering a checkpoint
 
 Use the dedicated renderer instead of `init.py`:
@@ -57,12 +62,27 @@ Use the dedicated renderer instead of `init.py`:
 ```bash
 python render_checkpoint.py /path/to/checkpoint --display
 python render_checkpoint.py /path/to/checkpoint --video-dir videos
+python render_checkpoint.py /path/to/checkpoint --results-json evaluation.json
 ```
 
 The renderer runs one complete deterministic episode by default. Use
 `--episodes`, `--seed`, `--device`, `--max-steps`, or `--stochastic` to change
 the rollout. Video mode writes one MP4 per episode and refuses to replace an
 existing output unless `--overwrite` is supplied.
+
+`--results-json` runs without a rendering backend and atomically writes strict
+JSON. For the AMBI comparison protocol, evaluate the two aliases separately:
+
+```bash
+python render_checkpoint.py /path/to/model_best \
+  --results-json evaluation/best.json --episodes 5 --seed 101
+python render_checkpoint.py /path/to/model_latest \
+  --results-json evaluation/latest.json --episodes 5 --seed 101
+```
+
+These commands use deterministic policy means and environment seeds 101–105.
+The JSON includes the checkpoint identity, per-episode returns and lengths,
+summary statistics, and resolved runtime metadata.
 
 New checkpoints include an adjacent `.metadata.json` file containing the exact
 environment, wrapper, and algorithm settings. Existing checkpoints in their

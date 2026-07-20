@@ -58,7 +58,42 @@ class TDMPC2(torch.nn.Module):
 		self.last_plan_metrics = {}
 		print('Episode length:', cfg.episode_length)
 		print('Discount factor:', self.discount)
-		self.register_buffer('_prev_mean', torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device))
+		self.register_buffer(
+			'_prev_mean',
+			torch.zeros(
+				self.cfg.outer_planning_horizon,
+				self.cfg.action_dim,
+				device=self.device,
+			),
+		)
+		self.register_buffer(
+			'_transition_temporal_weights',
+			math.temporal_loss_weights(
+				self.cfg.train_unroll_horizon,
+				self.cfg.rho,
+				normalization=self.cfg.temporal_loss_normalization,
+				reference_horizon=self.cfg.temporal_loss_reference_horizon,
+				device=self.device,
+			),
+			persistent=False,
+		)
+		self.register_buffer(
+			'_actor_temporal_weights',
+			math.temporal_loss_weights(
+				self.cfg.train_unroll_horizon,
+				self.cfg.rho,
+				normalization=self.cfg.temporal_loss_normalization,
+				reference_horizon=self.cfg.temporal_loss_reference_horizon,
+				include_terminal=True,
+				device=self.device,
+			),
+			persistent=False,
+		)
+		self._legacy_temporal_reduction = math.temporal_loss_uses_legacy_order(
+			self.cfg.temporal_loss_normalization,
+			self.cfg.train_unroll_horizon,
+			self.cfg.temporal_loss_reference_horizon,
+		)
 
 	@property
 	def plan(self):
@@ -154,7 +189,7 @@ class TDMPC2(torch.nn.Module):
 		"""Estimate value of a trajectory starting at latent state z and executing given actions."""
 		G, discount = 0, 1
 		termination = torch.zeros(self.cfg.num_samples, 1, dtype=torch.float32, device=z.device)
-		for t in range(self.cfg.horizon):
+		for t in range(self.cfg.outer_planning_horizon):
 			reward = math.two_hot_inv(self.model.reward(z, actions[t], task), self.cfg)
 			z = self.model.next(z, actions[t], task)
 			G = G + discount * (1-termination) * reward
@@ -184,20 +219,20 @@ class TDMPC2(torch.nn.Module):
 		# Sample policy trajectories
 		z = self.model.encode(obs, task)
 		if self.cfg.num_pi_trajs > 0:
-			pi_actions = torch.empty(self.cfg.horizon, self.cfg.num_pi_trajs, self.cfg.action_dim, device=self.device)
+			pi_actions = torch.empty(self.cfg.outer_planning_horizon, self.cfg.num_pi_trajs, self.cfg.action_dim, device=self.device)
 			_z = z.repeat(self.cfg.num_pi_trajs, 1)
-			for t in range(self.cfg.horizon-1):
+			for t in range(self.cfg.outer_planning_horizon-1):
 				pi_actions[t], _ = self.model.pi(_z, task)
 				_z = self.model.next(_z, pi_actions[t], task)
 			pi_actions[-1], _ = self.model.pi(_z, task)
 
 		# Initialize state and parameters
 		z = z.repeat(self.cfg.num_samples, 1)
-		mean = torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device)
-		std = torch.full((self.cfg.horizon, self.cfg.action_dim), self.cfg.max_std, dtype=torch.float, device=self.device)
+		mean = torch.zeros(self.cfg.outer_planning_horizon, self.cfg.action_dim, device=self.device)
+		std = torch.full((self.cfg.outer_planning_horizon, self.cfg.action_dim), self.cfg.max_std, dtype=torch.float, device=self.device)
 		if not t0:
 			mean[:-1] = self._prev_mean[1:]
-		actions = torch.empty(self.cfg.horizon, self.cfg.num_samples, self.cfg.action_dim, device=self.device)
+		actions = torch.empty(self.cfg.outer_planning_horizon, self.cfg.num_samples, self.cfg.action_dim, device=self.device)
 		if self.cfg.num_pi_trajs > 0:
 			actions[:, :self.cfg.num_pi_trajs] = pi_actions
 
@@ -205,7 +240,7 @@ class TDMPC2(torch.nn.Module):
 		for _ in range(self.cfg.iterations):
 
 			# Sample actions
-			r = torch.randn(self.cfg.horizon, self.cfg.num_samples-self.cfg.num_pi_trajs, self.cfg.action_dim, device=std.device)
+			r = torch.randn(self.cfg.outer_planning_horizon, self.cfg.num_samples-self.cfg.num_pi_trajs, self.cfg.action_dim, device=std.device)
 			actions_sample = mean.unsqueeze(1) + std.unsqueeze(1) * r
 			actions_sample = actions_sample.clamp(-1, 1)
 			actions[:, self.cfg.num_pi_trajs:] = actions_sample
@@ -271,9 +306,18 @@ class TDMPC2(torch.nn.Module):
 		self.scale.update(qs[0])
 		qs = self.scale(qs)
 
-		# Loss is a weighted sum of Q-values
-		rho = torch.pow(self.cfg.rho, torch.arange(len(qs), device=self.device))
-		pi_loss = (-(self.cfg.entropy_coef * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho).mean()
+		actor_per_time = -(
+			self.cfg.entropy_coef * info["scaled_entropy"] + qs
+		).mean(dim=(1, 2))
+		pi_loss = math.reduce_temporal_loss(
+			actor_per_time,
+			self.cfg.rho,
+			normalization=self.cfg.temporal_loss_normalization,
+			reference_horizon=self.cfg.temporal_loss_reference_horizon,
+			include_terminal=True,
+			legacy_order="vector_mean",
+			weights=self._actor_temporal_weights,
+		)
 		pi_loss.backward()
 		pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
 		self.pi_optim.step()
@@ -317,14 +361,25 @@ class TDMPC2(torch.nn.Module):
 		self.model.train()
 
 		# Latent rollout
-		zs = torch.empty(self.cfg.horizon+1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)
+		zs = torch.empty(self.cfg.train_unroll_horizon+1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)
 		z = self.model.encode(obs[0], task)
 		zs[0] = z
-		consistency_loss = 0
+		consistency_terms = []
+		consistency_errors = []
 		for t, (_action, _next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):
 			z = self.model.next(z, _action, task)
-			consistency_loss = consistency_loss + F.mse_loss(z, _next_z) * self.cfg.rho**t
+			consistency_error = F.mse_loss(z, _next_z)
+			consistency_terms.append(consistency_error)
+			consistency_errors.append(consistency_error.detach())
 			zs[t+1] = z
+		consistency_loss = math.reduce_temporal_loss(
+			consistency_terms,
+			self.cfg.rho,
+			normalization=self.cfg.temporal_loss_normalization,
+			reference_horizon=self.cfg.temporal_loss_reference_horizon,
+			legacy_order="sequential",
+			weights=self._transition_temporal_weights,
+		)
 
 		# Predictions
 		_zs = zs[:-1]
@@ -334,19 +389,39 @@ class TDMPC2(torch.nn.Module):
 			termination_pred = self.model.termination(zs[1:], task, unnormalized=True)
 
 		# Compute losses
-		reward_loss, value_loss = 0, 0
+		reward_terms, value_loss = [], 0
 		for t, (rew_pred_unbind, rew_unbind, td_targets_unbind, qs_unbind) in enumerate(zip(reward_preds.unbind(0), reward.unbind(0), td_targets.unbind(0), qs.unbind(1))):
-			reward_loss = reward_loss + math.soft_ce(rew_pred_unbind, rew_unbind, self.cfg).mean() * self.cfg.rho**t
+			temporal_weight = (
+				self.cfg.rho**t
+				if self._legacy_temporal_reduction
+				else self._transition_temporal_weights[t]
+			)
+			reward_terms.append(math.soft_ce(
+				rew_pred_unbind, rew_unbind, self.cfg
+			).mean())
 			for _, qs_unbind_unbind in enumerate(qs_unbind.unbind(0)):
-				value_loss = value_loss + math.soft_ce(qs_unbind_unbind, td_targets_unbind, self.cfg).mean() * self.cfg.rho**t
+				value_loss = value_loss + math.soft_ce(
+					qs_unbind_unbind, td_targets_unbind, self.cfg
+				).mean() * temporal_weight
+		reward_loss = math.reduce_temporal_loss(
+			reward_terms,
+			self.cfg.rho,
+			normalization=self.cfg.temporal_loss_normalization,
+			reference_horizon=self.cfg.temporal_loss_reference_horizon,
+			legacy_order="sequential",
+			weights=self._transition_temporal_weights,
+		)
 
-		consistency_loss = consistency_loss / self.cfg.horizon
-		reward_loss = reward_loss / self.cfg.horizon
+		if self._legacy_temporal_reduction:
+			value_loss = value_loss / (
+				self.cfg.train_unroll_horizon * self.cfg.num_q
+			)
+		else:
+			value_loss = value_loss / self.cfg.num_q
 		if self.cfg.episodic:
 			termination_loss = F.binary_cross_entropy_with_logits(termination_pred, terminated)
 		else:
 			termination_loss = torch.zeros((), device=self.device)
-		value_loss = value_loss / (self.cfg.horizon * self.cfg.num_q)
 		total_loss = (
 			self.cfg.consistency_coef * consistency_loss +
 			self.cfg.reward_coef * reward_loss +
@@ -387,6 +462,18 @@ class TDMPC2(torch.nn.Module):
 			"reward_target_mean": reward.detach().mean(),
 			"num_updates": torch.tensor(float(self.num_updates), device=self.device),
 		})
+		for depth, consistency_error in enumerate(consistency_errors, start=1):
+			q_at_depth = q_values[:, depth - 1]
+			info[f"consistency_error_depth_{depth}"] = consistency_error
+			info[f"reward_error_depth_{depth}"] = (
+				reward_values[depth - 1] - reward[depth - 1]
+			).abs().mean()
+			info[f"q_error_depth_{depth}"] = (
+				q_at_depth - td_targets[depth - 1].detach().unsqueeze(0)
+			).abs().mean()
+			info[f"q_head_disagreement_depth_{depth}"] = q_at_depth.std(
+				dim=0, unbiased=False
+			).mean()
 		if self.cfg.episodic:
 			info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]))
 		info.update(pi_info)

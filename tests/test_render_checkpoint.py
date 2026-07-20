@@ -347,6 +347,91 @@ def test_display_rollouts_use_separate_envs_and_reset_ambi_planning(monkeypatch,
     assert rollout_env.close_calls == 1
 
 
+def test_results_json_runs_headlessly_and_records_deterministic_seed_set(
+    monkeypatch, tmp_path
+):
+    checkpoint = tmp_path / "model:Config_0_best"
+    checkpoint.write_bytes(b"checkpoint")
+    run_params = _run_params()
+    run_params["resolved_runtime"] = {
+        "horizons": {
+            "train_unroll_horizon": 3,
+            "outer_planning_horizon": 3,
+            "inner_rollout_horizon": 3,
+        }
+    }
+    _write_json(
+        Path(str(checkpoint) + ".metadata.json"), _metadata(run_params)
+    )
+
+    model_env = _ModelEnv()
+    rollout_env = _RolloutEnv()
+    model = _FakeModel()
+    render_modes = []
+    environments = iter((model_env, rollout_env))
+
+    def fake_build_env(run_params, experiment_params, *, render_mode):
+        render_modes.append(render_mode)
+        return next(environments)
+
+    monkeypatch.setattr(renderer, "build_env", fake_build_env)
+    monkeypatch.setattr(
+        renderer,
+        "initialize_alg",
+        lambda *args, **kwargs: (model, False, "AMBITDMPC2"),
+    )
+
+    output = tmp_path / "evaluation" / "best.json"
+    results = renderer.render_checkpoint(
+        checkpoint,
+        results_json=output,
+        episodes=5,
+        seed=101,
+        device="cpu",
+    )
+
+    assert render_modes == [None, None]
+    assert rollout_env.render_calls == 0
+    assert [result.seed for result in results] == [101, 102, 103, 104, 105]
+    assert all(call["deterministic"] is True for call in model.predict_calls)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["checkpoint"] == str(checkpoint.resolve())
+    assert payload["deterministic"] is True
+    assert payload["seeds"] == [101, 102, 103, 104, 105]
+    assert payload["summary"] == {
+        "capped_episodes": 0,
+        "episodes": 5,
+        "length_max": 2,
+        "length_mean": 2.0,
+        "length_min": 2,
+        "return_max": 2.5,
+        "return_mean": 2.5,
+        "return_min": 2.5,
+        "return_std": 0.0,
+    }
+    assert payload["checkpoint_metadata"]["kind"] == "latest"
+    assert payload["resolved_runtime"] == run_params["resolved_runtime"]
+    assert list(output.parent.glob(".*.tmp")) == []
+    assert model_env.close_calls == 1
+    assert rollout_env.close_calls == 1
+
+    with pytest.raises(renderer.RenderCheckpointError, match="already exists"):
+        renderer.render_checkpoint(checkpoint, results_json=output)
+
+
+def test_output_modes_include_headless_results_json(tmp_path):
+    parser = renderer.build_parser()
+    args = parser.parse_args(["checkpoint", "--results-json", str(tmp_path / "r.json")])
+    assert args.results_json == tmp_path / "r.json"
+
+    with pytest.raises(renderer.RenderCheckpointError, match="exactly one output mode"):
+        renderer.render_checkpoint(
+            tmp_path / "checkpoint",
+            display=True,
+            results_json=tmp_path / "r.json",
+        )
+
+
 class _FakeCV2:
     COLOR_RGB2BGR = 9
 

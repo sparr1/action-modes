@@ -1,6 +1,7 @@
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -123,9 +124,69 @@ def test_checkpointing_is_configured_without_trajectory_logging(monkeypatch, tmp
     assert call["save_strat"] == ("best", "latest")
     assert call["checkpoint_best_window"] == 7
     assert call["trial_run_params"]["seed"] == 11
+    assert call["trial_run_params"]["resolved_runtime"]["algorithm"] == (
+        "TDMPC2/TDMPC2Baseline"
+    )
     assert call["experiment_params"]["checkpoint_every"] == 5
     assert Path(call["save_path"]) == output_dir / "Experiment_STAMP" / "models"
     assert env.closed
+
+
+def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
+    cfg = SimpleNamespace(
+        train_unroll_horizon=6,
+        outer_planning_horizon=3,
+        inner_rollout_horizon=6,
+        temporal_loss_normalization="reference_weighted_mean",
+        temporal_loss_reference_horizon=3,
+        rho=0.7,
+        compile=True,
+        compile_strict=False,
+        inner_operator="sac",
+        inner_schedule_mode="canonical",
+        inner_rounds=4,
+        inner_rollouts_per_round=32,
+        inner_updates_per_round=192,
+        inner_nominal_updates_per_round=192,
+        inner_batch_size=64,
+        inner_replay_capacity=768,
+        inner_replay_sampling="with_replacement",
+        inner_replay_scope="action",
+        inner_model_step_budget=768,
+        inner_expected_update_slots=768,
+    )
+    critic_signature = {
+        "q_representation": "distributional",
+        "num_q": 5,
+        "num_bins": 101,
+        "vmin": -10.0,
+        "vmax": 10.0,
+    }
+    model = SimpleNamespace(
+        cfg=cfg,
+        agent=SimpleNamespace(model=SimpleNamespace(critic_signature=critic_signature)),
+    )
+
+    metadata = training_main._resolved_runtime_metadata(
+        model,
+        trial_run_params={
+            "alg": "AMBITDMPC2/AMBITDMPC2",
+            "seed": 55,
+        },
+    )
+
+    assert metadata["seed"] == 55
+    assert metadata["horizons"] == {
+        "train_unroll_horizon": 6,
+        "outer_planning_horizon": 3,
+        "inner_rollout_horizon": 6,
+    }
+    assert metadata["critic"] == critic_signature
+    assert metadata["compilation"] == {"enabled": True, "strict": False}
+    assert metadata["inner_budget"]["branches_per_action"] == 128
+    assert metadata["inner_budget"]["transitions_per_round"] == 192
+    assert metadata["inner_budget"]["transitions_per_action"] == 768
+    assert metadata["inner_budget"]["replay_rows_drawn_per_action"] == 49_152
 
 
 def test_per_algorithm_null_cadence_disables_experiment_checkpointing(

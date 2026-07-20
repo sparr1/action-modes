@@ -39,8 +39,8 @@ conda activate ambi
 echo "Starting AMBI training..."
 
 python3 main.py \
-  --run configs/experiments/AntNativeSACQRepresentation.json \
-  --alg-dir configs/algs
+  --run configs/ambi/experiments/canonical/native_sac.json \
+  --alg-dir configs/ambi/algs
 
 
 echo "End time: $(date)"

@@ -1,0 +1,31 @@
+{
+  "seed": 55,
+  "env": "Ant-v4",
+  "alg": "TDMPC2/TDMPC2Baseline",
+  "device": "cpu",
+  "alg_params": {
+    "model_size": 5,
+    "episodic": false,
+    "discount": 0.99,
+    "seed_steps": 16,
+    "pretrain_steps": 1,
+    "buffer_size": 5000,
+    "batch_size": 8,
+    "utd": 1,
+    "train_unroll_horizon": 6,
+    "outer_planning_horizon": 3,
+    "inner_rollout_horizon": 3,
+    "iterations": 2,
+    "num_samples": 32,
+    "num_elites": 4,
+    "num_pi_trajs": 2,
+    "temporal_loss_normalization": "reference_weighted_mean",
+    "temporal_loss_reference_horizon": 3,
+    "rho": 0.7,
+    "compile": false,
+    "mpc": true,
+    "wandb": false
+  },
+  "total_steps": 20,
+  "episodes": null
+}

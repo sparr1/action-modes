@@ -1,15 +1,22 @@
-# Native SAC distributional-Q ablation
+# Native SAC distributional-Q notes
 
-The native SAC implementation can keep its standard twin-critic structure while
-changing each critic from a scalar output to categorical logits over symlog Q
-bins. The soft Bellman target, clipped double-Q minimum, entropy temperature,
-and actor objective are otherwise unchanged.
+The active comparator is
+`configs/ambi/algs/native_sac_distributional_twin_q.json`.
+
+The native SAC implementation supports a distributional Q ensemble. This
+comparator deliberately retains standard SAC's twin-critic structure while
+changing the Q representation to categorical symlog bins. It applies the
+clipped twin-Q minimum to the Bellman target and actor objective.
 
 The distributional critic is selected with:
 
 ```json
 {
   "q_representation": "distributional",
+  "num_q": 2,
+  "q_pair_size": 2,
+  "q_target_reduction": "min_pair",
+  "q_actor_reduction": "min_pair",
   "q_num_bins": 101,
   "q_vmin": -10,
   "q_vmax": 10
@@ -19,30 +26,30 @@ The distributional critic is selected with:
 `q_vmin` and `q_vmax` bound the **symlog-transformed** target. Targets outside
 the support are clipped, and `q_target_clip_fraction` reports how often this
 happens. `q_distribution_entropy` and `q_distribution_max_probability` help
-diagnose categorical collapse. Both critic distributions are decoded to scalar
+diagnose categorical collapse. All critic distributions are decoded to scalar
 values before the SAC target minimum and actor loss are evaluated.
 
-Run the short smoke experiment with:
+Run the short consolidated smoke experiment with:
 
 ```bash
 python3 main.py \
-  --run configs/experiments/AntNativeDistributionalSACDebug.json \
-  --alg-dir configs/algs
+  --run configs/ambi/experiments/smoke/smoke_algorithm_wiring.json \
+  --alg-dir configs/ambi/algs
 ```
 
-Run the matched scalar-versus-distributional experiment with:
+Run the canonical one-seed exploratory comparator with:
 
 ```bash
 python3 main.py \
-  --run configs/experiments/AntNativeSACQRepresentation.json \
-  --alg-dir configs/algs
+  --run configs/ambi/experiments/canonical/native_sac.json \
+  --alg-dir configs/ambi/algs
 ```
 
-This comparison runs both variants on the same five seeds (55 through 59).
-
-The paired experiment deliberately uses two critics in both variants. Increasing
-the distributional ensemble size should be tested separately so representation
-and ensemble capacity are not changed in the same ablation.
+This checked-in run uses seed 55 only and is labeled exploratory in its
+manifest. The older scalar-versus-twin-distributional ablation remains under
+`configs/experiments/` for historical use. AMBI and TD-MPC2 use five heads;
+Native SAC remains twin-Q so distributional representation is not conflated
+with ensemble size.
 
 This is a categorical/two-hot Q parameterization trained from the usual scalar
 soft-SAC target. It should not be interpreted as a calibrated distribution over

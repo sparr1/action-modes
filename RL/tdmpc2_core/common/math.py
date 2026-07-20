@@ -1,4 +1,5 @@
 from functools import lru_cache
+from math import isfinite
 
 import torch
 import torch.nn.functional as F
@@ -6,6 +7,174 @@ try:
 	from tensordict import TensorDict
 except ImportError:  # tensordict<newer API compatibility
 	from tensordict.tensordict import TensorDict
+
+
+TEMPORAL_LOSS_NORMALIZATIONS = {
+	"divide_horizon",
+	"reference_weighted_mean",
+}
+
+
+def temporal_loss_uses_legacy_order(
+	normalization,
+	horizon,
+	reference_horizon,
+):
+	"""Whether a reducer must execute the historical arithmetic order.
+
+	The compatibility mode always does so. The new normalization also takes this
+	path at its reference horizon, which preserves the old value *and* floating-
+	point/gradient operation order exactly at the anchor.
+	"""
+	normalization = str(normalization).lower()
+	if normalization not in TEMPORAL_LOSS_NORMALIZATIONS:
+		raise ValueError(
+			"temporal loss normalization must be one of "
+			f"{sorted(TEMPORAL_LOSS_NORMALIZATIONS)}, got {normalization!r}."
+		)
+	return normalization == "divide_horizon" or int(horizon) == int(
+		reference_horizon
+	)
+
+
+def temporal_loss_weights(
+	horizon,
+	rho,
+	*,
+	normalization="reference_weighted_mean",
+	reference_horizon=3,
+	include_terminal=False,
+	device=None,
+	dtype=torch.float32,
+):
+	"""Return normalized geometric weights for one temporal objective.
+
+	Transition objectives contain ``horizon`` terms. Actor objectives contain the
+	additional terminal latent and therefore set ``include_terminal=True``. The
+	reference-weighted mode preserves the aggregate weight of the configured
+	reference horizon while redistributing it across the requested depth.
+
+	The implementation sums the finite geometric sequence directly instead of
+	using ``(1-rho**n)/(1-rho)``, so ``rho=1`` is well-defined.
+	"""
+	horizon = int(horizon)
+	reference_horizon = int(reference_horizon)
+	if horizon <= 0:
+		raise ValueError("horizon must be positive.")
+	if reference_horizon <= 0:
+		raise ValueError("reference_horizon must be positive.")
+	rho = float(rho)
+	if not isfinite(rho):
+		raise ValueError(f"rho must be finite, got {rho}.")
+	normalization = str(normalization).lower()
+	if normalization not in TEMPORAL_LOSS_NORMALIZATIONS:
+		raise ValueError(
+			"temporal loss normalization must be one of "
+			f"{sorted(TEMPORAL_LOSS_NORMALIZATIONS)}, got {normalization!r}."
+		)
+
+	term_offset = int(bool(include_terminal))
+	num_terms = horizon + term_offset
+	reference_terms = reference_horizon + term_offset
+	base = torch.as_tensor(rho, device=device, dtype=dtype)
+	weights = torch.pow(
+		base,
+		torch.arange(num_terms, device=device, dtype=dtype),
+	)
+	if normalization == "divide_horizon" or horizon == reference_horizon:
+		# The reference branch is deliberately identical to the legacy coefficient
+		# construction at H=H0.
+		return weights / num_terms
+
+	reference_weights = torch.pow(
+		base,
+		torch.arange(reference_terms, device=device, dtype=dtype),
+	)
+	requested_sum = weights.sum()
+	if not bool(torch.isfinite(requested_sum)) or float(requested_sum) == 0.0:
+		raise ValueError(
+			"Temporal weights must have a finite, non-zero sum; "
+			f"got rho={rho}, horizon={horizon}."
+		)
+	reference_mean_weight = reference_weights.sum() / reference_terms
+	return weights * (reference_mean_weight / requested_sum)
+
+
+def reduce_temporal_loss(
+	per_time_losses,
+	rho,
+	*,
+	normalization="reference_weighted_mean",
+	reference_horizon=3,
+	include_terminal=False,
+	legacy_order="sequential",
+	weights=None,
+):
+	"""Reduce scalar losses over time with exact anchor compatibility.
+
+	``legacy_order`` records the historical expression used by the caller:
+
+	* ``sequential``: accumulate ``loss[t] * rho**t`` and divide afterwards.
+	* ``vector_mean``: ``(losses * rho_weights).mean()`` (outer actors).
+	* ``vector_sum_divide``: vectorized weighted sum followed by division.
+
+	At the reference horizon, and for ``divide_horizon`` at every horizon, these
+	paths intentionally preserve the former floating-point operation order. At
+	other horizons the supplied normalized weights implement the fixed aggregate
+	temporal weight.
+	"""
+	if legacy_order not in {"sequential", "vector_mean", "vector_sum_divide"}:
+		raise ValueError(f"Unsupported legacy temporal reduction {legacy_order!r}.")
+	values = per_time_losses if torch.is_tensor(per_time_losses) else None
+	terms = (
+		tuple(per_time_losses.unbind(0))
+		if values is not None
+		else tuple(per_time_losses)
+	)
+	if not terms:
+		raise ValueError("per_time_losses must contain at least one temporal term.")
+	if any(term.ndim != 0 for term in terms):
+		raise ValueError("Each temporal loss must already be reduced to a scalar.")
+	num_terms = len(terms)
+	horizon = num_terms - int(bool(include_terminal))
+	if horizon <= 0:
+		raise ValueError("Resolved temporal horizon must be positive.")
+
+	if temporal_loss_uses_legacy_order(
+		normalization,
+		horizon,
+		reference_horizon,
+	):
+		if legacy_order == "sequential":
+			total = 0
+			for index, loss in enumerate(terms):
+				total = total + loss * float(rho) ** index
+			return total / num_terms
+		if values is None:
+			values = torch.stack(terms, dim=0)
+		raw_weights = torch.pow(
+			float(rho),
+			torch.arange(num_terms, device=values.device),
+		).to(dtype=values.dtype)
+		weighted = values * raw_weights
+		if legacy_order == "vector_mean":
+			return weighted.mean()
+		return weighted.sum() / num_terms
+
+	if values is None:
+		values = torch.stack(terms, dim=0)
+	if weights is None:
+		weights = temporal_loss_weights(
+			horizon,
+			rho,
+			normalization=normalization,
+			reference_horizon=reference_horizon,
+			include_terminal=include_terminal,
+			device=values.device,
+			dtype=values.dtype,
+		)
+	weights = weights[:num_terms].to(device=values.device, dtype=values.dtype)
+	return (values * weights).sum()
 
 
 def soft_ce(pred, target, cfg):

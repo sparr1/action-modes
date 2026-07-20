@@ -6,7 +6,7 @@ import warnings
 
 import numpy as np
 
-from RL.TDMPC2 import TDMPC2Baseline
+from RL.TDMPC2 import TDMPC2Baseline, _normalize_horizon_params
 from RL.tdmpc2_core.ambi_agent import AMBITDMPC2Agent
 from utils.utils import setup_logs
 
@@ -51,7 +51,7 @@ _AMBI_DEFAULTS = {
     "inner_operator": "sac",
     "inner_rounds": 4,
     "inner_rollouts_per_round": 64,
-    "inner_rollout_horizon": None,
+    "inner_rollout_horizon": 3,
     "inner_updates_per_round": "auto",
 
     # Deprecated total-budget controls. These remain accepted on an isolated
@@ -216,7 +216,7 @@ def _normalize_legacy_params(params):
         rollouts = int(params.pop("inner_rollouts", 32))
         rollout_horizon = params.pop("inner_horizon", None)
         if rollout_horizon is None:
-            rollout_horizon = params.get("horizon", 3)
+            rollout_horizon = 3
         updates_per_round = params.pop("inner_updates_per_iteration", 1)
         if requested_operator == "mppi":
             if int(updates_per_round) not in {0, 1}:
@@ -352,7 +352,13 @@ class AMBITDMPC2(TDMPC2Baseline):
         self._wandb_inner_steps = 0
 
     def _build_cfg(self, params):
+        # Resolve the outer legacy alias before translating AMBI's separate
+        # legacy inner-loop aliases. This rejects only combinations the caller
+        # actually supplied while allowing an all-legacy configuration to make
+        # its one-release migration cleanly.
+        params = _normalize_horizon_params(params, resolve_defaults=False)
         params, schedule_mode = _normalize_legacy_params(params)
+        params = _normalize_horizon_params(params)
         explicit_num_q = params.get("num_q", None)
         requested_operator = str(
             params.get("inner_operator", _AMBI_DEFAULTS["inner_operator"])
@@ -487,15 +493,19 @@ class AMBITDMPC2(TDMPC2Baseline):
             raise ValueError("inner_operator must be one of 'none', 'sac', 'td3', or 'mppi'.")
 
         if cfg.inner_rollout_horizon is None:
-            cfg.inner_rollout_horizon = cfg.horizon
+            cfg.inner_rollout_horizon = 3
         cfg.inner_rollout_horizon = int(cfg.inner_rollout_horizon)
         if cfg.inner_rollout_horizon <= 0:
             raise ValueError("inner_rollout_horizon must be positive.")
-        cfg.inner_horizon_ratio = cfg.inner_rollout_horizon / float(cfg.horizon)
-        if cfg.inner_rollout_horizon > int(cfg.horizon):
+        cfg.inner_horizon_ratio = cfg.inner_rollout_horizon / float(
+            cfg.train_unroll_horizon
+        )
+        if cfg.inner_rollout_horizon > int(cfg.train_unroll_horizon):
             warnings.warn(
-                "inner_rollout_horizon exceeds the horizon used to train the world model; "
-                "this increases compounding model-bias risk.",
+                f"inner_rollout_horizon={cfg.inner_rollout_horizon} exceeds "
+                f"train_unroll_horizon={cfg.train_unroll_horizon}; the inner "
+                "controller is extrapolating beyond recurrent world-model training, "
+                "which increases compounding model-bias risk.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -901,6 +911,17 @@ class AMBITDMPC2(TDMPC2Baseline):
             if value not in _LIFECYCLE_SCOPES:
                 raise ValueError(f"{key} must be one of {sorted(_LIFECYCLE_SCOPES)}.")
             setattr(cfg, key, value)
+        if (
+            cfg.inner_operator in {"sac", "td3"}
+            and cfg.inner_replay_scope == "action"
+            and cfg.inner_replay_capacity < cfg.inner_model_step_budget
+        ):
+            raise ValueError(
+                "Action-local inner_replay_capacity must be at least the cumulative "
+                "nominal J*N*H transitions for one real action: "
+                f"capacity={cfg.inner_replay_capacity}, "
+                f"required={cfg.inner_model_step_budget}."
+            )
         for component in ("actor", "critic", "temperature"):
             parameter_scope = getattr(cfg, f"inner_{component}_scope")
             optimizer_scope = getattr(cfg, f"inner_{component}_optimizer_scope")

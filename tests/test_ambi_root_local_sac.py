@@ -15,7 +15,7 @@ from utils.ambi_research import load_preset_matrix, resolve_preset
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MATRIX = ROOT / "configs/research/ambi_inner_decoupling.json"
+MATRIX = ROOT / "configs/ambi/legacy/ambi_inner_decoupling.json"
 
 
 def _build_cfg(**params):
@@ -48,7 +48,8 @@ def _tiny_params(**overrides):
         "vmin": -5,
         "vmax": 5,
         "batch_size": 2,
-        "horizon": 2,
+        "train_unroll_horizon": 2,
+        "outer_planning_horizon": 2,
         "buffer_size": 32,
         "seed_steps": 4,
         "pretrain_steps": 1,
@@ -459,7 +460,8 @@ def test_auto_uses_realized_round_transitions_but_explicit_g_is_fixed(
 ):
     model = _tiny_model(
         episodic=True,
-        horizon=3,
+        train_unroll_horizon=3,
+        outer_planning_horizon=3,
         inner_rounds=2,
         inner_rollouts_per_round=3,
         inner_rollout_horizon=3,
@@ -497,7 +499,8 @@ def test_auto_uses_realized_round_transitions_but_explicit_g_is_fixed(
 def test_canonical_without_replacement_fails_on_realized_round_underfill():
     model = _tiny_model(
         episodic=True,
-        horizon=3,
+        train_unroll_horizon=3,
+        outer_planning_horizon=3,
         inner_rounds=2,
         inner_rollouts_per_round=3,
         inner_rollout_horizon=3,

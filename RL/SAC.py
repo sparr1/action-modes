@@ -120,14 +120,6 @@ class SAC(Algorithm):
         else:
             actor_arch = critic_arch = self._validated_net_arch(net_arch, "net_arch")
 
-        num_q = int(self.params.get("num_q", 2))
-        q_pair_size = int(self.params.get("q_pair_size", 2))
-        if num_q != 2 or q_pair_size != 2:
-            raise ValueError(
-                "Native SAC keeps exactly two critics for a clean scalar-versus-"
-                "distributional comparison; num_q and q_pair_size must both be 2."
-            )
-
         device = self.run_params.get("device", self.params.get("device", "auto"))
         return SACConfig(
             learning_rate=float(self.params.get("learning_rate", 3e-4)),
@@ -145,6 +137,14 @@ class SAC(Algorithm):
             actor_net_arch=actor_arch,
             critic_net_arch=critic_arch,
             q_representation=str(self.params.get("q_representation", "scalar")).lower(),
+            num_q=self.params.get("num_q", 2),
+            q_pair_size=self.params.get("q_pair_size", 2),
+            q_target_reduction=str(
+                self.params.get("q_target_reduction", "min_pair")
+            ).lower(),
+            q_actor_reduction=str(
+                self.params.get("q_actor_reduction", "min_pair")
+            ).lower(),
             q_num_bins=int(self.params.get("q_num_bins", 101)),
             q_vmin=float(self.params.get("q_vmin", -10.0)),
             q_vmax=float(self.params.get("q_vmax", 10.0)),
@@ -581,6 +581,7 @@ class SAC(Algorithm):
             critical_keys = [
                 "learning_rate", "tau", "gamma", "ent_coef", "target_entropy",
                 "target_update_interval", "actor_net_arch", "critic_net_arch", "adam_eps",
+                "num_q", "q_pair_size", "q_target_reduction", "q_actor_reduction",
             ]
             saved_representation = str(saved.get("q_representation", "scalar")).lower()
             current_representation = str(current["q_representation"]).lower()
@@ -590,6 +591,10 @@ class SAC(Algorithm):
 
             legacy_defaults = {
                 "q_representation": "scalar",
+                "num_q": 2,
+                "q_pair_size": 2,
+                "q_target_reduction": "min_pair",
+                "q_actor_reduction": "min_pair",
                 "q_num_bins": 101,
                 "q_vmin": -10.0,
                 "q_vmax": 10.0,

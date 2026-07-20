@@ -3,6 +3,7 @@ import math
 import os
 import random
 import time
+import warnings
 from types import SimpleNamespace
 
 import gymnasium as gym
@@ -20,6 +21,7 @@ from RL.tdmpc2_core.agent import TDMPC2
 from RL.tdmpc2_core.common.buffer import Buffer
 from RL.tdmpc2_core.common.checkpoint import AsyncCheckpointWriter
 from RL.tdmpc2_core.common.device import resolve_device
+from RL.tdmpc2_core.common.math import TEMPORAL_LOSS_NORMALIZATIONS
 from utils.checkpointing import (
     CheckpointTracker,
     explicit_checkpoint_target,
@@ -60,10 +62,16 @@ _DEFAULTS = {
     "num_samples": 512,
     "num_elites": 64,
     "num_pi_trajs": 24,
-    "horizon": 3,
+    "train_unroll_horizon": 3,
+    "outer_planning_horizon": 3,
+    "inner_rollout_horizon": 3,
     "min_std": 0.05,
     "max_std": 2.0,
     "temperature": 0.5,
+
+    # temporal weighting
+    "temporal_loss_normalization": "reference_weighted_mean",
+    "temporal_loss_reference_horizon": 3,
 
     # actor / critic
     "log_std_min": -10,
@@ -88,6 +96,52 @@ _DEFAULTS = {
     "seed": 1,
     "device": "auto",
 }
+
+
+_EXPLICIT_HORIZON_FIELDS = {
+    "train_unroll_horizon",
+    "outer_planning_horizon",
+    "inner_rollout_horizon",
+}
+
+
+def _positive_int(value, key):
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be a positive integer.")
+    try:
+        numeric = float(value)
+        resolved = int(numeric)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{key} must be a positive integer.") from exc
+    if not math.isfinite(numeric) or resolved <= 0 or numeric != resolved:
+        raise ValueError(f"{key} must be a positive integer.")
+    return resolved
+
+
+def _normalize_horizon_params(params, *, resolve_defaults=True):
+    """Resolve canonical horizons while retaining one-release legacy support."""
+    params = copy.deepcopy(params)
+    if "horizon" in params:
+        conflicts = sorted(set(params) & _EXPLICIT_HORIZON_FIELDS)
+        if conflicts:
+            raise ValueError(
+                "Cannot combine legacy horizon with explicit horizon "
+                f"fields: {conflicts}."
+            )
+        legacy_horizon = _positive_int(params.pop("horizon"), "horizon")
+        warnings.warn(
+            "Legacy 'horizon' is deprecated; use train_unroll_horizon and "
+            "outer_planning_horizon explicitly.",
+            FutureWarning,
+            stacklevel=3,
+        )
+        params["train_unroll_horizon"] = legacy_horizon
+        params["outer_planning_horizon"] = legacy_horizon
+
+    for key in _EXPLICIT_HORIZON_FIELDS:
+        if resolve_defaults or key in params:
+            params[key] = _positive_int(params.get(key, 3), key)
+    return params
 
 
 class _TDMPC2Config(SimpleNamespace):
@@ -461,6 +515,17 @@ class TDMPC2Baseline(Algorithm):
         self.run_params = run_params or {}
         self.experiment_params = experiment_params or {}
         self.cfg = self._build_cfg(custom_params or {})
+        print(
+            "Resolved horizons:",
+            f"train_unroll_horizon={self.cfg.train_unroll_horizon},",
+            f"outer_planning_horizon={self.cfg.outer_planning_horizon},",
+            f"inner_rollout_horizon={self.cfg.inner_rollout_horizon}",
+        )
+        print(
+            "Temporal loss normalization:",
+            f"{self.cfg.temporal_loss_normalization} ",
+            f"(reference_horizon={self.cfg.temporal_loss_reference_horizon})",
+        )
 
         self._set_seed(self.cfg.seed)
         self.agent = self._make_agent(self.cfg)
@@ -535,6 +600,7 @@ class TDMPC2Baseline(Algorithm):
         )
 
     def _build_cfg(self, params):
+        params = _normalize_horizon_params(params)
         cfg = copy.deepcopy(_DEFAULTS)
         cfg.update(copy.deepcopy(params))
 
@@ -601,6 +667,26 @@ class TDMPC2Baseline(Algorithm):
             cfg["pretrain_steps"] = cfg["seed_steps"]
         cfg["pretrain_steps"] = int(cfg["pretrain_steps"])
         cfg["utd"] = int(cfg.get("utd", 1))
+
+        cfg["rho"] = float(cfg["rho"])
+        if not math.isfinite(cfg["rho"]):
+            raise ValueError("rho must be finite.")
+        cfg["temporal_loss_normalization"] = str(
+            cfg["temporal_loss_normalization"]
+        ).lower()
+        if cfg["temporal_loss_normalization"] not in TEMPORAL_LOSS_NORMALIZATIONS:
+            raise ValueError(
+                "temporal_loss_normalization must be one of "
+                f"{sorted(TEMPORAL_LOSS_NORMALIZATIONS)}."
+            )
+        cfg["temporal_loss_reference_horizon"] = _positive_int(
+            cfg["temporal_loss_reference_horizon"],
+            "temporal_loss_reference_horizon",
+        )
+        # Read-only compatibility alias for integrations that still size outer
+        # training tensors through cfg.horizon. Core code must use the canonical
+        # fields so planning can differ from recurrent training.
+        cfg["horizon"] = cfg["train_unroll_horizon"]
 
         # Allow a simple fixed discount override in alg_params, e.g. "discount": 0.99.
         if "discount" in cfg and cfg["discount"] is not None:

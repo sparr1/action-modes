@@ -24,7 +24,8 @@ def _params(**overrides):
         "vmin": -5,
         "vmax": 5,
         "batch_size": 4,
-        "horizon": 2,
+        "train_unroll_horizon": 2,
+        "outer_planning_horizon": 2,
         "buffer_size": 100,
         "seed_steps": 4,
         "pretrain_steps": 1,
@@ -140,9 +141,9 @@ def test_sac_inner_and_outer_updates_support_both_q_representations(
     assert (agent.num_updates, agent.outer_version) == updates_before
     _assert_finite(agent.last_inner_metrics)
 
-    obs = torch.randn(model.cfg.horizon + 1, model.cfg.batch_size, 3)
-    actions = torch.randn(model.cfg.horizon, model.cfg.batch_size, 1).tanh()
-    rewards = torch.randn(model.cfg.horizon, model.cfg.batch_size, 1)
+    obs = torch.randn(model.cfg.train_unroll_horizon + 1, model.cfg.batch_size, 3)
+    actions = torch.randn(model.cfg.train_unroll_horizon, model.cfg.batch_size, 1).tanh()
+    rewards = torch.randn(model.cfg.train_unroll_horizon, model.cfg.batch_size, 1)
     update = agent._update(obs, actions, rewards, torch.zeros_like(rewards))
     _assert_finite(update)
 
@@ -243,9 +244,9 @@ def test_episode_scoped_replay_persists_but_is_invalidated_after_outer_update():
     assert id(agent.inner_engine.state.actor) == actor_id
     assert agent.inner_engine.state.replay.size == 16
 
-    obs = torch.randn(model.cfg.horizon + 1, model.cfg.batch_size, 3)
-    actions = torch.randn(model.cfg.horizon, model.cfg.batch_size, 1).tanh()
-    rewards = torch.randn(model.cfg.horizon, model.cfg.batch_size, 1)
+    obs = torch.randn(model.cfg.train_unroll_horizon + 1, model.cfg.batch_size, 3)
+    actions = torch.randn(model.cfg.train_unroll_horizon, model.cfg.batch_size, 1).tanh()
+    rewards = torch.randn(model.cfg.train_unroll_horizon, model.cfg.batch_size, 1)
     agent._update(obs, actions, rewards, torch.zeros_like(rewards))
     agent.act(torch.zeros(3), t0=False)
     assert id(agent.inner_engine.state.actor) == actor_id
@@ -445,9 +446,9 @@ def test_native_checkpoint_roundtrips_all_outer_training_state(
     tmp_path, representation, num_q
 ):
     source = _model(q_representation=representation, num_q=num_q)
-    obs = torch.randn(source.cfg.horizon + 1, source.cfg.batch_size, 3)
-    actions = torch.randn(source.cfg.horizon, source.cfg.batch_size, 1).tanh()
-    rewards = torch.randn(source.cfg.horizon, source.cfg.batch_size, 1)
+    obs = torch.randn(source.cfg.train_unroll_horizon + 1, source.cfg.batch_size, 3)
+    actions = torch.randn(source.cfg.train_unroll_horizon, source.cfg.batch_size, 1).tanh()
+    rewards = torch.randn(source.cfg.train_unroll_horizon, source.cfg.batch_size, 1)
     source.agent._update(obs, actions, rewards, torch.zeros_like(rewards))
     checkpoint = tmp_path / f"{representation}.pt"
     source.agent.save(checkpoint)

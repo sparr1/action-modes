@@ -5,6 +5,7 @@ import math
 import os
 import random
 import shutil
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -84,6 +85,178 @@ def _remove_saved_checkpoint(checkpoint_path):
             artifact.unlink()
         except FileNotFoundError:
             pass
+
+
+_RUNTIME_CONFIG_FIELDS = (
+    "train_unroll_horizon",
+    "outer_planning_horizon",
+    "inner_rollout_horizon",
+    "temporal_loss_normalization",
+    "temporal_loss_reference_horizon",
+    "rho",
+    "model_size",
+    "num_q",
+    "num_bins",
+    "vmin",
+    "vmax",
+    "q_pair_size",
+    "q_target_reduction",
+    "q_actor_reduction",
+    "outer_q_target_reduction",
+    "outer_q_actor_reduction",
+    "inner_q_target_reduction",
+    "inner_q_actor_reduction",
+    "compile",
+    "compile_strict",
+    "inner_operator",
+    "inner_schedule_mode",
+    "inner_rounds",
+    "inner_rollouts_per_round",
+    "inner_updates_per_round",
+    "inner_nominal_updates_per_round",
+    "inner_batch_size",
+    "inner_replay_capacity",
+    "inner_replay_sampling",
+    "inner_replay_scope",
+    "inner_model_step_budget",
+    "inner_expected_update_slots",
+)
+
+
+def _json_safe_metadata(value):
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_safe_metadata(item) for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_metadata(item) for item in value]
+    return str(value)
+
+
+def _resolved_runtime_metadata(model, *, trial_run_params):
+    """Return the resolved, portable settings needed to interpret one run."""
+
+    cfg = getattr(model, "cfg", None)
+    resolved = {
+        key: getattr(cfg, key)
+        for key in _RUNTIME_CONFIG_FIELDS
+        if cfg is not None and hasattr(cfg, key)
+    }
+
+    critic_signature = None
+    agent = getattr(model, "agent", None)
+    for candidate in (agent, getattr(agent, "model", None)):
+        signature = getattr(candidate, "critic_signature", None)
+        if isinstance(signature, Mapping):
+            critic_signature = dict(signature)
+            break
+    if critic_signature is None:
+        critic_keys = (
+            "num_q",
+            "num_bins",
+            "vmin",
+            "vmax",
+            "q_pair_size",
+            "q_target_reduction",
+            "q_actor_reduction",
+        )
+        inferred = {key: resolved[key] for key in critic_keys if key in resolved}
+        critic_signature = inferred or None
+    elif critic_signature is not None:
+        for key in (
+            "q_pair_size",
+            "q_target_reduction",
+            "q_actor_reduction",
+            "outer_q_target_reduction",
+            "outer_q_actor_reduction",
+            "inner_q_target_reduction",
+            "inner_q_actor_reduction",
+        ):
+            if key in resolved:
+                critic_signature.setdefault(key, resolved[key])
+
+    if (
+        trial_run_params.get("alg") == "TDMPC2/TDMPC2Baseline"
+        and critic_signature is not None
+    ):
+        critic_signature.setdefault("q_pair_size", 2)
+        critic_signature.setdefault("bellman_target_reduction", "min_pair")
+        critic_signature.setdefault("actor_reduction", "mean_pair")
+        critic_signature.setdefault("planner_terminal_reduction", "mean_pair")
+
+    horizons = {
+        key: int(resolved[key])
+        for key in (
+            "train_unroll_horizon",
+            "outer_planning_horizon",
+            "inner_rollout_horizon",
+        )
+        if key in resolved
+    }
+    temporal = {
+        key: resolved[key]
+        for key in (
+            "temporal_loss_normalization",
+            "temporal_loss_reference_horizon",
+            "rho",
+        )
+        if key in resolved
+    }
+    compile_metadata = {
+        "enabled": bool(resolved.get("compile", False)),
+        "strict": bool(resolved.get("compile_strict", False)),
+    }
+
+    inner_keys = (
+        "inner_operator",
+        "inner_schedule_mode",
+        "inner_rounds",
+        "inner_rollouts_per_round",
+        "inner_updates_per_round",
+        "inner_nominal_updates_per_round",
+        "inner_batch_size",
+        "inner_replay_capacity",
+        "inner_replay_sampling",
+        "inner_replay_scope",
+        "inner_model_step_budget",
+        "inner_expected_update_slots",
+    )
+    inner = {key: resolved[key] for key in inner_keys if key in resolved}
+    if {
+        "inner_rounds",
+        "inner_rollouts_per_round",
+        "inner_rollout_horizon",
+    }.issubset(resolved):
+        rounds = int(resolved["inner_rounds"])
+        rollouts = int(resolved["inner_rollouts_per_round"])
+        horizon = int(resolved["inner_rollout_horizon"])
+        inner.update(
+            branches_per_action=rounds * rollouts,
+            transitions_per_round=rollouts * horizon,
+            transitions_per_action=rounds * rollouts * horizon,
+        )
+    if "inner_expected_update_slots" in resolved and "inner_batch_size" in resolved:
+        inner["replay_rows_drawn_per_action"] = int(
+            resolved["inner_expected_update_slots"] * resolved["inner_batch_size"]
+        )
+
+    metadata = {
+        "schema_version": 1,
+        "algorithm": trial_run_params.get("alg"),
+        "seed": int(trial_run_params["seed"]),
+        "horizons": horizons,
+        "temporal_loss": temporal,
+        "critic": critic_signature,
+        "compilation": compile_metadata,
+        "inner_budget": inner,
+    }
+    return _json_safe_metadata(metadata)
 
 
 def main():
@@ -264,6 +437,13 @@ def main():
 
             model, baseline, alg_name = initialize_alg(trial_run_params["alg"], trial_run_params["alg_params"], domain, full_run_params=trial_run_params, experiment_params=experiment_params)
             print(alg_name, "initialized.")
+            trial_run_params["resolved_runtime"] = _resolved_runtime_metadata(
+                model, trial_run_params=trial_run_params
+            )
+            print(
+                "Resolved runtime metadata:",
+                json.dumps(trial_run_params["resolved_runtime"], sort_keys=True),
+            )
 
             if checkpoint_config.enabled:
                 if not supports_composable_checkpointing(model):

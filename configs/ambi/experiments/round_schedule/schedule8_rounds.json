@@ -1,0 +1,11 @@
+{
+  "study_type": "single_seed_exploratory_screening",
+  "study_note": "Single-seed exploratory screening only; make no confidence, significance, or confirmatory claims.",
+  "overrides_alg": {"seed": 55, "device": "cuda", "env": "Ant-v4", "total_steps": 1000000, "episodes": null},
+  "env_params": {"render_mode": null, "exclude_current_positions_from_observation": true, "max_episode_steps": 1000, "terminate_when_unhealthy": false},
+  "trials": 1,
+  "configs": ["ambi_schedule8_rounds"],
+  "logs": "timestamp", "save_trials": "none", "checkpoint_every": 100000,
+  "save_strat": ["best", "latest"], "checkpoint_best_window": 100,
+  "log_info": false, "log_type": "summary"
+}

@@ -33,7 +33,8 @@ from utils.ambi_research import (
 DEFAULT_MATRIX = (
     Path(__file__).resolve().parent
     / "configs"
-    / "research"
+    / "ambi"
+    / "legacy"
     / "ambi_inner_decoupling.json"
 )
 _MAX_NUMPY_SEED = 2**32 - 1
@@ -47,7 +48,7 @@ def build_parser():
         "--matrix",
         type=Path,
         default=DEFAULT_MATRIX,
-        help="Research preset matrix (default: configs/research/ambi_inner_decoupling.json).",
+        help="Legacy frozen-checkpoint matrix (default: configs/ambi/legacy/ambi_inner_decoupling.json).",
     )
     parser.add_argument(
         "--checkpoint",

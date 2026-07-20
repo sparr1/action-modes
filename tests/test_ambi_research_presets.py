@@ -22,7 +22,7 @@ from utils.ambi_research import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MATRIX = ROOT / "configs/research/ambi_inner_decoupling.json"
+MATRIX = ROOT / "configs/ambi/legacy/ambi_inner_decoupling.json"
 
 
 def _build_cfg(resolved):

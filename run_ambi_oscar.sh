@@ -42,7 +42,9 @@ echo "Starting AMBI training..."
 # Legacy exact-environment AMBI: configs/experiments/AntAMBI.json
 # python main.py -r configs/experiments/AntAMBITDMPC2Debug.json --num-runs 1
 
-python main.py -r configs/experiments/AntAMBITDMPC2.json
+python main.py \
+  --run configs/ambi/experiments/canonical/ambi_anchor.json \
+  --alg-dir configs/ambi/algs
 
 echo "End time: $(date)"
 echo "Job completed!"

@@ -1,0 +1,32 @@
+{
+  "study_type": "single_seed_exploratory_screening",
+  "study_note": "Single-seed exploratory screening only; make no confidence, significance, or confirmatory claims.",
+  "overrides_alg": {"seed": 55, "device": "cuda", "env": "Ant-v4", "total_steps": 1000000, "episodes": null},
+  "env_params": {"render_mode": null, "exclude_current_positions_from_observation": true, "max_episode_steps": 1000, "terminate_when_unhealthy": false},
+  "trials": 1,
+  "configs": [
+    "native_sac_distributional_twin_q",
+    "tdmpc2_baseline",
+    "ambi_anchor",
+    "ambi_horizon_train6_inner3",
+    "ambi_horizon_train3_inner6",
+    "ambi_horizon_train6_inner6",
+    "ambi_fixed_budget_inner1_rollouts192",
+    "ambi_fixed_budget_inner2_rollouts96",
+    "ambi_fixed_budget_inner4_rollouts48",
+    "ambi_breadth_depth_inner3_rollouts32",
+    "ambi_breadth_depth_inner6_rollouts64",
+    "ambi_updates64_per_round",
+    "ambi_batch128",
+    "ambi_schedule1_round",
+    "ambi_schedule2_rounds",
+    "ambi_schedule8_rounds"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 100000,
+  "save_strat": ["best", "latest"],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}

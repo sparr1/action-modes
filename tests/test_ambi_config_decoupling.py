@@ -111,7 +111,8 @@ def test_compute_and_component_controls_validate_independently():
 def test_long_control_horizon_is_an_explicit_warning_not_a_gate():
     with pytest.warns(UserWarning, match="model-bias"):
         cfg = _build_cfg(
-            horizon=2,
+            train_unroll_horizon=2,
+            outer_planning_horizon=2,
             inner_rollout_horizon=3,
             inner_model_step_budget=96,
             inner_rounds=1,

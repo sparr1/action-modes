@@ -39,12 +39,26 @@ class AMBITDMPC2Agent(torch.nn.Module):
             enabled=bool(getattr(cfg, "compile", False)),
             strict=bool(getattr(cfg, "compile_strict", False)),
         )
-        rho_base = torch.tensor(float(cfg.rho), device=self.device)
         self.register_buffer(
-            "_rho_weights",
-            torch.pow(
-                rho_base,
-                torch.arange(int(cfg.horizon) + 1, device=self.device),
+            "_transition_temporal_weights",
+            td_math.temporal_loss_weights(
+                cfg.train_unroll_horizon,
+                cfg.rho,
+                normalization=cfg.temporal_loss_normalization,
+                reference_horizon=cfg.temporal_loss_reference_horizon,
+                device=self.device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_actor_temporal_weights",
+            td_math.temporal_loss_weights(
+                cfg.train_unroll_horizon,
+                cfg.rho,
+                normalization=cfg.temporal_loss_normalization,
+                reference_horizon=cfg.temporal_loss_reference_horizon,
+                include_terminal=True,
+                device=self.device,
             ),
             persistent=False,
         )
@@ -447,7 +461,15 @@ class AMBITDMPC2Agent(torch.nn.Module):
         actor_per_time = (alpha * policy_info["log_prob"] - q_policy).mean(
             dim=(1, 2)
         )
-        actor_loss = (actor_per_time * self._rho_weights[: zs.shape[0]]).mean()
+        actor_loss = td_math.reduce_temporal_loss(
+            actor_per_time,
+            self.cfg.rho,
+            normalization=self.cfg.temporal_loss_normalization,
+            reference_horizon=self.cfg.temporal_loss_reference_horizon,
+            include_terminal=True,
+            legacy_order="vector_mean",
+            weights=self._actor_temporal_weights,
+        )
 
         self.pi_optim.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -476,16 +498,24 @@ class AMBITDMPC2Agent(torch.nn.Module):
         """Pure fixed-horizon world/critic loss region."""
         z = self.model.encode(initial_obs)
         latent_states = [z]
-        consistency_loss = torch.zeros((), device=self.device)
-        for time_index, (recorded_action, next_z_target) in enumerate(
-            zip(action.unbind(0), next_z_targets.unbind(0))
+        consistency_errors = []
+        for recorded_action, next_z_target in zip(
+            action.unbind(0), next_z_targets.unbind(0)
         ):
             z = self.model.next(z, recorded_action)
-            consistency_loss = consistency_loss + F.mse_loss(z, next_z_target) * (
-                self.cfg.rho**time_index
-            )
+            consistency_error = F.mse_loss(z, next_z_target)
+            consistency_errors.append(consistency_error)
             latent_states.append(z)
         latent_states = torch.stack(latent_states, dim=0)
+        consistency_per_time = torch.stack(consistency_errors, dim=0)
+        consistency_loss = td_math.reduce_temporal_loss(
+            consistency_errors,
+            self.cfg.rho,
+            normalization=self.cfg.temporal_loss_normalization,
+            reference_horizon=self.cfg.temporal_loss_reference_horizon,
+            legacy_order="sequential",
+            weights=self._transition_temporal_weights,
+        )
 
         rollout_states = latent_states[:-1]
         rollout_joint = self.model.joint_input(rollout_states, action)
@@ -497,25 +527,35 @@ class AMBITDMPC2Agent(torch.nn.Module):
             else None
         )
 
-        horizon_weights = self._rho_weights[: int(self.cfg.horizon)]
         reward_per_sample = td_math.soft_ce(
             reward_predictions, reward, self.cfg
         )
         reward_per_time = reward_per_sample.mean(
             dim=tuple(range(1, reward_per_sample.ndim))
         )
-        reward_loss = (reward_per_time * horizon_weights).sum()
+        reward_loss = td_math.reduce_temporal_loss(
+            reward_per_time,
+            self.cfg.rho,
+            normalization=self.cfg.temporal_loss_normalization,
+            reference_horizon=self.cfg.temporal_loss_reference_horizon,
+            legacy_order="vector_sum_divide",
+            weights=self._transition_temporal_weights,
+        )
         critic_per_sample = self.model.critic_loss(
             q_predictions, td_targets, reduction="none"
         )
         critic_per_time = critic_per_sample.mean(
             dim=(0,) + tuple(range(2, critic_per_sample.ndim))
         )
-        critic_loss = (critic_per_time * horizon_weights).sum()
+        critic_loss = td_math.reduce_temporal_loss(
+            critic_per_time,
+            self.cfg.rho,
+            normalization=self.cfg.temporal_loss_normalization,
+            reference_horizon=self.cfg.temporal_loss_reference_horizon,
+            legacy_order="vector_sum_divide",
+            weights=self._transition_temporal_weights,
+        )
 
-        consistency_loss = consistency_loss / self.cfg.horizon
-        reward_loss = reward_loss / self.cfg.horizon
-        critic_loss = critic_loss / self.cfg.horizon
         if self.cfg.episodic:
             termination_loss = F.binary_cross_entropy_with_logits(
                 termination_prediction, terminated
@@ -533,6 +573,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             reward_predictions,
             q_predictions,
             termination_prediction,
+            consistency_per_time,
             consistency_loss,
             reward_loss,
             critic_loss,
@@ -552,6 +593,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             reward_predictions,
             q_predictions,
             termination_prediction,
+            consistency_per_time,
             consistency_loss,
             reward_loss,
             critic_loss,
@@ -619,6 +661,20 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 self._outer_update_region.failed
             ),
         }
+        for depth in range(int(self.cfg.train_unroll_horizon)):
+            q_at_depth = q_values[:, depth]
+            info[f"consistency_error_depth_{depth + 1}"] = (
+                consistency_per_time[depth].detach()
+            )
+            info[f"reward_error_depth_{depth + 1}"] = (
+                reward_values[depth] - reward[depth]
+            ).abs().mean()
+            info[f"q_error_depth_{depth + 1}"] = (
+                q_at_depth - td_targets[depth].detach().unsqueeze(0)
+            ).abs().mean()
+            info[f"q_head_disagreement_depth_{depth + 1}"] = q_at_depth.std(
+                dim=0, unbiased=False
+            ).mean()
         if self.cfg.episodic:
             info.update(
                 td_math.termination_statistics(
