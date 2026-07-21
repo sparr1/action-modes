@@ -45,6 +45,9 @@ replay distribution.
 - `batch_size/`: inner batch size 64 versus 128.
 - `round_schedule/`: 1, 2, 4, or 8 collect/update rounds while holding total
   imagined transitions and total update slots fixed at 768 per action.
+- `round_dose/`: eight full-size collect/update rounds, doubling the anchor's
+  imagined transitions, update slots, and action-local replay capacity from
+  768 to 1,536 per action.
 - `smoke/`: short CPU checks for five-head construction, train-6/plan-3 routing,
   and the executable inner-horizon extrapolation warning, plus a GPU throughput
   pilot that runs several actions with the full J4/N64/H3/G192 inner schedule.

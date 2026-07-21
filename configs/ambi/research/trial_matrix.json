@@ -377,6 +377,23 @@
       "updates_per_action": 768,
       "replay_capacity": 768,
       "replay_rows_per_action": 49152
+    },
+    {
+      "group": "round_dose",
+      "trial": "8_rounds_full_dose",
+      "config": "ambi_rounds8_full_dose",
+      "train": 3,
+      "plan": 3,
+      "inner": 3,
+      "rounds": 8,
+      "rollouts_per_round": 64,
+      "updates_per_round": 192,
+      "batch": 64,
+      "transitions_per_round": 192,
+      "transitions_per_action": 1536,
+      "updates_per_action": 1536,
+      "replay_capacity": 1536,
+      "replay_rows_per_action": 98304
     }
   ],
   "behavioral_duplicates": {

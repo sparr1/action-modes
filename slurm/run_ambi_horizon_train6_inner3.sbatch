@@ -6,7 +6,7 @@
 #SBATCH --partition=gpus
 #SBATCH --gres=gpu:1
 #SBATCH --mem=8G
-#SBATCH --time=192:00:00
+#SBATCH --time=300:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 #SBATCH --nodelist=gpu[1907]
@@ -15,7 +15,7 @@
 set -Eeuo pipefail
 
 # Submit this file from the repository root:
-#   sbatch slurm/run_tdmpc2.sbatch
+#   sbatch slurm/run_ambi_horizon_train6_inner3.sbatch
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 cd "$PROJECT_DIR"
 
@@ -38,10 +38,9 @@ conda activate ambi
 # Run the training script
 echo "Starting AMBI training..."
 
-python3 main.py \
-  --run configs/ambi/experiments/canonical/native_sac.json \
+python main.py \
+  --run configs/ambi/experiments/horizon/horizon_train6_inner3.json \
   --alg-dir configs/ambi/algs
-
 
 echo "End time: $(date)"
 echo "Job completed!"

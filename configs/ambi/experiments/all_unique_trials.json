@@ -20,7 +20,8 @@
     "ambi_batch128",
     "ambi_schedule1_round",
     "ambi_schedule2_rounds",
-    "ambi_schedule8_rounds"
+    "ambi_schedule8_rounds",
+    "ambi_rounds8_full_dose"
   ],
   "logs": "timestamp",
   "save_trials": "none",

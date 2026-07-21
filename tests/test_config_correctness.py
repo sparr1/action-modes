@@ -128,7 +128,7 @@ def test_all_full_manifests_are_one_seed_one_million_and_resolve_flat_configs():
 
 def test_end_to_end_matrix_is_the_deterministic_source_for_flat_ambi_configs():
     rendered = render_condition_configs(SUITE)
-    assert len(rendered) == 21
+    assert len(rendered) == 22
     for filename, expected in rendered.items():
         assert (AMBI_ALGS / filename).read_text() == expected, filename
 
@@ -181,6 +181,23 @@ def test_fixed_budget_frontier_and_round_controls_have_the_requested_counts():
     assert {item["transitions_per_action"] for item in rounds} == {768}
     assert {item["updates_per_action"] for item in rounds} == {768}
     assert {item["replay_rows_per_action"] for item in rounds} == {49_152}
+
+
+def test_full_dose_eight_round_condition_scales_replay_and_compute():
+    conditions = load_suite(SUITE)["conditions"]
+    dose = [item for item in conditions if item["group"] == "round_dose"]
+    assert len(dose) == 1
+    condition = dose[0]
+    assert (
+        condition["rounds"],
+        condition["rollouts_per_round"],
+        condition["inner"],
+        condition["updates_per_round"],
+    ) == (8, 64, 3, 192)
+    assert condition["transitions_per_action"] == 1_536
+    assert condition["updates_per_action"] == 1_536
+    assert condition["replay_capacity"] == 1_536
+    assert condition["replay_rows_per_action"] == 98_304
 
 
 def test_all_unique_manifest_omits_behavioral_anchor_aliases():
