@@ -15,7 +15,7 @@
 set -Eeuo pipefail
 
 # Submit this file from the repository root:
-#   sbatch slurm/run_ambi_full_copy.sbatch
+#   sbatch slurm/run_ambi_fixed_budget_inner2_rollouts96.sbatch
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 cd "$PROJECT_DIR"
 
@@ -38,16 +38,9 @@ conda activate ambi
 # Run the training script
 echo "Starting AMBI training..."
 
-# Legacy exact-environment AMBI: configs/experiments/AntAMBI.json
-# python main.py -r configs/experiments/AntAMBITDMPC2Debug.json --num-runs 1
-
 python main.py \
-  --run configs/ambi/experiments/canonical/ambi_anchor.json \
+  --run configs/ambi/experiments/fixed_budget/fixed_budget_inner2_rollouts96.json \
   --alg-dir configs/ambi/algs
-# python main.py -r configs/experiments/AntNativeSAC2.json
-# python main.py -r configs/experiments/AntSAC2.json
-
-# python main.py -r configs/experiments/AntNativeSACDebug.json --num-runs 1
 
 echo "End time: $(date)"
 echo "Job completed!"

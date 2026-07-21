@@ -5,17 +5,17 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --partition=gpus
 #SBATCH --gres=gpu:1
-#SBATCH --mem=32G
-#SBATCH --time=192:00:00
+#SBATCH --mem=16G
+#SBATCH --time=300:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
-#SBATCH --nodelist=gpu[2201]
+#SBATCH --nodelist=gpu[2001]
 
 
 set -Eeuo pipefail
 
 # Submit this file from the repository root:
-#   sbatch slurm/run_native_sac.sbatch
+#   sbatch slurm/run_ambi_breadth_depth_inner6_rollouts32.sbatch
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 cd "$PROJECT_DIR"
 
@@ -38,16 +38,9 @@ conda activate ambi
 # Run the training script
 echo "Starting AMBI training..."
 
-# Legacy exact-environment AMBI: configs/experiments/AntAMBI.json
-# python main.py -r configs/experiments/AntAMBITDMPC2Debug.json --num-runs 1
-
 python main.py \
-  --run configs/ambi/experiments/canonical/native_sac.json \
+  --run configs/ambi/experiments/breadth_depth/breadth_depth_inner6_rollouts32.json \
   --alg-dir configs/ambi/algs
-# python main.py -r configs/experiments/AntNativeSAC2.json
-# python main.py -r configs/experiments/AntSAC2.json
-
-# python main.py -r configs/experiments/AntNativeSACDebug.json --num-runs 1
 
 echo "End time: $(date)"
 echo "Job completed!"
