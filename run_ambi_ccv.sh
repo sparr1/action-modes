@@ -28,7 +28,7 @@ source venv_ccv/bin/activate
 # Run the training script
 echo "Starting AMBI training..."
 python main.py \
-  --run configs/ambi/experiments/canonical/ambi_anchor.json \
+  --run configs/ambi/experiments/ambi_anchor.json \
   --alg-dir configs/ambi/algs
 
 echo "End time: $(date)"

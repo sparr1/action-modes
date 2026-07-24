@@ -1,0 +1,43 @@
+{
+  "seed": 55,
+  "env": "Ant-v4",
+  "alg": "SAC/SAC",
+  "device": "cuda",
+  "alg_params": {
+    "verbose": 1,
+    "buffer_size": 1000000,
+    "learning_starts": 10000,
+    "batch_size": 128,
+    "gradient_steps": 50,
+    "train_freq": 50,
+    "learning_rate": 0.00005,
+    "gamma": 0.99,
+    "tau": 0.005,
+    "ent_coef": "auto",
+    "target_entropy": "auto",
+    "target_update_interval": 1,
+    "net_arch": [256, 256],
+    "q_representation": "distributional",
+    "num_q": 5,
+    "q_pair_size": 2,
+    "q_target_reduction": "min_pair",
+    "q_actor_reduction": "min_pair",
+    "q_num_bins": 101,
+    "q_vmin": -10,
+    "q_vmax": 10,
+    "wandb": true,
+    "wandb_project": "ambi",
+    "wandb_step_every": 1000,
+    "wandb_entity": "rwgao_b-brown-university",
+    "wandb_run_name": "AntNativeDistributionalSACFiveQ-Ant-v4",
+    "wandb_tags": [
+      "canonical",
+      "native_sac",
+      "distributional_q",
+      "five_q",
+      "tdmpc2_comparator"
+    ]
+  },
+  "total_steps": 1000000,
+  "episodes": null
+}

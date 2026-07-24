@@ -43,7 +43,7 @@ echo "Starting AMBI training..."
 # python main.py -r configs/experiments/AntAMBITDMPC2Debug.json --num-runs 1
 
 python main.py \
-  --run configs/ambi/experiments/canonical/ambi_anchor.json \
+  --run configs/ambi/experiments/ambi_anchor.json \
   --alg-dir configs/ambi/algs
 
 echo "End time: $(date)"

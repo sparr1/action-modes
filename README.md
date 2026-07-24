@@ -50,10 +50,11 @@ for `latest`; `none` must be used alone. If `save_strat` is omitted, a positive
 Checkpoint files are model snapshots and do not universally contain replay or
 environment state for full training resume.
 
-The consolidated Native SAC, TD-MPC2, AMBI TD-MPC2, and end-to-end research
-configs are documented in `configs/ambi/README.md`. The canonical entry point
-is `configs/ambi/experiments/canonical/baseline_comparison.json`, used
-with `--alg-dir configs/ambi/algs`.
+The compact AMBI branch-count and imagination-horizon suite lives under
+`configs/ambi/`. Each of its five algorithm files has one matching runnable
+manifest under `configs/ambi/experiments/`; the anchor entry point is
+`configs/ambi/experiments/ambi_anchor.json`, used with
+`--alg-dir configs/ambi/algs`.
 
 ## Rendering a checkpoint
 

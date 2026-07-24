@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=ambi_ant_richard
+#SBATCH --job-name=ambi_horizon_h6
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --partition=gpus
 #SBATCH --gres=gpu:1
-#SBATCH --mem=32G
-#SBATCH --time=192:00:00
+#SBATCH --mem=8G
+#SBATCH --time=300:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
-#SBATCH --nodelist=gpu[2201]
+#SBATCH --nodelist=gpu[1907]
 
 
 set -Eeuo pipefail
 
 # Submit this file from the repository root:
-#   sbatch slurm/run.sbatch
+#   sbatch slurm/run_ambi_horizon_h6.sbatch
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 cd "$PROJECT_DIR"
 
@@ -38,16 +38,9 @@ conda activate ambi
 # Run the training script
 echo "Starting AMBI training..."
 
-# Legacy exact-environment AMBI: configs/experiments/AntAMBI.json
-# python main.py -r configs/experiments/AntAMBITDMPC2Debug.json --num-runs 1
-
 python main.py \
-  --run configs/ambi/experiments/ambi_anchor.json \
+  --run configs/ambi/experiments/ambi_horizon_h6.json \
   --alg-dir configs/ambi/algs
-# python main.py -r configs/experiments/AntNativeSAC2.json
-# python main.py -r configs/experiments/AntSAC2.json
-
-# python main.py -r configs/experiments/AntNativeSACDebug.json --num-runs 1
 
 echo "End time: $(date)"
 echo "Job completed!"

@@ -1,14 +1,15 @@
-# Legacy AMBI research location
+# Frozen-checkpoint AMBI research
 
-The active end-to-end suite is now documented in `configs/ambi/README.md`.
-The frozen-checkpoint matrix moved to
-`configs/ambi/legacy/ambi_inner_decoupling.json` so it cannot be confused with
-the primary independently trained comparisons.
+The active end-to-end configs live directly under `configs/ambi/`.
+The frozen-checkpoint matrix is
+`configs/research/ambi_inner_decoupling.json`, outside the active AMBI training
+tree so it cannot be confused with the independently trained branch and horizon
+comparisons.
 
 # Frozen-checkpoint preset workflow
 
-`../ambi/legacy/ambi_inner_decoupling.json` is a compact matrix of one-axis-at-a-time
-overrides based on `configs/algs/AntAMBITDMPC2.json`. It covers:
+`ambi_inner_decoupling.json` is a compact matrix of one-axis-at-a-time overrides
+based on `configs/algs/AntAMBITDMPC2.json`. It covers:
 
 - none, SAC, TD3, and compute-matched MPPI inner operators;
 - the reference five-head distributional-Q model and a scalar twin-Q ablation;

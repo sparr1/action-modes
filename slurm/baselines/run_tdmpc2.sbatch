@@ -42,8 +42,8 @@ echo "Starting AMBI training..."
 # python main.py -r configs/experiments/AntAMBITDMPC2Debug.json --num-runs 1
 
 python main.py \
-  --run configs/ambi/experiments/canonical/tdmpc2.json \
-  --alg-dir configs/ambi/algs
+  --run configs/experiments/AntTDMPC2Comparator.json \
+  --alg-dir configs/algs
 # python main.py -r configs/experiments/AntNativeSAC2.json
 # python main.py -r configs/experiments/AntSAC2.json
 

@@ -1,7 +1,7 @@
 # Native SAC distributional-Q notes
 
-The active comparator is
-`configs/ambi/algs/native_sac_distributional_five_q.json`.
+The five-head comparator is
+`configs/algs/AntNativeDistributionalSACFiveQ.json`.
 
 The native SAC implementation supports a distributional Q ensemble. The active
 comparator uses five heads to match the size-5 TD-MPC2 and AMBI critics. A
@@ -29,20 +29,12 @@ happens. `q_distribution_entropy` and `q_distribution_max_probability` help
 diagnose categorical collapse. All critic distributions are decoded to scalar
 values before the SAC target minimum and actor loss are evaluated.
 
-Run the short consolidated smoke experiment with:
+Run the one-seed exploratory comparator with:
 
 ```bash
 python3 main.py \
-  --run configs/ambi/experiments/smoke/smoke_algorithm_wiring.json \
-  --alg-dir configs/ambi/algs
-```
-
-Run the canonical one-seed exploratory comparator with:
-
-```bash
-python3 main.py \
-  --run configs/ambi/experiments/canonical/native_sac.json \
-  --alg-dir configs/ambi/algs
+  --run configs/experiments/AntNativeDistributionalSACFiveQ.json \
+  --alg-dir configs/algs
 ```
 
 This checked-in run uses seed 55 only and is labeled exploratory in its
