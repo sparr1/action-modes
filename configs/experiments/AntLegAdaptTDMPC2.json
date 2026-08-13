@@ -1,0 +1,24 @@
+{
+    "overrides_alg": {
+        "seed": 55,
+        "device": "cuda",
+        "env": "LegAdaptAnt-v0",
+        "total_steps": 1000000,
+        "episodes": null
+    },
+    "env_params": {
+        "render_mode": null,
+        "exclude_current_positions_from_observation": false,
+        "total_timesteps": 1000000,
+        "start_legs": 4,
+        "end_legs": 3,
+        "switch_fraction": 0.5,
+        "contact_cost_weight": 0.0
+    },
+    "trials": 1,
+    "configs": ["AntLegAdaptTDMPC2"],
+    "logs": "timestamp",
+    "save_trials": "best",
+    "checkpoint_every": 100000,
+    "log_info": false
+}

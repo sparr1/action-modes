@@ -2,10 +2,10 @@
 #SBATCH --job-name=ambi_ant
 #SBATCH --output=logs/ambi_ant_%j.out
 #SBATCH --error=logs/ambi_ant_%j.err
-#SBATCH --time=96:00:00
+#SBATCH --time=48:00:00
 #SBATCH --mem=32G
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=6
@@ -28,8 +28,8 @@ source venv_ccv/bin/activate
 # Run the training script
 echo "Starting AMBI training..."
 python main.py \
-  --run configs/ambi/experiments/ambi_anchor.json \
-  --alg-dir configs/ambi/algs
+  --run configs/experiments/AntLegAdaptPaperSweep.json \
+  --alg-dir configs/algs
 
 echo "End time: $(date)"
 echo "Job completed!"

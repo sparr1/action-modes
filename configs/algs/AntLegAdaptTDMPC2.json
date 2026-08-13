@@ -1,0 +1,29 @@
+{
+    "seed": 55,
+    "env": "LegAdaptAnt-v0",
+    "alg": "TDMPC2/TDMPC2Baseline",
+    "device": "cuda",
+    "alg_params": {
+        "model_size": 5,
+        "episodic": false,
+        "discount": 0.99,
+        "buffer_size": 1000000,
+        "batch_size": 256,
+        "utd": 1,
+        "horizon": 3,
+        "iterations": 6,
+        "num_samples": 512,
+        "num_elites": 64,
+        "num_pi_trajs": 24,
+        "compile": false,
+        "mpc": true,
+        "rho": 0.7,
+        "wandb": true,
+        "wandb_project": "ambi",
+        "wandb_step_every": 1000,
+        "wandb_entity": "heewon_seo",
+        "wandb_tags": ["leg-adaptation", "tdmpc2-baseline"]
+    },
+    "total_steps": 1000000,
+    "episodes": null
+}
