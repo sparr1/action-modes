@@ -35,3 +35,12 @@ register(id="Ant3LegDeadStump-v0",
     order_enforce=True,
     kwargs={"exclude_current_positions_from_observation":False, "contact_cost_weight":0.0}
     )
+
+# Keep this entry point as a string: importing the existing ``domains``
+# package must not require DMControl, MuJoCo 3, or a rendering backend.
+register(
+    id="DMControl-v0",
+    entry_point="domains.dmcontrol:DMControlEnv",
+    max_episode_steps=500,
+    order_enforce=True,
+)

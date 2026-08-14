@@ -147,6 +147,10 @@ class SoftWorldModel(nn.Module):
     def encode(self, obs, task=None):
         if task is not None:
             raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
+        if self.cfg.obs == "rgb" and obs.ndim == 5:
+            return torch.stack(
+                [self._encoder[self.cfg.obs](time_obs) for time_obs in obs]
+            )
         return self._encoder[self.cfg.obs](obs)
 
     @staticmethod

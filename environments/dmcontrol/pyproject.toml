@@ -1,0 +1,45 @@
+[project]
+name = "ambi-dmcontrol-runtime"
+version = "0.1.0"
+description = "Isolated, reproducible runtime for AMBI single-task DMControl experiments"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "dm-control==1.0.16",
+    "dm-env==1.6",
+    "glfw==2.7.0",
+    "gymnasium==0.29.1",
+    "mujoco==3.1.2",
+    "numpy==1.24.4",
+    "opencv-python-headless==4.10.0.82",
+    "tensordict==0.4.0",
+    "torch==2.3.1",
+    "torchrl==0.4.0",
+    "typing-extensions>=4.14.1",
+    "wandb==0.17.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==8.2.2",
+]
+
+[tool.uv]
+package = false
+environments = [
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+required-environments = [
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu121", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true

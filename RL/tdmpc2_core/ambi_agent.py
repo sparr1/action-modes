@@ -202,10 +202,26 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self.last_inner_rollout_lengths = []
         self.inner_engine.reset_episode()
 
+    def observation_signature(self):
+        """Return the portable observation contract used by this checkpoint."""
+        mode = str(self.cfg.obs)
+        shape = tuple(int(value) for value in self.cfg.obs_shape[mode])
+        dtype = getattr(
+            self.cfg,
+            "obs_dtype",
+            "uint8" if mode == "rgb" else "float32",
+        )
+        return {
+            "mode": mode,
+            "shape": list(shape),
+            "dtype": str(dtype),
+        }
+
     def checkpoint_state(self):
-        """Return the version-2 checkpoint structure over live outer state."""
+        """Return the version-3 checkpoint structure over live outer state."""
         state = {
-            "checkpoint_version": 2,
+            "checkpoint_version": 3,
+            "observation_spec": self.observation_signature(),
             "critic_spec": self.model.critic_signature,
             "policy_spec": {
                 "log_std_min": float(self.cfg.log_std_min),
@@ -253,10 +269,23 @@ class AMBITDMPC2Agent(torch.nn.Module):
             else torch.load(fp, map_location=self.device, weights_only=False)
         )
         checkpoint_version = state.get("checkpoint_version") if isinstance(state, dict) else None
-        if checkpoint_version is not None and int(checkpoint_version) not in {1, 2}:
+        if checkpoint_version is not None and int(checkpoint_version) not in {1, 2, 3}:
             raise ValueError(
                 f"Unsupported AMBI checkpoint_version={checkpoint_version!r}; "
-                "supported versions are 1 and 2."
+                "supported versions are 1, 2, and 3."
+            )
+        saved_observation = (
+            state.get("observation_spec") if isinstance(state, dict) else None
+        )
+        configured_observation = self.observation_signature()
+        if (
+            saved_observation is not None
+            and saved_observation != configured_observation
+        ):
+            raise ValueError(
+                "Checkpoint observation specification does not match this agent: "
+                f"checkpoint={saved_observation}, "
+                f"configured={configured_observation}."
             )
         saved_spec = state.get("critic_spec") if isinstance(state, dict) else None
         if saved_spec is not None and saved_spec != self.model.critic_signature:
@@ -401,14 +430,30 @@ class AMBITDMPC2Agent(torch.nn.Module):
         was_training = self.model.training
         self.model.eval()
         try:
-            with torch.no_grad():
-                root_z = self.model.encode(obs).detach()
-            action, metrics, lengths = self.inner_engine.act(
-                root_z,
-                t0=t0,
-                eval_mode=eval_mode,
-                collect_diagnostics=collect_diagnostics,
-            )
+            if self.cfg.obs == "rgb":
+                # ShiftAug uses the default generator. Enclose the root pixel
+                # crop and the nested inner action in one saved RNG scope so
+                # action selection cannot advance the outer learner's global
+                # CPU/CUDA RNG state.
+                with self.inner_engine.rng.action_fork():
+                    with self.inner_engine.rng.fork("observation"):
+                        with torch.no_grad():
+                            root_z = self.model.encode(obs).detach()
+                    action, metrics, lengths = self.inner_engine.act(
+                        root_z,
+                        t0=t0,
+                        eval_mode=eval_mode,
+                        collect_diagnostics=collect_diagnostics,
+                    )
+            else:
+                with torch.no_grad():
+                    root_z = self.model.encode(obs).detach()
+                action, metrics, lengths = self.inner_engine.act(
+                    root_z,
+                    t0=t0,
+                    eval_mode=eval_mode,
+                    collect_diagnostics=collect_diagnostics,
+                )
         finally:
             self.model.train(was_training)
         action, metrics, lengths = self._materialize_action_metrics(

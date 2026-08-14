@@ -251,6 +251,62 @@ def test_official_vectorized_checkpoint_keys_convert_exactly():
         torch.testing.assert_close(converted[key], value, rtol=0, atol=0)
 
 
+def test_baseline_checkpoint_records_observation_contract_and_rejects_mismatch_before_mutation():
+    env = gym.make("Pendulum-v1", max_episode_steps=5)
+    model = make_model(TDMPC2Baseline, env)
+    model.agent.num_updates = 7
+    before = {
+        key: value.detach().clone()
+        for key, value in model.agent.model.state_dict().items()
+    }
+    checkpoint = model.agent.checkpoint_state()
+
+    assert checkpoint["observation_spec"] == {
+        "mode": "state",
+        "shape": [3],
+        "dtype": "float32",
+    }
+    checkpoint["observation_spec"] = {
+        "mode": "rgb",
+        "shape": [9, 64, 64],
+        "dtype": "uint8",
+    }
+    checkpoint["num_updates"] = 99
+
+    with pytest.raises(ValueError, match="observation specification"):
+        model.agent.load(checkpoint)
+
+    assert model.agent.num_updates == 7
+    for key, value in model.agent.model.state_dict().items():
+        torch.testing.assert_close(value, before[key], rtol=0, atol=0)
+
+
+def test_baseline_legacy_architecture_mismatch_fails_before_any_tensor_load():
+    env = gym.make("Pendulum-v1", max_episode_steps=5)
+    model = make_model(TDMPC2Baseline, env)
+    model.agent.num_updates = 7
+    before = {
+        key: value.detach().clone()
+        for key, value in model.agent.model.state_dict().items()
+    }
+    incoming = {key: value.detach().clone() for key, value in before.items()}
+    changed_key = next(key for key, value in incoming.items() if value.numel() > 1)
+    incoming[changed_key].add_(1.0)
+    mismatch_key = next(
+        key
+        for key, value in incoming.items()
+        if key != changed_key and value.ndim > 0 and value.shape[0] > 1
+    )
+    incoming[mismatch_key] = incoming[mismatch_key][:-1].clone()
+
+    with pytest.raises(ValueError, match="incompatible before load"):
+        model.agent.load({"model": incoming, "num_updates": 99})
+
+    assert model.agent.num_updates == 7
+    for key, value in model.agent.model.state_dict().items():
+        torch.testing.assert_close(value, before[key], rtol=0, atol=0)
+
+
 class TrueTerminationEnv(gym.Env):
     metadata = {}
 

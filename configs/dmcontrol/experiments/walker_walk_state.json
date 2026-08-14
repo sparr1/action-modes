@@ -1,0 +1,27 @@
+{
+  "study_type": "single_seed_benchmark_template",
+  "study_note": "Single-seed template for single-task DMControl state observations; increase trials and choose seeds before confirmatory use.",
+  "overrides_alg": {
+    "env": "DMControl-v0"
+  },
+  "env_params": {
+    "task": "walker-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "walker_walk_tdmpc2_state",
+    "walker_walk_ambi_state"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 100000,
+  "save_strat": [
+    "best",
+    "latest"
+  ],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}

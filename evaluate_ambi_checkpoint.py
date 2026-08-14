@@ -336,6 +336,32 @@ def _critic_architecture_key(resolved):
     )
 
 
+def _observation_architecture_key(resolved):
+    """Resolve the single-task observation contract before model creation."""
+    alg_params = resolved["algorithm_config"].get("alg_params", {})
+    env_params = resolved.get("environment", {}).get("params", {})
+    env_mode = env_params.get("obs", env_params.get("observation_type"))
+    alg_mode = alg_params.get("obs")
+    if env_mode is not None:
+        env_mode = str(env_mode).lower()
+    if alg_mode is not None:
+        alg_mode = str(alg_mode).lower()
+    if env_mode is not None and alg_mode is not None and env_mode != alg_mode:
+        raise ValueError(
+            f"Preset {resolved['selector']!r} has conflicting observation modes: "
+            f"environment={env_mode!r}, algorithm={alg_mode!r}."
+        )
+    mode = env_mode or alg_mode or "state"
+    if mode not in {"state", "rgb"}:
+        raise ValueError(
+            f"Preset {resolved['selector']!r} has unsupported observation mode "
+            f"{mode!r}; expected 'state' or 'rgb'."
+        )
+    if mode == "rgb":
+        return mode, (9, 64, 64), "uint8"
+    return mode, None, "float32"
+
+
 def _validate_frozen_selection(matrix, resolved_presets):
     for resolved in resolved_presets:
         comparison = matrix["comparisons"][resolved["comparison"]]
@@ -356,6 +382,15 @@ def _validate_frozen_selection(matrix, resolved_presets):
             "A single checkpoint cannot evaluate presets with different critic "
             "architectures. Evaluate exactly one Q-representation preset per invocation "
             "with its matching checkpoint."
+        )
+    observations = {
+        _observation_architecture_key(resolved) for resolved in resolved_presets
+    }
+    if len(observations) > 1:
+        raise ValueError(
+            "A single checkpoint cannot evaluate presets with different observation "
+            "contracts. Evaluate state and RGB presets separately with their matching "
+            "checkpoints."
         )
 
 

@@ -1,0 +1,22 @@
+{
+  "study_type": "tdmpc2_dmc6_state_benchmark",
+  "study_note": "Official-style TD-MPC2 state benchmark over seeds 1-3 with ten online evaluation episodes every 100k agent steps. Model checkpoints and trajectory logs are disabled; W&B syncs online from node-local temporary storage, and only the tiny evaluation CSV plus Slurm output remain in Hydra home storage.",
+  "overrides_alg": {
+    "env": "DMControl-v0"
+  },
+  "env_params": {
+    "task": "cup-catch",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 3,
+  "configs": [
+    "tdmpc2_state_benchmark"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": null,
+  "save_strat": "none",
+  "log_info": false,
+  "log_type": "summary"
+}

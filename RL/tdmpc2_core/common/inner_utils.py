@@ -183,6 +183,7 @@ class InnerRNG:
         "execution",
         "mppi",
         "diagnostics",
+        "observation",
     )
 
     def __init__(self, seed, device):

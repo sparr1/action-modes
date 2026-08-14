@@ -125,9 +125,25 @@ class TDMPC2(torch.nn.Module):
 		self._prev_mean.zero_()
 		self.last_plan_metrics = {}
 
+	def observation_signature(self):
+		"""Return the portable observation contract used by this checkpoint."""
+		mode = str(self.cfg.obs)
+		shape = tuple(int(value) for value in self.cfg.obs_shape[mode])
+		dtype = getattr(
+			self.cfg,
+			"obs_dtype",
+			"uint8" if mode == "rgb" else "float32",
+		)
+		return {
+			"mode": mode,
+			"shape": list(shape),
+			"dtype": str(dtype),
+		}
+
 	def checkpoint_state(self):
 		"""Return the checkpoint-native state without copying live tensors."""
 		return {
+			"observation_spec": self.observation_signature(),
 			"model": self.model.state_dict(),
 			"num_updates": self.num_updates,
 		}
@@ -152,10 +168,39 @@ class TDMPC2(torch.nn.Module):
 			state = fp
 		else:
 			state = torch.load(fp, map_location=self.device, weights_only=False)
-		self.num_updates = int(state.get("num_updates", 0))
+		saved_observation = (
+			state.get("observation_spec") if isinstance(state, dict) else None
+		)
+		configured_observation = self.observation_signature()
+		if (
+			saved_observation is not None
+			and saved_observation != configured_observation
+		):
+			raise ValueError(
+				"Checkpoint observation specification does not match this agent: "
+				f"checkpoint={saved_observation}, "
+				f"configured={configured_observation}."
+			)
 		state_dict = state["model"] if "model" in state else state
-		state_dict = api_model_conversion(self.model.state_dict(), state_dict)
+		expected = self.model.state_dict()
+		state_dict = api_model_conversion(expected, state_dict)
+		missing = sorted(set(expected) - set(state_dict))
+		unexpected = sorted(set(state_dict) - set(expected))
+		shape_mismatches = sorted(
+			key
+			for key in set(expected) & set(state_dict)
+			if torch.is_tensor(expected[key])
+			and torch.is_tensor(state_dict[key])
+			and tuple(expected[key].shape) != tuple(state_dict[key].shape)
+		)
+		if missing or unexpected or shape_mismatches:
+			raise ValueError(
+				"Checkpoint model architecture is incompatible before load: "
+				f"missing={missing[:5]}, unexpected={unexpected[:5]}, "
+				f"shape_mismatches={shape_mismatches[:5]}."
+			)
 		self.model.load_state_dict(state_dict)
+		self.num_updates = int(state.get("num_updates", 0))
 		return
 
 	@torch.no_grad()

@@ -134,6 +134,13 @@ def test_checkpointing_is_configured_without_trajectory_logging(monkeypatch, tmp
 
 def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
     cfg = SimpleNamespace(
+        obs="rgb",
+        obs_shape={"rgb": (9, 64, 64)},
+        obs_dtype="uint8",
+        num_channels=32,
+        latent_dim=512,
+        action_dim=6,
+        episode_length=500,
         train_unroll_horizon=6,
         outer_planning_horizon=3,
         inner_rollout_horizon=6,
@@ -165,6 +172,13 @@ def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
     model = SimpleNamespace(
         cfg=cfg,
         agent=SimpleNamespace(model=SimpleNamespace(critic_signature=critic_signature)),
+        env=SimpleNamespace(
+            task_name="walker-walk",
+            action_repeat=2,
+            frame_stack=3,
+            image_size=64,
+            camera_id=0,
+        ),
     )
 
     metadata = training_main._resolved_runtime_metadata(
@@ -176,6 +190,20 @@ def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
     )
 
     assert metadata["seed"] == 55
+    assert metadata["observation"] == {
+        "mode": "rgb",
+        "shape": [9, 64, 64],
+        "dtype": "uint8",
+        "num_channels": 32,
+        "latent_dim": 512,
+        "task": "walker-walk",
+        "action_repeat": 2,
+        "frame_stack": 3,
+        "image_size": 64,
+        "camera_id": 0,
+        "action_dim": 6,
+        "episode_length": 500,
+    }
     assert metadata["horizons"] == {
         "train_unroll_horizon": 6,
         "outer_planning_horizon": 3,

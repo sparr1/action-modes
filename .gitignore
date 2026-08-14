@@ -2,5 +2,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+environments/dmcontrol/.venv/
 logs/*
 !logs/.gitkeep

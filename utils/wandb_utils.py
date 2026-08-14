@@ -346,12 +346,15 @@ def init_wandb(params: dict | None, *, default_project: str, run_name: str | Non
     name = params.get("wandb_run_name", run_name)
     mode = params.get("wandb_mode", None)
     tags = params.get("wandb_tags", None)
+    group = params.get("wandb_group", None)
 
     kwargs = {"project": project, "entity": entity, "name": name, "config": config or {}}
     if mode:
         kwargs["mode"] = mode
     if tags:
         kwargs["tags"] = tags
+    if group:
+        kwargs["group"] = group
 
     run = wandb.init(**kwargs)
     wandb.define_metric("env_step")
@@ -359,6 +362,7 @@ def init_wandb(params: dict | None, *, default_project: str, run_name: str | Non
     wandb.define_metric("rollout/*", step_metric="env_step")
     wandb.define_metric("episode/*", step_metric="env_step")
     wandb.define_metric("time/*", step_metric="env_step")
+    wandb.define_metric("eval/*", step_metric="env_step")
     return run
 
 

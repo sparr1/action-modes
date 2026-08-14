@@ -88,6 +88,15 @@ def _remove_saved_checkpoint(checkpoint_path):
 
 
 _RUNTIME_CONFIG_FIELDS = (
+    "obs",
+    "obs_shape",
+    "obs_dtype",
+    "num_channels",
+    "latent_dim",
+    "action_dim",
+    "episode_length",
+    "eval_freq",
+    "eval_episodes",
     "train_unroll_horizon",
     "outer_planning_horizon",
     "inner_rollout_horizon",
@@ -213,6 +222,48 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
         "strict": bool(resolved.get("compile_strict", False)),
     }
 
+    observation = {}
+    observation_mode = resolved.get("obs")
+    observation_shapes = resolved.get("obs_shape")
+    if observation_mode is not None:
+        observation["mode"] = str(observation_mode)
+    if (
+        observation_mode is not None
+        and isinstance(observation_shapes, Mapping)
+        and observation_mode in observation_shapes
+    ):
+        observation["shape"] = list(observation_shapes[observation_mode])
+    if "obs_dtype" in resolved:
+        observation["dtype"] = str(resolved["obs_dtype"])
+    for key in ("num_channels", "latent_dim"):
+        if key in resolved:
+            observation[key] = int(resolved[key])
+
+    env = getattr(model, "env", None)
+    for metadata_key, attribute in (
+        ("task", "task_name"),
+        ("action_repeat", "action_repeat"),
+        ("frame_stack", "frame_stack"),
+        ("image_size", "image_size"),
+        ("camera_id", "camera_id"),
+    ):
+        if env is None:
+            break
+        try:
+            value = (
+                env.get_wrapper_attr(attribute)
+                if hasattr(env, "get_wrapper_attr")
+                else getattr(env, attribute)
+            )
+        except (AttributeError, TypeError):
+            continue
+        if value is not None:
+            observation[metadata_key] = value
+    if "action_dim" in resolved:
+        observation["action_dim"] = int(resolved["action_dim"])
+    if "episode_length" in resolved:
+        observation["episode_length"] = int(resolved["episode_length"])
+
     inner_keys = (
         "inner_operator",
         "inner_schedule_mode",
@@ -250,6 +301,7 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
         "schema_version": 1,
         "algorithm": trial_run_params.get("alg"),
         "seed": int(trial_run_params["seed"]),
+        "observation": observation,
         "horizons": horizons,
         "temporal_loss": temporal,
         "critic": critic_signature,

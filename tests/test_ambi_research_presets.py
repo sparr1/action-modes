@@ -1,5 +1,6 @@
 import json
 import warnings
+from copy import deepcopy
 from pathlib import Path
 
 import gymnasium as gym
@@ -194,3 +195,11 @@ def test_frozen_selection_rejects_train_only_and_mixed_architecture_axes():
     )
     with pytest.raises(ValueError, match="different critic architectures"):
         _validate_frozen_selection(matrix, [scalar, distributional])
+
+    state = resolve_preset(MATRIX, "inner_operator/sac", matrix=matrix)
+    rgb = deepcopy(state)
+    rgb["selector"] = "synthetic/rgb"
+    rgb["environment"]["params"]["obs"] = "rgb"
+    rgb["algorithm_config"]["alg_params"]["obs"] = "rgb"
+    with pytest.raises(ValueError, match="different observation contracts"):
+        _validate_frozen_selection(matrix, [state, rgb])

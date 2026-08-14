@@ -1,0 +1,25 @@
+{
+  "seed": 55,
+  "env": "DMControl-v0",
+  "alg": "TDMPC2/TDMPC2Baseline",
+  "device": "auto",
+  "alg_params": {
+    "obs": "state",
+    "model_size": 5,
+    "episodic": false,
+    "discount": 0.99,
+    "buffer_size": 1000000,
+    "batch_size": 256,
+    "utd": 1,
+    "train_unroll_horizon": 3,
+    "outer_planning_horizon": 3,
+    "inner_rollout_horizon": 3,
+    "temporal_loss_normalization": "reference_weighted_mean",
+    "temporal_loss_reference_horizon": 3,
+    "compile": false,
+    "mpc": true,
+    "wandb": false
+  },
+  "total_steps": 1000000,
+  "episodes": null
+}

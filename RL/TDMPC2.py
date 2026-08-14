@@ -1,4 +1,5 @@
 import copy
+import csv
 import math
 import os
 import random
@@ -56,6 +57,11 @@ _DEFAULTS = {
     "utd": 1,
     "pretrain_steps": None,
 
+    # evaluation (disabled unless an explicit cadence is configured)
+    "eval_freq": None,
+    "eval_episodes": 10,
+    "eval_csv_path": None,
+
     # planning
     "mpc": True,
     "iterations": 6,
@@ -103,6 +109,10 @@ _EXPLICIT_HORIZON_FIELDS = {
     "outer_planning_horizon",
     "inner_rollout_horizon",
 }
+
+
+_RGB_OBS_SHAPE = (9, 64, 64)
+_RGB_REPLAY_WARNING_BYTES = 8 * 1024**3
 
 
 def _positive_int(value, key):
@@ -537,8 +547,8 @@ class TDMPC2Baseline(Algorithm):
             max(2, int(self.cfg.episode_length) + 1)
         )
         self._observation_staging = torch.empty(
-            int(self.cfg.obs_shape["state"][0]),
-            dtype=torch.float32,
+            tuple(self.cfg.obs_shape[self.cfg.obs]),
+            dtype=self._obs_torch_dtype,
             device="cpu",
             pin_memory=self._pin_episode_staging,
         )
@@ -572,6 +582,12 @@ class TDMPC2Baseline(Algorithm):
         self._last_terminated = False
         self._last_truncated = False
         self._last_info = {}
+        self._eval_freq = self.cfg.eval_freq
+        self._eval_episodes = self.cfg.eval_episodes
+        self._eval_csv_path = self.cfg.eval_csv_path or os.environ.get(
+            "TDMPC2_EVAL_CSV"
+        )
+        self._eval_csv_initialized = False
 
         print("Architecture:", self.agent.model)
 
@@ -584,7 +600,9 @@ class TDMPC2Baseline(Algorithm):
         return self.agent.act(obs_t, t0=t0, eval_mode=eval_mode)
 
     def _wandb_run_name(self):
-        return f"TDMPC2-{self.run_params.get('env', 'env')}-seed{self.cfg.seed}"
+        env_params = self.experiment_params.get("env_params", {})
+        task = env_params.get("task", self.run_params.get("env", "env"))
+        return f"TDMPC2-{task}-seed{self.cfg.seed}"
 
     def _init_wandb(self):
         return init_wandb(
@@ -599,20 +617,80 @@ class TDMPC2Baseline(Algorithm):
             },
         )
 
-    def _build_cfg(self, params):
-        params = _normalize_horizon_params(params)
-        cfg = copy.deepcopy(_DEFAULTS)
-        cfg.update(copy.deepcopy(params))
+    def _environment_observation_type(self):
+        """Return an environment-declared TD-MPC2 observation mode, if any."""
+        try:
+            observation_type = self.env.get_wrapper_attr("observation_type")
+        except AttributeError:
+            try:
+                # Avoid Wrapper.__getattr__, which emits a deprecation warning
+                # for a legitimately absent optional declaration.
+                observation_type = object.__getattribute__(
+                    self.env, "observation_type"
+                )
+            except AttributeError:
+                observation_type = None
+        if observation_type is None:
+            return None
+        observation_type = str(observation_type).lower()
+        if observation_type not in {"state", "rgb"}:
+            raise ValueError(
+                "Environment observation_type must be 'state' or 'rgb', "
+                f"got {observation_type!r}."
+            )
+        return observation_type
 
-        run_device = self.run_params.get("device", None)
-        if "device" not in params and run_device is not None:
-            cfg["device"] = run_device
-        cfg["device"] = str(resolve_device(cfg["device"]))
+    def _resolve_observation_space(self, params):
+        """Resolve and validate the state/RGB contract before model creation."""
+        declared_obs = self._environment_observation_type()
+        requested_obs = None
+        if "obs" in params:
+            requested_obs = str(params["obs"]).lower()
+            if requested_obs not in {"state", "rgb"}:
+                raise ValueError(
+                    "alg_params.obs must be 'state' or 'rgb', "
+                    f"got {requested_obs!r}."
+                )
+        if (
+            declared_obs is not None
+            and requested_obs is not None
+            and declared_obs != requested_obs
+        ):
+            raise ValueError(
+                "alg_params.obs does not match the environment's declared "
+                "observation_type: "
+                f"alg_params.obs={requested_obs!r}, "
+                f"observation_type={declared_obs!r}."
+            )
 
-        cfg["seed"] = int(self.run_params.get("seed", cfg.get("seed", 1)))
-        cfg["steps"] = int(float(self.run_params.get("total_steps", cfg.get("steps", 1_000_000))))
-
+        observation_type = declared_obs or requested_obs or "state"
         self._obs_space = self.env.observation_space
+        if observation_type == "rgb":
+            if not isinstance(self._obs_space, gym.spaces.Box):
+                raise NotImplementedError(
+                    "TD-MPC2 RGB observations require a Box observation space."
+                )
+            if tuple(self._obs_space.shape) != _RGB_OBS_SHAPE:
+                raise ValueError(
+                    "TD-MPC2 RGB observations must use CHW frame stacks with "
+                    f"shape {_RGB_OBS_SHAPE}; got {self._obs_space.shape}."
+                )
+            if np.dtype(self._obs_space.dtype) != np.dtype(np.uint8):
+                raise ValueError(
+                    "TD-MPC2 RGB observations must use dtype uint8; "
+                    f"got {self._obs_space.dtype}."
+                )
+            if not (
+                np.all(self._obs_space.low == 0)
+                and np.all(self._obs_space.high == 255)
+            ):
+                raise ValueError(
+                    "TD-MPC2 RGB observation bounds must be exactly [0, 255]."
+                )
+            self._obs_np_dtype = np.dtype(np.uint8)
+            self._obs_torch_dtype = torch.uint8
+            return observation_type, _RGB_OBS_SHAPE
+
         if isinstance(self._obs_space, gym.spaces.Dict):
             image_like = [
                 key for key, space in self._obs_space.spaces.items()
@@ -632,7 +710,29 @@ class TDMPC2Baseline(Algorithm):
                 )
             obs_dim = int(np.prod(self._obs_space.shape))
         else:
-            raise NotImplementedError("TD-MPC2Baseline only supports Box or Dict observation spaces.")
+            raise NotImplementedError(
+                "TD-MPC2Baseline only supports Box or Dict observation spaces."
+            )
+        self._obs_np_dtype = np.dtype(np.float32)
+        self._obs_torch_dtype = torch.float32
+        return observation_type, (obs_dim,)
+
+    def _build_cfg(self, params):
+        params = _normalize_horizon_params(params)
+        cfg = copy.deepcopy(_DEFAULTS)
+        cfg.update(copy.deepcopy(params))
+
+        run_device = self.run_params.get("device", None)
+        if "device" not in params and run_device is not None:
+            cfg["device"] = run_device
+        cfg["device"] = str(resolve_device(cfg["device"]))
+
+        cfg["seed"] = int(self.run_params.get("seed", cfg.get("seed", 1)))
+        cfg["steps"] = int(float(self.run_params.get("total_steps", cfg.get("steps", 1_000_000))))
+
+        observation_type, observation_shape = self._resolve_observation_space(
+            params
+        )
 
         if not isinstance(self.env.action_space, gym.spaces.Box):
             raise NotImplementedError("TD-MPC2Baseline only supports continuous Box action spaces.")
@@ -655,6 +755,22 @@ class TDMPC2Baseline(Algorithm):
                 raise ValueError(f"Invalid TD-MPC2 model_size={model_size}. Expected one of {list(MODEL_SIZE)}.")
             cfg.update(copy.deepcopy(MODEL_SIZE[model_size]))
             cfg["model_size"] = model_size
+        if observation_type == "rgb" and int(cfg["latent_dim"]) != (
+            16 * int(cfg["num_channels"])
+        ):
+            raise ValueError(
+                "TD-MPC2's 64x64 RGB encoder requires "
+                "latent_dim == 16 * num_channels; "
+                f"got latent_dim={cfg['latent_dim']} and "
+                f"num_channels={cfg['num_channels']}."
+            )
+        if observation_type == "rgb" and bool(
+            cfg.get("compile_strict", False)
+        ):
+            raise ValueError(
+                "RGB observations with compile_strict=True are not supported; "
+                "use eager execution or compile_strict=False."
+            )
 
         episode_length = cfg.get("episode_length", None) or self._infer_episode_length()
         cfg["episode_length"] = int(episode_length)
@@ -667,6 +783,22 @@ class TDMPC2Baseline(Algorithm):
             cfg["pretrain_steps"] = cfg["seed_steps"]
         cfg["pretrain_steps"] = int(cfg["pretrain_steps"])
         cfg["utd"] = int(cfg.get("utd", 1))
+
+        eval_freq = cfg.get("eval_freq", None)
+        cfg["eval_freq"] = (
+            None if eval_freq is None else _positive_int(eval_freq, "eval_freq")
+        )
+        cfg["eval_episodes"] = _positive_int(
+            cfg.get("eval_episodes", 10), "eval_episodes"
+        )
+        eval_csv_path = cfg.get("eval_csv_path", None)
+        if eval_csv_path is not None:
+            if not isinstance(eval_csv_path, (str, os.PathLike)):
+                raise ValueError("eval_csv_path must be a filesystem path or null.")
+            eval_csv_path = os.fspath(eval_csv_path).strip()
+            if not eval_csv_path:
+                raise ValueError("eval_csv_path cannot be empty.")
+        cfg["eval_csv_path"] = eval_csv_path
 
         cfg["rho"] = float(cfg["rho"])
         if not math.isfinite(cfg["rho"]):
@@ -693,8 +825,25 @@ class TDMPC2Baseline(Algorithm):
             cfg["discount_min"] = float(cfg["discount"])
             cfg["discount_max"] = float(cfg["discount"])
 
-        cfg["obs"] = "state"
-        cfg["obs_shape"] = {"state": (obs_dim,)}
+        cfg["obs"] = observation_type
+        cfg["obs_shape"] = {observation_type: observation_shape}
+        cfg["obs_dtype"] = self._obs_np_dtype.name
+        if observation_type == "rgb":
+            replay_rows = min(int(cfg["buffer_size"]), int(cfg["steps"]))
+            replay_observation_bytes = (
+                replay_rows
+                * int(np.prod(observation_shape))
+                * self._obs_np_dtype.itemsize
+            )
+            if replay_observation_bytes >= _RGB_REPLAY_WARNING_BYTES:
+                warnings.warn(
+                    "RGB replay observations alone are projected to require "
+                    f"{replay_observation_bytes / 1e9:.1f} GB for "
+                    f"{replay_rows:,} uint8 rows. Replay capacity is unchanged; "
+                    "set buffer_size explicitly if this footprint is not intended.",
+                    UserWarning,
+                    stacklevel=3,
+                )
         cfg["action_dim"] = action_dim
         cfg["multitask"] = False
         cfg["tasks"] = [self.run_params.get("env", "ambi-task")]
@@ -729,17 +878,35 @@ class TDMPC2Baseline(Algorithm):
             pass
 
     def _obs_to_numpy(self, obs):
+        if self.cfg.obs == "rgb":
+            obs = np.asarray(obs)
+            expected_shape = tuple(self.cfg.obs_shape["rgb"])
+            if tuple(obs.shape) != expected_shape:
+                raise ValueError(
+                    "RGB observation shape changed at runtime: "
+                    f"expected {expected_shape}, got {obs.shape}."
+                )
+            if obs.dtype != self._obs_np_dtype:
+                raise ValueError(
+                    "RGB observation dtype changed at runtime: "
+                    f"expected {self._obs_np_dtype.name}, got {obs.dtype}."
+                )
+            return np.ascontiguousarray(obs)
         if isinstance(self._obs_space, gym.spaces.Dict):
             obs = flatten(self._obs_space, obs)
         return np.asarray(obs, dtype=np.float32).reshape(-1)
 
     def _obs_to_tensor(self, obs):
-        return torch.as_tensor(self._obs_to_numpy(obs), dtype=torch.float32)
+        return torch.as_tensor(
+            self._obs_to_numpy(obs), dtype=self._obs_torch_dtype
+        )
 
     def _reuse_observation_tensor(self, obs):
         """Copy one environment observation into reusable CPU staging."""
         self._observation_staging.copy_(
-            torch.as_tensor(self._obs_to_numpy(obs), dtype=torch.float32)
+            torch.as_tensor(
+                self._obs_to_numpy(obs), dtype=self._obs_torch_dtype
+            )
         )
         return self._observation_staging
 
@@ -768,7 +935,7 @@ class TDMPC2Baseline(Algorithm):
         return self._scale_action(self.env.action_space.sample())
 
     def _allocate_episode_staging(self, capacity):
-        obs_dim = int(self.cfg.obs_shape["state"][0])
+        obs_shape = tuple(self.cfg.obs_shape[self.cfg.obs])
         empty_kwargs = {
             "dtype": torch.float32,
             "device": "cpu",
@@ -776,7 +943,12 @@ class TDMPC2Baseline(Algorithm):
         }
         return TensorDict(
             {
-                "obs": torch.empty((capacity, obs_dim), **empty_kwargs),
+                "obs": torch.empty(
+                    (capacity, *obs_shape),
+                    dtype=self._obs_torch_dtype,
+                    device="cpu",
+                    pin_memory=self._pin_episode_staging,
+                ),
                 "action": torch.empty((capacity, self.cfg.action_dim), **empty_kwargs),
                 "reward": torch.empty((capacity,), **empty_kwargs),
                 "terminated": torch.empty((capacity,), **empty_kwargs),
@@ -1146,6 +1318,84 @@ class TDMPC2Baseline(Algorithm):
             signature=self._checkpoint_signature(),
         )
 
+    def _prepare_eval_csv(self):
+        """Create one tiny, official-format evaluation CSV for this seed."""
+        if self._eval_csv_initialized or not self._eval_csv_path:
+            return
+        path = os.path.abspath(os.path.expanduser(self._eval_csv_path))
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            raise FileExistsError(
+                f"Refusing to mix TD-MPC2 evaluation rows with existing file: {path}"
+            )
+        with open(path, "w", newline="") as stream:
+            csv.writer(stream).writerow(("step", "reward", "seed"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._eval_csv_path = path
+        self._eval_csv_initialized = True
+
+    def _record_evaluation(self, step, reward):
+        reward = float(reward)
+        print(
+            "TD-MPC2 evaluation:",
+            f"step={int(step)},",
+            f"reward={reward:.1f},",
+            f"episodes={self._eval_episodes},",
+            f"seed={self.cfg.seed}",
+            flush=True,
+        )
+        if self._eval_csv_path:
+            self._prepare_eval_csv()
+            with open(self._eval_csv_path, "a", newline="") as stream:
+                csv.writer(stream).writerow(
+                    (int(step), f"{reward:.1f}", int(self.cfg.seed))
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+        log_wandb(
+            self._wandb_run,
+            {
+                "eval/episode_reward": reward,
+                "eval/episodes": int(self._eval_episodes),
+            },
+            step=int(step),
+        )
+
+    @torch.no_grad()
+    def _evaluate_policy(self, step, *, initial_obs=None):
+        """Run the official ten-episode deterministic-policy evaluation."""
+        episode_returns = []
+        for episode in range(self._eval_episodes):
+            if episode == 0 and initial_obs is not None:
+                obs = initial_obs
+                self.reset()
+            else:
+                obs, _ = self._reset_env()
+
+            episode_return = 0.0
+            episode_step = 0
+            done = False
+            while not done:
+                obs_t = self._reuse_observation_tensor(obs)
+                action_norm = self._act_agent(
+                    obs_t,
+                    t0=(episode_step == 0),
+                    eval_mode=True,
+                ).numpy()
+                action_env = self._unscale_action(action_norm)
+                obs, reward, terminated, truncated, _ = self.env.step(action_env)
+                episode_return += float(reward)
+                episode_step += 1
+                done = bool(terminated or truncated)
+            episode_returns.append(episode_return)
+
+        mean_return = float(np.nanmean(episode_returns))
+        self._record_evaluation(step, mean_return)
+        return mean_return
+
     def learn(self, total_timesteps=10000):
         total_timesteps = int(float(total_timesteps))
         if total_timesteps < 0:
@@ -1165,9 +1415,17 @@ class TDMPC2Baseline(Algorithm):
 
         try:
             obs, _ = self._reset_env(seed=self.cfg.seed)
+            if self._eval_freq is not None:
+                self._prepare_eval_csv()
+                # Reuse the authoritative seeded reset as evaluation episode
+                # one. This matches upstream, whose environment is constructed
+                # with cfg.seed immediately before its step-zero evaluation.
+                self._evaluate_policy(0, initial_obs=obs)
+                obs, _ = self._reset_env()
             obs_t = self._reuse_observation_tensor(obs)
             episode_rows = self._start_episode_staging(obs_t)
             episode_step = 0
+            eval_pending = False
 
             while self._global_step < total_timesteps:
                 planned = not (self._global_step <= self.cfg.seed_steps or self.buffer.num_eps == 0)
@@ -1200,6 +1458,11 @@ class TDMPC2Baseline(Algorithm):
                 )
                 episode_rows += 1
                 self._global_step += 1
+                if (
+                    self._eval_freq is not None
+                    and self._global_step % self._eval_freq == 0
+                ):
+                    eval_pending = True
                 episode_step += 1
                 self._episode_return += float(reward)
                 self._episode_len += 1
@@ -1245,6 +1508,9 @@ class TDMPC2Baseline(Algorithm):
                 self._maybe_checkpoint()
 
                 if done:
+                    if eval_pending:
+                        self._evaluate_policy(self._global_step)
+                        eval_pending = False
                     self._episode_idx += 1
                     self._episode_return = 0.0
                     self._episode_len = 0

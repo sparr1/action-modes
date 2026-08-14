@@ -1,0 +1,25 @@
+{
+  "study_type": "functional_smoke_test",
+  "study_note": "Humanoid Walk state integration check only. The seed, task, model, losses, and optimizer settings match the benchmark; replay, warmup, planning, batch, and training budgets are intentionally reduced and are not benchmark settings.",
+  "overrides_alg": {
+    "env": "DMControl-v0"
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "tdmpc2_humanoid_walk_state_smoke"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 500,
+  "save_strat": [
+    "latest"
+  ],
+  "checkpoint_best_window": 1,
+  "log_info": false,
+  "log_type": "summary"
+}

@@ -531,6 +531,55 @@ def test_unknown_checkpoint_version_fails_without_partial_mutation():
     _assert_tree_equal(model.agent.model.state_dict(), before)
 
 
+def test_version_three_checkpoint_records_observation_contract():
+    model = _model()
+    checkpoint = model.agent.checkpoint_state()
+    assert checkpoint["checkpoint_version"] == 3
+    assert checkpoint["observation_spec"] == {
+        "mode": "state",
+        "shape": [3],
+        "dtype": "float32",
+    }
+
+
+@pytest.mark.parametrize("legacy_version", [1, 2])
+def test_versioned_legacy_checkpoint_without_observation_metadata_still_loads(
+    legacy_version,
+):
+    source = _model()
+    checkpoint = _clone_tree(source.agent.checkpoint_state())
+    checkpoint["checkpoint_version"] = legacy_version
+    checkpoint.pop("observation_spec")
+
+    restored = _model()
+    restored.agent.load(checkpoint)
+    _assert_tree_equal(restored.agent.model.state_dict(), source.agent.model.state_dict())
+
+
+def test_ambi_observation_mismatch_fails_before_outer_state_mutation():
+    model = _model()
+    model.agent.num_updates = 7
+    model.agent.outer_version = 11
+    before_model = _clone_tree(model.agent.model.state_dict())
+    before_optim = _clone_tree(model.agent.optim.state_dict())
+    checkpoint = _clone_tree(model.agent.checkpoint_state())
+    checkpoint["observation_spec"] = {
+        "mode": "rgb",
+        "shape": [9, 64, 64],
+        "dtype": "uint8",
+    }
+    checkpoint["num_updates"] = 99
+    checkpoint["outer_version"] = 99
+
+    with pytest.raises(ValueError, match="observation specification"):
+        model.agent.load(checkpoint)
+
+    _assert_tree_equal(model.agent.model.state_dict(), before_model)
+    _assert_tree_equal(model.agent.optim.state_dict(), before_optim)
+    assert model.agent.num_updates == 7
+    assert model.agent.outer_version == 11
+
+
 @pytest.mark.parametrize(
     ("representation", "num_q", "adaptation"),
     [

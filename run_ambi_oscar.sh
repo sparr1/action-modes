@@ -5,11 +5,10 @@
 #SBATCH --time=48:00:00
 #SBATCH --mem=32G
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:l40s:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=6
-#SBATCH --constraint=geforce3090
 
 
 set -Eeuo pipefail

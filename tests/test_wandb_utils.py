@@ -1,9 +1,11 @@
 import math
+import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from utils.wandb_utils import WandbAccumulator, extract_reward_components
+from utils.wandb_utils import WandbAccumulator, extract_reward_components, init_wandb
 
 
 def test_accumulator_combines_weighted_sums_and_last_values_then_clears():
@@ -104,3 +106,41 @@ def test_extract_reward_components_uses_finite_numeric_scalars_and_normalized_na
     }
     assert extract_reward_components(None) == {}
     assert extract_reward_components([info]) == {}
+
+
+def test_init_wandb_forwards_online_group_and_defines_eval_metrics(monkeypatch):
+    calls = {}
+    defined = []
+    run = object()
+
+    fake_wandb = SimpleNamespace(
+        init=lambda **kwargs: calls.update(kwargs) or run,
+        define_metric=lambda *args, **kwargs: defined.append((args, kwargs)),
+    )
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    result = init_wandb(
+        {
+            "wandb": True,
+            "wandb_project": "ambi",
+            "wandb_entity": "brown",
+            "wandb_mode": "online",
+            "wandb_group": "humanoid",
+            "wandb_tags": ["benchmark"],
+        },
+        default_project="unused",
+        run_name="seed-1",
+        config={"seed": 1},
+    )
+
+    assert result is run
+    assert calls == {
+        "project": "ambi",
+        "entity": "brown",
+        "name": "seed-1",
+        "config": {"seed": 1},
+        "mode": "online",
+        "tags": ["benchmark"],
+        "group": "humanoid",
+    }
+    assert (("eval/*",), {"step_metric": "env_step"}) in defined

@@ -210,10 +210,22 @@ def test_legacy_ambi_configs_do_not_mix_horizon_schemas():
 
 def test_launchers_reference_only_existing_new_ambi_manifests():
     anchor_manifest = "configs/ambi/experiments/ambi_anchor.json"
-    for name in ("run_ambi_ccv.sh", "run_ambi_hydra.sh", "run_ambi_oscar.sh"):
+    launcher_targets = {
+        "run_ambi_hydra.sh": (anchor_manifest, "configs/ambi/algs"),
+        "run_ambi_oscar.sh": (anchor_manifest, "configs/ambi/algs"),
+        "run_ambi_ccv.sh": (
+            "configs/experiments/AntLegAdaptPaperSweep.json",
+            "configs/algs",
+        ),
+    }
+    for name, (manifest, alg_dir) in launcher_targets.items():
         contents = (ROOT / name).read_text()
-        assert anchor_manifest in contents
-        assert "--alg-dir configs/ambi/algs" in contents
+        assert manifest in contents
+        assert f"--alg-dir {alg_dir}" in contents
+        assert (ROOT / manifest).is_file()
+
+    oscar_launcher = (ROOT / "run_ambi_oscar.sh").read_text()
+    assert "#SBATCH --gres=gpu:l40s:1" in oscar_launcher
 
     slurm_targets = {
         "run_ambi_anchor.sbatch": anchor_manifest,
