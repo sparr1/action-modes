@@ -20,6 +20,70 @@ class CanaryError(RuntimeError):
     pass
 
 
+def verify_resumed_lineage(
+    *,
+    lineage_dir: str | os.PathLike[str],
+    first_segment: str,
+    second_segment: str,
+    minimum_first_step: int,
+) -> dict[str, Any]:
+    """Prove that the real second segment advanced learned state on one W&B run."""
+
+    if not first_segment or not second_segment or first_segment == second_segment:
+        raise CanaryError("canary segment IDs must be distinct and non-empty")
+    if type(minimum_first_step) is not int or minimum_first_step < 0:
+        raise CanaryError("minimum first step must be a non-negative integer")
+    try:
+        from utils.resume_lineage import LineageStore
+
+        with LineageStore.open(lineage_dir, mode="required") as store:
+            latest = store.load()
+            if latest.parent_generation is None:
+                raise CanaryError("latest canary generation has no retained predecessor")
+            predecessor = store.load(latest.parent_generation)
+    except CanaryError:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+        raise CanaryError(f"could not validate the resumed canary lineage: {exc}") from exc
+
+    first = predecessor.metadata
+    second = latest.metadata
+    for metadata, expected_segment, label in (
+        (first, first_segment, "first"),
+        (second, second_segment, "second"),
+    ):
+        if metadata.get("segment_id") != expected_segment:
+            raise CanaryError(f"{label} generation has the wrong segment ID")
+        for field in ("global_step", "num_updates"):
+            value = metadata.get(field)
+            if type(value) is not int or value < 0:
+                raise CanaryError(f"{label} generation has invalid {field}")
+        run_id = metadata.get("wandb_run_id")
+        if not isinstance(run_id, str) or not run_id:
+            raise CanaryError(f"{label} generation has no W&B run ID")
+
+    if first["global_step"] <= minimum_first_step or first["num_updates"] <= 0:
+        raise CanaryError("first canary segment did not reach learned-state training")
+    if second["global_step"] <= first["global_step"]:
+        raise CanaryError("required canary segment did not advance environment steps")
+    if second["num_updates"] <= first["num_updates"]:
+        raise CanaryError("required canary segment did not advance optimizer updates")
+    if second["wandb_run_id"] != first["wandb_run_id"]:
+        raise CanaryError("required canary segment created a different W&B run")
+
+    return {
+        "schema_version": 1,
+        "first_generation": predecessor.generation_id,
+        "second_generation": latest.generation_id,
+        "first_step": first["global_step"],
+        "second_step": second["global_step"],
+        "first_updates": first["num_updates"],
+        "second_updates": second["num_updates"],
+        "wandb_run_id": second["wandb_run_id"],
+        "verified": True,
+    }
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -338,26 +402,41 @@ def _resolved_spec(run_path: Path, algorithm_path: Path) -> dict[str, int]:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run", required=True)
-    parser.add_argument("--algorithm", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--durable-root", required=True)
-    parser.add_argument("--shard-rows", type=int, default=100_000)
-    parser.add_argument("--maximum-estimated-bytes", type=int, required=True)
+    commands = parser.add_subparsers(dest="command", required=True)
+    verify = commands.add_parser("verify-lineage")
+    verify.add_argument("--lineage-dir", required=True)
+    verify.add_argument("--first-segment", required=True)
+    verify.add_argument("--second-segment", required=True)
+    verify.add_argument("--minimum-first-step", type=int, required=True)
+    benchmark = commands.add_parser("benchmark-replay")
+    benchmark.add_argument("--run", required=True)
+    benchmark.add_argument("--algorithm", required=True)
+    benchmark.add_argument("--output", required=True)
+    benchmark.add_argument("--durable-root", required=True)
+    benchmark.add_argument("--shard-rows", type=int, default=100_000)
+    benchmark.add_argument("--maximum-estimated-bytes", type=int, required=True)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        spec = _resolved_spec(Path(args.run), Path(args.algorithm))
-        metrics = benchmark_full_replay(
-            output_path=args.output,
-            durability_root=args.durable_root,
-            shard_rows=args.shard_rows,
-            maximum_estimated_bytes=args.maximum_estimated_bytes,
-            **spec,
-        )
+        if args.command == "verify-lineage":
+            metrics = verify_resumed_lineage(
+                lineage_dir=args.lineage_dir,
+                first_segment=args.first_segment,
+                second_segment=args.second_segment,
+                minimum_first_step=args.minimum_first_step,
+            )
+        else:
+            spec = _resolved_spec(Path(args.run), Path(args.algorithm))
+            metrics = benchmark_full_replay(
+                output_path=args.output,
+                durability_root=args.durable_root,
+                shard_rows=args.shard_rows,
+                maximum_estimated_bytes=args.maximum_estimated_bytes,
+                **spec,
+            )
     except CanaryError as exc:
         print(f"Oscar resume canary failed: {exc}", file=sys.stderr)
         return 2

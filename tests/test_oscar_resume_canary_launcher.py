@@ -40,6 +40,7 @@ case "$*" in
   *"utils.oscar_resume_launcher quota"*) exit 0 ;;
   *"utils.oscar_resume_launcher storage"*) printf '%s\n' '{"total_seconds":0.1}' ;;
   *"utils.oscar_resume_launcher handoff"*) exit 0 ;;
+  *"utils.oscar_resume_canary verify-lineage"*) exit "${FAKE_VERIFY_STATUS:-0}" ;;
   *) exit 91 ;;
 esac
 """,
@@ -133,13 +134,15 @@ def test_canary_has_bounded_gpu_debug_resources_and_no_requeue():
     assert "#SBATCH --requeue" not in contents
     assert "scontrol" not in contents
     assert "AMBI_WANDB_REWIND_VERIFIED" not in contents
-    assert "benchmark-replay" not in contents  # module has one unambiguous command
+    assert "utils.oscar_resume_canary verify-lineage" in contents
+    assert "utils.oscar_resume_canary benchmark-replay" in contents
     assert "--shard-rows 100000" in contents
     assert "--maximum-estimated-bytes 4000000000" in contents
 
 
 def test_canary_runs_new_then_required_and_real_replay_benchmark(tmp_path):
     env, _, srun_path, python_path = _environment(tmp_path)
+    env["AMBI_DURABLE_QUOTA_PATH"] = "/oscar/home"
     result = _run(env)
     assert result.returncode == 0, result.stderr
     calls = _calls(srun_path)
@@ -150,11 +153,21 @@ def test_canary_runs_new_then_required_and_real_replay_benchmark(tmp_path):
         assert call[call.index("--resume-mode") + 1] == mode
         assert call[call.index("--resume-wandb-mode") + 1] == "online"
         assert call[call.index("--drain-after-seconds") + 1] == "300"
+        assert call[call.index("--run") + 1].endswith(
+            "AntAMBITDMPC2ResumeCanary.json"
+        )
+        assert call[call.index("--alg-dir") + 1].endswith("configs/algs")
     assert "utils.oscar_resume_canary" in calls[2]
+    assert "benchmark-replay" in calls[2]
     assert calls[2][calls[2].index("--run") + 1].endswith("ambi_anchor.json")
     assert calls[2][calls[2].index("--algorithm") + 1].endswith("ambi_anchor.json")
     python_calls = python_path.read_text(encoding="utf-8").splitlines()
+    quota_call = next(
+        call for call in python_calls if "utils.oscar_resume_launcher quota" in call
+    )
+    assert "--filesystem-path /oscar/home" in quota_call
     assert sum("utils.oscar_resume_launcher handoff" in call for call in python_calls) == 2
+    assert sum("utils.oscar_resume_canary verify-lineage" in call for call in python_calls) == 1
     assert any("utils.oscar_resume_launcher storage" in call for call in python_calls)
     result_path = (
         Path(env["AMBI_DURABLE_ROOT"])
@@ -198,3 +211,13 @@ def test_canary_rejects_existing_lineage_and_segment_failure(tmp_path):
     assert failure.returncode != 0
     assert "instead of clean handoff 75" in failure.stderr
     assert len(_calls(failure_srun)) == 1
+
+
+def test_canary_stops_before_replay_when_resumed_progress_is_unverified(tmp_path):
+    env, _, srun_path, _ = _environment(tmp_path)
+    env["FAKE_VERIFY_STATUS"] = "23"
+    result = _run(env)
+    assert result.returncode != 0
+    calls = _calls(srun_path)
+    assert len(calls) == 2
+    assert all("benchmark-replay" not in call for call in calls)

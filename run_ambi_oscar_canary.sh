@@ -50,8 +50,12 @@ conda activate ambi
 ambi_python="${AMBI_PYTHON:-python}"
 
 quota_output="$(checkquota)" || fail "checkquota failed"
+quota_args=(--allocation "${AMBI_DURABLE_QUOTA_LABEL:-data+rbalestr}")
+if [[ -n "${AMBI_DURABLE_QUOTA_PATH:-}" ]]; then
+	quota_args+=(--filesystem-path "$AMBI_DURABLE_QUOTA_PATH")
+fi
 printf '%s\n' "$quota_output" | "$ambi_python" -m utils.oscar_resume_launcher quota \
-	--allocation "${AMBI_DURABLE_QUOTA_LABEL:-data+rbalestr}"
+	"${quota_args[@]}"
 "$ambi_python" -m utils.oscar_resume_launcher storage \
 	--durable-root "$AMBI_DURABLE_ROOT" \
 	--lineage-dir "$AMBI_LINEAGE_DIR" \
@@ -61,6 +65,9 @@ printf '%s\n' "$quota_output" | "$ambi_python" -m utils.oscar_resume_launcher qu
 console_root="$AMBI_DURABLE_ROOT/resume-canary/$SLURM_JOB_ID"
 mkdir -p "$(dirname -- "$console_root")"
 mkdir "$console_root" || fail "canary output directory already exists"
+
+canary_run="${AMBI_CANARY_RUN_CONFIG:-configs/experiments/AntAMBITDMPC2ResumeCanary.json}"
+canary_alg_dir="${AMBI_CANARY_ALG_DIR:-configs/algs}"
 
 run_segment() {
 	local index="$1"
@@ -76,8 +83,8 @@ run_segment() {
 		--output="$console_dir/stdout.log" \
 		--error="$console_dir/stderr.log" \
 		"$ambi_python" main.py \
-		--run configs/ambi/experiments/ambi_anchor.json \
-		--alg-dir configs/ambi/algs \
+		--run "$canary_run" \
+		--alg-dir "$canary_alg_dir" \
 		--num-runs 1 \
 		--lineage-dir "$AMBI_LINEAGE_DIR" \
 		--resume-mode "$mode" \
@@ -97,12 +104,18 @@ run_segment() {
 run_segment 0 new
 run_segment 1 required
 
+"$ambi_python" -m utils.oscar_resume_canary verify-lineage \
+	--lineage-dir "$AMBI_LINEAGE_DIR" \
+	--first-segment "${SLURM_JOB_ID}.canary.0" \
+	--second-segment "${SLURM_JOB_ID}.canary.1" \
+	--minimum-first-step 500
+
 benchmark_dir="$console_root/replay-benchmark"
 mkdir "$benchmark_dir"
 srun --unbuffered --kill-on-bad-exit=1 \
 	--output="$benchmark_dir/stdout.log" \
 	--error="$benchmark_dir/stderr.log" \
-	"$ambi_python" -m utils.oscar_resume_canary \
+	"$ambi_python" -m utils.oscar_resume_canary benchmark-replay \
 	--run configs/ambi/experiments/ambi_anchor.json \
 	--algorithm configs/ambi/algs/ambi_anchor.json \
 	--output "$console_root/REPLAY_BENCHMARK.json" \

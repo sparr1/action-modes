@@ -89,15 +89,41 @@ def _generation_metadata(lineage_dir: Path, generation: str) -> dict[str, Any]:
     return metadata
 
 
-def verify_quota_output(output: str, allocation: str) -> str:
-    """Require exactly one allocation row whose final state is exactly ``OK``."""
+def verify_quota_output(
+    output: str, allocation: str, filesystem_path: str | None = None
+) -> str:
+    """Require exactly one selected allocation row ending in exactly ``OK``.
+
+    Some Oscar allocations have separate rows for home and scratch under the
+    same allocation name. ``filesystem_path`` selects one such row by an exact
+    whitespace-delimited field match; omitting it preserves the stricter
+    single-row behavior.
+    """
 
     if not allocation or any(character.isspace() for character in allocation):
         raise QuotaPreflightError("quota allocation must be one non-empty field")
-    rows = [line.strip() for line in output.splitlines() if allocation in line.split()]
+    if filesystem_path is not None and (
+        not filesystem_path
+        or any(character.isspace() for character in filesystem_path)
+    ):
+        raise QuotaPreflightError("quota filesystem path must be one non-empty field")
+    rows = []
+    for line in output.splitlines():
+        fields = line.split()
+        if allocation not in fields:
+            continue
+        if filesystem_path is not None and filesystem_path not in fields:
+            continue
+        rows.append(line.strip())
     if len(rows) != 1:
+        selection = (
+            f" and filesystem path {filesystem_path!r}"
+            if filesystem_path is not None
+            else ""
+        )
         raise QuotaPreflightError(
-            f"expected exactly one checkquota row for {allocation!r}; found {len(rows)}"
+            f"expected exactly one checkquota row for {allocation!r}{selection}; "
+            f"found {len(rows)}"
         )
     fields = rows[0].split()
     if not fields or fields[-1] != "OK":
@@ -264,6 +290,7 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     quota = commands.add_parser("quota")
     quota.add_argument("--allocation", required=True)
+    quota.add_argument("--filesystem-path")
     storage = commands.add_parser("storage")
     storage.add_argument("--durable-root", required=True)
     storage.add_argument("--lineage-dir", required=True)
@@ -281,7 +308,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "quota":
-            verify_quota_output(sys.stdin.read(), args.allocation)
+            verify_quota_output(
+                sys.stdin.read(), args.allocation, args.filesystem_path
+            )
         elif args.command == "storage":
             storage_metrics = {} if args.print_metrics else None
             verify_durable_storage(

@@ -199,6 +199,43 @@ def test_quota_requires_one_row_ending_in_exact_ok():
             verify_quota_output(output, "data+rbalestr")
 
 
+def test_quota_can_select_exact_filesystem_path_for_shared_allocation():
+    output = (
+        "rgao48 /oscar/scratch 1 TB 2 TB GRACE_EXPIRED\n"
+        "rgao48 /oscar/home 80 GB 100 GB OK\n"
+    )
+    with pytest.raises(QuotaPreflightError, match="found 2"):
+        verify_quota_output(output, "rgao48")
+    assert (
+        verify_quota_output(output, "rgao48", "/oscar/home")
+        == "rgao48 /oscar/home 80 GB 100 GB OK"
+    )
+    with pytest.raises(QuotaPreflightError, match="not exactly OK"):
+        verify_quota_output(output, "rgao48", "/oscar/scratch")
+    with pytest.raises(QuotaPreflightError, match="found 0"):
+        verify_quota_output(output, "rgao48", "/oscar/hom")
+    with pytest.raises(QuotaPreflightError, match="one non-empty field"):
+        verify_quota_output(output, "rgao48", "/oscar/home path")
+
+
+def test_launcher_passes_optional_quota_filesystem_path(tmp_path):
+    env, _, args_path, scontrol = _launcher_environment(tmp_path, status=23)
+    env.update(
+        {
+            "AMBI_DURABLE_QUOTA_LABEL": "rgao48",
+            "AMBI_DURABLE_QUOTA_PATH": "/oscar/home",
+            "FAKE_QUOTA": (
+                "rgao48 /oscar/scratch 1 TB 2 TB GRACE_EXPIRED\n"
+                "rgao48 /oscar/home 80 GB 100 GB OK"
+            ),
+        }
+    )
+    result = _run(env)
+    assert result.returncode == 23, result.stderr
+    assert args_path.exists()
+    assert not scontrol.exists()
+
+
 def test_storage_requires_child_path_and_performs_fsync_probe(tmp_path, monkeypatch):
     root = tmp_path / "durable"
     root.mkdir()

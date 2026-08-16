@@ -669,6 +669,8 @@ class TrainingResumeSession:
                 "phase": phase,
                 "replay_rows": rows,
                 "wandb_event_count": len(wandb_state["events"]),
+                "wandb_run_id": wandb_state["run_id"],
+                "num_updates": int(model._num_updates),
                 "host": socket.gethostname(),
                 "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
             },

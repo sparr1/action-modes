@@ -71,8 +71,12 @@ conda activate ambi
 ambi_python="${AMBI_PYTHON:-python}"
 
 quota_output="$(checkquota)" || fail "checkquota failed"
+quota_args=(--allocation "${AMBI_DURABLE_QUOTA_LABEL:-data+rbalestr}")
+if [[ -n "${AMBI_DURABLE_QUOTA_PATH:-}" ]]; then
+	quota_args+=(--filesystem-path "$AMBI_DURABLE_QUOTA_PATH")
+fi
 printf '%s\n' "$quota_output" | "$ambi_python" -m utils.oscar_resume_launcher quota \
-	--allocation "${AMBI_DURABLE_QUOTA_LABEL:-data+rbalestr}"
+	"${quota_args[@]}"
 "$ambi_python" -m utils.oscar_resume_launcher storage \
 	--durable-root "$AMBI_DURABLE_ROOT" --lineage-dir "$AMBI_LINEAGE_DIR"
 
