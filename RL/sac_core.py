@@ -100,11 +100,25 @@ class SACConfig:
     seed: Optional[int] = None
     device: str = "auto"
     verbose: int = 1
+    actor_lr: Optional[float] = None
+    critic_lr: Optional[float] = None
+    alpha_lr: Optional[float] = None
+    actor_betas: Tuple[float, float] = (0.9, 0.999)
+    critic_betas: Tuple[float, float] = (0.9, 0.999)
+    alpha_betas: Tuple[float, float] = (0.9, 0.999)
+    log_std_min: float = LOG_STD_MIN
+    log_std_max: float = LOG_STD_MAX
 
     def __post_init__(self):
         self.q_representation = str(self.q_representation).lower()
         if self.num_q is None:
             self.num_q = 5 if self.q_representation == "distributional" else 2
+        if self.actor_lr is None:
+            self.actor_lr = self.learning_rate
+        if self.critic_lr is None:
+            self.critic_lr = self.learning_rate
+        if self.alpha_lr is None:
+            self.alpha_lr = self.learning_rate
 
 
 class ReplayBuffer:
@@ -180,8 +194,18 @@ class ReplayBuffer:
 
 
 class SquashedGaussianActor(nn.Module):
-    def __init__(self, obs_dim: int, action_dim: int, net_arch: Tuple[int, ...]):
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        net_arch: Tuple[int, ...],
+        *,
+        log_std_min: float = LOG_STD_MIN,
+        log_std_max: float = LOG_STD_MAX,
+    ):
         super().__init__()
+        self.log_std_min = float(log_std_min)
+        self.log_std_max = float(log_std_max)
         self.latent_pi = make_feature_mlp(obs_dim, net_arch)
         latent_dim = obs_dim if len(net_arch) == 0 else net_arch[-1]
         self.mu = nn.Linear(latent_dim, action_dim)
@@ -190,7 +214,9 @@ class SquashedGaussianActor(nn.Module):
     def get_action_dist_params(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         latent_pi = self.latent_pi(obs)
         mean_actions = self.mu(latent_pi)
-        log_std = torch.clamp(self.log_std(latent_pi), LOG_STD_MIN, LOG_STD_MAX)
+        log_std = torch.clamp(
+            self.log_std(latent_pi), self.log_std_min, self.log_std_max
+        )
         return mean_actions, log_std
 
     def action_log_prob(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -264,6 +290,35 @@ class SACAgent:
         if float(config.adam_eps) <= 0.0:
             raise ValueError("adam_eps must be positive.")
 
+        for key in ("learning_rate", "actor_lr", "critic_lr", "alpha_lr"):
+            raw_value = getattr(config, key)
+            if isinstance(raw_value, bool):
+                raise ValueError(f"{key} must be a positive finite number.")
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{key} must be a positive finite number.") from exc
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{key} must be a positive finite number.")
+            setattr(config, key, value)
+
+        for key in ("actor_betas", "critic_betas", "alpha_betas"):
+            setattr(config, key, self._validated_adam_betas(key, getattr(config, key)))
+
+        for key in ("log_std_min", "log_std_max"):
+            raw_value = getattr(config, key)
+            if isinstance(raw_value, bool):
+                raise ValueError(f"{key} must be a finite number.")
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{key} must be a finite number.") from exc
+            if not np.isfinite(value):
+                raise ValueError(f"{key} must be a finite number.")
+            setattr(config, key, value)
+        if config.log_std_min >= config.log_std_max:
+            raise ValueError("log_std_min must be smaller than log_std_max.")
+
         for key in ("num_q", "q_pair_size"):
             raw_value = getattr(config, key)
             if isinstance(raw_value, bool):
@@ -302,7 +357,13 @@ class SACAgent:
         )
         if self.q_backend.representation == "scalar" and config.q_pair_size != 2:
             raise ValueError("Scalar SAC requires q_pair_size=2 for twin-Q semantics.")
-        self.actor = SquashedGaussianActor(obs_dim, action_dim, actor_arch).to(self.device)
+        self.actor = SquashedGaussianActor(
+            obs_dim,
+            action_dim,
+            actor_arch,
+            log_std_min=config.log_std_min,
+            log_std_max=config.log_std_max,
+        ).to(self.device)
         self.critic = ContinuousCritic(
             obs_dim,
             action_dim,
@@ -322,10 +383,16 @@ class SACAgent:
         self.critic_target.requires_grad_(False)
 
         self.actor_optimizer = torch.optim.Adam(
-            self.actor.parameters(), lr=config.learning_rate, eps=config.adam_eps
+            self.actor.parameters(),
+            lr=config.actor_lr,
+            betas=config.actor_betas,
+            eps=config.adam_eps,
         )
         self.critic_optimizer = torch.optim.Adam(
-            self.critic.parameters(), lr=config.learning_rate, eps=config.adam_eps
+            self.critic.parameters(),
+            lr=config.critic_lr,
+            betas=config.critic_betas,
+            eps=config.adam_eps,
         )
 
         self.target_entropy = self._make_target_entropy(config.target_entropy)
@@ -339,7 +406,10 @@ class SACAgent:
                     raise ValueError("Initial entropy coefficient must be > 0.")
             self.log_ent_coef = torch.log(torch.ones(1, device=self.device) * init_value).requires_grad_(True)
             self.ent_coef_optimizer = torch.optim.Adam(
-                [self.log_ent_coef], lr=config.learning_rate, eps=config.adam_eps
+                [self.log_ent_coef],
+                lr=config.alpha_lr,
+                betas=config.alpha_betas,
+                eps=config.adam_eps,
             )
             self.ent_coef_tensor = None
         else:
@@ -349,6 +419,36 @@ class SACAgent:
             self.ent_coef_tensor = torch.tensor(fixed_ent_coef, device=self.device)
 
         self.num_updates = 0
+
+    @staticmethod
+    def _validated_adam_betas(name: str, value) -> Tuple[float, float]:
+        if isinstance(value, (str, bytes)):
+            raise ValueError(f"{name} must contain exactly two numbers.")
+        try:
+            values = tuple(value)
+        except TypeError as exc:
+            raise ValueError(f"{name} must contain exactly two numbers.") from exc
+        if len(values) != 2:
+            raise ValueError(f"{name} must contain exactly two numbers.")
+
+        betas = []
+        for beta in values:
+            if isinstance(beta, bool):
+                raise ValueError(
+                    f"{name} values must be finite and satisfy 0 <= beta < 1."
+                )
+            try:
+                beta = float(beta)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"{name} values must be finite and satisfy 0 <= beta < 1."
+                ) from exc
+            if not np.isfinite(beta) or not 0.0 <= beta < 1.0:
+                raise ValueError(
+                    f"{name} values must be finite and satisfy 0 <= beta < 1."
+                )
+            betas.append(beta)
+        return tuple(betas)
 
     def _make_target_entropy(self, target_entropy: str | float) -> float:
         if target_entropy == "auto":

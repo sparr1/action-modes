@@ -7,6 +7,7 @@ scaling follow Stable-Baselines3 SAC semantics as closely as possible.
 
 from __future__ import annotations
 
+import csv
 import os
 import random
 import time
@@ -84,6 +85,29 @@ class SAC(Algorithm):
         self._last_terminated = False
         self._last_truncated = False
         self._last_info = {}
+        self._eval_freq = self._optional_eval_frequency(
+            self.params.get("eval_freq", None)
+        )
+        self._eval_episodes = None
+        self._eval_csv_path = None
+        self._eval_csv_initialized = False
+        self._eval_pending = False
+        if self._eval_freq is not None:
+            self._eval_episodes = self._positive_int(
+                self.params.get("eval_episodes", 10), "eval_episodes"
+            )
+            eval_csv_path = self.params.get("eval_csv_path")
+            if eval_csv_path is None:
+                eval_csv_path = os.environ.get("SAC_EVAL_CSV")
+            if eval_csv_path is not None:
+                if not isinstance(eval_csv_path, (str, os.PathLike)):
+                    raise ValueError(
+                        "eval_csv_path must be a filesystem path or null."
+                    )
+                eval_csv_path = os.fspath(eval_csv_path).strip()
+                if not eval_csv_path:
+                    raise ValueError("eval_csv_path cannot be empty.")
+            self._eval_csv_path = eval_csv_path
 
     def _init_wandb(self):
         return init_wandb(
@@ -124,8 +148,15 @@ class SAC(Algorithm):
         q_representation = str(
             self.params.get("q_representation", "scalar")
         ).lower()
+        learning_rate = float(self.params.get("learning_rate", 3e-4))
         return SACConfig(
-            learning_rate=float(self.params.get("learning_rate", 3e-4)),
+            learning_rate=learning_rate,
+            actor_lr=self.params.get("actor_lr", learning_rate),
+            critic_lr=self.params.get("critic_lr", learning_rate),
+            alpha_lr=self.params.get("alpha_lr", learning_rate),
+            actor_betas=self.params.get("actor_betas", (0.9, 0.999)),
+            critic_betas=self.params.get("critic_betas", (0.9, 0.999)),
+            alpha_betas=self.params.get("alpha_betas", (0.9, 0.999)),
             buffer_size=int(float(self.params.get("buffer_size", 1_000_000))),
             learning_starts=int(float(self.params.get("learning_starts", 100))),
             batch_size=int(float(self.params.get("batch_size", 256))),
@@ -152,6 +183,8 @@ class SAC(Algorithm):
             q_vmin=float(self.params.get("q_vmin", -10.0)),
             q_vmax=float(self.params.get("q_vmax", 10.0)),
             adam_eps=float(self.params.get("adam_eps", 1e-8)),
+            log_std_min=self.params.get("log_std_min", -20.0),
+            log_std_max=self.params.get("log_std_max", 2.0),
             seed=self.seed,
             device=device,
             verbose=self.verbose,
@@ -165,6 +198,24 @@ class SAC(Algorithm):
         if any(width <= 0 for width in widths):
             raise ValueError(f"{name} must contain only positive layer widths.")
         return widths
+
+    @staticmethod
+    def _positive_int(value, name: str) -> int:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (Integral, Real))
+            or not np.isfinite(value)
+            or int(value) != value
+            or int(value) <= 0
+        ):
+            raise ValueError(f"{name} must be a positive integer.")
+        return int(value)
+
+    @classmethod
+    def _optional_eval_frequency(cls, value):
+        if value is None:
+            return None
+        return cls._positive_int(value, "eval_freq")
 
     def _parse_train_freq(self, train_freq) -> Tuple[int, str]:
         if isinstance(train_freq, (list, tuple)):
@@ -290,6 +341,16 @@ class SAC(Algorithm):
             "episode/current_return": float(self._episode_return),
             "episode/current_len": int(self._episode_len),
         }
+        if any(
+            key in self.params for key in ("actor_lr", "critic_lr", "alpha_lr")
+        ):
+            payload.update(
+                {
+                    "train/actor_learning_rate": float(self.cfg.actor_lr),
+                    "train/critic_learning_rate": float(self.cfg.critic_lr),
+                    "train/alpha_learning_rate": float(self.cfg.alpha_lr),
+                }
+            )
         payload.update(self._replay_wandb_payload())
         payload.update(self._wandb_reward_window.pop())
         payload.update(self._wandb_train_window.pop())
@@ -357,6 +418,77 @@ class SAC(Algorithm):
                 self._checkpoint.targets(self.num_timesteps, final=True)
             )
 
+    def _prepare_eval_csv(self):
+        if self._eval_csv_initialized or self._eval_csv_path is None:
+            return
+        path = os.path.abspath(os.path.expanduser(self._eval_csv_path))
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        try:
+            stream = open(path, "x", newline="")
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"Refusing to overwrite existing native SAC evaluation file: {path}"
+            ) from exc
+        with stream:
+            csv.writer(stream).writerow(("step", "reward", "seed"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._eval_csv_path = path
+        self._eval_csv_initialized = True
+
+    def _record_evaluation(self, step, reward):
+        reward = float(reward)
+        print(
+            "Native SAC evaluation:",
+            f"step={int(step)},",
+            f"reward={reward:.1f},",
+            f"episodes={self._eval_episodes},",
+            f"seed={self.seed}",
+            flush=True,
+        )
+        if self._eval_csv_path is not None:
+            self._prepare_eval_csv()
+            with open(self._eval_csv_path, "a", newline="") as stream:
+                csv.writer(stream).writerow(
+                    (int(step), f"{reward:.1f}", int(self.seed))
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+        log_wandb(
+            self._wandb_run,
+            {
+                "eval/episode_reward": reward,
+                "eval/episodes": int(self._eval_episodes),
+            },
+            step=int(step),
+        )
+
+    @torch.no_grad()
+    def _evaluate_policy(self, step, *, initial_obs=None):
+        episode_returns = []
+        for episode in range(self._eval_episodes):
+            if episode == 0 and initial_obs is not None:
+                obs = initial_obs
+            else:
+                obs = self._reset_env()
+
+            episode_return = 0.0
+            done = False
+            while not done:
+                obs_flat = self._flatten_obs(obs)
+                action_norm = self.agent.act(obs_flat, deterministic=True)
+                action_env = self._unscale_action(action_norm)
+                obs, reward, terminated, truncated, _ = self.env.step(action_env)
+                episode_return += float(reward)
+                done = bool(terminated or truncated)
+            episode_returns.append(episode_return)
+
+        mean_return = float(np.mean(episode_returns))
+        self._record_evaluation(step, mean_return)
+        return mean_return
+
     def _checkpoint_state(self):
         return {
             "checkpoint_version": 2,
@@ -408,6 +540,12 @@ class SAC(Algorithm):
             self._wandb_run = self._init_wandb()
 
         try:
+            run_step_zero_eval = self._eval_freq is not None and (
+                reset_num_timesteps
+                or (self.num_timesteps == 0 and self._last_obs is None)
+            )
+            if self._eval_freq is not None:
+                self._prepare_eval_csv()
             if reset_num_timesteps:
                 self.num_timesteps = 0
                 self._episode_idx = 0
@@ -416,6 +554,8 @@ class SAC(Algorithm):
                 self._collected_steps = 0
                 self._collected_episodes = 0
                 self._last_metrics = {}
+                if self._eval_freq is not None:
+                    self._eval_pending = False
                 if isinstance(self._checkpoint, CheckpointTracker):
                     self._checkpoint.reset()
                 reset_seed = self.seed if not self._env_seeded else None
@@ -432,6 +572,10 @@ class SAC(Algorithm):
                     obs = self._last_obs
             self._last_obs = obs
             self._reset_wandb_window()
+            if run_step_zero_eval:
+                self._evaluate_policy(0, initial_obs=obs)
+                obs = self._reset_env()
+                self._last_obs = obs
         except Exception:
             finish_wandb(self._wandb_run)
             self._wandb_run = None
@@ -458,6 +602,11 @@ class SAC(Algorithm):
                 next_obs_flat = self._flatten_obs(next_obs)
                 self.replay_buffer.add(obs_flat, action_norm, reward, next_obs_flat, terminated, truncated)
                 self.num_timesteps += 1
+                if (
+                    self._eval_freq is not None
+                    and self.num_timesteps % self._eval_freq == 0
+                ):
+                    self._eval_pending = True
                 self._episode_return += float(reward)
                 self._episode_len += 1
                 self._last_reward = float(reward)
@@ -480,6 +629,9 @@ class SAC(Algorithm):
                 self._maybe_checkpoint()
 
                 if done:
+                    if self._eval_pending:
+                        self._evaluate_policy(self.num_timesteps)
+                        self._eval_pending = False
                     self._episode_idx += 1
                     self._episode_return = 0.0
                     self._episode_len = 0
@@ -584,6 +736,9 @@ class SAC(Algorithm):
             critical_keys = [
                 "learning_rate", "tau", "gamma", "ent_coef", "target_entropy",
                 "target_update_interval", "actor_net_arch", "critic_net_arch", "adam_eps",
+                "actor_lr", "critic_lr", "alpha_lr",
+                "actor_betas", "critic_betas", "alpha_betas",
+                "log_std_min", "log_std_max",
                 "num_q", "q_pair_size", "q_target_reduction", "q_actor_reduction",
             ]
             saved_representation = str(saved.get("q_representation", "scalar")).lower()
@@ -601,7 +756,15 @@ class SAC(Algorithm):
                 "q_num_bins": 101,
                 "q_vmin": -10.0,
                 "q_vmax": 10.0,
+                "actor_betas": (0.9, 0.999),
+                "critic_betas": (0.9, 0.999),
+                "alpha_betas": (0.9, 0.999),
+                "log_std_min": -20.0,
+                "log_std_max": 2.0,
             }
+            legacy_learning_rate = saved.get("learning_rate", 3e-4)
+            for key in ("actor_lr", "critic_lr", "alpha_lr"):
+                legacy_defaults[key] = legacy_learning_rate
             mismatches = {
                 key: (saved.get(key, legacy_defaults.get(key)), current.get(key))
                 for key in critical_keys
@@ -623,6 +786,7 @@ class SAC(Algorithm):
         self._episode_len = 0
         self._collected_steps = 0
         self._collected_episodes = 0
+        self._eval_pending = False
         return self
 
 

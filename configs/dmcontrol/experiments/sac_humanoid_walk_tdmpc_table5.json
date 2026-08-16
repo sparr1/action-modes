@@ -1,0 +1,22 @@
+{
+  "study_type": "native_sac_humanoid_walk_tdmpc_table5_benchmark",
+  "study_note": "Ordinary direct-state native SAC on DMControl Humanoid Walk using the published TD-MPC Table-5 numerical optimizer, replay, network-width, and update-schedule hyperparameters that are expressible in this repository. This is not a byte-for-byte Yarats SAC reproduction: the local learner consumes the 67-value state directly rather than implementing Table 5's latent-100 encoder and retains its established SB3-like critic-loss, alpha-loss, log-standard-deviation, initialization, and update-order semantics. Seven million agent decisions at action repeat 2 equal the published 14 million raw simulator steps. The three seeds are separate W&B runs in one group. Deterministic ten-episode evaluations run at step zero and every 50k agent decisions (100k raw steps); this evaluation cadence is an operational comparator protocol, not a Table-5 training hyperparameter. Model checkpoints and trajectory logs are disabled; W&B stages on node-local storage, leaving only tiny evaluation CSVs and Slurm output in Hydra home storage.",
+  "overrides_alg": {
+    "env": "DMControl-v0"
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 3,
+  "configs": [
+    "sac_humanoid_walk_tdmpc_table5"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": null,
+  "save_strat": "none",
+  "log_info": false,
+  "log_type": "summary"
+}

@@ -66,6 +66,114 @@ def test_asymmetric_and_empty_network_architectures_are_preserved():
     assert len(model.agent.critic.qf1) == 1
 
 
+def test_native_sac_resolves_separate_optimizer_hyperparameters_and_auto_alpha():
+    env = ShortEpisodeEnv()
+    model = SAC(
+        "SAC",
+        env,
+        {
+            "device": "cpu",
+            "net_arch": [8],
+            "learning_rate": 9e-4,
+            "actor_lr": 1e-4,
+            "critic_lr": 2e-4,
+            "alpha_lr": 3e-4,
+            "actor_betas": [0.8, 0.91],
+            "critic_betas": [0.7, 0.92],
+            "alpha_betas": [0.6, 0.93],
+            "ent_coef": "auto_0.1",
+            "log_std_min": -10,
+            "log_std_max": 1.5,
+            "wandb": False,
+        },
+        {},
+        {},
+    )
+
+    assert model.cfg.actor_lr == 1e-4
+    assert model.cfg.critic_lr == 2e-4
+    assert model.cfg.alpha_lr == 3e-4
+    assert model.cfg.actor_betas == (0.8, 0.91)
+    assert model.cfg.critic_betas == (0.7, 0.92)
+    assert model.cfg.alpha_betas == (0.6, 0.93)
+    assert model.cfg.log_std_min == -10
+    assert model.cfg.log_std_max == 1.5
+
+    actor_group = model.agent.actor_optimizer.param_groups[0]
+    critic_group = model.agent.critic_optimizer.param_groups[0]
+    alpha_group = model.agent.ent_coef_optimizer.param_groups[0]
+    assert (actor_group["lr"], actor_group["betas"]) == (1e-4, (0.8, 0.91))
+    assert (critic_group["lr"], critic_group["betas"]) == (2e-4, (0.7, 0.92))
+    assert (alpha_group["lr"], alpha_group["betas"]) == (3e-4, (0.6, 0.93))
+    torch.testing.assert_close(
+        model.agent.log_ent_coef.detach().exp(), torch.tensor([0.1])
+    )
+
+
+def test_native_sac_optimizer_and_log_std_defaults_preserve_legacy_behavior():
+    config = SACConfig(learning_rate=7e-4, net_arch=(8,), device="cpu")
+    agent = SACAgent(2, 1, config)
+
+    assert (config.actor_lr, config.critic_lr, config.alpha_lr) == (7e-4,) * 3
+    assert config.actor_betas == config.critic_betas == config.alpha_betas == (
+        0.9,
+        0.999,
+    )
+    assert config.log_std_min == -20
+    assert config.log_std_max == 2
+    assert agent.actor_optimizer.param_groups[0]["lr"] == 7e-4
+    assert agent.critic_optimizer.param_groups[0]["lr"] == 7e-4
+    assert agent.ent_coef_optimizer.param_groups[0]["lr"] == 7e-4
+
+
+def test_native_sac_actor_uses_configured_log_std_clamps():
+    agent = SACAgent(
+        2,
+        1,
+        SACConfig(
+            net_arch=(8,),
+            log_std_min=-7.5,
+            log_std_max=0.75,
+            device="cpu",
+        ),
+    )
+    observations = torch.zeros(3, 2)
+
+    with torch.no_grad():
+        agent.actor.log_std.weight.zero_()
+        agent.actor.log_std.bias.fill_(100.0)
+    _, upper = agent.actor.get_action_dist_params(observations)
+    torch.testing.assert_close(upper, torch.full_like(upper, 0.75))
+
+    with torch.no_grad():
+        agent.actor.log_std.bias.fill_(-100.0)
+    _, lower = agent.actor.get_action_dist_params(observations)
+    torch.testing.assert_close(lower, torch.full_like(lower, -7.5))
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"actor_lr": 0.0}, "actor_lr"),
+        ({"critic_lr": float("inf")}, "critic_lr"),
+        ({"alpha_lr": -1e-4}, "alpha_lr"),
+        ({"actor_betas": [0.9]}, "actor_betas"),
+        ({"critic_betas": [0.9, float("nan")]}, "critic_betas"),
+        ({"alpha_betas": [0.9, 1.0]}, "alpha_betas"),
+        ({"actor_betas": [False, 0.999]}, "actor_betas"),
+        ({"log_std_min": float("-inf")}, "log_std_min"),
+        ({"log_std_max": float("nan")}, "log_std_max"),
+        ({"log_std_min": 2.0, "log_std_max": 2.0}, "smaller"),
+        ({"log_std_min": 3.0, "log_std_max": 2.0}, "smaller"),
+    ],
+)
+def test_native_sac_rejects_invalid_optimizer_and_log_std_settings(overrides, match):
+    values = {"net_arch": (8,), "device": "cpu"}
+    values.update(overrides)
+    with pytest.raises(ValueError, match=match):
+        SACAgent(2, 1, SACConfig(**values))
+
+
 def test_reward_logging_preserves_termination_metadata():
     data = setup_logs(
         reward=1.0,
@@ -258,6 +366,87 @@ def test_checkpoint_load_validates_configuration_and_is_not_fake_resume(tmp_path
         restored.load(checkpoint, resume=True)
     with pytest.raises(ValueError, match="configuration mismatch"):
         build(gamma=0.5).load(checkpoint)
+
+
+def test_checkpoint_strict_config_covers_sac_optimizer_and_log_std_settings(tmp_path):
+    source_params = {
+        "device": "cpu",
+        "seed": 3,
+        "learning_starts": 100,
+        "buffer_size": 32,
+        "net_arch": [8],
+        "actor_lr": 1e-4,
+        "critic_lr": 2e-4,
+        "alpha_lr": 3e-4,
+        "actor_betas": [0.8, 0.91],
+        "critic_betas": [0.7, 0.92],
+        "alpha_betas": [0.6, 0.93],
+        "log_std_min": -10,
+        "log_std_max": 1.5,
+        "wandb": False,
+    }
+
+    def build(**overrides):
+        params = dict(source_params)
+        params.update(overrides)
+        return SAC(
+            "SAC",
+            ShortEpisodeEnv(),
+            params,
+            {"seed": 3, "device": "cpu", "env": "ShortEpisodeEnv"},
+            {},
+        )
+
+    source = build()
+    source.save(tmp_path, "custom_optimizer")
+    checkpoint = tmp_path / "custom_optimizer.pt"
+    build().load(checkpoint)
+
+    mismatches = {
+        "actor_lr": 4e-4,
+        "critic_lr": 4e-4,
+        "alpha_lr": 4e-4,
+        "actor_betas": [0.81, 0.91],
+        "critic_betas": [0.71, 0.92],
+        "alpha_betas": [0.61, 0.93],
+        "log_std_min": -9,
+        "log_std_max": 1.6,
+    }
+    for key, value in mismatches.items():
+        with pytest.raises(ValueError, match=key):
+            build(**{key: value}).load(checkpoint)
+
+
+def test_legacy_checkpoint_config_infers_new_sac_defaults(tmp_path):
+    params = {
+        "device": "cpu",
+        "seed": 3,
+        "learning_rate": 7e-4,
+        "learning_starts": 100,
+        "buffer_size": 32,
+        "net_arch": [8],
+        "wandb": False,
+    }
+    run_params = {"seed": 3, "device": "cpu", "env": "ShortEpisodeEnv"}
+    source = SAC("SAC", ShortEpisodeEnv(), params, run_params, {})
+    source.save(tmp_path, "legacy")
+    checkpoint_path = tmp_path / "legacy.pt"
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    for key in (
+        "actor_lr",
+        "critic_lr",
+        "alpha_lr",
+        "actor_betas",
+        "critic_betas",
+        "alpha_betas",
+        "log_std_min",
+        "log_std_max",
+    ):
+        checkpoint["config"].pop(key)
+    torch.save(checkpoint, checkpoint_path)
+
+    restored = SAC("SAC", ShortEpisodeEnv(), params, run_params, {})
+    restored.load(checkpoint_path)
 
 
 def test_native_sac_composes_best_and_latest_without_numbered_checkpoints(tmp_path):
