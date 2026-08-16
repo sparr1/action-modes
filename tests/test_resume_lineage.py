@@ -1,5 +1,7 @@
 import errno
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -90,6 +92,34 @@ def test_new_lineage_durably_creates_missing_parent_chain(tmp_path, monkeypatch)
         pass
     assert tmp_path in synced
     assert root.parent in synced
+
+
+def test_sibling_lineages_can_create_their_shared_parent_concurrently(
+    tmp_path, monkeypatch
+):
+    shared = tmp_path / "allocation" / "sweep"
+    barrier = threading.Barrier(2)
+    real_mkdir = Path.mkdir
+
+    def synchronized_mkdir(path, *args, **kwargs):
+        if path == shared:
+            barrier.wait(timeout=5)
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", synchronized_mkdir)
+
+    def create(label):
+        root = shared / label
+        with LineageStore.open(
+            root, mode="new", lineage_metadata={"id": label}
+        ):
+            pass
+        return root
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        roots = tuple(executor.map(create, ("g2", "g4")))
+
+    assert all((root / "LINEAGE.json").is_file() for root in roots)
 
 
 def test_process_lifetime_lock_rejects_second_writer(tmp_path):

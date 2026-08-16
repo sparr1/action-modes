@@ -735,7 +735,14 @@ def _mkdir_durable(path: Path) -> None:
     if current.is_symlink() or not current.is_dir():
         raise OSError(f"Lineage ancestor is not a directory: {current}")
     for directory in reversed(missing):
-        directory.mkdir()
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            # Independent lineages may start concurrently below the same new
+            # allocation directory.  Another creator winning that parent race
+            # is valid; a symlink or non-directory at the path is not.
+            if directory.is_symlink() or not directory.is_dir():
+                raise
         _fsync_directory(directory.parent)
 
 
