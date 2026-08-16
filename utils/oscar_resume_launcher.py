@@ -92,7 +92,7 @@ def _generation_metadata(lineage_dir: Path, generation: str) -> dict[str, Any]:
 def verify_quota_output(
     output: str, allocation: str, filesystem_path: str | None = None
 ) -> str:
-    """Require exactly one selected allocation row ending in exactly ``OK``.
+    """Require exactly one selected allocation row with usage state ``OK``.
 
     Some Oscar allocations have separate rows for home and scratch under the
     same allocation name. ``filesystem_path`` selects one such row by an exact
@@ -126,7 +126,10 @@ def verify_quota_output(
             f"found {len(rows)}"
         )
     fields = rows[0].split()
-    if not fields or fields[-1] != "OK":
+    usage_state_is_ok = bool(fields) and (
+        fields[-1] == "OK" or (len(fields) >= 2 and fields[-2] == "OK")
+    )
+    if not usage_state_is_ok:
         raise QuotaPreflightError(
             f"durable allocation {allocation!r} is not exactly OK: {rows[0]}"
         )

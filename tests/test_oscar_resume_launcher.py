@@ -185,7 +185,7 @@ def test_resources_and_foreground_signal_contract_are_explicit():
     assert "AMBI_OSCAR_TRANSIENT_ROOTS" not in contents
 
 
-def test_quota_requires_one_row_ending_in_exact_ok():
+def test_quota_requires_one_row_with_exact_ok_usage_state():
     assert verify_quota_output(
         "data+rbalestr 1 TB 2 TB OK\n", "data+rbalestr"
     ).endswith(" OK")
@@ -201,14 +201,14 @@ def test_quota_requires_one_row_ending_in_exact_ok():
 
 def test_quota_can_select_exact_filesystem_path_for_shared_allocation():
     output = (
-        "rgao48 /oscar/scratch 1 TB 2 TB GRACE_EXPIRED\n"
-        "rgao48 /oscar/home 80 GB 100 GB OK\n"
+        "rgao48 /oscar/scratch 1 TB 2 TB GRACE_EXPIRED None\n"
+        "rgao48 /oscar/home 80 GB 100 GB OK None\n"
     )
     with pytest.raises(QuotaPreflightError, match="found 2"):
         verify_quota_output(output, "rgao48")
     assert (
         verify_quota_output(output, "rgao48", "/oscar/home")
-        == "rgao48 /oscar/home 80 GB 100 GB OK"
+        == "rgao48 /oscar/home 80 GB 100 GB OK None"
     )
     with pytest.raises(QuotaPreflightError, match="not exactly OK"):
         verify_quota_output(output, "rgao48", "/oscar/scratch")
@@ -225,8 +225,8 @@ def test_launcher_passes_optional_quota_filesystem_path(tmp_path):
             "AMBI_DURABLE_QUOTA_LABEL": "rgao48",
             "AMBI_DURABLE_QUOTA_PATH": "/oscar/home",
             "FAKE_QUOTA": (
-                "rgao48 /oscar/scratch 1 TB 2 TB GRACE_EXPIRED\n"
-                "rgao48 /oscar/home 80 GB 100 GB OK"
+                "rgao48 /oscar/scratch 1 TB 2 TB GRACE_EXPIRED None\n"
+                "rgao48 /oscar/home 80 GB 100 GB OK None"
             ),
         }
     )
