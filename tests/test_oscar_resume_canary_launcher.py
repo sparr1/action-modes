@@ -107,6 +107,23 @@ def _run(env):
     )
 
 
+def test_canary_accepts_slurm_spooled_script_copy(tmp_path):
+    env, _, srun_path, _ = _environment(tmp_path)
+    spool = tmp_path / "slurm-spool-script"
+    spool.write_bytes(LAUNCHER.read_bytes())
+    result = subprocess.run(
+        ["bash", str(spool)],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert len(_calls(srun_path)) == 3
+
+
 def _calls(path: Path):
     result = []
     current = None

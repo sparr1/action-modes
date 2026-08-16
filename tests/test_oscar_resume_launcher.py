@@ -166,6 +166,23 @@ def _run(env):
     )
 
 
+def test_launcher_accepts_slurm_spooled_script_copy(tmp_path):
+    env, _, args_path, _ = _launcher_environment(tmp_path, status=23)
+    spool = tmp_path / "slurm-spool-script"
+    spool.write_bytes(LAUNCHER.read_bytes())
+    result = subprocess.run(
+        ["bash", str(spool)],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 23, result.stderr
+    assert args_path.exists()
+
+
 def test_resources_and_foreground_signal_contract_are_explicit():
     contents = LAUNCHER.read_text(encoding="utf-8")
     for directive in (

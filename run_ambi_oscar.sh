@@ -25,9 +25,7 @@ fail() {
 : "${AMBI_LINEAGE_DIR:?Set AMBI_LINEAGE_DIR to a lineage below AMBI_DURABLE_ROOT.}"
 : "${SLURM_JOB_ID:?This launcher must run as a Slurm batch job.}"
 
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 project_dir="$(cd -- "${SLURM_SUBMIT_DIR:-$PWD}" && pwd -P)"
-[[ "$project_dir" == "$script_dir" ]] || fail "submit from repository root $script_dir"
 cd "$project_dir"
 
 git_root="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "not a Git checkout"

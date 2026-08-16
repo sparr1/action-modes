@@ -25,9 +25,7 @@ fail() {
 : "${SLURM_JOB_ID:?This launcher must run as a Slurm batch job.}"
 [[ "${SLURM_RESTART_COUNT:-0}" == 0 ]] || fail "canary requires a fresh allocation"
 
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 project_dir="$(cd -- "${SLURM_SUBMIT_DIR:-$PWD}" && pwd -P)"
-[[ "$project_dir" == "$script_dir" ]] || fail "submit from repository root $script_dir"
 cd "$project_dir"
 git_root="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "not a Git checkout"
 git_root="$(cd -- "$git_root" && pwd -P)"
