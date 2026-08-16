@@ -219,6 +219,74 @@ class CheckpointTracker:
         self._episode_count = 0
         self._best_score = None
 
+    def state_dict(self) -> dict[str, Any]:
+        """Return dynamic policy state; lineage identity owns static config."""
+        return {
+            "schema_version": 2,
+            "episode_count": self._episode_count,
+            "best_score": self._best_score,
+            "recent_returns": list(self._returns),
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore tracker state after strict policy compatibility checks."""
+        normalized = self.validate_state_dict(state)
+        self._returns = deque(normalized["recent_returns"], maxlen=self.best_window)
+        self._episode_count = normalized["episode_count"]
+        self._best_score = normalized["best_score"]
+
+    def validate_state_dict(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        """Validate and normalize resume policy state without mutation."""
+        fields = {
+            "schema_version",
+            "episode_count",
+            "best_score",
+            "recent_returns",
+        }
+        if (
+            not isinstance(state, Mapping)
+            or set(state) != fields
+            or state.get("schema_version") != 2
+        ):
+            raise ValueError("Unsupported CheckpointTracker resume schema.")
+        episode_count = state.get("episode_count")
+        if (
+            isinstance(episode_count, bool)
+            or not isinstance(episode_count, int)
+            or episode_count < 0
+        ):
+            raise ValueError("CheckpointTracker episode_count is invalid.")
+        returns = state.get("recent_returns")
+        if (
+            not isinstance(returns, list)
+            or len(returns) > self.best_window
+            or len(returns) > episode_count
+        ):
+            raise ValueError("CheckpointTracker recent_returns are invalid.")
+        normalized_returns = []
+        for value in returns:
+            value = float(value)
+            if not math.isfinite(value):
+                raise ValueError("CheckpointTracker returns must be finite.")
+            normalized_returns.append(value)
+        best_score = state.get("best_score")
+        if best_score is not None:
+            best_score = float(best_score)
+            if not math.isfinite(best_score):
+                raise ValueError(
+                    "CheckpointTracker best_score must be finite or null."
+                )
+            if "best" not in self.strategies or not normalized_returns:
+                raise ValueError(
+                    "CheckpointTracker best_score has no compatible best policy/history."
+                )
+
+        return {
+            "episode_count": episode_count,
+            "best_score": best_score,
+            "recent_returns": normalized_returns,
+        }
+
     def record_episode_return(self, episode_return: Any) -> None:
         """Record one completed episode, excluding non-finite scores."""
 

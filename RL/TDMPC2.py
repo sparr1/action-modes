@@ -5,6 +5,7 @@ import os
 import random
 import time
 import warnings
+from collections.abc import Mapping
 from types import SimpleNamespace
 
 import gymnasium as gym
@@ -508,7 +509,6 @@ class _DeviceMeanAccumulator:
     def pop_floats(self, *, include_stats=False):
         return self.floats(clear=True, include_stats=include_stats)
 
-
 class TDMPC2Baseline(Algorithm):
     """
     AMBI wrapper for single-task TD-MPC2.
@@ -572,6 +572,8 @@ class TDMPC2Baseline(Algorithm):
         )
         self._wandb_start_time = None
         self._wandb_window_start_time = None
+        self._wandb_elapsed_offset = 0.0
+        self._wandb_window_seconds_offset = 0.0
         self._wandb_window_start_step = 0
         self._wandb_train_seconds = 0.0
         self._wandb_planner_seconds = 0.0
@@ -604,17 +606,32 @@ class TDMPC2Baseline(Algorithm):
         task = env_params.get("task", self.run_params.get("env", "env"))
         return f"TDMPC2-{task}-seed{self.cfg.seed}"
 
-    def _init_wandb(self):
+    def _init_wandb(self, *, resume_context=None):
+        run_config = copy.deepcopy(self.run_params)
+        algorithm_config = copy.deepcopy(self.custom_params or {})
+        resolved_config = copy.deepcopy(vars(self.cfg))
+        if resume_context is not None:
+            # Segment destinations are operational and change on every resume.
+            # Keep them out of W&B's otherwise-stable run config just as the
+            # scientific lineage fingerprint does.
+            algorithm_config.pop("eval_csv_path", None)
+            resolved_config.pop("eval_csv_path", None)
+            nested_algorithm = run_config.get("alg_params")
+            if isinstance(nested_algorithm, Mapping):
+                nested_algorithm = copy.deepcopy(dict(nested_algorithm))
+                nested_algorithm.pop("eval_csv_path", None)
+                run_config["alg_params"] = nested_algorithm
         return init_wandb(
             self.custom_params or {},
             default_project="ambi",
             run_name=self._wandb_run_name(),
             config={
                 "algorithm": self.__class__.__name__,
-                "run_params": self.run_params,
-                "alg_params": self.custom_params or {},
-                "config": vars(self.cfg),
+                "run_params": run_config,
+                "alg_params": algorithm_config,
+                "config": resolved_config,
             },
+            resume_context=resume_context,
         )
 
     def _environment_observation_type(self):
@@ -1068,6 +1085,8 @@ class TDMPC2Baseline(Algorithm):
         now = time.perf_counter()
         self._wandb_start_time = now
         self._wandb_window_start_time = now
+        self._wandb_elapsed_offset = 0.0
+        self._wandb_window_seconds_offset = 0.0
         self._wandb_window_start_step = int(self._global_step)
         self._wandb_train_seconds = 0.0
         self._wandb_planner_seconds = 0.0
@@ -1167,11 +1186,14 @@ class TDMPC2Baseline(Algorithm):
         now = time.perf_counter()
         start = self._wandb_start_time if self._wandb_start_time is not None else now
         window_start = self._wandb_window_start_time if self._wandb_window_start_time is not None else now
-        window_seconds = max(0.0, now - window_start)
+        window_seconds = self._wandb_window_seconds_offset + max(
+            0.0, now - window_start
+        )
+        elapsed_seconds = self._wandb_elapsed_offset + max(0.0, now - start)
         window_steps = max(0, int(self._global_step) - int(self._wandb_window_start_step))
         payload = {
             "time/window_seconds": float(window_seconds),
-            "time/time_elapsed": float(max(0.0, now - start)),
+            "time/time_elapsed": float(elapsed_seconds),
             "time/total_timesteps": int(self._global_step),
             "time/fps": float(window_steps / window_seconds) if window_seconds > 0 else 0.0,
             "time/train_seconds": float(self._wandb_train_seconds),
@@ -1182,10 +1204,26 @@ class TDMPC2Baseline(Algorithm):
             "time/planner_seconds": float(self._wandb_planner_seconds),
         }
         self._wandb_window_start_time = now
+        self._wandb_window_seconds_offset = 0.0
         self._wandb_window_start_step = int(self._global_step)
         self._wandb_train_seconds = 0.0
         self._wandb_planner_seconds = 0.0
         return payload
+
+    def _commit_resume_timing_checkpoint(self, wandb_state):
+        """Continue active timing from the exact pre-serialization boundary.
+
+        Generation serialization/publication, restore/reconciliation, and queue
+        residence are operational pauses. Reset the monotonic references after
+        those operations so a continuing and restored process use the same
+        timing prefix. Required pre-capture log/snapshot flushes remain included.
+        """
+
+        now = time.perf_counter()
+        self._wandb_elapsed_offset = float(wandb_state["elapsed_seconds"])
+        self._wandb_window_seconds_offset = float(wandb_state["window_seconds"])
+        self._wandb_start_time = now
+        self._wandb_window_start_time = now
 
     def _extra_wandb_payload(self, updates_since_log):
         del updates_since_log
@@ -1206,10 +1244,14 @@ class TDMPC2Baseline(Algorithm):
         done = bool(terminated or truncated)
         cadence_due = self._global_step % self._wandb_every == 0
         if not force and not cadence_due:
-            if completed_episode:
+            if completed_episode and getattr(self, "_resume_enabled", False):
+                # Resume boundaries are deterministic scientific boundaries.
+                # Emit one complete aggregate+episode event here; the later
+                # boundary flush then becomes a no-op.
+                force = True
+            elif completed_episode:
                 # Emit the exact episode result without consuming the running
-                # training window. Aggregate moments therefore retain every
-                # sample across episode boundaries until the declared cadence.
+                # training window. Legacy runs retain it to the cadence.
                 episode_payload = {
                     "train/reward": float(reward),
                     "train/done": int(done),
@@ -1227,7 +1269,9 @@ class TDMPC2Baseline(Algorithm):
                     step=self._global_step,
                 )
                 self._last_wandb_step = int(self._global_step)
-            return
+                return
+            else:
+                return
         if (
             force
             and not self._wandb_train_window
@@ -1252,6 +1296,8 @@ class TDMPC2Baseline(Algorithm):
             "episode/current_return": float(self._episode_return),
             "episode/current_len": int(self._episode_len),
         }
+        if getattr(self, "_resume_enabled", False):
+            payload["episode/index"] = int(self._episode_idx)
         payload.update(self._replay_wandb_payload())
         payload.update(self._wandb_reward_window.pop())
         payload.update(self._wandb_train_window.pop())
@@ -1318,6 +1364,352 @@ class TDMPC2Baseline(Algorithm):
             signature=self._checkpoint_signature(),
         )
 
+    def enable_training_resume(self, *, total_timesteps):
+        """Enable the explicit boundary-only scientific resume contract."""
+
+        from utils.resume_runtime import validate_environment_capability
+
+        total_timesteps = int(total_timesteps)
+        if self.cfg.obs != "state":
+            raise NotImplementedError("Exact TD-MPC2 resume supports state observations only.")
+        if total_timesteps != int(self.cfg.steps):
+            raise ValueError("Resume total_timesteps must match the constructed step target.")
+        episode_length = int(self.cfg.episode_length)
+        validate_environment_capability(
+            self.env, expected_episode_steps=episode_length
+        )
+        if total_timesteps < 0 or total_timesteps % episode_length != 0:
+            raise ValueError(
+                "Boundary-only resume requires total_steps to be a non-negative "
+                f"multiple of episode_length={episode_length}."
+            )
+        self.buffer.enable_resumable_storage()
+        self._resume_enabled = True
+        self._resume_phase = "before_initial_seeded_reset"
+        self._eval_pending = self._eval_freq is not None
+        self._step_zero_eval_done = self._eval_freq is None
+        return self
+
+    @staticmethod
+    def _resume_nonnegative_int(value, name):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"Resume {name} must be a non-negative integer.")
+        return int(value)
+
+    def _training_resume_algorithm_state(self):
+        """Subclass-specific wrapper state; baseline has no additional fields."""
+
+        return None
+
+    def _preflight_training_resume_algorithm_state(self, state):
+        if state is not None:
+            raise ValueError("Baseline trainer state must not contain AMBI wrapper state.")
+        return None
+
+    def _load_training_resume_algorithm_state(self, state):
+        self._preflight_training_resume_algorithm_state(state)
+
+    def training_state_dict(self, *, phase=None):
+        """Capture complete learner state at one reviewed episode boundary."""
+
+        if not getattr(self, "_resume_enabled", False):
+            raise RuntimeError("Training resume has not been enabled for this learner.")
+        phase = self._resume_phase if phase is None else phase
+        if phase not in {
+            "before_initial_seeded_reset",
+            "between_episodes_before_reset",
+        }:
+            raise ValueError(f"Unsupported resume phase {phase!r}.")
+        if self._episode_len != 0 or self._episode_return != 0.0:
+            raise RuntimeError("A full trainer checkpoint requires an episode boundary.")
+        if not self._predict_t0:
+            raise RuntimeError("Episode-local prediction state was not cleared.")
+        if int(getattr(self.agent, "num_updates", -1)) != int(self._num_updates):
+            raise RuntimeError("Wrapper and agent update counters diverged.")
+        if any(
+            (
+                self._wandb_train_window,
+                self._wandb_update_window,
+                self._wandb_reward_window,
+            )
+        ):
+            raise RuntimeError(
+                "Full checkpoints require an empty W&B metric window; "
+                "publish through TrainingResumeSession."
+            )
+        if self._wandb_train_seconds != 0.0 or self._wandb_planner_seconds != 0.0:
+            raise RuntimeError("W&B timing windows were not flushed before checkpointing.")
+        if self._wandb_last_updates != self._num_updates:
+            raise RuntimeError("W&B and trainer update counters diverged at checkpoint.")
+        if self._wandb_window_start_step != self._global_step or (
+            self._last_wandb_step is not None
+            and self._last_wandb_step != self._global_step
+        ):
+            raise RuntimeError("W&B metric boundaries diverged from trainer progress.")
+        logger_state = None
+        if self.alg_logger is not None:
+            logger_state = self.alg_logger.resume_state_dict()
+            if logger_state["step_count"] != self._global_step:
+                raise RuntimeError("Logger and learner environment-step counters diverged.")
+            if logger_state["episode_count"] != self._episode_idx:
+                raise RuntimeError("Logger and learner episode counters diverged.")
+        tracker_state = None
+        if self._checkpointing is not None:
+            if not isinstance(self._checkpointing, CheckpointTracker):
+                raise RuntimeError(
+                    "Exact resume requires CheckpointTracker, not legacy tuple checkpointing."
+                )
+            tracker_state = self._checkpointing.state_dict()
+            if tracker_state["episode_count"] != self._episode_idx:
+                raise RuntimeError("Checkpoint tracker and learner episodes diverged.")
+
+        timing_now = time.perf_counter()
+        elapsed_start = (
+            self._wandb_start_time
+            if self._wandb_start_time is not None
+            else timing_now
+        )
+        window_start_time = (
+            self._wandb_window_start_time
+            if self._wandb_window_start_time is not None
+            else timing_now
+        )
+        return {
+            "schema": "tdmpc2-wrapper-training-state",
+            "version": 4,
+            "phase": phase,
+            "total_steps": int(self.cfg.steps),
+            "global_step": int(self._global_step),
+            "completed_episodes": int(self._episode_idx),
+            "pretrained": bool(self._pretrained),
+            "num_updates": int(self._num_updates),
+            "eval_pending": bool(self._eval_pending),
+            "step_zero_eval_done": bool(self._step_zero_eval_done),
+            "algorithm_state": self._training_resume_algorithm_state(),
+            "agent": self.agent.training_state_dict(),
+            "logger": logger_state,
+            "checkpoint_tracker": tracker_state,
+            "wandb": {
+                "reward_component_aliases": dict(self._reward_component_aliases),
+                "window_start_step": int(self._wandb_window_start_step),
+                "elapsed_seconds": float(
+                    self._wandb_elapsed_offset
+                    + max(0.0, timing_now - elapsed_start)
+                ),
+                "window_seconds": float(
+                    self._wandb_window_seconds_offset
+                    + max(0.0, timing_now - window_start_time)
+                ),
+                "last_updates": int(self._wandb_last_updates),
+                "last_step": self._last_wandb_step,
+            },
+        }
+
+    def preflight_training_state_dict(self, state):
+        """Validate a complete trainer state before mutating this learner."""
+
+        expected = {
+            "schema",
+            "version",
+            "phase",
+            "total_steps",
+            "global_step",
+            "completed_episodes",
+            "pretrained",
+            "num_updates",
+            "eval_pending",
+            "step_zero_eval_done",
+            "algorithm_state",
+            "agent",
+            "logger",
+            "checkpoint_tracker",
+            "wandb",
+        }
+        if not isinstance(state, Mapping) or set(state) != expected:
+            raise ValueError("Trainer resume fields do not match the supported schema.")
+        if state["schema"] != "tdmpc2-wrapper-training-state" or state["version"] != 4:
+            raise ValueError("Unsupported trainer resume schema/version.")
+        phase = state["phase"]
+        if phase not in {
+            "before_initial_seeded_reset",
+            "between_episodes_before_reset",
+        }:
+            raise ValueError(f"Unsupported trainer resume phase {phase!r}.")
+        if state["total_steps"] != int(self.cfg.steps):
+            raise ValueError("Trainer absolute step target changed across resume.")
+        global_step = self._resume_nonnegative_int(state["global_step"], "global_step")
+        episodes = self._resume_nonnegative_int(
+            state["completed_episodes"], "completed_episodes"
+        )
+        updates = self._resume_nonnegative_int(state["num_updates"], "num_updates")
+        if global_step > int(self.cfg.steps):
+            raise ValueError("Trainer global_step exceeds the immutable target.")
+        if phase == "before_initial_seeded_reset" and (global_step or episodes or updates):
+            raise ValueError("The initial resume phase must have zero progress counters.")
+        if (
+            phase == "between_episodes_before_reset"
+            and global_step != episodes * int(self.cfg.episode_length)
+        ):
+            raise ValueError("Trainer steps and completed fixed-length episodes differ.")
+        for name in ("pretrained", "eval_pending", "step_zero_eval_done"):
+            if not isinstance(state[name], bool):
+                raise TypeError(f"Trainer {name} must be bool.")
+        if self._eval_freq is None and state["eval_pending"]:
+            raise ValueError("Evaluation cannot be pending when eval_freq is disabled.")
+        if phase == "before_initial_seeded_reset":
+            if state["eval_pending"] is not (self._eval_freq is not None):
+                raise ValueError(
+                    "The genesis checkpoint has inconsistent step-zero evaluation state."
+                )
+            if state["step_zero_eval_done"] is not (self._eval_freq is None):
+                raise ValueError(
+                    "The genesis checkpoint has an invalid step-zero evaluation marker."
+                )
+        elif not state["step_zero_eval_done"]:
+            raise ValueError(
+                "A between-episode checkpoint cannot precede the canonical "
+                "step-zero evaluation."
+            )
+        algorithm_state = self._preflight_training_resume_algorithm_state(
+            state["algorithm_state"]
+        )
+
+        agent_preflight = getattr(self.agent, "_preflight_training_state_dict", None)
+        agent_commit = getattr(self.agent, "_commit_training_state_candidate", None)
+        if not callable(agent_preflight) or not callable(agent_commit):
+            raise TypeError(
+                "The configured agent lacks exact training-state preflight/commit."
+            )
+        agent_candidate = agent_preflight(state["agent"])
+        boundary_prepared = state["agent"].get("boundary_prepared")
+        expected_boundary = phase == "between_episodes_before_reset"
+        if boundary_prepared is not expected_boundary:
+            raise ValueError(
+                "Agent boundary preparation does not match the trainer resume phase."
+            )
+        if int(state["agent"].get("num_updates", state["agent"].get("outer", {}).get("num_updates", -1))) != updates:
+            raise ValueError("Trainer and agent update counters differ in the checkpoint.")
+
+        logger_state = state["logger"]
+        if (self.alg_logger is None) != (logger_state is None):
+            raise ValueError("Training logger enablement changed across resume.")
+        if self.alg_logger is not None:
+            normalized_logger = self.alg_logger.validate_resume_state_dict(logger_state)
+            if normalized_logger["step_count"] != global_step:
+                raise ValueError("Saved logger and learner steps differ.")
+            if normalized_logger["episode_count"] != episodes:
+                raise ValueError("Saved logger and learner episodes differ.")
+
+        tracker_state = state["checkpoint_tracker"]
+        if (self._checkpointing is None) != (tracker_state is None):
+            raise ValueError("Model-snapshot checkpoint policy changed across resume.")
+        if self._checkpointing is not None:
+            if not isinstance(self._checkpointing, CheckpointTracker):
+                raise ValueError("Resume requires a CheckpointTracker policy.")
+            normalized_tracker = self._checkpointing.validate_state_dict(tracker_state)
+            if normalized_tracker["episode_count"] != episodes:
+                raise ValueError("Saved checkpoint tracker and learner episodes differ.")
+
+        wandb_state = state["wandb"]
+        wandb_fields = {
+            "reward_component_aliases",
+            "window_start_step",
+            "elapsed_seconds",
+            "window_seconds",
+            "last_updates",
+            "last_step",
+        }
+        if not isinstance(wandb_state, Mapping) or set(wandb_state) != wandb_fields:
+            raise ValueError("Trainer W&B boundary fields are invalid.")
+        aliases = wandb_state["reward_component_aliases"]
+        if (
+            not isinstance(aliases, Mapping)
+            or any(not isinstance(key, str) or not isinstance(value, str) for key, value in aliases.items())
+        ):
+            raise ValueError("Trainer reward metric aliases are invalid.")
+        window_start = self._resume_nonnegative_int(
+            wandb_state["window_start_step"], "W&B window_start_step"
+        )
+        last_updates = self._resume_nonnegative_int(
+            wandb_state["last_updates"], "W&B last_updates"
+        )
+        if window_start != global_step or last_updates != updates:
+            raise ValueError("Saved W&B boundary counters differ from trainer progress.")
+        last_step = wandb_state["last_step"]
+        if last_step is not None:
+            last_step = self._resume_nonnegative_int(last_step, "W&B last_step")
+            if last_step != global_step:
+                raise ValueError("Saved W&B step differs from trainer progress.")
+        for name in ("elapsed_seconds", "window_seconds"):
+            value = float(wandb_state[name])
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"Trainer W&B {name} must be finite and non-negative.")
+        if float(wandb_state["window_seconds"]) > float(
+            wandb_state["elapsed_seconds"]
+        ):
+            raise ValueError("Trainer W&B window time exceeds lineage elapsed time.")
+
+        return {
+            "phase": phase,
+            "global_step": global_step,
+            "episodes": episodes,
+            "updates": updates,
+            "last_step": last_step,
+            "algorithm_state": algorithm_state,
+            "agent_candidate": agent_candidate,
+        }
+
+    def load_training_state_dict(self, state):
+        """Restore a fully preflighted trainer snapshot into a fresh learner."""
+
+        if self._global_step != 0 or self.buffer.num_eps != 0:
+            raise ValueError("Trainer state must be loaded into a fresh learner.")
+        candidate = self.preflight_training_state_dict(state)
+        self.agent._commit_training_state_candidate(candidate["agent_candidate"])
+        self._global_step = candidate["global_step"]
+        self._episode_idx = candidate["episodes"]
+        self._episode_return = 0.0
+        self._episode_len = 0
+        self._pretrained = state["pretrained"]
+        self._num_updates = candidate["updates"]
+        self._eval_pending = state["eval_pending"]
+        self._step_zero_eval_done = state["step_zero_eval_done"]
+        self._load_training_resume_algorithm_state(candidate["algorithm_state"])
+        self._resume_phase = candidate["phase"]
+        if self.alg_logger is not None:
+            self.alg_logger.load_resume_state_dict(state["logger"])
+        if self._checkpointing is not None:
+            self._checkpointing.load_state_dict(state["checkpoint_tracker"])
+        self._wandb_train_window.clear()
+        self._wandb_reward_window.clear()
+        self._wandb_update_window.clear()
+        wandb_state = state["wandb"]
+        self._reward_component_aliases = dict(wandb_state["reward_component_aliases"])
+        self._reserved_reward_metric_keys = self._reward_metric_family(
+            "rollout/reward"
+        )
+        for alias in self._reward_component_aliases.values():
+            self._reserved_reward_metric_keys.update(
+                self._reward_metric_family(alias)
+            )
+        self._wandb_window_start_step = int(wandb_state["window_start_step"])
+        self._wandb_elapsed_offset = float(wandb_state["elapsed_seconds"])
+        self._wandb_window_seconds_offset = float(wandb_state["window_seconds"])
+        self._wandb_train_seconds = 0.0
+        self._wandb_planner_seconds = 0.0
+        self._wandb_last_updates = int(wandb_state["last_updates"])
+        self._last_wandb_step = candidate["last_step"]
+        now = time.perf_counter()
+        self._wandb_start_time = now
+        self._wandb_window_start_time = now
+        self._last_reward = 0.0
+        self._last_terminated = False
+        self._last_truncated = False
+        self._last_info = {}
+        self._last_train_metrics = None
+        self._predict_t0 = True
+        return self
+
     def _prepare_eval_csv(self):
         """Create one tiny, official-format evaluation CSV for this seed."""
         if self._eval_csv_initialized or not self._eval_csv_path:
@@ -1331,7 +1723,12 @@ class TDMPC2Baseline(Algorithm):
                 f"Refusing to mix TD-MPC2 evaluation rows with existing file: {path}"
             )
         with open(path, "w", newline="") as stream:
-            csv.writer(stream).writerow(("step", "reward", "seed"))
+            header = (
+                ("step", "episode", "reward", "seed")
+                if getattr(self, "_resume_enabled", False)
+                else ("step", "reward", "seed")
+            )
+            csv.writer(stream).writerow(header)
             stream.flush()
             os.fsync(stream.fileno())
         self._eval_csv_path = path
@@ -1350,19 +1747,26 @@ class TDMPC2Baseline(Algorithm):
         if self._eval_csv_path:
             self._prepare_eval_csv()
             with open(self._eval_csv_path, "a", newline="") as stream:
-                csv.writer(stream).writerow(
-                    (int(step), f"{reward:.1f}", int(self.cfg.seed))
+                row = (
+                    (
+                        int(step),
+                        int(self._episode_idx),
+                        f"{reward:.1f}",
+                        int(self.cfg.seed),
+                    )
+                    if getattr(self, "_resume_enabled", False)
+                    else (int(step), f"{reward:.1f}", int(self.cfg.seed))
                 )
+                csv.writer(stream).writerow(row)
                 stream.flush()
                 os.fsync(stream.fileno())
-        log_wandb(
-            self._wandb_run,
-            {
-                "eval/episode_reward": reward,
-                "eval/episodes": int(self._eval_episodes),
-            },
-            step=int(step),
-        )
+        payload = {
+            "eval/episode_reward": reward,
+            "eval/episodes": int(self._eval_episodes),
+        }
+        if getattr(self, "_resume_enabled", False):
+            payload["episode/index"] = int(self._episode_idx)
+        log_wandb(self._wandb_run, payload, step=int(step))
 
     @torch.no_grad()
     def _evaluate_policy(self, step, *, initial_obs=None):
@@ -1396,10 +1800,322 @@ class TDMPC2Baseline(Algorithm):
         self._record_evaluation(step, mean_return)
         return mean_return
 
-    def learn(self, total_timesteps=10000):
+    def _prepare_resume_boundary(self):
+        # Resume-mode metric events must depend on the scientific episode
+        # trajectory, never on where Slurm happened to split the process.
+        self._force_resume_metric_boundary()
+        prepare = getattr(self.agent, "prepare_training_resume_boundary", None)
+        if not callable(prepare):
+            raise TypeError("The agent lacks episode-boundary resume preparation.")
+        prepare()
+        self._predict_t0 = True
+        self._resume_phase = "between_episodes_before_reset"
+
+    def _force_resume_metric_boundary(self):
+        self._log_wandb_step(
+            self._last_reward,
+            self._last_terminated,
+            self._last_truncated,
+            self._last_info,
+            force=True,
+        )
+
+    def _resume_exit_at_boundary(self, resume_session, *, reason, complete=False):
+        generation = resume_session.publish(self, reason=reason)
+        if complete:
+            return resume_session.complete(self, generation)
+        return resume_session.clean_handoff(self, generation)
+
+    def _checkpoint_after_resume_evaluation(self, resume_session, *, label):
+        """Honor timers/signals that became due while evaluation was active."""
+
+        if resume_session.drain_requested():
+            return self._resume_exit_at_boundary(
+                resume_session, reason=f"drain-after-{label}"
+            )
+        if not resume_session.checkpoint_due():
+            return None
+        generation = resume_session.publish(
+            self, reason=f"hourly-after-{label}"
+        )
+        if resume_session.drain_requested():
+            generation = resume_session.publish(
+                self, reason=f"drain-during-{label}-checkpoint"
+            )
+            return resume_session.clean_handoff(self, generation)
+        return None
+
+    def _run_training_episode(self, obs, total_timesteps, *, eval_pending):
+        """Run the one shared environment-step/update loop to a safe boundary."""
+
+        obs_t = self._reuse_observation_tensor(obs)
+        episode_rows = self._start_episode_staging(obs_t)
+        episode_step = 0
+        while self._global_step < total_timesteps:
+            planned = not (
+                self._global_step <= self.cfg.seed_steps
+                or self.buffer.num_eps == 0
+            )
+            action_start = time.perf_counter()
+            if not planned:
+                action_norm = self._random_action_norm()
+            else:
+                action_norm = self._act_agent(
+                    obs_t,
+                    t0=(episode_step == 0),
+                    eval_mode=False,
+                ).numpy()
+            self._record_action_metrics(
+                planned=planned,
+                action_seconds=time.perf_counter() - action_start,
+            )
+
+            action_env = self._unscale_action(action_norm)
+            next_obs, reward, terminated, truncated, info = self.env.step(
+                action_env
+            )
+            done = bool(terminated or truncated)
+            true_terminated = bool(terminated)
+            next_obs_t = self._reuse_observation_tensor(next_obs)
+            self._stage_transition(
+                episode_rows,
+                next_obs_t,
+                action_norm,
+                reward,
+                true_terminated,
+            )
+            episode_rows += 1
+            self._global_step += 1
+            if (
+                self._eval_freq is not None
+                and self._global_step % self._eval_freq == 0
+            ):
+                eval_pending = True
+            episode_step += 1
+            self._episode_return += float(reward)
+            self._episode_len += 1
+            self._last_reward = float(reward)
+            self._last_terminated = bool(terminated)
+            self._last_truncated = bool(truncated)
+            self._last_info = dict(info or {})
+            self._accumulate_reward_metrics(reward, info)
+            self._log_step(
+                reward, next_obs, action_env, terminated, truncated, info
+            )
+
+            if done:
+                if true_terminated and not self.cfg.episodic:
+                    raise ValueError(
+                        "TD-MPC2 saw terminated=True while episodic=False. "
+                        "Set alg_params.episodic=true or disable true terminations in the env."
+                    )
+                self.buffer.add(self._episode_staging[:episode_rows])
+
+            if self._global_step > self.cfg.seed_steps and self.buffer.num_eps > 0:
+                num_updates = (
+                    self.cfg.pretrain_steps if not self._pretrained else self.cfg.utd
+                )
+                if not self._pretrained:
+                    print("Pretraining TD-MPC2 on seed data...")
+                    self._pretrained = True
+                burst_metrics = _DeviceMeanAccumulator()
+                train_start = time.perf_counter()
+                for _ in range(num_updates):
+                    train_metrics = self.agent.update(self.buffer)
+                    self._num_updates += 1
+                    burst_metrics.update(train_metrics)
+                    self._accumulate_train_metrics(train_metrics)
+                self._wandb_train_seconds += time.perf_counter() - train_start
+                self._last_train_metrics = burst_metrics.snapshot()
+
+            self._log_wandb_step(
+                reward,
+                terminated,
+                truncated,
+                info,
+                completed_episode=done,
+            )
+            if done and isinstance(self._checkpointing, CheckpointTracker):
+                self._checkpointing.record_episode_return(self._episode_return)
+            self._maybe_checkpoint()
+
+            if done:
+                return True, eval_pending
+            obs = next_obs
+            obs_t = next_obs_t
+        return False, eval_pending
+
+    def _start_resumable_training(self, total_timesteps, resume_session):
+        """Restore/start one segment and stop before the shared step loop."""
+
+        from utils.resume_training import ResumeIncompatibilityError
+
+        resume_session.prepare_learner(self)
+        if self._global_step == total_timesteps and not (
+            self._resume_phase == "before_initial_seeded_reset"
+            and self._eval_pending
+        ):
+            generation = (
+                resume_session.publish(self, reason="target-recovery")
+                if resume_session.mode == "required"
+                else resume_session.last_generation
+            )
+            return None, resume_session.complete(self, generation)
+
+        phase = self._resume_phase
+        if phase == "before_initial_seeded_reset":
+            if resume_session.drain_requested():
+                return None, self._resume_exit_at_boundary(
+                    resume_session, reason="drain-before-initial-reset"
+                )
+            obs, _ = self._reset_env(seed=self.cfg.seed)
+            if self._eval_pending:
+                self._prepare_eval_csv()
+                self._evaluate_policy(0, initial_obs=obs)
+                self._eval_pending = False
+                self._step_zero_eval_done = True
+                self._prepare_resume_boundary()
+                if self._global_step == total_timesteps:
+                    generation = resume_session.publish(
+                        self, reason="target-after-step-zero-eval"
+                    )
+                    return None, resume_session.complete(self, generation)
+                result = self._checkpoint_after_resume_evaluation(
+                    resume_session, label="step-zero-eval"
+                )
+                if result is not None:
+                    return None, result
+                obs, _ = self._reset_env()
+        elif phase == "between_episodes_before_reset":
+            if resume_session.drain_requested():
+                return None, self._resume_exit_at_boundary(
+                    resume_session, reason="drain-before-pending-eval"
+                )
+            if self._eval_pending:
+                self._evaluate_policy(self._global_step)
+                self._eval_pending = False
+                self._prepare_resume_boundary()
+                result = self._checkpoint_after_resume_evaluation(
+                    resume_session, label="pending-eval"
+                )
+                if result is not None:
+                    return None, result
+            obs, _ = self._reset_env()
+        else:
+            raise ResumeIncompatibilityError(
+                f"Unsupported resumable learner phase {phase!r}."
+            )
+        self._resume_phase = "in_episode"
+        return obs, None
+
+    def _finish_resumable_episode(self, total_timesteps, resume_session):
+        """Commit/evaluate one completed episode before the next reset."""
+
+        if self._global_step == total_timesteps:
+            self._final_checkpoint()
+        self._episode_idx += 1
+        self._episode_return = 0.0
+        self._episode_len = 0
+        self._prepare_resume_boundary()
+
+        if self._global_step == total_timesteps:
+            if self._eval_pending:
+                self._evaluate_policy(self._global_step)
+                self._eval_pending = False
+                self._prepare_resume_boundary()
+            generation = resume_session.publish(self, reason="target")
+            return None, resume_session.complete(self, generation)
+
+        drain = resume_session.drain_requested()
+        due = resume_session.checkpoint_due()
+        generation = None
+        if due or drain:
+            generation = resume_session.publish(
+                self, reason="drain" if drain else "hourly"
+            )
+
+        # One newer generation covers a signal delivered during an ordinary
+        # hourly publication; repeated signals during that drain publication
+        # remain idempotent.
+        if resume_session.drain_requested():
+            if not drain:
+                generation = resume_session.publish(
+                    self, reason="drain-during-checkpoint"
+                )
+            return None, resume_session.clean_handoff(self, generation)
+
+        if self._eval_pending:
+            self._evaluate_policy(self._global_step)
+            self._eval_pending = False
+            self._prepare_resume_boundary()
+            result = self._checkpoint_after_resume_evaluation(
+                resume_session, label="pending-eval"
+            )
+            if result is not None:
+                return None, result
+
+        obs, _ = self._reset_env()
+        self._resume_phase = "in_episode"
+        return obs, None
+
+    def _learn_resumable(self, total_timesteps, resume_session):
+        """Train through exact episode boundaries under a durable lineage."""
+
+        from utils.resume_training import ResumeIncompatibilityError
+
+        if not getattr(self, "_resume_enabled", False):
+            raise RuntimeError("enable_training_resume() must precede resumable learn().")
+        if total_timesteps != int(self.cfg.steps):
+            raise ResumeIncompatibilityError(
+                "The resumable absolute target differs from the constructed learner."
+            )
+        failed = False
+        try:
+            obs, result = self._start_resumable_training(
+                total_timesteps, resume_session
+            )
+            if result is not None:
+                return result
+            while self._global_step < total_timesteps:
+                completed, self._eval_pending = self._run_training_episode(
+                    obs,
+                    total_timesteps,
+                    eval_pending=self._eval_pending,
+                )
+                if not completed:
+                    raise ResumeIncompatibilityError(
+                        "The absolute target was reached inside an active episode; "
+                        "partial-episode physics snapshots are unsupported."
+                    )
+                obs, result = self._finish_resumable_episode(
+                    total_timesteps, resume_session
+                )
+                if result is not None:
+                    return result
+            raise AssertionError("Resumable loop exited without a boundary result.")
+        except BaseException as primary_error:
+            failed = True
+            resume_session.abort_wandb(self, primary_error)
+            try:
+                self._checkpoint_writer.shutdown()
+            except BaseException as cleanup_error:
+                add_note = getattr(primary_error, "add_note", None)
+                if callable(add_note):
+                    add_note(
+                        "Additional model-snapshot cleanup failure after segmented "
+                        f"training stopped: {cleanup_error}"
+                    )
+            raise
+        finally:
+            if not failed:
+                self._checkpoint_writer.shutdown()
+
+    def learn(self, total_timesteps=10000, *, resume_session=None):
         total_timesteps = int(float(total_timesteps))
         if total_timesteps < 0:
             raise ValueError("total_timesteps must be non-negative.")
+        if resume_session is not None:
+            return self._learn_resumable(total_timesteps, resume_session)
         if total_timesteps != int(self.cfg.steps):
             if self._global_step != 0 or self.buffer.num_eps != 0:
                 raise ValueError(
@@ -1422,105 +2138,23 @@ class TDMPC2Baseline(Algorithm):
                 # with cfg.seed immediately before its step-zero evaluation.
                 self._evaluate_policy(0, initial_obs=obs)
                 obs, _ = self._reset_env()
-            obs_t = self._reuse_observation_tensor(obs)
-            episode_rows = self._start_episode_staging(obs_t)
-            episode_step = 0
             eval_pending = False
 
             while self._global_step < total_timesteps:
-                planned = not (self._global_step <= self.cfg.seed_steps or self.buffer.num_eps == 0)
-                action_start = time.perf_counter()
-                if not planned:
-                    action_norm = self._random_action_norm()
-                else:
-                    action_norm = self._act_agent(
-                        obs_t,
-                        t0=(episode_step == 0),
-                        eval_mode=False,
-                    ).numpy()
-                self._record_action_metrics(
-                    planned=planned,
-                    action_seconds=time.perf_counter() - action_start,
+                completed, eval_pending = self._run_training_episode(
+                    obs,
+                    total_timesteps,
+                    eval_pending=eval_pending,
                 )
-
-                action_env = self._unscale_action(action_norm)
-                next_obs, reward, terminated, truncated, info = self.env.step(action_env)
-                done = bool(terminated or truncated)
-                true_terminated = bool(terminated)
-
-                next_obs_t = self._reuse_observation_tensor(next_obs)
-                self._stage_transition(
-                    episode_rows,
-                    next_obs_t,
-                    action_norm,
-                    reward,
-                    true_terminated,
-                )
-                episode_rows += 1
-                self._global_step += 1
-                if (
-                    self._eval_freq is not None
-                    and self._global_step % self._eval_freq == 0
-                ):
-                    eval_pending = True
-                episode_step += 1
-                self._episode_return += float(reward)
-                self._episode_len += 1
-                self._last_reward = float(reward)
-                self._last_terminated = bool(terminated)
-                self._last_truncated = bool(truncated)
-                self._last_info = dict(info or {})
-                self._accumulate_reward_metrics(reward, info)
-                self._log_step(reward, next_obs, action_env, terminated, truncated, info)
-
-                if done:
-                    if true_terminated and not self.cfg.episodic:
-                        raise ValueError(
-                            "TD-MPC2 saw terminated=True while episodic=False. "
-                            "Set alg_params.episodic=true or disable true terminations in the env."
-                        )
-                    self.buffer.add(self._episode_staging[:episode_rows])
-
-                if self._global_step > self.cfg.seed_steps and self.buffer.num_eps > 0:
-                    num_updates = self.cfg.pretrain_steps if not self._pretrained else self.cfg.utd
-                    if not self._pretrained:
-                        print("Pretraining TD-MPC2 on seed data...")
-                        self._pretrained = True
-                    burst_metrics = _DeviceMeanAccumulator()
-                    train_start = time.perf_counter()
-                    for _ in range(num_updates):
-                        train_metrics = self.agent.update(self.buffer)
-                        self._num_updates += 1
-                        burst_metrics.update(train_metrics)
-                        self._accumulate_train_metrics(train_metrics)
-                    self._wandb_train_seconds += time.perf_counter() - train_start
-                    self._last_train_metrics = burst_metrics.snapshot()
-
-                self._log_wandb_step(
-                    reward,
-                    terminated,
-                    truncated,
-                    info,
-                    completed_episode=done,
-                )
-                if done and isinstance(self._checkpointing, CheckpointTracker):
-                    self._checkpointing.record_episode_return(self._episode_return)
-                self._maybe_checkpoint()
-
-                if done:
-                    if eval_pending:
-                        self._evaluate_policy(self._global_step)
-                        eval_pending = False
-                    self._episode_idx += 1
-                    self._episode_return = 0.0
-                    self._episode_len = 0
-                    obs, _ = self._reset_env()
-                    obs_t = self._reuse_observation_tensor(obs)
-                    episode_rows = self._start_episode_staging(obs_t)
-                    episode_step = 0
-                else:
-                    obs = next_obs
-                    obs_t = next_obs_t
+                if not completed:
+                    break
+                if eval_pending:
+                    self._evaluate_policy(self._global_step)
+                    eval_pending = False
+                self._episode_idx += 1
+                self._episode_return = 0.0
+                self._episode_len = 0
+                obs, _ = self._reset_env()
             self._final_checkpoint()
             return self
         finally:

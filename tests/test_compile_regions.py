@@ -1,8 +1,10 @@
 from copy import deepcopy
 import gc
 import pickle
+import random
 import weakref
 
+import numpy as np
 import pytest
 import torch
 
@@ -26,6 +28,62 @@ def test_compile_region_is_lazy_fixed_shape_and_cached(monkeypatch):
     assert len(compile_calls) == 1
     assert compile_calls[0][1] == {"fullgraph": False, "dynamic": False}
     assert not region.failed
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_successful_compile_region_construction_preserves_all_rng(
+    monkeypatch, strict
+):
+    explicit = torch.Generator().manual_seed(8675309)
+
+    def eager(value, *, generator):
+        del generator
+        return value.square()
+
+    def fake_compile(function, **_kwargs):
+        random.random()
+        np.random.random()
+        torch.rand(())
+        torch.rand((), generator=explicit)
+        return function
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    region = CompileRegion(
+        "rng-neutral construction", eager, enabled=True, strict=strict
+    )
+
+    random.seed(101)
+    np.random.seed(202)
+    torch.manual_seed(303)
+    explicit.manual_seed(404)
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+    explicit_state = explicit.get_state()
+    expected = (
+        random.random(),
+        np.random.random(),
+        torch.rand(()),
+        torch.rand((), generator=explicit),
+    )
+    random.setstate(python_state)
+    np.random.set_state(numpy_state)
+    torch.random.set_rng_state(torch_state)
+    explicit.set_state(explicit_state)
+
+    torch.testing.assert_close(
+        region(torch.tensor(3.0), generator=explicit), torch.tensor(9.0)
+    )
+    actual = (
+        random.random(),
+        np.random.random(),
+        torch.rand(()),
+        torch.rand((), generator=explicit),
+    )
+
+    assert actual[:2] == expected[:2]
+    torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
+    torch.testing.assert_close(actual[3], expected[3], rtol=0, atol=0)
 
 
 def test_non_strict_compile_failure_warns_once_and_stays_eager(monkeypatch):
@@ -199,6 +257,40 @@ def test_ensemble_compile_failure_is_sticky(monkeypatch):
 
     ensemble.enable_compile(strict=False)
     assert not ensemble._compile_enabled
+
+
+@pytest.mark.parametrize("detached", [False, True])
+@pytest.mark.parametrize("strict", [False, True])
+def test_successful_ensemble_wrapper_construction_preserves_global_rng(
+    monkeypatch, detached, strict
+):
+    def fake_compile(function, **_kwargs):
+        random.random()
+        np.random.random()
+        torch.rand(())
+        return function
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    ensemble = Ensemble([torch.nn.Linear(2, 1)])
+    ensemble.enable_compile(strict=strict)
+    call = ensemble.forward_detached if detached else ensemble.forward
+
+    random.seed(505)
+    np.random.seed(606)
+    torch.manual_seed(707)
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+    expected = (random.random(), np.random.random(), torch.rand(()))
+    random.setstate(python_state)
+    np.random.set_state(numpy_state)
+    torch.random.set_rng_state(torch_state)
+
+    assert call(torch.ones(1, 2)).shape == (1, 1, 1)
+    actual = (random.random(), np.random.random(), torch.rand(()))
+
+    assert actual[:2] == expected[:2]
+    torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
 
 
 def test_ensemble_compile_mode_change_rebuilds_wrappers(monkeypatch):

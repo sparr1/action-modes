@@ -1,5 +1,6 @@
 import csv
 import json
+import os
 
 import numpy as np
 import pytest
@@ -87,6 +88,44 @@ def test_detailed_logger_preserves_episode_json_schema_and_flushes_worker(tmp_pa
         "info": [[{"terminated": False, "truncated": True}]],
         "inner_steps": [[2, 3]],
         "cumulative_step": 1,
+    }
+
+
+def test_durable_flush_fsyncs_every_segment_log_prefix(tmp_path, monkeypatch):
+    synced_files = []
+    synced_directories = []
+    monkeypatch.setattr(
+        log_module,
+        "_fsync_regular_file",
+        lambda path: synced_files.append(os.fspath(path)),
+    )
+    monkeypatch.setattr(
+        log_module,
+        "_fsync_directory",
+        lambda path: synced_directories.append(os.fspath(path)),
+    )
+    logger = TrainingLogger(tmp_path, log_info=False, log_type="detailed")
+    logger.on_step(
+        setup_logs(
+            reward=1.0,
+            obs=np.array([[1.0]], dtype=np.float32),
+            action=np.array([[0.0]], dtype=np.float32),
+            dones=[True],
+            materialize=False,
+        )
+    )
+
+    logger.flush_durable()
+    logger.close()
+
+    assert set(synced_files) == {
+        os.fspath(tmp_path / "step_stats.csv"),
+        os.fspath(tmp_path / "stats.txt"),
+        os.fspath(tmp_path / "train_episodes" / "episode_1.json"),
+    }
+    assert set(synced_directories) == {
+        os.fspath(tmp_path),
+        os.fspath(tmp_path / "train_episodes"),
     }
 
 
@@ -212,3 +251,75 @@ def test_buffered_step_writer_closes_stream_after_flush_failure():
 
     assert stream.close_calls == 1
     assert stream.closed
+
+
+def test_resume_state_starts_fresh_segment_at_absolute_offsets(tmp_path):
+    first = AMBITrainingLogger(
+        tmp_path / "segment-0", log_info=False, log_type="summary"
+    )
+    first.on_step(
+        setup_logs(
+            reward=2.0,
+            obs=np.zeros((1, 2), dtype=np.float32),
+            action=np.zeros((1, 1), dtype=np.float32),
+            dones=[True],
+            inner_steps=[[3]],
+            materialize=False,
+        )
+    )
+    state = first.resume_state_dict()
+    first.close()
+
+    resumed = AMBITrainingLogger(
+        tmp_path / "segment-1", log_info=False, log_type="summary"
+    )
+    resumed.load_resume_state_dict(state)
+    resumed.on_step(
+        setup_logs(
+            reward=4.0,
+            obs=np.zeros((1, 2), dtype=np.float32),
+            action=np.zeros((1, 1), dtype=np.float32),
+            dones=[True],
+            inner_steps=[[5]],
+            materialize=False,
+        )
+    )
+    resumed.close()
+
+    with open(tmp_path / "segment-1" / "step_stats.csv", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert rows[0]["global_step"] == "2"
+    assert rows[0]["episode"] == "2"
+    assert (tmp_path / "segment-1" / "stats.txt").read_text().startswith(
+        "episode_2:"
+    )
+    assert resumed.total_reward == 6.0
+    assert resumed.inner_step_count == 8.0
+
+
+def test_resume_state_rejects_partial_episode(tmp_path):
+    logger = TrainingLogger(tmp_path, log_info=False, log_type="summary")
+    logger.on_step(
+        setup_logs(
+            reward=1.0,
+            obs=np.zeros((1, 1), dtype=np.float32),
+            action=np.zeros((1, 1), dtype=np.float32),
+            dones=[False],
+            materialize=False,
+        )
+    )
+    with pytest.raises(ValueError, match="between episodes"):
+        logger.resume_state_dict()
+    logger.close()
+
+
+def test_resume_state_rejects_unknown_fields_and_negative_inner_count(tmp_path):
+    logger = AMBITrainingLogger(
+        tmp_path, log_info=False, log_type="summary"
+    )
+    state = logger.resume_state_dict()
+    with pytest.raises(ValueError, match="schema"):
+        logger.validate_resume_state_dict({**state, "future": 1})
+    with pytest.raises(ValueError, match="non-negative"):
+        logger.validate_resume_state_dict({**state, "inner_step_count": -1.0})
+    logger.close()

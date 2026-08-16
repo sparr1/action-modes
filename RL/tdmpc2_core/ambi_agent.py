@@ -10,6 +10,12 @@ from .common.device import resolve_device
 from .common.layers import api_model_conversion
 from .common.soft_world_model import SoftWorldModel
 from .inner_improvement import InnerImprovementEngine, polyak_update
+from .common.training_state import (
+    preflight_adam_state,
+    preflight_module_state,
+    require_exact_keys,
+    require_tensor,
+)
 
 
 # Backward-compatible public test/debug hook.
@@ -137,6 +143,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self.last_inner_metrics = {}
         self.last_inner_rollout_lengths = []
         self.inner_engine = InnerImprovementEngine(self)
+        self._resume_boundary_prepared = False
         self.model.eval()
 
         print("Episode length:", cfg.episode_length)
@@ -198,9 +205,25 @@ class AMBITDMPC2Agent(torch.nn.Module):
         return self.fixed_ent_coef
 
     def reset(self):
+        if self._resume_boundary_prepared:
+            # A full checkpoint already advanced the inner episode lifecycle.
+            # The first environment reset after that checkpoint must not
+            # expire/increment it a second time, in either the source process
+            # or a resumed process.
+            self._resume_boundary_prepared = False
+            return
         self.last_inner_metrics = {}
         self.last_inner_rollout_lengths = []
         self.inner_engine.reset_episode()
+
+    def prepare_training_resume_boundary(self):
+        """Expire episode state once, deferring the actual environment reset."""
+        if not self._resume_boundary_prepared:
+            self.last_inner_metrics = {}
+            self.last_inner_rollout_lengths = []
+            self.inner_engine.prepare_training_resume_boundary()
+            self._resume_boundary_prepared = True
+        return self
 
     def observation_signature(self):
         """Return the portable observation contract used by this checkpoint."""
@@ -243,6 +266,156 @@ class AMBITDMPC2Agent(torch.nn.Module):
         else:
             state["fixed_ent_coef"] = self.fixed_ent_coef.detach()
         return state
+
+    def training_state_dict(self):
+        """Return exact outer and persistent inner state for run continuation."""
+        if self.outer_version != self.num_updates:
+            raise RuntimeError(
+                "AMBI live outer state is inconsistent: "
+                "outer_version must equal num_updates."
+            )
+        inner = self.inner_engine.training_state_dict()
+        inner_outer_version = inner["workspace"]["counters"]["outer_version"]
+        if inner_outer_version > self.outer_version:
+            raise RuntimeError(
+                "AMBI live persistent inner workspace is newer than the outer learner."
+            )
+        return {
+            "schema": "ambi-tdmpc2-agent-training-state",
+            "version": 1,
+            "outer": self.checkpoint_state(),
+            "inner": inner,
+            "model_training": bool(self.model.training),
+            "boundary_prepared": bool(self._resume_boundary_prepared),
+        }
+
+    def _preflight_outer_training_state(self, state):
+        expected_keys = {
+            "checkpoint_version",
+            "observation_spec",
+            "critic_spec",
+            "policy_spec",
+            "entropy_spec",
+            "model",
+            "optim",
+            "pi_optim",
+            "num_updates",
+            "outer_version",
+        }
+        if self.log_ent_coef is not None:
+            expected_keys.update({"log_ent_coef", "ent_coef_optim"})
+        else:
+            expected_keys.add("fixed_ent_coef")
+        state = require_exact_keys(state, expected_keys, "AMBI outer training state")
+        if state["checkpoint_version"] != 3:
+            raise ValueError("AMBI exact training state requires outer checkpoint version 3.")
+        for key in ("num_updates", "outer_version"):
+            value = state[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"AMBI outer {key} must be a non-negative integer.")
+        if state["outer_version"] != state["num_updates"]:
+            raise ValueError(
+                "AMBI outer exact training state requires "
+                "outer_version == num_updates."
+            )
+        preflight_module_state(self.model, state["model"], "AMBI outer model")
+        preflight_adam_state(
+            self.optim,
+            state["optim"],
+            "AMBI outer optimizer",
+            expected_steps=state["num_updates"],
+        )
+        preflight_adam_state(
+            self.pi_optim,
+            state["pi_optim"],
+            "AMBI outer policy optimizer",
+            expected_steps=state["num_updates"],
+        )
+        if self.ent_coef_optim is not None:
+            preflight_adam_state(
+                self.ent_coef_optim,
+                state["ent_coef_optim"],
+                "AMBI outer entropy optimizer",
+                expected_steps=state["num_updates"],
+            )
+            require_tensor(
+                state["log_ent_coef"],
+                "AMBI outer log_ent_coef",
+                shape=self.log_ent_coef.shape,
+                dtype=self.log_ent_coef.dtype,
+            )
+        else:
+            fixed = require_tensor(
+                state["fixed_ent_coef"],
+                "AMBI outer fixed_ent_coef",
+                shape=self.fixed_ent_coef.shape,
+                dtype=self.fixed_ent_coef.dtype,
+            )
+            if not torch.equal(
+                fixed.detach().cpu(), self.fixed_ent_coef.detach().cpu()
+            ):
+                raise ValueError(
+                    "AMBI outer fixed entropy coefficient differs from configuration."
+                )
+        # The lineage fingerprint checks every resolved scientific setting.
+        # The established model-checkpoint loader below remains the single
+        # authority for signature, entropy, and optimizer-layout validation.
+        return state
+
+    def _preflight_training_state_dict(self, state):
+        state = require_exact_keys(
+            state,
+            {
+                "schema",
+                "version",
+                "outer",
+                "inner",
+                "model_training",
+                "boundary_prepared",
+            },
+            "AMBI agent training state",
+        )
+        if (
+            state["schema"] != "ambi-tdmpc2-agent-training-state"
+            or state["version"] != 1
+        ):
+            raise ValueError("Unsupported AMBI agent training-state version.")
+        outer = self._preflight_outer_training_state(state["outer"])
+        inner_candidate = self.inner_engine._preflight_training_state_dict(
+            state["inner"]
+        )
+        inner_outer_version = inner_candidate["state"].outer_version
+        if inner_outer_version > outer["outer_version"]:
+            raise ValueError(
+                "AMBI persistent inner workspace cannot be newer than the saved "
+                "outer learner: "
+                f"inner outer_version={inner_outer_version}, "
+                f"outer_version={outer['outer_version']}."
+            )
+        if not isinstance(state["model_training"], bool):
+            raise TypeError("AMBI model_training must be bool.")
+        if not isinstance(state["boundary_prepared"], bool):
+            raise TypeError("AMBI boundary_prepared must be bool.")
+        return state, outer, inner_candidate
+
+    def load_training_state_dict(self, state):
+        """Strictly restore outer state and every run-persistent inner component."""
+        candidate = self._preflight_training_state_dict(state)
+        return self._commit_training_state_candidate(candidate)
+
+    def _commit_training_state_candidate(self, candidate):
+        """Install a candidate returned by strict exact-state preflight."""
+        state, outer, inner_candidate = candidate
+        # ``load`` retains the established model-checkpoint implementation and
+        # clears old inner allocations. Exact preflight above makes its input a
+        # complete version-3 state rather than a permissive transfer checkpoint.
+        self.load(outer)
+        self.inner_engine._commit_training_state_candidate(inner_candidate)
+        self.last_inner_metrics = {}
+        self.last_inner_rollout_lengths = []
+        self.model.train(state["model_training"])
+        self._resume_boundary_prepared = state["boundary_prepared"]
+        return self
 
     def save(self, fp):
         save_checkpoint(self.checkpoint_state(), fp)
@@ -377,6 +550,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self.inner_engine.clear_all()
         self.last_inner_metrics = {}
         self.last_inner_rollout_lengths = []
+        self._resume_boundary_prepared = False
         self.model.eval()
         return self
 

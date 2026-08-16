@@ -1,5 +1,7 @@
-import numpy as np
+import copy
+
 import mujoco
+import numpy as np
 from gymnasium.spaces import Box
 from .ant_variable_legs import AntVariableLegsEnv
 
@@ -28,8 +30,7 @@ class AntLegAdaptationEnv(AntVariableLegsEnv):
     switch_fraction : float
         Fraction of total_timesteps at which to trigger the switch (default 0.5).
     xml_file : str
-        Output XML filename written into assets/. Change this if running
-        multiple adaptation envs simultaneously to avoid file collisions.
+        Filename used for this instance's private generated XML.
     """
 
     def __init__(
@@ -121,3 +122,93 @@ class AntLegAdaptationEnv(AntVariableLegsEnv):
         info["num_legs"] = self.num_legs
         info["switched"] = self._switched
         return self._pad_obs(obs), info
+
+    def training_resume_state(self):
+        state = super().training_resume_state()
+        state.update(
+            adaptation_schema_version=1,
+            steps_taken=int(self._steps_taken),
+            switched=bool(self._switched),
+            pending_switch=bool(self._pending_switch),
+            start_legs=int(self._start_legs),
+            end_legs=int(self._end_legs),
+            switch_step=int(self._switch_step),
+            np_random=copy.deepcopy(self.np_random.bit_generator.state),
+        )
+        return state
+
+    def load_training_resume_state(self, state):
+        self.validate_training_resume_state(state)
+        saved_switched = state["switched"]
+        if saved_switched and not self._switched:
+            self._do_switch()
+        self._steps_taken = state["steps_taken"]
+        self._switched = saved_switched
+        self._pending_switch = state["pending_switch"]
+        self.np_random.bit_generator.state = copy.deepcopy(state["np_random"])
+
+    def validate_training_resume_state(self, state):
+        expected = {
+            "schema_version",
+            "num_legs",
+            "np_random",
+            "adaptation_schema_version",
+            "steps_taken",
+            "switched",
+            "pending_switch",
+            "start_legs",
+            "end_legs",
+            "switch_step",
+        }
+        if (
+            not isinstance(state, dict)
+            or set(state) != expected
+            or state.get("schema_version") != 1
+            or state.get("adaptation_schema_version") != 1
+        ):
+            raise ValueError("Unsupported leg-adaptation training-resume state.")
+        immutable = {
+            "start_legs": self._start_legs,
+            "end_legs": self._end_legs,
+            "switch_step": self._switch_step,
+        }
+        for key, value in immutable.items():
+            if state.get(key) != int(value):
+                raise ValueError(f"Leg-adaptation {key} changed across resume.")
+        for key in ("switched", "pending_switch"):
+            if not isinstance(state.get(key), bool):
+                raise ValueError(f"Leg-adaptation {key} must be bool.")
+        steps_taken = state.get("steps_taken")
+        if isinstance(steps_taken, bool) or not isinstance(steps_taken, int) or steps_taken < 0:
+            raise ValueError("Leg-adaptation steps_taken is invalid.")
+        saved_switched = state["switched"]
+        pending_switch = state["pending_switch"]
+        if saved_switched:
+            if pending_switch:
+                raise ValueError(
+                    "A switched morphology cannot also have a pending switch."
+                )
+            if steps_taken < self._switch_step:
+                raise ValueError(
+                    "A switched morphology cannot predate the switch step."
+                )
+        elif pending_switch:
+            if steps_taken < self._switch_step:
+                raise ValueError(
+                    "A pending morphology switch cannot predate the switch step."
+                )
+        elif steps_taken >= self._switch_step:
+            raise ValueError(
+                "An unswitched morphology at or after the switch step must be pending."
+            )
+        expected_legs = self._end_legs if saved_switched else self._start_legs
+        if state.get("num_legs") != int(expected_legs):
+            raise ValueError("Leg-adaptation morphology state is inconsistent.")
+        if saved_switched and not self._switched:
+            # The actual model rebuild occurs only after every checkpoint
+            # component has passed preflight.
+            pass
+        elif not saved_switched and self._switched:
+            raise ValueError("Cannot restore a pre-switch state into a switched model.")
+        probe = copy.deepcopy(self.np_random)
+        probe.bit_generator.state = copy.deepcopy(state["np_random"])

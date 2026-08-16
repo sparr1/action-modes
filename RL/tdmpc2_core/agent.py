@@ -1,4 +1,5 @@
 import time
+from collections.abc import Mapping
 
 import torch
 import torch.nn.functional as F
@@ -9,6 +10,11 @@ from .common.world_model import WorldModel
 from .common.layers import api_model_conversion
 from .common.device import resolve_device
 from .common.checkpoint import save_checkpoint
+from .common.training_state import (
+	preflight_adam_state,
+	preflight_module_state,
+	require_exact_keys,
+)
 try:
 	from tensordict import TensorDict
 except ImportError:  # tensordict<newer API compatibility
@@ -56,6 +62,7 @@ class TDMPC2(torch.nn.Module):
 		) if self.cfg.multitask else self._get_discount(cfg.episode_length)
 		self.num_updates = 0
 		self.last_plan_metrics = {}
+		self._resume_boundary_prepared = False
 		print('Episode length:', cfg.episode_length)
 		print('Discount factor:', self.discount)
 		self.register_buffer(
@@ -122,8 +129,19 @@ class TDMPC2(torch.nn.Module):
 	@torch.no_grad()
 	def reset(self):
 		"""Reset episode-local planning state."""
+		if self._resume_boundary_prepared:
+			self._resume_boundary_prepared = False
+			return
 		self._prev_mean.zero_()
 		self.last_plan_metrics = {}
+
+	def prepare_training_resume_boundary(self):
+		"""Expire planning state before a between-episode checkpoint."""
+		if not self._resume_boundary_prepared:
+			self._prev_mean.zero_()
+			self.last_plan_metrics = {}
+			self._resume_boundary_prepared = True
+		return self
 
 	def observation_signature(self):
 		"""Return the portable observation contract used by this checkpoint."""
@@ -147,6 +165,129 @@ class TDMPC2(torch.nn.Module):
 			"model": self.model.state_dict(),
 			"num_updates": self.num_updates,
 		}
+
+	def training_state_dict(self):
+		"""Return the exact, versioned state required to continue training.
+
+		Unlike :meth:`checkpoint_state`, this contract is deliberately strict and
+		does not accept architecture conversion or partial state.
+		"""
+		return {
+			"schema": "tdmpc2-agent-training-state",
+			"version": 1,
+			"observation_spec": self.observation_signature(),
+			"model": self.model.state_dict(),
+			"optim": self.optim.state_dict(),
+			"pi_optim": self.pi_optim.state_dict(),
+			"scale": self.scale.state_dict(),
+			"num_updates": int(self.num_updates),
+			"planning": {
+				"prev_mean": self._prev_mean,
+				"last_plan_metrics": self.last_plan_metrics,
+			},
+			"model_training": bool(self.model.training),
+			"boundary_prepared": bool(self._resume_boundary_prepared),
+		}
+
+	def _preflight_training_state_dict(self, state):
+		state = require_exact_keys(
+			state,
+			{
+				"schema",
+				"version",
+				"observation_spec",
+				"model",
+				"optim",
+				"pi_optim",
+				"scale",
+				"num_updates",
+				"planning",
+				"model_training",
+				"boundary_prepared",
+			},
+			"TD-MPC2 training state",
+		)
+		if state["schema"] != "tdmpc2-agent-training-state" or state["version"] != 1:
+			raise ValueError(
+				"Unsupported TD-MPC2 training-state schema/version: "
+				f"schema={state['schema']!r}, version={state['version']!r}."
+			)
+		if state["observation_spec"] != self.observation_signature():
+			raise ValueError(
+				"TD-MPC2 training-state observation specification differs from "
+				"the configured agent."
+			)
+		if isinstance(state["num_updates"], bool) or not isinstance(
+			state["num_updates"], int
+		) or state["num_updates"] < 0:
+			raise ValueError("training-state num_updates must be a non-negative integer.")
+		preflight_module_state(self.model, state["model"], "training-state model")
+		preflight_adam_state(
+			self.optim,
+			state["optim"],
+			"training-state optim",
+			expected_steps=state["num_updates"],
+		)
+		preflight_adam_state(
+			self.pi_optim,
+			state["pi_optim"],
+			"training-state pi_optim",
+			expected_steps=state["num_updates"],
+		)
+		scale = require_exact_keys(
+			state["scale"], {"value", "percentiles"}, "training-state scale"
+		)
+		preflight_module_state(self.scale, scale, "training-state scale")
+		expected_percentiles = self.scale.state_dict()["percentiles"]
+		if not torch.equal(
+			scale["percentiles"].detach().cpu(),
+			expected_percentiles.detach().cpu(),
+		):
+			raise ValueError(
+				"training-state scale percentiles differ from the configured policy."
+			)
+		planning = require_exact_keys(
+			state["planning"],
+			{"prev_mean", "last_plan_metrics"},
+			"training-state planning",
+		)
+		prev_mean = planning["prev_mean"]
+		if (
+			not torch.is_tensor(prev_mean)
+			or prev_mean.shape != self._prev_mean.shape
+			or prev_mean.dtype != self._prev_mean.dtype
+		):
+			raise ValueError("training-state planning prev_mean is incompatible.")
+		if not isinstance(planning["last_plan_metrics"], Mapping):
+			raise TypeError("training-state last_plan_metrics must be a mapping.")
+		if not isinstance(state["model_training"], bool):
+			raise TypeError("training-state model_training must be bool.")
+		if not isinstance(state["boundary_prepared"], bool):
+			raise TypeError("training-state boundary_prepared must be bool.")
+		return state
+
+	def load_training_state_dict(self, state):
+		"""Strictly restore an exact training snapshot.
+
+		All structural checks run before any live tensor is changed. Callers are
+		expected to restore process/global RNG after this method, so optimizer
+		device remapping and any reconstruction cannot perturb the resumed stream.
+		"""
+		state = self._preflight_training_state_dict(state)
+		return self._commit_training_state_candidate(state)
+
+	def _commit_training_state_candidate(self, state):
+		"""Install a candidate returned by strict exact-state preflight."""
+		self.model.load_state_dict(state["model"])
+		self.optim.load_state_dict(state["optim"])
+		self.pi_optim.load_state_dict(state["pi_optim"])
+		self.scale.load_state_dict(state["scale"])
+		self._prev_mean.copy_(state["planning"]["prev_mean"].to(self.device))
+		self.last_plan_metrics = dict(state["planning"]["last_plan_metrics"])
+		self.num_updates = int(state["num_updates"])
+		self.model.train(state["model_training"])
+		self._resume_boundary_prepared = state["boundary_prepared"]
+		return self
 
 	def save(self, fp):
 		"""
@@ -201,6 +342,7 @@ class TDMPC2(torch.nn.Module):
 			)
 		self.model.load_state_dict(state_dict)
 		self.num_updates = int(state.get("num_updates", 0))
+		self._resume_boundary_prepared = False
 		return
 
 	@torch.no_grad()

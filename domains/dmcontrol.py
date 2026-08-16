@@ -8,6 +8,7 @@ contain the dedicated DMControl dependency set.
 from __future__ import annotations
 
 from collections import deque
+import copy
 import importlib
 from typing import Any, Mapping
 
@@ -315,6 +316,48 @@ class DMControlEnv(gym.Env):
         env, self._env = getattr(self, "_env", None), None
         if env is not None:
             self._close_raw_env(env)
+
+    def training_resume_state(self) -> dict[str, Any]:
+        """Return the reviewed state-only, between-episode resume contract."""
+        if self.observation_type != "state":
+            raise ValueError("Training resume does not support DMControl RGB state.")
+        task_random = self._env.task.random
+        if not isinstance(task_random, np.random.RandomState):
+            raise TypeError("DMControl task.random is not numpy.random.RandomState.")
+        return {
+            "schema_version": 1,
+            "task": self.task_name,
+            "observation_type": self.observation_type,
+            "task_random_state": copy.deepcopy(task_random.get_state()),
+        }
+
+    def load_training_resume_state(self, state: Mapping[str, Any]) -> None:
+        """Restore reset RNG for the next state-observation episode."""
+        self.validate_training_resume_state(state)
+        task_random = self._env.task.random
+        task_random.set_state(copy.deepcopy(state["task_random_state"]))
+
+    def validate_training_resume_state(self, state: Mapping[str, Any]) -> None:
+        """Validate the explicit reset-state contract without mutating it."""
+        expected = {
+            "schema_version",
+            "task",
+            "observation_type",
+            "task_random_state",
+        }
+        if (
+            not isinstance(state, Mapping)
+            or set(state) != expected
+            or state.get("schema_version") != 1
+        ):
+            raise ValueError("Unsupported DMControl training-resume state.")
+        if state.get("task") != self.task_name or state.get("observation_type") != "state":
+            raise ValueError("DMControl task/observation changed across resume.")
+        task_random = self._env.task.random
+        if not isinstance(task_random, np.random.RandomState):
+            raise TypeError("DMControl task.random is not numpy.random.RandomState.")
+        probe = np.random.RandomState()
+        probe.set_state(copy.deepcopy(state["task_random_state"]))
 
 
 __all__ = ["DMControlEnv"]

@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.func import functional_call
 
+from .compile_regions import _capture_rng_state, _restore_rng_state
+
 
 _DETACHED_PARAMETER_VIEWS = weakref.WeakKeyDictionary()
 
@@ -102,57 +104,6 @@ class Ensemble(nn.Module):
 	def compile_failed(self):
 		return self._compile_failed
 
-	def _rng_snapshot(self, args, kwargs):
-		"""Capture default and explicit RNGs relevant to one compiled call."""
-		cuda_devices = set()
-		generators = {}
-
-		def visit(value):
-			if torch.is_tensor(value):
-				if value.device.type == "cuda":
-					cuda_devices.add(
-						value.device.index
-						if value.device.index is not None
-						else torch.cuda.current_device()
-					)
-				return
-			if isinstance(value, torch.Generator):
-				generators[id(value)] = (value, value.get_state())
-				device = torch.device(value.device)
-				if device.type == "cuda":
-					cuda_devices.add(
-						device.index
-						if device.index is not None
-						else torch.cuda.current_device()
-					)
-				return
-			if isinstance(value, dict):
-				for item in value.values():
-					visit(item)
-			elif isinstance(value, (tuple, list)):
-				for item in value:
-					visit(item)
-
-		# Critic calls always carry tensor inputs on the critic device. Discovering
-		# devices from call arguments avoids walking the full parameter/buffer tree
-		# on every compiled invocation while retaining complete RNG rollback.
-		visit(args)
-		visit(kwargs)
-		cuda_states = {
-			device: torch.cuda.get_rng_state(device)
-			for device in cuda_devices
-		}
-		return torch.random.get_rng_state(), cuda_states, generators
-
-	@staticmethod
-	def _restore_rng_snapshot(snapshot):
-		cpu_state, cuda_states, generators = snapshot
-		torch.random.set_rng_state(cpu_state)
-		for device, state in cuda_states.items():
-			torch.cuda.set_rng_state(state, device)
-		for generator, state in generators.values():
-			generator.set_state(state)
-
 	def _disable_compilation(self, exc, *, detached):
 		# Compilation is sticky-disabled for this ensemble, so release both
 		# process-local wrappers immediately.
@@ -179,11 +130,24 @@ class Ensemble(nn.Module):
 			and torch.compiler.is_compiling()
 		):
 			return self._forward_eager(*args, **kwargs)
-		rng_snapshot = (
-			self._rng_snapshot(args, kwargs) if not self._compile_strict else None
-		)
 		compiled = self._compiled_forward
+		rng_snapshot = (
+			_capture_rng_state(
+				args,
+				kwargs,
+				include_host_globals=compiled is None,
+			)
+			if not self._compile_strict
+			else None
+		)
 		if compiled is None:
+			construction_rng_snapshot = (
+				rng_snapshot
+				if rng_snapshot is not None
+				else _capture_rng_state(
+					args, kwargs, include_host_globals=True
+				)
+			)
 			try:
 				compiled = torch.compile(
 					self._forward_eager,
@@ -191,18 +155,21 @@ class Ensemble(nn.Module):
 					dynamic=False,
 				)
 			except Exception as exc:
+				_restore_rng_state(construction_rng_snapshot)
 				if self._compile_strict:
 					raise
-				self._restore_rng_snapshot(rng_snapshot)
 				self._disable_compilation(exc, detached=False)
 				return self._forward_eager(*args, **kwargs)
+			# Lazy wrapper construction is process-local control work and may be
+			# repeated after resume. Only the compiled call may consume RNG.
+			_restore_rng_state(construction_rng_snapshot)
 			object.__setattr__(self, "_compiled_forward", compiled)
 		try:
 			result = compiled(*args, **kwargs)
 		except Exception as exc:
 			if self._compile_strict:
 				raise
-			self._restore_rng_snapshot(rng_snapshot)
+			_restore_rng_state(rng_snapshot)
 			self._disable_compilation(exc, detached=False)
 			return self._forward_eager(*args, **kwargs)
 		return result
@@ -234,11 +201,24 @@ class Ensemble(nn.Module):
 			)
 		):
 			return self._forward_detached_eager(*args, **kwargs)
-		rng_snapshot = (
-			self._rng_snapshot(args, kwargs) if not self._compile_strict else None
-		)
 		compiled = self._compiled_detached_forward
+		rng_snapshot = (
+			_capture_rng_state(
+				args,
+				kwargs,
+				include_host_globals=compiled is None,
+			)
+			if not self._compile_strict
+			else None
+		)
 		if compiled is None:
+			construction_rng_snapshot = (
+				rng_snapshot
+				if rng_snapshot is not None
+				else _capture_rng_state(
+					args, kwargs, include_host_globals=True
+				)
+			)
 			try:
 				compiled = torch.compile(
 					self._forward_detached_eager,
@@ -246,18 +226,19 @@ class Ensemble(nn.Module):
 					dynamic=False,
 				)
 			except Exception as exc:
+				_restore_rng_state(construction_rng_snapshot)
 				if self._compile_strict:
 					raise
-				self._restore_rng_snapshot(rng_snapshot)
 				self._disable_compilation(exc, detached=True)
 				return self._forward_detached_eager(*args, **kwargs)
+			_restore_rng_state(construction_rng_snapshot)
 			object.__setattr__(self, "_compiled_detached_forward", compiled)
 		try:
 			result = compiled(*args, **kwargs)
 		except Exception as exc:
 			if self._compile_strict:
 				raise
-			self._restore_rng_snapshot(rng_snapshot)
+			_restore_rng_state(rng_snapshot)
 			self._disable_compilation(exc, detached=True)
 			return self._forward_detached_eager(*args, **kwargs)
 		return result

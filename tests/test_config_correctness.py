@@ -221,7 +221,11 @@ def test_launchers_reference_only_existing_new_ambi_manifests():
     for name, (manifest, alg_dir) in launcher_targets.items():
         contents = (ROOT / name).read_text()
         assert manifest in contents
-        assert f"--alg-dir {alg_dir}" in contents
+        if name == "run_ambi_oscar.sh":
+            assert f"AMBI_RUN_CONFIG:-{manifest}" in contents
+            assert f"AMBI_ALG_DIR:-{alg_dir}" in contents
+        else:
+            assert f"--alg-dir {alg_dir}" in contents
         assert (ROOT / manifest).is_file()
 
     oscar_launcher = (ROOT / "run_ambi_oscar.sh").read_text()

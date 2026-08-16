@@ -3,6 +3,7 @@
 import copy
 import math
 import warnings
+from collections.abc import Mapping
 
 import numpy as np
 
@@ -1159,6 +1160,46 @@ class AMBITDMPC2(TDMPC2Baseline):
 
     def _reset_wandb_window(self):
         super()._reset_wandb_window()
+        self._wandb_inner_seconds = 0.0
+        self._wandb_inner_actions = 0
+        self._wandb_inner_steps = 0
+
+    def _training_resume_algorithm_state(self):
+        if (
+            self._wandb_inner_seconds != 0.0
+            or self._wandb_inner_actions != 0
+            or self._wandb_inner_steps != 0
+        ):
+            raise RuntimeError("AMBI W&B timing counters were not flushed.")
+        return {
+            "schema": "ambi-wrapper-training-state",
+            "version": 2,
+            "inner_steps_total": int(self._inner_steps_total),
+            "inner_updates_total": int(self._inner_updates_total),
+        }
+
+    def _preflight_training_resume_algorithm_state(self, state):
+        expected = {
+            "schema",
+            "version",
+            "inner_steps_total",
+            "inner_updates_total",
+        }
+        if not isinstance(state, Mapping) or set(state) != expected:
+            raise ValueError("AMBI wrapper training-state fields are invalid.")
+        if state["schema"] != "ambi-wrapper-training-state" or state["version"] != 2:
+            raise ValueError("Unsupported AMBI wrapper training-state version.")
+        normalized = dict(state)
+        for key in ("inner_steps_total", "inner_updates_total"):
+            value = normalized[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"AMBI wrapper {key} must be a non-negative integer.")
+        return normalized
+
+    def _load_training_resume_algorithm_state(self, state):
+        state = self._preflight_training_resume_algorithm_state(state)
+        self._inner_steps_total = state["inner_steps_total"]
+        self._inner_updates_total = state["inner_updates_total"]
         self._wandb_inner_seconds = 0.0
         self._wandb_inner_actions = 0
         self._wandb_inner_steps = 0

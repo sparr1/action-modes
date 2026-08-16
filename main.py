@@ -5,8 +5,16 @@ import math
 import os
 import random
 import shutil
+import time
 from collections.abc import Mapping
 from pathlib import Path
+
+
+# Capture the control-clock origin before importing the heavier scientific
+# stack. Exact-resume drain budgets supplied directly on the CLI are measured
+# from this process-wide origin, not from later session construction.
+_PROCESS_STARTED_MONOTONIC = time.monotonic()
+_MONOTONIC = time.monotonic
 
 import numpy as np
 
@@ -146,6 +154,27 @@ def _json_safe_metadata(value):
     if isinstance(value, (list, tuple)):
         return [_json_safe_metadata(item) for item in value]
     return str(value)
+
+
+def _remaining_resume_drain_seconds(args, *, process_started_monotonic):
+    """Charge Python startup/preflight time against the supplied deadline."""
+
+    requested = args.get("drain_after_seconds")
+    if requested is None:
+        return None
+    process_budget = float(requested)
+    now = float(_MONOTONIC())
+    process_started = float(process_started_monotonic)
+    process_elapsed = now - process_started
+    if not math.isfinite(process_elapsed) or process_elapsed < 0.0:
+        raise ValueError("The process monotonic drain clock moved backwards.")
+    remaining = process_budget - process_elapsed
+    if not math.isfinite(remaining) or remaining <= 0.0:
+        raise ValueError(
+            "The drain deadline expired during Python configuration/environment/"
+            "fingerprint preflight; refusing to open or resume a lineage."
+        )
+    return float(remaining)
 
 
 def _resolved_runtime_metadata(model, *, trial_run_params):
@@ -311,6 +340,207 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
     return _json_safe_metadata(metadata)
 
 
+def _run_resumable_experiment(
+    *,
+    args,
+    experiment_params,
+    runtime_params,
+    checkpoint_configs,
+    log_setting,
+    log_info_setting,
+    log_type_setting,
+    save_trials_setting,
+):
+    """Run the single opt-in exact-resume cell without entering legacy paths."""
+
+    from utils.resume_identity import (
+        lineage_identity,
+        validate_resume_selection,
+    )
+    from utils.resume_runtime import environment_contract
+    from utils.resume_training import TrainingResumeSession
+
+    if len(runtime_params) != 1 or experiment_params.get("trials") != 1:
+        raise ValueError(
+            "Training resume requires a manifest with exactly one algorithm and one trial."
+        )
+    if args["alg_index"] != 0 or args["trial_index"] != 0:
+        raise ValueError(
+            "Training resume does not accept nonzero algorithm/trial start indices."
+        )
+    run_params = copy.deepcopy(runtime_params[0])
+    requested_wandb_mode = args.get("resume_wandb_mode")
+    if requested_wandb_mode is not None:
+        alg_params = run_params.get("alg_params")
+        if not isinstance(alg_params, dict):
+            raise ValueError(
+                "--resume-wandb-mode requires an algorithm configuration with "
+                "an alg_params object."
+            )
+        configured_wandb_mode = alg_params.get("wandb_mode")
+        if configured_wandb_mode not in (None, requested_wandb_mode):
+            raise ValueError(
+                "--resume-wandb-mode conflicts with alg_params.wandb_mode: "
+                f"{configured_wandb_mode!r}."
+            )
+        # This explicit, resume-only launcher selection is applied before the
+        # immutable scientific identity and resolved learner contract are built.
+        # Legacy Hydra invocations do not pass this option and retain their
+        # historical W&B configuration behavior.
+        alg_params["wandb_mode"] = requested_wandb_mode
+    resume_alg_params = run_params.get("alg_params")
+    if (
+        not isinstance(resume_alg_params, Mapping)
+        or resume_alg_params.get("wandb") is not True
+        or resume_alg_params.get("wandb_mode") != "online"
+    ):
+        raise ValueError(
+            "Exact resume requires alg_params.wandb=true and "
+            "alg_params.wandb_mode='online'."
+        )
+    trial_seed = int(run_params.get("seed", 0))
+    run_params["seed"] = trial_seed
+    observation_mode = (run_params.get("alg_params") or {}).get("obs", "state")
+    validate_resume_selection(
+        algorithm=run_params["alg"],
+        observation_mode=observation_mode,
+        num_runs=args["num_runs"],
+        save_trials=save_trials_setting,
+        checkpoint_minutes=args["resume_checkpoint_minutes"],
+        drain_after_seconds=args["drain_after_seconds"],
+    )
+    if log_setting not in {"none", "timestamp", "warn", "overwrite", "overwrite-safe"}:
+        raise ValueError("Unsupported segmented logging policy.")
+    raw_steps = float(run_params["total_steps"])
+    total_steps = int(raw_steps)
+    if not math.isfinite(raw_steps) or raw_steps != total_steps or total_steps < 0:
+        raise ValueError("Resumable total_steps must be a non-negative integer.")
+
+    domain = None
+    session = None
+    model = None
+    training_logger = None
+    primary_error = None
+    cleanup_errors = []
+    try:
+        seed_everything(trial_seed)
+        domain = build_env(run_params, experiment_params)
+        seed_env_spaces(domain, trial_seed)
+        run_params["resume_environment"] = environment_contract(domain)
+        episode_steps = int(run_params["resume_environment"]["episode_steps"])
+        if total_steps % episode_steps:
+            raise ValueError(
+                "Resumable total_steps must end at an episode boundary: "
+                f"{total_steps} is not divisible by {episode_steps}."
+            )
+        identity = lineage_identity(
+            trial_run_params=run_params,
+            experiment_params=experiment_params,
+            repo_root=Path(__file__).resolve().parent,
+        )
+        drain_after_seconds = _remaining_resume_drain_seconds(
+            args,
+            process_started_monotonic=_PROCESS_STARTED_MONOTONIC,
+        )
+        # Acquiring the process-lifetime lease precedes model and W&B
+        # construction, so a competing segment cannot allocate or log first.
+        session = TrainingResumeSession.open(
+            args["lineage_dir"],
+            mode=args["resume_mode"],
+            scientific_identity=identity,
+            total_steps=total_steps,
+            checkpoint_minutes=args["resume_checkpoint_minutes"],
+            drain_after_seconds=drain_after_seconds,
+            resume_generation=args["resume_generation"],
+        )
+
+        model_run_params = copy.deepcopy(run_params)
+        model, _baseline, alg_name = initialize_alg(
+            model_run_params["alg"],
+            model_run_params["alg_params"],
+            domain,
+            full_run_params=model_run_params,
+            experiment_params=experiment_params,
+        )
+        print(alg_name, "initialized in exact-resume mode.")
+        model_run_params["resolved_runtime"] = _resolved_runtime_metadata(
+            model, trial_run_params=model_run_params
+        )
+        model.enable_training_resume(total_timesteps=total_steps)
+
+        checkpoint_config = checkpoint_configs[0]
+        if checkpoint_config.enabled:
+            if not supports_composable_checkpointing(model):
+                raise ValueError(
+                    f"Algorithm {model_run_params['alg']!r} lacks composable model snapshots."
+                )
+            snapshot_dir = session.segment_dir / "model_snapshots"
+            snapshot_dir.mkdir()
+            model.set_checkpointing(
+                save_freq=checkpoint_config.every,
+                save_path=str(snapshot_dir),
+                name_prefix=f"model:{model_run_params['name']}_0",
+                save_strat=checkpoint_config.strategies,
+                checkpoint_best_window=checkpoint_config.best_window,
+                trial_run_params=model_run_params,
+                experiment_params=experiment_params,
+            )
+
+        if log_setting != "none":
+            is_ambi = "AMBI" in model_run_params["alg"].upper() or (
+                hasattr(model, "agent")
+                and hasattr(model.agent, "last_inner_rollout_lengths")
+            )
+            logger_class = AMBITrainingLogger if is_ambi else TrainingLogger
+            training_logger = logger_class(
+                log_info=log_info_setting, log_type=log_type_setting
+            )
+            training_logger.reset()
+            training_logger.set_log_dir(str(session.segment_log_dir))
+            model.set_logger(training_logger)
+        with (session.segment_dir / "resolved_run.json").open("x") as stream:
+            json.dump(_json_safe_metadata(model_run_params), stream, indent=2)
+
+        return model.learn(
+            total_timesteps=total_steps,
+            resume_session=session,
+        )
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        if training_logger is not None:
+            try:
+                training_logger.close()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if model is not None:
+            writer = getattr(model, "_checkpoint_writer", None)
+            if writer is not None:
+                try:
+                    writer.shutdown()
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+        if domain is not None:
+            try:
+                domain.close()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if session is not None:
+            try:
+                session.close()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if cleanup_errors:
+            if primary_error is not None:
+                add_note = getattr(primary_error, "add_note", None)
+                if callable(add_note):
+                    for cleanup_error in cleanup_errors:
+                        add_note(f"Additional cleanup failure: {cleanup_error}")
+            else:
+                raise cleanup_errors[0]
+
+
 def main():
     parser = argparse.ArgumentParser(description="action mode learning experiments")
     parser.add_argument('-r', '--run', help='config file for a run', required=True,)
@@ -319,6 +549,16 @@ def main():
     parser.add_argument('--num-runs', help='number of consecutive trials to run', default = -1, type = int)
     parser.add_argument('--alg-index', help='which algorithm to start running first',default = 0, type=int)
     parser.add_argument('--trial-index', help='which trial index to start from', default = 0, type = int)
+    parser.add_argument('--lineage-dir', help='durable exact-resume lineage directory')
+    parser.add_argument('--resume-mode', choices=('new', 'required'))
+    parser.add_argument('--resume-generation', help='explicit committed rollback generation')
+    parser.add_argument('--resume-checkpoint-minutes', default=60.0, type=float)
+    parser.add_argument('--drain-after-seconds', type=float)
+    parser.add_argument(
+        '--resume-wandb-mode',
+        choices=('online',),
+        help='explicit W&B mode for exact resume (Oscar requires online)',
+    )
     args = vars(parser.parse_args())
     print(args)
     config, alg_dir, log_dir, num_runs, alg_ind, trial_ind = args['run'], args['alg_dir'], args['log_dir'], args['num_runs'], args['alg_index'], args['trial_index']
@@ -392,6 +632,29 @@ def main():
         for run_params in runtime_params
     ]
     checkpointing_requested = any(config.enabled for config in checkpoint_configs)
+
+    resume_requested = args["resume_mode"] is not None or args["lineage_dir"] is not None
+    if resume_requested:
+        if args["resume_mode"] is None or args["lineage_dir"] is None:
+            raise ValueError(
+                "--resume-mode and --lineage-dir are required together."
+            )
+        return _run_resumable_experiment(
+            args=args,
+            experiment_params=experiment_params,
+            runtime_params=runtime_params,
+            checkpoint_configs=checkpoint_configs,
+            log_setting=log_setting,
+            log_info_setting=log_info_setting,
+            log_type_setting=log_type_setting,
+            save_trials_setting=save_trials_setting,
+        )
+    if args["resume_generation"] is not None:
+        raise ValueError("--resume-generation requires exact resume mode.")
+    if args["drain_after_seconds"] is not None:
+        raise ValueError("--drain-after-seconds requires exact resume mode.")
+    if args["resume_wandb_mode"] is not None:
+        raise ValueError("--resume-wandb-mode requires exact resume mode.")
 
     # seed = experiment_params["seed"]
 
@@ -582,4 +845,4 @@ def main():
             # print("num_timesteps", callback.num_timesteps)
 
 if __name__ == '__main__':
-   main()
+   raise SystemExit(main() or 0)

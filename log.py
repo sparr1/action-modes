@@ -17,6 +17,26 @@ _STEP_FIELDS = [
 ]
 
 
+def _fsync_regular_file(path):
+    """Make one already-written log file durable without changing its contents."""
+
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path):
+    """Persist directory entries created by the segment log writers."""
+
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _as_list(value):
     if value is None:
         return []
@@ -163,9 +183,11 @@ class _BufferedStepWriter:
     def writerow(self, row):
         self._writer.writerow(row)
 
-    def flush(self):
+    def flush(self, *, durable=False):
         if not self._stream.closed:
             self._stream.flush()
+            if durable:
+                _fsync_regular_file(self.path)
 
     def close(self):
         if not self._stream.closed:
@@ -192,6 +214,8 @@ class _BackgroundJSONWriter:
         self._queue = queue.Queue(maxsize=max_pending)
         self._error = None
         self._closed = False
+        self._dirty_paths = set()
+        self._dirty_paths_lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._run,
             name="ambi-trajectory-writer",
@@ -210,6 +234,8 @@ class _BackgroundJSONWriter:
                     try:
                         with open(path, "w") as stream:
                             json.dump(payload, stream)
+                        with self._dirty_paths_lock:
+                            self._dirty_paths.add(os.path.abspath(path))
                     except BaseException as exc:  # surfaced on flush/close
                         self._error = exc
             finally:
@@ -226,9 +252,19 @@ class _BackgroundJSONWriter:
         self._queue.put((path, payload))
         self._raise_error()
 
-    def flush(self):
+    def flush(self, *, durable=False):
         self._queue.join()
         self._raise_error()
+        if not durable:
+            return
+        with self._dirty_paths_lock:
+            dirty_paths = tuple(sorted(self._dirty_paths))
+        for path in dirty_paths:
+            _fsync_regular_file(path)
+        for directory in sorted({os.path.dirname(path) for path in dirty_paths}):
+            _fsync_directory(directory)
+        with self._dirty_paths_lock:
+            self._dirty_paths.difference_update(dirty_paths)
 
     def close(self):
         if self._closed:
@@ -299,6 +335,67 @@ class _BaseTrainingLogger:
             "healthy_bonus": 0.0,
             "control cost": 0.0,
             "contact cost": 0.0,
+        }
+
+    def resume_state_dict(self):
+        """Return dynamic counters; the lineage fingerprint owns logger config."""
+        if self.episode_step_count != 0 or self.episode_num_steps != 0:
+            raise ValueError(
+                "Training logger resume state can only be captured between episodes."
+            )
+        return {
+            "schema_version": 2,
+            "step_count": int(self.step_count),
+            "episode_count": int(self.episode_count),
+            "total_reward": float(self.total_reward),
+            "inner_step_count": float(self.inner_step_count),
+        }
+
+    def load_resume_state_dict(self, state):
+        """Restore absolute counters into a fresh, empty segment logger."""
+        normalized = self.validate_resume_state_dict(state)
+        if self.step_count or self.episode_count or self.episode_step_count:
+            raise ValueError("Training logger must be fresh before resume state is loaded.")
+        self.step_count = normalized["step_count"]
+        self.episode_count = normalized["episode_count"]
+        self.total_reward = normalized["total_reward"]
+        self.inner_step_count = normalized["inner_step_count"]
+
+    def validate_resume_state_dict(self, state):
+        """Return normalized between-episode counters without mutating the logger."""
+        fields = {
+            "schema_version",
+            "step_count",
+            "episode_count",
+            "total_reward",
+            "inner_step_count",
+        }
+        if (
+            not isinstance(state, dict)
+            or set(state) != fields
+            or state.get("schema_version") != 2
+        ):
+            raise ValueError("Unsupported training logger resume schema.")
+        for key in ("step_count", "episode_count"):
+            value = state.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"Training logger {key} is invalid.")
+        try:
+            total_reward = float(state["total_reward"])
+            inner_step_count = float(state["inner_step_count"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "Training logger cumulative values must be numeric."
+            ) from exc
+        if not np.isfinite(total_reward) or not np.isfinite(inner_step_count):
+            raise ValueError("Training logger cumulative values must be finite.")
+        if inner_step_count < 0:
+            raise ValueError("Training logger inner_step_count must be non-negative.")
+        return {
+            "step_count": int(state["step_count"]),
+            "episode_count": int(state["episode_count"]),
+            "total_reward": total_reward,
+            "inner_step_count": inner_step_count,
         }
 
     def set_log_dir(self, log_dir):
@@ -454,6 +551,20 @@ class _BaseTrainingLogger:
             self._step_writer.flush()
         if self._trajectory_writer is not None:
             self._trajectory_writer.flush()
+
+    def flush_durable(self):
+        """Flush and fsync every segment-local training-log prefix."""
+
+        if self._step_writer is not None:
+            self._step_writer.flush(durable=True)
+        if self._trajectory_writer is not None:
+            self._trajectory_writer.flush(durable=True)
+        if hasattr(self, "summary_file") and os.path.exists(self.summary_file):
+            _fsync_regular_file(self.summary_file)
+        if hasattr(self, "train_episodes_dir"):
+            _fsync_directory(self.train_episodes_dir)
+        if hasattr(self, "log_dir"):
+            _fsync_directory(self.log_dir)
 
     def close(self):
         if self._closed:

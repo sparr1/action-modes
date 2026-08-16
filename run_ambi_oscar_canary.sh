@@ -1,0 +1,113 @@
+#!/bin/bash
+#SBATCH --job-name=ambi_resume_canary
+#SBATCH --output=logs/ambi_resume_canary_%j.out
+#SBATCH --error=logs/ambi_resume_canary_%j.err
+#SBATCH --time=01:00:00
+#SBATCH --mem=32G
+#SBATCH --partition=gpu-debug
+#SBATCH --gres=gpu:1
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=6
+
+set -Eeuo pipefail
+umask 077
+
+fail() {
+	echo "Oscar resume canary error: $*" >&2
+	exit 2
+}
+
+[[ "${AMBI_RUN_OSCAR_RESUME_CANARY:-0}" == 1 ]] || fail \
+	"set AMBI_RUN_OSCAR_RESUME_CANARY=1 to authorize the live gpu-debug canary"
+: "${AMBI_DURABLE_ROOT:?Set AMBI_DURABLE_ROOT to an operator-approved durable allocation directory.}"
+: "${AMBI_LINEAGE_DIR:?Set AMBI_LINEAGE_DIR to a new lineage below AMBI_DURABLE_ROOT.}"
+: "${SLURM_JOB_ID:?This launcher must run as a Slurm batch job.}"
+[[ "${SLURM_RESTART_COUNT:-0}" == 0 ]] || fail "canary requires a fresh allocation"
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+project_dir="$(cd -- "${SLURM_SUBMIT_DIR:-$PWD}" && pwd -P)"
+[[ "$project_dir" == "$script_dir" ]] || fail "submit from repository root $script_dir"
+cd "$project_dir"
+git_root="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "not a Git checkout"
+git_root="$(cd -- "$git_root" && pwd -P)"
+[[ "$git_root" == "$project_dir" ]] || fail "submit directory is not the Git root"
+[[ -z "$(git status --porcelain --untracked-files=all)" ]] || fail \
+	"the live canary requires a clean checkout"
+
+drain_seconds="${AMBI_CANARY_DRAIN_AFTER_SECONDS:-300}"
+checkpoint_minutes="${AMBI_RESUME_CHECKPOINT_MINUTES:-60}"
+[[ "$drain_seconds" =~ ^[1-9][0-9]*$ ]] || fail "canary drain must be positive"
+(( drain_seconds <= 900 )) || fail "canary drain must not exceed 900 seconds"
+[[ "$checkpoint_minutes" =~ ^[1-9][0-9]*$ ]] || fail \
+	"checkpoint cadence must be positive"
+
+mkdir -p logs
+module load miniforge3/25.3.0-3
+: "${MAMBA_ROOT_PREFIX:?The miniforge module did not set MAMBA_ROOT_PREFIX.}"
+source "${MAMBA_ROOT_PREFIX}/etc/profile.d/conda.sh"
+conda activate ambi
+ambi_python="${AMBI_PYTHON:-python}"
+
+quota_output="$(checkquota)" || fail "checkquota failed"
+printf '%s\n' "$quota_output" | "$ambi_python" -m utils.oscar_resume_launcher quota \
+	--allocation "${AMBI_DURABLE_QUOTA_LABEL:-data+rbalestr}"
+"$ambi_python" -m utils.oscar_resume_launcher storage \
+	--durable-root "$AMBI_DURABLE_ROOT" \
+	--lineage-dir "$AMBI_LINEAGE_DIR" \
+	--print-metrics
+[[ ! -e "$AMBI_LINEAGE_DIR" ]] || fail "AMBI_LINEAGE_DIR must not exist"
+
+console_root="$AMBI_DURABLE_ROOT/resume-canary/$SLURM_JOB_ID"
+mkdir -p "$(dirname -- "$console_root")"
+mkdir "$console_root" || fail "canary output directory already exists"
+
+run_segment() {
+	local index="$1"
+	local mode="$2"
+	local segment_id="${SLURM_JOB_ID}.canary.${index}"
+	local console_dir="$console_root/segment-$index"
+	local status
+	mkdir "$console_dir"
+	export AMBI_SEGMENT_ID="$segment_id"
+	export AMBI_SEGMENT_CONSOLE_DIR="$console_dir"
+	set +e
+	srun --unbuffered --kill-on-bad-exit=1 \
+		--output="$console_dir/stdout.log" \
+		--error="$console_dir/stderr.log" \
+		"$ambi_python" main.py \
+		--run configs/ambi/experiments/ambi_anchor.json \
+		--alg-dir configs/ambi/algs \
+		--num-runs 1 \
+		--lineage-dir "$AMBI_LINEAGE_DIR" \
+		--resume-mode "$mode" \
+		--resume-wandb-mode online \
+		--resume-checkpoint-minutes "$checkpoint_minutes" \
+		--drain-after-seconds "$drain_seconds"
+	status=$?
+	set -e
+	[[ "$status" == 75 ]] || fail \
+		"segment $segment_id returned $status instead of clean handoff 75"
+	"$ambi_python" -m utils.oscar_resume_launcher handoff \
+		--lineage-dir "$AMBI_LINEAGE_DIR" \
+		--slurm-job-id "$SLURM_JOB_ID" \
+		--segment-id "$segment_id"
+}
+
+run_segment 0 new
+run_segment 1 required
+
+benchmark_dir="$console_root/replay-benchmark"
+mkdir "$benchmark_dir"
+srun --unbuffered --kill-on-bad-exit=1 \
+	--output="$benchmark_dir/stdout.log" \
+	--error="$benchmark_dir/stderr.log" \
+	"$ambi_python" -m utils.oscar_resume_canary \
+	--run configs/ambi/experiments/ambi_anchor.json \
+	--algorithm configs/ambi/algs/ambi_anchor.json \
+	--output "$console_root/REPLAY_BENCHMARK.json" \
+	--durable-root "$AMBI_DURABLE_ROOT" \
+	--shard-rows 100000 \
+	--maximum-estimated-bytes 4000000000
+
+echo "Two-segment resume smoke passed. Replay measurements: $console_root/REPLAY_BENCHMARK.json"

@@ -32,6 +32,7 @@ class _FakePhysics:
 class _FakeRawEnv:
     def __init__(self, seed):
         self.seed = seed
+        self.task = SimpleNamespace(random=np.random.RandomState(seed))
         self.step_count = 0
         self.actions = []
         self.close_calls = 0
@@ -88,7 +89,12 @@ class _FakeRawEnv:
 
 class _FakeSuite:
     ALL_TASKS = (
+        ("finger", "spin"),
         ("walker", "walk"),
+        ("cheetah", "run"),
+        ("cartpole", "swingup"),
+        ("humanoid", "walk"),
+        ("reacher", "easy"),
         ("quadruped", "walk"),
         ("ball_in_cup", "catch"),
         ("point_mass", "easy"),
@@ -257,6 +263,37 @@ def test_rgb_observation_has_exact_upstream_frame_stack(fake_dmcontrol):
         ]
     finally:
         env.close()
+
+
+@pytest.mark.parametrize(
+    "task",
+    (
+        "finger-spin",
+        "walker-walk",
+        "cheetah-run",
+        "cartpole-swingup",
+        "humanoid-walk",
+        "reacher-easy",
+        "cup-catch",
+    ),
+)
+def test_state_task_rng_resume_reproduces_the_next_reset_stream(fake_dmcontrol, task):
+    module, _, _ = fake_dmcontrol
+    source = module.DMControlEnv(task=task)
+    restored = module.DMControlEnv(task=task)
+    try:
+        source.reset(seed=37)
+        restored.reset(seed=37)
+        source._env.task.random.uniform(size=11)
+        state = source.training_resume_state()
+        expected = source._env.task.random.uniform(size=11)
+
+        restored.load_training_resume_state(state)
+        actual = restored._env.task.random.uniform(size=11)
+        np.testing.assert_array_equal(actual, expected)
+    finally:
+        source.close()
+        restored.close()
 
 
 def test_policy_pixels_are_independent_of_public_render_mode(fake_dmcontrol):

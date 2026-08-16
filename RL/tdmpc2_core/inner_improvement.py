@@ -5,7 +5,7 @@ optimizers, target critics, and entropy coefficient are never mutated here.
 """
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 import time
 
 import torch
@@ -24,6 +24,13 @@ from .common.inner_utils import (
 )
 from .common.latent_buffer import LatentReplayBuffer
 from .common.lora import lorafy_copy, lorafy_shared, trainable_parameters
+from .common.training_state import (
+    preflight_adam_state,
+    preflight_module_state,
+    require_exact_keys,
+    require_mapping,
+    require_tensor,
+)
 
 
 @torch.no_grad()
@@ -62,6 +69,7 @@ class InnerWorkspace:
     actor_steps: int = 0
     actor_lifetime_steps: int = 0
     temperature_steps: int = 0
+    temperature_lifetime_steps: int = 0
     target_steps: int = 0
     critic_target_steps: int = 0
     actor_target_steps: int = 0
@@ -249,6 +257,603 @@ class InnerImprovementEngine:
         if str(self.cfg.inner_mppi_warm_start_scope) != "run":
             self._mppi_prev_mean = None
 
+    def prepare_training_resume_boundary(self):
+        """Canonicalize an episode boundary for exact process continuation.
+
+        Ordinary episode resets retain action-scoped allocations as an
+        unobservable performance cache. A restarted process cannot retain that
+        cache, however, and constructing a replacement can consume private
+        initialization RNG. Resume capture therefore drops it in the source
+        process as well and clears every action-local diagnostic/counter field
+        before serializing.
+        """
+        if self._pending_timers:
+            raise RuntimeError(
+                "AMBI inner timing must be finalized before preparing a resume boundary."
+            )
+        self.reset_episode()
+        self._action_pool = InnerWorkspace()
+        self._clear_action_transients()
+        self._require_resume_boundary()
+        return self
+
+    _PERSISTENT_COUNTER_FIELDS = (
+        "outer_version",
+        "critic_lifetime_steps",
+        "actor_lifetime_steps",
+        "temperature_lifetime_steps",
+    )
+
+    _ACTION_TRANSIENT_COUNTER_FIELDS = (
+        "critic_steps",
+        "actor_steps",
+        "temperature_steps",
+        "target_steps",
+        "critic_target_steps",
+        "actor_target_steps",
+        "replay_draws",
+        "policy_evaluations",
+        "q_evaluations",
+    )
+
+    @staticmethod
+    def _nondefault_workspace_fields(workspace):
+        """Return populated fields without comparing tensors or modules."""
+        empty = InnerWorkspace()
+        populated = []
+        for descriptor in dataclass_fields(InnerWorkspace):
+            value = getattr(workspace, descriptor.name)
+            default = getattr(empty, descriptor.name)
+            if default is None:
+                nondefault = value is not None
+            elif isinstance(default, list):
+                nondefault = bool(value)
+            else:
+                nondefault = value != default
+            if nondefault:
+                populated.append(descriptor.name)
+        return populated
+
+    def _clear_action_transients(self):
+        for name in self._ACTION_TRANSIENT_COUNTER_FIELDS:
+            setattr(self.state, name, 0)
+        self.state.sampled_ids.clear()
+        self._collect_diagnostics = True
+
+    def _active_rl_workspace(self):
+        return (
+            str(self.cfg.inner_operator) in {"sac", "td3"}
+            and int(self.cfg.inner_rounds) > 0
+        )
+
+    def _expected_persistent_workspace_fields(self, *, initialized):
+        """Return the exact run-scoped component inventory after a boundary."""
+        fields = {
+            name: False
+            for name in (
+                "actor",
+                "actor_anchor",
+                "actor_target",
+                "critic",
+                "critic_anchor",
+                "critic_target",
+                "actor_optim",
+                "critic_optim",
+                "log_alpha",
+                "alpha_fixed",
+                "temperature_optim",
+                "replay",
+            )
+        }
+        if not initialized:
+            return fields
+
+        cfg = self.cfg
+        actor_run = str(cfg.inner_actor_scope) == "run"
+        critic_run = str(cfg.inner_critic_scope) == "run"
+        temperature_run = str(cfg.inner_temperature_scope) == "run"
+        if actor_run:
+            fields["actor"] = True
+            shared_lora = (
+                str(cfg.inner_actor_adaptation) == "lora"
+                and bool(cfg.inner_rebase_persistent)
+            )
+            needs_anchor = (
+                float(cfg.inner_outer_policy_kl_coef) > 0.0
+                or float(cfg.inner_outer_action_l2_coef) > 0.0
+            )
+            fields["actor_anchor"] = not shared_lora or needs_anchor
+            fields["actor_target"] = str(cfg.inner_operator) == "td3"
+        if critic_run:
+            fields["critic"] = True
+            fields["critic_anchor"] = not (
+                str(cfg.inner_critic_adaptation) == "lora"
+                and bool(cfg.inner_rebase_persistent)
+            )
+            fields["critic_target"] = (
+                str(cfg.inner_bootstrap_source) == "inner_target"
+            )
+        fields["actor_optim"] = (
+            actor_run
+            and str(cfg.inner_actor_optimizer_scope) == "run"
+            and str(cfg.inner_actor_adaptation) != "frozen"
+            and self._component_has_updates("actor")
+        )
+        fields["critic_optim"] = (
+            critic_run
+            and str(cfg.inner_critic_optimizer_scope) == "run"
+            and str(cfg.inner_critic_adaptation) != "frozen"
+            and self._component_has_updates("critic")
+        )
+        if temperature_run:
+            if str(cfg.inner_temperature_mode) == "auto":
+                fields["log_alpha"] = True
+            else:
+                fields["alpha_fixed"] = True
+        fields["temperature_optim"] = (
+            temperature_run
+            and str(cfg.inner_temperature_optimizer_scope) == "run"
+            and self._component_has_updates("temperature")
+        )
+        fields["replay"] = str(cfg.inner_replay_scope) == "run"
+        return fields
+
+    def _inventory_mismatch(self, workspace, *, initialized, serialized=False):
+        expected = self._expected_persistent_workspace_fields(
+            initialized=initialized
+        )
+        return {
+            name: {"expected": present, "actual": actual}
+            for name, present in expected.items()
+            if (actual := (
+                workspace[name] is not None
+                if serialized
+                else getattr(workspace, name) is not None
+            ))
+            is not present
+        }
+
+    @staticmethod
+    def _module_training_state(module, *, outer=None):
+        if module is None:
+            return None
+        if outer is not None and module is outer:
+            return {"kind": "outer-reference"}
+        return {
+            "kind": "module",
+            "state": module.state_dict(),
+            "training": bool(module.training),
+        }
+
+    def _require_resume_boundary(self):
+        """Reject snapshots that would silently discard transient inner state."""
+        if self._pending_timers:
+            raise RuntimeError(
+                "AMBI inner timing must be finalized before capturing training state."
+            )
+        pooled = self._nondefault_workspace_fields(self._action_pool)
+        if pooled:
+            raise RuntimeError(
+                "AMBI action allocation state must be cleared at the exact resume "
+                f"boundary; pooled fields are still live: {sorted(pooled)}."
+            )
+        live_action_counters = {
+            name: int(getattr(self.state, name))
+            for name in self._ACTION_TRANSIENT_COUNTER_FIELDS
+            if int(getattr(self.state, name)) != 0
+        }
+        if live_action_counters or self.state.sampled_ids:
+            raise RuntimeError(
+                "AMBI action-local counters and sampled IDs must be cleared at "
+                "the exact resume boundary."
+            )
+        if self._collect_diagnostics is not True:
+            raise RuntimeError(
+                "AMBI action-local diagnostic mode must be reset at the exact "
+                "resume boundary."
+            )
+        initialized_rl = self._active_rl_workspace() and self.action_index > 0
+        if initialized_rl:
+            if self.state.outer_version < 0:
+                raise RuntimeError(
+                    "Initialized AMBI inner state lacks an outer-version anchor."
+                )
+        elif self.state.outer_version != -1:
+            raise RuntimeError(
+                "Uninitialized AMBI inner state has an unexpected outer version."
+            )
+        mismatched = self._inventory_mismatch(
+            self.state, initialized=initialized_rl
+        )
+        if mismatched:
+            raise RuntimeError(
+                "AMBI training state requires a canonical episode boundary; "
+                "persistent workspace inventory is incomplete or unexpected: "
+                f"{mismatched}."
+            )
+        expected_mppi = (
+            str(self.cfg.inner_operator) == "mppi"
+            and self.action_index > 0
+            and str(self.cfg.inner_mppi_warm_start_scope) == "run"
+        )
+        if (self._mppi_prev_mean is not None) is not expected_mppi:
+            raise RuntimeError(
+                "AMBI MPPI warm-start inventory does not match its configured "
+                "lifetime and action history."
+            )
+
+    def training_state_dict(self):
+        """Return persistent inner scientific state at an episode boundary."""
+        self._require_resume_boundary()
+        state = self.state
+        return {
+            "schema": "ambi-inner-engine-training-state",
+            "version": 1,
+            "action_index": int(self.action_index),
+            "episode_index": int(self.episode_index),
+            "rng": self.rng.training_state_dict(),
+            "workspace": {
+                "actor": self._module_training_state(state.actor),
+                "actor_anchor": self._module_training_state(
+                    state.actor_anchor, outer=self.model._pi
+                ),
+                "actor_target": self._module_training_state(state.actor_target),
+                "critic": self._module_training_state(state.critic),
+                "critic_anchor": self._module_training_state(
+                    state.critic_anchor, outer=self.model._Qs
+                ),
+                "critic_target": self._module_training_state(state.critic_target),
+                "actor_optim": (
+                    None if state.actor_optim is None else state.actor_optim.state_dict()
+                ),
+                "critic_optim": (
+                    None if state.critic_optim is None else state.critic_optim.state_dict()
+                ),
+                "log_alpha": (
+                    None if state.log_alpha is None else state.log_alpha.detach()
+                ),
+                "alpha_fixed": (
+                    None if state.alpha_fixed is None else state.alpha_fixed.detach()
+                ),
+                "temperature_optim": (
+                    None
+                    if state.temperature_optim is None
+                    else state.temperature_optim.state_dict()
+                ),
+                "replay": (
+                    None if state.replay is None else state.replay.training_state_dict()
+                ),
+                "counters": {
+                    field: int(getattr(state, field))
+                    for field in self._PERSISTENT_COUNTER_FIELDS
+                },
+            },
+            "mppi_prev_mean": self._mppi_prev_mean,
+        }
+
+    def _load_module_candidate(
+        self,
+        payload,
+        *,
+        name,
+        factory,
+        outer_reference=None,
+    ):
+        if payload is None:
+            return None
+        payload = require_mapping(payload, name)
+        kind = payload.get("kind")
+        if kind == "outer-reference":
+            require_exact_keys(payload, {"kind"}, name)
+            if outer_reference is None:
+                raise ValueError(f"{name} cannot reference an outer module.")
+            return outer_reference
+        if kind != "module":
+            raise ValueError(f"{name} has unknown module payload kind {kind!r}.")
+        payload = require_exact_keys(
+            payload, {"kind", "state", "training"}, name
+        )
+        if not isinstance(payload["training"], bool):
+            raise TypeError(f"{name}.training must be bool.")
+        module = factory()
+        preflight_module_state(module, payload["state"], name)
+        try:
+            module.load_state_dict(payload["state"], strict=True)
+        except (KeyError, TypeError, RuntimeError, ValueError) as exc:
+            raise ValueError(f"{name} is incompatible: {exc}") from exc
+        module.train(payload["training"])
+        return module
+
+    @staticmethod
+    def _load_optimizer_candidate(optimizer, payload, name, *, expected_steps):
+        if optimizer is None:
+            raise ValueError(f"{name} has no trainable parameters.")
+        preflight_adam_state(
+            optimizer, payload, name, expected_steps=expected_steps
+        )
+        try:
+            optimizer.load_state_dict(payload)
+        except (KeyError, TypeError, RuntimeError, ValueError) as exc:
+            raise ValueError(f"{name} is incompatible: {exc}") from exc
+        return optimizer
+
+    @staticmethod
+    def _validate_index(value, name):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer.")
+        return int(value)
+
+    def _preflight_training_state_dict(self, state):
+        state = require_exact_keys(
+            state,
+            {
+                "schema",
+                "version",
+                "action_index",
+                "episode_index",
+                "rng",
+                "workspace",
+                "mppi_prev_mean",
+            },
+            "AMBI inner-engine training state",
+        )
+        if (
+            state["schema"] != "ambi-inner-engine-training-state"
+            or state["version"] != 1
+        ):
+            raise ValueError("Unsupported AMBI inner-engine training-state version.")
+        action_index = self._validate_index(state["action_index"], "action_index")
+        episode_index = self._validate_index(state["episode_index"], "episode_index")
+        workspace = require_exact_keys(
+            state["workspace"],
+            {
+                "actor",
+                "actor_anchor",
+                "actor_target",
+                "critic",
+                "critic_anchor",
+                "critic_target",
+                "actor_optim",
+                "critic_optim",
+                "log_alpha",
+                "alpha_fixed",
+                "temperature_optim",
+                "replay",
+                "counters",
+            },
+            "AMBI inner workspace training state",
+        )
+        counters = require_exact_keys(
+            workspace["counters"],
+            self._PERSISTENT_COUNTER_FIELDS,
+            "inner workspace counters",
+        )
+        normalized_counters = {}
+        for field in self._PERSISTENT_COUNTER_FIELDS:
+            value = counters[field]
+            if field == "outer_version":
+                if isinstance(value, bool) or not isinstance(value, int) or value < -1:
+                    raise ValueError("outer_version must be an integer greater than -2.")
+                normalized_counters[field] = int(value)
+            else:
+                normalized_counters[field] = self._validate_index(value, field)
+        initialized_rl = self._active_rl_workspace() and action_index > 0
+        outer_version = normalized_counters["outer_version"]
+        if initialized_rl:
+            if outer_version < 0:
+                raise ValueError(
+                    "Initialized AMBI inner checkpoint lacks an outer-version anchor."
+                )
+        elif outer_version != -1:
+            raise ValueError(
+                "Uninitialized AMBI inner checkpoint has an unexpected outer version."
+            )
+
+        mismatched_inventory = self._inventory_mismatch(
+            workspace, initialized=initialized_rl, serialized=True
+        )
+        if mismatched_inventory:
+            raise ValueError(
+                "AMBI checkpoint persistent workspace inventory is incomplete or "
+                f"unexpected: {mismatched_inventory}."
+            )
+        # Build the complete destination off to the side. Failures below do
+        # not mutate the current engine or its RNG streams.
+        probe_rng = InnerRNG(self.cfg.seed, self.device)
+        with probe_rng.action_fork():
+            with probe_rng.fork("initialization"):
+                candidate = InnerWorkspace()
+                module_specs = (
+                    (
+                        "actor",
+                        lambda: self._adapt_module(self.model._pi, "actor"),
+                        None,
+                    ),
+                    (
+                        "critic",
+                        lambda: self._adapt_module(self.model._Qs, "critic"),
+                        None,
+                    ),
+                    (
+                        "actor_anchor",
+                        lambda: deepcopy(self.model._pi)
+                        .to(self.device)
+                        .requires_grad_(False),
+                        self.model._pi,
+                    ),
+                    (
+                        "critic_anchor",
+                        lambda: deepcopy(self.model._Qs)
+                        .to(self.device)
+                        .requires_grad_(False),
+                        self.model._Qs,
+                    ),
+                    (
+                        "actor_target",
+                        lambda: deepcopy(candidate.actor)
+                        .to(self.device)
+                        .requires_grad_(False),
+                        None,
+                    ),
+                    (
+                        "critic_target",
+                        lambda: deepcopy(candidate.critic)
+                        .to(self.device)
+                        .requires_grad_(False),
+                        None,
+                    ),
+                )
+                for name, factory, outer_reference in module_specs:
+                    setattr(
+                        candidate,
+                        name,
+                        self._load_module_candidate(
+                            workspace[name],
+                            name=f"inner {name.replace('_', ' ')}",
+                            factory=factory,
+                            outer_reference=outer_reference,
+                        ),
+                    )
+
+        candidate.actor_params = (
+            [] if candidate.actor is None else trainable_parameters(candidate.actor)
+        )
+        candidate.critic_params = (
+            [] if candidate.critic is None else trainable_parameters(candidate.critic)
+        )
+        candidate.actor_trainable_count = sum(
+            parameter.numel() for parameter in candidate.actor_params
+        )
+        candidate.critic_trainable_count = sum(
+            parameter.numel() for parameter in candidate.critic_params
+        )
+        if workspace["actor_optim"] is not None:
+            if candidate.actor is None:
+                raise ValueError("Inner actor optimizer exists without an actor.")
+            candidate.actor_optim = self._load_optimizer_candidate(
+                self._new_optimizer(candidate.actor, "actor"),
+                workspace["actor_optim"],
+                "Inner actor optimizer",
+                expected_steps=normalized_counters["actor_lifetime_steps"],
+            )
+        if workspace["critic_optim"] is not None:
+            if candidate.critic is None:
+                raise ValueError("Inner critic optimizer exists without a critic.")
+            candidate.critic_optim = self._load_optimizer_candidate(
+                self._new_optimizer(candidate.critic, "critic"),
+                workspace["critic_optim"],
+                "Inner critic optimizer",
+                expected_steps=normalized_counters["critic_lifetime_steps"],
+            )
+
+        log_alpha, alpha_fixed = workspace["log_alpha"], workspace["alpha_fixed"]
+        if log_alpha is not None and alpha_fixed is not None:
+            raise ValueError("Inner temperature cannot be both learned and fixed.")
+        if log_alpha is not None:
+            log_alpha = require_tensor(
+                log_alpha,
+                "inner log_alpha",
+                shape=(),
+                dtype=self.agent.alpha.dtype,
+            )
+            candidate.log_alpha = torch.nn.Parameter(
+                log_alpha.detach().to(self.device).clone()
+            )
+        if alpha_fixed is not None:
+            expected_shape = (
+                self.agent.alpha.shape
+                if str(self.cfg.inner_temperature_mode) == "inherit_outer"
+                else torch.Size([])
+            )
+            alpha_fixed = require_tensor(
+                alpha_fixed,
+                "inner alpha_fixed",
+                shape=expected_shape,
+                dtype=self.agent.alpha.dtype,
+            )
+            candidate.alpha_fixed = alpha_fixed.detach().to(self.device).clone()
+        if workspace["temperature_optim"] is not None:
+            if candidate.log_alpha is None:
+                raise ValueError(
+                    "Inner temperature optimizer exists without learned log_alpha."
+                )
+            candidate.temperature_optim = torch.optim.Adam(
+                [candidate.log_alpha],
+                lr=float(self.cfg.inner_temperature_lr),
+                eps=float(self.cfg.inner_adam_eps),
+                capturable=False,
+                foreach=self.device.type == "cuda",
+            )
+            self._load_optimizer_candidate(
+                candidate.temperature_optim,
+                workspace["temperature_optim"],
+                "Inner temperature optimizer",
+                expected_steps=normalized_counters["temperature_lifetime_steps"],
+            )
+
+        if workspace["replay"] is not None:
+            candidate.replay = LatentReplayBuffer(
+                capacity=self.cfg.inner_replay_capacity,
+                latent_dim=self.cfg.latent_dim,
+                action_dim=self.cfg.action_dim,
+                device=self.device,
+            )
+            candidate.replay.load_training_state_dict(workspace["replay"])
+
+        for field, value in normalized_counters.items():
+            setattr(candidate, field, value)
+        candidate.sampled_ids = []
+
+        previous_mean = state["mppi_prev_mean"]
+        expected_mppi = (
+            str(self.cfg.inner_operator) == "mppi"
+            and action_index > 0
+            and str(self.cfg.inner_mppi_warm_start_scope) == "run"
+        )
+        if (previous_mean is not None) is not expected_mppi:
+            raise ValueError(
+                "AMBI checkpoint MPPI warm-start inventory does not match its "
+                "configured lifetime and action history."
+            )
+        if previous_mean is not None:
+            previous_mean = require_tensor(
+                previous_mean,
+                "inner MPPI previous mean",
+                shape=(self.cfg.inner_rollout_horizon, self.cfg.action_dim),
+                dtype=next(self.model.parameters()).dtype,
+            )
+            if not previous_mean.is_floating_point():
+                raise ValueError("Inner MPPI previous mean must be floating point.")
+            previous_mean = previous_mean.detach().to(self.device).clone()
+
+        candidate_rng = InnerRNG(self.cfg.seed, self.device)
+        candidate_rng.load_training_state_dict(state["rng"])
+        return {
+            "state": candidate,
+            "rng": candidate_rng,
+            "action_index": action_index,
+            "episode_index": episode_index,
+            "mppi_prev_mean": previous_mean,
+        }
+
+    def load_training_state_dict(self, state):
+        """Transactionally restore validated persistent inner state."""
+        candidate = self._preflight_training_state_dict(state)
+        return self._commit_training_state_candidate(candidate)
+
+    def _commit_training_state_candidate(self, candidate):
+        """Install a candidate returned by strict preflight."""
+        self.state = candidate["state"]
+        self._action_pool = InnerWorkspace()
+        self.rng = candidate["rng"]
+        self.action_index = candidate["action_index"]
+        self.episode_index = candidate["episode_index"]
+        self._mppi_prev_mean = candidate["mppi_prev_mean"]
+        self._collect_diagnostics = True
+        self._pending_timers = {}
+        self._initialize_compile_regions()
+        return self
+
     def mark_outer_update(self, version):
         # Workspaces are refreshed lazily at the next action, after all outer
         # updates in the current real environment step have completed.
@@ -332,6 +937,7 @@ class InnerImprovementEngine:
             else:
                 self._action_pool.temperature_optim = None
             state.log_alpha = state.alpha_fixed = state.temperature_optim = None
+            state.temperature_lifetime_steps = 0
         elif self._scope_expires(
             cfg.inner_temperature_optimizer_scope,
             t0=t0,
@@ -343,6 +949,7 @@ class InnerImprovementEngine:
             ):
                 self._action_pool.temperature_optim = state.temperature_optim
             state.temperature_optim = None
+            state.temperature_lifetime_steps = 0
 
         if self._scope_expires(cfg.inner_replay_scope, t0=t0, include_action=include_action):
             if str(cfg.inner_replay_scope) == "action" and state.replay is not None:
@@ -1224,6 +1831,7 @@ class InnerImprovementEngine:
                 )
                 state.temperature_optim.step()
                 state.temperature_steps += 1
+                state.temperature_lifetime_steps += 1
                 metrics.update(
                     temperature_loss=temperature_loss.detach(),
                     temperature_grad_norm=torch.as_tensor(

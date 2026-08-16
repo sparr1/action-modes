@@ -2,6 +2,8 @@
 
 import torch
 
+from .training_state import require_exact_keys
+
 
 class LatentReplayBuffer:
     """Fixed-size packed replay storage for AMBI's latent transitions.
@@ -249,10 +251,168 @@ class LatentReplayBuffer:
             "sample_id": self._sample_ids(indices),
         }
 
+    def training_state_dict(self):
+        """Wrap the existing physical-ring state in a versioned contract."""
+        return {
+            "schema": "ambi-latent-replay-training-state",
+            "version": 1,
+            "latent_dim": self.latent_dim,
+            "action_dim": self.action_dim,
+            "state": self.state_dict(),
+        }
+
+    def _validate_ring_metadata(self, *, pos, full, next_sample_id, owner):
+        if not isinstance(full, bool):
+            raise TypeError(f"{owner} full flag must be bool.")
+        if isinstance(pos, bool) or not isinstance(pos, int) or not 0 <= pos < self.capacity:
+            raise ValueError(f"{owner} write position is invalid.")
+        if (
+            isinstance(next_sample_id, bool)
+            or not isinstance(next_sample_id, int)
+            or next_sample_id < 0
+        ):
+            raise ValueError(f"{owner} next_sample_id is invalid.")
+        expected_pos = next_sample_id % self.capacity
+        if pos != expected_pos:
+            raise ValueError(
+                f"{owner} write position is inconsistent with next_sample_id: "
+                f"checkpoint={pos}, expected={expected_pos}."
+            )
+        expected_full = next_sample_id >= self.capacity
+        if full is not expected_full:
+            raise ValueError(
+                f"{owner} full flag is inconsistent with next_sample_id."
+            )
+        return min(next_sample_id, self.capacity)
+
+    def load_training_state_dict(self, state):
+        """Restore an exact, device-portable physical ring snapshot."""
+        state = require_exact_keys(
+            state,
+            {
+                "schema",
+                "version",
+                "latent_dim",
+                "action_dim",
+                "state",
+            },
+            "latent replay training state",
+        )
+        if (
+            state["schema"] != "ambi-latent-replay-training-state"
+            or state["version"] != 1
+        ):
+            raise ValueError("Unsupported latent replay training-state version.")
+        expected = {
+            "latent_dim": self.latent_dim,
+            "action_dim": self.action_dim,
+        }
+        actual = {key: state[key] for key in expected}
+        if actual != expected:
+            raise ValueError(
+                "Latent replay training-state configuration is incompatible: "
+                f"checkpoint={actual}, configured={expected}."
+            )
+        candidate = self._preflight_exact_state_dict(state["state"])
+        self._commit_state_candidate(candidate)
+        return self
+
+    def _preflight_exact_state_dict(self, state):
+        state = require_exact_keys(
+            state,
+            {
+                "capacity",
+                "pos",
+                "full",
+                "next_sample_id",
+                "z",
+                "action",
+                "reward",
+                "next_z",
+                "terminated",
+                "sample_id",
+            },
+            "latent replay physical state",
+        )
+        capacity = state["capacity"]
+        if (
+            isinstance(capacity, bool)
+            or not isinstance(capacity, int)
+            or capacity != self.capacity
+        ):
+            raise ValueError("Latent replay state capacity does not match this buffer.")
+
+        widths = {
+            "z": self.latent_dim,
+            "action": self.action_dim,
+            "reward": 1,
+            "next_z": self.latent_dim,
+            "terminated": 1,
+        }
+        values = []
+        size = None
+        for name, width in widths.items():
+            value = state[name]
+            if not torch.is_tensor(value) or value.ndim != 2:
+                raise TypeError(f"Latent replay field {name!r} must be a matrix tensor.")
+            if value.shape[1] != width:
+                raise ValueError(f"Latent replay field {name!r} has the wrong width.")
+            if value.dtype != self._storage.dtype:
+                raise ValueError(f"Latent replay field {name!r} has the wrong dtype.")
+            if size is None:
+                size = int(value.shape[0])
+            elif value.shape[0] != size:
+                raise ValueError("Latent replay fields have different row counts.")
+            values.append(value)
+        if not 0 <= size <= self.capacity:
+            raise ValueError("Latent replay state has an invalid size.")
+
+        full, pos, next_sample_id = (
+            state["full"],
+            state["pos"],
+            state["next_sample_id"],
+        )
+        expected_size = self._validate_ring_metadata(
+            pos=pos,
+            full=full,
+            next_sample_id=next_sample_id,
+            owner="Latent replay state",
+        )
+        if size != expected_size:
+            raise ValueError("Latent replay size is inconsistent with ring metadata.")
+
+        sample_id = state["sample_id"]
+        if (
+            not torch.is_tensor(sample_id)
+            or sample_id.shape != torch.Size([size])
+            or sample_id.dtype != torch.long
+        ):
+            raise ValueError("Latent replay sample_id has the wrong shape or dtype.")
+        indices = torch.arange(size, dtype=torch.long)
+        oldest = next_sample_id - size
+        expected_ids = (
+            torch.remainder(indices - pos, self.capacity) + oldest
+            if full
+            else indices + oldest
+        )
+        if not torch.equal(sample_id.detach().cpu(), expected_ids):
+            raise ValueError("Latent replay sample_id is inconsistent with ring metadata.")
+
+        packed = self._pack_fields(tuple(values), size) if size else None
+        return packed, size, full, pos, next_sample_id
+
+    def _commit_state_candidate(self, candidate):
+        packed, size, full, pos, next_sample_id = candidate
+        if size:
+            self._storage[:size].copy_(packed)
+        self.full = full
+        self.pos = pos
+        self.next_sample_id = next_sample_id
+
     def load_state_dict(self, state):
         """Restore replay contents into this buffer, respecting its capacity."""
-        self.clear()
         if not state:
+            self.clear()
             return
         if int(state.get("capacity", self.capacity)) != self.capacity:
             raise ValueError("Latent replay state capacity does not match this buffer.")
@@ -269,11 +429,18 @@ class LatentReplayBuffer:
         )
         if packed_size != size:
             raise ValueError("Latent replay state fields have incompatible shapes.")
-        if size:
-            self._storage[:size].copy_(self._pack_fields(values, size))
+        full = state.get("full", size == self.capacity)
+        pos = state.get("pos", 0 if full else size)
+        next_sample_id = state.get("next_sample_id", size)
+        expected_size = self._validate_ring_metadata(
+            pos=pos,
+            full=full,
+            next_sample_id=next_sample_id,
+            owner="Latent replay state",
+        )
+        if size != expected_size:
+            raise ValueError("Latent replay size is inconsistent with ring metadata.")
+        packed = self._pack_fields(values, size) if size else None
 
-        self.full = bool(state.get("full", size == self.capacity))
-        self.pos = int(state.get("pos", 0 if self.full else size))
-        if not 0 <= self.pos < self.capacity:
-            raise ValueError("Latent replay state has an invalid write position.")
-        self.next_sample_id = int(state.get("next_sample_id", size))
+        # All validation finishes before live metadata or storage is changed.
+        self._commit_state_candidate((packed, size, full, pos, next_sample_id))

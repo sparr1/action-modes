@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from .lora import LoRALinear, LoRANormedLinear
+from .training_state import require_exact_keys, require_tensor
 
 
 _SCOPES = {"action": 0, "episode": 1, "run": 2}
@@ -205,6 +206,92 @@ class InnerRNG:
 
     def generator(self, name):
         return self.generators[name]
+
+    def training_state_dict(self):
+        """Return every private generator at a quiescent action boundary."""
+        if self._action_fork_depth != 0:
+            raise RuntimeError(
+                "Inner RNG state can only be captured outside an active RNG fork."
+            )
+        return {
+            "schema": "ambi-inner-rng-training-state",
+            "version": 1,
+            "device_type": self.device.type,
+            "streams": {
+                name: generator.get_state().clone()
+                for name, generator in self.generators.items()
+            },
+            "phase_streams": {
+                name: generator.get_state().clone()
+                for name, generator in self.phase_generators.items()
+            },
+            "action_fork_depth": 0,
+        }
+
+    def _preflight_training_state_dict(self, state):
+        state = require_exact_keys(
+            state,
+            {
+                "schema",
+                "version",
+                "device_type",
+                "streams",
+                "phase_streams",
+                "action_fork_depth",
+            },
+            "inner RNG training state",
+        )
+        if (
+            state["schema"] != "ambi-inner-rng-training-state"
+            or state["version"] != 1
+        ):
+            raise ValueError("Unsupported AMBI inner RNG training-state version.")
+        if state["device_type"] != self.device.type:
+            raise ValueError(
+                "AMBI inner RNG device type is incompatible: "
+                f"checkpoint={state['device_type']!r}, configured={self.device.type!r}."
+            )
+        if state["action_fork_depth"] != 0:
+            raise ValueError("An active AMBI inner RNG fork cannot be restored.")
+        streams = require_exact_keys(
+            state["streams"], self.STREAMS, "inner RNG streams"
+        )
+        phase_streams = require_exact_keys(
+            state["phase_streams"], self.STREAMS, "inner RNG phase streams"
+        )
+        generator_device = (
+            self.device if self.device.type == "cuda" else torch.device("cpu")
+        )
+        # ``set_state`` performs the backend-specific structural validation.
+        # Use temporary generators so a bad later stream cannot partially
+        # advance or replace any live generator.
+        for name in self.STREAMS:
+            stream = require_tensor(
+                streams[name], f"inner RNG stream {name!r}", dtype=torch.uint8
+            )
+            phase = require_tensor(
+                phase_streams[name],
+                f"inner RNG phase stream {name!r}",
+                dtype=torch.uint8,
+            )
+            if stream.ndim != 1 or phase.ndim != 1:
+                raise ValueError("Serialized generator states must be one-dimensional.")
+            probe = torch.Generator(device=generator_device)
+            probe.set_state(stream.detach().cpu())
+            phase_probe = torch.Generator(device="cpu")
+            phase_probe.set_state(phase.detach().cpu())
+        return state
+
+    def load_training_state_dict(self, state):
+        """Restore every named and implicit-randomness seed stream exactly."""
+        state = self._preflight_training_state_dict(state)
+        for name in self.STREAMS:
+            self.generators[name].set_state(state["streams"][name].detach().cpu())
+            self.phase_generators[name].set_state(
+                state["phase_streams"][name].detach().cpu()
+            )
+        self._action_fork_depth = 0
+        return self
 
     def _fork_devices(self):
         if self.device.type != "cuda":

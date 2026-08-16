@@ -1,10 +1,13 @@
-import numpy as np
+import copy
 import os
 import shutil
+import tempfile
+import xml.etree.ElementTree as ET
+
+import numpy as np
 from gymnasium import utils
 from gymnasium.envs.mujoco import MujocoEnv
 from gymnasium.spaces import Box
-import xml.etree.ElementTree as ET
 
 
 DEFAULT_CAMERA_CONFIG = {
@@ -75,29 +78,45 @@ class AntVariableLegsEnv(MujocoEnv, utils.EzPickle):
             exclude_current_positions_from_observation
         )
         
-        # Store paths for XML files
-        self.xml_template = os.path.join(os.path.dirname(__file__), "assets", "ant_variable_legs_template.xml")
-        self.xml_file = os.path.join(os.path.dirname(__file__), "assets", xml_file)
-        
-        # Create template if it doesn't exist
-        if not os.path.exists(self.xml_template):
-            shutil.copy2(self.xml_file, self.xml_template)
-        
-        # Set up the environment with the specified number of legs
-        self._set_num_legs(num_legs)
-        
-        observation_space = Box(
-            low=-np.inf, high=np.inf, shape=(self._get_obs_dim(),), dtype=np.float64
+        assets = os.path.join(os.path.dirname(__file__), "assets")
+        self.xml_template = os.path.join(assets, "ant_variable_legs_template.xml")
+        if not os.path.isfile(self.xml_template):
+            raise FileNotFoundError(f"Missing Ant XML template: {self.xml_template}")
+
+        # Generated morphology is process-local. Writing it into the source
+        # tree dirties clean cluster checkouts and lets concurrent jobs race.
+        requested_xml = os.fspath(xml_file)
+        source_xml = (
+            requested_xml
+            if os.path.isabs(requested_xml)
+            else os.path.join(assets, requested_xml)
         )
-        
-        MujocoEnv.__init__(
-            self,
-            self.xml_file,
-            5,
-            observation_space=observation_space,
-            default_camera_config=DEFAULT_CAMERA_CONFIG,
-            **kwargs
+        self._xml_workspace = tempfile.TemporaryDirectory(prefix="ambi-ant-")
+        self.xml_file = os.path.join(
+            self._xml_workspace.name, os.path.basename(requested_xml)
         )
+
+        try:
+            shutil.copy2(
+                source_xml if os.path.isfile(source_xml) else self.xml_template,
+                self.xml_file,
+            )
+            self._set_num_legs(num_legs)
+            observation_space = Box(
+                low=-np.inf, high=np.inf, shape=(self._get_obs_dim(),), dtype=np.float64
+            )
+            MujocoEnv.__init__(
+                self,
+                self.xml_file,
+                5,
+                observation_space=observation_space,
+                default_camera_config=DEFAULT_CAMERA_CONFIG,
+                **kwargs
+            )
+        except Exception:
+            self._xml_workspace.cleanup()
+            self._xml_workspace = None
+            raise
 
     def _get_obs_dim(self):
         # 27 base dimensions + additional dimensions for each leg beyond 4
@@ -212,6 +231,15 @@ class AntVariableLegsEnv(MujocoEnv, utils.EzPickle):
         # Save the modified XML
         tree.write(self.xml_file)
 
+    def close(self):
+        try:
+            super().close()
+        finally:
+            workspace = getattr(self, "_xml_workspace", None)
+            if workspace is not None:
+                workspace.cleanup()
+                self._xml_workspace = None
+
     def control_cost(self, action):
         control_cost = self._ctrl_cost_weight * np.sum(np.square(action))
         return control_cost
@@ -300,10 +328,34 @@ class AntVariableLegsEnv(MujocoEnv, utils.EzPickle):
 
         return observation
 
+    def training_resume_state(self):
+        """Capture state needed to reproduce the next episode reset."""
+        return {
+            "schema_version": 1,
+            "num_legs": int(self.num_legs),
+            "np_random": copy.deepcopy(self.np_random.bit_generator.state),
+        }
+
+    def load_training_resume_state(self, state):
+        self.validate_training_resume_state(state)
+        self.np_random.bit_generator.state = copy.deepcopy(state["np_random"])
+
+    def validate_training_resume_state(self, state):
+        if (
+            not isinstance(state, dict)
+            or set(state) != {"schema_version", "num_legs", "np_random"}
+            or state.get("schema_version") != 1
+        ):
+            raise ValueError("Unsupported variable-ant training-resume state.")
+        if state.get("num_legs") != int(self.num_legs):
+            raise ValueError("Variable-ant morphology changed across resume.")
+        probe = copy.deepcopy(self.np_random)
+        probe.bit_generator.state = copy.deepcopy(state["np_random"])
+
     def viewer_setup(self):
         assert self.viewer is not None
         for key, value in DEFAULT_CAMERA_CONFIG.items():
             if isinstance(value, np.ndarray):
                 getattr(self.viewer.cam, key)[:] = value
             else:
-                setattr(self.viewer.cam, key, value) 
+                setattr(self.viewer.cam, key, value)

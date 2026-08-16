@@ -14,6 +14,17 @@ from numbers import Real
 
 import numpy as np
 
+from utils.wandb_resume import (
+    EVENT_INDEX_KEY,
+    CheckpointedWandbRun,
+    WandbCapabilityError,
+    WandbInitializationError,
+    WandbRemoteWriteError,
+    WandbResumeConfigurationError,
+    WandbResumeContext,
+    validate_wandb_resume_capabilities,
+)
+
 
 DEFAULT_WANDB_ENTITY = "rwgao_b-brown-university"
 DEFAULT_WANDB_PROJECT = "ambi"
@@ -333,13 +344,53 @@ def wandb_enabled(params: dict | None) -> bool:
     return bool(params and params.get("wandb", False))
 
 
-def init_wandb(params: dict | None, *, default_project: str, run_name: str | None, config: dict | None = None):
+def _finish_failed_resume_initialization(run, primary_error: BaseException) -> None:
+    """Close an initialized exact-resume run without masking its primary error."""
+
+    if run is None:
+        return
+    try:
+        finish = getattr(run, "finish", None)
+        if not callable(finish):
+            raise WandbCapabilityError(
+                "The initialized W&B run does not provide callable finish()."
+            )
+        finish()
+    except BaseException as cleanup_error:
+        add_note = getattr(primary_error, "add_note", None)
+        if callable(add_note):
+            add_note(
+                "Additional W&B finish failure after exact-resume "
+                f"initialization stopped: {cleanup_error}"
+            )
+
+
+def init_wandb(
+    params: dict | None,
+    *,
+    default_project: str,
+    run_name: str | None,
+    config: dict | None = None,
+    resume_context: WandbResumeContext | None = None,
+    wandb_module: object | None = None,
+):
+    if resume_context is not None and not wandb_enabled(params):
+        raise WandbResumeConfigurationError(
+            "A W&B resume context requires wandb=true; it cannot fall back to disabled logging."
+        )
     if not wandb_enabled(params):
         return None
-    try:
-        import wandb
-    except ImportError as exc:
-        raise RuntimeError("wandb=True but the wandb package is not installed. Run `pip install wandb` or set wandb=false.") from exc
+    if wandb_module is None:
+        try:
+            import wandb
+        except ImportError as exc:
+            if resume_context is not None:
+                raise WandbCapabilityError(
+                    "A W&B resume context requires the wandb package, but it is not installed."
+                ) from exc
+            raise RuntimeError("wandb=True but the wandb package is not installed. Run `pip install wandb` or set wandb=false.") from exc
+    else:
+        wandb = wandb_module
 
     project = params.get("wandb_project", default_project or DEFAULT_WANDB_PROJECT)
     entity = params.get("wandb_entity", DEFAULT_WANDB_ENTITY)
@@ -356,18 +407,84 @@ def init_wandb(params: dict | None, *, default_project: str, run_name: str | Non
     if group:
         kwargs["group"] = group
 
-    run = wandb.init(**kwargs)
-    wandb.define_metric("env_step")
-    wandb.define_metric("train/*", step_metric="env_step")
-    wandb.define_metric("rollout/*", step_metric="env_step")
-    wandb.define_metric("episode/*", step_metric="env_step")
-    wandb.define_metric("time/*", step_metric="env_step")
-    wandb.define_metric("eval/*", step_metric="env_step")
-    return run
+    if resume_context is not None:
+        if not isinstance(resume_context, WandbResumeContext):
+            raise WandbResumeConfigurationError(
+                "resume_context must be a WandbResumeContext."
+            )
+        if mode != "online":
+            raise WandbResumeConfigurationError(
+                "Durable one-run W&B resume requires explicit wandb_mode='online'."
+            )
+        validate_wandb_resume_capabilities(wandb)
+        if resume_context.directory is not None:
+            kwargs["dir"] = str(resume_context.directory)
+        kwargs["id"] = resume_context.run_id
+        # These are stricter than resume='allow': a new lineage cannot attach
+        # to an existing run, and a resumed lineage cannot silently create one.
+        kwargs["resume"] = "never" if resume_context.new_run else "must"
+
+    run = None
+    try:
+        run = wandb.init(**kwargs)
+        wandb.define_metric("env_step")
+        wandb.define_metric("train/*", step_metric="env_step")
+        wandb.define_metric("rollout/*", step_metric="env_step")
+        wandb.define_metric("episode/*", step_metric="env_step")
+        wandb.define_metric("time/*", step_metric="env_step")
+        wandb.define_metric("eval/*", step_metric="env_step")
+    except Exception as exc:
+        if resume_context is not None:
+            error = WandbInitializationError(
+                f"Could not initialize prepared online W&B run {resume_context.run_id!r}."
+            )
+            _finish_failed_resume_initialization(run, error)
+            raise error from exc
+        raise
+    if resume_context is None:
+        return run
+
+    try:
+        wandb.define_metric(EVENT_INDEX_KEY)
+    except Exception as exc:
+        error = WandbInitializationError(
+            f"Could not define resume metrics for W&B run {resume_context.run_id!r}."
+        )
+        _finish_failed_resume_initialization(run, error)
+        raise error from exc
+    missing_run_methods = [
+        method
+        for method in ("log", "finish")
+        if not callable(getattr(run, method, None))
+    ]
+    if missing_run_methods:
+        error = WandbInitializationError(
+            "The initialized W&B run lacks callable methods required for exact "
+            f"resume: {', '.join(missing_run_methods)}."
+        )
+        _finish_failed_resume_initialization(run, error)
+        raise error
+    checkpointed_run = CheckpointedWandbRun(
+        run,
+        resume_context,
+        wandb_module=wandb,
+        entity=entity,
+        project=project,
+    )
+    if not resume_context.new_run:
+        try:
+            checkpointed_run.synchronize_resumed_checkpoint()
+        except WandbRemoteWriteError as primary_error:
+            _finish_failed_resume_initialization(run, primary_error)
+            raise
+    return checkpointed_run
 
 
 def log_wandb(run, payload: dict, *, step: int) -> None:
     if run is None:
+        return
+    if isinstance(run, CheckpointedWandbRun):
+        run.log(payload, env_step=step)
         return
     payload = dict(payload)
     payload.setdefault("env_step", int(step))
@@ -376,4 +493,15 @@ def log_wandb(run, payload: dict, *, step: int) -> None:
 
 def finish_wandb(run) -> None:
     if run is not None:
+        run.finish()
+
+
+def abort_wandb(run) -> None:
+    """Close a failed resumable run without claiming remote reconciliation."""
+
+    if run is None:
+        return
+    if isinstance(run, CheckpointedWandbRun):
+        run.abort()
+    else:
         run.finish()

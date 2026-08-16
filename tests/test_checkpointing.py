@@ -180,6 +180,38 @@ def test_none_strategy_never_requests_periodic_or_final_publication(tmp_path):
     assert tracker.targets(7, final=True) == ()
 
 
+def test_checkpoint_tracker_resume_round_trip_and_state_validation(tmp_path):
+    tracker = CheckpointTracker(
+        5,
+        tmp_path,
+        "model",
+        save_strat=["best", "latest"],
+        best_window=2,
+    )
+    tracker.record_episode_return(1.0)
+    tracker.record_episode_return(3.0)
+    tracker.targets(5)
+    state = tracker.state_dict()
+
+    restored = CheckpointTracker(
+        5,
+        tmp_path,
+        "model",
+        save_strat=["best", "latest"],
+        best_window=2,
+    )
+    restored.load_state_dict(state)
+
+    assert restored.episode_count == 2
+    assert restored.recent_returns == (1.0, 3.0)
+    assert restored.best_score == 2.0
+
+    with pytest.raises(ValueError, match="schema"):
+        restored.load_state_dict({**state, "future": 1})
+    with pytest.raises(ValueError, match="recent_returns"):
+        restored.load_state_dict({**state, "episode_count": 1})
+
+
 def test_sb3_callback_tracks_returns_and_refreshes_latest_at_clean_end(tmp_path):
     np = pytest.importorskip("numpy")
     pytest.importorskip("stable_baselines3")

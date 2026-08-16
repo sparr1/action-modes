@@ -6,6 +6,8 @@ from .device import cuda_mem_get_info, resolve_device
 from torchrl.data.replay_buffers import ReplayBuffer, LazyTensorStorage
 from torchrl.data.replay_buffers.samplers import SliceSampler
 
+from .training_state import require_exact_keys
+
 
 class Buffer():
 	"""
@@ -13,19 +15,12 @@ class Buffer():
 	Uses CUDA memory if available, and CPU memory otherwise.
 	"""
 
-	def __init__(self, cfg):
+	def __init__(self, cfg, *, resumable=False):
 		self.cfg = cfg
 		self._device = resolve_device(getattr(cfg, 'device', None))
 		self.cfg.device = str(self._device)
 		self._capacity = min(cfg.buffer_size, getattr(cfg, 'steps', cfg.buffer_size))
-		self._sampler = SliceSampler(
-			num_slices=self.cfg.batch_size,
-			end_key=None,
-			traj_key='episode',
-			truncated_key=None,
-			strict_length=True,
-			cache_values=cfg.multitask,
-		)
+		self._sampler = self._make_sampler()
 		self._batch_size = cfg.batch_size * (cfg.train_unroll_horizon+1)
 		self._num_eps = 0
 		self._num_transitions = 0
@@ -33,6 +28,41 @@ class Buffer():
 		self._resident_episode_rows = deque()
 		self._resident_rows = 0
 		self._pin_memory = False
+		self._resumable_storage = False
+		if resumable:
+			self.enable_resumable_storage()
+
+	def _make_sampler(self):
+		return SliceSampler(
+			num_slices=self.cfg.batch_size,
+			end_key=None,
+			traj_key='episode',
+			truncated_key=None,
+			strict_length=True,
+			cache_values=self.cfg.multitask,
+		)
+
+	@property
+	def resumable_storage(self):
+		return self._resumable_storage
+
+	def enable_resumable_storage(self):
+		"""Force CPU replay placement before the first row is allocated.
+
+		Legacy callers retain adaptive CPU/CUDA placement. Exact resume callers
+		must opt in before collection so a later GPU change never changes replay
+		placement or the TorchRL writer/sampler contract.
+		"""
+		if getattr(self.cfg, 'obs', 'state') != 'state':
+			raise NotImplementedError(
+				"Exact replay resume supports state observations only; RGB is unsupported."
+			)
+		if self._num_eps != 0 or hasattr(self, '_buffer'):
+			raise RuntimeError(
+				"Resumable replay storage must be enabled before the first episode."
+			)
+		self._resumable_storage = True
+		return self
 
 	@property
 	def capacity(self):
@@ -92,17 +122,17 @@ class Buffer():
 			else:
 				self._resident_episode_rows[0] = [rows, initial_rows, resident_transitions]
 
-	def _reserve_buffer(self, storage):
+	def _reserve_buffer(self, storage, *, sampler=None, pin_memory=None):
 		"""
 		Reserve a buffer with the given storage.
 		"""
 		return ReplayBuffer(
 			storage=storage,
-			sampler=self._sampler,
+			sampler=self._sampler if sampler is None else sampler,
 			# TorchRL pins the sampled TensorDict, providing the staging memory
 			# required for the non-blocking CPU-to-CUDA transfer below. Pinning
 			# CUDA storage (or CPU-only training) has no benefit and is unsafe.
-			pin_memory=self._pin_memory,
+			pin_memory=self._pin_memory if pin_memory is None else bool(pin_memory),
 			prefetch=0,
 			batch_size=self._batch_size,
 		)
@@ -127,7 +157,15 @@ class Buffer():
 		total_bytes = bytes_per_step*self._capacity
 		print(f'Storage required: {total_bytes/1e9:.2f} GB')
 		# Heuristic: decide whether to use CUDA or CPU memory
-		storage_device = str(self._device) if self._device.type == 'cuda' and 2.5*total_bytes < mem_free else 'cpu'
+		storage_device = (
+			'cpu'
+			if self._resumable_storage
+			else (
+				str(self._device)
+				if self._device.type == 'cuda' and 2.5*total_bytes < mem_free
+				else 'cpu'
+			)
+		)
 		print(f'Using {storage_device.upper()} memory for storage.')
 		self._storage_device = torch.device(storage_device)
 		self._pin_memory = self._uses_pinned_staging(
@@ -190,3 +228,445 @@ class Buffer():
 			-1, self.cfg.train_unroll_horizon+1
 		).permute(1, 0)
 		return self._prepare_batch(td)
+
+	def _training_signature(self):
+		mode = str(getattr(self.cfg, "obs", "state"))
+		obs_shapes = getattr(self.cfg, "obs_shape", None)
+		observation_shape = None
+		if obs_shapes is not None:
+			observation_shape = list(obs_shapes[mode])
+		return {
+			"capacity": int(self._capacity),
+			"batch_size": int(self.cfg.batch_size),
+			"train_unroll_horizon": int(self.cfg.train_unroll_horizon),
+			"multitask": bool(self.cfg.multitask),
+			"observation_mode": str(getattr(self.cfg, "obs", "state")),
+			"observation_shape": observation_shape,
+			"observation_dtype": str(
+				getattr(self.cfg, "obs_dtype", "float32")
+			),
+			"action_dim": (
+				None
+				if not hasattr(self.cfg, "action_dim")
+				else int(self.cfg.action_dim)
+			),
+		}
+
+	def _configured_field_specs(self):
+		"""Return the fixed state-observation replay tensor contract."""
+		mode = str(getattr(self.cfg, "obs", "state"))
+		observation_shapes = getattr(self.cfg, "obs_shape", None)
+		if observation_shapes is None or mode not in observation_shapes:
+			raise ValueError("Replay configuration lacks an observation shape.")
+		action_dim = getattr(self.cfg, "action_dim", None)
+		if isinstance(action_dim, bool) or not isinstance(action_dim, int) or action_dim <= 0:
+			raise ValueError("Replay configuration lacks a positive action dimension.")
+		observation_dtype = str(getattr(self.cfg, "obs_dtype", "float32"))
+		if not observation_dtype.startswith("torch."):
+			observation_dtype = f"torch.{observation_dtype}"
+		specs = {
+			"obs": {
+				"name": "obs",
+				"shape": [int(value) for value in observation_shapes[mode]],
+				"dtype": observation_dtype,
+			},
+			"action": {
+				"name": "action",
+				"shape": [action_dim],
+				"dtype": "torch.float32",
+			},
+			"reward": {"name": "reward", "shape": [], "dtype": "torch.float32"},
+			"terminated": {
+				"name": "terminated",
+				"shape": [],
+				"dtype": "torch.float32",
+			},
+			"episode": {"name": "episode", "shape": [], "dtype": "torch.int64"},
+		}
+		if bool(self.cfg.multitask):
+			specs["task"] = {
+				"name": "task",
+				"shape": [],
+				"dtype": "torch.int64",
+			}
+		return specs
+
+	def _accounting_state(self):
+		return {
+			"num_eps": int(self._num_eps),
+			"num_transitions": int(self._num_transitions),
+			"total_transitions": int(self._total_transitions),
+			"resident_episode_rows": [
+				list(entry) for entry in self._resident_episode_rows
+			],
+			"resident_rows": int(self._resident_rows),
+		}
+
+	@classmethod
+	def _clone_tree_to_cpu(cls, value):
+		if torch.is_tensor(value):
+			return value.detach().cpu().clone()
+		if isinstance(value, dict):
+			return type(value)(
+				(key, cls._clone_tree_to_cpu(item)) for key, item in value.items()
+			)
+		if isinstance(value, list):
+			return [cls._clone_tree_to_cpu(item) for item in value]
+		if isinstance(value, tuple):
+			return tuple(cls._clone_tree_to_cpu(item) for item in value)
+		return value
+
+	def _storage_tensor_state(self):
+		"""Return live CPU storage tensor references without cloning them."""
+		if not hasattr(self, "_buffer"):
+			return None, 0, None
+		# ReplayBuffer.state_dict() clones LazyTensorStorage in full. Calling it
+		# here would therefore materialize one capacity-sized copy for metadata and
+		# another for every shard. Read the live physical storage directly and only
+		# clone the bounded slice in training_state_shard().
+		storage_state = self._buffer._storage._storage
+		rows = int(len(self._buffer))
+		fields = {
+			key: value
+			for key, value in storage_state.items()
+			if not str(key).startswith("__")
+		}
+		if (
+			not fields
+			or any(not isinstance(key, str) for key in fields)
+			or any(not torch.is_tensor(value) for value in fields.values())
+		):
+			raise TypeError(
+				"Sharded replay serialization requires flat tensor-backed state fields."
+			)
+		expected_fields = {"obs", "action", "reward", "terminated", "episode"}
+		if bool(self.cfg.multitask):
+			expected_fields.add("task")
+		if set(fields) != expected_fields:
+			raise ValueError(
+				"Replay storage fields are incompatible with the state-observation "
+				f"contract: storage={sorted(fields)}, expected={sorted(expected_fields)}."
+			)
+		if any(value.device.type != "cpu" for value in fields.values()):
+			raise RuntimeError("Resumable replay unexpectedly uses non-CPU storage.")
+		torchrl = {
+			"sampler": self._clone_tree_to_cpu(self._buffer._sampler.state_dict()),
+			"writer": self._clone_tree_to_cpu(self._buffer._writer.state_dict()),
+			"transforms": self._clone_tree_to_cpu(
+				self._buffer._transform.state_dict()
+			),
+			"batch_size": self._buffer._batch_size,
+		}
+		return fields, rows, torchrl
+
+	def training_state_metadata(self):
+		"""Return replay metadata without copying the capacity-sized storage.
+
+		Pair this with :meth:`iter_training_state_shards`. The returned mapping has
+		no resident replay tensor, so a checkpoint writer can serialize it with
+		bounded additional memory.
+		"""
+		if not self._resumable_storage:
+			raise RuntimeError(
+				"Replay training state requires enable_resumable_storage() before use."
+			)
+		fields, rows, torchrl = self._storage_tensor_state()
+		initialized = torchrl is not None
+		if initialized and self._storage_device.type != "cpu":
+			raise RuntimeError("Resumable replay unexpectedly uses non-CPU storage.")
+		field_specs = []
+		if fields is not None:
+			for name, value in fields.items():
+				field_specs.append(
+					{
+						"name": str(name),
+						"shape": list(value.shape[1:]),
+						"dtype": str(value.dtype),
+					}
+				)
+			if {spec["name"]: spec for spec in field_specs} != (
+				self._configured_field_specs()
+			):
+				raise RuntimeError(
+					"Live replay tensors do not match the configured exact-resume schema."
+				)
+		return {
+			"schema": "tdmpc2-replay-sharded-training-state",
+			"version": 1,
+			"signature": self._training_signature(),
+			"storage_device": "cpu",
+			"initialized": initialized,
+			"storage_rows": rows,
+			"field_specs": field_specs,
+			"torchrl": torchrl,
+			**self._accounting_state(),
+		}
+
+	def iter_training_state_shards(self, *, max_rows):
+		"""Yield capacity-bounded CPU slices in physical storage order."""
+		if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows <= 0:
+			raise ValueError("Replay shard max_rows must be a positive integer.")
+		metadata = self.training_state_metadata()
+		rows = metadata["storage_rows"]
+		for shard_index in range((rows + max_rows - 1) // max_rows):
+			yield self.training_state_shard(shard_index, max_rows=max_rows)
+
+	def training_state_shard(self, index, *, max_rows):
+		"""Materialize exactly one shard for a deferred lineage file writer."""
+		if not self._resumable_storage:
+			raise RuntimeError(
+				"Replay training state requires enable_resumable_storage() before use."
+			)
+		if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows <= 0:
+			raise ValueError("Replay shard max_rows must be a positive integer.")
+		if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+			raise ValueError("Replay shard index must be a non-negative integer.")
+		fields, rows, _ = self._storage_tensor_state()
+		start = index * max_rows
+		if fields is None or start >= rows:
+			raise IndexError(
+				f"Replay shard index {index} is outside {rows} resident rows."
+			)
+		stop = min(rows, start + max_rows)
+		return {
+			"schema": "tdmpc2-replay-shard",
+			"version": 1,
+			"index": index,
+			"start": start,
+			"stop": stop,
+			"fields": {
+				name: value[start:stop].clone()
+				for name, value in fields.items()
+			},
+		}
+
+	def _preflight_sharded_metadata(self, metadata):
+		metadata = require_exact_keys(
+			metadata,
+			{
+				"schema",
+				"version",
+				"signature",
+				"storage_device",
+				"initialized",
+				"storage_rows",
+				"field_specs",
+				"torchrl",
+				"num_eps",
+				"num_transitions",
+				"total_transitions",
+				"resident_episode_rows",
+				"resident_rows",
+			},
+			"TD-MPC2 replay sharded metadata",
+		)
+		if (
+			metadata["schema"] != "tdmpc2-replay-sharded-training-state"
+			or metadata["version"] != 1
+		):
+			raise ValueError("Unsupported TD-MPC2 sharded replay version.")
+		if metadata["signature"] != self._training_signature():
+			raise ValueError("Sharded replay signature is incompatible.")
+		if metadata["storage_device"] != "cpu":
+			raise ValueError("Exact resume requires CPU replay storage.")
+		if not isinstance(metadata["initialized"], bool):
+			raise TypeError("Replay initialized flag must be bool.")
+		rows = metadata["storage_rows"]
+		if isinstance(rows, bool) or not isinstance(rows, int) or not 0 <= rows <= self._capacity:
+			raise ValueError("Sharded replay storage_rows is invalid.")
+		specs = metadata["field_specs"]
+		if not isinstance(specs, list):
+			raise TypeError("Sharded replay field_specs must be a list.")
+		field_specs = {}
+		for index, spec in enumerate(specs):
+			spec = require_exact_keys(
+				spec,
+				{"name", "shape", "dtype"},
+				f"replay field specification {index}",
+			)
+			name, shape, dtype = spec["name"], spec["shape"], spec["dtype"]
+			if not isinstance(name, str) or not isinstance(dtype, str):
+				raise TypeError("Replay field names and dtypes must be strings.")
+			if (
+				not isinstance(shape, list)
+				or any(
+					isinstance(value, bool)
+					or not isinstance(value, int)
+					or value < 0
+					for value in shape
+				)
+			):
+				raise ValueError("Replay field shapes must contain non-negative integers.")
+			field_specs[name] = {"name": name, "shape": shape, "dtype": dtype}
+		if len(field_specs) != len(specs):
+			raise ValueError("Replay field names must be unique.")
+		if metadata["initialized"]:
+			if rows <= 0 or not field_specs or metadata["torchrl"] is None:
+				raise ValueError("Initialized sharded replay metadata is incomplete.")
+			expected_specs = self._configured_field_specs()
+			if field_specs != expected_specs:
+				raise ValueError(
+					"Sharded replay field specifications are incompatible with the "
+					f"configured contract: checkpoint={field_specs}, "
+					f"configured={expected_specs}."
+				)
+			torchrl = require_exact_keys(
+				metadata["torchrl"],
+				{"sampler", "writer", "transforms", "batch_size"},
+				"sharded replay TorchRL metadata",
+			)
+			if torchrl["batch_size"] != self._batch_size:
+				raise ValueError("Sharded replay TorchRL batch size is incompatible.")
+			writer = require_exact_keys(
+				torchrl["writer"], {"_cursor"}, "sharded replay writer state"
+			)
+			cursor = writer["_cursor"]
+			if isinstance(cursor, bool) or not isinstance(cursor, int) or not 0 <= cursor < self._capacity:
+				raise ValueError("Sharded replay writer cursor is invalid.")
+		else:
+			if rows != 0 or field_specs or metadata["torchrl"] is not None:
+				raise ValueError("Uninitialized sharded replay must contain no storage.")
+		self._preflight_accounting(metadata, candidate_size=rows)
+		if metadata["initialized"]:
+			self._preflight_writer_cursor(
+				metadata["torchrl"]["writer"]["_cursor"], metadata
+			)
+		return metadata, field_specs
+
+	def load_training_state_shards(self, metadata, shards):
+		"""Transactionally stream validated physical replay shards into storage."""
+		if not self._resumable_storage:
+			raise RuntimeError(
+				"Replay restore requires enable_resumable_storage() before use."
+			)
+		metadata, field_specs = self._preflight_sharded_metadata(metadata)
+		candidate = None
+		expected_start = 0
+		expected_index = 0
+		if metadata["initialized"]:
+			pin_memory = self._uses_pinned_staging("cpu", self._device)
+			candidate = self._reserve_buffer(
+				LazyTensorStorage(self._capacity, device="cpu"),
+				sampler=self._make_sampler(),
+				pin_memory=pin_memory,
+			)
+
+		for shard in shards:
+			if candidate is None:
+				raise ValueError("Uninitialized replay must not have data shards.")
+			shard = require_exact_keys(
+				shard,
+				{"schema", "version", "index", "start", "stop", "fields"},
+				f"replay shard {expected_index}",
+			)
+			if shard["schema"] != "tdmpc2-replay-shard" or shard["version"] != 1:
+				raise ValueError("Unsupported replay shard schema/version.")
+			if shard["index"] != expected_index or shard["start"] != expected_start:
+				raise ValueError("Replay shards are missing, duplicated, or out of order.")
+			stop = shard["stop"]
+			if isinstance(stop, bool) or not isinstance(stop, int) or not expected_start < stop <= metadata["storage_rows"]:
+				raise ValueError("Replay shard row range is invalid.")
+			row_count = stop - expected_start
+			fields = require_exact_keys(
+				shard["fields"], field_specs, f"replay shard {expected_index} fields"
+			)
+			td_fields = {}
+			for name, spec in field_specs.items():
+				value = fields[name]
+				if not torch.is_tensor(value):
+					raise TypeError(f"Replay shard field {name!r} must be a tensor.")
+				if value.device.type != "cpu":
+					raise ValueError(f"Replay shard field {name!r} must be on CPU.")
+				if list(value.shape) != [row_count, *spec["shape"]]:
+					raise ValueError(f"Replay shard field {name!r} has the wrong shape.")
+				if str(value.dtype) != spec["dtype"]:
+					raise ValueError(f"Replay shard field {name!r} has the wrong dtype.")
+				td_fields[name] = value
+			candidate.extend(TensorDict(td_fields, batch_size=[row_count]))
+			expected_start = stop
+			expected_index += 1
+
+		if expected_start != metadata["storage_rows"]:
+			raise ValueError("Replay shard sequence ended before all rows were restored.")
+		if candidate is not None:
+			torchrl = metadata["torchrl"]
+			candidate._sampler.load_state_dict(torchrl["sampler"])
+			candidate._writer.load_state_dict(torchrl["writer"])
+			candidate._transform.load_state_dict(torchrl["transforms"])
+			candidate._batch_size = torchrl["batch_size"]
+			if len(candidate) != metadata["storage_rows"]:
+				raise ValueError("Streamed replay size differs from metadata.")
+
+		self._commit_restored_state(metadata, candidate)
+		return self
+
+	def _preflight_accounting(self, state, *, candidate_size):
+		integer_fields = (
+			"num_eps",
+			"num_transitions",
+			"total_transitions",
+			"resident_rows",
+		)
+		for key in integer_fields:
+			value = state[key]
+			if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+				raise ValueError(f"Replay {key} must be a non-negative integer.")
+		rows = state["resident_episode_rows"]
+		if not isinstance(rows, list):
+			raise TypeError("Replay resident_episode_rows must be a list.")
+		row_sum = transition_sum = 0
+		for index, entry in enumerate(rows):
+			if not isinstance(entry, (list, tuple)) or len(entry) != 3:
+				raise ValueError(
+					f"Replay resident episode entry {index} must contain three integers."
+				)
+			if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in entry):
+				raise ValueError(
+					f"Replay resident episode entry {index} contains invalid counters."
+				)
+			episode_rows, initial_rows, transitions = entry
+			if initial_rows not in {0, 1} or transitions != episode_rows - initial_rows:
+				raise ValueError(
+					f"Replay resident episode entry {index} is internally inconsistent."
+				)
+			row_sum += episode_rows
+			transition_sum += transitions
+		if row_sum != state["resident_rows"] or row_sum != candidate_size:
+			raise ValueError("Replay resident row accounting does not match storage.")
+		if transition_sum != state["num_transitions"]:
+			raise ValueError("Replay resident transition accounting is inconsistent.")
+		if state["total_transitions"] < state["num_transitions"]:
+			raise ValueError("Replay cumulative transitions precede resident transitions.")
+		if len(rows) > state["num_eps"]:
+			raise ValueError("Replay contains more resident episodes than submitted episodes.")
+		if bool(state["initialized"]) != (state["num_eps"] > 0):
+			raise ValueError("Replay initialization and episode counters disagree.")
+
+	def _preflight_writer_cursor(self, cursor, state):
+		"""Tie TorchRL's physical write cursor to cumulative submitted rows."""
+		if self._capacity <= 0:
+			raise ValueError("Initialized replay cannot have zero capacity.")
+		expected = (state["total_transitions"] + state["num_eps"]) % self._capacity
+		if cursor != expected:
+			raise ValueError(
+				"Replay writer cursor is inconsistent with cumulative submitted rows: "
+				f"checkpoint={cursor}, expected={expected}."
+			)
+
+	def _commit_restored_state(self, state, candidate):
+		if candidate is None:
+			if hasattr(self, "_buffer"):
+				del self._buffer
+			self._sampler = self._make_sampler()
+		else:
+			self._buffer = candidate
+			self._sampler = candidate._sampler
+			self._storage_device = torch.device("cpu")
+			self._pin_memory = self._uses_pinned_staging("cpu", self._device)
+		self._num_eps = int(state["num_eps"])
+		self._num_transitions = int(state["num_transitions"])
+		self._total_transitions = int(state["total_transitions"])
+		self._resident_episode_rows = deque(
+			list(entry) for entry in state["resident_episode_rows"]
+		)
+		self._resident_rows = int(state["resident_rows"])
