@@ -1,0 +1,374 @@
+{
+  "schema_version": 1,
+  "benchmark": "ambi-inner-latency",
+  "metadata": {
+    "description": "Action-selection latency matrix around the current Humanoid Walk G4 AMBI configuration. The benchmark loads one fixed outer checkpoint and never trains or steps the environment.",
+    "center": "center_j2_n32_g4",
+    "deduplication": "The center belongs to all four families and appears exactly once, leaving 15 unique J/N/G cells.",
+    "families": {
+      "G": "Hold J=2 and N=32; vary G over 0, 2, 4, 8, 16.",
+      "N": "Hold J=2 and G=4; vary N over 8, 16, 32, 64, 128.",
+      "natural_J": "Hold N=32 and G=4; vary J over 1, 2, 4, 8.",
+      "matched_work_J": "Vary J while holding J*N*H=192 imagined transitions and J*G=8 update slots."
+    }
+  },
+  "base": {
+    "algorithm_config": "../dmcontrol/algs/ambi_humanoid_walk_updates_g4.json",
+    "environment": {
+      "id": "DMControl-v0",
+      "params": {
+        "task": "humanoid-walk",
+        "obs": "state",
+        "render_mode": null
+      }
+    }
+  },
+  "settings": {
+    "device": "cuda",
+    "action_mode": "training",
+    "cold_calls": 1,
+    "warmup_calls": 49,
+    "measured_calls": 200,
+    "observation_bank_size": 64,
+    "environment_seed": 55,
+    "controller_seed": 55,
+    "collect_diagnostics": false,
+    "wandb": false,
+    "H": 3,
+    "B": 64,
+    "blocks": 3,
+    "block_order_seed": 20260817
+  },
+  "counter_formulas": {
+    "inner_rollouts": "J * N",
+    "inner_model_steps": "J * N * H",
+    "inner_total_model_steps": "J * N * H when collect_diagnostics=false",
+    "resolved_inner_replay_capacity": "J * N * H",
+    "inner_buffer_capacity": "J * N * H",
+    "inner_update_slots": "J * G",
+    "inner_critic_optimizer_steps": "J * G",
+    "inner_actor_optimizer_steps": "J * G",
+    "inner_temperature_optimizer_steps": "0 because the base uses inner_temperature_mode=inherit_outer",
+    "inner_critic_target_updates": "J * G because the base target-update interval is 1",
+    "inner_replay_draws": "J * G * B",
+    "inner_policy_evaluations": "J * N * H + 2 * J * G * B + 1",
+    "inner_q_evaluations": "3 * J * G * B"
+  },
+  "cells": [
+    {
+      "name": "center_j2_n32_g4",
+      "J": 2,
+      "N": 32,
+      "G": 4,
+      "families": ["G", "N", "natural_J", "matched_work_J"],
+      "expected_counters": {
+        "inner_rollouts": 64,
+        "inner_model_steps": 192,
+        "inner_total_model_steps": 192,
+        "inner_buffer_capacity": 192,
+        "inner_update_slots": 8,
+        "inner_critic_optimizer_steps": 8,
+        "inner_actor_optimizer_steps": 8,
+        "inner_temperature_optimizer_steps": 0,
+        "inner_critic_target_updates": 8,
+        "inner_replay_draws": 512,
+        "inner_policy_evaluations": 1217,
+        "inner_q_evaluations": 1536
+      }
+    },
+    {
+      "name": "g_sweep_g0",
+      "J": 2,
+      "N": 32,
+      "G": 0,
+      "families": ["G"],
+      "expected_counters": {
+        "inner_rollouts": 64,
+        "inner_model_steps": 192,
+        "inner_total_model_steps": 192,
+        "inner_buffer_capacity": 192,
+        "inner_update_slots": 0,
+        "inner_critic_optimizer_steps": 0,
+        "inner_actor_optimizer_steps": 0,
+        "inner_temperature_optimizer_steps": 0,
+        "inner_critic_target_updates": 0,
+        "inner_replay_draws": 0,
+        "inner_policy_evaluations": 193,
+        "inner_q_evaluations": 0
+      }
+    },
+    {
+      "name": "g_sweep_g2",
+      "J": 2,
+      "N": 32,
+      "G": 2,
+      "families": ["G"],
+      "expected_counters": {
+        "inner_rollouts": 64,
+        "inner_model_steps": 192,
+        "inner_total_model_steps": 192,
+        "inner_buffer_capacity": 192,
+        "inner_update_slots": 4,
+        "inner_critic_optimizer_steps": 4,
+        "inner_actor_optimizer_steps": 4,
+        "inner_temperature_optimizer_steps": 0,
+        "inner_critic_target_updates": 4,
+        "inner_replay_draws": 256,
+        "inner_policy_evaluations": 705,
+        "inner_q_evaluations": 768
+      }
+    },
+    {
+      "name": "g_sweep_g8",
+      "J": 2,
+      "N": 32,
+      "G": 8,
+      "families": ["G"],
+      "expected_counters": {
+        "inner_rollouts": 64,
+        "inner_model_steps": 192,
+        "inner_total_model_steps": 192,
+        "inner_buffer_capacity": 192,
+        "inner_update_slots": 16,
+        "inner_critic_optimizer_steps": 16,
+        "inner_actor_optimizer_steps": 16,
+        "inner_temperature_optimizer_steps": 0,
+        "inner_critic_target_updates": 16,
+        "inner_replay_draws": 1024,
+        "inner_policy_evaluations": 2241,
+        "inner_q_evaluations": 3072
+      }
+    },
+    {
+      "name": "g_sweep_g16",
+      "J": 2,
+      "N": 32,
+      "G": 16,
+      "families": ["G"],
+      "expected_counters": {
+        "inner_rollouts": 64,
+        "inner_model_steps": 192,
+        "inner_total_model_steps": 192,
+        "inner_buffer_capacity": 192,
+        "inner_update_slots": 32,
+        "inner_critic_optimizer_steps": 32,
+        "inner_actor_optimizer_steps": 32,
+        "inner_temperature_optimizer_steps": 0,
+        "inner_critic_target_updates": 32,
+        "inner_replay_draws": 2048,
+        "inner_policy_evaluations": 4289,
+        "inner_q_evaluations": 6144
+      }
+    },
+    {
+      "name": "n_sweep_n8",
+      "J": 2,
+      "N": 8,
+      "G": 4,
+      "families": ["N"],
+      "expected_counters": {
+        "inner_rollouts": 16,
+        "inner_model_steps": 48,
+        "inner_total_model_steps": 48,
+        "inner_buffer_capacity": 48,
+        "inner_update_slots": 8,
+        "inner_critic_optimizer_steps": 8,
+        "inner_actor_optimizer_steps": 8,
+        "inner_temperature_optimizer_steps": 0,
+        "inner_critic_target_updates": 8,
+        "inner_replay_draws": 512,
+        "inner_policy_evaluations": 1073,
+        "inner_q_evaluations": 1536
+      }
+    },
+    {
+      "name": "n_sweep_n16",
+      "J": 2,
+      "N": 16,
+      "G": 4,
+      "families": ["N"],
+      "expected_counters": {
+        "inner_rollouts": 32,
+        "inner_model_steps": 96,
+        "inner_total_model_steps": 96,
+        "inner_buffer_capacity": 96,
+        "inner_update_slots": 8,
+        "inner_critic_optimizer_steps": 8,
+        "inner_actor_optimizer_steps": 8,
+        "inner_temperature_optimizer_steps": 0,
+        "inner_critic_target_updates": 8,
+        "inner_replay_draws": 512,
+        "inner_policy_evaluations": 1121,
+        "inner_q_evaluations": 1536
+      }
+    },
+    {
+      "name": "n_sweep_n64",
+      "J": 2,
+      "N": 64,
+      "G": 4,
+      "families": ["N"],
+      "expected_counters": {
+        "inner_rollouts": 128,
+        "inner_model_steps": 384,
+        "inner_total_model_steps": 384,
+        "inner_buffer_capacity": 384,
+        "inner_update_slots": 8,
+        "inner_critic_optimizer_steps": 8,
+        "inner_actor_optimizer_steps": 8,
+        "inner_temperature_optimizer_steps": 0,
+        "inner_critic_target_updates": 8,
+        "inner_replay_draws": 512,
+        "inner_policy_evaluations": 1409,
+        "inner_q_evaluations": 1536
+      }
+    },
+    {
+      "name": "n_sweep_n128",
+      "J": 2,
+      "N": 128,
+      "G": 4,
+      "families": ["N"],
+      "expected_counters": {
+        "inner_rollouts": 256,
+        "inner_model_steps": 768,
+        "inner_total_model_steps": 768,
+        "inner_buffer_capacity": 768,
+        "inner_update_slots": 8,
+        "inner_critic_optimizer_steps": 8,
+        "inner_actor_optimizer_steps": 8,
+        "inner_temperature_optimizer_steps": 0,
+        "inner_critic_target_updates": 8,
+        "inner_replay_draws": 512,
+        "inner_policy_evaluations": 1793,
+        "inner_q_evaluations": 1536
+      }
+    },
+    {
+      "name": "natural_j1",
+      "J": 1,
+      "N": 32,
+      "G": 4,
+      "families": ["natural_J"],
+      "expected_counters": {
+        "inner_rollouts": 32,
+        "inner_model_steps": 96,
+        "inner_total_model_steps": 96,
+        "inner_buffer_capacity": 96,
+        "inner_update_slots": 4,
+        "inner_critic_optimizer_steps": 4,
+        "inner_actor_optimizer_steps": 4,
+        "inner_temperature_optimizer_steps": 0,
+        "inner_critic_target_updates": 4,
+        "inner_replay_draws": 256,
+        "inner_policy_evaluations": 609,
+        "inner_q_evaluations": 768
+      }
+    },
+    {
+      "name": "natural_j4",
+      "J": 4,
+      "N": 32,
+      "G": 4,
+      "families": ["natural_J"],
+      "expected_counters": {
+        "inner_rollouts": 128,
+        "inner_model_steps": 384,
+        "inner_total_model_steps": 384,
+        "inner_buffer_capacity": 384,
+        "inner_update_slots": 16,
+        "inner_critic_optimizer_steps": 16,
+        "inner_actor_optimizer_steps": 16,
+        "inner_temperature_optimizer_steps": 0,
+        "inner_critic_target_updates": 16,
+        "inner_replay_draws": 1024,
+        "inner_policy_evaluations": 2433,
+        "inner_q_evaluations": 3072
+      }
+    },
+    {
+      "name": "natural_j8",
+      "J": 8,
+      "N": 32,
+      "G": 4,
+      "families": ["natural_J"],
+      "expected_counters": {
+        "inner_rollouts": 256,
+        "inner_model_steps": 768,
+        "inner_total_model_steps": 768,
+        "inner_buffer_capacity": 768,
+        "inner_update_slots": 32,
+        "inner_critic_optimizer_steps": 32,
+        "inner_actor_optimizer_steps": 32,
+        "inner_temperature_optimizer_steps": 0,
+        "inner_critic_target_updates": 32,
+        "inner_replay_draws": 2048,
+        "inner_policy_evaluations": 4865,
+        "inner_q_evaluations": 6144
+      }
+    },
+    {
+      "name": "matched_j1_n64_g8",
+      "J": 1,
+      "N": 64,
+      "G": 8,
+      "families": ["matched_work_J"],
+      "expected_counters": {
+        "inner_rollouts": 64,
+        "inner_model_steps": 192,
+        "inner_total_model_steps": 192,
+        "inner_buffer_capacity": 192,
+        "inner_update_slots": 8,
+        "inner_critic_optimizer_steps": 8,
+        "inner_actor_optimizer_steps": 8,
+        "inner_temperature_optimizer_steps": 0,
+        "inner_critic_target_updates": 8,
+        "inner_replay_draws": 512,
+        "inner_policy_evaluations": 1217,
+        "inner_q_evaluations": 1536
+      }
+    },
+    {
+      "name": "matched_j4_n16_g2",
+      "J": 4,
+      "N": 16,
+      "G": 2,
+      "families": ["matched_work_J"],
+      "expected_counters": {
+        "inner_rollouts": 64,
+        "inner_model_steps": 192,
+        "inner_total_model_steps": 192,
+        "inner_buffer_capacity": 192,
+        "inner_update_slots": 8,
+        "inner_critic_optimizer_steps": 8,
+        "inner_actor_optimizer_steps": 8,
+        "inner_temperature_optimizer_steps": 0,
+        "inner_critic_target_updates": 8,
+        "inner_replay_draws": 512,
+        "inner_policy_evaluations": 1217,
+        "inner_q_evaluations": 1536
+      }
+    },
+    {
+      "name": "matched_j8_n8_g1",
+      "J": 8,
+      "N": 8,
+      "G": 1,
+      "families": ["matched_work_J"],
+      "expected_counters": {
+        "inner_rollouts": 64,
+        "inner_model_steps": 192,
+        "inner_total_model_steps": 192,
+        "inner_buffer_capacity": 192,
+        "inner_update_slots": 8,
+        "inner_critic_optimizer_steps": 8,
+        "inner_actor_optimizer_steps": 8,
+        "inner_temperature_optimizer_steps": 0,
+        "inner_critic_target_updates": 8,
+        "inner_replay_draws": 512,
+        "inner_policy_evaluations": 1217,
+        "inner_q_evaluations": 1536
+      }
+    }
+  ]
+}
