@@ -1122,7 +1122,7 @@ def _view_specs() -> tuple[tuple[str, str, str], ...]:
 
 def _x_labels(view_name: str, keys: Sequence[CellKey]) -> list[str]:
     if view_name == "matched_J":
-        return [f"{key.J}\nN={key.N}, G={key.G}" for key in keys]
+        return [f"{key.J}\nN{key.N}/G{key.G}" for key in keys]
     variable = "J" if view_name == "J" else view_name
     return [str(getattr(key, variable)) for key in keys]
 
@@ -1255,7 +1255,7 @@ def plot_phases(dataset: Dataset, png_path: Path, pdf_path: Path) -> tuple[Path,
         ax.scatter(x, total_means, marker="D", s=19, color="black", zorder=4, label="wall mean")
         ax.set_xticks(x, _x_labels(view_name, keys))
         ax.set_xlabel(xlabel)
-        ax.set_ylabel("Paired representative mean (ms/action)")
+        ax.set_ylabel("Latency (ms/action)")
         ax.set_title(title)
         ax.set_ylim(bottom=0)
         ax.grid(axis="x", visible=False)
@@ -1266,14 +1266,14 @@ def plot_phases(dataset: Dataset, png_path: Path, pdf_path: Path) -> tuple[Path,
         0.5,
         0.012,
         _footer(dataset)
-        + " Each additive phase stack uses the block nearest the median wall mean, "
+        + "\nEach additive phase stack uses the block nearest the median wall mean, "
         + "scaled to its displayed diamond.",
         ha="center",
         va="bottom",
         fontsize=7.0,
         color="0.3",
     )
-    fig.tight_layout(rect=(0, 0.05, 1, 0.86))
+    fig.tight_layout(rect=(0.035, 0.055, 1, 0.84), h_pad=3.4, w_pad=2.0)
     fig.savefig(png_path, dpi=300, bbox_inches="tight")
     fig.savefig(pdf_path, bbox_inches="tight")
     plt.close(fig)
