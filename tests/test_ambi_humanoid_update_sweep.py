@@ -28,6 +28,15 @@ BASE_V1_TAGS = [
     "critic-lr1e-4",
     "actor-lr5e-5",
 ]
+BASE_V1_VARIANTS = {
+    "ambi_humanoid_walk_base_j2_n32_g8": (2, 32, 8),
+    "ambi_humanoid_walk_base_j4_n32_g2": (4, 32, 2),
+    "ambi_humanoid_walk_base_j4_n32_g4": (4, 32, 4),
+    "ambi_humanoid_walk_base_j2_n64_g2": (2, 64, 2),
+    "ambi_humanoid_walk_base_j2_n64_g4": (2, 64, 4),
+    "ambi_humanoid_walk_base_j2_n64_g8": (2, 64, 8),
+    "ambi_humanoid_walk_base_j2_n128_g4": (2, 128, 4),
+}
 LR_CELLS = {
     "ambi_humanoid_walk_updates_g4_critic_lr1e4": {
         "inner_actor_lr": 5e-5,
@@ -92,6 +101,33 @@ def _load(path: Path):
 
 def _name(updates: int) -> str:
     return f"ambi_humanoid_walk_updates_g{updates}"
+
+
+def _base_variant_tags(rounds: int, rollouts: int, updates: int) -> list[str]:
+    return [
+        "ambi",
+        "dmcontrol",
+        "humanoid-walk",
+        "state",
+        "base-v1",
+        "tdmpc2-aligned-recipe",
+        "14m-decisions",
+        "runtime-variant",
+        f"j{rounds}",
+        f"n{rollouts}",
+        f"g{updates}",
+        "critic-lr1e-4",
+        "actor-lr5e-5",
+    ]
+
+
+def _base_variant_study_note(rounds: int, rollouts: int, updates: int) -> str:
+    return (
+        "Single-seed exploratory 14-million-decision Humanoid Walk base-v1 "
+        f"runtime variant with J={rounds}, N={rollouts}, H=3, and G={updates}; "
+        "all other recipe parameters match the base. Make no confidence, "
+        "significance, or confirmatory claims."
+    )
 
 
 def test_humanoid_update_sweep_changes_only_task_and_update_dose_from_anchor():
@@ -284,3 +320,55 @@ def test_humanoid_base_v1_has_a_matching_runnable_manifest():
 
     assert actual == expected
     assert actual["overrides_alg"]["total_steps"] == 14_000_000
+
+
+def test_humanoid_base_v1_runtime_variants_change_only_j_n_g_and_capacity():
+    baseline = _load(ALGORITHM_ROOT / f"{BASE_V1}.json")
+    run_names = {baseline["alg_params"]["wandb_run_name"]}
+
+    for name, (rounds, rollouts, updates) in BASE_V1_VARIANTS.items():
+        actual = _load(ALGORITHM_ROOT / f"{name}.json")
+        expected = copy.deepcopy(baseline)
+        expected["alg_params"].update(
+            {
+                "inner_rounds": rounds,
+                "inner_rollouts_per_round": rollouts,
+                "inner_updates_per_round": updates,
+                "inner_replay_capacity": rounds * rollouts * 3,
+                "wandb_run_name": (
+                    "AMBITDMPC2-humanoid-walk-base-v1-"
+                    f"j{rounds}-n{rollouts}-g{updates}-seed55"
+                ),
+                "wandb_tags": _base_variant_tags(rounds, rollouts, updates),
+            }
+        )
+
+        assert actual == expected
+        params = actual["alg_params"]
+        assert actual["total_steps"] == 14_000_000
+        assert params["inner_replay_capacity"] == rounds * rollouts * 3
+        assert rounds * updates > 0
+        assert "wandb_group" not in params
+        run_names.add(params["wandb_run_name"])
+
+    assert len(run_names) == len(BASE_V1_VARIANTS) + 1
+
+
+def test_humanoid_base_v1_runtime_variants_have_matching_manifests():
+    baseline = _load(EXPERIMENT_ROOT / f"{BASE_V1}.json")
+
+    for name, (rounds, rollouts, updates) in BASE_V1_VARIANTS.items():
+        actual = _load(EXPERIMENT_ROOT / f"{name}.json")
+        expected = copy.deepcopy(baseline)
+        expected.update(
+            {
+                "study_type": "single_seed_exploratory_base_runtime_variant",
+                "study_note": _base_variant_study_note(
+                    rounds, rollouts, updates
+                ),
+                "configs": [name],
+            }
+        )
+
+        assert actual == expected
+        assert actual["overrides_alg"]["total_steps"] == 14_000_000
