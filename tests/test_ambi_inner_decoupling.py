@@ -785,6 +785,33 @@ def test_outer_scalar_soft_target_and_optimizer_partition_are_preserved(monkeypa
     )
 
 
+def test_outer_actor_and_inner_sac_adam_epsilons_are_wired_independently():
+    model = _model(
+        adam_eps=1e-8,
+        actor_adam_eps=1e-5,
+        inner_adam_eps=3e-8,
+        inner_temperature_mode="auto",
+        inner_temperature_updates_per_action=2,
+    )
+    agent = model.agent
+
+    assert {group["eps"] for group in agent.optim.param_groups} == {1e-8}
+    assert {group["eps"] for group in agent.pi_optim.param_groups} == {1e-5}
+    assert {group["eps"] for group in agent.ent_coef_optim.param_groups} == {1e-8}
+
+    engine = agent.inner_engine
+    with engine.rng.fork("initialization"):
+        engine._prepare_workspace(t0=True)
+    inner_optimizers = (
+        engine.state.actor_optim,
+        engine.state.critic_optim,
+        engine.state.temperature_optim,
+    )
+    assert all(optimizer is not None for optimizer in inner_optimizers)
+    for optimizer in inner_optimizers:
+        assert {group["eps"] for group in optimizer.param_groups} == {3e-8}
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_cuda_act_preserves_all_global_rng_streams_and_outer_state():
     model = _model(

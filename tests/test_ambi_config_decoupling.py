@@ -155,6 +155,21 @@ def test_actor_and_critic_target_controls_resolve_independently():
     assert cfg.inner_critic_target_update_interval == 5
 
 
+def test_actor_adam_epsilon_defaults_to_main_and_validates_independent_override():
+    inherited = _build_cfg(adam_eps=2e-8)
+    assert inherited.adam_eps == pytest.approx(2e-8)
+    assert inherited.actor_adam_eps == pytest.approx(2e-8)
+
+    split = _build_cfg(adam_eps=1e-8, actor_adam_eps=1e-5)
+    assert split.adam_eps == pytest.approx(1e-8)
+    assert split.actor_adam_eps == pytest.approx(1e-5)
+
+    with pytest.raises(ValueError, match="actor_adam_eps"):
+        _build_cfg(actor_adam_eps=float("nan"))
+    with pytest.raises(ValueError, match="must be positive"):
+        _build_cfg(actor_adam_eps=0.0)
+
+
 def test_inert_noise_knob_combinations_and_nonfinite_values_fail_early():
     with pytest.raises(ValueError, match="noise_std requires"):
         _build_cfg(inner_behavior_action="mean", inner_behavior_noise_std=0.1)

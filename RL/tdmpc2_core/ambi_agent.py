@@ -99,7 +99,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self.pi_optim = torch.optim.Adam(
             self.model._pi.parameters(),
             lr=float(getattr(cfg, "actor_lr", cfg.lr)),
-            eps=float(getattr(cfg, "adam_eps", 1e-8)),
+            eps=float(cfg.actor_adam_eps),
             capturable=self.device.type == "cuda",
             foreach=self.device.type == "cuda",
         )

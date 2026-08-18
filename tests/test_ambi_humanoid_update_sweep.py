@@ -9,6 +9,25 @@ ALGORITHM_ROOT = ROOT / "configs/dmcontrol/algs"
 EXPERIMENT_ROOT = ROOT / "configs/dmcontrol/experiments"
 UPDATES = (2, 4, 8, 16)
 BASE_G4 = "ambi_humanoid_walk_updates_g4"
+BASE_V1 = "ambi_humanoid_walk_base"
+BASE_V1_STUDY_NOTE = (
+    "Single-seed exploratory 14-million-decision Humanoid Walk base-v1 run "
+    "using the G4 inner schedule and selected inner critic learning rate with "
+    "TD-MPC2-aligned outer recipe parameters; make no confidence, "
+    "significance, or confirmatory claims."
+)
+BASE_V1_TAGS = [
+    "ambi",
+    "dmcontrol",
+    "humanoid-walk",
+    "state",
+    "base-v1",
+    "tdmpc2-aligned-recipe",
+    "14m-decisions",
+    "g4",
+    "critic-lr1e-4",
+    "actor-lr5e-5",
+]
 LR_CELLS = {
     "ambi_humanoid_walk_updates_g4_critic_lr1e4": {
         "inner_actor_lr": 5e-5,
@@ -217,3 +236,51 @@ def test_g4_learning_rate_cells_reuse_the_resumable_humanoid_protocol():
         expected["configs"] = [name]
 
         assert actual == expected
+
+
+def test_humanoid_base_v1_changes_only_the_selected_tdmpc2_recipe_parameters():
+    selected = _load(
+        ALGORITHM_ROOT / "ambi_humanoid_walk_updates_g4_critic_lr1e4.json"
+    )
+    actual = _load(ALGORITHM_ROOT / f"{BASE_V1}.json")
+    expected = copy.deepcopy(selected)
+    expected["alg_params"].update(
+        {
+            "rho": 0.5,
+            "critic_coef": 0.1,
+            "tau": 0.01,
+            "actor_adam_eps": 1e-5,
+            "wandb_run_name": "AMBITDMPC2-humanoid-walk-base-v1-g4-seed55",
+            "wandb_tags": BASE_V1_TAGS,
+        }
+    )
+    expected["total_steps"] = 14_000_000
+
+    assert actual == expected
+    params = actual["alg_params"]
+    assert actual["total_steps"] == 14_000_000
+    assert params["inner_updates_per_round"] == 4
+    assert params["inner_actor_lr"] == 5e-5
+    assert params["inner_critic_lr"] == 1e-4
+    assert params["adam_eps"] == 1e-8
+    assert params["inner_adam_eps"] == 1e-8
+    assert params["inner_critic_target_tau"] == 0.005
+
+
+def test_humanoid_base_v1_has_a_matching_runnable_manifest():
+    selected = _load(
+        EXPERIMENT_ROOT / "ambi_humanoid_walk_updates_g4_critic_lr1e4.json"
+    )
+    actual = _load(EXPERIMENT_ROOT / f"{BASE_V1}.json")
+    expected = copy.deepcopy(selected)
+    expected.update(
+        {
+            "study_type": "single_seed_exploratory_base",
+            "study_note": BASE_V1_STUDY_NOTE,
+            "configs": [BASE_V1],
+        }
+    )
+    expected["overrides_alg"]["total_steps"] = 14_000_000
+
+    assert actual == expected
+    assert actual["overrides_alg"]["total_steps"] == 14_000_000

@@ -36,6 +36,7 @@ _AMBI_DEFAULTS = {
     "actor_lr": 3e-4,
     "critic_lr": 3e-4,
     "adam_eps": 1e-8,
+    "actor_adam_eps": None,
     "log_std_min": -20,
     "log_std_max": 2,
     "ent_coef": "auto",
@@ -997,9 +998,15 @@ class AMBITDMPC2(TDMPC2Baseline):
         if not 0.0 < cfg.inner_actor_target_tau <= 1.0:
             raise ValueError("inner_actor_target_tau must be in (0, 1].")
         cfg.adam_eps = _finite_float(cfg.adam_eps, "adam_eps")
+        cfg.actor_adam_eps = _finite_float(
+            cfg.adam_eps if cfg.actor_adam_eps is None else cfg.actor_adam_eps,
+            "actor_adam_eps",
+        )
         cfg.inner_adam_eps = _finite_float(cfg.inner_adam_eps, "inner_adam_eps")
-        if cfg.adam_eps <= 0.0 or cfg.inner_adam_eps <= 0.0:
-            raise ValueError("adam_eps and inner_adam_eps must be positive.")
+        if min(cfg.adam_eps, cfg.actor_adam_eps, cfg.inner_adam_eps) <= 0.0:
+            raise ValueError(
+                "adam_eps, actor_adam_eps, and inner_adam_eps must be positive."
+            )
 
         for key in ("actor_lr", "critic_lr", "ent_coef_lr"):
             value = _finite_float(getattr(cfg, key), key)
