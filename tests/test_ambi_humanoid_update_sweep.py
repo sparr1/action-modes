@@ -10,6 +10,8 @@ EXPERIMENT_ROOT = ROOT / "configs/dmcontrol/experiments"
 UPDATES = (2, 4, 8, 16)
 BASE_G4 = "ambi_humanoid_walk_updates_g4"
 BASE_V1 = "ambi_humanoid_walk_base"
+BASE_V1_LORA_R8 = "ambi_humanoid_walk_base_lora_r8"
+BASE_V1_LORA_R16 = "ambi_humanoid_walk_base_lora_r16"
 BASE_V1_ACTOR_MEAN_PAIR = "ambi_humanoid_walk_base_actor_mean_pair"
 BASE_V1_PERCENTILE_NORMALIZED = "ambi_humanoid_walk_base_percentile_normalized"
 BASE_V1_STUDY_NOTE = (
@@ -17,6 +19,20 @@ BASE_V1_STUDY_NOTE = (
     "using the G4 inner schedule and selected inner critic learning rate with "
     "TD-MPC2-aligned outer recipe parameters; make no confidence, "
     "significance, or confirmatory claims."
+)
+BASE_V1_LORA_R8_STUDY_NOTE = (
+    "Single-seed exploratory 14-million-decision Humanoid Walk base-v1 G4 run "
+    "changing only the inner actor and critic from full cloned modules to "
+    "rank-8 LoRA adapters with alpha=16 (direct scale=2); all other training "
+    "recipe parameters match the base. Make no confidence, significance, or "
+    "confirmatory claims."
+)
+BASE_V1_LORA_R16_STUDY_NOTE = (
+    "Single-seed exploratory 14-million-decision Humanoid Walk base-v1 G4 run "
+    "changing only the inner actor and critic from full cloned modules to "
+    "rank-16 LoRA adapters with alpha=32 (direct scale=2); all other training "
+    "recipe parameters match the base. Make no confidence, significance, or "
+    "confirmatory claims."
 )
 BASE_V1_ACTOR_MEAN_PAIR_STUDY_NOTE = (
     "Single-seed exploratory 14-million-decision Humanoid Walk base-v1 run "
@@ -342,6 +358,112 @@ def test_humanoid_base_v1_has_a_matching_runnable_manifest():
 
     assert actual == expected
     assert actual["overrides_alg"]["total_steps"] == 14_000_000
+
+
+def test_humanoid_base_v1_lora_r8_changes_only_inner_adaptation():
+    baseline = _load(ALGORITHM_ROOT / f"{BASE_V1}.json")
+    actual = _load(ALGORITHM_ROOT / f"{BASE_V1_LORA_R8}.json")
+    expected = copy.deepcopy(baseline)
+    expected["alg_params"].update(
+        {
+            "inner_actor_adaptation": "lora",
+            "inner_critic_adaptation": "lora",
+            "inner_actor_lora_rank": 8,
+            "inner_actor_lora_scale": 2.0,
+            "inner_actor_lora_dropout": 0.0,
+            "inner_critic_lora_rank": 8,
+            "inner_critic_lora_scale": 2.0,
+            "inner_critic_lora_dropout": 0.0,
+            "wandb_run_name": (
+                "AMBITDMPC2-humanoid-walk-base-v1-g4-"
+                "lora-r8-alpha16-seed55"
+            ),
+            "wandb_tags": [
+                *BASE_V1_TAGS,
+                "inner-lora",
+                "lora-r8",
+                "lora-alpha16",
+                "lora-scale2",
+            ],
+        }
+    )
+
+    assert actual == expected
+    params = actual["alg_params"]
+    assert (
+        params["inner_actor_lora_scale"] * params["inner_actor_lora_rank"] == 16
+    )
+    assert (
+        params["inner_critic_lora_scale"] * params["inner_critic_lora_rank"]
+        == 16
+    )
+    assert actual["seed"] == 55
+    assert actual["total_steps"] == 14_000_000
+
+
+def test_humanoid_base_v1_lora_r8_has_a_matching_manifest():
+    baseline = _load(EXPERIMENT_ROOT / f"{BASE_V1}.json")
+    actual = _load(EXPERIMENT_ROOT / f"{BASE_V1_LORA_R8}.json")
+    expected = copy.deepcopy(baseline)
+    expected.update(
+        {
+            "study_type": "single_seed_exploratory_inner_adaptation",
+            "study_note": BASE_V1_LORA_R8_STUDY_NOTE,
+            "configs": [BASE_V1_LORA_R8],
+        }
+    )
+
+    assert actual == expected
+
+
+def test_humanoid_base_v1_lora_r16_changes_only_rank_from_r8():
+    rank8 = _load(ALGORITHM_ROOT / f"{BASE_V1_LORA_R8}.json")
+    actual = _load(ALGORITHM_ROOT / f"{BASE_V1_LORA_R16}.json")
+    expected = copy.deepcopy(rank8)
+    expected["alg_params"].update(
+        {
+            "inner_actor_lora_rank": 16,
+            "inner_critic_lora_rank": 16,
+            "wandb_run_name": (
+                "AMBITDMPC2-humanoid-walk-base-v1-g4-"
+                "lora-r16-alpha32-seed55"
+            ),
+            "wandb_tags": [
+                tag.replace("lora-r8", "lora-r16").replace(
+                    "lora-alpha16", "lora-alpha32"
+                )
+                for tag in rank8["alg_params"]["wandb_tags"]
+            ],
+        }
+    )
+
+    assert actual == expected
+    params = actual["alg_params"]
+    assert params["inner_actor_lora_scale"] == 2.0
+    assert params["inner_critic_lora_scale"] == 2.0
+    assert (
+        params["inner_actor_lora_scale"] * params["inner_actor_lora_rank"] == 32
+    )
+    assert (
+        params["inner_critic_lora_scale"] * params["inner_critic_lora_rank"]
+        == 32
+    )
+    assert actual["seed"] == 55
+    assert actual["total_steps"] == 14_000_000
+
+
+def test_humanoid_base_v1_lora_r16_has_a_matching_manifest():
+    rank8 = _load(EXPERIMENT_ROOT / f"{BASE_V1_LORA_R8}.json")
+    actual = _load(EXPERIMENT_ROOT / f"{BASE_V1_LORA_R16}.json")
+    expected = copy.deepcopy(rank8)
+    expected.update(
+        {
+            "study_note": BASE_V1_LORA_R16_STUDY_NOTE,
+            "configs": [BASE_V1_LORA_R16],
+        }
+    )
+
+    assert actual == expected
 
 
 def test_humanoid_base_v1_actor_mean_pair_changes_only_policy_q_reductions():

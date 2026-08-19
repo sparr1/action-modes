@@ -1,0 +1,25 @@
+{
+  "study_type": "single_seed_exploratory_inner_adaptation",
+  "study_note": "Single-seed exploratory 14-million-decision Humanoid Walk base-v1 G4 run changing only the inner actor and critic from full cloned modules to rank-16 LoRA adapters with alpha=32 (direct scale=2); all other training recipe parameters match the base. Make no confidence, significance, or confirmatory claims.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": ["ambi_humanoid_walk_base_lora_r16"],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 100000,
+  "save_strat": ["best", "latest"],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}
