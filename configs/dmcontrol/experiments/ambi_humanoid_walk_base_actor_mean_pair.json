@@ -1,0 +1,25 @@
+{
+  "study_type": "single_seed_exploratory_actor_q_reduction",
+  "study_note": "Single-seed exploratory 14-million-decision Humanoid Walk base-v1 run changing only the outer and inner policy-learning Q reductions from a random-pair minimum to a random-pair mean; target-Q reductions remain min_pair. Make no confidence, significance, or confirmatory claims.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": ["ambi_humanoid_walk_base_actor_mean_pair"],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 100000,
+  "save_strat": ["best", "latest"],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}

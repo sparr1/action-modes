@@ -10,11 +10,18 @@ EXPERIMENT_ROOT = ROOT / "configs/dmcontrol/experiments"
 UPDATES = (2, 4, 8, 16)
 BASE_G4 = "ambi_humanoid_walk_updates_g4"
 BASE_V1 = "ambi_humanoid_walk_base"
+BASE_V1_ACTOR_MEAN_PAIR = "ambi_humanoid_walk_base_actor_mean_pair"
 BASE_V1_STUDY_NOTE = (
     "Single-seed exploratory 14-million-decision Humanoid Walk base-v1 run "
     "using the G4 inner schedule and selected inner critic learning rate with "
     "TD-MPC2-aligned outer recipe parameters; make no confidence, "
     "significance, or confirmatory claims."
+)
+BASE_V1_ACTOR_MEAN_PAIR_STUDY_NOTE = (
+    "Single-seed exploratory 14-million-decision Humanoid Walk base-v1 run "
+    "changing only the outer and inner policy-learning Q reductions from a "
+    "random-pair minimum to a random-pair mean; target-Q reductions remain "
+    "min_pair. Make no confidence, significance, or confirmatory claims."
 )
 BASE_V1_TAGS = [
     "ambi",
@@ -327,6 +334,49 @@ def test_humanoid_base_v1_has_a_matching_runnable_manifest():
 
     assert actual == expected
     assert actual["overrides_alg"]["total_steps"] == 14_000_000
+
+
+def test_humanoid_base_v1_actor_mean_pair_changes_only_policy_q_reductions():
+    baseline = _load(ALGORITHM_ROOT / f"{BASE_V1}.json")
+    actual = _load(ALGORITHM_ROOT / f"{BASE_V1_ACTOR_MEAN_PAIR}.json")
+    expected = copy.deepcopy(baseline)
+    expected["alg_params"].update(
+        {
+            "outer_q_actor_reduction": "mean_pair",
+            "inner_q_actor_reduction": "mean_pair",
+            "wandb_run_name": (
+                "AMBITDMPC2-humanoid-walk-base-v1-g4-"
+                "actor-mean-pair-seed55"
+            ),
+            "wandb_tags": [*BASE_V1_TAGS, "actor-q-mean-pair"],
+        }
+    )
+
+    assert actual == expected
+    params = actual["alg_params"]
+    assert params["outer_q_target_reduction"] == "min_pair"
+    assert params["inner_q_target_reduction"] == "min_pair"
+    assert params["q_pair_size"] == 2
+    assert params["inner_temperature_mode"] == "auto"
+    assert params["inner_temperature_initialization"] == "inherit_outer"
+    assert params["inner_target_entropy"] == "inherit_outer"
+    assert actual["seed"] == 55
+    assert actual["total_steps"] == 14_000_000
+
+
+def test_humanoid_base_v1_actor_mean_pair_has_a_matching_manifest():
+    baseline = _load(EXPERIMENT_ROOT / f"{BASE_V1}.json")
+    actual = _load(EXPERIMENT_ROOT / f"{BASE_V1_ACTOR_MEAN_PAIR}.json")
+    expected = copy.deepcopy(baseline)
+    expected.update(
+        {
+            "study_type": "single_seed_exploratory_actor_q_reduction",
+            "study_note": BASE_V1_ACTOR_MEAN_PAIR_STUDY_NOTE,
+            "configs": [BASE_V1_ACTOR_MEAN_PAIR],
+        }
+    )
+
+    assert actual == expected
 
 
 def test_humanoid_base_v1_runtime_variants_change_only_j_n_g_and_capacity():
