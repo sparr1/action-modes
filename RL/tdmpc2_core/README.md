@@ -61,6 +61,15 @@ including a learned action-local entropy temperature initialized from the
 current outer temperature at each root, and retains a matched MPPI inner
 operator for comparison.
 
+AMBI can optionally use TD-MPC2's running P95-P5 actor-value scale through
+`sac_actor_loss_scale_mode="tdmpc2_percentile_range"` (the default is
+`"none"`). Unlike TD-MPC2's fixed-entropy policy prior, AMBI divides the entire
+soft SAC actor objective by the detached scale, so Q and the learned entropy
+coefficient remain in consistent units. The outer learner updates the scale
+from real-replay actor values; each root-local SAC solve freezes one snapshot
+for the whole action. Rewards, Bellman targets, temperature losses, TD3, and
+MPPI are not normalized by this option.
+
 Model saves are suitable for evaluation and weight transfer. They do not include
 replay, environment state, or all trainer counters, so they are not exact
 mid-run resume checkpoints.

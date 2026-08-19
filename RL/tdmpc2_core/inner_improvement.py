@@ -110,9 +110,14 @@ class InnerImprovementEngine:
         critic_kernel = (
             self._td3_critic_kernel if operator == "td3" else self._sac_critic_kernel
         )
-        actor_kernel = (
-            self._td3_actor_kernel if operator == "td3" else self._sac_actor_kernel
-        )
+        if operator == "td3":
+            actor_kernel = self._td3_actor_kernel
+        elif self._sac_actor_loss_scale_enabled:
+            actor_kernel = self._scaled_sac_actor_kernel
+        else:
+            # Keep the feature-off compiled callable and its signature exactly
+            # as they were before actor-loss scaling was introduced.
+            actor_kernel = self._sac_actor_kernel
         self._compile_regions = {
             "rollout": CompileRegion(
                 "fixed-shape inner rollout",
@@ -141,6 +146,16 @@ class InnerImprovementEngine:
         if self.state.alpha_fixed is not None:
             return self.state.alpha_fixed
         return self.agent.alpha.detach()
+
+    @property
+    def _sac_actor_loss_scale_enabled(self):
+        return (
+            str(self.cfg.inner_operator) == "sac"
+            and str(
+                getattr(self.cfg, "sac_actor_loss_scale_mode", "none")
+            )
+            == "tdmpc2_percentile_range"
+        )
 
     @property
     def _uses_canonical_schedule(self):
@@ -1774,8 +1789,52 @@ class InnerImprovementEngine:
             kl.mean(),
         )
 
-    def _sac_policy_step(self, batch, *, update_temperature, update_actor, alpha):
+    def _scaled_sac_actor_kernel(
+        self,
+        z,
+        alpha,
+        actor_loss_scale,
+        policy_noise,
+        pair_indices,
+        update_actor,
+    ):
+        """SAC policy region with one explicit, action-frozen loss scale."""
+        log_prob, entropy, actor_loss, q_mean, kl_mean = self._sac_actor_kernel(
+            z,
+            alpha,
+            policy_noise,
+            pair_indices,
+            update_actor,
+        )
+        return (
+            log_prob,
+            entropy,
+            actor_loss / actor_loss_scale.reshape(()),
+            q_mean,
+            kl_mean,
+        )
+
+    def _sac_policy_step(
+        self,
+        batch,
+        *,
+        update_temperature,
+        update_actor,
+        alpha,
+        actor_loss_scale=None,
+    ):
         state, cfg = self.state, self.cfg
+        scale_enabled = self._sac_actor_loss_scale_enabled
+        if scale_enabled and actor_loss_scale is None:
+            raise RuntimeError(
+                "Scaled inner SAC actor update requires an action-frozen "
+                "actor_loss_scale tensor."
+            )
+        if not scale_enabled and actor_loss_scale is not None:
+            raise RuntimeError(
+                "Inner SAC actor_loss_scale was supplied while "
+                "sac_actor_loss_scale_mode='none'."
+            )
         batch_size = int(batch["z"].shape[0])
         with self.rng.fork("gradient_policy") as generator:
             policy_noise = torch.randn(
@@ -1787,15 +1846,27 @@ class InnerImprovementEngine:
             # SAC pair selection remains inside Q on the forked default RNG so
             # it follows policy/critic dropout in the legacy order.
             pair_indices = None
-            log_prob, entropy, actor_loss, q_mean, kl_mean = (
-                self._compile_regions["actor"](
-                    batch["z"],
-                    alpha,
-                    policy_noise,
-                    pair_indices,
-                    update_actor,
+            if not scale_enabled:
+                log_prob, entropy, actor_loss, q_mean, kl_mean = (
+                    self._compile_regions["actor"](
+                        batch["z"],
+                        alpha,
+                        policy_noise,
+                        pair_indices,
+                        update_actor,
+                    )
                 )
-            )
+            else:
+                log_prob, entropy, actor_loss, q_mean, kl_mean = (
+                    self._compile_regions["actor"](
+                        batch["z"],
+                        alpha,
+                        actor_loss_scale,
+                        policy_noise,
+                        pair_indices,
+                        update_actor,
+                    )
+                )
             state.policy_evaluations += batch_size
 
             metrics = {}
@@ -2026,7 +2097,13 @@ class InnerImprovementEngine:
             state.target_steps += 1
             state.actor_target_steps += 1
 
-    def _run_updates(self, round_index, allocations):
+    def _run_updates(
+        self,
+        round_index,
+        allocations,
+        *,
+        actor_loss_scale=None,
+    ):
         critic_count = allocations["critic"][round_index]
         actor_count = allocations["actor"][round_index]
         temperature_count = allocations["temperature"][round_index]
@@ -2034,9 +2111,17 @@ class InnerImprovementEngine:
             critic_count=critic_count,
             actor_count=actor_count,
             temperature_count=temperature_count,
+            actor_loss_scale=actor_loss_scale,
         )
 
-    def _run_update_counts(self, *, critic_count, actor_count, temperature_count):
+    def _run_update_counts(
+        self,
+        *,
+        critic_count,
+        actor_count,
+        temperature_count,
+        actor_loss_scale=None,
+    ):
         slots = max(critic_count, actor_count, temperature_count)
         metrics = []
         replay_indices = None
@@ -2089,6 +2174,7 @@ class InnerImprovementEngine:
                             update_temperature=do_temperature,
                             update_actor=do_actor,
                             alpha=alpha,
+                            actor_loss_scale=actor_loss_scale,
                         )
                     )
             else:
@@ -2457,6 +2543,11 @@ class InnerImprovementEngine:
         with self.rng.fork("initialization"):
             self._prepare_workspace(t0=t0)
         self._timer_stop("inner_setup_seconds", setup_start)
+        actor_loss_scale = None
+        if self._sac_actor_loss_scale_enabled:
+            # Outer training owns the running estimator. Each real action uses
+            # one immutable snapshot throughout all root-local update slots.
+            actor_loss_scale = self.agent.actor_loss_scale.detach().clone()
         alpha_initial = self.alpha.detach().clone()
         allocations = None
         if not self._uses_canonical_schedule:
@@ -2510,10 +2601,15 @@ class InnerImprovementEngine:
                         and cfg.inner_temperature_mode == "auto"
                         else 0
                     ),
+                    actor_loss_scale=actor_loss_scale,
                 )
                 requested_update_slots += round_updates
             else:
-                round_metrics = self._run_updates(round_index, allocations)
+                round_metrics = self._run_updates(
+                    round_index,
+                    allocations,
+                    actor_loss_scale=actor_loss_scale,
+                )
                 requested_update_slots += max(
                     allocations["critic"][round_index],
                     allocations["actor"][round_index],
@@ -2627,6 +2723,11 @@ class InnerImprovementEngine:
                 state.log_alpha.numel() if state.log_alpha is not None else 0
             ),
         )
+        if actor_loss_scale is not None:
+            metrics["inner_actor_loss_scale"] = actor_loss_scale.reshape(())
+            metrics["inner_effective_alpha"] = (
+                alpha_final / actor_loss_scale
+            ).mean()
         if self._collect_diagnostics and state.sampled_ids:
             sampled = torch.cat(state.sampled_ids)
             metrics["inner_replay_unique_fraction"] = (

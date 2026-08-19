@@ -1,5 +1,6 @@
 import pytest
 
+import utils.resume_identity as resume_identity
 from utils.resume_identity import (
     ResumeConfigurationError,
     canonical_json,
@@ -42,6 +43,51 @@ def test_scientific_projection_excludes_only_the_segment_eval_destination():
     assert scientific_trial_parameters(left) != scientific_trial_parameters(
         changed_input
     )
+
+
+def test_sac_actor_loss_scale_fields_change_lineage_fingerprint(monkeypatch):
+    monkeypatch.setattr(
+        resume_identity,
+        "source_identity",
+        lambda _repo_root: {"commit": "test", "dirty": False},
+    )
+    monkeypatch.setattr(
+        resume_identity,
+        "dependency_identity",
+        lambda: {"python": "test"},
+    )
+    base = {
+        "alg": "AMBITDMPC2/AMBITDMPC2",
+        "seed": 7,
+        "alg_params": {
+            "sac_actor_loss_scale_mode": "none",
+            "sac_actor_loss_scale_tau": 0.01,
+        },
+    }
+    changed_mode = {
+        **base,
+        "alg_params": {
+            **base["alg_params"],
+            "sac_actor_loss_scale_mode": "tdmpc2_percentile_range",
+        },
+    }
+    changed_tau = {
+        **base,
+        "alg_params": {
+            **base["alg_params"],
+            "sac_actor_loss_scale_tau": 0.02,
+        },
+    }
+
+    def fingerprint(trial_run_params):
+        return resume_identity.lineage_identity(
+            trial_run_params=trial_run_params,
+            experiment_params={"exp_name": "test"},
+            repo_root=".",
+        )["fingerprint"]
+
+    assert fingerprint(base) != fingerprint(changed_mode)
+    assert fingerprint(base) != fingerprint(changed_tau)
 
 
 def test_resume_selection_is_strict_and_resource_neutral():

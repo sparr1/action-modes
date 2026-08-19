@@ -498,6 +498,27 @@ def test_no_q_diagnostic_is_fabricated_when_no_q_evaluation_ran():
     metrics = model.agent.last_inner_metrics
     assert "inner_q_abs_mean" not in metrics
     assert "inner_alpha_to_abs_q" not in metrics
+    assert "inner_actor_loss_scale" not in metrics
+    assert "inner_effective_alpha" not in metrics
+
+
+def test_scaled_sac_gauges_do_not_require_an_inner_q_evaluation():
+    model = _model(
+        sac_actor_loss_scale_mode="tdmpc2_percentile_range",
+        inner_critic_updates_per_action=0,
+        inner_actor_updates_per_action=0,
+        inner_temperature_updates_per_action=0,
+    )
+    model.agent.act(
+        torch.zeros(model.cfg.obs_shape["state"]),
+        collect_diagnostics=False,
+    )
+    metrics = model.agent.last_inner_metrics
+
+    assert metrics["inner_actor_loss_scale"] == 1.0
+    assert metrics["inner_effective_alpha"] == metrics["inner_alpha_final"]
+    assert "inner_q_abs_mean" not in metrics
+    assert "inner_alpha_to_abs_q" not in metrics
 
 
 def test_dense_non_episodic_rollout_counts_and_horizon_major_replay(monkeypatch):

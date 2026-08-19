@@ -13,6 +13,7 @@ from utils.utils import setup_logs
 
 
 _Q_REDUCTIONS = {"min_pair", "mean_pair", "min_all", "mean_all"}
+_SAC_ACTOR_LOSS_SCALE_MODES = {"none", "tdmpc2_percentile_range"}
 _ADAPTATION_MODES = {"frozen", "clone", "lora"}
 _LIFECYCLE_SCOPES = {"action", "episode", "run"}
 _SCOPE_RANK = {"action": 0, "episode": 1, "run": 2}
@@ -32,6 +33,8 @@ _AMBI_DEFAULTS = {
     "inner_q_target_reduction": "min_pair",
     "inner_q_actor_reduction": "min_pair",
     "mppi_terminal_q_reduction": "mean_pair",
+    "sac_actor_loss_scale_mode": "none",
+    "sac_actor_loss_scale_tau": 0.01,
     "critic_coef": 1.0,
     "actor_lr": 3e-4,
     "critic_lr": 3e-4,
@@ -487,6 +490,37 @@ class AMBITDMPC2(TDMPC2Baseline):
             if value not in _Q_REDUCTIONS:
                 raise ValueError(f"{key} must be one of {sorted(_Q_REDUCTIONS)}, got {value!r}.")
             setattr(cfg, key, value)
+
+        if not isinstance(cfg.sac_actor_loss_scale_mode, str):
+            raise ValueError(
+                "sac_actor_loss_scale_mode must be one of "
+                f"{sorted(_SAC_ACTOR_LOSS_SCALE_MODES)}, got "
+                f"{cfg.sac_actor_loss_scale_mode!r}."
+            )
+        cfg.sac_actor_loss_scale_mode = cfg.sac_actor_loss_scale_mode.lower()
+        if cfg.sac_actor_loss_scale_mode not in _SAC_ACTOR_LOSS_SCALE_MODES:
+            raise ValueError(
+                "sac_actor_loss_scale_mode must be one of "
+                f"{sorted(_SAC_ACTOR_LOSS_SCALE_MODES)}, got "
+                f"{cfg.sac_actor_loss_scale_mode!r}."
+            )
+        if (
+            cfg.sac_actor_loss_scale_tau is None
+            or isinstance(cfg.sac_actor_loss_scale_tau, bool)
+        ):
+            raise ValueError(
+                "sac_actor_loss_scale_tau must be a finite float in (0, 1]."
+            )
+        try:
+            cfg.sac_actor_loss_scale_tau = _finite_float(
+                cfg.sac_actor_loss_scale_tau, "sac_actor_loss_scale_tau"
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "sac_actor_loss_scale_tau must be a finite float in (0, 1]."
+            ) from exc
+        if not 0.0 < cfg.sac_actor_loss_scale_tau <= 1.0:
+            raise ValueError("sac_actor_loss_scale_tau must be in (0, 1].")
 
         if cfg.inner_operator is None:
             raise ValueError("inner_operator must be a string, not null.")
@@ -1380,6 +1414,8 @@ class AMBITDMPC2(TDMPC2Baseline):
         action_gauges = {
             "inner_alpha",
             "inner_alpha_to_abs_q",
+            "inner_actor_loss_scale",
+            "inner_effective_alpha",
             "inner_buffer_size",
             "inner_buffer_capacity",
             "inner_buffer_fill_ratio",

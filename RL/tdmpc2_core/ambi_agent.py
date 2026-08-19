@@ -1,5 +1,7 @@
 """AMBI agent with TD-MPC2 representation learning and configurable inner control."""
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -8,6 +10,7 @@ from .common.compile_regions import CompileRegion
 from .common.checkpoint import save_checkpoint
 from .common.device import resolve_device
 from .common.layers import api_model_conversion
+from .common.scale import percentile_range
 from .common.soft_world_model import SoftWorldModel
 from .inner_improvement import InnerImprovementEngine, polyak_update
 from .common.training_state import (
@@ -20,6 +23,10 @@ from .common.training_state import (
 
 # Backward-compatible public test/debug hook.
 _polyak_update = polyak_update
+
+_ACTOR_LOSS_SCALE_MODE = "tdmpc2_percentile_range"
+_ACTOR_LOSS_SCALE_PERCENTILES = (5.0, 95.0)
+_ACTOR_LOSS_SCALE_FLOOR = 1.0
 
 
 class AMBITDMPC2Agent(torch.nn.Module):
@@ -68,6 +75,35 @@ class AMBITDMPC2Agent(torch.nn.Module):
             ),
             persistent=False,
         )
+        self._actor_loss_scale_mode = str(
+            getattr(cfg, "sac_actor_loss_scale_mode", "none")
+        ).lower()
+        if self._actor_loss_scale_mode == _ACTOR_LOSS_SCALE_MODE:
+            scale_tau = float(getattr(cfg, "sac_actor_loss_scale_tau", 0.01))
+            if not math.isfinite(scale_tau) or not 0.0 < scale_tau <= 1.0:
+                raise ValueError("sac_actor_loss_scale_tau must be in (0, 1].")
+            self._actor_loss_scale_tau = scale_tau
+            self.register_buffer(
+                "_actor_loss_scale_value",
+                torch.ones(1, dtype=torch.float32, device=self.device),
+            )
+            self.register_buffer(
+                "_actor_loss_scale_percentiles",
+                torch.tensor(
+                    _ACTOR_LOSS_SCALE_PERCENTILES,
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+            )
+        elif self._actor_loss_scale_mode == "none":
+            self._actor_loss_scale_tau = None
+            self._actor_loss_scale_value = None
+            self._actor_loss_scale_percentiles = None
+        else:
+            raise ValueError(
+                "sac_actor_loss_scale_mode must be 'none' or "
+                f"{_ACTOR_LOSS_SCALE_MODE!r}."
+            )
         self._world_critic_params = (
             list(self.model._encoder.parameters())
             + list(self.model._dynamics.parameters())
@@ -204,6 +240,93 @@ class AMBITDMPC2Agent(torch.nn.Module):
             return self.log_ent_coef.exp()
         return self.fixed_ent_coef
 
+    @property
+    def actor_loss_scale_enabled(self):
+        return self._actor_loss_scale_mode == _ACTOR_LOSS_SCALE_MODE
+
+    @property
+    def actor_loss_scale(self):
+        if not self.actor_loss_scale_enabled:
+            return None
+        return self._actor_loss_scale_value
+
+    def _actor_loss_scale_spec(self):
+        if not self.actor_loss_scale_enabled:
+            return None
+        return {
+            "mode": _ACTOR_LOSS_SCALE_MODE,
+            "application": "full_sac_actor_objective",
+            "source": "decoded_outer_actor_q_depth0",
+            "reduction": str(self.cfg.outer_q_actor_reduction),
+            "percentiles": list(_ACTOR_LOSS_SCALE_PERCENTILES),
+            "tau": self._actor_loss_scale_tau,
+            "floor": _ACTOR_LOSS_SCALE_FLOOR,
+        }
+
+    def _actor_loss_scale_state(self):
+        if not self.actor_loss_scale_enabled:
+            return None
+        return {
+            "value": self._actor_loss_scale_value.detach(),
+            "percentiles": self._actor_loss_scale_percentiles.detach(),
+        }
+
+    def _preflight_actor_loss_scale(self, spec, state):
+        if not self.actor_loss_scale_enabled:
+            raise ValueError(
+                "Checkpoint actor-loss scaling is enabled but the configured agent "
+                "has sac_actor_loss_scale_mode='none'."
+            )
+        expected_spec = self._actor_loss_scale_spec()
+        spec = require_exact_keys(
+            spec, expected_spec.keys(), "AMBI actor-loss scale specification"
+        )
+        if dict(spec) != expected_spec:
+            raise ValueError(
+                "Checkpoint actor-loss scale specification does not match this agent: "
+                f"checkpoint={dict(spec)}, configured={expected_spec}."
+            )
+        state = require_exact_keys(
+            state, {"value", "percentiles"}, "AMBI actor-loss scale state"
+        )
+        value = require_tensor(
+            state["value"],
+            "AMBI actor-loss scale value",
+            shape=self._actor_loss_scale_value.shape,
+            dtype=self._actor_loss_scale_value.dtype,
+        )
+        percentiles = require_tensor(
+            state["percentiles"],
+            "AMBI actor-loss scale percentiles",
+            shape=self._actor_loss_scale_percentiles.shape,
+            dtype=self._actor_loss_scale_percentiles.dtype,
+        )
+        if not bool(torch.isfinite(value).all().item()) or bool(
+            (value < _ACTOR_LOSS_SCALE_FLOOR).any().item()
+        ):
+            raise ValueError(
+                "AMBI actor-loss scale value must be finite and at least its floor."
+            )
+        if not torch.equal(
+            percentiles.detach().cpu(),
+            self._actor_loss_scale_percentiles.detach().cpu(),
+        ):
+            raise ValueError(
+                "AMBI actor-loss scale percentiles differ from the configured policy."
+            )
+        return state
+
+    @torch.no_grad()
+    def _update_actor_loss_scale(self, q_values):
+        if not self.actor_loss_scale_enabled:
+            return
+        value = percentile_range(
+            q_values.detach(),
+            self._actor_loss_scale_percentiles,
+            minimum=_ACTOR_LOSS_SCALE_FLOOR,
+        )
+        self._actor_loss_scale_value.lerp_(value, self._actor_loss_scale_tau)
+
     def reset(self):
         if self._resume_boundary_prepared:
             # A full checkpoint already advanced the inner episode lifecycle.
@@ -241,9 +364,9 @@ class AMBITDMPC2Agent(torch.nn.Module):
         }
 
     def checkpoint_state(self):
-        """Return the version-3 checkpoint structure over live outer state."""
+        """Return the portable checkpoint structure over live outer state."""
         state = {
-            "checkpoint_version": 3,
+            "checkpoint_version": 4 if self.actor_loss_scale_enabled else 3,
             "observation_spec": self.observation_signature(),
             "critic_spec": self.model.critic_signature,
             "policy_spec": {
@@ -265,6 +388,9 @@ class AMBITDMPC2Agent(torch.nn.Module):
             state["ent_coef_optim"] = self.ent_coef_optim.state_dict()
         else:
             state["fixed_ent_coef"] = self.fixed_ent_coef.detach()
+        if self.actor_loss_scale_enabled:
+            state["actor_loss_scale_spec"] = self._actor_loss_scale_spec()
+            state["actor_loss_scale_state"] = self._actor_loss_scale_state()
         return state
 
     def training_state_dict(self):
@@ -282,7 +408,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             )
         return {
             "schema": "ambi-tdmpc2-agent-training-state",
-            "version": 1,
+            "version": 2 if self.actor_loss_scale_enabled else 1,
             "outer": self.checkpoint_state(),
             "inner": inner,
             "model_training": bool(self.model.training),
@@ -306,9 +432,17 @@ class AMBITDMPC2Agent(torch.nn.Module):
             expected_keys.update({"log_ent_coef", "ent_coef_optim"})
         else:
             expected_keys.add("fixed_ent_coef")
+        if self.actor_loss_scale_enabled:
+            expected_keys.update(
+                {"actor_loss_scale_spec", "actor_loss_scale_state"}
+            )
         state = require_exact_keys(state, expected_keys, "AMBI outer training state")
-        if state["checkpoint_version"] != 3:
-            raise ValueError("AMBI exact training state requires outer checkpoint version 3.")
+        expected_checkpoint_version = 4 if self.actor_loss_scale_enabled else 3
+        if state["checkpoint_version"] != expected_checkpoint_version:
+            raise ValueError(
+                "AMBI exact training state requires outer checkpoint version "
+                f"{expected_checkpoint_version}."
+            )
         for key in ("num_updates", "outer_version"):
             value = state[key]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -357,6 +491,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 raise ValueError(
                     "AMBI outer fixed entropy coefficient differs from configuration."
                 )
+        if self.actor_loss_scale_enabled:
+            self._preflight_actor_loss_scale(
+                state["actor_loss_scale_spec"], state["actor_loss_scale_state"]
+            )
         # The lineage fingerprint checks every resolved scientific setting.
         # The established model-checkpoint loader below remains the single
         # authority for signature, entropy, and optimizer-layout validation.
@@ -375,9 +513,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
             },
             "AMBI agent training state",
         )
+        expected_version = 2 if self.actor_loss_scale_enabled else 1
         if (
             state["schema"] != "ambi-tdmpc2-agent-training-state"
-            or state["version"] != 1
+            or state["version"] != expected_version
         ):
             raise ValueError("Unsupported AMBI agent training-state version.")
         outer = self._preflight_outer_training_state(state["outer"])
@@ -408,7 +547,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         state, outer, inner_candidate = candidate
         # ``load`` retains the established model-checkpoint implementation and
         # clears old inner allocations. Exact preflight above makes its input a
-        # complete version-3 state rather than a permissive transfer checkpoint.
+        # complete versioned state rather than a permissive transfer checkpoint.
         self.load(outer)
         self.inner_engine._commit_training_state_candidate(inner_candidate)
         self.last_inner_metrics = {}
@@ -442,11 +581,31 @@ class AMBITDMPC2Agent(torch.nn.Module):
             else torch.load(fp, map_location=self.device, weights_only=False)
         )
         checkpoint_version = state.get("checkpoint_version") if isinstance(state, dict) else None
-        if checkpoint_version is not None and int(checkpoint_version) not in {1, 2, 3}:
+        if checkpoint_version is not None and int(checkpoint_version) not in {1, 2, 3, 4}:
             raise ValueError(
                 f"Unsupported AMBI checkpoint_version={checkpoint_version!r}; "
-                "supported versions are 1, 2, and 3."
+                "supported versions are 1, 2, 3, and 4."
             )
+        structured_checkpoint = isinstance(state, dict) and "model" in state
+        actor_loss_scale_candidate = None
+        if structured_checkpoint:
+            if self.actor_loss_scale_enabled:
+                if checkpoint_version != 4:
+                    raise ValueError(
+                        "An enabled actor-loss scaler requires a version-4 AMBI "
+                        "checkpoint with persistent scale state. For intentional "
+                        "weight transfer from a legacy checkpoint, load its model "
+                        "state into a fresh agent instead."
+                    )
+                actor_loss_scale_candidate = self._preflight_actor_loss_scale(
+                    state.get("actor_loss_scale_spec"),
+                    state.get("actor_loss_scale_state"),
+                )
+            elif checkpoint_version == 4:
+                raise ValueError(
+                    "Checkpoint actor-loss scaling is enabled but the configured "
+                    "agent has sac_actor_loss_scale_mode='none'."
+                )
         saved_observation = (
             state.get("observation_spec") if isinstance(state, dict) else None
         )
@@ -486,7 +645,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 "Checkpoint entropy specification does not match this agent: "
                 f"checkpoint={saved_entropy_spec}, configured={configured_entropy_spec}."
             )
-        if isinstance(state, dict) and "model" in state:
+        if structured_checkpoint:
             saved_auto_alpha = "log_ent_coef" in state or "ent_coef_optim" in state
             configured_auto_alpha = self.log_ent_coef is not None
             if saved_auto_alpha != configured_auto_alpha:
@@ -545,6 +704,19 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 self.ent_coef_optim.load_state_dict(state["ent_coef_optim"])
         elif "fixed_ent_coef" in state:
             self.fixed_ent_coef.copy_(state["fixed_ent_coef"].to(self.device))
+        if self.actor_loss_scale_enabled:
+            if actor_loss_scale_candidate is None:
+                # Raw model-only imports are explicit weight transfers. Their
+                # missing training statistic starts from the documented neutral
+                # value rather than inheriting live state from unrelated weights.
+                self._actor_loss_scale_value.fill_(_ACTOR_LOSS_SCALE_FLOOR)
+            else:
+                self._actor_loss_scale_value.copy_(
+                    actor_loss_scale_candidate["value"].to(self.device)
+                )
+                self._actor_loss_scale_percentiles.copy_(
+                    actor_loss_scale_candidate["percentiles"].to(self.device)
+                )
 
         # Inner state is deliberately not checkpointed or resumed.
         self.inner_engine.clear_all()
@@ -677,9 +849,11 @@ class AMBITDMPC2Agent(torch.nn.Module):
             reduction=self.cfg.outer_q_actor_reduction,
             detach=True,
         )
-        actor_per_time = (alpha * policy_info["log_prob"] - q_policy).mean(
-            dim=(1, 2)
-        )
+        actor_objective = alpha * policy_info["log_prob"] - q_policy
+        if self.actor_loss_scale_enabled:
+            self._update_actor_loss_scale(q_policy[0])
+            actor_objective = actor_objective / self._actor_loss_scale_value
+        actor_per_time = actor_objective.mean(dim=(1, 2))
         actor_loss = td_math.reduce_temporal_loss(
             actor_per_time,
             self.cfg.rho,
@@ -696,7 +870,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             self.model._pi.parameters(), float(self.cfg.grad_clip_norm)
         )
         self.pi_optim.step()
-        return {
+        metrics = {
             "actor_loss": actor_loss.detach(),
             "actor_grad_norm": torch.as_tensor(actor_grad_norm).detach(),
             "actor_entropy": policy_info["entropy"].detach().mean(),
@@ -704,6 +878,12 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "ent_coef": alpha.detach(),
             "ent_coef_loss": entropy_coefficient_loss.detach(),
         }
+        if self.actor_loss_scale_enabled:
+            metrics["actor_loss_scale"] = self._actor_loss_scale_value.detach()
+            metrics["actor_effective_ent_coef"] = (
+                alpha / self._actor_loss_scale_value
+            ).detach()
+        return metrics
 
     def _outer_update_kernel(
         self,

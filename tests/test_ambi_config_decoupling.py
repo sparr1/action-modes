@@ -41,6 +41,37 @@ def test_q_representation_is_independent_of_model_size_expansion():
     assert explicit_ensemble.q_bin_size == pytest.approx(0.4)
 
 
+def test_sac_actor_loss_scale_defaults_and_normalizes_explicit_mode():
+    default = _build_cfg()
+    assert default.sac_actor_loss_scale_mode == "none"
+    assert default.sac_actor_loss_scale_tau == pytest.approx(0.01)
+
+    enabled = _build_cfg(
+        sac_actor_loss_scale_mode="TDMPC2_PERCENTILE_RANGE",
+        sac_actor_loss_scale_tau=0.2,
+    )
+    assert enabled.sac_actor_loss_scale_mode == "tdmpc2_percentile_range"
+    assert enabled.sac_actor_loss_scale_tau == pytest.approx(0.2)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [None, True, 1, "percentile_range", "unknown"],
+)
+def test_sac_actor_loss_scale_mode_is_strict(mode):
+    with pytest.raises(ValueError, match="sac_actor_loss_scale_mode"):
+        _build_cfg(sac_actor_loss_scale_mode=mode)
+
+
+@pytest.mark.parametrize(
+    "tau",
+    [None, True, "invalid", float("nan"), float("inf"), 0.0, -0.1, 1.1],
+)
+def test_sac_actor_loss_scale_tau_is_strict(tau):
+    with pytest.raises(ValueError, match="sac_actor_loss_scale_tau"):
+        _build_cfg(sac_actor_loss_scale_tau=tau)
+
+
 def test_legacy_ant_compute_and_lora_resolve_exactly():
     with pytest.warns(DeprecationWarning):
         cfg = _build_cfg(

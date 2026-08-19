@@ -123,6 +123,8 @@ _RUNTIME_CONFIG_FIELDS = (
     "outer_q_actor_reduction",
     "inner_q_target_reduction",
     "inner_q_actor_reduction",
+    "sac_actor_loss_scale_mode",
+    "sac_actor_loss_scale_tau",
     "compile",
     "compile_strict",
     "inner_operator",
@@ -250,6 +252,15 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
         "enabled": bool(resolved.get("compile", False)),
         "strict": bool(resolved.get("compile_strict", False)),
     }
+    actor_loss_scale = {}
+    if {
+        "sac_actor_loss_scale_mode",
+        "sac_actor_loss_scale_tau",
+    }.issubset(resolved):
+        actor_loss_scale = {
+            "mode": resolved["sac_actor_loss_scale_mode"],
+            "tau": resolved["sac_actor_loss_scale_tau"],
+        }
 
     observation = {}
     observation_mode = resolved.get("obs")
@@ -337,6 +348,8 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
         "compilation": compile_metadata,
         "inner_budget": inner,
     }
+    if actor_loss_scale:
+        metadata["actor_loss_scale"] = actor_loss_scale
     return _json_safe_metadata(metadata)
 
 

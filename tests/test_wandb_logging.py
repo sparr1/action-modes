@@ -447,6 +447,8 @@ def test_ambi_inner_metrics_survive_matching_episode_and_wandb_boundaries(monkey
             "inner_actor_loss": 5.0,
             "inner_critic_loss": 7.0,
             "inner_alpha": 0.2,
+            "inner_actor_loss_scale": 2.0,
+            "inner_effective_alpha": 0.1,
             "inner_q_mean": 1.5,
             "inner_q_target_mean": 2.0,
             "inner_actor_q_mean": 1.75,
@@ -471,6 +473,8 @@ def test_ambi_inner_metrics_survive_matching_episode_and_wandb_boundaries(monkey
     assert payload["train/inner_steps"] == 12.0
     assert payload["train/inner_updates"] == 6.0
     assert payload["train/inner_actor_loss"] == 5.0
+    assert payload["train/inner_actor_loss_scale"] == 2.0
+    assert payload["train/inner_effective_alpha"] == 0.1
     assert payload["train/inner_return_mean"] == pytest.approx(2.0)
     assert payload["train/inner_return_std"] == pytest.approx(1.0)
     assert payload["train/inner_steps_total"] == 12

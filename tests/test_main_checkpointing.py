@@ -127,6 +127,7 @@ def test_checkpointing_is_configured_without_trajectory_logging(monkeypatch, tmp
     assert call["trial_run_params"]["resolved_runtime"]["algorithm"] == (
         "TDMPC2/TDMPC2Baseline"
     )
+    assert "actor_loss_scale" not in call["trial_run_params"]["resolved_runtime"]
     assert call["experiment_params"]["checkpoint_every"] == 5
     assert Path(call["save_path"]) == output_dir / "Experiment_STAMP" / "models"
     assert env.closed
@@ -147,6 +148,8 @@ def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
         temporal_loss_normalization="reference_weighted_mean",
         temporal_loss_reference_horizon=3,
         rho=0.7,
+        sac_actor_loss_scale_mode="tdmpc2_percentile_range",
+        sac_actor_loss_scale_tau=0.01,
         compile=True,
         compile_strict=False,
         inner_operator="sac",
@@ -210,6 +213,10 @@ def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
         "inner_rollout_horizon": 6,
     }
     assert metadata["critic"] == critic_signature
+    assert metadata["actor_loss_scale"] == {
+        "mode": "tdmpc2_percentile_range",
+        "tau": 0.01,
+    }
     assert metadata["compilation"] == {"enabled": True, "strict": False}
     assert metadata["inner_budget"]["branches_per_action"] == 128
     assert metadata["inner_budget"]["transitions_per_round"] == 192

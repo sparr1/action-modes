@@ -325,17 +325,32 @@ def _mixed_lifetime_model(env):
     return model
 
 
-def _active_ambi_model(env, lifetime, *, compiled=False):
+def _active_ambi_model(
+    env,
+    lifetime,
+    *,
+    compiled=False,
+    actor_loss_scaling=False,
+):
     if lifetime == "mixed":
-        return _mixed_lifetime_model(env)
-    return _model(
-        env,
-        algorithm=AMBITDMPC2,
-        inner_scope=lifetime,
-        total_steps=6,
-        compile=compiled,
-        compile_strict=False,
-    )
+        model = _mixed_lifetime_model(env)
+    else:
+        model = _model(
+            env,
+            algorithm=AMBITDMPC2,
+            inner_scope=lifetime,
+            total_steps=6,
+            compile=compiled,
+            compile_strict=False,
+            sac_actor_loss_scale_mode=(
+                "tdmpc2_percentile_range" if actor_loss_scaling else "none"
+            ),
+        )
+    if actor_loss_scaling:
+        # Keep S observably non-unit through this tiny run so the split test
+        # proves the statistic itself, rather than only the v4 schema, resumes.
+        model.agent.actor_loss_scale.fill_(3.0)
+    return model
 
 
 _PERSISTENT_WORKSPACE_FIELDS = {
@@ -355,18 +370,23 @@ _PERSISTENT_WORKSPACE_FIELDS = {
 
 
 @pytest.mark.parametrize(
-    ("lifetime", "compiled"),
+    ("lifetime", "compiled", "actor_loss_scaling"),
     [
-        ("action", False),
-        ("episode", False),
-        ("run", False),
-        ("mixed", False),
-        ("run", True),
+        ("action", False, False),
+        ("episode", False, False),
+        ("run", False, False),
+        ("mixed", False, False),
+        ("run", True, False),
+        ("action", False, True),
     ],
-    ids=["action", "episode", "run", "mixed", "run-compiled"],
+    ids=["action", "episode", "run", "mixed", "run-compiled", "action-scaled"],
 )
 def test_ambi_resume_after_inner_actions_preserves_lifetime_inventory_and_result(
-    monkeypatch, tmp_path, lifetime, compiled
+    monkeypatch,
+    tmp_path,
+    lifetime,
+    compiled,
+    actor_loss_scaling,
 ):
     """The handoff occurs only after persistent AMBI state has been exercised."""
 
@@ -385,10 +405,14 @@ def test_ambi_resume_after_inner_actions_preserves_lifetime_inventory_and_result
 
     continuous_env = BoundaryEnv()
     continuous_model = _active_ambi_model(
-        continuous_env, lifetime, compiled=compiled
+        continuous_env,
+        lifetime,
+        compiled=compiled,
+        actor_loss_scaling=actor_loss_scaling,
     )
+    path_suffix = f"{lifetime}-scaled" if actor_loss_scaling else lifetime
     continuous_session = _session(
-        tmp_path / f"continuous-active-{lifetime}",
+        tmp_path / f"continuous-active-{path_suffix}",
         mode="new",
         segment="continuous",
         total_steps=6,
@@ -404,9 +428,14 @@ def test_ambi_resume_after_inner_actions_preserves_lifetime_inventory_and_result
         continuous_session.close()
 
     first_env = BoundaryEnv()
-    first_model = _active_ambi_model(first_env, lifetime, compiled=compiled)
+    first_model = _active_ambi_model(
+        first_env,
+        lifetime,
+        compiled=compiled,
+        actor_loss_scaling=actor_loss_scaling,
+    )
     first_session = _session(
-        tmp_path / f"split-active-{lifetime}",
+        tmp_path / f"split-active-{path_suffix}",
         mode="new",
         segment="part-1",
         total_steps=6,
@@ -454,9 +483,14 @@ def test_ambi_resume_after_inner_actions_preserves_lifetime_inventory_and_result
         first_session.close()
 
     second_env = BoundaryEnv()
-    second_model = _active_ambi_model(second_env, lifetime, compiled=compiled)
+    second_model = _active_ambi_model(
+        second_env,
+        lifetime,
+        compiled=compiled,
+        actor_loss_scaling=actor_loss_scaling,
+    )
     second_session = _session(
-        tmp_path / f"split-active-{lifetime}",
+        tmp_path / f"split-active-{path_suffix}",
         mode="required",
         segment="part-2",
         total_steps=6,
@@ -484,6 +518,14 @@ def test_ambi_resume_after_inner_actions_preserves_lifetime_inventory_and_result
     assert second_model._episode_idx == continuous_model._episode_idx == 3
     assert second_model._num_updates == continuous_model._num_updates == 5
     assert bool(compile_calls) is compiled
+    if actor_loss_scaling:
+        assert continuous_model.agent.actor_loss_scale.item() > 1.0
+        torch.testing.assert_close(
+            second_model.agent.actor_loss_scale,
+            continuous_model.agent.actor_loss_scale,
+            rtol=0,
+            atol=0,
+        )
     # Three two-step episodes submit nine replay rows to a six-row ring. The
     # first episode is therefore evicted after the resume boundary.
     assert second_model.buffer.size == continuous_model.buffer.size == 6

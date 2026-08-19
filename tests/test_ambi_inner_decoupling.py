@@ -653,6 +653,10 @@ def _toy_policy(z, task=None, *, policy=None, deterministic=False, **kwargs):
 def test_sac_inner_target_and_actor_objective_match_hand_computation(monkeypatch):
     model = _model(inner_rounds=1, inner_model_step_budget=8)
     engine = model.agent.inner_engine
+    assert (
+        engine._compile_regions["actor"].eager.__func__
+        is engine._sac_actor_kernel.__func__
+    )
     with engine.rng.fork("initialization"):
         engine._prepare_workspace(t0=True)
     batch = {
@@ -696,6 +700,185 @@ def test_sac_inner_target_and_actor_objective_match_hand_computation(monkeypatch
         alpha=alpha,
     )
     assert actor_metrics["actor_loss"] == pytest.approx(-2.125)
+
+
+def test_scaled_sac_inner_actor_divides_full_objective_but_not_temperature(
+    monkeypatch,
+):
+    model = _model(
+        inner_rounds=1,
+        inner_model_step_budget=8,
+        inner_outer_policy_kl_coef=0.5,
+        inner_temperature_mode="auto",
+        inner_temperature_updates_per_action=1,
+        inner_temperature_initialization="fixed",
+        inner_temperature=0.25,
+        sac_actor_loss_scale_mode="tdmpc2_percentile_range",
+    )
+    engine = model.agent.inner_engine
+    with engine.rng.fork("initialization"):
+        engine._prepare_workspace(t0=True)
+    batch = {
+        "z": torch.zeros(4, model.cfg.latent_dim),
+        "action": torch.zeros(4, model.cfg.action_dim),
+        "reward": torch.zeros(4, 1),
+        "next_z": torch.zeros(4, model.cfg.latent_dim),
+        "terminated": torch.zeros(4, 1),
+    }
+    monkeypatch.setattr(model.agent.model, "pi", _toy_policy)
+    monkeypatch.setattr(
+        model.agent.model,
+        "Q",
+        lambda z, action, **kwargs: action.sum(dim=-1, keepdim=True) * 0.0
+        + 2.0,
+    )
+    monkeypatch.setattr(
+        engine,
+        "_gaussian_kl",
+        lambda inner_info, outer_info: inner_info["log_prob"].new_full(
+            inner_info["log_prob"].shape, 4.0
+        ),
+    )
+    assert (
+        engine._compile_regions["actor"].eager.__func__
+        is engine._scaled_sac_actor_kernel.__func__
+    )
+
+    alpha = torch.tensor(0.25)
+    expected_temperature_loss = -(
+        engine.state.log_alpha.detach()
+        * (-0.5 + engine._resolved_inner_target_entropy())
+    ).mean()
+    metrics = engine._sac_policy_step(
+        batch,
+        update_temperature=True,
+        update_actor=True,
+        alpha=alpha,
+        actor_loss_scale=torch.tensor(2.0),
+    )
+
+    # The raw full objective is 0.25*(-0.5) - 2 + 0.5*4 = -0.125.
+    assert metrics["actor_loss"] == pytest.approx(-0.125 / 2.0)
+    torch.testing.assert_close(
+        metrics["temperature_loss"], expected_temperature_loss
+    )
+
+
+def test_scaled_sac_actor_compile_region_caches_explicit_scale_argument(monkeypatch):
+    model = _model(
+        inner_rounds=1,
+        inner_model_step_budget=8,
+        sac_actor_loss_scale_mode="tdmpc2_percentile_range",
+    )
+    engine = model.agent.inner_engine
+    with engine.rng.fork("initialization"):
+        engine._prepare_workspace(t0=True)
+    batch = {
+        "z": torch.zeros(4, model.cfg.latent_dim),
+        "action": torch.zeros(4, model.cfg.action_dim),
+        "reward": torch.zeros(4, 1),
+        "next_z": torch.zeros(4, model.cfg.latent_dim),
+        "terminated": torch.zeros(4, 1),
+    }
+    compile_calls = []
+    observed_scales = []
+
+    def fake_compile(function, **kwargs):
+        compile_calls.append((function, kwargs))
+
+        def compiled(*args, **call_kwargs):
+            observed_scales.append(args[2].detach().clone())
+            return function(*args, **call_kwargs)
+
+        return compiled
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    engine._compile_regions["actor"].enabled = True
+    for scale in (2.0, 3.0):
+        engine._sac_policy_step(
+            batch,
+            update_temperature=False,
+            update_actor=False,
+            alpha=torch.tensor(0.25),
+            actor_loss_scale=torch.tensor(scale),
+        )
+
+    assert len(compile_calls) == 1
+    assert compile_calls[0][1] == {"fullgraph": False, "dynamic": False}
+    torch.testing.assert_close(observed_scales[0], torch.tensor(2.0))
+    torch.testing.assert_close(observed_scales[1], torch.tensor(3.0))
+
+
+@pytest.mark.parametrize(
+    ("mode", "actor_loss_scale", "message"),
+    [
+        ("tdmpc2_percentile_range", None, "requires an action-frozen"),
+        ("none", torch.tensor(2.0), "mode='none'"),
+    ],
+)
+def test_sac_policy_step_rejects_actor_loss_scale_mode_mismatch(
+    mode,
+    actor_loss_scale,
+    message,
+):
+    model = _model(sac_actor_loss_scale_mode=mode)
+    engine = model.agent.inner_engine
+
+    with pytest.raises(RuntimeError, match=message):
+        engine._sac_policy_step(
+            {"z": torch.zeros(1, model.cfg.latent_dim)},
+            update_temperature=False,
+            update_actor=False,
+            alpha=torch.tensor(0.25),
+            actor_loss_scale=actor_loss_scale,
+        )
+
+
+def test_sac_actor_loss_scale_is_snapshotted_once_per_real_action(monkeypatch):
+    model = _model(sac_actor_loss_scale_mode="tdmpc2_percentile_range")
+    agent = model.agent
+    engine = agent.inner_engine
+    scale_reads = 0
+    action_scales = (2.0, 3.0)
+
+    def read_scale(_agent):
+        nonlocal scale_reads
+        scale = action_scales[scale_reads]
+        scale_reads += 1
+        return torch.tensor([scale])
+
+    monkeypatch.setattr(
+        type(agent),
+        "actor_loss_scale",
+        property(read_scale),
+        raising=False,
+    )
+    observed_scales = []
+    scaled_kernel = engine._compile_regions["actor"].eager
+
+    def record_scale(*args, **kwargs):
+        observed_scales.append(args[2].detach().clone())
+        return scaled_kernel(*args, **kwargs)
+
+    engine._compile_regions["actor"].eager = record_scale
+    action_metrics = []
+    for _ in action_scales:
+        agent.act(torch.zeros(3), collect_diagnostics=False)
+        action_metrics.append(dict(agent.last_inner_metrics))
+
+    assert scale_reads == len(action_scales)
+    slots_per_action = model.cfg.inner_actor_updates_per_action
+    assert len(observed_scales) == len(action_scales) * slots_per_action
+    for action_index, expected_scale in enumerate(action_scales):
+        start = action_index * slots_per_action
+        stop = start + slots_per_action
+        for scale in observed_scales[start:stop]:
+            torch.testing.assert_close(scale, torch.tensor([expected_scale]))
+        metrics = action_metrics[action_index]
+        assert metrics["inner_actor_loss_scale"] == pytest.approx(expected_scale)
+        assert metrics["inner_effective_alpha"] == pytest.approx(
+            metrics["inner_alpha_final"] / expected_scale
+        )
 
 
 def test_td3_inner_target_and_actor_objective_match_hand_computation(monkeypatch):
