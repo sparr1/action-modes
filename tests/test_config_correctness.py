@@ -78,7 +78,9 @@ def test_anchor_has_the_small_fixed_training_dose():
     assert params["inner_replay_scope"] == "action"
     assert params["inner_actor_adaptation"] == "clone"
     assert params["inner_critic_adaptation"] == "clone"
-    assert params["inner_temperature_mode"] == "inherit_outer"
+    assert params["inner_temperature_mode"] == "auto"
+    assert params["inner_temperature_initialization"] == "inherit_outer"
+    assert params["inner_target_entropy"] == "inherit_outer"
     assert params["inner_bootstrap_source"] == "inner_target"
     assert params["inner_critic_target_tau"] == 0.005
     assert params["inner_critic_target_update_interval"] == 1
@@ -129,7 +131,9 @@ def test_every_algorithm_has_consistent_replay_and_update_budgets():
         assert update_slots == 32, path
         assert replay_draws == 2048, path
         assert params["inner_replay_sampling"] == "with_replacement", path
-        assert params["inner_temperature_mode"] == "inherit_outer", path
+        assert params["inner_temperature_mode"] == "auto", path
+        assert params["inner_temperature_initialization"] == "inherit_outer", path
+        assert params["inner_target_entropy"] == "inherit_outer", path
 
 
 def test_branch_study_changes_only_branch_count_and_derived_capacity():

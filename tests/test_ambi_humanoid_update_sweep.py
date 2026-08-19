@@ -21,6 +21,7 @@ BASE_V1_TAGS = [
     "dmcontrol",
     "humanoid-walk",
     "state",
+    "inner-alpha-auto",
     "base-v1",
     "tdmpc2-aligned-recipe",
     "14m-decisions",
@@ -49,6 +50,7 @@ LR_CELLS = {
             "dmcontrol",
             "humanoid-walk",
             "state",
+            "inner-alpha-auto",
             "inner-learning-rate-screen",
             "g4",
             "critic-lr1e-4",
@@ -69,6 +71,7 @@ LR_CELLS = {
             "dmcontrol",
             "humanoid-walk",
             "state",
+            "inner-alpha-auto",
             "inner-learning-rate-screen",
             "g4",
             "critic-lr1e-4",
@@ -109,6 +112,7 @@ def _base_variant_tags(rounds: int, rollouts: int, updates: int) -> list[str]:
         "dmcontrol",
         "humanoid-walk",
         "state",
+        "inner-alpha-auto",
         "base-v1",
         "tdmpc2-aligned-recipe",
         "14m-decisions",
@@ -151,6 +155,7 @@ def test_humanoid_update_sweep_changes_only_task_and_update_dose_from_anchor():
             "dmcontrol",
             "humanoid-walk",
             "state",
+            "inner-alpha-auto",
             "inner-updates-screen",
             f"g{updates}",
         ]
@@ -173,7 +178,9 @@ def test_humanoid_update_sweep_is_log_spaced_and_keeps_anchor_work_budget():
             params["inner_batch_size"],
             params["inner_replay_capacity"],
         ) == (2, 32, 3, 64, 192)
-        assert params["inner_temperature_mode"] == "inherit_outer"
+        assert params["inner_temperature_mode"] == "auto"
+        assert params["inner_temperature_initialization"] == "inherit_outer"
+        assert params["inner_target_entropy"] == "inherit_outer"
         assert params["q_representation"] == "distributional"
         assert params["q_pair_size"] == 2
         assert params["compile"] is True

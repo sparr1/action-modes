@@ -56,8 +56,10 @@ SimNorm representation, and multi-step consistency/reward training, but replace
 TD-MPC2's policy prior with a squashed-Gaussian SAC actor and soft Bellman
 objectives. The reference AMBI model uses TD-MPC2's model-size-driven
 distributional ensemble (five Q heads at model size 5); scalar twin critics
-remain an explicit ablation. AMBI defaults to per-root inner SAC adaptation and
-retains a matched MPPI inner operator for comparison.
+remain an explicit ablation. AMBI defaults to per-root inner SAC adaptation,
+including a learned action-local entropy temperature initialized from the
+current outer temperature at each root, and retains a matched MPPI inner
+operator for comparison.
 
 Model saves are suitable for evaluation and weight transfer. They do not include
 replay, environment state, or all trainer counters, so they are not exact

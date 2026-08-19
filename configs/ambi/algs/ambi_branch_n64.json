@@ -41,7 +41,7 @@
     "inner_target_entropy": "inherit_outer",
     "inner_temperature_initialization": "inherit_outer",
     "inner_temperature_lr": 5e-05,
-    "inner_temperature_mode": "inherit_outer",
+    "inner_temperature_mode": "auto",
     "inner_temperature_optimizer_scope": "action",
     "inner_temperature_scope": "action",
     "inner_updates_per_round": 16,
