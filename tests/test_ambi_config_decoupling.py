@@ -54,6 +54,66 @@ def test_sac_actor_loss_scale_defaults_and_normalizes_explicit_mode():
     assert enabled.sac_actor_loss_scale_tau == pytest.approx(0.2)
 
 
+def test_critic_target_modes_default_to_entropy_and_normalize_independently():
+    default = _build_cfg()
+    assert default.outer_critic_target == "entropy_augmented"
+    assert default.inner_sac_critic_target == "entropy_augmented"
+
+    reward_return = _build_cfg(
+        outer_critic_target="REWARD_ONLY",
+        inner_sac_critic_target="reward_only",
+    )
+    assert reward_return.outer_critic_target == "reward_only"
+    assert reward_return.inner_sac_critic_target == "reward_only"
+
+    mixed = _build_cfg(
+        outer_critic_target="reward_only",
+        inner_sac_critic_target="ENTROPY_AUGMENTED",
+    )
+    assert mixed.outer_critic_target == "reward_only"
+    assert mixed.inner_sac_critic_target == "entropy_augmented"
+
+
+@pytest.mark.parametrize("key", ["outer_critic_target", "inner_sac_critic_target"])
+@pytest.mark.parametrize("mode", [None, True, 1, "soft", "unknown"])
+def test_critic_target_modes_are_strict(key, mode):
+    with pytest.raises(ValueError, match=key):
+        _build_cfg(**{key: mode})
+
+
+def test_all_head_q_reductions_are_configurable_independently():
+    cfg = _build_cfg(
+        q_representation="distributional",
+        num_q=5,
+        outer_q_target_reduction="MIN_ALL",
+        outer_q_actor_reduction="mean_all",
+        inner_q_target_reduction="min_all",
+        inner_q_actor_reduction="MEAN_ALL",
+    )
+
+    assert cfg.outer_q_target_reduction == "min_all"
+    assert cfg.outer_q_actor_reduction == "mean_all"
+    assert cfg.inner_q_target_reduction == "min_all"
+    assert cfg.inner_q_actor_reduction == "mean_all"
+
+
+def test_canonical_inner_sac_can_adapt_only_the_actor():
+    cfg = _build_cfg(
+        inner_rounds=2,
+        inner_rollouts_per_round=3,
+        inner_rollout_horizon=2,
+        inner_updates_per_round=4,
+        inner_actor_adaptation="clone",
+        inner_critic_adaptation="frozen",
+        inner_temperature_mode="inherit_outer",
+    )
+
+    assert cfg.inner_actor_updates_per_action == 8
+    assert cfg.inner_critic_updates_per_action == 0
+    assert cfg.inner_temperature_updates_per_action == 0
+    assert cfg.inner_expected_update_slots == 8
+
+
 @pytest.mark.parametrize(
     "mode",
     [None, True, 1, "percentile_range", "unknown"],

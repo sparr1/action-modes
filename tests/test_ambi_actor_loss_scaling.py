@@ -230,7 +230,7 @@ def test_enabled_checkpoint_and_exact_state_roundtrip_non_unit_scale():
 
     source.agent.prepare_training_resume_boundary()
     exact = _clone_tree(source.agent.training_state_dict())
-    assert exact["version"] == 2
+    assert exact["version"] == 4
     assert exact["outer"]["checkpoint_version"] == 4
     restored = _scaled_model()
     restored.agent.load_training_state_dict(exact)

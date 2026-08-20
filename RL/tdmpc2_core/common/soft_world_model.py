@@ -2,8 +2,8 @@
 
 The encoder, latent dynamics, reward, termination, policy architecture, SimNorm,
 and initialization follow the vendored TD-MPC2 implementation. Its control head
-supports either scalar twin critics or a TD-MPC2-style categorical Q ensemble
-while retaining the same soft SAC Bellman semantics.
+supports either scalar twin critics or a TD-MPC2-style categorical Q ensemble.
+AMBI configures whether their Bellman bootstrap includes policy entropy.
 """
 
 from copy import deepcopy
@@ -79,9 +79,9 @@ class SoftWorldModel(nn.Module):
     def __repr__(self):
         result = "AMBI TD-MPC2 Soft World Model\n"
         q_label = (
-            "Twin soft Q-functions"
+            "Twin Q-functions"
             if self.q_backend.representation == "scalar"
-            else "Distributional soft Q ensemble"
+            else "Distributional Q ensemble"
         )
         modules = [
             ("Encoder", self._encoder),

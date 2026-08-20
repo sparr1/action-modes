@@ -13,6 +13,7 @@ from utils.utils import setup_logs
 
 
 _Q_REDUCTIONS = {"min_pair", "mean_pair", "min_all", "mean_all"}
+_CRITIC_TARGETS = {"entropy_augmented", "reward_only"}
 _SAC_ACTOR_LOSS_SCALE_MODES = {"none", "tdmpc2_percentile_range"}
 _ADAPTATION_MODES = {"frozen", "clone", "lora"}
 _LIFECYCLE_SCOPES = {"action", "episode", "run"}
@@ -20,8 +21,8 @@ _SCOPE_RANK = {"action": 0, "episode": 1, "run": 2}
 
 
 _AMBI_DEFAULTS = {
-    # Outer latent SAC. Q representation and ensemble reduction are independent
-    # of the soft Bellman objective.
+    # Outer latent SAC. Q representation, ensemble reduction, and whether
+    # entropy enters policy evaluation are independent controls.
     "mpc": False,
     "q_representation": "distributional",
     "q_num_bins": None,
@@ -33,6 +34,8 @@ _AMBI_DEFAULTS = {
     "inner_q_target_reduction": "min_pair",
     "inner_q_actor_reduction": "min_pair",
     "mppi_terminal_q_reduction": "mean_pair",
+    "outer_critic_target": "entropy_augmented",
+    "inner_sac_critic_target": "entropy_augmented",
     "sac_actor_loss_scale_mode": "none",
     "sac_actor_loss_scale_tau": 0.01,
     "critic_coef": 1.0,
@@ -489,6 +492,19 @@ class AMBITDMPC2(TDMPC2Baseline):
             value = str(getattr(cfg, key)).lower()
             if value not in _Q_REDUCTIONS:
                 raise ValueError(f"{key} must be one of {sorted(_Q_REDUCTIONS)}, got {value!r}.")
+            setattr(cfg, key, value)
+
+        for key in ("outer_critic_target", "inner_sac_critic_target"):
+            value = getattr(cfg, key)
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"{key} must be one of {sorted(_CRITIC_TARGETS)}, got {value!r}."
+                )
+            value = value.lower()
+            if value not in _CRITIC_TARGETS:
+                raise ValueError(
+                    f"{key} must be one of {sorted(_CRITIC_TARGETS)}, got {value!r}."
+                )
             setattr(cfg, key, value)
 
         if not isinstance(cfg.sac_actor_loss_scale_mode, str):

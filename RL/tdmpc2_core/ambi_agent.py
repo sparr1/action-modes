@@ -200,6 +200,11 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "Q critic:",
             f"{critic_spec['q_representation']} ({critic_detail})",
         )
+        print(
+            "Critic targets:",
+            f"outer={cfg.outer_critic_target}, "
+            f"inner_sac={cfg.inner_sac_critic_target}",
+        )
         if cfg.inner_operator in {"sac", "td3"}:
             nominal_steps = (
                 int(cfg.inner_rounds)
@@ -377,6 +382,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 "mode": "auto" if self.log_ent_coef is not None else "fixed",
                 "target_entropy": float(self.target_entropy),
             },
+            "critic_target_spec": self._critic_target_spec(),
             "model": self.model.state_dict(),
             "optim": self.optim.state_dict(),
             "pi_optim": self.pi_optim.state_dict(),
@@ -393,6 +399,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
             state["actor_loss_scale_state"] = self._actor_loss_scale_state()
         return state
 
+    def _critic_target_spec(self):
+        """Return Bellman-target semantics recorded for reproducibility."""
+        return {
+            "outer_critic_target": str(self.cfg.outer_critic_target),
+            "inner_sac_critic_target": str(self.cfg.inner_sac_critic_target),
+        }
+
     def training_state_dict(self):
         """Return exact outer and persistent inner state for run continuation."""
         if self.outer_version != self.num_updates:
@@ -406,9 +419,11 @@ class AMBITDMPC2Agent(torch.nn.Module):
             raise RuntimeError(
                 "AMBI live persistent inner workspace is newer than the outer learner."
             )
+        # Versions 3/4 add exact critic-target provenance; the even version
+        # additionally carries actor-loss scale state.
         return {
             "schema": "ambi-tdmpc2-agent-training-state",
-            "version": 2 if self.actor_loss_scale_enabled else 1,
+            "version": 4 if self.actor_loss_scale_enabled else 3,
             "outer": self.checkpoint_state(),
             "inner": inner,
             "model_training": bool(self.model.training),
@@ -422,6 +437,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "critic_spec",
             "policy_spec",
             "entropy_spec",
+            "critic_target_spec",
             "model",
             "optim",
             "pi_optim",
@@ -442,6 +458,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
             raise ValueError(
                 "AMBI exact training state requires outer checkpoint version "
                 f"{expected_checkpoint_version}."
+            )
+        if state["critic_target_spec"] != self._critic_target_spec():
+            raise ValueError(
+                "AMBI exact training-state critic-target specification does not "
+                "match this agent: "
+                f"checkpoint={state['critic_target_spec']}, "
+                f"configured={self._critic_target_spec()}."
             )
         for key in ("num_updates", "outer_version"):
             value = state[key]
@@ -513,7 +536,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             },
             "AMBI agent training state",
         )
-        expected_version = 2 if self.actor_loss_scale_enabled else 1
+        expected_version = 4 if self.actor_loss_scale_enabled else 3
         if (
             state["schema"] != "ambi-tdmpc2-agent-training-state"
             or state["version"] != expected_version
@@ -625,6 +648,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 "Checkpoint critic specification does not match this agent: "
                 f"checkpoint={saved_spec}, configured={self.model.critic_signature}."
             )
+        # ``critic_target_spec`` is provenance rather than an architecture
+        # constraint for portable saves. Frozen-checkpoint studies may
+        # intentionally transfer these weights across target objectives; exact
+        # training-state restoration validates the specification separately.
         saved_policy_spec = state.get("policy_spec") if isinstance(state, dict) else None
         configured_policy_spec = {
             "log_std_min": float(self.cfg.log_std_min),
@@ -816,6 +843,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
 
     @torch.no_grad()
     def _soft_td_target(self, next_z, reward, terminated):
+        """Build the outer critic target; retain the historical helper name."""
         next_action, next_info = self.model.pi(next_z)
         next_q = self.model.Q(
             next_z,
@@ -823,9 +851,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
             target=True,
             reduction=self.cfg.outer_q_target_reduction,
         )
-        return reward + self.discount * (1.0 - terminated) * (
-            next_q - self.alpha.detach() * next_info["log_prob"]
-        )
+        bootstrap = next_q
+        if self.cfg.outer_critic_target == "entropy_augmented":
+            bootstrap = bootstrap - self.alpha.detach() * next_info["log_prob"]
+        return reward + self.discount * (1.0 - terminated) * bootstrap
 
     def _update_actor(self, zs):
         action, policy_info = self.model.pi(zs)
@@ -981,7 +1010,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         )
 
     def _update(self, obs, action, reward, terminated):
-        """One TD-MPC2-style model update with backend-neutral soft-Q regression."""
+        """One TD-MPC2-style model update with configurable Q regression."""
         with torch.no_grad():
             next_z_targets = self.model.encode(obs[1:])
             td_targets = self._soft_td_target(next_z_targets, reward, terminated)

@@ -540,20 +540,94 @@ def test_version_three_checkpoint_records_observation_contract():
         "shape": [3],
         "dtype": "float32",
     }
+    assert checkpoint["critic_target_spec"] == {
+        "outer_critic_target": "entropy_augmented",
+        "inner_sac_critic_target": "entropy_augmented",
+    }
+
+
+def test_portable_checkpoint_allows_intentional_critic_target_ablation():
+    source = _model(
+        outer_critic_target="entropy_augmented",
+        inner_sac_critic_target="entropy_augmented",
+    )
+    checkpoint = _clone_tree(source.agent.checkpoint_state())
+
+    reward_return = _model(
+        outer_critic_target="reward_only",
+        inner_sac_critic_target="reward_only",
+    )
+    reward_return.agent.load(checkpoint)
+
+    assert reward_return.agent._critic_target_spec() == {
+        "outer_critic_target": "reward_only",
+        "inner_sac_critic_target": "reward_only",
+    }
+    _assert_tree_equal(
+        reward_return.agent.model.state_dict(), source.agent.model.state_dict()
+    )
+
+
+@pytest.mark.parametrize(
+    ("actor_loss_scale_mode", "checkpoint_version"),
+    [("none", 3), ("tdmpc2_percentile_range", 4)],
+)
+def test_pre_target_spec_portable_checkpoint_still_loads(
+    actor_loss_scale_mode, checkpoint_version
+):
+    source = _model(sac_actor_loss_scale_mode=actor_loss_scale_mode)
+    checkpoint = _clone_tree(source.agent.checkpoint_state())
+    assert checkpoint["checkpoint_version"] == checkpoint_version
+    checkpoint.pop("critic_target_spec")
+
+    restored = _model(
+        sac_actor_loss_scale_mode=actor_loss_scale_mode,
+        outer_critic_target="reward_only",
+        inner_sac_critic_target="reward_only",
+    )
+    restored.agent.load(checkpoint)
+    _assert_tree_equal(
+        restored.agent.model.state_dict(), source.agent.model.state_dict()
+    )
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("outer_critic_target", "reward_only"),
+        ("inner_sac_critic_target", "reward_only"),
+    ],
+)
+def test_exact_training_state_rejects_critic_target_semantic_change(key, value):
+    source = _model()
+    checkpoint = _clone_tree(source.agent.training_state_dict())
+    configured = _model(**{key: value})
+    pristine = _clone_tree(configured.agent.training_state_dict())
+
+    with pytest.raises(ValueError, match="critic-target specification"):
+        configured.agent.load_training_state_dict(checkpoint)
+
+    _assert_tree_equal(configured.agent.training_state_dict(), pristine)
 
 
 @pytest.mark.parametrize("legacy_version", [1, 2])
-def test_versioned_legacy_checkpoint_without_observation_metadata_still_loads(
+def test_versioned_legacy_checkpoint_without_new_metadata_still_loads(
     legacy_version,
 ):
     source = _model()
     checkpoint = _clone_tree(source.agent.checkpoint_state())
     checkpoint["checkpoint_version"] = legacy_version
     checkpoint.pop("observation_spec")
+    checkpoint.pop("critic_target_spec")
 
-    restored = _model()
+    restored = _model(
+        outer_critic_target="reward_only",
+        inner_sac_critic_target="reward_only",
+    )
     restored.agent.load(checkpoint)
-    _assert_tree_equal(restored.agent.model.state_dict(), source.agent.model.state_dict())
+    _assert_tree_equal(
+        restored.agent.model.state_dict(), source.agent.model.state_dict()
+    )
 
 
 def test_ambi_observation_mismatch_fails_before_outer_state_mutation():
@@ -650,9 +724,27 @@ def _toy_policy(z, task=None, *, policy=None, deterministic=False, **kwargs):
     }
 
 
-def test_sac_inner_target_and_actor_objective_match_hand_computation(monkeypatch):
-    model = _model(inner_rounds=1, inner_model_step_budget=8)
+@pytest.mark.parametrize(
+    ("target_mode", "entropy_bonus"),
+    [("entropy_augmented", 0.5), ("reward_only", 0.0)],
+)
+def test_sac_inner_target_and_actor_objective_match_hand_computation(
+    monkeypatch, target_mode, entropy_bonus
+):
+    model = _model(
+        inner_rounds=1,
+        inner_model_step_budget=8,
+        inner_sac_critic_target=target_mode,
+    )
     engine = model.agent.inner_engine
+    compile_calls = []
+
+    def fake_compile(function, **kwargs):
+        compile_calls.append((function, kwargs))
+        return function
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    engine._compile_regions["critic"].enabled = True
     assert (
         engine._compile_regions["actor"].eager.__func__
         is engine._sac_actor_kernel.__func__
@@ -683,9 +775,11 @@ def test_sac_inner_target_and_actor_objective_match_hand_computation(monkeypatch
     alpha = torch.tensor(0.25)
     with engine.rng.fork("bootstrap"):
         engine._sac_critic_step(batch, alpha)
+    assert len(compile_calls) == 1
+    assert compile_calls[0][1] == {"fullgraph": False, "dynamic": False}
     expected_target = batch["reward"] + model.agent.discount * (
         1.0 - batch["terminated"]
-    ) * (5.0 + 0.5 * alpha)
+    ) * (5.0 + entropy_bonus * alpha)
     torch.testing.assert_close(captured["target"], expected_target)
 
     monkeypatch.setattr(
@@ -930,8 +1024,18 @@ def test_td3_inner_target_and_actor_objective_match_hand_computation(monkeypatch
     assert actor_metrics["actor_loss"] == pytest.approx(-3.0)
 
 
-def test_outer_scalar_soft_target_and_optimizer_partition_are_preserved(monkeypatch):
-    model = _model(q_representation="scalar", num_q=2)
+@pytest.mark.parametrize(
+    ("target_mode", "entropy_bonus"),
+    [("entropy_augmented", 0.4), ("reward_only", 0.0)],
+)
+def test_outer_scalar_target_and_optimizer_partition_are_preserved(
+    monkeypatch, target_mode, entropy_bonus
+):
+    model = _model(
+        q_representation="scalar",
+        num_q=2,
+        outer_critic_target=target_mode,
+    )
     agent = model.agent
 
     def outer_policy(z, *args, **kwargs):
@@ -950,7 +1054,7 @@ def test_outer_scalar_soft_target_and_optimizer_partition_are_preserved(monkeypa
         torch.zeros(2, model.cfg.latent_dim), reward, terminated
     )
     expected = reward + agent.discount * (1.0 - terminated) * (
-        6.0 + 0.4 * agent.alpha.detach()
+        6.0 + entropy_bonus * agent.alpha.detach()
     )
     torch.testing.assert_close(target, expected)
 

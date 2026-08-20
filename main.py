@@ -123,6 +123,8 @@ _RUNTIME_CONFIG_FIELDS = (
     "outer_q_actor_reduction",
     "inner_q_target_reduction",
     "inner_q_actor_reduction",
+    "outer_critic_target",
+    "inner_sac_critic_target",
     "sac_actor_loss_scale_mode",
     "sac_actor_loss_scale_tau",
     "compile",
@@ -205,6 +207,8 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
             "q_pair_size",
             "q_target_reduction",
             "q_actor_reduction",
+            "outer_critic_target",
+            "inner_sac_critic_target",
         )
         inferred = {key: resolved[key] for key in critic_keys if key in resolved}
         critic_signature = inferred or None
@@ -217,6 +221,8 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
             "outer_q_actor_reduction",
             "inner_q_target_reduction",
             "inner_q_actor_reduction",
+            "outer_critic_target",
+            "inner_sac_critic_target",
         ):
             if key in resolved:
                 critic_signature.setdefault(key, resolved[key])

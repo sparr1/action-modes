@@ -53,13 +53,32 @@ loadable through strict architecture preflight.
 `common/soft_world_model.py` and `ambi_agent.py` are AMBI extensions, not
 upstream TD-MPC2. They retain the encoder, latent dynamics, reward model,
 SimNorm representation, and multi-step consistency/reward training, but replace
-TD-MPC2's policy prior with a squashed-Gaussian SAC actor and soft Bellman
-objectives. The reference AMBI model uses TD-MPC2's model-size-driven
+TD-MPC2's policy prior with a squashed-Gaussian, entropy-regularized SAC actor.
+The reference AMBI model uses TD-MPC2's model-size-driven
 distributional ensemble (five Q heads at model size 5); scalar twin critics
 remain an explicit ablation. AMBI defaults to per-root inner SAC adaptation,
 including a learned action-local entropy temperature initialized from the
 current outer temperature at each root, and retains a matched MPPI inner
 operator for comparison.
+
+Policy optimization and critic evaluation can be ablated independently.
+`outer_critic_target` and `inner_sac_critic_target` each accept
+`"entropy_augmented"` (the default, which bootstraps with
+`Q - alpha * log_pi`) or `"reward_only"` (which bootstraps with `Q`). The
+reward-only setting changes only the corresponding Bellman target; it does not
+otherwise change actor sampling, the `alpha * log_pi - Q` actor loss, or the
+configured temperature behavior. To mirror TD-MPC2's reward-return critic in
+both places, set both fields to `"reward_only"`. Ensemble selection remains a
+separate control: `min_all` and `mean_all` use every Q head, while the `*_pair`
+modes use `q_pair_size` sampled heads.
+
+For an actor-only inner-SAC ablation, set
+`inner_actor_adaptation="clone"`, `inner_critic_adaptation="frozen"`, and
+`inner_temperature_mode="inherit_outer"`. The canonical schedule then resolves
+the inner critic and temperature update counts to zero while retaining actor
+updates. This combination is also available as
+`adapted_components/actor_only` in
+`configs/research/ambi_inner_decoupling.json`.
 
 AMBI can optionally use TD-MPC2's running P95-P5 actor-value scale through
 `sac_actor_loss_scale_mode="tdmpc2_percentile_range"` (the default is

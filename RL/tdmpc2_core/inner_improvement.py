@@ -1662,9 +1662,12 @@ class InnerImprovementEngine:
                     pair_indices=pair_indices,
                     trusted_pair_indices=True,
                 )
+            bootstrap = next_q
+            if cfg.inner_sac_critic_target == "entropy_augmented":
+                bootstrap = bootstrap - alpha * next_info["log_prob"]
             target_q = reward + float(self.agent.discount) * (
                 1.0 - terminated
-            ) * (next_q - alpha * next_info["log_prob"])
+            ) * bootstrap
 
         predictions = self.model.q_predictions(z, action, qs=state.critic)
         critic_loss = self.model.critic_loss(predictions, target_q)

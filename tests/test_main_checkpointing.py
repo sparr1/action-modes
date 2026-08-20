@@ -148,6 +148,8 @@ def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
         temporal_loss_normalization="reference_weighted_mean",
         temporal_loss_reference_horizon=3,
         rho=0.7,
+        outer_critic_target="reward_only",
+        inner_sac_critic_target="entropy_augmented",
         sac_actor_loss_scale_mode="tdmpc2_percentile_range",
         sac_actor_loss_scale_tau=0.01,
         compile=True,
@@ -212,7 +214,11 @@ def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
         "outer_planning_horizon": 3,
         "inner_rollout_horizon": 6,
     }
-    assert metadata["critic"] == critic_signature
+    assert metadata["critic"] == {
+        **critic_signature,
+        "outer_critic_target": "reward_only",
+        "inner_sac_critic_target": "entropy_augmented",
+    }
     assert metadata["actor_loss_scale"] == {
         "mode": "tdmpc2_percentile_range",
         "tau": 0.01,
