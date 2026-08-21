@@ -1,0 +1,25 @@
+{
+  "study_type": "single_seed_exploratory_frozen_inner_critic",
+  "study_note": "Single-seed exploratory 14-million-decision Humanoid Walk base-v1 G4 run changing only inner critic adaptation from clone to frozen; the outer target remains entropy-augmented, the inert inner target is pinned entropy-augmented for provenance, and five Q heads, all four min_all reductions, automatic outer and inner entropy coefficients, and no actor-loss percentile scaling remain unchanged. Make no confidence, significance, or confirmatory claims.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": ["ambi_humanoid_walk_base_min_all_frozen_critic"],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 100000,
+  "save_strat": ["best", "latest"],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}

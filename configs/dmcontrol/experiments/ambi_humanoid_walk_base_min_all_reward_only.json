@@ -1,0 +1,25 @@
+{
+  "study_type": "single_seed_exploratory_reward_only_targets",
+  "study_note": "Single-seed exploratory 14-million-decision Humanoid Walk base-v1 G4 run changing only both outer and inner critic targets from entropy-augmented to reward-only bootstraps; five Q heads, all four min_all reductions, the cloned inner critic, automatic outer and inner entropy coefficients, and no actor-loss percentile scaling remain unchanged. Make no confidence, significance, or confirmatory claims.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": ["ambi_humanoid_walk_base_min_all_reward_only"],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 100000,
+  "save_strat": ["best", "latest"],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}
