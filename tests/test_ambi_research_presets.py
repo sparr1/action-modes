@@ -6,6 +6,7 @@ from pathlib import Path
 import gymnasium as gym
 import pytest
 
+import evaluate_ambi_checkpoint as evaluator
 from evaluate_ambi_checkpoint import (
     _attach_paired_return_deltas,
     _validate_frozen_selection,
@@ -157,6 +158,58 @@ def test_frozen_evaluator_cli_parses_selection_and_reproducibility_controls():
     assert args.device == "cpu"
 
 
+def test_frozen_evaluator_output_is_no_clobber_by_default_and_atomic_on_overwrite(
+    monkeypatch, tmp_path
+):
+    output = tmp_path / "results" / "evaluation.json"
+    output.parent.mkdir()
+    output.write_text("old\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="--overwrite"):
+        evaluator._write_output_atomic(output, "new\n", overwrite=False)
+    assert output.read_text(encoding="utf-8") == "old\n"
+
+    replacements = []
+    real_replace = evaluator.os.replace
+
+    def tracking_replace(source, target):
+        replacements.append((Path(source), Path(target)))
+        return real_replace(source, target)
+
+    monkeypatch.setattr(evaluator.os, "replace", tracking_replace)
+    evaluator._write_output_atomic(output, "new\n", overwrite=True)
+
+    assert output.read_text(encoding="utf-8") == "new\n"
+    assert replacements and replacements[-1][1] == output
+    assert list(output.parent.glob(f".{output.name}.*.tmp")) == []
+
+
+def test_frozen_evaluator_preflights_existing_output_before_evaluation(
+    monkeypatch, tmp_path
+):
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    output = tmp_path / "evaluation.json"
+    output.write_text("keep\n", encoding="utf-8")
+    monkeypatch.setattr(
+        evaluator,
+        "evaluate_matrix",
+        lambda *_args, **_kwargs: pytest.fail("evaluation ran before output preflight"),
+    )
+
+    with pytest.raises(SystemExit):
+        evaluator.main(
+            [
+                "--checkpoint",
+                str(checkpoint),
+                "--output",
+                str(output),
+            ]
+        )
+
+    assert output.read_text(encoding="utf-8") == "keep\n"
+
+
 def test_frozen_evaluator_reports_seed_paired_reference_deltas():
     results = [
         {
@@ -203,3 +256,138 @@ def test_frozen_selection_rejects_train_only_and_mixed_architecture_axes():
     rgb["algorithm_config"]["alg_params"]["obs"] = "rgb"
     with pytest.raises(ValueError, match="different observation contracts"):
         _validate_frozen_selection(matrix, [state, rgb])
+
+
+def test_frozen_evaluation_closes_model_and_env_without_masking_primary_error(
+    monkeypatch, tmp_path
+):
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint")
+
+    class Space:
+        def seed(self, _seed):
+            return None
+
+    class Env:
+        def __init__(self):
+            self.action_space = Space()
+            self.observation_space = Space()
+            self.close_calls = 0
+
+        def reset(self, *, seed=None):
+            return 0, {}
+
+        def close(self):
+            self.close_calls += 1
+            raise OSError("environment close failed")
+
+    class Model:
+        def __init__(self):
+            self.agent = type("Agent", (), {"num_updates": 0})()
+            self.close_calls = 0
+
+        def predict(self, *_args, **_kwargs):
+            raise RuntimeError("evaluation failed")
+
+        def close(self):
+            self.close_calls += 1
+            raise OSError("model close failed")
+
+    env = Env()
+    model = Model()
+    monkeypatch.setattr(evaluator, "_make_env", lambda _resolved: env)
+    monkeypatch.setattr(
+        evaluator,
+        "_initialize_frozen_model",
+        lambda *_args, **_kwargs: (model, {"alg_params": {}}),
+    )
+    monkeypatch.setattr(evaluator, "_outer_state_digest", lambda _model: "digest")
+
+    with pytest.raises(RuntimeError, match="evaluation failed") as captured:
+        evaluator.evaluate_preset(
+            {"selector": "inner_operator/sac"},
+            checkpoint,
+            [7],
+            controller_seed=11,
+        )
+
+    assert str(captured.value) == "evaluation failed"
+    assert model.close_calls == 1
+    assert env.close_calls == 1
+    assert getattr(captured.value, "__notes__", ()) == [
+        "Additional cleanup failure: model close failed",
+        "Additional cleanup failure: environment close failed",
+    ]
+
+
+def test_frozen_model_is_closed_if_checkpoint_load_is_interrupted(
+    monkeypatch, tmp_path
+):
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    instances = []
+
+    class InterruptedModel:
+        def __init__(self, *_args, **_kwargs):
+            self.close_calls = 0
+            instances.append(self)
+
+        def load(self, _path):
+            raise KeyboardInterrupt()
+
+        def close(self):
+            self.close_calls += 1
+
+    module = type("Module", (), {"InterruptedModel": InterruptedModel})()
+    monkeypatch.setattr(evaluator.importlib, "import_module", lambda _name: module)
+    resolved = {
+        "selector": "synthetic/interrupted",
+        "algorithm_config": {
+            "alg": "Synthetic/InterruptedModel",
+            "alg_params": {},
+        },
+        "environment": {"id": "Synthetic-v0"},
+    }
+
+    with pytest.raises(KeyboardInterrupt):
+        evaluator._initialize_frozen_model(
+            resolved,
+            object(),
+            checkpoint,
+            controller_seed=3,
+        )
+
+    assert instances[0].close_calls == 1
+
+
+def test_frozen_evaluator_closes_base_env_if_wrapper_setup_is_interrupted(
+    monkeypatch,
+):
+    class Env:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            raise OSError("base env close failed")
+
+    env = Env()
+    monkeypatch.setattr(evaluator.gym, "make", lambda *_args, **_kwargs: env)
+    monkeypatch.setattr(
+        "utils.core.setup_wrapper",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    resolved = {
+        "algorithm_config": {
+            "env_wrapper": {"name": "synthetic:Wrapper"},
+        },
+        "environment": {"id": "Synthetic-v0"},
+    }
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        evaluator._make_env(resolved)
+
+    assert env.close_calls == 1
+    assert getattr(captured.value, "__notes__", ()) == [
+        "Additional cleanup failure: base env close failed"
+    ]

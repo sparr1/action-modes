@@ -13,6 +13,7 @@ BASE_V1 = "ambi_humanoid_walk_base"
 BASE_V1_LORA_R8 = "ambi_humanoid_walk_base_lora_r8"
 BASE_V1_LORA_R16 = "ambi_humanoid_walk_base_lora_r16"
 BASE_V1_ACTOR_MEAN_PAIR = "ambi_humanoid_walk_base_actor_mean_pair"
+BASE_V1_MIN_ALL = "ambi_humanoid_walk_base_min_all"
 BASE_V1_PERCENTILE_NORMALIZED = "ambi_humanoid_walk_base_percentile_normalized"
 BASE_V1_STUDY_NOTE = (
     "Single-seed exploratory 14-million-decision Humanoid Walk base-v1 run "
@@ -39,6 +40,14 @@ BASE_V1_ACTOR_MEAN_PAIR_STUDY_NOTE = (
     "changing only the outer and inner policy-learning Q reductions from a "
     "random-pair minimum to a random-pair mean; target-Q reductions remain "
     "min_pair. Make no confidence, significance, or confirmatory claims."
+)
+BASE_V1_MIN_ALL_STUDY_NOTE = (
+    "Single-seed exploratory 14-million-decision Humanoid Walk base-v1 G4 "
+    "anchor with five Q heads, min_all for all outer and inner actor/target "
+    "reductions, entropy-augmented outer and inner critic targets, an "
+    "adaptable cloned inner critic, automatic outer and inner entropy "
+    "coefficients, and no actor-loss percentile scaling. Make no confidence, "
+    "significance, or confirmatory claims."
 )
 BASE_V1_PERCENTILE_NORMALIZED_STUDY_NOTE = (
     "Single-seed exploratory 14-million-decision Humanoid Walk base-v1 G4 "
@@ -503,6 +512,63 @@ def test_humanoid_base_v1_actor_mean_pair_has_a_matching_manifest():
             "study_type": "single_seed_exploratory_actor_q_reduction",
             "study_note": BASE_V1_ACTOR_MEAN_PAIR_STUDY_NOTE,
             "configs": [BASE_V1_ACTOR_MEAN_PAIR],
+        }
+    )
+
+    assert actual == expected
+
+
+def test_humanoid_base_v1_min_all_pins_full_critic_recipe():
+    baseline = _load(ALGORITHM_ROOT / f"{BASE_V1}.json")
+    actual = _load(ALGORITHM_ROOT / f"{BASE_V1_MIN_ALL}.json")
+    expected = copy.deepcopy(baseline)
+    expected["alg_params"].update(
+        {
+            "num_q": 5,
+            "outer_q_target_reduction": "min_all",
+            "outer_q_actor_reduction": "min_all",
+            "inner_q_target_reduction": "min_all",
+            "inner_q_actor_reduction": "min_all",
+            "outer_critic_target": "entropy_augmented",
+            "inner_sac_critic_target": "entropy_augmented",
+            "sac_actor_loss_scale_mode": "none",
+            "wandb_run_name": (
+                "AMBITDMPC2-humanoid-walk-base-v1-g4-min-all-seed55"
+            ),
+            "wandb_tags": [
+                *BASE_V1_TAGS,
+                "q-min-all",
+                "q-heads-5",
+                "critic-target-entropy-augmented",
+                "inner-critic-clone",
+                "outer-alpha-auto",
+            ],
+        }
+    )
+
+    assert actual == expected
+    params = actual["alg_params"]
+    assert params["q_representation"] == "distributional"
+    assert params["q_pair_size"] == 2
+    assert {
+        params["outer_q_target_reduction"],
+        params["outer_q_actor_reduction"],
+        params["inner_q_target_reduction"],
+        params["inner_q_actor_reduction"],
+    } == {"min_all"}
+    assert actual["seed"] == 55
+    assert actual["total_steps"] == 14_000_000
+
+
+def test_humanoid_base_v1_min_all_has_a_matching_manifest():
+    baseline = _load(EXPERIMENT_ROOT / f"{BASE_V1}.json")
+    actual = _load(EXPERIMENT_ROOT / f"{BASE_V1_MIN_ALL}.json")
+    expected = copy.deepcopy(baseline)
+    expected.update(
+        {
+            "study_type": "single_seed_exploratory_all_head_q_minimum",
+            "study_note": BASE_V1_MIN_ALL_STUDY_NOTE,
+            "configs": [BASE_V1_MIN_ALL],
         }
     )
 

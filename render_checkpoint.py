@@ -23,6 +23,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 import domains  # noqa: F401  # Register project environments before build_env/gym.make.
+from utils.cleanup import add_cleanup_notes, raise_cleanup_errors
 from utils.core import build_env, initialize_alg
 
 
@@ -470,6 +471,7 @@ def _initialize_model(
     backend: str,
 ) -> Any:
     algorithm = run_params["alg"]
+    model = None
     try:
         model, _, _ = initialize_alg(
             algorithm,
@@ -496,24 +498,31 @@ def _initialize_model(
             model.model = loaded
         else:
             model.load(str(checkpoint))
-    except Exception as exc:
-        raise RenderCheckpointError(
-            f"Could not initialize {algorithm!r} and load {checkpoint}: {exc}"
-        ) from exc
 
-    if backend == "sb3":
-        sb3_model = model.get_model()
-        policy = getattr(sb3_model, "policy", None)
-        if policy is not None and hasattr(policy, "set_training_mode"):
-            policy.set_training_mode(False)
-    elif backend == "native_sac":
-        actor = getattr(getattr(model, "agent", None), "actor", None)
-        if actor is not None and hasattr(actor, "eval"):
-            actor.eval()
-    else:
-        world_model = getattr(getattr(model, "agent", None), "model", None)
-        if world_model is not None and hasattr(world_model, "eval"):
-            world_model.eval()
+        if backend == "sb3":
+            sb3_model = model.get_model()
+            policy = getattr(sb3_model, "policy", None)
+            if policy is not None and hasattr(policy, "set_training_mode"):
+                policy.set_training_mode(False)
+        elif backend == "native_sac":
+            actor = getattr(getattr(model, "agent", None), "actor", None)
+            if actor is not None and hasattr(actor, "eval"):
+                actor.eval()
+        else:
+            world_model = getattr(getattr(model, "agent", None), "model", None)
+            if world_model is not None and hasattr(world_model, "eval"):
+                world_model.eval()
+    except BaseException as exc:
+        if isinstance(exc, Exception):
+            error = RenderCheckpointError(
+                f"Could not initialize {algorithm!r} and load {checkpoint}: {exc}"
+            )
+        else:
+            error = exc
+        _close_resources(model, primary_error=error)
+        if error is exc:
+            raise
+        raise error from exc
     return model
 
 
@@ -836,16 +845,24 @@ def _rollout(
     return results
 
 
-def _close_quietly(*resources: Any) -> None:
+def _close_resources(
+    *resources: Any, primary_error: BaseException | None = None
+) -> None:
+    cleanup_errors = []
     for resource in resources:
-        if resource is None or not hasattr(resource, "close"):
+        close = getattr(resource, "close", None)
+        if not callable(close):
             continue
         try:
-            resource.close()
-        except Exception:
-            # Preserve the rendering/model exception, if any, while still
-            # attempting every cleanup operation.
-            pass
+            close()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+    if not cleanup_errors:
+        return
+    if primary_error is not None:
+        add_cleanup_notes(primary_error, cleanup_errors)
+        return
+    raise_cleanup_errors(cleanup_errors)
 
 
 def _preflight_results_output(path: Path, *, overwrite: bool) -> None:
@@ -1029,8 +1046,10 @@ def render_checkpoint(
     # backend also consumes the overridden seed in its own constructor.
     _seed_controller(first_seed)
 
+    model = None
     model_env = None
     rollout_env = None
+    primary_error = None
     try:
         model_env = build_env(
             run_params, experiment_params, render_mode=None
@@ -1076,8 +1095,16 @@ def render_checkpoint(
             )
             print(f"Wrote {resolved_results_json}")
         return results
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        _close_quietly(rollout_env, model_env)
+        _close_resources(
+            model,
+            rollout_env,
+            model_env,
+            primary_error=primary_error,
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

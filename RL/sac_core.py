@@ -17,6 +17,13 @@ from torch.nn import functional as F
 from torch.distributions import Normal
 
 from RL.tdmpc2_core.common.q_representation import QRepresentation
+from RL.tdmpc2_core.common.training_state import (
+    load_optimizer_state_preserving_hyperparameters,
+    preflight_module_state,
+    preflight_optimizer_state,
+    require_mapping,
+    require_tensor,
+)
 
 
 LOG_STD_MIN = -20
@@ -398,12 +405,18 @@ class SACAgent:
         self.target_entropy = self._make_target_entropy(config.target_entropy)
         self.ent_coef_optimizer = None
         self.log_ent_coef = None
+        if isinstance(config.ent_coef, (bool, np.bool_)):
+            raise ValueError("Entropy coefficient must be numeric, not a boolean.")
         if isinstance(config.ent_coef, str) and config.ent_coef.startswith("auto"):
+            if config.ent_coef != "auto" and not config.ent_coef.startswith("auto_"):
+                raise ValueError("Automatic entropy coefficient must use 'auto[_initial]'.")
             init_value = 1.0
             if "_" in config.ent_coef:
                 init_value = float(config.ent_coef.split("_", 1)[1])
-                if init_value <= 0:
-                    raise ValueError("Initial entropy coefficient must be > 0.")
+                if not np.isfinite(init_value) or init_value <= 0:
+                    raise ValueError(
+                        "Initial entropy coefficient must be positive and finite."
+                    )
             self.log_ent_coef = torch.log(torch.ones(1, device=self.device) * init_value).requires_grad_(True)
             self.ent_coef_optimizer = torch.optim.Adam(
                 [self.log_ent_coef],
@@ -414,8 +427,10 @@ class SACAgent:
             self.ent_coef_tensor = None
         else:
             fixed_ent_coef = float(config.ent_coef)
-            if fixed_ent_coef <= 0.0:
-                raise ValueError("Fixed entropy coefficient must be positive.")
+            if not np.isfinite(fixed_ent_coef) or fixed_ent_coef <= 0.0:
+                raise ValueError(
+                    "Fixed entropy coefficient must be positive and finite."
+                )
             self.ent_coef_tensor = torch.tensor(fixed_ent_coef, device=self.device)
 
         self.num_updates = 0
@@ -451,9 +466,14 @@ class SACAgent:
         return tuple(betas)
 
     def _make_target_entropy(self, target_entropy: str | float) -> float:
+        if isinstance(target_entropy, (bool, np.bool_)):
+            raise ValueError("target_entropy must be numeric, not a boolean.")
         if target_entropy == "auto":
             return float(-self.action_dim)
-        return float(target_entropy)
+        target_entropy = float(target_entropy)
+        if not np.isfinite(target_entropy):
+            raise ValueError("target_entropy must be finite or 'auto'.")
+        return target_entropy
 
     @property
     def critic_signature(self) -> Dict[str, object]:
@@ -692,6 +712,7 @@ class SACAgent:
         return state
 
     def load_state_dict(self, state: Dict[str, object]) -> None:
+        state = require_mapping(state, "SAC checkpoint state")
         legacy_scalar_spec = {
             "q_representation": "scalar",
             "num_q": 2,
@@ -719,18 +740,96 @@ class SACAgent:
                 f"checkpoint={saved_reduction_spec}, "
                 f"configured={self.reduction_signature}."
             )
+        saved_auto_entropy = (
+            "log_ent_coef" in state or "ent_coef_optimizer" in state
+        )
+        saved_fixed_entropy = "ent_coef_tensor" in state
+        if saved_auto_entropy == saved_fixed_entropy:
+            raise ValueError(
+                "Checkpoint must contain exactly one complete entropy-coefficient mode."
+            )
+        if saved_auto_entropy and not {
+            "log_ent_coef",
+            "ent_coef_optimizer",
+        }.issubset(state):
+            raise ValueError(
+                "Automatic-entropy checkpoint state is incomplete."
+            )
+        configured_auto_entropy = (
+            self.ent_coef_optimizer is not None and self.log_ent_coef is not None
+        )
+        if saved_auto_entropy != configured_auto_entropy:
+            raise ValueError(
+                "Checkpoint entropy mode does not match this SAC agent."
+            )
+        preflight_module_state(self.actor, state["actor"], "SAC checkpoint actor")
+        preflight_module_state(self.critic, state["critic"], "SAC checkpoint critic")
+        preflight_module_state(
+            self.critic_target,
+            state["critic_target"],
+            "SAC checkpoint target critic",
+        )
+        preflight_optimizer_state(
+            self.actor_optimizer,
+            state["actor_optimizer"],
+            "SAC checkpoint actor optimizer",
+        )
+        preflight_optimizer_state(
+            self.critic_optimizer,
+            state["critic_optimizer"],
+            "SAC checkpoint critic optimizer",
+        )
+        saved_num_updates = state.get("num_updates", 0)
+        if (
+            isinstance(saved_num_updates, bool)
+            or not isinstance(saved_num_updates, int)
+            or saved_num_updates < 0
+        ):
+            raise ValueError("SAC checkpoint num_updates must be a non-negative integer.")
+        if saved_auto_entropy:
+            saved_log_alpha = require_tensor(
+                state["log_ent_coef"],
+                "SAC checkpoint log_ent_coef",
+                shape=self.log_ent_coef.shape,
+                dtype=self.log_ent_coef.dtype,
+            )
+            if not bool(torch.isfinite(saved_log_alpha).all().item()):
+                raise ValueError("SAC checkpoint log_ent_coef must be finite.")
+            preflight_optimizer_state(
+                self.ent_coef_optimizer,
+                state["ent_coef_optimizer"],
+                "SAC checkpoint entropy optimizer",
+            )
+        else:
+            saved_fixed_alpha = require_tensor(
+                state["ent_coef_tensor"],
+                "SAC checkpoint fixed entropy coefficient",
+                shape=self.ent_coef_tensor.shape,
+                dtype=self.ent_coef_tensor.dtype,
+            )
+            if not bool(torch.isfinite(saved_fixed_alpha).all().item()):
+                raise ValueError(
+                    "SAC checkpoint fixed entropy coefficient must be finite."
+                )
+
+        # Every payload that can fail structurally has been checked before the
+        # first live module, optimizer, scalar, or counter is mutated.
         self.actor.load_state_dict(state["actor"])
         self.critic.load_state_dict(state["critic"])
         self.critic_target.load_state_dict(state["critic_target"])
-        self.actor_optimizer.load_state_dict(state["actor_optimizer"])
-        self.critic_optimizer.load_state_dict(state["critic_optimizer"])
-        self.num_updates = int(state.get("num_updates", 0))
+        load_optimizer_state_preserving_hyperparameters(
+            self.actor_optimizer, state["actor_optimizer"]
+        )
+        load_optimizer_state_preserving_hyperparameters(
+            self.critic_optimizer, state["critic_optimizer"]
+        )
+        self.num_updates = saved_num_updates
         if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
-            if "log_ent_coef" not in state or "ent_coef_optimizer" not in state:
-                raise ValueError("Checkpoint uses a fixed entropy coefficient, but this agent uses automatic entropy tuning.")
             self.log_ent_coef.data.copy_(state["log_ent_coef"].to(self.device))
-            self.ent_coef_optimizer.load_state_dict(state["ent_coef_optimizer"])
-        else:
-            if "ent_coef_tensor" not in state:
-                raise ValueError("Checkpoint uses automatic entropy tuning, but this agent uses a fixed coefficient.")
-            self.ent_coef_tensor = state["ent_coef_tensor"].to(self.device)
+            load_optimizer_state_preserving_hyperparameters(
+                self.ent_coef_optimizer, state["ent_coef_optimizer"]
+            )
+        # Fixed alpha is a fine-tuning configuration value rather than learned
+        # checkpoint state. Strict checkpoint loading already verifies config
+        # identity; permissive loading retains the receiving value. Automatic
+        # alpha above remains restorable.

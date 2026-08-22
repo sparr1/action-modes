@@ -145,6 +145,14 @@ class DMControlEnv(gym.Env):
         self.camera_id = 2 if self.domain_name == "quadruped" else 0
         self._frames: deque[np.ndarray] = deque(maxlen=_FRAME_STACK)
         self._env = self._make_raw_env(seed=0)
+        self._effective_control_timestep = self._get_effective_control_timestep(
+            self._env
+        )
+        self.metadata = dict(type(self).metadata)
+        if self._effective_control_timestep is not None:
+            self.metadata["render_fps"] = max(
+                1, int(round(1.0 / self._effective_control_timestep))
+            )
 
         action_spec = self._env.action_spec()
         action_low = np.broadcast_to(
@@ -189,6 +197,18 @@ class DMControlEnv(gym.Env):
         return self._action_scale.Wrapper(env, minimum=-1.0, maximum=1.0)
 
     @staticmethod
+    def _get_effective_control_timestep(env) -> float | None:
+        control_timestep = getattr(env, "control_timestep", None)
+        if not callable(control_timestep):
+            return None
+        timestep = float(control_timestep()) * _ACTION_REPEAT
+        if not np.isfinite(timestep) or timestep <= 0:
+            raise ValueError(
+                "DMControl returned an invalid effective control timestep."
+            )
+        return timestep
+
+    @staticmethod
     def _close_raw_env(env) -> None:
         try:
             close = getattr(env, "close", None)
@@ -222,6 +242,10 @@ class DMControlEnv(gym.Env):
         ):
             raise RuntimeError(
                 "DMControl action bounds changed after a seeded reconstruction."
+            )
+        if self._get_effective_control_timestep(env) != self._effective_control_timestep:
+            raise RuntimeError(
+                "DMControl control timestep changed after a seeded reconstruction."
             )
 
     def _rebuild_for_seed(self, seed: int) -> None:

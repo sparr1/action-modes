@@ -6,7 +6,7 @@ import torch
 
 from RL.TDMPC2 import TDMPC2Baseline
 from RL.tdmpc2_core.common import checkpoint as checkpoint_io
-from utils.checkpointing import CheckpointTracker
+from utils.checkpointing import CheckpointTarget, CheckpointTracker
 
 
 def test_async_snapshot_is_immutable_and_atomically_published(tmp_path):
@@ -60,6 +60,201 @@ def test_async_multi_alias_checkpoint_freezes_once_and_writes_sidecars(
         assert sidecar["checkpoint"]["kind"] == target.kind
         assert sidecar["trial_run_params"] == {"seed": 7}
     writer.shutdown()
+
+
+def test_async_metadata_failure_removes_old_sidecar_before_checkpoint_replace(
+    tmp_path, monkeypatch
+):
+    tracker = CheckpointTracker(
+        5,
+        tmp_path,
+        "model",
+        save_strat="latest",
+        periodic_step_suffix="",
+    )
+    writer = checkpoint_io.AsyncCheckpointWriter()
+    checkpoint = tmp_path / "model_latest"
+    sidecar = tmp_path / "model_latest.metadata.json"
+    try:
+        writer.save_many(
+            {"value": torch.tensor([1.0])},
+            tracker.targets(5),
+            signature=(5, 1, 1),
+        )
+        assert sidecar.is_file()
+
+        monkeypatch.setattr(
+            checkpoint_io,
+            "write_metadata_atomic",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OSError("injected sidecar failure")
+            ),
+        )
+        with pytest.raises(OSError, match="injected sidecar failure"):
+            writer.save_many(
+                {"value": torch.tensor([2.0])},
+                tracker.targets(10),
+                signature=(10, 2, 2),
+            )
+
+        torch.testing.assert_close(
+            torch.load(checkpoint, weights_only=False)["value"],
+            torch.tensor([2.0]),
+        )
+        assert not sidecar.exists()
+    finally:
+        writer.shutdown()
+
+
+def test_reused_snapshot_invalidates_target_sidecar_before_alias_publication(
+    tmp_path, monkeypatch
+):
+    writer = checkpoint_io.AsyncCheckpointWriter()
+    state = {"value": torch.tensor([4.0])}
+    signature = (20, 7, 7)
+    source = tmp_path / "periodic.pt"
+    target = tmp_path / "final.pt"
+    source_publication = CheckpointTarget(source, "periodic", {"step": 20})
+    target_publication = CheckpointTarget(target, "final", {"step": 20})
+    try:
+        writer.save_many(state, (source_publication,), signature=signature)
+        target.write_bytes(b"stale checkpoint")
+        target_sidecar = tmp_path / "final.pt.metadata.json"
+        target_sidecar.write_text('{"step": 1}', encoding="utf-8")
+
+        monkeypatch.setattr(
+            checkpoint_io,
+            "write_metadata_atomic",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OSError("injected reused-sidecar failure")
+            ),
+        )
+        with pytest.raises(OSError, match="injected reused-sidecar failure"):
+            writer.save_many(state, (target_publication,), signature=signature)
+
+        torch.testing.assert_close(
+            torch.load(target, weights_only=False)["value"],
+            torch.tensor([4.0]),
+        )
+        assert not target_sidecar.exists()
+        assert (tmp_path / "periodic.pt.metadata.json").is_file()
+    finally:
+        writer.shutdown()
+
+
+def test_async_publication_fsyncs_files_then_directories_before_metadata(
+    tmp_path, monkeypatch
+):
+    writer = checkpoint_io.AsyncCheckpointWriter()
+    target = CheckpointTarget(tmp_path / "model.pt", "latest", {"step": 5})
+    events = []
+    real_fsync_files = checkpoint_io.fsync_checkpoint_files
+    real_fsync_directories = checkpoint_io.fsync_checkpoint_directories
+    real_write_metadata = checkpoint_io.write_metadata_atomic
+
+    def record_files(paths):
+        paths = tuple(paths)
+        events.append("files")
+        return real_fsync_files(paths)
+
+    def record_directories(paths):
+        paths = tuple(paths)
+        events.append("directories")
+        return real_fsync_directories(paths)
+
+    def record_metadata(*args, **kwargs):
+        events.append("metadata")
+        return real_write_metadata(*args, **kwargs)
+
+    monkeypatch.setattr(checkpoint_io, "fsync_checkpoint_files", record_files)
+    monkeypatch.setattr(
+        checkpoint_io, "fsync_checkpoint_directories", record_directories
+    )
+    monkeypatch.setattr(checkpoint_io, "write_metadata_atomic", record_metadata)
+    try:
+        writer.save_many(
+            {"value": torch.tensor([3.0])},
+            (target,),
+            signature=(5, 1, 1),
+        )
+    finally:
+        writer.shutdown()
+
+    assert events == ["files", "directories", "metadata"]
+
+
+def test_async_file_fsync_failure_removes_old_sidecar_before_publication_error(
+    tmp_path, monkeypatch
+):
+    tracker = CheckpointTracker(
+        5,
+        tmp_path,
+        "model",
+        save_strat="latest",
+        periodic_step_suffix="",
+    )
+    writer = checkpoint_io.AsyncCheckpointWriter()
+    checkpoint = tmp_path / "model_latest"
+    sidecar = tmp_path / "model_latest.metadata.json"
+    try:
+        writer.save_many(
+            {"value": torch.tensor([1.0])},
+            tracker.targets(5),
+            signature=(5, 1, 1),
+        )
+        assert sidecar.is_file()
+        monkeypatch.setattr(
+            checkpoint_io,
+            "fsync_checkpoint_files",
+            lambda _paths: (_ for _ in ()).throw(
+                OSError("injected async file fsync failure")
+            ),
+        )
+
+        with pytest.raises(OSError, match="injected async file fsync failure"):
+            writer.save_many(
+                {"value": torch.tensor([2.0])},
+                tracker.targets(10),
+                signature=(10, 2, 2),
+            )
+
+        torch.testing.assert_close(
+            torch.load(checkpoint, weights_only=False)["value"],
+            torch.tensor([2.0]),
+        )
+        assert not sidecar.exists()
+    finally:
+        writer.shutdown()
+
+
+def test_standalone_torch_save_fsyncs_data_before_directory_entry(
+    tmp_path, monkeypatch
+):
+    events = []
+    real_fsync_files = checkpoint_io.fsync_checkpoint_files
+    real_fsync_directories = checkpoint_io.fsync_checkpoint_directories
+
+    def record_files(paths):
+        paths = tuple(paths)
+        events.append("files")
+        return real_fsync_files(paths)
+
+    def record_directories(paths):
+        paths = tuple(paths)
+        events.append("directories")
+        return real_fsync_directories(paths)
+
+    monkeypatch.setattr(checkpoint_io, "fsync_checkpoint_files", record_files)
+    monkeypatch.setattr(
+        checkpoint_io, "fsync_checkpoint_directories", record_directories
+    )
+
+    checkpoint_io.save_checkpoint(
+        {"value": torch.tensor([9.0])},
+        tmp_path / "standalone.pt",
+    )
+
+    assert events == ["files", "directories"]
 
 
 def test_identical_final_checkpoint_reuses_completed_snapshot(tmp_path, monkeypatch):

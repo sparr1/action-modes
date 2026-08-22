@@ -1304,7 +1304,13 @@ class InnerImprovementEngine:
                 parameter.numel() for parameter in state.critic_params
             )
         state.actor.train(cfg.inner_actor_adaptation != "frozen")
-        state.critic.train(cfg.inner_critic_adaptation != "frozen")
+        # The critic uses LayerNorm rather than BatchNorm, so eval mode only
+        # suppresses its inherited/adapter dropout; parameters and gradients
+        # remain active for inner critic and actor updates.
+        state.critic.train(
+            cfg.inner_critic_adaptation != "frozen"
+            and cfg.inner_critic_dropout_enabled
+        )
         if state.critic_target is not None:
             state.critic_target.eval()
         if state.actor_target is not None:
@@ -1342,6 +1348,7 @@ class InnerImprovementEngine:
         kwargs = {}
         if inner_bounds:
             kwargs.update(
+                log_std_mapping=self.cfg.inner_log_std_mapping,
                 log_std_min=self.cfg.inner_log_std_min,
                 log_std_max=self.cfg.inner_log_std_max,
             )
@@ -1650,6 +1657,7 @@ class InnerImprovementEngine:
                 next_z,
                 policy=state.actor,
                 noise=policy_noise,
+                log_std_mapping=cfg.inner_log_std_mapping,
                 log_std_min=cfg.inner_log_std_min,
                 log_std_max=cfg.inner_log_std_max,
             )
@@ -1755,6 +1763,7 @@ class InnerImprovementEngine:
             z,
             policy=state.actor,
             noise=policy_noise,
+            log_std_mapping=cfg.inner_log_std_mapping,
             log_std_min=cfg.inner_log_std_min,
             log_std_max=cfg.inner_log_std_max,
         )
@@ -2195,7 +2204,7 @@ class InnerImprovementEngine:
         return metrics
 
     @torch.no_grad()
-    def _execute_policy(self, root_z, policy, *, eval_mode):
+    def _execute_policy(self, root_z, policy, *, eval_mode, inner_bounds=True):
         mode = "mean" if eval_mode else str(self.cfg.inner_execution_action)
         std_scale = float(self.cfg.inner_execution_std_scale)
         if mode == "policy_sample" and std_scale == 0.0:
@@ -2210,13 +2219,24 @@ class InnerImprovementEngine:
                 generator=generator,
                 std_scale=max(std_scale, 1e-12),
                 noise_std=self.cfg.inner_execution_noise_std,
+                inner_bounds=inner_bounds,
             )
         self.state.policy_evaluations += int(root_z.shape[0])
         policy.train(was_training)
         return action
 
     @torch.no_grad()
-    def _evaluate_policy_trajectory(self, root_z, policy, generator, *, stochastic):
+    def _evaluate_policy_trajectory(
+        self,
+        root_z,
+        policy,
+        generator,
+        *,
+        stochastic,
+        log_std_mapping=None,
+        log_std_min=None,
+        log_std_max=None,
+    ):
         count = int(getattr(self.cfg, "inner_diagnostic_rollouts", 0))
         if count <= 0:
             return None
@@ -2232,8 +2252,9 @@ class InnerImprovementEngine:
                 policy=policy,
                 deterministic=not stochastic,
                 generator=generator,
-                log_std_min=self.cfg.inner_log_std_min,
-                log_std_max=self.cfg.inner_log_std_max,
+                log_std_mapping=log_std_mapping,
+                log_std_min=log_std_min,
+                log_std_max=log_std_max,
             )
             self.state.policy_evaluations += count
             joint = self.model.joint_input(z, action)
@@ -2258,8 +2279,9 @@ class InnerImprovementEngine:
             policy=policy,
             deterministic=not stochastic,
             generator=generator,
-            log_std_min=self.cfg.inner_log_std_min,
-            log_std_max=self.cfg.inner_log_std_max,
+            log_std_mapping=log_std_mapping,
+            log_std_min=log_std_min,
+            log_std_max=log_std_max,
         )
         self.state.policy_evaluations += count
         terminal_q = self.model.Q(
@@ -2324,6 +2346,9 @@ class InnerImprovementEngine:
                     improved_policy,
                     generator,
                     stochastic=self.cfg.inner_operator == "sac",
+                    log_std_mapping=self.cfg.inner_log_std_mapping,
+                    log_std_min=self.cfg.inner_log_std_min,
+                    log_std_max=self.cfg.inner_log_std_max,
                 )
             else:
                 outer_eval = improved_eval = None
@@ -2532,7 +2557,12 @@ class InnerImprovementEngine:
         return metrics
 
     def _act_none(self, root_z, *, eval_mode, start):
-        action = self._execute_policy(root_z, self.model._pi, eval_mode=eval_mode)
+        action = self._execute_policy(
+            root_z,
+            self.model._pi,
+            eval_mode=eval_mode,
+            inner_bounds=False,
+        )
         metrics = self._base_metrics(active=False)
         metrics["inner_policy_evaluations"] = 1.0
         return action[0], metrics, []

@@ -160,6 +160,29 @@ def test_policy_sampling_accepts_isolated_generator_std_scale_and_inner_bounds()
         model.pi(z, log_std_min=1.0, log_std_max=1.0)
 
 
+def test_tdmpc2_log_std_mapping_matches_the_vendored_transform():
+    model = SoftWorldModel(
+        model_cfg(
+            log_std_mapping="tdmpc2_tanh",
+            log_std_min=-10.0,
+            log_std_max=2.0,
+        )
+    )
+    raw_log_std = torch.tensor([0.75, -0.5])
+    with torch.no_grad():
+        for parameter in model._pi.parameters():
+            parameter.zero_()
+        model._pi[-1].bias[model.cfg.action_dim :].copy_(raw_log_std)
+
+    _, info = model.pi(
+        torch.zeros(3, model.cfg.latent_dim),
+        deterministic=True,
+    )
+    expected = td_math.log_std(raw_log_std, -10.0, 12.0).expand_as(info["log_std"])
+
+    torch.testing.assert_close(info["log_std"], expected, rtol=0, atol=0)
+
+
 def test_distributional_soft_target_loss_trains_all_ensemble_heads():
     backend = QRepresentation(
         "distributional",

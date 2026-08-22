@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import utils.checkpointing as checkpointing
 from utils.checkpointing import (
     CheckpointTracker,
     normalize_save_strat,
@@ -171,6 +172,172 @@ def test_fixed_alias_checkpoint_and_sidecar_are_both_replaced(tmp_path):
     metadata = json.loads(Path(f"{latest}.metadata.json").read_text())
     assert metadata["checkpoint"]["kind"] == "latest"
     assert metadata["checkpoint"]["step"] == 10
+
+
+def test_metadata_publication_failure_never_leaves_a_stale_shared_sidecar(
+    monkeypatch, tmp_path
+):
+    tracker = CheckpointTracker(5, tmp_path, "model", save_strat="latest")
+
+    def serialize(payload):
+        def write(path):
+            Path(path).write_bytes(payload)
+
+        return write
+
+    publish_checkpoint(tracker.targets(5), serialize(b"old"), extension=".pt")
+    checkpoint = tmp_path / "model_latest.pt"
+    sidecar = Path(f"{checkpoint}.metadata.json")
+    assert sidecar.is_file()
+
+    monkeypatch.setattr(
+        checkpointing,
+        "write_metadata_atomic",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("injected sidecar failure")
+        ),
+    )
+    with pytest.raises(OSError, match="injected sidecar failure"):
+        publish_checkpoint(
+            tracker.targets(10),
+            serialize(b"new"),
+            extension=".pt",
+        )
+
+    assert checkpoint.read_bytes() == b"new"
+    assert not sidecar.exists()
+
+
+def test_shared_serialization_failure_preserves_previous_checkpoint_pair(tmp_path):
+    tracker = CheckpointTracker(5, tmp_path, "model", save_strat="latest")
+
+    def write_old(path):
+        Path(path).write_bytes(b"old")
+
+    publish_checkpoint(tracker.targets(5), write_old, extension=".pt")
+    checkpoint = tmp_path / "model_latest.pt"
+    sidecar = Path(f"{checkpoint}.metadata.json")
+    previous_metadata = sidecar.read_bytes()
+
+    def fail_after_staging_write(path):
+        Path(path).write_bytes(b"incomplete-new")
+        raise OSError("injected serialization failure")
+
+    with pytest.raises(OSError, match="injected serialization failure"):
+        publish_checkpoint(
+            tracker.targets(10),
+            fail_after_staging_write,
+            extension=".pt",
+        )
+
+    assert checkpoint.read_bytes() == b"old"
+    assert sidecar.read_bytes() == previous_metadata
+
+
+def test_shared_publication_fsyncs_files_then_directories_before_metadata(
+    monkeypatch, tmp_path
+):
+    tracker = CheckpointTracker(5, tmp_path, "model", save_strat="latest")
+    events = []
+    synced_checkpoint_paths = []
+    real_fsync_files = checkpointing.fsync_checkpoint_files
+    real_fsync_directories = checkpointing.fsync_checkpoint_directories
+    real_write_metadata = checkpointing.write_metadata_atomic
+
+    def record_files(paths):
+        paths = tuple(paths)
+        events.append("files")
+        return real_fsync_files(paths)
+
+    def record_directories(paths):
+        paths = tuple(paths)
+        events.append("directories")
+        synced_checkpoint_paths.extend(paths)
+        return real_fsync_directories(paths)
+
+    def record_metadata(*args, **kwargs):
+        events.append("metadata")
+        return real_write_metadata(*args, **kwargs)
+
+    monkeypatch.setattr(checkpointing, "fsync_checkpoint_files", record_files)
+    monkeypatch.setattr(
+        checkpointing, "fsync_checkpoint_directories", record_directories
+    )
+    monkeypatch.setattr(checkpointing, "write_metadata_atomic", record_metadata)
+
+    def serialize(path):
+        Path(path).write_bytes(b"checkpoint")
+
+    publish_checkpoint(
+        tracker.targets(5),
+        serialize,
+        extension=".pt",
+    )
+
+    assert events == ["files", "directories", "metadata"]
+    assert synced_checkpoint_paths == [tmp_path / "model_latest.pt"]
+
+
+def test_metadata_replace_is_followed_by_sidecar_directory_fsync(
+    monkeypatch, tmp_path
+):
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    events = []
+    real_replace = checkpointing.os.replace
+    real_fsync_directory = checkpointing._fsync_directory
+
+    def record_replace(source, target):
+        events.append(("replace", Path(target)))
+        return real_replace(source, target)
+
+    def record_directory(path):
+        events.append(("directory", Path(path)))
+        return real_fsync_directory(path)
+
+    monkeypatch.setattr(checkpointing.os, "replace", record_replace)
+    monkeypatch.setattr(checkpointing, "_fsync_directory", record_directory)
+
+    sidecar = checkpointing.write_metadata_atomic(checkpoint, {"step": 5})
+
+    expected_sidecar = Path(f"{checkpoint}.metadata.json")
+    assert Path(sidecar) == expected_sidecar
+    assert events == [
+        ("replace", expected_sidecar),
+        ("directory", tmp_path),
+    ]
+
+
+def test_shared_file_fsync_failure_leaves_new_checkpoint_without_stale_sidecar(
+    monkeypatch, tmp_path
+):
+    tracker = CheckpointTracker(5, tmp_path, "model", save_strat="latest")
+
+    def serialize(payload):
+        def write(path):
+            Path(path).write_bytes(payload)
+
+        return write
+
+    publish_checkpoint(tracker.targets(5), serialize(b"old"), extension=".pt")
+    checkpoint = tmp_path / "model_latest.pt"
+    sidecar = Path(f"{checkpoint}.metadata.json")
+    assert sidecar.is_file()
+    monkeypatch.setattr(
+        checkpointing,
+        "fsync_checkpoint_files",
+        lambda _paths: (_ for _ in ()).throw(OSError("injected file fsync failure")),
+    )
+
+    with pytest.raises(OSError, match="injected file fsync failure"):
+        publish_checkpoint(
+            tracker.targets(10),
+            serialize(b"new"),
+            extension=".pt",
+        )
+
+    assert checkpoint.read_bytes() == b"new"
+    assert not sidecar.exists()
 
 
 def test_none_strategy_never_requests_periodic_or_final_publication(tmp_path):

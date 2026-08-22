@@ -6,6 +6,8 @@ import threading
 
 import numpy as np
 
+from utils.cleanup import raise_cleanup_errors
+
 
 # We have a few different settings for logs: "none", "overwrite", "warn", and
 # "timestamp". See main.py for the directory-handling policy. This module owns
@@ -191,18 +193,16 @@ class _BufferedStepWriter:
 
     def close(self):
         if not self._stream.closed:
-            error = None
+            cleanup_errors = []
             try:
                 self._stream.flush()
             except BaseException as exc:
-                error = exc
+                cleanup_errors.append(exc)
             try:
                 self._stream.close()
             except BaseException as exc:
-                if error is None:
-                    error = exc
-            if error is not None:
-                raise error
+                cleanup_errors.append(exc)
+            raise_cleanup_errors(cleanup_errors)
 
 
 class _BackgroundJSONWriter:
@@ -531,6 +531,10 @@ class _BaseTrainingLogger:
 
         done = _done_value(data["dones"])
         info = _info_dict(_as_list(infos)[0]) if infos else {}
+        truncated = bool(
+            info.get("truncated", info.get("TimeLimit.truncated", False))
+        )
+        terminated = bool(info.get("terminated", done and not truncated))
         if self._step_writer is not None:
             self._step_writer.writerow({
                 "global_step": self.step_count,
@@ -539,8 +543,8 @@ class _BaseTrainingLogger:
                 "reward": _as_float(rewards),
                 "episode_return": self.episode_return,
                 "done": int(done),
-                "terminated": int(bool(info.get("terminated", done))),
-                "truncated": int(bool(info.get("truncated", info.get("TimeLimit.truncated", False)))),
+                "terminated": int(terminated),
+                "truncated": int(truncated),
                 "inner_steps": inner_step_sum if self._include_inner_steps else "",
             })
         if done:
@@ -569,30 +573,27 @@ class _BaseTrainingLogger:
     def close(self):
         if self._closed:
             return
-        error = None
+        cleanup_errors = []
         try:
             self.flush()
         except BaseException as exc:
-            error = exc
+            cleanup_errors.append(exc)
         if self._step_writer is not None:
             try:
                 self._step_writer.close()
             except BaseException as exc:
-                if error is None:
-                    error = exc
+                cleanup_errors.append(exc)
             finally:
                 self._step_writer = None
         if self._trajectory_writer is not None:
             try:
                 self._trajectory_writer.close()
             except BaseException as exc:
-                if error is None:
-                    error = exc
+                cleanup_errors.append(exc)
             finally:
                 self._trajectory_writer = None
         self._closed = True
-        if error is not None:
-            raise error
+        raise_cleanup_errors(cleanup_errors)
 
     def __del__(self):
         try:

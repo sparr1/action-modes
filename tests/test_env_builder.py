@@ -120,6 +120,14 @@ def test_build_env_passes_requested_render_mode(monkeypatch):
             {"name": "example:UnknownWrapper", "wrapper_params": {}},
             "Unsupported wrapper",
         ),
+        (
+            {"name": "ScaledStateWrapper", "wrapper_params": {}},
+            "fully qualified",
+        ),
+        (
+            {"name": "modes.tasks:Subtask", "wrapper_params": {}},
+            "exactly 'Subtask'",
+        ),
         ({"name": "AntPlane"}, "must define 'wrapper_params'"),
         (
             {"name": "AntPlane", "wrapper_params": []},
@@ -180,3 +188,37 @@ def test_build_env_rejects_non_sequence_wrapper_collection_and_closes(monkeypatc
         )
 
     assert env.close_calls == 1
+
+
+def test_build_env_cleanup_failure_does_not_mask_wrapper_failure(monkeypatch):
+    class CloseFailureEnv(_FakeEnv):
+        def close(self):
+            self.close_calls += 1
+            raise KeyboardInterrupt("close interrupted")
+
+    env = CloseFailureEnv()
+    monkeypatch.setattr(core.gym, "make", lambda *_args, **_kwargs: env)
+    monkeypatch.setattr(
+        core,
+        "setup_wrapper",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("wrapper setup failed")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="wrapper setup failed") as captured:
+        core.build_env(
+            {
+                "env": "Example-v0",
+                "env_wrappers": [
+                    {"name": "AntPlane", "wrapper_params": {}},
+                ],
+            },
+            {},
+        )
+
+    assert env.close_calls == 1
+    assert str(captured.value) == "wrapper setup failed"
+    assert "Additional environment cleanup failure" in getattr(
+        captured.value, "__notes__", []
+    )[0]

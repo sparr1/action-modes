@@ -10,6 +10,20 @@ from mpdqn.common.platform_domain import PlatformFlattenedActionWrapper
 import numpy as np
 
 from mpdqn.common.wrappers import ScaledStateWrapper, ScaledParameterisedActionWrapper
+try:
+    from RL.pamdp_transition import (
+        save_pamdp_returns,
+        unpack_pamdp_step,
+        with_owned_environment,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "RL":
+        raise
+    from pamdp_transition import (
+        save_pamdp_returns,
+        unpack_pamdp_step,
+        with_owned_environment,
+    )
 
 
 def pad_action(act, act_param):
@@ -34,7 +48,9 @@ def evaluate(env, agent, episodes=1000):
             state = np.asarray(state, dtype = np.float32)
             act, act_param, all_action_parameters = agent.act(state)
             action = pad_action(act, act_param)
-            (state, _), reward, terminal, _ = env.step(action)
+            state, reward, _, _, terminal, _, _ = unpack_pamdp_step(
+                env.step(action)
+            )
             total_reward += reward
         timesteps.append(t)
         returns.append(total_reward)
@@ -79,13 +95,18 @@ def evaluate(env, agent, episodes=1000):
 @click.option('--save-frames', default=False, help="Save render frames from the environment. Incompatible with visualise.", type=bool)
 @click.option('--visualise', default=True, help="Render game states. Incompatible with save-frames.", type=bool)
 @click.option('--title', default="PDDQN", help="Prefix of output files", type=str)
+@with_owned_environment(lambda: gym.make('Platform-v0'))
 def run(seed, episodes, evaluation_episodes, batch_size, gamma, inverting_gradients, initial_memory_threshold,
         replay_memory_size, epsilon_steps, tau_actor, tau_actor_param, use_ornstein_noise, learning_rate_actor,
         learning_rate_actor_param, epsilon_final, zero_index_gradients, initialise_params, scale_actions,
         clip_grad, split, indexed, layers, multipass, weighted, average, random_weighted, render_freq,
-        save_freq, save_dir, save_frames, visualise, action_input_layer, title):
+        save_freq, save_dir, save_frames, visualise, action_input_layer, title,
+        _owned_env):
 
-    if save_freq > 0 and save_dir:
+    results_dir = save_dir
+    if results_dir:
+        os.makedirs(results_dir, exist_ok=True)
+    if save_freq > 0 and results_dir:
         save_dir = os.path.join(save_dir, title + "{}".format(str(seed)))
         os.makedirs(save_dir, exist_ok=True)
     assert not (save_frames and visualise)
@@ -96,7 +117,7 @@ def run(seed, episodes, evaluation_episodes, batch_size, gamma, inverting_gradie
         vidir = os.path.join(save_dir, "frames")
         os.makedirs(vidir, exist_ok=True)
 
-    env = gym.make('Platform-v0')
+    env = _owned_env
     initial_params_ = [3., 10., 400.]
     if scale_actions:
         for a in range(env.action_space.spaces[0].n):
@@ -115,8 +136,7 @@ def run(seed, episodes, evaluation_episodes, batch_size, gamma, inverting_gradie
     print("post-scale action wrapper obs", env.observation_space)
     print("post-scale action wrapper act", env.action_space)
     # quit()
-    dir = os.path.join(save_dir,title)
-    # env = Monitor(env, directory=os.path.join(dir,str(seed)), video_callable=False, write_upon_reset=False, force=True)
+    # env = Monitor(env, directory=os.path.join(results_dir, title, str(seed)), video_callable=False, write_upon_reset=False, force=True)
     env.seed(seed)
     np.random.seed(seed)
 
@@ -198,15 +218,11 @@ def run(seed, episodes, evaluation_episodes, batch_size, gamma, inverting_gradie
         agent.start_episode()
         for j in range(max_steps):
 
-            ret = env.step(action)
-            if(len(ret)==5):
-                (next_state, steps), reward, terminal, _, _ = ret
-            elif(len(ret)==4):
-                (next_state, steps), reward, terminal, _ = ret
-            # print("steps", steps)
-            # (next_state, steps), reward, terminal, _, _ = ret
-            # next_state = np.array(next_state, dtype=np.float32, copy=False)
-            next_state = np.asarray(state, dtype = np.float32)
+            next_state, reward, _, _, terminal, _, steps = unpack_pamdp_step(
+                env.step(action)
+            )
+            if not terminal and j + 1 >= max_steps:
+                terminal = True
 
             next_act, next_act_param, next_all_action_parameters = agent.act(next_state)
             next_action = pad_action(next_act, next_act_param)
@@ -233,15 +249,14 @@ def run(seed, episodes, evaluation_episodes, batch_size, gamma, inverting_gradie
             print('{0:5s} R:{1:.4f} r100:{2:.4f}'.format(str(i), total_reward / (i + 1), np.array(returns[-100:]).mean()))
     end_time = time.time()
     print("Took %.2f seconds" % (end_time - start_time))
-    env.close()
     if save_freq > 0 and save_dir:
         agent.save_models(os.path.join(save_dir, str(i)))
 
-    returns = env.get_episode_rewards()
-    print("Ave. return =", sum(returns) / len(returns))
-    print("Ave. last 100 episode return =", sum(returns[-100:]) / 100.)
-
-    np.save(os.path.join(dir, title + "{}".format(str(seed))),returns)
+    returns = list(env.get_episode_rewards())
+    if returns:
+        print("Ave. return =", float(np.mean(returns)))
+        print("Ave. last 100 episode return =", float(np.mean(returns[-100:])))
+    save_pamdp_returns(results_dir, title, seed, returns)
 
     if evaluation_episodes > 0:
         print("Evaluating agent over {} episodes".format(evaluation_episodes))
@@ -250,7 +265,9 @@ def run(seed, episodes, evaluation_episodes, batch_size, gamma, inverting_gradie
         agent.noise = None
         evaluation_returns = evaluate(env, agent, evaluation_episodes)
         print("Ave. evaluation return =", sum(evaluation_returns) / len(evaluation_returns))
-        np.save(os.path.join(dir, title + "{}e".format(str(seed))), evaluation_returns)
+        save_pamdp_returns(
+            results_dir, title, seed, evaluation_returns, evaluation=True
+        )
 
 
 if __name__ == '__main__':

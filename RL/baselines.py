@@ -12,6 +12,7 @@ from utils.checkpointing import (
     explicit_checkpoint_target,
     publish_checkpoint,
 )
+from utils.cleanup import add_cleanup_notes, raise_cleanup_errors
 from utils.utils import setup_logs
 from utils.wandb_utils import (
     WandbAccumulator,
@@ -95,14 +96,31 @@ class Baseline(Algorithm):
             self.callback.append(WandbBaselineCallback(self.name, self.params, env))
 
     def learn(self, **kwargs):
+        primary_error = None
+        cleanup_errors = []
         try:
             return self.model.learn(callback=self.callback, **kwargs)  # pass this env into ambi
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
             # SB3 does not call ``on_training_end`` when learning raises. Keep W&B
             # lifecycle cleanup idempotent so failed runs are not left open.
             for callback in self.callback:
                 if isinstance(callback, WandbBaselineCallback):
-                    callback.finish()
+                    try:
+                        callback.finish()
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
+            if cleanup_errors:
+                if primary_error is not None:
+                    add_cleanup_notes(
+                        primary_error,
+                        cleanup_errors,
+                        prefix="Additional baseline cleanup failure",
+                    )
+                else:
+                    raise_cleanup_errors(cleanup_errors)
 
     def predict(self, observation):
         return self.model.predict(observation)

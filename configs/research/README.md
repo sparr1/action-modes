@@ -64,6 +64,8 @@ fresh model for every preset, uses paired environment seeds, always returns the
 policy mean to the real environment, never calls the outer update, and hashes
 outer model/optimizer/temperature state before and after each run. Its output
 contains per-episode real returns and all finite model-predicted inner metrics.
+Output is written atomically, and an existing `--output` path is preserved
+unless `--overwrite` is supplied explicitly.
 When a comparison's reference preset is selected, it also reports seed-paired
 return deltas for every selected variant.
 

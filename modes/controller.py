@@ -60,10 +60,15 @@ class ModalController(Controller):
             #will this need some kind of error handling? feels like brittle
         with open(alg_config) as c:
             alg_params = json.load(c)
-            initial_model, alg_name, is_baseline = initialize_alg(alg_params["alg"], alg_params["alg_params"], domain, custom_action_space=custom_action_space)
+            initial_model, is_baseline, alg_name = initialize_alg(
+                alg_params["alg"],
+                alg_params["alg_params"],
+                domain,
+                custom_action_space=custom_action_space,
+            )
         initial_model.load(model_path)
 
-        return initial_model, alg_name, is_baseline
+        return initial_model, is_baseline, alg_name
 
     def load_task_wrapper(self, env, task_wrapper_settings):
         wrapper_name = task_wrapper_settings['name']
@@ -88,14 +93,22 @@ class ModalController(Controller):
         def __init__(self, env):
             super().__init__(env)
             #simply remove desired_goal
-            self.observation_space = gym.spaces.Dict({'achieved_goal': env.observation_space['desired_goal'], 'observation':env.observation_space['observation']})
+            self.observation_space = gym.spaces.Dict({'achieved_goal': env.observation_space['achieved_goal'], 'observation':env.observation_space['observation']})
         def observation(self, obs):
             return {'achieved_goal':obs['achieved_goal'], 'observation': obs['observation']}
 
 class OrchestralController(Controller):
-    def __init__(self, controller_config, domain, orchestral_action_space, sub_controllers = []):
+    def __init__(
+        self,
+        controller_config,
+        domain,
+        orchestral_action_space,
+        sub_controllers=None,
+    ):
         super().__init__(controller_config, domain)
-        self.sub_controllers = sub_controllers
+        self.sub_controllers = (
+            [] if sub_controllers is None else list(sub_controllers)
+        )
         self.orchestral_action_space = orchestral_action_space
         # self.base_action_space = self.controller_settings["base_action_space"]
         # self.base_observation_space = self.controller_settings["base_observation_space"]
@@ -135,7 +148,12 @@ class OrchestralController(Controller):
             #will this need some kind of error handling? feels like brittle
         with open(alg_config) as c:
             alg_params = json.load(c)
-            initial_model, alg_name, is_baseline = initialize_alg(alg_params["alg"], alg_params["alg_params"], domain, custom_action_space=self.orchestral_action_space)
+            initial_model, is_baseline, alg_name = initialize_alg(
+                alg_params["alg"],
+                alg_params["alg_params"],
+                domain,
+                custom_action_space=self.orchestral_action_space,
+            )
         if model_path:
             initial_model.load(model_path)
 

@@ -190,6 +190,26 @@ def test_basic_logger_keeps_csv_schema_and_close_is_idempotent(tmp_path):
     assert rows[0]["inner_steps"] == ""
 
 
+def test_time_limit_fallback_does_not_fabricate_true_termination(tmp_path):
+    logger = TrainingLogger(tmp_path, log_info=False, log_type="summary")
+    logger.on_step(
+        setup_logs(
+            reward=1.0,
+            obs=np.array([[1.0]], dtype=np.float32),
+            action=np.array([[0.0]], dtype=np.float32),
+            dones=[True],
+            info=[{"TimeLimit.truncated": True}],
+        )
+    )
+    logger.close()
+
+    with open(tmp_path / "step_stats.csv", newline="") as stream:
+        row = next(csv.DictReader(stream))
+    assert row["done"] == "1"
+    assert row["terminated"] == "0"
+    assert row["truncated"] == "1"
+
+
 def test_logger_closes_trajectory_writer_after_csv_close_failure():
     class FailingStepWriter:
         def __init__(self):
@@ -216,7 +236,7 @@ def test_logger_closes_trajectory_writer_after_csv_close_failure():
     logger._step_writer = step_writer
     logger._trajectory_writer = trajectory_writer
 
-    with pytest.raises(OSError, match="first CSV failure"):
+    with pytest.raises(OSError, match="first CSV failure") as captured:
         logger.close()
 
     assert step_writer.close_calls == 1
@@ -224,6 +244,9 @@ def test_logger_closes_trajectory_writer_after_csv_close_failure():
     assert logger._step_writer is None
     assert logger._trajectory_writer is None
     assert logger._closed
+    assert captured.value.__notes__ == [
+        "Additional cleanup failure: second CSV failure"
+    ]
 
 
 def test_buffered_step_writer_closes_stream_after_flush_failure():
@@ -246,11 +269,14 @@ def test_buffered_step_writer_closes_stream_after_flush_failure():
     stream = FailingStream()
     writer._stream = stream
 
-    with pytest.raises(OSError, match="first flush failure"):
+    with pytest.raises(OSError, match="first flush failure") as captured:
         writer.close()
 
     assert stream.close_calls == 1
     assert stream.closed
+    assert captured.value.__notes__ == [
+        "Additional cleanup failure: second close failure"
+    ]
 
 
 def test_resume_state_starts_fresh_segment_at_absolute_offsets(tmp_path):

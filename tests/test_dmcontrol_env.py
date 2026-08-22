@@ -56,6 +56,9 @@ class _FakeRawEnv:
     def observation_spec(self):
         return self._observation_spec
 
+    def control_timestep(self):
+        return 0.025
+
     def _observation(self):
         return OrderedDict(
             (
@@ -180,6 +183,7 @@ def test_state_observation_action_repeat_and_reward_match_tdmpc2(fake_dmcontrol)
         assert env.observation_type == "state"
         assert env.task_name == "walker-walk"
         assert env.action_repeat == 2
+        assert env.metadata["render_fps"] == 20
         assert env.frame_stack is None
         assert env.image_size is None
 

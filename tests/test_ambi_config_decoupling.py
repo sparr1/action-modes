@@ -54,6 +54,56 @@ def test_sac_actor_loss_scale_defaults_and_normalizes_explicit_mode():
     assert enabled.sac_actor_loss_scale_tau == pytest.approx(0.2)
 
 
+def test_log_std_mapping_and_bounds_inherit_and_override_independently():
+    default = _build_cfg()
+    assert default.log_std_mapping == "direct_clamp"
+    assert default.inner_log_std_mapping == "direct_clamp"
+    assert default.log_std_min == pytest.approx(-20.0)
+    assert default.log_std_max == pytest.approx(2.0)
+    assert default.inner_log_std_min == pytest.approx(-20.0)
+    assert default.inner_log_std_max == pytest.approx(2.0)
+
+    inherited = _build_cfg(
+        log_std_mapping="TDMPC2_TANH",
+        log_std_min=-10.0,
+        log_std_max=2.0,
+    )
+    assert inherited.log_std_mapping == "tdmpc2_tanh"
+    assert inherited.inner_log_std_mapping == "tdmpc2_tanh"
+    assert inherited.inner_log_std_min == pytest.approx(-10.0)
+    assert inherited.inner_log_std_max == pytest.approx(2.0)
+
+    overridden = _build_cfg(
+        log_std_mapping="tdmpc2_tanh",
+        log_std_min=-10.0,
+        log_std_max=2.0,
+        inner_log_std_mapping="DIRECT_CLAMP",
+        inner_log_std_min=-7.5,
+        inner_log_std_max=0.75,
+    )
+    assert overridden.log_std_mapping == "tdmpc2_tanh"
+    assert overridden.inner_log_std_mapping == "direct_clamp"
+    assert overridden.inner_log_std_min == pytest.approx(-7.5)
+    assert overridden.inner_log_std_max == pytest.approx(0.75)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("log_std_mapping", None),
+        ("log_std_mapping", True),
+        ("log_std_mapping", 1),
+        ("log_std_mapping", "tdmpc2"),
+        ("inner_log_std_mapping", True),
+        ("inner_log_std_mapping", 1),
+        ("inner_log_std_mapping", "tanh"),
+    ],
+)
+def test_log_std_mapping_values_are_strict(key, value):
+    with pytest.raises(ValueError, match=key):
+        _build_cfg(**{key: value})
+
+
 def test_critic_target_modes_default_to_entropy_and_normalize_independently():
     default = _build_cfg()
     assert default.outer_critic_target == "entropy_augmented"
@@ -275,6 +325,12 @@ def test_inert_noise_knob_combinations_and_nonfinite_values_fail_early():
     ):
         with pytest.raises(ValueError, match="finite"):
             _build_cfg(**{key: float("nan")})
+
+
+@pytest.mark.parametrize("key", ["tau", "ent_coef", "target_entropy"])
+def test_scientific_numeric_fields_reject_boolean_coercion(key):
+    with pytest.raises(ValueError, match="boolean"):
+        _build_cfg(**{key: True})
 
 
 def test_without_replacement_rejects_impossible_replay_capacity():

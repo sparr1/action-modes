@@ -5,9 +5,134 @@ configuration. These helpers reject structural and dtype/layout changes before
 PyTorch can silently cast or partially install an incompatible payload.
 """
 
+import copy
 from collections.abc import Mapping
 
 import torch
+
+
+def preflight_optimizer_state(optimizer, incoming, name):
+    """Validate a portable Adam-family snapshot without mutating ``optimizer``.
+
+    Portable loads may intentionally change group hyperparameters, so this
+    checks only schema, parameter layout, and per-parameter tensor structure.
+    It permits Adam's lazy (partially initialized) state inventory.
+    """
+
+    incoming = require_exact_keys(incoming, {"state", "param_groups"}, name)
+    groups = incoming["param_groups"]
+    if not isinstance(groups, list) or len(groups) != len(optimizer.param_groups):
+        raise ValueError(f"{name} parameter-group layout is incompatible.")
+
+    parameter_map = {}
+    parameter_amsgrad = {}
+    for incoming_group, live_group in zip(groups, optimizer.param_groups):
+        if not isinstance(incoming_group, Mapping):
+            raise TypeError(f"{name} parameter groups must be mappings.")
+        incoming_ids = incoming_group.get("params")
+        live_parameters = live_group["params"]
+        if not isinstance(incoming_ids, list) or len(incoming_ids) != len(
+            live_parameters
+        ):
+            raise ValueError(f"{name} parameter-group layout is incompatible.")
+        for parameter_id, parameter in zip(incoming_ids, live_parameters):
+            try:
+                duplicate = parameter_id in parameter_map
+            except TypeError as exc:
+                raise TypeError(
+                    f"{name} parameter identifiers must be hashable."
+                ) from exc
+            if duplicate:
+                raise ValueError(f"{name} contains duplicate parameter identifiers.")
+            parameter_map[parameter_id] = parameter
+            parameter_amsgrad[parameter_id] = bool(
+                incoming_group.get("amsgrad", False)
+            )
+
+    state = require_mapping(incoming["state"], f"{name} optimizer state")
+    unexpected = sorted(set(state) - set(parameter_map), key=repr)
+    if unexpected:
+        raise ValueError(
+            f"{name} optimizer state references unknown parameters: "
+            f"{unexpected[:5]}."
+        )
+    for parameter_id, parameter_state in state.items():
+        if not isinstance(parameter_state, Mapping):
+            raise TypeError(f"{name} per-parameter state must be a mapping.")
+        expected_fields = {"step", "exp_avg", "exp_avg_sq"}
+        if parameter_amsgrad[parameter_id]:
+            expected_fields.add("max_exp_avg_sq")
+        if set(parameter_state) != expected_fields:
+            raise ValueError(f"{name} per-parameter fields are incompatible.")
+        step = parameter_state["step"]
+        if torch.is_tensor(step):
+            valid_step = (
+                step.shape == torch.Size([])
+                and bool(torch.isfinite(step).item())
+                and float(step.item()) >= 0.0
+            )
+        else:
+            try:
+                numeric_step = float(step)
+            except (TypeError, ValueError, OverflowError):
+                valid_step = False
+            else:
+                valid_step = numeric_step >= 0.0 and torch.isfinite(
+                    torch.tensor(numeric_step)
+                ).item()
+        if not valid_step:
+            raise ValueError(f"{name} optimizer step is incompatible.")
+        parameter = parameter_map[parameter_id]
+        for field in expected_fields - {"step"}:
+            value = parameter_state[field]
+            if not torch.is_tensor(value) or value.shape != parameter.shape:
+                raise ValueError(
+                    f"{name} tensor {field!r} is incompatible with its parameter."
+                )
+    return incoming
+
+
+def load_optimizer_state_preserving_hyperparameters(optimizer, incoming):
+    """Load optimizer moments while retaining the receiving configuration.
+
+    ``Optimizer.load_state_dict`` replaces complete parameter-group mappings,
+    including learning rates, epsilon, betas, and execution options. That is
+    correct for exact resume, whose preflight requires identical groups, but it
+    silently defeats a new configuration during portable weight transfer or
+    fine-tuning. Snapshot every configured group field other than ``params`` and
+    restore those fields after PyTorch has remapped the incoming per-parameter
+    state onto the live parameters.
+    """
+
+    configured_groups = [
+        copy.deepcopy({key: value for key, value in group.items() if key != "params"})
+        for group in optimizer.param_groups
+    ]
+    optimizer.load_state_dict(incoming)
+    if len(optimizer.param_groups) != len(configured_groups):
+        raise ValueError("Loaded optimizer parameter-group layout is incompatible.")
+    for group, configured in zip(optimizer.param_groups, configured_groups):
+        parameters = group["params"]
+        group.clear()
+        group.update(configured)
+        group["params"] = parameters
+        for parameter in parameters:
+            parameter_state = optimizer.state.get(parameter)
+            if not parameter_state:
+                continue
+            if configured.get("amsgrad", False):
+                if "max_exp_avg_sq" not in parameter_state:
+                    # The source may have used ordinary Adam. At the transfer
+                    # boundary, the current second moment is the only sound
+                    # historical maximum from which AMSGrad can continue.
+                    parameter_state["max_exp_avg_sq"] = parameter_state[
+                        "exp_avg_sq"
+                    ].clone()
+            else:
+                # Keep state canonical when transferring in the reverse
+                # direction; ordinary Adam never reads the AMSGrad maximum.
+                parameter_state.pop("max_exp_avg_sq", None)
+    return optimizer
 
 
 def require_mapping(value, name):

@@ -1,9 +1,21 @@
 import copy
+from numbers import Integral, Real
 
 import mujoco
 import numpy as np
 from gymnasium.spaces import Box
-from .ant_variable_legs import AntVariableLegsEnv
+
+from .ant_variable_legs import AntVariableLegsEnv, DEFAULT_CAMERA_CONFIG
+
+
+def _add_cleanup_note(primary_error, message):
+    add_note = getattr(primary_error, "add_note", None)
+    if callable(add_note):
+        add_note(message)
+    else:
+        notes = list(getattr(primary_error, "__notes__", ()))
+        notes.append(message)
+        primary_error.__notes__ = notes
 
 
 class AntLegAdaptationEnv(AntVariableLegsEnv):
@@ -42,19 +54,54 @@ class AntLegAdaptationEnv(AntVariableLegsEnv):
         xml_file="ant_adaptation.xml",
         **kwargs,
     ):
-        self._total_timesteps = total_timesteps
-        self._start_legs = start_legs
-        self._end_legs = end_legs
-        self._switch_step = int(total_timesteps * switch_fraction)
+        if (
+            isinstance(total_timesteps, bool)
+            or not isinstance(total_timesteps, Integral)
+            or total_timesteps <= 0
+        ):
+            raise ValueError(
+                "AntLegAdaptationEnv total_timesteps must be a positive integer."
+            )
+        for name, value in (("start_legs", start_legs), ("end_legs", end_legs)):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Integral)
+                or value <= 0
+            ):
+                raise ValueError(
+                    f"AntLegAdaptationEnv {name} must be a positive integer."
+                )
+        if end_legs > start_legs:
+            raise ValueError(
+                "AntLegAdaptationEnv end_legs cannot exceed start_legs because "
+                "its observation and action spaces are fixed to start_legs."
+            )
+        if (
+            isinstance(switch_fraction, bool)
+            or not isinstance(switch_fraction, Real)
+            or not np.isfinite(switch_fraction)
+            or not 0.0 <= switch_fraction <= 1.0
+        ):
+            raise ValueError(
+                "AntLegAdaptationEnv switch_fraction must be finite and in [0, 1]."
+            )
+
+        self._total_timesteps = int(total_timesteps)
+        self._start_legs = int(start_legs)
+        self._end_legs = int(end_legs)
+        self._switch_fraction = float(switch_fraction)
+        self._switch_step = int(self._total_timesteps * self._switch_fraction)
         self._steps_taken = 0
         self._switched = False
-        self._pending_switch = False
+        # A zero-step first phase means the end morphology is authoritative at
+        # the first reset, rather than after one accidental start-morphology step.
+        self._pending_switch = self._switch_step == 0
 
-        super().__init__(num_legs=start_legs, xml_file=xml_file, **kwargs)
+        super().__init__(num_legs=self._start_legs, xml_file=xml_file, **kwargs)
 
         # Lock action space to start_legs dims — never changes
         self.action_space = Box(
-            low=-1.0, high=1.0, shape=(start_legs * 2,), dtype=np.float64
+            low=-1.0, high=1.0, shape=(self._start_legs * 2,), dtype=np.float64
         )
 
     # ------------------------------------------------------------------
@@ -73,12 +120,38 @@ class AntLegAdaptationEnv(AntVariableLegsEnv):
 
     def _do_switch(self):
         """Rebuild the MuJoCo model with end_legs at an episode boundary."""
-        self.num_legs = self._end_legs
+        # Keep Gymnasium's optional rendering imports lazy, as MujocoEnv does.
+        from gymnasium.envs.mujoco.mujoco_rendering import MujocoRenderer
+
         self._set_num_legs(self._end_legs)
 
-        self.model = mujoco.MjModel.from_xml_path(self.xml_file)
-        self.data = mujoco.MjData(self.model)
-        mujoco.mj_resetData(self.model, self.data)
+        new_model = mujoco.MjModel.from_xml_path(self.xml_file)
+        new_data = mujoco.MjData(new_model)
+        mujoco.mj_resetData(new_model, new_data)
+        new_renderer = MujocoRenderer(
+            new_model,
+            new_data,
+            default_cam_config=DEFAULT_CAMERA_CONFIG,
+        )
+
+        old_renderer = self.mujoco_renderer
+        try:
+            old_renderer.close()
+        except BaseException as exc:
+            try:
+                new_renderer.close()
+            except BaseException as cleanup_error:
+                _add_cleanup_note(
+                    exc,
+                    "Additional replacement-renderer cleanup failure: "
+                    f"{cleanup_error}",
+                )
+            raise
+
+        self.num_legs = self._end_legs
+        self.model = new_model
+        self.data = new_data
+        self.mujoco_renderer = new_renderer
         # Sync init state so reset_model() uses the new morphology
         self.init_qpos = self.data.qpos.ravel().copy()
         self.init_qvel = self.data.qvel.ravel().copy()

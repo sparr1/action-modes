@@ -14,8 +14,10 @@ from .common.scale import percentile_range
 from .common.soft_world_model import SoftWorldModel
 from .inner_improvement import InnerImprovementEngine, polyak_update
 from .common.training_state import (
+    load_optimizer_state_preserving_hyperparameters,
     preflight_adam_state,
     preflight_module_state,
+    preflight_optimizer_state,
     require_exact_keys,
     require_tensor,
 )
@@ -368,16 +370,41 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "dtype": str(dtype),
         }
 
+    def _policy_spec(self):
+        return {
+            "log_std_mapping": str(self.cfg.log_std_mapping),
+            "log_std_min": float(self.cfg.log_std_min),
+            "log_std_max": float(self.cfg.log_std_max),
+        }
+
+    @staticmethod
+    def _normalize_saved_policy_spec(policy_spec):
+        """Normalize policy metadata written before log-std mappings existed."""
+        if not isinstance(policy_spec, dict):
+            return policy_spec
+        legacy_keys = {"log_std_min", "log_std_max"}
+        current_keys = legacy_keys | {"log_std_mapping"}
+        keys = set(policy_spec)
+        if keys == legacy_keys:
+            # Direct clamping was the sole policy mapping before this field was
+            # added to version-3/4 checkpoints.
+            policy_spec = {**policy_spec, "log_std_mapping": "direct_clamp"}
+        elif keys != current_keys:
+            return policy_spec
+        else:
+            policy_spec = dict(policy_spec)
+        mapping = policy_spec["log_std_mapping"]
+        if isinstance(mapping, str):
+            policy_spec["log_std_mapping"] = mapping.lower()
+        return policy_spec
+
     def checkpoint_state(self):
         """Return the portable checkpoint structure over live outer state."""
         state = {
             "checkpoint_version": 4 if self.actor_loss_scale_enabled else 3,
             "observation_spec": self.observation_signature(),
             "critic_spec": self.model.critic_signature,
-            "policy_spec": {
-                "log_std_min": float(self.cfg.log_std_min),
-                "log_std_max": float(self.cfg.log_std_max),
-            },
+            "policy_spec": self._policy_spec(),
             "entropy_spec": {
                 "mode": "auto" if self.log_ent_coef is not None else "fixed",
                 "target_entropy": float(self.target_entropy),
@@ -589,13 +616,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
     def _preflight_optimizer(self, name, incoming, optimizer):
         if incoming is None:
             return
-        expected = optimizer.state_dict()
-        if self._optimizer_layout(incoming) != self._optimizer_layout(expected):
-            raise ValueError(
-                f"Checkpoint {name} parameter-group layout is incompatible: "
-                f"checkpoint={self._optimizer_layout(incoming)}, "
-                f"configured={self._optimizer_layout(expected)}."
-            )
+        preflight_optimizer_state(optimizer, incoming, f"Checkpoint {name}")
 
     def load(self, fp):
         state = (
@@ -653,10 +674,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
         # intentionally transfer these weights across target objectives; exact
         # training-state restoration validates the specification separately.
         saved_policy_spec = state.get("policy_spec") if isinstance(state, dict) else None
-        configured_policy_spec = {
-            "log_std_min": float(self.cfg.log_std_min),
-            "log_std_max": float(self.cfg.log_std_max),
-        }
+        saved_policy_spec = self._normalize_saved_policy_spec(saved_policy_spec)
+        configured_policy_spec = self._policy_spec()
         if saved_policy_spec is not None and saved_policy_spec != configured_policy_spec:
             raise ValueError(
                 "Checkpoint policy specification does not match this agent: "
@@ -673,7 +692,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 f"checkpoint={saved_entropy_spec}, configured={configured_entropy_spec}."
             )
         if structured_checkpoint:
-            saved_auto_alpha = "log_ent_coef" in state or "ent_coef_optim" in state
+            has_log_alpha = "log_ent_coef" in state
+            has_alpha_optimizer = "ent_coef_optim" in state
+            if has_log_alpha != has_alpha_optimizer:
+                raise ValueError(
+                    "Automatic-entropy checkpoint state is incomplete before load."
+                )
+            saved_auto_alpha = has_log_alpha
             configured_auto_alpha = self.log_ent_coef is not None
             if saved_auto_alpha != configured_auto_alpha:
                 raise ValueError(
@@ -681,25 +706,36 @@ class AMBITDMPC2Agent(torch.nn.Module):
                     f"checkpoint={'auto' if saved_auto_alpha else 'fixed'}, "
                     f"configured={'auto' if configured_auto_alpha else 'fixed'}."
                 )
+            if saved_auto_alpha:
+                saved_log_alpha = require_tensor(
+                    state["log_ent_coef"],
+                    "Checkpoint log_ent_coef",
+                    shape=self.log_ent_coef.shape,
+                    dtype=self.log_ent_coef.dtype,
+                )
+                if not bool(torch.isfinite(saved_log_alpha).all().item()):
+                    raise ValueError("Checkpoint log_ent_coef must be finite.")
+            else:
+                saved_fixed_alpha = require_tensor(
+                    state.get("fixed_ent_coef"),
+                    "Checkpoint fixed_ent_coef",
+                    shape=self.fixed_ent_coef.shape,
+                    dtype=self.fixed_ent_coef.dtype,
+                )
+                if not bool(torch.isfinite(saved_fixed_alpha).all().item()):
+                    raise ValueError("Checkpoint fixed_ent_coef must be finite.")
+
+            for key in ("num_updates", "outer_version"):
+                value = state.get(key, 0)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(
+                        f"Checkpoint {key} must be a non-negative integer."
+                    )
 
         incoming = state["model"] if "model" in state else state
         incoming = api_model_conversion(self.model.state_dict(), incoming)
         expected = self.model.state_dict()
-        missing = sorted(set(expected) - set(incoming))
-        unexpected = sorted(set(incoming) - set(expected))
-        shape_mismatches = sorted(
-            key
-            for key in set(expected) & set(incoming)
-            if torch.is_tensor(expected[key])
-            and torch.is_tensor(incoming[key])
-            and tuple(expected[key].shape) != tuple(incoming[key].shape)
-        )
-        if missing or unexpected or shape_mismatches:
-            raise ValueError(
-                "Checkpoint model architecture is incompatible before load: "
-                f"missing={missing[:5]}, unexpected={unexpected[:5]}, "
-                f"shape_mismatches={shape_mismatches[:5]}."
-            )
+        preflight_module_state(self.model, incoming, "Checkpoint model architecture")
         for key in ("log_std_min", "log_std_dif"):
             if key in incoming and key in expected and not torch.equal(
                 incoming[key].to(device=expected[key].device, dtype=expected[key].dtype),
@@ -720,17 +756,26 @@ class AMBITDMPC2Agent(torch.nn.Module):
         # All compatibility checks finish before any live state is mutated.
         self.model.load_state_dict(incoming)
         if "optim" in state:
-            self.optim.load_state_dict(state["optim"])
+            load_optimizer_state_preserving_hyperparameters(
+                self.optim, state["optim"]
+            )
         if "pi_optim" in state:
-            self.pi_optim.load_state_dict(state["pi_optim"])
+            load_optimizer_state_preserving_hyperparameters(
+                self.pi_optim, state["pi_optim"]
+            )
         self.num_updates = int(state.get("num_updates", 0))
         self.outer_version = int(state.get("outer_version", self.num_updates))
         if self.log_ent_coef is not None and "log_ent_coef" in state:
             self.log_ent_coef.data.copy_(state["log_ent_coef"].to(self.device))
             if "ent_coef_optim" in state:
-                self.ent_coef_optim.load_state_dict(state["ent_coef_optim"])
-        elif "fixed_ent_coef" in state:
-            self.fixed_ent_coef.copy_(state["fixed_ent_coef"].to(self.device))
+                load_optimizer_state_preserving_hyperparameters(
+                    self.ent_coef_optim, state["ent_coef_optim"]
+                )
+        # A fixed entropy coefficient is configuration, not learned state.
+        # Portable checkpoints are also used for weight transfer, so keep the
+        # receiving value just as we keep receiving optimizer hyperparameters.
+        # Exact resume preflight already requires the saved/configured values
+        # to match, while automatic entropy still restores its learned state.
         if self.actor_loss_scale_enabled:
             if actor_loss_scale_candidate is None:
                 # Raw model-only imports are explicit weight transfers. Their
@@ -812,21 +857,30 @@ class AMBITDMPC2Agent(torch.nn.Module):
                     with self.inner_engine.rng.fork("observation"):
                         with torch.no_grad():
                             root_z = self.model.encode(obs).detach()
+                    # The shared TD-MPC2 evaluator is inference-only, but an
+                    # AMBI action still performs its configured root-local
+                    # optimizer steps before returning a deterministic action.
+                    # Re-enable gradients locally without reconnecting the
+                    # detached root latent to the outer encoder.
+                    with torch.enable_grad():
+                        action, metrics, lengths = self.inner_engine.act(
+                            root_z,
+                            t0=t0,
+                            eval_mode=eval_mode,
+                            collect_diagnostics=collect_diagnostics,
+                        )
+            else:
+                with torch.no_grad():
+                    root_z = self.model.encode(obs).detach()
+                # See the pixel-observation branch above. Evaluation controls
+                # the executed action, not whether AMBI performs inner learning.
+                with torch.enable_grad():
                     action, metrics, lengths = self.inner_engine.act(
                         root_z,
                         t0=t0,
                         eval_mode=eval_mode,
                         collect_diagnostics=collect_diagnostics,
                     )
-            else:
-                with torch.no_grad():
-                    root_z = self.model.encode(obs).detach()
-                action, metrics, lengths = self.inner_engine.act(
-                    root_z,
-                    t0=t0,
-                    eval_mode=eval_mode,
-                    collect_diagnostics=collect_diagnostics,
-                )
         finally:
             self.model.train(was_training)
         action, metrics, lengths = self._materialize_action_metrics(

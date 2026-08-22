@@ -14,6 +14,8 @@ import hashlib
 import importlib
 import json
 import math
+import os
+import tempfile
 from pathlib import Path
 
 import gymnasium as gym
@@ -21,6 +23,7 @@ import numpy as np
 import torch
 
 from RL.tdmpc2_core import MODEL_SIZE
+from utils.cleanup import add_cleanup_notes, raise_cleanup_errors
 from utils.ambi_research import (
     PresetMatrixError,
     load_preset_matrix,
@@ -102,6 +105,11 @@ def build_parser():
         help="Write strict JSON results here instead of printing them to stdout.",
     )
     parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Atomically replace an existing --output file.",
+    )
+    parser.add_argument(
         "--allow-nonfinite-metrics",
         action="store_true",
         help="Record rather than fail on NaN/Inf model diagnostics.",
@@ -148,8 +156,8 @@ def _make_env(resolved):
 
             env = setup_wrapper(env, wrapper["name"], wrapper.get("wrapper_params", {}))
         return env
-    except Exception:
-        env.close()
+    except BaseException as exc:
+        _close_resources(env, primary_error=exc)
         raise
 
 
@@ -158,6 +166,77 @@ def _seed_spaces(env, seed):
         env.action_space.seed(seed)
     if hasattr(env.observation_space, "seed"):
         env.observation_space.seed(seed)
+
+
+def _close_resources(*resources, primary_error=None):
+    """Attempt every close and preserve the operation's primary failure."""
+
+    cleanup_errors = []
+    for resource in resources:
+        close = getattr(resource, "close", None)
+        if not callable(close):
+            continue
+        try:
+            close()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+    if not cleanup_errors:
+        return
+    if primary_error is not None:
+        add_cleanup_notes(primary_error, cleanup_errors)
+        return
+    raise_cleanup_errors(cleanup_errors)
+
+
+def _preflight_output(path, *, overwrite):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if not path.is_file():
+            raise IsADirectoryError(f"Evaluation output is not a file: {path}")
+        if not overwrite:
+            raise FileExistsError(
+                f"Evaluation output already exists: {path}. Pass --overwrite to replace it."
+            )
+
+
+def _write_output_atomic(path, serialized, *, overwrite):
+    """Publish one result file atomically, without clobbering by default."""
+
+    path = Path(path)
+    _preflight_output(path, overwrite=overwrite)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if overwrite:
+            os.replace(temporary_path, path)
+        else:
+            try:
+                os.link(temporary_path, path)
+            except FileExistsError as exc:
+                raise FileExistsError(
+                    f"Evaluation output already exists: {path}. "
+                    "Pass --overwrite to replace it."
+                ) from exc
+            temporary_path.unlink()
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _digest_update(digest, value):
@@ -422,13 +501,20 @@ def _initialize_frozen_model(resolved, env, checkpoint, controller_seed, device=
     )
     try:
         model.load(str(checkpoint))
-    except Exception as exc:
-        raise RuntimeError(
-            f"Preset {resolved['selector']!r} could not load checkpoint {checkpoint}: {exc}. "
-            "Q-representation comparisons require a separately trained checkpoint with the "
-            "matching critic architecture."
-        ) from exc
-    model.agent.model.eval()
+        model.agent.model.eval()
+    except BaseException as exc:
+        if isinstance(exc, Exception):
+            error = RuntimeError(
+                f"Preset {resolved['selector']!r} could not load checkpoint {checkpoint}: {exc}. "
+                "Q-representation comparisons require a separately trained checkpoint with the "
+                "matching critic architecture."
+            )
+        else:
+            error = exc
+        _close_resources(model, primary_error=error)
+        if error is exc:
+            raise
+        raise error from exc
     return model, run_config
 
 
@@ -463,20 +549,18 @@ def evaluate_preset(
         raise ValueError("max_steps must be positive when provided.")
 
     env = _make_env(resolved)
+    model = None
+    primary_error = None
     try:
         model, run_config = _initialize_frozen_model(
             resolved, env, checkpoint, controller_seed, device=device
         )
         digest_before = _outer_state_digest(model)
         updates_before = int(model.agent.num_updates)
-    except Exception:
-        env.close()
-        raise
-    metric_values = {}
-    nonfinite_metric_counts = {}
-    episodes = []
+        metric_values = {}
+        nonfinite_metric_counts = {}
+        episodes = []
 
-    try:
         for seed in seeds:
             seed = int(seed)
             _seed_spaces(env, seed)
@@ -537,47 +621,50 @@ def evaluate_preset(
                     ),
                 }
             )
+
+        digest_after = _outer_state_digest(model)
+        updates_after = int(model.agent.num_updates)
+        if digest_after != digest_before or updates_after != updates_before:
+            raise RuntimeError(
+                f"Frozen evaluation invariant failed for {resolved['selector']}: "
+                "outer state changed during action selection."
+            )
+        if nonfinite_metric_counts and not allow_nonfinite_metrics:
+            raise RuntimeError(
+                f"Non-finite model metrics for {resolved['selector']}: "
+                f"{dict(sorted(nonfinite_metric_counts.items()))}. Use "
+                "--allow-nonfinite-metrics only for diagnostic collection."
+            )
+
+        returns = [episode["return"] for episode in episodes]
+        lengths = [episode["length"] for episode in episodes]
+        return {
+            "selector": resolved["selector"],
+            "comparison": resolved["comparison"],
+            "variant": resolved["variant"],
+            "reference_variant": resolved["reference"],
+            "description": resolved["description"],
+            "critic_spec": copy.deepcopy(model.agent.model.critic_signature),
+            "controller_seed": int(controller_seed),
+            "environment_seeds": [int(seed) for seed in seeds],
+            "outer_updates_before": updates_before,
+            "outer_updates_after": updates_after,
+            "outer_state_unchanged": True,
+            "resolved_config": _jsonable(vars(model.cfg)),
+            "resolved_device": str(model.agent.device),
+            "return": _summary(returns),
+            "episode_length": _summary(lengths),
+            "episodes": episodes,
+            "model_metrics": _aggregate_metrics(metric_values),
+            "model_metric_availability": sorted(metric_values),
+            "nonfinite_model_metrics": dict(sorted(nonfinite_metric_counts.items())),
+            "alg_params": run_config["alg_params"],
+        }
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        env.close()
-
-    digest_after = _outer_state_digest(model)
-    updates_after = int(model.agent.num_updates)
-    if digest_after != digest_before or updates_after != updates_before:
-        raise RuntimeError(
-            f"Frozen evaluation invariant failed for {resolved['selector']}: "
-            "outer state changed during action selection."
-        )
-    if nonfinite_metric_counts and not allow_nonfinite_metrics:
-        raise RuntimeError(
-            f"Non-finite model metrics for {resolved['selector']}: "
-            f"{dict(sorted(nonfinite_metric_counts.items()))}. Use "
-            "--allow-nonfinite-metrics only for diagnostic collection."
-        )
-
-    returns = [episode["return"] for episode in episodes]
-    lengths = [episode["length"] for episode in episodes]
-    return {
-        "selector": resolved["selector"],
-        "comparison": resolved["comparison"],
-        "variant": resolved["variant"],
-        "reference_variant": resolved["reference"],
-        "description": resolved["description"],
-        "critic_spec": copy.deepcopy(model.agent.model.critic_signature),
-        "controller_seed": int(controller_seed),
-        "environment_seeds": [int(seed) for seed in seeds],
-        "outer_updates_before": updates_before,
-        "outer_updates_after": updates_after,
-        "outer_state_unchanged": True,
-        "resolved_config": _jsonable(vars(model.cfg)),
-        "resolved_device": str(model.agent.device),
-        "return": _summary(returns),
-        "episode_length": _summary(lengths),
-        "episodes": episodes,
-        "model_metrics": _aggregate_metrics(metric_values),
-        "model_metric_availability": sorted(metric_values),
-        "nonfinite_model_metrics": dict(sorted(nonfinite_metric_counts.items())),
-        "alg_params": run_config["alg_params"],
-    }
+        _close_resources(model, env, primary_error=primary_error)
 
 
 def evaluate_matrix(
@@ -666,6 +753,10 @@ def main(argv=None):
             if args.list_presets or args.materialize_dir is not None:
                 return 0
             parser.error("--checkpoint is required for evaluation.")
+        if args.overwrite and args.output is None:
+            parser.error("--overwrite requires --output.")
+        if args.output is not None:
+            _preflight_output(args.output, overwrite=args.overwrite)
 
         payload = evaluate_matrix(
             args.matrix,
@@ -681,8 +772,11 @@ def main(argv=None):
         if args.output is None:
             print(serialized, end="")
         else:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(serialized, encoding="utf-8")
+            _write_output_atomic(
+                args.output,
+                serialized,
+                overwrite=args.overwrite,
+            )
             print(f"wrote {args.output}")
         return 0
     except (PresetMatrixError, ValueError, RuntimeError, OSError) as exc:

@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +9,9 @@ import gymnasium as gym
 
 from RL.SAC import SAC
 from RL.sac_core import ReplayBuffer, SACAgent, SACConfig
+from RL.tdmpc2_core.common.training_state import (
+    load_optimizer_state_preserving_hyperparameters,
+)
 from utils.utils import setup_logs
 
 
@@ -34,6 +38,53 @@ class ShortEpisodeEnv(gym.Env):
         return obs, -float(np.square(action).sum()), False, truncated, {}
 
 
+def _optimizer_group_options(optimizer):
+    return [
+        {key: value for key, value in group.items() if key != "params"}
+        for group in optimizer.param_groups
+    ]
+
+
+def _set_foreign_optimizer_group_options(optimizer):
+    for group in optimizer.param_groups:
+        group.update(
+            weight_decay=0.25,
+            maximize=True,
+            foreach=False,
+            capturable=True,
+            differentiable=True,
+            fused=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_amsgrad", "target_amsgrad"),
+    [(False, True), (True, False)],
+)
+def test_optimizer_transfer_normalizes_amsgrad_state_for_next_step(
+    source_amsgrad, target_amsgrad
+):
+    source_parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+    source = torch.optim.Adam([source_parameter], amsgrad=source_amsgrad)
+    source_parameter.grad = torch.ones_like(source_parameter)
+    source.step()
+
+    target_parameter = torch.nn.Parameter(torch.tensor([3.0, 4.0]))
+    target = torch.optim.Adam([target_parameter], amsgrad=target_amsgrad)
+    load_optimizer_state_preserving_hyperparameters(target, source.state_dict())
+
+    target_state = target.state[target_parameter]
+    assert target.param_groups[0]["amsgrad"] is target_amsgrad
+    assert ("max_exp_avg_sq" in target_state) is target_amsgrad
+    if target_amsgrad and not source_amsgrad:
+        torch.testing.assert_close(
+            target_state["max_exp_avg_sq"], target_state["exp_avg_sq"]
+        )
+
+    target_parameter.grad = torch.ones_like(target_parameter)
+    target.step()
+
+
 def test_replay_samples_with_replacement_and_validates_shapes():
     replay = ReplayBuffer(obs_dim=3, action_dim=2, capacity=8)
     replay.add(np.zeros(3), np.zeros(2), 1.0, np.ones(3), False, False)
@@ -45,6 +96,34 @@ def test_replay_samples_with_replacement_and_validates_shapes():
         replay.add(np.zeros(1), np.zeros(2), 1.0, np.ones(3), False, False)
     with pytest.raises(ValueError, match="empty replay"):
         ReplayBuffer(3, 2, 8).sample(1, torch.device("cpu"))
+
+
+def test_native_sac_rejects_zero_width_action_dimensions_before_normalization():
+    env = ShortEpisodeEnv()
+    env.action_space = gym.spaces.Box(
+        low=np.array([0.0], dtype=np.float32),
+        high=np.array([0.0], dtype=np.float32),
+        dtype=np.float32,
+    )
+    with pytest.raises(ValueError, match="strictly increasing"):
+        SAC("SAC", env, {"device": "cpu", "wandb": False}, {}, {})
+
+
+@pytest.mark.parametrize("budget", [True, 1.5])
+def test_native_sac_rejects_inexact_timestep_budgets_before_training(budget):
+    env = ShortEpisodeEnv()
+    model = SAC(
+        "SAC",
+        env,
+        {"device": "cpu", "net_arch": [8], "wandb": False},
+        {},
+        {},
+    )
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        model.learn(total_timesteps=budget)
+
+    assert env.total_steps == 0
 
 
 def test_asymmetric_and_empty_network_architectures_are_preserved():
@@ -172,6 +251,25 @@ def test_native_sac_rejects_invalid_optimizer_and_log_std_settings(overrides, ma
     values.update(overrides)
     with pytest.raises(ValueError, match=match):
         SACAgent(2, 1, SACConfig(**values))
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"ent_coef": "auto_nan"}, "positive and finite"),
+        ({"ent_coef": "auto_inf"}, "positive and finite"),
+        ({"ent_coef": float("nan")}, "positive and finite"),
+        ({"ent_coef": float("inf")}, "positive and finite"),
+        ({"ent_coef": True}, "boolean"),
+        ({"ent_coef": "automatic"}, "auto"),
+        ({"target_entropy": float("nan")}, "target_entropy"),
+        ({"target_entropy": float("inf")}, "target_entropy"),
+        ({"target_entropy": True}, "boolean"),
+    ],
+)
+def test_native_sac_rejects_nonfinite_entropy_settings(overrides, match):
+    with pytest.raises(ValueError, match=match):
+        SACAgent(2, 1, SACConfig(net_arch=(8,), device="cpu", **overrides))
 
 
 def test_reward_logging_preserves_termination_metadata():
@@ -417,6 +515,174 @@ def test_checkpoint_strict_config_covers_sac_optimizer_and_log_std_settings(tmp_
             build(**{key: value}).load(checkpoint)
 
 
+def test_checkpoint_fine_tuning_keeps_receiving_optimizer_hyperparameters(tmp_path):
+    def build(**overrides):
+        params = {
+            "device": "cpu",
+            "seed": 3,
+            "learning_starts": 100,
+            "buffer_size": 32,
+            "batch_size": 4,
+            "net_arch": [8],
+            "ent_coef": "auto_0.5",
+            "wandb": False,
+        }
+        params.update(overrides)
+        return SAC(
+            "SAC",
+            ShortEpisodeEnv(),
+            params,
+            {"seed": 3, "device": "cpu", "env": "ShortEpisodeEnv"},
+            {},
+        )
+
+    source = build(
+        actor_lr=1e-4,
+        critic_lr=2e-4,
+        alpha_lr=3e-4,
+        actor_betas=[0.8, 0.91],
+        critic_betas=[0.7, 0.92],
+        alpha_betas=[0.6, 0.93],
+        adam_eps=2e-8,
+    )
+    for index in range(8):
+        source.replay_buffer.add(
+            np.array([index, -index], dtype=np.float32),
+            np.array([0.1], dtype=np.float32),
+            0.25,
+            np.array([index + 1, 1 - index], dtype=np.float32),
+            False,
+            False,
+        )
+    source.agent.update(source.replay_buffer, gradient_steps=1, batch_size=4)
+
+    restored = build(
+        actor_lr=4e-4,
+        critic_lr=5e-4,
+        alpha_lr=6e-4,
+        actor_betas=[0.81, 0.94],
+        critic_betas=[0.71, 0.95],
+        alpha_betas=[0.61, 0.96],
+        adam_eps=3e-8,
+    )
+    optimizer_pairs = (
+        (source.agent.actor_optimizer, restored.agent.actor_optimizer),
+        (source.agent.critic_optimizer, restored.agent.critic_optimizer),
+        (source.agent.ent_coef_optimizer, restored.agent.ent_coef_optimizer),
+    )
+    for saved, _ in optimizer_pairs:
+        _set_foreign_optimizer_group_options(saved)
+    checkpoint = source.save(tmp_path, "fine_tuning")
+    configured_options = [
+        _optimizer_group_options(target) for _, target in optimizer_pairs
+    ]
+
+    restored.load(checkpoint, strict_config=False)
+
+    torch.testing.assert_close(
+        restored.agent.log_ent_coef,
+        source.agent.log_ent_coef,
+        rtol=0,
+        atol=0,
+    )
+    for (saved, target), expected_options in zip(
+        optimizer_pairs, configured_options
+    ):
+        assert _optimizer_group_options(target) == expected_options
+        assert target.state_dict()["state"]
+        for parameter_id, saved_state in saved.state_dict()["state"].items():
+            target_state = target.state_dict()["state"][parameter_id]
+            assert target_state.keys() == saved_state.keys()
+            for key, value in saved_state.items():
+                torch.testing.assert_close(target_state[key], value, rtol=0, atol=0)
+
+
+def test_checkpoint_fine_tuning_keeps_receiving_fixed_entropy_coefficient(tmp_path):
+    source = SAC(
+        "SAC",
+        ShortEpisodeEnv(),
+        {
+            "device": "cpu",
+            "seed": 3,
+            "net_arch": [8],
+            "ent_coef": 0.2,
+            "wandb": False,
+        },
+        {"seed": 3, "device": "cpu", "env": "ShortEpisodeEnv"},
+        {},
+    )
+    checkpoint = source.save(tmp_path, "fixed_alpha")
+    restored = SAC(
+        "SAC",
+        ShortEpisodeEnv(),
+        {
+            "device": "cpu",
+            "seed": 4,
+            "net_arch": [8],
+            "ent_coef": 0.7,
+            "wandb": False,
+        },
+        {"seed": 4, "device": "cpu", "env": "ShortEpisodeEnv"},
+        {},
+    )
+
+    restored.load(checkpoint, strict_config=False)
+
+    torch.testing.assert_close(
+        restored.agent.ent_coef_tensor,
+        torch.tensor(0.7, device=restored.agent.device),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_sac_entropy_mode_mismatch_fails_before_model_mutation():
+    automatic = SACAgent(
+        2, 1, SACConfig(net_arch=(8,), ent_coef="auto_0.5", device="cpu")
+    )
+    fixed = SACAgent(
+        2, 1, SACConfig(net_arch=(8,), ent_coef=0.2, device="cpu")
+    )
+    before = {
+        key: value.detach().clone() for key, value in fixed.actor.state_dict().items()
+    }
+    incoming = automatic.state_dict()
+    with torch.no_grad():
+        next(iter(incoming["actor"].values())).add_(1.0)
+
+    with pytest.raises(ValueError, match="entropy mode"):
+        fixed.load_state_dict(incoming)
+
+    for key, value in fixed.actor.state_dict().items():
+        torch.testing.assert_close(value, before[key], rtol=0, atol=0)
+
+
+def test_sac_optimizer_preflight_prevents_partial_model_mutation():
+    source = SACAgent(2, 1, SACConfig(net_arch=(8,), device="cpu"))
+    source.critic_optimizer.zero_grad(set_to_none=True)
+    sum(parameter.sum() for parameter in source.critic.parameters()).backward()
+    source.critic_optimizer.step()
+    invalid = deepcopy(source.state_dict())
+    first_state = next(iter(invalid["critic_optimizer"]["state"].values()))
+    first_state["exp_avg"] = torch.zeros(999)
+
+    target = SACAgent(2, 1, SACConfig(net_arch=(8,), device="cpu"))
+    before_actor = deepcopy(target.actor.state_dict())
+    before_critic = deepcopy(target.critic.state_dict())
+    before_actor_optimizer = deepcopy(target.actor_optimizer.state_dict())
+    before_critic_optimizer = deepcopy(target.critic_optimizer.state_dict())
+
+    with pytest.raises(ValueError, match="exp_avg"):
+        target.load_state_dict(invalid)
+
+    for key, value in target.actor.state_dict().items():
+        torch.testing.assert_close(value, before_actor[key], rtol=0, atol=0)
+    for key, value in target.critic.state_dict().items():
+        torch.testing.assert_close(value, before_critic[key], rtol=0, atol=0)
+    assert target.actor_optimizer.state_dict() == before_actor_optimizer
+    assert target.critic_optimizer.state_dict() == before_critic_optimizer
+
+
 def test_legacy_checkpoint_config_infers_new_sac_defaults(tmp_path):
     params = {
         "device": "cpu",
@@ -605,3 +871,83 @@ def test_native_sac_one_step_matches_sb3_232():
         sb3_key = key.replace("qf1.", "qf0.").replace("qf2.", "qf1.")
         torch.testing.assert_close(value, sb3.critic.state_dict()[sb3_key], rtol=0, atol=1e-7)
     torch.testing.assert_close(native.log_ent_coef, sb3.log_ent_coef, rtol=0, atol=1e-7)
+
+
+def test_native_sac_cleanup_preserves_training_failure_and_attempts_wandb_finish(
+    monkeypatch,
+):
+    import importlib
+
+    sac_module = importlib.import_module("RL.SAC")
+
+    class FailingStepEnv(ShortEpisodeEnv):
+        def step(self, _action):
+            raise RuntimeError("training failed")
+
+    model = SAC(
+        "SAC",
+        FailingStepEnv(),
+        {"device": "cpu", "learning_starts": 100, "net_arch": [8], "wandb": False},
+        {},
+        {},
+    )
+    run = object()
+    model._wandb_run = run
+    cleanup_calls = []
+
+    def fail_final_log(*_args, **_kwargs):
+        cleanup_calls.append("log")
+        raise OSError("final log failed")
+
+    def fail_finish(actual_run):
+        assert actual_run is run
+        cleanup_calls.append("finish")
+        raise OSError("finish failed")
+
+    monkeypatch.setattr(model, "_log_wandb_step", fail_final_log)
+    monkeypatch.setattr(sac_module, "finish_wandb", fail_finish)
+
+    with pytest.raises(RuntimeError, match="training failed") as captured:
+        model.learn(total_timesteps=1)
+
+    assert cleanup_calls == ["log", "finish"]
+    assert model._wandb_run is None
+    assert getattr(captured.value, "__notes__", ()) == [
+        "Additional W&B cleanup failure: final log failed",
+        "Additional W&B cleanup failure: finish failed",
+    ]
+
+
+def test_native_sac_success_cleanup_raises_first_failure_with_later_note(monkeypatch):
+    import importlib
+
+    sac_module = importlib.import_module("RL.SAC")
+    model = SAC(
+        "SAC",
+        ShortEpisodeEnv(),
+        {"device": "cpu", "learning_starts": 100, "net_arch": [8], "wandb": False},
+        {},
+        {},
+    )
+    model._wandb_run = object()
+    cleanup_calls = []
+
+    def fail_final_log(*_args, **_kwargs):
+        cleanup_calls.append("log")
+        raise OSError("final log failed")
+
+    def fail_finish(_run):
+        cleanup_calls.append("finish")
+        raise ValueError("finish failed")
+
+    monkeypatch.setattr(model, "_log_wandb_step", fail_final_log)
+    monkeypatch.setattr(sac_module, "finish_wandb", fail_finish)
+
+    with pytest.raises(OSError, match="final log failed") as captured:
+        model.learn(total_timesteps=0)
+
+    assert cleanup_calls == ["log", "finish"]
+    assert model._wandb_run is None
+    assert getattr(captured.value, "__notes__", ()) == [
+        "Additional cleanup failure: finish failed"
+    ]

@@ -84,6 +84,28 @@ class OneStepTruncationEnv(gym.Env):
         return np.zeros(3, dtype=np.float32), 0.0, False, True, {}
 
 
+def test_tdmpc2_rejects_zero_width_action_dimensions_before_normalization():
+    env = OneStepTruncationEnv([])
+    env.action_space = gym.spaces.Box(
+        low=np.array([0.0], dtype=np.float32),
+        high=np.array([0.0], dtype=np.float32),
+        dtype=np.float32,
+    )
+    with pytest.raises(ValueError, match="strictly increasing"):
+        make_model(TDMPC2Baseline, env)
+
+
+@pytest.mark.parametrize("budget", [True, 1.5])
+def test_tdmpc2_rejects_inexact_timestep_budgets_before_training(budget):
+    events = []
+    model = make_model(TDMPC2Baseline, OneStepTruncationEnv(events))
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        model.learn(total_timesteps=budget)
+
+    assert events == []
+
+
 def test_ambi_preserves_the_exact_tdmpc2_training_loop_and_ordering():
     assert AMBITDMPC2.learn is TDMPC2Baseline.learn
     events = []
@@ -184,6 +206,42 @@ def test_soft_sac_actor_uses_direct_log_std_clamping():
     latent = torch.zeros(3, model.cfg.latent_dim)
     _, info = model.agent.model.pi(latent, deterministic=True)
     torch.testing.assert_close(info["log_std"], torch.zeros_like(info["log_std"]), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("mapping", "log_std_min", "expected_log_std"),
+    [
+        ("direct_clamp", -10.0, 0.0),
+        ("tdmpc2_tanh", -10.0, -4.0),
+        ("direct_clamp", -20.0, 0.0),
+        ("tdmpc2_tanh", -20.0, -9.0),
+    ],
+)
+def test_soft_sac_actor_zero_head_respects_mapping_and_bounds(
+    mapping, log_std_min, expected_log_std
+):
+    env = gym.make("Pendulum-v1", max_episode_steps=5)
+    model = make_model(
+        AMBITDMPC2,
+        env,
+        tiny_params(
+            log_std_mapping=mapping,
+            log_std_min=log_std_min,
+            log_std_max=2.0,
+        ),
+    )
+    with torch.no_grad():
+        for parameter in model.agent.model._pi.parameters():
+            parameter.zero_()
+
+    latent = torch.zeros(3, model.cfg.latent_dim)
+    _, info = model.agent.model.pi(latent, deterministic=True)
+    expected = torch.full_like(info["log_std"], expected_log_std)
+
+    torch.testing.assert_close(info["log_std"], expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        info["log_std"].exp(), expected.exp(), rtol=0, atol=0
+    )
 
 
 def test_unsafe_or_unsupported_configs_fail_early():
@@ -355,3 +413,70 @@ def test_true_termination_trains_when_episodic_enabled():
     model.learn(total_timesteps=7)
     assert model.agent.num_updates > 0
     assert torch.isfinite(torch.as_tensor(model._last_train_metrics["termination_loss"]))
+
+
+@pytest.mark.parametrize("fail_training", [False, True], ids=["success", "training-error"])
+def test_tdmpc2_finalizer_attempts_all_cleanup_and_preserves_primary(
+    monkeypatch, fail_training
+):
+    import importlib
+
+    tdmpc_module = importlib.import_module("RL.TDMPC2")
+    model = make_model(
+        TDMPC2Baseline,
+        OneStepTruncationEnv([]),
+        tiny_params(),
+        total_steps=0,
+    )
+    model._wandb_run = object()
+    cleanup_calls = []
+
+    class FailingLogger:
+        def flush(self):
+            cleanup_calls.append("logger")
+            raise LookupError("logger failed")
+
+    def fail_final_log(*_args, **_kwargs):
+        cleanup_calls.append("log")
+        raise OSError("final log failed")
+
+    def fail_finish(_run):
+        cleanup_calls.append("finish")
+        raise ValueError("finish failed")
+
+    def fail_writer_shutdown():
+        cleanup_calls.append("writer")
+        raise ArithmeticError("writer failed")
+
+    if fail_training:
+        monkeypatch.setattr(
+            model,
+            "_reset_env",
+            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("training failed")),
+        )
+    monkeypatch.setattr(model, "_log_wandb_step", fail_final_log)
+    monkeypatch.setattr(tdmpc_module, "finish_wandb", fail_finish)
+    monkeypatch.setattr(model._checkpoint_writer, "shutdown", fail_writer_shutdown)
+    model.alg_logger = FailingLogger()
+
+    expected = RuntimeError if fail_training else OSError
+    message = "training failed" if fail_training else "final log failed"
+    with pytest.raises(expected, match=message) as captured:
+        model.learn(total_timesteps=0)
+
+    assert cleanup_calls == ["log", "finish", "logger", "writer"]
+    assert model._wandb_run is None
+    notes = getattr(captured.value, "__notes__", ())
+    if fail_training:
+        assert notes == [
+            "Additional learner cleanup failure: final log failed",
+            "Additional learner cleanup failure: finish failed",
+            "Additional learner cleanup failure: logger failed",
+            "Additional learner cleanup failure: writer failed",
+        ]
+    else:
+        assert notes == [
+            "Additional cleanup failure: finish failed",
+            "Additional cleanup failure: logger failed",
+            "Additional cleanup failure: writer failed",
+        ]

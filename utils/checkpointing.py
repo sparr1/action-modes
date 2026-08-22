@@ -423,6 +423,49 @@ def metadata_path(checkpoint_path: str | os.PathLike[str]) -> Path:
     return Path(f"{os.fspath(checkpoint_path)}.metadata.json")
 
 
+def _fsync_directory(path: str | os.PathLike[str]) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def fsync_checkpoint_files(
+    checkpoint_paths: Iterable[str | os.PathLike[str]],
+) -> None:
+    for path in checkpoint_paths:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def fsync_checkpoint_directories(
+    checkpoint_paths: Iterable[str | os.PathLike[str]],
+) -> None:
+    for directory in sorted({Path(path).parent for path in checkpoint_paths}):
+        _fsync_directory(directory)
+
+
+def invalidate_metadata_sidecars(
+    checkpoint_paths: Iterable[str | os.PathLike[str]],
+) -> None:
+    """Durably remove old sidecars before replacing their checkpoint aliases."""
+
+    changed_directories = set()
+    for checkpoint_path in checkpoint_paths:
+        sidecar = metadata_path(checkpoint_path)
+        try:
+            sidecar.unlink()
+        except FileNotFoundError:
+            continue
+        changed_directories.add(sidecar.parent)
+    for directory in sorted(changed_directories):
+        _fsync_directory(directory)
+
+
 def _json_default(value):
     if isinstance(value, os.PathLike):
         return os.fspath(value)
@@ -455,6 +498,7 @@ def write_metadata_atomic(
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, target)
+        _fsync_directory(target.parent)
     finally:
         try:
             os.unlink(temporary)
@@ -533,10 +577,21 @@ def publish_checkpoint(
                 raise FileNotFoundError(
                     f"Checkpoint serializer did not create its promised output: {written_path}"
                 )
+        # A checkpoint and its sidecar cannot be atomically replaced as a pair.
+        # Remove old sidecars durably before exposing any new checkpoint bytes,
+        # so an interruption can only leave a missing sidecar, never stale
+        # metadata describing the new checkpoint.
+        invalidate_metadata_sidecars(actual_targets)
         os.replace(written_path, first)
         published = [str(first)]
         for target in actual_targets[1:]:
             published.append(atomic_clone(first, target))
+        # Make checkpoint data durable before its directory entries, then
+        # publish metadata that claims to describe those durable bytes. After
+        # the durable sidecar unlink above, a crash can therefore recover only
+        # the new pair or no sidecar.
+        fsync_checkpoint_files(actual_targets)
+        fsync_checkpoint_directories(actual_targets)
         for target, publication in zip(actual_targets, requested):
             write_metadata_atomic(target, publication.metadata)
         return tuple(published)

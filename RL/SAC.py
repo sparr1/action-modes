@@ -21,13 +21,14 @@ import torch
 from gymnasium.spaces import Box
 from gymnasium.spaces import utils as space_utils
 
-from RL.alg import Algorithm
+from RL.alg import Algorithm, validate_timestep_budget
 from RL.sac_core import ReplayBuffer, SACAgent, SACConfig
 from utils.checkpointing import (
     CheckpointTracker,
     explicit_checkpoint_target,
     publish_checkpoint,
 )
+from utils.cleanup import add_cleanup_notes, raise_cleanup_errors
 from utils.utils import setup_logs
 from utils.wandb_utils import (
     WandbAccumulator,
@@ -53,6 +54,11 @@ class SAC(Algorithm):
             raise ValueError("Native SAC supports continuous Box action spaces only.")
         if not np.all(np.isfinite(self.env.action_space.low)) or not np.all(np.isfinite(self.env.action_space.high)):
             raise ValueError("Native SAC requires finite action bounds.")
+        if np.any(self.env.action_space.high <= self.env.action_space.low):
+            raise ValueError(
+                "Native SAC requires every action dimension to have strictly "
+                "increasing bounds."
+            )
 
         self.obs_dim = int(space_utils.flatdim(self.env.observation_space))
         self.action_shape = self.env.action_space.shape
@@ -532,10 +538,8 @@ class SAC(Algorithm):
         self._rng_seeded = True
 
     def learn(self, total_timesteps=10000, reset_num_timesteps=True):
+        total_timesteps = validate_timestep_budget(total_timesteps)
         self._seed_once()
-        total_timesteps = int(float(total_timesteps))
-        if total_timesteps < 0:
-            raise ValueError("total_timesteps must be non-negative.")
         if self._wandb_run is None:
             self._wandb_run = self._init_wandb()
 
@@ -576,11 +580,24 @@ class SAC(Algorithm):
                 self._evaluate_policy(0, initial_obs=obs)
                 obs = self._reset_env()
                 self._last_obs = obs
-        except Exception:
-            finish_wandb(self._wandb_run)
-            self._wandb_run = None
+        except BaseException as primary_error:
+            cleanup_errors = []
+            if self._wandb_run is not None:
+                try:
+                    finish_wandb(self._wandb_run)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                finally:
+                    self._wandb_run = None
+            add_cleanup_notes(
+                primary_error,
+                cleanup_errors,
+                prefix="Additional W&B cleanup failure",
+            )
             raise
 
+        primary_error = None
+        cleanup_errors = []
         try:
             # Match SB3's rollout-chunk semantics: once a train-frequency chunk has
             # started, finish it even if that slightly overshoots total_timesteps.
@@ -641,17 +658,36 @@ class SAC(Algorithm):
                 self._last_obs = obs
             self._final_checkpoint()
             return self
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
             if self._wandb_run is not None:
-                self._log_wandb_step(
-                    self._last_reward,
-                    self._last_terminated,
-                    self._last_truncated,
-                    self._last_info,
-                    force=True,
-                )
-                finish_wandb(self._wandb_run)
-                self._wandb_run = None
+                try:
+                    self._log_wandb_step(
+                        self._last_reward,
+                        self._last_terminated,
+                        self._last_truncated,
+                        self._last_info,
+                        force=True,
+                    )
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+                try:
+                    finish_wandb(self._wandb_run)
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+                finally:
+                    self._wandb_run = None
+            if cleanup_errors:
+                if primary_error is not None:
+                    add_cleanup_notes(
+                        primary_error,
+                        cleanup_errors,
+                        prefix="Additional W&B cleanup failure",
+                    )
+                else:
+                    raise_cleanup_errors(cleanup_errors)
 
     def predict(self, observation, deterministic=False):
         obs_flat = self._flatten_obs(observation)

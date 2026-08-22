@@ -10,6 +10,8 @@ import gymnasium as gym
 import gymnasium_goal
 from gymnasium_goal.envs.config import GOAL_WIDTH, PITCH_LENGTH, PITCH_WIDTH
 
+from .mpqdn_wrappers import _parameter_action_index, _validate_parameter_values
+
 # sys.path.append(os.path.abspath(os.path.pardir))
 # from agents.basis import ScaledBasis  # TODO: fix relative import
 
@@ -57,7 +59,26 @@ class GoalFlattenedActionWrapper(gym.ActionWrapper):
     def __init__(self, env):
         super(GoalFlattenedActionWrapper, self).__init__(env)
         old_as = env.action_space
+        if (
+            not isinstance(old_as, gym.spaces.Tuple)
+            or len(old_as.spaces) != 2
+            or not isinstance(old_as.spaces[0], gym.spaces.Discrete)
+            or not isinstance(old_as.spaces[1], gym.spaces.Tuple)
+        ):
+            raise TypeError(
+                "GoalFlattenedActionWrapper requires "
+                "Tuple(Discrete, Tuple(Box, ...))."
+            )
         num_actions = old_as.spaces[0].n
+        self.num_actions = num_actions
+        self.parameter_spaces = tuple(old_as.spaces[1].spaces)
+        if len(self.parameter_spaces) != num_actions or not all(
+            isinstance(space, gym.spaces.Box) for space in self.parameter_spaces
+        ):
+            raise ValueError(
+                "GoalFlattenedActionWrapper requires one Box parameter space "
+                "per action."
+            )
         self.action_space = gym.spaces.Tuple((
             old_as.spaces[0],  # actions
             *(gym.spaces.Box(old_as.spaces[1].spaces[i].low, old_as.spaces[1].spaces[i].high, dtype=np.float32)
@@ -65,7 +86,16 @@ class GoalFlattenedActionWrapper(gym.ActionWrapper):
         ))
 
     def action(self, action):
-        return action
+        if not isinstance(action, (tuple, list)) or len(action) != self.num_actions + 1:
+            raise ValueError(
+                "Flattened parameterized action must contain an id followed by "
+                f"{self.num_actions} parameter arrays."
+            )
+        action_id = _parameter_action_index(action[0], self.num_actions)
+        parameters = _validate_parameter_values(
+            action[1:], self.parameter_spaces, scaled=False
+        )
+        return action_id, tuple(parameters)
 
 
 class GoalObservationWrapper(gym.ObservationWrapper):

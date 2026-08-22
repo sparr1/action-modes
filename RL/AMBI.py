@@ -179,7 +179,8 @@ class AMBI(Algorithm):
 
     def save(self, save_path, name):
         if hasattr(self.outer_agent, "save"):
-            self.outer_agent.save(save_path, name)
+            return self.outer_agent.save(save_path, name)
+        return None
 
     def load(self, load_path):
         if hasattr(self.outer_agent, "load"):

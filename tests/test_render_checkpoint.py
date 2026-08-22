@@ -281,6 +281,7 @@ class _FakeModel:
         self.agent = type("Agent", (), {"model": _EvalNode(), "actor": _EvalNode()})()
         self.loaded = None
         self.predict_calls = []
+        self.close_calls = 0
 
     def load(self, path):
         self.loaded = path
@@ -289,6 +290,9 @@ class _FakeModel:
     def predict(self, observation, **kwargs):
         self.predict_calls.append(kwargs)
         return np.array([0.0], dtype=np.float32), None
+
+    def close(self):
+        self.close_calls += 1
 
 
 def test_display_rollouts_use_separate_envs_and_reset_ambi_planning(monkeypatch, tmp_path):
@@ -343,6 +347,7 @@ def test_display_rollouts_use_separate_envs_and_reset_ambi_planning(monkeypatch,
     assert all(call["deterministic"] is True for call in model.predict_calls)
     assert all(call["collect_diagnostics"] is False for call in model.predict_calls)
     assert model.agent.model.eval_calls == 1
+    assert model.close_calls == 1
     assert model_env.close_calls == 1
     assert rollout_env.close_calls == 1
 
@@ -412,11 +417,70 @@ def test_results_json_runs_headlessly_and_records_deterministic_seed_set(
     assert payload["checkpoint_metadata"]["kind"] == "latest"
     assert payload["resolved_runtime"] == run_params["resolved_runtime"]
     assert list(output.parent.glob(".*.tmp")) == []
+    assert model.close_calls == 1
     assert model_env.close_calls == 1
     assert rollout_env.close_calls == 1
 
     with pytest.raises(renderer.RenderCheckpointError, match="already exists"):
         renderer.render_checkpoint(checkpoint, results_json=output)
+
+
+def test_render_cleanup_attempts_model_and_both_envs_without_masking_primary_error(
+    monkeypatch, tmp_path
+):
+    checkpoint = tmp_path / "model:Config_0_latest"
+    checkpoint.write_bytes(b"checkpoint")
+    _write_json(Path(str(checkpoint) + ".metadata.json"), _metadata())
+
+    class FailingModel(_FakeModel):
+        def close(self):
+            super().close()
+            raise OSError("model close failed")
+
+    class FailingModelEnv(_ModelEnv):
+        def close(self):
+            super().close()
+            raise OSError("model env close failed")
+
+    class FailingRolloutEnv(_RolloutEnv):
+        def close(self):
+            super().close()
+            raise OSError("rollout env close failed")
+
+    model = FailingModel()
+    model_env = FailingModelEnv()
+    rollout_env = FailingRolloutEnv()
+    environments = iter((model_env, rollout_env))
+    monkeypatch.setattr(
+        renderer,
+        "build_env",
+        lambda *_args, **_kwargs: next(environments),
+    )
+    monkeypatch.setattr(
+        renderer,
+        "initialize_alg",
+        lambda *_args, **_kwargs: (model, False, "AMBITDMPC2"),
+    )
+    monkeypatch.setattr(
+        renderer,
+        "_rollout",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("rollout failed")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="rollout failed") as captured:
+        renderer.render_checkpoint(checkpoint, display=True)
+
+    assert str(captured.value) == "rollout failed"
+    assert model.close_calls == 1
+    assert rollout_env.close_calls == 1
+    assert model_env.close_calls == 1
+    assert getattr(captured.value, "__notes__", ()) == [
+        "Additional cleanup failure: model close failed",
+        "Additional cleanup failure: rollout env close failed",
+        "Additional cleanup failure: model env close failed",
+    ]
 
 
 def test_output_modes_include_headless_results_json(tmp_path):
@@ -659,3 +723,30 @@ def test_sb3_restore_forwards_nonrendering_env_and_device(monkeypatch, tmp_path)
         (str(checkpoint), model_env, "cpu", {"buffer_size": 1})
     ]
     assert wrapper.model.policy.training_modes == [False]
+
+
+def test_model_is_closed_if_checkpoint_load_is_interrupted(monkeypatch, tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.write_bytes(b"checkpoint")
+
+    class InterruptedModel(_FakeModel):
+        def load(self, _path):
+            raise KeyboardInterrupt()
+
+    model = InterruptedModel()
+    monkeypatch.setattr(
+        renderer,
+        "initialize_alg",
+        lambda *_args, **_kwargs: (model, False, "AMBITDMPC2"),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        renderer._initialize_model(
+            checkpoint,
+            _run_params(),
+            _experiment_params(),
+            object(),
+            "ambi_tdmpc2",
+        )
+
+    assert model.close_calls == 1

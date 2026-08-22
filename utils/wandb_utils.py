@@ -14,6 +14,7 @@ from numbers import Real
 
 import numpy as np
 
+from utils.cleanup import add_cleanup_notes
 from utils.wandb_resume import (
     EVENT_INDEX_KEY,
     CheckpointedWandbRun,
@@ -28,6 +29,9 @@ from utils.wandb_resume import (
 
 DEFAULT_WANDB_ENTITY = "rwgao_b-brown-university"
 DEFAULT_WANDB_PROJECT = "ambi"
+SUPPORTED_WANDB_MODES = frozenset(
+    {"dryrun", "run", "offline", "online", "disabled", "shared"}
+)
 
 
 def _finite_float(value) -> float | None:
@@ -340,12 +344,27 @@ def extract_reward_components(info: Mapping | None) -> dict[str, float]:
     return payload
 
 
-def wandb_enabled(params: dict | None) -> bool:
-    return bool(params and params.get("wandb", False))
+def wandb_enabled(params: Mapping | None) -> bool:
+    if params is None:
+        return False
+    if not isinstance(params, Mapping):
+        raise ValueError("W&B parameters must be a mapping.")
+    enabled = params.get("wandb", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("'wandb' must be a boolean when provided.")
+    mode = params.get("wandb_mode")
+    if mode is not None and (
+        not isinstance(mode, str) or mode not in SUPPORTED_WANDB_MODES
+    ):
+        raise ValueError(
+            "'wandb_mode' must be one of "
+            f"{sorted(SUPPORTED_WANDB_MODES)} when provided."
+        )
+    return enabled
 
 
-def _finish_failed_resume_initialization(run, primary_error: BaseException) -> None:
-    """Close an initialized exact-resume run without masking its primary error."""
+def _finish_failed_initialization(run, primary_error: BaseException) -> None:
+    """Close a partially initialized W&B run without masking its primary error."""
 
     if run is None:
         return
@@ -357,12 +376,11 @@ def _finish_failed_resume_initialization(run, primary_error: BaseException) -> N
             )
         finish()
     except BaseException as cleanup_error:
-        add_note = getattr(primary_error, "add_note", None)
-        if callable(add_note):
-            add_note(
-                "Additional W&B finish failure after exact-resume "
-                f"initialization stopped: {cleanup_error}"
-            )
+        add_cleanup_notes(
+            primary_error,
+            (cleanup_error,),
+            prefix="Additional W&B finish failure after initialization stopped",
+        )
 
 
 def init_wandb(
@@ -433,24 +451,32 @@ def init_wandb(
         wandb.define_metric("episode/*", step_metric="env_step")
         wandb.define_metric("time/*", step_metric="env_step")
         wandb.define_metric("eval/*", step_metric="env_step")
-    except Exception as exc:
-        if resume_context is not None:
+    except BaseException as exc:
+        if resume_context is not None and isinstance(exc, Exception):
             error = WandbInitializationError(
                 f"Could not initialize prepared online W&B run {resume_context.run_id!r}."
             )
-            _finish_failed_resume_initialization(run, error)
-            raise error from exc
-        raise
+        else:
+            error = exc
+        _finish_failed_initialization(run, error)
+        if error is exc:
+            raise
+        raise error from exc
     if resume_context is None:
         return run
 
     try:
         wandb.define_metric(EVENT_INDEX_KEY)
-    except Exception as exc:
-        error = WandbInitializationError(
-            f"Could not define resume metrics for W&B run {resume_context.run_id!r}."
-        )
-        _finish_failed_resume_initialization(run, error)
+    except BaseException as exc:
+        if isinstance(exc, Exception):
+            error = WandbInitializationError(
+                f"Could not define resume metrics for W&B run {resume_context.run_id!r}."
+            )
+        else:
+            error = exc
+        _finish_failed_initialization(run, error)
+        if error is exc:
+            raise
         raise error from exc
     missing_run_methods = [
         method
@@ -462,7 +488,7 @@ def init_wandb(
             "The initialized W&B run lacks callable methods required for exact "
             f"resume: {', '.join(missing_run_methods)}."
         )
-        _finish_failed_resume_initialization(run, error)
+        _finish_failed_initialization(run, error)
         raise error
     checkpointed_run = CheckpointedWandbRun(
         run,
@@ -475,7 +501,7 @@ def init_wandb(
         try:
             checkpointed_run.synchronize_resumed_checkpoint()
         except WandbRemoteWriteError as primary_error:
-            _finish_failed_resume_initialization(run, primary_error)
+            _finish_failed_initialization(run, primary_error)
             raise
     return checkpointed_run
 

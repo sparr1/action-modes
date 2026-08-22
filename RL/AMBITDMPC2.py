@@ -9,6 +9,7 @@ import numpy as np
 
 from RL.TDMPC2 import TDMPC2Baseline, _normalize_horizon_params
 from RL.tdmpc2_core.ambi_agent import AMBITDMPC2Agent
+from RL.tdmpc2_core.common.soft_world_model import normalize_log_std_mapping
 from utils.utils import setup_logs
 
 
@@ -43,6 +44,7 @@ _AMBI_DEFAULTS = {
     "critic_lr": 3e-4,
     "adam_eps": 1e-8,
     "actor_adam_eps": None,
+    "log_std_mapping": "direct_clamp",
     "log_std_min": -20,
     "log_std_max": 2,
     "ent_coef": "auto",
@@ -76,6 +78,7 @@ _AMBI_DEFAULTS = {
     # Independently adaptable inner components.
     "inner_actor_adaptation": "clone",
     "inner_critic_adaptation": "clone",
+    "inner_critic_dropout_enabled": True,
     # ``None`` is resolved by operator: learned/root-local for SAC and disabled
     # for operators without an entropy objective.
     "inner_temperature_mode": None,
@@ -106,6 +109,7 @@ _AMBI_DEFAULTS = {
     "inner_execution_action": "policy_sample",
     "inner_execution_std_scale": 1.0,
     "inner_execution_noise_std": 0.0,
+    "inner_log_std_mapping": None,
     "inner_log_std_min": None,
     "inner_log_std_max": None,
 
@@ -194,7 +198,15 @@ def _legacy_warning(keys):
     )
 
 
+def _strict_bool(value, key):
+    if not isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{key} must be a boolean.")
+    return bool(value)
+
+
 def _finite_float(value, key):
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{key} must be a finite number, not a boolean.")
     value = float(value)
     if not math.isfinite(value):
         raise ValueError(f"{key} must be finite, got {value}.")
@@ -805,6 +817,10 @@ class AMBITDMPC2(TDMPC2Baseline):
             if value not in _ADAPTATION_MODES:
                 raise ValueError(f"{key} must be one of {sorted(_ADAPTATION_MODES)}.")
             setattr(cfg, key, value)
+        cfg.inner_critic_dropout_enabled = _strict_bool(
+            cfg.inner_critic_dropout_enabled,
+            "inner_critic_dropout_enabled",
+        )
         if (
             cfg.inner_operator in {"sac", "td3"}
             and cfg.inner_actor_updates_per_action > 0
@@ -937,6 +953,20 @@ class AMBITDMPC2(TDMPC2Baseline):
                     f"{prefix}_noise_std requires "
                     f"{prefix}_action='mean_plus_gaussian'."
                 )
+        cfg.log_std_mapping = normalize_log_std_mapping(
+            cfg.log_std_mapping, "log_std_mapping"
+        )
+        cfg.log_std_min = _finite_float(cfg.log_std_min, "log_std_min")
+        cfg.log_std_max = _finite_float(cfg.log_std_max, "log_std_max")
+        if cfg.log_std_min >= cfg.log_std_max:
+            raise ValueError("log_std_min must be less than log_std_max.")
+        cfg.inner_log_std_mapping = (
+            cfg.log_std_mapping
+            if cfg.inner_log_std_mapping is None
+            else normalize_log_std_mapping(
+                cfg.inner_log_std_mapping, "inner_log_std_mapping"
+            )
+        )
         cfg.inner_log_std_min = _finite_float(
             cfg.log_std_min if cfg.inner_log_std_min is None else cfg.inner_log_std_min,
             "inner_log_std_min",
@@ -1063,10 +1093,6 @@ class AMBITDMPC2(TDMPC2Baseline):
             if value <= 0.0:
                 raise ValueError(f"{key} must be positive.")
             setattr(cfg, key, value)
-        cfg.log_std_min = _finite_float(cfg.log_std_min, "log_std_min")
-        cfg.log_std_max = _finite_float(cfg.log_std_max, "log_std_max")
-        if cfg.log_std_min >= cfg.log_std_max:
-            raise ValueError("log_std_min must be less than log_std_max.")
         if isinstance(cfg.target_entropy, str):
             cfg.target_entropy = cfg.target_entropy.lower()
             if cfg.target_entropy != "auto":
@@ -1129,6 +1155,35 @@ class AMBITDMPC2(TDMPC2Baseline):
 
     def _make_agent(self, cfg):
         return AMBITDMPC2Agent(cfg)
+
+    def _evaluate_policy(self, step, *, initial_obs=None):
+        """Evaluate on an isolated copy of AMBI's persistent inner state.
+
+        Evaluation must run the real inner solve, including adaptation within
+        and across its own episodes, but those optimizer steps, replay inserts,
+        counters, and private RNG draws are not training data. Capture the
+        canonical boundary state and restore it after the shared evaluator
+        finishes (or raises). At an ordinary post-training-episode call, boundary
+        preparation also performs the single lifecycle reset that the subsequent
+        environment reset would otherwise perform.
+        """
+
+        engine = self.agent.inner_engine
+        try:
+            inner_state = copy.deepcopy(engine.training_state_dict())
+        except RuntimeError:
+            self.agent.prepare_training_resume_boundary()
+            inner_state = copy.deepcopy(engine.training_state_dict())
+        boundary_prepared = self.agent._resume_boundary_prepared
+        last_metrics = copy.deepcopy(self.agent.last_inner_metrics)
+        last_lengths = list(self.agent.last_inner_rollout_lengths)
+        try:
+            return super()._evaluate_policy(step, initial_obs=initial_obs)
+        finally:
+            engine.load_training_state_dict(inner_state)
+            self.agent.last_inner_metrics = last_metrics
+            self.agent.last_inner_rollout_lengths = last_lengths
+            self.agent._resume_boundary_prepared = boundary_prepared
 
     def _act_agent(self, obs_t, *, t0, eval_mode):
         # W&B records the resulting environment step, while action selection

@@ -526,6 +526,24 @@ def test_resume_initialization_failure_closes_the_partially_opened_run():
     assert wandb.raw_run.finished
 
 
+def test_resume_initialization_interrupt_closes_the_partially_opened_run():
+    wandb = _FakeWandb()
+
+    def interrupt_define(*_args, **_kwargs):
+        raise KeyboardInterrupt()
+
+    wandb.define_metric = interrupt_define
+    with pytest.raises(KeyboardInterrupt):
+        init_wandb(
+            _params(),
+            default_project="ambi",
+            run_name=None,
+            resume_context=WandbResumeContext.new(run_id="stable-run"),
+            wandb_module=wandb,
+        )
+    assert wandb.raw_run.finished
+
+
 def test_legacy_wandb_log_and_finish_are_unchanged():
     class LegacyRun:
         def __init__(self):

@@ -6,6 +6,24 @@ ROOT = Path(__file__).resolve().parents[1]
 AMBI_ROOT = ROOT / "configs/ambi"
 AMBI_ALGS = AMBI_ROOT / "algs"
 
+LEGACY_STATIC_MOVE_MANIFESTS = (
+    "AntMove",
+    "AntPlaneMove",
+    "AntPlaneMove2",
+    "AntPlaneMove3",
+    "AntPlaneMove4",
+    "AntPlaneMove5",
+    "AntPlaneMove6",
+    "AntPlaneMoveNew",
+    "AntPlaneMoveNew4.0",
+    "AntPlaneMoveNew5.0",
+    "AntPlaneMoveNew6.0",
+    "AntPlaneMoveNew8.0",
+    "AntPlaneRotate",
+    "AntPlaneRotateNew",
+    "AntPlaneRotateNew5.0",
+)
+
 
 def _reject_duplicate_keys(pairs):
     result = {}
@@ -27,6 +45,22 @@ def _params(name):
 def test_all_configs_are_valid_json_without_duplicate_keys():
     for path in sorted((ROOT / "configs").rglob("*.json")):
         _load_json_strict(path)
+
+
+def test_legacy_move_manifests_pin_their_historical_observation_slices():
+    expected_task_info = {
+        "velocity_coords": [15, 21],
+        "dir_coords": [3, 7],
+    }
+    for name in LEGACY_STATIC_MOVE_MANIFESTS:
+        experiment = _load_json_strict(
+            ROOT / "configs/experiments" / f"{name}.json"
+        )
+        wrapper_params = experiment["overrides_alg"]["env_wrapper"][
+            "wrapper_params"
+        ]
+        assert wrapper_params["task"] == "domains.Maze:Move", name
+        assert wrapper_params["task_info"] == expected_task_info, name
 
 
 def test_ambi_tree_contains_only_the_anchor_and_two_requested_studies():

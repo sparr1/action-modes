@@ -79,6 +79,70 @@ def _assert_finite(metrics):
             assert math.isfinite(float(value))
 
 
+@pytest.mark.parametrize("inner_operator", ["sac", "td3"])
+def test_online_evaluation_keeps_inner_optimizer_gradients_enabled(
+    inner_operator, monkeypatch
+):
+    model = _model(inner_operator=inner_operator)
+    model._eval_episodes = 1
+    model._record_evaluation = lambda step, reward: None
+    obs, _ = model._reset_env(seed=13)
+    update_counts = []
+    original_updates = model.agent.inner_engine._run_update_counts
+
+    def tracked_updates(**kwargs):
+        result = original_updates(**kwargs)
+        update_counts.append(
+            (kwargs["critic_count"], kwargs["actor_count"], len(result))
+        )
+        return result
+
+    monkeypatch.setattr(
+        model.agent.inner_engine, "_run_update_counts", tracked_updates
+    )
+    outer_before = {
+        key: value.detach().clone()
+        for key, value in model.agent.model.state_dict().items()
+    }
+    rng_before = torch.random.get_rng_state().clone()
+
+    model._evaluate_policy(0, initial_obs=obs)
+
+    assert update_counts
+    assert all(critic == actor == slots == 1 for critic, actor, slots in update_counts)
+    torch.testing.assert_close(torch.random.get_rng_state(), rng_before, rtol=0, atol=0)
+    for key, value in model.agent.model.state_dict().items():
+        torch.testing.assert_close(value, outer_before[key], rtol=0, atol=0)
+
+
+def test_online_evaluation_restores_run_scoped_inner_state_and_rng():
+    model = _model(
+        inner_actor_scope="run",
+        inner_critic_scope="run",
+        inner_temperature_scope="run",
+        inner_replay_scope="run",
+        inner_actor_optimizer_scope="run",
+        inner_critic_optimizer_scope="run",
+        inner_temperature_optimizer_scope="run",
+        inner_rebase_persistent=True,
+    )
+    model.agent.act(torch.zeros(3), t0=True, eval_mode=False)
+    model.agent.prepare_training_resume_boundary()
+    before = _clone_tree(model.agent.inner_engine.training_state_dict())
+    metrics_before = _clone_tree(model.agent.last_inner_metrics)
+    lengths_before = list(model.agent.last_inner_rollout_lengths)
+    model._eval_episodes = 2
+    model._record_evaluation = lambda step, reward: None
+    obs, _ = model.env.reset(seed=13)
+
+    model._evaluate_policy(5, initial_obs=obs)
+
+    _assert_tree_equal(model.agent.inner_engine.training_state_dict(), before)
+    _assert_tree_equal(model.agent.last_inner_metrics, metrics_before)
+    assert model.agent.last_inner_rollout_lengths == lengths_before
+    assert model.agent._resume_boundary_prepared is True
+
+
 def _clone_tree(value):
     if torch.is_tensor(value):
         return value.detach().clone()
@@ -89,6 +153,29 @@ def _clone_tree(value):
     if isinstance(value, tuple):
         return tuple(_clone_tree(item) for item in value)
     return deepcopy(value)
+
+
+def _optimizer_group_options(optimizer):
+    return _clone_tree(
+        [
+            {key: value for key, value in group.items() if key != "params"}
+            for group in optimizer.param_groups
+        ]
+    )
+
+
+def _set_foreign_optimizer_group_options(optimizer):
+    """Make checkpoint-only Adam options differ from receiving defaults."""
+
+    for group in optimizer.param_groups:
+        group.update(
+            weight_decay=0.25,
+            maximize=True,
+            foreach=False,
+            capturable=True,
+            differentiable=True,
+            fused=False,
+        )
 
 
 def _assert_tree_equal(actual, expected):
@@ -269,6 +356,104 @@ def test_checkpoint_preflight_rejects_q_architecture_mismatch(tmp_path):
         distributional.agent.load(checkpoint)
 
 
+def test_inner_policy_sampling_uses_its_mapping_and_bounds():
+    model = _model(
+        log_std_mapping="direct_clamp",
+        log_std_min=-20.0,
+        log_std_max=2.0,
+        inner_log_std_mapping="tdmpc2_tanh",
+        inner_log_std_min=-10.0,
+        inner_log_std_max=2.0,
+    )
+    with torch.no_grad():
+        for parameter in model.agent.model._pi.parameters():
+            parameter.zero_()
+    engine = model.agent.inner_engine
+    with engine.rng.fork("initialization"):
+        engine._prepare_workspace(t0=True)
+    latent = torch.zeros(2, model.cfg.latent_dim)
+    noise = torch.ones(2, model.cfg.action_dim)
+
+    action, _ = engine._policy_action(
+        latent,
+        engine.state.actor,
+        mode="policy_sample",
+        generator=None,
+        noise=noise,
+    )
+
+    expected = torch.tanh(torch.full_like(action, float(torch.exp(torch.tensor(-4.0)))))
+    torch.testing.assert_close(action, expected, rtol=0, atol=1e-7)
+
+
+def test_none_operator_executes_outer_policy_with_outer_log_std_mapping(monkeypatch):
+    model = _model(
+        inner_operator="none",
+        inner_model_step_budget=0,
+        inner_rounds=0,
+        inner_critic_updates_per_action=0,
+        inner_actor_updates_per_action=0,
+        inner_temperature_updates_per_action=0,
+        log_std_mapping="direct_clamp",
+        inner_log_std_mapping="tdmpc2_tanh",
+    )
+    engine = model.agent.inner_engine
+    inner_bounds = []
+    original = engine._policy_action
+
+    def tracked_policy_action(*args, **kwargs):
+        inner_bounds.append(kwargs.get("inner_bounds"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "_policy_action", tracked_policy_action)
+    model.agent.act(torch.zeros(3), t0=True, eval_mode=False)
+
+    assert inner_bounds == [False]
+
+
+def test_diagnostics_keep_outer_and_inner_log_std_semantics_separate(monkeypatch):
+    model = _model(
+        inner_diagnostic_rollouts=1,
+        log_std_mapping="direct_clamp",
+        log_std_min=-20.0,
+        log_std_max=2.0,
+        inner_log_std_mapping="tdmpc2_tanh",
+        inner_log_std_min=-10.0,
+        inner_log_std_max=2.0,
+    )
+    engine = model.agent.inner_engine
+    with engine.rng.fork("initialization"):
+        engine._prepare_workspace(t0=True)
+    calls = []
+    original = model.agent.model.pi
+
+    def tracked_pi(z, *args, **kwargs):
+        calls.append(
+            (
+                kwargs.get("policy"),
+                kwargs.get("log_std_mapping"),
+                kwargs.get("log_std_min"),
+                kwargs.get("log_std_max"),
+            )
+        )
+        return original(z, *args, **kwargs)
+
+    monkeypatch.setattr(model.agent.model, "pi", tracked_pi)
+    engine._diagnostics(
+        torch.zeros(1, model.cfg.latent_dim),
+        engine.state.actor,
+    )
+
+    outer_calls = [call for call in calls if call[0] is model.agent.model._pi]
+    inner_calls = [call for call in calls if call[0] is engine.state.actor]
+    assert outer_calls
+    assert inner_calls
+    assert all(call[1:] == (None, None, None) for call in outer_calls)
+    assert all(
+        call[1:] == ("tdmpc2_tanh", -10.0, 2.0) for call in inner_calls
+    )
+
+
 def test_persistent_target_intervals_count_optimizer_steps_across_actions():
     model = _model(
         inner_rounds=1,
@@ -438,6 +623,77 @@ def test_checkpoint_preflight_rejects_entropy_mode_before_mutation(tmp_path):
     _assert_tree_equal(fixed.agent.model.state_dict(), before)
 
 
+def test_checkpoint_policy_spec_records_and_rejects_mapping_mismatch():
+    source = _model(
+        log_std_mapping="direct_clamp",
+        log_std_min=-10.0,
+        log_std_max=2.0,
+    )
+    checkpoint = _clone_tree(source.agent.checkpoint_state())
+    assert checkpoint["policy_spec"] == {
+        "log_std_mapping": "direct_clamp",
+        "log_std_min": -10.0,
+        "log_std_max": 2.0,
+    }
+
+    incompatible = _model(
+        log_std_mapping="tdmpc2_tanh",
+        log_std_min=-10.0,
+        log_std_max=2.0,
+    )
+    incompatible.agent.num_updates = 7
+    incompatible.agent.outer_version = 7
+    before = _clone_tree(incompatible.agent.model.state_dict())
+    with pytest.raises(ValueError, match="policy specification"):
+        incompatible.agent.load(checkpoint)
+    _assert_tree_equal(incompatible.agent.model.state_dict(), before)
+    assert incompatible.agent.num_updates == 7
+    assert incompatible.agent.outer_version == 7
+
+
+@pytest.mark.parametrize(
+    ("actor_loss_scale_mode", "checkpoint_version"),
+    [("none", 3), ("tdmpc2_percentile_range", 4)],
+)
+def test_pre_mapping_policy_spec_preserves_direct_clamp_checkpoint_compatibility(
+    actor_loss_scale_mode, checkpoint_version
+):
+    source = _model(
+        log_std_mapping="direct_clamp",
+        sac_actor_loss_scale_mode=actor_loss_scale_mode,
+    )
+    checkpoint = _clone_tree(source.agent.checkpoint_state())
+    assert checkpoint["checkpoint_version"] == checkpoint_version
+    checkpoint["policy_spec"].pop("log_std_mapping")
+
+    restored = _model(
+        log_std_mapping="direct_clamp",
+        sac_actor_loss_scale_mode=actor_loss_scale_mode,
+    )
+    restored.agent.load(checkpoint)
+    _assert_tree_equal(
+        restored.agent.model.state_dict(), source.agent.model.state_dict()
+    )
+
+    incompatible = _model(
+        log_std_mapping="tdmpc2_tanh",
+        sac_actor_loss_scale_mode=actor_loss_scale_mode,
+    )
+    with pytest.raises(ValueError, match="policy specification"):
+        incompatible.agent.load(checkpoint)
+
+    exact = _clone_tree(source.agent.training_state_dict())
+    exact["outer"]["policy_spec"].pop("log_std_mapping")
+    exact_restored = _model(
+        log_std_mapping="direct_clamp",
+        sac_actor_loss_scale_mode=actor_loss_scale_mode,
+    )
+    exact_restored.agent.load_training_state_dict(exact)
+    _assert_tree_equal(
+        exact_restored.agent.model.state_dict(), source.agent.model.state_dict()
+    )
+
+
 @pytest.mark.parametrize(
     ("representation", "num_q"),
     [("scalar", 2), ("distributional", 5)],
@@ -472,6 +728,65 @@ def test_native_checkpoint_roundtrips_all_outer_training_state(
     assert restored.agent.num_updates == source.agent.num_updates
     assert restored.agent.outer_version == source.agent.outer_version
     assert restored.agent.inner_engine.state.outer_version == -1
+
+
+def test_portable_checkpoint_keeps_receiving_optimizer_hyperparameters():
+    source = _model(
+        lr=2e-3,
+        enc_lr_scale=0.2,
+        critic_lr=3e-3,
+        actor_lr=4e-3,
+        ent_coef_lr=5e-3,
+        adam_eps=2e-8,
+        actor_adam_eps=2e-5,
+    )
+    obs = torch.randn(source.cfg.train_unroll_horizon + 1, source.cfg.batch_size, 3)
+    actions = torch.randn(
+        source.cfg.train_unroll_horizon, source.cfg.batch_size, 1
+    ).tanh()
+    rewards = torch.randn(source.cfg.train_unroll_horizon, source.cfg.batch_size, 1)
+    source.agent._update(obs, actions, rewards, torch.zeros_like(rewards))
+
+    restored = _model(
+        lr=6e-3,
+        enc_lr_scale=0.4,
+        critic_lr=7e-3,
+        actor_lr=8e-3,
+        ent_coef_lr=9e-3,
+        adam_eps=3e-8,
+        actor_adam_eps=3e-5,
+    )
+    optimizers = (
+        (source.agent.optim, restored.agent.optim),
+        (source.agent.pi_optim, restored.agent.pi_optim),
+        (source.agent.ent_coef_optim, restored.agent.ent_coef_optim),
+    )
+    for saved, _ in optimizers:
+        _set_foreign_optimizer_group_options(saved)
+    configured_options = [
+        _optimizer_group_options(target) for _, target in optimizers
+    ]
+
+    restored.agent.load(source.agent.checkpoint_state())
+
+    for (saved, target), expected_options in zip(optimizers, configured_options):
+        _assert_tree_equal(_optimizer_group_options(target), expected_options)
+        assert target.state_dict()["state"]
+        _assert_tree_equal(target.state_dict()["state"], saved.state_dict()["state"])
+
+
+def test_portable_checkpoint_keeps_receiving_fixed_entropy_coefficient():
+    source = _model(ent_coef=0.2)
+    restored = _model(ent_coef=0.7)
+
+    restored.agent.load(source.agent.checkpoint_state())
+
+    torch.testing.assert_close(
+        restored.agent.fixed_ent_coef,
+        torch.tensor(0.7, device=restored.agent.device),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_legacy_scalar_checkpoint_and_vectorized_distributional_model_import():
@@ -529,6 +844,31 @@ def test_unknown_checkpoint_version_fails_without_partial_mutation():
     with pytest.raises(ValueError, match="Unsupported"):
         model.agent.load(invalid)
     _assert_tree_equal(model.agent.model.state_dict(), before)
+
+
+def test_portable_checkpoint_optimizer_preflight_prevents_partial_mutation():
+    source = _model()
+    obs = torch.randn(source.cfg.train_unroll_horizon + 1, source.cfg.batch_size, 3)
+    actions = torch.randn(
+        source.cfg.train_unroll_horizon, source.cfg.batch_size, 1
+    ).tanh()
+    rewards = torch.randn(source.cfg.train_unroll_horizon, source.cfg.batch_size, 1)
+    source.agent._update(obs, actions, rewards, torch.zeros_like(rewards))
+    invalid = _clone_tree(source.agent.checkpoint_state())
+    first_state = next(iter(invalid["optim"]["state"].values()))
+    first_state["exp_avg"] = torch.zeros(999)
+
+    target = _model()
+    before_model = _clone_tree(target.agent.model.state_dict())
+    before_optimizer = _clone_tree(target.agent.optim.state_dict())
+    before_counters = (target.agent.num_updates, target.agent.outer_version)
+
+    with pytest.raises(ValueError, match="exp_avg"):
+        target.agent.load(invalid)
+
+    _assert_tree_equal(target.agent.model.state_dict(), before_model)
+    _assert_tree_equal(target.agent.optim.state_dict(), before_optimizer)
+    assert (target.agent.num_updates, target.agent.outer_version) == before_counters
 
 
 def test_version_three_checkpoint_records_observation_contract():

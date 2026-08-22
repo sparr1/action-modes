@@ -36,6 +36,7 @@ from utils.checkpointing import (
     resolve_checkpoint_config,
     supports_composable_checkpointing,
 )
+from utils.cleanup import add_cleanup_notes, raise_cleanup_errors
 from utils.stats import handle_trial
 from utils.utils import datetime_stamp
 from log import TrainingLogger, AMBITrainingLogger
@@ -83,16 +84,137 @@ def _learn_resets_env_with_seed(alg_path):
 
 
 def _remove_saved_checkpoint(checkpoint_path):
-    """Remove one superseded cross-trial save and its matching sidecar only."""
+    """Remove superseded cross-trial artifacts and their matching sidecars."""
 
     if not checkpoint_path:
         return
-    checkpoint = Path(checkpoint_path)
-    for artifact in (checkpoint, Path(f"{checkpoint}.metadata.json")):
+    checkpoints = (
+        checkpoint_path
+        if isinstance(checkpoint_path, (list, tuple))
+        else (checkpoint_path,)
+    )
+    for checkpoint_path_item in checkpoints:
+        if not checkpoint_path_item:
+            continue
+        checkpoint = Path(checkpoint_path_item)
+        for artifact in (checkpoint, Path(f"{checkpoint}.metadata.json")):
+            try:
+                artifact.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _create_collision_safe_directory(base_path):
+    """Atomically reserve ``base_path`` or a numbered sibling."""
+
+    base = Path(base_path)
+    candidate = base
+    suffix = 1
+    while True:
         try:
-            artifact.unlink()
-        except FileNotFoundError:
-            pass
+            candidate.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            candidate = Path(f"{base}_{suffix}")
+            suffix += 1
+        else:
+            return os.path.join(os.fspath(candidate), "")
+
+
+def _is_plain_config_name(name):
+    """Whether ``name`` is a safe extension-free configuration basename."""
+
+    return (
+        isinstance(name, str)
+        and bool(name)
+        and name not in {".", ".."}
+        and "/" not in name
+        and "\\" not in name
+        and "\x00" not in name
+        and not name.lower().endswith(".json")
+    )
+
+
+def _experiment_name(config_path):
+    """Return a safe artifact-directory name for one experiment JSON file."""
+
+    filename = os.path.basename(os.fspath(config_path))
+    if not filename.endswith(".json"):
+        raise ValueError("--run must name a .json experiment configuration file.")
+    name = filename[:-5]
+    if not _is_plain_config_name(name):
+        raise ValueError(
+            "--run must have a non-empty, plain .json basename suitable for "
+            "an experiment artifact directory."
+        )
+    return name
+
+
+def _validate_overwrite_target(experiment_dir, log_root):
+    """Refuse recursive deletion unless the target is a safe direct child."""
+
+    target_path = Path(experiment_dir)
+    try:
+        root = Path(log_root).resolve()
+        target = target_path.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("Could not safely resolve the overwrite target.") from exc
+
+    repository_root = Path(__file__).resolve().parent
+    protected_targets = {
+        root,
+        Path(target.anchor),
+        Path.cwd().resolve(),
+        repository_root,
+        *repository_root.parents,
+    }
+    if (
+        target_path.is_symlink()
+        or target.parent != root
+        or target.parent == Path(target.anchor)
+        or target in protected_targets
+    ):
+        raise ValueError(
+            "Refusing to overwrite an unsafe experiment directory outside the "
+            "expected direct child of --log-dir."
+        )
+
+
+def _reject_duplicate_json_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite_json_constant(value):
+    raise ValueError(f"non-finite JSON number {value!r} is not allowed")
+
+
+def _parse_finite_json_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number {value!r} is not allowed")
+    return parsed
+
+
+def _load_config_json(path, description):
+    """Read finite, duplicate-free configuration JSON with path-rich errors."""
+
+    path = Path(path)
+    try:
+        with path.open(encoding="utf-8") as stream:
+            return json.load(
+                stream,
+                object_pairs_hook=_reject_duplicate_json_keys,
+                parse_constant=_reject_nonfinite_json_constant,
+                parse_float=_parse_finite_json_float,
+            )
+    except OSError as exc:
+        raise ValueError(f"Could not read {description} {path}: {exc}") from exc
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"Invalid {description} {path}: {exc}") from exc
 
 
 _RUNTIME_CONFIG_FIELDS = (
@@ -139,6 +261,7 @@ _RUNTIME_CONFIG_FIELDS = (
     "inner_replay_capacity",
     "inner_replay_sampling",
     "inner_replay_scope",
+    "inner_critic_dropout_enabled",
     "inner_model_step_budget",
     "inner_expected_update_slots",
 )
@@ -321,6 +444,7 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
         "inner_replay_capacity",
         "inner_replay_sampling",
         "inner_replay_scope",
+        "inner_critic_dropout_enabled",
         "inner_model_step_budget",
         "inner_expected_update_slots",
     )
@@ -540,6 +664,12 @@ def _run_resumable_experiment(
                     writer.shutdown()
                 except BaseException as exc:
                     cleanup_errors.append(exc)
+            close_model = getattr(model, "close", None)
+            if callable(close_model):
+                try:
+                    close_model()
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
         if domain is not None:
             try:
                 domain.close()
@@ -552,12 +682,9 @@ def _run_resumable_experiment(
                 cleanup_errors.append(exc)
         if cleanup_errors:
             if primary_error is not None:
-                add_note = getattr(primary_error, "add_note", None)
-                if callable(add_note):
-                    for cleanup_error in cleanup_errors:
-                        add_note(f"Additional cleanup failure: {cleanup_error}")
+                add_cleanup_notes(primary_error, cleanup_errors)
             else:
-                raise cleanup_errors[0]
+                raise_cleanup_errors(cleanup_errors)
 
 
 def main():
@@ -582,10 +709,33 @@ def main():
     print(args)
     config, alg_dir, log_dir, num_runs, alg_ind, trial_ind = args['run'], args['alg_dir'], args['log_dir'], args['num_runs'], args['alg_index'], args['trial_index']
 
+    if num_runs < -1:
+        raise ValueError("--num-runs must be -1 (unlimited) or non-negative.")
+    if alg_ind < 0:
+        raise ValueError("--alg-index must be non-negative.")
+    if trial_ind < 0:
+        raise ValueError("--trial-index must be non-negative.")
 
-    with open(config) as f:
-        experiment_params = json.load(f)
-        experiment_name = config.split('/')[-1][:-5] #cut out everything before the / and the extension .json
+
+    experiment_name = _experiment_name(config)
+    experiment_params = _load_config_json(config, "experiment configuration")
+    if not isinstance(experiment_params, dict):
+        raise ValueError("The experiment configuration must be a JSON object.")
+    configs = experiment_params.get("configs")
+    if (
+        not isinstance(configs, list)
+        or not configs
+        or any(not _is_plain_config_name(name) for name in configs)
+    ):
+        raise ValueError(
+            "Experiment 'configs' must be a non-empty list of plain basenames "
+            "without a .json extension."
+        )
+    if len(configs) != len(set(configs)):
+        raise ValueError("Experiment 'configs' must not contain duplicate names.")
+    trials = experiment_params.get("trials")
+    if isinstance(trials, bool) or not isinstance(trials, int) or trials <= 0:
+        raise ValueError("Experiment 'trials' must be a positive integer.")
     # print(experiment_params)
 
     #TODO: make a default configuration so I can cut all this code!
@@ -601,6 +751,10 @@ def main():
         save_trials_setting = experiment_params["save_trials"]
     else:
         save_trials_setting = "first"
+    if save_trials_setting not in (None, "none", "first", "all", "best"):
+        raise ValueError(
+            "unsupported save_trials setting; expected null, none, first, all, or best."
+        )
     if log_setting == "none" and save_trials_setting == "best":
         raise ValueError(
             "save_trials='best' requires trajectory logging so trials can be "
@@ -611,6 +765,8 @@ def main():
         log_info_setting = experiment_params["log_info"]
     else:
         log_info_setting = True #backwards compatibility
+    if not isinstance(log_info_setting, bool):
+        raise ValueError("Experiment 'log_info' must be a boolean.")
 
     if "log_type" in experiment_params:
         log_type_setting = experiment_params["log_type"]
@@ -621,24 +777,59 @@ def main():
             f"unsupported log_type {log_type_setting!r}; expected one of {SUPPORTED_LOG_TYPES}."
         )
 
-    num_algs = len(experiment_params["configs"])
+    num_algs = len(configs)
+    if alg_ind >= num_algs:
+        raise ValueError(
+            f"--alg-index {alg_ind} is out of range for {num_algs} algorithm config(s)."
+        )
+    if trial_ind >= trials:
+        raise ValueError(
+            f"--trial-index {trial_ind} is out of range for {trials} trial(s)."
+        )
     runtime_params = [dict() for _ in range(num_algs)]
+    overrides_alg = experiment_params.get("overrides_alg", {})
+    if not isinstance(overrides_alg, Mapping):
+        raise ValueError("Experiment 'overrides_alg' must be a JSON object.")
     print("Experiment testing")
-    for i, alg_config in enumerate(experiment_params["configs"]):
+    for i, alg_config in enumerate(configs):
         print("---------")
         print(alg_config)
         runtime_params[i]["name"] = alg_config
         print("verifying config exists and is proper:")
-        with open(os.path.join(alg_dir,alg_config+".json")) as f:
-            run_default_params = json.load(f)
-        runtime_params[i].update(run_default_params.copy())
+        algorithm_path = os.path.join(alg_dir, alg_config + ".json")
+        run_default_params = _load_config_json(
+            algorithm_path,
+            f"algorithm configuration {alg_config!r}",
+        )
+        if not isinstance(run_default_params, Mapping):
+            raise ValueError(
+                f"Algorithm configuration {alg_config!r} must be a JSON object."
+            )
+        runtime_params[i].update(dict(run_default_params))
         print("config found. Replacing settings based on experiment configs.")
-        for override_key, override_value in experiment_params.get("overrides_alg", {}).items():
+        for override_key, override_value in overrides_alg.items():
             if override_key in run_default_params:
                 print("setting of",override_key,"currently at",run_default_params[override_key], "overriden to", override_value,".")
             else:
                 print("override key of", override_key, "not found in run params, setting it to value", override_value, "anyway.")
             runtime_params[i][override_key] = override_value
+        total_steps = runtime_params[i].get("total_steps")
+        valid_total_steps = (
+            isinstance(total_steps, int)
+            and not isinstance(total_steps, bool)
+            and total_steps >= 0
+        ) or (
+            isinstance(total_steps, float)
+            and math.isfinite(total_steps)
+            and total_steps >= 0
+            and total_steps.is_integer()
+        )
+        if not valid_total_steps:
+            raise ValueError(
+                f"Algorithm configuration {alg_config!r} must resolve "
+                "'total_steps' to a finite, non-negative integer-valued number."
+            )
+        runtime_params[i]["total_steps"] = int(total_steps)
         print("full runtime alg configuration settings:")
         print(runtime_params[i])
         print("----------")
@@ -674,6 +865,9 @@ def main():
         raise ValueError("--drain-after-seconds requires exact resume mode.")
     if args["resume_wandb_mode"] is not None:
         raise ValueError("--resume-wandb-mode requires exact resume mode.")
+    if num_runs == 0:
+        print("completed running 0 trials!")
+        return
 
     # seed = experiment_params["seed"]
 
@@ -682,15 +876,20 @@ def main():
     if log_setting != "none":
         experiment_log_dir = os.path.join(log_dir, f'{experiment_name}', '')
         skip = False
+        experiment_dir_created = False
         if log_setting == "warn":
             if os.path.exists(experiment_log_dir):
                 print("WARNING: experiment has been run before. Check the files, and delete or change setting from \'warn\'.")
                 quit()
         elif log_setting == "overwrite":
             if(os.path.exists(experiment_log_dir)):
+                _validate_overwrite_target(experiment_log_dir, log_dir)
                 shutil.rmtree(experiment_log_dir) #delete the old experiment! be careful with this setting.
         elif log_setting =="timestamp":
-            experiment_log_dir=os.path.join(experiment_log_dir[:-1]+'_'+datetime_stamp(),"") #is there a way to do this with os path?
+            experiment_log_dir = _create_collision_safe_directory(
+                experiment_log_dir.rstrip(os.sep) + "_" + datetime_stamp()
+            )
+            experiment_dir_created = True
         elif log_setting == "overwrite-safe":
             print("this run started at", datetime_stamp())
             if os.path.exists(experiment_log_dir):
@@ -698,16 +897,27 @@ def main():
                 skip = True
 
         if not skip:
-            os.makedirs(experiment_log_dir, exist_ok=True)
+            if not experiment_dir_created:
+                os.makedirs(experiment_log_dir, exist_ok=True)
             with open(experiment_log_dir+"settings.json", "w") as f:
                 json.dump(experiment_params, f, indent=2) #put the experiment json params next to the data which resulted from a run with those parameters
         else:
             try:
-                with open(experiment_log_dir+"settings.json", "r") as f:
-                    existing_settings = json.load(f)
-                    print("Found existing settings:", existing_settings)
-            except (OSError, json.JSONDecodeError):
-                print("WARNING: experiment folder existed, but there was an issue reading the settings file. Proceeding with caution under the current settings.")
+                existing_settings = _load_config_json(
+                    os.path.join(experiment_log_dir, "settings.json"),
+                    "existing overwrite-safe settings",
+                )
+                print("Found existing settings:", existing_settings)
+            except ValueError as exc:
+                raise ValueError(
+                    "overwrite-safe found an existing experiment directory but could "
+                    "not verify its settings.json. Refusing to mix run provenance."
+                ) from exc
+            if existing_settings != experiment_params:
+                raise ValueError(
+                    "overwrite-safe found settings.json that differs from the current "
+                    "experiment configuration. Refusing to mix run provenance."
+                )
 
         if save_trials_setting not in (None, "none") or checkpointing_requested:
             model_save_dir = os.path.join(experiment_log_dir, "models", "")
@@ -716,19 +926,13 @@ def main():
         # ``logs: none`` disables trajectory logging, not requested model
         # artifacts. Use a collision-safe run folder so numbered checkpoints
         # and fixed aliases from earlier runs cannot be overwritten silently.
-        experiment_log_dir = os.path.join(
+        base_experiment_log_dir = os.path.join(
             log_dir,
             f"{experiment_name}_{datetime_stamp()}",
-            "",
         )
-        suffix = 1
-        base_experiment_log_dir = experiment_log_dir
-        while os.path.exists(experiment_log_dir):
-            experiment_log_dir = os.path.join(
-                f"{base_experiment_log_dir.rstrip(os.sep)}_{suffix}", ""
-            )
-            suffix += 1
-        os.makedirs(experiment_log_dir, exist_ok=False)
+        experiment_log_dir = _create_collision_safe_directory(
+            base_experiment_log_dir
+        )
         with open(os.path.join(experiment_log_dir, "settings.json"), "w") as f:
             json.dump(experiment_params, f, indent=2)
         model_save_dir = os.path.join(experiment_log_dir, "models", "")
@@ -746,11 +950,12 @@ def main():
             best_score = -math.inf
             best_trial_checkpoint = None
 
-        for t in range(trial_ind, experiment_params["trials"]):
+        first_trial = trial_ind if i == alg_ind else 0
+        for t in range(first_trial, experiment_params["trials"]):
             print()
             if ran_so_far == num_runs:
                 print("completed running", num_runs, "trials!")
-                quit()
+                return
 
             trial_run_params = copy.deepcopy(run_params)
             trial_seed = int(trial_run_params.get("seed", 0)) + t
@@ -761,44 +966,67 @@ def main():
             seed_everything(trial_seed)
 
             domain = build_env(trial_run_params, experiment_params)
+            model = None
+            try:
+                seed_env_spaces(domain, trial_seed)
+                # TD-MPC2 performs the same seeded reset at the start of learn().
+                # Avoid a discarded environment transition there while retaining
+                # the legacy reset semantics for algorithms that reset unseeded.
+                if not _learn_resets_env_with_seed(trial_run_params["alg"]):
+                    domain.reset(seed=trial_seed)
 
-            seed_env_spaces(domain, trial_seed)
-            # TD-MPC2 performs the same seeded reset at the start of learn().
-            # Avoid a discarded environment transition there while retaining
-            # the legacy reset semantics for algorithms that reset unseeded.
-            if not _learn_resets_env_with_seed(trial_run_params["alg"]):
-                domain.reset(seed=trial_seed)
-
-            model, baseline, alg_name = initialize_alg(trial_run_params["alg"], trial_run_params["alg_params"], domain, full_run_params=trial_run_params, experiment_params=experiment_params)
-            print(alg_name, "initialized.")
-            trial_run_params["resolved_runtime"] = _resolved_runtime_metadata(
-                model, trial_run_params=trial_run_params
-            )
-            print(
-                "Resolved runtime metadata:",
-                json.dumps(trial_run_params["resolved_runtime"], sort_keys=True),
-            )
-
-            if checkpoint_config.enabled:
-                if not supports_composable_checkpointing(model):
-                    domain.close()
-                    raise ValueError(
-                        f"Algorithm {trial_run_params['alg']!r} does not support "
-                        "checkpoint_every/save_strat. Supported algorithms are SB3 "
-                        "baselines, native SAC, TD-MPC2, and AMBI-TD-MPC2."
-                    )
-                model.set_checkpointing(
-                    save_freq=checkpoint_config.every,
-                    save_path=model_save_dir,
-                    name_prefix=f'model:{alg_config}_{t}',
-                    save_strat=checkpoint_config.strategies,
-                    checkpoint_best_window=checkpoint_config.best_window,
-                    trial_run_params=trial_run_params,
-                    experiment_params=experiment_params,
+                model, baseline, alg_name = initialize_alg(trial_run_params["alg"], trial_run_params["alg_params"], domain, full_run_params=trial_run_params, experiment_params=experiment_params)
+                print(alg_name, "initialized.")
+                trial_run_params["resolved_runtime"] = _resolved_runtime_metadata(
+                    model, trial_run_params=trial_run_params
                 )
+                print(
+                    "Resolved runtime metadata:",
+                    json.dumps(trial_run_params["resolved_runtime"], sort_keys=True),
+                )
+
+                if checkpoint_config.enabled:
+                    if not supports_composable_checkpointing(model):
+                        raise ValueError(
+                            f"Algorithm {trial_run_params['alg']!r} does not support "
+                            "checkpoint_every/save_strat. Supported algorithms are SB3 "
+                            "baselines, native SAC, TD-MPC2, and AMBI-TD-MPC2."
+                        )
+                    model.set_checkpointing(
+                        save_freq=checkpoint_config.every,
+                        save_path=model_save_dir,
+                        name_prefix=f'model:{alg_config}_{t}',
+                        save_strat=checkpoint_config.strategies,
+                        checkpoint_best_window=checkpoint_config.best_window,
+                        trial_run_params=trial_run_params,
+                        experiment_params=experiment_params,
+                    )
+            except BaseException as exc:
+                cleanup_errors = []
+                if model is not None:
+                    writer = getattr(model, "_checkpoint_writer", None)
+                    if writer is not None:
+                        try:
+                            writer.shutdown()
+                        except BaseException as cleanup_error:
+                            cleanup_errors.append(cleanup_error)
+                    close_model = getattr(model, "close", None)
+                    if callable(close_model):
+                        try:
+                            close_model()
+                        except BaseException as cleanup_error:
+                            cleanup_errors.append(cleanup_error)
+                try:
+                    domain.close()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                add_cleanup_notes(exc, cleanup_errors)
+                raise
 
             training_logger = None
             trial_log_dir = None
+            primary_error = None
+            cleanup_errors = []
             try:
                 if log_setting != "none":
                     trial_log_dir = experiment_log_dir + f'{alg_config}_{t}'
@@ -849,12 +1077,38 @@ def main():
 
                     with open(os.path.join(model_save_dir,"scores.txt"), "a") as f:
                         f.write(f'{alg_config}_{t}'+ ":" + str(score) + '\n')
+            except BaseException as exc:
+                primary_error = exc
+                raise
             finally:
                 if training_logger is not None:
-                    # Makes buffered CSV rows and queued detailed trajectories
-                    # durable on normal completion and training exceptions.
-                    training_logger.close()
-                domain.close()
+                    try:
+                        # Makes buffered CSV rows and queued detailed trajectories
+                        # durable on normal completion and training exceptions.
+                        training_logger.close()
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
+                writer = getattr(model, "_checkpoint_writer", None)
+                if writer is not None:
+                    try:
+                        writer.shutdown()
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
+                close_model = getattr(model, "close", None)
+                if callable(close_model):
+                    try:
+                        close_model()
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
+                try:
+                    domain.close()
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+                if cleanup_errors:
+                    if primary_error is not None:
+                        add_cleanup_notes(primary_error, cleanup_errors)
+                    else:
+                        raise_cleanup_errors(cleanup_errors)
             ran_so_far  += 1
 
             # print("training count", callback.training_count)

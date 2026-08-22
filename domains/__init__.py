@@ -13,7 +13,7 @@ register(id="VarLegsAnt-v0",
     entry_point="domains:AntVariableLegsEnv",
     max_episode_steps=1000,
     order_enforce=True,
-    kwargs={"exclude_current_positions_from_observation":False,"num_legs":8, "contact_cost_weight":.0, "render_mode":"human"}
+    kwargs={"exclude_current_positions_from_observation":False,"num_legs":8, "contact_cost_weight":.0, "render_mode":None}
     )
 
 if AntLegAdaptationEnv is not None:

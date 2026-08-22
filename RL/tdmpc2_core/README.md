@@ -61,6 +61,17 @@ including a learned action-local entropy temperature initialized from the
 current outer temperature at each root, and retains a matched MPPI inner
 operator for comparison.
 
+AMBI's actor log-standard-deviation transform is configurable independently of
+its bounds. `log_std_mapping="direct_clamp"` preserves the SAC-style default by
+clamping the actor head directly to `log_std_min`/`log_std_max` (default
+`[-20, 2]`). `log_std_mapping="tdmpc2_tanh"` uses TD-MPC2's smooth transform,
+`low + 0.5 * (high - low) * (tanh(raw) + 1)`. Exact upstream mapping and bounds
+are selected with `log_std_mapping="tdmpc2_tanh"`, `log_std_min=-10`, and
+`log_std_max=2`. The mapping never changes the bounds implicitly. The inner
+actor inherits these settings when `inner_log_std_mapping`,
+`inner_log_std_min`, and `inner_log_std_max` are `null`; each can be overridden
+independently for an ablation.
+
 Policy optimization and critic evaluation can be ablated independently.
 `outer_critic_target` and `inner_sac_critic_target` each accept
 `"entropy_augmented"` (the default, which bootstraps with
@@ -79,6 +90,15 @@ the inner critic and temperature update counts to zero while retaining actor
 updates. This combination is also available as
 `adapted_components/actor_only` in
 `configs/research/ambi_inner_decoupling.json`.
+
+Inner-critic dropout is independently switchable with
+`inner_critic_dropout_enabled`. Its default is `true`, preserving TD-MPC2's
+configured critic dropout during trainable inner critic and actor-Q updates.
+Set it to `false` for dropout-free, deterministic per-head forwards while
+leaving outer critic training unchanged. Ensemble-pair selection and SAC action
+sampling remain stochastic. The switch disables all dropout in the adapted
+critic, including a nonzero `inner_critic_lora_dropout`; target critics remain
+in eval mode in either setting.
 
 AMBI can optionally use TD-MPC2's running P95-P5 actor-value scale through
 `sac_actor_loss_scale_mode="tdmpc2_percentile_range"` (the default is

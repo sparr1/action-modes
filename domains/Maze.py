@@ -1,6 +1,7 @@
 import numpy as np
 import random as rnd
 import math
+from numbers import Real
 
 from modes.tasks import Task
 from modes.classifier import SupportClassifier
@@ -25,6 +26,46 @@ class Move(Task):
                  direction = "X", 
                  metric = "L1"):
         super().__init__()
+        for name, value in (
+            ("desired_velocity_minimum", desired_velocity_minimum),
+            ("desired_velocity_maximum", desired_velocity_maximum),
+        ):
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise ValueError(f"Move {name} must be a real number.")
+        if not math.isfinite(desired_velocity_minimum):
+            raise ValueError("Move desired_velocity_minimum must be finite.")
+        if math.isnan(desired_velocity_maximum) or desired_velocity_maximum == -math.inf:
+            raise ValueError(
+                "Move desired_velocity_maximum must be finite or positive infinity."
+            )
+        if desired_velocity_minimum > desired_velocity_maximum:
+            raise ValueError(
+                "Move desired_velocity_minimum cannot exceed "
+                "desired_velocity_maximum."
+            )
+        if (
+            isinstance(adaptive_margin_minimum, bool)
+            or not isinstance(adaptive_margin_minimum, Real)
+            or not math.isfinite(adaptive_margin_minimum)
+            or adaptive_margin_minimum <= 0
+        ):
+            raise ValueError("Move adaptive_margin_minimum must be finite and positive.")
+        if not isinstance(metric, str) or metric not in {"L1", "L2", "huber"}:
+            raise ValueError("Move metric must be one of 'L1', 'L2', or 'huber'.")
+        if not isinstance(direction, str) or direction not in {
+            "X", "Y", "Z", "XR", "YR", "ZR", "F"
+        }:
+            raise ValueError(
+                "Move direction must be one of X, Y, Z, XR, YR, ZR, or F."
+            )
+        if metric == "huber" and (
+            isinstance(margin, bool)
+            or not isinstance(margin, Real)
+            or not math.isfinite(margin)
+            or margin <= 0
+        ):
+            raise ValueError("Move huber margin must be finite and positive.")
+
         self.desired_velocity_minimum = desired_velocity_minimum #TODO refactor to range so as to have consistent API
         self.desired_velocity_maximum = desired_velocity_maximum
         #If you would like to avoid randomly sampling, just set minimum = maximum
@@ -76,9 +117,6 @@ class Move(Task):
             self.starting_weights[directions.index(direction)] = 1.0
         elif direction == 'F':
             pass
-        else:
-            direction = self.direction #better be a (6,) array!
-
         print(self.direction)
         print(self.starting_weights)
 
@@ -98,6 +136,11 @@ class Move(Task):
         
     def contact_cost(self, contact_forces):
         if self.cnt_cost:
+            if contact_forces is None:
+                raise RuntimeError(
+                    "Move contact_cost requires the environment to expose "
+                    "contact_forces."
+                )
             return .05*np.sqrt(np.sum(np.square(contact_forces)))
         else:
             return 0.0
@@ -177,7 +220,15 @@ class Move(Task):
         return self.desired_velocity
     
     def set_goal(self, new_goal):
-        self.desired_velocity = new_goal
+        try:
+            goal = np.asarray(new_goal, dtype=np.float64)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Move goal must be one finite scalar.") from exc
+        if goal.shape == (1,):
+            goal = goal[0]
+        if goal.shape != () or not np.isfinite(goal):
+            raise ValueError("Move goal must be one finite scalar.")
+        self.desired_velocity = float(goal)
     
     
     def set_task_info(self, task_info):
@@ -191,7 +242,11 @@ class Move(Task):
     def reset(self, seed = None):
         if seed is not None:
             rnd.seed(seed)
-        if self.desired_velocity_maximum == self.desired_velocity_minimum:
+        if self.maximize:
+            # The maximize reward ignores the target velocity, but downstream
+            # goal/diagnostic calculations still require a finite scalar.
+            self.desired_velocity = float(self.desired_velocity_minimum)
+        elif self.desired_velocity_maximum == self.desired_velocity_minimum:
             self.desired_velocity = self.desired_velocity_minimum
         else:
             if self.categorical:
@@ -236,6 +291,40 @@ class Change(Task):
                 target_coords = "X",
                 metric = "L1"):
         super().__init__()
+        for name, value in (
+            ("desired_coord_minimum", desired_coord_minimum),
+            ("desired_coord_maximum", desired_coord_maximum),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(value)
+            ):
+                raise ValueError(f"Change {name} must be a finite real number.")
+        if desired_coord_minimum > desired_coord_maximum:
+            raise ValueError(
+                "Change desired_coord_minimum cannot exceed desired_coord_maximum."
+            )
+        if not isinstance(metric, str) or metric not in {"L1", "L2", "huber"}:
+            raise ValueError("Change metric must be one of 'L1', 'L2', or 'huber'.")
+        if (
+            not isinstance(target_coords, str)
+            or not target_coords
+            or any(coord not in "XYZ" for coord in target_coords)
+            or len(set(target_coords)) != len(target_coords)
+        ):
+            raise ValueError(
+                "Change target_coords must be a non-empty, duplicate-free "
+                "selection from X, Y, and Z."
+            )
+        if metric == "huber" and (
+            isinstance(margin, bool)
+            or not isinstance(margin, Real)
+            or not math.isfinite(margin)
+            or margin <= 0
+        ):
+            raise ValueError("Change huber margin must be finite and positive.")
+
         self.include_xy = True
         self.desired_coord_minimum = desired_coord_minimum #TODO refactor to range so as to have consistent API
         self.desired_coord_maximum = desired_coord_maximum
@@ -283,6 +372,11 @@ class Change(Task):
         
     def contact_cost(self, contact_forces):
         if self.cnt_cost:
+            if contact_forces is None:
+                raise RuntimeError(
+                    "Change contact_cost requires the environment to expose "
+                    "contact_forces."
+                )
             return .05*np.sqrt(np.sum(np.square(contact_forces)))
         else:
             return 0.0
@@ -350,7 +444,19 @@ class Change(Task):
         return self.desired_coords
     
     def set_goal(self, new_goal):
-        self.desired_coords = new_goal
+        try:
+            goal = np.asarray(new_goal, dtype=np.float64)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"Change goal must contain {self.num_target_coords} finite values."
+            ) from exc
+        if goal.shape == () and self.num_target_coords == 1:
+            goal = goal.reshape(1)
+        if goal.shape != (self.num_target_coords,) or not np.isfinite(goal).all():
+            raise ValueError(
+                f"Change goal must contain {self.num_target_coords} finite values."
+            )
+        self.desired_coords = goal.tolist()
     
     
     def set_task_info(self, task_info):

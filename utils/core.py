@@ -18,11 +18,23 @@ def _validate_wrapper_config(wrapper, location):
     wrapper_name = wrapper.get("name")
     if not isinstance(wrapper_name, str) or not wrapper_name:
         raise ValueError(f"{location} must define a non-empty string 'name'.")
-    if wrapper_name.split(":")[-1] not in SUPPORTED_WRAPPERS:
+    short_name = wrapper_name.split(":")[-1]
+    if short_name not in SUPPORTED_WRAPPERS:
         raise ValueError(
             f"Unsupported wrapper {wrapper_name!r} in {location}; "
             f"expected one of {SUPPORTED_WRAPPERS}."
         )
+    if short_name == "Subtask" and wrapper_name != "Subtask":
+        raise ValueError(
+            f"{location} must name the task-aware wrapper exactly 'Subtask'."
+        )
+    if wrapper_name not in {"Subtask", "AntPlane"}:
+        parts = wrapper_name.split(":")
+        if len(parts) != 2 or not all(parts):
+            raise ValueError(
+                f"{location} wrapper {wrapper_name!r} must use the fully "
+                "qualified 'module:ClassName' form."
+            )
 
     if "wrapper_params" not in wrapper:
         raise ValueError(f"{location} must define 'wrapper_params'.")
@@ -64,13 +76,20 @@ def build_env(run_params, experiment_params, *, render_mode=_RENDER_MODE_UNSET):
                 run_params["env_wrapper"], "env_wrapper"
             )
             domain = setup_wrapper(domain, wrapper_name, wrapper_params)
-    except BaseException:
+    except BaseException as exc:
         try:
             domain.close()
-        except Exception:
+        except BaseException as cleanup_error:
             # Preserve the wrapper construction/validation failure as the
             # actionable error even if cleanup itself also fails.
-            pass
+            note = f"Additional environment cleanup failure: {cleanup_error}"
+            add_note = getattr(exc, "add_note", None)
+            if callable(add_note):
+                add_note(note)
+            else:
+                notes = list(getattr(exc, "__notes__", ()))
+                notes.append(note)
+                exc.__notes__ = notes
         raise
 
     return domain
@@ -144,8 +163,12 @@ def setup_wrapper(domain, wrapper_name, wrapper_params):
             module = importlib.import_module(module_name)
             task_class = getattr(module,task_name) #grab the specific task
             p = wrapper_params["task_params"]
-            task = task_class(**p)  
-            domain = Subtask(domain, task) #replace the reward function and termination conditions based on task, then return the new wrapped domain.
+            task = task_class(**p)
+            domain = Subtask(
+                domain,
+                task,
+                task_info=wrapper_params.get("task_info"),
+            ) #replace the reward function and termination conditions based on task, then return the new wrapped domain.
         except (ModuleNotFoundError, AttributeError) as e:
             raise ValueError(f"Could not find model class '{task_name}' in module '{module_name}': {e}")
     elif wrapper_name == 'AntPlane':

@@ -17,7 +17,7 @@ try:
 except ImportError:  # tensordict<newer API compatibility
     from tensordict.tensordict import TensorDict
 
-from RL.alg import Algorithm
+from RL.alg import Algorithm, validate_timestep_budget
 from RL.tdmpc2_core import MODEL_SIZE
 from RL.tdmpc2_core.agent import TDMPC2
 from RL.tdmpc2_core.common.buffer import Buffer
@@ -28,6 +28,7 @@ from utils.checkpointing import (
     CheckpointTracker,
     explicit_checkpoint_target,
 )
+from utils.cleanup import add_cleanup_notes, raise_cleanup_errors
 from utils.utils import setup_logs
 from utils.wandb_utils import (
     WandbAccumulator,
@@ -759,6 +760,11 @@ class TDMPC2Baseline(Algorithm):
         if not np.all(np.isfinite(self._action_low)) or not np.all(np.isfinite(self._action_high)):
             raise ValueError("TD-MPC2Baseline requires finite action-space bounds.")
         self._action_delta = self._action_high - self._action_low
+        if np.any(self._action_delta <= 0.0):
+            raise ValueError(
+                "TD-MPC2Baseline requires every action dimension to have "
+                "strictly increasing bounds."
+            )
         self._identity_action_scale = bool(
             np.array_equal(self._action_low, -np.ones_like(self._action_low))
             and np.array_equal(self._action_high, np.ones_like(self._action_high))
@@ -1369,7 +1375,7 @@ class TDMPC2Baseline(Algorithm):
 
         from utils.resume_runtime import validate_environment_capability
 
-        total_timesteps = int(total_timesteps)
+        total_timesteps = validate_timestep_budget(total_timesteps)
         if self.cfg.obs != "state":
             raise NotImplementedError("Exact TD-MPC2 resume supports state observations only.")
         if total_timesteps != int(self.cfg.steps):
@@ -2099,21 +2105,21 @@ class TDMPC2Baseline(Algorithm):
             try:
                 self._checkpoint_writer.shutdown()
             except BaseException as cleanup_error:
-                add_note = getattr(primary_error, "add_note", None)
-                if callable(add_note):
-                    add_note(
+                add_cleanup_notes(
+                    primary_error,
+                    (cleanup_error,),
+                    prefix=(
                         "Additional model-snapshot cleanup failure after segmented "
-                        f"training stopped: {cleanup_error}"
-                    )
+                        "training stopped"
+                    ),
+                )
             raise
         finally:
             if not failed:
                 self._checkpoint_writer.shutdown()
 
     def learn(self, total_timesteps=10000, *, resume_session=None):
-        total_timesteps = int(float(total_timesteps))
-        if total_timesteps < 0:
-            raise ValueError("total_timesteps must be non-negative.")
+        total_timesteps = validate_timestep_budget(total_timesteps)
         if resume_session is not None:
             return self._learn_resumable(total_timesteps, resume_session)
         if total_timesteps != int(self.cfg.steps):
@@ -2127,9 +2133,11 @@ class TDMPC2Baseline(Algorithm):
         self.cfg.steps = total_timesteps
         if self._wandb_run is None:
             self._wandb_run = self._init_wandb()
-        self._reset_wandb_window()
 
+        primary_error = None
+        cleanup_errors = []
         try:
+            self._reset_wandb_window()
             obs, _ = self._reset_env(seed=self.cfg.seed)
             if self._eval_freq is not None:
                 self._prepare_eval_csv()
@@ -2157,9 +2165,12 @@ class TDMPC2Baseline(Algorithm):
                 obs, _ = self._reset_env()
             self._final_checkpoint()
             return self
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            try:
-                if self._wandb_run is not None:
+            if self._wandb_run is not None:
+                try:
                     self._log_wandb_step(
                         self._last_reward,
                         self._last_terminated,
@@ -2167,17 +2178,35 @@ class TDMPC2Baseline(Algorithm):
                         self._last_info,
                         force=True,
                     )
-                    finish_wandb(self._wandb_run)
-                    self._wandb_run = None
-            finally:
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
                 try:
-                    if self.alg_logger is not None and hasattr(self.alg_logger, "flush"):
-                        self.alg_logger.flush()
+                    finish_wandb(self._wandb_run)
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
                 finally:
-                    # Periodic snapshots are exact at enqueue time, but an
-                    # exception or normal shutdown must still make the queued
-                    # atomic replacement durable before control returns.
-                    self._checkpoint_writer.shutdown()
+                    self._wandb_run = None
+            if self.alg_logger is not None and hasattr(self.alg_logger, "flush"):
+                try:
+                    self.alg_logger.flush()
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            # Periodic snapshots are exact at enqueue time, but an exception
+            # or normal shutdown must still make the queued atomic replacement
+            # durable before control returns.
+            try:
+                self._checkpoint_writer.shutdown()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            if cleanup_errors:
+                if primary_error is not None:
+                    add_cleanup_notes(
+                        primary_error,
+                        cleanup_errors,
+                        prefix="Additional learner cleanup failure",
+                    )
+                else:
+                    raise_cleanup_errors(cleanup_errors)
 
     def predict(self, observation, deterministic=True, episode_start=None):
         t0 = self._predict_t0 if episode_start is None else bool(episode_start)

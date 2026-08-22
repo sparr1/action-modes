@@ -1,4 +1,5 @@
 import copy
+from numbers import Integral
 import os
 import shutil
 import tempfile
@@ -39,6 +40,14 @@ class AntVariableLegsEnv(MujocoEnv, utils.EzPickle):
         num_legs=4,
         **kwargs
     ):
+        if (
+            isinstance(num_legs, bool)
+            or not isinstance(num_legs, Integral)
+            or num_legs <= 0
+        ):
+            raise ValueError("AntVariableLegsEnv num_legs must be a positive integer.")
+        num_legs = int(num_legs)
+
         utils.EzPickle.__init__(
             self,
             xml_file,
@@ -113,7 +122,7 @@ class AntVariableLegsEnv(MujocoEnv, utils.EzPickle):
                 default_camera_config=DEFAULT_CAMERA_CONFIG,
                 **kwargs
             )
-        except Exception:
+        except BaseException:
             self._xml_workspace.cleanup()
             self._xml_workspace = None
             raise
@@ -278,13 +287,16 @@ class AntVariableLegsEnv(MujocoEnv, utils.EzPickle):
 
         rewards = forward_reward + healthy_reward
 
-        costs = ctrl_cost = self.control_cost(action)
+        ctrl_cost = self.control_cost(action)
+        contact_cost = self.contact_cost(self.data.cfrc_ext)
+        costs = ctrl_cost + contact_cost
 
         terminated = self.terminated
         observation = self._get_obs()
         info = {
             "reward_forward": forward_reward,
             "reward_ctrl": -ctrl_cost,
+            "reward_contact": -contact_cost,
             "reward_survive": healthy_reward,
             "x_position": xy_position_after[0],
             "y_position": xy_position_after[1],

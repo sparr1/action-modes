@@ -1,6 +1,6 @@
 import gymnasium as gym
 import numpy as np
-from RL.alg import Algorithm
+from RL.alg import Algorithm, validate_timestep_budget
 from modes.controller import OrchestralController, ModalController
 import os, time, math
 import random
@@ -17,6 +17,13 @@ from utils.utils import setup_logs
 class ModalAlg(Algorithm):
     def __init__(self, name, env, orchestrator_config, mode_configs, num_modes):
         super().__init__(name, env)
+        if num_modes <= 0:
+            raise ValueError("ModalAlg requires at least one mode.")
+        if num_modes != len(mode_configs):
+            raise ValueError(
+                "num_modes must match the number of mode_configs: "
+                f"num_modes={num_modes}, mode_configs={len(mode_configs)}."
+            )
         mode_action_spaces = [gym.spaces.Box(low=-1.0, high=1.0, shape = (1,), dtype=np.float32) for i in range(num_modes)]
         orchestrator_action_space =  gym.spaces.Tuple([gym.spaces.Discrete(num_modes), gym.spaces.Tuple(mode_action_spaces)])
 
@@ -64,9 +71,9 @@ class ModalAlg(Algorithm):
 
     def learn(self, **kwargs): #for now, this is just learning the orchestrator given pretrained controllers
         if "total_timesteps" in kwargs:
-            total_timesteps = kwargs["total_timesteps"]
+            total_timesteps = validate_timestep_budget(kwargs["total_timesteps"])
         else:
-            total_timesteps = -1
+            raise ValueError("ModalAlg.learn requires total_timesteps.")
         reset_options = {}
         if "run_params" in kwargs:
             run_params = kwargs["run_params"]
@@ -96,7 +103,11 @@ class ModalAlg(Algorithm):
         #     vidir = os.path.join(save_dir, "frames")
         #     os.makedirs(vidir, exist_ok=True)
 
-        max_steps = 10000 #TODO this needs to be bigger than environment max steps
+        max_steps = validate_timestep_budget(
+            custom_params.get("max_steps", 10000), name="ModalAlg max_steps"
+        )
+        if max_steps == 0:
+            raise ValueError("ModalAlg max_steps must be positive.")
         total_reward = 0.
         returns = []
         start_time = time.time()
@@ -111,7 +122,6 @@ class ModalAlg(Algorithm):
 
         sticky_orch_value = 5
 
-        ret, info = env.reset(options = reset_options)
         while t_so_far < total_timesteps:
             # if save_freq > 0 and save_dir and i % save_freq == 0:
             #     self.orchestrator.model.save_models(os.path.join(save_dir, str(i)))
@@ -144,7 +154,8 @@ class ModalAlg(Algorithm):
             agent.start_episode()
 
             for j in range(max_steps):
-                t_so_far+=1
+                if t_so_far >= total_timesteps:
+                    break
                 
                 env_ret = env.step(base_action) #which comes from the controllers now
                 # if(len(ret)==5):
@@ -152,11 +163,25 @@ class ModalAlg(Algorithm):
                 # elif(len(ret)==4):
                 #     (next_state, steps), reward, terminal, _ = ret
                 next_raw_state, reward, terminal, truncated, info = env_ret
+                terminal = bool(terminal)
+                truncated = bool(truncated)
+                if not terminal and j + 1 >= max_steps:
+                    truncated = True
+                info = dict(info or {})
+                info["terminated"] = terminal
+                info["truncated"] = truncated
+                info["TimeLimit.truncated"] = truncated and not terminal
+                done = bool(terminal or truncated)
+                t_so_far += 1
 
                 # (next_state, steps), reward, terminal, _, _ = ret
                 # next_state = np.array(next_state, dtype=np.float32, copy=False)
                 # next_state = np.asarray(state, dtype = np.float32)
-                next_predict_ret = self.predict(next_raw_state, j%sticky_orch_value, old_orch_act)
+                next_predict_ret = self.predict(
+                    next_raw_state,
+                    (j + 1) % sticky_orch_value,
+                    old_orch_act,
+                )
                 # act, act_param, all_action_parameters = agent.act(state)
                 # act_param =  all_action_parameters[act]
 
@@ -174,22 +199,22 @@ class ModalAlg(Algorithm):
                 # next_action = self.pad_action(next_act, next_act_param)
 
                 agent.step(state, (act, all_action_parameters), reward, next_state,
-                        (next_act, next_all_action_parameters), terminal, 1)
+                        (next_act, next_all_action_parameters), done, 1)
+
+                episode_reward += reward
+                # if visualise and i % render_freq == 0:
+                #     env.render()
+                if self.alg_logger:
+                    data = setup_logs(reward, next_state, [act, act_param], [terminal, truncated], [info,])
+                    # print(data)
+                    self.alg_logger.on_step(data)
                 act, act_param, all_action_parameters = next_act, next_act_param, next_all_action_parameters
                 # action = next_action
                 base_action = next_base_action
                 # print(base_action)
                 raw_state = next_raw_state
                 state = next_state
-
-                episode_reward += reward
-                # if visualise and i % render_freq == 0:
-                #     env.render()
-                if self.alg_logger:
-                    data = setup_logs(reward, state, [act, act_param], [terminal, truncated], [info,])
-                    # print(data)
-                    self.alg_logger.on_step(data)
-                if terminal or truncated:
+                if done:
                     break
             i+=1
             agent.end_episode()
@@ -200,19 +225,20 @@ class ModalAlg(Algorithm):
             returns.append(episode_reward)
             total_reward += episode_reward
             if i % 100 == 0:
-                print('{0:5s} R:{1:.4f} r100:{2:.4f}'.format(str(t_so_far), total_reward / (i + 1), np.array(returns[-100:]).mean()))
+                print('{0:5s} R:{1:.4f} r100:{2:.4f}'.format(str(t_so_far), total_reward / i, np.array(returns[-100:]).mean()))
             
         end_time = time.time()
         print("Took %.2f seconds" % (end_time - start_time))
-        env.close()
         # if save_freq > 0 and save_dir:
         #     agent.save_models(os.path.join(save_dir, str(i)))
 
         # returns = env.get_episode_rewards()
-        print("Ave. return =", sum(returns) / len(returns))
-        print("Ave. last 100 episode return =", sum(returns[-100:]) / 100.)
+        if returns:
+            print("Ave. return =", float(np.mean(returns)))
+            print("Ave. last 100 episode return =", float(np.mean(returns[-100:])))
 
         # np.save(os.path.join(dir, title + "{}".format(str(seed))),returns)
         # self.orchestrator.model.learn(**kwargs)
+        return self
     def save(self, path, name):
-        self.orchestrator.model.save(path, name)
+        return self.orchestrator.model.save(path, name)

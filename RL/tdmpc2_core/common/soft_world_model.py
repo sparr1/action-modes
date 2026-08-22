@@ -15,6 +15,24 @@ from . import init, layers, math
 from .q_representation import QRepresentation
 
 
+DEFAULT_LOG_STD_MAPPING = "direct_clamp"
+LOG_STD_MAPPINGS = frozenset({DEFAULT_LOG_STD_MAPPING, "tdmpc2_tanh"})
+
+
+def normalize_log_std_mapping(value, key="log_std_mapping"):
+    """Validate and canonicalize a policy log-standard-deviation mapping."""
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{key} must be one of {sorted(LOG_STD_MAPPINGS)}, got {value!r}."
+        )
+    value = value.lower()
+    if value not in LOG_STD_MAPPINGS:
+        raise ValueError(
+            f"{key} must be one of {sorted(LOG_STD_MAPPINGS)}, got {value!r}."
+        )
+    return value
+
+
 class SoftWorldModel(nn.Module):
     """Single-task TD-MPC2 world model with a squashed-Gaussian SAC actor."""
 
@@ -60,6 +78,9 @@ class SoftWorldModel(nn.Module):
 
         self._log_std_min_value = float(cfg.log_std_min)
         self._log_std_max_value = float(cfg.log_std_max)
+        self._log_std_mapping = normalize_log_std_mapping(
+            getattr(cfg, "log_std_mapping", DEFAULT_LOG_STD_MAPPING)
+        )
         self.register_buffer("log_std_min", torch.tensor(self._log_std_min_value))
         self.register_buffer(
             "log_std_dif",
@@ -196,6 +217,7 @@ class SoftWorldModel(nn.Module):
         std_scale=1.0,
         log_std_min=None,
         log_std_max=None,
+        log_std_mapping=None,
     ):
         """Return policy parameters and one isolated standard-normal sample."""
         if task is not None:
@@ -207,10 +229,6 @@ class SoftWorldModel(nn.Module):
             raise ValueError(f"std_scale must be positive, got {std_scale}.")
 
         mean_raw, log_std = policy(z).chunk(2, dim=-1)
-        # SAC/SB3 clamp the predicted log standard deviation directly. TD-MPC2's
-        # policy prior instead interpolates tanh(log_std) across its bounds; with
-        # SAC's [-20, 2] bounds that would initialize near log_std=-9 and almost
-        # eliminate exploration.
         lower_bound = (
             self._log_std_min_value
             if log_std_min is None
@@ -228,7 +246,19 @@ class SoftWorldModel(nn.Module):
                 "log_std_min must be smaller than log_std_max, "
                 f"got {lower_bound} >= {upper_bound}."
             )
-        log_std = torch.clamp(log_std, min=lower_bound, max=upper_bound)
+        mapping = (
+            self._log_std_mapping
+            if log_std_mapping is None
+            else normalize_log_std_mapping(log_std_mapping)
+        )
+        if mapping == "direct_clamp":
+            log_std = torch.clamp(log_std, min=lower_bound, max=upper_bound)
+        else:
+            # Exact TD-MPC2 policy-prior mapping: smoothly interpolate the
+            # tanh-bounded head output across the configured interval.
+            log_std = lower_bound + 0.5 * (upper_bound - lower_bound) * (
+                torch.tanh(log_std) + 1.0
+            )
         if std_scale != 1.0:
             log_std = log_std + torch.log(log_std.new_tensor(std_scale))
 
@@ -266,6 +296,7 @@ class SoftWorldModel(nn.Module):
         std_scale=1.0,
         log_std_min=None,
         log_std_max=None,
+        log_std_mapping=None,
     ):
         """Sample only an action, omitting policy statistics and log-probability."""
         mean_raw, log_std, eps = self._policy_sample(
@@ -278,6 +309,7 @@ class SoftWorldModel(nn.Module):
             std_scale=std_scale,
             log_std_min=log_std_min,
             log_std_max=log_std_max,
+            log_std_mapping=log_std_mapping,
         )
         return torch.tanh(mean_raw + eps * log_std.exp())
 
@@ -293,6 +325,7 @@ class SoftWorldModel(nn.Module):
         std_scale=1.0,
         log_std_min=None,
         log_std_max=None,
+        log_std_mapping=None,
     ):
         """Sample a tanh-squashed action and return its corrected log-probability."""
         mean_raw, log_std, eps = self._policy_sample(
@@ -305,6 +338,7 @@ class SoftWorldModel(nn.Module):
             std_scale=std_scale,
             log_std_min=log_std_min,
             log_std_max=log_std_max,
+            log_std_mapping=log_std_mapping,
         )
         log_prob = math.gaussian_logprob(eps, log_std)
 

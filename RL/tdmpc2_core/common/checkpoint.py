@@ -19,7 +19,13 @@ from typing import Any
 
 import torch
 
-from utils.checkpointing import CheckpointTarget, write_metadata_atomic
+from utils.checkpointing import (
+    CheckpointTarget,
+    fsync_checkpoint_directories,
+    fsync_checkpoint_files,
+    invalidate_metadata_sidecars,
+    write_metadata_atomic,
+)
 
 
 class FrozenCheckpoint:
@@ -115,7 +121,7 @@ def freeze_checkpoint(state: Any) -> FrozenCheckpoint:
     return FrozenCheckpoint(frozen_state, events=events, keepalive=keepalive)
 
 
-def _atomic_torch_save(state: Any, fp):
+def _atomic_torch_save(state: Any, fp, *, durable=True):
     """Serialize to a sibling temporary file, then atomically replace ``fp``."""
 
     if not isinstance(fp, (str, os.PathLike)):
@@ -132,7 +138,11 @@ def _atomic_torch_save(state: Any, fp):
     os.close(descriptor)
     try:
         torch.save(state, temporary)
+        if durable:
+            fsync_checkpoint_files((temporary,))
         os.replace(temporary, target)
+        if durable:
+            fsync_checkpoint_directories((target,))
     finally:
         try:
             os.unlink(temporary)
@@ -215,14 +225,33 @@ class AsyncCheckpointWriter:
     def _write_many(snapshot, publications):
         state = snapshot.wait()
         first, _ = publications[0]
-        _atomic_torch_save(state, first)
-        paths = [str(first)]
-        for path, _ in publications[1:]:
-            paths.append(_atomic_clone(first, path))
-        for path, metadata in publications:
-            if metadata is not None:
-                write_metadata_atomic(path, metadata)
-        return tuple(paths)
+        first = Path(first)
+        first.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, staging = tempfile.mkstemp(
+            dir=first.parent,
+            prefix=f".{first.name}.",
+            suffix=".staging",
+        )
+        os.close(descriptor)
+        staging = Path(staging)
+        try:
+            _atomic_torch_save(state, staging, durable=False)
+            invalidate_metadata_sidecars(path for path, _ in publications)
+            os.replace(staging, first)
+            paths = [str(first)]
+            for path, _ in publications[1:]:
+                paths.append(_atomic_clone(first, path))
+            fsync_checkpoint_files(path for path, _ in publications)
+            fsync_checkpoint_directories(path for path, _ in publications)
+            for path, metadata in publications:
+                if metadata is not None:
+                    write_metadata_atomic(path, metadata)
+            return tuple(paths)
+        finally:
+            try:
+                staging.unlink()
+            except FileNotFoundError:
+                pass
 
     def enqueue(self, state, path, *, signature=None):
         """Queue one periodic save after making its exact-state snapshot."""
@@ -282,9 +311,12 @@ class AsyncCheckpointWriter:
             and self._last_path is not None
             and os.path.exists(self._last_path)
         ):
+            invalidate_metadata_sidecars(targets)
             for target in targets:
                 if target != self._last_path:
                     _atomic_clone(self._last_path, target)
+            fsync_checkpoint_files(targets)
+            fsync_checkpoint_directories(targets)
             for target, (_, metadata) in zip(targets, normalized):
                 if metadata is not None:
                     write_metadata_atomic(target, metadata)

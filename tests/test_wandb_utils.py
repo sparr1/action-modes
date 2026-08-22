@@ -5,7 +5,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from utils.wandb_utils import WandbAccumulator, extract_reward_components, init_wandb
+from utils.wandb_utils import (
+    SUPPORTED_WANDB_MODES,
+    WandbAccumulator,
+    extract_reward_components,
+    init_wandb,
+    wandb_enabled,
+)
 
 
 def test_accumulator_combines_weighted_sums_and_last_values_then_clears():
@@ -108,6 +114,30 @@ def test_extract_reward_components_uses_finite_numeric_scalars_and_normalized_na
     assert extract_reward_components([info]) == {}
 
 
+@pytest.mark.parametrize("value", [None, 0, 1, "false", "true", [], {}])
+def test_wandb_flag_must_be_a_literal_boolean(value):
+    with pytest.raises(ValueError, match="'wandb' must be a boolean"):
+        wandb_enabled({"wandb": value})
+
+
+def test_wandb_flag_defaults_false_and_accepts_literal_booleans():
+    assert not wandb_enabled(None)
+    assert not wandb_enabled({})
+    assert not wandb_enabled({"wandb": False})
+    assert wandb_enabled({"wandb": True})
+
+
+@pytest.mark.parametrize("mode", sorted(SUPPORTED_WANDB_MODES))
+def test_wandb_modes_match_the_pinned_sdk_contract(mode):
+    assert wandb_enabled({"wandb": True, "wandb_mode": mode})
+
+
+@pytest.mark.parametrize("mode", [False, 1, "sometimes", [], {}])
+def test_invalid_wandb_mode_is_rejected_even_when_logging_is_disabled(mode):
+    with pytest.raises(ValueError, match="'wandb_mode' must be one of"):
+        wandb_enabled({"wandb": False, "wandb_mode": mode})
+
+
 def test_init_wandb_forwards_online_group_and_defines_eval_metrics(monkeypatch):
     calls = {}
     defined = []
@@ -144,3 +174,65 @@ def test_init_wandb_forwards_online_group_and_defines_eval_metrics(monkeypatch):
         "group": "humanoid",
     }
     assert (("eval/*",), {"step_metric": "env_step"}) in defined
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("metric definition failed"), KeyboardInterrupt()],
+    ids=["exception", "interrupt"],
+)
+def test_normal_wandb_metric_definition_failure_finishes_partial_run(failure):
+    class Run:
+        def __init__(self):
+            self.finish_calls = 0
+
+        def finish(self):
+            self.finish_calls += 1
+
+    run = Run()
+    fake_wandb = SimpleNamespace(
+        init=lambda **_kwargs: run,
+        define_metric=lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    with pytest.raises(type(failure)):
+        init_wandb(
+            {"wandb": True},
+            default_project="ambi",
+            run_name="partial",
+            wandb_module=fake_wandb,
+        )
+
+    assert run.finish_calls == 1
+
+
+def test_wandb_finish_failure_does_not_mask_metric_definition_failure():
+    class Run:
+        def __init__(self):
+            self.finish_calls = 0
+
+        def finish(self):
+            self.finish_calls += 1
+            raise OSError("finish failed")
+
+    run = Run()
+    fake_wandb = SimpleNamespace(
+        init=lambda **_kwargs: run,
+        define_metric=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("metric definition failed")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="metric definition failed") as captured:
+        init_wandb(
+            {"wandb": True},
+            default_project="ambi",
+            run_name="partial",
+            wandb_module=fake_wandb,
+        )
+
+    assert str(captured.value) == "metric definition failed"
+    assert run.finish_calls == 1
+    assert getattr(captured.value, "__notes__", ()) == [
+        "Additional W&B finish failure after initialization stopped: finish failed"
+    ]

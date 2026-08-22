@@ -1,4 +1,6 @@
 import mujoco
+from numbers import Integral
+
 from .ant_variable_legs import AntVariableLegsEnv
 
 
@@ -18,7 +20,14 @@ class Ant3LegDeadStumpEnv(AntVariableLegsEnv):
     """
 
     def __init__(self, xml_file="ant_3leg_deadstump.xml", **kwargs):
-        kwargs.setdefault("num_legs", 3)
+        num_legs = kwargs.pop("num_legs", 3)
+        if (
+            isinstance(num_legs, bool)
+            or not isinstance(num_legs, Integral)
+            or int(num_legs) != 3
+        ):
+            raise ValueError("Ant3LegDeadStumpEnv requires num_legs=3.")
+        kwargs["num_legs"] = 3
         super().__init__(xml_file=xml_file, **kwargs)
 
         assert self.model.nu == 6, (
