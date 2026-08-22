@@ -1,0 +1,25 @@
+{
+  "study_type": "single_seed_exploratory_ten_head_minimum_runtime_variant",
+  "study_note": "Single-seed exploratory 14-million-decision Humanoid Walk q10 min_all runtime variant with J=2, N=32, H=3, and G=6, changing only inner gradient updates per round from the q10 min_all base. Make no confidence, significance, or confirmatory claims.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": ["ambi_humanoid_walk_base_min_all_q10_j2_n32_g6"],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 100000,
+  "save_strat": ["best", "latest"],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}
