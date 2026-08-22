@@ -1,0 +1,25 @@
+{
+  "study_type": "single_seed_exploratory_tdmpc2_actor_bounds_ablation",
+  "study_note": "Single-seed exploratory 14-million-decision Humanoid Walk base-v1 G4 ten-head min_all run using TD-MPC2's tanh log-standard-deviation mapping with upstream TD-MPC2's [-10, 2] bounds. The companion AMBI-bounds cell changes only the lower bound to -20; the adapted inner actor inherits the same mapping and bounds. All critic, reduction, target, adaptation, temperature, schedule, and optimization settings remain fixed. Make no confidence, significance, or confirmatory claims.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": ["ambi_humanoid_walk_base_min_all_q10_actor_tdmpc2_tanh_upstream_bounds"],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 100000,
+  "save_strat": ["best", "latest"],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}
