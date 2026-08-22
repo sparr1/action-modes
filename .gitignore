@@ -6,3 +6,6 @@ __pycache__/
 environments/dmcontrol/.venv/
 logs/*
 !logs/.gitkeep
+slurm/*.out
+slurm/*.err
+slurm/logs/
