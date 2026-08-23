@@ -11,6 +11,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import asdict
 from numbers import Integral
+import os
+from pathlib import Path
+import re
+import subprocess
 
 import numpy as np
 import torch
@@ -30,6 +34,7 @@ class XQC(SAC):
     _display_name = "XQC"
     _eval_file_label = "XQC"
     _eval_csv_environment_variable = "XQC_EVAL_CSV"
+    _comparison_implementation = "action-pytorch"
 
     def __init__(
         self,
@@ -49,6 +54,7 @@ class XQC(SAC):
             raise ValueError(
                 "This XQC port requires a one-dimensional Box feature vector."
             )
+        self._action_repeat = self._resolve_action_repeat(env)
         self._xqc_eval_env = None
         self._xqc_eval_env_seeded = False
         super().__init__(
@@ -58,6 +64,96 @@ class XQC(SAC):
             run_params=run_params,
             experiment_params=experiment_params,
         )
+
+    @staticmethod
+    def _resolve_action_repeat(env) -> int:
+        unwrapped = getattr(env, "unwrapped", env)
+        value = getattr(unwrapped, "action_repeat", 1)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Integral)
+            or int(value) <= 0
+        ):
+            raise ValueError(
+                "The XQC environment action_repeat must be a positive integer."
+            )
+        value = int(value)
+        configured = os.environ.get("XQC_ACTION_REPEAT")
+        if configured is not None:
+            try:
+                configured_value = int(configured)
+            except ValueError as exc:
+                raise ValueError("XQC_ACTION_REPEAT must be a positive integer.") from exc
+            if configured_value <= 0 or str(configured_value) != configured.strip():
+                raise ValueError("XQC_ACTION_REPEAT must be a positive integer.")
+            if value != configured_value:
+                raise ValueError(
+                    "XQC_ACTION_REPEAT does not match the training environment: "
+                    f"configured {configured_value}, environment {value}."
+                )
+        return value
+
+    @staticmethod
+    def _source_sha() -> str:
+        source_sha = os.environ.get("XQC_SOURCE_SHA")
+        if source_sha is None:
+            repository = Path(__file__).resolve().parents[1]
+            try:
+                source_sha = subprocess.check_output(
+                    ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+            except (OSError, subprocess.CalledProcessError) as exc:
+                raise RuntimeError(
+                    "Could not determine the Action Modes source SHA for XQC logging."
+                ) from exc
+        if re.fullmatch(r"[0-9a-f]{40}", source_sha or "") is None:
+            raise ValueError("XQC_SOURCE_SHA must be a full lowercase Git SHA.")
+        return source_sha
+
+    def _comparison_metadata(self):
+        implementation = os.environ.get(
+            "XQC_IMPLEMENTATION", self._comparison_implementation
+        )
+        if implementation != self._comparison_implementation:
+            raise ValueError(
+                "The Action Modes XQC port requires "
+                "XQC_IMPLEMENTATION=action-pytorch."
+            )
+        env_params = self.experiment_params.get("env_params", {}) or {}
+        task = os.environ.get("XQC_TASK") or env_params.get("task")
+        if task is None:
+            task = self.run_params.get("env", "unknown")
+        task = str(task).strip()
+        if not task:
+            raise ValueError("XQC_TASK must be non-empty when provided.")
+        comparison_id = os.environ.get("XQC_COMPARISON_ID", "untracked")
+        if (
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", comparison_id or "")
+            is None
+        ):
+            raise ValueError(
+                "XQC_COMPARISON_ID must use only letters, digits, '.', '_', and '-'."
+            )
+        if comparison_id != "untracked":
+            group = self.params.get("wandb_group") or os.environ.get(
+                "WANDB_RUN_GROUP"
+            )
+            expected_group = f"{comparison_id}-{implementation}"
+            if group != expected_group:
+                raise ValueError(
+                    "Action Modes XQC requires method-specific W&B group "
+                    f"{expected_group!r}, found {group!r}."
+                )
+        return {
+            "implementation": implementation,
+            "seed": int(self.seed),
+            "task": task,
+            "source_sha": self._source_sha(),
+            "comparison_id": comparison_id,
+            "action_repeat": self._action_repeat,
+        }
 
     def _make_config(self) -> XQCConfig:
         misleading_options = {
@@ -134,6 +230,10 @@ class XQC(SAC):
             adam_eps=self.params.get("adam_eps", 1e-8),
             weight_decay=self.params.get("weight_decay", 0.0),
             reward_normalization=True,
+            debug_checks=self.params.get("debug_checks", False),
+            compile=self.params.get("compile", True),
+            compile_strict=self.params.get("compile_strict", False),
+            optimizer_backend=self.params.get("optimizer_backend", "auto"),
             seed=self.seed,
             device=device,
             verbose=self.verbose,
@@ -153,19 +253,65 @@ class XQC(SAC):
         return XQCAgent(self.obs_dim, self.action_dim, self.cfg)
 
     def _init_wandb(self):
-        return init_wandb(
+        metadata = self._comparison_metadata()
+        run = init_wandb(
             self.params,
             default_project="ambi",
             run_name=(
-                f"XQC-{self.run_params.get('env', 'env')}-seed{self.seed}"
+                f"xqc-{metadata['implementation']}-{metadata['task']}-"
+                f"seed{metadata['seed']}"
             ),
             config={
+                **metadata,
                 "run_params": self.run_params,
                 "alg_params": self.params,
                 "config": asdict(self.cfg),
                 "official_xqc_commit": OFFICIAL_XQC_COMMIT,
             },
         )
+        if run is not None:
+            define_metric = getattr(run, "define_metric", None)
+            if not callable(define_metric):
+                raise RuntimeError(
+                    "The initialized W&B run cannot define comparison metrics."
+                )
+            define_metric("comparison/raw_frame")
+            for name in (
+                "comparison/decision_step",
+                "comparison/train_return",
+                "comparison/eval_return",
+            ):
+                define_metric(name, step_metric="comparison/raw_frame")
+        return run
+
+    def _wandb_step(self, decision_step: int) -> int:
+        return int(decision_step) * self._action_repeat
+
+    def _wandb_payload(self, payload, *, event: str, decision_step: int):
+        payload = dict(payload)
+        payload.update(
+            {
+                "comparison/raw_frame": self._wandb_step(decision_step),
+                "comparison/decision_step": int(decision_step),
+            }
+        )
+        if event == "train" and "episode/return" in payload:
+            payload["comparison/train_return"] = float(payload["episode/return"])
+        elif event == "eval":
+            payload["comparison/eval_return"] = float(
+                payload["eval/episode_reward"]
+            )
+        return payload
+
+    def _emit_wandb(self, payload, *, decision_step: int) -> None:
+        if self._wandb_run is None:
+            return
+        payload = dict(payload)
+        payload.setdefault("env_step", self._wandb_step(decision_step))
+        # XQC can finish a training episode and evaluate at the same raw frame.
+        # Let W&B allocate distinct internal rows; canonical and legacy charts
+        # use their explicit custom step metrics instead of W&B's private _step.
+        self._wandb_run.log(payload)
 
     def _observe_transition(self, reward, terminated, truncated):
         self.agent.observe_reward(reward, terminated, truncated)

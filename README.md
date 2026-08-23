@@ -137,6 +137,44 @@ after explicitly freezing and profiling an inner-loop compute schedule; the
 sparse historical Walker AMBI template inherits a substantially larger default
 inner workload and is not a confirmatory benchmark configuration.
 
+### XQC Humanoid Walk comparison on Hydra
+
+The XQC comparison runs four independent jobs concurrently: official JAX seed
+0, official JAX seed 1, Action Modes PyTorch seed 0, and Action Modes PyTorch
+seed 1. Each job owns one GPU and runs one actual seed; neither launcher
+vectorizes nor serializes seeds. From a clean, pushed Hydra checkout at the
+intended commit, submit the matrix with:
+
+```bash
+ACTION_SHA="$(git rev-parse HEAD)"
+COMPARISON_ID="xqc-hwalk-${ACTION_SHA:0:7}-$(date -u +%Y%m%dT%H%M%SZ)"
+slurm/submit_xqc_humanoid_walk_hydra.sh \
+  --expected-action-modes-sha "$ACTION_SHA" \
+  --official-dir /cs/home/rgao48/projects/xqc \
+  --results-root /cs/home/rgao48/xqc-humanoid-walk-parity \
+  --comparison-id "$COMPARISON_ID"
+```
+
+The helper refuses dirty or mismatched checkouts, verifies both dependency-lock
+hashes, and refuses to reuse an artifact directory. At submission time it uses
+`gpu2301` when four one-GPU slots are available, otherwise `gpu2201`; if neither
+node can hold all four but their combined free capacity can, it splits the four
+jobs across them. The availability check is a scheduler snapshot, so the jobs
+can still queue if cluster state changes immediately afterward. Add `--dry-run`
+to print the four `sbatch` commands without creating artifacts or submitting.
+
+All runs share the comparison ID, while W&B groups are method-specific:
+`<comparison-id>-official-jax` and `<comparison-id>-action-pytorch`. This makes
+each curve aggregate exactly seeds 0 and 1. The common comparison metrics are
+`comparison/raw_frame`, `comparison/train_return`, and
+`comparison/eval_return`; canonical charts use raw frame as their step axis.
+The PyTorch jobs require the compiled learner regions, automatically select
+fused Adam on CUDA, and keep hot-path debug checks disabled. Each run also
+records its implementation, seed, task, source SHA, and comparison ID in W&B
+configuration. Durable logs, evaluation CSVs, and W&B state live under
+`<results-root>/<comparison-id>/`, with implementation, seed, and Slurm job ID
+in every job directory name.
+
 ## Rendering a checkpoint
 
 Use the dedicated renderer instead of `init.py`:

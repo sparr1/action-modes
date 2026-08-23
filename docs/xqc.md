@@ -56,22 +56,28 @@ profile deliberately runs only the first two. The pinned official repository's
 raw frames its ten-seed mean return is 713.05, with individual seed returns
 ranging from 574.95 to 895.44.
 
-The profile logs online to the `ambi_humanoid` W&B project. It intentionally
-does not set a W&B group or tags: the Hydra launcher supplies one shared,
-launch-specific group and implementation tags to both comparison jobs.
-Run `slurm/run_xqc_humanoid_walk_hydra.sbatch` exactly twice with the same
-comparison group, once with `IMPLEMENTATION=official` and once with
-`IMPLEMENTATION=action`. Each allocation requests one GPU for up to 30 days;
-the preferred Hydra node is selected when the jobs are submitted, not pinned
-in the tracked launcher. Evaluation CSVs are written alongside the durable
-W&B run data as a recovery and post-processing fallback.
+The profile logs online to the `ambi_humanoid` W&B project. Use
+`slurm/submit_xqc_humanoid_walk_hydra.sh` to submit four independent jobs:
+official and Action Modes implementations for seeds 0 and 1. Each job owns one
+GPU and runs one seed, so no seed waits behind another. The helper prefers
+`gpu2301`, falls back to `gpu2201`, and refuses to submit unless four concurrent
+slots are visible across those nodes.
 
-Action Modes records evaluation steps in agent decisions. For comparison with
-the released raw-frame axis, multiply decision steps by the action repeat of
-two, except label the evaluation after decision one as frame zero. This gives
-the paper grid `0, 100000, ..., 1000000`. Different PyTorch/JAX random-number
-streams and the separately locked DMControl/MuJoCo versions preclude matching
-individual trajectories; compare the curve shape and aggregate returns.
+Each implementation has its own W&B group containing its two seed runs, while
+a shared comparison ID links both groups. Plot `comparison/train_return` or
+`comparison/eval_return` against `comparison/raw_frame`; these names and the
+axis are identical in both implementations. Implementation, seed, task, source
+SHA, and comparison ID are also recorded in each run's configuration.
+Evaluation CSVs are written alongside durable W&B data as a recovery and
+post-processing fallback. See the repository README for the exact submission
+command and artifact layout.
+
+The canonical W&B axis is the actual raw-frame count: the first evaluation is
+at frame 2 and later evaluations are at `100000, ..., 1000000`. The durable CSV
+also carries the paper's display convention, which relabels that first point as
+frame zero. Different PyTorch/JAX random-number streams and the separately
+locked DMControl/MuJoCo versions preclude matching individual trajectories;
+compare the curve shape and aggregate returns.
 
 Hydra validation is submitted from a clean checkout whose exact commit was
 pushed to GitHub. See `slurm/run_xqc_validation_hydra.sbatch`; the job also

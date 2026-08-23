@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import math
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from numbers import Integral, Real
@@ -125,6 +126,10 @@ class XQCConfig:
     adam_eps: float = 1e-8
     weight_decay: float = 0.0
     reward_normalization: bool = True
+    debug_checks: bool = False
+    compile: bool = False
+    compile_strict: bool = False
+    optimizer_backend: str = "auto"
     seed: Optional[int] = None
     device: str = "auto"
     verbose: int = 1
@@ -195,6 +200,23 @@ class XQCConfig:
         if not isinstance(self.reward_normalization, (bool, np.bool_)):
             raise ValueError("reward_normalization must be a boolean.")
         self.reward_normalization = bool(self.reward_normalization)
+        if not isinstance(self.debug_checks, (bool, np.bool_)):
+            raise ValueError("debug_checks must be a boolean.")
+        self.debug_checks = bool(self.debug_checks)
+        for field_name in ("compile", "compile_strict"):
+            if not isinstance(getattr(self, field_name), (bool, np.bool_)):
+                raise ValueError(f"{field_name} must be a boolean.")
+            setattr(self, field_name, bool(getattr(self, field_name)))
+        self.optimizer_backend = str(self.optimizer_backend).lower()
+        if self.optimizer_backend not in {
+            "auto",
+            "single_tensor",
+            "foreach",
+            "fused",
+        }:
+            raise ValueError(
+                "optimizer_backend must be auto, single_tensor, foreach, or fused."
+            )
         if self.seed is not None:
             self.seed = _nonnegative_int(self.seed, "seed")
         self.verbose = int(self.verbose)
@@ -537,6 +559,8 @@ def categorical_td_projection(
     discount: float | torch.Tensor,
     actor_entropy: torch.Tensor,
     support: torch.Tensor,
+    *,
+    validate_support: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Project the released XQC categorical Bellman target onto ``support``."""
 
@@ -548,21 +572,26 @@ def categorical_td_projection(
     )
     if support.ndim != 1 or support.shape[0] != num_atoms:
         raise ValueError("support must be one-dimensional and match the atom count.")
-    if num_atoms < 2 or not bool(torch.all(support[1:] > support[:-1]).item()):
+    if num_atoms < 2:
         raise ValueError("support must contain at least two strictly increasing atoms.")
     # Match the reference expression ``(max_v - min_v) / (num_bins - 1)``.
     # Using the first torch.linspace difference accumulates enough float32
     # rounding error for the top atom to ceil to ``num_atoms`` at 101 atoms.
     spacing = (support[-1] - support[0]) / (num_atoms - 1)
-    if not bool(
-        torch.allclose(
-            support[1:] - support[:-1],
-            spacing.expand_as(support[1:]),
-            rtol=1e-5,
-            atol=1e-7,
-        )
-    ):
-        raise ValueError("XQC categorical support must be evenly spaced.")
+    if validate_support:
+        if not bool(torch.all(support[1:] > support[:-1]).item()):
+            raise ValueError(
+                "support must contain at least two strictly increasing atoms."
+            )
+        if not bool(
+            torch.allclose(
+                support[1:] - support[:-1],
+                spacing.expand_as(support[1:]),
+                rtol=1e-5,
+                atol=1e-7,
+            )
+        ):
+            raise ValueError("XQC categorical support must be evenly spaced.")
 
     def batch_column(value, name: str) -> torch.Tensor:
         value = torch.as_tensor(
@@ -580,7 +609,12 @@ def categorical_td_projection(
     discount = batch_column(discount, "discount")
     actor_entropy = batch_column(actor_entropy, "actor_entropy")
     transformed = rewards + discount * masks * (support.reshape(1, -1) - actor_entropy)
-    transformed = transformed.clamp(float(support[0]), float(support[-1]))
+    # Tensor bounds avoid a device-to-host synchronization on CUDA. The public
+    # function validates arbitrary supports by default; the learner can skip
+    # that repeated validation because its registered support is immutable.
+    transformed = torch.maximum(
+        torch.minimum(transformed, support[-1]), support[0]
+    )
     clip_fraction = (
         (transformed == support[0]) | (transformed == support[-1])
     ).to(target_log_probs.dtype).mean()
@@ -625,23 +659,61 @@ def project_unit_rows_(module: nn.Module) -> nn.Module:
     bias, so all learned Dense kernels are normalized independently per output.
     """
 
-    for child in module.modules():
-        if isinstance(child, nn.Linear):
-            row_norms = torch.linalg.vector_norm(child.weight, dim=1, keepdim=True)
-            child.weight.div_(row_norms)
+    weights = tuple(
+        child.weight for child in module.modules() if isinstance(child, nn.Linear)
+    )
+    _project_unit_weights_(weights)
     return module
+
+
+@torch.no_grad()
+def _project_unit_weights_(weights: Iterable[torch.Tensor]) -> None:
+    """Project a cached collection of linear weights with one foreach divide."""
+
+    weights = tuple(weights)
+    if not weights:
+        return
+    row_norms = [
+        torch.linalg.vector_norm(weight, dim=1, keepdim=True)
+        for weight in weights
+    ]
+    torch._foreach_div_(weights, row_norms)
 
 
 def polyak_update_parameters(source: nn.Module, target: nn.Module, tau: float) -> None:
     """Polyak-average parameters only; target BN running buffers stay frozen."""
 
     with torch.no_grad():
-        source_parameters = dict(source.named_parameters())
-        target_parameters = dict(target.named_parameters())
-        if source_parameters.keys() != target_parameters.keys():
+        source_parameters = tuple(source.named_parameters())
+        target_parameters = tuple(target.named_parameters())
+        if tuple(name for name, _ in source_parameters) != tuple(
+            name for name, _ in target_parameters
+        ):
             raise ValueError("source and target parameter layouts do not match.")
-        for name, target_parameter in target_parameters.items():
-            target_parameter.mul_(1.0 - tau).add_(source_parameters[name], alpha=tau)
+        _polyak_update_parameter_lists_(
+            tuple(parameter for _, parameter in source_parameters),
+            tuple(parameter for _, parameter in target_parameters),
+            tau,
+        )
+
+
+@torch.no_grad()
+def _polyak_update_parameter_lists_(
+    source_parameters: Iterable[torch.Tensor],
+    target_parameters: Iterable[torch.Tensor],
+    tau: float,
+) -> None:
+    """Update cached parameter lists in a single multi-tensor operation."""
+
+    source_parameters = tuple(source_parameters)
+    target_parameters = tuple(target_parameters)
+    if len(source_parameters) != len(target_parameters):
+        raise ValueError("source and target parameter layouts do not match.")
+    # Retain the official/source expression order p*tau + tp*(1-tau), while
+    # reducing it to two multi-tensor launches.
+    tau = float(tau)
+    torch._foreach_mul_(target_parameters, 1.0 - tau)
+    torch._foreach_add_(target_parameters, source_parameters, alpha=tau)
 
 
 class DiscountedReturnNormalizer:
@@ -778,6 +850,105 @@ def _set_optimizer_lr(optimizer: torch.optim.Optimizer, value: float) -> None:
         group["lr"] = float(value)
 
 
+def _optimizer_execution_kwargs(
+    device: torch.device, backend: str
+) -> Dict[str, bool]:
+    """Resolve a numerically equivalent optimizer implementation.
+
+    The single-tensor path stays the CPU reference. CUDA defaults to the fused
+    implementation, which removes dozens of per-parameter kernel launches. A
+    foreach path remains available for installations where fused Adam is not
+    desired, without changing optimizer state or checkpoint contents.
+    """
+
+    backend = "fused" if backend == "auto" and device.type == "cuda" else backend
+    backend = "single_tensor" if backend == "auto" else backend
+    if backend == "fused":
+        if device.type != "cuda":
+            raise ValueError("The XQC fused optimizer backend requires CUDA.")
+        return {"fused": True}
+    if backend == "foreach":
+        return {"foreach": True}
+    return {"foreach": False}
+
+
+class _MutableCompileRegion:
+    """Lazy fixed-shape compilation with atomic eager fallback for BN buffers."""
+
+    def __init__(
+        self,
+        name: str,
+        eager,
+        mutable_buffers: Iterable[torch.Tensor],
+        *,
+        enabled: bool,
+        strict: bool,
+    ) -> None:
+        self.name = str(name)
+        self.eager = eager
+        self.mutable_buffers = tuple(mutable_buffers)
+        self.enabled = bool(enabled)
+        self.strict = bool(strict)
+        self.failed = False
+        self._compiled = None
+        self._warned = False
+        if self.enabled and not hasattr(torch, "compile"):
+            error = RuntimeError("torch.compile is unavailable in this PyTorch build.")
+            if self.strict:
+                raise error
+            self._fallback(error)
+
+    def _fallback(self, error: BaseException) -> None:
+        self.enabled = False
+        self.failed = True
+        self._compiled = None
+        if not self._warned:
+            warnings.warn(
+                f"Falling back to eager {self.name} after compile failure: {error}",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            self._warned = True
+
+    def __call__(self, *args):
+        if not self.enabled:
+            return self.eager(*args)
+        constructing = self._compiled is None
+        snapshots = (
+            tuple(buffer.detach().clone() for buffer in self.mutable_buffers)
+            if constructing and not self.strict
+            else None
+        )
+        if self._compiled is None:
+            try:
+                self._compiled = torch.compile(
+                    self.eager,
+                    # ``strict`` controls failure policy only. Keep the graph
+                    # mode identical between validation and production so the
+                    # gate exercises exactly what long runs execute.
+                    fullgraph=False,
+                    dynamic=False,
+                )
+            except Exception as error:
+                if self.strict:
+                    raise
+                self._fallback(error)
+                return self.eager(*args)
+        try:
+            return self._compiled(*args)
+        except Exception as error:
+            if snapshots is None:
+                # A graph which previously executed successfully must never be
+                # retried after partial state mutation.
+                raise RuntimeError(f"Compiled {self.name} failed at runtime.") from error
+            with torch.no_grad():
+                torch._foreach_copy_(self.mutable_buffers, snapshots)
+            if self.strict:
+                raise
+            self._fallback(error)
+            return self.eager(*args)
+
+
 class XQCAgent:
     """Standalone released-XQC learner over flat feature vectors."""
 
@@ -822,6 +993,25 @@ class XQCAgent:
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_target.requires_grad_(False)
 
+        # These identities never change across optimizer or checkpoint loads.
+        # Caching them avoids repeated module walks and dictionary construction
+        # on every learner step, and enables multi-tensor CUDA operations.
+        self._actor_linear_weights = tuple(
+            child.weight
+            for child in self.actor.modules()
+            if isinstance(child, nn.Linear)
+        )
+        self._critic_linear_weights = tuple(
+            child.weight
+            for child in self.critic.modules()
+            if isinstance(child, nn.Linear)
+        )
+        self._critic_parameters = tuple(self.critic.parameters())
+        self._critic_target_parameters = tuple(self.critic_target.parameters())
+        optimizer_execution = _optimizer_execution_kwargs(
+            self.device, config.optimizer_backend
+        )
+
         # With the released configuration, the Optax AdamW decay mask is empty:
         # hidden kernels are projected, predictor kernels are projected, and BN
         # decay is disabled.  Preserve that behavior even if the retained
@@ -832,7 +1022,7 @@ class XQCAgent:
             betas=(0.9, 0.999),
             eps=config.adam_eps,
             weight_decay=0.0,
-            foreach=False,
+            **optimizer_execution,
         )
         self.critic_optimizer = torch.optim.AdamW(
             self.critic.parameters(),
@@ -840,7 +1030,7 @@ class XQCAgent:
             betas=(0.9, 0.999),
             eps=config.adam_eps,
             weight_decay=0.0,
-            foreach=False,
+            **optimizer_execution,
         )
         self.log_temperature = nn.Parameter(
             torch.tensor(math.log(config.init_temperature), device=self.device)
@@ -850,7 +1040,7 @@ class XQCAgent:
             lr=config.actor_lr,
             betas=(0.9, 0.999),
             eps=config.adam_eps,
-            foreach=False,
+            **optimizer_execution,
         )
 
         self.target_entropy = (
@@ -867,6 +1057,30 @@ class XQCAgent:
         # portable between Hydra CUDA training and CPU evaluation machines.
         self.generator = torch.Generator(device="cpu")
         self.generator.manual_seed(0 if config.seed is None else config.seed)
+        self._training_generator = (
+            torch.Generator(device=self.device)
+            if self.device.type == "cuda"
+            else None
+        )
+        # Debug mode deliberately retains eager validation fences, including
+        # scalar support checks which are incompatible with a fixed graph.
+        compile_enabled = (
+            config.compile and not config.debug_checks and self.device.type == "cuda"
+        )
+        self._critic_loss_region = _MutableCompileRegion(
+            "XQC critic loss",
+            self._critic_loss_components,
+            self.critic.buffers(),
+            enabled=compile_enabled,
+            strict=config.compile_strict,
+        )
+        self._actor_loss_region = _MutableCompileRegion(
+            "XQC actor loss",
+            self._actor_loss_components,
+            self.actor.buffers(),
+            enabled=compile_enabled,
+            strict=config.compile_strict,
+        )
 
     @property
     def num_updates(self) -> int:
@@ -908,6 +1122,7 @@ class XQCAgent:
             "reward_normalization": self.config.reward_normalization,
             "weight_projection": "all_linear_weight_rows",
             "temperature_lr_source": "actor_lr",
+            "training_noise_rng": "portable_cpu_seed_device_local_v1",
         }
 
     def observe_reward(self, reward, terminated: bool, truncated: bool) -> None:
@@ -956,7 +1171,12 @@ class XQCAgent:
         values = self.critic.values_from_log_probs(F.log_softmax(logits, dim=-1))
         return tuple(values.unsqueeze(-1).unbind(0))
 
-    def _prepared_batch(self, batch: Mapping[str, object]) -> Dict[str, torch.Tensor]:
+    def _prepared_batch(
+        self,
+        batch: Mapping[str, object],
+        *,
+        validate_finite: bool = True,
+    ) -> Dict[str, torch.Tensor]:
         batch = require_mapping(batch, "XQC replay batch")
         required = {"obs", "actions", "rewards", "next_obs"}
         missing = sorted(required - set(batch))
@@ -983,7 +1203,9 @@ class XQCAgent:
         for name in ("rewards", "masks", "dones", "discount"):
             if name in prepared and prepared[name].numel() not in (1, batch_size):
                 raise ValueError(f"XQC batch field {name!r} has an incompatible shape.")
-        if not all(bool(torch.isfinite(value).all().item()) for value in prepared.values()):
+        if validate_finite and not all(
+            bool(torch.isfinite(value).all().item()) for value in prepared.values()
+        ):
             raise ValueError("XQC replay batches must contain only finite values.")
         if "masks" not in prepared:
             prepared["masks"] = 1.0 - prepared["dones"]
@@ -997,31 +1219,25 @@ class XQCAgent:
     def _freeze_parameters(module: nn.Module, frozen: bool) -> None:
         module.requires_grad_(not frozen)
 
-    def _update_once(
+    def _critic_loss_components(
         self,
-        batch: Mapping[str, object],
-        *,
-        next_noise: Optional[torch.Tensor] = None,
-        actor_noise: Optional[torch.Tensor] = None,
-    ) -> Dict[str, float]:
-        batch = self._prepared_batch(batch)
-        observations = batch["obs"]
-        actions = batch["actions"]
-        next_observations = batch["next_obs"]
-        batch_size = observations.shape[0]
-        rewards = batch["rewards"].reshape(batch_size)
-        masks = batch["masks"].reshape(batch_size)
-        discount = batch["discount"]
-        alpha = self.temperature.detach()
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        next_observations: torch.Tensor,
+        rewards: torch.Tensor,
+        masks: torch.Tensor,
+        discount: torch.Tensor,
+        alpha: torch.Tensor,
+        next_noise: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fixed-shape critic graph, including the official joined BN batch."""
 
-        # Critic: infer the next action from stored actor statistics, then run
-        # current and next samples together through each critic's batch moments.
+        batch_size = observations.shape[0]
         with torch.no_grad():
             next_actions, next_log_probs = self.actor.sample(
                 next_observations,
                 bn_mode="running",
                 noise=next_noise,
-                generator=self.generator,
             )
             joined_observations = torch.cat((observations, next_observations), dim=0)
             joined_actions = torch.cat((actions, next_actions), dim=0)
@@ -1041,6 +1257,7 @@ class XQCAgent:
                 discount,
                 alpha * next_log_probs,
                 self.critic.support,
+                validate_support=self.config.debug_checks,
             )
 
         online_joined_log_probs = self.critic.log_probs(
@@ -1050,6 +1267,75 @@ class XQCAgent:
         )
         current_log_probs = online_joined_log_probs[:, :batch_size]
         critic_loss = categorical_cross_entropy(current_log_probs, projected_targets)
+        return critic_loss, current_log_probs, target_q, clip_fraction
+
+    def _actor_loss_components(
+        self,
+        observations: torch.Tensor,
+        alpha: torch.Tensor,
+        actor_noise: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fixed-shape actor graph evaluated against the newly updated critic."""
+
+        policy_actions, policy_log_probs = self.actor.sample(
+            observations,
+            bn_mode="batch_update",
+            noise=actor_noise,
+        )
+        policy_logit_probs = self.critic.log_probs(
+            observations, policy_actions, bn_mode="running"
+        )
+        policy_q_values = self.critic.values_from_log_probs(policy_logit_probs)
+        minimum_policy_q = policy_q_values.min(dim=0).values
+        actor_loss = (alpha * policy_log_probs - minimum_policy_q).mean()
+        return actor_loss, policy_log_probs, minimum_policy_q
+
+    def _update_once(
+        self,
+        batch: Mapping[str, object],
+        *,
+        next_noise: Optional[torch.Tensor] = None,
+        actor_noise: Optional[torch.Tensor] = None,
+        prepared: bool = False,
+        collect_metrics: bool = True,
+    ) -> Dict[str, float]:
+        if not prepared:
+            batch = self._prepared_batch(
+                batch, validate_finite=self.config.debug_checks or collect_metrics
+            )
+        observations = batch["obs"]
+        actions = batch["actions"]
+        next_observations = batch["next_obs"]
+        batch_size = observations.shape[0]
+        rewards = batch["rewards"].reshape(batch_size)
+        masks = batch["masks"].reshape(batch_size)
+        discount = batch["discount"]
+        alpha = self.temperature.detach()
+
+        # Critic: infer the next action from stored actor statistics, then run
+        # current and next samples together through each critic's batch moments.
+        if next_noise is None:
+            next_noise = torch.randn(
+                (batch_size, self.action_dim),
+                dtype=observations.dtype,
+                device=self.generator.device,
+                generator=self.generator,
+            ).to(self.device)
+        (
+            critic_loss,
+            current_log_probs,
+            target_q,
+            clip_fraction,
+        ) = self._critic_loss_region(
+            observations,
+            actions,
+            next_observations,
+            rewards,
+            masks,
+            discount,
+            alpha,
+            next_noise,
+        )
         critic_lr = linear_learning_rate(
             self.config.critic_lr,
             self.config.lr_end,
@@ -1059,34 +1345,46 @@ class XQCAgent:
         _set_optimizer_lr(self.critic_optimizer, critic_lr)
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
-        critic_grad_norm = _global_grad_norm(self.critic.parameters())
+        critic_grad_norm = (
+            _global_grad_norm(self.critic.parameters())
+            if collect_metrics
+            else None
+        )
         self.critic_optimizer.step()
-        project_unit_rows_(self.critic)
+        _project_unit_weights_(self._critic_linear_weights)
 
         # The official target gate reads the pre-update critic Model.step, which
         # starts at one.  Hence interval N fires on attempts N-1, 2N-1, ... .
         if (self.update_step + 1) % self.config.target_update_interval == 0:
-            polyak_update_parameters(self.critic, self.critic_target, self.config.tau)
+            _polyak_update_parameter_lists_(
+                self._critic_parameters,
+                self._critic_target_parameters,
+                self.config.tau,
+            )
 
         # Actor: always evaluate the loss, gradient, BN update, and projection.
         # The conditional Optax wrapper masks only the Adam transformation.
         self._freeze_parameters(self.critic, frozen=True)
         try:
-            policy_actions, policy_log_probs = self.actor.sample(
+            if actor_noise is None:
+                actor_noise = torch.randn(
+                    (batch_size, self.action_dim),
+                    dtype=observations.dtype,
+                    device=self.generator.device,
+                    generator=self.generator,
+                ).to(self.device)
+            actor_loss, policy_log_probs, minimum_policy_q = self._actor_loss_region(
                 observations,
-                bn_mode="batch_update",
-                noise=actor_noise,
-                generator=self.generator,
+                alpha,
+                actor_noise,
             )
-            policy_logit_probs = self.critic.log_probs(
-                observations, policy_actions, bn_mode="running"
-            )
-            policy_q_values = self.critic.values_from_log_probs(policy_logit_probs)
-            minimum_policy_q = policy_q_values.min(dim=0).values
-            actor_loss = (alpha * policy_log_probs - minimum_policy_q).mean()
             self.actor_optimizer.zero_grad(set_to_none=True)
             actor_loss.backward()
-            actor_grad_norm = _global_grad_norm(self.actor.parameters())
+            actor_grad_norm = (
+                _global_grad_norm(self.actor.parameters())
+                if collect_metrics
+                else None
+            )
             actor_update_accepted = self.update_step % self.config.policy_delay == 0
             if actor_update_accepted:
                 actor_lr = linear_learning_rate(
@@ -1105,7 +1403,7 @@ class XQCAgent:
                     self.actor_optimizer_steps,
                     self.config.transition_steps,
                 )
-            project_unit_rows_(self.actor)
+            _project_unit_weights_(self._actor_linear_weights)
         finally:
             self._freeze_parameters(self.critic, frozen=False)
 
@@ -1116,7 +1414,11 @@ class XQCAgent:
         temperature_loss = temperature_value * (entropy - self.target_entropy)
         self.temperature_optimizer.zero_grad(set_to_none=True)
         temperature_loss.backward()
-        temperature_grad_norm = _global_grad_norm([self.log_temperature])
+        temperature_grad_norm = (
+            _global_grad_norm([self.log_temperature])
+            if collect_metrics
+            else None
+        )
         if actor_update_accepted:
             temperature_lr = linear_learning_rate(
                 self.config.actor_lr,
@@ -1136,30 +1438,178 @@ class XQCAgent:
             )
 
         self.update_step += 1
+        if not collect_metrics:
+            return {}
         current_values = self.critic.values_from_log_probs(current_log_probs.detach())
+        tensor_metric_names = (
+            "actor_loss",
+            "critic_loss",
+            "temperature",
+            "temperature_loss",
+            "policy_entropy",
+            "policy_log_prob",
+            "q1_mean",
+            "q2_mean",
+            "q_target_mean",
+            "q_policy_mean",
+            "q_disagreement_mean",
+            "q_target_clip_fraction",
+            "actor_grad_norm",
+            "critic_grad_norm",
+            "temperature_grad_norm",
+        )
+        tensor_metrics = torch.stack(
+            (
+                actor_loss.detach(),
+                critic_loss.detach(),
+                temperature_value.detach(),
+                temperature_loss.detach(),
+                entropy,
+                policy_log_probs.detach().mean(),
+                current_values[0].mean(),
+                current_values[1].mean(),
+                target_q.mean(),
+                minimum_policy_q.detach().mean(),
+                (current_values[0] - current_values[1]).abs().mean(),
+                clip_fraction,
+                actor_grad_norm.detach(),
+                critic_grad_norm.detach(),
+                temperature_grad_norm.detach(),
+            )
+        )
+        # One packed transfer replaces fifteen CUDA synchronization points.
+        host_metrics = tensor_metrics.cpu().tolist()
+        if self.config.debug_checks and not np.isfinite(host_metrics).all():
+            raise FloatingPointError("XQC learner produced a non-finite metric.")
+        metrics = dict(zip(tensor_metric_names, map(float, host_metrics)))
+        metrics.update(
+            {
+                "actor_update_accepted": float(actor_update_accepted),
+                "actor_learning_rate": float(actor_lr),
+                "critic_learning_rate": float(critic_lr),
+                "temperature_learning_rate": float(temperature_lr),
+                "reward_scale": float(self.reward_normalizer.scale),
+            }
+        )
+        return metrics
+
+    def _sample_update_noises(
+        self, gradient_steps: int, batch_size: int
+    ) -> torch.Tensor:
+        """Draw all UTD policy noise in one operation on the learner device.
+
+        CUDA uses a short-lived seed from the checkpointed CPU RNG stream. The
+        CUDA generator is reseeded for each public ``update`` call, so its
+        opaque device-specific state never needs to enter a checkpoint. This
+        keeps checkpoints loadable on CPU while eliminating pageable-CPU noise
+        copies from the training hot path. CPU retains the original generator
+        directly.
+        """
+
+        shape = (gradient_steps, 2, batch_size, self.action_dim)
+        if self._training_generator is None:
+            # CPU is the exact portable reference stream. Separate calls retain
+            # the historical draw boundaries used by ``_update_once``.
+            return torch.stack(
+                [
+                    torch.stack(
+                        [
+                            torch.randn(
+                                (batch_size, self.action_dim),
+                                dtype=torch.float32,
+                                device=self.device,
+                                generator=self.generator,
+                            )
+                            for _ in range(2)
+                        ]
+                    )
+                    for _ in range(gradient_steps)
+                ]
+            )
+        seed = int(
+            torch.randint(
+                0,
+                torch.iinfo(torch.int64).max,
+                (1,),
+                dtype=torch.int64,
+                device="cpu",
+                generator=self.generator,
+            )[0]
+        )
+        self._training_generator.manual_seed(seed)
+        return torch.randn(
+            shape,
+            dtype=torch.float32,
+            device=self.device,
+            generator=self._training_generator,
+        )
+
+    def _sample_replay_batch(
+        self, replay_buffer, total_batch_size: int
+    ) -> Mapping[str, object]:
+        """Sample UTD data once and use one packed host-to-device transfer."""
+
+        sample_device = (
+            torch.device("cpu") if self.device.type == "cuda" else self.device
+        )
+        batch = require_mapping(
+            replay_buffer.sample(total_batch_size, sample_device),
+            "XQC replay batch",
+        )
+        if self.device.type != "cuda":
+            return batch
+
+        relevant = {
+            key: torch.as_tensor(value, dtype=torch.float32)
+            for key, value in batch.items()
+            if key
+            in {
+                "obs",
+                "actions",
+                "rewards",
+                "next_obs",
+                "masks",
+                "dones",
+                "discount",
+            }
+        }
+        batched = [
+            (key, value)
+            for key, value in relevant.items()
+            if value.device.type == "cpu"
+            and value.ndim > 0
+            and value.shape[0] == total_batch_size
+        ]
+        if not batched:
+            return batch
+
+        packed = torch.cat(
+            [value.reshape(total_batch_size, -1) for _, value in batched], dim=1
+        ).to(self.device)
+        transferred = dict(batch)
+        offset = 0
+        for key, value in batched:
+            width = value.numel() // total_batch_size
+            transferred[key] = packed[:, offset : offset + width].reshape(value.shape)
+            offset += width
+        return transferred
+
+    @staticmethod
+    def _slice_prepared_batch(
+        batch: Mapping[str, torch.Tensor],
+        index: int,
+        batch_size: int,
+        total_batch_size: int,
+    ) -> Dict[str, torch.Tensor]:
+        start = index * batch_size
+        stop = start + batch_size
         return {
-            "actor_loss": float(actor_loss.detach().cpu()),
-            "critic_loss": float(critic_loss.detach().cpu()),
-            "temperature": float(temperature_value.detach().cpu()),
-            "temperature_loss": float(temperature_loss.detach().cpu()),
-            "policy_entropy": float(entropy.cpu()),
-            "policy_log_prob": float(policy_log_probs.detach().mean().cpu()),
-            "q1_mean": float(current_values[0].mean().cpu()),
-            "q2_mean": float(current_values[1].mean().cpu()),
-            "q_target_mean": float(target_q.mean().cpu()),
-            "q_policy_mean": float(minimum_policy_q.detach().mean().cpu()),
-            "q_disagreement_mean": float(
-                (current_values[0] - current_values[1]).abs().mean().cpu()
-            ),
-            "q_target_clip_fraction": float(clip_fraction.cpu()),
-            "actor_grad_norm": float(actor_grad_norm.detach().cpu()),
-            "critic_grad_norm": float(critic_grad_norm.detach().cpu()),
-            "temperature_grad_norm": float(temperature_grad_norm.detach().cpu()),
-            "actor_update_accepted": float(actor_update_accepted),
-            "actor_learning_rate": float(actor_lr),
-            "critic_learning_rate": float(critic_lr),
-            "temperature_learning_rate": float(temperature_lr),
-            "reward_scale": float(self.reward_normalizer.scale),
+            key: (
+                value[start:stop]
+                if value.ndim > 0 and value.shape[0] == total_batch_size
+                else value
+            )
+            for key, value in batch.items()
         }
 
     def update(
@@ -1167,10 +1617,23 @@ class XQCAgent:
     ) -> Dict[str, float]:
         gradient_steps = _positive_int(gradient_steps, "gradient_steps")
         batch_size = _positive_int(batch_size, "batch_size")
+        total_batch_size = gradient_steps * batch_size
+        batch = self._prepared_batch(
+            self._sample_replay_batch(replay_buffer, total_batch_size),
+            validate_finite=self.config.debug_checks,
+        )
+        noises = self._sample_update_noises(gradient_steps, batch_size)
         metrics = None
-        for _ in range(gradient_steps):
+        for index in range(gradient_steps):
+            collect_metrics = self.config.debug_checks or index == gradient_steps - 1
             metrics = self._update_once(
-                replay_buffer.sample(batch_size, self.device)
+                self._slice_prepared_batch(
+                    batch, index, batch_size, total_batch_size
+                ),
+                next_noise=noises[index, 0],
+                actor_noise=noises[index, 1],
+                prepared=True,
+                collect_metrics=collect_metrics,
             )
         # JAX's fori_loop threads only the most recent ``info`` mapping through
         # the state, so the released learner returns the final minibatch rather

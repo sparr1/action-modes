@@ -32,6 +32,20 @@ def _capture_args(**overrides):
     return argparse.Namespace(**values)
 
 
+def _canonical_args(**overrides):
+    values = {
+        "canonical_wandb": False,
+        "task": None,
+        "implementation": None,
+        "source_sha": None,
+        "base_seed": None,
+        "num_seeds": None,
+        "action_repeat": None,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
 def test_evaluation_capture_arguments_are_all_or_none(tmp_path):
     assert ORACLE._validate_evaluation_capture_args(_capture_args()) is False
 
@@ -266,3 +280,236 @@ def test_official_main_runs_directly_when_capture_is_absent():
     ORACLE._run_official_main(official_main)
 
     assert calls == ["official"]
+
+
+def test_canonical_wandb_metadata_requires_one_actual_seed_and_exact_source(
+    monkeypatch,
+):
+    assert ORACLE._canonical_wandb_metadata(_canonical_args()) is None
+    monkeypatch.setenv("XQC_COMPARISON_ID", "humanoid-parity")
+    valid = _canonical_args(
+        canonical_wandb=True,
+        task="humanoid-walk",
+        implementation="official-jax",
+        source_sha=ORACLE.OFFICIAL_COMMIT,
+        base_seed=1,
+        num_seeds=1,
+        action_repeat=2,
+    )
+    assert ORACLE._canonical_wandb_metadata(valid) == {
+        "implementation": "official-jax",
+        "seed": 1,
+        "task": "humanoid-walk",
+        "source_sha": ORACLE.OFFICIAL_COMMIT,
+        "comparison_id": "humanoid-parity",
+        "action_repeat": 2,
+    }
+
+    with pytest.raises(SystemExit, match="each actual seed"):
+        ORACLE._canonical_wandb_metadata(
+            _canonical_args(**{**vars(valid), "num_seeds": 2})
+        )
+    with pytest.raises(SystemExit, match="requires --source-sha"):
+        ORACLE._canonical_wandb_metadata(
+            _canonical_args(**{**vars(valid), "source_sha": None})
+        )
+    with pytest.raises(SystemExit, match="requires --implementation official-jax"):
+        ORACLE._canonical_wandb_metadata(
+            _canonical_args(**{**vars(valid), "implementation": "action-pytorch"})
+        )
+
+
+def test_canonical_wandb_initialization_labels_run_and_defines_raw_frame_axis(
+    monkeypatch,
+):
+    init_calls = []
+
+    class FakeRun:
+        def __init__(self):
+            self.definitions = []
+
+        def define_metric(self, name, **kwargs):
+            self.definitions.append((name, kwargs))
+
+    run = FakeRun()
+
+    def original_init(*args, **kwargs):
+        init_calls.append((args, kwargs))
+        return run
+
+    module = SimpleNamespace(init=original_init)
+    metadata = {
+        "implementation": "official-jax",
+        "seed": 1,
+        "task": "humanoid-walk",
+        "source_sha": ORACLE.OFFICIAL_COMMIT,
+        "comparison_id": "humanoid-parity",
+        "action_repeat": 2,
+    }
+    monkeypatch.setenv("WANDB_RUN_GROUP", "humanoid-parity-official-jax")
+    with ORACLE._patched_wandb_initialization(module, metadata):
+        assert module.init(
+            config={
+                "upstream": 7,
+                "seed": 1,
+                "num_seeds": 1,
+                "env": {"name": "humanoid-walk", "action_repeat": 2},
+            }
+        ) is run
+        assert module.init is not original_init
+    assert module.init is original_init
+
+    assert init_calls == [
+        (
+            (),
+            {
+                "config": {
+                    "upstream": 7,
+                    "seed": 1,
+                    "num_seeds": 1,
+                    "env": {"name": "humanoid-walk", "action_repeat": 2},
+                    **metadata,
+                },
+                "name": "xqc-official-jax-humanoid-walk-seed1",
+                "job_type": "official-jax",
+                "group": "humanoid-parity-official-jax",
+            },
+        )
+    ]
+    assert run.definitions == [
+        ("comparison/raw_frame", {}),
+        ("comparison/decision_step", {"step_metric": "comparison/raw_frame"}),
+        ("comparison/train_return", {"step_metric": "comparison/raw_frame"}),
+        ("comparison/eval_return", {"step_metric": "comparison/raw_frame"}),
+    ]
+
+
+def test_canonical_training_capture_tracks_termination_and_truncation_exactly():
+    class FakeWandb:
+        def __init__(self):
+            self.logs = []
+
+        def log(self, payload, step=None):
+            self.logs.append((step, dict(payload)))
+
+    class FakeParallelEnv:
+        queued_results = []
+
+        def __init__(self, label):
+            self.label = label
+
+        def step(self, _actions):
+            return self.queued_results.pop(0)
+
+    def result(reward, terminated=False, truncated=False):
+        return (
+            np.zeros((1, 2), dtype=np.float32),
+            np.array([reward], dtype=np.float32),
+            np.array([terminated]),
+            np.array([truncated]),
+            np.zeros(1, dtype=np.float32),
+        )
+
+    fake_wandb = FakeWandb()
+    logger = ORACLE._CanonicalWandbLogger(
+        fake_wandb,
+        action_repeat=2,
+    )
+    original_init = FakeParallelEnv.__init__
+    original_step = FakeParallelEnv.step
+    FakeParallelEnv.queued_results = [
+        result(1.0),
+        result(2.0, terminated=True),
+        result(100.0, truncated=True),
+        result(5.0, truncated=True),
+    ]
+    with ORACLE._patched_training_returns(
+        FakeParallelEnv,
+        logger,
+        num_seeds=1,
+    ):
+        train_env = FakeParallelEnv("train")
+        eval_env = FakeParallelEnv("eval")
+        train_env.step(None)
+        train_env.step(None)
+        eval_env.step(None)
+        train_env.step(None)
+
+    assert FakeParallelEnv.__init__ is original_init
+    assert FakeParallelEnv.step is original_step
+    assert fake_wandb.logs == [
+        (
+            None,
+            {
+                "comparison/raw_frame": 4,
+                "comparison/decision_step": 2,
+                "comparison/train_return": 3.0,
+                "episode/return": 3.0,
+                "episode/len": 2,
+                "episode/terminated": 1,
+                "episode/truncated": 0,
+            },
+        ),
+        (
+            None,
+            {
+                "comparison/raw_frame": 6,
+                "comparison/decision_step": 3,
+                "comparison/train_return": 5.0,
+                "episode/return": 5.0,
+                "episode/len": 1,
+                "episode/terminated": 0,
+                "episode/truncated": 1,
+            },
+        ),
+    ]
+
+
+def test_canonical_evaluation_logging_uses_same_labels_and_raw_frame_step():
+    class FakeWandb:
+        def __init__(self):
+            self.logs = []
+
+        def log(self, payload, step=None):
+            self.logs.append((step, dict(payload)))
+
+    forwarded = []
+    fake_wandb = FakeWandb()
+
+    def original_logging(step, infos, fps=30):
+        forwarded.append((step, infos, fps))
+        fake_wandb.log({"seed0/return": float(infos["return"][0])}, step=step)
+
+    module = SimpleNamespace(
+        log_multiple_seeds_to_wandb=original_logging
+    )
+    logger = ORACLE._CanonicalWandbLogger(
+        fake_wandb,
+        action_repeat=2,
+    )
+    with ORACLE._patched_evaluation_logging(
+        module,
+        canonical_logger=logger,
+    ):
+        module.log_multiple_seeds_to_wandb(
+            100_000,
+            {"return": np.array([321.5])},
+            fps=19,
+        )
+
+    assert len(forwarded) == 1
+    assert forwarded[0][0] == 100_000
+    np.testing.assert_array_equal(forwarded[0][1]["return"], [321.5])
+    assert forwarded[0][2] == 19
+    assert fake_wandb.logs == [
+        (
+            None,
+            {
+                "comparison/raw_frame": 100_000,
+                "comparison/decision_step": 50_000,
+                "comparison/eval_return": 321.5,
+                "eval/episode_reward": 321.5,
+            },
+        ),
+        (100_000, {"seed0/return": 321.5}),
+    ]

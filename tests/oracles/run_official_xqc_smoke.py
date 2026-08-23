@@ -7,13 +7,16 @@ import argparse
 import csv
 import math
 import os
+import re
 import subprocess
 import sys
+from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
 
 OFFICIAL_COMMIT = "9a6832bb742ef01bbe9f1e06153a9338e612dae5"
+CANONICAL_IMPLEMENTATION = "official-jax"
 EVALUATION_CSV_FIELDS = (
     "implementation",
     "source_commit",
@@ -63,6 +66,68 @@ def _validate_evaluation_capture_args(args) -> bool:
             "--expected-evaluation-rows must be divisible by --num-seeds"
         )
     return True
+
+
+def _canonical_wandb_metadata(args):
+    """Validate the opt-in single-seed comparison logging contract."""
+
+    specific_values = {
+        "--task": args.task,
+        "--implementation": args.implementation,
+        "--source-sha": args.source_sha,
+    }
+    if not args.canonical_wandb:
+        supplied = [
+            name for name, value in specific_values.items() if value is not None
+        ]
+        if supplied:
+            raise SystemExit(
+                f"{', '.join(supplied)} require --canonical-wandb"
+            )
+        return None
+
+    required_values = {
+        **specific_values,
+        "--base-seed": args.base_seed,
+        "--num-seeds": args.num_seeds,
+        "--action-repeat": args.action_repeat,
+    }
+    missing = [name for name, value in required_values.items() if value is None]
+    if missing:
+        raise SystemExit("--canonical-wandb requires " + ", ".join(missing))
+    if args.num_seeds != 1:
+        raise SystemExit(
+            "canonical W&B comparison requires --num-seeds 1 so each actual "
+            "seed has its own run"
+        )
+    if args.action_repeat < 1:
+        raise SystemExit("--action-repeat must be positive")
+    task = str(args.task).strip()
+    if not task:
+        raise SystemExit("--task must be non-empty")
+    if args.implementation != CANONICAL_IMPLEMENTATION:
+        raise SystemExit(
+            f"official wrapper requires --implementation {CANONICAL_IMPLEMENTATION}"
+        )
+    if args.source_sha != OFFICIAL_COMMIT:
+        raise SystemExit(
+            f"official wrapper requires --source-sha {OFFICIAL_COMMIT}"
+        )
+    comparison_id = os.environ.get("XQC_COMPARISON_ID")
+    if comparison_id is None:
+        raise SystemExit("--canonical-wandb requires XQC_COMPARISON_ID")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", comparison_id) is None:
+        raise SystemExit(
+            "XQC_COMPARISON_ID must use only letters, digits, '.', '_', and '-'"
+        )
+    return {
+        "implementation": CANONICAL_IMPLEMENTATION,
+        "seed": int(args.base_seed),
+        "task": task,
+        "source_sha": OFFICIAL_COMMIT,
+        "comparison_id": comparison_id,
+        "action_repeat": int(args.action_repeat),
+    }
 
 
 class _EvaluationCsvCapture:
@@ -199,14 +264,265 @@ class _EvaluationCsvCapture:
         self._sync()
 
 
+class _CanonicalWandbLogger:
+    """Emit comparable single-seed return series on the raw-frame axis."""
+
+    def __init__(self, wandb_module, *, action_repeat: int) -> None:
+        self.wandb = wandb_module
+        self.action_repeat = int(action_repeat)
+
+    @staticmethod
+    def _finite_float(value, label: str) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise SystemExit(f"official XQC {label} is not numeric: {value!r}") from exc
+        if not math.isfinite(result):
+            raise SystemExit(f"official XQC {label} is not finite: {value!r}")
+        return result
+
+    def _log(self, raw_frame: int, decision_step: int, payload) -> None:
+        raw_frame = int(raw_frame)
+        decision_step = int(decision_step)
+        if raw_frame != decision_step * self.action_repeat:
+            raise SystemExit(
+                "official XQC canonical W&B step does not match action repeat: "
+                f"raw_frame={raw_frame}, decision_step={decision_step}, "
+                f"action_repeat={self.action_repeat}"
+            )
+        # Training episode ends and evaluations can share one raw frame. W&B's
+        # private monotonically increasing step must therefore remain free to
+        # allocate separate rows; charts use comparison/raw_frame explicitly.
+        self.wandb.log(
+            {
+                "comparison/raw_frame": raw_frame,
+                "comparison/decision_step": decision_step,
+                **payload,
+            }
+        )
+
+    def record_training_episode(
+        self,
+        *,
+        decision_step: int,
+        episode_return,
+        episode_length: int,
+        terminated: bool,
+        truncated: bool,
+    ) -> None:
+        episode_return = self._finite_float(episode_return, "training return")
+        self._log(
+            decision_step * self.action_repeat,
+            decision_step,
+            {
+                "comparison/train_return": episode_return,
+                "episode/return": episode_return,
+                "episode/len": int(episode_length),
+                "episode/terminated": int(bool(terminated)),
+                "episode/truncated": int(bool(truncated)),
+            },
+        )
+
+    def record_evaluation(self, raw_frame, infos) -> None:
+        if "return" not in infos:
+            return
+
+        import numpy as np
+
+        returns = np.asarray(infos["return"])
+        if returns.shape != (1,):
+            raise SystemExit(
+                "official XQC canonical evaluation requires one return, "
+                f"found shape {returns.shape}"
+            )
+        try:
+            raw_frame_value = float(raw_frame)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise SystemExit(
+                f"official XQC evaluation step is not numeric: {raw_frame!r}"
+            ) from exc
+        raw_frame_int = int(raw_frame_value)
+        if (
+            not math.isfinite(raw_frame_value)
+            or raw_frame_value != raw_frame_int
+            or raw_frame_int < 0
+            or raw_frame_int % self.action_repeat
+        ):
+            raise SystemExit(
+                "official XQC evaluation raw frame must be a non-negative "
+                f"multiple of action repeat, found {raw_frame!r}"
+            )
+        evaluation_return = self._finite_float(
+            returns[0], "evaluation return"
+        )
+        self._log(
+            raw_frame_int,
+            raw_frame_int // self.action_repeat,
+            {
+                "comparison/eval_return": evaluation_return,
+                "eval/episode_reward": evaluation_return,
+            },
+        )
+
+
 @contextmanager
-def _patched_evaluation_logging(logging_module, capture):
+def _patched_wandb_initialization(wandb_module, metadata):
+    """Label the upstream run and define the shared raw-frame metric axis."""
+
+    original_init = wandb_module.init
+
+    def canonical_init(*args, **kwargs):
+        config = kwargs.get("config", {})
+        if not isinstance(config, Mapping):
+            raise SystemExit("official XQC resolved W&B config must be a mapping")
+        if int(config.get("seed", -1)) != metadata["seed"]:
+            raise SystemExit(
+                "official XQC Hydra seed does not match canonical W&B seed"
+            )
+        if int(config.get("num_seeds", -1)) != 1:
+            raise SystemExit("official XQC canonical W&B run must train one seed")
+        env_config = config.get("env")
+        if not isinstance(env_config, Mapping):
+            raise SystemExit("official XQC Hydra env config must be a mapping")
+        if env_config.get("name") != metadata["task"]:
+            raise SystemExit(
+                "official XQC Hydra task does not match canonical W&B task"
+            )
+        if int(env_config.get("action_repeat", -1)) != metadata["action_repeat"]:
+            raise SystemExit(
+                "official XQC Hydra action repeat does not match canonical W&B axis"
+            )
+        kwargs["config"] = {**dict(config), **metadata}
+        kwargs["name"] = (
+            f"xqc-{metadata['implementation']}-{metadata['task']}-"
+            f"seed{metadata['seed']}"
+        )
+        kwargs["job_type"] = metadata["implementation"]
+        group = os.environ.get("WANDB_RUN_GROUP")
+        expected_group = (
+            f"{metadata['comparison_id']}-{metadata['implementation']}"
+        )
+        if group != expected_group:
+            raise SystemExit(
+                "official XQC requires method-specific WANDB_RUN_GROUP="
+                f"{expected_group!r}, found {group!r}"
+            )
+        kwargs["group"] = group
+        run = original_init(*args, **kwargs)
+        define_metric = getattr(run, "define_metric", None)
+        if not callable(define_metric):
+            raise SystemExit(
+                "official XQC W&B run cannot define canonical comparison metrics"
+            )
+        define_metric("comparison/raw_frame")
+        for name in (
+            "comparison/decision_step",
+            "comparison/train_return",
+            "comparison/eval_return",
+        ):
+            define_metric(name, step_metric="comparison/raw_frame")
+        return run
+
+    wandb_module.init = canonical_init
+    try:
+        yield
+    finally:
+        wandb_module.init = original_init
+
+
+@contextmanager
+def _patched_training_returns(
+    parallel_env_class,
+    canonical_logger,
+    *,
+    num_seeds: int,
+):
+    """Observe upstream CPU environment outputs without modifying its checkout."""
+
+    original_init = parallel_env_class.__init__
+    original_step = parallel_env_class.step
+    trackers = {}
+    constructed = []
+
+    def tracked_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        constructed.append(self)
+        if len(constructed) == 1:
+            trackers[id(self)] = {
+                "decision_step": 0,
+                "returns": [0.0] * num_seeds,
+                "lengths": [0] * num_seeds,
+            }
+
+    def tracked_step(self, actions):
+        result = original_step(self, actions)
+        tracker = trackers.get(id(self))
+        if tracker is None:
+            return result
+
+        import numpy as np
+
+        _observations, rewards, terminals, truncations, _goals = result
+        rewards = np.asarray(rewards)
+        terminals = np.asarray(terminals, dtype=bool)
+        truncations = np.asarray(truncations, dtype=bool)
+        expected_shape = (num_seeds,)
+        for label, values in (
+            ("rewards", rewards),
+            ("terminals", terminals),
+            ("truncations", truncations),
+        ):
+            if values.shape != expected_shape:
+                raise SystemExit(
+                    f"official XQC training {label} has shape {values.shape}; "
+                    f"expected {expected_shape}"
+                )
+
+        tracker["decision_step"] += 1
+        for seed_index in range(num_seeds):
+            reward = canonical_logger._finite_float(
+                rewards[seed_index], "training reward"
+            )
+            tracker["returns"][seed_index] += reward
+            tracker["lengths"][seed_index] += 1
+            terminated = bool(terminals[seed_index])
+            truncated = bool(truncations[seed_index])
+            if terminated or truncated:
+                canonical_logger.record_training_episode(
+                    decision_step=tracker["decision_step"],
+                    episode_return=tracker["returns"][seed_index],
+                    episode_length=tracker["lengths"][seed_index],
+                    terminated=terminated,
+                    truncated=truncated,
+                )
+                tracker["returns"][seed_index] = 0.0
+                tracker["lengths"][seed_index] = 0
+        return result
+
+    parallel_env_class.__init__ = tracked_init
+    parallel_env_class.step = tracked_step
+    try:
+        yield
+    finally:
+        parallel_env_class.__init__ = original_init
+        parallel_env_class.step = original_step
+
+
+@contextmanager
+def _patched_evaluation_logging(
+    logging_module,
+    capture=None,
+    canonical_logger=None,
+):
     """Patch only the official call window and always restore its logger."""
 
     original_logging = logging_module.log_multiple_seeds_to_wandb
 
     def captured_logging(step, infos, fps=30):
-        capture.record(step, infos)
+        if capture is not None:
+            capture.record(step, infos)
+        if canonical_logger is not None:
+            canonical_logger.record_evaluation(step, infos)
         return original_logging(step, infos, fps=fps)
 
     logging_module.log_multiple_seeds_to_wandb = captured_logging
@@ -221,17 +537,23 @@ def _run_official_main(
     *,
     logging_module=None,
     evaluation_capture=None,
+    canonical_logger=None,
 ) -> None:
     """Run upstream directly unless the optional capture was requested."""
 
-    if evaluation_capture is None:
+    if evaluation_capture is None and canonical_logger is None:
         official_main()
         return
     if logging_module is None:
-        raise RuntimeError("evaluation capture requires the official logging module")
-    with _patched_evaluation_logging(logging_module, evaluation_capture):
+        raise RuntimeError("logging capture requires the official logging module")
+    with _patched_evaluation_logging(
+        logging_module,
+        evaluation_capture,
+        canonical_logger,
+    ):
         official_main()
-    evaluation_capture.assert_expected_rows()
+    if evaluation_capture is not None:
+        evaluation_capture.assert_expected_rows()
 
 
 def _assert_finite_leaves(label, leaves) -> None:
@@ -314,6 +636,10 @@ def main() -> None:
     parser.add_argument("--num-seeds", type=int)
     parser.add_argument("--action-repeat", type=int)
     parser.add_argument("--expected-evaluation-rows", type=int)
+    parser.add_argument("--canonical-wandb", action="store_true")
+    parser.add_argument("--task")
+    parser.add_argument("--implementation")
+    parser.add_argument("--source-sha")
     args, hydra_args = parser.parse_known_args()
 
     repo = args.official_repo.resolve()
@@ -344,17 +670,19 @@ def main() -> None:
     ):
         raise SystemExit("--max-projection-residual must be finite and non-negative")
     capture_evaluations = _validate_evaluation_capture_args(args)
+    canonical_metadata = _canonical_wandb_metadata(args)
 
     sys.path.insert(0, str(repo))
     sys.argv = [sys.argv[0], *hydra_args]
 
     from xqc.agents import XQCLearner
+    from xqc.envs import ParallelEnv
     from xqc.normalization import RewardNormalizer
     from train_parallel import main as official_main
 
     evaluation_capture = None
     official_logging = None
-    if capture_evaluations:
+    if capture_evaluations or canonical_metadata is not None:
         import xqc.logging as official_logging
 
         try:
@@ -395,14 +723,40 @@ def main() -> None:
         original_reward_normalizer_init(self, *init_args, **init_kwargs)
         reward_normalizer = self
 
+    canonical_logger = None
+    wandb_module = None
+    if canonical_metadata is not None:
+        import wandb as wandb_module
+
+        canonical_logger = _CanonicalWandbLogger(
+            wandb_module,
+            action_repeat=args.action_repeat,
+        )
+
     XQCLearner.update = counted_update
     RewardNormalizer.__init__ = captured_reward_normalizer_init
     try:
-        _run_official_main(
-            official_main,
-            logging_module=official_logging,
-            evaluation_capture=evaluation_capture,
-        )
+        if canonical_metadata is None:
+            _run_official_main(
+                official_main,
+                logging_module=official_logging,
+                evaluation_capture=evaluation_capture,
+            )
+        else:
+            with _patched_wandb_initialization(
+                wandb_module,
+                canonical_metadata,
+            ), _patched_training_returns(
+                ParallelEnv,
+                canonical_logger,
+                num_seeds=args.num_seeds,
+            ):
+                _run_official_main(
+                    official_main,
+                    logging_module=official_logging,
+                    evaluation_capture=evaluation_capture,
+                    canonical_logger=canonical_logger,
+                )
     finally:
         XQCLearner.update = original_update
         RewardNormalizer.__init__ = original_reward_normalizer_init

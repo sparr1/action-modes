@@ -1,6 +1,6 @@
 {
   "study_type": "xqc_humanoid_walk_two_seed_parity",
-  "study_note": "Two-seed Humanoid Walk parity check using seeds 0 and 1 and the released XQC one-million-raw-frame protocol: action repeat two, 500k agent decisions, UTD two, 5k-decision warmup, and ten deterministic evaluation episodes after decision one and every 50k decisions. This checks the port against the released implementation and its ten-seed paper curve; it is not a statistical reproduction of the paper result.",
+  "study_note": "Two-seed Humanoid Walk parity check using seeds 0 and 1 and the released XQC one-million-raw-frame protocol: action repeat two, 500k agent decisions, UTD two, 5k-decision warmup, and ten deterministic evaluation episodes after decision one and every 50k decisions. Hydra runs each implementation/seed cell as an independent one-GPU job, with no seed vectorization or serial seed loop. This checks the port against the released implementation and its ten-seed paper curve; it is not a statistical reproduction of the paper result.",
   "overrides_alg": {
     "env": "DMControl-v0"
   },

@@ -172,6 +172,26 @@ class SAC(Algorithm):
             config={"run_params": self.run_params, "alg_params": self.params, "config": asdict(self.cfg)},
         )
 
+    def _wandb_step(self, decision_step: int) -> int:
+        """Map an environment decision count to this algorithm's W&B axis."""
+
+        return int(decision_step)
+
+    def _wandb_payload(self, payload, *, event: str, decision_step: int):
+        """Allow subclasses to add comparison metrics without copying logging."""
+
+        del event, decision_step
+        return payload
+
+    def _emit_wandb(self, payload, *, decision_step: int) -> None:
+        """Emit one W&B event using the algorithm's selected global step."""
+
+        log_wandb(
+            self._wandb_run,
+            payload,
+            step=self._wandb_step(decision_step),
+        )
+
     def _make_config(self) -> SACConfig:
         unsupported = {
             "policy", "env", "tensorboard_log", "replay_buffer_class", "replay_buffer_kwargs",
@@ -417,7 +437,12 @@ class SAC(Algorithm):
                 "episode/return": float(self._episode_return),
                 "episode/len": int(self._episode_len),
             })
-        log_wandb(self._wandb_run, payload, step=self.num_timesteps)
+        payload = self._wandb_payload(
+            payload,
+            event="train",
+            decision_step=self.num_timesteps,
+        )
+        self._emit_wandb(payload, decision_step=self.num_timesteps)
         self._last_wandb_step = int(self.num_timesteps)
         self._wandb_last_updates = int(self.agent.num_updates)
 
@@ -514,14 +539,15 @@ class SAC(Algorithm):
                 )
                 stream.flush()
                 os.fsync(stream.fileno())
-        log_wandb(
-            self._wandb_run,
+        payload = self._wandb_payload(
             {
                 "eval/episode_reward": reward,
                 "eval/episodes": int(self._eval_episodes),
             },
-            step=int(step),
+            event="eval",
+            decision_step=int(step),
         )
+        self._emit_wandb(payload, decision_step=int(step))
 
     @torch.no_grad()
     def _evaluate_policy(self, step, *, initial_obs=None):
