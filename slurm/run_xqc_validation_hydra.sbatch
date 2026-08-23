@@ -119,7 +119,10 @@ srun --ntasks=1 "$ACTION_PYTHON" -m pytest -q \
   tests/test_dmcontrol_benchmark_configs.py
 
 cd "$OFFICIAL_DIR_REAL"
-srun --ntasks=1 "$OFFICIAL_PYTHON" train_parallel.py \
+srun --ntasks=1 "$OFFICIAL_PYTHON" \
+  "$PROJECT_DIR_REAL/tests/oracles/run_official_xqc_smoke.py" \
+  --official-repo "$OFFICIAL_DIR_REAL" \
+  --expected-updates 40 \
   env=walker-walk \
   seed=1 \
   num_seeds=1 \

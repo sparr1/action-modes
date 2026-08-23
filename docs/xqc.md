@@ -47,8 +47,12 @@ Prepare the two isolated, lock-resolved environments before submission:
 
 ```bash
 uv sync --project environments/dmcontrol --locked
+git -C /absolute/path/to/xqc checkout --detach 9a6832bb742ef01bbe9f1e06153a9338e612dae5
+git -C /absolute/path/to/xqc submodule update --init --recursive
 uv sync --project /absolute/path/to/xqc --locked
 ```
 
 The launcher refuses dirty or mismatched checkouts and places run artifacts in
-the job's `SLURM_TMPDIR`, falling back to the compute node's `/tmp` scratch.
+the job's `SLURM_TMPDIR`, falling back to the compute node's `/tmp` scratch. It
+counts completed updates around the unmodified official learner and requires
+exactly 40 in both the JAX and PyTorch smoke runs.

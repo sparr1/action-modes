@@ -310,6 +310,8 @@ def test_hydra_validation_launcher_is_clean_pinned_and_scratch_only():
     assert "from importlib.metadata import version" in contents
     assert "sha256sum" in contents
     assert "generate_xqc_official_fixture.py" in contents
+    assert "run_official_xqc_smoke.py" in contents
+    assert "--expected-updates 40" in contents
     assert "JAX_PLATFORMS=cpu srun" in contents
     assert "cmp \"$JOB_SCRATCH/xqc_official_fixture.json\"" in contents
     assert "nvidia-smi" in contents
