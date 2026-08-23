@@ -70,6 +70,7 @@ def seed_env_spaces(env, seed):
 _SEEDED_LEARN_RESET_ALGORITHMS = {
     "TDMPC2/TDMPC2Baseline",
     "AMBITDMPC2/AMBITDMPC2",
+    "AMBIXQC/AMBIXQC",
     "XQC/XQC",
 }
 
@@ -228,6 +229,7 @@ _RUNTIME_CONFIG_FIELDS = (
     "episode_length",
     "eval_freq",
     "eval_episodes",
+    "discount",
     "train_unroll_horizon",
     "outer_planning_horizon",
     "inner_rollout_horizon",
@@ -265,6 +267,24 @@ _RUNTIME_CONFIG_FIELDS = (
     "inner_critic_dropout_enabled",
     "inner_model_step_budget",
     "inner_expected_update_slots",
+    "xqc_actor_net_arch",
+    "xqc_critic_net_arch",
+    "xqc_num_atoms",
+    "xqc_vmin",
+    "xqc_vmax",
+    "xqc_actor_lr",
+    "xqc_critic_lr",
+    "xqc_lr_end",
+    "xqc_tau",
+    "xqc_policy_delay",
+    "xqc_target_update_interval",
+    "xqc_init_temperature",
+    "xqc_resolved_target_entropy",
+    "xqc_adam_eps",
+    "xqc_optimizer_backend",
+    "xqc_reward_normalization",
+    "xqc_lr_transition_steps",
+    "xqc_official_commit",
 )
 
 
@@ -468,6 +488,30 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
             resolved["inner_expected_update_slots"] * resolved["inner_batch_size"]
         )
 
+    xqc_keys = (
+        "xqc_actor_net_arch",
+        "xqc_critic_net_arch",
+        "xqc_num_atoms",
+        "xqc_vmin",
+        "xqc_vmax",
+        "xqc_actor_lr",
+        "xqc_critic_lr",
+        "xqc_lr_end",
+        "xqc_tau",
+        "xqc_policy_delay",
+        "xqc_target_update_interval",
+        "xqc_init_temperature",
+        "xqc_resolved_target_entropy",
+        "xqc_adam_eps",
+        "xqc_optimizer_backend",
+        "xqc_reward_normalization",
+        "xqc_lr_transition_steps",
+        "xqc_official_commit",
+    )
+    xqc = {key: resolved[key] for key in xqc_keys if key in resolved}
+    if xqc and "discount" in resolved:
+        xqc["discount"] = resolved["discount"]
+
     metadata = {
         "schema_version": 1,
         "algorithm": trial_run_params.get("alg"),
@@ -479,6 +523,8 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
         "compilation": compile_metadata,
         "inner_budget": inner,
     }
+    if xqc:
+        metadata["xqc"] = xqc
     if actor_loss_scale:
         metadata["actor_loss_scale"] = actor_loss_scale
     return _json_safe_metadata(metadata)

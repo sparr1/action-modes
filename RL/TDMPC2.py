@@ -602,6 +602,16 @@ class TDMPC2Baseline(Algorithm):
         """Action hook for subclasses that add call-scoped options."""
         return self.agent.act(obs_t, t0=t0, eval_mode=eval_mode)
 
+    def _observe_transition(self, reward, terminated, truncated):
+        """Observe one real training transition outside replay construction.
+
+        TD-MPC2 and native AMBI do not need this hook.  Derived learners can
+        use it for chronological state, such as a return normalizer, without
+        changing the raw rewards stored in the shared replay buffer.
+        """
+
+        del reward, terminated, truncated
+
     def _wandb_run_name(self):
         env_params = self.experiment_params.get("env_params", {})
         task = env_params.get("task", self.run_params.get("env", "env"))
@@ -1880,6 +1890,7 @@ class TDMPC2Baseline(Algorithm):
             next_obs, reward, terminated, truncated, info = self.env.step(
                 action_env
             )
+            self._observe_transition(reward, terminated, truncated)
             done = bool(terminated or truncated)
             true_terminated = bool(terminated)
             next_obs_t = self._reuse_observation_tensor(next_obs)

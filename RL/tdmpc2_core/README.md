@@ -63,6 +63,17 @@ from the current outer temperature. Scalar twin critics, LoRA, TD3, no inner
 improvement, and persistent inner scopes are explicit ablations. The MPPI inner
 operator is a compute-matched TD-MPC-style comparator, not AMBI's planner.
 
+AMBI-XQC is a separate algorithm rather than another native AMBI option. It
+retains the TOLD encoder, dynamics, reward/termination heads, and uninterrupted
+recurrent BPTT, while its persistent and action-local control learners use
+XQC's twin full-distribution Bellman target, BatchNorm state rules, projected
+linear weights, delayed actor/temperature updates, and real-return reward
+scale. Only chronological real rewards update that scale; each fresh inner
+learner sees one frozen snapshot and never updates it from imagined branches.
+The XQC controller semantics reuse the PyTorch port of official XQC commit
+`9a6832bb742ef01bbe9f1e06153a9338e612dae5`; TOLD remains derived from the
+TD-MPC2 source identified above.
+
 AMBI's actor log-standard-deviation transform is configurable independently of
 its bounds. `log_std_mapping="direct_clamp"` preserves the SAC-style default by
 clamping the actor head directly to `log_std_min`/`log_std_max` (default

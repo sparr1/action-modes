@@ -1,0 +1,25 @@
+{
+  "study_type": "functional_smoke_test",
+  "study_note": "AMBI-XQC Humanoid Walk state integration check only. It preserves TOLD recurrent training and exercises one fresh inner-XQC action after a reduced warmup. The shortened replay, batch, pretraining, inner-compute, and training budgets are not benchmark settings.",
+  "overrides_alg": {
+    "env": "DMControl-v0"
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambixqc_humanoid_walk_state_smoke"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 500,
+  "save_strat": [
+    "latest"
+  ],
+  "checkpoint_best_window": 1,
+  "log_info": false,
+  "log_type": "summary"
+}

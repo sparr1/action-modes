@@ -32,6 +32,7 @@ _MAX_NUMPY_SEED = 2**32 - 1
 _NATIVE_SAC = "SAC/SAC"
 _TDMPC2 = "TDMPC2/TDMPC2Baseline"
 _AMBI_TDMPC2 = "AMBITDMPC2/AMBITDMPC2"
+_AMBI_XQC = "AMBIXQC/AMBIXQC"
 _SB3_REPLAY_ALGORITHMS = {"DDPG", "DQN", "SAC", "TD3"}
 
 
@@ -369,12 +370,15 @@ def _backend_for(algorithm: str) -> str:
         return "tdmpc2"
     if algorithm == _AMBI_TDMPC2:
         return "ambi_tdmpc2"
+    if algorithm == _AMBI_XQC:
+        return "ambixqc"
     raise RenderCheckpointError(
         f"Algorithm {algorithm!r} is not supported by this renderer. Supported "
         "checkpoints are SB3 baselines ('baselines/...'), native SAC ('SAC/SAC'), "
         "TD-MPC2 ('TDMPC2/TDMPC2Baseline'), and AMBI-TD-MPC2 "
-        "('AMBITDMPC2/AMBITDMPC2'). Legacy AMBI, PAMDP, modes, Random, and "
-        "Stationary models require a backend-specific evaluator."
+        "('AMBITDMPC2/AMBITDMPC2'), and AMBI-XQC "
+        "('AMBIXQC/AMBIXQC'). Legacy AMBI, PAMDP, modes, Random, and Stationary "
+        "models require a backend-specific evaluator."
     )
 
 
@@ -405,7 +409,7 @@ def _prepare_run_params(
         # trains or restores replay, and capacity is not checkpoint model
         # compatibility, so avoid needless GB-scale allocations.
         alg_params["buffer_size"] = 1
-    if backend in {"tdmpc2", "ambi_tdmpc2"}:
+    if backend in {"tdmpc2", "ambi_tdmpc2", "ambixqc"}:
         alg_params["compile"] = False
         alg_params["compile_strict"] = False
     if backend == "ambi_tdmpc2":

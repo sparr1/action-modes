@@ -159,6 +159,7 @@ def test_sidecar_schema_and_backend_allowlist_errors_are_actionable(tmp_path):
     assert renderer._backend_for("SAC/SAC") == "native_sac"
     assert renderer._backend_for("TDMPC2/TDMPC2Baseline") == "tdmpc2"
     assert renderer._backend_for("AMBITDMPC2/AMBITDMPC2") == "ambi_tdmpc2"
+    assert renderer._backend_for("AMBIXQC/AMBIXQC") == "ambixqc"
 
 
 def test_render_overrides_are_isolated_and_disable_training_only_features(tmp_path):
@@ -183,6 +184,23 @@ def test_render_overrides_are_isolated_and_disable_training_only_features(tmp_pa
     assert context.trial_run_params["device"] == "cuda"
     assert context.trial_run_params["alg_params"]["wandb"] is True
     assert experiment_params is not context.experiment_params
+
+    ambixqc_run_params = _run_params("AMBIXQC/AMBIXQC")
+    ambixqc_run_params["alg_params"].pop("inner_diagnostic_rollouts")
+    ambixqc_context = renderer.RenderContext(
+        ambixqc_run_params,
+        _experiment_params(),
+        tmp_path / "ambixqc.json",
+    )
+    ambixqc_params, _ = renderer._prepare_run_params(
+        ambixqc_context,
+        backend="ambixqc",
+        device="cpu",
+        controller_seed=23,
+    )
+    assert ambixqc_params["alg_params"]["compile"] is False
+    assert ambixqc_params["alg_params"]["compile_strict"] is False
+    assert "inner_diagnostic_rollouts" not in ambixqc_params["alg_params"]
 
     native_context = renderer.RenderContext(
         _run_params("SAC/SAC"), _experiment_params(), tmp_path / "native.json"

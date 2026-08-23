@@ -40,6 +40,30 @@ and MPPI are auxiliary ablations or comparison operators. In particular, MPPI
 is the TD-MPC-style planning comparator; it is not AMBI's core action-selection
 algorithm.
 
+`AMBIXQC/AMBIXQC` is the XQC-backed form of the same AMBI pattern. It keeps
+TOLD and its recurrent multi-step BPTT training, replaces the persistent SAC
+control priors with the released XQC actor and twin categorical critics, and
+runs a fresh full-copy inner XQC learner at every non-warmup decision. Its
+first implementation is state-observation only and deliberately has no MPPI,
+TD3, LoRA, or persistent-inner switches. The reduced Humanoid Walk integration
+check is
+`configs/dmcontrol/experiments/ambixqc_humanoid_walk_state_smoke.json` and must
+be run with `--alg-dir configs/dmcontrol/algs`; it is not a benchmark.
+
+The resolved AMBI-XQC defaults use the released four-layer XQC actor
+(`256` units per layer), twin four-layer critics (`512` units per layer), 101
+atoms on `[-5, 5]`, `alpha=0.01`, policy delay 3, and `tau=0.005`. The fresh
+inner solve defaults to `J=2`, `N=32`, `H=3`, and `G=4`, with a 64-row batch
+and fixed `5e-5` actor/critic learning rates. Temperature always uses the actor
+learning rate. These are initial method defaults, not a frozen benchmark
+protocol; every experiment must record its resolved settings.
+
+AMBI-XQC v1 supports portable model checkpoints for evaluation and weight
+transfer. It is not allowlisted for exact trainer resume because that stronger
+contract also requires replay and environment state. The v1 controller and
+inner solve are eager-only; `compile` and `compile_strict` must both remain
+false until their stateful update regions receive separate correctness gates.
+
 ## Training checkpoints
 
 Within-run checkpoint retention is configured independently from end-of-trial

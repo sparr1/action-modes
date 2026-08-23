@@ -1470,8 +1470,12 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_critic_loss",
             "inner_critic_grad_norm",
             "inner_q_mean",
+            "inner_q1_mean",
+            "inner_q2_mean",
             "inner_q_abs_mean",
             "inner_q_target_mean",
+            "inner_q_policy_mean",
+            "inner_q_disagreement_mean",
             "inner_q_target_clip_fraction",
             "inner_td_error_abs_mean",
         }
@@ -1483,6 +1487,9 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_actor_q_min_all",
             "inner_actor_q_mean_all_minus_min_all",
             "inner_actor_entropy",
+            "inner_policy_entropy",
+            "inner_policy_log_prob",
+            "inner_actor_update_accepted",
             "inner_outer_policy_kl",
             "inner_outer_action_l2",
         }
@@ -1492,7 +1499,13 @@ class AMBITDMPC2(TDMPC2Baseline):
         }
         action_gauges = {
             "inner_alpha",
+            "inner_temperature",
             "inner_alpha_to_abs_q",
+            "inner_reward_scale",
+            "inner_actor_learning_rate",
+            "inner_critic_learning_rate",
+            "inner_temperature_learning_rate",
+            "inner_algorithm_xqc",
             "inner_actor_loss_scale",
             "inner_effective_alpha",
             "inner_buffer_size",
