@@ -82,6 +82,7 @@ export WANDB_DATA_DIR="$WANDB_LOCAL_ROOT/data"
 export WANDB_ARTIFACT_DIR="$WANDB_LOCAL_ROOT/artifacts"
 export WANDB_DISABLE_CODE=true
 export XQC_EVAL_CSV="$ACTION_RUN_ROOT/evaluation.csv"
+export ACTION_RUN_ROOT
 
 echo "Job: $SLURM_JOB_ID"
 echo "Node: $SLURM_NODELIST"
@@ -155,7 +156,7 @@ srun --ntasks=1 "$ACTION_PYTHON" main.py \
   --log-dir "$ACTION_RUN_ROOT" \
   --num-runs 1
 
-ACTION_RUN_ROOT="$ACTION_RUN_ROOT" srun --ntasks=1 "$ACTION_PYTHON" -c \
+srun --ntasks=1 "$ACTION_PYTHON" -c \
   'import glob,math,os,numpy as np,torch; from torch.utils._pytree import tree_leaves; paths=glob.glob(os.environ["ACTION_RUN_ROOT"]+"/**/*_latest.pt",recursive=True); assert len(paths)==1,paths; state=torch.load(paths[0],map_location="cpu",weights_only=False); agent=state["agent"]; assert state["algorithm"]=="XQC" and state["official_xqc_commit"]=="9a6832bb742ef01bbe9f1e06153a9338e612dae5"; assert state["num_timesteps"]==5020,state["num_timesteps"]; assert (agent["update_step"],agent["actor_optimizer_steps"],agent["temperature_optimizer_steps"])==(40,14,14); leaves=tree_leaves(state); assert all(not torch.is_tensor(x) or not (x.is_floating_point() or x.is_complex()) or bool(torch.isfinite(x).all()) for x in leaves); assert all(not isinstance(x,(float,np.floating,np.ndarray)) or bool(np.isfinite(x).all()) for x in leaves); weights=[value for group in (agent["actor"],agent["critic"]) for key,value in group.items() if key.endswith((".linear.weight","mean.weight","log_std.weight",".value.weight"))]; residual=max(float((torch.linalg.vector_norm(value,dim=1)-1).abs().max()) for value in weights); assert residual<=1e-6,residual; print(paths[0],agent["update_step"],residual)'
 
 require_clean_sha "$PROJECT_DIR_REAL" "$EXPECTED_ACTION_MODES_SHA" "Action Modes"

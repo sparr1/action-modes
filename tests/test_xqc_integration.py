@@ -322,6 +322,8 @@ def test_hydra_validation_launcher_is_clean_pinned_and_scratch_only():
     assert "nvidia-smi" in contents
     assert "srun --ntasks=1" in contents
     assert contents.count("-p no:cacheprovider") == 3
+    assert "export ACTION_RUN_ROOT" in contents
+    assert 'ACTION_RUN_ROOT="$ACTION_RUN_ROOT" srun' not in contents
     assert "run_xqc_validation_hydra.sbatch" in contents
     assert "xqc_walker_walk_state_smoke.json" in contents
     assert 'agent["update_step"]' in contents
