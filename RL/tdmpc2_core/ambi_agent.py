@@ -914,6 +914,296 @@ class AMBITDMPC2Agent(torch.nn.Module):
             bootstrap = bootstrap - self.alpha.detach() * next_info["log_prob"]
         return reward + self.discount * (1.0 - terminated) * bootstrap
 
+    def _should_run_value_equivalence_diagnostics(self):
+        """Whether the upcoming completed outer update is a sampled event."""
+        if not bool(getattr(self.cfg, "value_equivalence_diagnostics", False)):
+            return False
+        cadence = int(getattr(self.cfg, "value_equivalence_every_updates", 1000))
+        return (self.num_updates + 1) % cadence == 0
+
+    def _initial_inner_diagnostic_alpha(self):
+        """Return alpha at the beginning of a fresh inner SAC solve."""
+        mode = str(self.cfg.inner_temperature_mode)
+        if mode == "inherit_outer":
+            return self.alpha.detach()
+        if mode == "fixed":
+            return self.alpha.detach().new_tensor(float(self.cfg.inner_temperature))
+        if mode != "auto":
+            raise ValueError(f"Unknown inner temperature mode: {mode!r}")
+
+        initialization = str(self.cfg.inner_temperature_initialization)
+        if initialization == "inherit_outer":
+            return self.alpha.detach()
+        if initialization == "fixed":
+            return self.alpha.detach().new_tensor(float(self.cfg.inner_temperature))
+        raise ValueError(
+            "Unknown inner temperature initialization: "
+            f"{initialization!r}"
+        )
+
+    def _value_equivalence_reference_critic(self):
+        """Resolve the critic used by the fresh inner Bellman target."""
+        source = str(self.cfg.inner_bootstrap_source)
+        if source == "outer_target":
+            return self.model._target_Qs
+        if source in {"inner_target", "outer_online"}:
+            # A fresh action-local inner target is an eval-mode hard copy of
+            # the online critic, so evaluating the online module is equivalent
+            # without allocating or mutating an inner workspace.
+            return self.model._Qs
+        raise ValueError(f"Unknown inner bootstrap source: {source!r}")
+
+    @staticmethod
+    def _value_equivalence_masked_mean(value, mask=None):
+        if mask is None:
+            return value.mean()
+        weights = torch.broadcast_to(mask.to(dtype=value.dtype), value.shape)
+        return (value * weights).sum() / weights.sum()
+
+    @classmethod
+    def _value_equivalence_rmse(cls, error, mask=None):
+        return cls._value_equivalence_masked_mean(error.square(), mask).sqrt()
+
+    def _value_equivalence_q(
+        self,
+        critic,
+        z,
+        action,
+        reduction,
+        pair_indices,
+    ):
+        """Evaluate a paired diagnostic Q without touching lazy compile state."""
+        q_input = self.model.joint_input(z, action)
+        q_predictions = critic._forward_eager(q_input)
+        q_values = self.model.q_backend.decode(q_predictions)
+        return self.model.q_backend.reduce(
+            q_values,
+            reduction,
+            pair_indices=pair_indices,
+            trusted_pair_indices=pair_indices is not None,
+        )
+
+    @torch.no_grad()
+    def _value_equivalence_diagnostics(
+        self,
+        latent_states,
+        reward_predictions,
+        termination_prediction,
+        next_z_targets,
+        reward,
+        terminated,
+        diagnostic_update,
+    ):
+        """Compare fresh-inner soft Bellman targets on model and replay paths.
+
+        Depth one begins at the encoded replay root. Later depths use the
+        recurrent TOLD rollout under the recorded replay actions, so their
+        errors include accumulated latent-model drift. The evaluator remains
+        the fresh outer prior even when a non-canonical configuration persists
+        adapted inner modules across roots.
+        """
+        model_next_z = latent_states[1:].detach()
+        real_next_z = next_z_targets.detach()
+        real_reward = reward.detach()
+        real_terminated = terminated.detach().to(dtype=real_reward.dtype)
+        model_reward = td_math.two_hot_inv(
+            reward_predictions.detach(), self.cfg
+        )
+        if bool(self.cfg.episodic):
+            if termination_prediction is None:
+                raise RuntimeError(
+                    "Episodic value-equivalence diagnostics require termination logits."
+                )
+            model_terminated = (
+                torch.sigmoid(termination_prediction.detach())
+                > float(self.cfg.inner_termination_threshold)
+            ).to(dtype=real_reward.dtype)
+        else:
+            model_terminated = torch.zeros_like(real_terminated)
+
+        alive_before_depth = torch.ones_like(real_terminated)
+        if int(real_terminated.shape[0]) > 1:
+            matched_continuation = (
+                (1.0 - real_terminated[:-1])
+                * (1.0 - model_terminated[:-1])
+            )
+            alive_before_depth[1:] = torch.cumprod(
+                matched_continuation, dim=0
+            )
+
+        paired_next_z = torch.stack((real_next_z, model_next_z), dim=0)
+        critic = self._value_equivalence_reference_critic()
+        actor_training_modes = tuple(
+            (module, bool(module.training)) for module in self.model._pi.modules()
+        )
+        critic_training_modes = tuple(
+            (module, bool(module.training)) for module in critic.modules()
+        )
+
+        generator_device = self.device if self.device.type == "cuda" else "cpu"
+        generator = torch.Generator(device=generator_device)
+        seed = (
+            int(self.cfg.seed)
+            + 1_000_003 * int(diagnostic_update)
+            + 0x5EED5EED
+        ) % (2**63 - 1)
+        generator.manual_seed(seed)
+
+        value_sum = torch.zeros(
+            paired_next_z.shape[:-1] + (1,),
+            dtype=paired_next_z.dtype,
+            device=paired_next_z.device,
+        )
+        alpha = self._initial_inner_diagnostic_alpha()
+        reduction = str(self.cfg.inner_q_target_reduction)
+        mc_samples = int(self.cfg.value_equivalence_mc_samples)
+        try:
+            self.model._pi.eval()
+            critic.eval()
+            for _ in range(mc_samples):
+                policy_noise = torch.randn(
+                    real_next_z.shape[:-1] + (int(self.cfg.action_dim),),
+                    dtype=real_next_z.dtype,
+                    device=real_next_z.device,
+                    generator=generator,
+                )
+                paired_noise = policy_noise.unsqueeze(0).expand(
+                    (2,) + policy_noise.shape
+                )
+                next_action, next_info = self.model.pi(
+                    paired_next_z,
+                    policy=self.model._pi,
+                    noise=paired_noise,
+                    log_std_mapping=self.cfg.inner_log_std_mapping,
+                    log_std_min=self.cfg.inner_log_std_min,
+                    log_std_max=self.cfg.inner_log_std_max,
+                )
+                pair_indices = (
+                    self.model.q_backend.sample_pair_indices(
+                        self.device, generator=generator
+                    )
+                    if reduction.endswith("_pair")
+                    else None
+                )
+                next_q = self._value_equivalence_q(
+                    critic,
+                    paired_next_z,
+                    next_action,
+                    reduction,
+                    pair_indices,
+                )
+                bootstrap_value = next_q
+                if self.cfg.inner_sac_critic_target == "entropy_augmented":
+                    bootstrap_value = (
+                        bootstrap_value - alpha * next_info["log_prob"]
+                    )
+                value_sum.add_(bootstrap_value)
+        finally:
+            for module, was_training in actor_training_modes:
+                module.training = was_training
+            for module, was_training in critic_training_modes:
+                module.training = was_training
+
+        mean_value = value_sum / float(mc_samples)
+        real_value, model_value = mean_value.unbind(0)
+        real_bootstrap = (
+            float(self.discount) * (1.0 - real_terminated) * real_value
+        )
+        model_bootstrap = (
+            float(self.discount) * (1.0 - model_terminated) * model_value
+        )
+        reward_error = model_reward - real_reward
+        bootstrap_error = model_bootstrap - real_bootstrap
+        target_error = reward_error + bootstrap_error
+        reference_target = real_reward + real_bootstrap
+
+        target_rmse = self._value_equivalence_rmse(
+            target_error, alive_before_depth
+        )
+        eps = torch.finfo(target_error.dtype).eps
+        reference_rms = self._value_equivalence_rmse(
+            reference_target, alive_before_depth
+        )
+        reward_mse = self._value_equivalence_masked_mean(
+            reward_error.square(), alive_before_depth
+        )
+        bootstrap_mse = self._value_equivalence_masked_mean(
+            bootstrap_error.square(), alive_before_depth
+        )
+        cancellation_fraction = (
+            -2.0
+            * self._value_equivalence_masked_mean(
+                reward_error * bootstrap_error, alive_before_depth
+            )
+            / (reward_mse + bootstrap_mse + eps)
+        ).clamp(min=0.0, max=1.0)
+        info = {
+            "ve_prior_target_mae": self._value_equivalence_masked_mean(
+                target_error.abs(), alive_before_depth
+            ),
+            "ve_prior_target_rmse": target_rmse,
+            "ve_prior_target_bias": self._value_equivalence_masked_mean(
+                target_error, alive_before_depth
+            ),
+            "ve_prior_target_nrmse": target_rmse
+            / reference_rms.clamp_min(eps),
+            "ve_prior_target_abs_p95": torch.quantile(
+                target_error.abs()[alive_before_depth.bool()], 0.95
+            ),
+            "ve_prior_reference_target_rms": reference_rms,
+            "ve_prior_reward_rmse": reward_mse.sqrt(),
+            "ve_prior_bootstrap_rmse": bootstrap_mse.sqrt(),
+            "ve_prior_cancellation_fraction": cancellation_fraction,
+        }
+        for depth in range(int(self.cfg.train_unroll_horizon)):
+            depth_index = depth + 1
+            depth_target_error = target_error[depth]
+            depth_reward_error = reward_error[depth]
+            depth_bootstrap_error = bootstrap_error[depth]
+            depth_mask = alive_before_depth[depth]
+            if not bool(depth_mask.any().item()):
+                continue
+            info[f"ve_prior_target_mae_depth_{depth_index}"] = (
+                self._value_equivalence_masked_mean(
+                    depth_target_error.abs(), depth_mask
+                )
+            )
+            info[f"ve_prior_target_rmse_depth_{depth_index}"] = (
+                self._value_equivalence_rmse(depth_target_error, depth_mask)
+            )
+            info[f"ve_prior_target_bias_depth_{depth_index}"] = (
+                self._value_equivalence_masked_mean(
+                    depth_target_error, depth_mask
+                )
+            )
+            info[f"ve_prior_reward_rmse_depth_{depth_index}"] = (
+                self._value_equivalence_rmse(depth_reward_error, depth_mask)
+            )
+            info[f"ve_prior_bootstrap_rmse_depth_{depth_index}"] = (
+                self._value_equivalence_rmse(
+                    depth_bootstrap_error, depth_mask
+                )
+            )
+        if bool(self.cfg.episodic):
+            disagreement = (model_terminated != real_terminated).to(
+                dtype=real_reward.dtype
+            )
+            info["ve_prior_termination_disagreement"] = (
+                self._value_equivalence_masked_mean(
+                    disagreement, alive_before_depth
+                )
+            )
+            for depth in range(int(self.cfg.train_unroll_horizon)):
+                depth_mask = alive_before_depth[depth]
+                if not bool(depth_mask.any().item()):
+                    continue
+                info[f"ve_prior_termination_disagreement_depth_{depth + 1}"] = (
+                    self._value_equivalence_masked_mean(
+                        disagreement[depth], depth_mask
+                    )
+                )
+        return info
+
     def _update_actor(self, zs):
         action, policy_info = self.model.pi(zs)
         # Preserve the established SAC ordering: this slot's actor uses alpha
@@ -1116,6 +1406,18 @@ class AMBITDMPC2Agent(torch.nn.Module):
             td_targets,
         )
 
+        value_equivalence_info = {}
+        if self._should_run_value_equivalence_diagnostics():
+            value_equivalence_info = self._value_equivalence_diagnostics(
+                latent_states,
+                reward_predictions,
+                termination_prediction,
+                next_z_targets,
+                reward,
+                terminated,
+                diagnostic_update=self.num_updates + 1,
+            )
+
         self.optim.zero_grad(set_to_none=True)
         total_loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1191,6 +1493,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 )
             )
         info.update(actor_info)
+        info.update(value_equivalence_info)
         return info
 
     def update(self, buffer):

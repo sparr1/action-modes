@@ -355,3 +355,54 @@ def test_operator_specific_noop_controls_are_rejected():
             inner_temperature_mode="inherit_outer",
             inner_outer_policy_kl_coef=0.1,
         )
+
+
+def test_value_equivalence_diagnostic_defaults_are_inert_and_sparse():
+    cfg = _build_cfg()
+
+    assert cfg.value_equivalence_diagnostics is False
+    assert cfg.value_equivalence_every_updates == 1000
+    assert cfg.value_equivalence_mc_samples == 4
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true"])
+def test_value_equivalence_diagnostic_gate_is_strict_boolean(value):
+    with pytest.raises(ValueError, match="value_equivalence_diagnostics"):
+        _build_cfg(value_equivalence_diagnostics=value)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("value_equivalence_every_updates", True),
+        ("value_equivalence_every_updates", 0),
+        ("value_equivalence_every_updates", -1),
+        ("value_equivalence_every_updates", 1.5),
+        ("value_equivalence_every_updates", "4"),
+        ("value_equivalence_mc_samples", False),
+        ("value_equivalence_mc_samples", 0),
+        ("value_equivalence_mc_samples", -1),
+        ("value_equivalence_mc_samples", 2.5),
+        ("value_equivalence_mc_samples", "4"),
+    ],
+)
+def test_value_equivalence_positive_integer_controls_are_strict(key, value):
+    with pytest.raises(ValueError, match=key):
+        _build_cfg(**{key: value})
+
+
+def test_value_equivalence_monitor_requires_inner_sac_only_when_enabled():
+    enabled = _build_cfg(value_equivalence_diagnostics=True)
+    assert enabled.inner_operator == "sac"
+
+    disabled_td3 = _build_cfg(
+        inner_operator="td3",
+        value_equivalence_diagnostics=False,
+    )
+    assert disabled_td3.inner_operator == "td3"
+
+    with pytest.raises(ValueError, match="requires inner_operator='sac'"):
+        _build_cfg(
+            inner_operator="td3",
+            value_equivalence_diagnostics=True,
+        )

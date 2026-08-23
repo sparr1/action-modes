@@ -155,6 +155,12 @@ _AMBI_DEFAULTS = {
     # model-step budget. Zero preserves legacy runtime.
     "inner_diagnostic_rollouts": 0,
     "inner_diagnostics_every": 1,
+
+    # Sparse, observational value-equivalence monitoring on outer replay
+    # updates. Disabled by default so it cannot change the reference runtime.
+    "value_equivalence_diagnostics": False,
+    "value_equivalence_every_updates": 1000,
+    "value_equivalence_mc_samples": 4,
 }
 
 
@@ -207,6 +213,17 @@ def _strict_bool(value, key):
     if not isinstance(value, (bool, np.bool_)):
         raise ValueError(f"{key} must be a boolean.")
     return bool(value)
+
+
+def _strict_positive_int(value, key):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, np.integer)
+    ):
+        raise ValueError(f"{key} must be a positive integer.")
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"{key} must be a positive integer.")
+    return value
 
 
 def _finite_float(value, key):
@@ -1060,6 +1077,22 @@ class AMBITDMPC2(TDMPC2Baseline):
         cfg.inner_diagnostics_every = int(cfg.inner_diagnostics_every)
         if cfg.inner_diagnostics_every <= 0:
             raise ValueError("inner_diagnostics_every must be positive.")
+        cfg.value_equivalence_diagnostics = _strict_bool(
+            cfg.value_equivalence_diagnostics,
+            "value_equivalence_diagnostics",
+        )
+        cfg.value_equivalence_every_updates = _strict_positive_int(
+            cfg.value_equivalence_every_updates,
+            "value_equivalence_every_updates",
+        )
+        cfg.value_equivalence_mc_samples = _strict_positive_int(
+            cfg.value_equivalence_mc_samples,
+            "value_equivalence_mc_samples",
+        )
+        if cfg.value_equivalence_diagnostics and cfg.inner_operator != "sac":
+            raise ValueError(
+                "value_equivalence_diagnostics requires inner_operator='sac'."
+            )
         cfg.compile_strict = bool(cfg.compile_strict)
 
         cfg.inner_termination_threshold = _finite_float(

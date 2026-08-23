@@ -89,6 +89,48 @@ same-forward `actor_q_mean_all`, `actor_q_min_all`, and
 `actor_q_mean_all_minus_min_all` diagnostics. These metrics are observational;
 the configured actor reduction remains the only Q signal used by optimization.
 
+### Value-equivalence live monitor
+
+AMBI includes an optional, observational value-equivalence monitor for inner
+SAC. It has **fresh-prior semantics**: each sampled outer replay update evaluates
+the Bellman targets seen from the current outer actor, critic, and temperature
+initialization, before any root-local inner improvement. It therefore measures
+whether the current TOLD predictions preserve the TD targets that a newly
+initialized inner learner would receive; it is not a measurement of the critic
+after root-local adaptation. For persistent inner-scope ablations, the monitor
+still evaluates this fresh outer prior rather than the already-adapted modules
+retained by the inner workspace.
+
+The monitor is sparse. It runs every configured number of **outer learner
+updates**, independently of action-time `inner_diagnostics_every`, and its
+metrics are absent on unsampled updates rather than reported as zeros. Paired
+Monte Carlo samples reuse their random choices across the real-transition and
+model-transition sides of each comparison. The monitor does not contribute to
+any loss or optimizer update. The regular training accumulator publishes
+sampled values under `train/ve_prior_*`, including the normal metric count,
+minimum, and maximum summaries. Headline outputs cover target MAE, RMSE, bias,
+normalized RMSE, absolute-error p95, reference-target RMS, reward RMSE,
+bootstrap RMSE, and reward/bootstrap cancellation. `ve_prior_*_depth_1`
+measures the replay-supported transition from the encoded root; larger depth
+suffixes use recurrent model states under the recorded action sequence and
+therefore include accumulated rollout error. On episodic tasks, rows after
+either matched branch has already terminated are excluded, and a fully
+unsupported later depth is omitted.
+
+Enable it with:
+
+```json
+{
+  "value_equivalence_diagnostics": true,
+  "value_equivalence_every_updates": 1000,
+  "value_equivalence_mc_samples": 4
+}
+```
+
+`value_equivalence_every_updates` and `value_equivalence_mc_samples` must be
+strictly positive integers. The monitor currently requires
+`inner_operator="sac"`; it remains disabled by default.
+
 For an actor-only inner-SAC ablation, set
 `inner_actor_adaptation="clone"`, `inner_critic_adaptation="frozen"`, and
 `inner_temperature_mode="inherit_outer"`. The canonical schedule then resolves
