@@ -312,13 +312,16 @@ def test_hydra_validation_launcher_is_clean_pinned_and_scratch_only():
     assert "generate_xqc_official_fixture.py" in contents
     assert "compare_xqc_fixture.py" in contents
     assert "run_official_xqc_smoke.py" in contents
+    assert "tests/test_xqc_official_smoke_oracle.py" in contents
     assert "--expected-updates 40" in contents
+    assert "--max-projection-residual 1e-6" in contents
     assert "JAX_PLATFORMS=cpu srun" in contents
     assert "--atol 1e-6" in contents
     assert "--rtol 1e-5" in contents
     assert "cmp \"$JOB_SCRATCH/xqc_official_fixture.json\"" not in contents
     assert "nvidia-smi" in contents
     assert "srun --ntasks=1" in contents
+    assert contents.count("-p no:cacheprovider") == 3
     assert "run_xqc_validation_hydra.sbatch" in contents
     assert "xqc_walker_walk_state_smoke.json" in contents
     assert 'agent["update_step"]' in contents

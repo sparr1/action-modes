@@ -110,11 +110,18 @@ srun --ntasks=1 "$ACTION_PYTHON" -c \
   'import gymnasium as gym, domains; env=gym.make("DMControl-v0", task="walker-walk", obs="state", render_mode=None); obs,info=env.reset(seed=1); print(obs.shape, obs.dtype, env.action_space.shape); env.close()'
 
 AMBI_XQC_TEST_DEVICE=cpu srun --ntasks=1 "$ACTION_PYTHON" -m pytest -q \
-  tests/test_xqc_correctness.py tests/test_xqc_integration.py
+  -p no:cacheprovider \
+  tests/test_xqc_correctness.py \
+  tests/test_xqc_integration.py \
+  tests/test_xqc_official_smoke_oracle.py
 AMBI_XQC_TEST_DEVICE=cuda AMBI_XQC_REQUIRE_CUDA=1 \
   srun --ntasks=1 "$ACTION_PYTHON" -m pytest -q \
-    tests/test_xqc_correctness.py tests/test_xqc_integration.py
+    -p no:cacheprovider \
+    tests/test_xqc_correctness.py \
+    tests/test_xqc_integration.py \
+    tests/test_xqc_official_smoke_oracle.py
 srun --ntasks=1 "$ACTION_PYTHON" -m pytest -q \
+  -p no:cacheprovider \
   tests/test_sac_correctness.py \
   tests/test_sac_distributional_q.py \
   tests/test_sac_target_update_cadence.py \
@@ -127,6 +134,7 @@ srun --ntasks=1 "$OFFICIAL_PYTHON" \
   "$PROJECT_DIR_REAL/tests/oracles/run_official_xqc_smoke.py" \
   --official-repo "$OFFICIAL_DIR_REAL" \
   --expected-updates 40 \
+  --max-projection-residual 1e-6 \
   env=walker-walk \
   seed=1 \
   num_seeds=1 \
