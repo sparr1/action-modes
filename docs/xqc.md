@@ -55,4 +55,6 @@ uv sync --project /absolute/path/to/xqc --locked
 The launcher refuses dirty or mismatched checkouts and places run artifacts in
 the job's `SLURM_TMPDIR`, falling back to the compute node's `/tmp` scratch. It
 counts completed updates around the unmodified official learner and requires
-exactly 40 in both the JAX and PyTorch smoke runs.
+exactly 40 in both the JAX and PyTorch smoke runs. Regenerated oracle metadata
+and structure must match exactly; numeric leaves use `atol=1e-6` and
+`rtol=1e-5` to accommodate CPU-XLA differences across platforms.

@@ -100,8 +100,12 @@ JAX_PLATFORMS=cpu srun --ntasks=1 "$OFFICIAL_PYTHON" \
   "$PROJECT_DIR_REAL/tests/oracles/generate_xqc_official_fixture.py" \
   --official-repo "$OFFICIAL_DIR_REAL" \
   --output "$JOB_SCRATCH/xqc_official_fixture.json"
-cmp "$JOB_SCRATCH/xqc_official_fixture.json" \
-  "$PROJECT_DIR_REAL/tests/fixtures/xqc_official_9a6832b.json"
+srun --ntasks=1 "$ACTION_PYTHON" \
+  "$PROJECT_DIR_REAL/tests/oracles/compare_xqc_fixture.py" \
+  "$PROJECT_DIR_REAL/tests/fixtures/xqc_official_9a6832b.json" \
+  "$JOB_SCRATCH/xqc_official_fixture.json" \
+  --atol 1e-6 \
+  --rtol 1e-5
 srun --ntasks=1 "$ACTION_PYTHON" -c \
   'import gymnasium as gym, domains; env=gym.make("DMControl-v0", task="walker-walk", obs="state", render_mode=None); obs,info=env.reset(seed=1); print(obs.shape, obs.dtype, env.action_space.shape); env.close()'
 
