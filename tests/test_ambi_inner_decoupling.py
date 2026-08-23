@@ -1064,6 +1064,32 @@ def _toy_policy(z, task=None, *, policy=None, deterministic=False, **kwargs):
     }
 
 
+def _actor_q_heads(world_model, values):
+    values = tuple(float(value) for value in values)
+    assert len(values) == int(world_model.q_backend.num_q)
+
+    def critic(z, action, **kwargs):
+        q_base = action.sum(dim=-1, keepdim=True) * 0.0
+        q_all = torch.stack(tuple(q_base + value for value in values))
+        if kwargs.get("reduction") == "all":
+            return q_all
+        return world_model.q_backend.reduce(
+            q_all,
+            kwargs.get("reduction", "min_pair"),
+            pair_indices=kwargs.get("pair_indices"),
+            trusted_pair_indices=kwargs.get("trusted_pair_indices", False),
+        )
+
+    return critic
+
+
+def _constant_actor_q(world_model, value):
+    return _actor_q_heads(
+        world_model,
+        (value,) * int(world_model.q_backend.num_q),
+    )
+
+
 @pytest.mark.parametrize(
     ("target_mode", "entropy_bonus"),
     [("entropy_augmented", 0.5), ("reward_only", 0.0)],
@@ -1122,18 +1148,31 @@ def test_sac_inner_target_and_actor_objective_match_hand_computation(
     ) * (5.0 + entropy_bonus * alpha)
     torch.testing.assert_close(captured["target"], expected_target)
 
-    monkeypatch.setattr(
-        model.agent.model,
-        "Q",
-        lambda z, action, **kwargs: action.sum(dim=-1, keepdim=True) * 0.0 + 2.0,
-    )
+    actor_q_calls = []
+    actor_q = _actor_q_heads(model.agent.model, (2.0, 6.0))
+
+    def tracked_actor_q(z, action, **kwargs):
+        actor_q_calls.append(dict(kwargs))
+        return actor_q(z, action, **kwargs)
+
+    monkeypatch.setattr(model.agent.model, "Q", tracked_actor_q)
+    engine._compile_regions["actor"].enabled = True
     actor_metrics = engine._sac_policy_step(
         batch,
         update_temperature=False,
         update_actor=True,
         alpha=alpha,
     )
+    assert len(compile_calls) == 2
+    assert compile_calls[1][1] == {"fullgraph": False, "dynamic": False}
+    assert len(actor_q_calls) == 1
+    assert actor_q_calls[0]["reduction"] == "all"
+    assert actor_q_calls[0]["detach"] is True
+    assert actor_q_calls[0]["qs"] is engine.state.critic
     assert actor_metrics["actor_loss"] == pytest.approx(-2.125)
+    assert actor_metrics["actor_q_mean_all"] == pytest.approx(4.0)
+    assert actor_metrics["actor_q_min_all"] == pytest.approx(2.0)
+    assert actor_metrics["actor_q_mean_all_minus_min_all"] == pytest.approx(2.0)
 
 
 def test_scaled_sac_inner_actor_divides_full_objective_but_not_temperature(
@@ -1163,8 +1202,7 @@ def test_scaled_sac_inner_actor_divides_full_objective_but_not_temperature(
     monkeypatch.setattr(
         model.agent.model,
         "Q",
-        lambda z, action, **kwargs: action.sum(dim=-1, keepdim=True) * 0.0
-        + 2.0,
+        _constant_actor_q(model.agent.model, 2.0),
     )
     monkeypatch.setattr(
         engine,
@@ -1357,11 +1395,14 @@ def test_td3_inner_target_and_actor_objective_match_hand_computation(monkeypatch
     monkeypatch.setattr(
         model.agent.model,
         "Q",
-        lambda z, action, **kwargs: action.sum(dim=-1, keepdim=True) * 0.0 + 3.0,
+        _constant_actor_q(model.agent.model, 3.0),
     )
     with engine.rng.fork("gradient_policy"):
         actor_metrics = engine._td3_actor_step(batch)
     assert actor_metrics["actor_loss"] == pytest.approx(-3.0)
+    assert actor_metrics["actor_q_mean_all"] == pytest.approx(3.0)
+    assert actor_metrics["actor_q_min_all"] == pytest.approx(3.0)
+    assert actor_metrics["actor_q_mean_all_minus_min_all"] == pytest.approx(0.0)
 
 
 @pytest.mark.parametrize(

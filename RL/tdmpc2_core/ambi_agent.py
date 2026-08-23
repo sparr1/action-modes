@@ -926,11 +926,28 @@ class AMBITDMPC2Agent(torch.nn.Module):
             entropy_coefficient_loss.backward()
             self.ent_coef_optim.step()
 
-        q_policy = self.model.Q(
+        # Materialize the decoded ensemble once so the configured actor
+        # reduction and the observational head-gap diagnostics see exactly the
+        # same critic/dropout sample. The configured reduction below remains
+        # the only Q signal used by the actor objective.
+        q_policy_all = self.model.Q(
             zs,
             action,
-            reduction=self.cfg.outer_q_actor_reduction,
+            reduction="all",
             detach=True,
+        )
+        q_policy = self.model.q_backend.reduce(
+            q_policy_all,
+            self.cfg.outer_q_actor_reduction,
+        )
+        q_policy_all_detached = q_policy_all.detach()
+        q_policy_mean_all = self.model.q_backend.reduce(
+            q_policy_all_detached,
+            "mean_all",
+        )
+        q_policy_min_all = self.model.q_backend.reduce(
+            q_policy_all_detached,
+            "min_all",
         )
         actor_objective = alpha * policy_info["log_prob"] - q_policy
         if self.actor_loss_scale_enabled:
@@ -958,6 +975,11 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "actor_grad_norm": torch.as_tensor(actor_grad_norm).detach(),
             "actor_entropy": policy_info["entropy"].detach().mean(),
             "actor_q_mean": q_policy.detach().mean(),
+            "actor_q_mean_all": q_policy_mean_all.mean(),
+            "actor_q_min_all": q_policy_min_all.mean(),
+            "actor_q_mean_all_minus_min_all": (
+                q_policy_mean_all - q_policy_min_all
+            ).mean(),
             "ent_coef": alpha.detach(),
             "ent_coef_loss": entropy_coefficient_loss.detach(),
         }

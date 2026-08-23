@@ -46,8 +46,13 @@ def _stub_actor_batch(monkeypatch, agent, *, log_prob=-0.25):
             "entropy": -sampled_log_prob,
         }
 
-    def critic(z, action, **_kwargs):
-        return q_values.to(device=z.device, dtype=z.dtype) + action[..., :1] * 0.0
+    def critic(z, action, **kwargs):
+        value = q_values.to(device=z.device, dtype=z.dtype) + action[..., :1] * 0.0
+        if kwargs.get("reduction") == "all":
+            return value.unsqueeze(0).expand(
+                int(agent.cfg.num_q), *value.shape
+            )
+        return value
 
     monkeypatch.setattr(agent.model, "pi", policy)
     monkeypatch.setattr(agent.model, "Q", critic)
@@ -117,6 +122,52 @@ def test_disabled_scaler_preserves_v3_structure_metrics_and_skips_scale_math(
     metrics = agent._update_actor(zs)
     assert "actor_loss_scale" not in metrics
     assert "actor_effective_ent_coef" not in metrics
+
+
+def test_outer_actor_logs_same_forward_per_action_ensemble_gap(monkeypatch):
+    model = _model(outer_q_actor_reduction="min_all")
+    agent = model.agent
+    zs, _, _ = _stub_actor_batch(monkeypatch, agent)
+    steps, batch = zs.shape[:2]
+    head_zero = torch.arange(
+        steps * batch,
+        device=agent.device,
+        dtype=zs.dtype,
+    ).reshape(steps, batch, 1)
+    head_one = head_zero + torch.linspace(
+        2.0,
+        8.0,
+        steps * batch,
+        device=agent.device,
+        dtype=zs.dtype,
+    ).reshape(steps, batch, 1)
+    q_all = torch.stack((head_zero, head_one))
+    calls = []
+
+    def critic(z, action, **kwargs):
+        calls.append(dict(kwargs))
+        return q_all.to(device=z.device, dtype=z.dtype) + action[..., :1] * 0.0
+
+    monkeypatch.setattr(agent.model, "Q", critic)
+    metrics = agent._update_actor(zs)
+
+    q_mean_all = q_all.mean(dim=0)
+    q_min_all = q_all.min(dim=0).values
+    assert calls == [{"reduction": "all", "detach": True}]
+    torch.testing.assert_close(metrics["actor_q_mean"], q_min_all.mean())
+    torch.testing.assert_close(metrics["actor_q_mean_all"], q_mean_all.mean())
+    torch.testing.assert_close(metrics["actor_q_min_all"], q_min_all.mean())
+    torch.testing.assert_close(
+        metrics["actor_q_mean_all_minus_min_all"],
+        (q_mean_all - q_min_all).mean(),
+    )
+    for key in (
+        "actor_q_mean_all",
+        "actor_q_min_all",
+        "actor_q_mean_all_minus_min_all",
+    ):
+        assert not metrics[key].requires_grad
+        assert metrics[key].grad_fn is None
 
 
 def test_enabled_scaler_updates_from_depth_zero_and_scales_full_actor_objective(

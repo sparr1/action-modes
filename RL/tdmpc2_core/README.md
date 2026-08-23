@@ -82,6 +82,10 @@ configured temperature behavior. To mirror TD-MPC2's reward-return critic in
 both places, set both fields to `"reward_only"`. Ensemble selection remains a
 separate control: `min_all` and `mean_all` use every Q head, while the `*_pair`
 modes use `q_pair_size` sampled heads.
+Outer and inner actor updates also report the configured-reduction Q alongside
+same-forward `actor_q_mean_all`, `actor_q_min_all`, and
+`actor_q_mean_all_minus_min_all` diagnostics. These metrics are observational;
+the configured actor reduction remains the only Q signal used by optimization.
 
 For an actor-only inner-SAC ablation, set
 `inner_actor_adaptation="clone"`, `inner_critic_adaptation="frozen"`, and

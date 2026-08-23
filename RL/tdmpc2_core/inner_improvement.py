@@ -115,8 +115,8 @@ class InnerImprovementEngine:
         elif self._sac_actor_loss_scale_enabled:
             actor_kernel = self._scaled_sac_actor_kernel
         else:
-            # Keep the feature-off compiled callable and its signature exactly
-            # as they were before actor-loss scaling was introduced.
+            # Keep the feature-off compiled callable's input contract free of
+            # an actor-loss-scale argument.
             actor_kernel = self._sac_actor_kernel
         self._compile_regions = {
             "rollout": CompileRegion(
@@ -1769,16 +1769,41 @@ class InnerImprovementEngine:
         )
         zero = info["log_prob"].new_zeros(())
         if not update_actor:
-            return info["log_prob"], info["entropy"], zero, zero, zero
+            return (
+                info["log_prob"],
+                info["entropy"],
+                zero,
+                zero,
+                zero,
+                zero,
+                zero,
+                zero,
+            )
 
-        q_pi = self.model.Q(
+        # Reuse one decoded all-head evaluation for both the configured actor
+        # objective and diagnostics. This keeps dropout and pair-sampling RNG
+        # identical to the pre-diagnostic actor update.
+        q_pi_all = self.model.Q(
             z,
             action,
             qs=state.critic,
             detach=True,
-            reduction=cfg.inner_q_actor_reduction,
+            reduction="all",
+        )
+        q_pi = self.model.q_backend.reduce(
+            q_pi_all,
+            cfg.inner_q_actor_reduction,
             pair_indices=pair_indices,
             trusted_pair_indices=pair_indices is not None,
+        )
+        q_pi_all_detached = q_pi_all.detach()
+        q_pi_mean_all = self.model.q_backend.reduce(
+            q_pi_all_detached,
+            "mean_all",
+        )
+        q_pi_min_all = self.model.q_backend.reduce(
+            q_pi_all_detached,
+            "min_all",
         )
         actor_loss_values = alpha * info["log_prob"] - q_pi
         kl = torch.zeros_like(actor_loss_values)
@@ -1799,6 +1824,9 @@ class InnerImprovementEngine:
             actor_loss_values.mean(),
             q_pi.mean(),
             kl.mean(),
+            q_pi_mean_all.mean(),
+            q_pi_min_all.mean(),
+            (q_pi_mean_all - q_pi_min_all).mean(),
         )
 
     def _scaled_sac_actor_kernel(
@@ -1811,7 +1839,16 @@ class InnerImprovementEngine:
         update_actor,
     ):
         """SAC policy region with one explicit, action-frozen loss scale."""
-        log_prob, entropy, actor_loss, q_mean, kl_mean = self._sac_actor_kernel(
+        (
+            log_prob,
+            entropy,
+            actor_loss,
+            q_mean,
+            kl_mean,
+            q_mean_all,
+            q_min_all,
+            q_mean_all_minus_min_all,
+        ) = self._sac_actor_kernel(
             z,
             alpha,
             policy_noise,
@@ -1824,6 +1861,9 @@ class InnerImprovementEngine:
             actor_loss / actor_loss_scale.reshape(()),
             q_mean,
             kl_mean,
+            q_mean_all,
+            q_min_all,
+            q_mean_all_minus_min_all,
         )
 
     def _sac_policy_step(
@@ -1859,25 +1899,39 @@ class InnerImprovementEngine:
             # it follows policy/critic dropout in the legacy order.
             pair_indices = None
             if not scale_enabled:
-                log_prob, entropy, actor_loss, q_mean, kl_mean = (
-                    self._compile_regions["actor"](
-                        batch["z"],
-                        alpha,
-                        policy_noise,
-                        pair_indices,
-                        update_actor,
-                    )
+                (
+                    log_prob,
+                    entropy,
+                    actor_loss,
+                    q_mean,
+                    kl_mean,
+                    q_mean_all,
+                    q_min_all,
+                    q_mean_all_minus_min_all,
+                ) = self._compile_regions["actor"](
+                    batch["z"],
+                    alpha,
+                    policy_noise,
+                    pair_indices,
+                    update_actor,
                 )
             else:
-                log_prob, entropy, actor_loss, q_mean, kl_mean = (
-                    self._compile_regions["actor"](
-                        batch["z"],
-                        alpha,
-                        actor_loss_scale,
-                        policy_noise,
-                        pair_indices,
-                        update_actor,
-                    )
+                (
+                    log_prob,
+                    entropy,
+                    actor_loss,
+                    q_mean,
+                    kl_mean,
+                    q_mean_all,
+                    q_min_all,
+                    q_mean_all_minus_min_all,
+                ) = self._compile_regions["actor"](
+                    batch["z"],
+                    alpha,
+                    actor_loss_scale,
+                    policy_noise,
+                    pair_indices,
+                    update_actor,
                 )
             state.policy_evaluations += batch_size
 
@@ -1899,6 +1953,11 @@ class InnerImprovementEngine:
                     actor_loss=actor_loss.detach(),
                     actor_grad_norm=torch.as_tensor(actor_grad_norm).detach(),
                     actor_q_mean=q_mean.detach(),
+                    actor_q_mean_all=q_mean_all.detach(),
+                    actor_q_min_all=q_min_all.detach(),
+                    actor_q_mean_all_minus_min_all=(
+                        q_mean_all_minus_min_all.detach()
+                    ),
                     actor_entropy=entropy.detach().mean(),
                     outer_policy_kl=kl_mean.detach(),
                 )
@@ -2023,14 +2082,27 @@ class InnerImprovementEngine:
         """Pure TD3 actor loss region; the optimizer step stays eager."""
         state, cfg = self.state, self.cfg
         action, _ = self.model.pi(z, policy=state.actor, deterministic=True)
-        q_pi = self.model.Q(
+        q_pi_all = self.model.Q(
             z,
             action,
             qs=state.critic,
             detach=True,
-            reduction=cfg.inner_q_actor_reduction,
+            reduction="all",
+        )
+        q_pi = self.model.q_backend.reduce(
+            q_pi_all,
+            cfg.inner_q_actor_reduction,
             pair_indices=pair_indices,
             trusted_pair_indices=pair_indices is not None,
+        )
+        q_pi_all_detached = q_pi_all.detach()
+        q_pi_mean_all = self.model.q_backend.reduce(
+            q_pi_all_detached,
+            "mean_all",
+        )
+        q_pi_min_all = self.model.q_backend.reduce(
+            q_pi_all_detached,
+            "min_all",
         )
         anchor_l2 = torch.zeros_like(q_pi)
         if float(cfg.inner_outer_action_l2_coef) > 0.0:
@@ -2042,7 +2114,14 @@ class InnerImprovementEngine:
         actor_loss = (
             -q_pi + float(cfg.inner_outer_action_l2_coef) * anchor_l2
         ).mean()
-        return actor_loss, q_pi.mean(), anchor_l2.mean()
+        return (
+            actor_loss,
+            q_pi.mean(),
+            anchor_l2.mean(),
+            q_pi_mean_all.mean(),
+            q_pi_min_all.mean(),
+            (q_pi_mean_all - q_pi_min_all).mean(),
+        )
 
     def _td3_actor_step(self, batch):
         state, cfg = self.state, self.cfg
@@ -2050,10 +2129,14 @@ class InnerImprovementEngine:
         pair_indices = self._sample_pair_indices(
             self.rng.generator("gradient_policy")
         )
-        actor_loss, q_mean, anchor_l2_mean = self._compile_regions["actor"](
-            batch["z"],
-            pair_indices,
-        )
+        (
+            actor_loss,
+            q_mean,
+            anchor_l2_mean,
+            q_mean_all,
+            q_min_all,
+            q_mean_all_minus_min_all,
+        ) = self._compile_regions["actor"](batch["z"], pair_indices)
         state.policy_evaluations += batch_size
         state.q_evaluations += batch_size
         if float(cfg.inner_outer_action_l2_coef) > 0.0:
@@ -2070,6 +2153,11 @@ class InnerImprovementEngine:
             "actor_loss": actor_loss.detach(),
             "actor_grad_norm": torch.as_tensor(grad_norm).detach(),
             "actor_q_mean": q_mean.detach(),
+            "actor_q_mean_all": q_mean_all.detach(),
+            "actor_q_min_all": q_min_all.detach(),
+            "actor_q_mean_all_minus_min_all": (
+                q_mean_all_minus_min_all.detach()
+            ),
             "outer_action_l2": anchor_l2_mean.detach(),
         }
 
