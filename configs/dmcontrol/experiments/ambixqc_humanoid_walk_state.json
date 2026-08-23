@@ -1,0 +1,26 @@
+{
+  "study_type": "ambixqc_humanoid_walk_single_seed_exploratory",
+  "study_note": "Single-seed exploratory AMBI-XQC Humanoid Walk state run at seed 55 for one million agent decisions. TOLD uses recurrent three-step BPTT, while canonical action-local XQC uses J=2 rounds, N=32 rollouts per round, H=3 imagined steps, and G=4 updates per round. Ten online evaluation episodes run at step zero and every 100k decisions. This first full GPU execution screens throughput and learning behavior before any longer protocol; it is not a statistical or paper reproduction. W&B syncs online from node-local temporary storage; evaluations and portable best/latest checkpoints use the launcher's explicit durable result directory. Exact trainer resume is not supported.",
+  "overrides_alg": {
+    "env": "DMControl-v0"
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambixqc_humanoid_walk_state"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 100000,
+  "save_strat": [
+    "best",
+    "latest"
+  ],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}
