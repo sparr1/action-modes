@@ -40,6 +40,39 @@ begin only after decision 5,000 and UTD is two, it performs exactly 40 learner
 updates. This smoke checks execution and state invariants; it does not compare
 learning curves across PyTorch and JAX PRNGs.
 
+The Humanoid Walk comparison uses the same full learner profile for seeds 0
+and 1:
+
+```bash
+environments/dmcontrol/.venv/bin/python main.py \
+  --run configs/dmcontrol/experiments/xqc_humanoid_walk_state.json \
+  --alg-dir configs/dmcontrol/algs
+```
+
+This is a two-seed implementation-parity check, not a statistical reproduction
+of the paper. The paper curve aggregates ten seeds (0 through 9), whereas this
+profile deliberately runs only the first two. The pinned official repository's
+`results/xqc.csv` provides the released Humanoid Walk reference: at one million
+raw frames its ten-seed mean return is 713.05, with individual seed returns
+ranging from 574.95 to 895.44.
+
+The profile logs online to the `ambi_humanoid` W&B project. It intentionally
+does not set a W&B group or tags: the Hydra launcher supplies one shared,
+launch-specific group and implementation tags to both comparison jobs.
+Run `slurm/run_xqc_humanoid_walk_hydra.sbatch` exactly twice with the same
+comparison group, once with `IMPLEMENTATION=official` and once with
+`IMPLEMENTATION=action`. Each allocation requests one GPU for up to 30 days;
+the preferred Hydra node is selected when the jobs are submitted, not pinned
+in the tracked launcher. Evaluation CSVs are written alongside the durable
+W&B run data as a recovery and post-processing fallback.
+
+Action Modes records evaluation steps in agent decisions. For comparison with
+the released raw-frame axis, multiply decision steps by the action repeat of
+two, except label the evaluation after decision one as frame zero. This gives
+the paper grid `0, 100000, ..., 1000000`. Different PyTorch/JAX random-number
+streams and the separately locked DMControl/MuJoCo versions preclude matching
+individual trajectories; compare the curve shape and aggregate returns.
+
 Hydra validation is submitted from a clean checkout whose exact commit was
 pushed to GitHub. See `slurm/run_xqc_validation_hydra.sbatch`; the job also
 requires a separate clean official XQC checkout pinned to the commit above.

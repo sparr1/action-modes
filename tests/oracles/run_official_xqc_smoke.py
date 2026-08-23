@@ -4,13 +4,234 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import math
+import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 
 OFFICIAL_COMMIT = "9a6832bb742ef01bbe9f1e06153a9338e612dae5"
+EVALUATION_CSV_FIELDS = (
+    "implementation",
+    "source_commit",
+    "base_seed",
+    "num_seeds",
+    "seed_index",
+    "seed",
+    "evaluation_index",
+    "decision_step",
+    "raw_frame",
+    "paper_raw_frame",
+    "action_repeat",
+    "return",
+)
+
+
+def _validate_evaluation_capture_args(args) -> bool:
+    """Validate the all-or-none arguments for durable evaluation capture."""
+
+    values = {
+        "--base-seed": args.base_seed,
+        "--num-seeds": args.num_seeds,
+        "--action-repeat": args.action_repeat,
+        "--expected-evaluation-rows": args.expected_evaluation_rows,
+    }
+    if args.evaluation_csv is None:
+        supplied = [name for name, value in values.items() if value is not None]
+        if supplied:
+            raise SystemExit(
+                f"{', '.join(supplied)} require --evaluation-csv"
+            )
+        return False
+
+    missing = [name for name, value in values.items() if value is None]
+    if missing:
+        raise SystemExit(
+            "--evaluation-csv requires " + ", ".join(missing)
+        )
+    if args.num_seeds < 1:
+        raise SystemExit("--num-seeds must be positive")
+    if args.action_repeat < 1:
+        raise SystemExit("--action-repeat must be positive")
+    if args.expected_evaluation_rows < 1:
+        raise SystemExit("--expected-evaluation-rows must be positive")
+    if args.expected_evaluation_rows % args.num_seeds:
+        raise SystemExit(
+            "--expected-evaluation-rows must be divisible by --num-seeds"
+        )
+    return True
+
+
+class _EvaluationCsvCapture:
+    """Durably record official evaluation returns without editing upstream."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        base_seed: int,
+        num_seeds: int,
+        action_repeat: int,
+        expected_rows: int,
+    ) -> None:
+        self.path = Path(path)
+        self.base_seed = int(base_seed)
+        self.num_seeds = int(num_seeds)
+        self.action_repeat = int(action_repeat)
+        self.expected_rows = int(expected_rows)
+        self.row_count = 0
+        self.evaluation_count = 0
+        self._stream = self.path.open("x", encoding="utf-8", newline="")
+        try:
+            self._writer = csv.DictWriter(
+                self._stream,
+                fieldnames=EVALUATION_CSV_FIELDS,
+            )
+            self._writer.writeheader()
+            self._sync()
+        except Exception:
+            self._stream.close()
+            raise
+
+    def _sync(self) -> None:
+        self._stream.flush()
+        os.fsync(self._stream.fileno())
+
+    def close(self) -> None:
+        if not self._stream.closed:
+            self._stream.close()
+
+    def assert_expected_rows(self) -> None:
+        if self.row_count != self.expected_rows:
+            raise SystemExit(
+                "official XQC evaluation capture wrote "
+                f"{self.row_count} rows; expected {self.expected_rows}"
+            )
+
+    def record(self, step, infos) -> None:
+        """Record one evaluation event; ignore ordinary learner logging."""
+
+        if "return" not in infos:
+            return
+
+        import numpy as np
+
+        try:
+            raw_frame_value = float(step)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise SystemExit(
+                f"official XQC evaluation step is not numeric: {step!r}"
+            ) from exc
+        if not math.isfinite(raw_frame_value):
+            raise SystemExit(
+                "official XQC evaluation step must be a finite, non-negative "
+                f"integer, found {step!r}"
+            )
+        raw_frame = int(raw_frame_value)
+        if raw_frame_value != raw_frame or raw_frame < 0:
+            raise SystemExit(
+                "official XQC evaluation step must be a finite, non-negative "
+                f"integer, found {step!r}"
+            )
+        if raw_frame % self.action_repeat:
+            raise SystemExit(
+                f"official XQC evaluation raw frame {raw_frame} is not divisible "
+                f"by action repeat {self.action_repeat}"
+            )
+
+        try:
+            returns = np.asarray(infos["return"])
+        except (TypeError, ValueError) as exc:
+            raise SystemExit(
+                "official XQC evaluation returns are not array-like"
+            ) from exc
+        if returns.ndim != 1 or returns.size == 0:
+            raise SystemExit(
+                "official XQC evaluation returns must be a non-empty vector, "
+                f"found shape {returns.shape}"
+            )
+        if returns.size != self.num_seeds:
+            raise SystemExit(
+                "official XQC evaluation return count does not match "
+                f"--num-seeds: found {returns.size}, expected {self.num_seeds}"
+            )
+        if returns.dtype.kind not in "biuf":
+            raise SystemExit(
+                "official XQC evaluation returns must be real numeric values, "
+                f"found dtype {returns.dtype}"
+            )
+        if not bool(np.isfinite(returns).all()):
+            raise SystemExit(
+                "official XQC evaluation returns contain a non-finite value"
+            )
+        return_values = [float(value) for value in returns]
+        if not all(math.isfinite(value) for value in return_values):
+            raise SystemExit(
+                "official XQC evaluation returns cannot be represented as "
+                "finite CSV numbers"
+            )
+
+        evaluation_index = self.evaluation_count
+        decision_step = raw_frame // self.action_repeat
+        paper_raw_frame = 0 if evaluation_index == 0 else raw_frame
+        for seed_index, value in enumerate(return_values):
+            self._writer.writerow(
+                {
+                    "implementation": "official-jax",
+                    "source_commit": OFFICIAL_COMMIT,
+                    "base_seed": self.base_seed,
+                    "num_seeds": self.num_seeds,
+                    "seed_index": seed_index,
+                    "seed": self.base_seed + seed_index,
+                    "evaluation_index": evaluation_index,
+                    "decision_step": decision_step,
+                    "raw_frame": raw_frame,
+                    "paper_raw_frame": paper_raw_frame,
+                    "action_repeat": self.action_repeat,
+                    "return": value,
+                }
+            )
+            self.row_count += 1
+        self.evaluation_count += 1
+        self._sync()
+
+
+@contextmanager
+def _patched_evaluation_logging(logging_module, capture):
+    """Patch only the official call window and always restore its logger."""
+
+    original_logging = logging_module.log_multiple_seeds_to_wandb
+
+    def captured_logging(step, infos, fps=30):
+        capture.record(step, infos)
+        return original_logging(step, infos, fps=fps)
+
+    logging_module.log_multiple_seeds_to_wandb = captured_logging
+    try:
+        yield
+    finally:
+        logging_module.log_multiple_seeds_to_wandb = original_logging
+
+
+def _run_official_main(
+    official_main,
+    *,
+    logging_module=None,
+    evaluation_capture=None,
+) -> None:
+    """Run upstream directly unless the optional capture was requested."""
+
+    if evaluation_capture is None:
+        official_main()
+        return
+    if logging_module is None:
+        raise RuntimeError("evaluation capture requires the official logging module")
+    with _patched_evaluation_logging(logging_module, evaluation_capture):
+        official_main()
+    evaluation_capture.assert_expected_rows()
 
 
 def _assert_finite_leaves(label, leaves) -> None:
@@ -88,6 +309,11 @@ def main() -> None:
         type=float,
         required=True,
     )
+    parser.add_argument("--evaluation-csv", type=Path)
+    parser.add_argument("--base-seed", type=int)
+    parser.add_argument("--num-seeds", type=int)
+    parser.add_argument("--action-repeat", type=int)
+    parser.add_argument("--expected-evaluation-rows", type=int)
     args, hydra_args = parser.parse_known_args()
 
     repo = args.official_repo.resolve()
@@ -117,6 +343,7 @@ def main() -> None:
         or args.max_projection_residual < 0.0
     ):
         raise SystemExit("--max-projection-residual must be finite and non-negative")
+    capture_evaluations = _validate_evaluation_capture_args(args)
 
     sys.path.insert(0, str(repo))
     sys.argv = [sys.argv[0], *hydra_args]
@@ -124,6 +351,24 @@ def main() -> None:
     from xqc.agents import XQCLearner
     from xqc.normalization import RewardNormalizer
     from train_parallel import main as official_main
+
+    evaluation_capture = None
+    official_logging = None
+    if capture_evaluations:
+        import xqc.logging as official_logging
+
+        try:
+            evaluation_capture = _EvaluationCsvCapture(
+                args.evaluation_csv,
+                base_seed=args.base_seed,
+                num_seeds=args.num_seeds,
+                action_repeat=args.action_repeat,
+                expected_rows=args.expected_evaluation_rows,
+            )
+        except FileExistsError as exc:
+            raise SystemExit(
+                f"official XQC evaluation CSV already exists: {args.evaluation_csv}"
+            ) from exc
 
     completed_updates = 0
     last_learner = None
@@ -153,10 +398,16 @@ def main() -> None:
     XQCLearner.update = counted_update
     RewardNormalizer.__init__ = captured_reward_normalizer_init
     try:
-        official_main()
+        _run_official_main(
+            official_main,
+            logging_module=official_logging,
+            evaluation_capture=evaluation_capture,
+        )
     finally:
         XQCLearner.update = original_update
         RewardNormalizer.__init__ = original_reward_normalizer_init
+        if evaluation_capture is not None:
+            evaluation_capture.close()
 
     if completed_updates != args.expected_updates:
         raise SystemExit(

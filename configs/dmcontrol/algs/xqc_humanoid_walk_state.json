@@ -1,0 +1,52 @@
+{
+  "seed": 0,
+  "env": "DMControl-v0",
+  "alg": "XQC/XQC",
+  "device": "cuda",
+  "alg_params": {
+    "obs": "state",
+    "verbose": 1,
+    "buffer_size": 1000000,
+    "learning_starts": 5000,
+    "batch_size": 256,
+    "train_freq": 1,
+    "gradient_steps": 2,
+    "updates_per_step": 2,
+    "learning_rate": 0.0003,
+    "actor_lr": 0.0003,
+    "critic_lr": 0.0003,
+    "lr_end": 0.00003,
+    "num_interactions": 500000,
+    "gamma": 0.99,
+    "tau": 0.005,
+    "target_update_interval": 1,
+    "policy_delay": 3,
+    "actor_net_arch": [
+      256,
+      256,
+      256,
+      256
+    ],
+    "critic_net_arch": [
+      512,
+      512,
+      512,
+      512
+    ],
+    "num_atoms": 101,
+    "vmin": -5.0,
+    "vmax": 5.0,
+    "init_temperature": 0.01,
+    "target_entropy": "auto",
+    "adam_eps": 1e-8,
+    "weight_decay": 0.0,
+    "eval_freq": 50000,
+    "eval_episodes": 10,
+    "wandb": true,
+    "wandb_entity": "rwgao_b-brown-university",
+    "wandb_project": "ambi_humanoid",
+    "wandb_mode": "online"
+  },
+  "total_steps": 500000,
+  "episodes": null
+}
