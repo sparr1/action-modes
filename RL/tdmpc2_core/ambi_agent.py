@@ -1,4 +1,4 @@
-"""AMBI agent with TD-MPC2 representation learning and configurable inner control."""
+"""AMBI agent with TOLD priors and fresh per-root actor-critic adaptation."""
 
 import math
 
@@ -32,7 +32,11 @@ _ACTOR_LOSS_SCALE_FLOOR = 1.0
 
 
 class AMBITDMPC2Agent(torch.nn.Module):
-    """TD-MPC2-style online learner whose action improvement is configurable."""
+    """Online TOLD/prior learner with canonical cloned inner SAC.
+
+    Other inner operators and adaptation lifecycles are auxiliary ablations or
+    comparison methods.
+    """
 
     def __init__(self, cfg):
         super().__init__()

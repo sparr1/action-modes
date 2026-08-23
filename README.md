@@ -23,6 +23,23 @@ There may be many ways to get all kinds of different modes, but not all of the m
 
 The mode actions then become interpretable as saying "if I execute this mode, and this particular mode action, I will eventually settle in the high-dimensional base space, into a pattern of behavior which is high reward under this task. For instance, walking forwards, or rotating, etc. 
 
+## What AMBI is
+
+Anytime Model-Based Policy Improvement (AMBI) learns a task-oriented latent
+dynamics (TOLD) world model together with persistent actor and critic control
+priors. At every real environment decision, AMBI creates a fresh local actor,
+critic, target critic, optimizer state, and imagined replay from those priors;
+generates root-local experience with the frozen TOLD model; performs local
+off-policy actor-critic updates; and executes an action from the adapted actor.
+The local learner is then discarded, while the world model and control priors
+continue learning from real replay.
+
+The reference implementation uses full cloned actor and critic priors with
+inner SAC. LoRA adaptation, TD3, no inner improvement, persistent inner state,
+and MPPI are auxiliary ablations or comparison operators. In particular, MPPI
+is the TD-MPC-style planning comparator; it is not AMBI's core action-selection
+algorithm.
+
 ## Training checkpoints
 
 Within-run checkpoint retention is configured independently from end-of-trial

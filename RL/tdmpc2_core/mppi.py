@@ -1,4 +1,4 @@
-"""Stateless, backend-neutral MPPI planning for AMBI.
+"""Stateless, backend-neutral MPPI comparison operator for AMBI ablations.
 
 The helper in this module mirrors the MPPI update used by the vendored
 TD-MPC2 agent, but makes every source of compute explicit.  It operates on an
