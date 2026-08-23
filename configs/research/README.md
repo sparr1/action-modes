@@ -9,7 +9,11 @@ comparisons.
 # Frozen-checkpoint preset workflow
 
 `ambi_inner_decoupling.json` is a compact matrix of one-axis-at-a-time overrides
-based on `configs/algs/AntAMBITDMPC2.json`. It covers:
+based on `configs/algs/AntAMBITDMPC2.json`. The canonical AMBI reference is
+fresh, action-local, fully cloned inner SAC.
+The remaining operators, LoRA and persistence settings below deliberately test
+auxiliary ablations or comparators; they are not alternative definitions of
+AMBI. The matrix covers:
 
 - none, SAC, TD3, and compute-matched MPPI inner operators;
 - the reference five-head distributional-Q model and a scalar twin-Q ablation;

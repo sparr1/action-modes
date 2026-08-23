@@ -1,4 +1,8 @@
-"""AMBI with a TD-MPC2 world model and configurable inner improvement."""
+"""AMBI: TOLD priors with fresh per-root actor-critic adaptation.
+
+Cloned inner SAC is the canonical operator. Other supported adaptation modes
+and operators are auxiliary ablations or comparison methods.
+"""
 
 import copy
 import math
@@ -136,8 +140,9 @@ _AMBI_DEFAULTS = {
     "inner_td3_target_noise_std": 0.2,
     "inner_td3_target_noise_clip": 0.5,
 
-    # AMBI MPPI controls. Candidate count is derived from the common model-step
-    # budget, including the one-time policy-prior trajectory cost.
+    # Auxiliary MPPI-comparator controls. Candidate count is derived from the
+    # common model-step budget, including the one-time policy-prior trajectory
+    # cost.
     "inner_mppi_iterations": 1,
     "inner_mppi_num_elites": 8,
     "inner_mppi_num_pi_trajs": 0,
@@ -361,7 +366,7 @@ def _normalize_legacy_params(params):
 
 
 class AMBITDMPC2(TDMPC2Baseline):
-    """TD-MPC2 representation learning with a selectable AMBI inner operator."""
+    """TOLD learning with canonical cloned inner SAC and optional ablations."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -424,7 +429,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         if bool(params.get("mpc", False)):
             raise ValueError(
                 "AMBI keeps TD-MPC2's outer mpc flag disabled; select inner_operator='mppi' "
-                "for the matched AMBI planner."
+                "only for the matched TD-MPC/MPPI comparison ablation."
             )
 
         merged = dict(_AMBI_DEFAULTS)
@@ -1474,6 +1479,9 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_actor_loss",
             "inner_actor_grad_norm",
             "inner_actor_q_mean",
+            "inner_actor_q_mean_all",
+            "inner_actor_q_min_all",
+            "inner_actor_q_mean_all_minus_min_all",
             "inner_actor_entropy",
             "inner_outer_policy_kl",
             "inner_outer_action_l2",

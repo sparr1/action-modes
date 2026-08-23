@@ -281,6 +281,9 @@ def test_ambi_outer_and_inner_diagnostics_are_complete():
         "inner_q_mean",
         "inner_q_target_mean",
         "inner_actor_q_mean",
+        "inner_actor_q_mean_all",
+        "inner_actor_q_min_all",
+        "inner_actor_q_mean_all_minus_min_all",
         "inner_actor_entropy",
         "inner_td_error_abs_mean",
         "inner_policy_mean_delta_l2",
@@ -291,6 +294,9 @@ def test_ambi_outer_and_inner_diagnostics_are_complete():
     assert agent.last_inner_metrics["inner_rollouts"] == 8
     assert agent.last_inner_metrics["inner_steps"] == 16
     assert agent.last_inner_metrics["inner_updates"] == 4
+    assert agent.last_inner_metrics[
+        "inner_actor_q_mean_all_minus_min_all"
+    ] >= 0.0
     _assert_finite_metrics(agent.last_inner_metrics)
 
     obs = torch.randn(model.cfg.train_unroll_horizon + 1, model.cfg.batch_size, model.cfg.obs_shape["state"][0])
@@ -304,8 +310,12 @@ def test_ambi_outer_and_inner_diagnostics_are_complete():
         "reward_pred_mean",
         "reward_target_mean",
         "actor_q_mean",
+        "actor_q_mean_all",
+        "actor_q_min_all",
+        "actor_q_mean_all_minus_min_all",
         "num_updates",
     } <= set(metrics)
+    assert metrics["actor_q_mean_all_minus_min_all"] >= 0.0
     for depth in range(1, model.cfg.train_unroll_horizon + 1):
         assert {
             f"consistency_error_depth_{depth}",
@@ -314,6 +324,30 @@ def test_ambi_outer_and_inner_diagnostics_are_complete():
             f"q_head_disagreement_depth_{depth}",
         } <= set(metrics)
     _assert_finite_metrics(metrics)
+
+
+def test_ambi_actor_ensemble_gap_is_routed_to_wandb_window():
+    model = _make_model(AMBITDMPC2)
+    model.agent.last_inner_rollout_lengths = []
+    model.agent.last_inner_metrics = {
+        "inner_active": 1.0,
+        "inner_actor_optimizer_steps": 2.0,
+        "inner_actor_q_mean_all": 5.0,
+        "inner_actor_q_min_all": 3.5,
+        "inner_actor_q_mean_all_minus_min_all": 1.5,
+    }
+
+    model._record_action_metrics(planned=True, action_seconds=0.0)
+    payload = model._wandb_train_window.pop()
+
+    assert payload["train/inner_actor_q_mean_all"] == pytest.approx(5.0)
+    assert payload["train/inner_actor_q_min_all"] == pytest.approx(3.5)
+    assert payload["train/inner_actor_q_mean_all_minus_min_all"] == pytest.approx(
+        1.5
+    )
+    assert payload[
+        "train/inner_actor_q_mean_all_minus_min_all_count"
+    ] == pytest.approx(2.0)
 
 
 def test_replay_reports_real_transitions_and_storage_occupancy():

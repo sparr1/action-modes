@@ -54,12 +54,14 @@ loadable through strict architecture preflight.
 upstream TD-MPC2. They retain the encoder, latent dynamics, reward model,
 SimNorm representation, and multi-step consistency/reward training, but replace
 TD-MPC2's policy prior with a squashed-Gaussian, entropy-regularized SAC actor.
-The reference AMBI model uses TD-MPC2's model-size-driven
-distributional ensemble (five Q heads at model size 5); scalar twin critics
-remain an explicit ablation. AMBI defaults to per-root inner SAC adaptation,
-including a learned action-local entropy temperature initialized from the
-current outer temperature at each root, and retains a matched MPPI inner
-operator for comparison.
+Core AMBI learns persistent actor and critic control priors, fully clones them
+into a fresh root-local learner at every real decision, trains that learner on
+imagined TOLD transitions, and acts with the adapted actor. The reference model
+uses TD-MPC2's model-size-driven distributional ensemble (five Q heads at model
+size 5), inner SAC, and a learned action-local entropy temperature initialized
+from the current outer temperature. Scalar twin critics, LoRA, TD3, no inner
+improvement, and persistent inner scopes are explicit ablations. The MPPI inner
+operator is a compute-matched TD-MPC-style comparator, not AMBI's planner.
 
 AMBI's actor log-standard-deviation transform is configurable independently of
 its bounds. `log_std_mapping="direct_clamp"` preserves the SAC-style default by
@@ -82,6 +84,10 @@ configured temperature behavior. To mirror TD-MPC2's reward-return critic in
 both places, set both fields to `"reward_only"`. Ensemble selection remains a
 separate control: `min_all` and `mean_all` use every Q head, while the `*_pair`
 modes use `q_pair_size` sampled heads.
+Outer and inner actor updates also report the configured-reduction Q alongside
+same-forward `actor_q_mean_all`, `actor_q_min_all`, and
+`actor_q_mean_all_minus_min_all` diagnostics. These metrics are observational;
+the configured actor reduction remains the only Q signal used by optimization.
 
 For an actor-only inner-SAC ablation, set
 `inner_actor_adaptation="clone"`, `inner_critic_adaptation="frozen"`, and

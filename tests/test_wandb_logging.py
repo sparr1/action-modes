@@ -445,6 +445,7 @@ def test_ambi_inner_metrics_survive_matching_episode_and_wandb_boundaries(monkey
             "inner_rollout_len_max": 2.0,
             "inner_termination_rate": 0.0,
             "inner_actor_loss": 5.0,
+            "inner_actor_optimizer_steps": 2.0,
             "inner_critic_loss": 7.0,
             "inner_alpha": 0.2,
             "inner_actor_loss_scale": 2.0,
@@ -452,6 +453,9 @@ def test_ambi_inner_metrics_survive_matching_episode_and_wandb_boundaries(monkey
             "inner_q_mean": 1.5,
             "inner_q_target_mean": 2.0,
             "inner_actor_q_mean": 1.75,
+            "inner_actor_q_mean_all": 2.25,
+            "inner_actor_q_min_all": 1.25,
+            "inner_actor_q_mean_all_minus_min_all": 1.0,
             "inner_actor_entropy": 0.4,
             "inner_td_error_abs_mean": 0.5,
             "inner_policy_mean_delta_l2": 0.1,
@@ -473,8 +477,12 @@ def test_ambi_inner_metrics_survive_matching_episode_and_wandb_boundaries(monkey
     assert payload["train/inner_steps"] == 12.0
     assert payload["train/inner_updates"] == 6.0
     assert payload["train/inner_actor_loss"] == 5.0
+    assert payload["train/inner_actor_q_mean_all"] == 2.25
+    assert payload["train/inner_actor_q_min_all"] == 1.25
+    assert payload["train/inner_actor_q_mean_all_minus_min_all"] == 1.0
+    assert payload["train/inner_actor_q_mean_all_minus_min_all_count"] == 6.0
     assert payload["train/inner_actor_loss_scale"] == 2.0
-    assert payload["train/inner_effective_alpha"] == 0.1
+    assert payload["train/inner_effective_alpha"] == pytest.approx(0.1)
     assert payload["train/inner_return_mean"] == pytest.approx(2.0)
     assert payload["train/inner_return_std"] == pytest.approx(1.0)
     assert payload["train/inner_steps_total"] == 12
