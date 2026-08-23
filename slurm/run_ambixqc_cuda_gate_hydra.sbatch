@@ -190,7 +190,8 @@ srun --ntasks=1 "$PYTHON" main.py \
   --trial-index 0 \
   --num-runs 1
 
-SMOKE_ROOT="$SMOKE_ROOT" OFFICIAL_XQC_SHA="$OFFICIAL_XQC_SHA" \
+AMBIXQC_VALIDATE_SMOKE_ROOT="$SMOKE_ROOT" \
+AMBIXQC_VALIDATE_OFFICIAL_XQC_SHA="$OFFICIAL_XQC_SHA" \
   srun --ntasks=1 "$PYTHON" -c '
 import json
 import math
@@ -201,7 +202,7 @@ import numpy as np
 import torch
 
 
-root = Path(os.environ["SMOKE_ROOT"])
+root = Path(os.environ["AMBIXQC_VALIDATE_SMOKE_ROOT"])
 paths = [
     path
     for path in root.rglob("*_latest")
@@ -243,7 +244,8 @@ if set(state) != expected_fields or state["checkpoint_version"] != 1:
 signature = state["semantic_signature"]
 if (
     signature.get("algorithm") != "AMBIXQC"
-    or signature.get("official_xqc_commit") != os.environ["OFFICIAL_XQC_SHA"]
+    or signature.get("official_xqc_commit")
+    != os.environ["AMBIXQC_VALIDATE_OFFICIAL_XQC_SHA"]
     or signature.get("observation", {}).get("mode") != "state"
 ):
     raise SystemExit(f"unexpected AMBI-XQC semantics: {signature}")

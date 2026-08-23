@@ -89,6 +89,9 @@ def test_gate_runs_cuda_regression_focused_suites_and_humanoid_smoke():
 def test_gate_validates_final_checkpoint_semantics_and_numerics():
     contents = _contents()
 
+    assert 'AMBIXQC_VALIDATE_SMOKE_ROOT="$SMOKE_ROOT"' in contents
+    assert 'AMBIXQC_VALIDATE_OFFICIAL_XQC_SHA="$OFFICIAL_XQC_SHA"' in contents
+    assert '\nSMOKE_ROOT="$SMOKE_ROOT"' not in contents
     assert 'checkpoint.get("step") != 502' in contents
     assert 'trial.get("alg") != "AMBIXQC/AMBIXQC"' in contents
     assert "expected_counters = (2, 2, 2, 1, 1, 1)" in contents
