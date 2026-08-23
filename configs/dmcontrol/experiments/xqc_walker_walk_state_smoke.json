@@ -1,0 +1,25 @@
+{
+  "study_type": "functional_smoke_test",
+  "study_note": "Walker Walk state integration check only. It executes the official architecture and schedule through decision 5,020, producing exactly 40 learner updates after the 5,000-decision warmup. The shortened budget and single evaluation episode are not benchmark settings.",
+  "overrides_alg": {
+    "env": "DMControl-v0"
+  },
+  "env_params": {
+    "task": "walker-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "xqc_walker_walk_state_smoke"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 5020,
+  "save_strat": [
+    "latest"
+  ],
+  "checkpoint_best_window": 1,
+  "log_info": false,
+  "log_type": "summary"
+}

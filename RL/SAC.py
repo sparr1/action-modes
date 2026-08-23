@@ -41,6 +41,9 @@ from utils.wandb_utils import (
 
 class SAC(Algorithm):
     supports_composable_checkpointing = True
+    _display_name = "Native SAC"
+    _eval_file_label = "native SAC"
+    _eval_csv_environment_variable = "SAC_EVAL_CSV"
 
     def __init__(self, name, env, custom_params=None, run_params=None, experiment_params=None):
         super().__init__(name, env, custom_params=custom_params)
@@ -51,12 +54,14 @@ class SAC(Algorithm):
         self.verbose = int(self.params.get("verbose", 1))
 
         if not isinstance(self.env.action_space, Box):
-            raise ValueError("Native SAC supports continuous Box action spaces only.")
+            raise ValueError(
+                f"{self._display_name} supports continuous Box action spaces only."
+            )
         if not np.all(np.isfinite(self.env.action_space.low)) or not np.all(np.isfinite(self.env.action_space.high)):
-            raise ValueError("Native SAC requires finite action bounds.")
+            raise ValueError(f"{self._display_name} requires finite action bounds.")
         if np.any(self.env.action_space.high <= self.env.action_space.low):
             raise ValueError(
-                "Native SAC requires every action dimension to have strictly "
+                f"{self._display_name} requires every action dimension to have strictly "
                 "increasing bounds."
             )
 
@@ -64,8 +69,8 @@ class SAC(Algorithm):
         self.action_shape = self.env.action_space.shape
         self.action_dim = int(np.prod(self.action_shape))
         self.cfg = self._make_config()
-        self.replay_buffer = ReplayBuffer(self.obs_dim, self.action_dim, self.cfg.buffer_size)
-        self.agent = SACAgent(self.obs_dim, self.action_dim, self.cfg)
+        self.replay_buffer = self._make_replay_buffer()
+        self.agent = self._make_agent()
         self.num_timesteps = 0
         self._last_obs = None
         self._last_metrics = {}
@@ -104,7 +109,7 @@ class SAC(Algorithm):
             )
             eval_csv_path = self.params.get("eval_csv_path")
             if eval_csv_path is None:
-                eval_csv_path = os.environ.get("SAC_EVAL_CSV")
+                eval_csv_path = os.environ.get(self._eval_csv_environment_variable)
             if eval_csv_path is not None:
                 if not isinstance(eval_csv_path, (str, os.PathLike)):
                     raise ValueError(
@@ -114,6 +119,50 @@ class SAC(Algorithm):
                 if not eval_csv_path:
                     raise ValueError("eval_csv_path cannot be empty.")
             self._eval_csv_path = eval_csv_path
+
+    def _make_replay_buffer(self):
+        """Construct replay storage.
+
+        Kept as a deliberately small lifecycle seam for native off-policy
+        algorithms that share this wrapper's environment loop.
+        """
+
+        return ReplayBuffer(self.obs_dim, self.action_dim, self.cfg.buffer_size)
+
+    def _make_agent(self):
+        return SACAgent(self.obs_dim, self.action_dim, self.cfg)
+
+    def _observe_transition(self, reward, terminated, truncated):
+        """Observe a raw environment transition before it enters replay."""
+
+        return None
+
+    def _sample_random_action(self, interaction: int) -> bool:
+        # Preserve SAC's existing zero-based warmup boundary exactly.
+        return self.num_timesteps < self.cfg.learning_starts
+
+    def _should_run_initial_evaluation(self, reset_num_timesteps: bool) -> bool:
+        return self._eval_freq is not None and (
+            reset_num_timesteps
+            or (self.num_timesteps == 0 and self._last_obs is None)
+        )
+
+    def _is_evaluation_step(self, step: int) -> bool:
+        return self._eval_freq is not None and step % self._eval_freq == 0
+
+    def _evaluation_is_ready(self, episode_done: bool) -> bool:
+        # SAC historically defers evaluation until a training-episode boundary
+        # because evaluation uses the training environment itself.
+        return bool(episode_done)
+
+    def _get_evaluation_env(self):
+        return self.env
+
+    def _prepare_evaluation_environment(self):
+        return None
+
+    def _reset_evaluation_env(self):
+        return self._reset_env()
 
     def _init_wandb(self):
         return init_wandb(
@@ -403,7 +452,10 @@ class SAC(Algorithm):
             for key, value in self._last_metrics.items():
                 self._wandb_train_window.add_weighted(f"train/{key}", value, weight=gradient_steps)
         if self.verbose >= 2:
-            print(f"Native SAC update @ step {self.num_timesteps}: {self._last_metrics}")
+            print(
+                f"{self._display_name} update @ step {self.num_timesteps}: "
+                f"{self._last_metrics}"
+            )
         return self._last_metrics
 
     def _maybe_checkpoint(self):
@@ -435,7 +487,7 @@ class SAC(Algorithm):
             stream = open(path, "x", newline="")
         except FileExistsError as exc:
             raise FileExistsError(
-                f"Refusing to overwrite existing native SAC evaluation file: {path}"
+                f"Refusing to overwrite existing {self._eval_file_label} evaluation file: {path}"
             ) from exc
         with stream:
             csv.writer(stream).writerow(("step", "reward", "seed"))
@@ -447,7 +499,7 @@ class SAC(Algorithm):
     def _record_evaluation(self, step, reward):
         reward = float(reward)
         print(
-            "Native SAC evaluation:",
+            f"{self._display_name} evaluation:",
             f"step={int(step)},",
             f"reward={reward:.1f},",
             f"episodes={self._eval_episodes},",
@@ -473,12 +525,13 @@ class SAC(Algorithm):
 
     @torch.no_grad()
     def _evaluate_policy(self, step, *, initial_obs=None):
+        eval_env = self._get_evaluation_env()
         episode_returns = []
         for episode in range(self._eval_episodes):
             if episode == 0 and initial_obs is not None:
                 obs = initial_obs
             else:
-                obs = self._reset_env()
+                obs = self._reset_evaluation_env()
 
             episode_return = 0.0
             done = False
@@ -486,7 +539,7 @@ class SAC(Algorithm):
                 obs_flat = self._flatten_obs(obs)
                 action_norm = self.agent.act(obs_flat, deterministic=True)
                 action_env = self._unscale_action(action_norm)
-                obs, reward, terminated, truncated, _ = self.env.step(action_env)
+                obs, reward, terminated, truncated, _ = eval_env.step(action_env)
                 episode_return += float(reward)
                 done = bool(terminated or truncated)
             episode_returns.append(episode_return)
@@ -544,12 +597,12 @@ class SAC(Algorithm):
             self._wandb_run = self._init_wandb()
 
         try:
-            run_step_zero_eval = self._eval_freq is not None and (
+            run_step_zero_eval = self._should_run_initial_evaluation(
                 reset_num_timesteps
-                or (self.num_timesteps == 0 and self._last_obs is None)
             )
             if self._eval_freq is not None:
                 self._prepare_eval_csv()
+                self._prepare_evaluation_environment()
             if reset_num_timesteps:
                 self.num_timesteps = 0
                 self._episode_idx = 0
@@ -607,7 +660,8 @@ class SAC(Algorithm):
                 or self._collected_episodes > 0
             ):
                 obs_flat = self._flatten_obs(obs)
-                if self.num_timesteps < self.cfg.learning_starts:
+                interaction = self.num_timesteps + 1
+                if self._sample_random_action(interaction):
                     action_env = self.env.action_space.sample()
                     action_norm = self._scale_action(action_env)
                 else:
@@ -617,12 +671,10 @@ class SAC(Algorithm):
                 next_obs, reward, terminated, truncated, info = self.env.step(action_env)
                 done = bool(terminated or truncated)
                 next_obs_flat = self._flatten_obs(next_obs)
+                self._observe_transition(reward, terminated, truncated)
                 self.replay_buffer.add(obs_flat, action_norm, reward, next_obs_flat, terminated, truncated)
                 self.num_timesteps += 1
-                if (
-                    self._eval_freq is not None
-                    and self.num_timesteps % self._eval_freq == 0
-                ):
+                if self._is_evaluation_step(self.num_timesteps):
                     self._eval_pending = True
                 self._episode_return += float(reward)
                 self._episode_len += 1
@@ -644,11 +696,11 @@ class SAC(Algorithm):
                 if done and isinstance(self._checkpoint, CheckpointTracker):
                     self._checkpoint.record_episode_return(self._episode_return)
                 self._maybe_checkpoint()
+                if self._eval_pending and self._evaluation_is_ready(done):
+                    self._evaluate_policy(self.num_timesteps)
+                    self._eval_pending = False
 
                 if done:
-                    if self._eval_pending:
-                        self._evaluate_policy(self.num_timesteps)
-                        self._eval_pending = False
                     self._episode_idx += 1
                     self._episode_return = 0.0
                     self._episode_len = 0

@@ -70,6 +70,7 @@ def seed_env_spaces(env, seed):
 _SEEDED_LEARN_RESET_ALGORITHMS = {
     "TDMPC2/TDMPC2Baseline",
     "AMBITDMPC2/AMBITDMPC2",
+    "XQC/XQC",
 }
 
 
