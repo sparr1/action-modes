@@ -287,6 +287,7 @@ def test_ambi_outer_and_inner_diagnostics_are_complete():
         "inner_actor_entropy",
         "inner_td_error_abs_mean",
         "inner_policy_mean_delta_l2",
+        "inner_final_outer_policy_kl",
         "inner_outer_q_gain",
         "inner_action_seconds",
     }

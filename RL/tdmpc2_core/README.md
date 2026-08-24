@@ -89,6 +89,20 @@ same-forward `actor_q_mean_all`, `actor_q_min_all`, and
 `actor_q_mean_all_minus_min_all` diagnostics. These metrics are observational;
 the configured actor reduction remains the only Q signal used by optimization.
 
+Action-time SAC diagnostics also report `inner_final_outer_policy_kl` (published
+to W&B as `train/inner_final_outer_policy_kl`), the
+closed-form `KL(final adapted actor || current outer policy prior)` at the
+encoded real-decision root after all root-local updates. It uses the actors'
+diagonal pre-tanh Gaussian parameters and the same numerically stabilized
+closed-form helper as the KL regularizer. It is evaluated under `no_grad` and
+never contributes to the actor loss. It follows `inner_diagnostics_every` and
+is absent on unsampled actions; maintained AMBI presets sample it every 1,000
+real environment steps.
+This final observational metric is distinct from `inner_outer_policy_kl`, the
+intermediate actor-update statistic associated with a positive
+`inner_outer_policy_kl_coef`; when that regularizer is disabled, its update-time
+metric is omitted rather than reported as a false zero.
+
 ### Value-equivalence live monitor
 
 AMBI includes an optional, observational value-equivalence monitor for inner

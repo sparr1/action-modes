@@ -11,6 +11,7 @@ from RL.tdmpc2_core import inner_improvement
 _EXPENSIVE_DIAGNOSTIC_KEYS = {
     "inner_replay_unique_fraction",
     "inner_policy_mean_delta_l2",
+    "inner_final_outer_policy_kl",
     "inner_fixed_target_q_action_gain",
     "inner_outer_q_gain",
     "inner_fixed_target_q_outer",
@@ -170,6 +171,7 @@ def test_collect_diagnostics_false_omits_expensive_metrics_and_marks_unsampled()
     assert metrics["inner_diagnostics_sampled"] == 0.0
     assert metrics["inner_diagnostics_sample_count"] == 0.0
     assert _EXPENSIVE_DIAGNOSTIC_KEYS.isdisjoint(metrics)
+    assert "inner_outer_policy_kl" not in metrics
     assert "inner_diagnostic_seconds" not in metrics
     assert metrics["inner_model_steps"] == 4.0
     assert metrics["inner_total_model_steps"] == 4.0
@@ -189,6 +191,7 @@ def test_collect_diagnostics_true_includes_values_and_sampling_metadata():
     assert metrics["inner_diagnostics_sample_count"] == 1.0
     assert metrics["inner_diagnostics_step"] == 1.0
     assert _EXPENSIVE_DIAGNOSTIC_KEYS.issubset(metrics)
+    assert "inner_outer_policy_kl" not in metrics
     assert "inner_diagnostic_seconds" in metrics
     assert metrics["inner_diagnostic_model_steps"] == 8.0
     assert metrics["inner_total_model_steps"] == 12.0
@@ -422,7 +425,10 @@ def test_diagnostic_sampling_step_uses_last_event_semantics_in_wandb_window():
     model = _model()
     model._reset_wandb_window()
 
-    for sampling_step in (1000.0, 2000.0):
+    for sampling_step, final_outer_policy_kl in (
+        (1000.0, 0.5),
+        (2000.0, 1.5),
+    ):
         model.agent.last_inner_rollout_lengths = []
         model.agent.last_inner_metrics = {
             "inner_active": 1.0,
@@ -432,12 +438,17 @@ def test_diagnostic_sampling_step_uses_last_event_semantics_in_wandb_window():
             "inner_diagnostics_sampled": 1.0,
             "inner_diagnostics_sample_count": 1.0,
             "inner_diagnostics_step": sampling_step,
+            "inner_final_outer_policy_kl": final_outer_policy_kl,
         }
         model._record_action_metrics(planned=True, action_seconds=0.0)
 
     payload = model._wandb_train_window.pop()
     assert payload["train/inner_diagnostics_step"] == 2000.0
     assert "train/inner_diagnostics_step_mean" not in payload
+    assert payload["train/inner_final_outer_policy_kl"] == 1.0
+    assert payload["train/inner_final_outer_policy_kl_count"] == 2.0
+    assert payload["train/inner_final_outer_policy_kl_min"] == 0.5
+    assert payload["train/inner_final_outer_policy_kl_max"] == 1.5
 
 
 def test_zero_rollout_actions_do_not_create_termination_population_samples():
