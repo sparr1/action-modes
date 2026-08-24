@@ -26,6 +26,7 @@ _AMBIXQC_DEFAULTS = {
     "mpc": False,
     "discount": 0.99,
     "utd": 1,
+    "compile": False,
     "compile_strict": False,
 
     # Released XQC architecture and optimizer semantics.  The prefix keeps
@@ -278,11 +279,6 @@ class AMBIXQC(AMBITDMPC2):
         for key in ("compile", "compile_strict"):
             if key in params and not isinstance(params[key], (bool, np.bool_)):
                 raise ValueError(f"{key} must be a boolean.")
-            if bool(params.get(key, False)):
-                raise ValueError(
-                    "AMBIXQC v1 is eager-only; compile and compile_strict must "
-                    "both be false."
-                )
 
         merged = dict(_AMBIXQC_DEFAULTS)
         merged.update(params)
@@ -298,8 +294,8 @@ class AMBIXQC(AMBITDMPC2):
         cfg.discount_max = cfg.discount
         cfg.mpc = False
         cfg.utd = 1
-        cfg.compile = False
-        cfg.compile_strict = False
+        cfg.compile = bool(cfg.compile)
+        cfg.compile_strict = bool(cfg.compile_strict)
         cfg.value_coef = _finite_float(cfg.value_coef, "value_coef", positive=True)
 
         cfg.xqc_actor_net_arch = _architecture(

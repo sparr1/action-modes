@@ -65,9 +65,122 @@ of the XQC actor loss.
 
 AMBI-XQC v1 supports portable model checkpoints for evaluation and weight
 transfer. It is not allowlisted for exact trainer resume because that stronger
-contract also requires replay and environment state. The v1 controller and
-inner solve are eager-only; `compile` and `compile_strict` must both remain
-false until their stateful update regions receive separate correctness gates.
+contract also requires replay and environment state. Eager execution remains
+the canonical one-million-decision screen. CUDA runs may enable four
+fixed-shape compiled XQC loss regions—the persistent and action-local actor and
+critic regions—with `compile=true`; `compile_strict=true` makes any graph or
+runtime fallback fatal. The recurrent TOLD computation, optimizer mutations,
+and action-local lifecycle orchestration remain eager. A compile request is
+inactive on CPU rather than silently changing the device contract.
+
+### AMBI-XQC compiled execution and paired timing
+
+The canonical eager Humanoid Walk configuration remains
+`configs/dmcontrol/algs/ambixqc_humanoid_walk_state.json`. Its strictly compiled
+single-seed sibling is
+`configs/dmcontrol/experiments/ambixqc_humanoid_walk_state_compiled.json`, run
+with the same algorithm directory:
+
+```bash
+environments/dmcontrol/.venv/bin/python main.py \
+  --run configs/dmcontrol/experiments/ambixqc_humanoid_walk_state_compiled.json \
+  --alg-dir configs/dmcontrol/algs
+```
+
+The sibling preserves the eager run's model, XQC heads, inner schedule, seed,
+one-million-decision budget, evaluation cadence, and checkpoint policy. Only
+strict compilation and the W&B identity differ. It is still a single-seed
+exploratory run, not a learning-quality comparison.
+
+For compute-only profiling, use the environment-free exact-shape benchmark:
+
+```bash
+environments/dmcontrol/.venv/bin/python \
+  tests/benchmarks/ambixqc_compute_throughput.py \
+  --device cuda --warmup 10 --measured 50 \
+  --compile --compile-strict --require-compiled
+```
+
+Every iteration uses the production Humanoid observation/action dimensions,
+model-size-5 latent width, full released XQC networks, canonical
+`J=2/N=32/H=3/G=4` inner solve, and one synthetic recurrent outer update with
+`H=3` and `B=256`. It excludes DMControl, replay sampling, evaluation, logging,
+and checkpoint I/O. The JSON result records the first cycle with synchronized
+host wall-clock so compiler startup is fully included, then uses CUDA events
+for warmed and measured per-cycle p50 and p95. It also records throughput, peak
+CUDA allocation and reservation, all four compile statuses and fallbacks,
+exact counters, projection residual, outer-prior and workspace lifecycle
+checks, global RNG isolation, versions, source SHA, and configuration hash.
+`--output` uses exclusive creation and refuses to replace an existing file.
+
+The end-to-end timing manifest is
+`configs/dmcontrol/experiments/ambixqc_humanoid_walk_state_timing_pair.json`.
+Its eager and strict-compiled arms differ only in their compile flags. Each arm
+runs 1,502 decisions with the inclusive 500-step seed boundary, producing 501
+random actions, 1,001 planned inner actions, and 1,002 outer updates. Both keep
+the production networks, inner schedule, and outer batch. Evaluation, W&B, and
+trajectory logging are disabled; one final `latest` checkpoint at step 1,502 is
+retained solely to validate counters, finiteness, projection, and loading.
+Each canary records both its cold whole-process wall time and synchronized
+training-compute timings. The warmed compute total excludes the first planned
+inner action and the first outer update independently, because those two calls
+exercise the inner and outer compilation regions. The remaining 1,000 planned
+actions and 1,001 updates form the end-to-end performance canary.
+
+Oscar is the default venue for the paired GPU workflow. First commit and push
+the locally tested changes, then update a clean Oscar checkout through Git to
+that exact commit. From the Oscar checkout root, submit into the designated
+SHA-scoped scratch directory outside the checkout:
+
+```bash
+ACTION_SHA="$(git rev-parse HEAD)"
+RESULTS_ROOT="/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-compile/$ACTION_SHA"
+mkdir -p "$RESULTS_ROOT"
+slurm/submit_ambixqc_compile_pair_oscar.sh \
+  --expected-action-modes-sha "$ACTION_SHA" \
+  --results-root "$RESULTS_ROOT" \
+  --dry-run
+```
+
+Remove `--dry-run` only after reviewing the command. The results root is fixed
+to `/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-compile/<full-SHA>`; the job
+creates exactly one `<Slurm-job-id>` child, so every artifact lands under
+`/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-compile/<full-SHA>/<job-id>`.
+The submitter launches one two-hour L40S job. Before timing, that job runs the
+mandatory AMBI-XQC and shared compile-region CUDA correctness suites with a
+fresh cache. It then runs five independent compute processes per mode and
+alternates eager/compiled order across repetitions inside the job. Every
+process receives a new node-local XDG, TorchInductor, Triton, and CUDA cache, so
+compiled timing never benefits from a prior process. Each process retains 10
+cold/warmup cycles and 50 measured cycles. The job finally runs one eager and
+one compiled 1,502-step canary, also with separate fresh caches. Online W&B
+stays disabled. The job validates both final checkpoints, checks that the
+checkout remained clean, and writes a terminal `PASS` file. Neither script
+updates the checkout or resolves dependencies on the cluster.
+
+The job artifact directory contains five `compute-<mode>-rep<N>.json` files per
+mode, `compute-aggregate.json`, per-arm cold-process timing, warmed-compute and
+checkpoint-validation JSON, logs, GPU/runtime metadata, and `comparison.json`.
+The mandatory gate requires all learned state and metrics to be finite, exact
+counters and lifecycle/RNG checks, no compile fallback, all four compiled
+regions in every compiled repetition, and projection residual at most `1e-6`.
+It fails the job on a correctness violation.
+
+Performance is classified separately. The compiled median p50 must be at most
+`0.90` of eager, compiled median p95 at most `0.95`, the maximum p50 coefficient
+of variation at most `0.05`, no paired compiled repetition above `1.10` of its
+eager repetition, and median peak allocation at most `1.10` of eager. The
+warmed Humanoid compute canary must be at least five percent faster. A
+performance miss is recorded in `comparison.json` and `PERFORMANCE_MISS` but
+does not fail an otherwise-correct job. The aggregate also estimates
+compilation break-even as the median cold-cycle cost delta divided by steady
+p50 savings per action. The synchronized warmed canary timers bracket complete
+planned-action and outer-update calls, including eager TOLD recurrence,
+backward passes, optimizer work, and XQC orchestration, while excluding
+environment stepping, logging, and checkpoint I/O. The separately reported
+cold process time includes compilation, environment setup and stepping, replay,
+logging setup, and the final checkpoint, but it is not used for the five-percent
+classification. Reported speedup ratios greater than one favor compilation.
 
 ## Training checkpoints
 

@@ -19,6 +19,7 @@ from torch import nn
 from RL.xqc_core import (
     XQCActor,
     XQCTwinCritic,
+    _MutableCompileRegion,
     _global_grad_norm,
     _optimizer_execution_kwargs,
     _polyak_update_parameter_lists_,
@@ -210,6 +211,15 @@ class LatentXQCController(nn.Module):
         project_unit_rows_(self.critic)
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_target.requires_grad_(False)
+        # Compilation is configured only after the controller reaches its
+        # final device. ``Module.to`` may replace buffers, while compile
+        # regions must retain references to the live BatchNorm state they
+        # restore after a failed first invocation.
+        self._compile_requested = False
+        self._compile_strict = False
+        self._compile_configured = False
+        self._critic_loss_region = None
+        self._actor_loss_region = None
         self._refresh_cached_tensors()
 
     def _refresh_cached_tensors(self):
@@ -230,9 +240,67 @@ class LatentXQCController(nn.Module):
         # ``Module.to``/``cuda``/dtype conversion may replace Parameter
         # objects. Projection and Polyak updates must always reference the
         # live tensors after that conversion, never the pre-move objects.
+        requested = self._compile_requested
+        strict = self._compile_strict
+        configured = self._compile_configured
         result = super()._apply(fn)
         self._refresh_cached_tensors()
+        if configured:
+            self.configure_compile(enabled=requested, strict=strict)
         return result
+
+    def configure_compile(self, enabled: bool, strict: bool):
+        """Configure fixed-shape XQC loss regions after device placement."""
+
+        if not isinstance(enabled, bool) or not isinstance(strict, bool):
+            raise TypeError("enabled and strict must be booleans.")
+        self._compile_requested = enabled
+        self._compile_strict = strict
+        self._compile_configured = True
+        device = next(self.parameters()).device
+        compile_enabled = enabled and device.type == "cuda"
+        self._critic_loss_region = _MutableCompileRegion(
+            "AMBI-XQC critic loss",
+            self._critic_loss_components,
+            self.critic.buffers(),
+            enabled=compile_enabled,
+            strict=strict,
+        )
+        self._actor_loss_region = _MutableCompileRegion(
+            "AMBI-XQC actor loss",
+            self._actor_loss_components,
+            self.actor.buffers(),
+            enabled=compile_enabled,
+            strict=strict,
+        )
+        return self
+
+    @property
+    def compile_status(self):
+        critic = self._critic_loss_region
+        actor = self._actor_loss_region
+        return {
+            "requested": bool(self._compile_requested),
+            "enabled": bool(
+                (critic is not None and critic.enabled)
+                or (actor is not None and actor.enabled)
+            ),
+            "strict": bool(self._compile_strict),
+            "critic_compiled": bool(
+                critic is not None
+                and critic._compiled is not None
+                and not critic.failed
+            ),
+            "actor_compiled": bool(
+                actor is not None
+                and actor._compiled is not None
+                and not actor.failed
+            ),
+            "fallback": bool(
+                (critic is not None and critic.failed)
+                or (actor is not None and actor.failed)
+            ),
+        }
 
     @property
     def temperature(self):
@@ -300,47 +368,34 @@ class LatentXQCController(nn.Module):
             # introduce an otherwise unnecessary GPU synchronization.
             scale = flat["latents"].new_tensor(scale_value)
 
-        alpha = self.temperature.detach()
-        with torch.no_grad():
-            next_actions, next_log_prob = self.actor.sample(
-                flat["next_latents"], bn_mode="running", noise=next_noise
-            )
-            target_latents = torch.cat(
-                (flat["latents"].detach(), flat["next_latents"].detach()), dim=0
-            )
-            target_actions = torch.cat((flat["actions"], next_actions), dim=0)
-            target_joined = self.critic_target.log_probs(
-                target_latents, target_actions, bn_mode="batch_no_update"
-            )
-            target_next = target_joined[:, count:]
-            selected, target_values, target_head = select_lower_distribution(
-                target_next, self.critic_target.support
-            )
-            target_probabilities, clip_fraction = categorical_td_projection(
-                selected,
-                flat["rewards"] / scale,
-                flat["bootstrap_mask"],
-                flat["discount"],
-                alpha * next_log_prob,
-                self.critic.support,
-                validate_support=False,
-            )
-
-        joined_latents = torch.cat(
-            (flat["latents"], flat["next_latents"].detach()), dim=0
+        critic_loss = (
+            self._critic_loss_components
+            if self._critic_loss_region is None
+            else self._critic_loss_region
         )
-        joined_actions = torch.cat((flat["actions"], next_actions), dim=0)
-        joined_log_probs = self.critic.log_probs(
-            joined_latents, joined_actions, bn_mode="batch_update"
+        outputs = critic_loss(
+            flat["latents"],
+            flat["actions"],
+            flat["rewards"],
+            flat["next_latents"],
+            flat["bootstrap_mask"],
+            flat["discount"],
+            next_noise,
+            scale.reshape(()),
+            self.temperature.detach(),
         )
-        current_log_probs = joined_log_probs[:, :count]
-        per_head = -(
-            target_probabilities.unsqueeze(0) * current_log_probs
-        ).sum(dim=-1)
-        per_sample = per_head.sum(dim=0)
-        current_values = self.critic.values_from_log_probs(current_log_probs)
+        (
+            loss,
+            per_sample,
+            current_log_probs,
+            target_probabilities,
+            current_values,
+            target_values,
+            target_head,
+            clip_fraction,
+        ) = outputs
         return LatentXQCCriticObjective(
-            loss=per_sample.mean(),
+            loss=loss,
             per_sample_loss=per_sample.reshape(leading),
             current_log_probs=current_log_probs.reshape(
                 (2,) + leading + (self.config.num_atoms,)
@@ -352,6 +407,70 @@ class LatentXQCController(nn.Module):
             target_values=target_values.reshape(leading),
             target_head=target_head.reshape(leading),
             clip_fraction=clip_fraction,
+        )
+
+    def _critic_loss_components(
+        self,
+        latents: torch.Tensor,
+        actions: torch.Tensor,
+        rewards: torch.Tensor,
+        next_latents: torch.Tensor,
+        bootstrap_mask: torch.Tensor,
+        discount: torch.Tensor,
+        next_noise: torch.Tensor,
+        reward_scale: torch.Tensor,
+        alpha: torch.Tensor,
+    ):
+        """Fixed-shape critic math; validation and state updates stay eager."""
+
+        count = latents.shape[0]
+        with torch.no_grad():
+            next_actions, next_log_prob = self.actor.sample(
+                next_latents, bn_mode="running", noise=next_noise
+            )
+            target_latents = torch.cat(
+                (latents.detach(), next_latents.detach()), dim=0
+            )
+            target_actions = torch.cat((actions, next_actions), dim=0)
+            target_joined = self.critic_target.log_probs(
+                target_latents, target_actions, bn_mode="batch_no_update"
+            )
+            target_next = target_joined[:, count:]
+            selected, target_values, target_head = select_lower_distribution(
+                target_next, self.critic_target.support
+            )
+            target_probabilities, clip_fraction = categorical_td_projection(
+                selected,
+                rewards / reward_scale,
+                bootstrap_mask,
+                discount,
+                alpha * next_log_prob,
+                self.critic.support,
+                validate_support=False,
+            )
+
+        joined_latents = torch.cat(
+            (latents, next_latents.detach()), dim=0
+        )
+        joined_actions = torch.cat((actions, next_actions), dim=0)
+        joined_log_probs = self.critic.log_probs(
+            joined_latents, joined_actions, bn_mode="batch_update"
+        )
+        current_log_probs = joined_log_probs[:, :count]
+        per_head = -(
+            target_probabilities.unsqueeze(0) * current_log_probs
+        ).sum(dim=-1)
+        per_sample = per_head.sum(dim=0)
+        current_values = self.critic.values_from_log_probs(current_log_probs)
+        return (
+            per_sample.mean(),
+            per_sample,
+            current_log_probs,
+            target_probabilities,
+            current_values,
+            target_values,
+            target_head,
+            clip_fraction,
         )
 
     def actor_objective(
@@ -369,34 +488,58 @@ class LatentXQCController(nn.Module):
         actor_noise = torch.as_tensor(
             actor_noise, device=latents.device, dtype=latents.dtype
         ).reshape(count, self.action_dim)
-        alpha = self.temperature.detach() if alpha is None else alpha.detach()
+        alpha = self.temperature.detach() if alpha is None else torch.as_tensor(
+            alpha, device=latents.device, dtype=latents.dtype
+        ).reshape(()).detach()
 
         critic_requires_grad = tuple(
             parameter.requires_grad for parameter in self.critic.parameters()
         )
         self.critic.requires_grad_(False)
         try:
-            actions, log_prob = self.actor.sample(
-                flat_latents, bn_mode="batch_update", noise=actor_noise
+            actor_loss = (
+                self._actor_loss_components
+                if self._actor_loss_region is None
+                else self._actor_loss_region
             )
-            log_q = self.critic.log_probs(
-                flat_latents, actions, bn_mode="running"
-            )
-            q_values = self.critic.values_from_log_probs(log_q)
-            minimum_q = q_values.min(dim=0).values
-            per_sample = alpha * log_prob - minimum_q
+            outputs = actor_loss(flat_latents, actor_noise, alpha)
         finally:
             for parameter, requires_grad in zip(
                 self.critic.parameters(), critic_requires_grad
             ):
                 parameter.requires_grad_(requires_grad)
+        loss, per_sample, log_prob, entropy, q_values, minimum_q = outputs
         return LatentXQCActorObjective(
-            loss=per_sample.mean(),
+            loss=loss,
             per_sample_loss=per_sample.reshape(leading),
             log_prob=log_prob.reshape(leading),
-            entropy=(-log_prob).reshape(leading),
+            entropy=entropy.reshape(leading),
             q_values=q_values.reshape((2,) + leading),
             minimum_q=minimum_q.reshape(leading),
+        )
+
+    def _actor_loss_components(
+        self,
+        latents: torch.Tensor,
+        actor_noise: torch.Tensor,
+        alpha: torch.Tensor,
+    ):
+        """Fixed-shape actor math with critic parameter freezing handled eager."""
+
+        actions, log_prob = self.actor.sample(
+            latents, bn_mode="batch_update", noise=actor_noise
+        )
+        log_q = self.critic.log_probs(latents, actions, bn_mode="running")
+        q_values = self.critic.values_from_log_probs(log_q)
+        minimum_q = q_values.min(dim=0).values
+        per_sample = alpha * log_prob - minimum_q
+        return (
+            per_sample.mean(),
+            per_sample,
+            log_prob,
+            -log_prob,
+            q_values,
+            minimum_q,
         )
 
     @torch.no_grad()
@@ -454,6 +597,10 @@ class LatentXQCController(nn.Module):
         clone = LatentXQCController(
             self.latent_dim, self.action_dim, copy.deepcopy(self.config)
         ).to(next(self.parameters()).device)
+        clone.configure_compile(
+            enabled=self._compile_requested,
+            strict=self._compile_strict,
+        )
         clone.reset_prior_from_(self)
         return clone.make_workspace(
             actor_lr=actor_lr,
@@ -627,8 +774,10 @@ class LatentXQCWorkspace:
         )
         values = objective.current_values.detach()
         metrics = {
-            "critic_loss": objective.loss.detach(),
-            "actor_loss": actor.loss.detach(),
+            # Direct compiled outputs may use reusable CUDA-graph storage.
+            # Preserve per-slot history across the next invocation.
+            "critic_loss": objective.loss.detach().clone(),
+            "actor_loss": actor.loss.detach().clone(),
             "critic_grad_norm": critic_grad_norm.detach(),
             "critic_learning_rate": float(critic_lr),
             "target_updated": float(target_updated),
@@ -639,7 +788,7 @@ class LatentXQCWorkspace:
             "q_target_mean": objective.target_values.detach().mean(),
             "q_policy_mean": actor.minimum_q.detach().mean(),
             "q_disagreement_mean": (values[0] - values[1]).abs().mean(),
-            "q_target_clip_fraction": objective.clip_fraction.detach(),
+            "q_target_clip_fraction": objective.clip_fraction.detach().clone(),
         }
         metrics.update(step_info)
         return metrics

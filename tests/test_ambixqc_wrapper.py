@@ -110,8 +110,6 @@ def test_default_inner_budget_resolves_action_local_xqc_delay_counts():
         {"inner_model_step_budget": 10},
         {"inner_adam_eps": 1e-8},
         {"xqc_gamma": 0.99},
-        {"compile": True},
-        {"compile_strict": True},
     ],
 )
 def test_incompatible_or_inert_options_fail_early(params):

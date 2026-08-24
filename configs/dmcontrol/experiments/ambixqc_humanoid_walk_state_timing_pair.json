@@ -1,0 +1,26 @@
+{
+  "study_type": "ambixqc_eager_compiled_paired_timing_canary",
+  "study_note": "Paired same-GPU timing canary for eager and strict-compiled AMBI-XQC. Each arm runs 1,502 Humanoid Walk state decisions: 501 random actions through the inclusive seed boundary, 1,001 planned inner-XQC actions, and 1,002 outer updates. Both arms retain the production model-size-5 TOLD network, released full XQC heads, outer batch 256, and canonical J=2/N=32/H=3/G=4 action-local schedule. Evaluation, W&B, and trajectories are disabled; one final portable latest checkpoint is retained solely for counter, finiteness, and load validation. This measures training compute rather than learning quality and is not a benchmark score or statistical comparison.",
+  "overrides_alg": {
+    "env": "DMControl-v0"
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambixqc_humanoid_walk_state_timing_eager",
+    "ambixqc_humanoid_walk_state_timing_compiled"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 1502,
+  "save_strat": [
+    "latest"
+  ],
+  "checkpoint_best_window": 1,
+  "log_info": false,
+  "log_type": "summary"
+}

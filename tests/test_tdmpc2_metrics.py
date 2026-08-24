@@ -1,4 +1,6 @@
+import json
 import math
+from types import SimpleNamespace
 
 import gymnasium as gym
 import numpy as np
@@ -6,7 +8,11 @@ import pytest
 import torch
 
 from RL.AMBITDMPC2 import AMBITDMPC2
-from RL.TDMPC2 import TDMPC2Baseline, _DeviceMeanAccumulator
+from RL.TDMPC2 import (
+    TDMPC2Baseline,
+    _DeviceMeanAccumulator,
+    _summarize_training_compute_timing,
+)
 
 
 def _tiny_params(**overrides):
@@ -59,6 +65,54 @@ def _make_model(cls, params=None, total_steps=20):
         {"seed": 3, "device": "cpu", "env": "test-env", "total_steps": total_steps},
         {},
     )
+
+
+def test_training_compute_timing_excludes_each_cold_region_call():
+    payload = _summarize_training_compute_timing(
+        [9.0, 1.0, 3.0],
+        [8.0, 2.0, 4.0],
+    )
+
+    assert payload["warmup_rule"] == (
+        "exclude-first-planned-action-and-first-outer-update"
+    )
+    assert payload["cold_planned_action_seconds"] == 9.0
+    assert payload["cold_outer_update_seconds"] == 8.0
+    assert payload["warmed_planned_action_count"] == 2
+    assert payload["warmed_outer_update_count"] == 2
+    assert payload["warmed_planned_action_seconds"] == 4.0
+    assert payload["warmed_outer_update_seconds"] == 6.0
+    assert payload["warmed_compute_seconds"] == 10.0
+    assert payload["warmed_planned_action_p50_seconds"] == 2.0
+    assert payload["warmed_outer_update_p95_seconds"] == pytest.approx(3.9)
+
+
+@pytest.mark.parametrize("bad_value", [math.nan, math.inf, -1.0])
+def test_training_compute_timing_rejects_invalid_durations(bad_value):
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        _summarize_training_compute_timing([bad_value], [1.0])
+
+
+def test_training_compute_timing_artifact_is_exclusive(tmp_path):
+    model = object.__new__(TDMPC2Baseline)
+    model.cfg = SimpleNamespace(device="cpu")
+    model._global_step = 7
+    model._num_updates = 3
+    model._compute_timing_output = str(tmp_path / "compute.json")
+    model._compute_timing_planned_actions = [4.0, 1.0]
+    model._compute_timing_outer_updates = [3.0, 2.0]
+
+    model._write_compute_timing()
+
+    payload = json.loads(
+        (tmp_path / "compute.json").read_text(encoding="utf-8")
+    )
+    assert payload["device"] == "cpu"
+    assert payload["total_steps"] == 7
+    assert payload["num_updates"] == 3
+    assert payload["warmed_compute_seconds"] == 3.0
+    with pytest.raises(FileExistsError):
+        model._write_compute_timing()
 
 
 def _assert_finite_metrics(metrics):

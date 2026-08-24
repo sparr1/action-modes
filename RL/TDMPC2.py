@@ -1,5 +1,6 @@
 import copy
 import csv
+import json
 import math
 import os
 import random
@@ -115,6 +116,49 @@ _EXPLICIT_HORIZON_FIELDS = {
 
 _RGB_OBS_SHAPE = (9, 64, 64)
 _RGB_REPLAY_WARNING_BYTES = 8 * 1024**3
+
+
+def _summarize_training_compute_timing(
+    planned_action_seconds,
+    outer_update_seconds,
+):
+    """Summarize opt-in synchronized canary timings without affecting training."""
+
+    planned = [float(value) for value in planned_action_seconds]
+    updates = [float(value) for value in outer_update_seconds]
+    values = planned + updates
+    if any(not math.isfinite(value) or value < 0.0 for value in values):
+        raise ValueError("Training compute timings must be finite and non-negative.")
+
+    warmed_planned = planned[1:]
+    warmed_updates = updates[1:]
+
+    def percentile(samples, quantile):
+        if not samples:
+            return None
+        return float(np.percentile(np.asarray(samples, dtype=np.float64), quantile))
+
+    return {
+        "schema": "tdmpc2-training-compute-timing-v1",
+        "clock": "synchronized-host-wall",
+        "warmup_rule": "exclude-first-planned-action-and-first-outer-update",
+        "planned_action_count": len(planned),
+        "outer_update_count": len(updates),
+        "cold_planned_action_seconds": planned[0] if planned else None,
+        "cold_outer_update_seconds": updates[0] if updates else None,
+        "warmed_planned_action_count": len(warmed_planned),
+        "warmed_outer_update_count": len(warmed_updates),
+        "warmed_planned_action_seconds": float(sum(warmed_planned)),
+        "warmed_outer_update_seconds": float(sum(warmed_updates)),
+        "warmed_compute_seconds": float(sum(warmed_planned) + sum(warmed_updates)),
+        "warmed_planned_action_p50_seconds": percentile(warmed_planned, 50.0),
+        "warmed_planned_action_p95_seconds": percentile(warmed_planned, 95.0),
+        "warmed_outer_update_p50_seconds": percentile(warmed_updates, 50.0),
+        "warmed_outer_update_p95_seconds": percentile(warmed_updates, 95.0),
+        "planned_action_seconds": planned,
+        "outer_update_seconds": updates,
+        "all_finite": True,
+    }
 
 
 def _positive_int(value, key):
@@ -578,6 +622,15 @@ class TDMPC2Baseline(Algorithm):
         self._wandb_window_start_step = 0
         self._wandb_train_seconds = 0.0
         self._wandb_planner_seconds = 0.0
+        self._compute_timing_output = os.environ.get(
+            "TDMPC2_COMPUTE_TIMING_OUTPUT"
+        )
+        if self._compute_timing_output is not None and not os.path.isabs(
+            self._compute_timing_output
+        ):
+            raise ValueError("TDMPC2_COMPUTE_TIMING_OUTPUT must be absolute.")
+        self._compute_timing_planned_actions = []
+        self._compute_timing_outer_updates = []
         self._wandb_last_updates = 0
         self._num_updates = 0
         self._last_wandb_step = None
@@ -1186,6 +1239,48 @@ class TDMPC2Baseline(Algorithm):
             metric_key = key if key.startswith("planner_") else f"planner_{key}"
             packed_metrics[f"train/{metric_key}"] = value
         self._wandb_update_window.update(packed_metrics)
+
+    def _start_compute_timing(self):
+        if self._compute_timing_output is None:
+            return None
+        device = torch.device(self.cfg.device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return time.perf_counter()
+
+    def _stop_compute_timing(self, start):
+        if start is None:
+            return None
+        device = torch.device(self.cfg.device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return time.perf_counter() - start
+
+    def _write_compute_timing(self):
+        if self._compute_timing_output is None:
+            return
+        payload = _summarize_training_compute_timing(
+            self._compute_timing_planned_actions,
+            self._compute_timing_outer_updates,
+        )
+        device = torch.device(self.cfg.device)
+        payload.update(
+            {
+                "device": str(device),
+                "torch_version": torch.__version__,
+                "cuda_version": torch.version.cuda,
+                "cuda_device_name": (
+                    torch.cuda.get_device_name(device)
+                    if device.type == "cuda"
+                    else None
+                ),
+                "total_steps": int(self._global_step),
+                "num_updates": int(self._num_updates),
+            }
+        )
+        with open(self._compute_timing_output, "x", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2, sort_keys=True, allow_nan=False)
+            stream.write("\n")
 
     def _replay_wandb_payload(self):
         transitions = int(getattr(self.buffer, "num_transitions", 0))
@@ -1873,6 +1968,11 @@ class TDMPC2Baseline(Algorithm):
                 or self.buffer.num_eps == 0
             )
             action_start = time.perf_counter()
+            compute_action_start = (
+                self._start_compute_timing()
+                if planned and self._compute_timing_output is not None
+                else None
+            )
             if not planned:
                 action_norm = self._random_action_norm()
             else:
@@ -1881,6 +1981,13 @@ class TDMPC2Baseline(Algorithm):
                     t0=(episode_step == 0),
                     eval_mode=False,
                 ).numpy()
+                if compute_action_start is not None:
+                    compute_action_seconds = self._stop_compute_timing(
+                        compute_action_start
+                    )
+                    self._compute_timing_planned_actions.append(
+                        compute_action_seconds
+                    )
             self._record_action_metrics(
                 planned=planned,
                 action_seconds=time.perf_counter() - action_start,
@@ -1938,7 +2045,19 @@ class TDMPC2Baseline(Algorithm):
                 burst_metrics = _DeviceMeanAccumulator()
                 train_start = time.perf_counter()
                 for _ in range(num_updates):
+                    compute_update_start = (
+                        self._start_compute_timing()
+                        if self._compute_timing_output is not None
+                        else None
+                    )
                     train_metrics = self.agent.update(self.buffer)
+                    if compute_update_start is not None:
+                        compute_update_seconds = self._stop_compute_timing(
+                            compute_update_start
+                        )
+                        self._compute_timing_outer_updates.append(
+                            compute_update_seconds
+                        )
                     self._num_updates += 1
                     burst_metrics.update(train_metrics)
                     self._accumulate_train_metrics(train_metrics)
@@ -2175,6 +2294,7 @@ class TDMPC2Baseline(Algorithm):
                 self._episode_len = 0
                 obs, _ = self._reset_env()
             self._final_checkpoint()
+            self._write_compute_timing()
             return self
         except BaseException as exc:
             primary_error = exc

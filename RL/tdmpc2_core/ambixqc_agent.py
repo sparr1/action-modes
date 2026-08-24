@@ -50,11 +50,6 @@ class AMBIXQCAgent(nn.Module):
             raise NotImplementedError("AMBI-XQC supports CPU and CUDA only.")
         if str(cfg.obs) != "state":
             raise NotImplementedError("AMBI-XQC v1 supports state observations only.")
-        if bool(getattr(cfg, "compile", False)):
-            raise ValueError(
-                "AMBI-XQC v1 is eager-only; set compile=false until the recurrent "
-                "and action-local mutation paths have a dedicated compiler gate."
-            )
 
         self.model = XQCTOLDWorldModel(cfg).to(self.device)
         controller_cfg = LatentXQCConfig(
@@ -74,6 +69,10 @@ class AMBIXQCAgent(nn.Module):
         self.xqc_controller = LatentXQCController(
             int(cfg.latent_dim), int(cfg.action_dim), controller_cfg
         ).to(self.device)
+        self.xqc_controller.configure_compile(
+            enabled=bool(getattr(cfg, "compile", False)),
+            strict=bool(getattr(cfg, "compile_strict", False)),
+        )
         self.xqc_workspace = self.xqc_controller.make_workspace(
             actor_lr=float(cfg.xqc_actor_lr),
             critic_lr=float(cfg.xqc_critic_lr),
@@ -479,7 +478,7 @@ class AMBIXQCAgent(nn.Module):
             "q_mean": q_values.mean(),
             "q_abs_mean": q_values.abs().mean(),
             "q_head_disagreement": (q_values[0] - q_values[1]).abs().mean(),
-            "q_target_clip_fraction": critic.clip_fraction.detach(),
+            "q_target_clip_fraction": critic.clip_fraction.detach().clone(),
             "reward_pred_mean": reward_values.mean(),
             "reward_target_mean": reward.detach().mean(),
             "reward_abs_mean": reward.detach().abs().mean(),
@@ -489,7 +488,9 @@ class AMBIXQCAgent(nn.Module):
             "critic_learning_rate": float(critic_lr),
             "target_updated": float(target_updated),
             "num_updates": float(self.num_updates),
-            "compile_fallback": 0.0,
+            "compile_fallback": float(
+                self.xqc_controller.compile_status["fallback"]
+            ),
         }
         for depth in range(int(self.cfg.train_unroll_horizon)):
             info[f"consistency_error_depth_{depth + 1}"] = losses[

@@ -415,6 +415,21 @@ class InnerXQCEngine:
             "inner_diagnostics_sample_count": 0.0,
         }
 
+    def _compile_fallback_metrics(self):
+        controller = self.state.workspace.controller
+        critic = getattr(controller, "_critic_loss_region", None)
+        actor = getattr(controller, "_actor_loss_region", None)
+        critic_fallback = bool(critic is not None and critic.failed)
+        actor_fallback = bool(actor is not None and actor.failed)
+        return {
+            "inner_compile_rollout_fallback": 0.0,
+            "inner_compile_critic_fallback": float(critic_fallback),
+            "inner_compile_actor_fallback": float(actor_fallback),
+            "inner_compile_fallback": float(
+                critic_fallback or actor_fallback
+            ),
+        }
+
     def act(self, root_z, *, t0=False, eval_mode=False, collect_diagnostics=True):
         del t0  # The v1 learner is fresh at every action, including episode starts.
         self._pending_timers = {}
@@ -558,6 +573,7 @@ class InnerXQCEngine:
                 inner_termination_rate_max=termination_stats[3],
             )
             metrics.update(self._average_updates(update_history, root_z))
+            metrics.update(self._compile_fallback_metrics())
             if self._collect_diagnostics:
                 metrics.update(policy_diagnostics)
                 metrics["inner_diagnostics_sampled"] = 1.0
