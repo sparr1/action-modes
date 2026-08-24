@@ -18,9 +18,9 @@ umask 077
 # checkout, locked environment, and artifact root.
 
 readonly ACTION_LOCK_SHA="f123ba99aadde092401c0e912dbeb88994f00ae420680c69c18003965485efe6"
-readonly PROJECT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 
 : "${EXPECTED_ACTION_MODES_SHA:?Export the exact pushed Action Modes commit SHA.}"
+: "${AMBIXQC_ACTION_MODES_DIR:?Export the exact Action Modes checkout path.}"
 : "${AMBIXQC_BENCHMARK_RESULTS_ROOT:?Export an existing absolute durable result directory.}"
 : "${SLURM_JOB_ID:?This launcher must run inside a Slurm allocation.}"
 
@@ -33,11 +33,13 @@ fail() {
   "EXPECTED_ACTION_MODES_SHA must be a full lowercase 40-character SHA"
 [[ "$AMBIXQC_BENCHMARK_RESULTS_ROOT" == /* ]] || fail \
   "AMBIXQC_BENCHMARK_RESULTS_ROOT must be absolute"
+[[ "$AMBIXQC_ACTION_MODES_DIR" == /* && -d "$AMBIXQC_ACTION_MODES_DIR" ]] || fail \
+  "AMBIXQC_ACTION_MODES_DIR must be one existing absolute directory"
 [[ -d "$AMBIXQC_BENCHMARK_RESULTS_ROOT" ]] || fail \
   "AMBIXQC_BENCHMARK_RESULTS_ROOT must already exist"
 [[ -w "$AMBIXQC_BENCHMARK_RESULTS_ROOT" ]] || fail \
   "AMBIXQC_BENCHMARK_RESULTS_ROOT is not writable"
-readonly PROJECT_DIR_REAL="$(cd "$PROJECT_DIR" && pwd -P)"
+readonly PROJECT_DIR_REAL="$(cd "$AMBIXQC_ACTION_MODES_DIR" && pwd -P)"
 readonly RESULTS_ROOT_REAL="$(cd "$AMBIXQC_BENCHMARK_RESULTS_ROOT" && pwd -P)"
 readonly EXPECTED_RESULTS_ROOT="/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-compile/$EXPECTED_ACTION_MODES_SHA"
 readonly DEFAULT_PYTHON="$PROJECT_DIR_REAL/environments/dmcontrol/.venv/bin/python"

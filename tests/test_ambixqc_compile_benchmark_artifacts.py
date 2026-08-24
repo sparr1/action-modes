@@ -206,6 +206,8 @@ def test_oscar_pair_launcher_runs_both_arms_on_one_guarded_gpu():
     assert "#SBATCH --array" not in contents
     assert "#SBATCH --nodelist" not in contents
     assert "EXPECTED_ACTION_MODES_SHA" in contents
+    assert "AMBIXQC_ACTION_MODES_DIR" in contents
+    assert "SLURM_SUBMIT_DIR" not in contents
     assert "^[0-9a-f]{40}$" in contents
     assert contents.count(
         'require_clean_sha "$PROJECT_DIR_REAL" "$EXPECTED_ACTION_MODES_SHA"'
@@ -277,6 +279,7 @@ def test_oscar_submitter_requires_git_transport_and_new_external_artifacts():
     assert "durable results must be outside the Git checkout" in contents
     assert "/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-compile/$EXPECTED_ACTION_MODES_SHA" in contents
     assert "AMBIXQC_BENCHMARK_RESULTS_ROOT=$AMBIXQC_BENCHMARK_RESULTS_ROOT" in contents
+    assert "AMBIXQC_ACTION_MODES_DIR=$PROJECT_DIR" in contents
     assert "AMBIXQC_PAIR_ORDER=$AMBIXQC_PAIR_ORDER" in contents
     assert "--parsable" in contents
     assert '--chdir="$PROJECT_DIR"' in contents
