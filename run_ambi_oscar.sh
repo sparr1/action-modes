@@ -26,8 +26,17 @@ fail() {
 : "${AMBI_DURABLE_QUOTA_LABEL:?Set AMBI_DURABLE_QUOTA_LABEL; rgao48 AMBI runs use rgao48, never data+rbalestr.}"
 : "${AMBI_DURABLE_QUOTA_PATH:?Set AMBI_DURABLE_QUOTA_PATH; rgao48 AMBI runs use /oscar/home.}"
 : "${SLURM_JOB_ID:?This launcher must run as a Slurm batch job.}"
+approved_durable_root="/oscar/home/rgao48/ambi-durable"
 [[ "$AMBI_DURABLE_QUOTA_LABEL" != "data+rbalestr" ]] || fail \
 	"data+rbalestr is not an approved AMBI durable allocation; use the quota row that owns AMBI_DURABLE_ROOT"
+[[ "$AMBI_DURABLE_QUOTA_LABEL" == "rgao48" ]] || fail \
+	"AMBI_DURABLE_QUOTA_LABEL must be rgao48 for Oscar AMBI runs"
+[[ "$AMBI_DURABLE_QUOTA_PATH" == "/oscar/home" ]] || fail \
+	"AMBI_DURABLE_QUOTA_PATH must be /oscar/home for Oscar AMBI runs"
+if [[ -d /oscar/home/rgao48 ]]; then
+	[[ "$AMBI_DURABLE_ROOT" == "$approved_durable_root" ]] || fail \
+		"AMBI_DURABLE_ROOT must be $approved_durable_root on Oscar"
+fi
 
 project_dir="$(cd -- "${SLURM_SUBMIT_DIR:-$PWD}" && pwd -P)"
 cd "$project_dir"

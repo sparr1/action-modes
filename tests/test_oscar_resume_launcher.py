@@ -208,6 +208,10 @@ def test_resources_and_foreground_signal_contract_are_explicit():
     assert 'AMBI_DURABLE_QUOTA_PATH:?Set AMBI_DURABLE_QUOTA_PATH' in contents
     assert '--filesystem-path "$AMBI_DURABLE_QUOTA_PATH"' in contents
     assert '[[ "$AMBI_DURABLE_QUOTA_LABEL" != "data+rbalestr" ]]' in contents
+    assert '[[ "$AMBI_DURABLE_QUOTA_LABEL" == "rgao48" ]]' in contents
+    assert '[[ "$AMBI_DURABLE_QUOTA_PATH" == "/oscar/home" ]]' in contents
+    assert 'approved_durable_root="/oscar/home/rgao48/ambi-durable"' in contents
+    assert '[[ "$AMBI_DURABLE_ROOT" == "$approved_durable_root" ]]' in contents
 
 
 @pytest.mark.parametrize(
@@ -231,6 +235,32 @@ def test_launcher_rejects_data_rbalestr_before_quota_or_training(tmp_path):
     result = _run(env)
     assert result.returncode != 0
     assert "data+rbalestr is not an approved AMBI durable allocation" in result.stderr
+    assert not args_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("variable", "value", "message"),
+    (
+        (
+            "AMBI_DURABLE_QUOTA_LABEL",
+            "another-allocation",
+            "AMBI_DURABLE_QUOTA_LABEL must be rgao48",
+        ),
+        (
+            "AMBI_DURABLE_QUOTA_PATH",
+            "/oscar/scratch",
+            "AMBI_DURABLE_QUOTA_PATH must be /oscar/home",
+        ),
+    ),
+)
+def test_launcher_rejects_non_home_quota_selection_before_training(
+    tmp_path, variable, value, message
+):
+    env, _, args_path, _ = _launcher_environment(tmp_path, status=23)
+    env[variable] = value
+    result = _run(env)
+    assert result.returncode != 0
+    assert message in result.stderr
     assert not args_path.exists()
 
 

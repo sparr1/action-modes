@@ -83,8 +83,11 @@ AMBI_DURABLE_QUOTA_PATH=/oscar/home
 Pass all four values through `sbatch --export`. Use a new lineage for a fresh
 run and the same lineage only for its exact resume. `data+rbalestr` is a
 separate allocation and is not an approved AMBI durable target; both Oscar
-launchers reject that label. Oscar scratch and job-local storage are likewise
-not substitutes for the durable checkpoint root.
+launchers reject that label and any quota selection other than exactly
+`rgao48` plus `/oscar/home`. On Oscar they also require the exact durable root
+shown above, so the checked quota row and the checkpoint filesystem cannot
+diverge. Oscar scratch and job-local storage are not substitutes for the
+durable checkpoint root.
 
 The compact AMBI branch-count and imagination-horizon suite lives under
 `configs/ambi/`. Each of its five algorithm files has one matching runnable

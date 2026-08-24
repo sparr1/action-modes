@@ -2,6 +2,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "run_ambi_oscar_canary.sh"
@@ -158,6 +160,10 @@ def test_canary_has_bounded_gpu_debug_resources_and_no_requeue():
     assert 'AMBI_DURABLE_QUOTA_LABEL:?Set AMBI_DURABLE_QUOTA_LABEL' in contents
     assert 'AMBI_DURABLE_QUOTA_PATH:?Set AMBI_DURABLE_QUOTA_PATH' in contents
     assert '[[ "$AMBI_DURABLE_QUOTA_LABEL" != "data+rbalestr" ]]' in contents
+    assert '[[ "$AMBI_DURABLE_QUOTA_LABEL" == "rgao48" ]]' in contents
+    assert '[[ "$AMBI_DURABLE_QUOTA_PATH" == "/oscar/home" ]]' in contents
+    assert 'approved_durable_root="/oscar/home/rgao48/ambi-durable"' in contents
+    assert '[[ "$AMBI_DURABLE_ROOT" == "$approved_durable_root" ]]' in contents
     assert "--shard-rows 100000" in contents
     assert "--maximum-estimated-bytes 4000000000" in contents
 
@@ -197,6 +203,32 @@ def test_canary_runs_new_then_required_and_real_replay_benchmark(tmp_path):
         / "REPLAY_BENCHMARK.json"
     )
     assert result_path.read_text(encoding="utf-8").strip() == '{"verified":true}'
+
+
+@pytest.mark.parametrize(
+    ("variable", "value", "message"),
+    (
+        (
+            "AMBI_DURABLE_QUOTA_LABEL",
+            "data+rbalestr",
+            "data+rbalestr is not an approved AMBI durable allocation",
+        ),
+        (
+            "AMBI_DURABLE_QUOTA_PATH",
+            "/oscar/scratch",
+            "AMBI_DURABLE_QUOTA_PATH must be /oscar/home",
+        ),
+    ),
+)
+def test_canary_rejects_non_home_quota_selection_before_training(
+    tmp_path, variable, value, message
+):
+    env, _, srun_path, _ = _environment(tmp_path)
+    env[variable] = value
+    result = _run(env)
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not srun_path.exists()
 
 
 def test_canary_fails_before_srun_without_authorization_or_clean_checkout(tmp_path):
