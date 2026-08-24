@@ -22,8 +22,12 @@ fail() {
 	"set AMBI_RUN_OSCAR_RESUME_CANARY=1 to authorize the live gpu-debug canary"
 : "${AMBI_DURABLE_ROOT:?Set AMBI_DURABLE_ROOT to an operator-approved durable allocation directory.}"
 : "${AMBI_LINEAGE_DIR:?Set AMBI_LINEAGE_DIR to a new lineage below AMBI_DURABLE_ROOT.}"
+: "${AMBI_DURABLE_QUOTA_LABEL:?Set AMBI_DURABLE_QUOTA_LABEL; rgao48 AMBI runs use rgao48, never data+rbalestr.}"
+: "${AMBI_DURABLE_QUOTA_PATH:?Set AMBI_DURABLE_QUOTA_PATH; rgao48 AMBI runs use /oscar/home.}"
 : "${SLURM_JOB_ID:?This launcher must run as a Slurm batch job.}"
 [[ "${SLURM_RESTART_COUNT:-0}" == 0 ]] || fail "canary requires a fresh allocation"
+[[ "$AMBI_DURABLE_QUOTA_LABEL" != "data+rbalestr" ]] || fail \
+	"data+rbalestr is not an approved AMBI durable allocation; use the quota row that owns AMBI_DURABLE_ROOT"
 
 project_dir="$(cd -- "${SLURM_SUBMIT_DIR:-$PWD}" && pwd -P)"
 cd "$project_dir"
@@ -48,10 +52,10 @@ conda activate ambi
 ambi_python="${AMBI_PYTHON:-python}"
 
 quota_output="$(checkquota)" || fail "checkquota failed"
-quota_args=(--allocation "${AMBI_DURABLE_QUOTA_LABEL:-data+rbalestr}")
-if [[ -n "${AMBI_DURABLE_QUOTA_PATH:-}" ]]; then
-	quota_args+=(--filesystem-path "$AMBI_DURABLE_QUOTA_PATH")
-fi
+quota_args=(
+	--allocation "$AMBI_DURABLE_QUOTA_LABEL"
+	--filesystem-path "$AMBI_DURABLE_QUOTA_PATH"
+)
 printf '%s\n' "$quota_output" | "$ambi_python" -m utils.oscar_resume_launcher quota \
 	"${quota_args[@]}"
 "$ambi_python" -m utils.oscar_resume_launcher storage \

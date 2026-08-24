@@ -142,10 +142,14 @@ conda() { return 0; }
             "SLURM_SUBMIT_DIR": str(ROOT),
             "AMBI_DURABLE_ROOT": str(durable),
             "AMBI_LINEAGE_DIR": str(lineage),
+            "AMBI_DURABLE_QUOTA_LABEL": "rgao48",
+            "AMBI_DURABLE_QUOTA_PATH": "/oscar/home",
             "AMBI_PYTHON": sys.executable,
             "MAMBA_ROOT_PREFIX": str(mamba),
             "FAKE_GIT_ROOT": str(ROOT),
-            "FAKE_QUOTA": f"data+rbalestr 1 TB 2 TB {quota_state}",
+            "FAKE_QUOTA": (
+                f"rgao48 /oscar/home 1 TB 2 TB {quota_state} None"
+            ),
             "FAKE_STATUS": str(status),
             "FAKE_SRUN_ARGS": str(srun_args),
             "FAKE_SCONTROL_CALLS": str(scontrol_calls),
@@ -200,20 +204,48 @@ def test_resources_and_foreground_signal_contract_are_explicit():
     assert "AMBI_OSCAR_RESUME_CANARY_VERIFIED" not in contents
     assert "AMBI_OSCAR_DURABLE_PREFIX" not in contents
     assert "AMBI_OSCAR_TRANSIENT_ROOTS" not in contents
+    assert 'AMBI_DURABLE_QUOTA_LABEL:?Set AMBI_DURABLE_QUOTA_LABEL' in contents
+    assert 'AMBI_DURABLE_QUOTA_PATH:?Set AMBI_DURABLE_QUOTA_PATH' in contents
+    assert '--filesystem-path "$AMBI_DURABLE_QUOTA_PATH"' in contents
+    assert '[[ "$AMBI_DURABLE_QUOTA_LABEL" != "data+rbalestr" ]]' in contents
+
+
+@pytest.mark.parametrize(
+    "missing_variable",
+    ("AMBI_DURABLE_QUOTA_LABEL", "AMBI_DURABLE_QUOTA_PATH"),
+)
+def test_launcher_requires_explicit_durable_quota_selection(
+    tmp_path, missing_variable
+):
+    env, _, args_path, _ = _launcher_environment(tmp_path, status=23)
+    del env[missing_variable]
+    result = _run(env)
+    assert result.returncode != 0
+    assert missing_variable in result.stderr
+    assert not args_path.exists()
+
+
+def test_launcher_rejects_data_rbalestr_before_quota_or_training(tmp_path):
+    env, _, args_path, _ = _launcher_environment(tmp_path, status=23)
+    env["AMBI_DURABLE_QUOTA_LABEL"] = "data+rbalestr"
+    result = _run(env)
+    assert result.returncode != 0
+    assert "data+rbalestr is not an approved AMBI durable allocation" in result.stderr
+    assert not args_path.exists()
 
 
 def test_quota_requires_one_row_with_exact_ok_usage_state():
     assert verify_quota_output(
-        "data+rbalestr 1 TB 2 TB OK\n", "data+rbalestr"
+        "project-data 1 TB 2 TB OK\n", "project-data"
     ).endswith(" OK")
     for output in (
-        "data+rbalestr 1 TB 2 TB GRACE_EXPIRED\n",
-        "data+rbalestr 1 TB 2 TB NOT_OK\n",
+        "project-data 1 TB 2 TB GRACE_EXPIRED\n",
+        "project-data 1 TB 2 TB NOT_OK\n",
         "home 1 TB 2 TB OK\n",
-        "data+rbalestr a OK\ndata+rbalestr b OK\n",
+        "project-data a OK\nproject-data b OK\n",
     ):
         with pytest.raises(QuotaPreflightError):
-            verify_quota_output(output, "data+rbalestr")
+            verify_quota_output(output, "project-data")
 
 
 def test_quota_can_select_exact_filesystem_path_for_shared_allocation():
@@ -235,7 +267,7 @@ def test_quota_can_select_exact_filesystem_path_for_shared_allocation():
         verify_quota_output(output, "rgao48", "/oscar/home path")
 
 
-def test_launcher_passes_optional_quota_filesystem_path(tmp_path):
+def test_launcher_passes_explicit_home_quota_selection(tmp_path):
     env, _, args_path, scontrol = _launcher_environment(tmp_path, status=23)
     env.update(
         {

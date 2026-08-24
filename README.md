@@ -67,6 +67,25 @@ for `latest`; `none` must be used alone. If `save_strat` is omitted, a positive
 Checkpoint files are model snapshots and do not universally contain replay or
 environment state for full training resume.
 
+### Oscar durable checkpoint storage
+
+AMBI jobs submitted by `rgao48` on Oscar store resumable state under
+`/oscar/home/rgao48/ambi-durable`. The quota preflight must select the user home
+row that owns that path:
+
+```bash
+AMBI_DURABLE_ROOT=/oscar/home/rgao48/ambi-durable
+AMBI_LINEAGE_DIR=/oscar/home/rgao48/ambi-durable/lineages/<unique-lineage>
+AMBI_DURABLE_QUOTA_LABEL=rgao48
+AMBI_DURABLE_QUOTA_PATH=/oscar/home
+```
+
+Pass all four values through `sbatch --export`. Use a new lineage for a fresh
+run and the same lineage only for its exact resume. `data+rbalestr` is a
+separate allocation and is not an approved AMBI durable target; both Oscar
+launchers reject that label. Oscar scratch and job-local storage are likewise
+not substitutes for the durable checkpoint root.
+
 The compact AMBI branch-count and imagination-horizon suite lives under
 `configs/ambi/`. Each of its five algorithm files has one matching runnable
 manifest under `configs/ambi/experiments/`; the anchor entry point is

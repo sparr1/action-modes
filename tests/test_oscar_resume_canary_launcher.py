@@ -30,7 +30,7 @@ esac
     _executable(fake_bin / "module", "#!/bin/sh\nexit 0\n")
     _executable(
         fake_bin / "checkquota",
-        "#!/bin/sh\nprintf '%s\n' 'data+rbalestr 1 TB 2 TB OK'\n",
+        "#!/bin/sh\nprintf '%s\n' 'rgao48 /oscar/home 1 TB 2 TB OK None'\n",
     )
     _executable(
         fake_bin / "python",
@@ -85,6 +85,8 @@ exit "${FAKE_SEGMENT_STATUS:-75}"
             "AMBI_RUN_OSCAR_RESUME_CANARY": "1",
             "AMBI_DURABLE_ROOT": str(durable),
             "AMBI_LINEAGE_DIR": str(lineage),
+            "AMBI_DURABLE_QUOTA_LABEL": "rgao48",
+            "AMBI_DURABLE_QUOTA_PATH": "/oscar/home",
             "AMBI_PYTHON": str(fake_bin / "python"),
             "MAMBA_ROOT_PREFIX": str(mamba),
             "FAKE_GIT_ROOT": str(ROOT),
@@ -153,13 +155,15 @@ def test_canary_has_bounded_gpu_debug_resources_and_no_requeue():
     assert "AMBI_WANDB_REWIND_VERIFIED" not in contents
     assert "utils.oscar_resume_canary verify-lineage" in contents
     assert "utils.oscar_resume_canary benchmark-replay" in contents
+    assert 'AMBI_DURABLE_QUOTA_LABEL:?Set AMBI_DURABLE_QUOTA_LABEL' in contents
+    assert 'AMBI_DURABLE_QUOTA_PATH:?Set AMBI_DURABLE_QUOTA_PATH' in contents
+    assert '[[ "$AMBI_DURABLE_QUOTA_LABEL" != "data+rbalestr" ]]' in contents
     assert "--shard-rows 100000" in contents
     assert "--maximum-estimated-bytes 4000000000" in contents
 
 
 def test_canary_runs_new_then_required_and_real_replay_benchmark(tmp_path):
     env, _, srun_path, python_path = _environment(tmp_path)
-    env["AMBI_DURABLE_QUOTA_PATH"] = "/oscar/home"
     result = _run(env)
     assert result.returncode == 0, result.stderr
     calls = _calls(srun_path)
