@@ -1,0 +1,25 @@
+{
+  "study_type": "single_seed_exploratory_ten_head_outer_actor_mean_all_with_value_equivalence_diagnostics",
+  "study_note": "Single-seed exploratory 14-million-decision Humanoid Walk base-v1 G4 ten-head run whose sole learning-axis change from the q10 min_all anchor is the outer policy-learning Q reduction from min_all to mean_all; both outer and inner target reductions and the inner actor reduction remain min_all over ten heads, with entropy-augmented critic targets, a trainable cloned inner critic, automatic outer and inner entropy coefficients, and no actor-loss percentile scaling. Observational value-equivalence diagnostics run every 1,000 outer updates with four Monte Carlo samples and do not alter the learning objective. Make no confidence, significance, or confirmatory claims.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": ["ambi_humanoid_walk_base_min_all_q10_outer_actor_mean_all"],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 100000,
+  "save_strat": ["best", "latest"],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}
