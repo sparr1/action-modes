@@ -69,29 +69,32 @@ class FakeWandbRun:
         self.finished = True
 
 
-def _tiny_xqc(env):
+def _tiny_xqc(env, *, wandb_env_step_unit=None):
+    params = {
+        "device": "cpu",
+        "seed": 1,
+        "buffer_size": 32,
+        "learning_starts": 100,
+        "batch_size": 2,
+        "gradient_steps": 1,
+        "updates_per_step": 1,
+        "num_interactions": 4,
+        "actor_net_arch": [8],
+        "critic_net_arch": [8],
+        "num_atoms": 5,
+        "vmin": -2.0,
+        "vmax": 2.0,
+        "eval_freq": 2,
+        "eval_episodes": 1,
+        "wandb": True,
+        "wandb_step_every": 100,
+    }
+    if wandb_env_step_unit is not None:
+        params["wandb_env_step_unit"] = wandb_env_step_unit
     return XQC(
         "XQC",
         env,
-        {
-            "device": "cpu",
-            "seed": 1,
-            "buffer_size": 32,
-            "learning_starts": 100,
-            "batch_size": 2,
-            "gradient_steps": 1,
-            "updates_per_step": 1,
-            "num_interactions": 4,
-            "actor_net_arch": [8],
-            "critic_net_arch": [8],
-            "num_atoms": 5,
-            "vmin": -2.0,
-            "vmax": 2.0,
-            "eval_freq": 2,
-            "eval_episodes": 1,
-            "wandb": True,
-            "wandb_step_every": 100,
-        },
+        params,
         {
             "seed": 1,
             "device": "cpu",
@@ -204,3 +207,64 @@ def test_port_logs_canonical_train_and_eval_returns_on_raw_frame_axis(
     assert run.finished is True
     assert eval_env.closed is True
     assert run.log_steps and set(run.log_steps) == {None}
+
+
+def test_decision_env_step_keeps_comparison_axis_in_raw_frames(monkeypatch):
+    xqc_module = importlib.import_module("RL.XQC")
+    run = FakeWandbRun()
+    monkeypatch.setattr(xqc_module, "init_wandb", lambda *_args, **_kwargs: run)
+    monkeypatch.setenv("XQC_SOURCE_SHA", "a" * 40)
+
+    train_env = AlternatingDoneEnv()
+    eval_env = AlternatingDoneEnv(evaluation=True)
+    model = _tiny_xqc(train_env, wandb_env_step_unit="decision")
+    model._build_evaluation_env = lambda: eval_env
+    model.agent.act = lambda _obs, deterministic=False: np.zeros(
+        1, dtype=np.float32
+    )
+    model.learn(total_timesteps=4)
+
+    training = _payloads_with(run, "comparison/train_return")
+    assert [payload["env_step"] for _, payload in training] == [2, 4]
+    assert [payload["comparison/decision_step"] for _, payload in training] == [2, 4]
+    assert [payload["comparison/raw_frame"] for _, payload in training] == [4, 8]
+    assert [step for step, _ in training] == [4, 8]
+
+    evaluations = _payloads_with(run, "comparison/eval_return")
+    assert [payload["env_step"] for _, payload in evaluations] == [1, 2, 4]
+    assert [payload["comparison/raw_frame"] for _, payload in evaluations] == [
+        2,
+        4,
+        8,
+    ]
+
+
+def test_wandb_env_step_unit_defaults_to_raw_frames():
+    env = AlternatingDoneEnv()
+    try:
+        model = _tiny_xqc(env)
+        assert model._wandb_env_step_unit == "raw_frame"
+        assert model._wandb_env_step(7) == 14
+        assert model._wandb_step(7) == 14
+    finally:
+        env.close()
+
+
+def test_wandb_env_step_unit_is_validated_during_construction():
+    for invalid in ("frames", "Decision", "", None, 2, True):
+        env = AlternatingDoneEnv()
+        try:
+            params = {"wandb_env_step_unit": invalid}
+            with np.testing.assert_raises_regex(
+                ValueError,
+                "wandb_env_step_unit must be exactly 'raw_frame' or 'decision'",
+            ):
+                XQC(
+                    "XQC",
+                    env,
+                    params,
+                    {"seed": 1, "device": "cpu", "total_steps": 4},
+                    {},
+                )
+        finally:
+            env.close()

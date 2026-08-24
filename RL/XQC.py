@@ -47,6 +47,15 @@ class XQC(SAC):
         params = dict(custom_params or {})
         params.setdefault("eval_freq", 50_000)
         params.setdefault("eval_episodes", 10)
+        wandb_env_step_unit = params.get("wandb_env_step_unit", "raw_frame")
+        if not isinstance(wandb_env_step_unit, str) or wandb_env_step_unit not in {
+            "raw_frame",
+            "decision",
+        }:
+            raise ValueError(
+                "wandb_env_step_unit must be exactly 'raw_frame' or 'decision'."
+            )
+        self._wandb_env_step_unit = wandb_env_step_unit
         if params.get("obs", "state") != "state":
             raise ValueError("This XQC port supports state observations only.")
         observation_space = env.observation_space
@@ -287,6 +296,11 @@ class XQC(SAC):
     def _wandb_step(self, decision_step: int) -> int:
         return int(decision_step) * self._action_repeat
 
+    def _wandb_env_step(self, decision_step: int) -> int:
+        if self._wandb_env_step_unit == "decision":
+            return int(decision_step)
+        return self._wandb_step(decision_step)
+
     def _wandb_payload(self, payload, *, event: str, decision_step: int):
         payload = dict(payload)
         payload.update(
@@ -307,7 +321,7 @@ class XQC(SAC):
         if self._wandb_run is None:
             return
         payload = dict(payload)
-        payload.setdefault("env_step", self._wandb_step(decision_step))
+        payload.setdefault("env_step", self._wandb_env_step(decision_step))
         # XQC can finish a training episode and evaluate at the same raw frame.
         # Let W&B allocate distinct internal rows; canonical and legacy charts
         # use their explicit custom step metrics instead of W&B's private _step.

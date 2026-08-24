@@ -1,0 +1,26 @@
+{
+  "study_type": "xqc_humanoid_walk_single_seed_extended_budget_baseline",
+  "study_note": "Single-seed vanilla XQC Humanoid Walk state baseline at seed 55 for one million agent decisions and two million raw control frames. This keeps XQC's UTD-two learner, 5k-decision warmup, and evaluation after decision one and every 50k decisions, producing 21 evaluation rows. It extends the released 500k-decision budget solely to compare against the one-million-decision AMBI-XQC screen in the same W&B group; it is not a paper reproduction. Portable best/latest checkpoints are published every 100k decisions. Exact trainer resume is not supported.",
+  "overrides_alg": {
+    "env": "DMControl-v0"
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "xqc_humanoid_walk_state_1m"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 100000,
+  "save_strat": [
+    "best",
+    "latest"
+  ],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}
