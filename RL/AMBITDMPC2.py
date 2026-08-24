@@ -1532,6 +1532,7 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_alpha_delta",
             "inner_target_entropy",
             "inner_policy_mean_delta_l2",
+            "inner_final_outer_policy_kl",
             "inner_proposal_mean_delta_l2",
             "inner_fixed_target_q_action_gain",
             "inner_outer_q_gain",

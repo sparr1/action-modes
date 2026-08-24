@@ -454,6 +454,54 @@ def test_diagnostics_keep_outer_and_inner_log_std_semantics_separate(monkeypatch
     )
 
 
+def test_final_outer_policy_kl_is_observational_closed_form_and_restores_modes(
+    monkeypatch,
+):
+    model = _model(inner_diagnostic_rollouts=0, inner_outer_policy_kl_coef=0.0)
+    engine = model.agent.inner_engine
+    with engine.rng.fork("initialization"):
+        engine._prepare_workspace(t0=True)
+
+    outer_policy = model.agent.model._pi
+    improved_policy = engine.state.actor
+    outer_policy.eval()
+    improved_policy.train()
+    observed_modes = []
+
+    def known_gaussian_policy(z, *args, **kwargs):
+        del args
+        policy = kwargs["policy"]
+        observed_modes.append(bool(policy.training))
+        is_improved = policy is improved_policy
+        pre_tanh_mean = torch.full(
+            (*z.shape[:-1], model.cfg.action_dim),
+            1.0 if is_improved else 0.0,
+            dtype=z.dtype,
+            device=z.device,
+        )
+        log_std = torch.full_like(
+            pre_tanh_mean,
+            math.log(2.0) if is_improved else 0.0,
+        )
+        return torch.tanh(pre_tanh_mean), {
+            "pre_tanh_mean": pre_tanh_mean,
+            "log_std": log_std,
+        }
+
+    monkeypatch.setattr(model.agent.model, "pi", known_gaussian_policy)
+    metrics = engine._diagnostics(
+        torch.zeros(1, model.cfg.latent_dim),
+        improved_policy,
+    )
+
+    # Per action dimension: -log(2) + 0.5 * (2**2 + 1**2) - 0.5.
+    expected = model.cfg.action_dim * (2.0 - math.log(2.0))
+    assert metrics["inner_final_outer_policy_kl"] == pytest.approx(expected)
+    assert observed_modes == [False, False]
+    assert outer_policy.training is False
+    assert improved_policy.training is True
+
+
 def test_persistent_target_intervals_count_optimizer_steps_across_actions():
     model = _model(
         inner_rounds=1,
@@ -1231,6 +1279,7 @@ def test_scaled_sac_inner_actor_divides_full_objective_but_not_temperature(
 
     # The raw full objective is 0.25*(-0.5) - 2 + 0.5*4 = -0.125.
     assert metrics["actor_loss"] == pytest.approx(-0.125 / 2.0)
+    assert metrics["outer_policy_kl"] == pytest.approx(4.0)
     torch.testing.assert_close(
         metrics["temperature_loss"], expected_temperature_loss
     )

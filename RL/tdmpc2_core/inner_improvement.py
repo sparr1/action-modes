@@ -1959,8 +1959,12 @@ class InnerImprovementEngine:
                         q_mean_all_minus_min_all.detach()
                     ),
                     actor_entropy=entropy.detach().mean(),
-                    outer_policy_kl=kl_mean.detach(),
                 )
+                if float(cfg.inner_outer_policy_kl_coef) > 0.0:
+                    # This is the update-time regularizer statistic. When the
+                    # regularizer is disabled, omit it instead of publishing a
+                    # zero that could be mistaken for an evaluated KL.
+                    metrics["outer_policy_kl"] = kl_mean.detach()
             if update_temperature:
                 target_entropy = self._resolved_inner_target_entropy()
                 temperature_loss = -(
@@ -2392,7 +2396,36 @@ class InnerImprovementEngine:
     @torch.no_grad()
     def _diagnostics(self, root_z, improved_policy):
         with self.rng.fork("diagnostics") as generator:
-            if hasattr(self.model, "pi_action"):
+            final_outer_policy_kl = None
+            if self.cfg.inner_operator == "sac":
+                policy_training_modes = tuple(
+                    (module, bool(module.training))
+                    for policy in (self.model._pi, improved_policy)
+                    for module in policy.modules()
+                )
+                try:
+                    self.model._pi.eval()
+                    improved_policy.eval()
+                    outer_action, outer_info = self.model.pi(
+                        root_z,
+                        policy=self.model._pi,
+                        deterministic=True,
+                    )
+                    improved_action, improved_info = self.model.pi(
+                        root_z,
+                        policy=improved_policy,
+                        deterministic=True,
+                        log_std_mapping=self.cfg.inner_log_std_mapping,
+                        log_std_min=self.cfg.inner_log_std_min,
+                        log_std_max=self.cfg.inner_log_std_max,
+                    )
+                finally:
+                    for module, was_training in policy_training_modes:
+                        module.training = was_training
+                final_outer_policy_kl = self._gaussian_kl(
+                    improved_info, outer_info
+                ).mean()
+            elif hasattr(self.model, "pi_action"):
                 outer_action = self.model.pi_action(root_z, deterministic=True)
                 improved_action = self.model.pi_action(
                     root_z, policy=improved_policy, deterministic=True
@@ -2455,6 +2488,8 @@ class InnerImprovementEngine:
             ).mean(),
             "inner_fixed_evaluator_alpha": self.agent.alpha.detach().mean(),
         }
+        if final_outer_policy_kl is not None:
+            metrics["inner_final_outer_policy_kl"] = final_outer_policy_kl
         if self.cfg.q_representation == "distributional":
             probabilities = torch.softmax(
                 torch.cat((outer_predictions, improved_predictions), dim=1), dim=-1
