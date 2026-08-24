@@ -298,6 +298,7 @@ def test_xqc_specific_inner_metrics_are_routed_to_the_shared_wandb_window():
             "inner_critic_learning_rate": 5e-5,
             "inner_temperature_learning_rate": 5e-5,
             "inner_algorithm_xqc": 1.0,
+            "inner_final_outer_policy_kl": 0.25,
         },
     )
     wrapper._wandb_train_window = WandbAccumulator()
@@ -318,6 +319,10 @@ def test_xqc_specific_inner_metrics_are_routed_to_the_shared_wandb_window():
     assert payload["train/inner_reward_scale"] == pytest.approx(2.5)
     assert payload["train/inner_actor_learning_rate"] == pytest.approx(5e-5)
     assert payload["train/inner_algorithm_xqc"] == pytest.approx(1.0)
+    assert payload["train/inner_final_outer_policy_kl"] == pytest.approx(0.25)
+    assert payload["train/inner_final_outer_policy_kl_count"] == pytest.approx(1.0)
+    assert payload["train/inner_final_outer_policy_kl_min"] == pytest.approx(0.25)
+    assert payload["train/inner_final_outer_policy_kl_max"] == pytest.approx(0.25)
 
 
 def test_exact_trainer_resume_is_explicitly_unsupported_in_v1():

@@ -1,4 +1,5 @@
 from copy import deepcopy
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -24,7 +25,15 @@ class _FakeActor(nn.Module):
     def __init__(self, bias=0.0):
         super().__init__()
         self.bias = nn.Parameter(torch.tensor(float(bias)))
+        self.log_std = nn.Parameter(torch.tensor(0.0))
         self.bn_modes = []
+
+    def distribution(self, z, bn_mode="running"):
+        self.bn_modes.append(bn_mode)
+        return (
+            self.bias.expand(z.shape[0], 1),
+            self.log_std.expand(z.shape[0], 1),
+        )
 
     def sample(
         self,
@@ -35,8 +44,7 @@ class _FakeActor(nn.Module):
         noise=None,
         **_,
     ):
-        self.bn_modes.append(bn_mode)
-        pre_tanh = self.bias.expand(z.shape[0], 1)
+        pre_tanh, _ = self.distribution(z, bn_mode=bn_mode)
         # Keep the test action deterministic while requiring the engine to
         # supply correctly shaped private noise for every stochastic call.
         if not deterministic:
@@ -209,6 +217,7 @@ def test_action_local_xqc_uses_raw_imagination_and_frozen_real_reward_scale():
     assert metrics["inner_update_slots"] == 4
     assert metrics["inner_actor_optimizer_steps"] == 2
     assert metrics["inner_temperature_optimizer_steps"] == 2
+    assert metrics["inner_final_outer_policy_kl"] == pytest.approx(0.02)
     assert metrics["inner_reward_scale"] == pytest.approx(2.5)
     assert metrics["inner_buffer_size"] == 8
     assert all(record["reward_scale"] == 2.5 for record in outer.records)
@@ -227,6 +236,49 @@ def test_action_local_xqc_uses_raw_imagination_and_frozen_real_reward_scale():
     assert engine.state.replay is None
     assert set(engine._workspace_pool.controller.actor.bn_modes) == {"running"}
     assert torch.equal(engine._replay_pool.reward[:8], torch.ones(8, 1))
+
+
+def test_final_policy_kl_uses_closed_form_direction_and_running_bn_without_rng():
+    agent, outer = _agent()
+    engine = InnerXQCEngine(agent)
+    root = torch.zeros(1, 2)
+    with engine.rng.fork("initialization"):
+        engine._prepare_action()
+
+    inner_actor = engine.state.workspace.controller.actor
+    with torch.no_grad():
+        outer.actor.bias.fill_(0.0)
+        outer.actor.log_std.fill_(0.0)
+        inner_actor.bias.fill_(1.0)
+        inner_actor.log_std.fill_(math.log(2.0))
+    outer_before = deepcopy(outer.actor.state_dict())
+    inner_before = deepcopy(inner_actor.state_dict())
+    global_rng = torch.random.get_rng_state().clone()
+
+    metrics = engine._final_policy_diagnostics(root)
+
+    assert metrics["inner_final_outer_policy_kl"] == pytest.approx(
+        2.0 - math.log(2.0)
+    )
+    assert outer.actor.bn_modes[-1] == "running"
+    assert inner_actor.bn_modes[-1] == "running"
+    assert engine.state.policy_evaluations == 2
+    assert torch.equal(torch.random.get_rng_state(), global_rng)
+    _assert_tree_equal(outer.actor.state_dict(), outer_before)
+    _assert_tree_equal(inner_actor.state_dict(), inner_before)
+    engine._release_action()
+
+
+def test_unsampled_action_omits_final_policy_kl_and_diagnostic_work():
+    agent, _ = _agent()
+    engine = InnerXQCEngine(agent)
+
+    _, metrics, _ = engine.act(torch.zeros(1, 2), collect_diagnostics=False)
+    metrics = engine.finalize_timing_metrics(metrics)
+
+    assert "inner_final_outer_policy_kl" not in metrics
+    assert "inner_diagnostic_seconds" not in metrics
+    assert metrics["inner_policy_evaluations"] == 25.0
 
 
 def test_second_action_reuses_allocations_but_is_logically_fresh():

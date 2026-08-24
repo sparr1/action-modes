@@ -368,6 +368,45 @@ class InnerXQCEngine:
             result[f"inner_{key}"] = torch.stack(tensors).float().mean()
         return result
 
+    @staticmethod
+    def _gaussian_kl(
+        inner_mean,
+        inner_log_std,
+        outer_mean,
+        outer_log_std,
+    ):
+        """Closed-form KL(inner || outer) for diagonal pre-tanh Gaussians."""
+
+        mean_delta = inner_mean - outer_mean
+        ratio = (
+            inner_log_std.mul(2).exp() + mean_delta.square()
+        ) / outer_log_std.mul(2).exp().clamp_min(1e-12)
+        return (outer_log_std - inner_log_std + 0.5 * ratio - 0.5).sum(
+            dim=-1, keepdim=True
+        )
+
+    @torch.no_grad()
+    def _final_policy_diagnostics(self, root_z):
+        """Compare the deployed final local actor with its persistent prior."""
+
+        outer_mean, outer_log_std = self.outer_controller.actor.distribution(
+            root_z, bn_mode="running"
+        )
+        inner_mean, inner_log_std = (
+            self.state.workspace.controller.actor.distribution(
+                root_z, bn_mode="running"
+            )
+        )
+        self.state.policy_evaluations += 2 * int(root_z.shape[0])
+        return {
+            "inner_final_outer_policy_kl": self._gaussian_kl(
+                inner_mean,
+                inner_log_std,
+                outer_mean,
+                outer_log_std,
+            ).mean()
+        }
+
     def _base_metrics(self):
         return {
             "inner_active": 1.0,
@@ -421,6 +460,11 @@ class InnerXQCEngine:
             self._timer_stop("inner_execution_seconds", execution_start)
 
             workspace = self.state.workspace
+            policy_diagnostics = {}
+            if self._collect_diagnostics:
+                diagnostic_start = self._timer_start()
+                policy_diagnostics = self._final_policy_diagnostics(root_z)
+                self._timer_stop("inner_diagnostic_seconds", diagnostic_start)
             alpha_final = workspace.controller.temperature.detach().clone()
             length_values = torch.cat(all_lengths)
             termination_values = torch.cat(terminated).float()
@@ -515,6 +559,7 @@ class InnerXQCEngine:
             )
             metrics.update(self._average_updates(update_history, root_z))
             if self._collect_diagnostics:
+                metrics.update(policy_diagnostics)
                 metrics["inner_diagnostics_sampled"] = 1.0
                 metrics["inner_diagnostics_sample_count"] = 1.0
                 metrics["inner_diagnostics_step"] = float(self.action_index)

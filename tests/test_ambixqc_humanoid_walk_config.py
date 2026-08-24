@@ -87,6 +87,7 @@ def test_full_humanoid_config_freezes_the_first_gpu_screen():
     assert params["wandb_entity"] == "rwgao_b-brown-university"
     assert params["wandb_project"] == "ambi"
     assert params["wandb_group"] == "ambixqc-humanoid-walk-state-1m"
+    assert params["inner_diagnostics_every"] == params["wandb_step_every"] == 1000
     assert "wandb_run_name" not in params
     assert "1m-decisions" in params["wandb_tags"]
 

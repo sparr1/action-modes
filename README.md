@@ -58,6 +58,11 @@ and fixed `5e-5` actor/critic learning rates. Temperature always uses the actor
 learning rate. These are initial method defaults, not a frozen benchmark
 protocol; every experiment must record its resolved settings.
 
+AMBI-XQC uses the same sparse W&B key as inner SAC for final-policy drift:
+`train/inner_final_outer_policy_kl` reports the closed-form root-state
+`KL(final adapted actor || outer prior)` and is observational rather than part
+of the XQC actor loss.
+
 AMBI-XQC v1 supports portable model checkpoints for evaluation and weight
 transfer. It is not allowlisted for exact trainer resume because that stronger
 contract also requires replay and environment state. The v1 controller and

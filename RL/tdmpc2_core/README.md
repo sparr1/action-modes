@@ -74,6 +74,17 @@ The XQC controller semantics reuse the PyTorch port of official XQC commit
 `9a6832bb742ef01bbe9f1e06153a9338e612dae5`; TOLD remains derived from the
 TD-MPC2 source identified above.
 
+On sampled diagnostic actions, AMBI-XQC publishes the same
+`train/inner_final_outer_policy_kl` contract as inner SAC: the closed-form
+`KL(final adapted actor || current outer policy prior)` at the encoded
+real-decision root, summed over action dimensions. Both XQC actors are evaluated
+with their running BatchNorm statistics, matching deployed action selection and
+including action-local BatchNorm adaptation. The shared tanh transformation
+makes the pre-tanh diagonal-Gaussian KL equal to the squashed-policy KL. This is
+an observational `no_grad` action gauge, never a loss term; it follows
+`inner_diagnostics_every`, is absent on unsampled actions, and defaults to every
+1,000 real environment steps.
+
 AMBI's actor log-standard-deviation transform is configurable independently of
 its bounds. `log_std_mapping="direct_clamp"` preserves the SAC-style default by
 clamping the actor head directly to `log_std_min`/`log_std_max` (default
