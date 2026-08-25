@@ -418,10 +418,16 @@ class InnerXQCEngine:
         transitions = []
 
         for step in range(horizon):
-            action, _ = controller.sample_action(
-                z,
-                deterministic=False,
-                noise=policy_noise[step],
+            # The public sampling wrapper performs Python/NumPy scalar
+            # validation and computes a log probability that collection never
+            # consumes. Keep this fixed-shape region tensor-only while
+            # preserving the exact temperature=1 stochastic action equation.
+            mean, log_std = controller.actor.distribution(
+                z, bn_mode="running"
+            )
+            action = torch.tanh(
+                mean
+                + torch.exp(log_std) * 1.0 * policy_noise[step]
             )
             joint = self.model.joint_input(z, action)
             reward = td_math.two_hot_inv(
