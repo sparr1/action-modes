@@ -70,12 +70,26 @@ def _restore_rng_state(state):
 
 
 class CompileRegion:
-    """Lazily compile one tensor region with a warning/eager fallback."""
+    """Lazily compile one tensor region with a warning/eager fallback.
 
-    def __init__(self, name, eager, *, enabled=False, strict=False):
+    ``strict`` controls whether compiler/runtime failures propagate. By
+    default it also retains the historical full-graph behavior, while callers
+    may explicitly relax graph capture without relaxing failure handling.
+    """
+
+    def __init__(
+        self,
+        name,
+        eager,
+        *,
+        enabled=False,
+        strict=False,
+        fullgraph=None,
+    ):
         self.name = str(name)
         self.eager = eager
         self.strict = bool(strict)
+        self.fullgraph = self.strict if fullgraph is None else bool(fullgraph)
         self.enabled = bool(enabled)
         self.failed = False
         self._compiled = None
@@ -123,7 +137,7 @@ class CompileRegion:
             try:
                 compiled = torch.compile(
                     self.eager,
-                    fullgraph=self.strict,
+                    fullgraph=self.fullgraph,
                     dynamic=False,
                 )
             except Exception as error:

@@ -24,10 +24,11 @@ Usage:
     [--order eager-first|compiled-first] \
     [--dry-run]
 
-Submits one Oscar L40S job. The job runs eager and strict-compiled exact-shape
-compute benchmarks plus the paired 1,502-step Humanoid Walk timing canaries
-sequentially on the same GPU. The helper never updates the checkout: first
-transport the tested commit through Git and invoke this from that clean commit.
+Submits one Oscar L40S job. The job runs candidate eager, fixed-baseline
+strict-compiled, and candidate strict-compiled exact-shape benchmarks plus
+three 1,502-step Humanoid Walk timing canaries sequentially on the same GPU.
+The helper never updates the checkout: first transport the tested candidate
+commit through Git and invoke this from that clean commit.
 EOF
 }
 
@@ -99,7 +100,7 @@ done
 
 AMBIXQC_BENCHMARK_RESULTS_ROOT="$(cd "$AMBIXQC_BENCHMARK_RESULTS_ROOT" && pwd -P)"
 readonly AMBIXQC_BENCHMARK_RESULTS_ROOT
-readonly EXPECTED_RESULTS_ROOT="/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-compile/$EXPECTED_ACTION_MODES_SHA"
+readonly EXPECTED_RESULTS_ROOT="/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-dense-rollout/$EXPECTED_ACTION_MODES_SHA"
 case "$AMBIXQC_BENCHMARK_RESULTS_ROOT/" in
   "$PROJECT_DIR/"*) fail "durable results must be outside the Git checkout" ;;
 esac

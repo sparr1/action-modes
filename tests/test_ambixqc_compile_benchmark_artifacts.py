@@ -177,6 +177,12 @@ def test_exact_compute_benchmark_freezes_shape_workload_and_safety_contract():
     assert "agent.update(buffer)" in contents
     assert '"outer_compile_status"' in contents
     assert '"inner_compile_status"' in contents
+    assert '"inner_rollout_compile_status"' in contents
+    assert '"schema": "ambixqc-exact-compute-benchmark-v2"' in contents
+    assert '"all_five_regions_compiled"' in contents
+    assert '"all_four_regions_compiled"' not in contents
+    assert "all five AMBI-XQC compiled regions were required" in contents
+    assert 'or inner_rollout_compile["fallback"]' in contents
     assert '"outer_optimizer_backend"' in contents
     assert '"inner_optimizer_backend"' in contents
     assert '"cold_cycle_seconds"' in contents
@@ -185,6 +191,17 @@ def test_exact_compute_benchmark_freezes_shape_workload_and_safety_contract():
     assert "torch.cuda.synchronize(device)" in contents
     assert '"iteration_p50_seconds"' in contents
     assert '"iteration_p95_seconds"' in contents
+    assert '"inner_rollout_p50_seconds"' in contents
+    assert '"inner_rollout_p95_seconds"' in contents
+    assert '"exact_inner_workload"' in contents
+    assert '"exact_replay_state"' in contents
+    assert '"rollout_lengths"' in contents
+    assert "[PRODUCTION_TRAIN_HORIZON] * 64" in contents
+    assert '"policy_evaluations": 1217' in contents
+    assert '"q_evaluations": 2560' in contents
+    assert '"pos": int(replay_pool.pos)' in contents
+    assert '"full": bool(replay_pool.full)' in contents
+    assert '"next_sample_id": int(replay_pool.next_sample_id)' in contents
     assert '"actions_per_second"' in contents
     assert '"outer_updates_per_second"' in contents
     assert '"peak_cuda_allocated_bytes"' in contents
@@ -195,7 +212,7 @@ def test_exact_compute_benchmark_freezes_shape_workload_and_safety_contract():
     assert BENCHMARK.stat().st_mode & stat.S_IXUSR
 
 
-def test_oscar_pair_launcher_runs_both_arms_on_one_guarded_gpu():
+def test_oscar_pair_launcher_runs_three_arms_on_one_guarded_gpu():
     contents = LAUNCHER.read_text(encoding="utf-8")
 
     assert "#SBATCH --partition=gpu" in contents
@@ -212,12 +229,20 @@ def test_oscar_pair_launcher_runs_both_arms_on_one_guarded_gpu():
     assert contents.count(
         'require_clean_sha "$PROJECT_DIR_REAL" "$EXPECTED_ACTION_MODES_SHA"'
     ) == 2
+    assert contents.count(
+        'require_clean_sha "$BASELINE_DIR" "$BASELINE_ACTION_MODES_SHA"'
+    ) == 2
+    assert "b0c39193e8b9c922d091063b30d92b00dfd9f28f" in contents
+    assert "candidate SHA must differ from the fixed four-region baseline" in contents
+    assert 'git clone --shared --no-checkout "$PROJECT_DIR_REAL" "$BASELINE_DIR"' in contents
+    assert 'git -C "$BASELINE_DIR" checkout --detach "$BASELINE_ACTION_MODES_SHA"' in contents
     assert "status --porcelain=v1 --untracked-files=all" in contents
     assert "f123ba99aadde092401c0e912dbeb88994f00ae420680c69c18003965485efe6" in contents
     assert "durable results must be outside the Git checkout" in contents
     assert '[[ ! -e "$JOB_ROOT" && ! -L "$JOB_ROOT" ]]' in contents
     assert 'readonly JOB_ROOT="$RESULTS_ROOT_REAL/$SLURM_JOB_ID"' in contents
-    assert "/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-compile/$EXPECTED_ACTION_MODES_SHA" in contents
+    assert "/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-dense-rollout/$EXPECTED_ACTION_MODES_SHA" in contents
+    assert "/ambixqc-compile/" not in contents
     assert "rm -rf" not in contents
     assert "git pull" not in contents
     assert "git fetch" not in contents
@@ -237,6 +262,8 @@ def test_oscar_pair_launcher_runs_both_arms_on_one_guarded_gpu():
     assert "for repetition in 1 2 3 4 5" in contents
     assert "repetition % 2 == 1" in contents
     assert '[[ "$PAIR_ORDER" == eager-first ]]' in contents
+    assert "REP_MODES=(eager baseline candidate)" in contents
+    assert "REP_MODES=(candidate baseline eager)" in contents
     assert 'configure_process_cache "compute-$mode-rep$repetition"' in contents
     assert "TDMPC2_COMPUTE_TIMING_OUTPUT" in contents
     assert 'training-$mode-compute.json' in contents
@@ -248,8 +275,13 @@ def test_oscar_pair_launcher_runs_both_arms_on_one_guarded_gpu():
     assert '"compiled_p50_ratio_at_most_0p90"' in contents
     assert '"compiled_p95_ratio_at_most_0p95"' in contents
     assert '"maximum_p50_cv_at_most_0p05"' in contents
+    assert 'max_cv = max(cv["eager"], cv["candidate"])' in contents
     assert '"paired_compiled_p50_ratio_at_most_1p10"' in contents
     assert '"peak_allocation_ratio_at_most_1p10"' in contents
+    assert '"candidate_over_baseline_p50_at_most_0p97"' in contents
+    assert '"candidate_over_baseline_p95_at_most_1p00"' in contents
+    assert '"candidate_over_baseline_peak_allocation_at_most_1p10"' in contents
+    assert '"warmed_canary_candidate_over_baseline_at_most_0p97"' in contents
     assert '"compile_cost_break_even_actions"' in contents
     assert '"cold_process_elapsed_seconds"' in contents
     assert '"warmed_compute_seconds"' in contents
@@ -263,8 +295,17 @@ def test_oscar_pair_launcher_runs_both_arms_on_one_guarded_gpu():
     assert 'expected_counters = (1002, 1002, 1002, 334, 334, 1001)' in contents
     assert 'checkpoint.get("step") != 1502' in contents
     assert "p50_ratio_compiled_over_eager" in contents
+    assert "p50_ratio_candidate_over_baseline" in contents
+    assert "p95_ratio_candidate_over_baseline" in contents
+    assert "median_inner_rollout_p50_seconds" in contents
+    assert "median_inner_rollout_p95_seconds" in contents
+    assert 'record["all_five_regions_compiled"] != expected_compile' in contents
+    assert '"all_five_regions_compiled": True' in contents
     assert "warmed_canary_compute_speedup" in contents
+    assert 'if [[ -f "$JOB_ROOT/PERFORMANCE_MISS" ]]' in contents
+    assert 'printf \'CORRECTNESS_PASS\\n\' > "$JOB_ROOT/CORRECTNESS_PASS"' in contents
     assert 'printf \'PASS\\n\' > "$JOB_ROOT/PASS"' in contents
+    assert "candidate is not retention eligible" in contents
 
 
 def test_oscar_submitter_requires_git_transport_and_new_external_artifacts():
@@ -277,7 +318,8 @@ def test_oscar_submitter_requires_git_transport_and_new_external_artifacts():
     assert "--dry-run" in contents
     assert "submission requires a clean checkout" in contents
     assert "durable results must be outside the Git checkout" in contents
-    assert "/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-compile/$EXPECTED_ACTION_MODES_SHA" in contents
+    assert "/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-dense-rollout/$EXPECTED_ACTION_MODES_SHA" in contents
+    assert "/ambixqc-compile/" not in contents
     assert "AMBIXQC_BENCHMARK_RESULTS_ROOT=$AMBIXQC_BENCHMARK_RESULTS_ROOT" in contents
     assert "AMBIXQC_ACTION_MODES_DIR=$PROJECT_DIR" in contents
     assert "AMBIXQC_PAIR_ORDER=$AMBIXQC_PAIR_ORDER" in contents
@@ -299,12 +341,23 @@ def test_new_scripts_are_executable_valid_bash_and_documented():
     assert "ambixqc_humanoid_walk_state_timing_pair.json" in readme
     assert "submit_ambixqc_compile_pair_oscar.sh" in readme
     assert "First commit and push" in readme
-    assert "/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-compile/<full-SHA>/<job-id>" in readme
+    assert "/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-dense-rollout/<full-SHA>/<job-id>" in readme
+    assert "/ambixqc-compile/" not in readme
     assert "five independent compute processes per mode" in readme
     assert "mandatory AMBI-XQC and shared compile-region CUDA correctness suites" in readme
     assert "cold whole-process wall time" in readme
     assert "excludes the first planned" in readme
     assert "inner action and the first outer update independently" in readme
-    assert "not used for the five-percent" in readme
+    assert "b0c39193e8b9c922d091063b30d92b00dfd9f28f" in readme
+    assert "strict-compiled baseline" in readme
+    assert "strict-compiled candidate" in readme
+    assert "all five regions compiled" in readme
+    assert "candidate p50 and warmed-canary compute" in readme
+    assert "candidate p95 may not exceed" in readme
+    assert "candidate peak allocation may not exceed" in readme
+    assert "`PASS` unambiguously means every mandatory" in readme
+    assert "`CORRECTNESS_PASS` together with" in readme
+    assert "explicitly not eligible for" in readme
+    assert "not used for either warmed" in readme
     assert "classification" in readme
     assert "greater than one favor compilation" in readme.lower()

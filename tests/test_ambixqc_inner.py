@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+from RL.tdmpc2_core.common import math as td_math
 from RL.tdmpc2_core.inner_xqc import InnerXQCEngine
 from RL.tdmpc2_core.xqc_controller import LatentXQCConfig, LatentXQCController
 
@@ -22,10 +23,11 @@ def _assert_tree_equal(left, right):
 
 
 class _FakeActor(nn.Module):
-    def __init__(self, bias=0.0):
+    def __init__(self, bias=0.0, *, use_noise=False):
         super().__init__()
         self.bias = nn.Parameter(torch.tensor(float(bias)))
         self.log_std = nn.Parameter(torch.tensor(0.0))
+        self.use_noise = bool(use_noise)
         self.bn_modes = []
 
     def distribution(self, z, bn_mode="running"):
@@ -45,11 +47,11 @@ class _FakeActor(nn.Module):
         **_,
     ):
         pre_tanh, _ = self.distribution(z, bn_mode=bn_mode)
-        # Keep the test action deterministic while requiring the engine to
-        # supply correctly shaped private noise for every stochastic call.
+        # Keep ordinary tests deterministic while allowing the rollout oracle
+        # to make the private collection noise observable.
         if not deterministic:
             assert noise is not None and noise.shape == pre_tanh.shape
-            pre_tanh = pre_tanh + noise * 0.0
+            pre_tanh = pre_tanh + noise * float(self.use_noise)
         return torch.tanh(pre_tanh), torch.zeros(z.shape[0], device=z.device)
 
 
@@ -122,8 +124,8 @@ class _FakeWorkspace:
 
 
 class _FakeOuterController:
-    def __init__(self):
-        self.actor = _FakeActor()
+    def __init__(self, *, use_noise=False):
+        self.actor = _FakeActor(use_noise=use_noise)
         self.log_temperature = nn.Parameter(torch.tensor(-2.0))
         self.records = []
         self.clone_calls = 0
@@ -143,33 +145,50 @@ class _FakeOuterController:
 
 
 class _FakeTOLD(nn.Module):
-    def __init__(self, *, terminate=False):
+    def __init__(self, *, terminate=False, action_dependent=False):
         super().__init__()
         self.terminate = terminate
+        self.action_dependent = bool(action_dependent)
+        if self.action_dependent:
+            self.action_reward_scale = nn.Parameter(torch.tensor(0.5))
+            self.action_transition_scale = nn.Parameter(torch.tensor(0.25))
 
     @staticmethod
     def joint_input(z, action):
         return torch.cat((z, action), dim=-1)
 
-    @staticmethod
-    def reward_from_joint(joint):
-        return torch.ones(joint.shape[0], 1, device=joint.device)
+    def reward_from_joint(self, joint):
+        reward = torch.ones(joint.shape[0], 1, device=joint.device)
+        if self.action_dependent:
+            reward = reward + self.action_reward_scale * joint[:, -1:]
+        return reward
 
-    @staticmethod
-    def next_from_joint(joint):
-        return joint[:, :2] + 0.25
+    def next_from_joint(self, joint):
+        next_z = joint[:, :2] + 0.25
+        if self.action_dependent:
+            next_z = next_z + self.action_transition_scale * joint[:, -1:]
+        return next_z
 
     def termination(self, z):
         value = 1.0 if self.terminate else 0.0
         return torch.full((z.shape[0], 1), value, device=z.device)
 
 
-def _agent(*, episodic=False, terminate=False):
+def _agent(
+    *,
+    episodic=False,
+    terminate=False,
+    compile=False,
+    compile_strict=False,
+    oracle_rollout=False,
+):
     cfg = SimpleNamespace(
         seed=11,
         latent_dim=2,
         action_dim=1,
         episodic=episodic,
+        compile=compile,
+        compile_strict=compile_strict,
         num_bins=0,
         vmin=-10.0,
         vmax=10.0,
@@ -189,16 +208,208 @@ def _agent(*, episodic=False, terminate=False):
         inner_termination_threshold=0.5,
         inner_model_step_budget=8,
     )
-    controller = _FakeOuterController()
+    controller = _FakeOuterController(use_noise=oracle_rollout)
     agent = SimpleNamespace(
         cfg=cfg,
         device=torch.device("cpu"),
-        model=_FakeTOLD(terminate=terminate),
+        model=_FakeTOLD(
+            terminate=terminate,
+            action_dependent=oracle_rollout,
+        ),
         xqc_controller=controller,
         discount=0.9,
         reward_normalizer=SimpleNamespace(scale=2.5),
     )
     return agent, controller
+
+
+@torch.no_grad()
+def _legacy_stepwise_non_episodic_round(engine, root_z):
+    """Independent oracle for the pre-dense non-episodic rollout."""
+
+    cfg = engine.cfg
+    count = int(cfg.inner_rollouts_per_round)
+    horizon = int(cfg.inner_rollout_horizon)
+    z = root_z.expand(count, -1).clone()
+    alive = torch.ones(count, dtype=torch.bool, device=engine.device)
+    lengths = torch.zeros(count, dtype=torch.long, device=engine.device)
+    reward_sums = torch.zeros(count, dtype=root_z.dtype, device=engine.device)
+    discounted_rewards = torch.zeros_like(reward_sums)
+    discount_weight = torch.ones_like(reward_sums)
+    terminated_rollout = torch.zeros_like(alive)
+    transition_fields = ([], [], [], [], [])
+
+    for _ in range(horizon):
+        active = torch.nonzero(alive, as_tuple=False).squeeze(-1)
+        if active.numel() == 0:
+            break
+        active_z = z.index_select(0, active)
+        action = engine._sample_actor(active_z, stream="collection")
+        joint = engine.model.joint_input(active_z, action)
+        reward = td_math.two_hot_inv(
+            engine.model.reward_from_joint(joint), cfg
+        )
+        next_z = engine.model.next_from_joint(joint)
+        terminated = reward.new_zeros((active.numel(), 1))
+
+        for values, value in zip(
+            transition_fields,
+            (active_z, action, reward, next_z, terminated),
+        ):
+            values.append(value)
+
+        reward_vector = reward.squeeze(-1)
+        lengths[active] += 1
+        reward_sums[active] += reward_vector
+        discounted_rewards[active] += discount_weight[active] * reward_vector
+        discount_weight[active] *= float(engine.agent.discount)
+        z[active] = next_z
+
+    engine.state.replay.add_batch(
+        *(torch.cat(values, dim=0) for values in transition_fields)
+    )
+    return {
+        "lengths": lengths,
+        "reward_sums": reward_sums,
+        "discounted_rewards": discounted_rewards,
+        "terminated": terminated_rollout,
+    }
+
+
+def test_dense_non_episodic_round_matches_legacy_stepwise_oracle():
+    dense_agent, dense_outer = _agent(oracle_rollout=True)
+    legacy_agent, legacy_outer = _agent(oracle_rollout=True)
+    dense = InnerXQCEngine(dense_agent)
+    legacy = InnerXQCEngine(legacy_agent)
+    root = torch.zeros(1, 2)
+
+    with dense.rng.fork("initialization"):
+        dense._prepare_action()
+    with legacy.rng.fork("initialization"):
+        legacy._prepare_action()
+    dense_outer_before = deepcopy(dense_outer.actor.state_dict())
+    legacy_outer_before = deepcopy(legacy_outer.actor.state_dict())
+    dense_local_before = deepcopy(
+        dense.state.workspace.controller.actor.state_dict()
+    )
+    legacy_local_before = deepcopy(
+        legacy.state.workspace.controller.actor.state_dict()
+    )
+    dense_model_before = deepcopy(dense.model.state_dict())
+    legacy_model_before = deepcopy(legacy.model.state_dict())
+    global_rng = torch.random.get_rng_state().clone()
+
+    dense_result = dense._collect_dense_round(
+        root,
+        count=int(dense.cfg.inner_rollouts_per_round),
+        horizon=int(dense.cfg.inner_rollout_horizon),
+    )
+    legacy_result = _legacy_stepwise_non_episodic_round(legacy, root)
+
+    assert dense_result.keys() == legacy_result.keys()
+    for key in dense_result:
+        torch.testing.assert_close(
+            dense_result[key], legacy_result[key], atol=0, rtol=0
+        )
+    assert dense_result["lengths"].tolist() == [2, 2]
+    assert not bool(dense_result["terminated"].any())
+    assert dense.state.policy_evaluations == legacy.state.policy_evaluations == 4
+    assert torch.equal(torch.random.get_rng_state(), global_rng)
+    _assert_tree_equal(dense_outer.actor.state_dict(), dense_outer_before)
+    _assert_tree_equal(legacy_outer.actor.state_dict(), legacy_outer_before)
+    _assert_tree_equal(
+        dense.state.workspace.controller.actor.state_dict(), dense_local_before
+    )
+    _assert_tree_equal(
+        legacy.state.workspace.controller.actor.state_dict(), legacy_local_before
+    )
+    _assert_tree_equal(dense.model.state_dict(), dense_model_before)
+    _assert_tree_equal(legacy.model.state_dict(), legacy_model_before)
+    assert all(
+        parameter.grad is None
+        for module in (
+            dense_outer.actor,
+            legacy_outer.actor,
+            dense.state.workspace.controller.actor,
+            legacy.state.workspace.controller.actor,
+            dense.model,
+            legacy.model,
+        )
+        for parameter in module.parameters()
+    )
+
+    dense_replay = dense.state.replay.state_dict()
+    legacy_replay = legacy.state.replay.state_dict()
+    _assert_tree_equal(dense_replay, legacy_replay)
+    assert dense_replay["pos"] == 4
+    assert dense_replay["full"] is False
+    assert dense_replay["next_sample_id"] == 4
+    torch.testing.assert_close(
+        dense_replay["sample_id"], torch.arange(4), atol=0, rtol=0
+    )
+    actions = dense_replay["action"]
+    assert actions.unique().numel() > 1
+    assert bool(actions.abs().max() > 0)
+    torch.testing.assert_close(
+        dense_replay["reward"], 1.0 + 0.5 * actions, atol=0, rtol=0
+    )
+    # The first N rows are the common roots. Horizon-major ordering makes their
+    # action-dependent successors both the next_z rows at h0 and the z rows at
+    # h1; differing actions make this structure non-degenerate.
+    torch.testing.assert_close(
+        dense_replay["z"][:2],
+        torch.zeros(2, 2),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        dense_replay["z"][2:], dense_replay["next_z"][:2], atol=0, rtol=0
+    )
+    assert not torch.equal(
+        dense_replay["next_z"][0], dense_replay["next_z"][1]
+    )
+    _assert_tree_equal(
+        dense.rng.training_state_dict(), legacy.rng.training_state_dict()
+    )
+    dense._release_action()
+    legacy._release_action()
+
+
+def test_rollout_compile_status_distinguishes_cpu_inactive_and_episodic():
+    cpu_agent, _ = _agent(compile=True, compile_strict=True)
+    cpu = InnerXQCEngine(cpu_agent)
+    assert cpu.rollout_compile_status == {
+        "requested": True,
+        "applicable": True,
+        "enabled": False,
+        "strict": True,
+        "compiled": False,
+        "fallback": False,
+    }
+    cpu.act(torch.zeros(1, 2), collect_diagnostics=False)
+    assert cpu.rollout_compile_status["compiled"] is False
+    assert cpu.rollout_compile_status["fallback"] is False
+
+    episodic_agent, _ = _agent(
+        episodic=True,
+        terminate=True,
+        compile=True,
+        compile_strict=True,
+    )
+    episodic = InnerXQCEngine(episodic_agent)
+    assert episodic.rollout_compile_status == {
+        "requested": True,
+        "applicable": False,
+        "enabled": False,
+        "strict": True,
+        "compiled": False,
+        "fallback": False,
+    }
+    _, metrics, lengths = episodic.act(torch.zeros(1, 2))
+    assert lengths.tolist() == [1, 1, 1, 1]
+    assert metrics["inner_model_steps"] == 4
+    assert metrics["inner_termination_rate"] == pytest.approx(1.0)
+    assert metrics["inner_compile_rollout_fallback"] == 0.0
 
 
 def test_action_local_xqc_uses_raw_imagination_and_frozen_real_reward_scale():

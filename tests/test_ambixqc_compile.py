@@ -518,7 +518,9 @@ def test_cuda_compiled_workspace_matches_four_eager_state_machine_slots():
     )
 
 
-def _tiny_params(*, device, compile):
+def _tiny_params(*, device, compile, compile_strict=None):
+    if compile_strict is None:
+        compile_strict = compile
     return {
         "device": device,
         "model_size": None,
@@ -537,7 +539,7 @@ def _tiny_params(*, device, compile):
         "pretrain_steps": 1,
         "utd": 1,
         "compile": compile,
-        "compile_strict": compile,
+        "compile_strict": compile_strict,
         "episodic": False,
         "discount": 0.99,
         "wandb": False,
@@ -556,12 +558,16 @@ def _tiny_params(*, device, compile):
     }
 
 
-def _tiny_wrapper(*, device, compile):
+def _tiny_wrapper(*, device, compile, compile_strict=None):
     env = gym.make("Pendulum-v1", max_episode_steps=5)
     return AMBIXQC(
         "AMBIXQC",
         env,
-        _tiny_params(device=device, compile=compile),
+        _tiny_params(
+            device=device,
+            compile=compile,
+            compile_strict=compile_strict,
+        ),
         {"seed": 3, "device": device, "env": "test", "total_steps": 10},
         {},
     )
@@ -578,6 +584,14 @@ def test_outer_and_inner_fallback_status_reads_live_compile_regions():
         engine._prepare_action()
         try:
             controller = engine.state.workspace.controller
+            engine._rollout_region.failed = True
+            assert engine._compile_fallback_metrics() == {
+                "inner_compile_rollout_fallback": 1.0,
+                "inner_compile_critic_fallback": 0.0,
+                "inner_compile_actor_fallback": 0.0,
+                "inner_compile_fallback": 1.0,
+            }
+            engine._rollout_region.failed = False
             controller._critic_loss_region.failed = True
             assert engine._compile_fallback_metrics() == {
                 "inner_compile_rollout_fallback": 0.0,
@@ -589,6 +603,416 @@ def test_outer_and_inner_fallback_status_reads_live_compile_regions():
             engine._release_action()
     finally:
         wrapper.env.close()
+
+
+def test_mocked_rollout_compile_is_lazy_cached_and_invalidated_with_pool(
+    monkeypatch,
+):
+    wrapper = _tiny_wrapper(
+        device="cpu", compile=True, compile_strict=False
+    )
+    compile_calls = []
+
+    def fake_compile(function, **kwargs):
+        compile_calls.append((function.__name__, kwargs))
+        return function
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    try:
+        engine = wrapper.agent.inner_engine
+        with engine.rng.fork("initialization"):
+            engine._prepare_action()
+        first_region = engine._rollout_region
+        first_region.enabled = True
+        engine._release_action()
+
+        root_z = torch.zeros(1, int(engine.cfg.latent_dim))
+        engine.act(root_z, collect_diagnostics=False)
+        compiled_callable = first_region._compiled
+        assert compiled_callable is not None
+        engine.act(root_z, collect_diagnostics=False)
+
+        assert engine._rollout_region is first_region
+        assert engine._rollout_region._compiled is compiled_callable
+        assert compile_calls == [
+            (
+                "_dense_rollout_kernel",
+                {"fullgraph": False, "dynamic": False},
+            )
+        ]
+        assert engine.rollout_compile_status == {
+            "requested": True,
+            "applicable": True,
+            "enabled": True,
+            "strict": False,
+            "compiled": True,
+            "fallback": False,
+        }
+
+        boundary = deepcopy(engine.training_state_dict())
+        first_region.failed = True
+        _assert_nested_close(
+            engine.training_state_dict(), boundary, atol=0, rtol=0
+        )
+        first_region.failed = False
+
+        assert engine._workspace_pool is not None
+        assert engine._replay_pool is not None
+        engine.clear_all()
+        cleared = engine._rollout_region
+        assert engine._workspace_pool is None
+        assert engine._replay_pool is None
+        assert engine._rollout_controller is None
+        assert engine._rollout_region_key is None
+        assert cleared is not first_region
+        assert cleared._compiled is None
+
+        engine.load_training_state_dict(boundary)
+        invalidated = engine._rollout_region
+        assert invalidated is not first_region
+        assert invalidated is not cleared
+        assert invalidated._compiled is None
+        assert engine._rollout_controller is None
+
+        with engine.rng.fork("initialization"):
+            engine._prepare_action()
+        rebuilt = engine._rollout_region
+        assert rebuilt is invalidated
+        assert rebuilt._compiled is None
+        assert rebuilt.enabled is False
+        engine._release_action()
+    finally:
+        wrapper.env.close()
+
+
+def test_non_strict_late_rollout_failure_retries_once_without_duplicate_effects(
+    monkeypatch,
+):
+    reference_wrapper = _tiny_wrapper(device="cpu", compile=False)
+    candidate_wrapper = _tiny_wrapper(
+        device="cpu", compile=True, compile_strict=False
+    )
+    compile_calls = 0
+    compiled_calls = 0
+
+    def fake_compile(function, **kwargs):
+        nonlocal compile_calls
+        assert kwargs == {"fullgraph": False, "dynamic": False}
+        compile_calls += 1
+
+        def compiled(*args):
+            nonlocal compiled_calls
+            compiled_calls += 1
+            outputs = function(*args)
+            if compiled_calls == 2:
+                raise RuntimeError("injected late rollout failure")
+            return outputs
+
+        return compiled
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    try:
+        reference = reference_wrapper.agent
+        candidate = candidate_wrapper.agent
+        candidate.load_state_dict(deepcopy(reference.state_dict()))
+        candidate.inner_engine.load_training_state_dict(
+            deepcopy(reference.inner_engine.training_state_dict())
+        )
+        for engine in (reference.inner_engine, candidate.inner_engine):
+            with engine.rng.fork("initialization"):
+                engine._prepare_action()
+            if engine is candidate.inner_engine:
+                engine._rollout_region.enabled = True
+            engine._release_action()
+
+        root_z = torch.zeros(1, int(reference.cfg.latent_dim))
+
+        def run_pair(*, expect_fallback):
+            reference_result = reference.inner_engine.act(
+                root_z, collect_diagnostics=False
+            )
+            warning = pytest.warns(RuntimeWarning, match="Falling back")
+            if expect_fallback:
+                with warning:
+                    candidate_result = candidate.inner_engine.act(
+                        root_z, collect_diagnostics=False
+                    )
+            else:
+                candidate_result = candidate.inner_engine.act(
+                    root_z, collect_diagnostics=False
+                )
+            reference_action, reference_metrics, reference_lengths = reference_result
+            candidate_action, candidate_metrics, candidate_lengths = candidate_result
+            torch.testing.assert_close(
+                candidate_action, reference_action, atol=0, rtol=0
+            )
+            assert candidate_lengths == reference_lengths
+            assert candidate_metrics.keys() == reference_metrics.keys()
+            for key in reference_metrics:
+                if key in {
+                    "inner_compile_rollout_fallback",
+                    "inner_compile_fallback",
+                }:
+                    assert candidate_metrics[key] == float(expect_fallback)
+                    assert reference_metrics[key] == 0.0
+                else:
+                    _assert_nested_close(
+                        candidate_metrics[key],
+                        reference_metrics[key],
+                        atol=0,
+                        rtol=0,
+                    )
+
+            _assert_nested_close(
+                candidate.inner_engine._replay_pool.state_dict(),
+                reference.inner_engine._replay_pool.state_dict(),
+                atol=0,
+                rtol=0,
+            )
+            _assert_nested_close(
+                candidate.inner_engine.training_state_dict()["rng"],
+                reference.inner_engine.training_state_dict()["rng"],
+                atol=0,
+                rtol=0,
+            )
+            _assert_nested_close(
+                candidate.inner_engine._workspace_pool.state_dict(),
+                reference.inner_engine._workspace_pool.state_dict(),
+                atol=0,
+                rtol=0,
+            )
+
+        run_pair(expect_fallback=False)
+        run_pair(expect_fallback=True)
+        assert compile_calls == 1
+        assert compiled_calls == 2
+        assert candidate.inner_engine.action_index == 2
+        assert candidate.inner_engine._replay_pool.next_sample_id == 4
+        assert candidate.inner_engine.rollout_compile_status == {
+            "requested": True,
+            "applicable": True,
+            "enabled": False,
+            "strict": False,
+            "compiled": False,
+            "fallback": True,
+        }
+    finally:
+        reference_wrapper.env.close()
+        candidate_wrapper.env.close()
+
+
+def test_strict_rollout_failure_propagates_without_eager_retry(monkeypatch):
+    wrapper = _tiny_wrapper(device="cpu", compile=True, compile_strict=True)
+    eager_calls = 0
+
+    def fake_compile(_function, **kwargs):
+        assert kwargs == {"fullgraph": False, "dynamic": False}
+
+        def broken(*_args):
+            raise RuntimeError("injected strict rollout failure")
+
+        return broken
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    try:
+        engine = wrapper.agent.inner_engine
+        with engine.rng.fork("initialization"):
+            engine._prepare_action()
+        region = engine._rollout_region
+        region.enabled = True
+        eager = region.eager
+
+        def tracked_eager(*args):
+            nonlocal eager_calls
+            eager_calls += 1
+            return eager(*args)
+
+        region.eager = tracked_eager
+        engine._release_action()
+        cpu_rng = torch.random.get_rng_state().clone()
+
+        with pytest.raises(RuntimeError, match="injected strict rollout failure"):
+            engine.act(
+                torch.zeros(1, int(engine.cfg.latent_dim)),
+                collect_diagnostics=False,
+            )
+
+        assert eager_calls == 0
+        assert torch.equal(torch.random.get_rng_state(), cpu_rng)
+        assert engine.state.workspace is None
+        assert engine.state.replay is None
+        assert engine._workspace_pool is not None
+        assert engine._replay_pool is not None
+        assert engine._replay_pool.size == 0
+        assert engine.action_index == 1
+        assert engine.rollout_compile_status == {
+            "requested": True,
+            "applicable": True,
+            "enabled": True,
+            "strict": True,
+            "compiled": True,
+            "fallback": False,
+        }
+    finally:
+        wrapper.env.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_compiled_dense_round_matches_eager_replay_rng_and_state():
+    eager_wrapper = _tiny_wrapper(device="cuda", compile=False)
+    compiled_wrapper = _tiny_wrapper(device="cuda", compile=True)
+    try:
+        eager = eager_wrapper.agent
+        compiled = compiled_wrapper.agent
+        compiled.load_state_dict(deepcopy(eager.state_dict()))
+        compiled.inner_engine.load_training_state_dict(
+            deepcopy(eager.inner_engine.training_state_dict())
+        )
+        eager.model.eval()
+        compiled.model.eval()
+        for engine in (eager.inner_engine, compiled.inner_engine):
+            with engine.rng.fork("initialization"):
+                engine._prepare_action()
+
+        root_z = torch.linspace(
+            -0.5,
+            0.5,
+            int(eager.cfg.latent_dim),
+            device="cuda",
+        ).unsqueeze(0)
+        eager_model_before = deepcopy(eager.model.state_dict())
+        compiled_model_before = deepcopy(compiled.model.state_dict())
+        eager_outer_before = deepcopy(eager.xqc_controller.state_dict())
+        compiled_outer_before = deepcopy(compiled.xqc_controller.state_dict())
+        eager_local_before = deepcopy(
+            eager.inner_engine.state.workspace.controller.state_dict()
+        )
+        compiled_local_before = deepcopy(
+            compiled.inner_engine.state.workspace.controller.state_dict()
+        )
+        cpu_rng_before = torch.random.get_rng_state().clone()
+        cuda_rng_before = torch.cuda.get_rng_state().clone()
+
+        with eager.inner_engine.rng.action_fork():
+            eager_result = eager.inner_engine._collect_dense_round(
+                root_z,
+                count=int(eager.cfg.inner_rollouts_per_round),
+                horizon=int(eager.cfg.inner_rollout_horizon),
+            )
+        torch.testing.assert_close(
+            torch.random.get_rng_state(), cpu_rng_before, atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            torch.cuda.get_rng_state(), cuda_rng_before, atol=0, rtol=0
+        )
+        with compiled.inner_engine.rng.action_fork():
+            compiled_result = compiled.inner_engine._collect_dense_round(
+                root_z,
+                count=int(compiled.cfg.inner_rollouts_per_round),
+                horizon=int(compiled.cfg.inner_rollout_horizon),
+            )
+        torch.testing.assert_close(
+            torch.random.get_rng_state(), cpu_rng_before, atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            torch.cuda.get_rng_state(), cuda_rng_before, atol=0, rtol=0
+        )
+
+        assert eager_result.keys() == compiled_result.keys()
+        for key in eager_result:
+            torch.testing.assert_close(
+                compiled_result[key],
+                eager_result[key],
+                atol=1e-6,
+                rtol=1e-5,
+            )
+            assert compiled_result[key].requires_grad is False
+        assert eager_result["lengths"].tolist() == [2, 2]
+        assert not bool(compiled_result["terminated"].any())
+        assert (
+            eager.inner_engine.state.policy_evaluations
+            == compiled.inner_engine.state.policy_evaluations
+            == 4
+        )
+
+        eager_replay = eager.inner_engine.state.replay.state_dict()
+        compiled_replay = compiled.inner_engine.state.replay.state_dict()
+        for key in ("capacity", "pos", "full", "next_sample_id", "sample_id"):
+            _assert_nested_close(
+                eager_replay[key], compiled_replay[key], atol=0, rtol=0
+            )
+        for key in ("z", "action", "reward", "next_z", "terminated"):
+            torch.testing.assert_close(
+                compiled_replay[key],
+                eager_replay[key],
+                atol=1e-6,
+                rtol=1e-5,
+            )
+        assert compiled_replay["pos"] == 0
+        assert compiled_replay["full"] is True
+        assert compiled_replay["next_sample_id"] == 4
+        torch.testing.assert_close(
+            compiled_replay["sample_id"], torch.arange(4, device="cuda")
+        )
+
+        _assert_nested_close(
+            eager.inner_engine.rng.training_state_dict(),
+            compiled.inner_engine.rng.training_state_dict(),
+            atol=0,
+            rtol=0,
+        )
+        _assert_nested_close(
+            eager.model.state_dict(), eager_model_before, atol=0, rtol=0
+        )
+        _assert_nested_close(
+            compiled.model.state_dict(), compiled_model_before, atol=0, rtol=0
+        )
+        _assert_nested_close(
+            eager.xqc_controller.state_dict(), eager_outer_before, atol=0, rtol=0
+        )
+        _assert_nested_close(
+            compiled.xqc_controller.state_dict(),
+            compiled_outer_before,
+            atol=0,
+            rtol=0,
+        )
+        _assert_nested_close(
+            eager.inner_engine.state.workspace.controller.state_dict(),
+            eager_local_before,
+            atol=0,
+            rtol=0,
+        )
+        _assert_nested_close(
+            compiled.inner_engine.state.workspace.controller.state_dict(),
+            compiled_local_before,
+            atol=0,
+            rtol=0,
+        )
+        assert all(
+            parameter.grad is None
+            for module in (
+                eager.model,
+                compiled.model,
+                eager.inner_engine.state.workspace.controller,
+                compiled.inner_engine.state.workspace.controller,
+            )
+            for parameter in module.parameters()
+        )
+        assert compiled.inner_engine.rollout_compile_status == {
+            "requested": True,
+            "applicable": True,
+            "enabled": True,
+            "strict": True,
+            "compiled": True,
+            "fallback": False,
+        }
+    finally:
+        if eager_wrapper.agent.inner_engine.state.workspace is not None:
+            eager_wrapper.agent.inner_engine._release_action()
+        if compiled_wrapper.agent.inner_engine.state.workspace is not None:
+            compiled_wrapper.agent.inner_engine._release_action()
+        eager_wrapper.env.close()
+        compiled_wrapper.env.close()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
@@ -861,10 +1285,13 @@ def test_cuda_complete_compiled_inner_action_matches_eager_and_reuses_graphs(
             compiled_workspace.controller._critic_loss_region
         )
         compiled_actor_region = compiled_workspace.controller._actor_loss_region
+        compiled_rollout_region = compiled_engine._rollout_region
         compiled_critic_callable = compiled_critic_region._compiled
         compiled_actor_callable = compiled_actor_region._compiled
+        compiled_rollout_callable = compiled_rollout_region._compiled
         assert compiled_critic_callable is not None
         assert compiled_actor_callable is not None
+        assert compiled_rollout_callable is not None
 
         def assert_action_pair(eager_result, compiled_result, *, draw_start):
             eager_action, eager_metrics, eager_lengths = eager_result
@@ -932,6 +1359,14 @@ def test_cuda_complete_compiled_inner_action_matches_eager_and_reuses_graphs(
             assert eager_metrics["inner_actor_optimizer_steps"] == 3.0
             assert eager_metrics["inner_temperature_optimizer_steps"] == 3.0
             assert eager_metrics["inner_replay_draws"] == 16.0
+            assert eager_metrics["inner_model_steps"] == 8.0
+            assert eager_metrics["inner_rollout_count"] == 4.0
+            assert eager_metrics["inner_buffer_size"] == 8.0
+            assert eager_metrics["inner_buffer_capacity"] == 8.0
+            assert eager_metrics["inner_policy_evaluations"] == 43.0
+            assert eager_metrics["inner_q_evaluations"] == 80.0
+            assert eager_metrics["inner_termination_rate"] == 0.0
+            assert eager_metrics["inner_compile_rollout_fallback"] == 0.0
             eager_replay = eager_engine._replay_pool
             compiled_replay = compiled_engine._replay_pool
             eager_replay_state = eager_replay.state_dict()
@@ -972,12 +1407,37 @@ def test_cuda_complete_compiled_inner_action_matches_eager_and_reuses_graphs(
         assert eager_engine.action_index == compiled_engine.action_index == 1
 
         first_outer_state = deepcopy(eager.xqc_controller.state_dict())
+        dynamics_probe = torch.linspace(
+            -0.8,
+            0.8,
+            int(eager.cfg.latent_dim) + int(eager.cfg.action_dim),
+            device="cuda",
+        ).unsqueeze(0)
         with torch.no_grad():
+            eager_probe_before = eager.model.next_from_joint(dynamics_probe)
+            compiled_probe_before = compiled.model.next_from_joint(dynamics_probe)
+            torch.testing.assert_close(
+                eager_probe_before, compiled_probe_before, atol=0, rtol=0
+            )
             eager.xqc_controller.actor.mean.bias.add_(0.1)
             eager.xqc_controller.critic.q1.value.bias.add_(0.05)
             eager.xqc_controller.critic.q2.value.bias.sub_(0.025)
             eager.xqc_controller.actor.input_batch_norm.running_mean.add_(0.03)
             eager.xqc_controller.log_temperature.add_(0.02)
+            eager_dynamics_bias = eager.model._dynamics[-1].bias
+            compiled_dynamics_bias = compiled.model._dynamics[-1].bias
+            assert eager_dynamics_bias is not None
+            assert compiled_dynamics_bias is not None
+            eager_dynamics_bias[0].add_(0.25)
+            compiled_dynamics_bias[0].add_(0.25)
+            eager_probe_after = eager.model.next_from_joint(dynamics_probe)
+            compiled_probe_after = compiled.model.next_from_joint(dynamics_probe)
+            torch.testing.assert_close(
+                eager_probe_after, compiled_probe_after, atol=0, rtol=0
+            )
+            assert bool(
+                (eager_probe_after - eager_probe_before).abs().max() > 1e-6
+            )
         compiled.xqc_controller.load_state_dict(
             deepcopy(eager.xqc_controller.state_dict())
         )
@@ -1002,6 +1462,16 @@ def test_cuda_complete_compiled_inner_action_matches_eager_and_reuses_graphs(
         )
         assert compiled_critic_region._compiled is compiled_critic_callable
         assert compiled_actor_region._compiled is compiled_actor_callable
+        assert compiled_engine._rollout_region is compiled_rollout_region
+        assert compiled_rollout_region._compiled is compiled_rollout_callable
+        assert compiled_engine.rollout_compile_status == {
+            "requested": True,
+            "applicable": True,
+            "enabled": True,
+            "strict": True,
+            "compiled": True,
+            "fallback": False,
+        }
         assert compiled_engine._workspace_pool.controller.compile_status == {
             "requested": True,
             "enabled": True,

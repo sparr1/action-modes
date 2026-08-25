@@ -35,12 +35,14 @@ def test_successful_compile_region_construction_preserves_all_rng(
     monkeypatch, strict
 ):
     explicit = torch.Generator().manual_seed(8675309)
+    compile_kwargs = []
 
     def eager(value, *, generator):
         del generator
         return value.square()
 
-    def fake_compile(function, **_kwargs):
+    def fake_compile(function, **kwargs):
+        compile_kwargs.append(kwargs)
         random.random()
         np.random.random()
         torch.rand(())
@@ -84,6 +86,9 @@ def test_successful_compile_region_construction_preserves_all_rng(
     assert actual[:2] == expected[:2]
     torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
     torch.testing.assert_close(actual[3], expected[3], rtol=0, atol=0)
+    assert compile_kwargs == [
+        {"fullgraph": strict, "dynamic": False}
+    ]
 
 
 def test_non_strict_compile_failure_warns_once_and_stays_eager(monkeypatch):

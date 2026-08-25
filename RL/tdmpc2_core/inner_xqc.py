@@ -18,6 +18,7 @@ from typing import Any
 import torch
 
 from .common import math as td_math
+from .common.compile_regions import CompileRegion
 from .common.inner_utils import InnerRNG
 from .common.latent_buffer import LatentReplayBuffer
 from .common.training_state import require_exact_keys
@@ -59,6 +60,88 @@ class InnerXQCEngine:
         self.episode_index = 0
         self._collect_diagnostics = True
         self._pending_timers: dict[str, list[Any]] = {}
+        # The dense rollout closes over one stable pooled controller. Keeping
+        # that binding outside ``self.state`` avoids guarding on the
+        # action-local dataclass object, which is replaced after every action.
+        self._rollout_controller = None
+        self._rollout_region_key = None
+        self._rollout_region = self._new_rollout_compile_region()
+
+    def _new_rollout_compile_region(self):
+        requested = bool(getattr(self.cfg, "compile", False))
+        applicable = not bool(self.cfg.episodic)
+        return CompileRegion(
+            "AMBI-XQC dense rollout",
+            self._dense_rollout_kernel,
+            enabled=requested and applicable and self.device.type == "cuda",
+            strict=bool(getattr(self.cfg, "compile_strict", False)),
+            # XQC module helpers contain static Python validation that Dynamo
+            # can safely guard without requiring a single full graph. Failure
+            # handling remains strict when requested.
+            fullgraph=False,
+        )
+
+    @staticmethod
+    def _module_tensor_signature(module):
+        """Return enough placement information to reject a stale graph binding."""
+
+        if module is None:
+            return None
+        for iterator_name in ("parameters", "buffers"):
+            iterator = getattr(module, iterator_name, None)
+            if iterator is None:
+                continue
+            tensor = next(iterator(), None)
+            if tensor is not None:
+                return id(tensor), tensor.device, tensor.dtype
+        return None
+
+    def _rollout_controller_key(self, controller):
+        actor = getattr(controller, "actor", None)
+        return (
+            id(controller),
+            id(actor),
+            self._module_tensor_signature(actor),
+            id(self.model),
+            self._module_tensor_signature(self.model),
+        )
+
+    def _ensure_rollout_compile_region(self, controller):
+        key = self._rollout_controller_key(controller)
+        if key == self._rollout_region_key:
+            return self._rollout_region
+
+        # The initial wrapper has not captured anything yet, so binding the
+        # first controller does not require replacing it. This also keeps its
+        # requested/applicable status observable before the first action.
+        if self._rollout_region_key is None and self._rollout_controller is None:
+            self._rollout_controller = controller
+            self._rollout_region_key = key
+            return self._rollout_region
+
+        self._rollout_controller = controller
+        self._rollout_region_key = key
+        self._rollout_region = self._new_rollout_compile_region()
+        return self._rollout_region
+
+    def _invalidate_rollout_compile_region(self):
+        self._rollout_controller = None
+        self._rollout_region_key = None
+        self._rollout_region = self._new_rollout_compile_region()
+
+    @property
+    def rollout_compile_status(self):
+        region = self._rollout_region
+        return {
+            "requested": bool(getattr(self.cfg, "compile", False)),
+            "applicable": not bool(self.cfg.episodic),
+            "enabled": bool(region.enabled),
+            "strict": bool(getattr(self.cfg, "compile_strict", False)),
+            "compiled": bool(
+                region._compiled is not None and not region.failed
+            ),
+            "fallback": bool(region.failed),
+        }
 
     def clear_all(self):
         self.state = InnerXQCState()
@@ -68,6 +151,7 @@ class InnerXQCEngine:
         self.action_index = 0
         self.episode_index = 0
         self._pending_timers = {}
+        self._invalidate_rollout_compile_region()
 
     def reset_episode(self):
         # All learned inner state is action-local, so an episode boundary only
@@ -121,6 +205,7 @@ class InnerXQCEngine:
         self.episode_index = candidate["episode_index"]
         self.rng.load_training_state_dict(candidate["rng"])
         self._pending_timers = {}
+        self._invalidate_rollout_compile_region()
 
     def load_training_state_dict(self, state):
         candidate = self._preflight_training_state_dict(state)
@@ -201,6 +286,7 @@ class InnerXQCEngine:
             replay=replay,
             reward_scale=self._real_reward_scale(),
         )
+        self._ensure_rollout_compile_region(workspace.controller)
 
     def _release_action(self):
         if self.state.workspace is not None:
@@ -241,6 +327,23 @@ class InnerXQCEngine:
         cfg = self.cfg
         count = int(cfg.inner_rollouts_per_round)
         horizon = int(cfg.inner_rollout_horizon)
+        if not bool(cfg.episodic):
+            return self._collect_dense_round(
+                root_z,
+                count=count,
+                horizon=horizon,
+            )
+        return self._collect_dynamic_round(
+            root_z,
+            count=count,
+            horizon=horizon,
+        )
+
+    @torch.no_grad()
+    def _collect_dynamic_round(self, root_z, *, count, horizon):
+        """Dynamic alive-set rollout retained for episodic world models."""
+
+        cfg = self.cfg
         z = root_z.expand(count, -1).clone()
         alive = torch.ones(count, dtype=torch.bool, device=self.device)
         lengths = torch.zeros(count, dtype=torch.long, device=self.device)
@@ -292,6 +395,106 @@ class InnerXQCEngine:
             "reward_sums": reward_sums,
             "discounted_rewards": discounted_rewards,
             "terminated": terminated_rollout,
+        }
+
+    @torch.no_grad()
+    def _dense_rollout_kernel(
+        self,
+        root_z,
+        policy_noise,
+        reward_support,
+        discount,
+    ):
+        """Pure fixed-shape non-episodic rollout with tensor-only inputs."""
+
+        cfg = self.cfg
+        count = int(cfg.inner_rollouts_per_round)
+        horizon = int(cfg.inner_rollout_horizon)
+        controller = self._rollout_controller
+        z = root_z.expand(count, -1).clone()
+        reward_sums = root_z.new_zeros(count)
+        discounted_rewards = root_z.new_zeros(count)
+        discount_weight = root_z.new_ones(count)
+        transitions = []
+
+        for step in range(horizon):
+            action, _ = controller.sample_action(
+                z,
+                deterministic=False,
+                noise=policy_noise[step],
+            )
+            joint = self.model.joint_input(z, action)
+            reward = td_math.two_hot_inv(
+                self.model.reward_from_joint(joint),
+                cfg,
+                support=reward_support,
+            )
+            next_z = self.model.next_from_joint(joint)
+            terminated = reward.new_zeros((count, 1))
+            transitions.append(
+                torch.cat((z, action, reward, next_z, terminated), dim=-1)
+            )
+
+            reward_vector = reward.squeeze(-1)
+            reward_sums = reward_sums + reward_vector
+            discounted_rewards = (
+                discounted_rewards + discount_weight * reward_vector
+            )
+            discount_weight = discount_weight * discount
+            z = next_z
+
+        return (
+            torch.cat(transitions, dim=0),
+            reward_sums,
+            discounted_rewards,
+        )
+
+    @torch.no_grad()
+    def _collect_dense_round(self, root_z, *, count, horizon):
+        """Collect and commit one fixed-shape non-episodic rollout round."""
+
+        cfg = self.cfg
+        generator = self.rng.generator("collection")
+        # Preserve the released scientific RNG contract: one independent draw
+        # of shape N x A per horizon step, rather than one H x N x A draw.
+        policy_noise = torch.stack(
+            [
+                torch.randn(
+                    (count, int(cfg.action_dim)),
+                    dtype=root_z.dtype,
+                    device=root_z.device,
+                    generator=generator,
+                )
+                for _ in range(horizon)
+            ],
+            dim=0,
+        )
+        reward_support = td_math.categorical_support(root_z, cfg)
+        discount = root_z.new_tensor(float(self.agent.discount))
+        region = self._ensure_rollout_compile_region(
+            self.state.workspace.controller
+        )
+        packed, reward_sums, discounted_rewards = region(
+            root_z,
+            policy_noise,
+            reward_support,
+            discount,
+        )
+
+        # Compilation/fallback above is pure. Replay and counters commit once,
+        # only after it returns successfully.
+        self.state.replay.add_packed(packed)
+        self.state.policy_evaluations += count * horizon
+        return {
+            "lengths": torch.full(
+                (count,), horizon, dtype=torch.long, device=self.device
+            ),
+            # Compiled CUDA graphs may reuse output storage on the next round.
+            "reward_sums": reward_sums.clone(),
+            "discounted_rewards": discounted_rewards.clone(),
+            "terminated": torch.zeros(
+                count, dtype=torch.bool, device=self.device
+            ),
         }
 
     def _sample_batch(self):
@@ -417,16 +620,18 @@ class InnerXQCEngine:
 
     def _compile_fallback_metrics(self):
         controller = self.state.workspace.controller
+        rollout = self._rollout_region
         critic = getattr(controller, "_critic_loss_region", None)
         actor = getattr(controller, "_actor_loss_region", None)
+        rollout_fallback = bool(rollout.failed)
         critic_fallback = bool(critic is not None and critic.failed)
         actor_fallback = bool(actor is not None and actor.failed)
         return {
-            "inner_compile_rollout_fallback": 0.0,
+            "inner_compile_rollout_fallback": float(rollout_fallback),
             "inner_compile_critic_fallback": float(critic_fallback),
             "inner_compile_actor_fallback": float(actor_fallback),
             "inner_compile_fallback": float(
-                critic_fallback or actor_fallback
+                rollout_fallback or critic_fallback or actor_fallback
             ),
         }
 

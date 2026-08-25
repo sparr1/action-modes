@@ -469,12 +469,21 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
     measured_tokens = []
+    inner_rollout_seconds = []
     last_outer_metrics = None
     for _ in range(args.measured):
         token, action, last_outer_metrics = _run_cycle(
             agent, buffer, observation, timer
         )
         measured_tokens.append(token)
+        rollout_seconds = float(
+            agent.last_inner_metrics["inner_rollout_seconds"]
+        )
+        if not math.isfinite(rollout_seconds) or rollout_seconds <= 0.0:
+            raise RuntimeError(
+                "measured iteration produced an invalid inner rollout timing"
+            )
+        inner_rollout_seconds.append(rollout_seconds)
         if not bool(torch.isfinite(action).all()):
             raise RuntimeError("measured iteration produced a non-finite action")
     if device.type == "cuda":
@@ -487,19 +496,23 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         raise RuntimeError("benchmark ended without a reusable inner workspace")
     outer_compile = dict(agent.xqc_controller.compile_status)
     inner_compile = dict(inner.controller.compile_status)
+    inner_rollout_compile = dict(agent.inner_engine.rollout_compile_status)
     compile_fallback = bool(
-        outer_compile["fallback"] or inner_compile["fallback"]
+        outer_compile["fallback"]
+        or inner_compile["fallback"]
+        or inner_rollout_compile["fallback"]
     )
     compiled_regions = bool(
         outer_compile["critic_compiled"]
         and outer_compile["actor_compiled"]
         and inner_compile["critic_compiled"]
         and inner_compile["actor_compiled"]
+        and inner_rollout_compile["compiled"]
     )
     if compile_fallback:
         raise RuntimeError("AMBI-XQC benchmark observed a compile fallback")
     if args.require_compiled and not compiled_regions:
-        raise RuntimeError("all four AMBI-XQC compiled regions were required")
+        raise RuntimeError("all five AMBI-XQC compiled regions were required")
 
     expected_cycles = args.warmup + args.measured
     counters = {
@@ -539,6 +552,91 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             f"AMBI-XQC benchmark counters diverged: {counters} != {expected_counters}"
         )
 
+    rollout_lengths = list(agent.last_inner_rollout_lengths)
+    exact_inner_workload = {
+        "rounds": int(agent.last_inner_metrics["inner_rounds"]),
+        "requested_rollouts": int(
+            agent.last_inner_metrics["inner_requested_rollouts"]
+        ),
+        "realized_rollouts": int(agent.last_inner_metrics["inner_rollouts"]),
+        "rollout_horizon_min": int(
+            agent.last_inner_metrics["inner_rollout_len_min"]
+        ),
+        "rollout_horizon_max": int(
+            agent.last_inner_metrics["inner_rollout_len_max"]
+        ),
+        "model_step_budget": int(
+            agent.last_inner_metrics["inner_model_steps_budget"]
+        ),
+        "realized_model_steps": int(
+            agent.last_inner_metrics["inner_realized_model_steps"]
+        ),
+        "replay_size": int(agent.last_inner_metrics["inner_buffer_size"]),
+        "replay_capacity": int(
+            agent.last_inner_metrics["inner_buffer_capacity"]
+        ),
+        "replay_draws": int(agent.last_inner_metrics["inner_replay_draws"]),
+        "policy_evaluations": int(
+            agent.last_inner_metrics["inner_policy_evaluations"]
+        ),
+        "q_evaluations": int(
+            agent.last_inner_metrics["inner_q_evaluations"]
+        ),
+        "update_slots": int(agent.last_inner_metrics["inner_update_slots"]),
+        "requested_update_slots": int(
+            agent.last_inner_metrics["inner_requested_update_slots"]
+        ),
+    }
+    expected_inner_workload = {
+        "rounds": 2,
+        "requested_rollouts": 64,
+        "realized_rollouts": 64,
+        "rollout_horizon_min": 3,
+        "rollout_horizon_max": 3,
+        "model_step_budget": 192,
+        "realized_model_steps": 192,
+        "replay_size": 192,
+        "replay_capacity": 192,
+        "replay_draws": 512,
+        "policy_evaluations": 1217,
+        "q_evaluations": 2560,
+        "update_slots": 8,
+        "requested_update_slots": 8,
+    }
+    if exact_inner_workload != expected_inner_workload:
+        raise RuntimeError(
+            "AMBI-XQC benchmark inner workload diverged: "
+            f"{exact_inner_workload} != {expected_inner_workload}"
+        )
+    if rollout_lengths != [PRODUCTION_TRAIN_HORIZON] * 64:
+        raise RuntimeError(
+            "AMBI-XQC benchmark did not realize exactly 64 full H=3 rollouts"
+        )
+    replay_pool = agent.inner_engine._replay_pool
+    exact_replay_state = (
+        None
+        if replay_pool is None
+        else {
+            "size": int(replay_pool.size),
+            "capacity": int(replay_pool.capacity),
+            "pos": int(replay_pool.pos),
+            "full": bool(replay_pool.full),
+            "next_sample_id": int(replay_pool.next_sample_id),
+        }
+    )
+    expected_replay_state = {
+        "size": 192,
+        "capacity": 192,
+        "pos": 0,
+        "full": True,
+        "next_sample_id": 192,
+    }
+    if exact_replay_state != expected_replay_state:
+        raise RuntimeError(
+            "AMBI-XQC benchmark replay state diverged: "
+            f"{exact_replay_state} != {expected_replay_state}"
+        )
+
     finite = _all_finite(agent) and all(
         math.isfinite(float(value.detach().cpu() if torch.is_tensor(value) else value))
         for value in last_outer_metrics.values()
@@ -569,7 +667,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         else 0
     )
     result = {
-        "schema": "ambixqc-exact-compute-benchmark-v1",
+        "schema": "ambixqc-exact-compute-benchmark-v2",
         "source_sha": _source_sha(),
         "config_path": str(config_path.relative_to(ROOT)),
         "config_sha256": _file_sha256(config_path),
@@ -594,7 +692,8 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         "compile_strict": bool(args.compile_strict),
         "outer_compile_status": outer_compile,
         "inner_compile_status": inner_compile,
-        "all_four_regions_compiled": compiled_regions,
+        "inner_rollout_compile_status": inner_rollout_compile,
+        "all_five_regions_compiled": compiled_regions,
         "compile_fallback": compile_fallback,
         "optimizer_backend_requested": args.optimizer_backend,
         "outer_optimizer_backend": _optimizer_backend(
@@ -619,6 +718,13 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         "iteration_seconds": iteration_seconds,
         "iteration_p50_seconds": _percentile(iteration_seconds, 0.50),
         "iteration_p95_seconds": _percentile(iteration_seconds, 0.95),
+        "inner_rollout_seconds": inner_rollout_seconds,
+        "inner_rollout_p50_seconds": _percentile(
+            inner_rollout_seconds, 0.50
+        ),
+        "inner_rollout_p95_seconds": _percentile(
+            inner_rollout_seconds, 0.95
+        ),
         "elapsed_seconds": elapsed,
         "cycles_per_second": throughput,
         "actions_per_second": throughput,
@@ -631,6 +737,9 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         "workspace_reset_counters_fresh": reset_counters_fresh,
         "global_torch_rng_preserved": global_rng_preserved,
         "counters": counters,
+        "exact_inner_workload": exact_inner_workload,
+        "exact_replay_state": exact_replay_state,
+        "rollout_lengths": rollout_lengths,
         "projection_residual": projection_residual,
         "all_finite": finite,
     }

@@ -66,11 +66,12 @@ of the XQC actor loss.
 AMBI-XQC v1 supports portable model checkpoints for evaluation and weight
 transfer. It is not allowlisted for exact trainer resume because that stronger
 contract also requires replay and environment state. Eager execution remains
-the canonical one-million-decision screen. CUDA runs may enable four
-fixed-shape compiled XQC loss regions—the persistent and action-local actor and
-critic regions—with `compile=true`; `compile_strict=true` makes any graph or
-runtime fallback fatal. The recurrent TOLD computation, optimizer mutations,
-and action-local lifecycle orchestration remain eager. A compile request is
+the canonical one-million-decision screen. CUDA runs may enable five
+fixed-shape regions with `compile=true`: the persistent and action-local XQC
+actor and critic losses plus the dense, fixed-horizon non-episodic inner
+rollout. `compile_strict=true` makes any graph or runtime fallback fatal. The
+outer recurrent TOLD computation, optimizer mutations, action-local lifecycle
+orchestration, and episodic rollout path remain eager. A compile request is
 inactive on CPU rather than silently changing the device contract.
 
 ### AMBI-XQC compiled execution and paired timing
@@ -108,9 +109,11 @@ model-size-5 latent width, full released XQC networks, canonical
 and checkpoint I/O. The JSON result records the first cycle with synchronized
 host wall-clock so compiler startup is fully included, then uses CUDA events
 for warmed and measured per-cycle p50 and p95. It also records throughput, peak
-CUDA allocation and reservation, all four compile statuses and fallbacks,
-exact counters, projection residual, outer-prior and workspace lifecycle
-checks, global RNG isolation, versions, source SHA, and configuration hash.
+CUDA allocation and reservation, all five compile statuses and their aggregate
+fallback, inner-rollout p50 and p95, the exact 64 full `H=3` rollouts and
+192-transition replay fill, exact update/replay counters, projection residual,
+outer-prior and workspace lifecycle checks, global RNG isolation, versions,
+source SHA, and configuration hash.
 `--output` uses exclusive creation and refuses to replace an existing file.
 
 The end-to-end timing manifest is
@@ -134,7 +137,7 @@ SHA-scoped scratch directory outside the checkout:
 
 ```bash
 ACTION_SHA="$(git rev-parse HEAD)"
-RESULTS_ROOT="/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-compile/$ACTION_SHA"
+RESULTS_ROOT="/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-dense-rollout/$ACTION_SHA"
 mkdir -p "$RESULTS_ROOT"
 slurm/submit_ambixqc_compile_pair_oscar.sh \
   --expected-action-modes-sha "$ACTION_SHA" \
@@ -143,44 +146,62 @@ slurm/submit_ambixqc_compile_pair_oscar.sh \
 ```
 
 Remove `--dry-run` only after reviewing the command. The results root is fixed
-to `/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-compile/<full-SHA>`; the job
+to `/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-dense-rollout/<full-SHA>`; the job
 creates exactly one `<Slurm-job-id>` child, so every artifact lands under
-`/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-compile/<full-SHA>/<job-id>`.
+`/oscar/scratch/rgao48/ambi/benchmarks/ambixqc-dense-rollout/<full-SHA>/<job-id>`.
 The submitter launches one two-hour L40S job. Before timing, that job runs the
 mandatory AMBI-XQC and shared compile-region CUDA correctness suites with a
-fresh cache. It then runs five independent compute processes per mode and
-alternates eager/compiled order across repetitions inside the job. Every
-process receives a new node-local XDG, TorchInductor, Triton, and CUDA cache, so
-compiled timing never benefits from a prior process. Each process retains 10
-cold/warmup cycles and 50 measured cycles. The job finally runs one eager and
-one compiled 1,502-step canary, also with separate fresh caches. Online W&B
-stays disabled. The job validates both final checkpoints, checks that the
-checkout remained clean, and writes a terminal `PASS` file. Neither script
-updates the checkout or resolves dependencies on the cluster.
+fresh cache, including the fifth dense-rollout region. It creates a clean
+node-local Git checkout of the fixed four-region baseline
+`b0c39193e8b9c922d091063b30d92b00dfd9f28f`; no network update or source overlay
+is used. The job then runs five independent compute processes per mode for
+candidate eager, strict-compiled baseline, and strict-compiled candidate code,
+alternating the outer order across repetitions. Every process receives a new
+node-local XDG, TorchInductor, Triton, and CUDA cache, so compiled timing never
+benefits from a prior process. Each process retains 10 cold/warmup cycles and
+50 measured cycles. The job finally runs one 1,502-step canary for each of the
+three modes, also with separate fresh caches. Online W&B stays disabled. The
+job validates all three final checkpoints, checks that both checkouts remained
+clean, and writes a terminal marker. `PASS` unambiguously means every mandatory
+correctness and performance gate passed and the candidate is retention
+eligible. A nonfatal performance miss writes `CORRECTNESS_PASS` together with
+`PERFORMANCE_MISS`, but never `PASS`. Neither script updates a persistent
+checkout or resolves dependencies on the cluster.
 
-The job artifact directory contains five `compute-<mode>-rep<N>.json` files per
-mode, `compute-aggregate.json`, per-arm cold-process timing, warmed-compute and
-checkpoint-validation JSON, logs, GPU/runtime metadata, and `comparison.json`.
-The mandatory gate requires all learned state and metrics to be finite, exact
-counters and lifecycle/RNG checks, no compile fallback, all four compiled
-regions in every compiled repetition, and projection residual at most `1e-6`.
-It fails the job on a correctness violation.
+The candidate SHA scopes the result root and the fixed baseline SHA is recorded
+in the artifacts. The job artifact directory contains five
+`compute-<mode>-rep<N>.json` files for each of `eager`, `baseline`, and
+`candidate`, plus `compute-aggregate.json`, per-arm cold-process timing,
+warmed-compute and checkpoint-validation JSON, logs, GPU/runtime metadata, and
+`comparison.json`. The mandatory gate requires all learned state and metrics
+to be finite, the exact production rollout/replay/counter contract—including
+replay cursor/fullness/sample ID and policy/Q evaluation counts—and
+lifecycle/RNG checks, no compile fallback across the five candidate regions,
+all five regions compiled in every candidate repetition, and projection
+residual at most `1e-6`. It fails the job on a correctness violation.
 
-Performance is classified separately. The compiled median p50 must be at most
-`0.90` of eager, compiled median p95 at most `0.95`, the maximum p50 coefficient
-of variation at most `0.05`, no paired compiled repetition above `1.10` of its
-eager repetition, and median peak allocation at most `1.10` of eager. The
-warmed Humanoid compute canary must be at least five percent faster. A
+Performance is classified separately. The compiled candidate median p50 must
+be at most `0.90` of candidate eager, compiled candidate median p95 at most
+`0.95`, the maximum p50 coefficient of variation across candidate eager and
+compiled arms at most `0.05`, no paired candidate repetition above `1.10` of
+its eager repetition, and median peak allocation at most `1.10` of eager. The
+warmed Humanoid candidate compute canary must be at least five percent faster
+than eager. The incremental gates
+also require candidate p50 and warmed-canary compute to each be at most `0.97`
+of the compiled four-region baseline, while candidate p95 may not exceed the
+baseline and candidate peak allocation may not exceed `1.10` of baseline. A
 performance miss is recorded in `comparison.json` and `PERFORMANCE_MISS` but
-does not fail an otherwise-correct job. The aggregate also estimates
+does not fail an otherwise-correct job; that job is explicitly not eligible for
+retention. The aggregate also estimates
 compilation break-even as the median cold-cycle cost delta divided by steady
 p50 savings per action. The synchronized warmed canary timers bracket complete
 planned-action and outer-update calls, including eager TOLD recurrence,
 backward passes, optimizer work, and XQC orchestration, while excluding
 environment stepping, logging, and checkpoint I/O. The separately reported
 cold process time includes compilation, environment setup and stepping, replay,
-logging setup, and the final checkpoint, but it is not used for the five-percent
-classification. Reported speedup ratios greater than one favor compilation.
+logging setup, and the final checkpoint, but it is not used for either warmed
+performance classification. Reported speedup ratios
+greater than one favor compilation.
 
 ## Training checkpoints
 
