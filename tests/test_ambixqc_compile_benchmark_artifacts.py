@@ -260,10 +260,13 @@ def test_oscar_pair_launcher_runs_three_arms_on_one_guarded_gpu():
     assert "--no-compile --no-compile-strict" in contents
     assert "--compile --compile-strict --require-compiled" in contents
     assert "for repetition in 1 2 3 4 5" in contents
-    assert "repetition % 2 == 1" in contents
+    assert "if ((repetition % 2 == 1)); then" in contents
     assert '[[ "$PAIR_ORDER" == eager-first ]]' in contents
+    assert '&& [[ "$PAIR_ORDER" == eager-first ]]' not in contents
+    assert "|| ((repetition % 2 == 0))" not in contents
     assert "REP_MODES=(eager baseline candidate)" in contents
     assert "REP_MODES=(candidate baseline eager)" in contents
+    assert 'echo "Compute repetition $repetition order: ${REP_MODES[*]}"' in contents
     assert 'configure_process_cache "compute-$mode-rep$repetition"' in contents
     assert "TDMPC2_COMPUTE_TIMING_OUTPUT" in contents
     assert 'training-$mode-compute.json' in contents
@@ -306,6 +309,58 @@ def test_oscar_pair_launcher_runs_three_arms_on_one_guarded_gpu():
     assert 'printf \'CORRECTNESS_PASS\\n\' > "$JOB_ROOT/CORRECTNESS_PASS"' in contents
     assert 'printf \'PASS\\n\' > "$JOB_ROOT/PASS"' in contents
     assert "candidate is not retention eligible" in contents
+
+
+def test_oscar_compute_process_order_alternates_for_both_pair_orders():
+    contents = LAUNCHER.read_text(encoding="utf-8")
+    loop = contents.split("# BEGIN COMPUTE ORDER LOOP", 1)[1].split(
+        "# END COMPUTE ORDER LOOP", 1
+    )[0]
+
+    expected = {
+        "eager-first": [
+            mode
+            for repetition in range(1, 6)
+            for mode in (
+                ("eager", "baseline", "candidate")
+                if repetition % 2 == 1
+                else ("candidate", "baseline", "eager")
+            )
+        ],
+        "compiled-first": [
+            mode
+            for repetition in range(1, 6)
+            for mode in (
+                ("candidate", "baseline", "eager")
+                if repetition % 2 == 1
+                else ("eager", "baseline", "candidate")
+            )
+        ],
+    }
+    for pair_order, expected_modes in expected.items():
+        script = f'''\
+run_compute_benchmark() {{ printf '%s:%s\\n' "$1" "$2"; }}
+PAIR_ORDER={pair_order}
+{loop}
+'''
+        result = subprocess.run(
+            ["bash"],
+            input=script,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        calls = [
+            line
+            for line in result.stdout.splitlines()
+            if line.startswith(("eager:", "baseline:", "candidate:"))
+        ]
+        assert [line.split(":", 1)[0] for line in calls] == expected_modes
+        assert [int(line.split(":", 1)[1]) for line in calls] == [
+            repetition
+            for repetition in range(1, 6)
+            for _ in range(3)
+        ]
 
 
 def test_oscar_submitter_requires_git_transport_and_new_external_artifacts():

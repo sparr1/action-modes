@@ -394,17 +394,27 @@ srun --unbuffered --kill-on-bad-exit=1 --ntasks=1 "$PYTHON" -m pytest \
   tests/test_compile_regions.py \
   | tee "$JOB_ROOT/cuda-correctness-gate.log"
 
+# BEGIN COMPUTE ORDER LOOP -- exercised directly by the artifact test.
 for repetition in 1 2 3 4 5; do
-  if ((repetition % 2 == 1)) && [[ "$PAIR_ORDER" == eager-first ]] \
-    || ((repetition % 2 == 0)) && [[ "$PAIR_ORDER" == compiled-first ]]; then
-    REP_MODES=(eager baseline candidate)
+  if ((repetition % 2 == 1)); then
+    if [[ "$PAIR_ORDER" == eager-first ]]; then
+      REP_MODES=(eager baseline candidate)
+    else
+      REP_MODES=(candidate baseline eager)
+    fi
   else
-    REP_MODES=(candidate baseline eager)
+    if [[ "$PAIR_ORDER" == eager-first ]]; then
+      REP_MODES=(candidate baseline eager)
+    else
+      REP_MODES=(eager baseline candidate)
+    fi
   fi
+  echo "Compute repetition $repetition order: ${REP_MODES[*]}"
   for mode in "${REP_MODES[@]}"; do
     run_compute_benchmark "$mode" "$repetition"
   done
 done
+# END COMPUTE ORDER LOOP
 
 AMBIXQC_AGGREGATE_ROOT="$JOB_ROOT" \
 AMBIXQC_AGGREGATE_BASELINE_SHA="$BASELINE_ACTION_MODES_SHA" \
