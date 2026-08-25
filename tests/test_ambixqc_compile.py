@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from RL.AMBIXQC import AMBIXQC
+from RL.tdmpc2_core.common import math as td_math
 from RL.tdmpc2_core.xqc_controller import (
     LatentXQCBatch,
     LatentXQCConfig,
@@ -1338,23 +1339,6 @@ def test_cuda_complete_compiled_inner_action_matches_eager_and_reuses_graphs(
                 "inner_compile_actor_fallback",
                 "inner_compile_fallback",
             }
-            for key in eager_metrics:
-                if key in exact_metric_keys:
-                    _assert_nested_close(
-                        eager_metrics[key], compiled_metrics[key], atol=0, rtol=0
-                    )
-                else:
-                    atol, rtol = (
-                        (2e-4, 1e-3)
-                        if key in {"inner_actor_loss", "inner_q_policy_mean"}
-                        else (1e-5, 1e-4)
-                    )
-                    _assert_nested_close(
-                        eager_metrics[key],
-                        compiled_metrics[key],
-                        atol=atol,
-                        rtol=rtol,
-                    )
             assert eager_metrics["inner_update_slots"] == 8.0
             assert eager_metrics["inner_actor_optimizer_steps"] == 3.0
             assert eager_metrics["inner_temperature_optimizer_steps"] == 3.0
@@ -1402,11 +1386,59 @@ def test_cuda_complete_compiled_inner_action_matches_eager_and_reuses_graphs(
                 eager_engine._workspace_pool,
                 compiled_engine._workspace_pool,
             )
+            for key in eager_metrics:
+                try:
+                    if key in exact_metric_keys:
+                        _assert_nested_close(
+                            eager_metrics[key],
+                            compiled_metrics[key],
+                            atol=0,
+                            rtol=0,
+                        )
+                    else:
+                        atol, rtol = (
+                            (2e-4, 1e-3)
+                            if key in {"inner_actor_loss", "inner_q_policy_mean"}
+                            else (1e-5, 1e-4)
+                        )
+                        _assert_nested_close(
+                            eager_metrics[key],
+                            compiled_metrics[key],
+                            atol=atol,
+                            rtol=rtol,
+                        )
+                except AssertionError as exc:
+                    raise AssertionError(
+                        f"inner action metric mismatch for {key!r}"
+                    ) from exc
 
         assert_action_pair(first_eager, first_compiled, draw_start=0)
         assert eager_engine.action_index == compiled_engine.action_index == 1
 
         first_outer_state = deepcopy(eager.xqc_controller.state_dict())
+        rollout_probe_noise = torch.linspace(
+            -0.4,
+            0.4,
+            int(compiled.cfg.inner_rollout_horizon)
+            * int(compiled.cfg.inner_rollouts_per_round)
+            * int(compiled.cfg.action_dim),
+            device="cuda",
+        ).reshape(
+            int(compiled.cfg.inner_rollout_horizon),
+            int(compiled.cfg.inner_rollouts_per_round),
+            int(compiled.cfg.action_dim),
+        )
+        rollout_probe_support = td_math.categorical_support(
+            root_z, compiled.cfg
+        )
+        rollout_probe_discount = root_z.new_tensor(float(compiled.discount))
+        with torch.no_grad():
+            compiled_rollout_probe_before = compiled_rollout_region(
+                root_z,
+                rollout_probe_noise,
+                rollout_probe_support,
+                rollout_probe_discount,
+            )[0].clone()
         dynamics_probe = torch.linspace(
             -0.8,
             0.8,
@@ -1428,8 +1460,8 @@ def test_cuda_complete_compiled_inner_action_matches_eager_and_reuses_graphs(
             compiled_dynamics_bias = compiled.model._dynamics[-1].bias
             assert eager_dynamics_bias is not None
             assert compiled_dynamics_bias is not None
-            eager_dynamics_bias[0].add_(0.25)
-            compiled_dynamics_bias[0].add_(0.25)
+            eager_dynamics_bias[0].add_(0.01)
+            compiled_dynamics_bias[0].add_(0.01)
             eager_probe_after = eager.model.next_from_joint(dynamics_probe)
             compiled_probe_after = compiled.model.next_from_joint(dynamics_probe)
             torch.testing.assert_close(
@@ -1437,6 +1469,21 @@ def test_cuda_complete_compiled_inner_action_matches_eager_and_reuses_graphs(
             )
             assert bool(
                 (eager_probe_after - eager_probe_before).abs().max() > 1e-6
+            )
+            compiled_rollout_probe_after = compiled_rollout_region(
+                root_z,
+                rollout_probe_noise,
+                rollout_probe_support,
+                rollout_probe_discount,
+            )[0].clone()
+            assert bool(
+                (
+                    compiled_rollout_probe_after
+                    - compiled_rollout_probe_before
+                )
+                .abs()
+                .max()
+                > 1e-6
             )
         compiled.xqc_controller.load_state_dict(
             deepcopy(eager.xqc_controller.state_dict())
