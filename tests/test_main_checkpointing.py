@@ -142,6 +142,20 @@ def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
         latent_dim=512,
         action_dim=6,
         episode_length=500,
+        steps=1_000_000,
+        discount=0.99,
+        episodic=False,
+        utd=1,
+        eval_freq=50_000,
+        eval_episodes=1,
+        eval_value=True,
+        eval_value_samples=100,
+        eval_value_seed=12_345,
+        eval_value_protocols=[
+            "paper_deterministic",
+            "stochastic_bellman",
+        ],
+        outer_policy_episode_probability=0.5,
         train_unroll_horizon=6,
         outer_planning_horizon=3,
         inner_rollout_horizon=6,
@@ -225,6 +239,26 @@ def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
         "tau": 0.01,
     }
     assert metadata["compilation"] == {"enabled": True, "strict": False}
+    assert metadata["training"] == {
+        "steps": 1_000_000,
+        "discount": 0.99,
+        "episodic": False,
+        "utd": 1,
+    }
+    assert metadata["evaluation"] == {
+        "eval_freq": 50_000,
+        "eval_episodes": 1,
+        "eval_value": True,
+        "eval_value_samples": 100,
+        "eval_value_seed": 12_345,
+        "eval_value_protocols": [
+            "paper_deterministic",
+            "stochastic_bellman",
+        ],
+    }
+    assert metadata["collection"] == {
+        "outer_policy_episode_probability": 0.5,
+    }
     assert metadata["inner_budget"]["inner_critic_dropout_enabled"] is False
     assert metadata["inner_budget"]["branches_per_action"] == 128
     assert metadata["inner_budget"]["transitions_per_round"] == 192

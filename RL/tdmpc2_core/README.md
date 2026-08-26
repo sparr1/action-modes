@@ -174,3 +174,161 @@ MPPI are not normalized by this option.
 Model saves are suitable for evaluation and weight transfer. They do not include
 replay, environment state, or all trainer counters, so they are not exact
 mid-run resume checkpoints.
+
+### Figure 1 value-calibration protocols
+
+The public reference for the value-calibration evaluator is TD-MPC² commit
+[`d1c2632c36effd2f7b661bfe5f822a3db8054d40`](https://github.com/DarthUtopian/tdmpc_square_public/commit/d1c2632c36effd2f7b661bfe5f822a3db8054d40),
+specifically
+[`tdmpc_square/tdmpc_square/trainer/online_trainer.py::eval_value`](https://github.com/DarthUtopian/tdmpc_square_public/blob/d1c2632c36effd2f7b661bfe5f822a3db8054d40/tdmpc_square/tdmpc_square/trainer/online_trainer.py#L70-L99).
+For each value measurement, that code first averages 100 complete discounted
+rollouts under the deterministic mean of the nominal policy. It then draws an
+independent second batch of 100 environment resets, evaluates the current
+online critic at each initial state and deterministic mean action, selects two
+distinct Q heads at random from the five-head ensemble, decodes them, and
+averages the pair. Finally it reports the separate scalar means as `mc_value`
+and `q_value`. The released trainer calls ordinary policy evaluation first,
+runs the value measurement at step zero and at the first episode boundary
+after each requested cadence, and reuses the training environment and global
+NumPy/Torch random streams. Consequently, the upstream diagnostic itself
+changes later environment and learner randomness.
+
+AMBI exposes two explicitly separate protocols rather than treating those
+side effects as part of the scientific estimator:
+
+- `paper_deterministic` preserves the reference estimator's deterministic
+  mean-policy rollouts, independent 100-reset MC and Q batches, and random
+  two-of-five current-online-head mean. Its head pairs are sampled through a
+  private, namespaced seed instead of the learner's global NumPy stream.
+- `stochastic_bellman` evaluates the stochastic policy represented by AMBI's
+  reward-only Bellman critic. It pairs Q and Monte Carlo at the same seeded
+  initial state, evaluates Q at a sampled first action, executes that exact
+  action in the rollout, and then samples subsequent policy actions. It reports
+  the mean and minimum over all online Q heads instead of a random pair.
+
+As in the public evaluator, a Monte Carlo rollout stops on either environment
+termination or time-limit truncation and does not append a critic bootstrap at
+the boundary. Thus `stochastic_bellman` is Bellman-matched in its sampled action
+and subsequent policy, while its reported return remains the finite real-episode
+return used by the Figure 1 protocol.
+
+Both protocols use a dedicated evaluation environment, fixed namespaced seeds,
+and private random streams, so they do not alter the training environment,
+replay, or learner RNG state. These are deliberate controlled divergences from
+the released trainer. `paper_deterministic` is the compatibility-facing curve;
+`stochastic_bellman` is the Bellman-matched calibration curve, and their values
+must remain separately labeled and aggregated.
+
+Enable the observational probe through the existing online-evaluation cadence:
+
+```json
+{
+  "eval_freq": 50000,
+  "eval_value": true,
+  "eval_value_samples": 100,
+  "eval_value_seed": 12345,
+  "eval_value_protocols": [
+    "paper_deterministic",
+    "stochastic_bellman"
+  ]
+}
+```
+
+It is state-observation-only and requires a reward-only outer critic. The
+paper-facing W&B aliases are `eval/mc_value`, `eval/q_value`, and
+`eval/q_minus_mc`. Bellman-matched outputs are prefixed with
+`eval/stochastic_`; they include Monte Carlo value, all-head mean and min,
+paired mean-head bias/RMSE, and critic-head spread. All values are merged into
+the ordinary evaluation event, while `time/value_eval_seconds` records the
+additional wall time. The sample dispersions are within one evaluation event;
+they are not uncertainty estimates across training seeds.
+
+The maintained Humanoid Walk entry point is
+`configs/dmcontrol/experiments/ambi_humanoid_walk_base_min_all_reward_only_value_calibration.json`.
+It derives from the five-head `min_all`, reward-only base, runs one million
+agent decisions for trials 55--57, evaluates both protocols at step zero and
+every 50,000 decisions with 100 samples and evaluation seed 12345, and retains
+`all`, `best`, and `latest` checkpoints every 50,000 decisions. It intentionally
+omits `wandb_run_name`, allowing the normal AMBI run name to incorporate each
+resolved trial seed.
+
+#### Fifty-percent outer-policy trajectory ablation
+
+The paper also describes a middle-row intervention in which 50% of collection
+trajectories use the nominal policy. The public TD-MPC² repository does not
+include a configuration, branch, or patch implementing that collector, so its
+exact randomization and switching code cannot be audited. AMBI therefore makes
+the paper-stated trajectory semantics explicit: at each eligible fully
+post-seed episode start/reset, `outer_policy_episode_probability` controls one
+Bernoulli draw that selects the collector for the whole episode. The first
+episode that crosses the seed-collection boundary stays AMBI for its partial
+post-seed remainder; it is not randomized mid-episode. A value of `0.5` means
+that half of eligible episodes in expectation are collected by the unadapted
+outer policy; the other episodes use ordinary AMBI action-time improvement.
+The choice never switches within an episode and is not a per-decision 50/50
+action mixture.
+
+The Bernoulli choice is a stateless, namespaced hash of the training seed and
+episode-start environment step. Selected episodes use a separate episode-local
+Torch generator to sample the current stochastic outer actor, bypassing
+`agent.act` and the inner SAC engine. The selection and action streams do not
+advance the learner's global Python, NumPy, or Torch RNGs. Both trajectory types
+enter the ordinary replay and receive the unchanged outer UTD=1 updates.
+
+This intervention changes training collection only. Both value-calibration
+protocols still use their dedicated seeded evaluation environment and retain
+the estimator definitions above. Episode events expose
+`rollout/outer_policy_episode` and
+`rollout/outer_policy_episode_eligible`; training windows expose the outer and
+inner behavior action counts, the outer-action fraction, and separate action
+timing. The public patch is unavailable, so AMBI's episode-level implementation
+is the documented operationalization of the paper's condition, not a claim of
+byte-for-byte reproduction.
+
+The paired campaign entry point is
+`configs/dmcontrol/experiments/ambi_humanoid_walk_value_calibration_outer_policy_ablation.json`.
+It runs the unchanged zero-probability baseline and the `0.5` intervention for
+the same seeds 55--57, one-million-decision budget, evaluation seed 12345, and
+50,000-decision evaluation/checkpoint grid. The intervention retains all
+baseline W&B tags and adds `outer-policy-trajectory-ablation` and the
+paper-facing condition label `50pct-outer-policy-trajectories`; neither
+condition hard-codes a run name.
+
+After the three runs finish, render the exact-grid, equal-seed aggregate with:
+
+```bash
+python plot_value_calibration.py \
+  --run ENTITY/PROJECT/RUN_55 \
+  --run ENTITY/PROJECT/RUN_56 \
+  --run ENTITY/PROJECT/RUN_57 \
+  --output-prefix value_calibration
+```
+
+The same command accepts repeated `--history-csv` arguments for exported W&B
+histories. It writes a two-panel PNG and PDF plus an aggregate CSV, performs no
+interpolation or smoothing, and labels the band as mean plus or minus one
+across-seed population standard deviation.
+
+For the paired campaign, use the companion plotter to validate and render all
+six histories as one condition-by-protocol 2x2 figure:
+
+```bash
+python plot_value_calibration_ablation.py \
+  --baseline-run ENTITY/PROJECT/BASELINE_RUN_55 \
+  --baseline-run ENTITY/PROJECT/BASELINE_RUN_56 \
+  --baseline-run ENTITY/PROJECT/BASELINE_RUN_57 \
+  --fifty-run ENTITY/PROJECT/FIFTY_RUN_55 \
+  --fifty-run ENTITY/PROJECT/FIFTY_RUN_56 \
+  --fifty-run ENTITY/PROJECT/FIFTY_RUN_57 \
+  --output-prefix value_calibration_outer_policy_ablation
+```
+
+For exported histories, replace the W&B inputs with repeated seed-qualified
+`--baseline-history-csv SEED=PATH` and
+`--fifty-history-csv SEED=PATH` arguments. `--intervention-run` is an alias for
+`--fifty-run`, and `--intervention-history-csv` is an alias for
+`--fifty-history-csv`. The companion rejects missing or mismatched seeds and
+anything other than the shared exact 21-point grid. It writes one 2x2 PNG, PDF,
+and combined aggregate CSV. The paper-facing quantities are `eval/mc_value`,
+`eval/q_value`, and `eval/q_minus_mc`; the separately prefixed
+`eval/stochastic_*` outputs provide the Bellman-matched secondary analysis.

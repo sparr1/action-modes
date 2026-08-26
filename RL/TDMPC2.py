@@ -1216,6 +1216,19 @@ class TDMPC2Baseline(Algorithm):
         self._wandb_planner_seconds = 0.0
         return payload
 
+    def _timing_wandb_metric_keys(self):
+        """Return timing keys reserved by :meth:`_timing_wandb_payload`."""
+
+        return {
+            "time/window_seconds",
+            "time/time_elapsed",
+            "time/total_timesteps",
+            "time/fps",
+            "time/train_seconds",
+            "time/updates_per_second",
+            "time/planner_seconds",
+        }
+
     def _commit_resume_timing_checkpoint(self, wandb_state):
         """Continue active timing from the exact pre-serialization boundary.
 
@@ -1234,6 +1247,49 @@ class TDMPC2Baseline(Algorithm):
     def _extra_wandb_payload(self, updates_since_log):
         del updates_since_log
         return {}
+
+    def _episode_payload_extras(self):
+        """Return subclass metrics that are meaningful only at episode end."""
+        return {}
+
+    def _validate_episode_payload_extras(self, extras, *, reserved_keys):
+        """Validate episode-only metrics without consuming logging windows."""
+
+        if not isinstance(extras, Mapping):
+            raise TypeError("Episode payload extras must be a mapping.")
+        if not extras:
+            return {}
+        collisions = (set(reserved_keys) | {"env_step"}).intersection(extras)
+        if collisions:
+            raise ValueError(
+                "Episode payload extras collide with reserved metrics: "
+                f"{sorted(collisions)}."
+            )
+        validated = {}
+        for key, value in extras.items():
+            if not isinstance(key, str) or not key:
+                raise TypeError(
+                    "Episode payload extra keys must be non-empty strings."
+                )
+            if isinstance(value, (bool, np.bool_)) or not isinstance(
+                value, (int, float, np.integer, np.floating)
+            ):
+                raise TypeError(f"Episode payload extra {key!r} must be numeric.")
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                raise ValueError(
+                    f"Episode payload extra {key!r} must be finite."
+                )
+            validated[key] = value
+        return validated
+
+    def _merge_episode_payload_extras(self, payload):
+        extras = self._validate_episode_payload_extras(
+            self._episode_payload_extras(),
+            reserved_keys=payload,
+        )
+        payload.update(extras)
+        return payload
 
     def _log_wandb_step(
         self,
@@ -1269,6 +1325,7 @@ class TDMPC2Baseline(Algorithm):
                     "episode/current_return": float(self._episode_return),
                     "episode/current_len": int(self._episode_len),
                 }
+                self._merge_episode_payload_extras(episode_payload)
                 log_wandb(
                     self._wandb_run,
                     episode_payload,
@@ -1305,25 +1362,45 @@ class TDMPC2Baseline(Algorithm):
         if getattr(self, "_resume_enabled", False):
             payload["episode/index"] = int(self._episode_idx)
         payload.update(self._replay_wandb_payload())
-        payload.update(self._wandb_reward_window.pop())
-        payload.update(self._wandb_train_window.pop())
+        # Build a prospective row without consuming interval state. A malformed
+        # episode extension must not silently discard pending telemetry.
+        payload.update(self._wandb_reward_window.snapshot())
+        payload.update(self._wandb_train_window.snapshot())
         # One packed transfer per metric device replaces per-update scalar
         # reads from accelerator memory.
         payload.update(
-            self._wandb_update_window.pop_floats(include_stats=True)
+            self._wandb_update_window.floats(include_stats=True)
         )
         for key, value in self._resolve_reward_components(info).items():
             # Direct callers may not have populated the interval accumulator.
             # Never overwrite a sampled window mean with the final step.
             payload.setdefault(key, value)
-        payload.update(self._timing_wandb_payload(updates_since_log))
-        payload.update(self._extra_wandb_payload(updates_since_log))
+        extra_payload = self._extra_wandb_payload(updates_since_log)
         if completed_episode:
             payload.update({
                 "episode/index": int(self._episode_idx),
                 "episode/return": float(self._episode_return),
                 "episode/len": int(self._episode_len),
             })
+            episode_extras = self._validate_episode_payload_extras(
+                self._episode_payload_extras(),
+                reserved_keys=(
+                    set(payload)
+                    | set(extra_payload)
+                    | set(self._timing_wandb_metric_keys())
+                ),
+            )
+        else:
+            episode_extras = {}
+
+        # Extension validation succeeded. Commit the interval boundary once,
+        # preserving the historical timing/algorithm/episode precedence.
+        self._wandb_reward_window.clear()
+        self._wandb_train_window.clear()
+        self._wandb_update_window.clear()
+        payload.update(self._timing_wandb_payload(updates_since_log))
+        payload.update(extra_payload)
+        payload.update(episode_extras)
         log_wandb(self._wandb_run, payload, step=self._global_step)
         self._last_wandb_step = int(self._global_step)
         self._wandb_last_updates = int(self._num_updates)
@@ -1740,7 +1817,17 @@ class TDMPC2Baseline(Algorithm):
         self._eval_csv_path = path
         self._eval_csv_initialized = True
 
-    def _record_evaluation(self, step, reward):
+    def _evaluation_payload_extras(self, step):
+        """Return optional metrics to merge into this evaluation event.
+
+        Subclasses can run observational probes here without adding a second
+        evaluation scheduler or a second W&B event at the same environment
+        step. The base TD-MPC2 evaluator has no extra metrics.
+        """
+
+        return {}
+
+    def _record_evaluation(self, step, reward, *, extras=None):
         reward = float(reward)
         print(
             "TD-MPC2 evaluation:",
@@ -1772,6 +1859,38 @@ class TDMPC2Baseline(Algorithm):
         }
         if getattr(self, "_resume_enabled", False):
             payload["episode/index"] = int(self._episode_idx)
+        if extras is not None:
+            if not isinstance(extras, Mapping):
+                raise TypeError("Evaluation payload extras must be a mapping.")
+            reserved = {
+                "eval/episode_reward",
+                "eval/episodes",
+                "episode/index",
+                "env_step",
+            }
+            collisions = reserved.intersection(extras)
+            if collisions:
+                raise ValueError(
+                    "Evaluation payload extras collide with reserved metrics: "
+                    f"{sorted(collisions)}."
+                )
+            for key, value in extras.items():
+                if not isinstance(key, str) or not key:
+                    raise TypeError(
+                        "Evaluation payload extra keys must be non-empty strings."
+                    )
+                if isinstance(value, (bool, np.bool_)) or not isinstance(
+                    value, (int, float, np.integer, np.floating)
+                ):
+                    raise TypeError(
+                        f"Evaluation payload extra {key!r} must be numeric."
+                    )
+                numeric = float(value)
+                if not math.isfinite(numeric):
+                    raise ValueError(
+                        f"Evaluation payload extra {key!r} must be finite."
+                    )
+                payload[key] = numeric
         log_wandb(self._wandb_run, payload, step=int(step))
 
     @torch.no_grad()
@@ -1803,7 +1922,13 @@ class TDMPC2Baseline(Algorithm):
             episode_returns.append(episode_return)
 
         mean_return = float(np.nanmean(episode_returns))
-        self._record_evaluation(step, mean_return)
+        extras = self._evaluation_payload_extras(int(step))
+        if extras:
+            self._record_evaluation(step, mean_return, extras=extras)
+        else:
+            # Preserve the historical two-argument seam used by downstream
+            # evaluators and tests when no observational extension is active.
+            self._record_evaluation(step, mean_return)
         return mean_return
 
     def _prepare_resume_boundary(self):

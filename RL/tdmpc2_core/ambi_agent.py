@@ -837,6 +837,59 @@ class AMBITDMPC2Agent(torch.nn.Module):
             ]
         return cpu_action, materialized, rollout_lengths
 
+    @torch.no_grad()
+    def act_outer_policy(self, obs, *, generator):
+        """Sample the online outer actor without entering the AMBI inner engine."""
+        if not isinstance(generator, torch.Generator):
+            raise TypeError("generator must be a torch.Generator.")
+        generator_device = torch.device(generator.device)
+        expected_device = self.device if self.device.type == "cuda" else torch.device("cpu")
+        if generator_device.type != expected_device.type or (
+            generator_device.type == "cuda"
+            and generator_device.index not in {None, expected_device.index}
+        ):
+            raise ValueError(
+                "The outer-policy generator must be on the AMBI agent device."
+            )
+
+        self.last_inner_metrics = {}
+        self.last_inner_rollout_lengths = []
+        obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
+        training_modes = tuple(
+            (module, bool(module.training)) for module in self.model.modules()
+        )
+        fork_devices = []
+        if self.device.type == "cuda":
+            fork_devices = [
+                self.device.index
+                if self.device.index is not None
+                else torch.cuda.current_device()
+            ]
+        try:
+            self.model.eval()
+            # Pixel augmentation may use the default generator. Forking keeps
+            # that incidental randomness from advancing the outer learner's
+            # global stream; policy noise comes only from the episode-private
+            # generator supplied above.
+            with torch.random.fork_rng(devices=fork_devices, enabled=True):
+                root_z = self.model.encode(obs).detach()
+                action = self.model.pi_action(
+                    root_z,
+                    deterministic=False,
+                    generator=generator,
+                )
+        finally:
+            for module, was_training in training_modes:
+                module.training = was_training
+
+        if action.ndim < 1 or int(action.shape[0]) != 1:
+            raise ValueError(
+                "The outer policy must return one batched action per observation."
+            )
+        if not bool(torch.isfinite(action).all()):
+            raise ValueError("The outer policy returned a non-finite action.")
+        return action[0].detach().cpu()
+
     def act(
         self,
         obs,

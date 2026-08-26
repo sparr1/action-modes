@@ -1,0 +1,25 @@
+{
+  "study_type": "three_seed_value_calibration",
+  "study_note": "Three-seed, one-million-decision Humanoid Walk value-calibration run derived from the base-v1 G4 min_all reward-only configuration. It evaluates the paper-deterministic and stochastic-Bellman protocols at step zero and every 50,000 agent decisions with 100 fixed-seed samples per estimate; the paper-compatible MC and Q batches remain independent, while the stochastic protocol pairs each sampled first action with its rollout. All five Q heads, both reward-only critic targets, the cloned inner critic, automatic outer and inner entropy coefficients, and no actor-loss percentile scaling remain unchanged. This is a value-calibration protocol study, not a 14-million-decision performance comparison.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 3,
+  "configs": ["ambi_humanoid_walk_base_min_all_reward_only_value_calibration"],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 50000,
+  "save_strat": ["all", "best", "latest"],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}

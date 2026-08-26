@@ -5,11 +5,13 @@ and operators are auxiliary ablations or comparison methods.
 """
 
 import copy
+import hashlib
 import math
 import warnings
 from collections.abc import Mapping
 
 import numpy as np
+import torch
 
 from RL.TDMPC2 import TDMPC2Baseline, _normalize_horizon_params
 from RL.tdmpc2_core.ambi_agent import AMBITDMPC2Agent
@@ -20,6 +22,7 @@ from utils.utils import setup_logs
 _Q_REDUCTIONS = {"min_pair", "mean_pair", "min_all", "mean_all"}
 _CRITIC_TARGETS = {"entropy_augmented", "reward_only"}
 _SAC_ACTOR_LOSS_SCALE_MODES = {"none", "tdmpc2_percentile_range"}
+_VALUE_EVAL_PROTOCOLS = {"paper_deterministic", "stochastic_bellman"}
 _ADAPTATION_MODES = {"frozen", "clone", "lora"}
 _LIFECYCLE_SCOPES = {"action", "episode", "run"}
 _SCOPE_RANK = {"action": 0, "episode": 1, "run": 2}
@@ -57,6 +60,11 @@ _AMBI_DEFAULTS = {
     "tau": 0.005,
     "target_update_interval": 1,
     "compile_strict": False,
+
+    # Optional trajectory-level intervention used by value-calibration
+    # experiments. Eligible training episodes draw once between the canonical
+    # AMBI inner behavior and the stochastic outer actor.
+    "outer_policy_episode_probability": 0.0,
 
     # Canonical root-local training schedule. Each round collects N rollouts of
     # length H, appends them to the root-local replay, then runs G joint update
@@ -161,6 +169,13 @@ _AMBI_DEFAULTS = {
     "value_equivalence_diagnostics": False,
     "value_equivalence_every_updates": 1000,
     "value_equivalence_mc_samples": 4,
+
+    # Initial-state outer-Q calibration against real discounted rollouts.
+    # Disabled by default because the full Monte Carlo probe is expensive.
+    "eval_value": False,
+    "eval_value_samples": 100,
+    "eval_value_seed": 12345,
+    "eval_value_protocols": ["paper_deterministic", "stochastic_bellman"],
 }
 
 
@@ -226,6 +241,57 @@ def _strict_positive_int(value, key):
     return value
 
 
+def _strict_nonnegative_int(value, key):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, np.integer)
+    ):
+        raise ValueError(f"{key} must be a non-negative integer.")
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"{key} must be a non-negative integer.")
+    return value
+
+
+def _normalize_eval_value_protocols(value):
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValueError(
+            "eval_value_protocols must be a non-empty list containing only "
+            f"{sorted(_VALUE_EVAL_PROTOCOLS)}."
+        )
+    protocols = []
+    for protocol in value:
+        if not isinstance(protocol, str):
+            raise ValueError(
+                "eval_value_protocols entries must be strings from "
+                f"{sorted(_VALUE_EVAL_PROTOCOLS)}."
+            )
+        protocol = protocol.lower()
+        if protocol not in _VALUE_EVAL_PROTOCOLS:
+            raise ValueError(
+                "eval_value_protocols entries must be chosen from "
+                f"{sorted(_VALUE_EVAL_PROTOCOLS)}, got {protocol!r}."
+            )
+        if protocol in protocols:
+            raise ValueError(
+                f"eval_value_protocols contains duplicate entry {protocol!r}."
+            )
+        protocols.append(protocol)
+    if not protocols:
+        raise ValueError("eval_value_protocols must not be empty.")
+    return protocols
+
+
+def _strict_probability(value, key):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise ValueError(f"{key} must be a finite number in [0, 1].")
+    value = float(value)
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError(f"{key} must be a finite number in [0, 1].")
+    return value
+
+
 def _finite_float(value, key):
     if isinstance(value, (bool, np.bool_)):
         raise ValueError(f"{key} must be a finite number, not a boolean.")
@@ -233,6 +299,17 @@ def _finite_float(value, key):
     if not math.isfinite(value):
         raise ValueError(f"{key} must be finite, got {value}.")
     return value
+
+
+def _outer_policy_hash(seed, episode_start_step, namespace):
+    """Return a stable 64-bit episode-local value without touching an RNG."""
+    payload = f"{int(seed)}:{int(episode_start_step)}:{namespace}".encode("utf-8")
+    digest = hashlib.blake2b(
+        payload,
+        digest_size=8,
+        person=b"AMBI-outer-v1",
+    ).digest()
+    return int.from_bytes(digest, byteorder="little", signed=False)
 
 
 def _normalize_legacy_params(params):
@@ -387,11 +464,17 @@ class AMBITDMPC2(TDMPC2Baseline):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._value_calibration_evaluator = None
+        self._outer_policy_episode_eligible = False
+        self._outer_policy_episode_selected = False
+        self._outer_policy_action_generator = None
         self._inner_steps_total = 0
         self._inner_updates_total = 0
         self._wandb_inner_seconds = 0.0
         self._wandb_inner_actions = 0
         self._wandb_inner_steps = 0
+        self._wandb_outer_policy_seconds = 0.0
+        self._wandb_outer_policy_actions = 0
 
     def _build_cfg(self, params):
         # Resolve the outer legacy alias before translating AMBI's separate
@@ -453,6 +536,17 @@ class AMBITDMPC2(TDMPC2Baseline):
         if schedule_mode == "legacy" and requested_operator in {"sac", "td3"}:
             merged.update(_LEGACY_SCHEDULE_DEFAULTS)
         merged.update(params)
+        merged["outer_policy_episode_probability"] = _strict_probability(
+            merged["outer_policy_episode_probability"],
+            "outer_policy_episode_probability",
+        )
+        if merged["outer_policy_episode_probability"] > 0.0:
+            requested_obs = merged.get("obs")
+            if requested_obs is not None and str(requested_obs).lower() != "state":
+                raise ValueError(
+                    "A positive outer_policy_episode_probability currently "
+                    "requires state observations."
+                )
         if merged["inner_temperature_mode"] is None:
             merged["inner_temperature_mode"] = (
                 "auto" if requested_operator == "sac" else "inherit_outer"
@@ -481,6 +575,20 @@ class AMBITDMPC2(TDMPC2Baseline):
             )
         cfg = super()._build_cfg(merged)
         cfg.inner_schedule_mode = schedule_mode
+        cfg.outer_policy_episode_probability = float(
+            cfg.outer_policy_episode_probability
+        )
+        if cfg.outer_policy_episode_probability > 0.0:
+            if cfg.obs != "state":
+                raise ValueError(
+                    "A positive outer_policy_episode_probability currently "
+                    "requires state observations."
+                )
+            if str(cfg.inner_operator).lower() != "sac":
+                raise ValueError(
+                    "A positive outer_policy_episode_probability requires "
+                    "inner_operator='sac'."
+                )
 
         # ``model_size`` expands architecture defaults inside TD-MPC2. Restore
         # an explicit ensemble size afterwards; scalar SAC remains twin-Q while
@@ -1089,10 +1197,41 @@ class AMBITDMPC2(TDMPC2Baseline):
             cfg.value_equivalence_mc_samples,
             "value_equivalence_mc_samples",
         )
+        cfg.eval_value = _strict_bool(cfg.eval_value, "eval_value")
+        cfg.eval_value_samples = _strict_positive_int(
+            cfg.eval_value_samples,
+            "eval_value_samples",
+        )
+        cfg.eval_value_seed = _strict_nonnegative_int(
+            cfg.eval_value_seed,
+            "eval_value_seed",
+        )
+        cfg.eval_value_protocols = _normalize_eval_value_protocols(
+            cfg.eval_value_protocols
+        )
         if cfg.value_equivalence_diagnostics and cfg.inner_operator != "sac":
             raise ValueError(
                 "value_equivalence_diagnostics requires inner_operator='sac'."
             )
+        if cfg.eval_value:
+            if cfg.eval_freq is None:
+                raise ValueError("eval_value=true requires a configured eval_freq.")
+            if cfg.obs != "state":
+                raise ValueError(
+                    "eval_value=true currently supports state observations only."
+                )
+            if cfg.outer_critic_target != "reward_only":
+                raise ValueError(
+                    "eval_value=true requires outer_critic_target='reward_only' "
+                    "so discounted reward rollouts match the critic target."
+                )
+            if (
+                "paper_deterministic" in cfg.eval_value_protocols
+                and cfg.q_pair_size != 2
+            ):
+                raise ValueError(
+                    "paper_deterministic value evaluation requires q_pair_size=2."
+                )
         cfg.compile_strict = bool(cfg.compile_strict)
 
         cfg.inner_termination_threshold = _finite_float(
@@ -1194,6 +1333,41 @@ class AMBITDMPC2(TDMPC2Baseline):
     def _make_agent(self, cfg):
         return AMBITDMPC2Agent(cfg)
 
+    def _make_value_calibration_evaluator(self):
+        from RL.tdmpc2_core.value_calibration import ValueCalibrationEvaluator
+        from utils.core import build_env
+
+        return ValueCalibrationEvaluator(
+            model=self.agent.model,
+            env_factory=lambda: build_env(
+                self.run_params,
+                self.experiment_params,
+                render_mode=None,
+            ),
+            observation_to_tensor=self._obs_to_tensor,
+            unscale_action=self._unscale_action,
+            discount=float(self.cfg.discount),
+            samples=int(self.cfg.eval_value_samples),
+            seed=int(self.cfg.eval_value_seed),
+            protocols=tuple(self.cfg.eval_value_protocols),
+            device=self.agent.device,
+        )
+
+    def _evaluation_payload_extras(self, step):
+        if not self.cfg.eval_value:
+            return {}
+        if self._value_calibration_evaluator is None:
+            self._value_calibration_evaluator = (
+                self._make_value_calibration_evaluator()
+            )
+        return self._value_calibration_evaluator.evaluate()
+
+    def close(self):
+        evaluator = self._value_calibration_evaluator
+        self._value_calibration_evaluator = None
+        if evaluator is not None:
+            evaluator.close()
+
     def _evaluate_policy(self, step, *, initial_obs=None):
         """Evaluate on an isolated copy of AMBI's persistent inner state.
 
@@ -1223,7 +1397,77 @@ class AMBITDMPC2(TDMPC2Baseline):
             self.agent.last_inner_rollout_lengths = last_lengths
             self.agent._resume_boundary_prepared = boundary_prepared
 
+    def _select_outer_policy_episode(self, episode_start_step):
+        """Draw the episode intervention from a stateless, namespaced coin."""
+        probability = float(self.cfg.outer_policy_episode_probability)
+        if probability <= 0.0:
+            return False
+        if probability >= 1.0:
+            return True
+        coin = _outer_policy_hash(
+            self.cfg.seed,
+            episode_start_step,
+            "episode-coin",
+        ) / float(1 << 64)
+        return coin < probability
+
+    def _make_outer_policy_action_generator(self, episode_start_step):
+        device = torch.device(self.agent.device)
+        generator_device = device if device.type == "cuda" else torch.device("cpu")
+        generator = torch.Generator(device=generator_device)
+        generator.manual_seed(
+            _outer_policy_hash(
+                self.cfg.seed,
+                episode_start_step,
+                "action-stream",
+            )
+            % (2**63 - 1)
+        )
+        return generator
+
+    def _run_training_episode(self, obs, total_timesteps, *, eval_pending):
+        """Fix one behavior source for an entire eligible training episode."""
+        if (
+            self._outer_policy_episode_eligible
+            or self._outer_policy_episode_selected
+            or self._outer_policy_action_generator is not None
+        ):
+            raise RuntimeError("An outer-policy episode intervention is already active.")
+
+        try:
+            episode_start_step = int(self._global_step)
+            eligible = (
+                episode_start_step > int(self.cfg.seed_steps)
+                and int(self.buffer.num_eps) > 0
+            )
+            selected = bool(
+                eligible and self._select_outer_policy_episode(episode_start_step)
+            )
+            self._outer_policy_episode_eligible = bool(eligible)
+            self._outer_policy_episode_selected = selected
+            if selected:
+                self._outer_policy_action_generator = (
+                    self._make_outer_policy_action_generator(episode_start_step)
+                )
+            return super()._run_training_episode(
+                obs,
+                total_timesteps,
+                eval_pending=eval_pending,
+            )
+        finally:
+            self._outer_policy_action_generator = None
+            self._outer_policy_episode_selected = False
+            self._outer_policy_episode_eligible = False
+
     def _act_agent(self, obs_t, *, t0, eval_mode):
+        if self._outer_policy_episode_selected and not eval_mode:
+            generator = self._outer_policy_action_generator
+            if generator is None:
+                raise RuntimeError(
+                    "The selected outer-policy episode lacks its action generator."
+                )
+            return self.agent.act_outer_policy(obs_t, generator=generator)
+
         # W&B records the resulting environment step, while action selection
         # happens immediately before that step.
         sampling_step = int(self._global_step) + 1
@@ -1273,7 +1517,23 @@ class AMBITDMPC2(TDMPC2Baseline):
         return self._unscale_action(action_norm), None
 
     def _wandb_run_name(self):
-        return f"AMBITDMPC2-{self.run_params.get('env', 'env')}-seed{self.cfg.seed}"
+        explicit = (self.custom_params or {}).get("wandb_run_name")
+        if explicit is not None:
+            return explicit
+        run_name = self.run_params.get("name")
+        if not run_name:
+            run_name = self.run_params.get("env", "env")
+        return f"AMBITDMPC2-{run_name}-seed{self.cfg.seed}"
+
+    def _episode_payload_extras(self):
+        return {
+            "rollout/outer_policy_episode": int(
+                self._outer_policy_episode_selected
+            ),
+            "rollout/outer_policy_episode_eligible": int(
+                self._outer_policy_episode_eligible
+            ),
+        }
 
     def _log_step(self, reward, obs, action, terminated, truncated, info):
         """Use the existing logger while exposing imagined-step accounting."""
@@ -1313,14 +1573,26 @@ class AMBITDMPC2(TDMPC2Baseline):
         self._wandb_inner_seconds = 0.0
         self._wandb_inner_actions = 0
         self._wandb_inner_steps = 0
+        self._wandb_outer_policy_seconds = 0.0
+        self._wandb_outer_policy_actions = 0
 
     def _training_resume_algorithm_state(self):
         if (
             self._wandb_inner_seconds != 0.0
             or self._wandb_inner_actions != 0
             or self._wandb_inner_steps != 0
+            or self._wandb_outer_policy_seconds != 0.0
+            or self._wandb_outer_policy_actions != 0
         ):
             raise RuntimeError("AMBI W&B timing counters were not flushed.")
+        if (
+            self._outer_policy_episode_eligible
+            or self._outer_policy_episode_selected
+            or self._outer_policy_action_generator is not None
+        ):
+            raise RuntimeError(
+                "AMBI training state requires an outer-policy episode boundary."
+            )
         return {
             "schema": "ambi-wrapper-training-state",
             "version": 2,
@@ -1353,10 +1625,33 @@ class AMBITDMPC2(TDMPC2Baseline):
         self._wandb_inner_seconds = 0.0
         self._wandb_inner_actions = 0
         self._wandb_inner_steps = 0
+        self._wandb_outer_policy_seconds = 0.0
+        self._wandb_outer_policy_actions = 0
+        self._outer_policy_episode_eligible = False
+        self._outer_policy_episode_selected = False
+        self._outer_policy_action_generator = None
 
     def _record_action_metrics(self, *, planned, action_seconds):
-        # AMBI replaces MPPI, so action selection time is inner-adaptation time.
-        if not planned:
+        outer_policy_action = bool(
+            planned and getattr(self, "_outer_policy_episode_selected", False)
+        )
+        if planned:
+            self._wandb_train_window.add_weighted(
+                "train/outer_policy_action_fraction",
+                float(outer_policy_action),
+            )
+        self._wandb_train_window.update_sums({
+            "train/outer_policy_actions": int(outer_policy_action),
+            "train/inner_behavior_actions": int(planned and not outer_policy_action),
+        })
+        if outer_policy_action:
+            self._wandb_outer_policy_seconds += float(action_seconds)
+            self._wandb_outer_policy_actions += 1
+
+        # AMBI replaces MPPI, so planned inner-action selection time is
+        # adaptation time. Seed/random and direct-outer actions both report no
+        # inner work, including when stale diagnostics existed previously.
+        if not planned or outer_policy_action:
             self._wandb_train_window.add_weighted("train/inner_active", 0.0)
             self._wandb_train_window.update_sums({
                 "train/inner_actions": 0,
@@ -1628,6 +1923,8 @@ class AMBITDMPC2(TDMPC2Baseline):
         inner_seconds = float(self._wandb_inner_seconds)
         inner_actions = int(self._wandb_inner_actions)
         inner_steps = int(self._wandb_inner_steps)
+        outer_policy_seconds = float(self._wandb_outer_policy_seconds)
+        outer_policy_actions = int(self._wandb_outer_policy_actions)
         payload = super()._timing_wandb_payload(updates_since_log)
         payload.update({
             "time/outer_update_seconds": outer_update_seconds,
@@ -1638,11 +1935,29 @@ class AMBITDMPC2(TDMPC2Baseline):
             "time/inner_steps_per_second": (
                 float(inner_steps / inner_seconds) if inner_seconds > 0 else 0.0
             ),
+            "time/outer_policy_action_seconds": outer_policy_seconds,
+            "time/outer_policy_seconds_per_action": (
+                float(outer_policy_seconds / outer_policy_actions)
+                if outer_policy_actions > 0
+                else 0.0
+            ),
         })
         self._wandb_inner_seconds = 0.0
         self._wandb_inner_actions = 0
         self._wandb_inner_steps = 0
+        self._wandb_outer_policy_seconds = 0.0
+        self._wandb_outer_policy_actions = 0
         return payload
+
+    def _timing_wandb_metric_keys(self):
+        return super()._timing_wandb_metric_keys() | {
+            "time/outer_update_seconds",
+            "time/inner_action_seconds",
+            "time/inner_seconds_per_action",
+            "time/inner_steps_per_second",
+            "time/outer_policy_action_seconds",
+            "time/outer_policy_seconds_per_action",
+        }
 
     def _extra_wandb_payload(self, updates_since_log):
         del updates_since_log

@@ -1,0 +1,28 @@
+{
+  "study_type": "paired_three_seed_outer_policy_trajectory_ablation",
+  "study_note": "Paired three-seed, one-million-decision Humanoid Walk value-calibration campaign comparing the unchanged AMBI baseline with a 50% outer-policy-trajectory intervention. In the intervention, one Bernoulli draw with probability 0.5 is made at each eligible fully post-seed episode start/reset and selects the collector for that entire episode/trajectory; the first episode that crosses the seed-collection boundary stays AMBI for its partial post-seed remainder, and the intervention is not a per-decision policy mixture. Both conditions retain the same reward-only five-head min_all recipe, evaluation seed and protocols, 50,000-decision evaluation/checkpoint grid, and seeds 55--57. The paper states that 50% of trajectories use the nominal policy, but its public repository does not release the collection patch, so this is an explicit operationalization rather than a byte-for-byte reproduction.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 3,
+  "configs": [
+    "ambi_humanoid_walk_base_min_all_reward_only_value_calibration",
+    "ambi_humanoid_walk_base_min_all_reward_only_value_calibration_outer_policy_50"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 50000,
+  "save_strat": ["all", "best", "latest"],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}

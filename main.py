@@ -225,8 +225,17 @@ _RUNTIME_CONFIG_FIELDS = (
     "latent_dim",
     "action_dim",
     "episode_length",
+    "steps",
+    "discount",
+    "episodic",
+    "utd",
     "eval_freq",
     "eval_episodes",
+    "eval_value",
+    "eval_value_samples",
+    "eval_value_seed",
+    "eval_value_protocols",
+    "outer_policy_episode_probability",
     "train_unroll_horizon",
     "outer_planning_horizon",
     "inner_rollout_horizon",
@@ -467,6 +476,29 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
             resolved["inner_expected_update_slots"] * resolved["inner_batch_size"]
         )
 
+    training = {
+        key: resolved[key]
+        for key in ("steps", "discount", "episodic", "utd")
+        if key in resolved
+    }
+    evaluation = {
+        key: resolved[key]
+        for key in (
+            "eval_freq",
+            "eval_episodes",
+            "eval_value",
+            "eval_value_samples",
+            "eval_value_seed",
+            "eval_value_protocols",
+        )
+        if key in resolved
+    }
+    collection = {}
+    if "outer_policy_episode_probability" in resolved:
+        collection["outer_policy_episode_probability"] = resolved[
+            "outer_policy_episode_probability"
+        ]
+
     metadata = {
         "schema_version": 1,
         "algorithm": trial_run_params.get("alg"),
@@ -478,6 +510,12 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
         "compilation": compile_metadata,
         "inner_budget": inner,
     }
+    if training:
+        metadata["training"] = training
+    if evaluation:
+        metadata["evaluation"] = evaluation
+    if collection:
+        metadata["collection"] = collection
     if actor_loss_scale:
         metadata["actor_loss_scale"] = actor_loss_scale
     return _json_safe_metadata(metadata)
