@@ -8,6 +8,8 @@
 #SBATCH --mem=32G
 #SBATCH --time=96:00:00
 #SBATCH --array=0-8%6
+#SBATCH --requeue
+#SBATCH --signal=USR1@3600
 #SBATCH --output=slurm/%x-%A_%a.out
 #SBATCH --error=slurm/%x-%A_%a.err
 
@@ -29,9 +31,8 @@ fail() {
 # Submit from the clean action-modes repository root:
 #   sbatch --export=ALL,AMBI_VALUE_CALIBRATION_CAMPAIGN=<unique-campaign> \
 #     slurm/run_ambi_anchor_kl_oscar.sbatch
-# Each array cell runs one manifest trial directly. This launcher deliberately
-# has no Slurm requeue contract because exact resume currently requires a
-# one-trial manifest, while each behavior-KL manifest contains three trials.
+# Each array cell selects one tracked single-trial manifest and delegates
+# signal-aware draining, exact resume, and requeue to run_ambi_oscar.sh.
 project_dir="$(cd -- "${SLURM_SUBMIT_DIR:-$PWD}" && pwd -P)"
 cd "$project_dir"
 
@@ -60,37 +61,16 @@ trial_index=$((SLURM_ARRAY_TASK_ID / 3))
 seed=$((55 + trial_index))
 algorithm_config="${algorithm_configs[$variant_index]}"
 schedule_label="${schedule_labels[$variant_index]}"
-manifest="configs/dmcontrol/experiments/${algorithm_config}.json"
+manifest="configs/dmcontrol/experiments/${algorithm_config}_14m_seed${seed}.json"
 [[ -f "$manifest" ]] || fail "missing manifest: $manifest"
 [[ -f "$algorithm_dir/$algorithm_config.json" ]] || fail \
   "missing algorithm config: $algorithm_dir/$algorithm_config.json"
 
-approved_output_root="/oscar/home/rgao48/ambi-durable/value-calibration"
-output_root="${AMBI_VALUE_CALIBRATION_ROOT:-$approved_output_root}"
-[[ "$output_root" == /* ]] || fail \
-  "AMBI_VALUE_CALIBRATION_ROOT must be an absolute path"
-[[ "$output_root" != "/oscar/home" ]] || fail \
-  "AMBI_VALUE_CALIBRATION_ROOT must not be the broad /oscar/home directory"
-[[ "$output_root" != "/oscar/home/rgao48" ]] || fail \
-  "AMBI_VALUE_CALIBRATION_ROOT must not be the broad user home directory"
-if [[ -d /oscar/home/rgao48 ]]; then
-  [[ "$output_root" == "$approved_output_root" ]] || fail \
-    "AMBI_VALUE_CALIBRATION_ROOT must be $approved_output_root on Oscar"
-fi
-mkdir -p "$output_root"
-output_root="$(cd -- "$output_root" && pwd -P)"
-
 campaign="${AMBI_VALUE_CALIBRATION_CAMPAIGN:-job_${SLURM_ARRAY_JOB_ID}}"
 [[ "$campaign" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail \
   "AMBI_VALUE_CALIBRATION_CAMPAIGN must be a filesystem-safe basename"
-cell_output_root="$output_root/$campaign/task_${SLURM_ARRAY_TASK_ID}"
-run_root="$cell_output_root"
-
-available_kb="$(df -Pk "$output_root" | awk 'NR == 2 {print $4}')"
-[[ "$available_kb" =~ ^[0-9]+$ ]] || fail \
-  "could not determine free durable storage"
-(( available_kb >= 2 * 1024 * 1024 )) || fail \
-  "refusing to start with less than 2 GiB free in $output_root"
+approved_durable_root="/oscar/home/rgao48/ambi-durable"
+lineage_dir="$approved_durable_root/value-calibration/$campaign/task_${SLURM_ARRAY_TASK_ID}"
 
 wandb_local_root="${SLURM_TMPDIR:-/tmp}/ambi-anchor-kl-wandb-${SLURM_ARRAY_JOB_ID}-${SLURM_ARRAY_TASK_ID}"
 mkdir -p \
@@ -112,6 +92,13 @@ export WANDB_CACHE_DIR="$wandb_local_root/cache"
 export WANDB_DATA_DIR="$wandb_local_root/data"
 export WANDB_ARTIFACT_DIR="$wandb_local_root/artifacts"
 export WANDB_DISABLE_CODE=true
+export AMBI_DURABLE_ROOT="$approved_durable_root"
+export AMBI_LINEAGE_DIR="$lineage_dir"
+export AMBI_DURABLE_QUOTA_LABEL="rgao48"
+export AMBI_DURABLE_QUOTA_PATH="/oscar/home"
+export AMBI_RUN_CONFIG="$manifest"
+export AMBI_ALG_DIR="$algorithm_dir"
+export AMBI_PYTHON="$ambi_python"
 
 echo "Job: ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
 echo "Node: ${SLURM_NODELIST:-unknown}"
@@ -121,23 +108,15 @@ echo "Algorithm config: $algorithm_config"
 echo "Variant index: $variant_index"
 echo "Trial index: $trial_index"
 echo "Seed: $seed"
-echo "Agent decisions: 1000000"
+echo "Agent decisions: 14000000"
+echo "Raw simulator steps: 28000000"
 echo "Manifest: $manifest"
 echo "Campaign: $campaign"
-echo "Durable output root: $output_root"
-echo "Run root: $run_root"
+echo "Durable lineage: $lineage_dir"
 echo "W&B mode: $WANDB_MODE"
 echo "W&B local staging: $wandb_local_root"
 echo "Source commit: $source_commit"
-"$ambi_python" --version
-echo "SLURM_JOB_GPUS: ${SLURM_JOB_GPUS:-unset}"
-"$ambi_python" -c 'import os, torch; print("torch:", torch.__version__); print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES")); print("visible CUDA devices:", torch.cuda.device_count()); print("cuda:", torch.cuda.get_device_name())'
 
-srun --unbuffered --kill-on-bad-exit=1 \
-  "$ambi_python" main.py \
-  --run "$manifest" \
-  --alg-dir "$algorithm_dir" \
-  --log-dir "$run_root" \
-  --alg-index 0 \
-  --trial-index "$trial_index" \
-  --num-runs 1
+# The canonical Oscar launcher owns quota/storage validation, hourly durable
+# checkpoints, signal-aware draining, W&B continuity, and one-cell requeue.
+exec bash "$project_dir/run_ambi_oscar.sh"

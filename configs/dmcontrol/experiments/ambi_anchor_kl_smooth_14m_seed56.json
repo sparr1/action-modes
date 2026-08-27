@@ -1,0 +1,25 @@
+{
+  "study_type": "single_seed_14m_value_calibration",
+  "study_note": "Single-cell Oscar exact-resume manifest for the 14-million-decision Humanoid Walk analytic behavior-KL smooth-schedule run at seed 56. It retains the five-head min_all reward-only MC-value base and evaluates paper-deterministic and stochastic-Bellman Q-versus-MC metrics at step zero and every 50,000 decisions with 100 samples. Portable best/latest checkpoints are evaluated every 100,000 decisions; hourly exact-resume generations are managed separately by the Oscar launcher.",
+  "overrides_alg": {
+    "seed": 56,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": ["ambi_anchor_kl_smooth"],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 100000,
+  "save_strat": ["best", "latest"],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}

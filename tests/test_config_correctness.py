@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 
@@ -144,30 +145,43 @@ def test_behavior_kl_variants_change_only_the_approved_schedule_controls():
         "ambi_anchor_kl_quantile": "quantile_gate",
         "ambi_anchor_kl_dual": "dual",
     }
+    study_note = (
+        "Three-seed, 14-million-decision Humanoid Walk value-calibration run "
+        "derived from the base-v1 G4 min_all reward-only configuration. It "
+        "evaluates the paper-deterministic and stochastic-Bellman protocols at "
+        "step zero and every 50,000 agent decisions with 100 fixed-seed samples "
+        "per estimate; the paper-compatible MC and Q batches remain independent, "
+        "while the stochastic protocol pairs each sampled first action with its "
+        "rollout. All five Q heads, both reward-only critic targets, the cloned "
+        "inner critic, automatic outer and inner entropy coefficients, and no "
+        "actor-loss percentile scaling remain unchanged."
+    )
 
     for name, schedule in variants.items():
         variant = _load_json_strict(DMCONTROL_ALGS / f"{name}.json")
-        assert {key: value for key, value in variant.items() if key != "alg_params"} == {
-            key: value for key, value in base.items() if key != "alg_params"
-        }
-        params = dict(variant["alg_params"])
-        assert params.pop("outer_behavior_policy_kl_schedule") == schedule
-        for key, expected in kl_defaults.items():
-            assert params.pop(key) == expected
-        assert params == base["alg_params"]
+        expected_variant = copy.deepcopy(base)
+        expected_variant["total_steps"] = 14_000_000
+        expected_variant["alg_params"]["wandb_tags"] = [
+            "14m-decisions" if tag == "1m-decisions" else tag
+            for tag in expected_variant["alg_params"]["wandb_tags"]
+        ]
+        expected_variant["alg_params"].update(kl_defaults)
+        expected_variant["alg_params"][
+            "outer_behavior_policy_kl_schedule"
+        ] = schedule
+        assert variant == expected_variant
 
         experiment = _load_json_strict(
             DMCONTROL_EXPERIMENTS / f"{name}.json"
         )
-        assert experiment["configs"] == [name]
-        assert {key: value for key, value in experiment.items() if key != "configs"} == {
-            key: value
-            for key, value in base_experiment.items()
-            if key != "configs"
-        }
+        expected_experiment = copy.deepcopy(base_experiment)
+        expected_experiment["configs"] = [name]
+        expected_experiment["overrides_alg"]["total_steps"] = 14_000_000
+        expected_experiment["study_note"] = study_note
+        assert experiment == expected_experiment
         assert experiment["env_params"]["task"] == "humanoid-walk"
         assert experiment["trials"] == 3
-        assert experiment["overrides_alg"]["total_steps"] == 1_000_000
+        assert experiment["overrides_alg"]["total_steps"] == 14_000_000
         assert experiment["checkpoint_every"] == 50_000
         assert variant["alg_params"]["eval_freq"] == 50_000
         assert variant["alg_params"]["eval_value"] is True

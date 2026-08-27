@@ -111,8 +111,8 @@ environments/dmcontrol/.venv/bin/python main.py \
 The Humanoid Walk MC-value base also has three paired analytic behavior-KL
 entry points under `configs/dmcontrol/experiments`: `ambi_anchor_kl_smooth`,
 `ambi_anchor_kl_quantile`, and `ambi_anchor_kl_dual`. They retain the same
-five-head `min_all`, reward-only critic configuration, three seeds, one-million
-decision budget, and value-evaluation/checkpoint cadence.
+five-head `min_all`, reward-only critic configuration, three seeds, 14-million
+decision budget, and value-evaluation cadence.
 
 The default observation is the same state representation used by TD-MPC2's
 single-task benchmarks: DMControl observation components are flattened in their
