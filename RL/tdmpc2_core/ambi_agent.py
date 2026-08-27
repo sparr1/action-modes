@@ -1776,9 +1776,22 @@ class AMBITDMPC2Agent(torch.nn.Module):
         alpha = self.alpha.detach()
         entropy_coefficient_loss = torch.zeros((), device=self.device)
         if self.ent_coef_optim is not None:
+            entropy_residual_per_time = (
+                policy_info["log_prob"] + self.target_entropy
+            ).detach().mean(dim=(1, 2))
+            # Match the actor's relative depth mixture without making the
+            # temperature step size depend on horizon-level loss scaling.
+            entropy_temporal_weights = self._actor_temporal_weights.to(
+                dtype=entropy_residual_per_time.dtype
+            )
+            entropy_temporal_weights = (
+                entropy_temporal_weights / entropy_temporal_weights.sum()
+            )
+            weighted_entropy_residual = (
+                entropy_residual_per_time * entropy_temporal_weights
+            ).sum()
             entropy_coefficient_loss = -(
-                self.log_ent_coef
-                * (policy_info["log_prob"] + self.target_entropy).detach()
+                self.log_ent_coef * weighted_entropy_residual
             ).mean()
             self.ent_coef_optim.zero_grad(set_to_none=True)
             entropy_coefficient_loss.backward()
