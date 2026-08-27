@@ -5,6 +5,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 AMBI_ROOT = ROOT / "configs/ambi"
 AMBI_ALGS = AMBI_ROOT / "algs"
+DMCONTROL_ROOT = ROOT / "configs/dmcontrol"
+DMCONTROL_ALGS = DMCONTROL_ROOT / "algs"
+DMCONTROL_EXPERIMENTS = DMCONTROL_ROOT / "experiments"
 
 LEGACY_STATIC_MOVE_MANIFESTS = (
     "AntMove",
@@ -118,6 +121,56 @@ def test_anchor_has_the_small_fixed_training_dose():
     assert params["inner_bootstrap_source"] == "inner_target"
     assert params["inner_critic_target_tau"] == 0.005
     assert params["inner_critic_target_update_interval"] == 1
+
+
+def test_behavior_kl_variants_change_only_the_approved_schedule_controls():
+    base_name = "ambi_humanoid_walk_base_min_all_reward_only_value_calibration"
+    base = _load_json_strict(DMCONTROL_ALGS / f"{base_name}.json")
+    base_experiment = _load_json_strict(
+        DMCONTROL_EXPERIMENTS / f"{base_name}.json"
+    )
+    kl_defaults = {
+        "outer_behavior_policy_kl_coef": 1.0,
+        "outer_behavior_policy_kl_min_valid_count": "auto",
+        "outer_behavior_policy_kl_ramp_updates": 10_000,
+        "outer_behavior_policy_kl_q_threshold": 2.0,
+        "outer_behavior_policy_kl_target": 0.1,
+        "outer_behavior_policy_kl_dual_init": 0.1,
+        "outer_behavior_policy_kl_dual_lr": 3e-4,
+        "outer_behavior_policy_kl_dual_max": 10.0,
+    }
+    variants = {
+        "ambi_anchor_kl_smooth": "smooth",
+        "ambi_anchor_kl_quantile": "quantile_gate",
+        "ambi_anchor_kl_dual": "dual",
+    }
+
+    for name, schedule in variants.items():
+        variant = _load_json_strict(DMCONTROL_ALGS / f"{name}.json")
+        assert {key: value for key, value in variant.items() if key != "alg_params"} == {
+            key: value for key, value in base.items() if key != "alg_params"
+        }
+        params = dict(variant["alg_params"])
+        assert params.pop("outer_behavior_policy_kl_schedule") == schedule
+        for key, expected in kl_defaults.items():
+            assert params.pop(key) == expected
+        assert params == base["alg_params"]
+
+        experiment = _load_json_strict(
+            DMCONTROL_EXPERIMENTS / f"{name}.json"
+        )
+        assert experiment["configs"] == [name]
+        assert {key: value for key, value in experiment.items() if key != "configs"} == {
+            key: value
+            for key, value in base_experiment.items()
+            if key != "configs"
+        }
+        assert experiment["env_params"]["task"] == "humanoid-walk"
+        assert experiment["trials"] == 3
+        assert experiment["overrides_alg"]["total_steps"] == 1_000_000
+        assert experiment["checkpoint_every"] == 50_000
+        assert variant["alg_params"]["eval_freq"] == 50_000
+        assert variant["alg_params"]["eval_value"] is True
 
 
 def test_all_manifests_are_single_seed_full_runs_and_resolve_configs():

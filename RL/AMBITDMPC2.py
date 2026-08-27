@@ -22,6 +22,7 @@ from utils.utils import setup_logs
 _Q_REDUCTIONS = {"min_pair", "mean_pair", "min_all", "mean_all"}
 _CRITIC_TARGETS = {"entropy_augmented", "reward_only"}
 _SAC_ACTOR_LOSS_SCALE_MODES = {"none", "tdmpc2_percentile_range"}
+_BEHAVIOR_POLICY_KL_SCHEDULES = {"none", "smooth", "quantile_gate", "dual"}
 _VALUE_EVAL_PROTOCOLS = {"paper_deterministic", "stochastic_bellman"}
 _ADAPTATION_MODES = {"frozen", "clone", "lora"}
 _LIFECYCLE_SCOPES = {"action", "episode", "run"}
@@ -46,6 +47,18 @@ _AMBI_DEFAULTS = {
     "inner_sac_critic_target": "entropy_augmented",
     "sac_actor_loss_scale_mode": "none",
     "sac_actor_loss_scale_tau": 0.01,
+    # Optional analytic reverse-KL from the outer actor to the replayed
+    # action-generating policy. ``none`` preserves the historical runtime and
+    # replay schema; active schedules require stochastic inner SAC execution.
+    "outer_behavior_policy_kl_schedule": "none",
+    "outer_behavior_policy_kl_coef": 1.0,
+    "outer_behavior_policy_kl_min_valid_count": "auto",
+    "outer_behavior_policy_kl_ramp_updates": 10_000,
+    "outer_behavior_policy_kl_q_threshold": 2.0,
+    "outer_behavior_policy_kl_target": 0.1,
+    "outer_behavior_policy_kl_dual_init": 0.1,
+    "outer_behavior_policy_kl_dual_lr": 3e-4,
+    "outer_behavior_policy_kl_dual_max": 10.0,
     "critic_coef": 1.0,
     "actor_lr": 3e-4,
     "critic_lr": 3e-4,
@@ -281,6 +294,17 @@ def _normalize_eval_value_protocols(value):
     return protocols
 
 
+def _strict_nonnegative_float(value, key):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise ValueError(f"{key} must be a finite non-negative number.")
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"{key} must be a finite non-negative number.")
+    return value
+
+
 def _strict_probability(value, key):
     if isinstance(value, (bool, np.bool_)) or not isinstance(
         value, (int, float, np.integer, np.floating)
@@ -464,6 +488,7 @@ class AMBITDMPC2(TDMPC2Baseline):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._pending_behavior_policy = None
         self._value_calibration_evaluator = None
         self._outer_policy_episode_eligible = False
         self._outer_policy_episode_selected = False
@@ -475,6 +500,100 @@ class AMBITDMPC2(TDMPC2Baseline):
         self._wandb_inner_steps = 0
         self._wandb_outer_policy_seconds = 0.0
         self._wandb_outer_policy_actions = 0
+
+    @property
+    def _stores_behavior_policy(self):
+        return bool(getattr(self.cfg, "store_behavior_policy", False))
+
+    def _allocate_episode_staging(self, capacity):
+        staging = super()._allocate_episode_staging(capacity)
+        if not self._stores_behavior_policy:
+            return staging
+        tensor_kwargs = {
+            "device": "cpu",
+            "pin_memory": self._pin_episode_staging,
+        }
+        staging["behavior_pre_tanh_mean"] = torch.empty(
+            (capacity, self.cfg.action_dim),
+            dtype=torch.float32,
+            **tensor_kwargs,
+        )
+        staging["behavior_log_std"] = torch.empty(
+            (capacity, self.cfg.action_dim),
+            dtype=torch.float32,
+            **tensor_kwargs,
+        )
+        staging["behavior_policy_valid"] = torch.empty(
+            (capacity,),
+            dtype=torch.bool,
+            **tensor_kwargs,
+        )
+        return staging
+
+    def _ensure_episode_staging_capacity(self, required):
+        if not self._stores_behavior_policy:
+            return super()._ensure_episode_staging_capacity(required)
+        if required <= len(self._episode_staging):
+            return
+        old = self._episode_staging
+        replacement = self._allocate_episode_staging(
+            max(required, 2 * len(old))
+        )
+        for key in old.keys():
+            replacement[key][: len(old)].copy_(old[key])
+        self._episode_staging = replacement
+
+    def _start_episode_staging(self, obs_t):
+        rows = super()._start_episode_staging(obs_t)
+        self._pending_behavior_policy = None
+        if self._stores_behavior_policy:
+            self._episode_staging["behavior_pre_tanh_mean"][0].zero_()
+            self._episode_staging["behavior_log_std"][0].zero_()
+            self._episode_staging["behavior_policy_valid"][0] = False
+        return rows
+
+    def _random_action_norm(self):
+        self._pending_behavior_policy = None
+        return super()._random_action_norm()
+
+    def _stage_transition(self, row, obs_t, action, reward, terminated):
+        super()._stage_transition(row, obs_t, action, reward, terminated)
+        if not self._stores_behavior_policy:
+            return
+        behavior_policy = self._pending_behavior_policy
+        self._pending_behavior_policy = None
+        if behavior_policy is None:
+            self._episode_staging["behavior_pre_tanh_mean"][row].zero_()
+            self._episode_staging["behavior_log_std"][row].zero_()
+            self._episode_staging["behavior_policy_valid"][row] = False
+            return
+        mean = torch.as_tensor(
+            behavior_policy["pre_tanh_mean"], dtype=torch.float32
+        ).reshape(self.cfg.action_dim)
+        log_std = torch.as_tensor(
+            behavior_policy["log_std"], dtype=torch.float32
+        ).reshape(self.cfg.action_dim)
+        if not bool(torch.isfinite(mean).all()) or not bool(
+            torch.isfinite(log_std).all()
+        ):
+            raise ValueError(
+                "Captured behavior-policy parameters must be finite."
+            )
+        self._episode_staging["behavior_pre_tanh_mean"][row].copy_(mean)
+        self._episode_staging["behavior_log_std"][row].copy_(log_std)
+        self._episode_staging["behavior_policy_valid"][row] = True
+
+    def _to_td(self, obs, action=None, reward=None, terminated=None):
+        td = super()._to_td(obs, action, reward, terminated)
+        if self._stores_behavior_policy:
+            td["behavior_pre_tanh_mean"] = torch.zeros(
+                (1, self.cfg.action_dim), dtype=torch.float32
+            )
+            td["behavior_log_std"] = torch.zeros(
+                (1, self.cfg.action_dim), dtype=torch.float32
+            )
+            td["behavior_policy_valid"] = torch.zeros((1,), dtype=torch.bool)
+        return td
 
     def _build_cfg(self, params):
         # Resolve the outer legacy alias before translating AMBI's separate
@@ -1083,6 +1202,95 @@ class AMBITDMPC2(TDMPC2Baseline):
                     f"{prefix}_noise_std requires "
                     f"{prefix}_action='mean_plus_gaussian'."
                 )
+
+        schedule = cfg.outer_behavior_policy_kl_schedule
+        if not isinstance(schedule, str):
+            raise ValueError(
+                "outer_behavior_policy_kl_schedule must be one of "
+                f"{sorted(_BEHAVIOR_POLICY_KL_SCHEDULES)}, got {schedule!r}."
+            )
+        schedule = schedule.lower()
+        if schedule not in _BEHAVIOR_POLICY_KL_SCHEDULES:
+            raise ValueError(
+                "outer_behavior_policy_kl_schedule must be one of "
+                f"{sorted(_BEHAVIOR_POLICY_KL_SCHEDULES)}, got {schedule!r}."
+            )
+        cfg.outer_behavior_policy_kl_schedule = schedule
+
+        cfg.outer_behavior_policy_kl_coef = _strict_nonnegative_float(
+            cfg.outer_behavior_policy_kl_coef,
+            "outer_behavior_policy_kl_coef",
+        )
+        cfg.outer_behavior_policy_kl_ramp_updates = _strict_positive_int(
+            cfg.outer_behavior_policy_kl_ramp_updates,
+            "outer_behavior_policy_kl_ramp_updates",
+        )
+        for key in (
+            "outer_behavior_policy_kl_q_threshold",
+            "outer_behavior_policy_kl_target",
+            "outer_behavior_policy_kl_dual_init",
+            "outer_behavior_policy_kl_dual_lr",
+            "outer_behavior_policy_kl_dual_max",
+        ):
+            setattr(cfg, key, _strict_nonnegative_float(getattr(cfg, key), key))
+        if cfg.outer_behavior_policy_kl_q_threshold <= 0.0:
+            raise ValueError(
+                "outer_behavior_policy_kl_q_threshold must be positive."
+            )
+        for key in (
+            "outer_behavior_policy_kl_dual_init",
+            "outer_behavior_policy_kl_dual_lr",
+            "outer_behavior_policy_kl_dual_max",
+        ):
+            if getattr(cfg, key) <= 0.0:
+                raise ValueError(f"{key} must be positive.")
+        if (
+            cfg.outer_behavior_policy_kl_dual_init
+            > cfg.outer_behavior_policy_kl_dual_max
+        ):
+            raise ValueError(
+                "outer_behavior_policy_kl_dual_init must not exceed "
+                "outer_behavior_policy_kl_dual_max."
+            )
+
+        min_valid_count = cfg.outer_behavior_policy_kl_min_valid_count
+        if isinstance(min_valid_count, str):
+            if min_valid_count.lower() != "auto":
+                raise ValueError(
+                    "outer_behavior_policy_kl_min_valid_count must be 'auto' "
+                    "or a positive integer."
+                )
+            min_valid_count = int(cfg.batch_size)
+        else:
+            min_valid_count = _strict_positive_int(
+                min_valid_count,
+                "outer_behavior_policy_kl_min_valid_count",
+            )
+        cfg.outer_behavior_policy_kl_min_valid_count = min_valid_count
+
+        if schedule in {"smooth", "quantile_gate"}:
+            if cfg.outer_behavior_policy_kl_coef <= 0.0:
+                raise ValueError(
+                    "outer_behavior_policy_kl_coef must be positive for the "
+                    f"{schedule!r} schedule."
+                )
+        if schedule != "none":
+            if cfg.inner_operator != "sac":
+                raise ValueError(
+                    "An active outer behavior-policy KL schedule requires "
+                    "inner_operator='sac'."
+                )
+            if (
+                cfg.inner_execution_action != "policy_sample"
+                or cfg.inner_execution_std_scale <= 0.0
+            ):
+                raise ValueError(
+                    "An active outer behavior-policy KL schedule requires "
+                    "stochastic inner execution with "
+                    "inner_execution_action='policy_sample' and "
+                    "inner_execution_std_scale > 0."
+                )
+        cfg.store_behavior_policy = schedule != "none"
         cfg.log_std_mapping = normalize_log_std_mapping(
             cfg.log_std_mapping, "log_std_mapping"
         )
@@ -1455,6 +1663,7 @@ class AMBITDMPC2(TDMPC2Baseline):
                 eval_pending=eval_pending,
             )
         finally:
+            self._pending_behavior_policy = None
             self._outer_policy_action_generator = None
             self._outer_policy_episode_selected = False
             self._outer_policy_episode_eligible = False
@@ -1466,6 +1675,19 @@ class AMBITDMPC2(TDMPC2Baseline):
                 raise RuntimeError(
                     "The selected outer-policy episode lacks its action generator."
                 )
+            if self._stores_behavior_policy:
+                if self._pending_behavior_policy is not None:
+                    raise RuntimeError(
+                        "Behavior-policy metadata from the previous action was "
+                        "not consumed."
+                    )
+                action, behavior_policy = self.agent.act_outer_policy(
+                    obs_t,
+                    generator=generator,
+                    return_behavior_policy=True,
+                )
+                self._pending_behavior_policy = behavior_policy
+                return action
             return self.agent.act_outer_policy(obs_t, generator=generator)
 
         # W&B records the resulting environment step, while action selection
@@ -1474,12 +1696,27 @@ class AMBITDMPC2(TDMPC2Baseline):
         collect_diagnostics = (
             sampling_step % int(self.cfg.inner_diagnostics_every) == 0
         )
-        action = self.agent.act(
-            obs_t,
-            t0=t0,
-            eval_mode=eval_mode,
-            collect_diagnostics=collect_diagnostics,
-        )
+        if self._stores_behavior_policy and not eval_mode:
+            if self._pending_behavior_policy is not None:
+                raise RuntimeError(
+                    "Behavior-policy metadata from the previous action was not "
+                    "consumed."
+                )
+            action, behavior_policy = self.agent.act(
+                obs_t,
+                t0=t0,
+                eval_mode=eval_mode,
+                collect_diagnostics=collect_diagnostics,
+                return_behavior_policy=True,
+            )
+            self._pending_behavior_policy = behavior_policy
+        else:
+            action = self.agent.act(
+                obs_t,
+                t0=t0,
+                eval_mode=eval_mode,
+                collect_diagnostics=collect_diagnostics,
+            )
         # The engine's action index is useful to direct callers, but training
         # telemetry must use the real environment step (including seed/random
         # actions) that researchers see on the W&B x-axis.
@@ -1593,6 +1830,10 @@ class AMBITDMPC2(TDMPC2Baseline):
             raise RuntimeError(
                 "AMBI training state requires an outer-policy episode boundary."
             )
+        if self._pending_behavior_policy is not None:
+            raise RuntimeError(
+                "AMBI training state requires consumed behavior-policy metadata."
+            )
         return {
             "schema": "ambi-wrapper-training-state",
             "version": 2,
@@ -1630,6 +1871,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         self._outer_policy_episode_eligible = False
         self._outer_policy_episode_selected = False
         self._outer_policy_action_generator = None
+        self._pending_behavior_policy = None
 
     def _record_action_metrics(self, *, planned, action_seconds):
         outer_policy_action = bool(

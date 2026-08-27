@@ -1344,6 +1344,7 @@ class InnerImprovementEngine:
         std_scale=1.0,
         noise_std=0.0,
         inner_bounds=True,
+        return_info=False,
     ):
         kwargs = {}
         if inner_bounds:
@@ -1353,7 +1354,7 @@ class InnerImprovementEngine:
                 log_std_max=self.cfg.inner_log_std_max,
             )
         if mode == "policy_sample":
-            if hasattr(self.model, "pi_action"):
+            if hasattr(self.model, "pi_action") and not return_info:
                 return self.model.pi_action(
                     z,
                     policy=policy,
@@ -2296,7 +2297,15 @@ class InnerImprovementEngine:
         return metrics
 
     @torch.no_grad()
-    def _execute_policy(self, root_z, policy, *, eval_mode, inner_bounds=True):
+    def _execute_policy(
+        self,
+        root_z,
+        policy,
+        *,
+        eval_mode,
+        inner_bounds=True,
+        return_info=False,
+    ):
         mode = "mean" if eval_mode else str(self.cfg.inner_execution_action)
         std_scale = float(self.cfg.inner_execution_std_scale)
         if mode == "policy_sample" and std_scale == 0.0:
@@ -2304,7 +2313,7 @@ class InnerImprovementEngine:
         was_training = policy.training
         policy.eval()
         with self.rng.fork("execution") as generator:
-            action, _ = self._policy_action(
+            action, info = self._policy_action(
                 root_z,
                 policy,
                 mode=mode,
@@ -2312,9 +2321,12 @@ class InnerImprovementEngine:
                 std_scale=max(std_scale, 1e-12),
                 noise_std=self.cfg.inner_execution_noise_std,
                 inner_bounds=inner_bounds,
+                return_info=return_info,
             )
         self.state.policy_evaluations += int(root_z.shape[0])
         policy.train(was_training)
+        if return_info:
+            return action, info
         return action
 
     @torch.no_grad()
@@ -2679,18 +2691,46 @@ class InnerImprovementEngine:
         metrics.update(self._compile_fallback_metrics())
         return metrics
 
-    def _act_none(self, root_z, *, eval_mode, start):
-        action = self._execute_policy(
+    def _act_none(
+        self,
+        root_z,
+        *,
+        eval_mode,
+        start,
+        return_behavior_policy=False,
+    ):
+        capture_behavior = bool(return_behavior_policy and not eval_mode)
+        executed = self._execute_policy(
             root_z,
             self.model._pi,
             eval_mode=eval_mode,
             inner_bounds=False,
+            return_info=capture_behavior,
         )
+        if capture_behavior:
+            action, execution_info = executed
+            behavior_policy = {
+                "pre_tanh_mean": execution_info["pre_tanh_mean"][0].detach(),
+                "log_std": execution_info["log_std"][0].detach(),
+            }
+        else:
+            action = executed
+            behavior_policy = None
         metrics = self._base_metrics(active=False)
         metrics["inner_policy_evaluations"] = 1.0
+        if return_behavior_policy:
+            return action[0], metrics, [], behavior_policy
         return action[0], metrics, []
 
-    def _act_rl(self, root_z, *, t0, eval_mode, start):
+    def _act_rl(
+        self,
+        root_z,
+        *,
+        t0,
+        eval_mode,
+        start,
+        return_behavior_policy=False,
+    ):
         cfg, state = self.cfg, self.state
         setup_start = self._timer_start()
         # LoRA adapter initialization uses ordinary PyTorch initializers; fork
@@ -2776,7 +2816,22 @@ class InnerImprovementEngine:
             update_slots += len(round_metrics)
 
         execution_start = self._timer_start()
-        action = self._execute_policy(root_z, state.actor, eval_mode=eval_mode)
+        capture_behavior = bool(return_behavior_policy and not eval_mode)
+        executed = self._execute_policy(
+            root_z,
+            state.actor,
+            eval_mode=eval_mode,
+            return_info=capture_behavior,
+        )
+        if capture_behavior:
+            action, execution_info = executed
+            behavior_policy = {
+                "pre_tanh_mean": execution_info["pre_tanh_mean"][0].detach(),
+                "log_std": execution_info["log_std"][0].detach(),
+            }
+        else:
+            action = executed
+            behavior_policy = None
         self._timer_stop("inner_execution_seconds", execution_start)
         if self._collect_diagnostics:
             diagnostic_start = self._timer_start()
@@ -2919,6 +2974,8 @@ class InnerImprovementEngine:
             lengths_host = length_values.detach()
         else:
             lengths_host = [int(cfg.inner_rollout_horizon)] * rollout_count
+        if return_behavior_policy:
+            return action[0], metrics, lengths_host, behavior_policy
         return action[0], metrics, lengths_host
 
     @torch.no_grad()
@@ -3043,7 +3100,15 @@ class InnerImprovementEngine:
         )
         return result.action, metrics, candidate_lengths + policy_lengths
 
-    def act(self, root_z, *, t0=False, eval_mode=False, collect_diagnostics=True):
+    def act(
+        self,
+        root_z,
+        *,
+        t0=False,
+        eval_mode=False,
+        collect_diagnostics=True,
+        return_behavior_policy=False,
+    ):
         self._pending_timers = {}
         start = self._timer_start()
         self.action_index += 1
@@ -3058,17 +3123,32 @@ class InnerImprovementEngine:
                 and int(self.cfg.inner_rounds) == 0
             )
             if inactive:
-                action, metrics, lengths = self._act_none(
-                    root_z, eval_mode=eval_mode, start=start
+                result = self._act_none(
+                    root_z,
+                    eval_mode=eval_mode,
+                    start=start,
+                    return_behavior_policy=return_behavior_policy,
                 )
+                if return_behavior_policy:
+                    action, metrics, lengths, behavior_policy = result
+                else:
+                    action, metrics, lengths = result
             elif operator == "mppi":
                 action, metrics, lengths = self._act_mppi(
                     root_z, t0=t0, eval_mode=eval_mode, start=start
                 )
             else:
-                action, metrics, lengths = self._act_rl(
-                    root_z, t0=t0, eval_mode=eval_mode, start=start
+                result = self._act_rl(
+                    root_z,
+                    t0=t0,
+                    eval_mode=eval_mode,
+                    start=start,
+                    return_behavior_policy=return_behavior_policy,
                 )
+                if return_behavior_policy:
+                    action, metrics, lengths, behavior_policy = result
+                else:
+                    action, metrics, lengths = result
 
             self._timer_stop("inner_action_seconds", start)
 
@@ -3079,4 +3159,8 @@ class InnerImprovementEngine:
             # Action-scoped tensors are explicitly released after producing
             # the action; episode/run scopes survive by configuration.
             self._clear_expired(t0=False, include_action=True)
+        if return_behavior_policy:
+            if operator != "sac":
+                behavior_policy = None
+            return action, metrics, lengths, behavior_policy
         return action, metrics, lengths

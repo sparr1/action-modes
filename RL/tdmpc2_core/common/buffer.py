@@ -9,6 +9,14 @@ from torchrl.data.replay_buffers.samplers import SliceSampler
 from .training_state import require_exact_keys
 
 
+_BEHAVIOR_POLICY_FIELDS = (
+	"behavior_pre_tanh_mean",
+	"behavior_log_std",
+	"behavior_policy_valid",
+)
+_BEHAVIOR_POLICY_REPLAY_SIGNATURE = "pre-tanh-diagonal-gaussian-v1"
+
+
 class Buffer():
 	"""
 	Replay buffer for TD-MPC2 training. Based on torchrl.
@@ -203,12 +211,28 @@ class Buffer():
 		self._track_episode_rows(len(td))
 		return self._num_eps
 
-	def _prepare_batch(self, td):
+	def _prepare_batch(self, td, *, include_behavior_policy=False):
 		"""
 		Prepare a sampled batch for training (post-processing).
 		Expects `td` to be a TensorDict with batch size TxB.
 		"""
-		td = td.select("obs", "action", "reward", "terminated", "task", strict=False).to(self._device, non_blocking=True)
+		if include_behavior_policy and not self._behavior_policy_enabled():
+			raise RuntimeError(
+				"Behavior-policy replay is not enabled for this buffer."
+			)
+		selected = ("obs", "action", "reward", "terminated", "task")
+		if include_behavior_policy:
+			selected += _BEHAVIOR_POLICY_FIELDS
+		td = td.select(*selected, strict=False).to(
+			self._device, non_blocking=True
+		)
+		if include_behavior_policy:
+			missing = set(_BEHAVIOR_POLICY_FIELDS).difference(td.keys())
+			if missing:
+				raise RuntimeError(
+					"Replay sample lacks behavior-policy fields: "
+					f"{sorted(missing)}."
+				)
 		obs = td.get('obs').contiguous()
 		action = td.get('action')[1:].contiguous()
 		reward = td.get('reward')[1:].unsqueeze(-1).contiguous()
@@ -220,14 +244,32 @@ class Buffer():
 		task = td.get('task', None)
 		if task is not None:
 			task = task[0].contiguous()
-		return obs, action, reward, terminated, task
+		batch = (obs, action, reward, terminated, task)
+		if not include_behavior_policy:
+			return batch
+		behavior_mean = td.get("behavior_pre_tanh_mean")[1:].contiguous()
+		behavior_log_std = td.get("behavior_log_std")[1:].contiguous()
+		behavior_valid = (
+			td.get("behavior_policy_valid")[1:].unsqueeze(-1).contiguous()
+		)
+		return batch + (behavior_mean, behavior_log_std, behavior_valid)
 
-	def sample(self):
+	def sample(self, *, include_behavior_policy=False):
 		"""Sample a batch of subsequences from the buffer."""
 		td = self._buffer.sample().view(
 			-1, self.cfg.train_unroll_horizon+1
 		).permute(1, 0)
+		if include_behavior_policy:
+			return self._prepare_batch(td, include_behavior_policy=True)
+		# Keep the historical one-argument seam used by tests and downstream
+		# instrumentation when behavior-policy replay is disabled.
 		return self._prepare_batch(td)
+
+	def _behavior_policy_enabled(self):
+		return bool(getattr(self.cfg, "store_behavior_policy", False))
+
+	def _training_state_version(self):
+		return 2 if self._behavior_policy_enabled() else 1
 
 	def _training_signature(self):
 		mode = str(getattr(self.cfg, "obs", "state"))
@@ -235,7 +277,7 @@ class Buffer():
 		observation_shape = None
 		if obs_shapes is not None:
 			observation_shape = list(obs_shapes[mode])
-		return {
+		signature = {
 			"capacity": int(self._capacity),
 			"batch_size": int(self.cfg.batch_size),
 			"train_unroll_horizon": int(self.cfg.train_unroll_horizon),
@@ -251,6 +293,11 @@ class Buffer():
 				else int(self.cfg.action_dim)
 			),
 		}
+		if self._behavior_policy_enabled():
+			signature["behavior_policy_replay"] = (
+				_BEHAVIOR_POLICY_REPLAY_SIGNATURE
+			)
+		return signature
 
 	def _configured_field_specs(self):
 		"""Return the fixed state-observation replay tensor contract."""
@@ -289,6 +336,26 @@ class Buffer():
 				"shape": [],
 				"dtype": "torch.int64",
 			}
+		if self._behavior_policy_enabled():
+			specs.update(
+				{
+					"behavior_pre_tanh_mean": {
+						"name": "behavior_pre_tanh_mean",
+						"shape": [action_dim],
+						"dtype": "torch.float32",
+					},
+					"behavior_log_std": {
+						"name": "behavior_log_std",
+						"shape": [action_dim],
+						"dtype": "torch.float32",
+					},
+					"behavior_policy_valid": {
+						"name": "behavior_policy_valid",
+						"shape": [],
+						"dtype": "torch.bool",
+					},
+				}
+			)
 		return specs
 
 	def _accounting_state(self):
@@ -342,6 +409,8 @@ class Buffer():
 		expected_fields = {"obs", "action", "reward", "terminated", "episode"}
 		if bool(self.cfg.multitask):
 			expected_fields.add("task")
+		if self._behavior_policy_enabled():
+			expected_fields.update(_BEHAVIOR_POLICY_FIELDS)
 		if set(fields) != expected_fields:
 			raise ValueError(
 				"Replay storage fields are incompatible with the state-observation "
@@ -392,7 +461,7 @@ class Buffer():
 				)
 		return {
 			"schema": "tdmpc2-replay-sharded-training-state",
-			"version": 1,
+			"version": self._training_state_version(),
 			"signature": self._training_signature(),
 			"storage_device": "cpu",
 			"initialized": initialized,
@@ -430,7 +499,7 @@ class Buffer():
 		stop = min(rows, start + max_rows)
 		return {
 			"schema": "tdmpc2-replay-shard",
-			"version": 1,
+			"version": self._training_state_version(),
 			"index": index,
 			"start": start,
 			"stop": stop,
@@ -462,7 +531,7 @@ class Buffer():
 		)
 		if (
 			metadata["schema"] != "tdmpc2-replay-sharded-training-state"
-			or metadata["version"] != 1
+			or metadata["version"] != self._training_state_version()
 		):
 			raise ValueError("Unsupported TD-MPC2 sharded replay version.")
 		if metadata["signature"] != self._training_signature():
@@ -559,7 +628,10 @@ class Buffer():
 				{"schema", "version", "index", "start", "stop", "fields"},
 				f"replay shard {expected_index}",
 			)
-			if shard["schema"] != "tdmpc2-replay-shard" or shard["version"] != 1:
+			if (
+				shard["schema"] != "tdmpc2-replay-shard"
+				or shard["version"] != metadata["version"]
+			):
 				raise ValueError("Unsupported replay shard schema/version.")
 			if shard["index"] != expected_index or shard["start"] != expected_start:
 				raise ValueError("Replay shards are missing, duplicated, or out of order.")

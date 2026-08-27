@@ -90,7 +90,7 @@ diverge. Oscar scratch and job-local storage are not substitutes for the
 durable checkpoint root.
 
 The compact AMBI branch-count and imagination-horizon suite lives under
-`configs/ambi/`. Each of its five algorithm files has one matching runnable
+`configs/ambi/`. Each algorithm file has one matching runnable
 manifest under `configs/ambi/experiments/`; the anchor entry point is
 `configs/ambi/experiments/ambi_anchor.json`, used with
 `--alg-dir configs/ambi/algs`.
@@ -107,6 +107,12 @@ environments/dmcontrol/.venv/bin/python main.py \
   --run configs/dmcontrol/experiments/walker_walk_state.json \
   --alg-dir configs/dmcontrol/algs
 ```
+
+The Humanoid Walk MC-value base also has three paired analytic behavior-KL
+entry points under `configs/dmcontrol/experiments`: `ambi_anchor_kl_smooth`,
+`ambi_anchor_kl_quantile`, and `ambi_anchor_kl_dual`. They retain the same
+five-head `min_all`, reward-only critic configuration, three seeds, one-million
+decision budget, and value-evaluation/checkpoint cadence.
 
 The default observation is the same state representation used by TD-MPC2's
 single-task benchmarks: DMControl observation components are flattened in their
