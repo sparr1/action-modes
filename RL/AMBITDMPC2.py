@@ -195,6 +195,13 @@ _AMBI_DEFAULTS = {
     "eval_value_samples": 100,
     "eval_value_seed": 12345,
     "eval_value_protocols": ["paper_deterministic", "stochastic_bellman"],
+
+    # Optional Figure-2-style paired controller evaluation.  The probe runs
+    # on isolated environments and is disabled by default because a fresh
+    # inner solve at every evaluation state is intentionally expensive.
+    "eval_inner_comparison": False,
+    "eval_inner_comparison_episodes": 5,
+    "eval_inner_comparison_seed": 12345,
 }
 
 
@@ -496,6 +503,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         super().__init__(*args, **kwargs)
         self._pending_behavior_policy = None
         self._value_calibration_evaluator = None
+        self._paired_controller_evaluator = None
         self._outer_policy_episode_eligible = False
         self._outer_policy_episode_selected = False
         self._outer_policy_action_generator = None
@@ -1496,6 +1504,18 @@ class AMBITDMPC2(TDMPC2Baseline):
         cfg.eval_value_protocols = _normalize_eval_value_protocols(
             cfg.eval_value_protocols
         )
+        cfg.eval_inner_comparison = _strict_bool(
+            cfg.eval_inner_comparison,
+            "eval_inner_comparison",
+        )
+        cfg.eval_inner_comparison_episodes = _strict_positive_int(
+            cfg.eval_inner_comparison_episodes,
+            "eval_inner_comparison_episodes",
+        )
+        cfg.eval_inner_comparison_seed = _strict_nonnegative_int(
+            cfg.eval_inner_comparison_seed,
+            "eval_inner_comparison_seed",
+        )
         if cfg.value_equivalence_diagnostics and cfg.inner_operator != "sac":
             raise ValueError(
                 "value_equivalence_diagnostics requires inner_operator='sac'."
@@ -1519,6 +1539,46 @@ class AMBITDMPC2(TDMPC2Baseline):
                 raise ValueError(
                     "paper_deterministic value evaluation requires q_pair_size=2."
                 )
+        if cfg.eval_inner_comparison:
+            if cfg.eval_freq is None:
+                raise ValueError(
+                    "eval_inner_comparison=true requires a configured eval_freq."
+                )
+            if cfg.obs != "state":
+                raise ValueError(
+                    "eval_inner_comparison=true currently supports state "
+                    "observations only."
+                )
+            if cfg.inner_operator != "sac":
+                raise ValueError(
+                    "eval_inner_comparison=true requires inner_operator='sac'."
+                )
+            if int(cfg.inner_rounds) <= 0:
+                raise ValueError(
+                    "eval_inner_comparison=true requires an active inner SAC "
+                    "solve with inner_rounds>0."
+                )
+            if cfg.inner_diagnostic_rollouts != 0:
+                raise ValueError(
+                    "eval_inner_comparison=true requires "
+                    "inner_diagnostic_rollouts=0 so its root diagnostic is the "
+                    "fixed-target action-Q comparison only."
+                )
+            comparison_scopes = (
+                "inner_actor_scope",
+                "inner_critic_scope",
+                "inner_temperature_scope",
+                "inner_replay_scope",
+                "inner_actor_optimizer_scope",
+                "inner_critic_optimizer_scope",
+                "inner_temperature_optimizer_scope",
+            )
+            for key in comparison_scopes:
+                if getattr(cfg, key) != "action":
+                    raise ValueError(
+                        "eval_inner_comparison=true requires fresh action-local "
+                        f"inner state; {key} must be 'action'."
+                    )
         cfg.compile_strict = bool(cfg.compile_strict)
 
         cfg.inner_termination_threshold = _finite_float(
@@ -1640,20 +1700,81 @@ class AMBITDMPC2(TDMPC2Baseline):
             device=self.agent.device,
         )
 
+    def _make_paired_controller_evaluator(self):
+        from RL.tdmpc2_core.paired_controller_evaluation import (
+            PairedControllerEvaluator,
+        )
+        from utils.core import build_env
+
+        return PairedControllerEvaluator(
+            agent=self.agent,
+            env_factory=lambda: build_env(
+                self.run_params,
+                self.experiment_params,
+                render_mode=None,
+            ),
+            observation_to_tensor=self._obs_to_tensor,
+            unscale_action=self._unscale_action,
+            episodes=int(self.cfg.eval_inner_comparison_episodes),
+            seed=int(self.cfg.eval_inner_comparison_seed),
+            device=self.agent.device,
+        )
+
     def _evaluation_payload_extras(self, step):
-        if not self.cfg.eval_value:
-            return {}
-        if self._value_calibration_evaluator is None:
-            self._value_calibration_evaluator = (
-                self._make_value_calibration_evaluator()
-            )
-        return self._value_calibration_evaluator.evaluate()
+        del step
+        extras = {}
+        if bool(getattr(self.cfg, "eval_value", False)):
+            if self._value_calibration_evaluator is None:
+                self._value_calibration_evaluator = (
+                    self._make_value_calibration_evaluator()
+                )
+            value_extras = self._value_calibration_evaluator.evaluate()
+            if not isinstance(value_extras, Mapping):
+                raise TypeError(
+                    "The value-calibration evaluator must return a mapping."
+                )
+            extras.update(value_extras)
+
+        if bool(getattr(self.cfg, "eval_inner_comparison", False)):
+            if self._paired_controller_evaluator is None:
+                self._paired_controller_evaluator = (
+                    self._make_paired_controller_evaluator()
+                )
+            paired_extras = self._paired_controller_evaluator.evaluate()
+            if not isinstance(paired_extras, Mapping):
+                raise TypeError(
+                    "The paired-controller evaluator must return a mapping."
+                )
+            collisions = set(extras).intersection(paired_extras)
+            if collisions:
+                raise RuntimeError(
+                    "Evaluation probes emitted duplicate metrics: "
+                    f"{sorted(collisions)}."
+                )
+            extras.update(paired_extras)
+        return extras
 
     def close(self):
-        evaluator = self._value_calibration_evaluator
+        value_evaluator = getattr(self, "_value_calibration_evaluator", None)
+        paired_evaluator = getattr(self, "_paired_controller_evaluator", None)
         self._value_calibration_evaluator = None
-        if evaluator is not None:
-            evaluator.close()
+        self._paired_controller_evaluator = None
+        first_error = None
+        for evaluator in (value_evaluator, paired_evaluator):
+            if evaluator is None:
+                continue
+            try:
+                evaluator.close()
+            except BaseException as exc:  # Both auxiliary evaluators still close.
+                if first_error is None:
+                    first_error = exc
+                elif hasattr(first_error, "add_note"):
+                    first_error.add_note(
+                        "A second auxiliary evaluator also failed to close: "
+                        f"{exc!r}"
+                    )
+        if first_error is not None:
+            raise first_error
 
     def _evaluate_policy(self, step, *, initial_obs=None):
         """Evaluate on an isolated copy of AMBI's persistent inner state.

@@ -1191,21 +1191,42 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self,
         obs,
         *,
-        generator,
+        generator=None,
+        deterministic=False,
         return_behavior_policy=False,
     ):
-        """Sample the online outer actor without entering the AMBI inner engine."""
-        if not isinstance(generator, torch.Generator):
-            raise TypeError("generator must be a torch.Generator.")
-        generator_device = torch.device(generator.device)
-        expected_device = self.device if self.device.type == "cuda" else torch.device("cpu")
-        if generator_device.type != expected_device.type or (
-            generator_device.type == "cuda"
-            and generator_device.index not in {None, expected_device.index}
-        ):
-            raise ValueError(
-                "The outer-policy generator must be on the AMBI agent device."
+        """Act with the online outer actor without entering the inner engine.
+
+        Training interventions retain their historical stochastic behavior and
+        require an episode-private generator.  Observational evaluation can
+        instead request the deterministic policy mean without supplying or
+        advancing a generator.
+        """
+        if not isinstance(deterministic, bool):
+            raise TypeError("deterministic must be bool.")
+        if deterministic:
+            if generator is not None:
+                raise ValueError(
+                    "Deterministic outer-policy actions do not accept a generator."
+                )
+        else:
+            if not isinstance(generator, torch.Generator):
+                raise TypeError(
+                    "Stochastic outer-policy actions require a torch.Generator."
+                )
+            generator_device = torch.device(generator.device)
+            expected_device = (
+                self.device
+                if self.device.type == "cuda"
+                else torch.device("cpu")
             )
+            if generator_device.type != expected_device.type or (
+                generator_device.type == "cuda"
+                and generator_device.index not in {None, expected_device.index}
+            ):
+                raise ValueError(
+                    "The outer-policy generator must be on the AMBI agent device."
+                )
 
         self.last_inner_metrics = {}
         self.last_inner_rollout_lengths = []
@@ -1231,13 +1252,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 if return_behavior_policy:
                     action, policy_info = self.model.pi(
                         root_z,
-                        deterministic=False,
+                        deterministic=deterministic,
                         generator=generator,
                     )
                 else:
                     action = self.model.pi_action(
                         root_z,
-                        deterministic=False,
+                        deterministic=deterministic,
                         generator=generator,
                     )
         finally:

@@ -238,6 +238,32 @@ class InnerImprovementEngine:
         # untouched and ordinary action/episode resets retain their cache.
         self._initialize_compile_regions()
 
+    def reset_for_evaluation(self, seed):
+        """Reset an evaluation-only engine without rebuilding compile regions.
+
+        Paired controller evaluation reuses one engine that is never the live
+        training engine.  Each evaluation episode must nevertheless begin from
+        a fresh root-local workspace and an episode-private RNG stream.  Keep
+        the compiled callables intact so a fixed evaluation bank does not pay
+        compilation setup once per episode.
+        """
+
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise ValueError("Evaluation inner-engine seed must be non-negative.")
+        if self.rng._action_fork_depth != 0:
+            raise RuntimeError(
+                "Cannot reset the evaluation inner engine during an active action."
+            )
+        self.state = InnerWorkspace()
+        self._action_pool = InnerWorkspace()
+        self.rng = InnerRNG(seed, self.device)
+        self.action_index = 0
+        self.episode_index = 0
+        self._mppi_prev_mean = None
+        self._collect_diagnostics = True
+        self._pending_timers = {}
+        return self
+
     def _timer_start(self):
         if self.device.type == "cuda":
             event = torch.cuda.Event(enable_timing=True)

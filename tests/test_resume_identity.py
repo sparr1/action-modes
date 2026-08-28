@@ -45,6 +45,45 @@ def test_scientific_projection_excludes_only_the_segment_eval_destination():
     )
 
 
+def test_ambi_inner_comparison_defaults_canonicalize_scientific_lineage():
+    omitted = {
+        "alg": "AMBITDMPC2/AMBITDMPC2",
+        "seed": 7,
+        "alg_params": {"batch_size": 256},
+    }
+    explicit = {
+        **omitted,
+        "alg_params": {
+            **omitted["alg_params"],
+            "eval_inner_comparison": False,
+            "eval_inner_comparison_episodes": 5,
+            "eval_inner_comparison_seed": 12345,
+        },
+    }
+
+    omitted_projection = scientific_trial_parameters(omitted)
+    assert omitted_projection == scientific_trial_parameters(explicit)
+    assert omitted_projection["alg_params"] == {
+        "batch_size": 256,
+        "eval_inner_comparison": False,
+        "eval_inner_comparison_episodes": 5,
+        "eval_inner_comparison_seed": 12345,
+        "inner_actor_writeback_coef": 0.0,
+        "inner_critic_writeback_coef": 0.0,
+    }
+
+    for field, value in (
+        ("eval_inner_comparison", True),
+        ("eval_inner_comparison_episodes", 6),
+        ("eval_inner_comparison_seed", 12346),
+    ):
+        changed = {
+            **explicit,
+            "alg_params": {**explicit["alg_params"], field: value},
+        }
+        assert scientific_trial_parameters(changed) != omitted_projection
+
+
 def test_sac_actor_loss_scale_fields_change_lineage_fingerprint(monkeypatch):
     monkeypatch.setattr(
         resume_identity,

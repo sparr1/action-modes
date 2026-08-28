@@ -193,6 +193,79 @@ def _assert_tree_equal(actual, expected):
         assert actual == expected
 
 
+def test_evaluation_reset_freshens_state_and_private_rng_without_recompiling():
+    model = _model()
+    engine = model.agent.inner_engine
+    old_state = engine.state
+    old_action_pool = engine._action_pool
+    old_rng = engine.rng
+    compile_regions = engine._compile_regions
+    compile_region_ids = {
+        name: id(region) for name, region in compile_regions.items()
+    }
+
+    engine.state.actor = model.agent.model._pi
+    engine._action_pool.critic = model.agent.model._Qs
+    engine.action_index = 9
+    engine.episode_index = 4
+    engine._mppi_prev_mean = torch.ones(1, 1, model.cfg.action_dim)
+    engine._collect_diagnostics = False
+    engine._pending_timers = {"rollout": object()}
+    torch.rand(4, generator=engine.rng.generator("execution"))
+    torch.rand(4, generator=engine.rng.phase_generators["execution"])
+
+    global_rng = torch.random.get_rng_state().clone()
+    assert engine.reset_for_evaluation(919) is engine
+
+    assert engine.state is not old_state
+    assert engine.state.__dict__ == type(engine.state)().__dict__
+    assert engine._action_pool is not old_action_pool
+    assert engine._action_pool.__dict__ == type(engine._action_pool)().__dict__
+    assert engine.rng is not old_rng
+    expected_rng = type(engine.rng)(919, engine.device)
+    _assert_tree_equal(
+        engine.rng.training_state_dict(), expected_rng.training_state_dict()
+    )
+    assert engine.action_index == 0
+    assert engine.episode_index == 0
+    assert engine._mppi_prev_mean is None
+    assert engine._collect_diagnostics is True
+    assert engine._pending_timers == {}
+    assert engine._compile_regions is compile_regions
+    assert {
+        name: id(region) for name, region in engine._compile_regions.items()
+    } == compile_region_ids
+
+    first_draw = torch.rand(5, generator=engine.rng.generator("execution"))
+    engine.reset_for_evaluation(919)
+    second_draw = torch.rand(5, generator=engine.rng.generator("execution"))
+    torch.testing.assert_close(second_draw, first_draw, rtol=0, atol=0)
+    torch.testing.assert_close(
+        torch.random.get_rng_state(), global_rng, rtol=0, atol=0
+    )
+    assert engine._compile_regions is compile_regions
+    assert {
+        name: id(region) for name, region in engine._compile_regions.items()
+    } == compile_region_ids
+
+
+def test_evaluation_reset_rejects_active_action_without_mutating_engine():
+    model = _model()
+    engine = model.agent.inner_engine
+    state = engine.state
+    action_pool = engine._action_pool
+    rng = engine.rng
+    compile_regions = engine._compile_regions
+
+    with engine.rng.action_fork():
+        with pytest.raises(RuntimeError, match="during an active action"):
+            engine.reset_for_evaluation(23)
+        assert engine.state is state
+        assert engine._action_pool is action_pool
+        assert engine.rng is rng
+        assert engine._compile_regions is compile_regions
+
+
 @pytest.mark.parametrize(
     ("representation", "num_q"),
     [("scalar", 2), ("distributional", 5)],

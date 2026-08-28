@@ -235,6 +235,9 @@ _RUNTIME_CONFIG_FIELDS = (
     "eval_value_samples",
     "eval_value_seed",
     "eval_value_protocols",
+    "eval_inner_comparison",
+    "eval_inner_comparison_episodes",
+    "eval_inner_comparison_seed",
     "outer_policy_episode_probability",
     "train_unroll_horizon",
     "outer_planning_horizon",
@@ -494,6 +497,9 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
             "eval_value_samples",
             "eval_value_seed",
             "eval_value_protocols",
+            "eval_inner_comparison",
+            "eval_inner_comparison_episodes",
+            "eval_inner_comparison_seed",
         )
         if key in resolved
     }

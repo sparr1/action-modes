@@ -416,3 +416,54 @@ anything other than the shared exact 21-point grid. It writes one 2x2 PNG, PDF,
 and combined aggregate CSV. The paper-facing quantities are `eval/mc_value`,
 `eval/q_value`, and `eval/q_minus_mc`; the separately prefixed
 `eval/stochastic_*` outputs provide the Bellman-matched secondary analysis.
+
+### Figure 2 paired-controller protocol
+
+The online paired-controller probe measures whether action-local inner
+optimization improves control in the real environment. For each evaluation
+episode it resets independent auxiliary environments with the same explicit
+seed, then compares deterministic outer-only control against deterministic
+execution after a fresh inner SAC solve at every visited state. The primary
+quantity is the episode-paired fresh-inner-minus-outer return; the fixed-target
+root-Q action gain collected along the fresh-inner trajectory is a
+model-predicted diagnostic, not a substitute for that real return difference.
+Positive predicted gain with a negative real return delta is evidence of
+critic/model optimism or compounded distribution shift.
+
+Enable the observational probe with:
+
+```json
+{
+  "eval_inner_comparison": true,
+  "eval_inner_comparison_episodes": 5,
+  "eval_inner_comparison_seed": 12345,
+  "inner_diagnostic_rollouts": 0
+}
+```
+
+Zero diagnostic rollouts retains the fixed-target root-Q comparison without
+adding imagined diagnostic trajectories. The probe shares the frozen outer
+model read-only, disables inner writeback, and restores private inner and
+global RNG state; it does not touch the training environment or replay. Its
+numeric outputs merge into the ordinary evaluation event. Figure-facing
+uncertainty must be aggregated across the three independent training seeds;
+within-event episode dispersion and correlated per-state Q gains are only
+diagnostics.
+
+The paired real-control curves are
+`eval/paired_outer_episode_reward` and
+`eval/paired_fresh_inner_episode_reward`; their episode-paired difference is
+`eval/paired_fresh_inner_minus_outer`. Population standard deviations and the
+strict inner-win fraction are logged beside them. The complete fixed-critic
+root distribution uses the
+`eval/paired_fresh_inner_fixed_target_q_action_gain` stem (count, mean,
+population standard deviation, extrema, linear 5/25/50/75/95 percentiles, and
+positive fraction). Optimization-only model steps per action and control time
+with diagnostic time removed are logged separately from the observational
+diagnostic cost and total paired-evaluation wall time.
+
+The three `ambi_anchor_kl_{smooth,quantile,dual}` Humanoid Walk manifests run
+this five-episode protocol at the existing 50,000-decision cadence alongside
+Figure 1 value calibration. Their paired-controller settings are observational;
+after removing those settings and their W&B labels, the only learning-axis
+differences from the base are the declared replay behavior-policy-KL controls.

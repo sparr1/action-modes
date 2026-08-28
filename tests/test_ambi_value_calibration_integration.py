@@ -44,9 +44,9 @@ class _FakeRun:
         self.calls.append((int(step), dict(payload)))
 
 
-def _resolved_ambi_cfg(**overrides):
+def _resolved_ambi_cfg(*, config_env=None, **overrides):
     algorithm = object.__new__(AMBITDMPC2)
-    algorithm.env = gym.make("Pendulum-v1", max_episode_steps=5)
+    algorithm.env = config_env or gym.make("Pendulum-v1", max_episode_steps=5)
     algorithm.run_params = {
         "seed": 3,
         "device": "cpu",
@@ -156,6 +156,9 @@ def test_value_calibration_defaults_are_disabled_and_explicit():
         "paper_deterministic",
         "stochastic_bellman",
     ]
+    assert cfg.eval_inner_comparison is False
+    assert cfg.eval_inner_comparison_episodes == 5
+    assert cfg.eval_inner_comparison_seed == 12345
 
 
 def test_value_calibration_valid_reward_only_configuration_resolves():
@@ -168,6 +171,103 @@ def test_value_calibration_valid_reward_only_configuration_resolves():
 
     assert cfg.eval_value is True
     assert cfg.eval_freq == 50_000
+
+
+def test_inner_comparison_valid_configuration_resolves():
+    cfg = _resolved_ambi_cfg(
+        eval_inner_comparison=True,
+        eval_inner_comparison_episodes=7,
+        eval_inner_comparison_seed=24680,
+        eval_freq=50_000,
+    )
+
+    assert cfg.eval_inner_comparison is True
+    assert cfg.eval_inner_comparison_episodes == 7
+    assert cfg.eval_inner_comparison_seed == 24680
+    assert cfg.eval_freq == 50_000
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"eval_inner_comparison": 1}, "must be a boolean"),
+        ({"eval_inner_comparison_episodes": 0}, "positive integer"),
+        ({"eval_inner_comparison_episodes": True}, "positive integer"),
+        ({"eval_inner_comparison_seed": -1}, "non-negative integer"),
+        ({"eval_inner_comparison_seed": True}, "non-negative integer"),
+        ({"eval_inner_comparison": True}, "configured eval_freq"),
+        (
+            {"eval_inner_comparison": True, "eval_freq": 0},
+            "eval_freq",
+        ),
+        (
+            {
+                "eval_inner_comparison": True,
+                "eval_freq": 1,
+                "inner_operator": "td3",
+            },
+            "inner_operator='sac'",
+        ),
+        (
+            {
+                "eval_inner_comparison": True,
+                "eval_freq": 1,
+                "inner_rounds": 0,
+            },
+            "inner_rounds>0",
+        ),
+        (
+            {
+                "eval_inner_comparison": True,
+                "eval_freq": 1,
+                "inner_diagnostic_rollouts": 1,
+            },
+            "inner_diagnostic_rollouts=0",
+        ),
+    ],
+)
+def test_inner_comparison_configuration_fails_closed(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _resolved_ambi_cfg(**overrides)
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        "inner_actor_scope",
+        "inner_critic_scope",
+        "inner_temperature_scope",
+        "inner_replay_scope",
+        "inner_actor_optimizer_scope",
+        "inner_critic_optimizer_scope",
+        "inner_temperature_optimizer_scope",
+    ],
+)
+def test_inner_comparison_requires_every_scope_to_be_action_local(scope):
+    with pytest.raises(ValueError, match=scope):
+        _resolved_ambi_cfg(
+            eval_inner_comparison=True,
+            eval_freq=1,
+            **{scope: "episode"},
+        )
+
+
+def test_inner_comparison_rejects_rgb_observations():
+    env = _OneStepEnv()
+    env.observation_space = gym.spaces.Box(
+        0,
+        255,
+        shape=(9, 64, 64),
+        dtype=np.uint8,
+    )
+
+    with pytest.raises(ValueError, match="supports state observations only"):
+        _resolved_ambi_cfg(
+            config_env=env,
+            eval_inner_comparison=True,
+            eval_freq=1,
+            obs="rgb",
+        )
 
 
 @pytest.mark.parametrize(
@@ -256,40 +356,122 @@ def test_evaluation_payload_rejects_reserved_metric_collisions():
         model._record_evaluation(0, 1.0, extras={"env_step": 4.0})
 
 
-def test_ambi_value_evaluator_is_lazy_reused_and_closed_idempotently():
+def test_ambi_evaluators_are_lazy_merged_reused_and_closed_idempotently():
     class Evaluator:
-        def __init__(self):
+        def __init__(self, metrics):
+            self.metrics = metrics
             self.evaluate_calls = 0
             self.close_calls = 0
 
         def evaluate(self):
             self.evaluate_calls += 1
-            return {"eval/mc_value": 3.0}
+            return dict(self.metrics)
 
         def close(self):
             self.close_calls += 1
 
     algorithm = object.__new__(AMBITDMPC2)
-    algorithm.cfg = SimpleNamespace(eval_value=False)
+    algorithm.cfg = SimpleNamespace(
+        eval_value=False,
+        eval_inner_comparison=False,
+    )
     algorithm._value_calibration_evaluator = None
+    algorithm._paired_controller_evaluator = None
     algorithm._make_value_calibration_evaluator = lambda: pytest.fail(
+        "disabled diagnostics must not construct an evaluator"
+    )
+    algorithm._make_paired_controller_evaluator = lambda: pytest.fail(
         "disabled diagnostics must not construct an evaluator"
     )
     assert algorithm._evaluation_payload_extras(0) == {}
 
-    evaluator = Evaluator()
+    value_evaluator = Evaluator({"eval/mc_value": 3.0})
+    paired_evaluator = Evaluator({"eval/inner_return_delta": 1.5})
+    constructions = []
+
+    def make_value_evaluator():
+        constructions.append("value")
+        return value_evaluator
+
+    def make_paired_evaluator():
+        constructions.append("paired")
+        return paired_evaluator
+
     algorithm.cfg.eval_value = True
-    algorithm._make_value_calibration_evaluator = lambda: evaluator
-    assert algorithm._evaluation_payload_extras(0) == {"eval/mc_value": 3.0}
-    assert algorithm._evaluation_payload_extras(50_000) == {
-        "eval/mc_value": 3.0
+    algorithm.cfg.eval_inner_comparison = True
+    algorithm._make_value_calibration_evaluator = make_value_evaluator
+    algorithm._make_paired_controller_evaluator = make_paired_evaluator
+    expected = {
+        "eval/mc_value": 3.0,
+        "eval/inner_return_delta": 1.5,
     }
-    assert evaluator.evaluate_calls == 2
+    assert algorithm._evaluation_payload_extras(0) == expected
+    assert algorithm._evaluation_payload_extras(50_000) == expected
+    assert constructions == ["value", "paired"]
+    assert value_evaluator.evaluate_calls == 2
+    assert paired_evaluator.evaluate_calls == 2
 
     algorithm.close()
     algorithm.close()
-    assert evaluator.close_calls == 1
+    assert value_evaluator.close_calls == 1
+    assert paired_evaluator.close_calls == 1
     assert algorithm._value_calibration_evaluator is None
+    assert algorithm._paired_controller_evaluator is None
+
+
+def test_ambi_evaluation_payload_rejects_duplicate_probe_metrics():
+    class Evaluator:
+        def evaluate(self):
+            return {"eval/shared_metric": 1.0}
+
+        def close(self):
+            pass
+
+    algorithm = object.__new__(AMBITDMPC2)
+    algorithm.cfg = SimpleNamespace(
+        eval_value=True,
+        eval_inner_comparison=True,
+    )
+    algorithm._value_calibration_evaluator = None
+    algorithm._paired_controller_evaluator = None
+    algorithm._make_value_calibration_evaluator = Evaluator
+    algorithm._make_paired_controller_evaluator = Evaluator
+
+    with pytest.raises(RuntimeError, match="duplicate metrics") as error:
+        algorithm._evaluation_payload_extras(0)
+
+    assert "eval/shared_metric" in str(error.value)
+    algorithm.close()
+
+
+def test_ambi_close_attempts_both_evaluators_when_the_first_raises():
+    class CloseSignal(BaseException):
+        pass
+
+    class Evaluator:
+        def __init__(self, error=None):
+            self.error = error
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            if self.error is not None:
+                raise self.error
+
+    value_evaluator = Evaluator(CloseSignal("value close interrupted"))
+    paired_evaluator = Evaluator()
+    algorithm = object.__new__(AMBITDMPC2)
+    algorithm._value_calibration_evaluator = value_evaluator
+    algorithm._paired_controller_evaluator = paired_evaluator
+
+    with pytest.raises(CloseSignal, match="value close interrupted"):
+        algorithm.close()
+
+    assert value_evaluator.close_calls == 1
+    assert paired_evaluator.close_calls == 1
+    assert algorithm._value_calibration_evaluator is None
+    assert algorithm._paired_controller_evaluator is None
+    algorithm.close()
 
 
 def test_real_ambi_outer_probe_preserves_complete_agent_and_training_state(

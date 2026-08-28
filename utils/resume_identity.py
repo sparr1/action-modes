@@ -40,6 +40,9 @@ _AMBI_ALGORITHM = "AMBITDMPC2/AMBITDMPC2"
 _AMBI_RESOLVED_IDENTITY_DEFAULTS = {
     "inner_actor_writeback_coef": 0.0,
     "inner_critic_writeback_coef": 0.0,
+    "eval_inner_comparison": False,
+    "eval_inner_comparison_episodes": 5,
+    "eval_inner_comparison_seed": 12345,
 }
 
 
@@ -155,12 +158,20 @@ def scientific_trial_parameters(
         for field in _OPERATIONAL_ALGORITHM_FIELDS:
             algorithm.pop(field, None)
         if projected.get("alg") == _AMBI_ALGORITHM:
-            # These opt-in controls are resolved by AMBI even when omitted.
-            # Canonicalize them here as floats so an omitted/default zero and
-            # an explicit numeric zero describe the same scientific lineage.
+            # These controls are resolved by AMBI even when omitted. Preserve
+            # each default's scalar kind so omitted and explicit defaults
+            # describe the same scientific lineage.
             for field, default in _AMBI_RESOLVED_IDENTITY_DEFAULTS.items():
                 value = algorithm.get(field, default)
-                if isinstance(
+                if isinstance(default, bool) and isinstance(
+                    value, (bool, np.bool_)
+                ):
+                    value = bool(value)
+                elif isinstance(default, int) and isinstance(
+                    value, (int, np.integer)
+                ) and not isinstance(value, (bool, np.bool_)):
+                    value = int(value)
+                elif isinstance(default, float) and isinstance(
                     value, (int, float, np.integer, np.floating)
                 ) and not isinstance(value, (bool, np.bool_)):
                     value = float(value)

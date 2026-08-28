@@ -140,21 +140,38 @@ def test_behavior_kl_variants_change_only_the_approved_schedule_controls():
         "outer_behavior_policy_kl_dual_lr": 3e-4,
         "outer_behavior_policy_kl_dual_max": 10.0,
     }
+    paired_eval = {
+        "eval_inner_comparison": True,
+        "eval_inner_comparison_episodes": 5,
+        "eval_inner_comparison_seed": 12345,
+        "inner_diagnostic_rollouts": 0,
+    }
+    paired_tags = [
+        "figure2-left-paired-controller",
+        "paired-outer-vs-fresh-inner",
+        "eval-inner-comparison-every-50k",
+        "eval-inner-comparison-episodes-5",
+    ]
     variants = {
         "ambi_anchor_kl_smooth": "smooth",
         "ambi_anchor_kl_quantile": "quantile_gate",
         "ambi_anchor_kl_dual": "dual",
     }
-    study_note = (
-        "Three-seed, 14-million-decision Humanoid Walk value-calibration run "
-        "derived from the base-v1 G4 min_all reward-only configuration. It "
-        "evaluates the paper-deterministic and stochastic-Bellman protocols at "
-        "step zero and every 50,000 agent decisions with 100 fixed-seed samples "
-        "per estimate; the paper-compatible MC and Q batches remain independent, "
-        "while the stochastic protocol pairs each sampled first action with its "
-        "rollout. All five Q heads, both reward-only critic targets, the cloned "
-        "inner critic, automatic outer and inner entropy coefficients, and no "
-        "actor-loss percentile scaling remain unchanged."
+    required_study_note_disclosures = (
+        "14-million-decision",
+        "figure-1",
+        "figure-2-left paired-controller protocol",
+        "five environment-seed-paired episodes",
+        "seed 12345",
+        "deterministic outer-only control",
+        "fresh action-local inner sac solve at every state",
+        "inner_diagnostic_rollouts=0",
+        "real return delta is primary",
+        "critic/model optimism",
+        "evaluation-only compute",
+        "timed separately",
+        "not charged to the 14-million-decision training budget",
+        "observational",
     )
 
     for name, schedule in variants.items():
@@ -165,6 +182,10 @@ def test_behavior_kl_variants_change_only_the_approved_schedule_controls():
             "14m-decisions" if tag == "1m-decisions" else tag
             for tag in expected_variant["alg_params"]["wandb_tags"]
         ]
+        expected_tags = expected_variant["alg_params"]["wandb_tags"]
+        tag_index = expected_tags.index("three-seed")
+        expected_tags[tag_index:tag_index] = paired_tags
+        expected_variant["alg_params"].update(paired_eval)
         expected_variant["alg_params"].update(kl_defaults)
         expected_variant["alg_params"][
             "outer_behavior_policy_kl_schedule"
@@ -177,7 +198,13 @@ def test_behavior_kl_variants_change_only_the_approved_schedule_controls():
         expected_experiment = copy.deepcopy(base_experiment)
         expected_experiment["configs"] = [name]
         expected_experiment["overrides_alg"]["total_steps"] = 14_000_000
-        expected_experiment["study_note"] = study_note
+        expected_experiment["study_type"] = (
+            "three_seed_value_calibration_and_paired_controller"
+        )
+        study_note = experiment["study_note"].lower()
+        for disclosure in required_study_note_disclosures:
+            assert disclosure in study_note
+        expected_experiment["study_note"] = experiment["study_note"]
         assert experiment == expected_experiment
         assert experiment["env_params"]["task"] == "humanoid-walk"
         assert experiment["trials"] == 3
@@ -185,6 +212,12 @@ def test_behavior_kl_variants_change_only_the_approved_schedule_controls():
         assert experiment["checkpoint_every"] == 50_000
         assert variant["alg_params"]["eval_freq"] == 50_000
         assert variant["alg_params"]["eval_value"] is True
+        assert {
+            key: variant["alg_params"][key] for key in paired_eval
+        } == paired_eval
+        assert all(
+            tag in variant["alg_params"]["wandb_tags"] for tag in paired_tags
+        )
 
 
 def test_all_manifests_are_single_seed_full_runs_and_resolve_configs():

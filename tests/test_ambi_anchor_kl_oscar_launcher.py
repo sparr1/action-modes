@@ -67,6 +67,10 @@ def test_oscar_behavior_kl_array_maps_all_nine_guarded_cells(tmp_path):
         assert algorithm_payload["alg_params"][
             "outer_behavior_policy_kl_schedule"
         ] == schedule
+        assert algorithm_payload["alg_params"]["eval_inner_comparison"] is True
+        assert algorithm_payload["alg_params"]["eval_inner_comparison_episodes"] == 5
+        assert algorithm_payload["alg_params"]["eval_inner_comparison_seed"] == 12345
+        assert algorithm_payload["alg_params"]["inner_diagnostic_rollouts"] == 0
         assert config in contents
         for seed in (55, 56, 57):
             cell_manifest = ROOT / (

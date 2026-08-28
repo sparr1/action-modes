@@ -407,6 +407,7 @@ class _OuterModel(torch.nn.Module):
     def __init__(self, *, fail=False, nonfinite=False):
         super().__init__()
         self.child = torch.nn.Dropout(p=0.5)
+        self.register_buffer("mean_action", torch.tensor([0.25, -0.5]))
         self.fail = fail
         self.nonfinite = nonfinite
         self.encoded_shapes = []
@@ -422,12 +423,17 @@ class _OuterModel(torch.nn.Module):
         self.policy_calls.append((deterministic, generator))
         if self.fail:
             raise RuntimeError("outer actor failed")
-        action = torch.rand(
-            (z.shape[0], 2),
-            dtype=z.dtype,
-            device=z.device,
-            generator=generator,
-        )
+        if deterministic:
+            action = self.mean_action.to(dtype=z.dtype, device=z.device).expand(
+                z.shape[0], -1
+            )
+        else:
+            action = torch.rand(
+                (z.shape[0], 2),
+                dtype=z.dtype,
+                device=z.device,
+                generator=generator,
+            )
         if self.nonfinite:
             action[0, 0] = float("nan")
         return action
@@ -467,6 +473,65 @@ def test_direct_outer_actor_is_stochastic_online_and_rng_mode_isolated():
     assert random.getstate() == python_state
     _assert_numpy_rng_equal(np.random.get_state(), numpy_state)
     torch.testing.assert_close(torch.random.get_rng_state(), torch_state, rtol=0, atol=0)
+
+
+def test_direct_outer_actor_deterministic_mean_needs_no_generator_and_is_isolated():
+    model = _OuterModel()
+    model.train()
+    model.child.eval()
+    modes = tuple(module.training for module in model.modules())
+    agent = _outer_agent(model)
+
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state().clone()
+    action = agent.act_outer_policy(torch.zeros(3), deterministic=True)
+
+    torch.testing.assert_close(action, model.mean_action, rtol=0, atol=0)
+    assert model.encoded_shapes == [(1, 3)]
+    assert model.policy_calls == [(True, None)]
+    assert tuple(module.training for module in model.modules()) == modes
+    assert agent.last_inner_metrics == {}
+    assert agent.last_inner_rollout_lengths == []
+    assert random.getstate() == python_state
+    _assert_numpy_rng_equal(np.random.get_state(), numpy_state)
+    torch.testing.assert_close(torch.random.get_rng_state(), torch_state, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error", "message"),
+    [
+        ({}, TypeError, "require a torch.Generator"),
+        ({"generator": object()}, TypeError, "require a torch.Generator"),
+        ({"deterministic": 1}, TypeError, "deterministic must be bool"),
+        (
+            {
+                "deterministic": True,
+                "generator": torch.Generator(device="cpu").manual_seed(19),
+            },
+            ValueError,
+            "do not accept a generator",
+        ),
+    ],
+)
+def test_direct_outer_actor_validates_deterministic_and_stochastic_contract(
+    kwargs, error, message
+):
+    agent = _outer_agent(_OuterModel())
+
+    with pytest.raises(error, match=message):
+        agent.act_outer_policy(torch.zeros(3), **kwargs)
+
+
+def test_direct_outer_actor_rejects_stochastic_generator_on_wrong_device():
+    agent = _outer_agent(_OuterModel())
+    agent.device = torch.device("cuda:0")
+
+    with pytest.raises(ValueError, match="generator must be on the AMBI agent device"):
+        agent.act_outer_policy(
+            torch.zeros(3),
+            generator=torch.Generator(device="cpu").manual_seed(23),
+        )
 
 
 @pytest.mark.parametrize(

@@ -155,6 +155,9 @@ def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
             "paper_deterministic",
             "stochastic_bellman",
         ],
+        eval_inner_comparison=True,
+        eval_inner_comparison_episodes=7,
+        eval_inner_comparison_seed=24_680,
         outer_policy_episode_probability=0.5,
         train_unroll_horizon=6,
         outer_planning_horizon=3,
@@ -257,6 +260,9 @@ def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
             "paper_deterministic",
             "stochastic_bellman",
         ],
+        "eval_inner_comparison": True,
+        "eval_inner_comparison_episodes": 7,
+        "eval_inner_comparison_seed": 24_680,
     }
     assert metadata["collection"] == {
         "outer_policy_episode_probability": 0.5,

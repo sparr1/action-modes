@@ -22,6 +22,9 @@
     "mpc": false,
     "eval_freq": 50000,
     "eval_episodes": 1,
+    "eval_inner_comparison": true,
+    "eval_inner_comparison_episodes": 5,
+    "eval_inner_comparison_seed": 12345,
     "eval_value": true,
     "eval_value_samples": 100,
     "eval_value_seed": 12345,
@@ -70,6 +73,7 @@
     "inner_batch_size": 64,
     "inner_replay_capacity": 192,
     "inner_replay_sampling": "with_replacement",
+    "inner_diagnostic_rollouts": 0,
     "inner_diagnostics_every": 1000,
     "inner_actor_adaptation": "clone",
     "inner_critic_adaptation": "clone",
@@ -119,6 +123,10 @@
       "eval-value-samples-100",
       "paper-deterministic",
       "stochastic-bellman",
+      "figure2-left-paired-controller",
+      "paired-outer-vs-fresh-inner",
+      "eval-inner-comparison-every-50k",
+      "eval-inner-comparison-episodes-5",
       "three-seed"
     ]
   },
