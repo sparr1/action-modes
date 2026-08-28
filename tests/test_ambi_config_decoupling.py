@@ -54,6 +54,135 @@ def test_sac_actor_loss_scale_defaults_and_normalizes_explicit_mode():
     assert enabled.sac_actor_loss_scale_tau == pytest.approx(0.2)
 
 
+def test_behavior_policy_kl_defaults_and_auto_valid_count_resolution():
+    cfg = _build_cfg(batch_size=7)
+
+    assert cfg.outer_behavior_policy_kl_schedule == "none"
+    assert cfg.outer_behavior_policy_kl_coef == pytest.approx(1.0)
+    assert cfg.outer_behavior_policy_kl_min_valid_count == 7
+    assert cfg.outer_behavior_policy_kl_ramp_updates == 10_000
+    assert cfg.outer_behavior_policy_kl_q_threshold == pytest.approx(2.0)
+    assert cfg.outer_behavior_policy_kl_target == pytest.approx(0.1)
+    assert cfg.outer_behavior_policy_kl_dual_init == pytest.approx(0.1)
+    assert cfg.outer_behavior_policy_kl_dual_lr == pytest.approx(3e-4)
+    assert cfg.outer_behavior_policy_kl_dual_max == pytest.approx(10.0)
+
+
+@pytest.mark.parametrize(
+    ("requested", "resolved"),
+    [
+        ("NONE", "none"),
+        ("SMOOTH", "smooth"),
+        ("QUANTILE_GATE", "quantile_gate"),
+        ("DUAL", "dual"),
+    ],
+)
+def test_behavior_policy_kl_schedule_normalizes_supported_modes(
+    requested,
+    resolved,
+):
+    cfg = _build_cfg(outer_behavior_policy_kl_schedule=requested)
+    assert cfg.outer_behavior_policy_kl_schedule == resolved
+
+
+@pytest.mark.parametrize("value", [None, True, 1, "fixed", "quantile", "auto"])
+def test_behavior_policy_kl_schedule_is_strict(value):
+    with pytest.raises(ValueError, match="outer_behavior_policy_kl_schedule"):
+        _build_cfg(outer_behavior_policy_kl_schedule=value)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("outer_behavior_policy_kl_coef", None),
+        ("outer_behavior_policy_kl_coef", True),
+        ("outer_behavior_policy_kl_coef", "1.0"),
+        ("outer_behavior_policy_kl_coef", -0.1),
+        ("outer_behavior_policy_kl_coef", float("nan")),
+        ("outer_behavior_policy_kl_ramp_updates", True),
+        ("outer_behavior_policy_kl_ramp_updates", 0),
+        ("outer_behavior_policy_kl_ramp_updates", 1.5),
+        ("outer_behavior_policy_kl_q_threshold", 0.0),
+        ("outer_behavior_policy_kl_q_threshold", float("inf")),
+        ("outer_behavior_policy_kl_target", -0.1),
+        ("outer_behavior_policy_kl_dual_init", 0.0),
+        ("outer_behavior_policy_kl_dual_lr", 0.0),
+        ("outer_behavior_policy_kl_dual_max", 0.0),
+    ],
+)
+def test_behavior_policy_kl_numeric_controls_are_strict(key, value):
+    with pytest.raises(ValueError, match=key):
+        _build_cfg(**{key: value})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, True, 0, -1, 1.5, "32", "automatic"],
+)
+def test_behavior_policy_kl_min_valid_count_is_auto_or_positive_integer(value):
+    with pytest.raises(
+        ValueError,
+        match="outer_behavior_policy_kl_min_valid_count",
+    ):
+        _build_cfg(outer_behavior_policy_kl_min_valid_count=value)
+
+    explicit = _build_cfg(outer_behavior_policy_kl_min_valid_count=5)
+    assert explicit.outer_behavior_policy_kl_min_valid_count == 5
+
+
+def test_behavior_policy_kl_mode_specific_coefficient_and_dual_bounds():
+    for schedule in ("smooth", "quantile_gate"):
+        with pytest.raises(ValueError, match="outer_behavior_policy_kl_coef"):
+            _build_cfg(
+                outer_behavior_policy_kl_schedule=schedule,
+                outer_behavior_policy_kl_coef=0.0,
+            )
+
+    with pytest.raises(ValueError, match="dual_init.*dual_max"):
+        _build_cfg(
+            outer_behavior_policy_kl_dual_init=2.0,
+            outer_behavior_policy_kl_dual_max=1.0,
+        )
+
+    dual = _build_cfg(
+        outer_behavior_policy_kl_schedule="dual",
+        outer_behavior_policy_kl_coef=0.0,
+        outer_behavior_policy_kl_target=0.0,
+    )
+    assert dual.outer_behavior_policy_kl_coef == pytest.approx(0.0)
+    assert dual.outer_behavior_policy_kl_target == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("schedule", ["smooth", "quantile_gate", "dual"])
+def test_active_behavior_policy_kl_requires_stochastic_inner_sac(schedule):
+    enabled = _build_cfg(outer_behavior_policy_kl_schedule=schedule)
+    assert enabled.inner_operator == "sac"
+    assert enabled.inner_execution_action == "policy_sample"
+    assert enabled.inner_execution_std_scale > 0.0
+
+    with pytest.raises(ValueError, match="requires inner_operator='sac'"):
+        _build_cfg(
+            outer_behavior_policy_kl_schedule=schedule,
+            inner_operator="td3",
+        )
+    with pytest.raises(ValueError, match="stochastic inner execution"):
+        _build_cfg(
+            outer_behavior_policy_kl_schedule=schedule,
+            inner_execution_action="mean",
+        )
+    with pytest.raises(ValueError, match="stochastic inner execution"):
+        _build_cfg(
+            outer_behavior_policy_kl_schedule=schedule,
+            inner_execution_std_scale=0.0,
+        )
+
+    inactive = _build_cfg(
+        outer_behavior_policy_kl_schedule="none",
+        inner_execution_action="mean",
+    )
+    assert inactive.inner_execution_action == "mean"
+
+
 def test_log_std_mapping_and_bounds_inherit_and_override_independently():
     default = _build_cfg()
     assert default.log_std_mapping == "direct_clamp"

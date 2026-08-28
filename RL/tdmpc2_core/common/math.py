@@ -202,6 +202,44 @@ def gaussian_logprob(eps, log_std):
 	return log_prob.sum(-1, keepdim=True)
 
 
+def diagonal_gaussian_reverse_kl(
+	current_mean,
+	current_log_std,
+	behavior_mean,
+	behavior_log_std,
+	*,
+	sum_action_dim=True,
+):
+	"""Return ``KL(current || behavior)`` for diagonal Gaussians.
+
+	The behavior distribution is a fixed target: its arguments are detached so
+	gradients flow only through the current distribution. Inputs may broadcast,
+	which permits evaluating one current policy against multiple behavior-policy
+	components. By default the per-dimension KL is summed over the final action
+	dimension while retaining that dimension as a singleton.
+
+	The standard-deviation term is evaluated from log-standard-deviation
+	differences. This avoids forming tiny variances or dividing by a clamped
+	behavior variance when log standard deviations span the policy bounds.
+	"""
+	if not isinstance(sum_action_dim, bool):
+		raise TypeError("sum_action_dim must be bool.")
+	behavior_mean = behavior_mean.detach()
+	behavior_log_std = behavior_log_std.detach()
+	log_std_ratio = current_log_std - behavior_log_std
+	standardized_mean_delta = (
+		current_mean - behavior_mean
+	) * torch.exp(-behavior_log_std)
+	elementwise_kl = (
+		0.5 * torch.expm1(2.0 * log_std_ratio)
+		- log_std_ratio
+		+ 0.5 * standardized_mean_delta.square()
+	)
+	if sum_action_dim:
+		return elementwise_kl.sum(dim=-1, keepdim=True)
+	return elementwise_kl
+
+
 def squash(mu, pi, log_pi):
 	"""Apply squashing function."""
 	mu = torch.tanh(mu)

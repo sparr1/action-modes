@@ -229,6 +229,54 @@ def test_enabled_scaler_updates_from_depth_zero_and_scales_full_actor_objective(
     )
 
 
+def test_outer_temperature_uses_normalized_actor_temporal_weights(monkeypatch):
+    model = _model(ent_coef="auto_0.5", rho=0.5)
+    agent = model.agent
+    zs, _, _ = _stub_actor_batch(monkeypatch, agent)
+    depth_log_probs = torch.tensor(
+        [-0.25, -1.25, -3.25], device=agent.device
+    )
+    assert depth_log_probs.shape[0] == zs.shape[0]
+
+    def policy(z):
+        anchor = next(agent.model._pi.parameters()).reshape(-1)[0]
+        action = torch.zeros(
+            *z.shape[:-1], agent.cfg.action_dim, device=z.device, dtype=z.dtype
+        ) + anchor * 0.0
+        sampled_log_prob = depth_log_probs.to(dtype=z.dtype).reshape(-1, 1, 1)
+        sampled_log_prob = (
+            sampled_log_prob.expand(*z.shape[:-1], 1) + anchor * 0.0
+        )
+        return action, {
+            "log_prob": sampled_log_prob,
+            "entropy": -sampled_log_prob,
+        }
+
+    monkeypatch.setattr(agent.model, "pi", policy)
+    initial_log_alpha = agent.log_ent_coef.detach().clone()
+
+    metrics = agent._update_actor(zs)
+
+    normalized_weights = torch.pow(
+        torch.as_tensor(agent.cfg.rho, device=agent.device),
+        torch.arange(zs.shape[0], device=agent.device),
+    )
+    normalized_weights = normalized_weights / normalized_weights.sum()
+    entropy_residuals = depth_log_probs + agent.target_entropy
+    expected_temperature_loss = -(
+        initial_log_alpha * (normalized_weights * entropy_residuals).sum()
+    ).mean()
+    uniform_temperature_loss = -(
+        initial_log_alpha * entropy_residuals.mean()
+    ).mean()
+    torch.testing.assert_close(
+        metrics["ent_coef_loss"], expected_temperature_loss
+    )
+    assert not torch.isclose(
+        metrics["ent_coef_loss"], uniform_temperature_loss
+    )
+
+
 def test_enabled_scaler_does_not_change_raw_soft_bellman_target(monkeypatch):
     model = _scaled_model(ent_coef="auto_0.5")
     agent = model.agent

@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 
@@ -5,6 +6,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 AMBI_ROOT = ROOT / "configs/ambi"
 AMBI_ALGS = AMBI_ROOT / "algs"
+DMCONTROL_ROOT = ROOT / "configs/dmcontrol"
+DMCONTROL_ALGS = DMCONTROL_ROOT / "algs"
+DMCONTROL_EXPERIMENTS = DMCONTROL_ROOT / "experiments"
 
 LEGACY_STATIC_MOVE_MANIFESTS = (
     "AntMove",
@@ -118,6 +122,69 @@ def test_anchor_has_the_small_fixed_training_dose():
     assert params["inner_bootstrap_source"] == "inner_target"
     assert params["inner_critic_target_tau"] == 0.005
     assert params["inner_critic_target_update_interval"] == 1
+
+
+def test_behavior_kl_variants_change_only_the_approved_schedule_controls():
+    base_name = "ambi_humanoid_walk_base_min_all_reward_only_value_calibration"
+    base = _load_json_strict(DMCONTROL_ALGS / f"{base_name}.json")
+    base_experiment = _load_json_strict(
+        DMCONTROL_EXPERIMENTS / f"{base_name}.json"
+    )
+    kl_defaults = {
+        "outer_behavior_policy_kl_coef": 1.0,
+        "outer_behavior_policy_kl_min_valid_count": "auto",
+        "outer_behavior_policy_kl_ramp_updates": 10_000,
+        "outer_behavior_policy_kl_q_threshold": 2.0,
+        "outer_behavior_policy_kl_target": 0.1,
+        "outer_behavior_policy_kl_dual_init": 0.1,
+        "outer_behavior_policy_kl_dual_lr": 3e-4,
+        "outer_behavior_policy_kl_dual_max": 10.0,
+    }
+    variants = {
+        "ambi_anchor_kl_smooth": "smooth",
+        "ambi_anchor_kl_quantile": "quantile_gate",
+        "ambi_anchor_kl_dual": "dual",
+    }
+    study_note = (
+        "Three-seed, 14-million-decision Humanoid Walk value-calibration run "
+        "derived from the base-v1 G4 min_all reward-only configuration. It "
+        "evaluates the paper-deterministic and stochastic-Bellman protocols at "
+        "step zero and every 50,000 agent decisions with 100 fixed-seed samples "
+        "per estimate; the paper-compatible MC and Q batches remain independent, "
+        "while the stochastic protocol pairs each sampled first action with its "
+        "rollout. All five Q heads, both reward-only critic targets, the cloned "
+        "inner critic, automatic outer and inner entropy coefficients, and no "
+        "actor-loss percentile scaling remain unchanged."
+    )
+
+    for name, schedule in variants.items():
+        variant = _load_json_strict(DMCONTROL_ALGS / f"{name}.json")
+        expected_variant = copy.deepcopy(base)
+        expected_variant["total_steps"] = 14_000_000
+        expected_variant["alg_params"]["wandb_tags"] = [
+            "14m-decisions" if tag == "1m-decisions" else tag
+            for tag in expected_variant["alg_params"]["wandb_tags"]
+        ]
+        expected_variant["alg_params"].update(kl_defaults)
+        expected_variant["alg_params"][
+            "outer_behavior_policy_kl_schedule"
+        ] = schedule
+        assert variant == expected_variant
+
+        experiment = _load_json_strict(
+            DMCONTROL_EXPERIMENTS / f"{name}.json"
+        )
+        expected_experiment = copy.deepcopy(base_experiment)
+        expected_experiment["configs"] = [name]
+        expected_experiment["overrides_alg"]["total_steps"] = 14_000_000
+        expected_experiment["study_note"] = study_note
+        assert experiment == expected_experiment
+        assert experiment["env_params"]["task"] == "humanoid-walk"
+        assert experiment["trials"] == 3
+        assert experiment["overrides_alg"]["total_steps"] == 14_000_000
+        assert experiment["checkpoint_every"] == 50_000
+        assert variant["alg_params"]["eval_freq"] == 50_000
+        assert variant["alg_params"]["eval_value"] is True
 
 
 def test_all_manifests_are_single_seed_full_runs_and_resolve_configs():

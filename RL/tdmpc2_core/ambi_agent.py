@@ -29,6 +29,13 @@ _polyak_update = polyak_update
 _ACTOR_LOSS_SCALE_MODE = "tdmpc2_percentile_range"
 _ACTOR_LOSS_SCALE_PERCENTILES = (5.0, 95.0)
 _ACTOR_LOSS_SCALE_FLOOR = 1.0
+_BEHAVIOR_POLICY_KL_SCHEDULES = {
+    "none",
+    "smooth",
+    "quantile_gate",
+    "dual",
+}
+_BEHAVIOR_POLICY_KL_DUAL_MIN = 1e-8
 
 
 class AMBITDMPC2Agent(torch.nn.Module):
@@ -84,7 +91,27 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self._actor_loss_scale_mode = str(
             getattr(cfg, "sac_actor_loss_scale_mode", "none")
         ).lower()
-        if self._actor_loss_scale_mode == _ACTOR_LOSS_SCALE_MODE:
+        self._behavior_policy_kl_schedule = str(
+            getattr(cfg, "outer_behavior_policy_kl_schedule", "none")
+        ).lower()
+        if self._behavior_policy_kl_schedule not in _BEHAVIOR_POLICY_KL_SCHEDULES:
+            raise ValueError(
+                "outer_behavior_policy_kl_schedule must be one of "
+                f"{sorted(_BEHAVIOR_POLICY_KL_SCHEDULES)}."
+            )
+        if self._actor_loss_scale_mode not in {
+            "none",
+            _ACTOR_LOSS_SCALE_MODE,
+        }:
+            raise ValueError(
+                "sac_actor_loss_scale_mode must be 'none' or "
+                f"{_ACTOR_LOSS_SCALE_MODE!r}."
+            )
+        self._actor_q_range_enabled = (
+            self._actor_loss_scale_mode == _ACTOR_LOSS_SCALE_MODE
+            or self._behavior_policy_kl_schedule == "quantile_gate"
+        )
+        if self._actor_q_range_enabled:
             scale_tau = float(getattr(cfg, "sac_actor_loss_scale_tau", 0.01))
             if not math.isfinite(scale_tau) or not 0.0 < scale_tau <= 1.0:
                 raise ValueError("sac_actor_loss_scale_tau must be in (0, 1].")
@@ -101,15 +128,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
                     device=self.device,
                 ),
             )
-        elif self._actor_loss_scale_mode == "none":
+        else:
             self._actor_loss_scale_tau = None
             self._actor_loss_scale_value = None
             self._actor_loss_scale_percentiles = None
-        else:
-            raise ValueError(
-                "sac_actor_loss_scale_mode must be 'none' or "
-                f"{_ACTOR_LOSS_SCALE_MODE!r}."
-            )
         self._world_critic_params = (
             list(self.model._encoder.parameters())
             + list(self.model._dynamics.parameters())
@@ -177,6 +199,31 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 raise ValueError("Entropy coefficient must be positive.")
             self.register_buffer(
                 "fixed_ent_coef", torch.tensor(fixed, device=self.device)
+            )
+
+        self.behavior_policy_kl_eligible_updates = 0
+        self.behavior_policy_kl_dual_updates = 0
+        self.log_behavior_policy_kl_coef = None
+        self.behavior_policy_kl_optim = None
+        if self._behavior_policy_kl_schedule == "dual":
+            initial_kl_coef = float(
+                getattr(cfg, "outer_behavior_policy_kl_dual_init", 0.1)
+            )
+            self.log_behavior_policy_kl_coef = torch.nn.Parameter(
+                torch.log(
+                    torch.tensor(
+                        [initial_kl_coef],
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                )
+            )
+            self.behavior_policy_kl_optim = torch.optim.Adam(
+                [self.log_behavior_policy_kl_coef],
+                lr=float(getattr(cfg, "outer_behavior_policy_kl_dual_lr", 3e-4)),
+                eps=float(getattr(cfg, "adam_eps", 1e-8)),
+                capturable=self.device.type == "cuda",
+                foreach=self.device.type == "cuda",
             )
 
         self.discount = self._get_discount(cfg.episode_length)
@@ -261,6 +308,21 @@ class AMBITDMPC2Agent(torch.nn.Module):
             return None
         return self._actor_loss_scale_value
 
+    @property
+    def behavior_policy_kl_enabled(self):
+        return self._behavior_policy_kl_schedule != "none"
+
+    @property
+    def actor_q_range(self):
+        if not self._actor_q_range_enabled:
+            return None
+        return self._actor_loss_scale_value
+
+    def _checkpoint_version(self):
+        if self.behavior_policy_kl_enabled:
+            return 6 if self.actor_loss_scale_enabled else 5
+        return 4 if self.actor_loss_scale_enabled else 3
+
     def _actor_loss_scale_spec(self):
         if not self.actor_loss_scale_enabled:
             return None
@@ -274,8 +336,24 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "floor": _ACTOR_LOSS_SCALE_FLOOR,
         }
 
+    def _actor_q_range_spec(self):
+        if not self._actor_q_range_enabled:
+            return None
+        return {
+            "source": "decoded_outer_actor_q_depth0",
+            "reduction": str(self.cfg.outer_q_actor_reduction),
+            "percentiles": list(_ACTOR_LOSS_SCALE_PERCENTILES),
+            "tau": self._actor_loss_scale_tau,
+            "floor": _ACTOR_LOSS_SCALE_FLOOR,
+        }
+
     def _actor_loss_scale_state(self):
         if not self.actor_loss_scale_enabled:
+            return None
+        return self._actor_q_range_state()
+
+    def _actor_q_range_state(self):
+        if not self._actor_q_range_enabled:
             return None
         return {
             "value": self._actor_loss_scale_value.detach(),
@@ -297,18 +375,23 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 "Checkpoint actor-loss scale specification does not match this agent: "
                 f"checkpoint={dict(spec)}, configured={expected_spec}."
             )
-        state = require_exact_keys(
-            state, {"value", "percentiles"}, "AMBI actor-loss scale state"
+        return self._preflight_actor_q_range_state(
+            state, "AMBI actor-loss scale state"
         )
+
+    def _preflight_actor_q_range_state(self, state, label):
+        if not self._actor_q_range_enabled:
+            raise ValueError(f"{label} is present but Q-range tracking is disabled.")
+        state = require_exact_keys(state, {"value", "percentiles"}, label)
         value = require_tensor(
             state["value"],
-            "AMBI actor-loss scale value",
+            f"{label} value",
             shape=self._actor_loss_scale_value.shape,
             dtype=self._actor_loss_scale_value.dtype,
         )
         percentiles = require_tensor(
             state["percentiles"],
-            "AMBI actor-loss scale percentiles",
+            f"{label} percentiles",
             shape=self._actor_loss_scale_percentiles.shape,
             dtype=self._actor_loss_scale_percentiles.dtype,
         )
@@ -327,16 +410,176 @@ class AMBITDMPC2Agent(torch.nn.Module):
             )
         return state
 
+    def _behavior_policy_kl_spec(self):
+        if not self.behavior_policy_kl_enabled:
+            return None
+        return {
+            "schedule": self._behavior_policy_kl_schedule,
+            "direction": "current_outer_to_replayed_behavior",
+            "estimator": "analytic_diagonal_gaussian_jensen_component",
+            "action_transform": "shared_tanh",
+            "reduction": "per_action_dim_valid_weighted_temporal",
+            "min_valid_count": int(
+                self.cfg.outer_behavior_policy_kl_min_valid_count
+            ),
+            "coef": float(self.cfg.outer_behavior_policy_kl_coef),
+            "ramp_updates": int(
+                self.cfg.outer_behavior_policy_kl_ramp_updates
+            ),
+            "q_threshold": float(
+                self.cfg.outer_behavior_policy_kl_q_threshold
+            ),
+            "q_range": (
+                self._actor_q_range_spec()
+                if self._behavior_policy_kl_schedule == "quantile_gate"
+                else None
+            ),
+            "target": float(self.cfg.outer_behavior_policy_kl_target),
+            "dual_init": float(
+                self.cfg.outer_behavior_policy_kl_dual_init
+            ),
+            "dual_lr": float(self.cfg.outer_behavior_policy_kl_dual_lr),
+            "dual_min": _BEHAVIOR_POLICY_KL_DUAL_MIN,
+            "dual_max": float(self.cfg.outer_behavior_policy_kl_dual_max),
+            "actor_loss_scaling": (
+                "full_objective" if self.actor_loss_scale_enabled else "none"
+            ),
+        }
+
+    def _behavior_policy_kl_state(self):
+        schedule = self._behavior_policy_kl_schedule
+        if schedule == "smooth":
+            return {
+                "eligible_updates": int(
+                    self.behavior_policy_kl_eligible_updates
+                )
+            }
+        if schedule == "quantile_gate":
+            if self.actor_loss_scale_enabled:
+                return {}
+            return {"q_range": self._actor_q_range_state()}
+        if schedule == "dual":
+            return {
+                "log_coef": self.log_behavior_policy_kl_coef.detach(),
+                "optim": self.behavior_policy_kl_optim.state_dict(),
+                "dual_updates": int(self.behavior_policy_kl_dual_updates),
+            }
+        return None
+
+    def _preflight_behavior_policy_kl(self, spec, state, *, exact=False):
+        if not self.behavior_policy_kl_enabled:
+            raise ValueError(
+                "Checkpoint behavior-policy KL is enabled but the configured "
+                "schedule is 'none'."
+            )
+        expected_spec = self._behavior_policy_kl_spec()
+        spec = require_exact_keys(
+            spec,
+            expected_spec.keys(),
+            "AMBI behavior-policy KL specification",
+        )
+        if dict(spec) != expected_spec:
+            raise ValueError(
+                "Checkpoint behavior-policy KL specification does not match "
+                f"this agent: checkpoint={dict(spec)}, configured={expected_spec}."
+            )
+        schedule = self._behavior_policy_kl_schedule
+        if schedule == "smooth":
+            state = require_exact_keys(
+                state,
+                {"eligible_updates"},
+                "AMBI behavior-policy KL smooth state",
+            )
+            value = state["eligible_updates"]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    "AMBI behavior-policy KL eligible_updates must be a "
+                    "non-negative integer."
+                )
+        elif schedule == "quantile_gate":
+            expected_keys = set() if self.actor_loss_scale_enabled else {"q_range"}
+            state = require_exact_keys(
+                state,
+                expected_keys,
+                "AMBI behavior-policy KL quantile state",
+            )
+            if not self.actor_loss_scale_enabled:
+                self._preflight_actor_q_range_state(
+                    state["q_range"], "AMBI behavior-policy KL Q-range state"
+                )
+        elif schedule == "dual":
+            state = require_exact_keys(
+                state,
+                {"log_coef", "optim", "dual_updates"},
+                "AMBI behavior-policy KL dual state",
+            )
+            dual_updates = state["dual_updates"]
+            if (
+                isinstance(dual_updates, bool)
+                or not isinstance(dual_updates, int)
+                or dual_updates < 0
+            ):
+                raise ValueError(
+                    "AMBI behavior-policy KL dual_updates must be a "
+                    "non-negative integer."
+                )
+            log_coef = require_tensor(
+                state["log_coef"],
+                "AMBI behavior-policy KL log coefficient",
+                shape=self.log_behavior_policy_kl_coef.shape,
+                dtype=self.log_behavior_policy_kl_coef.dtype,
+            )
+            if not bool(torch.isfinite(log_coef).all().item()):
+                raise ValueError(
+                    "AMBI behavior-policy KL log coefficient must be finite."
+                )
+            minimum = math.log(_BEHAVIOR_POLICY_KL_DUAL_MIN)
+            maximum = math.log(float(self.cfg.outer_behavior_policy_kl_dual_max))
+            if bool(((log_coef < minimum) | (log_coef > maximum)).any().item()):
+                raise ValueError(
+                    "AMBI behavior-policy KL log coefficient is outside its "
+                    "configured bounds."
+                )
+            if exact:
+                preflight_adam_state(
+                    self.behavior_policy_kl_optim,
+                    state["optim"],
+                    "AMBI behavior-policy KL optimizer",
+                    expected_steps=dual_updates,
+                )
+            else:
+                self._preflight_optimizer(
+                    "behavior_policy_kl_optim",
+                    state["optim"],
+                    self.behavior_policy_kl_optim,
+                )
+        return state
+
+    @torch.no_grad()
+    def _reset_behavior_policy_kl_state(self):
+        self.behavior_policy_kl_eligible_updates = 0
+        self.behavior_policy_kl_dual_updates = 0
+        if self.log_behavior_policy_kl_coef is not None:
+            initial = float(self.cfg.outer_behavior_policy_kl_dual_init)
+            self.log_behavior_policy_kl_coef.fill_(math.log(initial))
+            self.behavior_policy_kl_optim.state.clear()
+        if (
+            self._behavior_policy_kl_schedule == "quantile_gate"
+            and not self.actor_loss_scale_enabled
+        ):
+            self._actor_loss_scale_value.fill_(_ACTOR_LOSS_SCALE_FLOOR)
+
     @torch.no_grad()
     def _update_actor_loss_scale(self, q_values):
-        if not self.actor_loss_scale_enabled:
-            return
+        if not self._actor_q_range_enabled:
+            return None
         value = percentile_range(
             q_values.detach(),
             self._actor_loss_scale_percentiles,
             minimum=_ACTOR_LOSS_SCALE_FLOOR,
         )
         self._actor_loss_scale_value.lerp_(value, self._actor_loss_scale_tau)
+        return value
 
     def reset(self):
         if self._resume_boundary_prepared:
@@ -405,7 +648,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
     def checkpoint_state(self):
         """Return the portable checkpoint structure over live outer state."""
         state = {
-            "checkpoint_version": 4 if self.actor_loss_scale_enabled else 3,
+            "checkpoint_version": self._checkpoint_version(),
             "observation_spec": self.observation_signature(),
             "critic_spec": self.model.critic_signature,
             "policy_spec": self._policy_spec(),
@@ -428,6 +671,9 @@ class AMBITDMPC2Agent(torch.nn.Module):
         if self.actor_loss_scale_enabled:
             state["actor_loss_scale_spec"] = self._actor_loss_scale_spec()
             state["actor_loss_scale_state"] = self._actor_loss_scale_state()
+        if self.behavior_policy_kl_enabled:
+            state["behavior_policy_kl_spec"] = self._behavior_policy_kl_spec()
+            state["behavior_policy_kl_state"] = self._behavior_policy_kl_state()
         return state
 
     def _critic_target_spec(self):
@@ -450,11 +696,12 @@ class AMBITDMPC2Agent(torch.nn.Module):
             raise RuntimeError(
                 "AMBI live persistent inner workspace is newer than the outer learner."
             )
-        # Versions 3/4 add exact critic-target provenance; the even version
-        # additionally carries actor-loss scale state.
+        # Versions 3/4 preserve the feature-disabled checkpoint contract.
+        # Versions 5/6 add behavior-policy KL state, with even versions also
+        # carrying actor-loss scaling state.
         return {
             "schema": "ambi-tdmpc2-agent-training-state",
-            "version": 4 if self.actor_loss_scale_enabled else 3,
+            "version": self._checkpoint_version(),
             "outer": self.checkpoint_state(),
             "inner": inner,
             "model_training": bool(self.model.training),
@@ -483,8 +730,12 @@ class AMBITDMPC2Agent(torch.nn.Module):
             expected_keys.update(
                 {"actor_loss_scale_spec", "actor_loss_scale_state"}
             )
+        if self.behavior_policy_kl_enabled:
+            expected_keys.update(
+                {"behavior_policy_kl_spec", "behavior_policy_kl_state"}
+            )
         state = require_exact_keys(state, expected_keys, "AMBI outer training state")
-        expected_checkpoint_version = 4 if self.actor_loss_scale_enabled else 3
+        expected_checkpoint_version = self._checkpoint_version()
         if state["checkpoint_version"] != expected_checkpoint_version:
             raise ValueError(
                 "AMBI exact training state requires outer checkpoint version "
@@ -549,6 +800,12 @@ class AMBITDMPC2Agent(torch.nn.Module):
             self._preflight_actor_loss_scale(
                 state["actor_loss_scale_spec"], state["actor_loss_scale_state"]
             )
+        if self.behavior_policy_kl_enabled:
+            self._preflight_behavior_policy_kl(
+                state["behavior_policy_kl_spec"],
+                state["behavior_policy_kl_state"],
+                exact=True,
+            )
         # The lineage fingerprint checks every resolved scientific setting.
         # The established model-checkpoint loader below remains the single
         # authority for signature, entropy, and optimizer-layout validation.
@@ -567,7 +824,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             },
             "AMBI agent training state",
         )
-        expected_version = 4 if self.actor_loss_scale_enabled else 3
+        expected_version = self._checkpoint_version()
         if (
             state["schema"] != "ambi-tdmpc2-agent-training-state"
             or state["version"] != expected_version
@@ -629,18 +886,49 @@ class AMBITDMPC2Agent(torch.nn.Module):
             else torch.load(fp, map_location=self.device, weights_only=False)
         )
         checkpoint_version = state.get("checkpoint_version") if isinstance(state, dict) else None
-        if checkpoint_version is not None and int(checkpoint_version) not in {1, 2, 3, 4}:
+        if checkpoint_version is not None and int(checkpoint_version) not in {
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+        }:
             raise ValueError(
                 f"Unsupported AMBI checkpoint_version={checkpoint_version!r}; "
-                "supported versions are 1, 2, 3, and 4."
+                "supported versions are 1 through 6."
             )
         structured_checkpoint = isinstance(state, dict) and "model" in state
         actor_loss_scale_candidate = None
+        behavior_policy_kl_candidate = None
         if structured_checkpoint:
-            if self.actor_loss_scale_enabled:
-                if checkpoint_version != 4:
+            if self.behavior_policy_kl_enabled:
+                expected = self._checkpoint_version()
+                if checkpoint_version != expected:
                     raise ValueError(
-                        "An enabled actor-loss scaler requires a version-4 AMBI "
+                        "An active behavior-policy KL schedule requires a "
+                        f"version-{expected} AMBI checkpoint with matching "
+                        "scheduler state. For intentional weight transfer, "
+                        "load the raw model state into a fresh agent instead."
+                    )
+                behavior_policy_kl_candidate = (
+                    self._preflight_behavior_policy_kl(
+                        state.get("behavior_policy_kl_spec"),
+                        state.get("behavior_policy_kl_state"),
+                        exact=False,
+                    )
+                )
+            elif checkpoint_version in {5, 6}:
+                raise ValueError(
+                    "Checkpoint behavior-policy KL is enabled but the "
+                    "configured schedule is 'none'."
+                )
+            if self.actor_loss_scale_enabled:
+                expected_scale_version = 6 if self.behavior_policy_kl_enabled else 4
+                if checkpoint_version != expected_scale_version:
+                    raise ValueError(
+                        "An enabled actor-loss scaler requires a "
+                        f"version-{expected_scale_version} AMBI "
                         "checkpoint with persistent scale state. For intentional "
                         "weight transfer from a legacy checkpoint, load its model "
                         "state into a fresh agent instead."
@@ -649,7 +937,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
                     state.get("actor_loss_scale_spec"),
                     state.get("actor_loss_scale_state"),
                 )
-            elif checkpoint_version == 4:
+            elif checkpoint_version in {4, 6}:
                 raise ValueError(
                     "Checkpoint actor-loss scaling is enabled but the configured "
                     "agent has sac_actor_loss_scale_mode='none'."
@@ -793,6 +1081,33 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 self._actor_loss_scale_percentiles.copy_(
                     actor_loss_scale_candidate["percentiles"].to(self.device)
                 )
+        if self.behavior_policy_kl_enabled:
+            if behavior_policy_kl_candidate is None:
+                self._reset_behavior_policy_kl_state()
+            elif self._behavior_policy_kl_schedule == "smooth":
+                self.behavior_policy_kl_eligible_updates = int(
+                    behavior_policy_kl_candidate["eligible_updates"]
+                )
+            elif self._behavior_policy_kl_schedule == "quantile_gate":
+                if not self.actor_loss_scale_enabled:
+                    q_range = behavior_policy_kl_candidate["q_range"]
+                    self._actor_loss_scale_value.copy_(
+                        q_range["value"].to(self.device)
+                    )
+                    self._actor_loss_scale_percentiles.copy_(
+                        q_range["percentiles"].to(self.device)
+                    )
+            elif self._behavior_policy_kl_schedule == "dual":
+                self.log_behavior_policy_kl_coef.data.copy_(
+                    behavior_policy_kl_candidate["log_coef"].to(self.device)
+                )
+                load_optimizer_state_preserving_hyperparameters(
+                    self.behavior_policy_kl_optim,
+                    behavior_policy_kl_candidate["optim"],
+                )
+                self.behavior_policy_kl_dual_updates = int(
+                    behavior_policy_kl_candidate["dual_updates"]
+                )
 
         # Inner state is deliberately not checkpointed or resumed.
         self.inner_engine.clear_all()
@@ -803,8 +1118,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
         return self
 
     @staticmethod
-    def _materialize_action_metrics(action, metrics, rollout_lengths):
-        """Copy action, scalar metrics, and lengths to the host together."""
+    def _materialize_action_metrics(
+        action,
+        metrics,
+        rollout_lengths,
+        behavior_policy=None,
+    ):
+        """Copy action, metrics, lengths, and optional policy data together."""
         tensor_items = [
             (key, value)
             for key, value in metrics.items()
@@ -824,6 +1144,16 @@ class AMBITDMPC2Agent(torch.nn.Module):
             pieces.append(
                 tensor_lengths.to(device=action.device, dtype=action.dtype)
             )
+        behavior_shapes = None
+        if behavior_policy is not None:
+            behavior_mean = behavior_policy["pre_tanh_mean"].detach().to(
+                device=action.device, dtype=action.dtype
+            )
+            behavior_log_std = behavior_policy["log_std"].detach().to(
+                device=action.device, dtype=action.dtype
+            )
+            behavior_shapes = (behavior_mean.shape, behavior_log_std.shape)
+            pieces.extend((behavior_mean.reshape(-1), behavior_log_std.reshape(-1)))
         packed = torch.cat(pieces).detach().cpu()
         action_size = int(action.numel())
         cpu_action = packed[:action_size].reshape(action.shape)
@@ -833,12 +1163,37 @@ class AMBITDMPC2Agent(torch.nn.Module):
         if tensor_lengths is not None:
             lengths_start = action_size + len(tensor_items)
             rollout_lengths = [
-                int(value) for value in packed[lengths_start:].tolist()
+                int(value)
+                for value in packed[
+                    lengths_start : lengths_start + tensor_lengths.numel()
+                ].tolist()
             ]
-        return cpu_action, materialized, rollout_lengths
+        if behavior_shapes is None:
+            return cpu_action, materialized, rollout_lengths
+        behavior_start = action_size + len(tensor_items)
+        if tensor_lengths is not None:
+            behavior_start += int(tensor_lengths.numel())
+        mean_shape, log_std_shape = behavior_shapes
+        mean_size = math.prod(mean_shape)
+        log_std_size = math.prod(log_std_shape)
+        materialized_behavior = {
+            "pre_tanh_mean": packed[
+                behavior_start : behavior_start + mean_size
+            ].reshape(mean_shape),
+            "log_std": packed[
+                behavior_start + mean_size : behavior_start + mean_size + log_std_size
+            ].reshape(log_std_shape),
+        }
+        return cpu_action, materialized, rollout_lengths, materialized_behavior
 
     @torch.no_grad()
-    def act_outer_policy(self, obs, *, generator):
+    def act_outer_policy(
+        self,
+        obs,
+        *,
+        generator,
+        return_behavior_policy=False,
+    ):
         """Sample the online outer actor without entering the AMBI inner engine."""
         if not isinstance(generator, torch.Generator):
             raise TypeError("generator must be a torch.Generator.")
@@ -873,11 +1228,18 @@ class AMBITDMPC2Agent(torch.nn.Module):
             # generator supplied above.
             with torch.random.fork_rng(devices=fork_devices, enabled=True):
                 root_z = self.model.encode(obs).detach()
-                action = self.model.pi_action(
-                    root_z,
-                    deterministic=False,
-                    generator=generator,
-                )
+                if return_behavior_policy:
+                    action, policy_info = self.model.pi(
+                        root_z,
+                        deterministic=False,
+                        generator=generator,
+                    )
+                else:
+                    action = self.model.pi_action(
+                        root_z,
+                        deterministic=False,
+                        generator=generator,
+                    )
         finally:
             for module, was_training in training_modes:
                 module.training = was_training
@@ -888,7 +1250,24 @@ class AMBITDMPC2Agent(torch.nn.Module):
             )
         if not bool(torch.isfinite(action).all()):
             raise ValueError("The outer policy returned a non-finite action.")
-        return action[0].detach().cpu()
+        if not return_behavior_policy:
+            return action[0].detach().cpu()
+        packed = torch.cat(
+            (
+                action[0].reshape(-1),
+                policy_info["pre_tanh_mean"][0].reshape(-1),
+                policy_info["log_std"][0].reshape(-1),
+            )
+        ).detach().cpu()
+        action_size = int(action[0].numel())
+        return packed[:action_size].reshape(action[0].shape), {
+            "pre_tanh_mean": packed[action_size : 2 * action_size].reshape(
+                action[0].shape
+            ),
+            "log_std": packed[2 * action_size : 3 * action_size].reshape(
+                action[0].shape
+            ),
+        }
 
     def act(
         self,
@@ -898,6 +1277,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         task=None,
         *,
         collect_diagnostics=True,
+        return_behavior_policy=False,
     ):
         if task is not None:
             raise ValueError("AMBI-TD-MPC2 currently supports single-task training only.")
@@ -920,11 +1300,12 @@ class AMBITDMPC2Agent(torch.nn.Module):
                     # Re-enable gradients locally without reconnecting the
                     # detached root latent to the outer encoder.
                     with torch.enable_grad():
-                        action, metrics, lengths = self.inner_engine.act(
+                        result = self.inner_engine.act(
                             root_z,
                             t0=t0,
                             eval_mode=eval_mode,
                             collect_diagnostics=collect_diagnostics,
+                            return_behavior_policy=return_behavior_policy,
                         )
             else:
                 with torch.no_grad():
@@ -932,20 +1313,42 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 # See the pixel-observation branch above. Evaluation controls
                 # the executed action, not whether AMBI performs inner learning.
                 with torch.enable_grad():
-                    action, metrics, lengths = self.inner_engine.act(
+                    result = self.inner_engine.act(
                         root_z,
                         t0=t0,
                         eval_mode=eval_mode,
                         collect_diagnostics=collect_diagnostics,
+                        return_behavior_policy=return_behavior_policy,
                     )
         finally:
             self.model.train(was_training)
-        action, metrics, lengths = self._materialize_action_metrics(
-            action, metrics, lengths
-        )
+        if return_behavior_policy:
+            action, metrics, lengths, behavior_policy = result
+            if behavior_policy is None:
+                action, metrics, lengths = self._materialize_action_metrics(
+                    action,
+                    metrics,
+                    lengths,
+                )
+            else:
+                action, metrics, lengths, behavior_policy = (
+                    self._materialize_action_metrics(
+                        action,
+                        metrics,
+                        lengths,
+                        behavior_policy=behavior_policy,
+                    )
+                )
+        else:
+            action, metrics, lengths = result
+            action, metrics, lengths = self._materialize_action_metrics(
+                action, metrics, lengths
+            )
         metrics = self.inner_engine.finalize_timing_metrics(metrics)
         self.last_inner_metrics = metrics
         self.last_inner_rollout_lengths = lengths
+        if return_behavior_policy:
+            return action, behavior_policy
         return action
 
     def _make_inner_modules(self):
@@ -1257,21 +1660,180 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 )
         return info
 
-    def _update_actor(self, zs):
+    def _behavior_policy_kl_loss(
+        self,
+        policy_info,
+        behavior_pre_tanh_mean,
+        behavior_log_std,
+        behavior_policy_valid,
+    ):
+        """Return the valid-weighted Jensen component reverse-KL estimate."""
+        if any(
+            value is None
+            for value in (
+                behavior_pre_tanh_mean,
+                behavior_log_std,
+                behavior_policy_valid,
+            )
+        ):
+            raise ValueError(
+                "An active behavior-policy KL schedule requires replayed "
+                "behavior mean, log-std, and validity tensors."
+            )
+        current_mean = policy_info["pre_tanh_mean"][:-1]
+        current_log_std = policy_info["log_std"][:-1]
+        if behavior_pre_tanh_mean.shape != current_mean.shape:
+            raise ValueError(
+                "Behavior-policy mean shape does not match the nonterminal "
+                f"actor states: {tuple(behavior_pre_tanh_mean.shape)} != "
+                f"{tuple(current_mean.shape)}."
+            )
+        if behavior_log_std.shape != current_log_std.shape:
+            raise ValueError(
+                "Behavior-policy log-std shape does not match the nonterminal "
+                f"actor states: {tuple(behavior_log_std.shape)} != "
+                f"{tuple(current_log_std.shape)}."
+            )
+        valid = behavior_policy_valid.to(device=self.device, dtype=torch.bool)
+        if valid.ndim == current_mean.ndim and valid.shape[-1] == 1:
+            valid = valid.squeeze(-1)
+        expected_valid_shape = current_mean.shape[:-1]
+        if valid.shape != expected_valid_shape:
+            raise ValueError(
+                "Behavior-policy validity shape does not match replay rows: "
+                f"{tuple(valid.shape)} != {tuple(expected_valid_shape)}."
+            )
+        kl_per_row = td_math.diagonal_gaussian_reverse_kl(
+            current_mean,
+            current_log_std,
+            behavior_pre_tanh_mean,
+            behavior_log_std,
+        ).squeeze(-1) / float(self.cfg.action_dim)
+        temporal_weights = self._transition_temporal_weights.to(
+            dtype=kl_per_row.dtype
+        )
+        temporal_weights = temporal_weights.reshape(
+            (int(temporal_weights.shape[0]),)
+            + (1,) * (kl_per_row.ndim - 1)
+        )
+        weighted_valid = temporal_weights * valid.to(dtype=kl_per_row.dtype)
+        denominator = weighted_valid.sum()
+        valid_count = int(valid.sum().item())
+        has_weighted_support = bool(
+            valid_count
+            and torch.isfinite(denominator).item()
+            and denominator.item() > 0.0
+        )
+        if has_weighted_support:
+            kl_loss = (
+                kl_per_row[valid] * weighted_valid[valid]
+            ).sum() / denominator
+            valid_values = kl_per_row[valid]
+            kl_p50 = torch.quantile(valid_values.detach(), 0.5)
+            kl_p95 = torch.quantile(valid_values.detach(), 0.95)
+        else:
+            kl_loss = (current_mean.sum() + current_log_std.sum()) * 0.0
+            kl_p50 = kl_loss.detach()
+            kl_p95 = kl_loss.detach()
+        ready = has_weighted_support and valid_count >= int(
+            self.cfg.outer_behavior_policy_kl_min_valid_count
+        )
+        metrics = {
+            "behavior_policy_kl": kl_loss.detach(),
+            "behavior_policy_kl_p50": kl_p50,
+            "behavior_policy_kl_p95": kl_p95,
+            "behavior_policy_kl_valid_count": float(valid_count),
+            "behavior_policy_kl_valid_fraction": (
+                float(valid_count) / float(valid.numel())
+            ),
+            "behavior_policy_kl_ready": float(ready),
+        }
+        return kl_loss, ready, metrics
+
+    def _update_actor(
+        self,
+        zs,
+        behavior_pre_tanh_mean=None,
+        behavior_log_std=None,
+        behavior_policy_valid=None,
+    ):
         action, policy_info = self.model.pi(zs)
+        behavior_kl = torch.zeros((), device=self.device)
+        behavior_kl_ready = False
+        behavior_kl_metrics = {}
+        if self.behavior_policy_kl_enabled:
+            behavior_kl, behavior_kl_ready, behavior_kl_metrics = (
+                self._behavior_policy_kl_loss(
+                    policy_info,
+                    behavior_pre_tanh_mean,
+                    behavior_log_std,
+                    behavior_policy_valid,
+                )
+            )
         # Preserve the established SAC ordering: this slot's actor uses alpha
         # from the beginning of the slot; an automatic-alpha step affects the
         # next outer update.
         alpha = self.alpha.detach()
         entropy_coefficient_loss = torch.zeros((), device=self.device)
         if self.ent_coef_optim is not None:
+            entropy_residual_per_time = (
+                policy_info["log_prob"] + self.target_entropy
+            ).detach().mean(dim=(1, 2))
+            # Match the actor's relative depth mixture without making the
+            # temperature step size depend on horizon-level loss scaling.
+            entropy_temporal_weights = self._actor_temporal_weights.to(
+                dtype=entropy_residual_per_time.dtype
+            )
+            entropy_temporal_weights = (
+                entropy_temporal_weights / entropy_temporal_weights.sum()
+            )
+            weighted_entropy_residual = (
+                entropy_residual_per_time * entropy_temporal_weights
+            ).sum()
             entropy_coefficient_loss = -(
-                self.log_ent_coef
-                * (policy_info["log_prob"] + self.target_entropy).detach()
+                self.log_ent_coef * weighted_entropy_residual
             ).mean()
             self.ent_coef_optim.zero_grad(set_to_none=True)
             entropy_coefficient_loss.backward()
             self.ent_coef_optim.step()
+
+        behavior_kl_coefficient = torch.zeros((), device=self.device)
+        behavior_kl_dual_loss = torch.zeros((), device=self.device)
+        behavior_kl_dual_violation = torch.zeros((), device=self.device)
+        behavior_kl_dual_cap_hit = torch.zeros((), device=self.device)
+        behavior_kl_dual_updated = torch.zeros((), device=self.device)
+        dual_coefficient_after = None
+        if self._behavior_policy_kl_schedule == "dual":
+            slot_coefficient = self.log_behavior_policy_kl_coef.exp().detach()
+            if behavior_kl_ready:
+                behavior_kl_coefficient = slot_coefficient.reshape(())
+                behavior_kl_dual_violation = (
+                    behavior_kl.detach()
+                    - float(self.cfg.outer_behavior_policy_kl_target)
+                )
+                behavior_kl_dual_loss = -(
+                    self.log_behavior_policy_kl_coef
+                    * behavior_kl_dual_violation
+                ).mean()
+                self.behavior_policy_kl_optim.zero_grad(set_to_none=True)
+                behavior_kl_dual_loss.backward()
+                self.behavior_policy_kl_optim.step()
+                with torch.no_grad():
+                    self.log_behavior_policy_kl_coef.clamp_(
+                        min=math.log(_BEHAVIOR_POLICY_KL_DUAL_MIN),
+                        max=math.log(
+                            float(self.cfg.outer_behavior_policy_kl_dual_max)
+                        ),
+                    )
+                self.behavior_policy_kl_dual_updates += 1
+                behavior_kl_dual_updated.fill_(1.0)
+            dual_coefficient_after = (
+                self.log_behavior_policy_kl_coef.exp().detach().reshape(())
+            )
+            behavior_kl_dual_cap_hit = (
+                self.log_behavior_policy_kl_coef.detach().reshape(())
+                >= math.log(float(self.cfg.outer_behavior_policy_kl_dual_max))
+            ).to(dtype=torch.float32)
 
         # Materialize the decoded ensemble once so the configured actor
         # reduction and the observational head-gap diagnostics see exactly the
@@ -1296,12 +1858,41 @@ class AMBITDMPC2Agent(torch.nn.Module):
             q_policy_all_detached,
             "min_all",
         )
+        q_range_instant = self._update_actor_loss_scale(q_policy[0])
+
+        smooth_progress = 0.0
+        quantile_gate_active = False
+        if self._behavior_policy_kl_schedule == "smooth":
+            ramp_updates = int(self.cfg.outer_behavior_policy_kl_ramp_updates)
+            completed = int(self.behavior_policy_kl_eligible_updates)
+            if behavior_kl_ready:
+                smooth_progress = min(
+                    float(completed + 1) / float(ramp_updates), 1.0
+                )
+                smooth_weight = smooth_progress * smooth_progress * (
+                    3.0 - 2.0 * smooth_progress
+                )
+                behavior_kl_coefficient = behavior_kl.new_tensor(
+                    float(self.cfg.outer_behavior_policy_kl_coef)
+                    * smooth_weight
+                )
+            else:
+                smooth_progress = min(
+                    float(completed) / float(ramp_updates), 1.0
+                )
+        elif self._behavior_policy_kl_schedule == "quantile_gate":
+            quantile_gate_active = bool(
+                self._actor_loss_scale_value.item()
+                > float(self.cfg.outer_behavior_policy_kl_q_threshold)
+            )
+            if behavior_kl_ready and quantile_gate_active:
+                behavior_kl_coefficient = behavior_kl.new_tensor(
+                    float(self.cfg.outer_behavior_policy_kl_coef)
+                )
+
         actor_objective = alpha * policy_info["log_prob"] - q_policy
-        if self.actor_loss_scale_enabled:
-            self._update_actor_loss_scale(q_policy[0])
-            actor_objective = actor_objective / self._actor_loss_scale_value
         actor_per_time = actor_objective.mean(dim=(1, 2))
-        actor_loss = td_math.reduce_temporal_loss(
+        sac_actor_loss = td_math.reduce_temporal_loss(
             actor_per_time,
             self.cfg.rho,
             normalization=self.cfg.temporal_loss_normalization,
@@ -1310,6 +1901,29 @@ class AMBITDMPC2Agent(torch.nn.Module):
             legacy_order="vector_mean",
             weights=self._actor_temporal_weights,
         )
+        if self.behavior_policy_kl_enabled:
+            actor_loss = (
+                sac_actor_loss + behavior_kl_coefficient * behavior_kl
+            )
+            if self.actor_loss_scale_enabled:
+                actor_loss = actor_loss / self._actor_loss_scale_value.reshape(())
+        else:
+            # Preserve the historical feature-disabled ordering, including
+            # scaling before temporal reduction.
+            if self.actor_loss_scale_enabled:
+                actor_objective = actor_objective / self._actor_loss_scale_value
+                actor_per_time = actor_objective.mean(dim=(1, 2))
+                actor_loss = td_math.reduce_temporal_loss(
+                    actor_per_time,
+                    self.cfg.rho,
+                    normalization=self.cfg.temporal_loss_normalization,
+                    reference_horizon=self.cfg.temporal_loss_reference_horizon,
+                    include_terminal=True,
+                    legacy_order="vector_mean",
+                    weights=self._actor_temporal_weights,
+                )
+            else:
+                actor_loss = sac_actor_loss
 
         self.pi_optim.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -1317,6 +1931,11 @@ class AMBITDMPC2Agent(torch.nn.Module):
             self.model._pi.parameters(), float(self.cfg.grad_clip_norm)
         )
         self.pi_optim.step()
+        if (
+            self._behavior_policy_kl_schedule == "smooth"
+            and behavior_kl_ready
+        ):
+            self.behavior_policy_kl_eligible_updates += 1
         metrics = {
             "actor_loss": actor_loss.detach(),
             "actor_grad_norm": torch.as_tensor(actor_grad_norm).detach(),
@@ -1335,6 +1954,71 @@ class AMBITDMPC2Agent(torch.nn.Module):
             metrics["actor_effective_ent_coef"] = (
                 alpha / self._actor_loss_scale_value
             ).detach()
+        if self.behavior_policy_kl_enabled:
+            actor_scale = (
+                self._actor_loss_scale_value.reshape(())
+                if self.actor_loss_scale_enabled
+                else behavior_kl.new_ones(())
+            )
+            metrics.update(behavior_kl_metrics)
+            metrics.update(
+                {
+                    "behavior_policy_kl_coefficient": (
+                        behavior_kl_coefficient.detach()
+                    ),
+                    "behavior_policy_kl_effective_coefficient": (
+                        behavior_kl_coefficient / actor_scale
+                    ).detach(),
+                    "behavior_policy_kl_weighted_loss": (
+                        behavior_kl_coefficient * behavior_kl / actor_scale
+                    ).detach(),
+                }
+            )
+            if self._actor_q_range_enabled:
+                metrics["actor_q_range_instant"] = q_range_instant.detach()
+                metrics["actor_q_range_ema"] = (
+                    self._actor_loss_scale_value.detach()
+                )
+            if self._behavior_policy_kl_schedule == "smooth":
+                metrics["behavior_policy_kl_ramp_progress"] = float(
+                    smooth_progress
+                )
+                metrics["behavior_policy_kl_eligible_updates"] = float(
+                    self.behavior_policy_kl_eligible_updates
+                )
+            elif self._behavior_policy_kl_schedule == "quantile_gate":
+                metrics["behavior_policy_kl_gate_active"] = float(
+                    quantile_gate_active
+                )
+                metrics["behavior_policy_kl_q_threshold"] = float(
+                    self.cfg.outer_behavior_policy_kl_q_threshold
+                )
+            elif self._behavior_policy_kl_schedule == "dual":
+                metrics.update(
+                    {
+                        "behavior_policy_kl_dual_coefficient": (
+                            dual_coefficient_after
+                        ),
+                        "behavior_policy_kl_dual_log_coefficient": (
+                            self.log_behavior_policy_kl_coef.detach().reshape(())
+                        ),
+                        "behavior_policy_kl_dual_violation": (
+                            behavior_kl_dual_violation.detach()
+                        ),
+                        "behavior_policy_kl_dual_loss": (
+                            behavior_kl_dual_loss.detach()
+                        ),
+                        "behavior_policy_kl_dual_updated": (
+                            behavior_kl_dual_updated.detach()
+                        ),
+                        "behavior_policy_kl_dual_updates": float(
+                            self.behavior_policy_kl_dual_updates
+                        ),
+                        "behavior_policy_kl_dual_cap_hit": (
+                            behavior_kl_dual_cap_hit.detach()
+                        ),
+                    }
+                )
         return metrics
 
     def _outer_update_kernel(
@@ -1432,7 +2116,16 @@ class AMBITDMPC2Agent(torch.nn.Module):
             total_loss,
         )
 
-    def _update(self, obs, action, reward, terminated):
+    def _update(
+        self,
+        obs,
+        action,
+        reward,
+        terminated,
+        behavior_pre_tanh_mean=None,
+        behavior_log_std=None,
+        behavior_policy_valid=None,
+    ):
         """One TD-MPC2-style model update with configurable Q regression."""
         with torch.no_grad():
             next_z_targets = self.model.encode(obs[1:])
@@ -1478,7 +2171,12 @@ class AMBITDMPC2Agent(torch.nn.Module):
         )
         self.optim.step()
 
-        actor_info = self._update_actor(latent_states.detach())
+        actor_info = self._update_actor(
+            latent_states.detach(),
+            behavior_pre_tanh_mean=behavior_pre_tanh_mean,
+            behavior_log_std=behavior_log_std,
+            behavior_policy_valid=behavior_policy_valid,
+        )
         if self.num_updates % int(self.cfg.target_update_interval) == 0:
             self.model.soft_update_target_Q()
         self.num_updates += 1
@@ -1550,7 +2248,22 @@ class AMBITDMPC2Agent(torch.nn.Module):
         return info
 
     def update(self, buffer):
-        obs, action, reward, terminated, task = buffer.sample()
+        if self.behavior_policy_kl_enabled:
+            (
+                obs,
+                action,
+                reward,
+                terminated,
+                task,
+                behavior_pre_tanh_mean,
+                behavior_log_std,
+                behavior_policy_valid,
+            ) = buffer.sample(include_behavior_policy=True)
+        else:
+            obs, action, reward, terminated, task = buffer.sample()
+            behavior_pre_tanh_mean = None
+            behavior_log_std = None
+            behavior_policy_valid = None
         if task is not None:
             raise NotImplementedError(
                 "AMBI-TD-MPC2 currently supports single-task training only."
@@ -1562,4 +2275,12 @@ class AMBITDMPC2Agent(torch.nn.Module):
             and hasattr(torch.compiler, "cudagraph_mark_step_begin")
         ):
             torch.compiler.cudagraph_mark_step_begin()
-        return self._update(obs, action, reward, terminated)
+        return self._update(
+            obs,
+            action,
+            reward,
+            terminated,
+            behavior_pre_tanh_mean=behavior_pre_tanh_mean,
+            behavior_log_std=behavior_log_std,
+            behavior_policy_valid=behavior_policy_valid,
+        )

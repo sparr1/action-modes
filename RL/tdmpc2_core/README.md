@@ -103,6 +103,30 @@ intermediate actor-update statistic associated with a positive
 `inner_outer_policy_kl_coef`; when that regularizer is disabled, its update-time
 metric is omitted rather than reported as a false zero.
 
+### Optional replay behavior-policy KL
+
+`outer_behavior_policy_kl_schedule` optionally adds the analytic reverse KL
+from the current outer actor to the action-generating replay policy. Both are
+represented by their diagonal pre-tanh Gaussians, so their shared invertible
+tanh leaves the KL unchanged. The replayed component is an empirical Jensen
+upper-bound surrogate for the unavailable historical policy mixture. The loss
+uses only the `H` actor states with corresponding actions, divides by action
+dimension, and renormalizes over valid rows; seed and random actions are
+invalid rather than zero-valued targets. This is the requested full reverse KL,
+including its current-policy log-density term, and is intentionally distinct
+from the released TD-M(PC)² implementation's sampled `-log mu(a)` regularizer.
+
+The default `"none"` preserves the legacy replay and checkpoint contracts.
+The active choices are `"smooth"` (a readiness-paused smoothstep ramp to
+`outer_behavior_policy_kl_coef`), `"quantile_gate"` (coefficient active only
+while the just-updated P95-P5 Q-range EMA is strictly above its threshold), and
+`"dual"` (a separately optimized log coefficient targeting
+`outer_behavior_policy_kl_target`). If actor-loss scaling is enabled, the
+entire raw SAC-plus-KL objective is divided by the shared Q-range scale; entropy
+and KL temperatures retain independent optimizers. Active modes require
+stochastic inner SAC execution. Replay and agent states move to versions 2 and
+5/6 respectively only while this feature is active.
+
 ### Value-equivalence live monitor
 
 AMBI includes an optional, observational value-equivalence monitor for inner
