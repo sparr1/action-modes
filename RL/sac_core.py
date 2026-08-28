@@ -226,11 +226,30 @@ class SquashedGaussianActor(nn.Module):
         )
         return mean_actions, log_std
 
-    def action_log_prob(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def action_log_prob(
+        self,
+        obs: torch.Tensor,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         mean_actions, log_std = self.get_action_dist_params(obs)
         std = torch.exp(log_std)
         dist = Normal(mean_actions, std)
-        gaussian_actions = dist.rsample()
+        if generator is None:
+            # Preserve the established training path exactly. In particular,
+            # SB3 parity depends on Normal.rsample() consuming the global Torch
+            # stream with its existing numerical implementation.
+            gaussian_actions = dist.rsample()
+        else:
+            # Evaluation diagnostics use an explicit, namespaced stream so they
+            # neither advance nor depend on training's global RNG state.
+            noise = torch.randn(
+                mean_actions.shape,
+                dtype=mean_actions.dtype,
+                device=mean_actions.device,
+                generator=generator,
+            )
+            gaussian_actions = mean_actions + std * noise
         actions = torch.tanh(gaussian_actions)
         log_prob = dist.log_prob(gaussian_actions)
         log_prob = log_prob - torch.log(1.0 - actions.pow(2) + EPS)
@@ -523,15 +542,52 @@ class SACAgent:
         action = self.actor(obs_t, deterministic=deterministic)
         return action.cpu().numpy()[0]
 
-    def q_predictions(self, obs, actions) -> Tuple[torch.Tensor, ...]:
+    @torch.no_grad()
+    def sample_action_log_prob(
+        self,
+        obs,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample normalized actions and log densities without changing modes."""
+
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        if obs_t.ndim == 1:
+            obs_t = obs_t.unsqueeze(0)
+        return self.actor.action_log_prob(obs_t, generator=generator)
+
+    @property
+    def entropy_coefficient(self) -> torch.Tensor:
+        """Return the current fixed or learned SAC temperature as a tensor."""
+
+        if self.log_ent_coef is not None:
+            return self.log_ent_coef.detach().exp()
+        return self.ent_coef_tensor.detach()
+
+    def q_predictions(
+        self,
+        obs,
+        actions,
+        *,
+        target: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
         """Return raw scalar predictions or categorical logits from all critics."""
         obs_t = self._as_batch_tensor(obs, self.device)
         act_t = self._as_batch_tensor(actions, self.device)
-        return self.critic(obs_t, act_t)
+        critic = self.critic_target if target else self.critic
+        return critic(obs_t, act_t)
 
-    def q_values(self, obs, actions) -> Tuple[torch.Tensor, ...]:
+    def q_values(
+        self,
+        obs,
+        actions,
+        *,
+        target: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
         """Expose decoded scalar Q-values from every native SAC critic."""
-        return self._decode_q_predictions(self.q_predictions(obs, actions))
+        return self._decode_q_predictions(
+            self.q_predictions(obs, actions, target=target)
+        )
 
     def update(self, replay_buffer: ReplayBuffer, gradient_steps: int, batch_size: int) -> Dict[str, float]:
         self.actor.train()

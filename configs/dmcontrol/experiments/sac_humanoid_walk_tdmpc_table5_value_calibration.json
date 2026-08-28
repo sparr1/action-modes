@@ -1,0 +1,26 @@
+{
+  "study_type": "native_sac_humanoid_walk_tdmpc_table5_value_calibration",
+  "study_note": "Three-seed, one-million-decision Humanoid Walk value-calibration run derived from the direct-state native SAC TD-MPC Table-5 comparator. It evaluates paper_deterministic and stochastic_soft_bellman at step zero and every 50,000 agent decisions with 100 fixed-seed samples per estimate. paper_deterministic is compatibility-only and is not matched to SAC's entropy-regularized critic target; stochastic_soft_bellman is the primary target-matched protocol. Its corrected discounted timeout tail bootstraps the finite soft return at truncation and supplies the primary critic bias and RMSE metrics. All other Table-5 native SAC optimizer, network, entropy, twin-Q, and update-schedule settings remain unchanged. This is a calibration study, not a 14-million-decision performance comparison. Model checkpoints and trajectory logs are disabled.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 3,
+  "configs": [
+    "sac_humanoid_walk_tdmpc_table5_value_calibration"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": null,
+  "save_strat": "none",
+  "log_info": false,
+  "log_type": "summary"
+}

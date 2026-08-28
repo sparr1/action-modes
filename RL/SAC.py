@@ -8,9 +8,11 @@ scaling follow Stable-Baselines3 SAC semantics as closely as possible.
 from __future__ import annotations
 
 import csv
+import math
 import os
 import random
 import time
+from collections.abc import Mapping
 from dataclasses import asdict
 from numbers import Integral, Real
 from pathlib import Path
@@ -39,6 +41,12 @@ from utils.wandb_utils import (
 )
 
 
+_VALUE_EVAL_PROTOCOLS = {
+    "paper_deterministic",
+    "stochastic_soft_bellman",
+}
+
+
 class SAC(Algorithm):
     supports_composable_checkpointing = True
 
@@ -64,8 +72,6 @@ class SAC(Algorithm):
         self.action_shape = self.env.action_space.shape
         self.action_dim = int(np.prod(self.action_shape))
         self.cfg = self._make_config()
-        self.replay_buffer = ReplayBuffer(self.obs_dim, self.action_dim, self.cfg.buffer_size)
-        self.agent = SACAgent(self.obs_dim, self.action_dim, self.cfg)
         self.num_timesteps = 0
         self._last_obs = None
         self._last_metrics = {}
@@ -115,12 +121,63 @@ class SAC(Algorithm):
                     raise ValueError("eval_csv_path cannot be empty.")
             self._eval_csv_path = eval_csv_path
 
+        # Expensive value-calibration probes are wrapper-only diagnostics. Keep
+        # them disabled by default and validate every option even while disabled
+        # so misspelled campaign settings cannot remain latent.
+        self._eval_value = self._strict_bool(
+            self.params.get("eval_value", False), "eval_value"
+        )
+        self._eval_value_samples = self._strict_positive_int(
+            self.params.get("eval_value_samples", 100), "eval_value_samples"
+        )
+        self._eval_value_seed = self._strict_nonnegative_int(
+            self.params.get("eval_value_seed", 12345), "eval_value_seed"
+        )
+        self._eval_value_protocols = self._normalize_eval_value_protocols(
+            self.params.get(
+                "eval_value_protocols",
+                ["paper_deterministic", "stochastic_soft_bellman"],
+            )
+        )
+        self._value_calibration_evaluator = None
+        if self._eval_value:
+            if self._eval_freq is None:
+                raise ValueError("eval_value=true requires a configured eval_freq.")
+            if self.cfg.q_representation != "scalar":
+                raise ValueError(
+                    "eval_value=true requires q_representation='scalar'."
+                )
+            if self.cfg.num_q != 2:
+                raise ValueError("eval_value=true requires num_q=2 twin-Q critics.")
+            if self.cfg.q_pair_size != 2:
+                raise ValueError("eval_value=true requires q_pair_size=2.")
+            if self.cfg.q_target_reduction != "min_pair":
+                raise ValueError(
+                    "eval_value=true requires q_target_reduction='min_pair'."
+                )
+            if self.cfg.q_actor_reduction != "min_pair":
+                raise ValueError(
+                    "eval_value=true requires q_actor_reduction='min_pair'."
+                )
+
+        # Allocate the large replay array and model only after all wrapper
+        # options have passed validation.
+        self.replay_buffer = ReplayBuffer(
+            self.obs_dim, self.action_dim, self.cfg.buffer_size
+        )
+        self.agent = SACAgent(self.obs_dim, self.action_dim, self.cfg)
+
     def _init_wandb(self):
         return init_wandb(
             self.params,
             default_project="ambi",
             run_name=f"NativeSAC-{self.run_params.get('env', 'env')}-seed{self.seed}",
-            config={"run_params": self.run_params, "alg_params": self.params, "config": asdict(self.cfg)},
+            config={
+                "run_params": self.run_params,
+                "experiment_params": self.experiment_params,
+                "alg_params": self.params,
+                "config": asdict(self.cfg),
+            },
         )
 
     def _make_config(self) -> SACConfig:
@@ -216,6 +273,63 @@ class SAC(Algorithm):
         ):
             raise ValueError(f"{name} must be a positive integer.")
         return int(value)
+
+    @staticmethod
+    def _strict_bool(value, name: str) -> bool:
+        if not isinstance(value, (bool, np.bool_)):
+            raise ValueError(f"{name} must be a boolean.")
+        return bool(value)
+
+    @staticmethod
+    def _strict_positive_int(value, name: str) -> int:
+        if isinstance(value, (bool, np.bool_)) or not isinstance(
+            value, (int, np.integer)
+        ):
+            raise ValueError(f"{name} must be a positive integer.")
+        value = int(value)
+        if value <= 0:
+            raise ValueError(f"{name} must be a positive integer.")
+        return value
+
+    @staticmethod
+    def _strict_nonnegative_int(value, name: str) -> int:
+        if isinstance(value, (bool, np.bool_)) or not isinstance(
+            value, (int, np.integer)
+        ):
+            raise ValueError(f"{name} must be a non-negative integer.")
+        value = int(value)
+        if value < 0:
+            raise ValueError(f"{name} must be a non-negative integer.")
+        return value
+
+    @staticmethod
+    def _normalize_eval_value_protocols(value):
+        if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+            raise ValueError(
+                "eval_value_protocols must be a non-empty list containing only "
+                f"{sorted(_VALUE_EVAL_PROTOCOLS)}."
+            )
+        protocols = []
+        for protocol in value:
+            if not isinstance(protocol, str):
+                raise ValueError(
+                    "eval_value_protocols entries must be strings from "
+                    f"{sorted(_VALUE_EVAL_PROTOCOLS)}."
+                )
+            protocol = protocol.lower()
+            if protocol not in _VALUE_EVAL_PROTOCOLS:
+                raise ValueError(
+                    "eval_value_protocols entries must be chosen from "
+                    f"{sorted(_VALUE_EVAL_PROTOCOLS)}, got {protocol!r}."
+                )
+            if protocol in protocols:
+                raise ValueError(
+                    f"eval_value_protocols contains duplicate entry {protocol!r}."
+                )
+            protocols.append(protocol)
+        if not protocols:
+            raise ValueError("eval_value_protocols must not be empty.")
+        return protocols
 
     @classmethod
     def _optional_eval_frequency(cls, value):
@@ -444,7 +558,42 @@ class SAC(Algorithm):
         self._eval_csv_path = path
         self._eval_csv_initialized = True
 
-    def _record_evaluation(self, step, reward):
+    def _make_value_calibration_evaluator(self):
+        from RL.sac_value_calibration import SACValueCalibrationEvaluator
+        from utils.core import build_env
+
+        return SACValueCalibrationEvaluator(
+            agent=self.agent,
+            env_factory=lambda: build_env(
+                self.run_params,
+                self.experiment_params,
+                render_mode=None,
+            ),
+            observation_to_array=self._flatten_obs,
+            unscale_action=self._unscale_action,
+            discount=float(self.cfg.gamma),
+            samples=int(self._eval_value_samples),
+            seed=int(self._eval_value_seed),
+            protocols=tuple(self._eval_value_protocols),
+            device=self.agent.device,
+        )
+
+    def _evaluation_payload_extras(self, step):
+        if not self._eval_value:
+            return {}
+        if self._value_calibration_evaluator is None:
+            self._value_calibration_evaluator = (
+                self._make_value_calibration_evaluator()
+            )
+        return self._value_calibration_evaluator.evaluate()
+
+    def close(self):
+        evaluator = self._value_calibration_evaluator
+        self._value_calibration_evaluator = None
+        if evaluator is not None:
+            evaluator.close()
+
+    def _record_evaluation(self, step, reward, *, extras=None):
         reward = float(reward)
         print(
             "Native SAC evaluation:",
@@ -462,14 +611,43 @@ class SAC(Algorithm):
                 )
                 stream.flush()
                 os.fsync(stream.fileno())
-        log_wandb(
-            self._wandb_run,
-            {
-                "eval/episode_reward": reward,
-                "eval/episodes": int(self._eval_episodes),
-            },
-            step=int(step),
-        )
+        payload = {
+            "eval/episode_reward": reward,
+            "eval/episodes": int(self._eval_episodes),
+        }
+        if extras is not None:
+            if not isinstance(extras, Mapping):
+                raise TypeError("Evaluation payload extras must be a mapping.")
+            reserved = {
+                "eval/episode_reward",
+                "eval/episodes",
+                "episode/index",
+                "env_step",
+            }
+            collisions = reserved.intersection(extras)
+            if collisions:
+                raise ValueError(
+                    "Evaluation payload extras collide with reserved metrics: "
+                    f"{sorted(collisions)}."
+                )
+            for key, value in extras.items():
+                if not isinstance(key, str) or not key:
+                    raise TypeError(
+                        "Evaluation payload extra keys must be non-empty strings."
+                    )
+                if isinstance(value, (bool, np.bool_)) or not isinstance(
+                    value, (int, float, np.integer, np.floating)
+                ):
+                    raise TypeError(
+                        f"Evaluation payload extra {key!r} must be numeric."
+                    )
+                numeric = float(value)
+                if not math.isfinite(numeric):
+                    raise ValueError(
+                        f"Evaluation payload extra {key!r} must be finite."
+                    )
+                payload[key] = numeric
+        log_wandb(self._wandb_run, payload, step=int(step))
 
     @torch.no_grad()
     def _evaluate_policy(self, step, *, initial_obs=None):
@@ -492,7 +670,13 @@ class SAC(Algorithm):
             episode_returns.append(episode_return)
 
         mean_return = float(np.mean(episode_returns))
-        self._record_evaluation(step, mean_return)
+        extras = self._evaluation_payload_extras(int(step))
+        if extras:
+            self._record_evaluation(step, mean_return, extras=extras)
+        else:
+            # Preserve the historical two-argument seam when diagnostics are
+            # disabled, including tests and downstream wrappers that replace it.
+            self._record_evaluation(step, mean_return)
         return mean_return
 
     def _checkpoint_state(self):
@@ -539,11 +723,11 @@ class SAC(Algorithm):
 
     def learn(self, total_timesteps=10000, reset_num_timesteps=True):
         total_timesteps = validate_timestep_budget(total_timesteps)
-        self._seed_once()
-        if self._wandb_run is None:
-            self._wandb_run = self._init_wandb()
 
         try:
+            self._seed_once()
+            if self._wandb_run is None:
+                self._wandb_run = self._init_wandb()
             run_step_zero_eval = self._eval_freq is not None and (
                 reset_num_timesteps
                 or (self.num_timesteps == 0 and self._last_obs is None)
@@ -582,6 +766,10 @@ class SAC(Algorithm):
                 self._last_obs = obs
         except BaseException as primary_error:
             cleanup_errors = []
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
             if self._wandb_run is not None:
                 try:
                     finish_wandb(self._wandb_run)
@@ -679,6 +867,10 @@ class SAC(Algorithm):
                     cleanup_errors.append(exc)
                 finally:
                     self._wandb_run = None
+            try:
+                self.close()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
             if cleanup_errors:
                 if primary_error is not None:
                     add_cleanup_notes(
