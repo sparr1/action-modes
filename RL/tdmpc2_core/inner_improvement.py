@@ -1,7 +1,9 @@
 """Componentized AMBI inner-loop improvement strategies.
 
-All state in this module is private to action selection. The outer world model,
-optimizers, target critics, and entropy coefficient are never mutated here.
+Inner learner state in this module is private to action selection. The optional
+training-only prior-writeback ablation can mutate the outer actor and online
+critic in place after action selection; outer optimizer state, target critics,
+the rest of the world model, and the entropy coefficient remain untouched.
 """
 
 from copy import deepcopy
@@ -3100,6 +3102,40 @@ class InnerImprovementEngine:
         )
         return result.action, metrics, candidate_lengths + policy_lengths
 
+    @torch.no_grad()
+    def _apply_control_prior_writeback(self):
+        """Assimilate final action-local SAC weights into online outer priors."""
+
+        state, cfg = self.state, self.cfg
+        actor_coef = float(cfg.inner_actor_writeback_coef)
+        critic_coef = float(cfg.inner_critic_writeback_coef)
+        applied = {
+            "inner_actor_writeback_coef": actor_coef,
+            "inner_critic_writeback_coef": critic_coef,
+            "inner_actor_writeback_applied": 0.0,
+            "inner_critic_writeback_applied": 0.0,
+        }
+        if actor_coef > 0.0 and state.actor is None:
+            raise RuntimeError(
+                "Actor prior write-back requires a live adapted inner actor."
+            )
+        if critic_coef > 0.0 and state.critic is None:
+            raise RuntimeError(
+                "Critic prior write-back requires a live adapted inner critic."
+            )
+
+        # Preflight both components before either mutation so an invalid joint
+        # request cannot leave only one persistent prior written back.
+        if actor_coef > 0.0:
+            polyak_update(state.actor, self.model._pi, actor_coef)
+            applied["inner_actor_writeback_applied"] = 1.0
+        if critic_coef > 0.0:
+            # Deliberately update only the online value prior. The persistent
+            # target critic retains its ordinary real-update EMA cadence.
+            polyak_update(state.critic, self.model._Qs, critic_coef)
+            applied["inner_critic_writeback_applied"] = 1.0
+        return applied
+
     def act(
         self,
         root_z,
@@ -3108,6 +3144,7 @@ class InnerImprovementEngine:
         eval_mode=False,
         collect_diagnostics=True,
         return_behavior_policy=False,
+        apply_inner_writeback=False,
     ):
         self._pending_timers = {}
         start = self._timer_start()
@@ -3149,6 +3186,26 @@ class InnerImprovementEngine:
                     action, metrics, lengths, behavior_policy = result
                 else:
                     action, metrics, lengths = result
+
+                writeback_active = bool(
+                    self.cfg.inner_actor_writeback_coef > 0.0
+                    or self.cfg.inner_critic_writeback_coef > 0.0
+                )
+                if writeback_active:
+                    metrics.update(
+                        {
+                            "inner_actor_writeback_coef": float(
+                                self.cfg.inner_actor_writeback_coef
+                            ),
+                            "inner_critic_writeback_coef": float(
+                                self.cfg.inner_critic_writeback_coef
+                            ),
+                            "inner_actor_writeback_applied": 0.0,
+                            "inner_critic_writeback_applied": 0.0,
+                        }
+                    )
+                    if bool(apply_inner_writeback) and not bool(eval_mode):
+                        metrics.update(self._apply_control_prior_writeback())
 
             self._timer_stop("inner_action_seconds", start)
 

@@ -63,6 +63,66 @@ from the current outer temperature. Scalar twin critics, LoRA, TD3, no inner
 improvement, and persistent inner scopes are explicit ablations. The MPPI inner
 operator is a compute-matched TD-MPC-style comparator, not AMBI's planner.
 
+### Optional adapted-prior writeback
+
+The reference behavior keeps the outer control priors immutable during action
+selection and discards the adapted action-local learner. The writeback ablation
+allows the final action-local actor and online critic to update their matching
+outer priors after a planned training action. For either component with outer
+parameters `w`, final to-go parameters `w_togo`, and configured coefficient
+`c`, the update is
+
+```text
+w <- (1 - c) * w + c * w_togo.
+```
+
+`inner_actor_writeback_coef` and `inner_critic_writeback_coef` are independent,
+strict finite numeric values in `[0, 1]`. Both default to `0.0`, preserving the
+fresh-prior AMBI path exactly. Setting either value to `1.0` is a hard
+replacement; intermediate values apply a Polyak interpolation. Each nonzero
+coefficient requires the canonical J/N/H/G inner schedule, inner SAC, `clone`
+adaptation, action-local parameters, and at least one optimizer update for its
+corresponding component. Any active writeback configuration also requires
+identical inner and outer log-standard-deviation mappings and bounds, keeping
+the full cloned learner in the same policy family as its persistent actor
+prior.
+
+Writeback is explicitly authorized only by the training collection path. Seed
+actions, direct `predict` and rendering calls, online evaluation, and frozen
+checkpoint evaluation cannot write back. Evaluation still performs its normal
+root-local optimizer steps; `eval_mode` controls the returned action, not inner
+learning. This separate gate prevents step-zero or periodic evaluation from
+silently changing the subsequent training prior.
+
+Within an authorized action, AMBI first finishes local updates, produces the
+environment action, and computes diagnostics against the unchanged outer
+prior. It then applies writeback immediately before tearing down the
+action-local workspace. Consequently, diagnostics such as
+`inner_final_outer_policy_kl` retain their pre-writeback meaning. Because the
+destination is the outer prior, the result survives episode resets and is
+included in later model checkpoints; optimizer, replay, temperature, and other
+inner lifetimes remain action-local.
+
+Both resolved coefficients are recorded in portable runtime metadata and in
+the exact-resume scientific identity. For lineage purposes, omitted defaults,
+integer zeros, and explicit `0.0` values canonicalize to the same disabled
+setting.
+
+The interpolation is in-place. It preserves the outer `Parameter` identities
+and the existing outer Adam moments, optimizer counters, entropy coefficient,
+and learner counters. Actor writeback targets only the outer policy. Critic
+writeback targets only the online outer critic; it does not copy the local
+target critic. The outer target critic remains untouched by writeback and
+continues to follow the online critic through the configured ordinary EMA.
+Neither the local entropy temperature nor any target-network state is written
+back.
+
+When at least one coefficient is nonzero, action metrics include
+`inner_actor_writeback_coef` and `inner_critic_writeback_coef`, together with
+the binary `inner_actor_writeback_applied` and
+`inner_critic_writeback_applied`. These are scalar bookkeeping metrics only;
+they add no imagined rollouts, policy or critic forwards, or optimizer steps.
+
 AMBI's actor log-standard-deviation transform is configurable independently of
 its bounds. `log_std_mapping="direct_clamp"` preserves the SAC-style default by
 clamping the actor head directly to `log_std_min`/`log_std_max` (default

@@ -55,6 +55,7 @@ def test_matrix_covers_each_decoupling_axis_and_has_paired_operator_defaults():
         "inner_operator",
         "q_representation",
         "adapted_components",
+        "prior_writeback",
         "temperature",
         "behavior_exploration",
         "execution_noise",
@@ -114,6 +115,36 @@ def test_materialized_presets_follow_existing_algorithm_json_shape(tmp_path):
     experiment = json.loads((tmp_path / "AMBIResearchExperiment.json").read_text())
     assert experiment["env_params"]["terminate_when_unhealthy"] is False
     assert experiment["configs"] == [path.stem for path in paths]
+
+
+def test_prior_writeback_grid_materializes_component_beta_combinations(tmp_path):
+    expected = {
+        "none": (0.0, 0.0),
+        "actor_001": (0.01, 0.0),
+        "actor_01": (0.1, 0.0),
+        "actor_1": (1.0, 0.0),
+        "critic_001": (0.0, 0.01),
+        "critic_01": (0.0, 0.1),
+        "critic_1": (0.0, 1.0),
+        "joint_001": (0.01, 0.01),
+        "joint_01": (0.1, 0.1),
+        "joint_1": (1.0, 1.0),
+    }
+    paths = materialize_presets(
+        MATRIX,
+        tmp_path,
+        comparisons=["prior_writeback"],
+    )
+
+    assert [path.name for path in paths] == [
+        f"prior_writeback__{variant}.json" for variant in expected
+    ]
+    for variant, (actor_coef, critic_coef) in expected.items():
+        payload = json.loads(
+            (tmp_path / f"prior_writeback__{variant}.json").read_text()
+        )
+        assert payload["alg_params"]["inner_actor_writeback_coef"] == actor_coef
+        assert payload["alg_params"]["inner_critic_writeback_coef"] == critic_coef
 
 
 def test_unknown_or_duplicate_preset_input_fails_clearly(tmp_path):
@@ -241,6 +272,10 @@ def test_frozen_selection_rejects_train_only_and_mixed_architecture_axes():
     execution = resolve_preset(MATRIX, "execution_noise/mean", matrix=matrix)
     with pytest.raises(ValueError, match="cannot be used in frozen evaluation"):
         _validate_frozen_selection(matrix, [execution])
+
+    writeback = resolve_preset(MATRIX, "prior_writeback/joint_1", matrix=matrix)
+    with pytest.raises(ValueError, match="deliberately disabled outside training"):
+        _validate_frozen_selection(matrix, [writeback])
 
     scalar = resolve_preset(MATRIX, "q_representation/scalar_twin", matrix=matrix)
     distributional = resolve_preset(

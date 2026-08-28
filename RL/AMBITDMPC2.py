@@ -126,6 +126,12 @@ _AMBI_DEFAULTS = {
     "inner_outer_policy_kl_coef": 0.0,
     "inner_outer_action_l2_coef": 0.0,
 
+    # Optional Reptile/Lookahead-style assimilation of the final action-local
+    # SAC weights into the persistent control priors. Zero preserves canonical
+    # fresh-per-root AMBI exactly; one performs a hard write-back.
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+
     # Exploration during imagined collection is independent of the entropy
     # objective and of noise on the action returned to the real environment.
     "inner_behavior_action": "policy_sample",
@@ -659,6 +665,11 @@ class AMBITDMPC2(TDMPC2Baseline):
             merged["outer_policy_episode_probability"],
             "outer_policy_episode_probability",
         )
+        for key in (
+            "inner_actor_writeback_coef",
+            "inner_critic_writeback_coef",
+        ):
+            merged[key] = _strict_probability(merged[key], key)
         if merged["outer_policy_episode_probability"] > 0.0:
             requested_obs = merged.get("obs")
             if requested_obs is not None and str(requested_obs).lower() != "state":
@@ -1351,6 +1362,74 @@ class AMBITDMPC2(TDMPC2Baseline):
                 )
         cfg.inner_rebase_persistent = bool(cfg.inner_rebase_persistent)
 
+        writeback_active = bool(
+            cfg.inner_actor_writeback_coef > 0.0
+            or cfg.inner_critic_writeback_coef > 0.0
+        )
+        if writeback_active:
+            if cfg.inner_schedule_mode != "canonical":
+                raise ValueError(
+                    "Active inner prior write-back requires the canonical "
+                    "J/N/H/G inner schedule."
+                )
+            if cfg.inner_operator != "sac":
+                raise ValueError(
+                    "Active inner prior write-back requires inner_operator='sac'."
+                )
+            for component in ("actor", "critic"):
+                if getattr(cfg, f"inner_{component}_adaptation") != "clone":
+                    raise ValueError(
+                        "Active inner prior write-back requires full-clone actor "
+                        "and critic adaptation; "
+                        f"inner_{component}_adaptation must be 'clone'."
+                    )
+            action_scopes = (
+                "inner_actor_scope",
+                "inner_critic_scope",
+                "inner_temperature_scope",
+                "inner_replay_scope",
+                "inner_actor_optimizer_scope",
+                "inner_critic_optimizer_scope",
+                "inner_temperature_optimizer_scope",
+            )
+            for key in action_scopes:
+                if getattr(cfg, key) != "action":
+                    raise ValueError(
+                        "Active inner prior write-back requires the canonical "
+                        f"action-local lifecycle; {key} must be 'action'."
+                    )
+            if cfg.outer_policy_episode_probability != 0.0:
+                raise ValueError(
+                    "Active inner prior write-back requires "
+                    "outer_policy_episode_probability=0 so every planned "
+                    "training action uses the inner SAC learner."
+                )
+            if (
+                cfg.inner_actor_writeback_coef > 0.0
+                and cfg.inner_actor_updates_per_action <= 0
+            ):
+                raise ValueError(
+                    "A positive inner_actor_writeback_coef requires positive "
+                    "inner actor updates per action."
+                )
+            if (
+                cfg.inner_critic_writeback_coef > 0.0
+                and cfg.inner_critic_updates_per_action <= 0
+            ):
+                raise ValueError(
+                    "A positive inner_critic_writeback_coef requires positive "
+                    "inner critic updates per action."
+                )
+            if (
+                cfg.inner_log_std_mapping != cfg.log_std_mapping
+                or cfg.inner_log_std_min != cfg.log_std_min
+                or cfg.inner_log_std_max != cfg.log_std_max
+            ):
+                raise ValueError(
+                    "Active inner prior write-back requires identical inner and "
+                    "outer actor log-std mappings and bounds."
+                )
+
         cfg.inner_mppi_num_elites = int(cfg.inner_mppi_num_elites)
         cfg.inner_mppi_num_pi_trajs = int(cfg.inner_mppi_num_pi_trajs)
         if cfg.inner_mppi_num_elites <= 0:
@@ -1708,6 +1787,7 @@ class AMBITDMPC2(TDMPC2Baseline):
                 eval_mode=eval_mode,
                 collect_diagnostics=collect_diagnostics,
                 return_behavior_policy=True,
+                apply_inner_writeback=not eval_mode,
             )
             self._pending_behavior_policy = behavior_policy
         else:
@@ -1716,6 +1796,7 @@ class AMBITDMPC2(TDMPC2Baseline):
                 t0=t0,
                 eval_mode=eval_mode,
                 collect_diagnostics=collect_diagnostics,
+                apply_inner_writeback=not eval_mode,
             )
         # The engine's action index is useful to direct callers, but training
         # telemetry must use the real environment step (including seed/random
@@ -1983,6 +2064,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_critic_optimizer_steps",
             "inner_actor_optimizer_steps",
             "inner_temperature_optimizer_steps",
+            "inner_actor_writeback_applied",
+            "inner_critic_writeback_applied",
             "inner_target_updates",
             "inner_critic_target_updates",
             "inner_actor_target_updates",
@@ -2088,6 +2171,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_alpha_final",
             "inner_alpha_delta",
             "inner_target_entropy",
+            "inner_actor_writeback_coef",
+            "inner_critic_writeback_coef",
             "inner_policy_mean_delta_l2",
             "inner_final_outer_policy_kl",
             "inner_proposal_mean_delta_l2",

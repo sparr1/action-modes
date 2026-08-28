@@ -150,6 +150,84 @@
         }
       }
     },
+    "prior_writeback": {
+      "description": "Interpolate action-local adapted actor and online-critic parameters into their outer priors after each planned training action, separating component choice from writeback coefficient beta.",
+      "frozen_evaluation": false,
+      "frozen_evaluation_reason": "Prior writeback is deliberately disabled outside training: applying it would violate the frozen outer checkpoint, while leaving it disabled would collapse every variant. Materialize and train this axis instead.",
+      "reference": "none",
+      "variants": {
+        "none": {
+          "description": "Do not write either adapted component back to its outer prior.",
+          "alg_params": {
+            "inner_actor_writeback_coef": 0.0,
+            "inner_critic_writeback_coef": 0.0
+          }
+        },
+        "actor_001": {
+          "description": "Write back one percent of the adapted actor displacement only.",
+          "alg_params": {
+            "inner_actor_writeback_coef": 0.01,
+            "inner_critic_writeback_coef": 0.0
+          }
+        },
+        "actor_01": {
+          "description": "Write back ten percent of the adapted actor displacement only.",
+          "alg_params": {
+            "inner_actor_writeback_coef": 0.1,
+            "inner_critic_writeback_coef": 0.0
+          }
+        },
+        "actor_1": {
+          "description": "Fully replace the outer actor prior with the adapted actor.",
+          "alg_params": {
+            "inner_actor_writeback_coef": 1.0,
+            "inner_critic_writeback_coef": 0.0
+          }
+        },
+        "critic_001": {
+          "description": "Write back one percent of the adapted online-critic displacement only.",
+          "alg_params": {
+            "inner_actor_writeback_coef": 0.0,
+            "inner_critic_writeback_coef": 0.01
+          }
+        },
+        "critic_01": {
+          "description": "Write back ten percent of the adapted online-critic displacement only.",
+          "alg_params": {
+            "inner_actor_writeback_coef": 0.0,
+            "inner_critic_writeback_coef": 0.1
+          }
+        },
+        "critic_1": {
+          "description": "Fully replace the outer online-critic prior with the adapted critic.",
+          "alg_params": {
+            "inner_actor_writeback_coef": 0.0,
+            "inner_critic_writeback_coef": 1.0
+          }
+        },
+        "joint_001": {
+          "description": "Write back one percent of both adapted component displacements.",
+          "alg_params": {
+            "inner_actor_writeback_coef": 0.01,
+            "inner_critic_writeback_coef": 0.01
+          }
+        },
+        "joint_01": {
+          "description": "Write back ten percent of both adapted component displacements.",
+          "alg_params": {
+            "inner_actor_writeback_coef": 0.1,
+            "inner_critic_writeback_coef": 0.1
+          }
+        },
+        "joint_1": {
+          "description": "Fully replace both outer priors with their adapted components.",
+          "alg_params": {
+            "inner_actor_writeback_coef": 1.0,
+            "inner_critic_writeback_coef": 1.0
+          }
+        }
+      }
+    },
     "temperature": {
       "description": "Change SAC entropy regularization independently of imagined behavior and execution noise.",
       "reference": "inherit_outer",

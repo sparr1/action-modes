@@ -140,8 +140,9 @@ def test_ambi_preserves_the_exact_tdmpc2_training_loop_and_ordering():
         eval_mode=False,
         task=None,
         collect_diagnostics=True,
+        apply_inner_writeback=False,
     ):
-        del collect_diagnostics
+        del collect_diagnostics, apply_inner_writeback
         events.append("act")
         return torch.zeros(model.cfg.action_dim)
 

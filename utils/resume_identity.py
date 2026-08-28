@@ -36,6 +36,11 @@ _DEPENDENCIES = (
 # explicit: paths to environments, pretrained models, or other scientific
 # inputs must remain fingerprinted.
 _OPERATIONAL_ALGORITHM_FIELDS = frozenset({"eval_csv_path"})
+_AMBI_ALGORITHM = "AMBITDMPC2/AMBITDMPC2"
+_AMBI_RESOLVED_IDENTITY_DEFAULTS = {
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+}
 
 
 class ResumeConfigurationError(ValueError):
@@ -149,6 +154,19 @@ def scientific_trial_parameters(
         algorithm = dict(raw_algorithm)
         for field in _OPERATIONAL_ALGORITHM_FIELDS:
             algorithm.pop(field, None)
+        if projected.get("alg") == _AMBI_ALGORITHM:
+            # These opt-in controls are resolved by AMBI even when omitted.
+            # Canonicalize them here as floats so an omitted/default zero and
+            # an explicit numeric zero describe the same scientific lineage.
+            for field, default in _AMBI_RESOLVED_IDENTITY_DEFAULTS.items():
+                value = algorithm.get(field, default)
+                if isinstance(
+                    value, (int, float, np.integer, np.floating)
+                ) and not isinstance(value, (bool, np.bool_)):
+                    value = float(value)
+                    if value == 0.0:
+                        value = 0.0
+                algorithm[field] = value
         projected["alg_params"] = algorithm
     return _json_safe(projected)
 

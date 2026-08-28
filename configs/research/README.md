@@ -18,6 +18,8 @@ AMBI. The matrix covers:
 - none, SAC, TD3, and compute-matched MPPI inner operators;
 - the reference five-head distributional-Q model and a scalar twin-Q ablation;
 - actor, critic, and temperature adaptation controls;
+- train-only actor, online-critic, and joint prior writeback at beta 0.01, 0.1,
+  and 1.0, plus the no-writeback reference;
 - temperature, imagined behavior, and returned-action exploration;
 - explicit J/N/H/G collection and joint-update schedules;
 - action, episode, and run lifecycles;
@@ -87,5 +89,8 @@ python3 evaluate_ambi_checkpoint.py --checkpoint scalar.pt \
 ```
 
 The evaluator rejects a mixed-architecture selection before running either
-side. It also rejects `execution_noise`, because deterministic evaluation must
-return the policy mean and would collapse those training-only variants.
+side. It also rejects the train-only `execution_noise` and `prior_writeback`
+axes. Deterministic evaluation returns the policy mean, which collapses the
+execution-noise variants. Prior writeback is deliberately disabled outside
+training, so its variants would likewise collapse under a frozen outer
+checkpoint. Materialize and train those axes instead.

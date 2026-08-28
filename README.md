@@ -40,6 +40,35 @@ and MPPI are auxiliary ablations or comparison operators. In particular, MPPI
 is the TD-MPC-style planning comparator; it is not AMBI's core action-selection
 algorithm.
 
+### Optional adapted-prior writeback
+
+AMBI normally discards each action-local learner. An opt-in training ablation
+can instead interpolate its final cloned actor and/or online critic back into
+the corresponding persistent prior:
+
+```text
+prior <- (1 - coefficient) * prior + coefficient * adapted_to_go
+```
+
+Set `inner_actor_writeback_coef` and `inner_critic_writeback_coef` independently
+to finite values in `[0, 1]`; both default to `0.0`, while `1.0` fully replaces
+that prior after every planned training action. A nonzero coefficient is
+restricted to the canonical J/N/H/G schedule with action-local, full-clone
+inner SAC, optimizer updates enabled for the corresponding component, and
+matching inner/outer actor log-standard-deviation semantics. The writeback
+occurs only after the returned action and diagnostics have been computed, and
+it persists across environment episode resets because it changes the outer
+prior itself.
+
+Evaluation and direct prediction still run inner improvement without changing
+the outer priors. Writeback preserves the outer parameter objects and their Adam
+state. Critic writeback targets only the online outer critic; its target critic
+continues its normal EMA updates. The inner temperature and target critic are
+never written back. When either coefficient is active, the lightweight
+`inner_actor_writeback_coef`, `inner_critic_writeback_coef`,
+`inner_actor_writeback_applied`, and `inner_critic_writeback_applied` metrics
+report the configured strengths and whether each writeback occurred.
+
 ## Training checkpoints
 
 Within-run checkpoint retention is configured independently from end-of-trial

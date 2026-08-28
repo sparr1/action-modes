@@ -1278,6 +1278,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         *,
         collect_diagnostics=True,
         return_behavior_policy=False,
+        apply_inner_writeback=False,
     ):
         if task is not None:
             raise ValueError("AMBI-TD-MPC2 currently supports single-task training only.")
@@ -1306,6 +1307,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
                             eval_mode=eval_mode,
                             collect_diagnostics=collect_diagnostics,
                             return_behavior_policy=return_behavior_policy,
+                            apply_inner_writeback=apply_inner_writeback,
                         )
             else:
                 with torch.no_grad():
@@ -1319,6 +1321,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
                         eval_mode=eval_mode,
                         collect_diagnostics=collect_diagnostics,
                         return_behavior_policy=return_behavior_policy,
+                        apply_inner_writeback=apply_inner_writeback,
                     )
         finally:
             self.model.train(was_training)

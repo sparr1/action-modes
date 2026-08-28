@@ -273,6 +273,8 @@ _RUNTIME_CONFIG_FIELDS = (
     "inner_critic_dropout_enabled",
     "inner_model_step_budget",
     "inner_expected_update_slots",
+    "inner_actor_writeback_coef",
+    "inner_critic_writeback_coef",
 )
 
 
@@ -456,6 +458,8 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
         "inner_critic_dropout_enabled",
         "inner_model_step_budget",
         "inner_expected_update_slots",
+        "inner_actor_writeback_coef",
+        "inner_critic_writeback_coef",
     )
     inner = {key: resolved[key] for key in inner_keys if key in resolved}
     if {

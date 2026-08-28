@@ -181,6 +181,8 @@ def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
         inner_critic_dropout_enabled=False,
         inner_model_step_budget=768,
         inner_expected_update_slots=768,
+        inner_actor_writeback_coef=0.0,
+        inner_critic_writeback_coef=0.0,
     )
     critic_signature = {
         "q_representation": "distributional",
@@ -260,6 +262,8 @@ def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
         "outer_policy_episode_probability": 0.5,
     }
     assert metadata["inner_budget"]["inner_critic_dropout_enabled"] is False
+    assert metadata["inner_budget"]["inner_actor_writeback_coef"] == 0.0
+    assert metadata["inner_budget"]["inner_critic_writeback_coef"] == 0.0
     assert metadata["inner_budget"]["branches_per_action"] == 128
     assert metadata["inner_budget"]["transitions_per_round"] == 192
     assert metadata["inner_budget"]["transitions_per_action"] == 768
