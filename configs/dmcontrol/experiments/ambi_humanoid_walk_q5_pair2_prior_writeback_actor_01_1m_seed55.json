@@ -1,0 +1,30 @@
+{
+  "study_type": "single_seed_1m_prior_writeback_phase1",
+  "study_note": "Seed-55 single-training-seed exploratory one-million-decision Humanoid Walk phase-1 prior-writeback actor-medium cell; one seed does not support a confidence or significance claim. After each planned training action and its diagnostics, 10% of the adapted actor displacement is written into the outer actor; critic write-back is disabled. This is the only learning-axis change from the q5-pair2 reference: the distributional critic retains five heads, every actor and target reduction samples two distinct heads and takes their minimum, both critic targets remain reward-only, and automatic outer temperature tuning retains the normalized rho-weighted actor-depth mixture. At step zero and every 50,000 decisions, observational evaluation runs the 100-sample fixed-seed Q-versus-MC protocols and five seed-12345 paired real-environment episodes comparing deterministic outer control with deterministic execution after a fresh action-local inner SAC solve at every state. The primary real improvement signal is eval/paired_fresh_inner_minus_outer. Training diagnostics publish the pre-writeback train/inner_final_outer_policy_kl every 1,000 decisions; no KL regularization loss is enabled. Evaluation disables write-back, adds only separately timed probe compute, and does not consume the training decision budget.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_humanoid_walk_q5_pair2_prior_writeback_actor_01_1m_seed55"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 50000,
+  "save_strat": [
+    "best",
+    "latest"
+  ],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}
