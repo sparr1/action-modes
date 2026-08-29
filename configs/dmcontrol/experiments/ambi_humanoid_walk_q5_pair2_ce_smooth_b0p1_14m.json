@@ -1,0 +1,25 @@
+{
+  "study_type": "single_seed_14m_behavior_regularizer_screen",
+  "study_note": "Seed-55 exploratory 14-million-decision Humanoid Walk dose screen of exact normalized squashed-action behavior cross-entropy with a terminal coefficient of 0.1 and a 500,000-eligible-update smoothstep ramp; one training seed does not support a confidence or significance claim. It differs from the 0.03 cross-entropy arm only in coefficient magnitude. Both critic targets remain reward-only, and automatic outer temperature tuning uses the normalized rho-weighted actor-depth mixture. At step zero and every 50,000 decisions, the observational evaluation runs the 100-sample fixed-seed Q-versus-MC protocols and five seed-12345 paired real-environment episodes comparing deterministic outer control with deterministic execution after a fresh action-local inner SAC solve at every state. The primary improvement signal is eval/paired_fresh_inner_minus_outer; with inner_diagnostic_rollouts=0, the evaluator also records the fixed-target root-Q action-gain distribution without extra diagnostic model rollouts. Positive predicted Q gain with negative real return delta indicates critic/model optimism or compounded distribution shift. These probes add substantial evaluation-only compute that is timed separately; they do not alter training or consume its decision budget.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": ["ambi_humanoid_walk_q5_pair2_ce_smooth_b0p1_14m"],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 100000,
+  "save_strat": ["best", "latest"],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}
