@@ -1,0 +1,30 @@
+{
+  "study_type": "single_seed_14m_inner_learning_rate_screen",
+  "study_note": "Seed-55 single-training-seed exploratory 14-million-decision Humanoid Walk inner-learning-rate cell derived from the q5-pair2 base. The two declared learning changes swap the inner rates: the cloned inner actor uses 1e-4 and the cloned inner critic uses 5e-5; all outer learning rates and other learning settings remain unchanged. The distributional critic retains five heads, and every configured actor and target reduction samples two distinct heads and takes their minimum. Both critic targets remain reward-only, and automatic outer temperature tuning retains the normalized rho-weighted actor-depth mixture. Online W&B and action-time diagnostics run every 1,000 decisions, including the final inner-to-outer policy KL and actor ensemble-gap metrics. The observational value-equivalence monitor is enabled every 1,000 model updates with four Monte Carlo samples; no value-equivalence training loss is enabled. At step zero and every 50,000 decisions, observational evaluation runs the 100-sample fixed-seed Q-versus-MC protocols and five seed-12345 paired real-environment episodes comparing deterministic outer control with deterministic execution after a fresh action-local inner SAC solve at every state. The primary real improvement signal is eval/paired_fresh_inner_minus_outer. With inner_diagnostic_rollouts=0, the evaluator still records the fixed-target root-Q action-gain distribution without extra diagnostic model rollouts. All probes add separately timed observational compute; they do not alter training or consume the 14-million-decision budget. One seed does not support a confidence or significance claim.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_humanoid_walk_q5_pair2_inner_lr_swap_14m_seed55"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 100000,
+  "save_strat": [
+    "best",
+    "latest"
+  ],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}
