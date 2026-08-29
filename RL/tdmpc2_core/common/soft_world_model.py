@@ -347,6 +347,7 @@ class SoftWorldModel(nn.Module):
         return action, {
             "mean": mean,
             "pre_tanh_mean": mean_raw,
+            "pre_tanh_action": pre_tanh_action,
             "log_std": log_std,
             "log_prob": log_prob,
             "entropy": -log_prob,

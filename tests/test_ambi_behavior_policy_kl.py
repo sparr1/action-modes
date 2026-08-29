@@ -36,6 +36,7 @@ def _stub_actor(monkeypatch, agent, *, current_mean=1.0, q_values=None):
         log_prob = log_prob + anchor * 0.0
         return action, {
             "pre_tanh_mean": mean,
+            "pre_tanh_action": mean,
             "log_std": log_std,
             "log_prob": log_prob,
             "entropy": -log_prob,
@@ -267,6 +268,131 @@ def test_behavior_kl_masks_invalid_rows_and_excludes_terminal_actor_state():
     assert policy_info["pre_tanh_mean"].grad[-1].abs().sum() == 0
 
 
+def test_action_space_ce_reduction_excludes_terminal_and_detaches_behavior():
+    agent = _kl_model(
+        "smooth",
+        outer_behavior_policy_objective="action_space_cross_entropy",
+        outer_behavior_policy_kl_min_valid_count=2,
+    ).agent
+    agent.cfg.action_dim = 2
+    steps = int(agent.cfg.train_unroll_horizon) + 1
+    batch = int(agent.cfg.batch_size)
+    shape = (steps, batch, agent.cfg.action_dim)
+    current_mean = torch.zeros(shape, requires_grad=True)
+    current_log_std = torch.full(shape, -0.2, requires_grad=True)
+    pre_tanh_action = torch.zeros(shape, requires_grad=True)
+    with torch.no_grad():
+        pre_tanh_action[0, 0] = torch.tensor([0.25, -0.5])
+        pre_tanh_action[1, 0] = torch.tensor([1.0, -1.5])
+        pre_tanh_action[-1] = 100.0
+    policy_info = {
+        "pre_tanh_mean": current_mean,
+        "pre_tanh_action": pre_tanh_action,
+        "log_std": current_log_std,
+    }
+    behavior_shape = (steps - 1, batch, agent.cfg.action_dim)
+    behavior_mean = torch.full(behavior_shape, 0.1, requires_grad=True)
+    behavior_log_std = torch.full(behavior_shape, -0.4, requires_grad=True)
+    valid = torch.zeros((steps - 1, batch, 1), dtype=torch.bool)
+    valid[0, 0] = True
+    valid[1, 0] = True
+
+    ce, ready, metrics = agent._behavior_policy_action_ce_loss(
+        policy_info, behavior_mean, behavior_log_std, valid
+    )
+
+    gaussian_rows = td_math.diagonal_gaussian_cross_entropy(
+        current_mean[:-1],
+        current_log_std[:-1],
+        behavior_mean,
+        behavior_log_std,
+    ).squeeze(-1) / 2.0
+    jacobian_rows = td_math.tanh_log_abs_det_jacobian(
+        pre_tanh_action[:-1]
+    ).squeeze(-1) / 2.0
+    weights = agent._transition_temporal_weights
+    total_rows = gaussian_rows + jacobian_rows
+    expected = (
+        weights[0] * total_rows[0, 0]
+        + weights[1] * total_rows[1, 0]
+    ) / (weights[0] + weights[1])
+    torch.testing.assert_close(ce, expected)
+    assert ready
+    assert metrics["behavior_policy_action_ce_valid_count"] == 2.0
+    assert metrics["behavior_policy_action_ce"] == pytest.approx(float(expected))
+    assert metrics["behavior_policy_action_ce"] == pytest.approx(
+        float(metrics["behavior_policy_action_ce_gaussian"])
+        + float(metrics["behavior_policy_action_ce_log_abs_det_jacobian"])
+    )
+
+    ce.backward()
+    assert current_mean.grad[-1].abs().sum() == 0
+    assert current_log_std.grad[-1].abs().sum() == 0
+    assert pre_tanh_action.grad[-1].abs().sum() == 0
+    assert behavior_mean.grad is None
+    assert behavior_log_std.grad is None
+
+
+def test_action_space_ce_uses_the_same_actor_sample_passed_to_q(monkeypatch):
+    agent = _kl_model(
+        "smooth",
+        outer_behavior_policy_objective="action_space_cross_entropy",
+    ).agent
+    steps = int(agent.cfg.train_unroll_horizon) + 1
+    batch = int(agent.cfg.batch_size)
+    pi_calls = 0
+    critic_actions = []
+
+    def policy(z):
+        nonlocal pi_calls
+        pi_calls += 1
+        anchor = next(agent.model._pi.parameters()).reshape(-1)[0]
+        shape = (*z.shape[:-1], agent.cfg.action_dim)
+        mean = torch.zeros(shape, device=z.device, dtype=z.dtype) + anchor * 0.0
+        log_std = torch.zeros_like(mean) + anchor * 0.0
+        pre_tanh_action = torch.full_like(mean, 1.25) + anchor * 0.0
+        action = torch.tanh(pre_tanh_action)
+        log_prob = torch.zeros((*z.shape[:-1], 1), device=z.device, dtype=z.dtype)
+        log_prob = log_prob + anchor * 0.0
+        return action, {
+            "pre_tanh_mean": mean,
+            "pre_tanh_action": pre_tanh_action,
+            "log_std": log_std,
+            "log_prob": log_prob,
+            "entropy": -log_prob,
+        }
+
+    def critic(z, action, **kwargs):
+        critic_actions.append(action.detach().clone())
+        values = action[..., :1] * 0.0
+        if kwargs.get("reduction") == "all":
+            return values.unsqueeze(0).expand(int(agent.cfg.num_q), *values.shape)
+        return values
+
+    monkeypatch.setattr(agent.model, "pi", policy)
+    monkeypatch.setattr(agent.model, "Q", critic)
+    zs = torch.zeros(steps, batch, agent.cfg.latent_dim, device=agent.device)
+    metrics = agent._update_actor(zs, *_behavior_batch(agent))
+
+    assert pi_calls == 1
+    assert len(critic_actions) == 1
+    torch.testing.assert_close(
+        critic_actions[0], torch.full_like(critic_actions[0], math.tanh(1.25))
+    )
+    expected_gaussian = 0.5 * (math.log(2.0 * math.pi) + 1.0)
+    expected_jacobian = 2.0 * (
+        math.log(2.0)
+        - 1.25
+        - torch.nn.functional.softplus(torch.tensor(-2.5)).item()
+    )
+    assert metrics["behavior_policy_action_ce_gaussian"] == pytest.approx(
+        expected_gaussian
+    )
+    assert metrics[
+        "behavior_policy_action_ce_log_abs_det_jacobian"
+    ] == pytest.approx(expected_jacobian)
+
+
 def test_smooth_schedule_uses_smoothstep_and_pauses_on_unready_batches(monkeypatch):
     agent = _kl_model(
         "smooth",
@@ -326,6 +452,57 @@ def test_quantile_gate_is_strict_reversible_and_does_not_enable_loss_scaling(
     assert back_equal["behavior_policy_kl_coefficient"] == 0.0
 
 
+def test_action_ce_smooth_schedule_uses_ce_metrics_and_pauses(monkeypatch):
+    agent = _kl_model(
+        "smooth",
+        outer_behavior_policy_objective="action_space_cross_entropy",
+        outer_behavior_policy_kl_coef=2.0,
+        outer_behavior_policy_kl_min_valid_count=2,
+    ).agent
+    zs = _stub_actor(monkeypatch, agent, current_mean=0.0)
+
+    first = agent._update_actor(zs, *_behavior_batch(agent))
+    assert first["behavior_policy_action_ce_ramp_progress"] == pytest.approx(0.25)
+    assert first["behavior_policy_action_ce_coefficient"] == pytest.approx(0.3125)
+    assert "behavior_policy_kl" not in first
+    assert agent.behavior_policy_kl_eligible_updates == 1
+
+    paused = agent._update_actor(zs, *_behavior_batch(agent, valid=False))
+    assert paused["behavior_policy_action_ce_coefficient"] == 0.0
+    assert paused["behavior_policy_action_ce_ramp_progress"] == pytest.approx(0.25)
+    assert paused["behavior_policy_action_ce_ready"] == 0.0
+    assert agent.behavior_policy_kl_eligible_updates == 1
+
+
+def test_action_ce_quantile_gate_is_strict_and_reversible(monkeypatch):
+    agent = _kl_model(
+        "quantile_gate",
+        outer_behavior_policy_objective="action_space_cross_entropy",
+        sac_actor_loss_scale_tau=1.0,
+        outer_behavior_policy_kl_q_threshold=2.0,
+    ).agent
+    zs = _stub_actor(monkeypatch, agent, current_mean=0.0)
+    ranges = iter((2.0, 2.01, 2.0))
+    monkeypatch.setattr(
+        ambi_agent_module,
+        "percentile_range",
+        lambda *_args, **_kwargs: torch.tensor(
+            [next(ranges)], device=agent.device
+        ),
+    )
+
+    equal = agent._update_actor(zs, *_behavior_batch(agent))
+    above = agent._update_actor(zs, *_behavior_batch(agent))
+    back_equal = agent._update_actor(zs, *_behavior_batch(agent))
+
+    assert equal["behavior_policy_action_ce_gate_active"] == 0.0
+    assert equal["behavior_policy_action_ce_coefficient"] == 0.0
+    assert above["behavior_policy_action_ce_gate_active"] == 1.0
+    assert above["behavior_policy_action_ce_coefficient"] == pytest.approx(1.0)
+    assert back_equal["behavior_policy_action_ce_gate_active"] == 0.0
+    assert back_equal["behavior_policy_action_ce_coefficient"] == 0.0
+
+
 @pytest.mark.parametrize(("behavior_mean", "direction"), [(0.0, "up"), (1.0, "down")])
 def test_log_dual_moves_in_the_violation_direction_with_one_step_lag(
     monkeypatch, behavior_mean, direction
@@ -370,8 +547,16 @@ def test_log_dual_freezes_on_unready_data_and_clamps_at_its_cap(monkeypatch):
 
 
 @pytest.mark.parametrize("schedule", ["smooth", "quantile_gate", "dual"])
-def test_active_scheduler_portable_state_roundtrips(schedule):
-    source = _kl_model(schedule).agent
+@pytest.mark.parametrize(
+    ("scale_mode", "expected_version"),
+    [("none", 5), ("tdmpc2_percentile_range", 6)],
+)
+def test_active_scheduler_portable_state_roundtrips(
+    schedule,
+    scale_mode,
+    expected_version,
+):
+    source = _kl_model(schedule, sac_actor_loss_scale_mode=scale_mode).agent
     if schedule == "smooth":
         source.behavior_policy_kl_eligible_updates = 7
     elif schedule == "quantile_gate":
@@ -380,9 +565,12 @@ def test_active_scheduler_portable_state_roundtrips(schedule):
         source.log_behavior_policy_kl_coef.data.fill_(math.log(0.7))
         source.behavior_policy_kl_dual_updates = 0
     state = source.checkpoint_state()
-    assert state["checkpoint_version"] == 5
+    assert state["checkpoint_version"] == expected_version
 
-    restored = _kl_model(schedule).agent
+    restored = _kl_model(
+        schedule,
+        sac_actor_loss_scale_mode=scale_mode,
+    ).agent
     restored.load(state)
     assert restored._behavior_policy_kl_spec() == source._behavior_policy_kl_spec()
     if schedule == "smooth":
@@ -393,6 +581,104 @@ def test_active_scheduler_portable_state_roundtrips(schedule):
         assert float(restored.log_behavior_policy_kl_coef.exp().detach()) == pytest.approx(
             0.7
         )
+
+
+@pytest.mark.parametrize("schedule", ["smooth", "quantile_gate"])
+@pytest.mark.parametrize(
+    ("scale_mode", "expected_version"),
+    [("none", 5), ("tdmpc2_percentile_range", 6)],
+)
+def test_action_ce_state_roundtrips_and_rejects_reverse_kl_checkpoint(
+    schedule,
+    scale_mode,
+    expected_version,
+):
+    source = _kl_model(
+        schedule,
+        outer_behavior_policy_objective="action_space_cross_entropy",
+        sac_actor_loss_scale_mode=scale_mode,
+    ).agent
+    if schedule == "smooth":
+        source.behavior_policy_kl_eligible_updates = 7
+    else:
+        source._actor_loss_scale_value.fill_(3.25)
+    state = source.checkpoint_state()
+    exact_state = source.training_state_dict()
+
+    assert state["checkpoint_version"] == expected_version
+    assert state["behavior_policy_kl_spec"]["objective"] == (
+        "action_space_cross_entropy"
+    )
+    restored = _kl_model(
+        schedule,
+        outer_behavior_policy_objective="action_space_cross_entropy",
+        sac_actor_loss_scale_mode=scale_mode,
+    ).agent
+    restored.load(state)
+    assert restored._behavior_policy_kl_spec() == source._behavior_policy_kl_spec()
+    if schedule == "smooth":
+        assert restored.behavior_policy_kl_eligible_updates == 7
+    else:
+        torch.testing.assert_close(restored.actor_q_range, torch.tensor([3.25]))
+
+    exact_restored = _kl_model(
+        schedule,
+        outer_behavior_policy_objective="action_space_cross_entropy",
+        sac_actor_loss_scale_mode=scale_mode,
+    ).agent
+    exact_restored.load_training_state_dict(exact_state)
+    assert exact_restored._behavior_policy_kl_spec() == (
+        source._behavior_policy_kl_spec()
+    )
+    if schedule == "smooth":
+        assert exact_restored.behavior_policy_kl_eligible_updates == 7
+    else:
+        torch.testing.assert_close(
+            exact_restored.actor_q_range, torch.tensor([3.25])
+        )
+
+    reverse_agent = _kl_model(
+        schedule,
+        sac_actor_loss_scale_mode=scale_mode,
+    ).agent
+    reverse_before = reverse_agent.checkpoint_state()
+    with pytest.raises(ValueError, match="behavior-policy KL specification"):
+        reverse_agent.load(state)
+    with pytest.raises(ValueError, match="behavior-policy KL specification"):
+        reverse_agent.load_training_state_dict(exact_state)
+    assert reverse_agent.num_updates == reverse_before["num_updates"]
+    assert "objective" not in reverse_agent._behavior_policy_kl_spec()
+
+    reverse_state = reverse_agent.checkpoint_state()
+    ce_target = _kl_model(
+        schedule,
+        outer_behavior_policy_objective="action_space_cross_entropy",
+        sac_actor_loss_scale_mode=scale_mode,
+    ).agent
+    ce_before = ce_target.checkpoint_state()
+    with pytest.raises(ValueError, match="behavior-policy KL specification"):
+        ce_target.load(reverse_state)
+    assert ce_target.num_updates == ce_before["num_updates"]
+
+
+@pytest.mark.parametrize(
+    ("scale_mode", "expected_version"),
+    [("none", 5), ("tdmpc2_percentile_range", 6)],
+)
+def test_reverse_kl_version_5_and_6_specs_remain_legacy_compatible(
+    scale_mode,
+    expected_version,
+):
+    agent = _kl_model(
+        "smooth",
+        sac_actor_loss_scale_mode=scale_mode,
+    ).agent
+    spec = agent.checkpoint_state()["behavior_policy_kl_spec"]
+
+    assert agent.checkpoint_state()["checkpoint_version"] == expected_version
+    assert "objective" not in spec
+    assert spec["estimator"] == "analytic_diagonal_gaussian_jensen_component"
+    assert spec["action_transform"] == "shared_tanh"
 
 
 def test_behavior_kl_and_actor_scaling_share_one_q_tracker_and_scale_full_loss(
@@ -420,6 +706,36 @@ def test_behavior_kl_and_actor_scaling_share_one_q_tracker_and_scale_full_loss(
     assert metrics["behavior_policy_kl"] == pytest.approx(0.5)
     assert metrics["behavior_policy_kl_weighted_loss"] == pytest.approx(0.125)
     assert metrics["actor_loss"] == pytest.approx(0.125)
+    assert agent.checkpoint_state()["checkpoint_version"] == 6
+
+
+def test_action_ce_and_actor_scaling_share_tracker_and_scale_full_loss(monkeypatch):
+    agent = _kl_model(
+        "quantile_gate",
+        outer_behavior_policy_objective="action_space_cross_entropy",
+        sac_actor_loss_scale_mode="tdmpc2_percentile_range",
+        sac_actor_loss_scale_tau=1.0,
+        outer_behavior_policy_kl_q_threshold=2.0,
+    ).agent
+    zs = _stub_actor(monkeypatch, agent, current_mean=0.0)
+    calls = 0
+
+    def fixed_range(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return torch.tensor([4.0], device=agent.device)
+
+    monkeypatch.setattr(ambi_agent_module, "percentile_range", fixed_range)
+    metrics = agent._update_actor(zs, *_behavior_batch(agent))
+
+    expected_ce = 0.5 * (math.log(2.0 * math.pi) + 1.0)
+    assert calls == 1
+    assert metrics["actor_loss_scale"] == pytest.approx(4.0)
+    assert metrics["behavior_policy_action_ce"] == pytest.approx(expected_ce)
+    assert metrics["behavior_policy_action_ce_weighted_loss"] == pytest.approx(
+        expected_ce / 4.0
+    )
+    assert metrics["actor_loss"] == pytest.approx(expected_ce / 4.0)
     assert agent.checkpoint_state()["checkpoint_version"] == 6
 
 

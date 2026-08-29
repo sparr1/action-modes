@@ -22,6 +22,7 @@ from utils.utils import setup_logs
 _Q_REDUCTIONS = {"min_pair", "mean_pair", "min_all", "mean_all"}
 _CRITIC_TARGETS = {"entropy_augmented", "reward_only"}
 _SAC_ACTOR_LOSS_SCALE_MODES = {"none", "tdmpc2_percentile_range"}
+_BEHAVIOR_POLICY_OBJECTIVES = {"reverse_kl", "action_space_cross_entropy"}
 _BEHAVIOR_POLICY_KL_SCHEDULES = {"none", "smooth", "quantile_gate", "dual"}
 _VALUE_EVAL_PROTOCOLS = {"paper_deterministic", "stochastic_bellman"}
 _ADAPTATION_MODES = {"frozen", "clone", "lora"}
@@ -47,9 +48,10 @@ _AMBI_DEFAULTS = {
     "inner_sac_critic_target": "entropy_augmented",
     "sac_actor_loss_scale_mode": "none",
     "sac_actor_loss_scale_tau": 0.01,
-    # Optional analytic reverse-KL from the outer actor to the replayed
+    # Optional behavior-policy regularizer from the outer actor to the replayed
     # action-generating policy. ``none`` preserves the historical runtime and
     # replay schema; active schedules require stochastic inner SAC execution.
+    "outer_behavior_policy_objective": "reverse_kl",
     "outer_behavior_policy_kl_schedule": "none",
     "outer_behavior_policy_kl_coef": 1.0,
     "outer_behavior_policy_kl_min_valid_count": "auto",
@@ -1222,6 +1224,20 @@ class AMBITDMPC2(TDMPC2Baseline):
                     f"{prefix}_action='mean_plus_gaussian'."
                 )
 
+        objective = cfg.outer_behavior_policy_objective
+        if not isinstance(objective, str):
+            raise ValueError(
+                "outer_behavior_policy_objective must be one of "
+                f"{sorted(_BEHAVIOR_POLICY_OBJECTIVES)}, got {objective!r}."
+            )
+        objective = objective.lower()
+        if objective not in _BEHAVIOR_POLICY_OBJECTIVES:
+            raise ValueError(
+                "outer_behavior_policy_objective must be one of "
+                f"{sorted(_BEHAVIOR_POLICY_OBJECTIVES)}, got {objective!r}."
+            )
+        cfg.outer_behavior_policy_objective = objective
+
         schedule = cfg.outer_behavior_policy_kl_schedule
         if not isinstance(schedule, str):
             raise ValueError(
@@ -1235,6 +1251,11 @@ class AMBITDMPC2(TDMPC2Baseline):
                 f"{sorted(_BEHAVIOR_POLICY_KL_SCHEDULES)}, got {schedule!r}."
             )
         cfg.outer_behavior_policy_kl_schedule = schedule
+        if objective == "action_space_cross_entropy" and schedule == "dual":
+            raise ValueError(
+                "outer_behavior_policy_objective='action_space_cross_entropy' "
+                "does not support outer_behavior_policy_kl_schedule='dual'."
+            )
 
         cfg.outer_behavior_policy_kl_coef = _strict_nonnegative_float(
             cfg.outer_behavior_policy_kl_coef,
@@ -1296,7 +1317,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         if schedule != "none":
             if cfg.inner_operator != "sac":
                 raise ValueError(
-                    "An active outer behavior-policy KL schedule requires "
+                    "An active outer behavior-policy regularizer requires "
                     "inner_operator='sac'."
                 )
             if (
@@ -1304,7 +1325,7 @@ class AMBITDMPC2(TDMPC2Baseline):
                 or cfg.inner_execution_std_scale <= 0.0
             ):
                 raise ValueError(
-                    "An active outer behavior-policy KL schedule requires "
+                    "An active outer behavior-policy regularizer requires "
                     "stochastic inner execution with "
                     "inner_execution_action='policy_sample' and "
                     "inner_execution_std_scale > 0."

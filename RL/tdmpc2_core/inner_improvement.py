@@ -8,6 +8,7 @@ the rest of the world model, and the entropy coefficient remain untouched.
 
 from copy import deepcopy
 from dataclasses import dataclass, field, fields as dataclass_fields
+import math
 import time
 
 import torch
@@ -33,6 +34,10 @@ from .common.training_state import (
     require_mapping,
     require_tensor,
 )
+
+
+_INNER_ALPHA_FLOOR = 1e-8
+_INNER_LOG_ALPHA_FLOOR = math.log(_INNER_ALPHA_FLOOR)
 
 
 @torch.no_grad()
@@ -144,10 +149,27 @@ class InnerImprovementEngine:
     @property
     def alpha(self):
         if self.state.log_alpha is not None:
-            return self.state.log_alpha.exp()
+            return self.state.log_alpha.exp().clamp_min(_INNER_ALPHA_FLOOR)
         if self.state.alpha_fixed is not None:
+            if str(self.cfg.inner_temperature_mode) == "inherit_outer":
+                alpha = self.state.alpha_fixed
+                if getattr(self.agent, "log_ent_coef", None) is not None:
+                    return alpha.clamp_min(_INNER_ALPHA_FLOOR)
+                return alpha
             return self.state.alpha_fixed
-        return self.agent.alpha.detach()
+        alpha = self.agent.alpha.detach()
+        if (
+            str(self.cfg.inner_operator) == "sac"
+            and (
+                str(self.cfg.inner_temperature_mode) == "auto"
+                or (
+                    str(self.cfg.inner_temperature_mode) == "inherit_outer"
+                    and getattr(self.agent, "log_ent_coef", None) is not None
+                )
+            )
+        ):
+            return alpha.clamp_min(_INNER_ALPHA_FLOOR)
+        return alpha
 
     @property
     def _sac_actor_loss_scale_enabled(self):
@@ -217,13 +239,14 @@ class InnerImprovementEngine:
                 "inner_temperature_initialization must be 'inherit_outer' or "
                 f"'fixed', got {initialization!r}."
             )
-        valid = torch.isfinite(initial_alpha) & (initial_alpha > 0)
+        valid = torch.isfinite(initial_alpha) & (initial_alpha >= 0)
         if not bool(valid.item()):
             raise ValueError(
-                "The initial inner entropy coefficient must be finite and positive, "
+                "The initial inner entropy coefficient must be finite and "
+                "non-negative before flooring, "
                 f"got {float(initial_alpha.detach().item())}."
             )
-        return initial_alpha
+        return initial_alpha.clamp_min(_INNER_ALPHA_FLOOR)
 
     def clear_all(self):
         self.state = InnerWorkspace()
@@ -799,13 +822,19 @@ class InnerImprovementEngine:
                 shape=(),
                 dtype=self.agent.alpha.dtype,
             )
+            if not bool(torch.isfinite(log_alpha).all().item()):
+                raise ValueError("inner log_alpha must be finite.")
             candidate.log_alpha = torch.nn.Parameter(
-                log_alpha.detach().to(self.device).clone()
+                log_alpha.detach()
+                .to(self.device)
+                .clamp_min(_INNER_LOG_ALPHA_FLOOR)
+                .clone()
             )
         if alpha_fixed is not None:
+            temperature_mode = str(self.cfg.inner_temperature_mode)
             expected_shape = (
                 self.agent.alpha.shape
-                if str(self.cfg.inner_temperature_mode) == "inherit_outer"
+                if temperature_mode == "inherit_outer"
                 else torch.Size([])
             )
             alpha_fixed = require_tensor(
@@ -814,7 +843,18 @@ class InnerImprovementEngine:
                 shape=expected_shape,
                 dtype=self.agent.alpha.dtype,
             )
+            if not bool(torch.isfinite(alpha_fixed).all().item()):
+                raise ValueError("inner alpha_fixed must be finite.")
+            if temperature_mode == "inherit_outer" and bool(
+                (alpha_fixed < 0).any().item()
+            ):
+                raise ValueError("inherited inner alpha_fixed must be non-negative.")
             candidate.alpha_fixed = alpha_fixed.detach().to(self.device).clone()
+            if temperature_mode == "inherit_outer" and (
+                getattr(self.agent, "log_ent_coef", None) is not None
+                or bool((candidate.alpha_fixed <= 0).any().item())
+            ):
+                candidate.alpha_fixed.clamp_min_(_INNER_ALPHA_FLOOR)
         if workspace["temperature_optim"] is not None:
             if candidate.log_alpha is None:
                 raise ValueError(
@@ -1242,15 +1282,18 @@ class InnerImprovementEngine:
         mode = str(cfg.inner_temperature_mode)
         if mode == "inherit_outer":
             state.log_alpha = state.temperature_optim = None
+            inherited_alpha = self.agent.alpha.detach()
+            if getattr(self.agent, "log_ent_coef", None) is not None:
+                inherited_alpha = inherited_alpha.clamp_min(_INNER_ALPHA_FLOOR)
             if (
                 str(cfg.inner_temperature_scope) == "action"
                 and self._action_pool.alpha_fixed is not None
             ):
                 state.alpha_fixed = self._action_pool.alpha_fixed
                 self._action_pool.alpha_fixed = None
-                state.alpha_fixed.copy_(self.agent.alpha.detach())
+                state.alpha_fixed.copy_(inherited_alpha)
             else:
-                state.alpha_fixed = self.agent.alpha.detach().clone()
+                state.alpha_fixed = inherited_alpha.clone()
         elif mode == "fixed":
             state.log_alpha = state.temperature_optim = None
             if (
@@ -2005,6 +2048,8 @@ class InnerImprovementEngine:
                     [state.log_alpha], float(cfg.inner_temperature_grad_clip_norm)
                 )
                 state.temperature_optim.step()
+                with torch.no_grad():
+                    state.log_alpha.clamp_(min=_INNER_LOG_ALPHA_FLOOR)
                 state.temperature_steps += 1
                 state.temperature_lifetime_steps += 1
                 metrics.update(

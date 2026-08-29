@@ -240,6 +240,60 @@ def diagonal_gaussian_reverse_kl(
 	return elementwise_kl
 
 
+def diagonal_gaussian_cross_entropy(
+	current_mean,
+	current_log_std,
+	behavior_mean,
+	behavior_log_std,
+	*,
+	sum_action_dim=True,
+):
+	"""Return Gaussian ``-E_current[log behavior]`` in pre-tanh space.
+
+	The behavior distribution is a fixed target, so its arguments are detached.
+	Inputs may broadcast, and the final action dimension is summed with a retained
+	singleton by default. This is the analytic Gaussian component of squashed-
+	action cross entropy; add :func:`tanh_log_abs_det_jacobian` evaluated on a
+	current-policy sample to obtain an unbiased action-space estimator.
+	"""
+	if not isinstance(sum_action_dim, bool):
+		raise TypeError("sum_action_dim must be bool.")
+	behavior_mean = behavior_mean.detach()
+	behavior_log_std = behavior_log_std.detach()
+	log_std_ratio = current_log_std - behavior_log_std
+	standardized_mean_delta = (
+		current_mean - behavior_mean
+	) * torch.exp(-behavior_log_std)
+	elementwise_cross_entropy = 0.5 * (
+		1.8378770664093453
+		+ 2.0 * behavior_log_std
+		+ torch.exp(2.0 * log_std_ratio)
+		+ standardized_mean_delta.square()
+	)
+	if sum_action_dim:
+		return elementwise_cross_entropy.sum(dim=-1, keepdim=True)
+	return elementwise_cross_entropy
+
+
+def tanh_log_abs_det_jacobian(pre_tanh_action, *, sum_action_dim=True):
+	"""Return the exact, stable ``log|det J_tanh|``.
+
+	The softplus identity remains finite when ``tanh(pre_tanh_action)`` has
+	already rounded to ``-1`` or ``1``. By default independent action-coordinate
+	terms are summed while retaining a singleton final dimension.
+	"""
+	if not isinstance(sum_action_dim, bool):
+		raise TypeError("sum_action_dim must be bool.")
+	elementwise_log_abs_det = 2.0 * (
+		0.6931471805599453
+		- pre_tanh_action
+		- F.softplus(-2.0 * pre_tanh_action)
+	)
+	if sum_action_dim:
+		return elementwise_log_abs_det.sum(dim=-1, keepdim=True)
+	return elementwise_log_abs_det
+
+
 def squash(mu, pi, log_pi):
 	"""Apply squashing function."""
 	mu = torch.tanh(mu)

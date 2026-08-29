@@ -35,7 +35,12 @@ _BEHAVIOR_POLICY_KL_SCHEDULES = {
     "quantile_gate",
     "dual",
 }
+_BEHAVIOR_POLICY_OBJECTIVES = {
+    "reverse_kl",
+    "action_space_cross_entropy",
+}
 _BEHAVIOR_POLICY_KL_DUAL_MIN = 1e-8
+_ENTROPY_COEF_MIN = 1e-8
 
 
 class AMBITDMPC2Agent(torch.nn.Module):
@@ -94,10 +99,26 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self._behavior_policy_kl_schedule = str(
             getattr(cfg, "outer_behavior_policy_kl_schedule", "none")
         ).lower()
+        self._behavior_policy_objective = str(
+            getattr(cfg, "outer_behavior_policy_objective", "reverse_kl")
+        ).lower()
         if self._behavior_policy_kl_schedule not in _BEHAVIOR_POLICY_KL_SCHEDULES:
             raise ValueError(
                 "outer_behavior_policy_kl_schedule must be one of "
                 f"{sorted(_BEHAVIOR_POLICY_KL_SCHEDULES)}."
+            )
+        if self._behavior_policy_objective not in _BEHAVIOR_POLICY_OBJECTIVES:
+            raise ValueError(
+                "outer_behavior_policy_objective must be one of "
+                f"{sorted(_BEHAVIOR_POLICY_OBJECTIVES)}."
+            )
+        if (
+            self._behavior_policy_objective == "action_space_cross_entropy"
+            and self._behavior_policy_kl_schedule == "dual"
+        ):
+            raise ValueError(
+                "outer_behavior_policy_objective='action_space_cross_entropy' "
+                "does not support outer_behavior_policy_kl_schedule='dual'."
             )
         if self._actor_loss_scale_mode not in {
             "none",
@@ -180,6 +201,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 initial = float(ent_coef.split("_", 1)[1])
             if initial <= 0:
                 raise ValueError("Initial automatic entropy coefficient must be positive.")
+            initial = max(initial, _ENTROPY_COEF_MIN)
             self.log_ent_coef = torch.nn.Parameter(
                 torch.log(torch.tensor([initial], dtype=torch.float32, device=self.device))
             )
@@ -295,7 +317,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
     @property
     def alpha(self):
         if self.log_ent_coef is not None:
-            return self.log_ent_coef.exp()
+            return self.log_ent_coef.exp().clamp_min(_ENTROPY_COEF_MIN)
         return self.fixed_ent_coef
 
     @property
@@ -311,6 +333,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
     @property
     def behavior_policy_kl_enabled(self):
         return self._behavior_policy_kl_schedule != "none"
+
+    @property
+    def behavior_policy_objective(self):
+        return self._behavior_policy_objective
 
     @property
     def actor_q_range(self):
@@ -413,7 +439,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
     def _behavior_policy_kl_spec(self):
         if not self.behavior_policy_kl_enabled:
             return None
-        return {
+        spec = {
             "schedule": self._behavior_policy_kl_schedule,
             "direction": "current_outer_to_replayed_behavior",
             "estimator": "analytic_diagonal_gaussian_jensen_component",
@@ -444,6 +470,20 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "actor_loss_scaling": (
                 "full_objective" if self.actor_loss_scale_enabled else "none"
             ),
+        }
+        if self._behavior_policy_objective == "reverse_kl":
+            # Preserve the exact version-5/6 reverse-KL specification so
+            # existing structured checkpoints remain loadable.
+            return spec
+        return {
+            **spec,
+            "objective": "action_space_cross_entropy",
+            "direction": "current_outer_samples_under_replayed_behavior",
+            "estimator": (
+                "partially_analytic_single_sample_exact_action_space_"
+                "cross_entropy_jensen_component"
+            ),
+            "action_transform": "normalized_tanh_exact_log_abs_det_jacobian",
         }
 
     def _behavior_policy_kl_state(self):
@@ -1059,6 +1099,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self.outer_version = int(state.get("outer_version", self.num_updates))
         if self.log_ent_coef is not None and "log_ent_coef" in state:
             self.log_ent_coef.data.copy_(state["log_ent_coef"].to(self.device))
+            self.log_ent_coef.data.clamp_(min=math.log(_ENTROPY_COEF_MIN))
             if "ent_coef_optim" in state:
                 load_optimizer_state_preserving_hyperparameters(
                     self.ent_coef_optim, state["ent_coef_optim"]
@@ -1684,14 +1725,16 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 )
         return info
 
-    def _behavior_policy_kl_loss(
+    def _behavior_policy_inputs(
         self,
         policy_info,
         behavior_pre_tanh_mean,
         behavior_log_std,
         behavior_policy_valid,
+        *,
+        require_pre_tanh_action=False,
     ):
-        """Return the valid-weighted Jensen component reverse-KL estimate."""
+        """Validate and align current-policy and replayed behavior tensors."""
         if any(
             value is None
             for value in (
@@ -1701,11 +1744,26 @@ class AMBITDMPC2Agent(torch.nn.Module):
             )
         ):
             raise ValueError(
-                "An active behavior-policy KL schedule requires replayed "
+                "An active behavior-policy regularizer requires replayed "
                 "behavior mean, log-std, and validity tensors."
             )
         current_mean = policy_info["pre_tanh_mean"][:-1]
         current_log_std = policy_info["log_std"][:-1]
+        current_pre_tanh_action = None
+        if require_pre_tanh_action:
+            if "pre_tanh_action" not in policy_info:
+                raise ValueError(
+                    "Action-space behavior cross-entropy requires the current "
+                    "policy's pre-tanh action sample."
+                )
+            current_pre_tanh_action = policy_info["pre_tanh_action"][:-1]
+            if current_pre_tanh_action.shape != current_mean.shape:
+                raise ValueError(
+                    "Current pre-tanh action shape does not match the "
+                    "nonterminal actor states: "
+                    f"{tuple(current_pre_tanh_action.shape)} != "
+                    f"{tuple(current_mean.shape)}."
+                )
         if behavior_pre_tanh_mean.shape != current_mean.shape:
             raise ValueError(
                 "Behavior-policy mean shape does not match the nonterminal "
@@ -1727,20 +1785,16 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 "Behavior-policy validity shape does not match replay rows: "
                 f"{tuple(valid.shape)} != {tuple(expected_valid_shape)}."
             )
-        kl_per_row = td_math.diagonal_gaussian_reverse_kl(
-            current_mean,
-            current_log_std,
-            behavior_pre_tanh_mean,
-            behavior_log_std,
-        ).squeeze(-1) / float(self.cfg.action_dim)
-        temporal_weights = self._transition_temporal_weights.to(
-            dtype=kl_per_row.dtype
-        )
+        return current_mean, current_log_std, current_pre_tanh_action, valid
+
+    def _behavior_policy_row_statistics(self, values, valid, zero_anchor):
+        """Reduce per-row behavior losses with the established valid weights."""
+        temporal_weights = self._transition_temporal_weights.to(dtype=values.dtype)
         temporal_weights = temporal_weights.reshape(
             (int(temporal_weights.shape[0]),)
-            + (1,) * (kl_per_row.ndim - 1)
+            + (1,) * (values.ndim - 1)
         )
-        weighted_valid = temporal_weights * valid.to(dtype=kl_per_row.dtype)
+        weighted_valid = temporal_weights * valid.to(dtype=values.dtype)
         denominator = weighted_valid.sum()
         valid_count = int(valid.sum().item())
         has_weighted_support = bool(
@@ -1749,30 +1803,152 @@ class AMBITDMPC2Agent(torch.nn.Module):
             and denominator.item() > 0.0
         )
         if has_weighted_support:
-            kl_loss = (
-                kl_per_row[valid] * weighted_valid[valid]
-            ).sum() / denominator
-            valid_values = kl_per_row[valid]
-            kl_p50 = torch.quantile(valid_values.detach(), 0.5)
-            kl_p95 = torch.quantile(valid_values.detach(), 0.95)
+            loss = (values[valid] * weighted_valid[valid]).sum() / denominator
+            valid_values = values[valid]
+            p50 = torch.quantile(valid_values.detach(), 0.5)
+            p95 = torch.quantile(valid_values.detach(), 0.95)
         else:
-            kl_loss = (current_mean.sum() + current_log_std.sum()) * 0.0
-            kl_p50 = kl_loss.detach()
-            kl_p95 = kl_loss.detach()
+            loss = zero_anchor * 0.0
+            p50 = loss.detach()
+            p95 = loss.detach()
         ready = has_weighted_support and valid_count >= int(
             self.cfg.outer_behavior_policy_kl_min_valid_count
         )
-        metrics = {
-            "behavior_policy_kl": kl_loss.detach(),
-            "behavior_policy_kl_p50": kl_p50,
-            "behavior_policy_kl_p95": kl_p95,
-            "behavior_policy_kl_valid_count": float(valid_count),
-            "behavior_policy_kl_valid_fraction": (
-                float(valid_count) / float(valid.numel())
-            ),
-            "behavior_policy_kl_ready": float(ready),
+        return {
+            "loss": loss,
+            "p50": p50,
+            "p95": p95,
+            "valid_count": valid_count,
+            "valid_fraction": float(valid_count) / float(valid.numel()),
+            "ready": ready,
+            "has_weighted_support": has_weighted_support,
+            "weighted_valid": weighted_valid,
+            "denominator": denominator,
         }
-        return kl_loss, ready, metrics
+
+    def _behavior_policy_kl_loss(
+        self,
+        policy_info,
+        behavior_pre_tanh_mean,
+        behavior_log_std,
+        behavior_policy_valid,
+    ):
+        """Return the valid-weighted Jensen component reverse-KL estimate."""
+        current_mean, current_log_std, _, valid = self._behavior_policy_inputs(
+            policy_info,
+            behavior_pre_tanh_mean,
+            behavior_log_std,
+            behavior_policy_valid,
+        )
+        kl_per_row = td_math.diagonal_gaussian_reverse_kl(
+            current_mean,
+            current_log_std,
+            behavior_pre_tanh_mean,
+            behavior_log_std,
+        ).squeeze(-1) / float(self.cfg.action_dim)
+        stats = self._behavior_policy_row_statistics(
+            kl_per_row,
+            valid,
+            current_mean.sum() + current_log_std.sum(),
+        )
+        metrics = {
+            "behavior_policy_kl": stats["loss"].detach(),
+            "behavior_policy_kl_p50": stats["p50"],
+            "behavior_policy_kl_p95": stats["p95"],
+            "behavior_policy_kl_valid_count": float(stats["valid_count"]),
+            "behavior_policy_kl_valid_fraction": stats["valid_fraction"],
+            "behavior_policy_kl_ready": float(stats["ready"]),
+        }
+        return stats["loss"], stats["ready"], metrics
+
+    def _behavior_policy_action_ce_loss(
+        self,
+        policy_info,
+        behavior_pre_tanh_mean,
+        behavior_log_std,
+        behavior_policy_valid,
+    ):
+        """Return exact normalized-action CE with a sampled tanh correction."""
+        (
+            current_mean,
+            current_log_std,
+            current_pre_tanh_action,
+            valid,
+        ) = self._behavior_policy_inputs(
+            policy_info,
+            behavior_pre_tanh_mean,
+            behavior_log_std,
+            behavior_policy_valid,
+            require_pre_tanh_action=True,
+        )
+        action_dim = float(self.cfg.action_dim)
+        gaussian_per_row = td_math.diagonal_gaussian_cross_entropy(
+            current_mean,
+            current_log_std,
+            behavior_pre_tanh_mean,
+            behavior_log_std,
+        ).squeeze(-1) / action_dim
+        log_jacobian_per_row = td_math.tanh_log_abs_det_jacobian(
+            current_pre_tanh_action,
+        ).squeeze(-1) / action_dim
+        ce_per_row = gaussian_per_row + log_jacobian_per_row
+        stats = self._behavior_policy_row_statistics(
+            ce_per_row,
+            valid,
+            (
+                current_mean.sum()
+                + current_log_std.sum()
+                + current_pre_tanh_action.sum()
+            ),
+        )
+        if stats["has_weighted_support"]:
+            weighted_valid = stats["weighted_valid"]
+            denominator = stats["denominator"]
+            gaussian_component = (
+                gaussian_per_row[valid] * weighted_valid[valid]
+            ).sum() / denominator
+            jacobian_component = (
+                log_jacobian_per_row[valid] * weighted_valid[valid]
+            ).sum() / denominator
+        else:
+            gaussian_component = stats["loss"]
+            jacobian_component = stats["loss"]
+        metrics = {
+            "behavior_policy_action_ce": stats["loss"].detach(),
+            "behavior_policy_action_ce_gaussian": gaussian_component.detach(),
+            "behavior_policy_action_ce_log_abs_det_jacobian": (
+                jacobian_component.detach()
+            ),
+            "behavior_policy_action_ce_p50": stats["p50"],
+            "behavior_policy_action_ce_p95": stats["p95"],
+            "behavior_policy_action_ce_valid_count": float(
+                stats["valid_count"]
+            ),
+            "behavior_policy_action_ce_valid_fraction": stats["valid_fraction"],
+            "behavior_policy_action_ce_ready": float(stats["ready"]),
+        }
+        return stats["loss"], stats["ready"], metrics
+
+    def _behavior_policy_regularizer_loss(
+        self,
+        policy_info,
+        behavior_pre_tanh_mean,
+        behavior_log_std,
+        behavior_policy_valid,
+    ):
+        if self._behavior_policy_objective == "reverse_kl":
+            return self._behavior_policy_kl_loss(
+                policy_info,
+                behavior_pre_tanh_mean,
+                behavior_log_std,
+                behavior_policy_valid,
+            )
+        return self._behavior_policy_action_ce_loss(
+            policy_info,
+            behavior_pre_tanh_mean,
+            behavior_log_std,
+            behavior_policy_valid,
+        )
 
     def _update_actor(
         self,
@@ -1782,12 +1958,16 @@ class AMBITDMPC2Agent(torch.nn.Module):
         behavior_policy_valid=None,
     ):
         action, policy_info = self.model.pi(zs)
-        behavior_kl = torch.zeros((), device=self.device)
-        behavior_kl_ready = False
-        behavior_kl_metrics = {}
+        behavior_regularizer = torch.zeros((), device=self.device)
+        behavior_regularizer_ready = False
+        behavior_regularizer_metrics = {}
         if self.behavior_policy_kl_enabled:
-            behavior_kl, behavior_kl_ready, behavior_kl_metrics = (
-                self._behavior_policy_kl_loss(
+            (
+                behavior_regularizer,
+                behavior_regularizer_ready,
+                behavior_regularizer_metrics,
+            ) = (
+                self._behavior_policy_regularizer_loss(
                     policy_info,
                     behavior_pre_tanh_mean,
                     behavior_log_std,
@@ -1820,8 +2000,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
             self.ent_coef_optim.zero_grad(set_to_none=True)
             entropy_coefficient_loss.backward()
             self.ent_coef_optim.step()
+            with torch.no_grad():
+                self.log_ent_coef.clamp_(min=math.log(_ENTROPY_COEF_MIN))
 
-        behavior_kl_coefficient = torch.zeros((), device=self.device)
+        behavior_regularizer_coefficient = torch.zeros((), device=self.device)
         behavior_kl_dual_loss = torch.zeros((), device=self.device)
         behavior_kl_dual_violation = torch.zeros((), device=self.device)
         behavior_kl_dual_cap_hit = torch.zeros((), device=self.device)
@@ -1829,10 +2011,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
         dual_coefficient_after = None
         if self._behavior_policy_kl_schedule == "dual":
             slot_coefficient = self.log_behavior_policy_kl_coef.exp().detach()
-            if behavior_kl_ready:
-                behavior_kl_coefficient = slot_coefficient.reshape(())
+            if behavior_regularizer_ready:
+                behavior_regularizer_coefficient = slot_coefficient.reshape(())
                 behavior_kl_dual_violation = (
-                    behavior_kl.detach()
+                    behavior_regularizer.detach()
                     - float(self.cfg.outer_behavior_policy_kl_target)
                 )
                 behavior_kl_dual_loss = -(
@@ -1889,14 +2071,14 @@ class AMBITDMPC2Agent(torch.nn.Module):
         if self._behavior_policy_kl_schedule == "smooth":
             ramp_updates = int(self.cfg.outer_behavior_policy_kl_ramp_updates)
             completed = int(self.behavior_policy_kl_eligible_updates)
-            if behavior_kl_ready:
+            if behavior_regularizer_ready:
                 smooth_progress = min(
                     float(completed + 1) / float(ramp_updates), 1.0
                 )
                 smooth_weight = smooth_progress * smooth_progress * (
                     3.0 - 2.0 * smooth_progress
                 )
-                behavior_kl_coefficient = behavior_kl.new_tensor(
+                behavior_regularizer_coefficient = behavior_regularizer.new_tensor(
                     float(self.cfg.outer_behavior_policy_kl_coef)
                     * smooth_weight
                 )
@@ -1909,8 +2091,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 self._actor_loss_scale_value.item()
                 > float(self.cfg.outer_behavior_policy_kl_q_threshold)
             )
-            if behavior_kl_ready and quantile_gate_active:
-                behavior_kl_coefficient = behavior_kl.new_tensor(
+            if behavior_regularizer_ready and quantile_gate_active:
+                behavior_regularizer_coefficient = behavior_regularizer.new_tensor(
                     float(self.cfg.outer_behavior_policy_kl_coef)
                 )
 
@@ -1927,7 +2109,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
         )
         if self.behavior_policy_kl_enabled:
             actor_loss = (
-                sac_actor_loss + behavior_kl_coefficient * behavior_kl
+                sac_actor_loss
+                + behavior_regularizer_coefficient * behavior_regularizer
             )
             if self.actor_loss_scale_enabled:
                 actor_loss = actor_loss / self._actor_loss_scale_value.reshape(())
@@ -1957,7 +2140,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self.pi_optim.step()
         if (
             self._behavior_policy_kl_schedule == "smooth"
-            and behavior_kl_ready
+            and behavior_regularizer_ready
         ):
             self.behavior_policy_kl_eligible_updates += 1
         metrics = {
@@ -1973,28 +2156,40 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "ent_coef": alpha.detach(),
             "ent_coef_loss": entropy_coefficient_loss.detach(),
         }
+        if self.log_ent_coef is not None:
+            metrics["ent_coef_floor_hit"] = (
+                self.log_ent_coef.detach().reshape(())
+                <= math.log(_ENTROPY_COEF_MIN)
+            ).to(dtype=torch.float32)
         if self.actor_loss_scale_enabled:
             metrics["actor_loss_scale"] = self._actor_loss_scale_value.detach()
             metrics["actor_effective_ent_coef"] = (
                 alpha / self._actor_loss_scale_value
             ).detach()
         if self.behavior_policy_kl_enabled:
+            behavior_metric_prefix = (
+                "behavior_policy_kl"
+                if self._behavior_policy_objective == "reverse_kl"
+                else "behavior_policy_action_ce"
+            )
             actor_scale = (
                 self._actor_loss_scale_value.reshape(())
                 if self.actor_loss_scale_enabled
-                else behavior_kl.new_ones(())
+                else behavior_regularizer.new_ones(())
             )
-            metrics.update(behavior_kl_metrics)
+            metrics.update(behavior_regularizer_metrics)
             metrics.update(
                 {
-                    "behavior_policy_kl_coefficient": (
-                        behavior_kl_coefficient.detach()
+                    f"{behavior_metric_prefix}_coefficient": (
+                        behavior_regularizer_coefficient.detach()
                     ),
-                    "behavior_policy_kl_effective_coefficient": (
-                        behavior_kl_coefficient / actor_scale
+                    f"{behavior_metric_prefix}_effective_coefficient": (
+                        behavior_regularizer_coefficient / actor_scale
                     ).detach(),
-                    "behavior_policy_kl_weighted_loss": (
-                        behavior_kl_coefficient * behavior_kl / actor_scale
+                    f"{behavior_metric_prefix}_weighted_loss": (
+                        behavior_regularizer_coefficient
+                        * behavior_regularizer
+                        / actor_scale
                     ).detach(),
                 }
             )
@@ -2004,17 +2199,17 @@ class AMBITDMPC2Agent(torch.nn.Module):
                     self._actor_loss_scale_value.detach()
                 )
             if self._behavior_policy_kl_schedule == "smooth":
-                metrics["behavior_policy_kl_ramp_progress"] = float(
+                metrics[f"{behavior_metric_prefix}_ramp_progress"] = float(
                     smooth_progress
                 )
-                metrics["behavior_policy_kl_eligible_updates"] = float(
+                metrics[f"{behavior_metric_prefix}_eligible_updates"] = float(
                     self.behavior_policy_kl_eligible_updates
                 )
             elif self._behavior_policy_kl_schedule == "quantile_gate":
-                metrics["behavior_policy_kl_gate_active"] = float(
+                metrics[f"{behavior_metric_prefix}_gate_active"] = float(
                     quantile_gate_active
                 )
-                metrics["behavior_policy_kl_q_threshold"] = float(
+                metrics[f"{behavior_metric_prefix}_q_threshold"] = float(
                     self.cfg.outer_behavior_policy_kl_q_threshold
                 )
             elif self._behavior_policy_kl_schedule == "dual":

@@ -137,6 +137,13 @@ def test_policy_sampling_accepts_isolated_generator_std_scale_and_inner_bounds()
     )
     torch.testing.assert_close(first_action, second_action, rtol=0, atol=0)
     torch.testing.assert_close(first_info["pre_tanh_mean"], torch.zeros_like(z[:, :2]))
+    torch.testing.assert_close(
+        first_action,
+        torch.tanh(first_info["pre_tanh_action"]),
+        rtol=0,
+        atol=0,
+    )
+    assert first_info["pre_tanh_action"].requires_grad
     torch.testing.assert_close(first_info["log_prob"], second_info["log_prob"], rtol=0, atol=0)
     torch.testing.assert_close(
         first_info["log_std"],

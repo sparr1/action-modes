@@ -57,6 +57,7 @@ def test_sac_actor_loss_scale_defaults_and_normalizes_explicit_mode():
 def test_behavior_policy_kl_defaults_and_auto_valid_count_resolution():
     cfg = _build_cfg(batch_size=7)
 
+    assert cfg.outer_behavior_policy_objective == "reverse_kl"
     assert cfg.outer_behavior_policy_kl_schedule == "none"
     assert cfg.outer_behavior_policy_kl_coef == pytest.approx(1.0)
     assert cfg.outer_behavior_policy_kl_min_valid_count == 7
@@ -66,6 +67,27 @@ def test_behavior_policy_kl_defaults_and_auto_valid_count_resolution():
     assert cfg.outer_behavior_policy_kl_dual_init == pytest.approx(0.1)
     assert cfg.outer_behavior_policy_kl_dual_lr == pytest.approx(3e-4)
     assert cfg.outer_behavior_policy_kl_dual_max == pytest.approx(10.0)
+
+
+@pytest.mark.parametrize(
+    ("requested", "resolved"),
+    [
+        ("REVERSE_KL", "reverse_kl"),
+        ("ACTION_SPACE_CROSS_ENTROPY", "action_space_cross_entropy"),
+    ],
+)
+def test_behavior_policy_objective_normalizes_supported_modes(requested, resolved):
+    cfg = _build_cfg(outer_behavior_policy_objective=requested)
+    assert cfg.outer_behavior_policy_objective == resolved
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, True, 1, "kl", "cross_entropy", "auto"],
+)
+def test_behavior_policy_objective_is_strict(value):
+    with pytest.raises(ValueError, match="outer_behavior_policy_objective"):
+        _build_cfg(outer_behavior_policy_objective=value)
 
 
 @pytest.mark.parametrize(
@@ -153,34 +175,76 @@ def test_behavior_policy_kl_mode_specific_coefficient_and_dual_bounds():
     assert dual.outer_behavior_policy_kl_target == pytest.approx(0.0)
 
 
-@pytest.mark.parametrize("schedule", ["smooth", "quantile_gate", "dual"])
-def test_active_behavior_policy_kl_requires_stochastic_inner_sac(schedule):
-    enabled = _build_cfg(outer_behavior_policy_kl_schedule=schedule)
+@pytest.mark.parametrize("schedule", ["smooth", "quantile_gate"])
+def test_action_space_cross_entropy_supports_nondual_active_schedules(schedule):
+    cfg = _build_cfg(
+        outer_behavior_policy_objective="action_space_cross_entropy",
+        outer_behavior_policy_kl_schedule=schedule,
+    )
+    assert cfg.outer_behavior_policy_objective == "action_space_cross_entropy"
+    assert cfg.outer_behavior_policy_kl_schedule == schedule
+    assert cfg.store_behavior_policy is True
+
+
+def test_action_space_cross_entropy_rejects_dual_schedule():
+    with pytest.raises(
+        ValueError,
+        match="action_space_cross_entropy.*does not support.*dual",
+    ):
+        _build_cfg(
+            outer_behavior_policy_objective="action_space_cross_entropy",
+            outer_behavior_policy_kl_schedule="dual",
+        )
+
+
+@pytest.mark.parametrize(
+    ("objective", "schedule"),
+    [
+        ("reverse_kl", "smooth"),
+        ("reverse_kl", "quantile_gate"),
+        ("reverse_kl", "dual"),
+        ("action_space_cross_entropy", "smooth"),
+        ("action_space_cross_entropy", "quantile_gate"),
+    ],
+)
+def test_active_behavior_policy_regularizer_requires_stochastic_inner_sac(
+    objective,
+    schedule,
+):
+    enabled = _build_cfg(
+        outer_behavior_policy_objective=objective,
+        outer_behavior_policy_kl_schedule=schedule,
+    )
     assert enabled.inner_operator == "sac"
     assert enabled.inner_execution_action == "policy_sample"
     assert enabled.inner_execution_std_scale > 0.0
 
     with pytest.raises(ValueError, match="requires inner_operator='sac'"):
         _build_cfg(
+            outer_behavior_policy_objective=objective,
             outer_behavior_policy_kl_schedule=schedule,
             inner_operator="td3",
         )
     with pytest.raises(ValueError, match="stochastic inner execution"):
         _build_cfg(
+            outer_behavior_policy_objective=objective,
             outer_behavior_policy_kl_schedule=schedule,
             inner_execution_action="mean",
         )
     with pytest.raises(ValueError, match="stochastic inner execution"):
         _build_cfg(
+            outer_behavior_policy_objective=objective,
             outer_behavior_policy_kl_schedule=schedule,
             inner_execution_std_scale=0.0,
         )
 
     inactive = _build_cfg(
+        outer_behavior_policy_objective=objective,
         outer_behavior_policy_kl_schedule="none",
         inner_execution_action="mean",
     )
     assert inactive.inner_execution_action == "mean"
+    assert inactive.store_behavior_policy is False
 
 
 def test_log_std_mapping_and_bounds_inherit_and_override_independently():

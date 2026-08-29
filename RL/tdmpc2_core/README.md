@@ -163,18 +163,29 @@ intermediate actor-update statistic associated with a positive
 `inner_outer_policy_kl_coef`; when that regularizer is disabled, its update-time
 metric is omitted rather than reported as a false zero.
 
-### Optional replay behavior-policy KL
+### Optional replay behavior-policy regularizer
 
-`outer_behavior_policy_kl_schedule` optionally adds the analytic reverse KL
-from the current outer actor to the action-generating replay policy. Both are
-represented by their diagonal pre-tanh Gaussians, so their shared invertible
-tanh leaves the KL unchanged. The replayed component is an empirical Jensen
-upper-bound surrogate for the unavailable historical policy mixture. The loss
-uses only the `H` actor states with corresponding actions, divides by action
-dimension, and renormalizes over valid rows; seed and random actions are
-invalid rather than zero-valued targets. This is the requested full reverse KL,
-including its current-policy log-density term, and is intentionally distinct
-from the released TD-M(PC)² implementation's sampled `-log mu(a)` regularizer.
+`outer_behavior_policy_kl_schedule` optionally enables a replayed
+behavior-policy regularizer. `outer_behavior_policy_objective="reverse_kl"`
+(the default) preserves the analytic reverse KL from the current outer actor to
+the action-generating replay policy. Both are represented by diagonal pre-tanh
+Gaussians, so their shared invertible tanh leaves this KL unchanged.
+
+`outer_behavior_policy_objective="action_space_cross_entropy"` instead uses
+the exact normalized squashed-action cross entropy. Its Gaussian expectation
+is analytic, while the exact tanh log-Jacobian is evaluated stably on the same
+reparameterized pre-tanh sample already used by the SAC actor and critic. This
+partially analytic single-sample estimator has the exact CE objective and an
+unbiased gradient. Cross entropy can be negative and is coordinate dependent;
+ordinary SAC entropy remains active and separate.
+
+For either objective, the replayed component is an empirical Jensen upper-bound
+surrogate for the unavailable historical policy mixture. The loss uses only the
+`H` actor states with corresponding actions, divides by action dimension, and
+renormalizes over valid rows; seed and random actions are invalid rather than
+zero-valued targets. Reverse KL includes its current-policy log-density term and
+is intentionally distinct from the released TD-M(PC)² sampled `-log mu(a)`
+regularizer.
 
 The default `"none"` preserves the legacy replay and checkpoint contracts.
 The active choices are `"smooth"` (a readiness-paused smoothstep ramp to
@@ -182,10 +193,17 @@ The active choices are `"smooth"` (a readiness-paused smoothstep ramp to
 while the just-updated P95-P5 Q-range EMA is strictly above its threshold), and
 `"dual"` (a separately optimized log coefficient targeting
 `outer_behavior_policy_kl_target`). If actor-loss scaling is enabled, the
-entire raw SAC-plus-KL objective is divided by the shared Q-range scale; entropy
-and KL temperatures retain independent optimizers. Active modes require
-stochastic inner SAC execution. Replay and agent states move to versions 2 and
-5/6 respectively only while this feature is active.
+entire raw SAC-plus-regularizer objective is divided by the shared Q-range
+scale. The CE objective supports `"smooth"` and `"quantile_gate"` but rejects
+`"dual"`, because CE has no invariant zero-valued constraint target. Active
+modes require stochastic inner SAC execution. Replay and agent states move to
+versions 2 and 5/6 respectively only while this feature is active; exact
+checkpoint metadata rejects cross-objective continuation.
+
+Learned outer and inner SAC entropy coefficients have a numerical floor of
+`1e-8`. Fixed entropy coefficients retain their configured values. The floor
+prevents an underflowed outer coefficient from becoming an invalid zero when a
+fresh inner SAC solve inherits it.
 
 ### Value-equivalence live monitor
 
