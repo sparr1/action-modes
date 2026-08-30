@@ -191,6 +191,11 @@ _AMBI_DEFAULTS = {
     "value_equivalence_every_updates": 1000,
     "value_equivalence_mc_samples": 4,
 
+    # Optional value-only Bellman-equivalence training for continuing tasks.
+    # This is independent of the observational monitor above.
+    "value_equivalence_loss_coef": 0.0,
+    "value_equivalence_loss_mc_samples": 4,
+
     # Initial-state outer-Q calibration against real discounted rollouts.
     # Disabled by default because the full Monte Carlo probe is expensive.
     "eval_value": False,
@@ -1513,6 +1518,14 @@ class AMBITDMPC2(TDMPC2Baseline):
             cfg.value_equivalence_mc_samples,
             "value_equivalence_mc_samples",
         )
+        cfg.value_equivalence_loss_coef = _strict_nonnegative_float(
+            cfg.value_equivalence_loss_coef,
+            "value_equivalence_loss_coef",
+        )
+        cfg.value_equivalence_loss_mc_samples = _strict_positive_int(
+            cfg.value_equivalence_loss_mc_samples,
+            "value_equivalence_loss_mc_samples",
+        )
         cfg.eval_value = _strict_bool(cfg.eval_value, "eval_value")
         cfg.eval_value_samples = _strict_positive_int(
             cfg.eval_value_samples,
@@ -1541,6 +1554,18 @@ class AMBITDMPC2(TDMPC2Baseline):
             raise ValueError(
                 "value_equivalence_diagnostics requires inner_operator='sac'."
             )
+        if cfg.value_equivalence_loss_coef > 0.0:
+            if cfg.inner_operator != "sac":
+                raise ValueError(
+                    "A positive value_equivalence_loss_coef requires "
+                    "inner_operator='sac'."
+                )
+            if bool(cfg.episodic):
+                raise ValueError(
+                    "A positive value_equivalence_loss_coef requires "
+                    "episodic=false; the VE loss is value-only and does not "
+                    "model termination."
+                )
         if cfg.eval_value:
             if cfg.eval_freq is None:
                 raise ValueError("eval_value=true requires a configured eval_freq.")

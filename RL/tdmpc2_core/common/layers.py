@@ -13,6 +13,22 @@ from .compile_regions import _capture_rng_state, _restore_rng_state
 _DETACHED_PARAMETER_VIEWS = weakref.WeakKeyDictionary()
 
 
+def detached_module_forward(module, *args, **kwargs):
+	"""Evaluate ``module`` with frozen parameters and live input gradients.
+
+	The stateless parameter mapping prevents gradients from accumulating on the
+	module while leaving buffers, training mode, and differentiation with respect
+	to tensor inputs unchanged. Unlike the ensemble-specific fast path below,
+	this general helper intentionally creates fresh detached views so it remains
+	correct across arbitrary device and dtype moves.
+	"""
+	detached_parameters = {
+		name: parameter.detach()
+		for name, parameter in module.named_parameters()
+	}
+	return functional_call(module, detached_parameters, args, kwargs)
+
+
 class Ensemble(nn.Module):
 	"""
 	Q-function ensemble.

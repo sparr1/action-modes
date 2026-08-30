@@ -6,6 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from RL.tdmpc2_core.common import math as td_math
+from RL.tdmpc2_core.common.compile_regions import CompileRegion
+from RL.tdmpc2_core.common.layers import detached_module_forward
 from RL.tdmpc2_core.common.lora import LoRALinear, lorafy_copy
 from RL.tdmpc2_core.common.q_representation import QRepresentation
 from RL.tdmpc2_core.common.soft_world_model import SoftWorldModel
@@ -165,6 +167,145 @@ def test_policy_sampling_accepts_isolated_generator_std_scale_and_inner_bounds()
         model.pi(z, std_scale=0.0)
     with pytest.raises(ValueError, match="smaller than"):
         model.pi(z, log_std_min=1.0, log_std_max=1.0)
+
+
+def test_detached_module_forward_freezes_parameters_but_preserves_input_gradients():
+    torch.manual_seed(17)
+    module = nn.Sequential(
+        nn.Linear(3, 5),
+        nn.LayerNorm(5),
+        nn.Mish(),
+        nn.Linear(5, 2),
+    ).eval()
+    value = torch.randn(4, 3, requires_grad=True)
+    reference_value = value.detach().clone().requires_grad_(True)
+
+    expected = module(reference_value)
+    expected_input_gradient = torch.autograd.grad(
+        expected.square().sum(), reference_value
+    )[0]
+    actual = detached_module_forward(module, value)
+    parameters = tuple(module.parameters())
+    actual_gradients = torch.autograd.grad(
+        actual.square().sum(),
+        (value,) + parameters,
+        allow_unused=True,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual_gradients[0], expected_input_gradient, rtol=0, atol=0
+    )
+    assert torch.isfinite(actual_gradients[0]).all()
+    assert torch.count_nonzero(actual_gradients[0]) > 0
+    assert all(gradient is None for gradient in actual_gradients[1:])
+    assert all(parameter.grad is None for parameter in module.parameters())
+    assert module.training is False
+
+
+@pytest.mark.parametrize("training", [False, True])
+def test_detached_policy_matches_pi_and_routes_gradients_only_to_latents(training):
+    torch.manual_seed(23)
+    model = SoftWorldModel(model_cfg())
+    model._pi.train(training)
+    latent = torch.randn(4, model.cfg.latent_dim, requires_grad=True)
+    reference_latent = latent.detach().clone().requires_grad_(True)
+    noise = torch.randn(4, model.cfg.action_dim)
+
+    expected_action, expected_info = model.pi(reference_latent, noise=noise)
+    expected_input_gradient = torch.autograd.grad(
+        expected_action.square().sum() + expected_info["log_prob"].sum(),
+        reference_latent,
+    )[0]
+    action, info = model.pi(latent, noise=noise, detach_policy=True)
+    action_only = model.pi_action(latent, noise=noise, detach_policy=True)
+
+    torch.testing.assert_close(action, expected_action, rtol=0, atol=0)
+    torch.testing.assert_close(action_only, expected_action, rtol=0, atol=0)
+    assert info.keys() == expected_info.keys()
+    for key in info:
+        torch.testing.assert_close(info[key], expected_info[key], rtol=0, atol=0)
+
+    parameters = tuple(model._pi.parameters())
+    actual_gradients = torch.autograd.grad(
+        action.square().sum() + info["log_prob"].sum(),
+        (latent,) + parameters,
+        allow_unused=True,
+    )
+    torch.testing.assert_close(
+        actual_gradients[0], expected_input_gradient, rtol=0, atol=0
+    )
+    assert torch.isfinite(actual_gradients[0]).all()
+    assert torch.count_nonzero(actual_gradients[0]) > 0
+    assert all(gradient is None for gradient in actual_gradients[1:])
+    assert all(parameter.grad is None for parameter in model._pi.parameters())
+    assert model._pi.training is training
+
+
+def test_default_policy_path_still_accumulates_policy_gradients():
+    model = SoftWorldModel(model_cfg())
+    latent = torch.randn(3, model.cfg.latent_dim, requires_grad=True)
+    noise = torch.randn(3, model.cfg.action_dim)
+
+    action, info = model.pi(latent, noise=noise)
+    (action.square().sum() + info["log_prob"].sum()).backward()
+
+    assert latent.grad is not None
+    assert any(parameter.grad is not None for parameter in model._pi.parameters())
+
+
+def test_default_policy_path_remains_compatible_with_fixed_shape_compile_wrapper(
+    monkeypatch,
+):
+    monkeypatch.setattr(torch, "compile", lambda function, **_kwargs: function)
+    model = SoftWorldModel(model_cfg()).eval()
+    latent = torch.randn(2, model.cfg.latent_dim, requires_grad=True)
+    noise = torch.randn(2, model.cfg.action_dim)
+    region = CompileRegion(
+        "detached policy",
+        lambda z, eps: model.pi(
+            z,
+            noise=eps,
+        )[0],
+        enabled=True,
+        strict=True,
+    )
+
+    action = region(latent, noise)
+    action.sum().backward()
+
+    assert action.shape == (2, model.cfg.action_dim)
+    assert latent.grad is not None
+    assert any(parameter.grad is not None for parameter in model._pi.parameters())
+    assert model._pi.training is False
+    assert not region.failed
+
+
+def test_detached_policy_runs_through_fixed_shape_compile_wrapper(monkeypatch):
+    monkeypatch.setattr(torch, "compile", lambda function, **_kwargs: function)
+    model = SoftWorldModel(model_cfg()).eval()
+    latent = torch.randn(2, model.cfg.latent_dim, requires_grad=True)
+    noise = torch.randn(2, model.cfg.action_dim)
+    region = CompileRegion(
+        "detached policy",
+        lambda z, eps: model.pi(
+            z,
+            noise=eps,
+            detach_policy=True,
+        )[0],
+        enabled=True,
+        strict=True,
+    )
+
+    action = region(latent, noise)
+    action.sum().backward()
+
+    assert action.shape == (2, model.cfg.action_dim)
+    assert latent.grad is not None
+    assert torch.count_nonzero(latent.grad) > 0
+    assert all(parameter.grad is None for parameter in model._pi.parameters())
+    assert model._pi.training is False
+    assert not region.failed
 
 
 def test_tdmpc2_log_std_mapping_matches_the_vendored_transform():

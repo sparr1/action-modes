@@ -1504,6 +1504,128 @@ class AMBITDMPC2Agent(torch.nn.Module):
             trusted_pair_indices=pair_indices is not None,
         )
 
+    def _value_equivalence_q_with_input_grad(
+        self,
+        critic,
+        z,
+        action,
+        reduction,
+        pair_indices,
+    ):
+        """Evaluate a frozen Q probe while preserving latent/action gradients."""
+        q_input = self.model.joint_input(z, action)
+        q_predictions = critic._forward_detached_eager(q_input)
+        q_values = self.model.q_backend.decode(q_predictions)
+        return self.model.q_backend.reduce(
+            q_values,
+            reduction,
+            pair_indices=pair_indices,
+            trusted_pair_indices=pair_indices is not None,
+        )
+
+    def _value_equivalence_loss(
+        self,
+        latent_states,
+        next_z_targets,
+        loss_update,
+    ):
+        """Match fresh-inner successor values without training the probe.
+
+        This is the value component of Bellman equivalence. TOLD's existing
+        reward objective continues to supervise rewards independently. The
+        maintained loss is continuing-task only, so it contains neither a
+        termination model nor a continuation mask.
+        """
+        model_next_z = latent_states[1:]
+        real_next_z = next_z_targets.detach()
+        paired_next_z = torch.stack((real_next_z, model_next_z), dim=0)
+        critic = self._value_equivalence_reference_critic()
+        actor_training_modes = tuple(
+            (module, bool(module.training)) for module in self.model._pi.modules()
+        )
+        critic_training_modes = tuple(
+            (module, bool(module.training)) for module in critic.modules()
+        )
+
+        generator_device = self.device if self.device.type == "cuda" else "cpu"
+        generator = torch.Generator(device=generator_device)
+        seed = (
+            int(self.cfg.seed)
+            + 1_000_003 * int(loss_update)
+            + 0x56454C4F5353
+        ) % (2**63 - 1)
+        generator.manual_seed(seed)
+
+        alpha = self._initial_inner_diagnostic_alpha()
+        reduction = str(self.cfg.inner_q_target_reduction)
+        mc_samples = int(self.cfg.value_equivalence_loss_mc_samples)
+        sampled_values = []
+        try:
+            self.model._pi.eval()
+            critic.eval()
+            for _ in range(mc_samples):
+                policy_noise = torch.randn(
+                    real_next_z.shape[:-1] + (int(self.cfg.action_dim),),
+                    dtype=real_next_z.dtype,
+                    device=real_next_z.device,
+                    generator=generator,
+                )
+                paired_noise = policy_noise.unsqueeze(0).expand(
+                    (2,) + policy_noise.shape
+                )
+                next_action, next_info = self.model.pi(
+                    paired_next_z,
+                    policy=self.model._pi,
+                    noise=paired_noise,
+                    log_std_mapping=self.cfg.inner_log_std_mapping,
+                    log_std_min=self.cfg.inner_log_std_min,
+                    log_std_max=self.cfg.inner_log_std_max,
+                    detach_policy=True,
+                )
+                pair_indices = (
+                    self.model.q_backend.sample_pair_indices(
+                        self.device, generator=generator
+                    )
+                    if reduction.endswith("_pair")
+                    else None
+                )
+                next_q = self._value_equivalence_q_with_input_grad(
+                    critic,
+                    paired_next_z,
+                    next_action,
+                    reduction,
+                    pair_indices,
+                )
+                bootstrap_value = next_q
+                if self.cfg.inner_sac_critic_target == "entropy_augmented":
+                    bootstrap_value = (
+                        bootstrap_value - alpha * next_info["log_prob"]
+                    )
+                sampled_values.append(bootstrap_value)
+        finally:
+            for module, was_training in actor_training_modes:
+                module.training = was_training
+            for module, was_training in critic_training_modes:
+                module.training = was_training
+
+        mean_value = torch.stack(sampled_values, dim=0).mean(dim=0)
+        real_value, model_value = mean_value.unbind(0)
+        value_error = float(self.discount) * (
+            model_value - real_value.detach()
+        )
+        per_depth_losses = value_error.square().mean(
+            dim=tuple(range(1, value_error.ndim))
+        )
+        loss = td_math.reduce_temporal_loss(
+            per_depth_losses,
+            self.cfg.rho,
+            normalization=self.cfg.temporal_loss_normalization,
+            reference_horizon=self.cfg.temporal_loss_reference_horizon,
+            legacy_order="vector_sum_divide",
+            weights=self._transition_temporal_weights,
+        )
+        return loss, per_depth_losses
+
     @torch.no_grad()
     def _value_equivalence_diagnostics(
         self,
@@ -2372,15 +2494,46 @@ class AMBITDMPC2Agent(torch.nn.Module):
         )
 
         value_equivalence_info = {}
+        value_equivalence_loss_coef = float(
+            self.cfg.value_equivalence_loss_coef
+        )
+        if value_equivalence_loss_coef > 0.0:
+            value_equivalence_loss, value_equivalence_depth_losses = (
+                self._value_equivalence_loss(
+                    latent_states,
+                    next_z_targets,
+                    loss_update=self.num_updates + 1,
+                )
+            )
+            weighted_value_equivalence_loss = (
+                value_equivalence_loss_coef * value_equivalence_loss
+            )
+            total_loss = total_loss + weighted_value_equivalence_loss
+            value_equivalence_info.update(
+                {
+                    "value_equivalence_loss": value_equivalence_loss.detach(),
+                    "value_equivalence_weighted_loss": (
+                        weighted_value_equivalence_loss.detach()
+                    ),
+                }
+            )
+            for depth, depth_loss in enumerate(
+                value_equivalence_depth_losses.unbind(0), start=1
+            ):
+                value_equivalence_info[
+                    f"value_equivalence_loss_depth_{depth}"
+                ] = depth_loss.detach()
         if self._should_run_value_equivalence_diagnostics():
-            value_equivalence_info = self._value_equivalence_diagnostics(
-                latent_states,
-                reward_predictions,
-                termination_prediction,
-                next_z_targets,
-                reward,
-                terminated,
-                diagnostic_update=self.num_updates + 1,
+            value_equivalence_info.update(
+                self._value_equivalence_diagnostics(
+                    latent_states,
+                    reward_predictions,
+                    termination_prediction,
+                    next_z_targets,
+                    reward,
+                    terminated,
+                    diagnostic_update=self.num_updates + 1,
+                )
             )
 
         self.optim.zero_grad(set_to_none=True)

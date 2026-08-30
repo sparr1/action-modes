@@ -205,6 +205,18 @@ Learned outer and inner SAC entropy coefficients have a numerical floor of
 prevents an underflowed outer coefficient from becoming an invalid zero when a
 fresh inner SAC solve inherits it.
 
+### Continuing-task and value-equivalence contract
+
+Maintained AMBI research follows TD-MPC2's continuing-task formulation with
+`episodic=false`. Time-limit truncations end data-collection episodes but do
+not mask Bellman bootstraps. In this mode TOLD has no termination head or
+termination loss, imagined inner replay always continues for its configured
+horizon, and value-equivalence training is deliberately **value-only**. It
+matches the discounted successor-value component while TOLD's existing reward
+cross-entropy supervises rewards separately. It does not predict, mask, or
+differentiate through termination. Supporting termination in this objective
+would be a separate research decision rather than an implicit extension.
+
 ### Value-equivalence live monitor
 
 AMBI includes an optional, observational value-equivalence monitor for inner
@@ -246,6 +258,36 @@ Enable it with:
 `value_equivalence_every_updates` and `value_equivalence_mc_samples` must be
 strictly positive integers. The monitor currently requires
 `inner_operator="sac"`; it remains disabled by default.
+
+### Value-equivalence training loss
+
+AMBI also includes an experimental, opt-in loss that trains TOLD to preserve
+the value component of the fresh-inner SAC Bellman operator. At recurrent depth
+`i`, it minimizes the raw squared residual
+`(gamma * mean_k[V_k(z_model[i+1]) - V_k(z_real[i+1])]) ** 2`, reduced with
+TOLD's existing temporal weights. The replay action advances the recurrent
+model, while each successor branch samples its own state-conditioned fresh-inner
+policy action. Paired branches share Gaussian base noise and critic-head choices,
+and the configured Monte Carlo values are averaged before the residual is
+squared. Actor and critic parameters remain fixed, but their input gradients
+train the source encoder and latent dynamics. The reward head receives only its
+existing supervised TOLD reward loss.
+
+Enable the loss explicitly with, for example:
+
+```json
+{
+  "value_equivalence_loss_coef": 1.0,
+  "value_equivalence_loss_mc_samples": 4
+}
+```
+
+The coefficient must be a finite non-negative number and the sample count a
+strictly positive integer. A positive coefficient requires
+`inner_operator="sac"` and `episodic=false`. The default coefficient is zero,
+so existing training and experiment configurations remain unchanged. Loss
+sampling is independent of `value_equivalence_mc_samples`, which controls only
+the observational live monitor.
 
 For an actor-only inner-SAC ablation, set
 `inner_actor_adaptation="clone"`, `inner_critic_adaptation="frozen"`, and

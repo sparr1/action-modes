@@ -556,6 +556,8 @@ def test_value_equivalence_diagnostic_defaults_are_inert_and_sparse():
     assert cfg.value_equivalence_diagnostics is False
     assert cfg.value_equivalence_every_updates == 1000
     assert cfg.value_equivalence_mc_samples == 4
+    assert cfg.value_equivalence_loss_coef == pytest.approx(0.0)
+    assert cfg.value_equivalence_loss_mc_samples == 4
 
 
 @pytest.mark.parametrize("value", [None, 0, 1, "true"])
@@ -577,6 +579,11 @@ def test_value_equivalence_diagnostic_gate_is_strict_boolean(value):
         ("value_equivalence_mc_samples", -1),
         ("value_equivalence_mc_samples", 2.5),
         ("value_equivalence_mc_samples", "4"),
+        ("value_equivalence_loss_mc_samples", False),
+        ("value_equivalence_loss_mc_samples", 0),
+        ("value_equivalence_loss_mc_samples", -1),
+        ("value_equivalence_loss_mc_samples", 2.5),
+        ("value_equivalence_loss_mc_samples", "4"),
     ],
 )
 def test_value_equivalence_positive_integer_controls_are_strict(key, value):
@@ -599,3 +606,48 @@ def test_value_equivalence_monitor_requires_inner_sac_only_when_enabled():
             inner_operator="td3",
             value_equivalence_diagnostics=True,
         )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, True, False, "0.1", -1, float("nan"), float("inf")],
+)
+def test_value_equivalence_loss_coefficient_is_strict(value):
+    with pytest.raises(ValueError, match="value_equivalence_loss_coef"):
+        _build_cfg(value_equivalence_loss_coef=value)
+
+
+def test_value_equivalence_loss_accepts_finite_nonnegative_numeric_values():
+    disabled = _build_cfg(value_equivalence_loss_coef=0)
+    enabled = _build_cfg(
+        value_equivalence_loss_coef=0.25,
+        value_equivalence_loss_mc_samples=2,
+    )
+
+    assert disabled.value_equivalence_loss_coef == pytest.approx(0.0)
+    assert enabled.value_equivalence_loss_coef == pytest.approx(0.25)
+    assert enabled.value_equivalence_loss_mc_samples == 2
+
+
+def test_value_equivalence_loss_requires_inner_sac_and_continuing_tasks():
+    with pytest.raises(ValueError, match="requires inner_operator='sac'"):
+        _build_cfg(
+            inner_operator="td3",
+            value_equivalence_loss_coef=0.25,
+        )
+    with pytest.raises(ValueError, match="requires episodic=false"):
+        _build_cfg(
+            episodic=True,
+            value_equivalence_loss_coef=0.25,
+        )
+
+    disabled_td3 = _build_cfg(
+        inner_operator="td3",
+        value_equivalence_loss_coef=0.0,
+    )
+    disabled_episodic = _build_cfg(
+        episodic=True,
+        value_equivalence_loss_coef=0.0,
+    )
+    assert disabled_td3.inner_operator == "td3"
+    assert disabled_episodic.episodic is True

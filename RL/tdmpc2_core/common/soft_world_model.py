@@ -211,6 +211,7 @@ class SoftWorldModel(nn.Module):
         task=None,
         *,
         policy=None,
+        detach_policy=False,
         deterministic=False,
         generator=None,
         noise=None,
@@ -228,7 +229,14 @@ class SoftWorldModel(nn.Module):
         if not 0.0 < std_scale < float("inf"):
             raise ValueError(f"std_scale must be positive, got {std_scale}.")
 
-        mean_raw, log_std = policy(z).chunk(2, dim=-1)
+        # Detached policy probes are evaluated eagerly outside the compiled
+        # TOLD kernel; the default path keeps existing compiled callers intact.
+        policy_output = (
+            layers.detached_module_forward(policy, z)
+            if detach_policy
+            else policy(z)
+        )
+        mean_raw, log_std = policy_output.chunk(2, dim=-1)
         lower_bound = (
             self._log_std_min_value
             if log_std_min is None
@@ -290,6 +298,7 @@ class SoftWorldModel(nn.Module):
         task=None,
         *,
         policy=None,
+        detach_policy=False,
         deterministic=False,
         generator=None,
         noise=None,
@@ -303,6 +312,7 @@ class SoftWorldModel(nn.Module):
             z,
             task,
             policy=policy,
+            detach_policy=detach_policy,
             deterministic=deterministic,
             generator=generator,
             noise=noise,
@@ -319,6 +329,7 @@ class SoftWorldModel(nn.Module):
         task=None,
         *,
         policy=None,
+        detach_policy=False,
         deterministic=False,
         generator=None,
         noise=None,
@@ -332,6 +343,7 @@ class SoftWorldModel(nn.Module):
             z,
             task,
             policy=policy,
+            detach_policy=detach_policy,
             deterministic=deterministic,
             generator=generator,
             noise=noise,
