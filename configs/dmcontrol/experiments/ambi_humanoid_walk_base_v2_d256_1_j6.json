@@ -1,0 +1,26 @@
+{
+  "study_type": "single_seed_exploratory_inner_loop_update_schedule",
+  "study_note": "D256-1-J6 (Half-scale 1:1 baseline) in the base-v2 single-seed exploratory Humanoid Walk inner-loop update-schedule study. It uses J=6, N=256 rollouts per round, H=3, batch size 256, and shared G=1 joint updates per round, for 1,536 total imagined rollouts, 4,608 imagined transitions, 6 critic, 6 actor, and 6 automatic-temperature updates across 6 joint update slots per real action. Replay capacity is 4,608, matching the per-action model-step budget. All non-inner-schedule algorithm settings, training-focused evaluation gates, 14-million-decision budget, seed 55, and no-model-checkpoint policy are inherited unchanged from base-v2. This remains a single-seed exploratory variant and supports no confidence, significance, or confirmatory claim.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_humanoid_walk_base_v2_d256_1_j6"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": null,
+  "save_strat": "none",
+  "log_info": false,
+  "log_type": "summary"
+}

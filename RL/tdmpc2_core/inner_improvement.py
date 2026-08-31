@@ -189,6 +189,12 @@ class InnerImprovementEngine:
         )
 
     @property
+    def _uses_component_update_schedule(self):
+        return self._uses_canonical_schedule and bool(
+            getattr(self.cfg, "inner_component_update_schedule", False)
+        )
+
+    @property
     def _mppi_iterations(self):
         return int(
             getattr(self.cfg, "inner_mppi_iterations", self.cfg.inner_rounds)
@@ -197,6 +203,14 @@ class InnerImprovementEngine:
     def _canonical_schedule_has_updates(self):
         if not self._uses_canonical_schedule:
             return False
+        if self._uses_component_update_schedule:
+            return any(
+                int(getattr(self.cfg, key, 0)) > 0
+                for key in (
+                    "inner_critic_updates_per_round",
+                    "inner_actor_updates_per_round",
+                )
+            )
         updates = getattr(self.cfg, "inner_updates_per_round", 0)
         return updates == "auto" or int(updates) > 0
 
@@ -204,6 +218,16 @@ class InnerImprovementEngine:
         """Whether an optimizer is needed for this action's resolved schedule."""
         cfg = self.cfg
         if self._uses_canonical_schedule:
+            if self._uses_component_update_schedule:
+                if component == "temperature":
+                    return (
+                        int(cfg.inner_actor_updates_per_round) > 0
+                        and cfg.inner_operator == "sac"
+                        and str(cfg.inner_temperature_mode) == "auto"
+                    )
+                return int(
+                    getattr(cfg, f"inner_{component}_updates_per_round")
+                ) > 0
             if not self._canonical_schedule_has_updates():
                 return False
             if component == "temperature":
@@ -2369,6 +2393,40 @@ class InnerImprovementEngine:
             metrics.append(slot_metrics)
         return metrics
 
+    def _run_component_update_counts(
+        self,
+        *,
+        critic_count,
+        actor_count,
+        actor_loss_scale=None,
+    ):
+        """Run canonical component counts in critic-first phases.
+
+        Each component optimizer step samples its own batch. Automatic SAC
+        temperature updates share the corresponding actor-phase batch and do
+        not create additional update slots.
+        """
+        metrics = self._run_update_counts(
+            critic_count=critic_count,
+            actor_count=0,
+            temperature_count=0,
+            actor_loss_scale=actor_loss_scale,
+        )
+        metrics.extend(
+            self._run_update_counts(
+                critic_count=0,
+                actor_count=actor_count,
+                temperature_count=(
+                    actor_count
+                    if self.cfg.inner_operator == "sac"
+                    and self.cfg.inner_temperature_mode == "auto"
+                    else 0
+                ),
+                actor_loss_scale=actor_loss_scale,
+            )
+        )
+        return metrics
+
     @torch.no_grad()
     def _execute_policy(
         self,
@@ -2846,33 +2904,43 @@ class InnerImprovementEngine:
 
             update_start = self._timer_start()
             if self._uses_canonical_schedule:
-                configured_updates = cfg.inner_updates_per_round
-                if configured_updates == "auto":
-                    # Episodic branches may terminate before H; UTD=1 tracks
-                    # transitions actually appended during this collection.
-                    round_updates = int(rollout["transition_count"])
+                if self._uses_component_update_schedule:
+                    critic_count = int(cfg.inner_critic_updates_per_round)
+                    actor_count = int(cfg.inner_actor_updates_per_round)
+                    round_metrics = self._run_component_update_counts(
+                        critic_count=critic_count,
+                        actor_count=actor_count,
+                        actor_loss_scale=actor_loss_scale,
+                    )
+                    requested_update_slots += critic_count + actor_count
                 else:
-                    round_updates = int(configured_updates)
-                round_metrics = self._run_update_counts(
-                    critic_count=(
-                        round_updates
-                        if cfg.inner_critic_adaptation != "frozen"
-                        else 0
-                    ),
-                    actor_count=(
-                        round_updates
-                        if cfg.inner_actor_adaptation != "frozen"
-                        else 0
-                    ),
-                    temperature_count=(
-                        round_updates
-                        if cfg.inner_operator == "sac"
-                        and cfg.inner_temperature_mode == "auto"
-                        else 0
-                    ),
-                    actor_loss_scale=actor_loss_scale,
-                )
-                requested_update_slots += round_updates
+                    configured_updates = cfg.inner_updates_per_round
+                    if configured_updates == "auto":
+                        # Episodic branches may terminate before H; UTD=1 tracks
+                        # transitions actually appended during this collection.
+                        round_updates = int(rollout["transition_count"])
+                    else:
+                        round_updates = int(configured_updates)
+                    round_metrics = self._run_update_counts(
+                        critic_count=(
+                            round_updates
+                            if cfg.inner_critic_adaptation != "frozen"
+                            else 0
+                        ),
+                        actor_count=(
+                            round_updates
+                            if cfg.inner_actor_adaptation != "frozen"
+                            else 0
+                        ),
+                        temperature_count=(
+                            round_updates
+                            if cfg.inner_operator == "sac"
+                            and cfg.inner_temperature_mode == "auto"
+                            else 0
+                        ),
+                        actor_loss_scale=actor_loss_scale,
+                    )
+                    requested_update_slots += round_updates
             else:
                 round_metrics = self._run_updates(
                     round_index,

@@ -90,6 +90,10 @@ _AMBI_DEFAULTS = {
     "inner_rollouts_per_round": 64,
     "inner_rollout_horizon": 3,
     "inner_updates_per_round": "auto",
+    # Optional canonical component schedule. Both values must be specified;
+    # unlike the shared-G schedule, critic phases precede actor phases.
+    "inner_critic_updates_per_round": None,
+    "inner_actor_updates_per_round": None,
 
     # Deprecated total-budget controls. These remain accepted on an isolated
     # legacy schedule path for one release and are resolved to nominal totals
@@ -223,6 +227,12 @@ _CANONICAL_SCHEDULE_KEYS = {
     "inner_rollouts_per_round",
     "inner_rollout_horizon",
     "inner_updates_per_round",
+    "inner_critic_updates_per_round",
+    "inner_actor_updates_per_round",
+}
+_COMPONENT_SCHEDULE_KEYS = {
+    "inner_critic_updates_per_round",
+    "inner_actor_updates_per_round",
 }
 _TOTAL_SCHEDULE_KEYS = {
     "inner_model_step_budget",
@@ -363,6 +373,20 @@ def _normalize_legacy_params(params):
     requested_operator = str(
         params.get("inner_operator", _AMBI_DEFAULTS["inner_operator"])
     ).lower()
+    component_schedule = sorted(set(params) & _COMPONENT_SCHEDULE_KEYS)
+    if component_schedule and len(component_schedule) != len(
+        _COMPONENT_SCHEDULE_KEYS
+    ):
+        missing = sorted(_COMPONENT_SCHEDULE_KEYS - set(component_schedule))
+        raise ValueError(
+            "inner_critic_updates_per_round and inner_actor_updates_per_round "
+            f"must be specified together; missing={missing}."
+        )
+    if component_schedule and requested_operator not in {"sac", "td3"}:
+        raise ValueError(
+            "inner_critic_updates_per_round and inner_actor_updates_per_round "
+            "are only valid for inner_operator='sac' or 'td3'."
+        )
     v1_schedule = sorted(set(params) & _V1_SCHEDULE_KEYS)
     if v1_schedule:
         conflicts = sorted(
@@ -402,8 +426,17 @@ def _normalize_legacy_params(params):
             params.setdefault("inner_temperature_mode", "inherit_outer")
 
     if requested_operator in {"sac", "td3"}:
+        if component_schedule and "inner_updates_per_round" in params:
+            raise ValueError(
+                "Cannot combine shared inner_updates_per_round with component "
+                "inner_critic_updates_per_round/inner_actor_updates_per_round."
+            )
         new_unique = sorted(
-            set(params) & {"inner_rollouts_per_round", "inner_updates_per_round"}
+            set(params)
+            & (
+                {"inner_rollouts_per_round", "inner_updates_per_round"}
+                | _COMPONENT_SCHEDULE_KEYS
+            )
         )
         totals = sorted(set(params) & _TOTAL_SCHEDULE_KEYS)
         if new_unique and totals:
@@ -416,7 +449,11 @@ def _normalize_legacy_params(params):
             _legacy_warning(totals)
     elif requested_operator == "mppi":
         invalid = sorted(
-            set(params) & {"inner_rollouts_per_round", "inner_updates_per_round"}
+            set(params)
+            & (
+                {"inner_rollouts_per_round", "inner_updates_per_round"}
+                | _COMPONENT_SCHEDULE_KEYS
+            )
         )
         if invalid:
             raise ValueError(f"MPPI does not use SAC/TD3 schedule controls: {invalid}.")
@@ -622,6 +659,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         # actually supplied while allowing an all-legacy configuration to make
         # its one-release migration cleanly.
         params = _normalize_horizon_params(params, resolve_defaults=False)
+        component_update_schedule = bool(set(params) & _COMPONENT_SCHEDULE_KEYS)
         params, schedule_mode = _normalize_legacy_params(params)
         params = _normalize_horizon_params(params)
         explicit_num_q = params.get("num_q", None)
@@ -676,6 +714,9 @@ class AMBITDMPC2(TDMPC2Baseline):
         if schedule_mode == "legacy" and requested_operator in {"sac", "td3"}:
             merged.update(_LEGACY_SCHEDULE_DEFAULTS)
         merged.update(params)
+        if component_update_schedule:
+            # The component schedule has no meaningful shared-G value.
+            merged["inner_updates_per_round"] = None
         merged["outer_policy_episode_probability"] = _strict_probability(
             merged["outer_policy_episode_probability"],
             "outer_policy_episode_probability",
@@ -720,6 +761,7 @@ class AMBITDMPC2(TDMPC2Baseline):
             )
         cfg = super()._build_cfg(merged)
         cfg.inner_schedule_mode = schedule_mode
+        cfg.inner_component_update_schedule = component_update_schedule
         cfg.outer_policy_episode_probability = float(
             cfg.outer_policy_episode_probability
         )
@@ -862,41 +904,65 @@ class AMBITDMPC2(TDMPC2Baseline):
                 cfg.inner_rollouts_per_round = int(cfg.inner_rollouts_per_round)
                 if cfg.inner_rollouts_per_round < 0:
                     raise ValueError("inner_rollouts_per_round must be non-negative.")
-                if isinstance(cfg.inner_updates_per_round, str):
-                    cfg.inner_updates_per_round = cfg.inner_updates_per_round.lower()
-                    if cfg.inner_updates_per_round != "auto":
-                        raise ValueError(
-                            "inner_updates_per_round must be a non-negative integer or 'auto'."
-                        )
-                    nominal_updates_per_round = (
-                        cfg.inner_rollouts_per_round * cfg.inner_rollout_horizon
+                if cfg.inner_component_update_schedule:
+                    cfg.inner_critic_updates_per_round = _strict_nonnegative_int(
+                        cfg.inner_critic_updates_per_round,
+                        "inner_critic_updates_per_round",
+                    )
+                    cfg.inner_actor_updates_per_round = _strict_nonnegative_int(
+                        cfg.inner_actor_updates_per_round,
+                        "inner_actor_updates_per_round",
+                    )
+                    cfg.inner_updates_per_round = None
+                    cfg.inner_critic_updates_per_action = (
+                        cfg.inner_rounds * cfg.inner_critic_updates_per_round
+                    )
+                    cfg.inner_actor_updates_per_action = (
+                        cfg.inner_rounds * cfg.inner_actor_updates_per_round
+                    )
+                    cfg.inner_temperature_updates_per_action = (
+                        cfg.inner_actor_updates_per_action
+                        if cfg.inner_operator == "sac"
+                        and str(cfg.inner_temperature_mode).lower() == "auto"
+                        else 0
                     )
                 else:
-                    cfg.inner_updates_per_round = int(cfg.inner_updates_per_round)
-                    if cfg.inner_updates_per_round < 0:
-                        raise ValueError("inner_updates_per_round must be non-negative.")
-                    nominal_updates_per_round = cfg.inner_updates_per_round
+                    if isinstance(cfg.inner_updates_per_round, str):
+                        cfg.inner_updates_per_round = cfg.inner_updates_per_round.lower()
+                        if cfg.inner_updates_per_round != "auto":
+                            raise ValueError(
+                                "inner_updates_per_round must be a non-negative integer or 'auto'."
+                            )
+                        nominal_updates_per_round = (
+                            cfg.inner_rollouts_per_round * cfg.inner_rollout_horizon
+                        )
+                    else:
+                        cfg.inner_updates_per_round = int(cfg.inner_updates_per_round)
+                        if cfg.inner_updates_per_round < 0:
+                            raise ValueError("inner_updates_per_round must be non-negative.")
+                        nominal_updates_per_round = cfg.inner_updates_per_round
+
+                    nominal_total = cfg.inner_rounds * nominal_updates_per_round
+                    actor_enabled = str(cfg.inner_actor_adaptation).lower() != "frozen"
+                    critic_enabled = str(cfg.inner_critic_adaptation).lower() != "frozen"
+                    temperature_enabled = (
+                        cfg.inner_operator == "sac"
+                        and str(cfg.inner_temperature_mode).lower() == "auto"
+                    )
+                    cfg.inner_critic_updates_per_action = (
+                        nominal_total if critic_enabled else 0
+                    )
+                    cfg.inner_actor_updates_per_action = (
+                        nominal_total if actor_enabled else 0
+                    )
+                    cfg.inner_temperature_updates_per_action = (
+                        nominal_total if temperature_enabled else 0
+                    )
 
                 cfg.inner_model_step_budget = (
                     cfg.inner_rounds
                     * cfg.inner_rollouts_per_round
                     * cfg.inner_rollout_horizon
-                )
-                nominal_total = cfg.inner_rounds * nominal_updates_per_round
-                actor_enabled = str(cfg.inner_actor_adaptation).lower() != "frozen"
-                critic_enabled = str(cfg.inner_critic_adaptation).lower() != "frozen"
-                temperature_enabled = (
-                    cfg.inner_operator == "sac"
-                    and str(cfg.inner_temperature_mode).lower() == "auto"
-                )
-                cfg.inner_critic_updates_per_action = (
-                    nominal_total if critic_enabled else 0
-                )
-                cfg.inner_actor_updates_per_action = (
-                    nominal_total if actor_enabled else 0
-                )
-                cfg.inner_temperature_updates_per_action = (
-                    nominal_total if temperature_enabled else 0
                 )
             else:
                 cfg.inner_updates_per_round = None
@@ -982,11 +1048,17 @@ class AMBITDMPC2(TDMPC2Baseline):
         )
         if cfg.inner_operator in {"sac", "td3"}:
             if cfg.inner_schedule_mode == "canonical":
-                cfg.inner_nominal_updates_per_round = (
-                    nominal_transitions_per_round
-                    if cfg.inner_updates_per_round == "auto"
-                    else int(cfg.inner_updates_per_round)
-                )
+                if cfg.inner_component_update_schedule:
+                    cfg.inner_nominal_updates_per_round = (
+                        cfg.inner_critic_updates_per_round
+                        + cfg.inner_actor_updates_per_round
+                    )
+                else:
+                    cfg.inner_nominal_updates_per_round = (
+                        nominal_transitions_per_round
+                        if cfg.inner_updates_per_round == "auto"
+                        else int(cfg.inner_updates_per_round)
+                    )
             else:
                 cfg.inner_nominal_updates_per_round = (
                     max(
@@ -1001,11 +1073,17 @@ class AMBITDMPC2(TDMPC2Baseline):
         else:
             cfg.inner_nominal_updates_per_round = 0
         cfg.inner_nominal_transitions_per_round = nominal_transitions_per_round
-        cfg.inner_expected_update_slots = max(
-            cfg.inner_critic_updates_per_action,
-            cfg.inner_actor_updates_per_action,
-            cfg.inner_temperature_updates_per_action,
-        )
+        if cfg.inner_component_update_schedule:
+            cfg.inner_expected_update_slots = (
+                cfg.inner_critic_updates_per_action
+                + cfg.inner_actor_updates_per_action
+            )
+        else:
+            cfg.inner_expected_update_slots = max(
+                cfg.inner_critic_updates_per_action,
+                cfg.inner_actor_updates_per_action,
+                cfg.inner_temperature_updates_per_action,
+            )
         cfg.inner_nominal_critic_utd = (
             cfg.inner_critic_updates_per_action / cfg.inner_model_step_budget
             if cfg.inner_model_step_budget > 0
@@ -1708,7 +1786,12 @@ class AMBITDMPC2(TDMPC2Baseline):
         cfg.inner_grad_clip_norm = max(
             cfg.inner_actor_grad_clip_norm, cfg.inner_critic_grad_clip_norm
         )
-        if cfg.inner_schedule_mode == "canonical":
+        if cfg.inner_component_update_schedule:
+            # There is no truthful legacy single-G alias for a phased C/A
+            # schedule. Keep it explicitly unset instead of reporting zero
+            # updates for a solve that may perform nonzero component steps.
+            cfg.inner_updates_per_iteration = None
+        elif cfg.inner_schedule_mode == "canonical":
             cfg.inner_updates_per_iteration = cfg.inner_nominal_updates_per_round
         elif (
             cfg.inner_rounds > 0

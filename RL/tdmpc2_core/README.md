@@ -289,6 +289,40 @@ so existing training and experiment configurations remain unchanged. Loss
 sampling is independent of `value_equivalence_mc_samples`, which controls only
 the observational live monitor.
 
+### Separate root-local critic and actor update counts
+
+Canonical SAC and TD3 schedules can give the root-local critic and actor
+different fixed update counts after each rollout round. Specify both component
+fields and omit the shared `inner_updates_per_round` field. For example, this
+large-rollout SAC schedule collects 512 length-three trajectories in each of
+eight rounds, then performs three critic updates followed by one actor update:
+
+```json
+{
+  "inner_rounds": 8,
+  "inner_rollouts_per_round": 512,
+  "inner_rollout_horizon": 3,
+  "inner_critic_updates_per_round": 3,
+  "inner_actor_updates_per_round": 1,
+  "inner_batch_size": 512,
+  "inner_replay_capacity": 12288
+}
+```
+
+Each critic or actor update draws its own minibatch through the existing
+cumulative action-local replay sampler. Automatic SAC temperature optimization
+follows the actor and runs once per actor update; TD3 and fixed-temperature SAC
+add no temperature step. The resolved runtime metadata records both per-round
+counts, their derived per-action critic, actor, and temperature totals, and the
+summed critic-plus-actor replay rows drawn. A component count may be zero.
+
+This component schedule is mutually exclusive with the shared canonical
+`inner_updates_per_round` control and with the deprecated per-action total
+budget controls. Existing configurations that use a shared integer or
+`"auto"` retain their joint update-slot behavior, batch sharing, and random
+number ordering. These controls do not change replay capacity, retention, or
+sampling semantics.
+
 For an actor-only inner-SAC ablation, set
 `inner_actor_adaptation="clone"`, `inner_critic_adaptation="frozen"`, and
 `inner_temperature_mode="inherit_outer"`. The canonical schedule then resolves

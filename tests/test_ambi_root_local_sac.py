@@ -102,6 +102,13 @@ def _tiny_model(**overrides):
     return _model_from_params(_tiny_params(**overrides))
 
 
+def _tiny_component_model(**overrides):
+    params = _tiny_params()
+    params.pop("inner_updates_per_round")
+    params.update(overrides)
+    return _model_from_params(params)
+
+
 def _tiny_legacy_model(**overrides):
     params = _tiny_params()
     params.pop("inner_rollouts_per_round")
@@ -449,6 +456,197 @@ def test_canonical_auto_schedule_collects_then_updates_at_every_round(monkeypatc
     )
     assert abs(float(metrics["inner_alpha_delta"])) > 0.0
     torch.testing.assert_close(agent.alpha, outer_alpha, rtol=0, atol=0)
+
+
+def test_canonical_component_schedule_is_critic_first_with_independent_batches(
+    monkeypatch,
+    capsys,
+):
+    model = _tiny_component_model(
+        inner_rounds=2,
+        inner_critic_updates_per_round=3,
+        inner_actor_updates_per_round=1,
+        inner_replay_capacity=8,
+    )
+    agent = model.agent
+    engine = agent.inner_engine
+    startup_output = capsys.readouterr().out
+    assert "C=3, A=1" in startup_output
+    assert "G=None" not in startup_output
+    events = []
+    sampled_replay_sizes = []
+    original_collect = engine._collect_round
+    original_sample = engine._sample_batch
+    original_critic = engine._sac_critic_step
+    original_policy = engine._sac_policy_step
+
+    def record_collect(root_z):
+        result = original_collect(root_z)
+        events.append(("collect", engine.state.replay.size))
+        return result
+
+    def record_sample(indices=None):
+        sampled_replay_sizes.append(engine.state.replay.size)
+        return original_sample(indices)
+
+    def record_critic(batch, alpha):
+        events.append(("critic", engine.state.replay.size))
+        return original_critic(batch, alpha)
+
+    def record_policy(batch, **kwargs):
+        events.append(
+            (
+                "actor_temperature",
+                engine.state.replay.size,
+                kwargs["update_actor"],
+                kwargs["update_temperature"],
+            )
+        )
+        return original_policy(batch, **kwargs)
+
+    monkeypatch.setattr(engine, "_collect_round", record_collect)
+    monkeypatch.setattr(engine, "_sample_batch", record_sample)
+    monkeypatch.setattr(engine, "_sac_critic_step", record_critic)
+    monkeypatch.setattr(engine, "_sac_policy_step", record_policy)
+    agent.act(torch.zeros(3), collect_diagnostics=False)
+
+    assert events == [
+        ("collect", 4),
+        ("critic", 4),
+        ("critic", 4),
+        ("critic", 4),
+        ("actor_temperature", 4, True, True),
+        ("collect", 8),
+        ("critic", 8),
+        ("critic", 8),
+        ("critic", 8),
+        ("actor_temperature", 8, True, True),
+    ]
+    assert sampled_replay_sizes == [4] * 4 + [8] * 4
+    metrics = agent.last_inner_metrics
+    assert metrics["inner_model_steps"] == 8
+    assert metrics["inner_update_slots"] == 8
+    assert metrics["inner_requested_update_slots"] == 8
+    assert metrics["inner_updates_per_round_realized"] == 4
+    assert metrics["inner_critic_optimizer_steps"] == 6
+    assert metrics["inner_actor_optimizer_steps"] == 2
+    assert metrics["inner_temperature_optimizer_steps"] == 2
+    assert metrics["inner_replay_draws"] == 8 * 4
+    assert metrics["inner_critic_utd"] == pytest.approx(6 / 8)
+    assert metrics["inner_actor_utd"] == pytest.approx(2 / 8)
+    assert metrics["inner_temperature_utd"] == pytest.approx(2 / 8)
+
+
+def test_unequal_component_counts_use_existing_fixed_shape_compile_regions(
+    monkeypatch,
+):
+    model = _tiny_component_model(
+        inner_rounds=1,
+        inner_critic_updates_per_round=2,
+        inner_actor_updates_per_round=1,
+        inner_replay_capacity=4,
+    )
+    engine = model.agent.inner_engine
+    compile_calls = []
+    compiled_shapes = {"_sac_critic_kernel": [], "_sac_actor_kernel": []}
+
+    def fake_compile(function, **kwargs):
+        name = function.__name__
+        compile_calls.append((name, kwargs))
+
+        def compiled(*args, **call_kwargs):
+            compiled_shapes[name].append(tuple(args[0].shape))
+            return function(*args, **call_kwargs)
+
+        return compiled
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    engine._compile_regions["critic"].enabled = True
+    engine._compile_regions["actor"].enabled = True
+    model.agent.act(torch.zeros(3), collect_diagnostics=False)
+
+    assert compile_calls == [
+        ("_sac_critic_kernel", {"fullgraph": False, "dynamic": False}),
+        ("_sac_actor_kernel", {"fullgraph": False, "dynamic": False}),
+    ]
+    expected_shape = (4, model.cfg.latent_dim)
+    assert compiled_shapes["_sac_critic_kernel"] == [expected_shape] * 2
+    assert compiled_shapes["_sac_actor_kernel"] == [expected_shape]
+
+
+@pytest.mark.parametrize(
+    (
+        "overrides",
+        "critic_steps",
+        "actor_steps",
+        "temperature_steps",
+    ),
+    [
+        (
+            {
+                "inner_critic_updates_per_round": 2,
+                "inner_actor_updates_per_round": 0,
+                "inner_actor_adaptation": "frozen",
+            },
+            4,
+            0,
+            0,
+        ),
+        (
+            {
+                "inner_critic_updates_per_round": 0,
+                "inner_actor_updates_per_round": 2,
+                "inner_critic_adaptation": "frozen",
+            },
+            0,
+            4,
+            4,
+        ),
+        (
+            {
+                "inner_critic_updates_per_round": 1,
+                "inner_actor_updates_per_round": 1,
+                "inner_temperature_mode": "fixed",
+                "inner_temperature_initialization": "fixed",
+            },
+            2,
+            2,
+            0,
+        ),
+        (
+            {
+                "inner_operator": "td3",
+                "inner_critic_updates_per_round": 2,
+                "inner_actor_updates_per_round": 1,
+                "inner_temperature_mode": "inherit_outer",
+            },
+            4,
+            2,
+            0,
+        ),
+    ],
+)
+def test_canonical_component_schedule_respects_operator_and_frozen_components(
+    overrides,
+    critic_steps,
+    actor_steps,
+    temperature_steps,
+):
+    model = _tiny_component_model(
+        inner_rounds=2,
+        inner_replay_capacity=8,
+        **overrides,
+    )
+    model.agent.act(torch.zeros(3), collect_diagnostics=False)
+    metrics = model.agent.last_inner_metrics
+    expected_slots = critic_steps + actor_steps
+
+    assert metrics["inner_critic_optimizer_steps"] == critic_steps
+    assert metrics["inner_actor_optimizer_steps"] == actor_steps
+    assert metrics["inner_temperature_optimizer_steps"] == temperature_steps
+    assert metrics["inner_update_slots"] == expected_slots
+    assert metrics["inner_requested_update_slots"] == expected_slots
+    assert metrics["inner_replay_draws"] == expected_slots * 4
 
 
 @pytest.mark.parametrize(

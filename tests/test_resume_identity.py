@@ -129,6 +129,54 @@ def test_sac_actor_loss_scale_fields_change_lineage_fingerprint(monkeypatch):
     assert fingerprint(base) != fingerprint(changed_tau)
 
 
+def test_separate_inner_update_counts_change_lineage_fingerprint(monkeypatch):
+    monkeypatch.setattr(
+        resume_identity,
+        "source_identity",
+        lambda _repo_root: {"commit": "test", "dirty": False},
+    )
+    monkeypatch.setattr(
+        resume_identity,
+        "dependency_identity",
+        lambda: {"python": "test"},
+    )
+    base = {
+        "alg": "AMBITDMPC2/AMBITDMPC2",
+        "seed": 7,
+        "alg_params": {
+            "inner_rounds": 8,
+            "inner_rollouts_per_round": 512,
+            "inner_rollout_horizon": 3,
+            "inner_critic_updates_per_round": 3,
+            "inner_actor_updates_per_round": 1,
+        },
+    }
+    changed_critic = {
+        **base,
+        "alg_params": {
+            **base["alg_params"],
+            "inner_critic_updates_per_round": 4,
+        },
+    }
+    changed_actor = {
+        **base,
+        "alg_params": {
+            **base["alg_params"],
+            "inner_actor_updates_per_round": 2,
+        },
+    }
+
+    def fingerprint(trial_run_params):
+        return resume_identity.lineage_identity(
+            trial_run_params=trial_run_params,
+            experiment_params={"exp_name": "test"},
+            repo_root=".",
+        )["fingerprint"]
+
+    assert fingerprint(base) != fingerprint(changed_critic)
+    assert fingerprint(base) != fingerprint(changed_actor)
+
+
 def test_resume_selection_is_strict_and_resource_neutral():
     validate_resume_selection(
         algorithm="AMBITDMPC2/AMBITDMPC2",

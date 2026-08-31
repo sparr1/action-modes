@@ -357,6 +357,180 @@ def test_canonical_inner_sac_can_adapt_only_the_actor():
     assert cfg.inner_expected_update_slots == 8
 
 
+def test_canonical_component_updates_resolve_independent_per_round_totals():
+    cfg = _build_cfg(
+        inner_rounds=2,
+        inner_rollouts_per_round=3,
+        inner_rollout_horizon=2,
+        inner_critic_updates_per_round=3,
+        inner_actor_updates_per_round=1,
+    )
+
+    assert cfg.inner_schedule_mode == "canonical"
+    assert cfg.inner_component_update_schedule is True
+    assert cfg.inner_updates_per_round is None
+    assert cfg.inner_critic_updates_per_round == 3
+    assert cfg.inner_actor_updates_per_round == 1
+    assert cfg.inner_critic_updates_per_action == 6
+    assert cfg.inner_actor_updates_per_action == 2
+    assert cfg.inner_temperature_updates_per_action == 2
+    assert cfg.inner_model_step_budget == 12
+    assert cfg.inner_nominal_updates_per_round == 4
+    assert cfg.inner_expected_update_slots == 8
+    assert cfg.inner_nominal_critic_utd == pytest.approx(0.5)
+    assert cfg.inner_updates_per_iteration is None
+
+
+def test_shared_canonical_updates_keep_existing_resolution_contract():
+    cfg = _build_cfg(
+        inner_rounds=2,
+        inner_rollouts_per_round=3,
+        inner_rollout_horizon=2,
+        inner_updates_per_round=4,
+    )
+
+    assert cfg.inner_schedule_mode == "canonical"
+    assert cfg.inner_component_update_schedule is False
+    assert cfg.inner_critic_updates_per_round is None
+    assert cfg.inner_actor_updates_per_round is None
+    assert cfg.inner_updates_per_round == 4
+    assert cfg.inner_critic_updates_per_action == 8
+    assert cfg.inner_actor_updates_per_action == 8
+    assert cfg.inner_temperature_updates_per_action == 8
+    assert cfg.inner_nominal_updates_per_round == 4
+    assert cfg.inner_expected_update_slots == 8
+    assert cfg.inner_updates_per_iteration == 4
+
+
+def test_equal_component_counts_do_not_expose_a_shared_legacy_g_alias():
+    cfg = _build_cfg(
+        inner_critic_updates_per_round=1,
+        inner_actor_updates_per_round=1,
+    )
+
+    assert cfg.inner_updates_per_round is None
+    assert cfg.inner_updates_per_iteration is None
+
+
+def test_component_updates_support_zero_counts_and_frozen_components():
+    critic_only = _build_cfg(
+        inner_rounds=2,
+        inner_critic_updates_per_round=3,
+        inner_actor_updates_per_round=0,
+        inner_actor_adaptation="frozen",
+    )
+    actor_only = _build_cfg(
+        inner_rounds=2,
+        inner_critic_updates_per_round=0,
+        inner_actor_updates_per_round=2,
+        inner_critic_adaptation="frozen",
+    )
+
+    assert critic_only.inner_critic_updates_per_action == 6
+    assert critic_only.inner_actor_updates_per_action == 0
+    assert critic_only.inner_temperature_updates_per_action == 0
+    assert critic_only.inner_expected_update_slots == 6
+    assert actor_only.inner_critic_updates_per_action == 0
+    assert actor_only.inner_actor_updates_per_action == 4
+    assert actor_only.inner_temperature_updates_per_action == 4
+    assert actor_only.inner_expected_update_slots == 4
+
+
+def test_component_temperature_updates_follow_actor_only_for_auto_sac():
+    fixed_sac = _build_cfg(
+        inner_critic_updates_per_round=3,
+        inner_actor_updates_per_round=1,
+        inner_temperature_mode="fixed",
+    )
+    td3 = _build_cfg(
+        inner_operator="td3",
+        inner_critic_updates_per_round=3,
+        inner_actor_updates_per_round=1,
+    )
+
+    assert fixed_sac.inner_temperature_updates_per_action == 0
+    assert td3.inner_temperature_mode == "inherit_outer"
+    assert td3.inner_temperature_updates_per_action == 0
+    assert td3.inner_critic_updates_per_action == 12
+    assert td3.inner_actor_updates_per_action == 4
+    assert td3.inner_expected_update_slots == 16
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("inner_critic_updates_per_round", None),
+        ("inner_critic_updates_per_round", True),
+        ("inner_critic_updates_per_round", False),
+        ("inner_critic_updates_per_round", -1),
+        ("inner_critic_updates_per_round", 1.5),
+        ("inner_critic_updates_per_round", "1"),
+        ("inner_critic_updates_per_round", "auto"),
+        ("inner_actor_updates_per_round", None),
+        ("inner_actor_updates_per_round", True),
+        ("inner_actor_updates_per_round", False),
+        ("inner_actor_updates_per_round", -1),
+        ("inner_actor_updates_per_round", 1.5),
+        ("inner_actor_updates_per_round", "1"),
+        ("inner_actor_updates_per_round", "auto"),
+    ],
+)
+def test_component_update_counts_are_strict_nonnegative_integers(key, value):
+    params = {
+        "inner_critic_updates_per_round": 1,
+        "inner_actor_updates_per_round": 1,
+    }
+    params[key] = value
+
+    with pytest.raises(ValueError, match=key):
+        _build_cfg(**params)
+
+
+def test_component_update_counts_must_be_supplied_together():
+    with pytest.raises(ValueError, match="must be specified together"):
+        _build_cfg(inner_critic_updates_per_round=1)
+    with pytest.raises(ValueError, match="must be specified together"):
+        _build_cfg(inner_actor_updates_per_round=1)
+
+
+def test_component_updates_reject_conflicting_schedule_interfaces():
+    component = {
+        "inner_critic_updates_per_round": 3,
+        "inner_actor_updates_per_round": 1,
+    }
+    with pytest.raises(ValueError, match="Cannot combine shared"):
+        _build_cfg(**component, inner_updates_per_round=2)
+    with pytest.raises(ValueError, match="Cannot mix canonical J/N/H/G"):
+        _build_cfg(**component, inner_critic_updates_per_action=3)
+    with pytest.raises(ValueError, match="Cannot mix legacy and canonical"):
+        _build_cfg(**component, inner_iterations=2)
+
+
+@pytest.mark.parametrize("operator", ["none", "mppi"])
+def test_component_updates_require_a_gradient_inner_operator(operator):
+    with pytest.raises(ValueError, match="only valid for inner_operator"):
+        _build_cfg(
+            inner_operator=operator,
+            inner_critic_updates_per_round=0,
+            inner_actor_updates_per_round=0,
+        )
+
+
+def test_positive_component_updates_reject_frozen_components():
+    with pytest.raises(ValueError, match="Positive actor updates"):
+        _build_cfg(
+            inner_critic_updates_per_round=0,
+            inner_actor_updates_per_round=1,
+            inner_actor_adaptation="frozen",
+        )
+    with pytest.raises(ValueError, match="Positive critic updates"):
+        _build_cfg(
+            inner_critic_updates_per_round=1,
+            inner_actor_updates_per_round=0,
+            inner_critic_adaptation="frozen",
+        )
+
+
 @pytest.mark.parametrize(
     "mode",
     [None, True, 1, "percentile_range", "unknown"],

@@ -1,0 +1,24 @@
+{
+  "study_type": "single_seed_exploratory_training_base",
+  "study_note": "Single-seed exploratory 14-million-decision Humanoid Walk base-v2 derived from the strongest base-v1 training recipe. It uses J=8, N=32, H=3, and G=1, yielding 768 imagined transitions and eight joint actor, critic, and automatic-temperature update slots per real action. The outer and inner target-network tau values are both 0.01, and the outer and inner automatic-temperature learning rates are both 3e-4. Ordinary controller evaluation, paired outer-versus-fresh-inner real-environment evaluation, real-environment Q-versus-MC value evaluation, sparse value-equivalence MC diagnostics, value-equivalence training loss, and paired imagined diagnostic rollouts are disabled so the run focuses on training performance. Portable periodic and final model saves are disabled. This remains a single-seed exploratory run and supports no confidence, significance, or confirmatory claim.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": ["ambi_humanoid_walk_base_v2"],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": null,
+  "save_strat": "none",
+  "log_info": false,
+  "log_type": "summary"
+}

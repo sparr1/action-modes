@@ -286,10 +286,17 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 * int(cfg.inner_rollouts_per_round)
                 * int(cfg.inner_rollout_horizon)
             )
+            if cfg.inner_component_update_schedule:
+                update_schedule = (
+                    f"C={cfg.inner_critic_updates_per_round}, "
+                    f"A={cfg.inner_actor_updates_per_round}"
+                )
+            else:
+                update_schedule = f"G={cfg.inner_updates_per_round}"
             print(
                 "Inner schedule:",
                 f"J={cfg.inner_rounds}, N={cfg.inner_rollouts_per_round}, "
-                f"H={cfg.inner_rollout_horizon}, G={cfg.inner_updates_per_round}, "
+                f"H={cfg.inner_rollout_horizon}, {update_schedule}, "
                 f"nominal_transitions={nominal_steps}, "
                 f"expected_update_slots={cfg.inner_expected_update_slots}, "
                 f"critic_utd={cfg.inner_nominal_critic_utd:g}",

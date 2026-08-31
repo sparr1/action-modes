@@ -176,7 +176,13 @@ def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
         inner_rounds=4,
         inner_rollouts_per_round=32,
         inner_updates_per_round=192,
+        inner_component_update_schedule=False,
+        inner_critic_updates_per_round=None,
+        inner_actor_updates_per_round=None,
         inner_nominal_updates_per_round=192,
+        inner_critic_updates_per_action=768,
+        inner_actor_updates_per_action=768,
+        inner_temperature_updates_per_action=768,
         inner_batch_size=64,
         inner_replay_capacity=768,
         inner_replay_sampling="with_replacement",
@@ -270,10 +276,62 @@ def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
     assert metadata["inner_budget"]["inner_critic_dropout_enabled"] is False
     assert metadata["inner_budget"]["inner_actor_writeback_coef"] == 0.0
     assert metadata["inner_budget"]["inner_critic_writeback_coef"] == 0.0
+    assert metadata["inner_budget"]["inner_component_update_schedule"] is False
+    assert metadata["inner_budget"]["inner_critic_updates_per_action"] == 768
+    assert metadata["inner_budget"]["inner_actor_updates_per_action"] == 768
+    assert metadata["inner_budget"]["inner_temperature_updates_per_action"] == 768
     assert metadata["inner_budget"]["branches_per_action"] == 128
     assert metadata["inner_budget"]["transitions_per_round"] == 192
     assert metadata["inner_budget"]["transitions_per_action"] == 768
     assert metadata["inner_budget"]["replay_rows_drawn_per_action"] == 49_152
+
+
+def test_resolved_runtime_metadata_contains_separate_inner_update_budget():
+    cfg = SimpleNamespace(
+        inner_operator="sac",
+        inner_schedule_mode="canonical",
+        inner_rounds=2,
+        inner_rollouts_per_round=32,
+        inner_rollout_horizon=3,
+        inner_updates_per_round=None,
+        inner_component_update_schedule=True,
+        inner_critic_updates_per_round=3,
+        inner_actor_updates_per_round=1,
+        inner_nominal_updates_per_round=4,
+        inner_critic_updates_per_action=6,
+        inner_actor_updates_per_action=2,
+        inner_temperature_updates_per_action=2,
+        inner_batch_size=64,
+        inner_replay_capacity=192,
+        inner_replay_sampling="with_replacement",
+        inner_replay_scope="action",
+        inner_model_step_budget=192,
+        inner_expected_update_slots=8,
+    )
+    model = SimpleNamespace(cfg=cfg, agent=None, env=None)
+
+    metadata = training_main._resolved_runtime_metadata(
+        model,
+        trial_run_params={
+            "alg": "AMBITDMPC2/AMBITDMPC2",
+            "seed": 55,
+        },
+    )
+
+    inner = metadata["inner_budget"]
+    assert inner["inner_updates_per_round"] is None
+    assert inner["inner_component_update_schedule"] is True
+    assert inner["inner_critic_updates_per_round"] == 3
+    assert inner["inner_actor_updates_per_round"] == 1
+    assert inner["inner_nominal_updates_per_round"] == 4
+    assert inner["inner_critic_updates_per_action"] == 6
+    assert inner["inner_actor_updates_per_action"] == 2
+    assert inner["inner_temperature_updates_per_action"] == 2
+    assert inner["inner_expected_update_slots"] == 8
+    assert inner["branches_per_action"] == 64
+    assert inner["transitions_per_round"] == 96
+    assert inner["transitions_per_action"] == 192
+    assert inner["replay_rows_drawn_per_action"] == 512
 
 
 def test_per_algorithm_null_cadence_disables_experiment_checkpointing(
