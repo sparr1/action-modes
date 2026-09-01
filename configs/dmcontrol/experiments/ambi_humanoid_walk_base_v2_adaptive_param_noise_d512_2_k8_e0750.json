@@ -1,0 +1,26 @@
+{
+  "study_type": "single_seed_exploratory_adaptive_parameter_noise_d512_2",
+  "study_note": "Adaptive parameter-noise D512-2 screen with explorer fraction 3/4 (0.750): P=128 clean rollouts and E=384 perturbed rollouts per round, distributed across K=8 perturbed actors with R=48 rollouts per actor. It retains the D512-2 schedule exactly: J=8, N=512, H=3, batch size 512, replay capacity 12,288, phased C=3 primary critic, A=1 primary actor, and T=1 primary automatic-temperature updates per round. Perturbations target 0.10 post-tanh mean-action RMS and use the clean actor log standard deviation for stochastic SAC sampling. Perturbed actors contribute only pooled imagined replay data, while real-environment execution always samples the clean primary actor. The 14-million-decision budget, seed 55, training-focused evaluation gates, and no-model-checkpoint policy are unchanged. This is a single-seed exploratory cell and supports no confidence, significance, or confirmatory claim.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_humanoid_walk_base_v2_adaptive_param_noise_d512_2_k8_e0750"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": null,
+  "save_strat": "none",
+  "log_info": false,
+  "log_type": "summary"
+}
