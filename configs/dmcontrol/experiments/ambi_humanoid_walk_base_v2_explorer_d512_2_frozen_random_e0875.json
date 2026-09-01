@@ -1,0 +1,26 @@
+{
+  "study_type": "single_seed_exploratory_random_explorer_d512_2",
+  "study_note": "Frozen random explorer D512-2 random-explorer screen with explorer fraction 7/8 (0.875): 64 P and 448 R rollouts per round. It retains the D512-2 schedule exactly: J=8, N=512, H=3, batch size 512, replay capacity 12,288, phased C=3 primary critic, A=1 primary actor, and T=1 primary automatic-temperature updates per round. R remains freshly initialized and frozen at every real-action root, contributing only pooled replay data. P is the sole learned actor, and its critic receives C=3 updates per round and always bootstraps through P. Final real-environment execution always samples P; fixed outer-Q P/R decisions are logged counterfactually. The 14-million-decision budget, seed 55, training-focused evaluation gates, and no-model-checkpoint policy are unchanged. This is a single-seed exploratory cell and supports no confidence, significance, or confirmatory claim.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_humanoid_walk_base_v2_explorer_d512_2_frozen_random_e0875"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": null,
+  "save_strat": "none",
+  "log_info": false,
+  "log_type": "summary"
+}

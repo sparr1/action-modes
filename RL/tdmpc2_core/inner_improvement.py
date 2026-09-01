@@ -2975,15 +2975,57 @@ class InnerImprovementEngine:
         state.policy_evaluations += 2 * batch_size
         state.q_evaluations += 2 * batch_size
         metrics = {}
+
+        # Build both disjoint online-critic graphs before mutating either
+        # critic.  A single autograd traversal can then schedule the paired
+        # branches together while the two optimizers retain fully independent
+        # parameters and Adam state.  Keeping the forward order P then R also
+        # preserves the private dropout/RNG contract of the former sequential
+        # implementation.
+        primary_update = None
         if update_primary:
-            predictions = self.model.q_predictions(
+            primary_predictions = self.model.q_predictions(
                 batch["z"], batch["action"], qs=state.critic
             )
-            loss = self.model.critic_loss(predictions, primary_target)
-            values = self.model.q_backend.decode(predictions.detach())
+            primary_loss = self.model.critic_loss(
+                primary_predictions, primary_target
+            )
+            primary_update = (
+                primary_loss,
+                self.model.q_backend.decode(primary_predictions.detach()),
+            )
+
+        explorer_update = None
+        if update_explorer:
+            explorer_predictions = self.model.q_predictions(
+                batch["z"], batch["action"], qs=state.explorer_critic
+            )
+            explorer_loss = self.model.critic_loss(
+                explorer_predictions, explorer_target
+            )
+            explorer_update = (
+                explorer_loss,
+                self.model.q_backend.decode(explorer_predictions.detach()),
+            )
+
+        # Clear both extant optimizers even in an asymmetric update slot so a
+        # component whose dose is already exhausted never retains stale grads
+        # from the preceding paired slot.
+        if state.critic_optim is not None:
             state.critic_optim.zero_grad(set_to_none=True)
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(
+        if state.explorer_critic_optim is not None:
+            state.explorer_critic_optim.zero_grad(set_to_none=True)
+        losses = tuple(
+            update[0]
+            for update in (primary_update, explorer_update)
+            if update is not None
+        )
+        if losses:
+            torch.autograd.backward(losses)
+
+        if primary_update is not None:
+            primary_loss, primary_values = primary_update
+            primary_grad_norm = torch.nn.utils.clip_grad_norm_(
                 state.critic_params, float(cfg.inner_critic_grad_clip_norm)
             )
             state.critic_optim.step()
@@ -2991,30 +3033,26 @@ class InnerImprovementEngine:
             state.critic_lifetime_steps += 1
             state.q_evaluations += batch_size
             metrics.update(
-                critic_loss=loss.detach(),
-                critic_grad_norm=torch.as_tensor(grad_norm).detach(),
-                q_mean=values.mean(),
-                q_abs_mean=values.abs().mean(),
+                critic_loss=primary_loss.detach(),
+                critic_grad_norm=torch.as_tensor(primary_grad_norm).detach(),
+                q_mean=primary_values.mean(),
+                q_abs_mean=primary_values.abs().mean(),
                 q_target_mean=primary_target.mean(),
                 q_target_clip_fraction=self._q_target_clip_fraction(
                     primary_target
                 ),
                 td_error_abs_mean=(
-                    values - primary_target.unsqueeze(0)
+                    primary_values - primary_target.unsqueeze(0)
                 ).abs().mean(),
             )
             metrics.update(
-                self._source_td_metrics(batch, values, primary_target)
+                self._source_td_metrics(
+                    batch, primary_values, primary_target
+                )
             )
-        if update_explorer:
-            predictions = self.model.q_predictions(
-                batch["z"], batch["action"], qs=state.explorer_critic
-            )
-            loss = self.model.critic_loss(predictions, explorer_target)
-            values = self.model.q_backend.decode(predictions.detach())
-            state.explorer_critic_optim.zero_grad(set_to_none=True)
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(
+        if explorer_update is not None:
+            explorer_loss, explorer_values = explorer_update
+            explorer_grad_norm = torch.nn.utils.clip_grad_norm_(
                 state.explorer_critic_params,
                 float(cfg.inner_critic_grad_clip_norm),
             )
@@ -3023,21 +3061,26 @@ class InnerImprovementEngine:
             state.explorer_critic_lifetime_steps += 1
             state.q_evaluations += batch_size
             metrics.update(
-                explorer_critic_loss=loss.detach(),
-                explorer_critic_grad_norm=torch.as_tensor(grad_norm).detach(),
-                explorer_q_mean=values.mean(),
-                explorer_q_abs_mean=values.abs().mean(),
+                explorer_critic_loss=explorer_loss.detach(),
+                explorer_critic_grad_norm=torch.as_tensor(
+                    explorer_grad_norm
+                ).detach(),
+                explorer_q_mean=explorer_values.mean(),
+                explorer_q_abs_mean=explorer_values.abs().mean(),
                 explorer_q_target_mean=explorer_target.mean(),
                 explorer_q_target_clip_fraction=self._q_target_clip_fraction(
                     explorer_target
                 ),
                 explorer_critic_td_error_abs_mean=(
-                    values - explorer_target.unsqueeze(0)
+                    explorer_values - explorer_target.unsqueeze(0)
                 ).abs().mean(),
             )
             metrics.update(
                 self._source_td_metrics(
-                    batch, values, explorer_target, prefix="explorer_critic_"
+                    batch,
+                    explorer_values,
+                    explorer_target,
+                    prefix="explorer_critic_",
                 )
             )
         return metrics
