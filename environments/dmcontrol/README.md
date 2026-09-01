@@ -59,6 +59,19 @@ environments/dmcontrol/.venv/bin/python main.py \
 Use `--num-runs 1` to run only the first algorithm in either comparison
 manifest, or `--alg-index 1 --num-runs 1` to run only AMBI-TD-MPC2.
 
+The adaptive parameter-noise D512 example is a full-cost, single-seed Humanoid
+Walk screen. It runs `J=8`, `N=512`, and `H=3`; each real decision therefore
+uses 12,288 imagined transitions, split into 256 clean rollouts and 256 noisy
+rollouts from four perturbed actors (64 each). Its configured budget is 14
+million decisions, so inspect the config and submit it through the normal
+scheduled-compute workflow rather than treating it as a local smoke test:
+
+```bash
+environments/dmcontrol/.venv/bin/python main.py \
+  --run configs/dmcontrol/experiments/ambi_humanoid_walk_base_v2_adaptive_param_noise_d512_k4.json \
+  --alg-dir configs/dmcontrol/algs
+```
+
 ## Rendering backends
 
 Choose the MuJoCo rendering backend in the job environment **before** Python

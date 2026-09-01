@@ -13,11 +13,22 @@ class LatentReplayBuffer:
     while the public field views and sample dictionary remain unchanged.
     """
 
-    def __init__(self, capacity, latent_dim, action_dim, device):
+    def __init__(
+        self,
+        capacity,
+        latent_dim,
+        action_dim,
+        device,
+        *,
+        store_source=False,
+    ):
         self.capacity = max(1, int(capacity))
         self.device = torch.device(device)
         self.latent_dim = int(latent_dim)
         self.action_dim = int(action_dim)
+        if not isinstance(store_source, bool):
+            raise TypeError("store_source must be bool.")
+        self.store_source = store_source
         if self.latent_dim <= 0 or self.action_dim <= 0:
             raise ValueError("Latent and action dimensions must be positive.")
 
@@ -39,6 +50,16 @@ class LatentReplayBuffer:
         self.reward = self._storage[:, self._field_slices["reward"]]
         self.next_z = self._storage[:, self._field_slices["next_z"]]
         self.terminated = self._storage[:, self._field_slices["terminated"]]
+        self.source = (
+            torch.empty(
+                self.capacity,
+                1,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            if self.store_source
+            else None
+        )
 
         self.pos = 0
         self.full = False
@@ -99,12 +120,52 @@ class LatentReplayBuffer:
             packed[:, field_slice].copy_(value)
         return packed
 
-    def _append_packed(self, packed, original_n):
+    def _reshape_source(self, source, n):
+        """Validate and materialize primary/explorer labels for one append."""
+        if not self.store_source:
+            if source is not None:
+                raise ValueError(
+                    "Latent replay source labels require store_source=True."
+                )
+            return None
+        if source is None:
+            raise ValueError(
+                "Source labels are required when latent replay store_source=True."
+            )
+        if isinstance(source, bool):
+            source = int(source)
+        if isinstance(source, int):
+            if source not in (0, 1):
+                raise ValueError("Latent replay source labels must be 0 or 1.")
+            return torch.full(
+                (n, 1),
+                source,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+        if not torch.is_tensor(source):
+            raise TypeError("Latent replay source labels must be an integer or tensor.")
+        source = source.detach()
+        if source.numel() == 1:
+            source = source.reshape(1, 1).expand(n, 1)
+        else:
+            source = source.reshape(-1, 1)
+            if source.shape[0] != n:
+                raise ValueError(
+                    "Latent replay source labels must match the transition row count."
+                )
+        if not bool(torch.logical_or(source == 0, source == 1).all().item()):
+            raise ValueError("Latent replay source labels must be 0 or 1.")
+        return source.to(device=self.device, dtype=torch.uint8)
+
+    def _append_packed(self, packed, original_n, source=None):
         self.next_sample_id += original_n
         old_pos = self.pos
         n = original_n
         if n >= self.capacity:
             packed = packed[-self.capacity :]
+            if source is not None:
+                source = source[-self.capacity :]
             n = self.capacity
             # ``packed`` now starts at the oldest retained transition. A
             # sequence of smaller appends would place that row at the final
@@ -118,20 +179,25 @@ class LatentReplayBuffer:
         first = min(n, self.capacity - write_pos)
         second = n - first
         self._storage[write_pos : write_pos + first].copy_(packed[:first])
+        if self.source is not None:
+            self.source[write_pos : write_pos + first].copy_(source[:first])
         if second:
             self._storage[:second].copy_(packed[first:])
+            if self.source is not None:
+                self.source[:second].copy_(source[first:])
 
         self.pos = (old_pos + original_n) % self.capacity
         self.full = self.full or (old_pos + original_n >= self.capacity)
 
-    def add_batch(self, z, action, reward, next_z, terminated):
+    def add_batch(self, z, action, reward, next_z, terminated, *, source=None):
         """Append a flat batch of transitions in its existing row order."""
         values, n = self._reshape_fields(z, action, reward, next_z, terminated)
         if n == 0:
             return
-        self._append_packed(self._pack_fields(values, n), n)
+        source = self._reshape_source(source, n)
+        self._append_packed(self._pack_fields(values, n), n, source)
 
-    def add_packed(self, packed):
+    def add_packed(self, packed, *, source=None):
         """Append rows already laid out like the packed replay allocation."""
         if not torch.is_tensor(packed) or packed.ndim < 2:
             raise TypeError("Packed latent replay rows must be a tensor with rows.")
@@ -145,16 +211,18 @@ class LatentReplayBuffer:
         if packed.dtype != self._storage.dtype:
             packed = packed.to(dtype=self._storage.dtype)
         if packed.shape[0]:
-            self._append_packed(packed, int(packed.shape[0]))
+            n = int(packed.shape[0])
+            source = self._reshape_source(source, n)
+            self._append_packed(packed, n, source)
 
-    def add_round(self, z, action, reward, next_z, terminated):
+    def add_round(self, z, action, reward, next_z, terminated, *, source=None):
         """Append a dense rollout round in horizon-major order.
 
         Inputs may have any common leading dimensions (normally ``H x N``).
         Flattening keeps the last dimension as the field width, so transitions
         are stored as ``h0/n0, h0/n1, ..., h1/n0, ...`` in one append.
         """
-        self.add_batch(z, action, reward, next_z, terminated)
+        self.add_batch(z, action, reward, next_z, terminated, source=source)
 
     def _draw_indices(self, batch_size, replacement, generator):
         if replacement:
@@ -229,6 +297,8 @@ class LatentReplayBuffer:
             name: packed[:, field_slice]
             for name, field_slice in self._field_slices.items()
         }
+        if self.source is not None:
+            batch["source"] = self.source.index_select(0, indices)
         if include_ids:
             batch["indices"] = indices
             batch["sample_ids"] = self._sample_ids(indices)
@@ -238,7 +308,7 @@ class LatentReplayBuffer:
         """Return the live replay contents for in-process lifecycle management."""
         size = self.size
         indices = torch.arange(size, dtype=torch.long, device=self.device)
-        return {
+        state = {
             "capacity": self.capacity,
             "pos": self.pos,
             "full": self.full,
@@ -250,16 +320,22 @@ class LatentReplayBuffer:
             "terminated": self.terminated[:size].clone(),
             "sample_id": self._sample_ids(indices),
         }
+        if self.source is not None:
+            state["source"] = self.source[:size].clone()
+        return state
 
     def training_state_dict(self):
         """Wrap the existing physical-ring state in a versioned contract."""
-        return {
+        state = {
             "schema": "ambi-latent-replay-training-state",
-            "version": 1,
+            "version": 2 if self.store_source else 1,
             "latent_dim": self.latent_dim,
             "action_dim": self.action_dim,
             "state": self.state_dict(),
         }
+        if self.store_source:
+            state["store_source"] = True
+        return state
 
     def _validate_ring_metadata(self, *, pos, full, next_sample_id, owner):
         if not isinstance(full, bool):
@@ -287,22 +363,28 @@ class LatentReplayBuffer:
 
     def load_training_state_dict(self, state):
         """Restore an exact, device-portable physical ring snapshot."""
+        top_level_keys = {
+            "schema",
+            "version",
+            "latent_dim",
+            "action_dim",
+            "state",
+        }
+        if self.store_source:
+            top_level_keys.add("store_source")
         state = require_exact_keys(
             state,
-            {
-                "schema",
-                "version",
-                "latent_dim",
-                "action_dim",
-                "state",
-            },
+            top_level_keys,
             "latent replay training state",
         )
+        expected_version = 2 if self.store_source else 1
         if (
             state["schema"] != "ambi-latent-replay-training-state"
-            or state["version"] != 1
+            or state["version"] != expected_version
         ):
             raise ValueError("Unsupported latent replay training-state version.")
+        if self.store_source and state["store_source"] is not True:
+            raise ValueError("Latent replay source-label configuration is incompatible.")
         expected = {
             "latent_dim": self.latent_dim,
             "action_dim": self.action_dim,
@@ -318,20 +400,23 @@ class LatentReplayBuffer:
         return self
 
     def _preflight_exact_state_dict(self, state):
+        physical_keys = {
+            "capacity",
+            "pos",
+            "full",
+            "next_sample_id",
+            "z",
+            "action",
+            "reward",
+            "next_z",
+            "terminated",
+            "sample_id",
+        }
+        if self.store_source:
+            physical_keys.add("source")
         state = require_exact_keys(
             state,
-            {
-                "capacity",
-                "pos",
-                "full",
-                "next_sample_id",
-                "z",
-                "action",
-                "reward",
-                "next_z",
-                "terminated",
-                "sample_id",
-            },
+            physical_keys,
             "latent replay physical state",
         )
         capacity = state["capacity"]
@@ -398,13 +483,28 @@ class LatentReplayBuffer:
         if not torch.equal(sample_id.detach().cpu(), expected_ids):
             raise ValueError("Latent replay sample_id is inconsistent with ring metadata.")
 
+        source = None
+        if self.store_source:
+            source = state["source"]
+            if (
+                not torch.is_tensor(source)
+                or source.shape != torch.Size([size, 1])
+                or source.dtype != torch.uint8
+            ):
+                raise ValueError("Latent replay source has the wrong shape or dtype.")
+            if not bool(torch.logical_or(source == 0, source == 1).all().item()):
+                raise ValueError("Latent replay source labels must be 0 or 1.")
+            source = source.detach().to(self.device)
+
         packed = self._pack_fields(tuple(values), size) if size else None
-        return packed, size, full, pos, next_sample_id
+        return packed, source, size, full, pos, next_sample_id
 
     def _commit_state_candidate(self, candidate):
-        packed, size, full, pos, next_sample_id = candidate
+        packed, source, size, full, pos, next_sample_id = candidate
         if size:
             self._storage[:size].copy_(packed)
+            if self.source is not None:
+                self.source[:size].copy_(source)
         self.full = full
         self.pos = pos
         self.next_sample_id = next_sample_id
@@ -441,6 +541,16 @@ class LatentReplayBuffer:
         if size != expected_size:
             raise ValueError("Latent replay size is inconsistent with ring metadata.")
         packed = self._pack_fields(values, size) if size else None
+        if self.store_source:
+            source = self._reshape_source(state.get("source"), size)
+        else:
+            source = None
+        if not self.store_source and "source" in state:
+            raise ValueError(
+                "Latent replay source labels require store_source=True."
+            )
 
         # All validation finishes before live metadata or storage is changed.
-        self._commit_state_candidate((packed, size, full, pos, next_sample_id))
+        self._commit_state_candidate(
+            (packed, source, size, full, pos, next_sample_id)
+        )

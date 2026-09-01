@@ -40,6 +40,27 @@ _AMBI_ALGORITHM = "AMBITDMPC2/AMBITDMPC2"
 _AMBI_RESOLVED_IDENTITY_DEFAULTS = {
     "inner_actor_writeback_coef": 0.0,
     "inner_critic_writeback_coef": 0.0,
+    "inner_explorer_mode": "none",
+    "inner_prior_rollout_weight": 0.5,
+    "inner_behavior_action": "policy_sample",
+    "inner_behavior_std_scale": 1.0,
+    "inner_log_std_mapping": None,
+    "inner_log_std_min": None,
+    "inner_log_std_max": None,
+    "inner_mixture_target_estimator": "stratified",
+    "inner_explorer_actor_updates_per_round": None,
+    "inner_explorer_critic_updates_per_round": None,
+    "inner_explorer_temperature_updates_per_round": None,
+    "inner_param_noise_actor_count": None,
+    "inner_param_noise_target_action_rms": 0.1,
+    "inner_param_noise_sigma_init": 1e-3,
+    "inner_param_noise_sigma_min": 1e-6,
+    "inner_param_noise_sigma_max": 0.1,
+    "inner_param_noise_calibration_directions": 8,
+    "inner_param_noise_calibration_batch_size": 32,
+    "inner_param_noise_calibration_max_probes": 8,
+    "inner_execution_policy_source": "primary",
+    "inner_execution_handoff_samples": 8,
     "eval_inner_comparison": False,
     "eval_inner_comparison_episodes": 5,
     "eval_inner_comparison_seed": 12345,
@@ -178,6 +199,37 @@ def scientific_trial_parameters(
                     if value == 0.0:
                         value = 0.0
                 algorithm[field] = value
+            for field in (
+                "inner_explorer_mode",
+                "inner_behavior_action",
+                "inner_execution_policy_source",
+                "inner_mixture_target_estimator",
+            ):
+                value = algorithm.get(field)
+                if isinstance(value, str):
+                    algorithm[field] = value.lower()
+            inner_mapping = algorithm.get("inner_log_std_mapping")
+            if inner_mapping is None:
+                inner_mapping = algorithm.get(
+                    "log_std_mapping", "direct_clamp"
+                )
+            if isinstance(inner_mapping, str):
+                inner_mapping = inner_mapping.lower()
+            algorithm["inner_log_std_mapping"] = inner_mapping
+            if algorithm.get("inner_log_std_min") is None:
+                algorithm["inner_log_std_min"] = algorithm.get(
+                    "log_std_min", -20
+                )
+            if algorithm.get("inner_log_std_max") is None:
+                algorithm["inner_log_std_max"] = algorithm.get(
+                    "log_std_max", 2
+                )
+            for field in ("inner_log_std_min", "inner_log_std_max"):
+                value = algorithm[field]
+                if isinstance(
+                    value, (int, float, np.integer, np.floating)
+                ) and not isinstance(value, (bool, np.bool_)):
+                    algorithm[field] = float(value)
         projected["alg_params"] = algorithm
     return _json_safe(projected)
 

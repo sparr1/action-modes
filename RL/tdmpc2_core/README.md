@@ -331,6 +331,111 @@ updates. This combination is also available as
 `adapted_components/actor_only` in
 `configs/research/ambi_inner_decoupling.json`.
 
+### Explorer policy populations
+
+The action-local SAC solver can split its fixed rollout population between the
+prior-initialized learner `P` and an exploratory population `R`. Set
+`inner_explorer_mode` to `frozen_random`, `shared_mixture`,
+`separate_critics`, or `adaptive_param_noise`; the default `none` preserves the
+one-policy implementation and its random-number ordering.
+`inner_prior_rollout_weight` is always the weight of `P`. It must divide the
+per-round rollout count exactly, so the split adds no model transitions to the
+configured `J*N*H` optimization budget. Actor identity is selected once per
+imagined trajectory and retained for its full horizon. Both sources append to
+one uniformly sampled root-local replay.
+
+`adaptive_param_noise` is behavior-only: it creates `K` independent Gaussian
+parameter perturbations around the current clean inner actor before every
+round. `inner_param_noise_actor_count` is required, and the exploratory count
+must divide evenly by `K`; every perturbed actor receives the same number of
+rollouts. For example, `N=512`, `inner_prior_rollout_weight=0.5`, and `K=4`
+produce 256 clean rollouts and 64 rollouts from each of four perturbed actors.
+Each perturbation is fixed for the full imagined horizon. Hidden linear
+weights and biases plus the final mean rows are perturbed, while LayerNorm and
+the final log-standard-deviation rows remain clean. Rollouts sample around the
+perturbed mean using the clean actor's state-dependent log standard deviation,
+so replicas from one perturbed actor are distinct without allowing parameter
+noise to change SAC entropy.
+
+The raw parameter scale is reset at every real decision and recalibrated before
+each round to `inner_param_noise_target_action_rms`, measured as per-coordinate
+post-tanh RMS between deterministic clean and perturbed means on the same
+latents. The calibrated scale is warm-started only between rounds of that one
+decision and discarded after the clean actor executes. Perturbed actors are
+never optimized, used for Bellman continuation, or eligible for real-action
+execution.
+
+The first calibration uses only the root latent. Later rounds use the root plus
+up to `inner_param_noise_calibration_batch_size-1` uniformly sampled latents
+from completed rounds in the action-local replay. A probe sequence samples
+`inner_param_noise_calibration_directions` Gaussian directions once and reuses
+them while adjusting sigma. Each miss applies
+`sigma *= clip(sqrt(target / measured), 0.5, 2.0)` and clamps the result to
+`[inner_param_noise_sigma_min, inner_param_noise_sigma_max]`. Calibration stops
+within 10% of the target, on reaching a bound, or after
+`inner_param_noise_calibration_max_probes` probes. Defaults are target RMS
+`0.10`, sigma `0.001` in `[0.000001, 0.1]`, 8 directions, 32 calibration
+latents, and 8 probes.
+
+This mode requires `inner_behavior_action="policy_sample"`, positive
+`inner_behavior_std_scale`, primary-only execution, nonempty exact primary and
+explorer splits, and zero explorer actor/critic/temperature updates. Diagnostics
+report the exact actor/replica allocation, target and realized action RMS,
+sigma path, calibration probes/evaluations/time, target and bound hits, action
+saturation, and source-conditioned rollout/replay counts. W&B interval summaries
+pool RMS and saturation by their realized row/probe counts, including episodic
+rollouts whose populations terminate at different depths.
+
+The materialized random-actor modes deliberately have different Bellman
+meanings:
+
+- `frozen_random` never updates `R`; its transitions train the ordinary local
+  `P` critic, whose continuation policy remains `P`.
+- `shared_mixture` trains both actors against one critic for the stepwise action
+  mixture `mu = w*pi_P + (1-w)*pi_R`. Its SAC entropy is the exact marginal
+  `-log mu(a|z)`, evaluated by applying both Gaussian densities to the same
+  pre-tanh action. The categorical continuation can be stratified across a
+  minibatch or integrated with a weighted evaluation of both actors.
+- `separate_critics` gives each actor its own online critic, target critic,
+  temperature, and optimizer. Both critics use every replay transition, but
+  `Q_P` bootstraps through `P` and `Q_R` through `R`; replay sharing is the only
+  cross-policy information channel.
+
+All explorer scientific state is freshly reset under AMBI's private
+initialization stream at every real decision; module and Adam tensor allocations
+may be pooled, but parameters, moments, steps, and temperatures never carry over.
+Active modes therefore require
+the canonical action-local clone configuration and reject persistent scopes,
+LoRA, prior writeback, and an outer-policy anchor loss. The explorer actor uses
+an independent optimizer when it learns. `separate_critics` additionally owns
+an independent critic optimizer and, under automatic entropy tuning, an
+independent temperature optimizer. `shared_mixture` instead has one shared
+critic and one shared temperature; the exact marginal actor loss performs one
+joint backward pass so its cross-density gradients intentionally reach both
+actors.
+
+The returned environment action defaults to `P`. The
+`inner_execution_policy_source` ablation can instead use `R`, sample a component
+with the same `w`, select between deterministic component means with the frozen
+outer target critic, or compare stochastic `H`-step soft handoffs. The handoff
+score averages `inner_execution_handoff_samples` trajectories per actor, uses
+one frozen outer entropy coefficient for both prefixes, and adds exactly one
+outer-prior target value at the final latent. This terminal handoff is only an
+execution selector. The ordinary imagined horizon remains a collection cutoff,
+and its final replay transition receives the same one-step bootstrap as every
+other row.
+
+Whenever a two-policy random-explorer mode (`frozen_random`, `shared_mixture`,
+or `separate_critics`) is active, execution also records an RNG-free
+counterfactual from the fixed outer target critic, regardless of which selector
+actually supplies the environment action. It evaluates the deterministic `P`
+and `R` means with `min_all`, assigns exact ties to `P`, and logs both values,
+the signed `Q_R-Q_P` margin, the counterfactual source and mean action, agreement
+with the actual execution source, and distance to the executed action. The
+`outer_q_gate` selector reuses this evaluation rather than running a duplicate
+pair of policy and critic forwards. No corresponding metrics or computation are
+introduced without a concrete `R` actor.
+
 Inner-critic dropout is independently switchable with
 `inner_critic_dropout_enabled`. Its default is `true`, preserving TD-MPC2's
 configured critic dropout during trainable inner critic and actor-Q updates.

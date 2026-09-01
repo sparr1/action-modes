@@ -28,6 +28,21 @@ _VALUE_EVAL_PROTOCOLS = {"paper_deterministic", "stochastic_bellman"}
 _ADAPTATION_MODES = {"frozen", "clone", "lora"}
 _LIFECYCLE_SCOPES = {"action", "episode", "run"}
 _SCOPE_RANK = {"action": 0, "episode": 1, "run": 2}
+_INNER_EXPLORER_MODES = {
+    "none",
+    "adaptive_param_noise",
+    "frozen_random",
+    "shared_mixture",
+    "separate_critics",
+}
+_INNER_MIXTURE_TARGET_ESTIMATORS = {"stratified", "weighted"}
+_INNER_EXECUTION_POLICY_SOURCES = {
+    "primary",
+    "explorer",
+    "mixture_sample",
+    "outer_q_gate",
+    "outer_soft_handoff",
+}
 
 
 _AMBI_DEFAULTS = {
@@ -95,6 +110,27 @@ _AMBI_DEFAULTS = {
     "inner_critic_updates_per_round": None,
     "inner_actor_updates_per_round": None,
 
+    # Optional action-local random explorer. The prior weight always denotes
+    # the primary/prior-initialized policy's share of imagined rollouts.
+    "inner_explorer_mode": "none",
+    "inner_prior_rollout_weight": 0.5,
+    "inner_mixture_target_estimator": "stratified",
+    "inner_explorer_actor_updates_per_round": None,
+    "inner_explorer_critic_updates_per_round": None,
+    "inner_explorer_temperature_updates_per_round": None,
+
+    # Action-local adaptive parameter noise. The actor count is deliberately
+    # explicit whenever the mode is active so each configured rollout has an
+    # unambiguous policy identity and equal allocation.
+    "inner_param_noise_actor_count": None,
+    "inner_param_noise_target_action_rms": 0.1,
+    "inner_param_noise_sigma_init": 1e-3,
+    "inner_param_noise_sigma_min": 1e-6,
+    "inner_param_noise_sigma_max": 0.1,
+    "inner_param_noise_calibration_directions": 8,
+    "inner_param_noise_calibration_batch_size": 32,
+    "inner_param_noise_calibration_max_probes": 8,
+
     # Deprecated total-budget controls. These remain accepted on an isolated
     # legacy schedule path for one release and are resolved to nominal totals
     # for canonical configurations.
@@ -146,6 +182,8 @@ _AMBI_DEFAULTS = {
     "inner_execution_action": "policy_sample",
     "inner_execution_std_scale": 1.0,
     "inner_execution_noise_std": 0.0,
+    "inner_execution_policy_source": "primary",
+    "inner_execution_handoff_samples": 8,
     "inner_log_std_mapping": None,
     "inner_log_std_min": None,
     "inner_log_std_max": None,
@@ -353,6 +391,460 @@ def _finite_float(value, key):
     if not math.isfinite(value):
         raise ValueError(f"{key} must be finite, got {value}.")
     return value
+
+
+def _normalize_choice(value, key, choices):
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be one of {sorted(choices)}, got {value!r}.")
+    value = value.lower()
+    if value not in choices:
+        raise ValueError(f"{key} must be one of {sorted(choices)}, got {value!r}.")
+    return value
+
+
+def _integral_weighted_count(total, weight, *, total_key, weight_key):
+    weighted = int(total) * float(weight)
+    rounded = round(weighted)
+    if not math.isclose(weighted, rounded, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError(
+            f"{total_key} * {weight_key} must be integral, got "
+            f"{total} * {weight} = {weighted}."
+        )
+    return int(rounded)
+
+
+def _resolve_random_explorer_config(cfg):
+    """Validate and resolve the action-local two-policy experiment contract."""
+
+    cfg.inner_explorer_mode = _normalize_choice(
+        cfg.inner_explorer_mode,
+        "inner_explorer_mode",
+        _INNER_EXPLORER_MODES,
+    )
+    cfg.inner_mixture_target_estimator = _normalize_choice(
+        cfg.inner_mixture_target_estimator,
+        "inner_mixture_target_estimator",
+        _INNER_MIXTURE_TARGET_ESTIMATORS,
+    )
+    cfg.inner_execution_policy_source = _normalize_choice(
+        cfg.inner_execution_policy_source,
+        "inner_execution_policy_source",
+        _INNER_EXECUTION_POLICY_SOURCES,
+    )
+    cfg.inner_execution_handoff_samples = _strict_positive_int(
+        cfg.inner_execution_handoff_samples,
+        "inner_execution_handoff_samples",
+    )
+    cfg.inner_prior_rollout_weight = _strict_probability(
+        cfg.inner_prior_rollout_weight,
+        "inner_prior_rollout_weight",
+    )
+
+    requested_param_noise_actor_count = cfg.inner_param_noise_actor_count
+    if requested_param_noise_actor_count is not None:
+        requested_param_noise_actor_count = _strict_positive_int(
+            requested_param_noise_actor_count,
+            "inner_param_noise_actor_count",
+        )
+    for key in (
+        "inner_param_noise_target_action_rms",
+        "inner_param_noise_sigma_init",
+        "inner_param_noise_sigma_min",
+        "inner_param_noise_sigma_max",
+    ):
+        setattr(cfg, key, _strict_nonnegative_float(getattr(cfg, key), key))
+    if not 0.0 < cfg.inner_param_noise_target_action_rms < 2.0:
+        raise ValueError(
+            "inner_param_noise_target_action_rms must be strictly between "
+            "0 and 2 in normalized post-tanh action units."
+        )
+    if not (
+        0.0
+        < cfg.inner_param_noise_sigma_min
+        <= cfg.inner_param_noise_sigma_init
+        <= cfg.inner_param_noise_sigma_max
+    ):
+        raise ValueError(
+            "Adaptive parameter-noise scales must satisfy "
+            "0 < inner_param_noise_sigma_min <= inner_param_noise_sigma_init "
+            "<= inner_param_noise_sigma_max."
+        )
+    for key in (
+        "inner_param_noise_calibration_directions",
+        "inner_param_noise_calibration_batch_size",
+        "inner_param_noise_calibration_max_probes",
+    ):
+        setattr(cfg, key, _strict_positive_int(getattr(cfg, key), key))
+
+    requested_explorer_updates = {}
+    for component in ("actor", "critic", "temperature"):
+        key = f"inner_explorer_{component}_updates_per_round"
+        value = getattr(cfg, key)
+        if value is not None:
+            value = _strict_nonnegative_int(value, key)
+        requested_explorer_updates[component] = value
+
+    rounds = int(cfg.inner_rounds)
+    cfg.inner_primary_updates_per_round_is_auto = bool(
+        cfg.inner_schedule_mode == "canonical"
+        and not cfg.inner_component_update_schedule
+        and cfg.inner_updates_per_round == "auto"
+    )
+    for component in ("actor", "critic", "temperature"):
+        total = int(getattr(cfg, f"inner_{component}_updates_per_action"))
+        setattr(cfg, f"inner_primary_{component}_updates_per_action", total)
+        if rounds > 0:
+            quotient, remainder = divmod(total, rounds)
+            per_round = quotient if remainder == 0 else total / rounds
+        else:
+            per_round = 0
+        setattr(cfg, f"inner_primary_{component}_updates_per_round", per_round)
+
+    mode = cfg.inner_explorer_mode
+    active = mode != "none"
+    cfg.inner_explorer_active = active
+    cfg.inner_param_noise_active = mode == "adaptive_param_noise"
+    cfg.inner_explorer_trainable = mode in {"shared_mixture", "separate_critics"}
+    cfg.inner_explorer_has_separate_critic = mode == "separate_critics"
+
+    if mode == "adaptive_param_noise":
+        if requested_param_noise_actor_count is None:
+            raise ValueError(
+                "inner_explorer_mode='adaptive_param_noise' requires an explicit "
+                "positive inner_param_noise_actor_count."
+            )
+        if cfg.inner_behavior_action != "policy_sample":
+            raise ValueError(
+                "inner_explorer_mode='adaptive_param_noise' requires "
+                "inner_behavior_action='policy_sample'."
+            )
+        if cfg.inner_behavior_std_scale <= 0.0:
+            raise ValueError(
+                "inner_explorer_mode='adaptive_param_noise' requires a positive "
+                "inner_behavior_std_scale so multiple rollouts assigned to one "
+                "perturbed actor remain stochastic."
+            )
+        if cfg.inner_execution_policy_source != "primary":
+            raise ValueError(
+                "inner_explorer_mode='adaptive_param_noise' requires "
+                "inner_execution_policy_source='primary'."
+            )
+    elif requested_param_noise_actor_count is not None:
+        raise ValueError(
+            "inner_param_noise_actor_count is only valid when "
+            "inner_explorer_mode='adaptive_param_noise'."
+        )
+
+    if not active:
+        nonzero = {
+            component: value
+            for component, value in requested_explorer_updates.items()
+            if value not in {None, 0}
+        }
+        if nonzero:
+            raise ValueError(
+                "inner_explorer_mode='none' cannot use explorer optimizer "
+                f"updates: {nonzero}."
+            )
+        if cfg.inner_execution_policy_source != "primary":
+            raise ValueError(
+                "inner_execution_policy_source must be 'primary' when "
+                "inner_explorer_mode='none'."
+            )
+    else:
+        if cfg.inner_operator != "sac":
+            raise ValueError("An active inner explorer requires inner_operator='sac'.")
+        if cfg.inner_schedule_mode != "canonical":
+            raise ValueError(
+                "An active inner explorer requires the canonical per-round schedule."
+            )
+        if cfg.inner_rounds <= 0 or cfg.inner_rollouts_per_round <= 0:
+            raise ValueError(
+                "An active inner explorer requires positive inner_rounds and "
+                "inner_rollouts_per_round."
+            )
+        for component in ("actor", "critic"):
+            if getattr(cfg, f"inner_{component}_adaptation") != "clone":
+                raise ValueError(
+                    "An active inner explorer requires clone adaptation; "
+                    f"inner_{component}_adaptation must be 'clone'."
+                )
+        action_scopes = (
+            "inner_actor_scope",
+            "inner_critic_scope",
+            "inner_temperature_scope",
+            "inner_replay_scope",
+            "inner_actor_optimizer_scope",
+            "inner_critic_optimizer_scope",
+            "inner_temperature_optimizer_scope",
+        )
+        for key in action_scopes:
+            if getattr(cfg, key) != "action":
+                raise ValueError(
+                    "An active inner explorer requires action-local state; "
+                    f"{key} must be 'action'."
+                )
+        if cfg.inner_bootstrap_source != "inner_target":
+            raise ValueError(
+                "An active inner explorer requires "
+                "inner_bootstrap_source='inner_target'."
+            )
+        if not 0.0 < cfg.inner_prior_rollout_weight < 1.0:
+            raise ValueError(
+                "An active inner explorer requires "
+                "inner_prior_rollout_weight strictly between 0 and 1."
+            )
+        if (
+            cfg.inner_actor_writeback_coef != 0.0
+            or cfg.inner_critic_writeback_coef != 0.0
+        ):
+            raise ValueError(
+                "An active inner explorer does not support inner actor or critic "
+                "writeback."
+            )
+        if (
+            cfg.inner_outer_policy_kl_coef != 0.0
+            or cfg.inner_outer_action_l2_coef != 0.0
+        ):
+            raise ValueError(
+                "An active inner explorer requires zero inner outer-policy "
+                "regularization coefficients."
+            )
+        if (
+            mode == "shared_mixture"
+            and cfg.inner_sac_critic_target != "entropy_augmented"
+        ):
+            raise ValueError(
+                "inner_explorer_mode='shared_mixture' requires "
+                "inner_sac_critic_target='entropy_augmented'."
+            )
+        if (
+            cfg.inner_execution_policy_source == "outer_soft_handoff"
+            and cfg.outer_critic_target != "entropy_augmented"
+        ):
+            raise ValueError(
+                "inner_execution_policy_source='outer_soft_handoff' requires "
+                "outer_critic_target='entropy_augmented'."
+            )
+        if (
+            cfg.outer_behavior_policy_kl_schedule != "none"
+            and cfg.inner_execution_policy_source
+            in {"mixture_sample", "outer_soft_handoff"}
+        ):
+            raise ValueError(
+                "An active outer behavior-policy regularizer is incompatible "
+                "with mixture_sample or outer_soft_handoff execution."
+            )
+
+    if active:
+        primary_rollouts = _integral_weighted_count(
+            cfg.inner_rollouts_per_round,
+            cfg.inner_prior_rollout_weight,
+            total_key="inner_rollouts_per_round",
+            weight_key="inner_prior_rollout_weight",
+        )
+        explorer_rollouts = cfg.inner_rollouts_per_round - primary_rollouts
+        if primary_rollouts <= 0 or explorer_rollouts <= 0:
+            raise ValueError(
+                "An active inner explorer requires non-empty primary and "
+                "explorer rollout populations after exact allocation, got "
+                f"primary={primary_rollouts}, explorer={explorer_rollouts}."
+            )
+    else:
+        primary_rollouts = cfg.inner_rollouts_per_round
+        explorer_rollouts = 0
+    cfg.inner_primary_rollouts_per_round = int(primary_rollouts)
+    cfg.inner_explorer_rollouts_per_round = int(explorer_rollouts)
+    total_rollouts = (
+        cfg.inner_primary_rollouts_per_round
+        + cfg.inner_explorer_rollouts_per_round
+    )
+    cfg.inner_primary_rollout_fraction = (
+        cfg.inner_primary_rollouts_per_round / total_rollouts
+        if total_rollouts > 0
+        else 0.0
+    )
+    cfg.inner_explorer_rollout_fraction = (
+        cfg.inner_explorer_rollouts_per_round / total_rollouts
+        if total_rollouts > 0
+        else 0.0
+    )
+    if mode == "adaptive_param_noise":
+        actor_count = int(requested_param_noise_actor_count)
+        explorer_rollouts = cfg.inner_explorer_rollouts_per_round
+        if actor_count > explorer_rollouts:
+            raise ValueError(
+                "inner_param_noise_actor_count cannot exceed the resolved "
+                "inner_explorer_rollouts_per_round: "
+                f"{actor_count} > {explorer_rollouts}."
+            )
+        if explorer_rollouts % actor_count != 0:
+            raise ValueError(
+                "inner_explorer_rollouts_per_round must be exactly divisible by "
+                "inner_param_noise_actor_count, got "
+                f"{explorer_rollouts} % {actor_count}."
+            )
+        cfg.inner_param_noise_actor_count = actor_count
+        cfg.inner_param_noise_rollouts_per_actor = explorer_rollouts // actor_count
+    else:
+        cfg.inner_param_noise_actor_count = None
+        cfg.inner_param_noise_rollouts_per_actor = 0
+
+    cfg.inner_primary_target_rows_per_batch = None
+    cfg.inner_explorer_target_rows_per_batch = None
+    if (
+        mode == "shared_mixture"
+        and cfg.inner_mixture_target_estimator == "stratified"
+    ):
+        primary_rows = _integral_weighted_count(
+            cfg.inner_batch_size,
+            cfg.inner_prior_rollout_weight,
+            total_key="inner_batch_size",
+            weight_key="inner_prior_rollout_weight",
+        )
+        cfg.inner_primary_target_rows_per_batch = primary_rows
+        cfg.inner_explorer_target_rows_per_batch = cfg.inner_batch_size - primary_rows
+
+    primary_updates = {
+        component: getattr(cfg, f"inner_primary_{component}_updates_per_round")
+        for component in ("actor", "critic", "temperature")
+    }
+    if active and any(
+        not isinstance(value, int) for value in primary_updates.values()
+    ):
+        raise ValueError(
+            "An active inner explorer requires integral primary optimizer "
+            "update counts in every round."
+        )
+
+    if mode in {"none", "adaptive_param_noise", "frozen_random"}:
+        nonzero = {
+            component: value
+            for component, value in requested_explorer_updates.items()
+            if value not in {None, 0}
+        }
+        if nonzero:
+            raise ValueError(
+                f"inner_explorer_mode={mode!r} has no explorer optimizers: {nonzero}."
+            )
+        explorer_updates = {component: 0 for component in primary_updates}
+        explorer_inherits = {component: False for component in primary_updates}
+    elif mode == "shared_mixture":
+        actor_updates = requested_explorer_updates["actor"]
+        if (
+            cfg.inner_primary_updates_per_round_is_auto
+            and actor_updates is not None
+        ):
+            raise ValueError(
+                "inner_explorer_mode='shared_mixture' with "
+                "inner_updates_per_round='auto' requires "
+                "inner_explorer_actor_updates_per_round=null so both actors "
+                "follow the realized transition count."
+            )
+        actor_updates = (
+            primary_updates["actor"] if actor_updates is None else actor_updates
+        )
+        if actor_updates != primary_updates["actor"]:
+            raise ValueError(
+                "inner_explorer_mode='shared_mixture' requires equal primary "
+                "and explorer actor update counts."
+            )
+        for component in ("critic", "temperature"):
+            if requested_explorer_updates[component] not in {None, 0}:
+                raise ValueError(
+                    "inner_explorer_mode='shared_mixture' uses one shared "
+                    f"{component}; inner_explorer_{component}_updates_per_round "
+                    "must be zero or null."
+                )
+        explorer_updates = {
+            "actor": actor_updates,
+            "critic": 0,
+            "temperature": 0,
+        }
+        explorer_inherits = {
+            "actor": requested_explorer_updates["actor"] is None,
+            "critic": False,
+            "temperature": False,
+        }
+    else:
+        explorer_updates = {
+            component: (
+                primary_updates[component]
+                if requested_explorer_updates[component] is None
+                else requested_explorer_updates[component]
+            )
+            for component in primary_updates
+        }
+        explorer_inherits = {
+            component: requested_explorer_updates[component] is None
+            for component in primary_updates
+        }
+
+    if (
+        explorer_updates["temperature"] > 0
+        and cfg.inner_temperature_mode != "auto"
+    ):
+        raise ValueError(
+            "Positive inner_explorer_temperature_updates_per_round requires "
+            "inner_temperature_mode='auto'."
+        )
+
+    for component, per_round in explorer_updates.items():
+        setattr(
+            cfg,
+            f"inner_explorer_{component}_updates_inherit_primary",
+            bool(explorer_inherits[component]),
+        )
+        setattr(
+            cfg,
+            f"inner_explorer_{component}_updates_per_round",
+            int(per_round),
+        )
+        setattr(
+            cfg,
+            f"inner_explorer_{component}_updates_per_action",
+            int(per_round) * rounds,
+        )
+    cfg.inner_primary_optimizer_steps_per_action = sum(
+        int(getattr(cfg, f"inner_{component}_updates_per_action"))
+        for component in ("actor", "critic", "temperature")
+    )
+    cfg.inner_explorer_optimizer_steps_per_action = sum(
+        getattr(cfg, f"inner_explorer_{component}_updates_per_action")
+        for component in ("actor", "critic", "temperature")
+    )
+    cfg.inner_total_optimizer_steps_per_action = (
+        cfg.inner_primary_optimizer_steps_per_action
+        + cfg.inner_explorer_optimizer_steps_per_action
+    )
+
+    # Resolve the actual active-population slot contract. Ordinary canonical
+    # scheduling shares one minibatch across every component enabled in a slot;
+    # the explicit component schedule has a critic phase followed by an
+    # actor/temperature phase. R may have a larger explicit dose than P in the
+    # separate-critic experiment, so the P-only estimate is insufficient.
+    if active:
+        if cfg.inner_component_update_schedule:
+            critic_slots = max(
+                int(primary_updates["critic"]),
+                int(explorer_updates["critic"]),
+            )
+            actor_slots = max(
+                int(primary_updates["actor"]),
+                int(primary_updates["temperature"]),
+                int(explorer_updates["actor"]),
+                int(explorer_updates["temperature"]),
+            )
+            slots_per_round = critic_slots + actor_slots
+        else:
+            slots_per_round = max(
+                *(int(value) for value in primary_updates.values()),
+                *(int(value) for value in explorer_updates.values()),
+            )
+        cfg.inner_nominal_updates_per_round = int(slots_per_round)
+        cfg.inner_expected_update_slots = int(slots_per_round) * rounds
+
+    return cfg
 
 
 def _outer_policy_hash(seed, episode_start_step, namespace):
@@ -1542,6 +2034,8 @@ class AMBITDMPC2(TDMPC2Baseline):
                     "outer actor log-std mappings and bounds."
                 )
 
+        _resolve_random_explorer_config(cfg)
+
         cfg.inner_mppi_num_elites = int(cfg.inner_mppi_num_elites)
         cfg.inner_mppi_num_pi_trajs = int(cfg.inner_mppi_num_pi_trajs)
         if cfg.inner_mppi_num_elites <= 0:
@@ -2249,6 +2743,19 @@ class AMBITDMPC2(TDMPC2Baseline):
                 "train/inner_q_evaluations": 0,
                 "train/inner_replay_draws": 0,
                 "train/inner_diagnostic_model_steps": 0,
+                "train/inner_primary_rollouts": 0,
+                "train/inner_explorer_rollouts": 0,
+                "train/inner_primary_transitions": 0,
+                "train/inner_explorer_transitions": 0,
+                "train/inner_optimization_model_steps": 0,
+                "train/inner_selector_model_steps": 0,
+                "train/inner_explorer_actor_optimizer_steps": 0,
+                "train/inner_explorer_critic_optimizer_steps": 0,
+                "train/inner_explorer_temperature_optimizer_steps": 0,
+                "train/inner_explorer_target_updates": 0,
+                "train/inner_explorer_critic_target_updates": 0,
+                "train/inner_selector_primary_wins": 0,
+                "train/inner_selector_explorer_wins": 0,
             })
             return
 
@@ -2322,8 +2829,35 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_policy_evaluations",
             "inner_q_evaluations",
             "inner_replay_draws",
+            "inner_primary_replay_samples",
+            "inner_explorer_replay_samples",
             "inner_diagnostic_model_steps",
             "inner_diagnostics_sample_count",
+            "inner_primary_rollouts",
+            "inner_explorer_rollouts",
+            "inner_primary_transitions",
+            "inner_explorer_transitions",
+            "inner_optimization_model_steps",
+            "inner_selector_model_steps",
+            "inner_explorer_actor_optimizer_steps",
+            "inner_explorer_critic_optimizer_steps",
+            "inner_explorer_temperature_optimizer_steps",
+            "inner_explorer_target_updates",
+            "inner_explorer_critic_target_updates",
+            "inner_selector_primary_wins",
+            "inner_selector_explorer_wins",
+            "inner_fixed_q_counterfactual_primary_wins",
+            "inner_fixed_q_counterfactual_explorer_wins",
+            "inner_fixed_q_counterfactual_policy_evaluations",
+            "inner_fixed_q_counterfactual_q_evaluations",
+            "inner_primary_td_error_abs_count",
+            "inner_explorer_td_error_abs_count",
+            "inner_explorer_critic_primary_td_error_abs_count",
+            "inner_explorer_critic_explorer_td_error_abs_count",
+            "inner_param_noise_calibration_probes",
+            "inner_param_noise_calibration_policy_evaluations",
+            "inner_param_noise_calibration_rounds",
+            "inner_param_noise_mean_action_saturation_count",
             "planner_policy_model_steps",
             "planner_candidate_model_steps",
             "planner_model_steps",
@@ -2341,6 +2875,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_execution_seconds",
             "inner_diagnostic_seconds",
             "inner_mppi_seconds",
+            "inner_selector_seconds",
+            "inner_param_noise_calibration_seconds",
         }
         for key in timing_metrics:
             if key in metrics:
@@ -2378,6 +2914,15 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_q_target_clip_fraction",
             "inner_td_error_abs_mean",
         }
+        explorer_critic_metrics = {
+            "inner_explorer_critic_loss",
+            "inner_explorer_critic_grad_norm",
+            "inner_explorer_q_mean",
+            "inner_explorer_q_abs_mean",
+            "inner_explorer_q_target_mean",
+            "inner_explorer_q_target_clip_fraction",
+            "inner_explorer_critic_td_error_abs_mean",
+        }
         actor_metrics = {
             "inner_actor_loss",
             "inner_actor_grad_norm",
@@ -2386,12 +2931,23 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_actor_q_min_all",
             "inner_actor_q_mean_all_minus_min_all",
             "inner_actor_entropy",
+            "inner_mixture_log_prob",
             "inner_outer_policy_kl",
             "inner_outer_action_l2",
+        }
+        explorer_actor_metrics = {
+            "inner_explorer_actor_loss",
+            "inner_explorer_actor_grad_norm",
+            "inner_explorer_actor_q_mean",
+            "inner_explorer_actor_entropy",
         }
         temperature_metrics = {
             "inner_temperature_loss",
             "inner_temperature_grad_norm",
+        }
+        explorer_temperature_metrics = {
+            "inner_explorer_temperature_loss",
+            "inner_explorer_temperature_grad_norm",
         }
         action_gauges = {
             "inner_alpha",
@@ -2405,6 +2961,13 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_actor_trainable_params",
             "inner_critic_trainable_params",
             "inner_temperature_trainable_params",
+            "inner_explorer_actor_trainable_params",
+            "inner_explorer_critic_trainable_params",
+            "inner_explorer_temperature_trainable_params",
+            "inner_explorer_alpha",
+            "inner_explorer_alpha_initial",
+            "inner_explorer_alpha_final",
+            "inner_explorer_alpha_delta",
             "inner_rounds",
             "inner_mppi_iterations",
             "inner_rollouts_per_round",
@@ -2417,6 +2980,32 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_critic_utd",
             "inner_actor_utd",
             "inner_temperature_utd",
+            "inner_explorer_actor_utd",
+            "inner_explorer_critic_utd",
+            "inner_explorer_temperature_utd",
+            "inner_primary_rollout_fraction",
+            "inner_explorer_rollout_fraction",
+            "inner_primary_replay_fraction",
+            "inner_explorer_replay_fraction",
+            "inner_selector_primary_score",
+            "inner_selector_explorer_score",
+            "inner_selector_score_margin",
+            "inner_selector_score_variance",
+            "inner_primary_explorer_action_l2",
+            "inner_fixed_q_counterfactual_primary_q",
+            "inner_fixed_q_counterfactual_explorer_q",
+            "inner_fixed_q_counterfactual_margin",
+            "inner_fixed_q_counterfactual_explorer_rate",
+            "inner_fixed_q_counterfactual_execution_agreement",
+            "inner_fixed_q_counterfactual_action_l2_to_executed",
+            "inner_param_noise_actor_count",
+            "inner_param_noise_rollouts_per_actor",
+            "inner_param_noise_target_action_rms",
+            "inner_param_noise_sigma_initial",
+            "inner_param_noise_sigma_final",
+            "inner_param_noise_sigma_mean",
+            "inner_param_noise_sigma_min",
+            "inner_param_noise_sigma_max",
             "inner_alpha_initial",
             "inner_alpha_final",
             "inner_alpha_delta",
@@ -2463,12 +3052,155 @@ class AMBITDMPC2(TDMPC2Baseline):
             "planner_num_pi_trajs",
             "planner_iterations",
         }
+        action_gauges.update(
+            key
+            for key in metrics
+            if key.startswith("inner_fixed_q_counterfactual_action_")
+            and key.removeprefix("inner_fixed_q_counterfactual_action_").isdigit()
+        )
+
+        # Source-conditioned TD summaries have an exact sampled-row count.
+        # Route them separately from ordinary per-optimizer diagnostics so a
+        # minibatch that contains one source sparsely (or not at all) cannot
+        # bias the interval mean.
+        source_td_metrics = {
+            "inner_primary_td_error_abs_mean": (
+                "inner_primary_td_error_abs_count"
+            ),
+            "inner_explorer_td_error_abs_mean": (
+                "inner_explorer_td_error_abs_count"
+            ),
+            "inner_explorer_critic_primary_td_error_abs_mean": (
+                "inner_explorer_critic_primary_td_error_abs_count"
+            ),
+            "inner_explorer_critic_explorer_td_error_abs_mean": (
+                "inner_explorer_critic_explorer_td_error_abs_count"
+            ),
+        }
+        for key, count_key in source_td_metrics.items():
+            count = int(metrics.get(count_key, 0))
+            if key in metrics and count > 0:
+                self._wandb_train_window.add_weighted(
+                    f"train/{key}", metrics[key], weight=count
+                )
+
+        replay_sample_total = int(
+            metrics.get("inner_primary_replay_samples", 0)
+        ) + int(
+            metrics.get("inner_explorer_replay_samples", 0)
+        )
+        if replay_sample_total > 0:
+            for source in ("primary", "explorer"):
+                key = f"inner_{source}_replay_sample_fraction"
+                if key in metrics:
+                    self._wandb_train_window.add_weighted(
+                        f"train/{key}",
+                        metrics[key],
+                        weight=replay_sample_total,
+                    )
+        for source in ("primary", "explorer"):
+            # These source-specific summaries are computed over individual
+            # imagined transitions (reward and terminal indicator), not over
+            # per-rollout aggregates.  Episodic compaction can give the two
+            # sources different realized lengths, so transition counts are the
+            # only correct aggregation weights.
+            source_count = int(metrics.get(f"inner_{source}_transitions", 0))
+            if source_count <= 0:
+                continue
+            for stem in ("reward", "termination_rate"):
+                mean_key = f"inner_{source}_{stem}_mean"
+                if mean_key not in metrics:
+                    continue
+                target = f"train/inner_{source}_{stem}"
+                mean = metrics[mean_key]
+                self._wandb_train_window.add_weighted(
+                    target,
+                    mean,
+                    weight=source_count,
+                )
+                self._wandb_train_window.add_stats(
+                    target,
+                    count=source_count,
+                    mean=mean,
+                    std=metrics.get(f"inner_{source}_{stem}_std", 0.0),
+                    min_value=metrics.get(f"inner_{source}_{stem}_min", mean),
+                    max_value=metrics.get(f"inner_{source}_{stem}_max", mean),
+                )
+
+        for stem, count_key in (
+            (
+                "inner_param_noise_calibration_action_rms",
+                "inner_param_noise_calibration_action_rms_count",
+            ),
+            (
+                "inner_param_noise_behavior_action_rms",
+                "inner_param_noise_behavior_action_rms_count",
+            ),
+        ):
+            count = int(metrics.get(count_key, 0))
+            mean_key = f"{stem}_mean"
+            if count <= 0 or mean_key not in metrics:
+                continue
+            mean = metrics[mean_key]
+            self._wandb_train_window.add_stats(
+                f"train/{stem}",
+                count=count,
+                mean=mean,
+                std=metrics.get(f"{stem}_std", 0.0),
+                min_value=metrics.get(f"{stem}_min", mean),
+                max_value=metrics.get(f"{stem}_max", mean),
+            )
+
+        for key, count_key in (
+            (
+                "inner_param_noise_calibration_target_hit_fraction",
+                "inner_param_noise_calibration_rounds",
+            ),
+            (
+                "inner_param_noise_sigma_bound_hit_fraction",
+                "inner_param_noise_calibration_probes",
+            ),
+            (
+                "inner_param_noise_mean_action_saturation_fraction",
+                "inner_param_noise_mean_action_saturation_count",
+            ),
+        ):
+            count = int(metrics.get(count_key, 0))
+            if count > 0 and key in metrics:
+                self._wandb_train_window.add_weighted(
+                    f"train/{key}", metrics[key], weight=count
+                )
         weighted_groups = (
             (critic_metrics, max(1, int(metrics.get("inner_critic_optimizer_steps", 0)))),
+            (
+                explorer_critic_metrics,
+                max(
+                    1,
+                    int(metrics.get("inner_explorer_critic_optimizer_steps", 0)),
+                ),
+            ),
             (actor_metrics, max(1, int(metrics.get("inner_actor_optimizer_steps", 0)))),
+            (
+                explorer_actor_metrics,
+                max(
+                    1,
+                    int(metrics.get("inner_explorer_actor_optimizer_steps", 0)),
+                ),
+            ),
             (
                 temperature_metrics,
                 max(1, int(metrics.get("inner_temperature_optimizer_steps", 0))),
+            ),
+            (
+                explorer_temperature_metrics,
+                max(
+                    1,
+                    int(
+                        metrics.get(
+                            "inner_explorer_temperature_optimizer_steps", 0
+                        )
+                    ),
+                ),
             ),
             (action_gauges, 1),
         )

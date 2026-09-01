@@ -7,6 +7,7 @@ AMBI configures whether their Bellman bootstrap includes policy entropy.
 """
 
 from copy import deepcopy
+from numbers import Real
 
 import torch
 import torch.nn as nn
@@ -221,6 +222,51 @@ class SoftWorldModel(nn.Module):
         log_std_mapping=None,
     ):
         """Return policy parameters and one isolated standard-normal sample."""
+        mean_raw, log_std = self._policy_parameters(
+            z,
+            task,
+            policy=policy,
+            detach_policy=detach_policy,
+            std_scale=std_scale,
+            log_std_min=log_std_min,
+            log_std_max=log_std_max,
+            log_std_mapping=log_std_mapping,
+        )
+        if noise is not None and generator is not None:
+            raise ValueError("Specify either policy noise or a generator, not both.")
+        if noise is not None and noise.shape != mean_raw.shape:
+            raise ValueError(
+                "Policy noise must match the action-parameter shape, "
+                f"got {tuple(noise.shape)} != {tuple(mean_raw.shape)}."
+            )
+        if deterministic:
+            eps = torch.zeros_like(mean_raw)
+        elif noise is not None:
+            eps = noise.to(device=mean_raw.device, dtype=mean_raw.dtype)
+        elif generator is None:
+            eps = torch.randn_like(mean_raw)
+        else:
+            eps = torch.randn(
+                mean_raw.shape,
+                dtype=mean_raw.dtype,
+                device=mean_raw.device,
+                generator=generator,
+            )
+        return mean_raw, log_std, eps
+
+    def _policy_parameters(
+        self,
+        z,
+        task=None,
+        *,
+        policy=None,
+        detach_policy=False,
+        std_scale=1.0,
+        log_std_min=None,
+        log_std_max=None,
+        log_std_mapping=None,
+    ):
+        """Return the policy's differentiable pre-tanh Gaussian parameters."""
         if task is not None:
             raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
         policy = self._pi if policy is None else policy
@@ -247,9 +293,7 @@ class SoftWorldModel(nn.Module):
             if log_std_max is None
             else float(log_std_max)
         )
-        if not (
-            float("-inf") < lower_bound < upper_bound < float("inf")
-        ):
+        if not float("-inf") < lower_bound < upper_bound < float("inf"):
             raise ValueError(
                 "log_std_min must be smaller than log_std_max, "
                 f"got {lower_bound} >= {upper_bound}."
@@ -269,28 +313,132 @@ class SoftWorldModel(nn.Module):
             )
         if std_scale != 1.0:
             log_std = log_std + torch.log(log_std.new_tensor(std_scale))
+        return mean_raw, log_std
 
-        if noise is not None and generator is not None:
-            raise ValueError("Specify either policy noise or a generator, not both.")
-        if noise is not None and noise.shape != mean_raw.shape:
-            raise ValueError(
-                "Policy noise must match the action-parameter shape, "
-                f"got {tuple(noise.shape)} != {tuple(mean_raw.shape)}."
-            )
-        if deterministic:
-            eps = torch.zeros_like(mean_raw)
-        elif noise is not None:
-            eps = noise.to(device=mean_raw.device, dtype=mean_raw.dtype)
-        elif generator is None:
-            eps = torch.randn_like(mean_raw)
-        else:
-            eps = torch.randn(
-                mean_raw.shape,
-                dtype=mean_raw.dtype,
-                device=mean_raw.device,
-                generator=generator,
-            )
-        return mean_raw, log_std, eps
+    def policy_stats(
+        self,
+        z,
+        task=None,
+        *,
+        policy=None,
+        detach_policy=False,
+        std_scale=1.0,
+        log_std_min=None,
+        log_std_max=None,
+        log_std_mapping=None,
+    ):
+        """Return differentiable squashed-Gaussian statistics without sampling."""
+        mean_raw, log_std = self._policy_parameters(
+            z,
+            task,
+            policy=policy,
+            detach_policy=detach_policy,
+            std_scale=std_scale,
+            log_std_min=log_std_min,
+            log_std_max=log_std_max,
+            log_std_mapping=log_std_mapping,
+        )
+        return {
+            "mean": torch.tanh(mean_raw),
+            "pre_tanh_mean": mean_raw,
+            "log_std": log_std,
+        }
+
+    @staticmethod
+    def _gaussian_component_log_prob(pre_tanh_action, pre_tanh_mean, log_std):
+        """Evaluate one diagonal Gaussian before the common tanh transform."""
+        if not all(
+            torch.is_tensor(value)
+            for value in (pre_tanh_action, pre_tanh_mean, log_std)
+        ):
+            raise TypeError("Policy density inputs must be tensors.")
+        if (
+            pre_tanh_action.ndim == 0
+            or pre_tanh_mean.ndim == 0
+            or log_std.ndim == 0
+        ):
+            raise ValueError("Policy density inputs must include an action dimension.")
+        if not (
+            pre_tanh_action.shape[-1]
+            == pre_tanh_mean.shape[-1]
+            == log_std.shape[-1]
+        ):
+            raise ValueError("Policy density inputs must share their action dimension.")
+        eps = (pre_tanh_action - pre_tanh_mean) * torch.exp(-log_std)
+        elementwise = -0.5 * eps.square() - log_std - 0.9189385332046727
+        return elementwise.sum(dim=-1, keepdim=True)
+
+    @classmethod
+    def squashed_component_log_prob(
+        cls,
+        pre_tanh_action,
+        pre_tanh_mean,
+        log_std,
+    ):
+        """Evaluate a policy component at an arbitrary pre-tanh action."""
+        gaussian_log_prob = cls._gaussian_component_log_prob(
+            pre_tanh_action,
+            pre_tanh_mean,
+            log_std,
+        )
+        return gaussian_log_prob - math.tanh_log_abs_det_jacobian(
+            pre_tanh_action
+        )
+
+    @classmethod
+    def mixture_log_prob(
+        cls,
+        pre_tanh_action,
+        primary_stats,
+        explorer_stats,
+        prior_weight,
+    ):
+        """Evaluate the exact two-component squashed-policy mixture density.
+
+        Both component densities are evaluated at the same pre-tanh action.
+        Their Gaussian log densities are mixed before subtracting the one tanh
+        Jacobian shared by the invertible action transform. No component is
+        detached, so an actor loss can intentionally update both policies.
+        """
+        if not isinstance(primary_stats, dict) or not isinstance(explorer_stats, dict):
+            raise TypeError("Mixture policy statistics must be dictionaries.")
+        required = {"pre_tanh_mean", "log_std"}
+        for label, stats in (
+            ("primary", primary_stats),
+            ("explorer", explorer_stats),
+        ):
+            missing = required.difference(stats)
+            if missing:
+                raise KeyError(
+                    f"{label} mixture statistics are missing {sorted(missing)}."
+                )
+        if isinstance(prior_weight, bool) or not isinstance(prior_weight, Real):
+            raise TypeError("prior_weight must be a real scalar.")
+        prior_weight = float(prior_weight)
+        if not 0.0 < prior_weight < 1.0:
+            raise ValueError("prior_weight must be strictly between zero and one.")
+
+        primary_log_prob = cls._gaussian_component_log_prob(
+            pre_tanh_action,
+            primary_stats["pre_tanh_mean"],
+            primary_stats["log_std"],
+        )
+        explorer_log_prob = cls._gaussian_component_log_prob(
+            pre_tanh_action,
+            explorer_stats["pre_tanh_mean"],
+            explorer_stats["log_std"],
+        )
+        log_weights = primary_log_prob.new_tensor(
+            [prior_weight, 1.0 - prior_weight]
+        ).log()
+        gaussian_mixture_log_prob = torch.logsumexp(
+            torch.stack((primary_log_prob, explorer_log_prob), dim=0)
+            + log_weights.view(2, *([1] * primary_log_prob.ndim)),
+            dim=0,
+        )
+        return gaussian_mixture_log_prob - math.tanh_log_abs_det_jacobian(
+            pre_tanh_action
+        )
 
     def pi_action(
         self,

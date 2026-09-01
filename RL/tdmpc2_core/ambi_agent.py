@@ -725,10 +725,177 @@ class AMBITDMPC2Agent(torch.nn.Module):
 
     def _critic_target_spec(self):
         """Return Bellman-target semantics recorded for reproducibility."""
-        return {
+        spec = {
             "outer_critic_target": str(self.cfg.outer_critic_target),
             "inner_sac_critic_target": str(self.cfg.inner_sac_critic_target),
         }
+        # Preserve the feature-off checkpoint contract byte-for-byte. Active
+        # populations add their complete resolved Bellman/execution identity;
+        # their absence itself denotes the legacy single-policy controller.
+        if str(getattr(self.cfg, "inner_explorer_mode", "none")) != "none":
+            spec["inner_population"] = self._inner_population_spec()
+        return spec
+
+    def _inner_population_spec(self):
+        """Return resolved two-policy inner-control semantics.
+
+        The auxiliary policy is action-local and therefore is not part of a
+        portable model checkpoint.  Its algorithm and resolved compute dose
+        are nevertheless scientific state: exact continuation must reject a
+        checkpoint produced under different Bellman or execution semantics.
+        """
+
+        cfg = self.cfg
+        mode = str(getattr(cfg, "inner_explorer_mode", "none"))
+        spec = {
+            "mode": mode,
+            "prior_rollout_weight": float(
+                getattr(cfg, "inner_prior_rollout_weight", 0.5)
+            ),
+            "mixture_target_estimator": str(
+                getattr(cfg, "inner_mixture_target_estimator", "stratified")
+            ),
+            "primary_rollouts_per_round": int(
+                getattr(cfg, "inner_primary_rollouts_per_round", 0)
+            ),
+            "explorer_rollouts_per_round": int(
+                getattr(cfg, "inner_explorer_rollouts_per_round", 0)
+            ),
+            "primary_target_rows_per_batch": getattr(
+                cfg, "inner_primary_target_rows_per_batch", None
+            ),
+            "explorer_target_rows_per_batch": getattr(
+                cfg, "inner_explorer_target_rows_per_batch", None
+            ),
+            "rounds": int(getattr(cfg, "inner_rounds", 0)),
+            "batch_size": int(getattr(cfg, "inner_batch_size", 0)),
+            "component_update_schedule": bool(
+                getattr(cfg, "inner_component_update_schedule", False)
+            ),
+            "nominal_updates_per_round": int(
+                getattr(cfg, "inner_nominal_updates_per_round", 0)
+            ),
+            "expected_update_slots": int(
+                getattr(cfg, "inner_expected_update_slots", 0)
+            ),
+            "primary_actor_updates_per_round": int(
+                getattr(cfg, "inner_primary_actor_updates_per_round", 0) or 0
+            ),
+            "primary_critic_updates_per_round": int(
+                getattr(cfg, "inner_primary_critic_updates_per_round", 0) or 0
+            ),
+            "primary_temperature_updates_per_round": int(
+                getattr(cfg, "inner_primary_temperature_updates_per_round", 0)
+                or 0
+            ),
+            "explorer_actor_updates_per_round": int(
+                getattr(cfg, "inner_explorer_actor_updates_per_round", 0) or 0
+            ),
+            "explorer_critic_updates_per_round": int(
+                getattr(cfg, "inner_explorer_critic_updates_per_round", 0) or 0
+            ),
+            "explorer_temperature_updates_per_round": int(
+                getattr(cfg, "inner_explorer_temperature_updates_per_round", 0)
+                or 0
+            ),
+            "primary_optimizer_steps_per_action": int(
+                getattr(cfg, "inner_primary_optimizer_steps_per_action", 0)
+            ),
+            "explorer_optimizer_steps_per_action": int(
+                getattr(cfg, "inner_explorer_optimizer_steps_per_action", 0)
+            ),
+            "total_optimizer_steps_per_action": int(
+                getattr(cfg, "inner_total_optimizer_steps_per_action", 0)
+            ),
+            "execution_policy_source": str(
+                getattr(cfg, "inner_execution_policy_source", "primary")
+            ),
+            "execution_handoff_samples": int(
+                getattr(cfg, "inner_execution_handoff_samples", 8)
+            ),
+            "primary_updates_per_round_is_auto": bool(
+                getattr(cfg, "inner_primary_updates_per_round_is_auto", False)
+            ),
+            "explorer_actor_updates_inherit_primary": bool(
+                getattr(
+                    cfg,
+                    "inner_explorer_actor_updates_inherit_primary",
+                    False,
+                )
+            ),
+            "explorer_critic_updates_inherit_primary": bool(
+                getattr(
+                    cfg,
+                    "inner_explorer_critic_updates_inherit_primary",
+                    False,
+                )
+            ),
+            "explorer_temperature_updates_inherit_primary": bool(
+                getattr(
+                    cfg,
+                    "inner_explorer_temperature_updates_inherit_primary",
+                    False,
+                )
+            ),
+        }
+        # Preserve every existing random-explorer specification exactly.
+        # Adaptive parameter noise adds its action-local population and fixed
+        # calibration semantics only when that mode is active.
+        if mode == "adaptive_param_noise":
+            spec["parameter_noise"] = {
+                "actor_count": int(cfg.inner_param_noise_actor_count),
+                "rollouts_per_actor": int(
+                    cfg.inner_param_noise_rollouts_per_actor
+                ),
+                "target_action_rms": float(
+                    cfg.inner_param_noise_target_action_rms
+                ),
+                "sigma_init": float(cfg.inner_param_noise_sigma_init),
+                "sigma_min": float(cfg.inner_param_noise_sigma_min),
+                "sigma_max": float(cfg.inner_param_noise_sigma_max),
+                "calibration_directions": int(
+                    cfg.inner_param_noise_calibration_directions
+                ),
+                "calibration_batch_size": int(
+                    cfg.inner_param_noise_calibration_batch_size
+                ),
+                "calibration_max_probes": int(
+                    cfg.inner_param_noise_calibration_max_probes
+                ),
+                "behavior_action": str(cfg.inner_behavior_action),
+                "behavior_std_scale": float(cfg.inner_behavior_std_scale),
+                "perturbed_policy_output": "mean_only",
+                "behavior_log_std_source": "clean_actor",
+                "clean_log_std_mapping": str(cfg.inner_log_std_mapping),
+                "clean_log_std_min": float(cfg.inner_log_std_min),
+                "clean_log_std_max": float(cfg.inner_log_std_max),
+                "reset_per_action": True,
+                "recalibrate_per_round": True,
+                "calibration_relative_tolerance": 0.10,
+                "calibration_log_error_exponent": 0.5,
+                "calibration_update_ratio_min": 0.5,
+                "calibration_update_ratio_max": 2.0,
+            }
+        return spec
+
+    def _normalize_saved_critic_target_spec(self, spec):
+        """Upgrade exact states written before inner populations existed.
+
+        Legacy states are valid only for the disabled population mode.  In
+        that case the new settings are inert, so canonicalize them to this
+        agent's resolved disabled specification.  Active modes deliberately
+        receive no migration and fail the ordinary exact-spec comparison.
+        """
+
+        if not isinstance(spec, dict):
+            return spec
+        legacy_keys = {"outer_critic_target", "inner_sac_critic_target"}
+        if (
+            set(spec) == legacy_keys
+            and str(getattr(self.cfg, "inner_explorer_mode", "none")) == "none"
+        ):
+            return spec
+        return spec
 
     def training_state_dict(self):
         """Return exact outer and persistent inner state for run continuation."""
@@ -788,11 +955,14 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 "AMBI exact training state requires outer checkpoint version "
                 f"{expected_checkpoint_version}."
             )
-        if state["critic_target_spec"] != self._critic_target_spec():
+        saved_target_spec = self._normalize_saved_critic_target_spec(
+            state["critic_target_spec"]
+        )
+        if saved_target_spec != self._critic_target_spec():
             raise ValueError(
                 "AMBI exact training-state critic-target specification does not "
                 "match this agent: "
-                f"checkpoint={state['critic_target_spec']}, "
+                f"checkpoint={saved_target_spec}, "
                 f"configured={self._critic_target_spec()}."
             )
         for key in ("num_updates", "outer_version"):

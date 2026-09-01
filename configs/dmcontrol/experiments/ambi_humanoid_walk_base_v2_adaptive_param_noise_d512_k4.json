@@ -1,0 +1,26 @@
+{
+  "study_type": "single_seed_exploratory_adaptive_parameter_noise",
+  "study_note": "Adaptive parameter-noise population screen derived from base-v2 D512-1. It retains J=8, N=512, H=3, G=1, batch size 512, replay capacity 12,288, seed 55, and the 14-million-decision training budget. Each round assigns 256 rollouts to the clean inner actor and 256 to K=4 independently perturbed actors, or 64 rollouts per perturbed actor, without changing the 12,288 imagined transitions per real action. The perturbations target 0.10 post-tanh mean-action RMS and use the clean actor log standard deviation for SAC sampling. This is a single-seed exploratory screen and supports no confirmatory claim.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_humanoid_walk_base_v2_adaptive_param_noise_d512_k4"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": null,
+  "save_strat": "none",
+  "log_info": false,
+  "log_type": "summary"
+}

@@ -13,6 +13,7 @@ import time
 
 import torch
 
+from .common import init as td_init
 from .common import math as td_math
 from .common.compile_regions import CompileRegion
 from .common.inner_utils import (
@@ -27,6 +28,14 @@ from .common.inner_utils import (
 )
 from .common.latent_buffer import LatentReplayBuffer
 from .common.lora import lorafy_copy, lorafy_shared, trainable_parameters
+from .common.parameter_noise import (
+    adapt_parameter_noise_stddev,
+    classify_parameter_noise_actor,
+    make_perturbed_actor_parameters,
+    parameter_noise_action_rms,
+    population_actor_mean_raw,
+    sample_parameter_deltas,
+)
 from .common.training_state import (
     preflight_adam_state,
     preflight_module_state,
@@ -38,6 +47,7 @@ from .common.training_state import (
 
 _INNER_ALPHA_FLOOR = 1e-8
 _INNER_LOG_ALPHA_FLOOR = math.log(_INNER_ALPHA_FLOOR)
+_PARAMETER_NOISE_FUNCTIONAL_CHUNK_SIZE = 8
 
 
 @torch.no_grad()
@@ -88,6 +98,33 @@ class InnerWorkspace:
     critic_params: list[torch.nn.Parameter] = field(default_factory=list)
     actor_trainable_count: int = 0
     critic_trainable_count: int = 0
+    # Random-explorer components are deliberately action-local.  Keeping them
+    # in the same workspace/pool lets the hot allocations be reused without
+    # ever turning the freshly initialized explorer into persistent state.
+    explorer_actor: torch.nn.Module | None = None
+    explorer_actor_optim: torch.optim.Optimizer | None = None
+    explorer_actor_params: list[torch.nn.Parameter] = field(default_factory=list)
+    explorer_actor_trainable_count: int = 0
+    explorer_actor_steps: int = 0
+    explorer_actor_lifetime_steps: int = 0
+    explorer_critic: torch.nn.Module | None = None
+    explorer_critic_target: torch.nn.Module | None = None
+    explorer_critic_optim: torch.optim.Optimizer | None = None
+    explorer_critic_params: list[torch.nn.Parameter] = field(default_factory=list)
+    explorer_critic_trainable_count: int = 0
+    explorer_critic_steps: int = 0
+    explorer_critic_lifetime_steps: int = 0
+    explorer_critic_target_steps: int = 0
+    explorer_log_alpha: torch.nn.Parameter | None = None
+    explorer_alpha_fixed: torch.Tensor | None = None
+    explorer_temperature_optim: torch.optim.Optimizer | None = None
+    explorer_temperature_steps: int = 0
+    explorer_temperature_lifetime_steps: int = 0
+    sampled_sources: list[torch.Tensor] = field(default_factory=list)
+    primary_rollouts: int = 0
+    explorer_rollouts: int = 0
+    primary_transitions: int = 0
+    explorer_transitions: int = 0
 
 
 class InnerImprovementEngine:
@@ -108,6 +145,8 @@ class InnerImprovementEngine:
         self._mppi_prev_mean = None
         self._collect_diagnostics = True
         self._pending_timers = {}
+        self._parameter_noise_spec = None
+        self._clear_parameter_noise_action_state()
         self._initialize_compile_regions()
 
     def _initialize_compile_regions(self):
@@ -170,6 +209,39 @@ class InnerImprovementEngine:
         ):
             return alpha.clamp_min(_INNER_ALPHA_FLOOR)
         return alpha
+
+    @property
+    def _explorer_mode(self):
+        return str(getattr(self.cfg, "inner_explorer_mode", "none"))
+
+    @property
+    def _explorer_active(self):
+        """Whether replay contains a labelled auxiliary population."""
+        return self._explorer_mode != "none"
+
+    @property
+    def _materialized_explorer_active(self):
+        """Whether the auxiliary population owns a concrete actor module."""
+        return self._explorer_mode in {
+            "frozen_random",
+            "shared_mixture",
+            "separate_critics",
+        }
+
+    @property
+    def _parameter_noise_active(self):
+        return self._explorer_mode == "adaptive_param_noise"
+
+    @property
+    def explorer_alpha(self):
+        """Entropy coefficient owned by R in the separate-critic variant."""
+        state = self.state
+        if state.explorer_log_alpha is not None:
+            return state.explorer_log_alpha.exp().clamp_min(_INNER_ALPHA_FLOOR)
+        if state.explorer_alpha_fixed is not None:
+            return state.explorer_alpha_fixed
+        # Shared-mixture and frozen modes intentionally have no R alpha.
+        return self.alpha
 
     @property
     def _sac_actor_loss_scale_enabled(self):
@@ -280,6 +352,8 @@ class InnerImprovementEngine:
         self.episode_index = 0
         self._mppi_prev_mean = None
         self._pending_timers = {}
+        self._parameter_noise_spec = None
+        self._clear_parameter_noise_action_state()
         # A checkpoint load invalidates action-local module identities. Rebuild
         # only the non-serialized compile callables; model/checkpoint keys stay
         # untouched and ordinary action/episode resets retain their cache.
@@ -309,7 +383,27 @@ class InnerImprovementEngine:
         self._mppi_prev_mean = None
         self._collect_diagnostics = True
         self._pending_timers = {}
+        self._clear_parameter_noise_action_state()
         return self
+
+    def _clear_parameter_noise_action_state(self):
+        """Drop action-local adaptive-noise state and metric accumulators."""
+        self._parameter_noise_stddev = None
+        self._parameter_noise_sigma_values = []
+        self._parameter_noise_calibration_rms = []
+        self._parameter_noise_calibration_hits = []
+        self._parameter_noise_sigma_bound_hits = []
+        self._parameter_noise_behavior_action_rms = []
+        self._parameter_noise_saturation_sum = None
+        self._parameter_noise_saturation_count = 0
+        self._parameter_noise_calibration_probes = 0
+        self._parameter_noise_calibration_policy_evaluations = 0
+
+    def _reset_parameter_noise_action_state(self):
+        self._clear_parameter_noise_action_state()
+        if self._parameter_noise_active:
+            initial = float(self.cfg.inner_param_noise_sigma_init)
+            self._parameter_noise_stddev = initial
 
     def _timer_start(self):
         if self.device.type == "cuda":
@@ -384,6 +478,14 @@ class InnerImprovementEngine:
         "replay_draws",
         "policy_evaluations",
         "q_evaluations",
+        "explorer_actor_steps",
+        "explorer_critic_steps",
+        "explorer_critic_target_steps",
+        "explorer_temperature_steps",
+        "primary_rollouts",
+        "explorer_rollouts",
+        "primary_transitions",
+        "explorer_transitions",
     )
 
     @staticmethod
@@ -408,6 +510,7 @@ class InnerImprovementEngine:
         for name in self._ACTION_TRANSIENT_COUNTER_FIELDS:
             setattr(self.state, name, 0)
         self.state.sampled_ids.clear()
+        self.state.sampled_sources.clear()
         self._collect_diagnostics = True
 
     def _active_rl_workspace(self):
@@ -542,6 +645,42 @@ class InnerImprovementEngine:
                 "AMBI action-local diagnostic mode must be reset at the exact "
                 "resume boundary."
             )
+        explorer_live = {
+            name: value
+            for name in (
+                "explorer_actor",
+                "explorer_actor_optim",
+                "explorer_critic",
+                "explorer_critic_target",
+                "explorer_critic_optim",
+                "explorer_log_alpha",
+                "explorer_alpha_fixed",
+                "explorer_temperature_optim",
+            )
+            if (value := getattr(self.state, name)) is not None
+        }
+        explorer_counts = {
+            name: int(getattr(self.state, name))
+            for name in (
+                "explorer_actor_trainable_count",
+                "explorer_actor_lifetime_steps",
+                "explorer_critic_trainable_count",
+                "explorer_critic_lifetime_steps",
+                "explorer_temperature_lifetime_steps",
+            )
+            if int(getattr(self.state, name)) != 0
+        }
+        if (
+            explorer_live
+            or explorer_counts
+            or self.state.explorer_actor_params
+            or self.state.explorer_critic_params
+            or self.state.sampled_sources
+        ):
+            raise RuntimeError(
+                "Random-explorer state must be empty at the exact action/episode "
+                "resume boundary."
+            )
         initialized_rl = self._active_rl_workspace() and self.action_index > 0
         if initialized_rl:
             if self.state.outer_version < 0:
@@ -576,9 +715,12 @@ class InnerImprovementEngine:
         """Return persistent inner scientific state at an episode boundary."""
         self._require_resume_boundary()
         state = self.state
-        return {
+        payload = {
             "schema": "ambi-inner-engine-training-state",
-            "version": 1,
+            # Version 1 remains byte-for-byte compatible for feature-off runs.
+            # Version 2 records the active population identity; all R modules
+            # are action-local and are therefore intentionally absent here.
+            "version": 2 if self._explorer_active else 1,
             "action_index": int(self.action_index),
             "episode_index": int(self.episode_index),
             "rng": self.rng.training_state_dict(),
@@ -620,6 +762,9 @@ class InnerImprovementEngine:
             },
             "mppi_prev_mean": self._mppi_prev_mean,
         }
+        if self._explorer_active:
+            payload["explorer_mode"] = self._explorer_mode
+        return payload
 
     def _load_module_candidate(
         self,
@@ -674,9 +819,9 @@ class InnerImprovementEngine:
         return int(value)
 
     def _preflight_training_state_dict(self, state):
-        state = require_exact_keys(
-            state,
-            {
+        state = require_mapping(state, "AMBI inner-engine training state")
+        version = state.get("version")
+        common_keys = {
                 "schema",
                 "version",
                 "action_index",
@@ -684,12 +829,37 @@ class InnerImprovementEngine:
                 "rng",
                 "workspace",
                 "mppi_prev_mean",
-            },
+        }
+        if version == 1:
+            if self._explorer_active:
+                raise ValueError(
+                    "Legacy AMBI inner-engine state can only be loaded with "
+                    "inner_explorer_mode='none'."
+                )
+            expected_keys = common_keys
+        elif version == 2:
+            expected_keys = common_keys | {"explorer_mode"}
+            if not self._explorer_active:
+                raise ValueError(
+                    "Random-explorer AMBI state cannot be loaded with "
+                    "inner_explorer_mode='none'."
+                )
+            if state.get("explorer_mode") != self._explorer_mode:
+                raise ValueError(
+                    "AMBI random-explorer mode is incompatible: "
+                    f"checkpoint={state.get('explorer_mode')!r}, "
+                    f"configured={self._explorer_mode!r}."
+                )
+        else:
+            raise ValueError("Unsupported AMBI inner-engine training-state version.")
+        state = require_exact_keys(
+            state,
+            expected_keys,
             "AMBI inner-engine training state",
         )
         if (
             state["schema"] != "ambi-inner-engine-training-state"
-            or state["version"] != 1
+            or state["version"] not in {1, 2}
         ):
             raise ValueError("Unsupported AMBI inner-engine training-state version.")
         action_index = self._validate_index(state["action_index"], "action_index")
@@ -958,6 +1128,8 @@ class InnerImprovementEngine:
         self._mppi_prev_mean = candidate["mppi_prev_mean"]
         self._collect_diagnostics = True
         self._pending_timers = {}
+        self._parameter_noise_spec = None
+        self._clear_parameter_noise_action_state()
         self._initialize_compile_regions()
         return self
 
@@ -1062,6 +1234,49 @@ class InnerImprovementEngine:
             if str(cfg.inner_replay_scope) == "action" and state.replay is not None:
                 self._action_pool.replay = state.replay
             state.replay = None
+
+        # Active explorer configurations are validated as action-local.  Pool
+        # the allocations, but reset every scientific value at the next root.
+        if self._materialized_explorer_active and include_action:
+            pool = self._action_pool
+            if state.explorer_actor is not None:
+                pool.explorer_actor = state.explorer_actor
+                pool.explorer_actor_optim = state.explorer_actor_optim
+                pool.explorer_actor_params = state.explorer_actor_params
+                pool.explorer_actor_trainable_count = (
+                    state.explorer_actor_trainable_count
+                )
+            if state.explorer_critic is not None:
+                pool.explorer_critic = state.explorer_critic
+                pool.explorer_critic_target = state.explorer_critic_target
+                pool.explorer_critic_optim = state.explorer_critic_optim
+                pool.explorer_critic_params = state.explorer_critic_params
+                pool.explorer_critic_trainable_count = (
+                    state.explorer_critic_trainable_count
+                )
+            if (
+                state.explorer_log_alpha is not None
+                or state.explorer_alpha_fixed is not None
+            ):
+                pool.explorer_log_alpha = state.explorer_log_alpha
+                pool.explorer_alpha_fixed = state.explorer_alpha_fixed
+                pool.explorer_temperature_optim = state.explorer_temperature_optim
+
+            state.explorer_actor = state.explorer_actor_optim = None
+            state.explorer_actor_params = []
+            state.explorer_actor_trainable_count = 0
+            state.explorer_actor_lifetime_steps = 0
+            state.explorer_critic = state.explorer_critic_target = None
+            state.explorer_critic_optim = None
+            state.explorer_critic_params = []
+            state.explorer_critic_trainable_count = 0
+            state.explorer_critic_lifetime_steps = 0
+            state.explorer_log_alpha = state.explorer_alpha_fixed = None
+            state.explorer_temperature_optim = None
+            state.explorer_temperature_lifetime_steps = 0
+
+        if include_action:
+            self._clear_parameter_noise_action_state()
 
     @staticmethod
     def _reset_optimizer(optimizer):
@@ -1187,6 +1402,150 @@ class InnerImprovementEngine:
             anchor.load_state_dict(outer.state_dict())
             if target is not None:
                 target.load_state_dict(outer.state_dict())
+
+    def _prepare_explorer_workspace(self):
+        """Create/reset the action-local randomly initialized policy R."""
+        if not self._materialized_explorer_active:
+            return
+        state, pool, cfg = self.state, self._action_pool, self.cfg
+        mode = self._explorer_mode
+        train_actor = mode in {"shared_mixture", "separate_critics"}
+
+        explorer_actor = pool.explorer_actor
+        if explorer_actor is None:
+            # Deepcopy supplies only the architecture and device placement; the
+            # next line overwrites every initialized TD-MPC parameter.
+            explorer_actor = deepcopy(self.model._pi).to(self.device)
+        else:
+            pool.explorer_actor = None
+        explorer_actor.apply(td_init.weight_init)
+        # ``weight_init`` mirrors model construction for linear layers; the
+        # LayerNorm defaults are supplied by their constructors and therefore
+        # need an explicit reset when reusing/deep-copying an actor.
+        for module in explorer_actor.modules():
+            if isinstance(module, torch.nn.LayerNorm):
+                module.reset_parameters()
+        explorer_actor.requires_grad_(train_actor)
+        explorer_actor.train(train_actor)
+        state.explorer_actor = explorer_actor
+        state.explorer_actor_params = (
+            trainable_parameters(explorer_actor) if train_actor else []
+        )
+        state.explorer_actor_trainable_count = sum(
+            parameter.numel() for parameter in state.explorer_actor_params
+        )
+        state.explorer_actor_lifetime_steps = 0
+
+        explorer_actor_optim = pool.explorer_actor_optim
+        pool.explorer_actor_optim = None
+        if train_actor and int(
+            getattr(cfg, "inner_explorer_actor_updates_per_round", 0)
+        ) > 0:
+            if explorer_actor_optim is None:
+                explorer_actor_optim = self._new_optimizer(explorer_actor, "actor")
+            else:
+                self._reset_optimizer(explorer_actor_optim)
+        else:
+            explorer_actor_optim = None
+        state.explorer_actor_optim = explorer_actor_optim
+
+        if mode == "separate_critics":
+            explorer_critic = pool.explorer_critic
+            pool.explorer_critic = None
+            if explorer_critic is None:
+                explorer_critic = deepcopy(self.model._Qs).to(self.device)
+            else:
+                explorer_critic.load_state_dict(self.model._Qs.state_dict())
+            explorer_critic.requires_grad_(True)
+            explorer_critic.train(bool(cfg.inner_critic_dropout_enabled))
+            state.explorer_critic = explorer_critic
+            state.explorer_critic_params = trainable_parameters(explorer_critic)
+            state.explorer_critic_trainable_count = sum(
+                parameter.numel() for parameter in state.explorer_critic_params
+            )
+            state.explorer_critic_lifetime_steps = 0
+
+            explorer_target = pool.explorer_critic_target
+            pool.explorer_critic_target = None
+            if explorer_target is None:
+                explorer_target = deepcopy(explorer_critic).to(self.device)
+            else:
+                explorer_target.load_state_dict(explorer_critic.state_dict())
+            explorer_target.requires_grad_(False).eval()
+            state.explorer_critic_target = explorer_target
+            if bool(getattr(cfg, "compile", False)):
+                for critic in (explorer_critic, explorer_target):
+                    if hasattr(critic, "enable_compile"):
+                        critic.enable_compile(
+                            strict=bool(getattr(cfg, "compile_strict", False))
+                        )
+
+            explorer_critic_optim = pool.explorer_critic_optim
+            pool.explorer_critic_optim = None
+            if int(getattr(cfg, "inner_explorer_critic_updates_per_round", 0)) > 0:
+                if explorer_critic_optim is None:
+                    explorer_critic_optim = self._new_optimizer(
+                        explorer_critic, "critic"
+                    )
+                else:
+                    self._reset_optimizer(explorer_critic_optim)
+            else:
+                explorer_critic_optim = None
+            state.explorer_critic_optim = explorer_critic_optim
+
+            temperature_mode = str(cfg.inner_temperature_mode)
+            explorer_log_alpha = pool.explorer_log_alpha
+            explorer_alpha_fixed = pool.explorer_alpha_fixed
+            explorer_temperature_optim = pool.explorer_temperature_optim
+            pool.explorer_log_alpha = pool.explorer_alpha_fixed = None
+            pool.explorer_temperature_optim = None
+            if temperature_mode == "auto":
+                initial_log_alpha = self._initial_inner_alpha().log()
+                if explorer_log_alpha is None:
+                    explorer_log_alpha = torch.nn.Parameter(
+                        initial_log_alpha.clone()
+                    )
+                else:
+                    with torch.no_grad():
+                        explorer_log_alpha.copy_(initial_log_alpha)
+                explorer_alpha_fixed = None
+                if int(
+                    getattr(cfg, "inner_explorer_temperature_updates_per_round", 0)
+                ) > 0:
+                    if explorer_temperature_optim is None:
+                        explorer_temperature_optim = torch.optim.Adam(
+                            [explorer_log_alpha],
+                            lr=float(cfg.inner_temperature_lr),
+                            eps=float(cfg.inner_adam_eps),
+                            capturable=False,
+                            foreach=self.device.type == "cuda",
+                        )
+                    else:
+                        self._reset_optimizer(explorer_temperature_optim)
+                else:
+                    explorer_temperature_optim = None
+            else:
+                explorer_log_alpha = explorer_temperature_optim = None
+                inherited = (
+                    self.agent.alpha.detach().clone()
+                    if temperature_mode == "inherit_outer"
+                    else torch.tensor(float(cfg.inner_temperature), device=self.device)
+                )
+                if explorer_alpha_fixed is None:
+                    explorer_alpha_fixed = inherited
+                else:
+                    explorer_alpha_fixed.copy_(inherited)
+            state.explorer_log_alpha = explorer_log_alpha
+            state.explorer_alpha_fixed = explorer_alpha_fixed
+            state.explorer_temperature_optim = explorer_temperature_optim
+            state.explorer_temperature_lifetime_steps = 0
+        else:
+            state.explorer_critic = state.explorer_critic_target = None
+            state.explorer_critic_optim = None
+            state.explorer_critic_params = []
+            state.explorer_critic_trainable_count = 0
+            state.explorer_log_alpha = state.explorer_alpha_fixed = None
+            state.explorer_temperature_optim = None
 
     def _prepare_workspace(self, *, t0):
         state, cfg = self.state, self.cfg
@@ -1376,6 +1735,7 @@ class InnerImprovementEngine:
                     latent_dim=cfg.latent_dim,
                     action_dim=cfg.action_dim,
                     device=self.device,
+                    store_source=self._explorer_active,
                 )
         elif outer_changed:
             # Latents are coordinates of the current encoder/dynamics and may
@@ -1388,6 +1748,12 @@ class InnerImprovementEngine:
         state.replay_draws = 0
         state.policy_evaluations = state.q_evaluations = 0
         state.sampled_ids.clear()
+        state.sampled_sources.clear()
+        state.explorer_actor_steps = state.explorer_critic_steps = 0
+        state.explorer_critic_target_steps = 0
+        state.explorer_temperature_steps = 0
+        state.primary_rollouts = state.explorer_rollouts = 0
+        state.primary_transitions = state.explorer_transitions = 0
         if actor_was_missing and not actor_restored:
             state.actor_params = trainable_parameters(state.actor)
             state.actor_trainable_count = sum(
@@ -1410,6 +1776,8 @@ class InnerImprovementEngine:
             state.critic_target.eval()
         if state.actor_target is not None:
             state.actor_target.eval()
+        self._prepare_explorer_workspace()
+        self._reset_parameter_noise_action_state()
 
     def make_modules_for_compatibility(self):
         """Legacy test/debug hook returning freshly created inner modules."""
@@ -1466,7 +1834,7 @@ class InnerImprovementEngine:
                 std_scale=std_scale,
                 **kwargs,
             )
-        if hasattr(self.model, "pi_action"):
+        if hasattr(self.model, "pi_action") and not return_info:
             mean = self.model.pi_action(
                 z,
                 policy=policy,
@@ -1490,8 +1858,552 @@ class InnerImprovementEngine:
         return (mean + noise * float(noise_std)).clamp(-1.0, 1.0), info
 
     @torch.no_grad()
+    def _collect_policy_population(
+        self,
+        root_z,
+        policy,
+        *,
+        count,
+        horizon,
+        source,
+        generator,
+    ):
+        """Collect one rollout population while preserving actor identity."""
+        cfg, state = self.cfg, self.state
+        z = root_z.expand(count, -1).clone()
+        alive = torch.ones(count, dtype=torch.bool, device=self.device)
+        lengths = torch.zeros(count, dtype=torch.long, device=self.device)
+        reward_sums = torch.zeros(count, device=self.device)
+        discounted_rewards = torch.zeros(count, device=self.device)
+        terminated_rollout = torch.zeros(count, dtype=torch.bool, device=self.device)
+        discounts = torch.ones(count, device=self.device)
+        transition_fields = ([], [], [], [], [])
+        transition_count = 0
+        std_scale = float(cfg.inner_behavior_std_scale)
+        behavior_mode = str(cfg.inner_behavior_action)
+        if behavior_mode == "policy_sample" and std_scale == 0.0:
+            behavior_mode = "mean"
+
+        for _ in range(horizon):
+            active = (
+                torch.nonzero(alive, as_tuple=False).squeeze(-1)
+                if cfg.episodic
+                else torch.arange(count, device=self.device)
+            )
+            if active.numel() == 0:
+                break
+            active_z = z.index_select(0, active)
+            action, _ = self._policy_action(
+                active_z,
+                policy,
+                mode=behavior_mode,
+                generator=generator,
+                std_scale=max(std_scale, 1e-12),
+                noise_std=cfg.inner_behavior_noise_std,
+            )
+            active_count = int(active.numel())
+            state.policy_evaluations += active_count
+            transition_count += active_count
+            joint = self.model.joint_input(active_z, action)
+            reward = td_math.two_hot_inv(self.model.reward_from_joint(joint), cfg)
+            next_z = self.model.next_from_joint(joint)
+            terminated = (
+                (
+                    self.model.termination(next_z)
+                    > float(cfg.inner_termination_threshold)
+                ).float()
+                if cfg.episodic
+                else reward.new_zeros(active_count, 1)
+            )
+            for field, value in zip(
+                transition_fields,
+                (active_z, action, reward, next_z, terminated),
+            ):
+                field.append(value)
+            reward_vector = reward.squeeze(-1)
+            lengths[active] += 1
+            reward_sums[active] += reward_vector
+            discounted_rewards[active] += discounts[active] * reward_vector
+            discounts[active] *= float(self.agent.discount)
+            z[active] = next_z
+            if cfg.episodic:
+                just_terminated = terminated.squeeze(-1) >= 0.5
+                terminated_rollout[active] |= just_terminated
+                alive[active] = ~just_terminated
+
+        if transition_fields[0]:
+            flattened_fields = tuple(
+                torch.cat(values, dim=0) for values in transition_fields
+            )
+            state.replay.add_batch(
+                *flattened_fields,
+                source=int(source),
+            )
+            transition_rewards = flattened_fields[2].reshape(-1)
+            transition_terminated = flattened_fields[4].reshape(-1).to(
+                dtype=torch.bool
+            )
+        else:
+            transition_rewards = root_z.new_empty(0)
+            transition_terminated = torch.empty(
+                0, dtype=torch.bool, device=self.device
+            )
+        return {
+            "lengths": lengths,
+            "reward_sums": reward_sums,
+            "discounted_rewards": discounted_rewards,
+            "terminated": terminated_rollout,
+            "transition_count": transition_count,
+            "sources": torch.full(
+                (count,), int(source), dtype=torch.uint8, device=self.device
+            ),
+            "transition_rewards": transition_rewards,
+            "transition_terminated": transition_terminated,
+            "transition_sources": torch.full(
+                (transition_count,),
+                int(source),
+                dtype=torch.uint8,
+                device=self.device,
+            ),
+        }
+
+    def _parameter_noise_actor_spec(self):
+        if self._parameter_noise_spec is None:
+            self._parameter_noise_spec = classify_parameter_noise_actor(
+                self.state.actor,
+                action_dim=int(self.cfg.action_dim),
+            )
+        return self._parameter_noise_spec
+
+    @torch.no_grad()
+    def _calibrate_parameter_noise(self, root_z, generator):
+        """Fit sigma at a round boundary using only previously known states."""
+        cfg, state = self.cfg, self.state
+        spec = self._parameter_noise_actor_spec()
+        directions = int(cfg.inner_param_noise_calibration_directions)
+        batch_size = int(cfg.inner_param_noise_calibration_batch_size)
+        if int(root_z.shape[0]) != 1:
+            raise ValueError(
+                "Adaptive parameter-noise calibration expects one root latent."
+            )
+        calibration_rows = [root_z.detach()]
+        replay_rows = min(max(0, batch_size - 1), int(state.replay.size))
+        if replay_rows:
+            # Uniform without replacement. Round one has an empty replay and
+            # therefore calibrates on the root alone; later rounds can use at
+            # most B-1 states that existed before the current collection.
+            indices = torch.randperm(
+                int(state.replay.size),
+                device=self.device,
+                generator=generator,
+            )[:replay_rows]
+            calibration_rows.append(
+                state.replay.z[: state.replay.size]
+                .index_select(0, indices)
+                .detach()
+            )
+        sampled = torch.cat(calibration_rows, dim=0)
+        calibration_latents = sampled.unsqueeze(0).expand(directions, -1, -1)
+        deltas = sample_parameter_deltas(
+            state.actor,
+            spec,
+            directions,
+            generator=generator,
+        )
+
+        sigma = float(self._parameter_noise_stddev)
+        target = float(cfg.inner_param_noise_target_action_rms)
+        target_hit = False
+        evaluations_per_probe = 2 * directions * int(sampled.shape[0])
+        for _ in range(int(cfg.inner_param_noise_calibration_max_probes)):
+            parameters = make_perturbed_actor_parameters(
+                state.actor,
+                spec,
+                deltas,
+                sigma,
+            )
+            measured = parameter_noise_action_rms(
+                state.actor,
+                spec,
+                parameters,
+                calibration_latents,
+                chunk_size=_PARAMETER_NOISE_FUNCTIONAL_CHUNK_SIZE,
+            )
+            if not bool(torch.isfinite(measured).item()):
+                raise RuntimeError(
+                    "Adaptive parameter-noise calibration produced a non-finite "
+                    "post-tanh action RMS."
+                )
+            self._parameter_noise_calibration_rms.append(measured.detach())
+            self._parameter_noise_calibration_probes += 1
+            self._parameter_noise_calibration_policy_evaluations += (
+                evaluations_per_probe
+            )
+            state.policy_evaluations += evaluations_per_probe
+
+            measured_value = float(measured.item())
+            target_hit = abs(measured_value - target) <= 0.10 * target
+            if target_hit:
+                self._parameter_noise_sigma_bound_hits.append(0.0)
+                break
+            sigma = adapt_parameter_noise_stddev(
+                sigma,
+                measured_value,
+                target,
+                adaptation_rate=0.5,
+                min_stddev=float(cfg.inner_param_noise_sigma_min),
+                max_stddev=float(cfg.inner_param_noise_sigma_max),
+                max_update_ratio=2.0,
+            )
+            at_bound = sigma in {
+                float(cfg.inner_param_noise_sigma_min),
+                float(cfg.inner_param_noise_sigma_max),
+            }
+            self._parameter_noise_sigma_bound_hits.append(float(at_bound))
+            if at_bound:
+                break
+
+        self._parameter_noise_stddev = float(sigma)
+        self._parameter_noise_sigma_values.append(float(sigma))
+        self._parameter_noise_calibration_hits.append(float(target_hit))
+        return spec
+
+    @torch.no_grad()
+    def _collect_parameter_noise_population(
+        self,
+        root_z,
+        *,
+        spec,
+        batched_parameters,
+        actor_count,
+        rollouts_per_actor,
+        horizon,
+        generator,
+    ):
+        """Roll out K fixed perturbed actors with equal actor-major groups."""
+        cfg, state = self.cfg, self.state
+        count = actor_count * rollouts_per_actor
+        z = (
+            root_z.expand(actor_count, rollouts_per_actor, -1)
+            .clone()
+            .contiguous()
+        )
+        alive = torch.ones(count, dtype=torch.bool, device=self.device)
+        lengths = torch.zeros(count, dtype=torch.long, device=self.device)
+        reward_sums = torch.zeros(count, device=self.device)
+        discounted_rewards = torch.zeros(count, device=self.device)
+        terminated_rollout = torch.zeros(
+            count, dtype=torch.bool, device=self.device
+        )
+        discounts = torch.ones(count, device=self.device)
+        transition_fields = ([], [], [], [], [])
+        transition_count = 0
+        action_dim = int(cfg.action_dim)
+        std_scale = max(float(cfg.inner_behavior_std_scale), 1e-12)
+
+        for _ in range(horizon):
+            active = (
+                torch.nonzero(alive, as_tuple=False).squeeze(-1)
+                if cfg.episodic
+                else torch.arange(count, device=self.device)
+            )
+            if active.numel() == 0:
+                break
+            flat_z = z.reshape(count, -1)
+            noisy_mean_raw = population_actor_mean_raw(
+                state.actor,
+                spec,
+                batched_parameters,
+                z,
+                chunk_size=_PARAMETER_NOISE_FUNCTIONAL_CHUNK_SIZE,
+            )
+            clean_stats = self.model.policy_stats(
+                flat_z,
+                policy=state.actor,
+                std_scale=std_scale,
+                **self._inner_policy_kwargs(),
+            )
+            if noisy_mean_raw.shape != (
+                actor_count,
+                rollouts_per_actor,
+                action_dim,
+            ):
+                raise RuntimeError(
+                    "Perturbed actor population returned an unexpected action shape: "
+                    f"{tuple(noisy_mean_raw.shape)}."
+                )
+            torch._assert_async(
+                torch.isfinite(noisy_mean_raw).all(),
+                "Adaptive parameter-noise behavior produced non-finite means.",
+            )
+            noise = torch.randn(
+                noisy_mean_raw.shape,
+                dtype=noisy_mean_raw.dtype,
+                device=noisy_mean_raw.device,
+                generator=generator,
+            )
+            clean_log_std = clean_stats["log_std"].reshape(
+                actor_count, rollouts_per_actor, action_dim
+            )
+            action_population = torch.tanh(
+                noisy_mean_raw + noise * clean_log_std.exp()
+            )
+            noisy_mean = torch.tanh(noisy_mean_raw).reshape(count, action_dim)
+            clean_mean = clean_stats["mean"].reshape(count, action_dim)
+
+            active_count = int(active.numel())
+            active_z = flat_z.index_select(0, active)
+            action = action_population.reshape(count, action_dim).index_select(
+                0, active
+            )
+            torch._assert_async(
+                torch.isfinite(action).all(),
+                "Adaptive parameter-noise behavior produced non-finite actions.",
+            )
+
+            row_rms = (
+                (noisy_mean - clean_mean).square().mean(dim=-1).sqrt()
+            ).index_select(0, active)
+            self._parameter_noise_behavior_action_rms.append(row_rms.detach())
+            active_noisy_mean = noisy_mean.index_select(0, active)
+            saturation = (active_noisy_mean.abs() >= 0.99).sum()
+            if self._parameter_noise_saturation_sum is None:
+                self._parameter_noise_saturation_sum = saturation
+            else:
+                self._parameter_noise_saturation_sum = (
+                    self._parameter_noise_saturation_sum + saturation
+                )
+            self._parameter_noise_saturation_count += active_count * action_dim
+
+            # Both the functional noisy actor and the clean actor statistics
+            # execute for every fixed-shape group row at each horizon step.
+            state.policy_evaluations += 2 * count
+            transition_count += active_count
+            joint = self.model.joint_input(active_z, action)
+            reward = td_math.two_hot_inv(self.model.reward_from_joint(joint), cfg)
+            next_z = self.model.next_from_joint(joint)
+            terminated = (
+                (
+                    self.model.termination(next_z)
+                    > float(cfg.inner_termination_threshold)
+                ).float()
+                if cfg.episodic
+                else reward.new_zeros(active_count, 1)
+            )
+            for field, value in zip(
+                transition_fields,
+                (active_z, action, reward, next_z, terminated),
+            ):
+                field.append(value)
+            reward_vector = reward.squeeze(-1)
+            lengths[active] += 1
+            reward_sums[active] += reward_vector
+            discounted_rewards[active] += discounts[active] * reward_vector
+            discounts[active] *= float(self.agent.discount)
+            flat_z[active] = next_z
+            if cfg.episodic:
+                just_terminated = terminated.squeeze(-1) >= 0.5
+                terminated_rollout[active] |= just_terminated
+                alive[active] = ~just_terminated
+
+        if transition_fields[0]:
+            flattened_fields = tuple(
+                torch.cat(values, dim=0) for values in transition_fields
+            )
+            state.replay.add_batch(*flattened_fields, source=1)
+            transition_rewards = flattened_fields[2].reshape(-1)
+            transition_terminated = flattened_fields[4].reshape(-1).to(
+                dtype=torch.bool
+            )
+        else:
+            transition_rewards = root_z.new_empty(0)
+            transition_terminated = torch.empty(
+                0, dtype=torch.bool, device=self.device
+            )
+        return {
+            "lengths": lengths,
+            "reward_sums": reward_sums,
+            "discounted_rewards": discounted_rewards,
+            "terminated": terminated_rollout,
+            "transition_count": transition_count,
+            "sources": torch.ones(count, dtype=torch.uint8, device=self.device),
+            "transition_rewards": transition_rewards,
+            "transition_terminated": transition_terminated,
+            "transition_sources": torch.ones(
+                transition_count, dtype=torch.uint8, device=self.device
+            ),
+        }
+
+    @torch.no_grad()
+    def _collect_parameter_noise_round(self, root_z):
+        """Collect clean P and grouped parameter-noise populations."""
+        cfg, state = self.cfg, self.state
+        primary_count = int(cfg.inner_primary_rollouts_per_round)
+        explorer_count = int(cfg.inner_explorer_rollouts_per_round)
+        actor_count = int(cfg.inner_param_noise_actor_count)
+        rollouts_per_actor = int(cfg.inner_param_noise_rollouts_per_actor)
+        if explorer_count != actor_count * rollouts_per_actor:
+            raise RuntimeError(
+                "Adaptive parameter-noise rollout allocation is not exactly grouped."
+            )
+        if primary_count <= 0 or explorer_count <= 0:
+            raise RuntimeError(
+                "Adaptive parameter-noise rounds require non-empty populations."
+            )
+
+        training_modes = tuple(
+            (module, bool(module.training))
+            for root in (state.actor, self.model)
+            for module in root.modules()
+        )
+        state.actor.eval()
+        self.model.eval()
+        try:
+            # Calibration is logically part of round initialization. It sees
+            # the root plus replay states from completed rounds only, and its
+            # random draws cannot perturb behavior collection's RNG sequence.
+            calibration_start = self._timer_start()
+            with self.rng.fork("initialization") as calibration_generator:
+                spec = self._calibrate_parameter_noise(
+                    root_z,
+                    calibration_generator,
+                )
+            self._timer_stop(
+                "inner_param_noise_calibration_seconds", calibration_start
+            )
+            with self.rng.fork("collection") as generator:
+                primary = self._collect_policy_population(
+                    root_z,
+                    state.actor,
+                    count=primary_count,
+                    horizon=int(cfg.inner_rollout_horizon),
+                    source=0,
+                    generator=generator,
+                )
+                deltas = sample_parameter_deltas(
+                    state.actor,
+                    spec,
+                    actor_count,
+                    generator=generator,
+                )
+                parameters = make_perturbed_actor_parameters(
+                    state.actor,
+                    spec,
+                    deltas,
+                    float(self._parameter_noise_stddev),
+                )
+                explorer = self._collect_parameter_noise_population(
+                    root_z,
+                    spec=spec,
+                    batched_parameters=parameters,
+                    actor_count=actor_count,
+                    rollouts_per_actor=rollouts_per_actor,
+                    horizon=int(cfg.inner_rollout_horizon),
+                    generator=generator,
+                )
+        finally:
+            for module, was_training in training_modes:
+                module.training = was_training
+
+        state.primary_rollouts += primary_count
+        state.explorer_rollouts += explorer_count
+        state.primary_transitions += int(primary["transition_count"])
+        state.explorer_transitions += int(explorer["transition_count"])
+        return {
+            key: torch.cat((primary[key], explorer[key]), dim=0)
+            for key in (
+                "lengths",
+                "reward_sums",
+                "discounted_rewards",
+                "terminated",
+                "sources",
+                "transition_rewards",
+                "transition_terminated",
+                "transition_sources",
+            )
+        } | {
+            "transition_count": int(primary["transition_count"])
+            + int(explorer["transition_count"])
+        }
+
+    @torch.no_grad()
+    def _collect_explorer_round(self, root_z):
+        """Collect exact P/R populations into one source-labelled replay."""
+        cfg, state = self.cfg, self.state
+        total = int(cfg.inner_rollouts_per_round)
+        horizon = int(cfg.inner_rollout_horizon)
+        primary_exact = total * float(cfg.inner_prior_rollout_weight)
+        primary_count = int(round(primary_exact))
+        if not math.isclose(primary_exact, primary_count, abs_tol=1e-9):
+            raise RuntimeError(
+                "inner_rollouts_per_round * inner_prior_rollout_weight must "
+                "resolve to an integer population."
+            )
+        explorer_count = total - primary_count
+        if primary_count <= 0 or explorer_count <= 0:
+            raise RuntimeError("Active explorer rounds require non-empty P and R populations.")
+
+        training_modes = tuple(
+            (module, bool(module.training))
+            for root in (state.actor, state.explorer_actor, self.model)
+            for module in root.modules()
+        )
+        state.actor.eval()
+        state.explorer_actor.eval()
+        self.model.eval()
+        try:
+            with self.rng.fork("collection") as generator:
+                # Fixed order is part of the reproducibility contract.
+                primary = self._collect_policy_population(
+                    root_z,
+                    state.actor,
+                    count=primary_count,
+                    horizon=horizon,
+                    source=0,
+                    generator=generator,
+                )
+                explorer = self._collect_policy_population(
+                    root_z,
+                    state.explorer_actor,
+                    count=explorer_count,
+                    horizon=horizon,
+                    source=1,
+                    generator=generator,
+                )
+        finally:
+            # Restore exact per-module modes; calling model.train(...) here
+            # would incorrectly switch frozen target critics back to training.
+            for module, was_training in training_modes:
+                module.training = was_training
+
+        state.primary_rollouts += primary_count
+        state.explorer_rollouts += explorer_count
+        state.primary_transitions += int(primary["transition_count"])
+        state.explorer_transitions += int(explorer["transition_count"])
+        return {
+            key: torch.cat((primary[key], explorer[key]), dim=0)
+            for key in (
+                "lengths",
+                "reward_sums",
+                "discounted_rewards",
+                "terminated",
+                "sources",
+                "transition_rewards",
+                "transition_terminated",
+                "transition_sources",
+            )
+        } | {
+            "transition_count": int(primary["transition_count"])
+            + int(explorer["transition_count"])
+        }
+
+    @torch.no_grad()
     def _collect_round(self, root_z):
         cfg, state = self.cfg, self.state
+        if self._parameter_noise_active:
+            return self._collect_parameter_noise_round(root_z)
+        if self._materialized_explorer_active:
+            return self._collect_explorer_round(root_z)
         count = int(cfg.inner_rollouts_per_round)
         horizon = int(cfg.inner_rollout_horizon)
         if count == 0:
@@ -1701,6 +2613,8 @@ class InnerImprovementEngine:
         self.state.replay_draws += int(batch["z"].shape[0])
         if self._collect_diagnostics and "sample_ids" in batch:
             self.state.sampled_ids.append(batch["sample_ids"].detach())
+        if "source" in batch:
+            self.state.sampled_sources.append(batch["source"].detach())
         return batch
 
     def _bootstrap_q(
@@ -1823,7 +2737,7 @@ class InnerImprovementEngine:
         state.critic_steps += 1
         state.critic_lifetime_steps += 1
 
-        return {
+        metrics = {
             "critic_loss": critic_loss.detach(),
             "critic_grad_norm": torch.as_tensor(grad_norm).detach(),
             "q_mean": values.mean(),
@@ -1832,6 +2746,301 @@ class InnerImprovementEngine:
             "q_target_clip_fraction": clip_fraction.detach(),
             "td_error_abs_mean": (values - target_q.unsqueeze(0)).abs().mean(),
         }
+        metrics.update(self._source_td_metrics(batch, values, target_q))
+        return metrics
+
+    @staticmethod
+    def _source_td_metrics(batch, values, target_q, *, prefix=""):
+        if "source" not in batch:
+            return {}
+        row_error = (values - target_q.unsqueeze(0)).abs().mean(dim=0).reshape(-1)
+        source = batch["source"].reshape(-1).to(dtype=torch.long)
+        result = {}
+        for value, label in ((0, "primary"), (1, "explorer")):
+            selected = row_error[source == value]
+            if selected.numel():
+                stem = f"{prefix}{label}_td_error_abs"
+                result[f"{stem}_mean"] = selected.mean()
+                result[f"{stem}_sum"] = selected.sum()
+                result[f"{stem}_count"] = selected.new_tensor(selected.numel())
+        return result
+
+    def _inner_policy_kwargs(self):
+        return {
+            "log_std_mapping": self.cfg.inner_log_std_mapping,
+            "log_std_min": self.cfg.inner_log_std_min,
+            "log_std_max": self.cfg.inner_log_std_max,
+        }
+
+    def _q_with(self, z, action, critic, *, reduction=None):
+        return self.model.Q(
+            z,
+            action,
+            qs=critic,
+            reduction=(reduction or self.cfg.inner_q_target_reduction),
+        )
+
+    def _q_target_clip_fraction(self, target_q):
+        if self.cfg.q_representation != "distributional":
+            return target_q.new_zeros(())
+        symlog_target = td_math.symlog(target_q.detach())
+        return (
+            (symlog_target <= float(self.cfg.q_vmin))
+            | (symlog_target >= float(self.cfg.q_vmax))
+        ).float().mean()
+
+    def _shared_mixture_critic_step(self, batch, alpha):
+        """One Q^mu update with a source-independent continuation mixture."""
+        state, cfg = self.state, self.cfg
+        batch_size = int(batch["z"].shape[0])
+        generator = self.rng.generator("bootstrap")
+        shape = (*batch["next_z"].shape[:-1], int(cfg.action_dim))
+        primary_noise = torch.randn(
+            shape,
+            device=self.device,
+            dtype=batch["next_z"].dtype,
+            generator=generator,
+        )
+        explorer_noise = torch.randn(
+            shape,
+            device=self.device,
+            dtype=batch["next_z"].dtype,
+            generator=generator,
+        )
+        weight = float(cfg.inner_prior_rollout_weight)
+        with torch.no_grad():
+            primary_action, primary_info = self.model.pi(
+                batch["next_z"],
+                policy=state.actor,
+                noise=primary_noise,
+                **self._inner_policy_kwargs(),
+            )
+            explorer_action, explorer_info = self.model.pi(
+                batch["next_z"],
+                policy=state.explorer_actor,
+                noise=explorer_noise,
+                **self._inner_policy_kwargs(),
+            )
+            estimator = str(cfg.inner_mixture_target_estimator)
+            if estimator == "stratified":
+                primary_exact = batch_size * weight
+                primary_count = int(round(primary_exact))
+                if not math.isclose(primary_exact, primary_count, abs_tol=1e-9):
+                    raise RuntimeError(
+                        "inner_batch_size * inner_prior_rollout_weight must be "
+                        "integral for stratified mixture targets."
+                    )
+                permutation = torch.randperm(
+                    batch_size, device=self.device, generator=generator
+                )
+                choose_primary = torch.zeros(
+                    batch_size, 1, dtype=torch.bool, device=self.device
+                )
+                choose_primary[permutation[:primary_count]] = True
+                next_action = torch.where(
+                    choose_primary, primary_action, explorer_action
+                )
+                pre_tanh_action = torch.where(
+                    choose_primary,
+                    primary_info["pre_tanh_action"],
+                    explorer_info["pre_tanh_action"],
+                )
+                log_mu = self.model.mixture_log_prob(
+                    pre_tanh_action,
+                    primary_info,
+                    explorer_info,
+                    weight,
+                )
+                bootstrap = self._bootstrap_q(batch["next_z"], next_action)
+                state.q_evaluations += batch_size
+                if cfg.inner_sac_critic_target == "entropy_augmented":
+                    bootstrap = bootstrap - alpha * log_mu
+            elif estimator == "weighted":
+                primary_log_mu = self.model.mixture_log_prob(
+                    primary_info["pre_tanh_action"],
+                    primary_info,
+                    explorer_info,
+                    weight,
+                )
+                explorer_log_mu = self.model.mixture_log_prob(
+                    explorer_info["pre_tanh_action"],
+                    primary_info,
+                    explorer_info,
+                    weight,
+                )
+                # One critic call makes the randomly selected Q pair common to
+                # both mixture components instead of injecting component-wise
+                # evaluator noise into the weighted expectation.
+                both_value = self._bootstrap_q(
+                    torch.cat((batch["next_z"], batch["next_z"]), dim=0),
+                    torch.cat((primary_action, explorer_action), dim=0),
+                )
+                primary_value, explorer_value = both_value.split(batch_size, dim=0)
+                state.q_evaluations += 2 * batch_size
+                if cfg.inner_sac_critic_target == "entropy_augmented":
+                    primary_value = primary_value - alpha * primary_log_mu
+                    explorer_value = explorer_value - alpha * explorer_log_mu
+                bootstrap = weight * primary_value + (1.0 - weight) * explorer_value
+            else:
+                raise ValueError(
+                    f"Unknown inner mixture target estimator: {estimator!r}"
+                )
+            target_q = batch["reward"] + float(self.agent.discount) * (
+                1.0 - batch["terminated"]
+            ) * bootstrap
+
+        state.policy_evaluations += 2 * batch_size
+        predictions = self.model.q_predictions(
+            batch["z"], batch["action"], qs=state.critic
+        )
+        critic_loss = self.model.critic_loss(predictions, target_q)
+        values = self.model.q_backend.decode(predictions.detach())
+        state.q_evaluations += batch_size
+        state.critic_optim.zero_grad(set_to_none=True)
+        critic_loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            state.critic_params, float(cfg.inner_critic_grad_clip_norm)
+        )
+        state.critic_optim.step()
+        state.critic_steps += 1
+        state.critic_lifetime_steps += 1
+        metrics = {
+            "critic_loss": critic_loss.detach(),
+            "critic_grad_norm": torch.as_tensor(grad_norm).detach(),
+            "q_mean": values.mean(),
+            "q_abs_mean": values.abs().mean(),
+            "q_target_mean": target_q.mean(),
+            "q_target_clip_fraction": self._q_target_clip_fraction(target_q),
+            "td_error_abs_mean": (values - target_q.unsqueeze(0)).abs().mean(),
+        }
+        metrics.update(self._source_td_metrics(batch, values, target_q))
+        return metrics
+
+    def _separate_critics_step(
+        self,
+        batch,
+        *,
+        update_primary,
+        update_explorer,
+    ):
+        """Paired Q_P/Q_R updates from the same replay minibatch."""
+        state, cfg = self.state, self.cfg
+        batch_size = int(batch["z"].shape[0])
+        generator = self.rng.generator("bootstrap")
+        shape = (*batch["next_z"].shape[:-1], int(cfg.action_dim))
+        primary_noise = torch.randn(
+            shape,
+            device=self.device,
+            dtype=batch["next_z"].dtype,
+            generator=generator,
+        )
+        explorer_noise = torch.randn(
+            shape,
+            device=self.device,
+            dtype=batch["next_z"].dtype,
+            generator=generator,
+        )
+        with torch.no_grad():
+            primary_action, primary_info = self.model.pi(
+                batch["next_z"],
+                policy=state.actor,
+                noise=primary_noise,
+                **self._inner_policy_kwargs(),
+            )
+            explorer_action, explorer_info = self.model.pi(
+                batch["next_z"],
+                policy=state.explorer_actor,
+                noise=explorer_noise,
+                **self._inner_policy_kwargs(),
+            )
+            primary_bootstrap = self._q_with(
+                batch["next_z"], primary_action, state.critic_target
+            )
+            explorer_bootstrap = self._q_with(
+                batch["next_z"], explorer_action, state.explorer_critic_target
+            )
+            if cfg.inner_sac_critic_target == "entropy_augmented":
+                primary_bootstrap = (
+                    primary_bootstrap - self.alpha.detach() * primary_info["log_prob"]
+                )
+                explorer_bootstrap = (
+                    explorer_bootstrap
+                    - self.explorer_alpha.detach() * explorer_info["log_prob"]
+                )
+            continuation = float(self.agent.discount) * (
+                1.0 - batch["terminated"]
+            )
+            primary_target = batch["reward"] + continuation * primary_bootstrap
+            explorer_target = batch["reward"] + continuation * explorer_bootstrap
+        state.policy_evaluations += 2 * batch_size
+        state.q_evaluations += 2 * batch_size
+        metrics = {}
+        if update_primary:
+            predictions = self.model.q_predictions(
+                batch["z"], batch["action"], qs=state.critic
+            )
+            loss = self.model.critic_loss(predictions, primary_target)
+            values = self.model.q_backend.decode(predictions.detach())
+            state.critic_optim.zero_grad(set_to_none=True)
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                state.critic_params, float(cfg.inner_critic_grad_clip_norm)
+            )
+            state.critic_optim.step()
+            state.critic_steps += 1
+            state.critic_lifetime_steps += 1
+            state.q_evaluations += batch_size
+            metrics.update(
+                critic_loss=loss.detach(),
+                critic_grad_norm=torch.as_tensor(grad_norm).detach(),
+                q_mean=values.mean(),
+                q_abs_mean=values.abs().mean(),
+                q_target_mean=primary_target.mean(),
+                q_target_clip_fraction=self._q_target_clip_fraction(
+                    primary_target
+                ),
+                td_error_abs_mean=(
+                    values - primary_target.unsqueeze(0)
+                ).abs().mean(),
+            )
+            metrics.update(
+                self._source_td_metrics(batch, values, primary_target)
+            )
+        if update_explorer:
+            predictions = self.model.q_predictions(
+                batch["z"], batch["action"], qs=state.explorer_critic
+            )
+            loss = self.model.critic_loss(predictions, explorer_target)
+            values = self.model.q_backend.decode(predictions.detach())
+            state.explorer_critic_optim.zero_grad(set_to_none=True)
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                state.explorer_critic_params,
+                float(cfg.inner_critic_grad_clip_norm),
+            )
+            state.explorer_critic_optim.step()
+            state.explorer_critic_steps += 1
+            state.explorer_critic_lifetime_steps += 1
+            state.q_evaluations += batch_size
+            metrics.update(
+                explorer_critic_loss=loss.detach(),
+                explorer_critic_grad_norm=torch.as_tensor(grad_norm).detach(),
+                explorer_q_mean=values.mean(),
+                explorer_q_abs_mean=values.abs().mean(),
+                explorer_q_target_mean=explorer_target.mean(),
+                explorer_q_target_clip_fraction=self._q_target_clip_fraction(
+                    explorer_target
+                ),
+                explorer_critic_td_error_abs_mean=(
+                    values - explorer_target.unsqueeze(0)
+                ).abs().mean(),
+            )
+            metrics.update(
+                self._source_td_metrics(
+                    batch, values, explorer_target, prefix="explorer_critic_"
+                )
+            )
+        return metrics
 
     @staticmethod
     def _gaussian_kl(inner_info, outer_info):
@@ -2082,6 +3291,304 @@ class InnerImprovementEngine:
                         temperature_grad_norm
                     ).detach(),
                 )
+            return metrics
+
+    def _shared_mixture_policy_step(
+        self,
+        batch,
+        *,
+        update_actor,
+        update_temperature,
+        actor_loss_scale=None,
+    ):
+        """Joint exact-mixture actor/temperature update.
+
+        Both component optimizers step from the same backward pass.  The
+        cross-density terms in log(mu) intentionally connect P and R; critic
+        parameters are detached while action gradients remain live.
+        """
+        state, cfg = self.state, self.cfg
+        batch_size = int(batch["z"].shape[0])
+        weight = float(cfg.inner_prior_rollout_weight)
+        with self.rng.fork("gradient_policy") as generator:
+            shape = (*batch["z"].shape[:-1], int(cfg.action_dim))
+            primary_noise = torch.randn(
+                shape,
+                device=self.device,
+                dtype=batch["z"].dtype,
+                generator=generator,
+            )
+            explorer_noise = torch.randn(
+                shape,
+                device=self.device,
+                dtype=batch["z"].dtype,
+                generator=generator,
+            )
+            primary_action, primary_info = self.model.pi(
+                batch["z"],
+                policy=state.actor,
+                noise=primary_noise,
+                **self._inner_policy_kwargs(),
+            )
+            explorer_action, explorer_info = self.model.pi(
+                batch["z"],
+                policy=state.explorer_actor,
+                noise=explorer_noise,
+                **self._inner_policy_kwargs(),
+            )
+            primary_log_mu = self.model.mixture_log_prob(
+                primary_info["pre_tanh_action"],
+                primary_info,
+                explorer_info,
+                weight,
+            )
+            explorer_log_mu = self.model.mixture_log_prob(
+                explorer_info["pre_tanh_action"],
+                primary_info,
+                explorer_info,
+                weight,
+            )
+            state.policy_evaluations += 2 * batch_size
+            metrics = {}
+            if update_actor:
+                both_q_all = self.model.Q(
+                    torch.cat((batch["z"], batch["z"]), dim=0),
+                    torch.cat((primary_action, explorer_action), dim=0),
+                    qs=state.critic,
+                    detach=True,
+                    reduction="all",
+                )
+                both_q = self.model.q_backend.reduce(
+                    both_q_all, cfg.inner_q_actor_reduction
+                )
+                primary_q, explorer_q = both_q.split(batch_size, dim=0)
+                alpha = self.alpha.detach()
+                primary_objective = alpha * primary_log_mu - primary_q
+                explorer_objective = alpha * explorer_log_mu - explorer_q
+                actor_loss = (
+                    weight * primary_objective.mean()
+                    + (1.0 - weight) * explorer_objective.mean()
+                )
+                if actor_loss_scale is not None:
+                    actor_loss = actor_loss / actor_loss_scale.reshape(())
+                state.actor_optim.zero_grad(set_to_none=True)
+                state.explorer_actor_optim.zero_grad(set_to_none=True)
+                actor_loss.backward()
+                primary_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    state.actor_params, float(cfg.inner_actor_grad_clip_norm)
+                )
+                explorer_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    state.explorer_actor_params,
+                    float(cfg.inner_actor_grad_clip_norm),
+                )
+                state.actor_optim.step()
+                state.explorer_actor_optim.step()
+                state.actor_steps += 1
+                state.actor_lifetime_steps += 1
+                state.explorer_actor_steps += 1
+                state.explorer_actor_lifetime_steps += 1
+                state.q_evaluations += 2 * batch_size
+                metrics.update(
+                    actor_loss=actor_loss.detach(),
+                    actor_grad_norm=torch.as_tensor(primary_grad_norm).detach(),
+                    explorer_actor_grad_norm=torch.as_tensor(
+                        explorer_grad_norm
+                    ).detach(),
+                    actor_q_mean=primary_q.detach().mean(),
+                    explorer_actor_q_mean=explorer_q.detach().mean(),
+                    mixture_log_prob=(
+                        weight * primary_log_mu.detach().mean()
+                        + (1.0 - weight) * explorer_log_mu.detach().mean()
+                    ),
+                    actor_entropy=-primary_log_mu.detach().mean(),
+                    explorer_actor_entropy=-explorer_log_mu.detach().mean(),
+                )
+            if update_temperature:
+                expected_log_mu = (
+                    weight * primary_log_mu
+                    + (1.0 - weight) * explorer_log_mu
+                )
+                temperature_loss = -(
+                    state.log_alpha
+                    * (
+                        expected_log_mu
+                        + self._resolved_inner_target_entropy()
+                    ).detach()
+                ).mean()
+                state.temperature_optim.zero_grad(set_to_none=True)
+                temperature_loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    [state.log_alpha], float(cfg.inner_temperature_grad_clip_norm)
+                )
+                state.temperature_optim.step()
+                with torch.no_grad():
+                    state.log_alpha.clamp_(min=_INNER_LOG_ALPHA_FLOOR)
+                state.temperature_steps += 1
+                state.temperature_lifetime_steps += 1
+                metrics.update(
+                    temperature_loss=temperature_loss.detach(),
+                    temperature_grad_norm=torch.as_tensor(grad_norm).detach(),
+                )
+            return metrics
+
+    def _separate_policy_step(
+        self,
+        batch,
+        *,
+        update_primary_actor,
+        update_explorer_actor,
+        update_primary_temperature,
+        update_explorer_temperature,
+        actor_loss_scale=None,
+    ):
+        """Disjoint P/R actor and alpha updates on a paired minibatch."""
+        state, cfg = self.state, self.cfg
+        batch_size = int(batch["z"].shape[0])
+        with self.rng.fork("gradient_policy") as generator:
+            shape = (*batch["z"].shape[:-1], int(cfg.action_dim))
+            primary_noise = torch.randn(
+                shape,
+                device=self.device,
+                dtype=batch["z"].dtype,
+                generator=generator,
+            )
+            explorer_noise = torch.randn(
+                shape,
+                device=self.device,
+                dtype=batch["z"].dtype,
+                generator=generator,
+            )
+            primary_action, primary_info = self.model.pi(
+                batch["z"],
+                policy=state.actor,
+                noise=primary_noise,
+                **self._inner_policy_kwargs(),
+            )
+            explorer_action, explorer_info = self.model.pi(
+                batch["z"],
+                policy=state.explorer_actor,
+                noise=explorer_noise,
+                **self._inner_policy_kwargs(),
+            )
+            state.policy_evaluations += 2 * batch_size
+            metrics = {}
+
+            def actor_update(
+                *,
+                enabled,
+                action,
+                info,
+                critic,
+                alpha,
+                optimizer,
+                params,
+                explorer,
+            ):
+                if not enabled:
+                    return
+                q_all = self.model.Q(
+                    batch["z"],
+                    action,
+                    qs=critic,
+                    detach=True,
+                    reduction="all",
+                )
+                q_value = self.model.q_backend.reduce(
+                    q_all, cfg.inner_q_actor_reduction
+                )
+                loss = (alpha.detach() * info["log_prob"] - q_value).mean()
+                if actor_loss_scale is not None:
+                    loss = loss / actor_loss_scale.reshape(())
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    params, float(cfg.inner_actor_grad_clip_norm)
+                )
+                optimizer.step()
+                state.q_evaluations += batch_size
+                prefix = "explorer_" if explorer else ""
+                metrics.update(
+                    {
+                        f"{prefix}actor_loss": loss.detach(),
+                        f"{prefix}actor_grad_norm": torch.as_tensor(
+                            grad_norm
+                        ).detach(),
+                        f"{prefix}actor_q_mean": q_value.detach().mean(),
+                        f"{prefix}actor_entropy": info["entropy"].detach().mean(),
+                    }
+                )
+                if explorer:
+                    state.explorer_actor_steps += 1
+                    state.explorer_actor_lifetime_steps += 1
+                else:
+                    state.actor_steps += 1
+                    state.actor_lifetime_steps += 1
+
+            actor_update(
+                enabled=update_primary_actor,
+                action=primary_action,
+                info=primary_info,
+                critic=state.critic,
+                alpha=self.alpha,
+                optimizer=state.actor_optim,
+                params=state.actor_params,
+                explorer=False,
+            )
+            actor_update(
+                enabled=update_explorer_actor,
+                action=explorer_action,
+                info=explorer_info,
+                critic=state.explorer_critic,
+                alpha=self.explorer_alpha,
+                optimizer=state.explorer_actor_optim,
+                params=state.explorer_actor_params,
+                explorer=True,
+            )
+
+            def temperature_update(*, enabled, info, parameter, optimizer, explorer):
+                if not enabled:
+                    return
+                loss = -(
+                    parameter
+                    * (
+                        info["log_prob"]
+                        + self._resolved_inner_target_entropy()
+                    ).detach()
+                ).mean()
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    [parameter], float(cfg.inner_temperature_grad_clip_norm)
+                )
+                optimizer.step()
+                with torch.no_grad():
+                    parameter.clamp_(min=_INNER_LOG_ALPHA_FLOOR)
+                prefix = "explorer_" if explorer else ""
+                metrics[f"{prefix}temperature_loss"] = loss.detach()
+                metrics[f"{prefix}temperature_grad_norm"] = torch.as_tensor(
+                    grad_norm
+                ).detach()
+                if explorer:
+                    state.explorer_temperature_steps += 1
+                    state.explorer_temperature_lifetime_steps += 1
+                else:
+                    state.temperature_steps += 1
+                    state.temperature_lifetime_steps += 1
+
+            temperature_update(
+                enabled=update_primary_temperature,
+                info=primary_info,
+                parameter=state.log_alpha,
+                optimizer=state.temperature_optim,
+                explorer=False,
+            )
+            temperature_update(
+                enabled=update_explorer_temperature,
+                info=explorer_info,
+                parameter=state.explorer_log_alpha,
+                optimizer=state.explorer_temperature_optim,
+                explorer=True,
+            )
             return metrics
 
     def _td3_critic_kernel(
@@ -2427,6 +3934,258 @@ class InnerImprovementEngine:
         )
         return metrics
 
+    def _maybe_update_explorer_critic_target(self, *, critic_updated):
+        state, cfg = self.state, self.cfg
+        if (
+            critic_updated
+            and state.explorer_critic_lifetime_steps > 0
+            and state.explorer_critic_lifetime_steps
+            % int(cfg.inner_critic_target_update_interval)
+            == 0
+        ):
+            polyak_update(
+                state.explorer_critic,
+                state.explorer_critic_target,
+                cfg.inner_critic_target_tau,
+            )
+            state.target_steps += 1
+            state.explorer_critic_target_steps += 1
+
+    def _resolved_primary_round_count(self, component):
+        return int(
+            getattr(
+                self.cfg,
+                f"inner_primary_{component}_updates_per_round",
+                getattr(self.cfg, f"inner_{component}_updates_per_round", 0),
+            )
+        )
+
+    def _run_two_policy_component_updates(
+        self,
+        *,
+        realized_transition_count,
+        actor_loss_scale=None,
+    ):
+        """Run critic-first component doses for an active explorer round."""
+        cfg = self.cfg
+        mode = self._explorer_mode
+        primary_critic = self._resolved_primary_round_count("critic")
+        primary_actor = self._resolved_primary_round_count("actor")
+        primary_temperature = self._resolved_primary_round_count("temperature")
+        explorer_critic = int(cfg.inner_explorer_critic_updates_per_round)
+        explorer_actor = int(cfg.inner_explorer_actor_updates_per_round)
+        explorer_temperature = int(
+            cfg.inner_explorer_temperature_updates_per_round
+        )
+        canonical_auto = (
+            not self._uses_component_update_schedule
+            and bool(
+                getattr(
+                    cfg,
+                    "inner_primary_updates_per_round_is_auto",
+                    getattr(cfg, "inner_updates_per_round", None) == "auto",
+                )
+            )
+        )
+        if canonical_auto:
+            realized = int(realized_transition_count)
+            primary_critic = realized
+            primary_actor = realized
+            primary_temperature = (
+                realized if str(cfg.inner_temperature_mode) == "auto" else 0
+            )
+            if mode == "shared_mixture":
+                explorer_actor = primary_actor
+            elif mode == "separate_critics":
+                for component, primary_value in (
+                    ("critic", primary_critic),
+                    ("actor", primary_actor),
+                    ("temperature", primary_temperature),
+                ):
+                    if bool(
+                        getattr(
+                            cfg,
+                            f"inner_explorer_{component}_updates_inherit_primary",
+                            True,
+                        )
+                    ):
+                        if component == "critic":
+                            explorer_critic = primary_value
+                        elif component == "actor":
+                            explorer_actor = primary_value
+                        else:
+                            explorer_temperature = primary_value
+
+        if not self._uses_component_update_schedule:
+            # Canonical G scheduling is joint: each slot draws exactly one
+            # minibatch, runs critic work first, then actor/temperature work
+            # on that same batch.  This preserves the historical replay-draw
+            # and update-slot contract while allowing paired R updates.
+            if mode in {"frozen_random", "adaptive_param_noise"}:
+                return self._run_update_counts(
+                    critic_count=primary_critic,
+                    actor_count=primary_actor,
+                    temperature_count=primary_temperature,
+                    actor_loss_scale=actor_loss_scale,
+                )
+            history = []
+            slots = max(
+                primary_critic,
+                primary_actor,
+                primary_temperature,
+                explorer_critic,
+                explorer_actor,
+                explorer_temperature,
+            )
+            for slot in range(slots):
+                batch = self._sample_batch()
+                update_primary_critic = slot < primary_critic
+                update_explorer_critic = slot < explorer_critic
+                update_primary_actor = slot < primary_actor
+                update_explorer_actor = slot < explorer_actor
+                update_primary_temperature = slot < primary_temperature
+                update_explorer_temperature = slot < explorer_temperature
+                slot_metrics = {}
+                if mode == "shared_mixture":
+                    if update_primary_critic:
+                        with self.rng.fork("bootstrap"):
+                            slot_metrics.update(
+                                self._shared_mixture_critic_step(
+                                    batch, self.alpha.detach()
+                                )
+                            )
+                    if update_primary_actor or update_primary_temperature:
+                        slot_metrics.update(
+                            self._shared_mixture_policy_step(
+                                batch,
+                                update_actor=update_primary_actor,
+                                update_temperature=update_primary_temperature,
+                                actor_loss_scale=actor_loss_scale,
+                            )
+                        )
+                    self._maybe_update_targets(
+                        critic_updated=update_primary_critic,
+                        actor_updated=update_primary_actor,
+                    )
+                elif mode == "separate_critics":
+                    if update_primary_critic or update_explorer_critic:
+                        with self.rng.fork("bootstrap"):
+                            slot_metrics.update(
+                                self._separate_critics_step(
+                                    batch,
+                                    update_primary=update_primary_critic,
+                                    update_explorer=update_explorer_critic,
+                                )
+                            )
+                    if (
+                        update_primary_actor
+                        or update_explorer_actor
+                        or update_primary_temperature
+                        or update_explorer_temperature
+                    ):
+                        slot_metrics.update(
+                            self._separate_policy_step(
+                                batch,
+                                update_primary_actor=update_primary_actor,
+                                update_explorer_actor=update_explorer_actor,
+                                update_primary_temperature=(
+                                    update_primary_temperature
+                                ),
+                                update_explorer_temperature=(
+                                    update_explorer_temperature
+                                ),
+                                actor_loss_scale=actor_loss_scale,
+                            )
+                        )
+                    self._maybe_update_targets(
+                        critic_updated=update_primary_critic,
+                        actor_updated=update_primary_actor,
+                    )
+                    self._maybe_update_explorer_critic_target(
+                        critic_updated=update_explorer_critic
+                    )
+                else:
+                    raise ValueError(f"Unknown explorer mode: {mode!r}")
+                history.append(slot_metrics)
+            return history
+
+        if mode in {"frozen_random", "adaptive_param_noise"}:
+            return self._run_component_update_counts(
+                critic_count=primary_critic,
+                actor_count=primary_actor,
+                actor_loss_scale=actor_loss_scale,
+            )
+
+        history = []
+        critic_slots = max(primary_critic, explorer_critic)
+        for slot in range(critic_slots):
+            batch = self._sample_batch()
+            update_primary = slot < primary_critic
+            update_explorer = slot < explorer_critic
+            if mode == "shared_mixture":
+                if not update_primary:
+                    continue
+                with self.rng.fork("bootstrap"):
+                    slot_metrics = self._shared_mixture_critic_step(
+                        batch, self.alpha.detach()
+                    )
+                self._maybe_update_targets(
+                    critic_updated=True, actor_updated=False
+                )
+            elif mode == "separate_critics":
+                with self.rng.fork("bootstrap"):
+                    slot_metrics = self._separate_critics_step(
+                        batch,
+                        update_primary=update_primary,
+                        update_explorer=update_explorer,
+                    )
+                self._maybe_update_targets(
+                    critic_updated=update_primary, actor_updated=False
+                )
+                self._maybe_update_explorer_critic_target(
+                    critic_updated=update_explorer
+                )
+            else:
+                raise ValueError(f"Unknown explorer mode: {mode!r}")
+            history.append(slot_metrics)
+
+        actor_slots = max(
+            primary_actor,
+            explorer_actor,
+            primary_temperature,
+            explorer_temperature,
+        )
+        for slot in range(actor_slots):
+            batch = self._sample_batch()
+            if mode == "shared_mixture":
+                update_actor = slot < primary_actor
+                update_temperature = slot < primary_temperature
+                slot_metrics = self._shared_mixture_policy_step(
+                    batch,
+                    update_actor=update_actor,
+                    update_temperature=update_temperature,
+                    actor_loss_scale=actor_loss_scale,
+                )
+                self._maybe_update_targets(
+                    critic_updated=False, actor_updated=update_actor
+                )
+            else:
+                update_primary_actor = slot < primary_actor
+                update_explorer_actor = slot < explorer_actor
+                slot_metrics = self._separate_policy_step(
+                    batch,
+                    update_primary_actor=update_primary_actor,
+                    update_explorer_actor=update_explorer_actor,
+                    update_primary_temperature=slot < primary_temperature,
+                    update_explorer_temperature=slot < explorer_temperature,
+                    actor_loss_scale=actor_loss_scale,
+                )
+                self._maybe_update_targets(
+                    critic_updated=False, actor_updated=update_primary_actor
+                )
+            history.append(slot_metrics)
+        return history
+
     @torch.no_grad()
     def _execute_policy(
         self,
@@ -2441,24 +4200,271 @@ class InnerImprovementEngine:
         std_scale = float(self.cfg.inner_execution_std_scale)
         if mode == "policy_sample" and std_scale == 0.0:
             mode = "mean"
-        was_training = policy.training
-        policy.eval()
-        with self.rng.fork("execution") as generator:
-            action, info = self._policy_action(
-                root_z,
-                policy,
-                mode=mode,
-                generator=generator,
-                std_scale=max(std_scale, 1e-12),
-                noise_std=self.cfg.inner_execution_noise_std,
-                inner_bounds=inner_bounds,
-                return_info=return_info,
-            )
+        training_modes = tuple(
+            (module, bool(module.training)) for module in policy.modules()
+        )
+        try:
+            policy.eval()
+            with self.rng.fork("execution") as generator:
+                action, info = self._policy_action(
+                    root_z,
+                    policy,
+                    mode=mode,
+                    generator=generator,
+                    std_scale=max(std_scale, 1e-12),
+                    noise_std=self.cfg.inner_execution_noise_std,
+                    inner_bounds=inner_bounds,
+                    return_info=return_info,
+                )
+        finally:
+            for module, was_training in training_modes:
+                module.training = was_training
         self.state.policy_evaluations += int(root_z.shape[0])
-        policy.train(was_training)
         if return_info:
             return action, info
         return action
+
+    @torch.no_grad()
+    def _outer_soft_handoff_scores(self, root_z, policy, generator):
+        """Score one actor with a soft H-step prefix and one outer tail."""
+        cfg = self.cfg
+        samples = int(cfg.inner_execution_handoff_samples)
+        horizon = int(cfg.inner_rollout_horizon)
+        z = root_z.expand(samples, -1).clone()
+        score = z.new_zeros(samples, 1)
+        continuation = z.new_ones(samples, 1)
+        discount = z.new_ones(samples, 1)
+        outer_alpha = self.agent.alpha.detach()
+        for _ in range(horizon):
+            action, info = self.model.pi(
+                z,
+                policy=policy,
+                generator=generator,
+                **self._inner_policy_kwargs(),
+            )
+            self.state.policy_evaluations += samples
+            joint = self.model.joint_input(z, action)
+            reward = td_math.two_hot_inv(
+                self.model.reward_from_joint(joint), cfg
+            )
+            score += discount * continuation * (
+                reward - outer_alpha * info["log_prob"]
+            )
+            z = self.model.next_from_joint(joint)
+            if cfg.episodic:
+                terminated = (
+                    self.model.termination(z)
+                    > float(cfg.inner_termination_threshold)
+                ).float()
+                continuation *= 1.0 - terminated
+            discount *= float(self.agent.discount)
+
+        # The imagined collection horizon is not terminal.  Only this explicit
+        # selector appends one outer-prior action/value tail.
+        terminal_action, terminal_info = self.model.pi(
+            z,
+            policy=self.model._pi,
+            generator=generator,
+        )
+        terminal_q = self.model.Q(
+            z,
+            terminal_action,
+            target=True,
+            reduction="min_all",
+        )
+        self.state.policy_evaluations += samples
+        self.state.q_evaluations += samples
+        score += discount * continuation * (
+            terminal_q - outer_alpha * terminal_info["log_prob"]
+        )
+        return score, samples * horizon
+
+    @torch.no_grad()
+    def _fixed_q_counterfactual(self, root_z):
+        """Evaluate the deterministic P/R means under the fixed outer target Q."""
+        state = self.state
+        training_modes = tuple(
+            (module, bool(module.training))
+            for root in (state.actor, state.explorer_actor, self.model._target_Qs)
+            for module in root.modules()
+        )
+        try:
+            state.actor.eval()
+            state.explorer_actor.eval()
+            self.model._target_Qs.eval()
+            primary_stats = self.model.policy_stats(
+                root_z,
+                policy=state.actor,
+                **self._inner_policy_kwargs(),
+            )
+            explorer_stats = self.model.policy_stats(
+                root_z,
+                policy=state.explorer_actor,
+                **self._inner_policy_kwargs(),
+            )
+            primary_q = self.model.Q(
+                root_z,
+                primary_stats["mean"],
+                target=True,
+                reduction="min_all",
+            )
+            explorer_q = self.model.Q(
+                root_z,
+                explorer_stats["mean"],
+                target=True,
+                reduction="min_all",
+            )
+        finally:
+            for module, was_training in training_modes:
+                module.training = was_training
+
+        batch_size = int(root_z.shape[0])
+        state.policy_evaluations += 2 * batch_size
+        state.q_evaluations += 2 * batch_size
+        primary_q = primary_q.reshape(())
+        explorer_q = explorer_q.reshape(())
+        selected_primary = bool((primary_q >= explorer_q).item())
+        selected_action = (
+            primary_stats["mean"]
+            if selected_primary
+            else explorer_stats["mean"]
+        )
+        metrics = {
+            "inner_fixed_q_counterfactual_primary_q": primary_q,
+            "inner_fixed_q_counterfactual_explorer_q": explorer_q,
+            "inner_fixed_q_counterfactual_margin": explorer_q - primary_q,
+            "inner_fixed_q_counterfactual_primary_wins": float(selected_primary),
+            "inner_fixed_q_counterfactual_explorer_wins": float(
+                not selected_primary
+            ),
+            "inner_fixed_q_counterfactual_explorer_rate": float(
+                not selected_primary
+            ),
+            "inner_fixed_q_counterfactual_policy_evaluations": float(
+                2 * batch_size
+            ),
+            "inner_fixed_q_counterfactual_q_evaluations": float(2 * batch_size),
+            "inner_primary_explorer_action_l2": torch.linalg.vector_norm(
+                primary_stats["mean"] - explorer_stats["mean"], dim=-1
+            ).mean(),
+        }
+        for index, value in enumerate(selected_action[0].reshape(-1)):
+            metrics[f"inner_fixed_q_counterfactual_action_{index}"] = value
+        return {
+            "metrics": metrics,
+            "selected_primary": selected_primary,
+            "selected_action": selected_action,
+        }
+
+    @torch.no_grad()
+    def _execute_two_policy(
+        self,
+        root_z,
+        *,
+        eval_mode,
+        return_info,
+    ):
+        """Select P/R according to the configured execution controller."""
+        selector_start = self._timer_start()
+        if int(root_z.shape[0]) != 1:
+            raise ValueError("Random-explorer execution expects one root latent.")
+        state, cfg = self.state, self.cfg
+        source = str(cfg.inner_execution_policy_source)
+        selected = state.actor
+        selected_primary = True
+        metrics = {
+            "inner_selector_model_steps": 0.0,
+            "inner_selector_primary_wins": 0.0,
+            "inner_selector_explorer_wins": 0.0,
+            "inner_selector_score_margin": 0.0,
+            "inner_selector_score_variance": 0.0,
+        }
+        counterfactual = self._fixed_q_counterfactual(root_z)
+        metrics.update(counterfactual["metrics"])
+
+        if source == "primary":
+            pass
+        elif source == "explorer":
+            selected = state.explorer_actor
+            selected_primary = False
+        elif source == "mixture_sample":
+            with self.rng.fork("execution") as generator:
+                selected_primary = bool(
+                    (
+                        torch.rand((), device=self.device, generator=generator)
+                        < float(cfg.inner_prior_rollout_weight)
+                    ).item()
+                )
+            selected = state.actor if selected_primary else state.explorer_actor
+        elif source == "outer_q_gate":
+            selected_primary = counterfactual["selected_primary"]
+            selected = state.actor if selected_primary else state.explorer_actor
+            metrics["inner_selector_score_margin"] = (
+                metrics["inner_fixed_q_counterfactual_margin"].abs()
+            )
+        elif source == "outer_soft_handoff":
+            training_modes = tuple(
+                (module, bool(module.training))
+                for root in (state.actor, state.explorer_actor, self.model)
+                for module in root.modules()
+            )
+            try:
+                state.actor.eval()
+                state.explorer_actor.eval()
+                self.model.eval()
+                with self.rng.fork("execution") as generator:
+                    common_state = generator.get_state()
+                    primary_scores, primary_steps = self._outer_soft_handoff_scores(
+                        root_z, state.actor, generator
+                    )
+                    generator.set_state(common_state)
+                    explorer_scores, explorer_steps = self._outer_soft_handoff_scores(
+                        root_z, state.explorer_actor, generator
+                    )
+            finally:
+                for module, was_training in training_modes:
+                    module.training = was_training
+            primary_score = primary_scores.mean()
+            explorer_score = explorer_scores.mean()
+            selected_primary = bool((primary_score >= explorer_score).item())
+            selected = state.actor if selected_primary else state.explorer_actor
+            metrics.update(
+                inner_selector_model_steps=float(primary_steps + explorer_steps),
+                inner_selector_score_margin=(
+                    primary_score - explorer_score
+                ).abs(),
+                inner_selector_score_variance=torch.stack(
+                    (
+                        primary_scores.var(unbiased=False),
+                        explorer_scores.var(unbiased=False),
+                    )
+                ).mean(),
+                inner_selector_primary_score=primary_score,
+                inner_selector_explorer_score=explorer_score,
+            )
+        else:
+            raise ValueError(f"Unknown inner execution policy source: {source!r}")
+
+        metrics["inner_selector_primary_wins"] = float(selected_primary)
+        metrics["inner_selector_explorer_wins"] = float(not selected_primary)
+        self._timer_stop("inner_selector_seconds", selector_start)
+        executed = self._execute_policy(
+            root_z,
+            selected,
+            eval_mode=eval_mode,
+            return_info=return_info,
+        )
+        executed_action = executed[0] if return_info else executed
+        metrics["inner_fixed_q_counterfactual_execution_agreement"] = float(
+            selected_primary == counterfactual["selected_primary"]
+        )
+        metrics["inner_fixed_q_counterfactual_action_l2_to_executed"] = (
+            torch.linalg.vector_norm(
+                counterfactual["selected_action"] - executed_action,
+                dim=-1,
+            ).mean()
+        )
+        return executed, metrics, selected
 
     @torch.no_grad()
     def _evaluate_policy_trajectory(
@@ -2695,8 +4701,13 @@ class InnerImprovementEngine:
             for key, value in item.items():
                 grouped.setdefault(key, []).append(torch.as_tensor(value).reshape(()))
         metrics = {}
+        auxiliary = {
+            key
+            for key in grouped
+            if key.endswith(("_sum", "_count"))
+        }
         for key, values in grouped.items():
-            if not values:
+            if not values or key in auxiliary:
                 continue
             stacked = torch.stack(values)
             prefix = f"inner_{key}"
@@ -2704,6 +4715,17 @@ class InnerImprovementEngine:
             metrics[f"{prefix}_std"] = stacked.std(unbiased=False)
             metrics[f"{prefix}_min"] = stacked.min()
             metrics[f"{prefix}_max"] = stacked.max()
+        # Per-source minibatch populations vary. Aggregate TD errors by their
+        # exact row count instead of averaging per-slot means equally.
+        for sum_key in sorted(key for key in grouped if key.endswith("_sum")):
+            stem = sum_key[: -len("_sum")]
+            count_key = f"{stem}_count"
+            if count_key not in grouped:
+                continue
+            total_sum = torch.stack(grouped[sum_key]).sum()
+            total_count = torch.stack(grouped[count_key]).sum()
+            metrics[f"inner_{stem}_mean"] = total_sum / total_count.clamp_min(1)
+            metrics[f"inner_{stem}_count"] = total_count
         return metrics
 
     def _compile_fallback_metrics(self):
@@ -2725,6 +4747,16 @@ class InnerImprovementEngine:
             self.state.critic_target is not None
             and getattr(self.state.critic_target, "compile_failed", False)
         )
+        explorer_critic_fallback = bool(
+            self.state.explorer_critic is not None
+            and getattr(self.state.explorer_critic, "compile_failed", False)
+        )
+        explorer_target_fallback = bool(
+            self.state.explorer_critic_target is not None
+            and getattr(
+                self.state.explorer_critic_target, "compile_failed", False
+            )
+        )
         outer_module_fallback = bool(
             getattr(getattr(self.model, "_Qs", None), "compile_failed", False)
         )
@@ -2735,6 +4767,8 @@ class InnerImprovementEngine:
             critic_region_fallback
             or critic_module_fallback
             or target_module_fallback
+            or explorer_critic_fallback
+            or explorer_target_fallback
             or outer_module_fallback
             or outer_target_fallback
         )
@@ -2744,6 +4778,96 @@ class InnerImprovementEngine:
             "inner_compile_actor_fallback": float(actor_fallback),
             "inner_compile_fallback": float(
                 rollout_fallback or critic_fallback or actor_fallback
+            ),
+        }
+
+    def _parameter_noise_metrics(self):
+        """Summarize the action-local calibration and realized population."""
+        if not self._parameter_noise_active:
+            return {}
+        sigma_stats = self._stats(self._parameter_noise_sigma_values)
+        behavior_stats = self._stats(self._parameter_noise_behavior_action_rms)
+        behavior_count = sum(
+            int(values.numel())
+            for values in self._parameter_noise_behavior_action_rms
+        )
+        if self._parameter_noise_calibration_rms:
+            calibration_values = torch.stack(
+                self._parameter_noise_calibration_rms
+            )
+            calibration_stats = self._stats(calibration_values)
+        else:
+            calibration_stats = (0.0, 0.0, 0.0, 0.0)
+        target_hit_fraction = (
+            sum(self._parameter_noise_calibration_hits)
+            / len(self._parameter_noise_calibration_hits)
+            if self._parameter_noise_calibration_hits
+            else 0.0
+        )
+        bound_hit_fraction = (
+            sum(self._parameter_noise_sigma_bound_hits)
+            / len(self._parameter_noise_sigma_bound_hits)
+            if self._parameter_noise_sigma_bound_hits
+            else 0.0
+        )
+        saturation_fraction = (
+            self._parameter_noise_saturation_sum.float()
+            / float(self._parameter_noise_saturation_count)
+            if self._parameter_noise_saturation_sum is not None
+            and self._parameter_noise_saturation_count > 0
+            else 0.0
+        )
+        return {
+            "inner_param_noise_actor_count": float(
+                self.cfg.inner_param_noise_actor_count
+            ),
+            "inner_param_noise_rollouts_per_actor": float(
+                self.cfg.inner_param_noise_rollouts_per_actor
+            ),
+            "inner_param_noise_target_action_rms": float(
+                self.cfg.inner_param_noise_target_action_rms
+            ),
+            "inner_param_noise_sigma_initial": float(
+                self.cfg.inner_param_noise_sigma_init
+            ),
+            "inner_param_noise_sigma_final": float(
+                self._parameter_noise_stddev
+            ),
+            "inner_param_noise_sigma_mean": sigma_stats[0],
+            "inner_param_noise_sigma_min": sigma_stats[2],
+            "inner_param_noise_sigma_max": sigma_stats[3],
+            "inner_param_noise_calibration_probes": float(
+                self._parameter_noise_calibration_probes
+            ),
+            "inner_param_noise_calibration_policy_evaluations": float(
+                self._parameter_noise_calibration_policy_evaluations
+            ),
+            "inner_param_noise_calibration_rounds": float(
+                len(self._parameter_noise_calibration_hits)
+            ),
+            "inner_param_noise_calibration_action_rms_count": float(
+                len(self._parameter_noise_calibration_rms)
+            ),
+            "inner_param_noise_calibration_action_rms_mean": calibration_stats[0],
+            "inner_param_noise_calibration_action_rms_std": calibration_stats[1],
+            "inner_param_noise_calibration_action_rms_min": calibration_stats[2],
+            "inner_param_noise_calibration_action_rms_max": calibration_stats[3],
+            "inner_param_noise_calibration_target_hit_fraction": float(
+                target_hit_fraction
+            ),
+            "inner_param_noise_sigma_bound_hit_fraction": float(
+                bound_hit_fraction
+            ),
+            "inner_param_noise_behavior_action_rms_count": float(behavior_count),
+            "inner_param_noise_behavior_action_rms_mean": behavior_stats[0],
+            "inner_param_noise_behavior_action_rms_std": behavior_stats[1],
+            "inner_param_noise_behavior_action_rms_min": behavior_stats[2],
+            "inner_param_noise_behavior_action_rms_max": behavior_stats[3],
+            "inner_param_noise_mean_action_saturation_count": float(
+                self._parameter_noise_saturation_count
+            ),
+            "inner_param_noise_mean_action_saturation_fraction": (
+                saturation_fraction
             ),
         }
 
@@ -2818,6 +4942,44 @@ class InnerImprovementEngine:
             "inner_action_seconds": float(action_seconds),
             "inner_diagnostics_sampled": 0.0,
             "inner_diagnostics_sample_count": 0.0,
+            "inner_primary_rollouts": 0.0,
+            "inner_explorer_rollouts": 0.0,
+            "inner_primary_transitions": 0.0,
+            "inner_explorer_transitions": 0.0,
+            "inner_primary_replay_fraction": 0.0,
+            "inner_explorer_replay_fraction": 0.0,
+            "inner_primary_replay_samples": 0.0,
+            "inner_explorer_replay_samples": 0.0,
+            "inner_primary_replay_sample_fraction": 0.0,
+            "inner_explorer_replay_sample_fraction": 0.0,
+            "inner_optimization_model_steps": 0.0,
+            "inner_selector_model_steps": 0.0,
+            "inner_selector_primary_wins": 0.0,
+            "inner_selector_explorer_wins": 0.0,
+            "inner_selector_score_margin": 0.0,
+            "inner_selector_score_variance": 0.0,
+            "inner_explorer_actor_optimizer_steps": 0.0,
+            "inner_explorer_critic_optimizer_steps": 0.0,
+            "inner_explorer_temperature_optimizer_steps": 0.0,
+            "inner_explorer_critic_target_updates": 0.0,
+            "inner_explorer_target_updates": 0.0,
+            "inner_explorer_actor_trainable_params": 0.0,
+            "inner_explorer_critic_trainable_params": 0.0,
+            "inner_explorer_temperature_trainable_params": 0.0,
+            "inner_explorer_alpha": 0.0,
+            "inner_explorer_alpha_initial": 0.0,
+            "inner_explorer_alpha_final": 0.0,
+            "inner_explorer_alpha_delta": 0.0,
+            "inner_primary_explorer_action_l2": 0.0,
+            "inner_explorer_actor_utd": 0.0,
+            "inner_explorer_critic_utd": 0.0,
+            "inner_explorer_temperature_utd": 0.0,
+            "inner_primary_rollout_fraction": 0.0,
+            "inner_explorer_rollout_fraction": 0.0,
+            "inner_primary_td_error_abs_count": 0.0,
+            "inner_explorer_td_error_abs_count": 0.0,
+            "inner_explorer_critic_primary_td_error_abs_count": 0.0,
+            "inner_explorer_critic_explorer_td_error_abs_count": 0.0,
         }
         metrics.update(self._compile_fallback_metrics())
         return metrics
@@ -2876,6 +5038,11 @@ class InnerImprovementEngine:
             # one immutable snapshot throughout all root-local update slots.
             actor_loss_scale = self.agent.actor_loss_scale.detach().clone()
         alpha_initial = self.alpha.detach().clone()
+        explorer_alpha_initial = (
+            self.explorer_alpha.detach().clone()
+            if self._explorer_mode == "separate_critics"
+            else root_z.new_zeros(())
+        )
         allocations = None
         if not self._uses_canonical_schedule:
             allocations = {
@@ -2890,6 +5057,9 @@ class InnerImprovementEngine:
                 ),
             }
         all_lengths, reward_sums, discounted_rewards, terminated = [], [], [], []
+        transition_rewards_by_source = []
+        transition_terminated_by_source = []
+        transition_sources = []
         update_history = []
         update_slots = 0
         requested_update_slots = 0
@@ -2901,18 +5071,34 @@ class InnerImprovementEngine:
             reward_sums.append(rollout["reward_sums"])
             discounted_rewards.append(rollout["discounted_rewards"])
             terminated.append(rollout["terminated"])
+            if "sources" in rollout:
+                transition_rewards_by_source.append(rollout["transition_rewards"])
+                transition_terminated_by_source.append(
+                    rollout["transition_terminated"]
+                )
+                transition_sources.append(rollout["transition_sources"])
 
             update_start = self._timer_start()
             if self._uses_canonical_schedule:
-                if self._uses_component_update_schedule:
-                    critic_count = int(cfg.inner_critic_updates_per_round)
-                    actor_count = int(cfg.inner_actor_updates_per_round)
-                    round_metrics = self._run_component_update_counts(
-                        critic_count=critic_count,
-                        actor_count=actor_count,
-                        actor_loss_scale=actor_loss_scale,
-                    )
-                    requested_update_slots += critic_count + actor_count
+                if self._explorer_active or self._uses_component_update_schedule:
+                    if self._explorer_active:
+                        round_metrics = self._run_two_policy_component_updates(
+                            realized_transition_count=rollout["transition_count"],
+                            actor_loss_scale=actor_loss_scale
+                        )
+                        # The realized history length is the exact number of
+                        # critic-first + actor-phase slots actually requested,
+                        # including episodic canonical-auto compaction.
+                        requested_update_slots += len(round_metrics)
+                    else:
+                        critic_count = int(cfg.inner_critic_updates_per_round)
+                        actor_count = int(cfg.inner_actor_updates_per_round)
+                        round_metrics = self._run_component_update_counts(
+                            critic_count=critic_count,
+                            actor_count=actor_count,
+                            actor_loss_scale=actor_loss_scale,
+                        )
+                        requested_update_slots += critic_count + actor_count
                 else:
                     configured_updates = cfg.inner_updates_per_round
                     if configured_updates == "auto":
@@ -2958,12 +5144,23 @@ class InnerImprovementEngine:
 
         execution_start = self._timer_start()
         capture_behavior = bool(return_behavior_policy and not eval_mode)
-        executed = self._execute_policy(
-            root_z,
-            state.actor,
-            eval_mode=eval_mode,
-            return_info=capture_behavior,
-        )
+        selector_metrics = {}
+        selected_policy = state.actor
+        if self._materialized_explorer_active:
+            executed, selector_metrics, selected_policy = self._execute_two_policy(
+                root_z,
+                eval_mode=eval_mode,
+                return_info=capture_behavior,
+            )
+        else:
+            if self._parameter_noise_active:
+                selector_metrics["inner_selector_primary_wins"] = 1.0
+            executed = self._execute_policy(
+                root_z,
+                state.actor,
+                eval_mode=eval_mode,
+                return_info=capture_behavior,
+            )
         if capture_behavior:
             action, execution_info = executed
             behavior_policy = {
@@ -2976,7 +5173,7 @@ class InnerImprovementEngine:
         self._timer_stop("inner_execution_seconds", execution_start)
         if self._collect_diagnostics:
             diagnostic_start = self._timer_start()
-            diagnostic_metrics = self._diagnostics(root_z, state.actor)
+            diagnostic_metrics = self._diagnostics(root_z, selected_policy)
             self._timer_stop("inner_diagnostic_seconds", diagnostic_start)
         else:
             diagnostic_metrics = {}
@@ -2988,6 +5185,21 @@ class InnerImprovementEngine:
         terminated_values = (
             torch.cat(terminated, dim=0) if terminated else root_z.new_empty(0)
         )
+        source_transition_reward_values = (
+            torch.cat(transition_rewards_by_source, dim=0)
+            if transition_rewards_by_source
+            else root_z.new_empty(0)
+        )
+        source_transition_terminated_values = (
+            torch.cat(transition_terminated_by_source, dim=0)
+            if transition_terminated_by_source
+            else torch.empty(0, dtype=torch.bool, device=self.device)
+        )
+        transition_source_values = (
+            torch.cat(transition_sources, dim=0)
+            if transition_sources
+            else torch.empty(0, dtype=torch.uint8, device=self.device)
+        )
         termination_stats = self._stats(terminated_values.float())
         rollout_count = int(length_values.numel())
         realized_model_steps = length_values.sum()
@@ -2998,6 +5210,11 @@ class InnerImprovementEngine:
         )
         utd_denominator = realized_model_steps.clamp_min(1)
         alpha_final = self.alpha.detach().clone()
+        explorer_alpha_final = (
+            self.explorer_alpha.detach().clone()
+            if self._explorer_mode == "separate_critics"
+            else root_z.new_zeros(())
+        )
         metrics = self._base_metrics(active=True)
         metrics.update(
             inner_rounds=float(cfg.inner_rounds),
@@ -3074,7 +5291,100 @@ class InnerImprovementEngine:
             inner_temperature_trainable_params=float(
                 state.log_alpha.numel() if state.log_alpha is not None else 0
             ),
+            inner_primary_rollouts=float(state.primary_rollouts),
+            inner_explorer_rollouts=float(state.explorer_rollouts),
+            inner_primary_transitions=float(state.primary_transitions),
+            inner_explorer_transitions=float(state.explorer_transitions),
+            inner_optimization_model_steps=realized_model_steps,
+            inner_explorer_actor_optimizer_steps=float(
+                state.explorer_actor_steps
+            ),
+            inner_explorer_critic_optimizer_steps=float(
+                state.explorer_critic_steps
+            ),
+            inner_explorer_temperature_optimizer_steps=float(
+                state.explorer_temperature_steps
+            ),
+            inner_explorer_critic_target_updates=float(
+                state.explorer_critic_target_steps
+            ),
+            inner_explorer_target_updates=float(
+                state.explorer_critic_target_steps
+            ),
+            inner_explorer_actor_trainable_params=float(
+                state.explorer_actor_trainable_count
+            ),
+            inner_explorer_critic_trainable_params=float(
+                state.explorer_critic_trainable_count
+            ),
+            inner_explorer_temperature_trainable_params=float(
+                state.explorer_log_alpha.numel()
+                if state.explorer_log_alpha is not None
+                else 0
+            ),
+            inner_explorer_alpha=explorer_alpha_final.mean(),
+            inner_explorer_alpha_initial=explorer_alpha_initial.mean(),
+            inner_explorer_alpha_final=explorer_alpha_final.mean(),
+            inner_explorer_alpha_delta=(
+                explorer_alpha_final - explorer_alpha_initial
+            ).mean(),
+            inner_explorer_actor_utd=(
+                torch.as_tensor(
+                    float(state.explorer_actor_steps), device=self.device
+                )
+                / utd_denominator
+            ),
+            inner_explorer_critic_utd=(
+                torch.as_tensor(
+                    float(state.explorer_critic_steps), device=self.device
+                )
+                / utd_denominator
+            ),
+            inner_explorer_temperature_utd=(
+                torch.as_tensor(
+                    float(state.explorer_temperature_steps), device=self.device
+                )
+                / utd_denominator
+            ),
+            inner_primary_rollout_fraction=(
+                float(state.primary_rollouts) / float(max(1, rollout_count))
+            ),
+            inner_explorer_rollout_fraction=(
+                float(state.explorer_rollouts) / float(max(1, rollout_count))
+            ),
         )
+        metrics.update(selector_metrics)
+        if self._explorer_active:
+            replay_sources = state.replay.source[: state.replay.size].float()
+            explorer_replay_fraction = (
+                replay_sources.mean() if replay_sources.numel() else root_z.new_zeros(())
+            )
+            metrics["inner_explorer_replay_fraction"] = explorer_replay_fraction
+            metrics["inner_primary_replay_fraction"] = 1.0 - explorer_replay_fraction
+            for source_value, source_name in ((0, "primary"), (1, "explorer")):
+                selected_rewards = source_transition_reward_values[
+                    transition_source_values == source_value
+                ]
+                selected_terminated = source_transition_terminated_values[
+                    transition_source_values == source_value
+                ]
+                reward_source_stats = self._stats(selected_rewards)
+                termination_source_stats = self._stats(selected_terminated.float())
+                for suffix, value in zip(
+                    ("mean", "std", "min", "max"), reward_source_stats
+                ):
+                    metrics[f"inner_{source_name}_reward_{suffix}"] = value
+                for suffix, value in zip(
+                    ("mean", "std", "min", "max"), termination_source_stats
+                ):
+                    metrics[
+                        f"inner_{source_name}_termination_rate_{suffix}"
+                    ] = value
+                metrics[f"inner_{source_name}_termination_rate"] = (
+                    termination_source_stats[0]
+                )
+
+        metrics.update(self._parameter_noise_metrics())
         if actor_loss_scale is not None:
             metrics["inner_actor_loss_scale"] = actor_loss_scale.reshape(())
             metrics["inner_effective_alpha"] = (
@@ -3085,11 +5395,25 @@ class InnerImprovementEngine:
             metrics["inner_replay_unique_fraction"] = (
                 sampled.unique().numel() / sampled.numel()
             )
+        if state.sampled_sources:
+            sampled_sources = torch.cat(state.sampled_sources).reshape(-1)
+            total_samples = int(sampled_sources.numel())
+            primary_samples = (sampled_sources == 0).sum()
+            explorer_samples = (sampled_sources == 1).sum()
+            metrics["inner_primary_replay_samples"] = primary_samples
+            metrics["inner_explorer_replay_samples"] = explorer_samples
+            metrics["inner_primary_replay_sample_fraction"] = (
+                primary_samples.float() / float(max(1, total_samples))
+            )
+            metrics["inner_explorer_replay_sample_fraction"] = (
+                explorer_samples.float() / float(max(1, total_samples))
+            )
         metrics.update(self._average_update_metrics(update_history))
         metrics.update(diagnostic_metrics)
         metrics["inner_total_model_steps"] = (
             metrics["inner_model_steps"]
             + metrics.get("inner_diagnostic_model_steps", 0.0)
+            + metrics.get("inner_selector_model_steps", 0.0)
         )
         if self._collect_diagnostics:
             metrics["inner_diagnostics_sampled"] = 1.0
