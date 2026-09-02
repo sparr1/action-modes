@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=tdmpc2-hw-allpi
+#SBATCH --job-name=tdmpc2-hw-pi-init
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -14,7 +14,7 @@
 set -Eeuo pipefail
 
 # Select the requested Hydra node at submission time, for example:
-#   sbatch --nodelist=gpu2301 slurm/run_tdmpc2_humanoid_walk_all_policy_rollouts.sbatch
+#   sbatch --nodelist=gpu2301 slurm/run_tdmpc2_humanoid_walk_mppi_policy_init512_gaussian_refine.sbatch
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 cd "$PROJECT_DIR"
 
@@ -31,13 +31,13 @@ if (( AVAILABLE_KB < 2 * 1024 * 1024 )); then
   exit 1
 fi
 
-MANIFEST="configs/dmcontrol/experiments/tdmpc2_humanoid_walk_all_policy_rollouts.json"
+MANIFEST="configs/dmcontrol/experiments/tdmpc2_humanoid_walk_mppi_policy_init512_gaussian_refine.json"
 TRIAL_INDEX="$SLURM_ARRAY_TASK_ID"
 SEED=$((TRIAL_INDEX + 1))
-RUN_ROOT="$PROJECT_DIR/logs/dmcontrol/tdmpc2_all_policy_rollouts/humanoid_walk/seed_${SEED}/job_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
-EVAL_ROOT="$PROJECT_DIR/results/dmcontrol/tdmpc2_all_policy_rollouts/humanoid_walk/seed_${SEED}"
+RUN_ROOT="$PROJECT_DIR/logs/dmcontrol/tdmpc2_policy_init_mppi/humanoid_walk/seed_${SEED}/job_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
+EVAL_ROOT="$PROJECT_DIR/results/dmcontrol/tdmpc2_policy_init_mppi/humanoid_walk/seed_${SEED}"
 EVAL_CSV="$EVAL_ROOT/job_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.csv"
-WANDB_LOCAL_ROOT="${SLURM_TMPDIR:-/tmp}/tdmpc2-allpi-wandb-${SLURM_ARRAY_JOB_ID}-${SLURM_ARRAY_TASK_ID}"
+WANDB_LOCAL_ROOT="${SLURM_TMPDIR:-/tmp}/tdmpc2-pi-init-wandb-${SLURM_ARRAY_JOB_ID}-${SLURM_ARRAY_TASK_ID}"
 mkdir -p "$EVAL_ROOT"
 mkdir -p "$WANDB_LOCAL_ROOT" "$WANDB_LOCAL_ROOT/cache" "$WANDB_LOCAL_ROOT/data" "$WANDB_LOCAL_ROOT/artifacts"
 
@@ -57,7 +57,9 @@ echo "Node: $SLURM_NODELIST"
 echo "Task: humanoid-walk"
 echo "Seed: $SEED"
 echo "Agent decisions: 14000000"
-echo "Policy proposal trajectories: 512 / 512"
+echo "Configured MPPI iterations: 6; Humanoid effective iterations: 8"
+echo "First population: 512 policy / 0 Gaussian proposals"
+echo "Refinement populations: 0 policy / 512 Gaussian proposals"
 echo "Manifest: $MANIFEST"
 echo "Evaluation CSV: $EVAL_CSV"
 echo "W&B local staging: $WANDB_LOCAL_ROOT"

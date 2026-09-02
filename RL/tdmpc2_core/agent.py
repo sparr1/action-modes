@@ -423,14 +423,25 @@ class TDMPC2(torch.nn.Module):
 		if self.cfg.num_pi_trajs > 0:
 			actions[:, :self.cfg.num_pi_trajs] = pi_actions
 
-		# Iterate MPPI
-		for _ in range(self.cfg.iterations):
+		# Iterate MPPI. The upstream/default schedule keeps the same policy-prior
+		# prefix in every population. The opt-in initialization schedule uses that
+		# prefix only in the first population, then overwrites the full population
+		# with samples from the elite-fitted Gaussian on later iterations.
+		for iteration in range(self.cfg.iterations):
+			num_policy_candidates = self.cfg.num_pi_trajs
+			if self.cfg.num_pi_trajs_first_iteration_only and iteration > 0:
+				num_policy_candidates = 0
 
 			# Sample actions
-			r = torch.randn(self.cfg.outer_planning_horizon, self.cfg.num_samples-self.cfg.num_pi_trajs, self.cfg.action_dim, device=std.device)
+			r = torch.randn(
+				self.cfg.outer_planning_horizon,
+				self.cfg.num_samples-num_policy_candidates,
+				self.cfg.action_dim,
+				device=std.device,
+			)
 			actions_sample = mean.unsqueeze(1) + std.unsqueeze(1) * r
 			actions_sample = actions_sample.clamp(-1, 1)
-			actions[:, self.cfg.num_pi_trajs:] = actions_sample
+			actions[:, num_policy_candidates:] = actions_sample
 			if self.cfg.multitask:
 				actions = actions * self.model._action_masks[task]
 

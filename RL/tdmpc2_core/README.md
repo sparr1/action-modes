@@ -42,6 +42,17 @@ ways:
   requires `latent_dim == 16 * num_channels` (the model-size-5 default is 512);
 - current official vectorized-critic checkpoints are converted on load.
 
+The upstream planner schedule remains the default: the same `num_pi_trajs`
+policy-prior trajectories occupy a fixed prefix of every MPPI population. An
+explicit planning ablation can instead set
+`num_pi_trajs_first_iteration_only=true`. In that mode the policy trajectories
+appear only in the first population; the elite-weighted mean and standard
+deviation fitted from that population generate every candidate in subsequent
+refinement iterations. This is a policy-initialized MPPI intervention, not
+upstream TD-MPC2 behavior. With `num_pi_trajs=512` and `num_samples=512`, the
+first population is entirely policy-generated and every later population is
+entirely Gaussian refinement.
+
 Replay keeps complete overlapping RGB frame stacks as `uint8`, matching
 upstream behavior. Random-shift augmentation remains active during acting and
 evaluation. AMBI isolates the acting-time crop in its private RNG stream, but

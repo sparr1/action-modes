@@ -70,6 +70,7 @@ _DEFAULTS = {
     "num_samples": 512,
     "num_elites": 64,
     "num_pi_trajs": 24,
+    "num_pi_trajs_first_iteration_only": False,
     "train_unroll_horizon": 3,
     "outer_planning_horizon": 3,
     "inner_rollout_horizon": 3,
@@ -128,6 +129,25 @@ def _positive_int(value, key):
     if not math.isfinite(numeric) or resolved <= 0 or numeric != resolved:
         raise ValueError(f"{key} must be a positive integer.")
     return resolved
+
+
+def _nonnegative_int(value, key):
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{key} must be a non-negative integer.")
+    try:
+        numeric = float(value)
+        resolved = int(numeric)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{key} must be a non-negative integer.") from exc
+    if not math.isfinite(numeric) or resolved < 0 or numeric != resolved:
+        raise ValueError(f"{key} must be a non-negative integer.")
+    return resolved
+
+
+def _strict_bool(value, key):
+    if not isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{key} must be a boolean.")
+    return bool(value)
 
 
 def _normalize_horizon_params(params, *, resolve_defaults=True):
@@ -822,6 +842,37 @@ class TDMPC2Baseline(Algorithm):
             if not eval_csv_path:
                 raise ValueError("eval_csv_path cannot be empty.")
         cfg["eval_csv_path"] = eval_csv_path
+
+        cfg["iterations"] = _positive_int(cfg["iterations"], "iterations")
+        cfg["num_samples"] = _positive_int(cfg["num_samples"], "num_samples")
+        cfg["num_elites"] = _positive_int(cfg["num_elites"], "num_elites")
+        cfg["num_pi_trajs"] = _nonnegative_int(
+            cfg["num_pi_trajs"], "num_pi_trajs"
+        )
+        cfg["num_pi_trajs_first_iteration_only"] = _strict_bool(
+            cfg["num_pi_trajs_first_iteration_only"],
+            "num_pi_trajs_first_iteration_only",
+        )
+        if cfg["num_elites"] > cfg["num_samples"]:
+            raise ValueError("num_elites cannot exceed num_samples.")
+        if cfg["num_pi_trajs"] > cfg["num_samples"]:
+            raise ValueError("num_pi_trajs cannot exceed num_samples.")
+        if cfg["num_pi_trajs_first_iteration_only"]:
+            if not bool(cfg["mpc"]):
+                raise ValueError(
+                    "num_pi_trajs_first_iteration_only=true requires mpc=true."
+                )
+            if cfg["num_pi_trajs"] == 0:
+                raise ValueError(
+                    "num_pi_trajs_first_iteration_only=true requires "
+                    "num_pi_trajs>0."
+                )
+            effective_iterations = cfg["iterations"] + 2 * int(action_dim >= 20)
+            if effective_iterations < 2:
+                raise ValueError(
+                    "num_pi_trajs_first_iteration_only=true requires at least "
+                    "two effective planning iterations."
+                )
 
         cfg["rho"] = float(cfg["rho"])
         if not math.isfinite(cfg["rho"]):
