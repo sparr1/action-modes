@@ -97,7 +97,7 @@ def test_ablation_changes_only_the_policy_proposal_schedule_and_wandb_metadata()
                 "state",
                 "benchmark",
                 "policy-init-512-gaussian-refine",
-                "first-population-policy-only",
+                "first-population-all-policy-prior-candidates",
             ],
         }
     )
@@ -131,10 +131,13 @@ def test_ablation_manifest_preserves_the_three_seed_baseline_protocol():
     assert manifest["configs"] == [
         "tdmpc2_humanoid_walk_state_mppi_policy_init512_gaussian_refine"
     ]
-    assert "iteration 0 contains 512 stochastic policy-prior trajectories" in (
+    assert "iteration 0 contains 512 stochastic policy-prior candidate" in (
         manifest["study_note"]
     )
     assert "iterations 1-7 each draw all 512 proposals" in manifest["study_note"]
+    assert "first 2,500 random seed-collection decisions" in manifest["study_note"]
+    assert "Q(z_H, pi(z_H))" in manifest["study_note"]
+    assert "13,312 per invocation (+7.9%)" in manifest["study_note"]
 
 
 def test_ablation_launcher_has_long_runtime_and_explicit_schedule():
@@ -147,8 +150,14 @@ def test_ablation_launcher_has_long_runtime_and_explicit_schedule():
     assert "#SBATCH --nodelist" not in contents
     assert "sbatch --nodelist=gpu2301" in contents
     assert "Agent decisions: 14000000" in contents
-    assert "First population: 512 policy / 0 Gaussian proposals" in contents
-    assert "Refinement populations: 0 policy / 512 Gaussian proposals" in contents
+    assert (
+        "First population: 512 policy-prior / 0 Gaussian candidate trajectories"
+        in contents
+    )
+    assert (
+        "Refinement populations: 0 policy-prior / 512 Gaussian candidate "
+        "trajectories" in contents
+    )
     assert "tdmpc2_humanoid_walk_mppi_policy_init512_gaussian_refine.json" in contents
     assert 'TRIAL_INDEX="$SLURM_ARRAY_TASK_ID"' in contents
     assert "SEED=$((TRIAL_INDEX + 1))" in contents
@@ -217,6 +226,56 @@ def test_first_iteration_schedule_requires_a_strict_boolean(invalid):
                 "device": "cpu",
                 "num_pi_trajs_first_iteration_only": invalid,
             },
+            {"seed": 3, "device": "cpu", "env": "test-env", "total_steps": 1},
+            {},
+        )
+    env.close()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {
+                "mpc": False,
+                "num_pi_trajs": 4,
+                "num_pi_trajs_first_iteration_only": True,
+            },
+            "requires mpc=true",
+        ),
+        (
+            {
+                "num_pi_trajs": 0,
+                "num_pi_trajs_first_iteration_only": True,
+            },
+            "requires num_pi_trajs>0",
+        ),
+        (
+            {
+                "iterations": 1,
+                "num_pi_trajs": 4,
+                "num_pi_trajs_first_iteration_only": True,
+            },
+            "requires at least two effective planning iterations",
+        ),
+        ({"mpc": "true"}, "mpc must be a boolean"),
+    ],
+    ids=("mpc-disabled", "no-policy-trajectories", "no-refinement", "mpc-type"),
+)
+def test_policy_initialization_schedule_rejects_incoherent_planners(
+    overrides,
+    message,
+):
+    import gymnasium as gym
+
+    from RL.TDMPC2 import TDMPC2Baseline
+
+    env = gym.make("Pendulum-v1", max_episode_steps=5)
+    with pytest.raises(ValueError, match=message):
+        TDMPC2Baseline(
+            "invalid-policy-initialization-planner-test",
+            env,
+            {"device": "cpu", **overrides},
             {"seed": 3, "device": "cpu", "env": "test-env", "total_steps": 1},
             {},
         )

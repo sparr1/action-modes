@@ -119,7 +119,7 @@ _RGB_REPLAY_WARNING_BYTES = 8 * 1024**3
 
 
 def _positive_int(value, key):
-    if isinstance(value, bool):
+    if isinstance(value, (bool, np.bool_)):
         raise ValueError(f"{key} must be a positive integer.")
     try:
         numeric = float(value)
@@ -849,6 +849,7 @@ class TDMPC2Baseline(Algorithm):
         cfg["num_pi_trajs"] = _nonnegative_int(
             cfg["num_pi_trajs"], "num_pi_trajs"
         )
+        cfg["mpc"] = _strict_bool(cfg["mpc"], "mpc")
         cfg["num_pi_trajs_first_iteration_only"] = _strict_bool(
             cfg["num_pi_trajs_first_iteration_only"],
             "num_pi_trajs_first_iteration_only",
@@ -858,7 +859,7 @@ class TDMPC2Baseline(Algorithm):
         if cfg["num_pi_trajs"] > cfg["num_samples"]:
             raise ValueError("num_pi_trajs cannot exceed num_samples.")
         if cfg["num_pi_trajs_first_iteration_only"]:
-            if not bool(cfg["mpc"]):
+            if not cfg["mpc"]:
                 raise ValueError(
                     "num_pi_trajs_first_iteration_only=true requires mpc=true."
                 )

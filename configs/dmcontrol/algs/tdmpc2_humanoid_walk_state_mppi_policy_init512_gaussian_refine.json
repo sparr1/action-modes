@@ -63,7 +63,7 @@
       "state",
       "benchmark",
       "policy-init-512-gaussian-refine",
-      "first-population-policy-only"
+      "first-population-all-policy-prior-candidates"
     ]
   },
   "total_steps": 14000000,
