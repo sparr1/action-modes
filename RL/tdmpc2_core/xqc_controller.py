@@ -353,11 +353,18 @@ class LatentXQCController(nn.Module):
                 device=flat["latents"].device,
                 dtype=flat["latents"].dtype,
             )
-            if (
-                scale.numel() != 1
-                or not bool(torch.isfinite(scale).all())
-                or not bool(scale > 0)
-            ):
+            if scale.numel() != 1:
+                raise ValueError("reward_scale must be one positive finite scalar.")
+            valid_scale = (torch.isfinite(scale) & (scale > 0)).reshape(())
+            if scale.device.type == "cuda":
+                # A Python bool here would synchronize every adaptive inner
+                # update. Preserve validation while leaving the scalar and its
+                # assertion ordered asynchronously on the CUDA stream.
+                torch._assert_async(
+                    valid_scale,
+                    "reward_scale must be one positive finite scalar.",
+                )
+            elif not bool(valid_scale):
                 raise ValueError("reward_scale must be one positive finite scalar.")
         else:
             scale_value = float(reward_scale)

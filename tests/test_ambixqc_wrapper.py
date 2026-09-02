@@ -47,6 +47,7 @@ def test_default_config_is_xqc_over_told_without_ambi_auxiliary_modes():
     assert cfg.inner_critic_scope == "action"
     assert cfg.inner_temperature_scope == "action"
     assert cfg.inner_replay_scope == "action"
+    assert cfg.inner_reward_normalization == "frozen_real_scale"
 
     assert cfg.xqc_actor_net_arch == (256, 256, 256, 256)
     assert cfg.xqc_critic_net_arch == (512, 512, 512, 512)
@@ -84,6 +85,23 @@ def test_default_inner_budget_resolves_action_local_xqc_delay_counts():
     assert cfg.inner_actor_updates_per_action == 3
     assert cfg.inner_temperature_updates_per_action == 3
     assert cfg.inner_temperature_lr == pytest.approx(cfg.inner_actor_lr)
+
+
+def test_action_local_imagined_reward_normalization_is_explicit_and_validated():
+    cfg = _build_cfg(inner_reward_normalization="action_local_imagined")
+
+    assert cfg.inner_reward_normalization == "action_local_imagined"
+
+    for value in (
+        True,
+        False,
+        None,
+        "imagined",
+        "action-local-imagined",
+        "frozen_outer_scale",
+    ):
+        with pytest.raises(ValueError, match="inner_reward_normalization"):
+            _build_cfg(inner_reward_normalization=value)
 
 
 @pytest.mark.parametrize(
@@ -272,6 +290,27 @@ def test_runtime_metadata_records_xqc_semantics():
     assert metadata["xqc"]["discount"] == pytest.approx(0.99)
     assert metadata["inner_budget"]["inner_operator"] == "xqc"
     assert metadata["inner_budget"]["transitions_per_action"] == 192
+    assert metadata["inner_budget"]["inner_critic_updates_per_action"] == 8
+    assert metadata["inner_budget"]["inner_actor_updates_per_action"] == 3
+    assert metadata["inner_budget"]["inner_temperature_updates_per_action"] == 3
+    assert metadata["inner_budget"]["replay_rows_drawn_per_action"] == 512
+    assert (
+        metadata["inner_budget"]["inner_reward_normalization"]
+        == "frozen_real_scale"
+    )
+
+    adaptive_cfg = _build_cfg(
+        inner_reward_normalization="action_local_imagined"
+    )
+    model.cfg = adaptive_cfg
+    adaptive_metadata = training_main._resolved_runtime_metadata(
+        model,
+        trial_run_params={"alg": "AMBIXQC/AMBIXQC", "seed": 3},
+    )
+    assert (
+        adaptive_metadata["inner_budget"]["inner_reward_normalization"]
+        == "action_local_imagined"
+    )
 
 
 def test_xqc_specific_inner_metrics_are_routed_to_the_shared_wandb_window():
@@ -292,6 +331,12 @@ def test_xqc_specific_inner_metrics_are_routed_to_the_shared_wandb_window():
             "inner_actor_update_accepted": 1.0,
             "inner_policy_entropy": 0.75,
             "inner_reward_scale": 2.5,
+            "inner_reward_scale_initial": 3.0,
+            "inner_reward_scale_final": 2.5,
+            "inner_reward_scale_delta": -0.5,
+            "inner_reward_normalizer_count_initial": 0.0,
+            "inner_reward_normalizer_count_final": 192.0,
+            "inner_reward_normalizer_imagined_updates": 192.0,
             "inner_actor_learning_rate": 5e-5,
             "inner_critic_learning_rate": 5e-5,
             "inner_temperature_learning_rate": 5e-5,
@@ -315,6 +360,18 @@ def test_xqc_specific_inner_metrics_are_routed_to_the_shared_wandb_window():
     assert payload["train/inner_actor_update_accepted"] == pytest.approx(1.0)
     assert payload["train/inner_policy_entropy"] == pytest.approx(0.75)
     assert payload["train/inner_reward_scale"] == pytest.approx(2.5)
+    assert payload["train/inner_reward_scale_initial"] == pytest.approx(3.0)
+    assert payload["train/inner_reward_scale_final"] == pytest.approx(2.5)
+    assert payload["train/inner_reward_scale_delta"] == pytest.approx(-0.5)
+    assert payload["train/inner_reward_normalizer_count_initial"] == pytest.approx(
+        0.0
+    )
+    assert payload["train/inner_reward_normalizer_count_final"] == pytest.approx(
+        192.0
+    )
+    assert payload[
+        "train/inner_reward_normalizer_imagined_updates"
+    ] == pytest.approx(192.0)
     assert payload["train/inner_actor_learning_rate"] == pytest.approx(5e-5)
     assert payload["train/inner_algorithm_xqc"] == pytest.approx(1.0)
     assert payload["train/inner_final_outer_policy_kl"] == pytest.approx(0.25)

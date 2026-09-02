@@ -582,7 +582,12 @@ class AMBIXQCAgent(nn.Module):
             "lr_transition_steps": int(self.cfg.xqc_lr_transition_steps),
             "adam_eps": float(self.cfg.xqc_adam_eps),
             "optimizer_backend": str(self.cfg.xqc_optimizer_backend),
-            "reward_normalization": "real_discounted_return_only",
+            "reward_normalization": (
+                "real_discounted_return_plus_fresh_action_local_imagined_returns"
+                if self.cfg.inner_reward_normalization
+                == "action_local_imagined"
+                else "real_discounted_return_only"
+            ),
             "weight_projection": "all_linear_weight_rows",
             "temperature_lr_source": "actor_lr",
             "training_noise_rng": "outer_device_local_plus_named_inner_streams_v1",

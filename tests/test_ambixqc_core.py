@@ -218,7 +218,7 @@ def test_outer_xqc_delay_runs_actor_and_temperature_at_zero_and_three():
     wrapper.env.close()
 
 
-def test_real_reward_normalizer_resets_on_timeout_and_imagination_does_not_touch_it():
+def test_frozen_real_reward_scale_resets_on_timeout_and_imagination_does_not_touch_it():
     wrapper = _tiny_model()
     agent = wrapper.agent
     agent.observe_reward(2.0, False, False)
@@ -236,6 +236,51 @@ def test_real_reward_normalizer_resets_on_timeout_and_imagination_does_not_touch
     assert agent.last_inner_metrics["inner_reward_scale"] == pytest.approx(
         agent.reward_normalizer.scale
     )
+    assert agent.last_inner_metrics["inner_reward_scale_initial"] == pytest.approx(
+        agent.reward_normalizer.scale
+    )
+    assert agent.last_inner_metrics["inner_reward_scale_final"] == pytest.approx(
+        agent.reward_normalizer.scale
+    )
+    assert agent.last_inner_metrics["inner_reward_scale_delta"] == pytest.approx(0.0)
+    assert agent.last_inner_metrics["inner_reward_normalizer_count_initial"] == 2.0
+    assert agent.last_inner_metrics["inner_reward_normalizer_count_final"] == 2.0
+    assert agent.last_inner_metrics[
+        "inner_reward_normalizer_imagined_updates"
+    ] == 0.0
+    wrapper.env.close()
+
+
+def test_action_local_imagined_reward_statistics_are_fresh_and_never_write_back():
+    wrapper = _tiny_model(
+        inner_reward_normalization="action_local_imagined"
+    )
+    agent = wrapper.agent
+    agent.observe_reward(2.0, False, False)
+    agent.observe_reward(3.0, False, True)
+    outer_state = deepcopy(agent.reward_normalizer.state_dict())
+
+    obs, _ = wrapper.env.reset(seed=3)
+    action, _ = wrapper.predict(obs, deterministic=False)
+
+    assert action.shape == wrapper.env.action_space.shape
+    assert _tree_equal(agent.reward_normalizer.state_dict(), outer_state)
+    metrics = agent.last_inner_metrics
+    assert metrics["inner_reward_scale_initial"] == pytest.approx(
+        agent.reward_normalizer.scale
+    )
+    assert metrics["inner_reward_scale"] == pytest.approx(
+        metrics["inner_reward_scale_final"]
+    )
+    assert metrics["inner_reward_scale_delta"] == pytest.approx(
+        metrics["inner_reward_scale_final"] - metrics["inner_reward_scale_initial"]
+    )
+    assert metrics["inner_reward_normalizer_count_initial"] == 0.0
+    assert metrics["inner_reward_normalizer_count_final"] == 4.0
+    assert metrics["inner_reward_normalizer_imagined_updates"] == 4.0
+    assert metrics["inner_reward_normalizer_imagined_updates"] == metrics[
+        "inner_realized_model_steps"
+    ]
     wrapper.env.close()
 
 
@@ -302,6 +347,27 @@ def test_portable_checkpoint_round_trip_and_bad_state_is_atomic():
     assert _tree_equal(restored.checkpoint_state(), before)
     wrapper.env.close()
     restored_wrapper.env.close()
+
+
+def test_inner_reward_normalization_mode_is_checkpoint_semantic():
+    frozen_wrapper = _tiny_model()
+    adaptive_wrapper = _tiny_model(
+        inner_reward_normalization="action_local_imagined"
+    )
+    frozen = frozen_wrapper.agent
+    adaptive = adaptive_wrapper.agent
+
+    assert frozen.semantic_signature()["reward_normalization"] == (
+        "real_discounted_return_only"
+    )
+    assert adaptive.semantic_signature()["reward_normalization"] == (
+        "real_discounted_return_plus_fresh_action_local_imagined_returns"
+    )
+    with pytest.raises(ValueError, match="semantics"):
+        frozen.load(deepcopy(adaptive.checkpoint_state()))
+
+    frozen_wrapper.env.close()
+    adaptive_wrapper.env.close()
 
 
 def test_inner_action_is_logically_fresh_and_does_not_mutate_outer_prior():

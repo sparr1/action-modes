@@ -58,6 +58,10 @@ _AMBIXQC_DEFAULTS = {
     "inner_batch_size": 64,
     "inner_replay_capacity": None,
     "inner_replay_sampling": "with_replacement",
+    # Existing experiments retain the real-stream scale snapshot. Heavy
+    # inner-data screens can opt into fresh action-local imagined-return
+    # moments without contaminating the persistent real-data normalizer.
+    "inner_reward_normalization": "frozen_real_scale",
     "inner_actor_lr": 5e-5,
     "inner_critic_lr": 5e-5,
     "inner_diagnostics_every": 1000,
@@ -71,6 +75,7 @@ _PUBLIC_INNER_KEYS = {
     "inner_batch_size",
     "inner_replay_capacity",
     "inner_replay_sampling",
+    "inner_reward_normalization",
     "inner_actor_lr",
     "inner_critic_lr",
     "inner_diagnostics_every",
@@ -396,6 +401,20 @@ class AMBIXQC(AMBITDMPC2):
         if cfg.inner_replay_sampling != "with_replacement":
             raise ValueError(
                 "AMBI-XQC v1 requires inner_replay_sampling='with_replacement'."
+            )
+        if not isinstance(cfg.inner_reward_normalization, str):
+            raise ValueError(
+                "inner_reward_normalization must be 'frozen_real_scale' or "
+                "'action_local_imagined'."
+            )
+        cfg.inner_reward_normalization = cfg.inner_reward_normalization.lower()
+        if cfg.inner_reward_normalization not in {
+            "frozen_real_scale",
+            "action_local_imagined",
+        }:
+            raise ValueError(
+                "inner_reward_normalization must be 'frozen_real_scale' or "
+                "'action_local_imagined'."
             )
         cfg.inner_actor_lr = _finite_float(
             cfg.inner_actor_lr, "inner_actor_lr", positive=True

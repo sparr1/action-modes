@@ -25,13 +25,78 @@ from .common.training_state import require_exact_keys
 from .xqc_controller import LatentXQCBatch, LatentXQCWorkspace
 
 
+class _ActionLocalReturnNormalizer:
+    """Device-local running moments for independent imagined return streams."""
+
+    def __init__(self, *, device, epsilon=1e-8):
+        self.device = torch.device(device)
+        self.epsilon = float(epsilon)
+        self.mean = torch.zeros((), dtype=torch.float64, device=self.device)
+        self.mean_squared = torch.zeros_like(self.mean)
+        self.var = torch.ones_like(self.mean)
+        self.count = torch.zeros_like(self.mean)
+        self.maximum = torch.full_like(self.mean, -torch.inf)
+        self.minimum = torch.full_like(self.mean, torch.inf)
+
+    @property
+    def scale(self):
+        return self.var.clamp_min(0.0).sqrt() + self.epsilon
+
+    @torch.no_grad()
+    def update(self, returns):
+        """Merge one batch of branchwise discounted-return observations."""
+
+        values = torch.as_tensor(returns, device=self.device).detach().reshape(-1)
+        if values.numel() == 0:
+            return False
+        values = values.to(dtype=torch.float64)
+        finite = torch.isfinite(values).all()
+        if values.device.type == "cuda":
+            torch._assert_async(
+                finite, "Imagined discounted returns must all be finite."
+            )
+        elif not bool(finite):
+            raise ValueError("Imagined discounted returns must all be finite.")
+
+        batch_count = values.new_tensor(float(values.numel()))
+        batch_mean = values.mean()
+        batch_mean_squared = values.square().mean()
+        batch_var = values.var(unbiased=False)
+        total_count = self.count + batch_count
+        delta = batch_mean - self.mean
+        delta_squared = batch_mean_squared - self.mean_squared
+        new_mean = self.mean + delta * batch_count / total_count
+        new_mean_squared = (
+            self.mean_squared + delta_squared * batch_count / total_count
+        )
+        new_m2 = (
+            self.var * self.count
+            + batch_var * batch_count
+            + delta.square() * self.count * batch_count / total_count
+        )
+        new_var = new_m2 / total_count
+
+        self.mean.copy_(new_mean)
+        self.mean_squared.copy_(new_mean_squared)
+        self.var.copy_(new_var)
+        self.count.copy_(total_count)
+        absolute = values.abs()
+        self.maximum.copy_(torch.maximum(self.maximum, absolute.max()))
+        self.minimum.copy_(torch.minimum(self.minimum, absolute.min()))
+        return True
+
+
 @dataclass
 class InnerXQCState:
     """Only the logically live state of the current decision."""
 
     workspace: LatentXQCWorkspace | None = None
     replay: LatentReplayBuffer | None = None
-    reward_scale: float = 1.0
+    reward_scale: float | torch.Tensor = 1.0
+    reward_scale_initial: float | torch.Tensor = 1.0
+    reward_return_seed: float = 0.0
+    reward_normalizer: _ActionLocalReturnNormalizer | None = None
+    reward_normalizer_count_initial: float | torch.Tensor = 0.0
     replay_draws: int = 0
     policy_evaluations: int = 0
     sampled_ids: list[torch.Tensor] = field(default_factory=list)
@@ -252,6 +317,33 @@ class InnerXQCEngine:
             )
         return scale
 
+    def _real_return_accumulator(self) -> float:
+        normalizer = getattr(self.agent, "reward_normalizer", None)
+        accumulator = (
+            0.0
+            if normalizer is None
+            else float(getattr(normalizer, "return_accumulator", 0.0))
+        )
+        if not math.isfinite(accumulator):
+            raise ValueError(
+                "AMBI-XQC's real return accumulator must be finite."
+            )
+        return accumulator
+
+    def _real_reward_normalizer_count(self) -> float:
+        normalizer = getattr(self.agent, "reward_normalizer", None)
+        count = (
+            0.0
+            if normalizer is None
+            else float(getattr(normalizer, "count", 0.0))
+        )
+        if not math.isfinite(count) or count < 0.0:
+            raise ValueError(
+                "AMBI-XQC's real reward-normalizer count must be finite and "
+                "non-negative."
+            )
+        return count
+
     def _prepare_action(self):
         cfg = self.cfg
         if self._workspace_pool is None:
@@ -281,12 +373,60 @@ class InnerXQCEngine:
             self._replay_pool = None
             replay.clear()
 
+        outer_scale = self._real_reward_scale()
+        adaptive = (
+            str(self.cfg.inner_reward_normalization)
+            == "action_local_imagined"
+        )
+        reward_normalizer = (
+            _ActionLocalReturnNormalizer(device=self.device)
+            if adaptive
+            else None
+        )
+        if reward_normalizer is None:
+            reward_scale = outer_scale
+            reward_scale_initial = outer_scale
+            reward_normalizer_count_initial = (
+                self._real_reward_normalizer_count()
+            )
+        else:
+            # The adaptive scale is consumed by every XQC update slot. Keep a
+            # scalar in the replay/controller dtype on device so each round
+            # can update it without synchronizing a CUDA value back to Python.
+            reward_scale = replay.reward.new_tensor(outer_scale)
+            reward_scale_initial = reward_scale.clone()
+            reward_normalizer_count_initial = reward_normalizer.count.clone()
         self.state = InnerXQCState(
             workspace=workspace,
             replay=replay,
-            reward_scale=self._real_reward_scale(),
+            reward_scale=reward_scale,
+            reward_scale_initial=reward_scale_initial,
+            reward_return_seed=self._real_return_accumulator(),
+            reward_normalizer=reward_normalizer,
+            reward_normalizer_count_initial=reward_normalizer_count_initial,
         )
         self._ensure_rollout_compile_region(workspace.controller)
+
+    def _new_branch_return_accumulator(self, count, reference):
+        return torch.full(
+            (int(count),),
+            float(self.state.reward_return_seed),
+            # Official reward-normalizer moments and the persistent real
+            # accumulator are float64. Keep the imagined recurrence equally
+            # precise even though replay/model rewards remain float32.
+            dtype=torch.float64,
+            device=reference.device,
+        )
+
+    def _update_reward_normalizer(self, return_samples):
+        normalizer = self.state.reward_normalizer
+        if normalizer is None:
+            return
+        if normalizer.update(return_samples):
+            # Cast once per collection round into the preallocated controller
+            # scalar. The XQC update slots then consume it without any
+            # device-to-host scalar materialization.
+            self.state.reward_scale.copy_(normalizer.scale)
 
     def _release_action(self):
         if self.state.workspace is not None:
@@ -352,6 +492,12 @@ class InnerXQCEngine:
         discount_weight = torch.ones_like(reward_sums)
         terminated_rollout = torch.zeros_like(alive)
         transition_fields = ([], [], [], [], [])
+        normalizer_returns = []
+        return_accumulator = (
+            self._new_branch_return_accumulator(count, root_z)
+            if self.state.reward_normalizer is not None
+            else None
+        )
 
         for _ in range(horizon):
             active = torch.nonzero(alive, as_tuple=False).squeeze(-1)
@@ -377,6 +523,15 @@ class InnerXQCEngine:
             transition_fields[4].append(terminated)
 
             reward_vector = reward.squeeze(-1)
+            if return_accumulator is not None:
+                active_returns = (
+                    float(self.agent.discount)
+                    * (1.0 - terminated.squeeze(-1))
+                    * return_accumulator.index_select(0, active)
+                    + reward_vector
+                )
+                return_accumulator[active] = active_returns
+                normalizer_returns.append(active_returns)
             lengths[active] += 1
             reward_sums[active] += reward_vector
             discounted_rewards[active] += discount_weight[active] * reward_vector
@@ -395,6 +550,11 @@ class InnerXQCEngine:
             "reward_sums": reward_sums,
             "discounted_rewards": discounted_rewards,
             "terminated": terminated_rollout,
+            "reward_normalizer_returns": (
+                torch.cat(normalizer_returns)
+                if normalizer_returns
+                else root_z.new_empty((0,))
+            ),
         }
 
     @torch.no_grad()
@@ -501,7 +661,33 @@ class InnerXQCEngine:
             "terminated": torch.zeros(
                 count, dtype=torch.bool, device=self.device
             ),
+            "reward_normalizer_returns": self._dense_return_samples(
+                packed,
+                count=count,
+                horizon=horizon,
+            ),
         }
+
+    def _dense_return_samples(self, packed, *, count, horizon):
+        if self.state.reward_normalizer is None:
+            return packed.new_empty((0,))
+        rows = packed.reshape(
+            int(horizon), int(count), packed.shape[-1]
+        )
+        reward_index = int(self.cfg.latent_dim) + int(self.cfg.action_dim)
+        rewards = rows[..., reward_index]
+        terminated = rows[..., -1]
+        accumulator = self._new_branch_return_accumulator(count, rewards)
+        samples = []
+        for step in range(int(horizon)):
+            accumulator = (
+                float(self.agent.discount)
+                * (1.0 - terminated[step])
+                * accumulator
+                + rewards[step]
+            )
+            samples.append(accumulator)
+        return torch.cat(samples)
 
     def _sample_batch(self):
         replacement = self.cfg.inner_replay_sampling == "with_replacement"
@@ -668,6 +854,12 @@ class InnerXQCEngine:
             for _ in range(int(self.cfg.inner_rounds)):
                 rollout_start = self._timer_start()
                 rollout = self._collect_round(root_z)
+                # Collection is the data-generating event. Update running
+                # return moments exactly once per imagined transition before
+                # replay sampling, so the scale is independent of UTD and G.
+                self._update_reward_normalizer(
+                    rollout["reward_normalizer_returns"]
+                )
                 self._timer_stop("inner_rollout_seconds", rollout_start)
                 all_lengths.append(rollout["lengths"])
                 reward_sums.append(rollout["reward_sums"])
@@ -708,6 +900,15 @@ class InnerXQCEngine:
             update_batch_work = update_slots * int(self.cfg.inner_batch_size)
             realized_steps = length_values.sum()
             utd_denominator = realized_steps.clamp_min(1)
+            local_reward_normalizer = self.state.reward_normalizer
+            if local_reward_normalizer is None:
+                normalizer_count_final = self.state.reward_normalizer_count_initial
+                imagined_normalizer_updates = 0.0
+            else:
+                normalizer_count_final = local_reward_normalizer.count
+                imagined_normalizer_updates = normalizer_count_final
+            reward_scale_initial = self.state.reward_scale_initial
+            reward_scale_final = self.state.reward_scale
 
             metrics = self._base_metrics()
             metrics.update(
@@ -757,7 +958,19 @@ class InnerXQCEngine:
                 inner_buffer_fill_ratio=float(
                     self.state.replay.size / self.state.replay.capacity
                 ),
-                inner_reward_scale=float(self.state.reward_scale),
+                inner_reward_scale=reward_scale_final,
+                inner_reward_scale_initial=reward_scale_initial,
+                inner_reward_scale_final=reward_scale_final,
+                inner_reward_scale_delta=(
+                    reward_scale_final - reward_scale_initial
+                ),
+                inner_reward_normalizer_count_initial=(
+                    self.state.reward_normalizer_count_initial
+                ),
+                inner_reward_normalizer_count_final=normalizer_count_final,
+                inner_reward_normalizer_imagined_updates=(
+                    imagined_normalizer_updates
+                ),
                 inner_alpha=alpha_final.mean(),
                 inner_alpha_initial=alpha_initial.mean(),
                 inner_alpha_final=alpha_final.mean(),

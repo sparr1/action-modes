@@ -1,3 +1,5 @@
+import inspect
+
 import pytest
 import torch
 
@@ -257,7 +259,7 @@ def test_latent_critic_restores_arbitrary_leading_dimensions_without_detaching()
             discount=0.99,
         ),
         next_noise=torch.randn(3, 5, 2),
-        reward_scale=2.0,
+        reward_scale=torch.tensor(2.0),
     )
 
     assert objective.per_sample_loss.shape == (3, 5)
@@ -265,3 +267,101 @@ def test_latent_critic_restores_arbitrary_leading_dimensions_without_detaching()
     objective.per_sample_loss[-1].mean().backward()
     assert latent.grad is not None
     assert latent.grad[-1].abs().sum() > 0
+
+
+@pytest.mark.parametrize(
+    "reward_scale",
+    (
+        torch.tensor(0.0),
+        torch.tensor(-1.0),
+        torch.tensor(torch.inf),
+        torch.tensor(torch.nan),
+        torch.ones(2),
+    ),
+)
+def test_tensor_reward_scale_cpu_validation_preserves_value_errors(reward_scale):
+    controller = LatentXQCController(
+        3,
+        1,
+        LatentXQCConfig(
+            actor_net_arch=(8,),
+            critic_net_arch=(8,),
+            num_atoms=11,
+            target_entropy=-0.5,
+            optimizer_backend="single_tensor",
+        ),
+    )
+    batch = LatentXQCBatch(
+        latents=torch.randn(2, 3),
+        actions=torch.randn(2, 1).tanh(),
+        rewards=torch.randn(2, 1),
+        next_latents=torch.randn(2, 3),
+        bootstrap_mask=torch.ones(2, 1),
+        discount=0.99,
+    )
+
+    with pytest.raises(
+        ValueError, match="reward_scale must be one positive finite scalar"
+    ):
+        controller.critic_objective(
+            batch,
+            next_noise=torch.randn(2, 1),
+            reward_scale=reward_scale,
+        )
+
+
+def test_cuda_tensor_reward_scale_validation_uses_async_assertion():
+    source = inspect.getsource(LatentXQCController.critic_objective)
+
+    assert 'if scale.device.type == "cuda":' in source
+    assert "torch._assert_async(" in source
+    assert "bool(torch.isfinite(scale)" not in source
+    assert "bool(scale > 0)" not in source
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_tensor_reward_scale_does_not_materialize_a_host_scalar(monkeypatch):
+    device = torch.device("cuda")
+    controller = LatentXQCController(
+        3,
+        1,
+        LatentXQCConfig(
+            actor_net_arch=(8,),
+            critic_net_arch=(8,),
+            num_atoms=11,
+            target_entropy=-0.5,
+            optimizer_backend="single_tensor",
+        ),
+    ).to(device)
+    batch = LatentXQCBatch(
+        latents=torch.randn(2, 3, device=device),
+        actions=torch.randn(2, 1, device=device).tanh(),
+        rewards=torch.randn(2, 1, device=device),
+        next_latents=torch.randn(2, 3, device=device),
+        bootstrap_mask=torch.ones(2, 1, device=device),
+        discount=0.99,
+    )
+    original_item = torch.Tensor.item
+    original_bool = torch.Tensor.__bool__
+
+    def guarded_item(tensor, *args, **kwargs):
+        if tensor.device.type == "cuda":
+            raise AssertionError("CUDA reward-scale validation called Tensor.item()")
+        return original_item(tensor, *args, **kwargs)
+
+    def guarded_bool(tensor):
+        if tensor.device.type == "cuda":
+            raise AssertionError("CUDA reward-scale validation converted a tensor to bool")
+        return original_bool(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "item", guarded_item)
+    monkeypatch.setattr(torch.Tensor, "__bool__", guarded_bool)
+
+    objective = controller.critic_objective(
+        batch,
+        next_noise=torch.randn(2, 1, device=device),
+        reward_scale=torch.tensor(2.0, device=device),
+    )
+    torch.cuda.synchronize()
+
+    assert objective.loss.device == device

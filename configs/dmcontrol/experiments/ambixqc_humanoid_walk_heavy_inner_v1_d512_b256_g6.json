@@ -1,0 +1,26 @@
+{
+  "study_type": "ambixqc_humanoid_walk_heavy_inner_v1_schedule_single_seed_exploratory",
+  "study_note": "XQC-native heavy-inner-v1 d512_b256_g6 cell for Humanoid Walk state observations. It uses J=8, N=512, H=3, G=6, and batch size 256, giving 48 critic update slots, 16 accepted actor optimizer steps, and 16 accepted automatic-temperature optimizer steps per planned action. Action-local imagined-return reward normalization starts fresh at every planned action, seeds each imagined branch from the outer real return accumulator, and updates before that round's optimizer slots. No imagined normalization statistics write back to the outer real normalizer. The budget is 14 million decisions. Evaluation is disabled, there are no model checkpoints, and exact trainer resume is unsupported. This is a single-seed, non-confirmatory exploratory run.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambixqc_humanoid_walk_heavy_inner_v1_d512_b256_g6"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": null,
+  "save_strat": "none",
+  "log_info": false,
+  "log_type": "summary"
+}

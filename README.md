@@ -93,6 +93,137 @@ one-million-decision budget, evaluation cadence, and checkpoint policy. Only
 strict compilation and the W&B identity differ. It is still a single-seed
 exploratory run, not a learning-quality comparison.
 
+### AMBI-XQC heavy inner-loop v1 suite
+
+The `ambixqc_humanoid_walk_heavy_inner_v1` suite is an XQC-native heavy-compute
+screen derived from the strict compiled production configuration above. Every
+cell preserves the XQC/TOLD model, optimizer,
+target, policy-delay, and recurrent-training settings; uses seed 55, strict
+compilation, horizon `H=3`, and a 14-million decision budget; and explicitly
+sets `inner_reward_normalization="action_local_imagined"`. Relative to the
+strict compiled production configuration, the base changes only the decision
+budget, evaluation cadence, declared inner schedule, inner reward-normalization
+mode, W&B identity, and manifest logging/checkpoint policy; the other cells
+change only the inner schedule and cell identity relative to that base. The
+source matrix is native AMBI commit
+`698bd074551bc48128cb34f78adaf8caaab1f188`. Matching algorithm and experiment
+JSON files live under `configs/dmcontrol/algs` and
+`configs/dmcontrol/experiments`. The table abbreviates the common
+`ambixqc_humanoid_walk_heavy_inner_v1` stem.
+
+| Cell suffix | J | N | H | G | Batch | Replay capacity | Critic slots | Accepted actor / temperature optimizer steps |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| base (no suffix) | 8 | 32 | 3 | 1 | 64 | 768 | 8 | 3 |
+| `d256_g1_j6` | 6 | 256 | 3 | 1 | 256 | 4,608 | 6 | 2 |
+| `d256_g1` | 8 | 256 | 3 | 1 | 256 | 6,144 | 8 | 3 |
+| `d256_g3` | 8 | 256 | 3 | 3 | 256 | 6,144 | 24 | 8 |
+| `d512_g1_j6` | 6 | 512 | 3 | 1 | 512 | 9,216 | 6 | 2 |
+| `d512_g1` | 8 | 512 | 3 | 1 | 512 | 12,288 | 8 | 3 |
+| `d512_g3_j6` | 6 | 512 | 3 | 3 | 512 | 9,216 | 18 | 6 |
+| `d512_g3` | 8 | 512 | 3 | 3 | 512 | 12,288 | 24 | 8 |
+| `d512_b256_g6` | 8 | 512 | 3 | 6 | 256 | 12,288 | 48 | 16 |
+
+The source-to-XQC projection is explicit:
+
+| Native AMBI cell | AMBI-XQC cell suffix |
+| --- | --- |
+| base-v2 | base (no suffix) |
+| D256-1-J6 | `d256_g1_j6` |
+| D256-1 | `d256_g1` |
+| D256-2 | `d256_g3` |
+| D512-1-J6 | `d512_g1_j6` |
+| D512-1 | `d512_g1` |
+| D512-4-J6 | `d512_g3_j6` |
+| D512-2, D512-3, or D512-4 | `d512_g3` |
+| D512-5 | `d512_b256_g6` |
+
+Here `G` is the existing shared XQC optimizer-slot count per round; this suite
+does not add a component-specific scheduler or alter XQC update-slot ordering.
+Each slot updates the critic, while policy delay 3 accepts actor and automatic
+temperature optimizer steps at zero-based slots `0, 3, 6, ...`, so the accepted
+count is `((J*G - 1) // 3) + 1`. The actor objective and gradient are still
+evaluated on every slot, and actor BatchNorm buffers still update on every
+slot. Online critic BatchNorm buffers likewise update on critic training
+batches. Target-critic BatchNorm retains XQC's `batch_no_update` behavior, and
+rollout/execution forwards consume rather than modify the learned running
+statistics. Replay capacity is exactly `J*N*H`.
+
+The heavy suite's reward normalization is action-local. At every planned
+action, the imagined-return moments start empty, while every independent branch
+seeds its discounted-return accumulator from the current outer real-return
+accumulator. Branch accumulators never flow into neighboring branches and reset
+to that same real-root seed at the start of each round. All realized imagined
+transitions update the local moments once during collection; the resulting
+scale is then used by that round's XQC optimizer slots. Replay rewards remain
+raw. The local statistics are discarded after action selection and never write
+back to the chronological outer real-reward normalizer. With no imagined sample
+yet, the outer real scale is the action's fallback initial scale. Other
+AMBI-XQC configurations retain the backward-compatible
+`inner_reward_normalization="frozen_real_scale"` default unless they opt in
+explicitly. W&B records the initial, final, and delta reward scales, the local
+moment counts, and the number of imagined transitions incorporated.
+
+The projection preserves `J`, `N`, `H`, batch size, replay capacity, and critic
+slot dose. It does not preserve native SAC actor/alpha scheduling, phased
+ordering, minibatch-draw counts, or optimizer semantics. In particular, when
+the native AMBI `D512-2`, `D512-3`, and `D512-4` cells are projected by treating
+their three critic updates per round as shared XQC `G=3`, all three resolve to
+`d512_g3`; this is not a claim of component-schedule equivalence.
+
+These are single-seed, non-confirmatory exploratory configurations. Every
+manifest keeps the source suite's timestamped summary logging while disabling
+evaluation and model checkpoints, and AMBI-XQC still has no exact
+trainer-resume path.
+
+The dedicated Hydra launcher intentionally exposes only the two requested
+source-projection cells: `d512_g3_j6` (native D512-4-J6) and `d512_g3` (native
+D512-2, also the collapsed D512-3/D512-4 projection). It submits one atomic
+two-task array, with the array index serving as the fixed allowlist; there is no
+caller-selectable manifest. Each task requests one GPU, eight CPUs, 64 GiB of
+host memory, and at most 30 days. The submitter pins both tasks to `gpu2301`,
+requires two immediately available matching GPU/CPU/memory slots, and has no
+fallback node. It requires eight GiB of durable free space for the pair; each
+array task rechecks that at least four GiB remains and requires eight GiB in
+its node-local scratch filesystem. Automatic requeue is disabled because the
+runs have no exact-resume state.
+
+First commit and push the tested changes, then update a clean Hydra checkout
+through Git to that exact commit. Create a new durable result root outside the
+checkout and point `--python` at an existing locked DMControl environment. The
+environment may belong to a different clean checkout only when its `uv.lock`
+is byte-identical:
+
+```bash
+ACTION_SHA="$(git rev-parse HEAD)"
+RUN_ID="ambixqc-heavy-inner-${ACTION_SHA:0:7}-$(date -u +%Y%m%dT%H%M%SZ)"
+RESULTS_ROOT="/cs/home/rgao48/ambixqc-heavy-inner-v1"
+DMCONTROL_PYTHON="/absolute/path/to/action-modes/environments/dmcontrol/.venv/bin/python"
+mkdir -p "$RESULTS_ROOT"
+slurm/submit_ambixqc_humanoid_walk_heavy_inner_pair_hydra.sh \
+  --expected-action-modes-sha "$ACTION_SHA" \
+  --results-root "$RESULTS_ROOT" \
+  --run-id "$RUN_ID" \
+  --python "$DMCONTROL_PYTHON" \
+  --dry-run
+```
+
+Remove `--dry-run` only after reviewing the single `sbatch` command and the
+reported `gpu2301` capacity. The availability check is a scheduler snapshot;
+the array can still queue if capacity changes after the check. Each task gets a
+unique cell/job artifact directory and W&B run ID. Torch, TorchInductor,
+Triton, CUDA, NumPy/Numba, plotting, temporary, and W&B state are isolated on
+node-local storage. Durable storage receives the timestamped summary output,
+provenance/runtime probes, job log, and a final `PASS` marker. There is no
+evaluation or model-checkpoint acceptance check because both manifests
+deliberately disable those outputs, and a failed job cannot resume exactly.
+Before Python starts, inherited compiler-debug and CUDA synchronization/cache
+overrides are cleared. The runtime probe requires exactly one visible NVIDIA
+L40 with at least 44 GiB of memory. Both cells require strict compilation, so
+any compile fallback is fatal. Their optimizer backend remains `auto`: fused
+Adam is intended on CUDA, but the runtime selection is authoritative and the
+launcher does not claim that fused execution occurred merely from the config.
+No job is submitted by adding these launch files.
+
 For compute-only profiling, use the environment-free exact-shape benchmark:
 
 ```bash

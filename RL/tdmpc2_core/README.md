@@ -67,9 +67,20 @@ AMBI-XQC is a separate algorithm rather than another native AMBI option. It
 retains the TOLD encoder, dynamics, reward/termination heads, and uninterrupted
 recurrent BPTT, while its persistent and action-local control learners use
 XQC's twin full-distribution Bellman target, BatchNorm state rules, projected
-linear weights, delayed actor/temperature updates, and real-return reward
-scale. Only chronological real rewards update that scale; each fresh inner
-learner sees one frozen snapshot and never updates it from imagined branches.
+linear weights, delayed actor/temperature updates, and discounted-return reward
+scale. `inner_reward_normalization="frozen_real_scale"` preserves the original
+behavior: only chronological real rewards update the normalizer and each fresh
+inner learner sees one frozen scale. The opt-in
+`"action_local_imagined"` mode creates empty action-local return moments, seeds
+each independent imagined branch accumulator from the current outer real
+return, resets branches to that seed every collection round, and updates the
+local scale from every realized imagined transition before that round's XQC
+updates. Raw replay rewards remain unchanged, the local moments are discarded
+after the action, and imagined statistics never write back to the outer
+normalizer. SimNorm itself has no running state. Inner online actor and critic
+BatchNorm statistics already adapt on their respective training batches;
+target-critic buffers keep official XQC's `batch_no_update` rule, while rollout
+and execution consume the adapted running statistics without mutating them.
 The XQC controller semantics reuse the PyTorch port of official XQC commit
 `9a6832bb742ef01bbe9f1e06153a9338e612dae5`; TOLD remains derived from the
 TD-MPC2 source identified above.

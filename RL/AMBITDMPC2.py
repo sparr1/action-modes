@@ -1347,6 +1347,7 @@ class AMBITDMPC2(TDMPC2Baseline):
                 "train/inner_policy_evaluations": 0,
                 "train/inner_q_evaluations": 0,
                 "train/inner_replay_draws": 0,
+                "train/inner_reward_normalizer_imagined_updates": 0,
                 "train/inner_diagnostic_model_steps": 0,
             })
             return
@@ -1419,6 +1420,7 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_policy_evaluations",
             "inner_q_evaluations",
             "inner_replay_draws",
+            "inner_reward_normalizer_imagined_updates",
             "inner_diagnostic_model_steps",
             "inner_diagnostics_sample_count",
             "planner_policy_model_steps",
@@ -1502,6 +1504,11 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_temperature",
             "inner_alpha_to_abs_q",
             "inner_reward_scale",
+            "inner_reward_scale_initial",
+            "inner_reward_scale_final",
+            "inner_reward_scale_delta",
+            "inner_reward_normalizer_count_initial",
+            "inner_reward_normalizer_count_final",
             "inner_actor_learning_rate",
             "inner_critic_learning_rate",
             "inner_temperature_learning_rate",

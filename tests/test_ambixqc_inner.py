@@ -1,4 +1,5 @@
 from copy import deepcopy
+import inspect
 import math
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ from torch import nn
 from RL.tdmpc2_core.common import math as td_math
 from RL.tdmpc2_core.inner_xqc import InnerXQCEngine
 from RL.tdmpc2_core.xqc_controller import LatentXQCConfig, LatentXQCController
+from RL.xqc_core import DiscountedReturnNormalizer
 
 
 def _assert_tree_equal(left, right):
@@ -107,7 +109,11 @@ class _FakeWorkspace:
                 "next_latents": batch.next_latents.detach().clone(),
                 "bootstrap_mask": batch.bootstrap_mask.detach().clone(),
                 "discount": batch.discount.detach().clone(),
-                "reward_scale": float(reward_scale),
+                "reward_scale": (
+                    reward_scale.detach().clone()
+                    if torch.is_tensor(reward_scale)
+                    else float(reward_scale)
+                ),
             }
         )
         accepted = self.update_step % self.controller.config.policy_delay == 0
@@ -145,9 +151,16 @@ class _FakeOuterController:
 
 
 class _FakeTOLD(nn.Module):
-    def __init__(self, *, terminate=False, action_dependent=False):
+    def __init__(
+        self,
+        *,
+        terminate=False,
+        mixed_termination=False,
+        action_dependent=False,
+    ):
         super().__init__()
         self.terminate = terminate
+        self.mixed_termination = bool(mixed_termination)
         self.action_dependent = bool(action_dependent)
         if self.action_dependent:
             self.action_reward_scale = nn.Parameter(torch.tensor(0.5))
@@ -170,6 +183,12 @@ class _FakeTOLD(nn.Module):
         return next_z
 
     def termination(self, z):
+        if self.mixed_termination:
+            # For N=2 this yields one terminated and one surviving branch on
+            # the first step; the surviving singleton terminates next.
+            values = torch.ones(z.shape[0], 1, device=z.device)
+            values[1::2] = 0.0
+            return values
         value = 1.0 if self.terminate else 0.0
         return torch.full((z.shape[0], 1), value, device=z.device)
 
@@ -181,6 +200,9 @@ def _agent(
     compile=False,
     compile_strict=False,
     oracle_rollout=False,
+    mixed_termination=False,
+    reward_mode="frozen_real_scale",
+    reward_normalizer=None,
 ):
     cfg = SimpleNamespace(
         seed=11,
@@ -207,6 +229,7 @@ def _agent(
         xqc_target_update_interval=1,
         inner_termination_threshold=0.5,
         inner_model_step_budget=8,
+        inner_reward_normalization=reward_mode,
     )
     controller = _FakeOuterController(use_noise=oracle_rollout)
     agent = SimpleNamespace(
@@ -214,11 +237,16 @@ def _agent(
         device=torch.device("cpu"),
         model=_FakeTOLD(
             terminate=terminate,
+            mixed_termination=mixed_termination,
             action_dependent=oracle_rollout,
         ),
         xqc_controller=controller,
         discount=0.9,
-        reward_normalizer=SimpleNamespace(scale=2.5),
+        reward_normalizer=(
+            SimpleNamespace(scale=2.5, return_accumulator=4.0)
+            if reward_normalizer is None
+            else reward_normalizer
+        ),
     )
     return agent, controller
 
@@ -273,6 +301,7 @@ def _legacy_stepwise_non_episodic_round(engine, root_z):
         "reward_sums": reward_sums,
         "discounted_rewards": discounted_rewards,
         "terminated": terminated_rollout,
+        "reward_normalizer_returns": root_z.new_empty((0,)),
     }
 
 
@@ -430,6 +459,12 @@ def test_action_local_xqc_uses_raw_imagination_and_frozen_real_reward_scale():
     assert metrics["inner_temperature_optimizer_steps"] == 2
     assert metrics["inner_final_outer_policy_kl"] == pytest.approx(0.02)
     assert metrics["inner_reward_scale"] == pytest.approx(2.5)
+    assert metrics["inner_reward_scale_initial"] == pytest.approx(2.5)
+    assert metrics["inner_reward_scale_final"] == pytest.approx(2.5)
+    assert metrics["inner_reward_scale_delta"] == pytest.approx(0.0)
+    assert metrics["inner_reward_normalizer_count_initial"] == 0.0
+    assert metrics["inner_reward_normalizer_count_final"] == 0.0
+    assert metrics["inner_reward_normalizer_imagined_updates"] == 0.0
     assert metrics["inner_buffer_size"] == 8
     assert all(record["reward_scale"] == 2.5 for record in outer.records)
     assert all(torch.equal(record["rewards"], torch.ones(2, 1)) for record in outer.records)
@@ -447,6 +482,160 @@ def test_action_local_xqc_uses_raw_imagination_and_frozen_real_reward_scale():
     assert engine.state.replay is None
     assert set(engine._workspace_pool.controller.actor.bn_modes) == {"running"}
     assert torch.equal(engine._replay_pool.reward[:8], torch.ones(8, 1))
+
+
+def _seeded_outer_reward_normalizer():
+    normalizer = DiscountedReturnNormalizer(0.9)
+    normalizer.update(2.0, False)
+    normalizer.update(3.0, False)
+    return normalizer
+
+
+def _population_scale(values, epsilon):
+    values = torch.as_tensor(values, dtype=torch.float64)
+    return float(values.var(unbiased=False).sqrt()) + float(epsilon)
+
+
+def test_action_local_imagined_reward_normalization_is_branchwise_round_local_and_precedes_updates():
+    normalizer = _seeded_outer_reward_normalizer()
+    outer_normalizer_before = deepcopy(normalizer.state_dict())
+    agent, outer = _agent(
+        oracle_rollout=True,
+        reward_mode="action_local_imagined",
+        reward_normalizer=normalizer,
+    )
+    engine = InnerXQCEngine(agent)
+
+    _, metrics, lengths = engine.act(torch.zeros(1, 2), eval_mode=False)
+
+    assert lengths == [2, 2, 2, 2]
+    _assert_tree_equal(normalizer.state_dict(), outer_normalizer_before)
+    raw_rewards = engine._replay_pool.reward[:8, 0].detach().double()
+    assert raw_rewards.unique().numel() > 1
+
+    all_returns = []
+    expected_round_scales = []
+    for rewards in raw_rewards.reshape(2, 2, 2):
+        branch_returns = torch.full(
+            (2,), normalizer.return_accumulator, dtype=torch.float64
+        )
+        for step_rewards in rewards:
+            branch_returns = 0.9 * branch_returns + step_rewards
+            all_returns.extend(branch_returns.tolist())
+        expected_round_scales.append(
+            _population_scale(all_returns, normalizer.epsilon)
+        )
+
+    # A single flattened recurrence would leak one branch into the next and
+    # must not accidentally agree with the branchwise oracle.
+    flat_accumulator = float(normalizer.return_accumulator)
+    flattened_returns = []
+    for reward in raw_rewards:
+        flat_accumulator = 0.9 * flat_accumulator + float(reward)
+        flattened_returns.append(flat_accumulator)
+    assert expected_round_scales[-1] != pytest.approx(
+        _population_scale(flattened_returns, normalizer.epsilon)
+    )
+
+    assert [record["reward_scale"] for record in outer.records] == pytest.approx(
+        [
+            expected_round_scales[0],
+            expected_round_scales[0],
+            expected_round_scales[1],
+            expected_round_scales[1],
+        ]
+    )
+    assert all(torch.is_tensor(record["reward_scale"]) for record in outer.records)
+    assert all(
+        bool(torch.isin(record["rewards"].reshape(-1).double(), raw_rewards).all())
+        for record in outer.records
+    )
+    expected_final = expected_round_scales[-1]
+    assert metrics["inner_reward_scale_initial"] == pytest.approx(normalizer.scale)
+    assert metrics["inner_reward_scale"] == pytest.approx(expected_final)
+    assert metrics["inner_reward_scale_final"] == pytest.approx(expected_final)
+    assert metrics["inner_reward_scale_delta"] == pytest.approx(
+        expected_final - normalizer.scale
+    )
+    assert metrics["inner_reward_normalizer_count_initial"] == 0.0
+    assert metrics["inner_reward_normalizer_count_final"] == 8.0
+    assert metrics["inner_reward_normalizer_imagined_updates"] == 8.0
+    assert metrics["inner_reward_normalizer_imagined_updates"] == metrics[
+        "inner_realized_model_steps"
+    ]
+    for key in (
+        "inner_reward_scale",
+        "inner_reward_scale_initial",
+        "inner_reward_scale_final",
+        "inner_reward_scale_delta",
+        "inner_reward_normalizer_count_initial",
+        "inner_reward_normalizer_count_final",
+        "inner_reward_normalizer_imagined_updates",
+    ):
+        assert torch.is_tensor(metrics[key]), key
+        assert metrics[key].shape == (), key
+
+
+def test_action_local_reward_hot_path_has_no_host_scalar_extraction():
+    source = "\n".join(
+        (
+            inspect.getsource(InnerXQCEngine._update_reward_normalizer),
+            inspect.getsource(InnerXQCEngine.act),
+        )
+    )
+
+    assert ".item(" not in source
+    assert "float(normalizer.scale" not in source
+    assert "float(local_reward_normalizer.count" not in source
+    assert "float(self.state.reward_scale" not in source
+
+
+def test_action_local_imagined_reward_normalization_resets_terminated_branches_before_reward():
+    normalizer = _seeded_outer_reward_normalizer()
+    outer_normalizer_before = deepcopy(normalizer.state_dict())
+    agent, outer = _agent(
+        episodic=True,
+        mixed_termination=True,
+        reward_mode="action_local_imagined",
+        reward_normalizer=normalizer,
+    )
+    engine = InnerXQCEngine(agent)
+
+    _, metrics, lengths = engine.act(torch.zeros(1, 2), eval_mode=False)
+
+    assert lengths.tolist() == [1, 2, 1, 2]
+    _assert_tree_equal(normalizer.state_dict(), outer_normalizer_before)
+    assert engine._replay_pool.size == 6
+    torch.testing.assert_close(
+        engine._replay_pool.reward[:6], torch.ones(6, 1), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        engine._replay_pool.terminated[:6, 0],
+        torch.tensor([1.0, 0.0, 1.0, 1.0, 0.0, 1.0]),
+        atol=0,
+        rtol=0,
+    )
+    per_round_returns = [
+        1.0,
+        0.9 * normalizer.return_accumulator + 1.0,
+        1.0,
+    ]
+    expected_scale = _population_scale(
+        per_round_returns * 2, normalizer.epsilon
+    )
+    assert [record["reward_scale"] for record in outer.records] == pytest.approx(
+        [expected_scale] * 4
+    )
+    assert all(
+        torch.equal(record["rewards"], torch.ones(2, 1))
+        for record in outer.records
+    )
+    assert metrics["inner_reward_scale_final"] == pytest.approx(expected_scale)
+    assert metrics["inner_reward_normalizer_count_final"] == 6.0
+    assert metrics["inner_reward_normalizer_imagined_updates"] == 6.0
+    assert metrics["inner_reward_normalizer_imagined_updates"] == metrics[
+        "inner_realized_model_steps"
+    ]
 
 
 def test_final_policy_kl_uses_closed_form_direction_and_running_bn_without_rng():
@@ -493,7 +682,12 @@ def test_unsampled_action_omits_final_policy_kl_and_diagnostic_work():
 
 
 def test_second_action_reuses_allocations_but_is_logically_fresh():
-    agent, outer = _agent()
+    normalizer = _seeded_outer_reward_normalizer()
+    outer_normalizer_before = deepcopy(normalizer.state_dict())
+    agent, outer = _agent(
+        reward_mode="action_local_imagined",
+        reward_normalizer=normalizer,
+    )
     engine = InnerXQCEngine(agent)
     root = torch.zeros(1, 2)
 
@@ -507,6 +701,14 @@ def test_second_action_reuses_allocations_but_is_logically_fresh():
     assert torch.equal(first_action, second_action)
     assert first_metrics["inner_actor_optimizer_steps"] == 2
     assert second_metrics["inner_actor_optimizer_steps"] == 2
+    assert first_metrics["inner_reward_normalizer_count_initial"] == 0.0
+    assert second_metrics["inner_reward_normalizer_count_initial"] == 0.0
+    assert first_metrics["inner_reward_normalizer_count_final"] == 8.0
+    assert second_metrics["inner_reward_normalizer_count_final"] == 8.0
+    assert first_metrics["inner_reward_scale_final"] == pytest.approx(
+        second_metrics["inner_reward_scale_final"]
+    )
+    _assert_tree_equal(normalizer.state_dict(), outer_normalizer_before)
 
 
 def test_true_imagined_termination_masks_bootstrap_but_horizon_does_not():
@@ -555,7 +757,7 @@ def test_bad_inner_boundary_state_fails_before_mutation():
     _assert_tree_equal(engine.training_state_dict(), before)
 
 
-def test_real_inner_xqc_update_is_finite_isolated_and_keeps_target_bn_frozen():
+def test_real_inner_xqc_update_adapts_online_bn_and_keeps_official_target_bn_frozen():
     agent, _ = _agent()
     torch.manual_seed(19)
     controller = LatentXQCController(
@@ -574,6 +776,10 @@ def test_real_inner_xqc_update_is_finite_isolated_and_keeps_target_bn_frozen():
     target_buffer_start = {
         name: value.detach().clone()
         for name, value in controller.critic.named_buffers()
+    }
+    actor_buffer_start = {
+        name: value.detach().clone()
+        for name, value in controller.actor.named_buffers()
     }
     engine = InnerXQCEngine(agent)
     global_rng = torch.random.get_rng_state().clone()
@@ -596,6 +802,11 @@ def test_real_inner_xqc_update_is_finite_isolated_and_keeps_target_bn_frozen():
     assert any(
         not torch.equal(value, target_buffer_start[name])
         for name, value in inner.critic.named_buffers()
+        if name.endswith(("running_mean", "running_var"))
+    )
+    assert any(
+        not torch.equal(value, actor_buffer_start[name])
+        for name, value in inner.actor.named_buffers()
         if name.endswith(("running_mean", "running_var"))
     )
 
