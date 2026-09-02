@@ -142,5 +142,4 @@ def test_outer_planner_runs_with_no_gaussian_proposal_slots():
     assert action.shape == env.action_space.shape
     assert np.isfinite(action).all()
     assert model.cfg.num_pi_trajs == model.cfg.num_samples == 16
-    model.close()
     env.close()
