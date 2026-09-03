@@ -15,6 +15,18 @@ import torch
 
 from RL.TDMPC2 import TDMPC2Baseline, _normalize_horizon_params
 from RL.tdmpc2_core.ambi_agent import AMBITDMPC2Agent
+from RL.tdmpc2_core.common.search_config import (
+    INNER_CRITIC_HORIZON_MODES,
+    INNER_DEPTH_UPDATE_ORDERS,
+    INNER_LEAF_Q_SOURCES,
+    INNER_OFFPOLICY_MODES,
+    INNER_Q_OBJECTIVES,
+    INNER_RETURN_ESTIMATORS,
+    INNER_SEARCH_BOOTSTRAP_CRITICS,
+    INNER_SEARCH_REPLAY_RETENTIONS,
+    INNER_TARGET_UPDATE_EVENTS,
+    resolve_inner_search_semantics,
+)
 from RL.tdmpc2_core.common.soft_world_model import normalize_log_std_mapping
 from utils.utils import setup_logs
 
@@ -43,6 +55,9 @@ _INNER_EXECUTION_POLICY_SOURCES = {
     "outer_q_gate",
     "outer_soft_handoff",
 }
+
+_GRADIENT_INNER_OPERATORS = {"sac", "td3", "vtrace"}
+_INNER_OPERATORS = {"none", "sac", "td3", "mppi", "vtrace"}
 
 
 _AMBI_DEFAULTS = {
@@ -153,6 +168,31 @@ _AMBI_DEFAULTS = {
     "inner_temperature": 1.0,
     "inner_target_entropy": "inherit_outer",
     "inner_bootstrap_source": "inner_target",
+
+    # Opt-in finite-horizon search. These fields are deliberately dormant for
+    # ``legacy_continuing`` so omitted settings preserve the historical inner
+    # loop, compile regions, replay schema, and RNG ordering exactly.
+    "inner_q_objective": "legacy_continuing",
+    "inner_critic_horizon_mode": "shared",
+    "inner_return_estimator": "td0",
+    "inner_return_steps": None,
+    "inner_return_lambda": None,
+    "inner_leaf_q_source": "outer_target",
+    "inner_leaf_value_samples": 1,
+    "inner_search_replay_retention": "action",
+    "inner_offpolicy_mode": "none",
+    "inner_search_bootstrap_critic": "target",
+    "inner_target_update_event": "optimizer_step",
+    "inner_depth_update_order": "mixed",
+
+    # Genuine V-trace actor-critic settings. The scalar inner V prior is
+    # distilled from reward-only outer-Q Monte Carlo evaluations before each
+    # root solve; it is not a relabeled SAC Q target.
+    "inner_vtrace_rho_clip": 1.0,
+    "inner_vtrace_c_clip": 1.0,
+    "inner_vtrace_pg_rho_clip": 1.0,
+    "inner_vtrace_distill_updates": 64,
+    "inner_vtrace_distill_action_samples": 4,
     "inner_actor_lr": 5e-5,
     "inner_critic_lr": 5e-5,
     "inner_temperature_lr": 5e-5,
@@ -279,6 +319,27 @@ _TOTAL_SCHEDULE_KEYS = {
     "inner_temperature_updates_per_action",
 }
 
+_FINITE_SEARCH_FIELDS = {
+    "inner_critic_horizon_mode",
+    "inner_return_estimator",
+    "inner_return_steps",
+    "inner_return_lambda",
+    "inner_leaf_q_source",
+    "inner_leaf_value_samples",
+    "inner_search_replay_retention",
+    "inner_offpolicy_mode",
+    "inner_search_bootstrap_critic",
+    "inner_target_update_event",
+    "inner_depth_update_order",
+}
+_VTRACE_FIELDS = {
+    "inner_vtrace_rho_clip",
+    "inner_vtrace_c_clip",
+    "inner_vtrace_pg_rho_clip",
+    "inner_vtrace_distill_updates",
+    "inner_vtrace_distill_action_samples",
+}
+
 _LEGACY_SCHEDULE_DEFAULTS = {
     "inner_rounds": 1,
     "inner_rollout_horizon": None,
@@ -400,6 +461,388 @@ def _normalize_choice(value, key, choices):
     if value not in choices:
         raise ValueError(f"{key} must be one of {sorted(choices)}, got {value!r}.")
     return value
+
+
+def _normalize_inner_search_config(cfg):
+    """Normalize finite-search scalars and expose centralized predicates."""
+
+    for key, choices in (
+        ("inner_q_objective", INNER_Q_OBJECTIVES),
+        ("inner_critic_horizon_mode", INNER_CRITIC_HORIZON_MODES),
+        ("inner_return_estimator", INNER_RETURN_ESTIMATORS),
+        ("inner_leaf_q_source", INNER_LEAF_Q_SOURCES),
+        ("inner_search_replay_retention", INNER_SEARCH_REPLAY_RETENTIONS),
+        ("inner_offpolicy_mode", INNER_OFFPOLICY_MODES),
+        ("inner_search_bootstrap_critic", INNER_SEARCH_BOOTSTRAP_CRITICS),
+        ("inner_target_update_event", INNER_TARGET_UPDATE_EVENTS),
+        ("inner_depth_update_order", INNER_DEPTH_UPDATE_ORDERS),
+    ):
+        setattr(cfg, key, _normalize_choice(getattr(cfg, key), key, choices))
+
+    if cfg.inner_return_steps is not None:
+        cfg.inner_return_steps = _strict_positive_int(
+            cfg.inner_return_steps, "inner_return_steps"
+        )
+    if cfg.inner_return_lambda is not None:
+        cfg.inner_return_lambda = _finite_float(
+            cfg.inner_return_lambda, "inner_return_lambda"
+        )
+    cfg.inner_leaf_value_samples = _strict_positive_int(
+        cfg.inner_leaf_value_samples, "inner_leaf_value_samples"
+    )
+    for key in (
+        "inner_vtrace_rho_clip",
+        "inner_vtrace_c_clip",
+        "inner_vtrace_pg_rho_clip",
+    ):
+        value = _finite_float(getattr(cfg, key), key)
+        if value <= 0.0:
+            raise ValueError(f"{key} must be positive.")
+        setattr(cfg, key, value)
+    cfg.inner_vtrace_distill_updates = _strict_positive_int(
+        cfg.inner_vtrace_distill_updates, "inner_vtrace_distill_updates"
+    )
+    cfg.inner_vtrace_distill_action_samples = _strict_positive_int(
+        cfg.inner_vtrace_distill_action_samples,
+        "inner_vtrace_distill_action_samples",
+    )
+
+    semantics = resolve_inner_search_semantics(cfg)
+    cfg.inner_search_active = semantics.is_search
+    cfg.inner_search_family = (
+        "vtrace"
+        if semantics.is_vtrace
+        else "finite_q"
+        if semantics.is_finite_q
+        else "legacy"
+    )
+    cfg.inner_uses_outer_leaf = semantics.uses_outer_leaf
+    cfg.inner_uses_inner_target = semantics.uses_inner_target
+    cfg.inner_uses_structured_replay = semantics.uses_structured_replay
+    cfg.inner_requires_behavior_log_prob = semantics.needs_behavior_log_prob
+    cfg.inner_effective_target_update_event = semantics.target_update_event
+
+
+def _validate_inner_search_config(cfg, supplied_keys):
+    """Reject ambiguous or mathematically redundant search combinations."""
+
+    semantics = resolve_inner_search_semantics(cfg)
+    if cfg.inner_operator == "vtrace":
+        if cfg.inner_q_objective != "finite_horizon":
+            raise ValueError(
+                "inner_operator='vtrace' requires "
+                "inner_q_objective='finite_horizon'."
+            )
+    elif cfg.inner_q_objective == "finite_horizon":
+        if cfg.inner_operator != "sac":
+            raise ValueError(
+                "inner_q_objective='finite_horizon' requires "
+                "inner_operator='sac' (or use inner_operator='vtrace' for the "
+                "separate value-based family)."
+            )
+
+    if not semantics.is_search:
+        for key in sorted(_FINITE_SEARCH_FIELDS | _VTRACE_FIELDS):
+            if key in supplied_keys and getattr(cfg, key) != _AMBI_DEFAULTS[key]:
+                raise ValueError(
+                    f"{key} is only active for finite-horizon search; "
+                    "select inner_q_objective='finite_horizon'."
+                )
+        return
+
+    if "inner_bootstrap_source" in supplied_keys:
+        raise ValueError(
+            "inner_bootstrap_source belongs exclusively to "
+            "inner_q_objective='legacy_continuing'; finite search must use "
+            "inner_leaf_q_source and inner_search_bootstrap_critic."
+        )
+    # Make accidental legacy-source use fail close to its callsite. The search
+    # engine consumes only the centralized predicates/new source fields.
+    cfg.inner_bootstrap_source = None
+
+    if cfg.inner_schedule_mode != "canonical":
+        raise ValueError("Finite search requires the canonical J/N/H schedule.")
+    if cfg.inner_rounds <= 0 or cfg.inner_rollouts_per_round <= 0:
+        raise ValueError("Finite search requires positive inner rounds and rollouts.")
+    if cfg.inner_critic_updates_per_action <= 0:
+        raise ValueError("Finite search requires positive inner critic/value updates.")
+    if cfg.inner_actor_updates_per_action <= 0:
+        raise ValueError("Finite search requires positive inner actor updates.")
+
+    if semantics.is_vtrace:
+        if cfg.inner_depth_update_order != "mixed":
+            raise ValueError(
+                "V-trace updates linked full trajectories and requires "
+                "inner_depth_update_order='mixed'."
+            )
+        if cfg.inner_return_estimator != "td0" or cfg.inner_return_steps is not None:
+            raise ValueError(
+                "V-trace has its own value target; keep inner_return_estimator='td0' "
+                "and inner_return_steps=null."
+            )
+        if cfg.inner_return_lambda is None or not 0.0 < cfg.inner_return_lambda <= 1.0:
+            raise ValueError(
+                "V-trace requires inner_return_lambda in (0, 1]."
+            )
+        if cfg.inner_offpolicy_mode != "per_decision_is":
+            raise ValueError(
+                "V-trace requires inner_offpolicy_mode='per_decision_is'."
+            )
+        if cfg.inner_search_bootstrap_critic not in {"target", "frozen_target"}:
+            raise ValueError(
+                "V-trace requires a target value network so distilled online "
+                "values can be hard-copied before adaptation."
+            )
+        if cfg.inner_vtrace_c_clip > cfg.inner_vtrace_rho_clip:
+            raise ValueError(
+                "inner_vtrace_c_clip cannot exceed inner_vtrace_rho_clip."
+            )
+        if cfg.inner_critic_adaptation != "clone":
+            raise ValueError(
+                "V-trace scalar value layouts require "
+                "inner_critic_adaptation='clone'."
+            )
+        if cfg.inner_outer_policy_kl_coef != 0.0:
+            raise ValueError(
+                "V-trace uses likelihood-ratio actor advantages and does not "
+                "support the SAC inner_outer_policy_kl_coef regularizer."
+            )
+        if (
+            cfg.outer_critic_target != "reward_only"
+            or cfg.inner_sac_critic_target != "reward_only"
+        ):
+            raise ValueError(
+                "V-trace requires reward-only outer and inner value semantics."
+            )
+    else:
+        for key in sorted(_VTRACE_FIELDS):
+            if key in supplied_keys and getattr(cfg, key) != _AMBI_DEFAULTS[key]:
+                raise ValueError(f"{key} is only valid for inner_operator='vtrace'.")
+        estimator = cfg.inner_return_estimator
+        if estimator == "n_step":
+            if cfg.inner_return_steps is None:
+                raise ValueError("n_step requires inner_return_steps.")
+            if not 2 <= cfg.inner_return_steps < cfg.inner_rollout_horizon:
+                raise ValueError(
+                    "n_step requires 2 <= inner_return_steps < "
+                    "inner_rollout_horizon."
+                )
+        elif cfg.inner_return_steps is not None:
+            raise ValueError(
+                "inner_return_steps is only valid with inner_return_estimator='n_step'."
+            )
+
+        if estimator == "lambda_return":
+            if (
+                cfg.inner_return_lambda is None
+                or not 0.0 < cfg.inner_return_lambda < 1.0
+            ):
+                raise ValueError(
+                    "lambda_return requires inner_return_lambda in (0, 1); use "
+                    "td0 or full_suffix for the endpoints."
+                )
+        elif estimator == "retrace":
+            if (
+                cfg.inner_return_lambda is None
+                or not 0.0 < cfg.inner_return_lambda <= 1.0
+            ):
+                raise ValueError("Retrace requires inner_return_lambda in (0, 1].")
+        elif cfg.inner_return_lambda is not None:
+            raise ValueError(
+                "inner_return_lambda is only valid for lambda_return, Retrace, or "
+                "the V-trace operator."
+            )
+
+        if estimator == "td0":
+            if cfg.inner_offpolicy_mode != "none":
+                raise ValueError(
+                    "TD(0) re-samples its next action and needs no trajectory "
+                    "importance correction; use inner_offpolicy_mode='none'."
+                )
+        elif estimator == "retrace":
+            if (
+                cfg.inner_search_replay_retention != "action"
+                or cfg.inner_offpolicy_mode != "per_decision_is"
+            ):
+                raise ValueError(
+                    "Retrace requires action-retained replay and exact "
+                    "per-decision policy ratios."
+                )
+        elif cfg.inner_search_replay_retention == "round":
+            if cfg.inner_offpolicy_mode != "none":
+                raise ValueError(
+                    "Fresh-round multistep trajectories require "
+                    "inner_offpolicy_mode='none'."
+                )
+        elif cfg.inner_offpolicy_mode not in {
+            "uncorrected",
+            "per_decision_is",
+            "resimulate",
+        }:
+            raise ValueError(
+                "Action-retained multistep replay must explicitly select "
+                "uncorrected, per_decision_is, or resimulate semantics."
+            )
+
+        if cfg.outer_critic_target != cfg.inner_sac_critic_target:
+            raise ValueError(
+                "Finite-Q search requires matching outer_critic_target and "
+                "inner_sac_critic_target reward/soft-return conventions."
+            )
+        if cfg.inner_critic_adaptation == "lora" and (
+            cfg.inner_critic_horizon_mode != "shared"
+        ):
+            raise ValueError(
+                "Critic LoRA is supported only by shared finite-Q search; "
+                "depth-conditioned and stage-head critics require full clones."
+            )
+
+    if cfg.inner_actor_adaptation not in {"clone", "lora"}:
+        raise ValueError("Finite search requires clone or LoRA actor adaptation.")
+    if cfg.inner_critic_adaptation not in {"clone", "lora"}:
+        raise ValueError("Finite search requires an adaptable inner critic/value.")
+
+    if semantics.requires_multistep_labels and not cfg.inner_component_update_schedule:
+        raise ValueError(
+            "Multistep Q and V-trace modes require explicit critic-first/"
+            "actor-second inner component schedules."
+        )
+
+    if cfg.inner_return_estimator == "full_suffix":
+        if (
+            cfg.inner_search_bootstrap_critic != "none"
+            or cfg.inner_target_update_event != "none"
+        ):
+            raise ValueError(
+                "full_suffix uses no inner bootstrap or inner target; set "
+                "inner_search_bootstrap_critic='none' and "
+                "inner_target_update_event='none'."
+            )
+    elif cfg.inner_search_bootstrap_critic == "none":
+        raise ValueError(
+            "inner_search_bootstrap_critic='none' is valid only for full_suffix."
+        )
+
+    bootstrap = cfg.inner_search_bootstrap_critic
+    event = cfg.inner_target_update_event
+    if bootstrap == "target":
+        if event not in {"optimizer_step", "round_end", "depth_stage"}:
+            raise ValueError(
+                "An updating target critic requires optimizer_step, round_end, "
+                "or depth_stage target updates."
+            )
+    elif event != "none":
+        raise ValueError(
+            f"inner_search_bootstrap_critic={bootstrap!r} requires "
+            "inner_target_update_event='none'."
+        )
+
+    if event == "round_end" and cfg.inner_critic_target_update_interval != 1:
+        raise ValueError("round_end target updates require interval 1.")
+    if event == "depth_stage":
+        if semantics.is_vtrace:
+            raise ValueError("depth_stage propagation is a finite-Q TD(0) strategy.")
+        if cfg.inner_return_estimator != "td0":
+            raise ValueError("depth_stage propagation requires TD(0).")
+        if cfg.inner_depth_update_order != "backward":
+            raise ValueError("depth_stage propagation requires backward updates.")
+        if cfg.inner_critic_horizon_mode == "shared":
+            raise ValueError(
+                "depth_stage propagation requires depth_conditioned or stage_heads."
+            )
+        if (
+            cfg.inner_critic_target_tau != 1.0
+            or cfg.inner_critic_target_update_interval != 1
+        ):
+            raise ValueError("depth_stage propagation requires tau=1 and interval=1.")
+        if not cfg.inner_component_update_schedule:
+            raise ValueError(
+                "depth_stage propagation requires an explicit critic-first schedule."
+            )
+
+    density_required = semantics.needs_behavior_log_prob
+    if density_required and (
+        cfg.inner_behavior_action != "policy_sample"
+        or cfg.inner_behavior_std_scale != 1.0
+        or cfg.inner_behavior_noise_std != 0.0
+    ):
+        raise ValueError(
+            "PDIS, Retrace, and V-trace require exact policy_sample behavior "
+            "with std_scale=1 and no added Gaussian noise."
+        )
+    onpolicy_suffix_required = (
+        semantics.is_finite_q
+        and cfg.inner_return_estimator != "td0"
+        and cfg.inner_search_replay_retention == "round"
+        and cfg.inner_offpolicy_mode == "none"
+    )
+    if onpolicy_suffix_required and (
+        cfg.inner_behavior_action != "policy_sample"
+        or cfg.inner_behavior_std_scale != 1.0
+        or cfg.inner_behavior_noise_std != 0.0
+    ):
+        raise ValueError(
+            "Fresh-round multistep targets are on-policy only with exact "
+            "policy_sample behavior, std_scale=1, and no added Gaussian noise; "
+            "use action-retained inner_offpolicy_mode='uncorrected' to label an "
+            "approximate behavior-policy ablation explicitly."
+        )
+    if density_required and cfg.inner_actor_lora_dropout != 0.0:
+        raise ValueError(
+            "Exact PDIS, Retrace, and V-trace policy densities require "
+            "inner_actor_lora_dropout=0 so collection and target-density "
+            "evaluation represent the same actor."
+        )
+
+    if cfg.inner_explorer_mode != "none":
+        raise ValueError("Finite search is incompatible with explorer populations.")
+    if cfg.inner_execution_policy_source != "primary":
+        raise ValueError(
+            "Finite search requires inner_execution_policy_source='primary'."
+        )
+    if cfg.outer_policy_episode_probability != 0.0:
+        raise ValueError(
+            "Finite search is incompatible with outer-policy episode mixing."
+        )
+    if cfg.inner_actor_writeback_coef != 0.0 or cfg.inner_critic_writeback_coef != 0.0:
+        raise ValueError("Finite search does not support critic or actor writeback.")
+    if cfg.value_equivalence_diagnostics or cfg.value_equivalence_loss_coef != 0.0:
+        raise ValueError(
+            "Legacy continuing-task value-equivalence probes are not defined "
+            "for finite search."
+        )
+    for key in (
+        "inner_actor_scope",
+        "inner_critic_scope",
+        "inner_temperature_scope",
+        "inner_replay_scope",
+        "inner_actor_optimizer_scope",
+        "inner_critic_optimizer_scope",
+        "inner_temperature_optimizer_scope",
+    ):
+        if getattr(cfg, key) != "action":
+            raise ValueError(f"Finite search requires {key}='action'.")
+
+    if cfg.inner_replay_capacity % cfg.inner_rollout_horizon:
+        raise ValueError(
+            "Structured search replay capacity must be an exact multiple of "
+            "inner_rollout_horizon so the ring stores only complete trajectories."
+        )
+    required_capacity = (
+        cfg.inner_rollouts_per_round * cfg.inner_rollout_horizon
+        if cfg.inner_search_replay_retention == "round"
+        else cfg.inner_model_step_budget
+    )
+    if cfg.inner_replay_capacity < required_capacity:
+        raise ValueError(
+            "Structured search replay capacity is too small for whole-trajectory "
+            f"retention: capacity={cfg.inner_replay_capacity}, "
+            f"required={required_capacity}."
+        )
+
+    # Refresh the derived fields after validation has made the legacy source
+    # explicitly unavailable.
+    _normalize_inner_search_config(cfg)
 
 
 def _integral_weighted_count(total, weight, *, total_key, weight_key):
@@ -874,10 +1317,10 @@ def _normalize_legacy_params(params):
             "inner_critic_updates_per_round and inner_actor_updates_per_round "
             f"must be specified together; missing={missing}."
         )
-    if component_schedule and requested_operator not in {"sac", "td3"}:
+    if component_schedule and requested_operator not in _GRADIENT_INNER_OPERATORS:
         raise ValueError(
             "inner_critic_updates_per_round and inner_actor_updates_per_round "
-            "are only valid for inner_operator='sac' or 'td3'."
+            "are only valid for inner_operator='sac', 'td3', or 'vtrace'."
         )
     v1_schedule = sorted(set(params) & _V1_SCHEDULE_KEYS)
     if v1_schedule:
@@ -917,7 +1360,7 @@ def _normalize_legacy_params(params):
             # The historical alias did not learn a local temperature.
             params.setdefault("inner_temperature_mode", "inherit_outer")
 
-    if requested_operator in {"sac", "td3"}:
+    if requested_operator in _GRADIENT_INNER_OPERATORS:
         if component_schedule and "inner_updates_per_round" in params:
             raise ValueError(
                 "Cannot combine shared inner_updates_per_round with component "
@@ -1150,6 +1593,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         # legacy inner-loop aliases. This rejects only combinations the caller
         # actually supplied while allowing an all-legacy configuration to make
         # its one-release migration cleanly.
+        supplied_keys = set(params)
         params = _normalize_horizon_params(params, resolve_defaults=False)
         component_update_schedule = bool(set(params) & _COMPONENT_SCHEDULE_KEYS)
         params, schedule_mode = _normalize_legacy_params(params)
@@ -1158,9 +1602,9 @@ class AMBITDMPC2(TDMPC2Baseline):
         requested_operator = str(
             params.get("inner_operator", _AMBI_DEFAULTS["inner_operator"])
         ).lower()
-        if requested_operator not in {"none", "sac", "td3", "mppi"}:
+        if requested_operator not in _INNER_OPERATORS:
             raise ValueError(
-                "inner_operator must be one of 'none', 'sac', 'td3', or 'mppi'."
+                f"inner_operator must be one of {sorted(_INNER_OPERATORS)}."
             )
         if requested_operator in {"none", "mppi"}:
             forbidden_updates = {
@@ -1227,7 +1671,9 @@ class AMBITDMPC2(TDMPC2Baseline):
                 )
         if merged["inner_temperature_mode"] is None:
             merged["inner_temperature_mode"] = (
-                "auto" if requested_operator == "sac" else "inherit_outer"
+                "auto"
+                if requested_operator in {"sac", "vtrace"}
+                else "inherit_outer"
             )
         if requested_operator == "none":
             merged.update(
@@ -1362,8 +1808,10 @@ class AMBITDMPC2(TDMPC2Baseline):
         if cfg.inner_operator is None:
             raise ValueError("inner_operator must be a string, not null.")
         cfg.inner_operator = str(cfg.inner_operator).lower()
-        if cfg.inner_operator not in {"none", "sac", "td3", "mppi"}:
-            raise ValueError("inner_operator must be one of 'none', 'sac', 'td3', or 'mppi'.")
+        if cfg.inner_operator not in _INNER_OPERATORS:
+            raise ValueError(
+                f"inner_operator must be one of {sorted(_INNER_OPERATORS)}."
+            )
 
         if cfg.inner_rollout_horizon is None:
             cfg.inner_rollout_horizon = 3
@@ -1383,11 +1831,13 @@ class AMBITDMPC2(TDMPC2Baseline):
                 stacklevel=2,
             )
 
+        _normalize_inner_search_config(cfg)
+
         cfg.inner_mppi_iterations = int(cfg.inner_mppi_iterations)
         if cfg.inner_mppi_iterations < 0:
             raise ValueError("inner_mppi_iterations must be non-negative.")
 
-        if cfg.inner_operator in {"sac", "td3"}:
+        if cfg.inner_operator in _GRADIENT_INNER_OPERATORS:
             cfg.inner_rounds = int(cfg.inner_rounds)
             if cfg.inner_rounds < 0:
                 raise ValueError("inner_rounds must be non-negative.")
@@ -1414,7 +1864,7 @@ class AMBITDMPC2(TDMPC2Baseline):
                     )
                     cfg.inner_temperature_updates_per_action = (
                         cfg.inner_actor_updates_per_action
-                        if cfg.inner_operator == "sac"
+                        if cfg.inner_operator in {"sac", "vtrace"}
                         and str(cfg.inner_temperature_mode).lower() == "auto"
                         else 0
                     )
@@ -1438,7 +1888,7 @@ class AMBITDMPC2(TDMPC2Baseline):
                     actor_enabled = str(cfg.inner_actor_adaptation).lower() != "frozen"
                     critic_enabled = str(cfg.inner_critic_adaptation).lower() != "frozen"
                     temperature_enabled = (
-                        cfg.inner_operator == "sac"
+                        cfg.inner_operator in {"sac", "vtrace"}
                         and str(cfg.inner_temperature_mode).lower() == "auto"
                     )
                     cfg.inner_critic_updates_per_action = (
@@ -1538,8 +1988,46 @@ class AMBITDMPC2(TDMPC2Baseline):
         nominal_transitions_per_round = (
             cfg.inner_rollouts_per_round * cfg.inner_rollout_horizon
         )
-        if cfg.inner_operator in {"sac", "td3"}:
-            if cfg.inner_schedule_mode == "canonical":
+        # ``inner_critic_updates_per_round`` (or shared G) is the number of
+        # critic optimizer steps in a mixed-depth phase.  A finite-Q backward
+        # sweep deliberately applies that same dose at every h=1,...,H stage,
+        # so the public per-action total and UTD must include the H multiplier.
+        # V-trace keeps its canonical linked-trajectory update and is validated
+        # to use mixed ordering.
+        search_critic_depth_stages = (
+            cfg.inner_rollout_horizon
+            if cfg.inner_search_family == "finite_q"
+            and cfg.inner_depth_update_order == "backward"
+            else 1
+        )
+        if cfg.inner_search_active:
+            cfg.inner_critic_depth_stages = int(search_critic_depth_stages)
+            cfg.inner_critic_updates_per_action *= int(
+                search_critic_depth_stages
+            )
+            cfg.inner_effective_critic_updates_per_round = (
+                cfg.inner_critic_updates_per_action // cfg.inner_rounds
+                if cfg.inner_rounds > 0
+                else 0
+            )
+        if cfg.inner_operator in _GRADIENT_INNER_OPERATORS:
+            if cfg.inner_search_active:
+                # Finite search always runs a critic-first phase followed by a
+                # combined actor/temperature phase, even when the legacy G
+                # spelling supplies their equal base doses.
+                cfg.inner_nominal_updates_per_round = (
+                    (
+                        cfg.inner_critic_updates_per_action
+                        + max(
+                            cfg.inner_actor_updates_per_action,
+                            cfg.inner_temperature_updates_per_action,
+                        )
+                    )
+                    // cfg.inner_rounds
+                    if cfg.inner_rounds > 0
+                    else 0
+                )
+            elif cfg.inner_schedule_mode == "canonical":
                 if cfg.inner_component_update_schedule:
                     cfg.inner_nominal_updates_per_round = (
                         cfg.inner_critic_updates_per_round
@@ -1565,7 +2053,15 @@ class AMBITDMPC2(TDMPC2Baseline):
         else:
             cfg.inner_nominal_updates_per_round = 0
         cfg.inner_nominal_transitions_per_round = nominal_transitions_per_round
-        if cfg.inner_component_update_schedule:
+        if cfg.inner_search_active:
+            cfg.inner_expected_update_slots = (
+                cfg.inner_critic_updates_per_action
+                + max(
+                    cfg.inner_actor_updates_per_action,
+                    cfg.inner_temperature_updates_per_action,
+                )
+            )
+        elif cfg.inner_component_update_schedule:
             cfg.inner_expected_update_slots = (
                 cfg.inner_critic_updates_per_action
                 + cfg.inner_actor_updates_per_action
@@ -1583,7 +2079,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         )
 
         if (
-            cfg.inner_operator in {"sac", "td3"}
+            cfg.inner_operator in _GRADIENT_INNER_OPERATORS
             and cfg.inner_model_step_budget == 0
             and any(
                 getattr(cfg, key) > 0
@@ -1636,7 +2132,7 @@ class AMBITDMPC2(TDMPC2Baseline):
             )
         )
         if (
-            cfg.inner_operator in {"sac", "td3"}
+            cfg.inner_operator in _GRADIENT_INNER_OPERATORS
             and cfg.inner_replay_sampling == "without_replacement"
             and has_inner_updates
             and cfg.inner_batch_size > cfg.inner_replay_capacity
@@ -1646,16 +2142,30 @@ class AMBITDMPC2(TDMPC2Baseline):
                 ">= inner_batch_size."
             )
         if (
-            cfg.inner_operator in {"sac", "td3"}
+            cfg.inner_operator in _GRADIENT_INNER_OPERATORS
             and cfg.inner_replay_sampling == "without_replacement"
             and has_inner_updates
             and cfg.inner_rounds > 0
-            and cfg.inner_batch_size > cfg.inner_model_step_budget // cfg.inner_rounds
         ):
-            raise ValueError(
-                "without-replacement inner replay cannot fill inner_batch_size before the "
-                "first update round; reduce the batch or increase the model-step budget."
+            first_update_population = (
+                cfg.inner_model_step_budget // cfg.inner_rounds
             )
+            if cfg.inner_search_active and (
+                cfg.inner_operator == "vtrace"
+                or cfg.inner_depth_update_order == "backward"
+            ):
+                # V-trace samples whole trajectories, while every backward
+                # finite-Q sweep filters anchors to one depth at a time. Both
+                # therefore have only N eligible samples in the first round,
+                # even when replay is retained for the whole action.
+                first_update_population = cfg.inner_rollouts_per_round
+            if cfg.inner_batch_size > first_update_population:
+                raise ValueError(
+                    "without-replacement inner replay cannot fill "
+                    "inner_batch_size from the first-round eligible population: "
+                    f"batch={cfg.inner_batch_size}, "
+                    f"eligible={first_update_population}."
+                )
 
         for key in ("inner_actor_adaptation", "inner_critic_adaptation"):
             value = str(getattr(cfg, key)).lower()
@@ -1667,13 +2177,13 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_critic_dropout_enabled",
         )
         if (
-            cfg.inner_operator in {"sac", "td3"}
+            cfg.inner_operator in _GRADIENT_INNER_OPERATORS
             and cfg.inner_actor_updates_per_action > 0
             and cfg.inner_actor_adaptation == "frozen"
         ):
             raise ValueError("Positive actor updates require adaptable inner_actor_adaptation.")
         if (
-            cfg.inner_operator in {"sac", "td3"}
+            cfg.inner_operator in _GRADIENT_INNER_OPERATORS
             and cfg.inner_critic_updates_per_action > 0
             and cfg.inner_critic_adaptation == "frozen"
         ):
@@ -1685,8 +2195,10 @@ class AMBITDMPC2(TDMPC2Baseline):
                 "inner_temperature_mode must be 'inherit_outer', 'fixed', or 'auto'."
             )
         if cfg.inner_temperature_updates_per_action > 0:
-            if cfg.inner_operator != "sac":
-                raise ValueError("Temperature updates are only valid for the SAC inner operator.")
+            if cfg.inner_operator not in {"sac", "vtrace"}:
+                raise ValueError(
+                    "Temperature updates are only valid for SAC or V-trace."
+                )
             if cfg.inner_temperature_mode != "auto":
                 raise ValueError("Temperature updates require inner_temperature_mode='auto'.")
         if cfg.inner_operator == "td3" and cfg.inner_temperature_mode != "inherit_outer":
@@ -1754,7 +2266,10 @@ class AMBITDMPC2(TDMPC2Baseline):
             if value <= 0.0:
                 raise ValueError(f"{key} must be positive.")
             setattr(cfg, key, value)
-        if cfg.inner_operator == "sac" and cfg.inner_outer_action_l2_coef != 0.0:
+        if (
+            cfg.inner_operator in {"sac", "vtrace"}
+            and cfg.inner_outer_action_l2_coef != 0.0
+        ):
             raise ValueError(
                 "inner_outer_action_l2_coef is a TD3-only policy anchor."
             )
@@ -1947,7 +2462,8 @@ class AMBITDMPC2(TDMPC2Baseline):
                 raise ValueError(f"{key} must be one of {sorted(_LIFECYCLE_SCOPES)}.")
             setattr(cfg, key, value)
         if (
-            cfg.inner_operator in {"sac", "td3"}
+            not cfg.inner_search_active
+            and cfg.inner_operator in {"sac", "td3"}
             and cfg.inner_replay_scope == "action"
             and cfg.inner_replay_capacity < cfg.inner_model_step_budget
         ):
@@ -2256,6 +2772,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             cfg.ent_coef = _finite_float(cfg.ent_coef, "ent_coef")
             if cfg.ent_coef <= 0.0:
                 raise ValueError("ent_coef must be positive.")
+
+        _validate_inner_search_config(cfg, supplied_keys)
 
         # Read-only aliases keep legacy integrations working for one release.
         # Canonical agent code must not use these for scheduling mixed updates.
@@ -2854,6 +3372,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_explorer_td_error_abs_count",
             "inner_explorer_critic_primary_td_error_abs_count",
             "inner_explorer_critic_explorer_td_error_abs_count",
+            "inner_target_model_steps",
+            "inner_vtrace_distill_optimizer_steps",
             "inner_param_noise_calibration_probes",
             "inner_param_noise_calibration_policy_evaluations",
             "inner_param_noise_calibration_rounds",
@@ -2864,6 +3384,15 @@ class AMBITDMPC2(TDMPC2Baseline):
             "planner_policy_evaluations",
             "planner_q_evaluations",
         }
+        # Finite-search depth populations are dynamic in H. Their sample counts
+        # are work counters, while Q/target/loss moments are pooled separately
+        # below using exact per-depth sufficient statistics.
+        counter_metrics.update(
+            key
+            for key in metrics
+            if key.startswith("inner_depth_")
+            and key.endswith("_sample_count")
+        )
         for key in counter_metrics:
             if key in metrics:
                 self._wandb_train_window.add_sum(f"train/{key}", metrics[key])
@@ -2913,6 +3442,26 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_q_target_mean",
             "inner_q_target_clip_fraction",
             "inner_td_error_abs_mean",
+            # Finite-Q return diagnostics and V-trace critic diagnostics. These
+            # are one scalar summary per critic target construction, so their
+            # population is the number of critic optimizer steps.
+            "inner_bootstrap_contribution",
+            "inner_leaf_contribution",
+            "inner_effective_return_length",
+            "inner_ratio_mean",
+            "inner_ratio_max",
+            "inner_ratio_clipped_fraction",
+            "inner_ess",
+            "inner_normalized_ess",
+            "inner_pdis_weight_mean",
+            "inner_pdis_weight_max",
+            "inner_pdis_weight_ess",
+            "inner_pdis_weight_normalized_ess",
+            "inner_vtrace_ratio_mean",
+            "inner_vtrace_ratio_max",
+            "inner_vtrace_ratio_clipped_fraction",
+            "inner_vtrace_ess",
+            "inner_vtrace_normalized_ess",
         }
         explorer_critic_metrics = {
             "inner_explorer_critic_loss",
@@ -2934,6 +3483,10 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_mixture_log_prob",
             "inner_outer_policy_kl",
             "inner_outer_action_l2",
+            "inner_actor_policy_gradient_loss",
+            "inner_actor_entropy_loss",
+            "inner_vtrace_actor_advantage",
+            "inner_vtrace_pg_ratio_clipped_fraction",
         }
         explorer_actor_metrics = {
             "inner_explorer_actor_loss",
@@ -3028,6 +3581,10 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_compile_critic_fallback",
             "inner_compile_actor_fallback",
             "inner_compile_fallback",
+            "inner_buffer_peak_size",
+            "inner_vtrace_distill_error",
+            "inner_vtrace_distill_error_initial",
+            "inner_vtrace_distill_updates",
             "inner_predicted_j_outer",
             "inner_predicted_j_improved",
             "inner_predicted_j_gain",
@@ -3058,6 +3615,38 @@ class AMBITDMPC2(TDMPC2Baseline):
             if key.startswith("inner_fixed_q_counterfactual_action_")
             and key.removeprefix("inner_fixed_q_counterfactual_action_").isdigit()
         )
+        action_gauges.update(
+            key for key in metrics if key.startswith("inner_search_root_")
+        )
+
+        # Pool each depth's actual transition population. Zero-sample depths are
+        # intentionally absent from Q/target/loss summaries rather than adding a
+        # fabricated zero observation; their sample-count counter still records
+        # zero work. The engine supplies exact within-action moments, allowing
+        # WandbAccumulator to merge sparse depths across actions without losing
+        # their min/max or weighting every minibatch equally.
+        for sample_count_key in sorted(
+            key
+            for key in metrics
+            if key.startswith("inner_depth_")
+            and key.endswith("_sample_count")
+        ):
+            depth_prefix = sample_count_key.removesuffix("_sample_count")
+            for stem in ("q", "target", "critic_loss"):
+                metric_prefix = f"{depth_prefix}_{stem}"
+                count = int(metrics.get(f"{metric_prefix}_count", 0))
+                mean_key = f"{metric_prefix}_mean"
+                if count <= 0 or mean_key not in metrics:
+                    continue
+                mean = metrics[mean_key]
+                self._wandb_train_window.add_stats(
+                    f"train/{metric_prefix}",
+                    count=count,
+                    mean=mean,
+                    std=metrics.get(f"{metric_prefix}_std", 0.0),
+                    min_value=metrics.get(f"{metric_prefix}_min", mean),
+                    max_value=metrics.get(f"{metric_prefix}_max", mean),
+                )
 
         # Source-conditioned TD summaries have an exact sampled-row count.
         # Route them separately from ordinary per-optimizer diagnostics so a

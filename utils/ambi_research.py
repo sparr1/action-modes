@@ -73,6 +73,25 @@ def validate_preset_matrix(matrix):
         raise PresetMatrixError("base_alg_config must be relative to the matrix file.")
 
     _require_mapping(matrix.get("shared_alg_params", {}), "shared_alg_params")
+    generated_wandb = matrix.get("generated_wandb")
+    if generated_wandb is not None:
+        generated_wandb = _require_mapping(generated_wandb, "generated_wandb")
+        unknown = set(generated_wandb) - {"run_name_prefix", "tags"}
+        if unknown:
+            raise PresetMatrixError(
+                f"Unknown generated_wandb fields: {sorted(unknown)}."
+            )
+        _validate_name(
+            generated_wandb.get("run_name_prefix"),
+            "generated_wandb.run_name_prefix",
+        )
+        tags = generated_wandb.get("tags", [])
+        if not isinstance(tags, list) or any(
+            not isinstance(tag, str) or not tag for tag in tags
+        ):
+            raise PresetMatrixError(
+                "generated_wandb.tags must be a list of non-empty strings."
+            )
     environment = _require_mapping(matrix.get("environment", {}), "environment")
     if not isinstance(environment.get("id"), str) or not environment["id"]:
         raise PresetMatrixError("environment.id must be a non-empty string.")
@@ -247,7 +266,11 @@ def resolve_preset(matrix_path, selector, matrix=None):
     alg_params = _require_mapping(
         algorithm_config.get("alg_params"), f"{base_path}.alg_params"
     )
-    alg_params.update(copy.deepcopy(matrix.get("shared_alg_params", {})))
+    for key, value in copy.deepcopy(matrix.get("shared_alg_params", {})).items():
+        if value is None:
+            alg_params.pop(key, None)
+        else:
+            alg_params[key] = value
     # A preset normally overlays a small set of values onto the base config.
     # ``null`` is the explicit deletion marker for operator-specific controls:
     # for example, an MPPI variant must remove the SAC-only J/N/G schedule it
@@ -258,6 +281,19 @@ def resolve_preset(matrix_path, selector, matrix=None):
         else:
             alg_params[key] = value
     algorithm_config.update(copy.deepcopy(variant.get("run_params", {})))
+
+    generated_wandb = matrix.get("generated_wandb")
+    if generated_wandb is not None:
+        prefix = generated_wandb["run_name_prefix"]
+        seed = algorithm_config.get("seed")
+        seed_suffix = f"-seed{seed}" if seed is not None else ""
+        alg_params["wandb_run_name"] = (
+            f"{prefix}-{comparison_name}-{variant_name}{seed_suffix}"
+        )
+        selector_tag = f"{prefix}-{comparison_name}-{variant_name}"
+        alg_params["wandb_tags"] = list(
+            dict.fromkeys([*generated_wandb.get("tags", []), selector_tag])
+        )
 
     return {
         "selector": selector,

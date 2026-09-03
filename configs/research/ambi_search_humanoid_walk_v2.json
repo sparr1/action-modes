@@ -1,0 +1,254 @@
+{
+  "schema_version": 1,
+  "description": "Humanoid Walk v2 AMBI Search matrix. Each selector is an independently trainable research recipe; materialize on demand and do not treat these single-seed cells as confirmatory evidence.",
+  "base_alg_config": "../dmcontrol/algs/ambi_humanoid_walk_base_v2.json",
+  "generated_wandb": {
+    "run_name_prefix": "ambisearch-humanoid-walk-v2",
+    "tags": [
+      "ambi",
+      "ambisearch",
+      "dmcontrol",
+      "humanoid-walk",
+      "state",
+      "base-v2",
+      "single-seed",
+      "seed55"
+    ]
+  },
+  "shared_alg_params": {
+    "inner_q_objective": "finite_horizon",
+    "inner_bootstrap_source": null,
+    "inner_critic_horizon_mode": "shared",
+    "inner_return_estimator": "td0",
+    "inner_leaf_q_source": "outer_target",
+    "inner_leaf_value_samples": 1,
+    "inner_search_replay_retention": "round",
+    "inner_offpolicy_mode": "none",
+    "inner_search_bootstrap_critic": "target",
+    "inner_target_update_event": "optimizer_step",
+    "inner_depth_update_order": "mixed",
+    "inner_updates_per_round": null,
+    "inner_critic_updates_per_round": 1,
+    "inner_actor_updates_per_round": 1,
+    "inner_explorer_mode": "none",
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0
+  },
+  "environment": {
+    "id": "DMControl-v0",
+    "params": {
+      "task": "humanoid-walk",
+      "obs": "state",
+      "render_mode": null
+    }
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "seeds": [55],
+    "max_steps": 500,
+    "default_presets": [
+      "controls/no_inner",
+      "controls/legacy_continuing",
+      "q_architecture_estimator/shared_td0",
+      "replay_correction/retrace",
+      "target_strategy/depth_stage_hard",
+      "vtrace_layout_retention/shared_round"
+    ]
+  },
+  "comparisons": {
+    "controls": {
+      "description": "No-inner and unchanged continuing-task AMBI controls from the same Humanoid Walk v2 base.",
+      "reference": "legacy_continuing",
+      "variants": {
+        "no_inner": {
+          "description": "Execute the outer policy with no imagined search or gradient updates.",
+          "alg_params": {
+            "inner_operator": "none",
+            "inner_q_objective": "legacy_continuing",
+            "inner_bootstrap_source": "inner_target",
+            "inner_search_replay_retention": "action",
+            "inner_rounds": null,
+            "inner_rollouts_per_round": null,
+            "inner_rollout_horizon": null,
+            "inner_critic_updates_per_round": null,
+            "inner_actor_updates_per_round": null
+          }
+        },
+        "legacy_continuing": {
+          "description": "Bit-for-bit legacy continuing-task inner SAC using its historical flat replay and repeated bootstrapping.",
+          "alg_params": {
+            "inner_operator": "sac",
+            "inner_q_objective": "legacy_continuing",
+            "inner_bootstrap_source": "inner_target",
+            "inner_search_replay_retention": "action",
+            "inner_critic_updates_per_round": null,
+            "inner_actor_updates_per_round": null,
+            "inner_updates_per_round": 1
+          }
+        }
+      }
+    },
+    "q_architecture_estimator": {
+      "description": "Complete three-layout by five-estimator finite-Q matrix. Multistep cells use fresh-round trajectories and critic-first updates.",
+      "reference": "shared_td0",
+      "variants": {
+        "shared_td0": {
+          "description": "Shared RL-Search-style Q projection with TD(0).",
+          "alg_params": {"inner_critic_horizon_mode": "shared", "inner_return_estimator": "td0"}
+        },
+        "shared_n_step": {
+          "description": "Shared critic with linked two-step returns.",
+          "alg_params": {"inner_critic_horizon_mode": "shared", "inner_return_estimator": "n_step", "inner_return_steps": 2}
+        },
+        "shared_lambda_return": {
+          "description": "Shared critic with a finite lambda-return mixture.",
+          "alg_params": {"inner_critic_horizon_mode": "shared", "inner_return_estimator": "lambda_return", "inner_return_lambda": 0.5}
+        },
+        "shared_full_suffix": {
+          "description": "Shared critic fit to complete suffixes ending at the outer leaf.",
+          "alg_params": {"inner_critic_horizon_mode": "shared", "inner_return_estimator": "full_suffix", "inner_search_bootstrap_critic": "none", "inner_target_update_event": "none"}
+        },
+        "shared_retrace": {
+          "description": "Shared critic with depth-aware Retrace control variates.",
+          "alg_params": {"inner_critic_horizon_mode": "shared", "inner_return_estimator": "retrace", "inner_return_lambda": 0.95, "inner_search_replay_retention": "action", "inner_offpolicy_mode": "per_decision_is"}
+        },
+        "depth_conditioned_td0": {
+          "description": "One-hot remaining-depth critic with TD(0).",
+          "alg_params": {"inner_critic_horizon_mode": "depth_conditioned", "inner_return_estimator": "td0"}
+        },
+        "depth_conditioned_n_step": {
+          "description": "One-hot remaining-depth critic with linked two-step returns.",
+          "alg_params": {"inner_critic_horizon_mode": "depth_conditioned", "inner_return_estimator": "n_step", "inner_return_steps": 2}
+        },
+        "depth_conditioned_lambda_return": {
+          "description": "One-hot remaining-depth critic with finite lambda returns.",
+          "alg_params": {"inner_critic_horizon_mode": "depth_conditioned", "inner_return_estimator": "lambda_return", "inner_return_lambda": 0.5}
+        },
+        "depth_conditioned_full_suffix": {
+          "description": "One-hot remaining-depth critic fit to complete suffixes.",
+          "alg_params": {"inner_critic_horizon_mode": "depth_conditioned", "inner_return_estimator": "full_suffix", "inner_search_bootstrap_critic": "none", "inner_target_update_event": "none"}
+        },
+        "depth_conditioned_retrace": {
+          "description": "One-hot remaining-depth critic with Retrace.",
+          "alg_params": {"inner_critic_horizon_mode": "depth_conditioned", "inner_return_estimator": "retrace", "inner_return_lambda": 0.95, "inner_search_replay_retention": "action", "inner_offpolicy_mode": "per_decision_is"}
+        },
+        "stage_heads_td0": {
+          "description": "Shared trunk with a distinct output head per remaining depth and TD(0).",
+          "alg_params": {"inner_critic_horizon_mode": "stage_heads", "inner_return_estimator": "td0"}
+        },
+        "stage_heads_n_step": {
+          "description": "Stage-head critic with linked two-step returns.",
+          "alg_params": {"inner_critic_horizon_mode": "stage_heads", "inner_return_estimator": "n_step", "inner_return_steps": 2}
+        },
+        "stage_heads_lambda_return": {
+          "description": "Stage-head critic with finite lambda returns.",
+          "alg_params": {"inner_critic_horizon_mode": "stage_heads", "inner_return_estimator": "lambda_return", "inner_return_lambda": 0.5}
+        },
+        "stage_heads_full_suffix": {
+          "description": "Stage-head critic fit to complete suffixes.",
+          "alg_params": {"inner_critic_horizon_mode": "stage_heads", "inner_return_estimator": "full_suffix", "inner_search_bootstrap_critic": "none", "inner_target_update_event": "none"}
+        },
+        "stage_heads_retrace": {
+          "description": "Stage-head critic with depth-aware Retrace.",
+          "alg_params": {"inner_critic_horizon_mode": "stage_heads", "inner_return_estimator": "retrace", "inner_return_lambda": 0.95, "inner_search_replay_retention": "action", "inner_offpolicy_mode": "per_decision_is"}
+        }
+      }
+    },
+    "replay_correction": {
+      "description": "Linked-return replay and correction choices on a depth-conditioned critic.",
+      "reference": "fresh_round",
+      "variants": {
+        "fresh_round": {
+          "description": "Discard each round after improvement; no off-policy correction.",
+          "alg_params": {"inner_critic_horizon_mode": "depth_conditioned", "inner_return_estimator": "n_step", "inner_return_steps": 2, "inner_search_replay_retention": "round", "inner_offpolicy_mode": "none"}
+        },
+        "uncorrected": {
+          "description": "Retain trajectories across rounds as an explicitly approximate diagnostic.",
+          "alg_params": {"inner_critic_horizon_mode": "depth_conditioned", "inner_return_estimator": "n_step", "inner_return_steps": 2, "inner_search_replay_retention": "action", "inner_offpolicy_mode": "uncorrected"}
+        },
+        "pdis": {
+          "description": "Action-retained linked returns with exact per-decision importance sampling.",
+          "alg_params": {"inner_critic_horizon_mode": "depth_conditioned", "inner_return_estimator": "n_step", "inner_return_steps": 2, "inner_search_replay_retention": "action", "inner_offpolicy_mode": "per_decision_is"}
+        },
+        "resimulate": {
+          "description": "Sample a replay successor and regenerate its suffix under the current policy through the model.",
+          "alg_params": {"inner_critic_horizon_mode": "depth_conditioned", "inner_return_estimator": "n_step", "inner_return_steps": 2, "inner_search_replay_retention": "action", "inner_offpolicy_mode": "resimulate"}
+        },
+        "retrace": {
+          "description": "Action-retained depth-aware Retrace TD-error control variates.",
+          "alg_params": {"inner_critic_horizon_mode": "depth_conditioned", "inner_return_estimator": "retrace", "inner_return_lambda": 0.95, "inner_search_replay_retention": "action", "inner_offpolicy_mode": "per_decision_is"}
+        }
+      }
+    },
+    "target_strategy": {
+      "description": "Every recursive finite-Q bootstrap and target-update role.",
+      "reference": "optimizer_step_ema",
+      "variants": {
+        "online": {
+          "description": "Bootstrap from a no-grad online snapshot and allocate no target critic.",
+          "alg_params": {"inner_return_estimator": "td0", "inner_search_bootstrap_critic": "online", "inner_target_update_event": "none"}
+        },
+        "frozen_target": {
+          "description": "Hard-copy once at root initialization and never update the target.",
+          "alg_params": {"inner_return_estimator": "td0", "inner_search_bootstrap_critic": "frozen_target", "inner_target_update_event": "none"}
+        },
+        "optimizer_step_ema": {
+          "description": "Apply the configured EMA after optimizer steps.",
+          "alg_params": {"inner_return_estimator": "td0", "inner_search_bootstrap_critic": "target", "inner_target_update_event": "optimizer_step", "inner_critic_target_tau": 0.01, "inner_critic_target_update_interval": 1}
+        },
+        "round_end_ema": {
+          "description": "Apply one EMA update after the critic phase of each collection round.",
+          "alg_params": {"inner_return_estimator": "td0", "inner_search_bootstrap_critic": "target", "inner_target_update_event": "round_end", "inner_critic_target_tau": 0.01, "inner_critic_target_update_interval": 1}
+        },
+        "depth_stage_hard": {
+          "description": "Sweep h=1 through H and hard-propagate each completed stage before the next.",
+          "alg_params": {"inner_critic_horizon_mode": "stage_heads", "inner_return_estimator": "td0", "inner_search_bootstrap_critic": "target", "inner_target_update_event": "depth_stage", "inner_depth_update_order": "backward", "inner_critic_target_tau": 1.0, "inner_critic_target_update_interval": 1}
+        }
+      }
+    },
+    "leaf_q_source": {
+      "description": "Freeze either the outer target-Q or outer online-Q snapshot as the h=0 blueprint leaf.",
+      "reference": "outer_target",
+      "variants": {
+        "outer_target": {
+          "description": "Use the frozen outer target-Q ensemble at V0.",
+          "alg_params": {"inner_leaf_q_source": "outer_target"}
+        },
+        "outer_online": {
+          "description": "Use the frozen outer online-Q ensemble at V0.",
+          "alg_params": {"inner_leaf_q_source": "outer_online"}
+        }
+      }
+    },
+    "vtrace_layout_retention": {
+      "description": "Genuine V-trace actor-critic with three scalar value layouts and fresh-round or action-retained trajectories.",
+      "reference": "shared_round",
+      "variants": {
+        "shared_round": {
+          "description": "Shared V projection with fresh-round trajectories.",
+          "alg_params": {"inner_operator": "vtrace", "inner_critic_horizon_mode": "shared", "inner_return_lambda": 0.95, "inner_search_replay_retention": "round", "inner_offpolicy_mode": "per_decision_is", "outer_critic_target": "reward_only", "inner_sac_critic_target": "reward_only"}
+        },
+        "shared_action": {
+          "description": "Shared V projection with action-retained off-policy trajectories.",
+          "alg_params": {"inner_operator": "vtrace", "inner_critic_horizon_mode": "shared", "inner_return_lambda": 0.95, "inner_search_replay_retention": "action", "inner_offpolicy_mode": "per_decision_is", "outer_critic_target": "reward_only", "inner_sac_critic_target": "reward_only"}
+        },
+        "depth_conditioned_round": {
+          "description": "One-hot remaining-depth V with fresh-round trajectories.",
+          "alg_params": {"inner_operator": "vtrace", "inner_critic_horizon_mode": "depth_conditioned", "inner_return_lambda": 0.95, "inner_search_replay_retention": "round", "inner_offpolicy_mode": "per_decision_is", "outer_critic_target": "reward_only", "inner_sac_critic_target": "reward_only"}
+        },
+        "depth_conditioned_action": {
+          "description": "One-hot remaining-depth V with action-retained trajectories.",
+          "alg_params": {"inner_operator": "vtrace", "inner_critic_horizon_mode": "depth_conditioned", "inner_return_lambda": 0.95, "inner_search_replay_retention": "action", "inner_offpolicy_mode": "per_decision_is", "outer_critic_target": "reward_only", "inner_sac_critic_target": "reward_only"}
+        },
+        "stage_heads_round": {
+          "description": "Stage-head V with fresh-round trajectories.",
+          "alg_params": {"inner_operator": "vtrace", "inner_critic_horizon_mode": "stage_heads", "inner_return_lambda": 0.95, "inner_search_replay_retention": "round", "inner_offpolicy_mode": "per_decision_is", "outer_critic_target": "reward_only", "inner_sac_critic_target": "reward_only"}
+        },
+        "stage_heads_action": {
+          "description": "Stage-head V with action-retained trajectories.",
+          "alg_params": {"inner_operator": "vtrace", "inner_critic_horizon_mode": "stage_heads", "inner_return_lambda": 0.95, "inner_search_replay_retention": "action", "inner_offpolicy_mode": "per_decision_is", "outer_critic_target": "reward_only", "inner_sac_critic_target": "reward_only"}
+        }
+      }
+    }
+  }
+}

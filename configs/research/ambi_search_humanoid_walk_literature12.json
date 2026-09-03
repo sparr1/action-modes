@@ -1,0 +1,250 @@
+{
+  "schema_version": 1,
+  "description": "Twelve single-seed Humanoid Walk v2 AMBI Search experiments selected from the finite-horizon implementation using literature-shaped root-solve compute. All cells deliberately disable the inner-to-outer policy KL regularizer.",
+  "base_alg_config": "../dmcontrol/algs/ambi_humanoid_walk_base_v2.json",
+  "generated_wandb": {
+    "run_name_prefix": "ambisearch-hw-lit12",
+    "tags": [
+      "ambi",
+      "ambisearch",
+      "dmcontrol",
+      "humanoid-walk",
+      "state",
+      "literature-shaped",
+      "no-kl",
+      "j8",
+      "n512",
+      "h3",
+      "batch512",
+      "single-seed",
+      "seed55"
+    ]
+  },
+  "shared_alg_params": {
+    "inner_operator": "sac",
+    "inner_q_objective": "finite_horizon",
+    "inner_bootstrap_source": null,
+    "inner_critic_horizon_mode": "shared",
+    "inner_return_estimator": "full_suffix",
+    "inner_leaf_q_source": "outer_online",
+    "inner_leaf_value_samples": 1,
+    "inner_search_replay_retention": "round",
+    "inner_offpolicy_mode": "none",
+    "inner_search_bootstrap_critic": "none",
+    "inner_target_update_event": "none",
+    "inner_depth_update_order": "mixed",
+    "inner_rounds": 8,
+    "inner_rollouts_per_round": 512,
+    "inner_updates_per_round": null,
+    "inner_critic_updates_per_round": 3,
+    "inner_actor_updates_per_round": 1,
+    "inner_batch_size": 512,
+    "inner_replay_capacity": 12288,
+    "inner_replay_sampling": "without_replacement",
+    "inner_actor_lr": 0.00025,
+    "inner_critic_lr": 0.00025,
+    "inner_temperature_mode": "inherit_outer",
+    "inner_behavior_action": "policy_sample",
+    "inner_behavior_std_scale": 1.0,
+    "inner_behavior_noise_std": 0.0,
+    "inner_execution_policy_source": "primary",
+    "inner_execution_std_scale": 1.0,
+    "inner_execution_noise_std": 0.0,
+    "inner_rebase_persistent": false,
+    "inner_explorer_mode": "none",
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_outer_policy_kl_coef": 0.0,
+    "inner_outer_action_l2_coef": 0.0,
+    "outer_behavior_policy_kl_schedule": "none",
+    "outer_behavior_policy_kl_coef": 0.0
+  },
+  "environment": {
+    "id": "DMControl-v0",
+    "params": {
+      "task": "humanoid-walk",
+      "obs": "state",
+      "render_mode": null
+    }
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "seeds": [55],
+    "max_steps": 500,
+    "default_presets": [
+      "full_suffix/shared_a1",
+      "full_suffix/depth_a1",
+      "full_suffix/stage_a1",
+      "full_suffix/shared_a4",
+      "full_suffix/depth_a4",
+      "lambda_online/shared_a4",
+      "lambda_online/depth_a4",
+      "lambda_online/shared_a12",
+      "vtrace/shared_a4",
+      "vtrace/depth_a4",
+      "hard_propagation/stage_td0",
+      "polyak_ablation/depth_lambda_tau005"
+    ]
+  },
+  "comparisons": {
+    "full_suffix": {
+      "description": "Fit finite Q values to complete three-step imagined suffixes and the frozen outer-online leaf, with no recursive inner bootstrap.",
+      "reference": "shared_a1",
+      "variants": {
+        "shared_a1": {
+          "description": "One shared Q function and one actor update after three critic minibatches per round.",
+          "alg_params": {
+            "inner_critic_horizon_mode": "shared"
+          }
+        },
+        "depth_a1": {
+          "description": "Depth-conditioned Q and one actor update after three critic minibatches per round.",
+          "alg_params": {
+            "inner_critic_horizon_mode": "depth_conditioned"
+          }
+        },
+        "stage_a1": {
+          "description": "A separate Q output head for each remaining depth and one actor update per round.",
+          "alg_params": {
+            "inner_critic_horizon_mode": "stage_heads"
+          }
+        },
+        "shared_a4": {
+          "description": "The shared-Q full-suffix cell with four actor updates per fresh collection round.",
+          "alg_params": {
+            "inner_critic_horizon_mode": "shared",
+            "inner_actor_updates_per_round": 4
+          }
+        },
+        "depth_a4": {
+          "description": "The depth-conditioned full-suffix cell with four actor updates per fresh collection round.",
+          "alg_params": {
+            "inner_critic_horizon_mode": "depth_conditioned",
+            "inner_actor_updates_per_round": 4
+          }
+        }
+      }
+    },
+    "lambda_online": {
+      "description": "Use a 0.95 finite lambda mixture and bootstrap shorter suffixes from a no-gradient snapshot of the current inner Q.",
+      "reference": "shared_a4",
+      "variants": {
+        "shared_a4": {
+          "description": "Shared Q with three critic and four actor minibatches per fresh round.",
+          "alg_params": {
+            "inner_critic_horizon_mode": "shared",
+            "inner_return_estimator": "lambda_return",
+            "inner_return_lambda": 0.95,
+            "inner_search_bootstrap_critic": "online",
+            "inner_actor_updates_per_round": 4
+          }
+        },
+        "depth_a4": {
+          "description": "Depth-conditioned Q with three critic and four actor minibatches per fresh round.",
+          "alg_params": {
+            "inner_critic_horizon_mode": "depth_conditioned",
+            "inner_return_estimator": "lambda_return",
+            "inner_return_lambda": 0.95,
+            "inner_search_bootstrap_critic": "online",
+            "inner_actor_updates_per_round": 4
+          }
+        },
+        "shared_a12": {
+          "description": "A high actor-dose shared-Q test with twelve actor minibatches per fresh round.",
+          "alg_params": {
+            "inner_critic_horizon_mode": "shared",
+            "inner_return_estimator": "lambda_return",
+            "inner_return_lambda": 0.95,
+            "inner_search_bootstrap_critic": "online",
+            "inner_actor_updates_per_round": 12
+          }
+        }
+      }
+    },
+    "vtrace": {
+      "description": "Use likelihood-ratio policy improvement with a distilled scalar value prior and canonical clipped V-trace targets.",
+      "reference": "shared_a4",
+      "variants": {
+        "shared_a4": {
+          "description": "Shared scalar V with one full-trajectory value minibatch and four actor minibatches per round.",
+          "alg_params": {
+            "inner_operator": "vtrace",
+            "inner_critic_horizon_mode": "shared",
+            "inner_return_estimator": "td0",
+            "inner_return_lambda": 0.95,
+            "inner_offpolicy_mode": "per_decision_is",
+            "inner_search_bootstrap_critic": "target",
+            "inner_target_update_event": "optimizer_step",
+            "inner_critic_updates_per_round": 1,
+            "inner_actor_updates_per_round": 4,
+            "inner_critic_target_tau": 1.0,
+            "inner_critic_target_update_interval": 1,
+            "inner_vtrace_distill_updates": 64,
+            "inner_vtrace_distill_action_samples": 4,
+            "outer_critic_target": "reward_only",
+            "inner_sac_critic_target": "reward_only"
+          }
+        },
+        "depth_a4": {
+          "description": "Depth-conditioned scalar V with one full-trajectory value minibatch and four actor minibatches per round.",
+          "alg_params": {
+            "inner_operator": "vtrace",
+            "inner_critic_horizon_mode": "depth_conditioned",
+            "inner_return_estimator": "td0",
+            "inner_return_lambda": 0.95,
+            "inner_offpolicy_mode": "per_decision_is",
+            "inner_search_bootstrap_critic": "target",
+            "inner_target_update_event": "optimizer_step",
+            "inner_critic_updates_per_round": 1,
+            "inner_actor_updates_per_round": 4,
+            "inner_critic_target_tau": 1.0,
+            "inner_critic_target_update_interval": 1,
+            "inner_vtrace_distill_updates": 64,
+            "inner_vtrace_distill_action_samples": 4,
+            "outer_critic_target": "reward_only",
+            "inner_sac_critic_target": "reward_only"
+          }
+        }
+      }
+    },
+    "hard_propagation": {
+      "description": "Learn h=1, then h=2, then h=3 and hard-copy each completed depth before the next one.",
+      "reference": "stage_td0",
+      "variants": {
+        "stage_td0": {
+          "description": "Stage-head TD(0) with one critic update at each depth and one actor update after the full sweep.",
+          "alg_params": {
+            "inner_critic_horizon_mode": "stage_heads",
+            "inner_return_estimator": "td0",
+            "inner_search_bootstrap_critic": "target",
+            "inner_target_update_event": "depth_stage",
+            "inner_depth_update_order": "backward",
+            "inner_critic_updates_per_round": 1,
+            "inner_actor_updates_per_round": 1,
+            "inner_critic_target_tau": 1.0,
+            "inner_critic_target_update_interval": 1
+          }
+        }
+      }
+    },
+    "polyak_ablation": {
+      "description": "A single AMBI-specific test of a lagged recursive target; the closest search methods do not use this inner Polyak mechanism.",
+      "reference": "depth_lambda_tau005",
+      "variants": {
+        "depth_lambda_tau005": {
+          "description": "Depth-conditioned 0.95 lambda returns with an optimizer-step target updated at tau 0.05.",
+          "alg_params": {
+            "inner_critic_horizon_mode": "depth_conditioned",
+            "inner_return_estimator": "lambda_return",
+            "inner_return_lambda": 0.95,
+            "inner_search_bootstrap_critic": "target",
+            "inner_target_update_event": "optimizer_step",
+            "inner_actor_updates_per_round": 4,
+            "inner_critic_target_tau": 0.05,
+            "inner_critic_target_update_interval": 1
+          }
+        }
+      }
+    }
+  }
+}

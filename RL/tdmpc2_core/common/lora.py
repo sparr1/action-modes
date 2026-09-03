@@ -15,24 +15,29 @@ class _LoRABaseReference:
 
     def __getattr__(self, name):
         if name == "base":
-            reference = self.__dict__.get("_shared_base_ref")
-            if reference is not None:
+            try:
+                reference = object.__getattribute__(self, "_shared_base_ref")
+            except AttributeError:
+                # Owned bases are registered children resolved by nn.Module.
+                pass
+            else:
                 base = reference()
                 if base is None:
                     raise RuntimeError("The shared LoRA base module no longer exists.")
                 return base
         return super().__getattr__(name)
 
-    @property
-    def shares_base(self):
-        return "_shared_base_ref" in self.__dict__
-
     def _set_base(self, base, *, share_base):
+        # Keep this as an ordinary boolean attribute rather than a property
+        # that introspects ``__dict__``.  Dynamo can specialize the owned-base
+        # branch in strict graphs; Python object-dictionary operations are not
+        # traceable there.
+        self.shares_base = bool(share_base)
         if share_base:
             # Bypass ``nn.Module.__setattr__`` so the outer module does not
             # become a child of the inner adapter. This keeps it out of
             # parameters(), state_dict(), train()/eval(), to(), and deepcopy().
-            self.__dict__["_shared_base_ref"] = weakref.ref(base)
+            object.__setattr__(self, "_shared_base_ref", weakref.ref(base))
         else:
             self.base = base
             self.base.requires_grad_(False)
@@ -68,7 +73,7 @@ class LoRALinear(_LoRABaseReference, nn.Module):
             or base.out_features != self.lora_B.shape[0]
         ):
             raise ValueError("Shared LoRA base shape does not match its adapters.")
-        self.__dict__["_shared_base_ref"] = weakref.ref(base)
+        object.__setattr__(self, "_shared_base_ref", weakref.ref(base))
         return self
 
     def forward(self, x):
@@ -126,7 +131,7 @@ class LoRANormedLinear(_LoRABaseReference, nn.Module):
             or tuple(base.ln.normalized_shape) != (self.lora_B.shape[0],)
         ):
             raise ValueError("Shared LoRA base shape does not match its adapters.")
-        self.__dict__["_shared_base_ref"] = weakref.ref(base)
+        object.__setattr__(self, "_shared_base_ref", weakref.ref(base))
         return self
 
     def forward(self, x):

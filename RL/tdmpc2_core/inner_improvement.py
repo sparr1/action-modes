@@ -28,6 +28,18 @@ from .common.inner_utils import (
 )
 from .common.latent_buffer import LatentReplayBuffer
 from .common.lora import lorafy_copy, lorafy_shared, trainable_parameters
+from .common.horizon_value import build_horizon_q, build_horizon_value
+from .common.search_replay import SearchReplayBuffer
+from .common.search_returns import (
+    full_suffix_target,
+    importance_sampling_ratios,
+    lambda_return_target,
+    n_step_target,
+    retrace_target,
+    td0_target,
+    vtrace_actor_loss,
+    vtrace_targets,
+)
 from .common.parameter_noise import (
     adapt_parameter_noise_stddev,
     classify_parameter_noise_actor,
@@ -125,6 +137,12 @@ class InnerWorkspace:
     explorer_rollouts: int = 0
     primary_transitions: int = 0
     explorer_transitions: int = 0
+    # Finite-horizon search is deliberately action-local.  These counters are
+    # kept in the ordinary workspace so the public diagnostics and reset
+    # machinery continue to have one source of truth without changing the
+    # legacy replay/checkpoint schemas.
+    target_model_steps: int = 0
+    value_distill_steps: int = 0
 
 
 class InnerImprovementEngine:
@@ -152,6 +170,7 @@ class InnerImprovementEngine:
     def _initialize_compile_regions(self):
         enabled = bool(getattr(self.cfg, "compile", False))
         strict = bool(getattr(self.cfg, "compile_strict", False))
+        search_enabled = enabled and self._finite_search_active
         operator = str(self.cfg.inner_operator)
         critic_kernel = (
             self._td3_critic_kernel if operator == "td3" else self._sac_critic_kernel
@@ -183,6 +202,42 @@ class InnerImprovementEngine:
                 enabled=enabled,
                 strict=strict,
             ),
+            "search_rollout": CompileRegion(
+                "finite-search structured rollout",
+                self._search_rollout_kernel,
+                enabled=search_enabled,
+                strict=strict,
+            ),
+            "search_leaf": CompileRegion(
+                "finite-search blueprint leaf",
+                self._search_outer_leaf_kernel,
+                enabled=search_enabled,
+                strict=strict,
+            ),
+            "search_critic": CompileRegion(
+                "finite-search Q critic",
+                self._search_critic_loss_kernel,
+                enabled=search_enabled,
+                strict=strict,
+            ),
+            "search_actor": CompileRegion(
+                "finite-search SAC actor",
+                self._search_actor_loss_kernel,
+                enabled=search_enabled,
+                strict=strict,
+            ),
+            "search_value_critic": CompileRegion(
+                "finite-search V-trace critic",
+                self._search_value_critic_loss_kernel,
+                enabled=search_enabled,
+                strict=strict,
+            ),
+            "search_vtrace_actor": CompileRegion(
+                "finite-search V-trace actor",
+                self._search_vtrace_actor_loss_kernel,
+                enabled=search_enabled,
+                strict=strict,
+            ),
         }
 
     @property
@@ -198,7 +253,7 @@ class InnerImprovementEngine:
             return self.state.alpha_fixed
         alpha = self.agent.alpha.detach()
         if (
-            str(self.cfg.inner_operator) == "sac"
+            str(self.cfg.inner_operator) in {"sac", "vtrace"}
             and (
                 str(self.cfg.inner_temperature_mode) == "auto"
                 or (
@@ -209,6 +264,29 @@ class InnerImprovementEngine:
         ):
             return alpha.clamp_min(_INNER_ALPHA_FLOOR)
         return alpha
+
+    @property
+    def _finite_search_active(self):
+        """Whether this action uses the opt-in blueprint-tail search engine."""
+        return (
+            str(getattr(self.cfg, "inner_q_objective", "legacy_continuing"))
+            == "finite_horizon"
+            or str(self.cfg.inner_operator) == "vtrace"
+        )
+
+    @property
+    def _search_uses_target(self):
+        return str(
+            getattr(self.cfg, "inner_search_bootstrap_critic", "target")
+        ) in {"target", "frozen_target"}
+
+    @property
+    def _search_target_update_event(self):
+        return str(getattr(self.cfg, "inner_target_update_event", "optimizer_step"))
+
+    @property
+    def _search_is_soft(self):
+        return str(self.cfg.inner_sac_critic_target) == "entropy_augmented"
 
     @property
     def _explorer_mode(self):
@@ -294,7 +372,7 @@ class InnerImprovementEngine:
                 if component == "temperature":
                     return (
                         int(cfg.inner_actor_updates_per_round) > 0
-                        and cfg.inner_operator == "sac"
+                        and cfg.inner_operator in {"sac", "vtrace"}
                         and str(cfg.inner_temperature_mode) == "auto"
                     )
                 return int(
@@ -304,7 +382,7 @@ class InnerImprovementEngine:
                 return False
             if component == "temperature":
                 return (
-                    cfg.inner_operator == "sac"
+                    cfg.inner_operator in {"sac", "vtrace"}
                     and str(cfg.inner_temperature_mode) == "auto"
                 )
             return str(getattr(cfg, f"inner_{component}_adaptation")) != "frozen"
@@ -375,8 +453,20 @@ class InnerImprovementEngine:
             raise RuntimeError(
                 "Cannot reset the evaluation inner engine during an active action."
             )
-        self.state = InnerWorkspace()
-        self._action_pool = InnerWorkspace()
+        if self._finite_search_active:
+            # Finite search is validated as entirely action-local.  Expire a
+            # partially live solve into the reusable pool, but preserve the
+            # workspace and pooled allocation identities captured by strict
+            # Dynamo guards.  `_prepare_search_workspace` hard-resets every
+            # scientific value before the next evaluation action.
+            self._clear_expired(t0=True, include_action=True)
+            self._reset_search_workspace_counters(self.state)
+            self.state.outer_version = -1
+        else:
+            # Preserve legacy evaluation semantics, including the deliberate
+            # removal of any episode/run-scoped learner state.
+            self.state = InnerWorkspace()
+            self._action_pool = InnerWorkspace()
         self.rng = InnerRNG(seed, self.device)
         self.action_index = 0
         self.episode_index = 0
@@ -486,6 +576,8 @@ class InnerImprovementEngine:
         "explorer_rollouts",
         "primary_transitions",
         "explorer_transitions",
+        "target_model_steps",
+        "value_distill_steps",
     )
 
     @staticmethod
@@ -515,7 +607,7 @@ class InnerImprovementEngine:
 
     def _active_rl_workspace(self):
         return (
-            str(self.cfg.inner_operator) in {"sac", "td3"}
+            str(self.cfg.inner_operator) in {"sac", "td3", "vtrace"}
             and int(self.cfg.inner_rounds) > 0
         )
 
@@ -1547,7 +1639,293 @@ class InnerImprovementEngine:
             state.explorer_log_alpha = state.explorer_alpha_fixed = None
             state.explorer_temperature_optim = None
 
+    def _new_search_critic(self):
+        """Construct one action-local finite Q or V function.
+
+        The outer world model is never rewritten: transformed critics exist
+        only inside this workspace, which keeps portable checkpoint keys
+        identical across every search variant.
+        """
+        cfg = self.cfg
+        horizon = int(cfg.inner_rollout_horizon)
+        layout = str(getattr(cfg, "inner_critic_horizon_mode", "shared"))
+        if str(cfg.inner_operator) == "vtrace":
+            critic = build_horizon_value(
+                int(cfg.latent_dim),
+                (int(cfg.mlp_dim), int(cfg.mlp_dim)),
+                horizon,
+                layout,
+                dropout=(
+                    float(cfg.dropout)
+                    if bool(cfg.inner_critic_dropout_enabled)
+                    else 0.0
+                ),
+            ).to(self.device)
+        else:
+            critic = build_horizon_q(
+                self.model._Qs, horizon, layout
+            ).to(self.device)
+            adaptation = str(cfg.inner_critic_adaptation)
+            if adaptation == "lora":
+                # A copied adapter base remains owned by the horizon wrapper;
+                # using the ordinary action-local shared-base helper here would
+                # leave weak references to a temporary transformed module.
+                critic = lorafy_copy(
+                    critic,
+                    rank=cfg.inner_critic_lora_rank,
+                    scale=cfg.inner_critic_lora_scale,
+                    dropout=cfg.inner_critic_lora_dropout,
+                ).to(self.device)
+        adaptation = str(cfg.inner_critic_adaptation)
+        if adaptation == "frozen":
+            critic.requires_grad_(False)
+        elif adaptation != "lora":
+            critic.requires_grad_(True)
+        return critic
+
+    def _new_search_actor(self):
+        """Construct a compile-safe action-local search policy."""
+        cfg = self.cfg
+        if str(cfg.inner_actor_adaptation) != "lora":
+            return self._adapt_module(self.model._pi, "actor")
+        # The legacy action-local LoRA optimization uses weak references to
+        # outer bases.  Strict Dynamo cannot represent that dynamic
+        # ``__getattr__`` path.  Search instead owns one reusable frozen base;
+        # it is rebased in-place from the outer actor at every root, retaining
+        # identical LoRA mathematics without recompilation or per-action copy
+        # allocation.
+        return lorafy_copy(
+            self.model._pi,
+            rank=cfg.inner_actor_lora_rank,
+            scale=cfg.inner_actor_lora_scale,
+            dropout=cfg.inner_actor_lora_dropout,
+        ).to(self.device)
+
+    def _reset_search_critic(self, critic):
+        """Reset a pooled search value module without changing its identity."""
+        cfg = self.cfg
+        if str(cfg.inner_operator) == "vtrace":
+            # This runs inside the private initialization RNG fork.  The
+            # replacement used internally by HorizonValue only supplies fresh
+            # tensors to load; the live Parameters seen by Adam/Dynamo remain
+            # unchanged.
+            critic.reset_parameters()
+            return
+        if str(cfg.inner_critic_adaptation) == "lora":
+            # Validation restricts critic LoRA to the shared layout, whose
+            # ensemble paths exactly match the outer ensemble after removing
+            # the horizon wrapper.  Refresh every owned base from the current
+            # outer Q and initialize fresh zero-output adapters in-place.
+            if str(cfg.inner_critic_horizon_mode) != "shared":
+                raise RuntimeError("Search critic LoRA requires the shared layout.")
+            rebase_lora_base_(critic.ensemble, self.model._Qs)
+            reset_lora_adapters_(critic)
+            return
+        critic.reset_from_outer(self.model._Qs)
+
+    @staticmethod
+    def _reset_search_workspace_counters(state):
+        """Restore the observable root-local accounting of a fresh workspace."""
+        for name in (
+            "critic_steps",
+            "critic_lifetime_steps",
+            "actor_steps",
+            "actor_lifetime_steps",
+            "temperature_steps",
+            "temperature_lifetime_steps",
+            "target_steps",
+            "critic_target_steps",
+            "actor_target_steps",
+            "replay_draws",
+            "policy_evaluations",
+            "q_evaluations",
+            "explorer_actor_steps",
+            "explorer_actor_lifetime_steps",
+            "explorer_critic_steps",
+            "explorer_critic_lifetime_steps",
+            "explorer_critic_target_steps",
+            "explorer_temperature_steps",
+            "explorer_temperature_lifetime_steps",
+            "primary_rollouts",
+            "explorer_rollouts",
+            "primary_transitions",
+            "explorer_transitions",
+            "target_model_steps",
+            "value_distill_steps",
+        ):
+            setattr(state, name, 0)
+        state.sampled_ids.clear()
+        state.sampled_sources.clear()
+
+    def _prepare_search_workspace(self, *, t0):
+        """Initialize an isolated root-local blueprint-tail search solve."""
+        cfg, state, pool = self.cfg, self.state, self._action_pool
+        # Search is action-local scientifically, but keeping the workspace,
+        # module, Parameter, optimizer, and replay objects stable lets strict
+        # torch.compile reuse its guards across real actions.  The ordinary
+        # action-scope teardown has already pooled these objects; reset every
+        # learned value below before making them live again.
+        self._clear_expired(t0=t0, include_action=True)
+
+        actor_restored = self._restore_action_component("actor", self.model._pi)
+        if not actor_restored:
+            state.actor = self._new_search_actor()
+            state.actor_params = trainable_parameters(state.actor)
+            state.actor_trainable_count = sum(
+                parameter.numel() for parameter in state.actor_params
+            )
+            if state.actor_params and self._component_has_updates("actor"):
+                state.actor_optim = self._new_optimizer(state.actor, "actor")
+        needs_actor_anchor = (
+            float(cfg.inner_outer_policy_kl_coef) > 0.0
+            or float(cfg.inner_outer_action_l2_coef) > 0.0
+        )
+        state.actor_anchor = self.model._pi if needs_actor_anchor else None
+
+        critic_restored = pool.critic is not None
+        if critic_restored:
+            state.critic = pool.critic
+            pool.critic = None
+            pool.critic_anchor = None
+            state.critic_params = pool.critic_params
+            pool.critic_params = []
+            state.critic_trainable_count = pool.critic_trainable_count
+            pool.critic_trainable_count = 0
+            state.critic_optim = pool.critic_optim
+            pool.critic_optim = None
+            self._reset_search_critic(state.critic)
+            self._reset_optimizer(state.critic_optim)
+        else:
+            state.critic = self._new_search_critic()
+            state.critic_params = trainable_parameters(state.critic)
+            state.critic_trainable_count = sum(
+                parameter.numel() for parameter in state.critic_params
+            )
+            if state.critic_params and self._component_has_updates("critic"):
+                state.critic_optim = self._new_optimizer(state.critic, "critic")
+
+        bootstrap = str(
+            getattr(cfg, "inner_search_bootstrap_critic", "target")
+        )
+        if bootstrap in {"target", "frozen_target"}:
+            target = pool.critic_target
+            pool.critic_target = None
+            if target is None:
+                target = state.critic.make_target()
+            else:
+                target.hard_update_from(state.critic)
+                target.requires_grad_(False)
+            state.critic_target = target
+        else:
+            state.critic_target = None
+            pool.critic_target = None
+
+        pooled_log_alpha = pool.log_alpha
+        pooled_alpha_fixed = pool.alpha_fixed
+        pooled_temperature_optim = pool.temperature_optim
+        pool.log_alpha = pool.alpha_fixed = pool.temperature_optim = None
+        temperature_mode = str(cfg.inner_temperature_mode)
+        if temperature_mode == "auto":
+            initial_log_alpha = self._initial_inner_alpha().log()
+            if pooled_log_alpha is None:
+                state.log_alpha = torch.nn.Parameter(initial_log_alpha.clone())
+            else:
+                state.log_alpha = pooled_log_alpha
+                with torch.no_grad():
+                    state.log_alpha.copy_(initial_log_alpha)
+            state.alpha_fixed = None
+            if self._component_has_updates("temperature"):
+                if pooled_temperature_optim is None:
+                    state.temperature_optim = torch.optim.Adam(
+                        [state.log_alpha],
+                        lr=float(cfg.inner_temperature_lr),
+                        eps=float(cfg.inner_adam_eps),
+                        capturable=False,
+                        foreach=self.device.type == "cuda",
+                    )
+                else:
+                    state.temperature_optim = pooled_temperature_optim
+                    self._reset_optimizer(state.temperature_optim)
+            else:
+                state.temperature_optim = None
+        else:
+            value = (
+                self.agent.alpha.detach()
+                if temperature_mode == "inherit_outer"
+                else torch.tensor(
+                    float(cfg.inner_temperature), device=self.device
+                )
+            )
+            state.log_alpha = state.temperature_optim = None
+            if (
+                pooled_alpha_fixed is not None
+                and pooled_alpha_fixed.shape == value.shape
+                and pooled_alpha_fixed.dtype == value.dtype
+            ):
+                state.alpha_fixed = pooled_alpha_fixed
+                state.alpha_fixed.copy_(value)
+            else:
+                state.alpha_fixed = value.clone()
+
+        replay = pool.replay
+        pool.replay = None
+        if replay is None:
+            replay = SearchReplayBuffer(
+                capacity=int(cfg.inner_replay_capacity),
+                horizon=int(cfg.inner_rollout_horizon),
+                latent_dim=int(cfg.latent_dim),
+                action_dim=int(cfg.action_dim),
+                device=self.device,
+                dtype=next(self.model.parameters()).dtype,
+            )
+        else:
+            # Root-local IDs restart exactly as they did when this buffer was
+            # newly allocated.  Round-local clears remain monotonic within the
+            # solve via clear(reset_identity=False).
+            replay.clear(reset_identity=True)
+        state.replay = replay
+        state.outer_version = self.agent.outer_version
+        # Search policy densities must name one deterministic network. Eval
+        # mode disables adapter dropout while retaining all parameter/input
+        # gradients used by SAC or V-trace actor updates.
+        state.actor.eval()
+        state.critic.train(
+            str(cfg.inner_critic_adaptation) != "frozen"
+            and bool(cfg.inner_critic_dropout_enabled)
+        )
+        if bool(getattr(cfg, "compile", False)) and hasattr(
+            state.critic, "enable_compile"
+        ):
+            state.critic.enable_compile(
+                strict=bool(getattr(cfg, "compile_strict", False))
+            )
+        if state.critic_target is not None:
+            state.critic_target.eval()
+            if bool(getattr(cfg, "compile", False)) and hasattr(
+                state.critic_target, "enable_compile"
+            ):
+                # Successor evaluation pads every outer/inner depth split to a
+                # fixed row count, so dynamic=False target compilation is safe
+                # and reusable across root actions.
+                state.critic_target.enable_compile(
+                    strict=bool(getattr(cfg, "compile_strict", False))
+                )
+        outer_alpha = self.agent.alpha.detach()
+        if not hasattr(self, "_search_outer_alpha"):
+            self._search_outer_alpha = outer_alpha.clone()
+        else:
+            self._search_outer_alpha.copy_(outer_alpha)
+        self._search_round_id = 0
+        self._search_distilled = False
+        self._search_depth_metrics = []
+        self._search_return_metrics = []
+        self._search_buffer_peak_size = 0
+        self._reset_search_workspace_counters(state)
+        self._reset_parameter_noise_action_state()
+
     def _prepare_workspace(self, *, t0):
+        if self._finite_search_active:
+            return self._prepare_search_workspace(t0=t0)
         state, cfg = self.state, self.cfg
         self._clear_expired(t0=t0, include_action=True)
 
@@ -2489,6 +2867,226 @@ class InnerImprovementEngine:
             "transition_count": transition_count,
         }
 
+    def _search_rollout_kernel(self, root_z, policy_noise, reward_support):
+        """Pure fixed-shape finite-search rollout.
+
+        All random policy noise is supplied by the eager caller so compiling
+        this region cannot change the scientific RNG stream.  Padded rows are
+        still evaluated to retain a static shape and are removed by ``valid``.
+        """
+        cfg, state = self.cfg, self.state
+        count = int(cfg.inner_rollouts_per_round)
+        horizon = int(cfg.inner_rollout_horizon)
+        behavior_mode = str(cfg.inner_behavior_action)
+        std_scale = float(cfg.inner_behavior_std_scale)
+        if behavior_mode == "policy_sample" and std_scale == 0.0:
+            behavior_mode = "mean"
+
+        z = root_z.expand(count, -1).clone()
+        alive = torch.ones(count, dtype=torch.bool, device=z.device)
+        lengths = torch.zeros(count, dtype=torch.long, device=z.device)
+        reward_sums = z.new_zeros(count)
+        discounted_rewards = z.new_zeros(count)
+        terminated_rollout = torch.zeros(
+            count, dtype=torch.bool, device=z.device
+        )
+        discount_weight = z.new_ones(count)
+        fields = [[] for _ in range(8)]
+
+        for step in range(horizon):
+            valid = alive
+            # Keep this hot fixed-shape region free of ``_policy_action``'s
+            # dynamically assembled kwargs dictionary: strict Dynamo cannot
+            # inline ``dict.update`` in a full graph.  The branches below are
+            # specialized from immutable resolved config values and reproduce
+            # the same behavior while exposing only tensor operations.
+            if behavior_mode == "policy_sample":
+                action, info = self.model.pi(
+                    z,
+                    policy=state.actor,
+                    noise=policy_noise[step],
+                    std_scale=max(std_scale, 1e-12),
+                    log_std_mapping=cfg.inner_log_std_mapping,
+                    log_std_min=cfg.inner_log_std_min,
+                    log_std_max=cfg.inner_log_std_max,
+                )
+                pre_tanh_action = info["pre_tanh_action"]
+                behavior_log_prob = info["log_prob"]
+            else:
+                mean, info = self.model.pi(
+                    z,
+                    policy=state.actor,
+                    deterministic=True,
+                    log_std_mapping=cfg.inner_log_std_mapping,
+                    log_std_min=cfg.inner_log_std_min,
+                    log_std_max=cfg.inner_log_std_max,
+                )
+                if behavior_mode == "mean":
+                    action = mean
+                    pre_tanh_action = info["pre_tanh_action"]
+                    behavior_log_prob = info["log_prob"]
+                elif behavior_mode == "mean_plus_gaussian":
+                    action = (
+                        mean
+                        + policy_noise[step]
+                        * float(cfg.inner_behavior_noise_std)
+                    ).clamp(-1.0, 1.0)
+                    # The legacy flat buffer needs only the executed action.
+                    # Structured multistep labels additionally evaluate
+                    # log pi(a|z) at every linked future action, so retain the
+                    # inverse-tanh coordinate of the *perturbed* action rather
+                    # than the deterministic policy mean.  Clipped Gaussian
+                    # behavior can put mass exactly on +/-1, outside a tanh
+                    # Gaussian's open support; this stable inverse is part of
+                    # the explicitly approximate ``uncorrected`` recipe.
+                    density_action = action.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+                    pre_tanh_action = torch.atanh(density_action)
+                    behavior_log_prob = self.model.squashed_component_log_prob(
+                        pre_tanh_action,
+                        info["pre_tanh_mean"],
+                        info["log_std"],
+                    )
+                else:
+                    raise ValueError(
+                        f"Unknown action sampling mode: {behavior_mode!r}"
+                    )
+            joint = self.model.joint_input(z, action)
+            reward = td_math.two_hot_inv(
+                self.model.reward_from_joint(joint), cfg, support=reward_support
+            )
+            next_z = self.model.next_from_joint(joint)
+            if bool(cfg.episodic):
+                terminated = (
+                    self.model.termination(next_z)
+                    > float(cfg.inner_termination_threshold)
+                )
+            else:
+                terminated = torch.zeros(
+                    count, 1, dtype=torch.bool, device=z.device
+                )
+            terminated = terminated & valid.unsqueeze(-1)
+            valid_column = valid.unsqueeze(-1)
+            values = (
+                z,
+                action,
+                pre_tanh_action,
+                reward,
+                next_z,
+                terminated,
+                valid_column,
+                behavior_log_prob,
+            )
+            for destination, value in zip(fields, values):
+                destination.append(value)
+
+            reward_vector = reward.squeeze(-1)
+            valid_float = valid.to(dtype=reward_vector.dtype)
+            lengths = lengths + valid.long()
+            reward_sums = reward_sums + valid_float * reward_vector
+            discounted_rewards = discounted_rewards + (
+                valid_float * discount_weight * reward_vector
+            )
+            discount_weight = discount_weight * float(self.agent.discount)
+            terminated_now = terminated.squeeze(-1)
+            terminated_rollout = terminated_rollout | terminated_now
+            alive = alive & ~terminated_now
+            z = next_z
+
+        return tuple(torch.stack(values, dim=1) for values in fields) + (
+            lengths,
+            reward_sums,
+            discounted_rewards,
+            terminated_rollout,
+        )
+
+    @torch.no_grad()
+    def _collect_search_round(self, root_z):
+        """Collect one fixed-shape, trajectory-major finite-search round."""
+        cfg, state = self.cfg, self.state
+        count = int(cfg.inner_rollouts_per_round)
+        horizon = int(cfg.inner_rollout_horizon)
+        if str(getattr(cfg, "inner_search_replay_retention", "action")) == "round":
+            state.replay.clear()
+        if count == 0:
+            empty = root_z.new_empty((0,))
+            return {
+                "lengths": empty.to(dtype=torch.long),
+                "reward_sums": empty,
+                "discounted_rewards": empty,
+                "terminated": empty.to(dtype=torch.bool),
+                "transition_count": 0,
+            }
+
+        actor_modes = tuple((m, bool(m.training)) for m in state.actor.modules())
+        model_modes = tuple((m, bool(m.training)) for m in self.model.modules())
+        state.actor.eval()
+        self.model.eval()
+        try:
+            with self.rng.fork("collection") as generator:
+                behavior_mode = str(cfg.inner_behavior_action)
+                std_scale = float(cfg.inner_behavior_std_scale)
+                needs_noise = (
+                    behavior_mode == "mean_plus_gaussian"
+                    or (behavior_mode == "policy_sample" and std_scale != 0.0)
+                )
+                if needs_noise:
+                    policy_noise = torch.stack(
+                        [
+                            torch.randn(
+                                (count, int(cfg.action_dim)),
+                                device=self.device,
+                                dtype=root_z.dtype,
+                                generator=generator,
+                            )
+                            for _ in range(horizon)
+                        ],
+                        dim=0,
+                    )
+                else:
+                    policy_noise = root_z.new_empty(
+                        (0, count, int(cfg.action_dim))
+                    )
+                reward_support = td_math.categorical_support(root_z, cfg)
+                rollout = self._compile_regions["search_rollout"](
+                    root_z, policy_noise, reward_support
+                )
+        finally:
+            for module, was_training in actor_modes + model_modes:
+                module.training = was_training
+
+        field_names = (
+            "z",
+            "action",
+            "pre_tanh_action",
+            "reward",
+            "next_z",
+            "terminated",
+            "valid",
+            "behavior_log_prob",
+        )
+        trajectory_fields = dict(zip(field_names, rollout[: len(field_names)]))
+        lengths, reward_sums, discounted_rewards, terminated_rollout = rollout[-4:]
+        state.replay.add_trajectories(
+            **trajectory_fields,
+            round_id=self._search_round_id,
+        )
+        self._search_buffer_peak_size = max(
+            self._search_buffer_peak_size, state.replay.transition_size
+        )
+        self._search_round_id += 1
+        transitions = int(lengths.sum().item())
+        state.policy_evaluations += count * horizon
+        state.primary_rollouts += count
+        state.primary_transitions += transitions
+        state.actor.eval()
+        return {
+            "lengths": lengths,
+            "reward_sums": reward_sums,
+            "discounted_rewards": discounted_rewards,
+            "terminated": terminated_rollout,
+            "transition_count": transitions,
+        }
+
     @torch.no_grad()
     def _dense_rollout_kernel(self, root_z, policy_noise, reward_support):
         """Pure fixed-shape rollout; replay/counters are updated by the caller."""
@@ -2616,6 +3214,629 @@ class InnerImprovementEngine:
         if "source" in batch:
             self.state.sampled_sources.append(batch["source"].detach())
         return batch
+
+    def _search_q_predictions(
+        self, z, action, remaining_horizon, *, critic=None, detach=False
+    ):
+        critic = self.state.critic if critic is None else critic
+        q_input = self.model.joint_input(z, action)
+        if detach:
+            return critic.forward_detached(q_input, remaining_horizon)
+        return critic(q_input, remaining_horizon)
+
+    def _search_q(
+        self,
+        z,
+        action,
+        remaining_horizon,
+        *,
+        critic=None,
+        detach=False,
+        reduction=None,
+        pair_indices=None,
+    ):
+        predictions = self._search_q_predictions(
+            z,
+            action,
+            remaining_horizon,
+            critic=critic,
+            detach=detach,
+        )
+        values = self.model.q_backend.decode(predictions)
+        return self.model.q_backend.reduce(
+            values,
+            reduction or self.cfg.inner_q_target_reduction,
+            pair_indices=pair_indices,
+            trusted_pair_indices=pair_indices is not None,
+        )
+
+    def _search_outer_leaf_kernel(self, flat_z, policy_noise, pair_indices):
+        """Pure frozen-blueprint value evaluation with supplied policy noise."""
+        cfg = self.cfg
+        source = str(getattr(cfg, "inner_leaf_q_source", "outer_target"))
+        action, info = self.model.pi(
+            flat_z,
+            policy=self.model._pi,
+            noise=policy_noise,
+        )
+        q = self.model.Q(
+            flat_z,
+            action,
+            target=source == "outer_target",
+            reduction=cfg.inner_q_target_reduction,
+            pair_indices=pair_indices,
+            trusted_pair_indices=pair_indices is not None,
+        )
+        if self._search_is_soft:
+            q = q - self._search_outer_alpha * info["log_prob"]
+        return q
+
+    @torch.no_grad()
+    def _search_outer_leaf_value(
+        self, z, *, generator, pair_indices=None, active_mask=None
+    ):
+        """Monte-Carlo outer-policy value on a fixed-size padded row set."""
+        cfg = self.cfg
+        samples = int(getattr(cfg, "inner_leaf_value_samples", 1))
+        if active_mask is None:
+            active_mask = torch.ones(
+                z.shape[0], dtype=torch.bool, device=z.device
+            )
+        else:
+            active_mask = active_mask.reshape(-1).to(
+                device=z.device, dtype=torch.bool
+            )
+            if active_mask.shape[0] != z.shape[0]:
+                raise ValueError("Leaf active mask must match its latent rows.")
+        flat_z = (
+            z.unsqueeze(0)
+            .expand(samples, *z.shape)
+            .reshape(samples * z.shape[0], z.shape[-1])
+        )
+        source = str(getattr(cfg, "inner_leaf_q_source", "outer_target"))
+        leaf_critic = (
+            self.model._target_Qs if source == "outer_target" else self.model._Qs
+        )
+        modes = tuple(
+            (module, bool(module.training))
+            for root in (self.model._pi, leaf_critic)
+            for module in root.modules()
+        )
+        try:
+            self.model._pi.eval()
+            leaf_critic.eval()
+            active_count = int(active_mask.sum().item())
+            selected_noise = torch.randn(
+                (samples, active_count, int(cfg.action_dim)),
+                device=flat_z.device,
+                dtype=flat_z.dtype,
+                generator=generator,
+            )
+            policy_noise = flat_z.new_zeros(
+                samples, z.shape[0], int(cfg.action_dim)
+            )
+            policy_noise[:, active_mask] = selected_noise
+            pair = pair_indices
+            if pair is None:
+                pair = self.model.q_backend.sample_pair_indices(
+                    self.device, generator=generator
+                )
+            q = self._compile_regions["search_leaf"](
+                flat_z,
+                policy_noise.reshape(flat_z.shape[0], int(cfg.action_dim)),
+                pair,
+            )
+        finally:
+            for module, was_training in modes:
+                module.training = was_training
+        self.state.policy_evaluations += samples * active_count
+        self.state.q_evaluations += samples * active_count
+        return q.reshape(samples, z.shape[0], 1).mean(dim=0)
+
+    @torch.no_grad()
+    def _search_inner_value(
+        self,
+        z,
+        remaining_horizon,
+        *,
+        generator,
+        pair_indices=None,
+        active_mask=None,
+    ):
+        """Sample the inner policy on a fixed-size padded row set."""
+        cfg, state = self.cfg, self.state
+        if active_mask is None:
+            active_mask = torch.ones(
+                z.shape[0], dtype=torch.bool, device=z.device
+            )
+        else:
+            active_mask = active_mask.reshape(-1).to(
+                device=z.device, dtype=torch.bool
+            )
+            if active_mask.shape[0] != z.shape[0]:
+                raise ValueError("Inner-value active mask must match its latent rows.")
+        active_count = int(active_mask.sum().item())
+        selected_noise = torch.randn(
+            (active_count, int(cfg.action_dim)),
+            device=z.device,
+            dtype=z.dtype,
+            generator=generator,
+        )
+        policy_noise = z.new_zeros(z.shape[0], int(cfg.action_dim))
+        policy_noise[active_mask] = selected_noise
+        action, info = self.model.pi(
+            z,
+            policy=state.actor,
+            noise=policy_noise,
+            **self._inner_policy_kwargs(),
+        )
+        source = str(getattr(cfg, "inner_search_bootstrap_critic", "target"))
+        critic = state.critic_target if source in {"target", "frozen_target"} else state.critic
+        was_training = bool(critic.training)
+        try:
+            critic.eval()
+            q = self._search_q(
+                z,
+                action,
+                remaining_horizon,
+                critic=critic,
+                reduction=cfg.inner_q_target_reduction,
+                pair_indices=pair_indices,
+            )
+        finally:
+            critic.train(was_training)
+        if self._search_is_soft:
+            q = q - self.alpha.detach() * info["log_prob"]
+        state.policy_evaluations += active_count
+        state.q_evaluations += active_count
+        return q
+
+    def _search_behavior_log_prob(self, z, pre_tanh_action):
+        stats = self.model.policy_stats(
+            z,
+            policy=self.state.actor,
+            **self._inner_policy_kwargs(),
+        )
+        return self.model.squashed_component_log_prob(
+            pre_tanh_action,
+            stats["pre_tanh_mean"],
+            stats["log_std"],
+        )
+
+    @torch.no_grad()
+    def _search_successor_value(
+        self,
+        next_z,
+        next_depth,
+        *,
+        generator,
+        pair_indices,
+        active_mask=None,
+    ):
+        """Evaluate V_0 or V_h without depth-composition-dependent shapes."""
+        next_depth = next_depth.reshape(-1).to(dtype=torch.long)
+        if next_depth.shape[0] != next_z.shape[0]:
+            raise ValueError("Successor depths must match successor latent rows.")
+        if active_mask is None:
+            active_mask = torch.ones(
+                next_z.shape[0], dtype=torch.bool, device=next_z.device
+            )
+        else:
+            active_mask = active_mask.reshape(-1).to(
+                device=next_z.device, dtype=torch.bool
+            )
+            if active_mask.shape[0] != next_z.shape[0]:
+                raise ValueError("Successor active mask must match latent rows.")
+        outer = active_mask & (next_depth == 0)
+        inner = active_mask & (next_depth > 0)
+        outer_value = self._search_outer_leaf_value(
+            next_z,
+            generator=generator,
+            pair_indices=pair_indices,
+            active_mask=outer,
+        )
+        safe_depth = next_depth.clamp_min(1)
+        if str(self.cfg.inner_operator) == "vtrace":
+            critic_source = str(
+                getattr(
+                    self.cfg, "inner_search_bootstrap_critic", "target"
+                )
+            )
+            critic = (
+                self.state.critic_target
+                if critic_source in {"target", "frozen_target"}
+                else self.state.critic
+            )
+            was_training = bool(critic.training)
+            try:
+                critic.eval()
+                inner_value = critic(next_z, safe_depth)
+            finally:
+                critic.train(was_training)
+            self.state.q_evaluations += int(inner.sum().item())
+        else:
+            inner_value = self._search_inner_value(
+                next_z,
+                safe_depth,
+                generator=generator,
+                pair_indices=pair_indices,
+                active_mask=inner,
+            )
+        zeros = next_z.new_zeros(next_z.shape[0], 1)
+        return torch.where(
+            outer.unsqueeze(-1),
+            outer_value,
+            torch.where(inner.unsqueeze(-1), inner_value, zeros),
+        )
+
+    def _sample_search_anchors(self, *, remaining_horizon=None):
+        state, cfg = self.state, self.cfg
+        replacement = str(cfg.inner_replay_sampling) == "with_replacement"
+        candidate_indices = None
+        if remaining_horizon is not None:
+            candidates = torch.nonzero(
+                state.replay.valid[: state.replay.size, :, 0], as_tuple=False
+            )
+            candidate_depth = state.replay.remaining_horizon[
+                candidates[:, 0], candidates[:, 1], 0
+            ]
+            eligible = torch.nonzero(
+                candidate_depth == int(remaining_horizon), as_tuple=False
+            ).squeeze(-1)
+            if eligible.numel() == 0:
+                raise ValueError(
+                    f"Search replay has no samples at depth {remaining_horizon}."
+                )
+            batch_size = int(cfg.inner_batch_size)
+            if not replacement and batch_size > eligible.numel():
+                raise ValueError(
+                    "Cannot sample a depth stage without replacement when the "
+                    "batch exceeds its eligible transitions."
+                )
+            generator = self.rng.generator("replay")
+            if replacement:
+                draw = torch.randint(
+                    eligible.numel(),
+                    (batch_size,),
+                    device=self.device,
+                    generator=generator,
+                )
+            else:
+                draw = torch.randperm(
+                    eligible.numel(), device=self.device, generator=generator
+                )[:batch_size]
+            candidate_indices = eligible.index_select(0, draw)
+        batch = state.replay.sample_anchors(
+            int(cfg.inner_batch_size),
+            replacement=replacement,
+            generator=self.rng.generator("replay"),
+            candidate_indices=candidate_indices,
+            include_ids=self._collect_diagnostics,
+        )
+        state.replay_draws += int(batch["z"].shape[0])
+        if self._collect_diagnostics and "trajectory_ids" in batch:
+            state.sampled_ids.append(batch["trajectory_ids"].detach())
+        return batch
+
+    def _sample_search_trajectories(self):
+        state, cfg = self.state, self.cfg
+        batch = state.replay.sample_trajectories(
+            int(cfg.inner_batch_size),
+            replacement=str(cfg.inner_replay_sampling) == "with_replacement",
+            generator=self.rng.generator("replay"),
+            include_ids=self._collect_diagnostics,
+        )
+        # Keep the public counter in sampled-transition units, matching flat
+        # replay and finite-Q anchor sampling rather than counting trajectories.
+        state.replay_draws += int(batch["valid"].sum().item())
+        if self._collect_diagnostics and "trajectory_ids" in batch:
+            state.sampled_ids.append(batch["trajectory_ids"].detach())
+        return batch
+
+    @torch.no_grad()
+    def _resimulate_search_batch(self, batch):
+        """Keep the sampled first transition and regenerate its suffix."""
+        cfg, state = self.cfg, self.state
+        horizon = int(cfg.inner_rollout_horizon)
+        estimator = str(cfg.inner_return_estimator)
+        maximum = (
+            int(cfg.inner_return_steps)
+            if estimator == "n_step"
+            else horizon
+        )
+        h = batch["remaining_horizon"][:, 0, 0].to(dtype=torch.long)
+        fields = {
+            name: torch.zeros_like(batch[name])
+            for name in (
+                "z",
+                "action",
+                "pre_tanh_action",
+                "reward",
+                "next_z",
+                "terminated",
+                "valid",
+                "behavior_log_prob",
+                "remaining_horizon",
+            )
+        }
+        for name in fields:
+            fields[name][:, 0] = batch[name][:, 0]
+        alive = fields["valid"][:, 0, 0] & ~fields["terminated"][:, 0, 0]
+        z = fields["next_z"][:, 0]
+        with self.rng.fork("bootstrap") as generator:
+            if maximum > 1:
+                policy_noise = torch.stack(
+                    [
+                        torch.randn(
+                            (z.shape[0], int(cfg.action_dim)),
+                            device=z.device,
+                            dtype=z.dtype,
+                            generator=generator,
+                        )
+                        for _ in range(maximum - 1)
+                    ],
+                    dim=0,
+                )
+            else:
+                policy_noise = z.new_empty(
+                    (0, z.shape[0], int(cfg.action_dim))
+                )
+            for step in range(1, maximum):
+                valid = alive & (step < h)
+                action, info = self.model.pi(
+                    z,
+                    policy=state.actor,
+                    noise=policy_noise[step - 1],
+                    **self._inner_policy_kwargs(),
+                )
+                joint = self.model.joint_input(z, action)
+                reward = td_math.two_hot_inv(
+                    self.model.reward_from_joint(joint), cfg
+                )
+                next_z = self.model.next_from_joint(joint)
+                if bool(cfg.episodic):
+                    terminated = (
+                        self.model.termination(next_z)
+                        > float(cfg.inner_termination_threshold)
+                    ) & valid.unsqueeze(-1)
+                else:
+                    terminated = torch.zeros_like(valid.unsqueeze(-1))
+                fields["z"][:, step] = z
+                fields["action"][:, step] = action
+                fields["pre_tanh_action"][:, step] = info["pre_tanh_action"]
+                fields["reward"][:, step] = reward
+                fields["next_z"][:, step] = next_z
+                fields["terminated"][:, step] = terminated
+                fields["valid"][:, step] = valid.unsqueeze(-1)
+                fields["behavior_log_prob"][:, step] = info["log_prob"]
+                fields["remaining_horizon"][:, step, 0] = torch.where(
+                    valid, h - step, torch.zeros_like(h)
+                )
+                realized = int(valid.sum().item())
+                state.target_model_steps += realized
+                state.policy_evaluations += int(z.shape[0])
+                alive = valid & ~terminated.squeeze(-1)
+                z = next_z
+        return batch | fields
+
+    @torch.no_grad()
+    def _build_search_q_target(self, batch):
+        """Construct one configured finite-horizon scalar Q label batch."""
+        cfg, state = self.cfg, self.state
+        if str(cfg.inner_offpolicy_mode) == "resimulate":
+            batch = self._resimulate_search_batch(batch)
+
+        rewards = batch["reward"]
+        valid = batch["valid"]
+        terminated = batch["terminated"]
+        batch_size, time = rewards.shape[:2]
+        h = batch["remaining_horizon"][:, 0, 0].to(dtype=torch.long)
+        estimator = str(cfg.inner_return_estimator)
+        alpha = self.alpha.detach() if self._search_is_soft else rewards.new_zeros(())
+
+        needs_sequence_density = estimator in {
+            "n_step",
+            "lambda_return",
+            "full_suffix",
+            "retrace",
+        }
+        if needs_sequence_density:
+            flat_z = batch["z"].reshape(batch_size * time, -1)
+            flat_pre_tanh = batch["pre_tanh_action"].reshape(
+                batch_size * time, -1
+            )
+            target_log_prob = self._search_behavior_log_prob(
+                flat_z, flat_pre_tanh
+            ).reshape(batch_size, time, 1)
+            state.policy_evaluations += int(valid.sum().item())
+        else:
+            target_log_prob = torch.zeros_like(rewards)
+
+        ratios = None
+        if str(cfg.inner_offpolicy_mode) == "per_decision_is":
+            ratios = importance_sampling_ratios(
+                target_log_prob,
+                batch["behavior_log_prob"],
+                valid=valid,
+            )
+
+        with self.rng.fork("bootstrap") as generator:
+            pair = self.model.q_backend.sample_pair_indices(
+                self.device, generator=generator
+            )
+
+            def successor_for(steps):
+                steps = steps.to(dtype=torch.long)
+                gather = (steps - 1).reshape(batch_size, 1, 1)
+                endpoint = batch["next_z"].gather(
+                    1, gather.expand(-1, 1, batch["next_z"].shape[-1])
+                )[:, 0]
+                return self._search_successor_value(
+                    endpoint,
+                    h - steps,
+                    generator=generator,
+                    pair_indices=pair,
+                )
+
+            if estimator == "td0":
+                target, diagnostics = td0_target(
+                    rewards[:, :1],
+                    successor_for(torch.ones_like(h)),
+                    discount=float(self.agent.discount),
+                    terminated=terminated[:, :1],
+                    valid=valid[:, :1],
+                    return_diagnostics=True,
+                )
+                diagnostics["leaf_contribution"] = torch.where(
+                    (h == 1).unsqueeze(-1),
+                    diagnostics["bootstrap_contribution"],
+                    torch.zeros_like(diagnostics["bootstrap_contribution"]),
+                )
+            elif estimator == "n_step":
+                steps = torch.minimum(
+                    h, torch.full_like(h, int(cfg.inner_return_steps))
+                )
+                target, diagnostics = n_step_target(
+                    rewards,
+                    successor_for(steps),
+                    steps=steps,
+                    discount=float(self.agent.discount),
+                    terminated=terminated,
+                    valid=valid,
+                    action_log_probs=target_log_prob,
+                    entropy_coefficient=alpha,
+                    importance_ratios=ratios,
+                    return_diagnostics=True,
+                )
+                # A bootstrap is a true blueprint leaf only when the chosen
+                # expansion exhausts this row's remaining search horizon.
+                diagnostics["leaf_contribution"] = torch.where(
+                    (steps == h).unsqueeze(-1),
+                    diagnostics["bootstrap_contribution"],
+                    torch.zeros_like(diagnostics["bootstrap_contribution"]),
+                )
+            elif estimator == "full_suffix":
+                leaf = successor_for(h)
+                target, diagnostics = full_suffix_target(
+                    rewards,
+                    leaf,
+                    horizon=h,
+                    discount=float(self.agent.discount),
+                    terminated=terminated,
+                    valid=valid,
+                    action_log_probs=target_log_prob,
+                    entropy_coefficient=alpha,
+                    importance_ratios=ratios,
+                    return_diagnostics=True,
+                )
+            elif estimator == "lambda_return":
+                bootstraps = rewards.new_zeros(batch_size, time, 1)
+                for step in range(1, time + 1):
+                    active = h >= step
+                    step_values = self._search_successor_value(
+                        batch["next_z"][:, step - 1],
+                        h - step,
+                        generator=generator,
+                        pair_indices=pair,
+                        active_mask=active,
+                    )
+                    bootstraps[:, step - 1] = torch.where(
+                        active.unsqueeze(-1),
+                        step_values,
+                        torch.zeros_like(step_values),
+                    )
+                target, diagnostics = lambda_return_target(
+                    rewards,
+                    bootstraps,
+                    horizon=h,
+                    trace_lambda=float(cfg.inner_return_lambda),
+                    discount=float(self.agent.discount),
+                    terminated=terminated,
+                    valid=valid,
+                    action_log_probs=target_log_prob,
+                    entropy_coefficient=alpha,
+                    importance_ratios=ratios,
+                    return_diagnostics=True,
+                )
+            elif estimator == "retrace":
+                critic_source = str(cfg.inner_search_bootstrap_critic)
+                target_critic = (
+                    state.critic_target
+                    if critic_source in {"target", "frozen_target"}
+                    else state.critic
+                )
+                safe_depth = batch["remaining_horizon"].clamp_min(1)
+                target_was_training = bool(target_critic.training)
+                try:
+                    target_critic.eval()
+                    current_predictions = self._search_q_predictions(
+                        batch["z"].reshape(batch_size * time, -1),
+                        batch["action"].reshape(batch_size * time, -1),
+                        safe_depth.reshape(batch_size * time),
+                        critic=target_critic,
+                    )
+                finally:
+                    target_critic.train(target_was_training)
+                current_q = self.model.q_backend.reduce(
+                    self.model.q_backend.decode(current_predictions),
+                    cfg.inner_q_target_reduction,
+                    pair_indices=pair,
+                    trusted_pair_indices=pair is not None,
+                ).reshape(batch_size, time, 1)
+                next_values = rewards.new_zeros(batch_size, time, 1)
+                flat_valid = valid[:, :, 0].reshape(-1)
+                flat_next = batch["next_z"].reshape(batch_size * time, -1)
+                flat_depth = (
+                    batch["remaining_horizon"][:, :, 0].reshape(-1) - 1
+                )
+                flat_next_values = self._search_successor_value(
+                    flat_next,
+                    flat_depth,
+                    generator=generator,
+                    pair_indices=pair,
+                    active_mask=flat_valid,
+                )
+                next_values = torch.where(
+                    valid,
+                    flat_next_values.reshape(batch_size, time, 1),
+                    next_values,
+                )
+                state.q_evaluations += int(valid.sum().item())
+                log_rhos = target_log_prob - batch["behavior_log_prob"]
+                target, diagnostics = retrace_target(
+                    rewards,
+                    current_q,
+                    next_values,
+                    log_rhos,
+                    discount=float(self.agent.discount),
+                    trace_lambda=float(cfg.inner_return_lambda),
+                    terminated=terminated,
+                    valid=valid,
+                    return_diagnostics=True,
+                )
+            else:
+                raise ValueError(f"Unknown finite search return estimator: {estimator!r}")
+
+        summary = {}
+        for key in (
+            "bootstrap_contribution",
+            "leaf_contribution",
+            "effective_return_length",
+            "ratio_mean",
+            "ratio_max",
+            "ratio_clipped_fraction",
+            "ess",
+            "normalized_ess",
+            "pdis_weight_mean",
+            "pdis_weight_max",
+            "pdis_weight_ess",
+            "pdis_weight_normalized_ess",
+        ):
+            value = diagnostics.get(key)
+            if value is not None:
+                summary[key] = value.detach().float().mean()
+        self._search_return_metrics.append(summary)
+        return batch, target, h, diagnostics
 
     def _bootstrap_q(
         self,
@@ -2747,6 +3968,615 @@ class InnerImprovementEngine:
             "td_error_abs_mean": (values - target_q.unsqueeze(0)).abs().mean(),
         }
         metrics.update(self._source_td_metrics(batch, values, target_q))
+        return metrics
+
+    def _search_critic_loss_kernel(self, z, action, depth, target_q):
+        """Pure depth-aware Q loss; target construction stays eager."""
+        predictions = self._search_q_predictions(z, action, depth)
+        critic_loss = self.model.critic_loss(predictions, target_q)
+        values = self.model.q_backend.decode(predictions.detach())
+        return critic_loss, predictions, values
+
+    def _search_actor_loss_kernel(
+        self,
+        z,
+        depth,
+        alpha,
+        policy_noise,
+        pair_indices,
+        update_actor,
+    ):
+        """Pure finite-horizon SAC actor region with caller-supplied noise."""
+        state, cfg = self.state, self.cfg
+        action, info = self.model.pi(
+            z,
+            policy=state.actor,
+            noise=policy_noise,
+            **self._inner_policy_kwargs(),
+        )
+        zero = info["log_prob"].new_zeros(())
+        if not update_actor:
+            return (
+                info["log_prob"],
+                info["entropy"],
+                zero,
+                zero,
+                zero,
+                zero,
+                zero,
+                zero,
+            )
+
+        # Strict Dynamo cannot trace the cached functional-call machinery used
+        # by ``forward_detached``.  Evaluate the critic normally in the tensor
+        # graph, then restrict eager autograd below to the actor parameters.
+        # This preserves exactly the desired dQ/da path without allocating or
+        # accumulating critic parameter gradients.
+        predictions = self._search_q_predictions(z, action, depth)
+        all_q = self.model.q_backend.decode(predictions)
+        q = self.model.q_backend.reduce(
+            all_q,
+            cfg.inner_q_actor_reduction,
+            pair_indices=pair_indices,
+            trusted_pair_indices=pair_indices is not None,
+        )
+        actor_values = alpha * info["log_prob"] - q
+        kl = torch.zeros_like(actor_values)
+        if float(cfg.inner_outer_policy_kl_coef) > 0.0:
+            with torch.no_grad():
+                _, outer_info = self.model.pi(
+                    z, policy=state.actor_anchor, deterministic=True
+                )
+            kl = self._gaussian_kl(info, outer_info)
+            actor_values = actor_values + float(
+                cfg.inner_outer_policy_kl_coef
+            ) * kl
+        all_q_detached = all_q.detach()
+        mean_all = self.model.q_backend.reduce(all_q_detached, "mean_all")
+        min_all = self.model.q_backend.reduce(all_q_detached, "min_all")
+        return (
+            info["log_prob"],
+            info["entropy"],
+            actor_values.mean(),
+            q.mean(),
+            kl.mean(),
+            mean_all.mean(),
+            min_all.mean(),
+            (mean_all - min_all).mean(),
+        )
+
+    def _search_value_critic_loss_kernel(self, z, depth, target, valid):
+        """Pure masked finite-horizon scalar-value loss."""
+        prediction = self.state.critic(z, depth)
+        valid_float = valid.to(dtype=prediction.dtype)
+        count = valid_float.sum().clamp_min(1)
+        loss = ((prediction - target) ** 2 * valid_float).sum() / count
+        return loss, prediction, count
+
+    def _search_vtrace_actor_loss_kernel(
+        self,
+        z,
+        pre_tanh_action,
+        pg_advantage,
+        valid,
+        alpha,
+        policy_noise,
+    ):
+        """Pure likelihood-ratio actor and entropy objectives for V-trace."""
+        state = self.state
+        stats = self.model.policy_stats(
+            z, policy=state.actor, **self._inner_policy_kwargs()
+        )
+        target_log_prob = self.model.squashed_component_log_prob(
+            pre_tanh_action, stats["pre_tanh_mean"], stats["log_std"]
+        )
+        _, entropy_info = self.model.pi(
+            z,
+            policy=state.actor,
+            noise=policy_noise,
+            **self._inner_policy_kwargs(),
+        )
+        actor_loss, pieces = vtrace_actor_loss(
+            target_log_prob,
+            pg_advantage,
+            valid=valid,
+            entropy_log_prob=entropy_info["log_prob"],
+            entropy_coefficient=alpha,
+            return_diagnostics=True,
+        )
+        return (
+            actor_loss,
+            pieces["policy_gradient_loss"],
+            pieces["entropy_loss"],
+            target_log_prob,
+            entropy_info["log_prob"],
+        )
+
+    def _search_q_critic_step(self, batch):
+        state, cfg = self.state, self.cfg
+        batch, target_q, depth, _ = self._build_search_q_target(batch)
+        critic_loss, predictions, values = self._compile_regions[
+            "search_critic"
+        ](batch["z"][:, 0], batch["action"][:, 0], depth, target_q)
+        state.critic_optim.zero_grad(set_to_none=True)
+        critic_loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            state.critic_params, float(cfg.inner_critic_grad_clip_norm)
+        )
+        state.critic_optim.step()
+        state.critic_steps += 1
+        state.critic_lifetime_steps += 1
+        state.q_evaluations += int(depth.shape[0])
+        self._maybe_update_search_target("optimizer_step")
+
+        metrics = {
+            "critic_loss": critic_loss.detach(),
+            "critic_grad_norm": torch.as_tensor(grad_norm).detach(),
+            "q_mean": values.mean(),
+            "q_abs_mean": values.abs().mean(),
+            "q_target_mean": target_q.mean(),
+            "q_target_clip_fraction": self._q_target_clip_fraction(target_q),
+            "td_error_abs_mean": (values - target_q.unsqueeze(0)).abs().mean(),
+        }
+        reduced = self.model.q_backend.reduce(values, "mean_all")
+        for h_value in range(1, int(cfg.inner_rollout_horizon) + 1):
+            selected = depth == h_value
+            prefix = f"depth_{h_value}"
+            zero = target_q.new_zeros(())
+            metrics[f"{prefix}_sample_count"] = selected.sum().float()
+            metrics[f"{prefix}_q_mean"] = zero
+            metrics[f"{prefix}_target_mean"] = zero
+            metrics[f"{prefix}_critic_loss"] = zero
+            metrics[f"{prefix}_q_sum"] = zero
+            metrics[f"{prefix}_q_squared_sum"] = zero
+            metrics[f"{prefix}_q_count"] = selected.sum().float()
+            metrics[f"{prefix}_target_sum"] = zero
+            metrics[f"{prefix}_target_squared_sum"] = zero
+            metrics[f"{prefix}_target_count"] = selected.sum().float()
+            metrics[f"{prefix}_critic_loss_sum"] = zero
+            metrics[f"{prefix}_critic_loss_squared_sum"] = zero
+            metrics[f"{prefix}_critic_loss_count"] = selected.sum().float()
+            if bool(selected.any().item()):
+                q_samples = reduced[selected].reshape(-1)
+                target_samples = target_q[selected].detach().reshape(-1)
+                loss_samples = self.model.critic_loss(
+                    predictions[:, selected].detach(),
+                    target_q[selected].detach(),
+                    reduction="none",
+                )
+                loss_samples = loss_samples.reshape(
+                    loss_samples.shape[0], int(selected.sum().item()), -1
+                ).mean(dim=(0, 2))
+                metrics[f"{prefix}_q_mean"] = q_samples.mean()
+                metrics[f"{prefix}_target_mean"] = target_samples.mean()
+                metrics[f"{prefix}_critic_loss"] = self.model.critic_loss(
+                    predictions[:, selected], target_q[selected]
+                ).detach()
+                for stem, samples in (
+                    ("q", q_samples),
+                    ("target", target_samples),
+                    ("critic_loss", loss_samples),
+                ):
+                    metrics[f"{prefix}_{stem}_sum"] = samples.sum()
+                    metrics[f"{prefix}_{stem}_squared_sum"] = samples.square().sum()
+                    metrics[f"{prefix}_{stem}_minimum"] = samples.min()
+                    metrics[f"{prefix}_{stem}_maximum"] = samples.max()
+        return metrics
+
+    def _search_q_policy_step(self, batch, *, update_actor, update_temperature):
+        state, cfg = self.state, self.cfg
+        z = batch["z"][:, 0]
+        depth = batch["remaining_horizon"][:, 0, 0]
+        with self.rng.fork("gradient_policy") as generator:
+            policy_noise = torch.randn(
+                (z.shape[0], int(cfg.action_dim)),
+                device=z.device,
+                dtype=z.dtype,
+                generator=generator,
+            )
+            pair = self.model.q_backend.sample_pair_indices(
+                self.device, generator=generator
+            )
+            (
+                log_prob,
+                entropy,
+                actor_loss,
+                actor_q_mean,
+                kl_mean,
+                q_mean_all,
+                q_min_all,
+                q_mean_all_minus_min_all,
+            ) = self._compile_regions["search_actor"](
+                z,
+                depth,
+                self.alpha.detach(),
+                policy_noise,
+                pair,
+                update_actor,
+            )
+            state.policy_evaluations += int(z.shape[0])
+            metrics = {}
+            if update_actor:
+                if float(cfg.inner_outer_policy_kl_coef) > 0.0:
+                    state.policy_evaluations += int(z.shape[0])
+                state.actor_optim.zero_grad(set_to_none=True)
+                torch.autograd.backward(actor_loss, inputs=state.actor_params)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    state.actor_params, float(cfg.inner_actor_grad_clip_norm)
+                )
+                state.actor_optim.step()
+                state.actor_steps += 1
+                state.actor_lifetime_steps += 1
+                state.q_evaluations += int(z.shape[0])
+                metrics.update(
+                    actor_loss=actor_loss.detach(),
+                    actor_grad_norm=torch.as_tensor(grad_norm).detach(),
+                    actor_q_mean=actor_q_mean.detach(),
+                    actor_q_mean_all=q_mean_all.detach(),
+                    actor_q_min_all=q_min_all.detach(),
+                    actor_q_mean_all_minus_min_all=(
+                        q_mean_all_minus_min_all.detach()
+                    ),
+                    actor_entropy=entropy.detach().mean(),
+                )
+                if float(cfg.inner_outer_policy_kl_coef) > 0.0:
+                    metrics["outer_policy_kl"] = kl_mean.detach()
+            if update_temperature:
+                target_entropy = self._resolved_inner_target_entropy()
+                temperature_loss = -(
+                    state.log_alpha
+                    * (log_prob + target_entropy).detach()
+                ).mean()
+                state.temperature_optim.zero_grad(set_to_none=True)
+                temperature_loss.backward()
+                temperature_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    [state.log_alpha],
+                    float(cfg.inner_temperature_grad_clip_norm),
+                )
+                state.temperature_optim.step()
+                with torch.no_grad():
+                    state.log_alpha.clamp_(min=_INNER_LOG_ALPHA_FLOOR)
+                state.temperature_steps += 1
+                state.temperature_lifetime_steps += 1
+                metrics.update(
+                    temperature_loss=temperature_loss.detach(),
+                    temperature_grad_norm=torch.as_tensor(
+                        temperature_grad_norm
+                    ).detach(),
+                )
+        return metrics
+
+    @torch.no_grad()
+    def _outer_reward_value_samples(self, z, *, samples, generator):
+        """Sample the frozen reward-only blueprint value for V distillation."""
+        flat_z = (
+            z.unsqueeze(0)
+            .expand(int(samples), *z.shape)
+            .reshape(int(samples) * z.shape[0], z.shape[-1])
+        )
+        source = str(getattr(self.cfg, "inner_leaf_q_source", "outer_target"))
+        leaf_critic = (
+            self.model._target_Qs if source == "outer_target" else self.model._Qs
+        )
+        modes = tuple(
+            (module, bool(module.training))
+            for root in (self.model._pi, leaf_critic)
+            for module in root.modules()
+        )
+        try:
+            self.model._pi.eval()
+            leaf_critic.eval()
+            policy_noise = torch.randn(
+                (flat_z.shape[0], int(self.cfg.action_dim)),
+                device=flat_z.device,
+                dtype=flat_z.dtype,
+                generator=generator,
+            )
+            pair = self.model.q_backend.sample_pair_indices(
+                self.device, generator=generator
+            )
+            q = self._compile_regions["search_leaf"](
+                flat_z, policy_noise, pair
+            )
+        finally:
+            for module, was_training in modes:
+                module.training = was_training
+        self.state.policy_evaluations += int(flat_z.shape[0])
+        self.state.q_evaluations += int(flat_z.shape[0])
+        return q.reshape(int(samples), z.shape[0], 1).mean(dim=0)
+
+    def _distill_search_value(self):
+        """Initialize V_h from Monte-Carlo evaluations of the outer Q prior."""
+        if self._search_distilled:
+            return {}
+        state, cfg = self.state, self.cfg
+        valid = state.replay.valid[: state.replay.size, :, 0]
+        latents = state.replay.z[: state.replay.size][valid]
+        if latents.numel() == 0:
+            raise RuntimeError("V-trace distillation requires collected search states.")
+        updates = int(cfg.inner_vtrace_distill_updates)
+        samples = int(cfg.inner_vtrace_distill_action_samples)
+        optimizer = torch.optim.Adam(
+            state.critic_params,
+            lr=float(cfg.inner_critic_lr),
+            eps=float(cfg.inner_adam_eps),
+            capturable=False,
+            foreach=self.device.type == "cuda",
+        )
+        errors = []
+        horizon = int(cfg.inner_rollout_horizon)
+        batch_size = int(cfg.inner_batch_size)
+        state.critic.train(bool(cfg.inner_critic_dropout_enabled))
+        for _ in range(updates):
+            with self.rng.fork("replay") as generator:
+                indices = torch.randint(
+                    latents.shape[0],
+                    (batch_size,),
+                    device=self.device,
+                    generator=generator,
+                )
+                depth = torch.randint(
+                    1,
+                    horizon + 1,
+                    (batch_size,),
+                    device=self.device,
+                    generator=generator,
+                )
+                z = latents.index_select(0, indices)
+            with self.rng.fork("bootstrap") as generator:
+                target = self._outer_reward_value_samples(
+                    z, samples=samples, generator=generator
+                )
+            prediction = state.critic(z, depth)
+            loss = (prediction - target).square().mean()
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                state.critic_params, float(cfg.inner_critic_grad_clip_norm)
+            )
+            optimizer.step()
+            errors.append(loss.detach())
+            state.value_distill_steps += 1
+        if state.critic_target is not None:
+            state.critic_target.hard_update_from(state.critic)
+            state.critic_target.eval()
+        # Distillation is initialization, not adaptation.  No moments or step
+        # counters from it may leak into the search optimizer.
+        self._reset_optimizer(state.critic_optim)
+        state.critic_steps = state.critic_lifetime_steps = 0
+        state.target_steps = state.critic_target_steps = 0
+        self._search_distilled = True
+        if not errors:
+            zero = latents.new_zeros(())
+            return {"vtrace_distill_error": zero}
+        stacked = torch.stack(errors)
+        return {
+            "vtrace_distill_error": stacked[-1],
+            "vtrace_distill_error_initial": stacked[0],
+            "vtrace_distill_updates": stacked.new_tensor(float(updates)),
+        }
+
+    @torch.no_grad()
+    def _build_vtrace_target(self, batch):
+        cfg, state = self.cfg, self.state
+        batch_size, time = batch["reward"].shape[:2]
+        valid = batch["valid"]
+        safe_depth = batch["remaining_horizon"].clamp_min(1)
+        source = str(cfg.inner_search_bootstrap_critic)
+        value_critic = (
+            state.critic_target
+            if source in {"target", "frozen_target"}
+            else state.critic
+        )
+        value_was_training = bool(value_critic.training)
+        try:
+            value_critic.eval()
+            values = value_critic(
+                batch["z"].reshape(batch_size * time, -1),
+                safe_depth.reshape(batch_size * time),
+            ).reshape(batch_size, time, 1)
+        finally:
+            value_critic.train(value_was_training)
+        next_values = torch.zeros_like(values)
+        flat_valid = valid[:, :, 0].reshape(-1)
+        with self.rng.fork("bootstrap") as generator:
+            pair = self.model.q_backend.sample_pair_indices(
+                self.device, generator=generator
+            )
+            flat_next = batch["next_z"].reshape(batch_size * time, -1)
+            flat_depth = (
+                batch["remaining_horizon"][:, :, 0].reshape(-1) - 1
+            )
+            flat_next_values = self._search_successor_value(
+                flat_next,
+                flat_depth,
+                generator=generator,
+                pair_indices=pair,
+                active_mask=flat_valid,
+            )
+            next_values = torch.where(
+                valid,
+                flat_next_values.reshape(batch_size, time, 1),
+                next_values,
+            )
+        target_log_prob = self._search_behavior_log_prob(
+            batch["z"].reshape(batch_size * time, -1),
+            batch["pre_tanh_action"].reshape(batch_size * time, -1),
+        ).reshape(batch_size, time, 1)
+        state.policy_evaluations += int(valid.sum().item())
+        state.q_evaluations += int(valid.sum().item())
+        result = vtrace_targets(
+            batch["reward"],
+            values,
+            next_values,
+            target_log_prob - batch["behavior_log_prob"],
+            discount=float(self.agent.discount),
+            trace_lambda=float(cfg.inner_return_lambda),
+            rho_clip=float(cfg.inner_vtrace_rho_clip),
+            c_clip=float(cfg.inner_vtrace_c_clip),
+            pg_rho_clip=float(cfg.inner_vtrace_pg_rho_clip),
+            terminated=batch["terminated"],
+            valid=valid,
+        )
+        return result, target_log_prob
+
+    def _vtrace_critic_step(self, batch):
+        state, cfg = self.state, self.cfg
+        target, _ = self._build_vtrace_target(batch)
+        batch_size, time = batch["reward"].shape[:2]
+        flat_valid = batch["valid"].reshape(batch_size * time, 1)
+        loss, flat_prediction, count = self._compile_regions[
+            "search_value_critic"
+        ](
+            batch["z"].reshape(batch_size * time, -1),
+            batch["remaining_horizon"].clamp_min(1).reshape(batch_size * time),
+            target["value_target"].reshape(batch_size * time, 1),
+            flat_valid,
+        )
+        prediction = flat_prediction.reshape(batch_size, time, 1)
+        valid = batch["valid"].to(dtype=prediction.dtype)
+        state.critic_optim.zero_grad(set_to_none=True)
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            state.critic_params, float(cfg.inner_critic_grad_clip_norm)
+        )
+        state.critic_optim.step()
+        state.critic_steps += 1
+        state.critic_lifetime_steps += 1
+        state.q_evaluations += int(batch["valid"].sum().item())
+        self._maybe_update_search_target("optimizer_step")
+        metrics = {
+            "critic_loss": loss.detach(),
+            "critic_grad_norm": torch.as_tensor(grad_norm).detach(),
+            "q_mean": (prediction.detach() * valid).sum() / count,
+            "q_abs_mean": (prediction.detach().abs() * valid).sum() / count,
+            "q_target_mean": (target["value_target"] * valid).sum() / count,
+            "td_error_abs_mean": (
+                (prediction.detach() - target["value_target"]).abs() * valid
+            ).sum()
+            / count,
+            "vtrace_ratio_mean": target["ratio_mean"],
+            "vtrace_ratio_max": target["ratio_max"],
+            "vtrace_ratio_clipped_fraction": target["ratio_clipped_fraction"],
+            "vtrace_ess": target["ess"],
+            "vtrace_normalized_ess": target["normalized_ess"],
+            "leaf_contribution": target["leaf_contribution"].mean(),
+            "effective_return_length": target["effective_return_length"].mean(),
+        }
+        for h_value in range(1, int(cfg.inner_rollout_horizon) + 1):
+            selected = batch["remaining_horizon"] == h_value
+            selected &= batch["valid"]
+            zero = prediction.new_zeros(())
+            metrics[f"depth_{h_value}_sample_count"] = selected.sum().float()
+            metrics[f"depth_{h_value}_q_mean"] = zero
+            metrics[f"depth_{h_value}_target_mean"] = zero
+            metrics[f"depth_{h_value}_critic_loss"] = zero
+            metrics[f"depth_{h_value}_q_sum"] = zero
+            metrics[f"depth_{h_value}_q_squared_sum"] = zero
+            metrics[f"depth_{h_value}_q_count"] = selected.sum().float()
+            metrics[f"depth_{h_value}_target_sum"] = zero
+            metrics[f"depth_{h_value}_target_squared_sum"] = zero
+            metrics[f"depth_{h_value}_target_count"] = selected.sum().float()
+            metrics[f"depth_{h_value}_critic_loss_sum"] = zero
+            metrics[f"depth_{h_value}_critic_loss_squared_sum"] = zero
+            metrics[f"depth_{h_value}_critic_loss_count"] = selected.sum().float()
+            if bool(selected.any().item()):
+                q_samples = prediction.detach()[selected].reshape(-1)
+                target_samples = target["value_target"][selected].detach().reshape(-1)
+                loss_samples = (q_samples - target_samples).square()
+                metrics[f"depth_{h_value}_q_mean"] = q_samples.mean()
+                metrics[f"depth_{h_value}_target_mean"] = target_samples.mean()
+                metrics[f"depth_{h_value}_critic_loss"] = loss_samples.mean()
+                for stem, samples in (
+                    ("q", q_samples),
+                    ("target", target_samples),
+                    ("critic_loss", loss_samples),
+                ):
+                    metrics[f"depth_{h_value}_{stem}_sum"] = samples.sum()
+                    metrics[f"depth_{h_value}_{stem}_squared_sum"] = (
+                        samples.square().sum()
+                    )
+                    metrics[f"depth_{h_value}_{stem}_minimum"] = samples.min()
+                    metrics[f"depth_{h_value}_{stem}_maximum"] = samples.max()
+        return metrics
+
+    def _vtrace_policy_step(self, batch, *, update_actor, update_temperature):
+        state, cfg = self.state, self.cfg
+        target, _ = self._build_vtrace_target(batch)
+        batch_size, time = batch["reward"].shape[:2]
+        flat_z = batch["z"].reshape(batch_size * time, -1)
+        flat_pre_tanh = batch["pre_tanh_action"].reshape(batch_size * time, -1)
+        with self.rng.fork("gradient_policy") as generator:
+            policy_noise = torch.randn(
+                (flat_z.shape[0], int(cfg.action_dim)),
+                device=flat_z.device,
+                dtype=flat_z.dtype,
+                generator=generator,
+            )
+            (
+                actor_loss,
+                policy_gradient_loss,
+                entropy_loss,
+                flat_target_log_prob,
+                flat_entropy_log_prob,
+            ) = self._compile_regions["search_vtrace_actor"](
+                flat_z,
+                flat_pre_tanh,
+                target["pg_advantage"].reshape(batch_size * time, 1),
+                batch["valid"].reshape(batch_size * time, 1),
+                self.alpha.detach(),
+                policy_noise,
+            )
+        target_log_prob = flat_target_log_prob.reshape(batch_size, time, 1)
+        entropy_log_prob = flat_entropy_log_prob.reshape(batch_size, time, 1)
+        state.policy_evaluations += 2 * int(batch["valid"].sum().item())
+        metrics = {}
+        if update_actor:
+            state.actor_optim.zero_grad(set_to_none=True)
+            actor_loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                state.actor_params, float(cfg.inner_actor_grad_clip_norm)
+            )
+            state.actor_optim.step()
+            state.actor_steps += 1
+            state.actor_lifetime_steps += 1
+            metrics.update(
+                actor_loss=actor_loss.detach(),
+                actor_grad_norm=torch.as_tensor(grad_norm).detach(),
+                actor_policy_gradient_loss=policy_gradient_loss.detach(),
+                actor_entropy_loss=entropy_loss.detach(),
+                actor_entropy=(-entropy_log_prob.detach())[batch["valid"]].mean(),
+                vtrace_actor_advantage=target["pg_advantage"][batch["valid"]].mean(),
+                vtrace_pg_ratio_clipped_fraction=(
+                    (target["rho"] > float(cfg.inner_vtrace_pg_rho_clip))
+                    & batch["valid"]
+                ).float().sum()
+                / batch["valid"].float().sum().clamp_min(1),
+            )
+        if update_temperature:
+            target_entropy = self._resolved_inner_target_entropy()
+            valid = batch["valid"].to(dtype=entropy_log_prob.dtype)
+            temperature_loss = -(
+                state.log_alpha
+                * (entropy_log_prob + target_entropy).detach()
+                * valid
+            ).sum() / valid.sum().clamp_min(1)
+            state.temperature_optim.zero_grad(set_to_none=True)
+            temperature_loss.backward()
+            temperature_grad_norm = torch.nn.utils.clip_grad_norm_(
+                [state.log_alpha], float(cfg.inner_temperature_grad_clip_norm)
+            )
+            state.temperature_optim.step()
+            with torch.no_grad():
+                state.log_alpha.clamp_(min=_INNER_LOG_ALPHA_FLOOR)
+            state.temperature_steps += 1
+            state.temperature_lifetime_steps += 1
+            metrics.update(
+                temperature_loss=temperature_loss.detach(),
+                temperature_grad_norm=torch.as_tensor(
+                    temperature_grad_norm
+                ).detach(),
+            )
         return metrics
 
     @staticmethod
@@ -3849,6 +5679,30 @@ class InnerImprovementEngine:
             state.target_steps += 1
             state.actor_target_steps += 1
 
+    def _maybe_update_search_target(self, event, *, remaining_horizon=None):
+        """Apply exactly one configured finite-search target-network event."""
+        state, cfg = self.state, self.cfg
+        if (
+            str(getattr(cfg, "inner_search_bootstrap_critic", "target"))
+            != "target"
+            or state.critic_target is None
+            or self._search_target_update_event != event
+        ):
+            return False
+        if event == "optimizer_step":
+            interval = int(cfg.inner_critic_target_update_interval)
+            if state.critic_lifetime_steps % interval:
+                return False
+        stage = remaining_horizon if event == "depth_stage" else None
+        state.critic_target.update_from(
+            state.critic,
+            tau=float(cfg.inner_critic_target_tau),
+            remaining_horizon=stage,
+        )
+        state.target_steps += 1
+        state.critic_target_steps += 1
+        return True
+
     def _run_updates(
         self,
         round_index,
@@ -3915,7 +5769,7 @@ class InnerImprovementEngine:
             )
             alpha = self.alpha.detach()
             slot_metrics = {}
-            if self.cfg.inner_operator == "sac":
+            if self.cfg.inner_operator in {"sac", "vtrace"}:
                 if do_critic:
                     with self.rng.fork("bootstrap"):
                         slot_metrics.update(self._sac_critic_step(batch, alpha))
@@ -3976,6 +5830,131 @@ class InnerImprovementEngine:
             )
         )
         return metrics
+
+    def _search_update_counts(self, round_index, realized_transition_count):
+        """Resolve one round's critic/actor/temperature doses."""
+        cfg = self.cfg
+        if self._uses_canonical_schedule:
+            if self._uses_component_update_schedule:
+                critic = int(cfg.inner_critic_updates_per_round)
+                actor = int(cfg.inner_actor_updates_per_round)
+            else:
+                configured = cfg.inner_updates_per_round
+                updates = (
+                    int(realized_transition_count)
+                    if configured == "auto"
+                    else int(configured)
+                )
+                critic = (
+                    updates if str(cfg.inner_critic_adaptation) != "frozen" else 0
+                )
+                actor = (
+                    updates if str(cfg.inner_actor_adaptation) != "frozen" else 0
+                )
+            temperature = (
+                actor if str(cfg.inner_temperature_mode) == "auto" else 0
+            )
+            return critic, actor, temperature
+        critic_allocation = allocate_across_rounds(
+            int(cfg.inner_critic_updates_per_action), int(cfg.inner_rounds)
+        )
+        actor_allocation = allocate_across_rounds(
+            int(cfg.inner_actor_updates_per_action), int(cfg.inner_rounds)
+        )
+        temperature_allocation = allocate_across_rounds(
+            int(cfg.inner_temperature_updates_per_action), int(cfg.inner_rounds)
+        )
+        return (
+            critic_allocation[round_index],
+            actor_allocation[round_index],
+            temperature_allocation[round_index],
+        )
+
+    def _run_search_round_updates(
+        self, *, round_index, realized_transition_count
+    ):
+        """Run finite-search critic-first then actor/temperature phases."""
+        cfg = self.cfg
+        critic_count, actor_count, temperature_count = self._search_update_counts(
+            round_index, realized_transition_count
+        )
+        history = []
+        operator = str(cfg.inner_operator)
+        if operator == "vtrace" and not self._search_distilled:
+            history.append(self._distill_search_value())
+
+        # A backward finite-Q pass is a fitted dynamic-programming sweep: C
+        # denotes the number of optimizer steps *at each depth*, and all
+        # h=1,...,H critic stages complete before policy improvement.  This is
+        # useful independently of the target-update strategy.  In particular,
+        # an ``online`` bootstrap observes the freshly fitted lower-depth
+        # critic directly, while optimizer-step/round-end/frozen targets retain
+        # their configured lag semantics.  ``depth_stage`` is the stricter
+        # hard-propagation special case validated by the configuration layer.
+        backward_q_sweep = (
+            operator != "vtrace"
+            and str(getattr(cfg, "inner_depth_update_order", "mixed"))
+            == "backward"
+        )
+        if backward_q_sweep:
+            for remaining_horizon in range(
+                1, int(cfg.inner_rollout_horizon) + 1
+            ):
+                for _ in range(critic_count):
+                    batch = self._sample_search_anchors(
+                        remaining_horizon=remaining_horizon
+                    )
+                    history.append(self._search_q_critic_step(batch))
+                if (
+                    critic_count
+                    and self._search_target_update_event == "depth_stage"
+                ):
+                    self._maybe_update_search_target(
+                        "depth_stage", remaining_horizon=remaining_horizon
+                    )
+        else:
+            for _ in range(critic_count):
+                batch = (
+                    self._sample_search_trajectories()
+                    if operator == "vtrace"
+                    else self._sample_search_anchors()
+                )
+                history.append(
+                    self._vtrace_critic_step(batch)
+                    if operator == "vtrace"
+                    else self._search_q_critic_step(batch)
+                )
+        if critic_count:
+            self._maybe_update_search_target("round_end")
+
+        slots = max(actor_count, temperature_count)
+        for slot in range(slots):
+            batch = (
+                self._sample_search_trajectories()
+                if operator == "vtrace"
+                else self._sample_search_anchors()
+            )
+            update_actor = slot < actor_count
+            update_temperature = slot < temperature_count
+            history.append(
+                self._vtrace_policy_step(
+                    batch,
+                    update_actor=update_actor,
+                    update_temperature=update_temperature,
+                )
+                if operator == "vtrace"
+                else self._search_q_policy_step(
+                    batch,
+                    update_actor=update_actor,
+                    update_temperature=update_temperature,
+                )
+            )
+        requested = (
+            critic_count * int(cfg.inner_rollout_horizon)
+            if backward_q_sweep
+            else critic_count
+        ) + slots
+        return history, requested
 
     def _maybe_update_explorer_critic_target(self, *, critic_updated):
         state, cfg = self.state, self.cfg
@@ -4529,7 +6508,11 @@ class InnerImprovementEngine:
         discount = torch.ones(count, 1, device=self.device)
         score = torch.zeros(count, 1, device=self.device)
         soft_score = torch.zeros(count, 1, device=self.device)
-        alpha = self.agent.alpha.detach()
+        alpha = (
+            self.alpha.detach()
+            if self._finite_search_active
+            else self.agent.alpha.detach()
+        )
         for _ in range(int(self.cfg.inner_rollout_horizon)):
             action, info = self.model.pi(
                 z,
@@ -4558,26 +6541,35 @@ class InnerImprovementEngine:
                 continuation *= 1.0 - terminated
             discount *= float(self.agent.discount)
 
+        tail_is_outer = self._finite_search_active
         terminal_action, terminal_info = self.model.pi(
             z,
-            policy=policy,
-            deterministic=not stochastic,
+            policy=self.model._pi if tail_is_outer else policy,
+            deterministic=(False if tail_is_outer else not stochastic),
             generator=generator,
-            log_std_mapping=log_std_mapping,
-            log_std_min=log_std_min,
-            log_std_max=log_std_max,
+            log_std_mapping=None if tail_is_outer else log_std_mapping,
+            log_std_min=None if tail_is_outer else log_std_min,
+            log_std_max=None if tail_is_outer else log_std_max,
         )
         self.state.policy_evaluations += count
         terminal_q = self.model.Q(
             z,
             terminal_action,
-            target=True,
+            target=(
+                str(getattr(self.cfg, "inner_leaf_q_source", "outer_target"))
+                == "outer_target"
+                if tail_is_outer
+                else True
+            ),
             reduction="mean_all",
         )
         self.state.q_evaluations += count
         score += discount * continuation * terminal_q
+        leaf_alpha = (
+            self._search_outer_alpha if tail_is_outer else alpha
+        )
         soft_score += discount * continuation * (
-            terminal_q - alpha * terminal_info["log_prob"]
+            terminal_q - leaf_alpha * terminal_info["log_prob"]
         )
         return {
             "score": score.mean(),
@@ -4587,9 +6579,10 @@ class InnerImprovementEngine:
 
     @torch.no_grad()
     def _diagnostics(self, root_z, improved_policy):
+        search_root_metrics = {}
         with self.rng.fork("diagnostics") as generator:
             final_outer_policy_kl = None
-            if self.cfg.inner_operator == "sac":
+            if self.cfg.inner_operator in {"sac", "vtrace"}:
                 policy_training_modes = tuple(
                     (module, bool(module.training))
                     for policy in (self.model._pi, improved_policy)
@@ -4645,20 +6638,84 @@ class InnerImprovementEngine:
                 improved_action - outer_action, dim=-1
             ).mean()
 
+            if self._finite_search_active:
+                # Keep the legacy frozen-outer-Q comparison above as a stable
+                # counterfactual, and additionally report the value function
+                # that actually drives this finite root solve.  All root
+                # queries are explicitly routed through h=H; using the default
+                # outer Q here would silently evaluate the continuing task
+                # instead of the configured finite search problem.
+                root_depth = torch.full(
+                    root_z.shape[:-1],
+                    int(self.cfg.inner_rollout_horizon),
+                    dtype=torch.long,
+                    device=root_z.device,
+                )
+                critic_modes = tuple(
+                    (module, bool(module.training))
+                    for module in self.state.critic.modules()
+                )
+                try:
+                    self.state.critic.eval()
+                    if str(self.cfg.inner_operator) == "vtrace":
+                        root_value = self.state.critic(root_z, root_depth)
+                        self.state.q_evaluations += int(root_z.shape[0])
+                        search_root_metrics.update(
+                            inner_search_root_v_h=root_value.mean(),
+                            inner_search_root_v_h_abs_mean=root_value.abs().mean(),
+                        )
+                    else:
+                        search_outer_predictions = self._search_q_predictions(
+                            root_z, outer_action, root_depth
+                        )
+                        search_improved_predictions = self._search_q_predictions(
+                            root_z, improved_action, root_depth
+                        )
+                        search_outer_q = self.model.q_backend.reduce(
+                            self.model.q_backend.decode(search_outer_predictions),
+                            "mean_all",
+                        )
+                        search_improved_q = self.model.q_backend.reduce(
+                            self.model.q_backend.decode(search_improved_predictions),
+                            "mean_all",
+                        )
+                        self.state.q_evaluations += 2 * int(root_z.shape[0])
+                        search_root_metrics.update(
+                            inner_search_root_q_outer_action=search_outer_q.mean(),
+                            inner_search_root_q_improved_action=(
+                                search_improved_q.mean()
+                            ),
+                            inner_search_root_q_action_gain=(
+                                search_improved_q - search_outer_q
+                            ).mean(),
+                            inner_search_root_q_abs_mean=torch.stack(
+                                (
+                                    search_outer_q.abs().mean(),
+                                    search_improved_q.abs().mean(),
+                                )
+                            ).mean(),
+                        )
+                finally:
+                    for module, was_training in critic_modes:
+                        module.training = was_training
+                search_root_metrics["inner_search_root_remaining_horizon"] = float(
+                    self.cfg.inner_rollout_horizon
+                )
+
             if int(self.cfg.inner_diagnostic_rollouts) > 0:
                 state_before = generator.get_state()
                 outer_eval = self._evaluate_policy_trajectory(
                     root_z,
                     self.model._pi,
                     generator,
-                    stochastic=self.cfg.inner_operator == "sac",
+                    stochastic=self.cfg.inner_operator in {"sac", "vtrace"},
                 )
                 generator.set_state(state_before)
                 improved_eval = self._evaluate_policy_trajectory(
                     root_z,
                     improved_policy,
                     generator,
-                    stochastic=self.cfg.inner_operator == "sac",
+                    stochastic=self.cfg.inner_operator in {"sac", "vtrace"},
                     log_std_mapping=self.cfg.inner_log_std_mapping,
                     log_std_min=self.cfg.inner_log_std_min,
                     log_std_max=self.cfg.inner_log_std_max,
@@ -4680,6 +6737,7 @@ class InnerImprovementEngine:
             ).mean(),
             "inner_fixed_evaluator_alpha": self.agent.alpha.detach().mean(),
         }
+        metrics.update(search_root_metrics)
         if final_outer_policy_kl is not None:
             metrics["inner_final_outer_policy_kl"] = final_outer_policy_kl
         if self.cfg.q_representation == "distributional":
@@ -4744,11 +6802,23 @@ class InnerImprovementEngine:
             for key, value in item.items():
                 grouped.setdefault(key, []).append(torch.as_tensor(value).reshape(()))
         metrics = {}
+        sample_counts = {
+            key
+            for key in grouped
+            if key.startswith("depth_") and key.endswith("_sample_count")
+        }
+        population_suffixes = (
+            "_sum",
+            "_squared_sum",
+            "_count",
+            "_minimum",
+            "_maximum",
+        )
         auxiliary = {
             key
             for key in grouped
-            if key.endswith(("_sum", "_count"))
-        }
+            if key.endswith(population_suffixes)
+        } - sample_counts
         for key, values in grouped.items():
             if not values or key in auxiliary:
                 continue
@@ -4758,9 +6828,13 @@ class InnerImprovementEngine:
             metrics[f"{prefix}_std"] = stacked.std(unbiased=False)
             metrics[f"{prefix}_min"] = stacked.min()
             metrics[f"{prefix}_max"] = stacked.max()
+        for key in sample_counts:
+            metrics[f"inner_{key}"] = torch.stack(grouped[key]).sum()
         # Per-source minibatch populations vary. Aggregate TD errors by their
         # exact row count instead of averaging per-slot means equally.
         for sum_key in sorted(key for key in grouped if key.endswith("_sum")):
+            if sum_key.endswith("_squared_sum"):
+                continue
             stem = sum_key[: -len("_sum")]
             count_key = f"{stem}_count"
             if count_key not in grouped:
@@ -4769,6 +6843,25 @@ class InnerImprovementEngine:
             total_count = torch.stack(grouped[count_key]).sum()
             metrics[f"inner_{stem}_mean"] = total_sum / total_count.clamp_min(1)
             metrics[f"inner_{stem}_count"] = total_count
+            squared_sum_key = f"{stem}_squared_sum"
+            if squared_sum_key not in grouped:
+                continue
+            mean = metrics[f"inner_{stem}_mean"]
+            total_squared_sum = torch.stack(grouped[squared_sum_key]).sum()
+            variance = (
+                total_squared_sum / total_count.clamp_min(1) - mean.square()
+            ).clamp_min(0)
+            metrics[f"inner_{stem}_std"] = variance.sqrt()
+            minimum_key = f"{stem}_minimum"
+            maximum_key = f"{stem}_maximum"
+            if minimum_key in grouped:
+                metrics[f"inner_{stem}_min"] = torch.stack(
+                    grouped[minimum_key]
+                ).min()
+            if maximum_key in grouped:
+                metrics[f"inner_{stem}_max"] = torch.stack(
+                    grouped[maximum_key]
+                ).max()
         return metrics
 
     def _compile_fallback_metrics(self):
@@ -4779,9 +6872,26 @@ class InnerImprovementEngine:
         metric dictionary is created, so sampling these flags earlier would
         miss a fallback that occurred during the current action.
         """
-        rollout_fallback = self._compile_regions["rollout"].failed
-        critic_region_fallback = self._compile_regions["critic"].failed
-        actor_fallback = self._compile_regions["actor"].failed
+        if self._finite_search_active:
+            rollout_fallback = self._compile_regions["search_rollout"].failed
+            leaf_fallback = self._compile_regions["search_leaf"].failed
+            if str(self.cfg.inner_operator) == "vtrace":
+                critic_region_fallback = self._compile_regions[
+                    "search_value_critic"
+                ].failed
+                actor_fallback = self._compile_regions[
+                    "search_vtrace_actor"
+                ].failed
+            else:
+                critic_region_fallback = self._compile_regions[
+                    "search_critic"
+                ].failed
+                actor_fallback = self._compile_regions["search_actor"].failed
+        else:
+            rollout_fallback = self._compile_regions["rollout"].failed
+            leaf_fallback = False
+            critic_region_fallback = self._compile_regions["critic"].failed
+            actor_fallback = self._compile_regions["actor"].failed
         critic_module_fallback = bool(
             self.state.critic is not None
             and getattr(self.state.critic, "compile_failed", False)
@@ -4808,6 +6918,7 @@ class InnerImprovementEngine:
         )
         critic_fallback = bool(
             critic_region_fallback
+            or leaf_fallback
             or critic_module_fallback
             or target_module_fallback
             or explorer_critic_fallback
@@ -4979,7 +7090,7 @@ class InnerImprovementEngine:
             "inner_alpha_delta": 0.0,
             "inner_target_entropy": (
                 float(self._resolved_inner_target_entropy())
-                if self.cfg.inner_operator == "sac"
+                if self.cfg.inner_operator in {"sac", "vtrace"}
                 else 0.0
             ),
             "inner_action_seconds": float(action_seconds),
@@ -5108,7 +7219,11 @@ class InnerImprovementEngine:
         requested_update_slots = 0
         for round_index in range(int(cfg.inner_rounds)):
             rollout_start = self._timer_start()
-            rollout = self._collect_round(root_z)
+            rollout = (
+                self._collect_search_round(root_z)
+                if self._finite_search_active
+                else self._collect_round(root_z)
+            )
             self._timer_stop("inner_rollout_seconds", rollout_start)
             all_lengths.append(rollout["lengths"])
             reward_sums.append(rollout["reward_sums"])
@@ -5122,7 +7237,13 @@ class InnerImprovementEngine:
                 transition_sources.append(rollout["transition_sources"])
 
             update_start = self._timer_start()
-            if self._uses_canonical_schedule:
+            if self._finite_search_active:
+                round_metrics, round_requested = self._run_search_round_updates(
+                    round_index=round_index,
+                    realized_transition_count=rollout["transition_count"],
+                )
+                requested_update_slots += round_requested
+            elif self._uses_canonical_schedule:
                 if self._explorer_active or self._uses_component_update_schedule:
                     if self._explorer_active:
                         round_metrics = self._run_two_policy_component_updates(
@@ -5181,9 +7302,23 @@ class InnerImprovementEngine:
                     allocations["actor"][round_index],
                     allocations["temperature"][round_index],
                 )
+            if (
+                self._finite_search_active
+                and str(cfg.inner_search_replay_retention) == "round"
+            ):
+                # Fresh fitted-evaluation data belongs to exactly one frozen
+                # behavior-policy phase and must not survive policy improvement.
+                state.replay.clear()
             self._timer_stop("inner_update_seconds", update_start)
             update_history.extend(round_metrics)
-            update_slots += len(round_metrics)
+            # V-prior distillation contributes diagnostics to ``round_metrics``
+            # but is an initialization phase with its own explicit optimizer-
+            # step counter, not one of the configured adaptation update slots.
+            # Search executes every requested critic/actor slot synchronously,
+            # so its resolved count is the exact realized slot count.
+            update_slots += (
+                round_requested if self._finite_search_active else len(round_metrics)
+            )
 
         execution_start = self._timer_start()
         capture_behavior = bool(return_behavior_policy and not eval_mode)
@@ -5300,9 +7435,20 @@ class InnerImprovementEngine:
             inner_policy_evaluations=float(state.policy_evaluations),
             inner_q_evaluations=float(state.q_evaluations),
             inner_replay_draws=float(state.replay_draws),
-            inner_buffer_size=float(state.replay.size),
+            inner_buffer_size=float(
+                state.replay.transition_size
+                if self._finite_search_active
+                else state.replay.size
+            ),
             inner_buffer_capacity=float(state.replay.capacity),
-            inner_buffer_fill_ratio=float(state.replay.size / state.replay.capacity),
+            inner_buffer_fill_ratio=float(
+                (
+                    state.replay.transition_size
+                    if self._finite_search_active
+                    else state.replay.size
+                )
+                / state.replay.capacity
+            ),
             inner_return_mean=reward_stats[0],
             inner_return_std=reward_stats[1],
             inner_return_min=reward_stats[2],
@@ -5338,7 +7484,12 @@ class InnerImprovementEngine:
             inner_explorer_rollouts=float(state.explorer_rollouts),
             inner_primary_transitions=float(state.primary_transitions),
             inner_explorer_transitions=float(state.explorer_transitions),
-            inner_optimization_model_steps=realized_model_steps,
+            inner_optimization_model_steps=(
+                realized_model_steps
+                + float(state.target_model_steps)
+                if self._finite_search_active
+                else realized_model_steps
+            ),
             inner_explorer_actor_optimizer_steps=float(
                 state.explorer_actor_steps
             ),
@@ -5452,12 +7603,34 @@ class InnerImprovementEngine:
                 explorer_samples.float() / float(max(1, total_samples))
             )
         metrics.update(self._average_update_metrics(update_history))
+        if self._finite_search_active:
+            metrics["inner_target_model_steps"] = float(state.target_model_steps)
+            metrics["inner_buffer_peak_size"] = float(
+                self._search_buffer_peak_size
+            )
+            metrics["inner_vtrace_distill_optimizer_steps"] = float(
+                state.value_distill_steps
+            )
+            search_return_metrics = self._average_update_metrics(
+                self._search_return_metrics
+            )
+            # `_average_update_metrics` uses the same stable `inner_` metric
+            # namespace as optimizer diagnostics.
+            metrics.update(search_return_metrics)
         metrics.update(diagnostic_metrics)
-        metrics["inner_total_model_steps"] = (
-            metrics["inner_model_steps"]
-            + metrics.get("inner_diagnostic_model_steps", 0.0)
-            + metrics.get("inner_selector_model_steps", 0.0)
-        )
+        if self._finite_search_active:
+            metrics["inner_total_model_steps"] = (
+                metrics["inner_model_steps"]
+                + metrics["inner_target_model_steps"]
+                + metrics.get("inner_diagnostic_model_steps", 0.0)
+                + metrics.get("inner_selector_model_steps", 0.0)
+            )
+        else:
+            metrics["inner_total_model_steps"] = (
+                metrics["inner_model_steps"]
+                + metrics.get("inner_diagnostic_model_steps", 0.0)
+                + metrics.get("inner_selector_model_steps", 0.0)
+            )
         if self._collect_diagnostics:
             metrics["inner_diagnostics_sampled"] = 1.0
             metrics["inner_diagnostics_sample_count"] = 1.0
@@ -5662,7 +7835,7 @@ class InnerImprovementEngine:
                 operator == "mppi"
                 and self._mppi_iterations == 0
             ) or (
-                operator in {"sac", "td3"}
+                operator in {"sac", "td3", "vtrace"}
                 and int(self.cfg.inner_rounds) == 0
             )
             if inactive:
@@ -5723,7 +7896,7 @@ class InnerImprovementEngine:
             # the action; episode/run scopes survive by configuration.
             self._clear_expired(t0=False, include_action=True)
         if return_behavior_policy:
-            if operator != "sac":
+            if operator not in {"sac", "vtrace"}:
                 behavior_policy = None
             return action, metrics, lengths, behavior_policy
         return action, metrics, lengths

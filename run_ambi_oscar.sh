@@ -24,18 +24,25 @@ fail() {
 : "${AMBI_DURABLE_ROOT:?Set AMBI_DURABLE_ROOT to an operator-approved durable allocation directory.}"
 : "${AMBI_LINEAGE_DIR:?Set AMBI_LINEAGE_DIR to a lineage below AMBI_DURABLE_ROOT.}"
 : "${AMBI_DURABLE_QUOTA_LABEL:?Set AMBI_DURABLE_QUOTA_LABEL; rgao48 AMBI runs use rgao48, never data+rbalestr.}"
-: "${AMBI_DURABLE_QUOTA_PATH:?Set AMBI_DURABLE_QUOTA_PATH; rgao48 AMBI runs use /oscar/home.}"
+: "${AMBI_DURABLE_QUOTA_PATH:?Set AMBI_DURABLE_QUOTA_PATH; rgao48 AMBI runs use /oscar/home or /oscar/scratch.}"
 : "${SLURM_JOB_ID:?This launcher must run as a Slurm batch job.}"
-approved_durable_root="/oscar/home/rgao48/ambi-durable"
+approved_home_root="/oscar/home/rgao48/ambi-durable"
+approved_scratch_root="/oscar/scratch/rgao48/ambi-durable"
 [[ "$AMBI_DURABLE_QUOTA_LABEL" != "data+rbalestr" ]] || fail \
 	"data+rbalestr is not an approved AMBI durable allocation; use the quota row that owns AMBI_DURABLE_ROOT"
 [[ "$AMBI_DURABLE_QUOTA_LABEL" == "rgao48" ]] || fail \
 	"AMBI_DURABLE_QUOTA_LABEL must be rgao48 for Oscar AMBI runs"
-[[ "$AMBI_DURABLE_QUOTA_PATH" == "/oscar/home" ]] || fail \
-	"AMBI_DURABLE_QUOTA_PATH must be /oscar/home for Oscar AMBI runs"
-if [[ -d /oscar/home/rgao48 ]]; then
-	[[ "$AMBI_DURABLE_ROOT" == "$approved_durable_root" ]] || fail \
-		"AMBI_DURABLE_ROOT must be $approved_durable_root on Oscar"
+[[ "$AMBI_DURABLE_QUOTA_PATH" == "/oscar/home" || \
+   "$AMBI_DURABLE_QUOTA_PATH" == "/oscar/scratch" ]] || fail \
+	"AMBI_DURABLE_QUOTA_PATH must be /oscar/home or /oscar/scratch for Oscar AMBI runs"
+if [[ -d /oscar/home/rgao48 || -d /oscar/scratch/rgao48 ]]; then
+	case "$AMBI_DURABLE_ROOT:$AMBI_DURABLE_QUOTA_PATH" in
+		"$approved_home_root:/oscar/home"|"$approved_scratch_root:/oscar/scratch")
+			;;
+		*)
+			fail "AMBI_DURABLE_ROOT and AMBI_DURABLE_QUOTA_PATH must be an approved exact pair: $approved_home_root with /oscar/home, or $approved_scratch_root with /oscar/scratch"
+			;;
+	esac
 fi
 
 project_dir="$(cd -- "${SLURM_SUBMIT_DIR:-$PWD}" && pwd -P)"

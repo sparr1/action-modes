@@ -209,9 +209,10 @@ def test_resources_and_foreground_signal_contract_are_explicit():
     assert '--filesystem-path "$AMBI_DURABLE_QUOTA_PATH"' in contents
     assert '[[ "$AMBI_DURABLE_QUOTA_LABEL" != "data+rbalestr" ]]' in contents
     assert '[[ "$AMBI_DURABLE_QUOTA_LABEL" == "rgao48" ]]' in contents
-    assert '[[ "$AMBI_DURABLE_QUOTA_PATH" == "/oscar/home" ]]' in contents
-    assert 'approved_durable_root="/oscar/home/rgao48/ambi-durable"' in contents
-    assert '[[ "$AMBI_DURABLE_ROOT" == "$approved_durable_root" ]]' in contents
+    assert 'approved_home_root="/oscar/home/rgao48/ambi-durable"' in contents
+    assert 'approved_scratch_root="/oscar/scratch/rgao48/ambi-durable"' in contents
+    assert '"$approved_home_root:/oscar/home"' in contents
+    assert '"$approved_scratch_root:/oscar/scratch"' in contents
 
 
 @pytest.mark.parametrize(
@@ -248,12 +249,12 @@ def test_launcher_rejects_data_rbalestr_before_quota_or_training(tmp_path):
         ),
         (
             "AMBI_DURABLE_QUOTA_PATH",
-            "/oscar/scratch",
-            "AMBI_DURABLE_QUOTA_PATH must be /oscar/home",
+            "/oscar/project",
+            "AMBI_DURABLE_QUOTA_PATH must be /oscar/home or /oscar/scratch",
         ),
     ),
 )
-def test_launcher_rejects_non_home_quota_selection_before_training(
+def test_launcher_rejects_unapproved_quota_selection_before_training(
     tmp_path, variable, value, message
 ):
     env, _, args_path, _ = _launcher_environment(tmp_path, status=23)
@@ -306,6 +307,24 @@ def test_launcher_passes_explicit_home_quota_selection(tmp_path):
             "FAKE_QUOTA": (
                 "rgao48 /oscar/scratch 1 TB 2 TB GRACE_EXPIRED None\n"
                 "rgao48 /oscar/home 80 GB 100 GB OK None"
+            ),
+        }
+    )
+    result = _run(env)
+    assert result.returncode == 23, result.stderr
+    assert args_path.exists()
+    assert not scontrol.exists()
+
+
+def test_launcher_passes_explicit_scratch_quota_selection(tmp_path):
+    env, _, args_path, scontrol = _launcher_environment(tmp_path, status=23)
+    env.update(
+        {
+            "AMBI_DURABLE_QUOTA_LABEL": "rgao48",
+            "AMBI_DURABLE_QUOTA_PATH": "/oscar/scratch",
+            "FAKE_QUOTA": (
+                "rgao48 /oscar/scratch 2 TB 10 TB OK None\n"
+                "rgao48 /oscar/home 84 GB 100 GB OK None"
             ),
         }
     )

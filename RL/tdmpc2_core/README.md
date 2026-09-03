@@ -63,6 +63,109 @@ from the current outer temperature. Scalar twin critics, LoRA, TD3, no inner
 improvement, and persistent inner scopes are explicit ablations. The MPPI inner
 operator is a compute-matched TD-MPC-style comparator, not AMBI's planner.
 
+### Opt-in finite-horizon AMBI Search
+
+`inner_q_objective="legacy_continuing"` remains the default and enters the
+unchanged flat-replay AMBI implementation.  The opt-in
+`inner_q_objective="finite_horizon"`, `inner_operator="sac"` path instead
+learns the value of the finite root solve.  With `h` model transitions left,
+
+```text
+V_0(z) = E[a ~ pi_outer] [Q_outer(z,a) - beta alpha_outer log pi_outer(a|z)]
+Q_h(z,a) = r(z,a) + gamma (1-d) V_{h-1}(z'),  h >= 1.
+```
+
+The outer actor, alpha, and selected outer online/target Q are snapshotted for
+the complete root solve.  The outer Q is therefore used only as the `h=0`
+leaf, never as a continuing bootstrap at every imagined row.  A Q target does
+not contain entropy for its conditioned current action.  When the configured
+outer and inner critics are `entropy_augmented`, entropy enters only the value
+of future sampled actions, following
+[SAC's soft-value convention](https://arxiv.org/abs/1812.05905).
+
+The finite-Q critic layout is selected by `inner_critic_horizon_mode`:
+
+- `shared` deliberately projects every `Q_h` into one cloned Q ensemble, the
+  shared-value approximation closest to RL Search;
+- `depth_conditioned` appends an H-way one-hot remaining-depth input and zeros
+  its newly added columns at initialization, so every depth initially equals
+  the outer Q;
+- `stage_heads` copies the outer trunk and initializes H separate output heads
+  from its final layer.
+
+`inner_return_estimator` selects `td0`, fixed `n_step`, finite
+`lambda_return`, `full_suffix`, or true depth-aware `retrace`.  TD(0) samples a
+new successor action and is valid with either round- or action-retained replay
+without importance correction.  Linked multistep returns use fresh-round data,
+explicitly approximate `uncorrected` action replay, exact
+`per_decision_is`, or `resimulate` suffixes under the current policy. Fresh-
+round multistep labels are accepted as on-policy only for an exact
+`policy_sample` with unit standard-deviation scale and no added Gaussian
+noise; deliberately mean/scaled/noisy linked behavior belongs under the named
+`uncorrected` retained-replay diagnostic. For that approximate noisy mode the
+structured buffer records the stable inverse-tanh coordinate of the action
+that the model actually received, so future soft-entropy terms are at least
+evaluated at the linked action rather than at the unperturbed policy mean. Retrace
+uses clipped trace coefficients in TD-error control variates; it is not a
+[clipped direct return](https://papers.nips.cc/paper/2016/file/c3992e9a68c5ae12bd18488bc579b30d-Paper.pdf).
+Full suffixes reach the frozen outer leaf directly and
+therefore allocate no inner target network.  Multistep labels are built before
+the actor/temperature phase, so these modes require explicit
+`inner_critic_updates_per_round` and `inner_actor_updates_per_round` settings.
+Fixed n-step depth is configured by `inner_return_steps`; lambda-return,
+Retrace, and V-trace traces use `inner_return_lambda` under their respective
+validated ranges.
+
+Target roles are independent of the return estimator.  `target` creates an
+initial hard copy and updates it at `optimizer_step`, `round_end`, or
+`depth_stage`; `frozen_target` creates the initial copy but never updates it;
+`online` uses a no-grad online snapshot and allocates no target; `none` is
+reserved for `full_suffix`.  `inner_depth_update_order="mixed"` draws each
+critic minibatch from every available depth.  `"backward"` instead performs
+the configured critic dose separately at `h=1,...,H`, then begins the actor
+phase.  Thus `C` (or `G`) is a per-depth critic dose in a backward sweep and the
+reported critic-step total and UTD include the resulting H multiplier.  This
+ordering works with online semi-gradient bootstraps as well as updating,
+frozen, and absent targets; each target retains its own configured cadence.
+Hard `depth_stage` propagation is the stricter TD(0) case: it requires a
+depth-conditioned or stage-head critic, tau one, and interval one, and copies
+each newly fitted stage before fitting its parent.  V-trace always updates its
+linked full trajectory and therefore requires mixed ordering.  The legacy
+`inner_bootstrap_source` is rejected by finite-search configurations; use
+`inner_leaf_q_source` and `inner_search_bootstrap_critic` instead.
+
+`inner_operator="vtrace"` is a separate actor-critic family, not a SAC target
+alias.  It builds a scalar shared, depth-conditioned, or stage-head `V_h`,
+distills its root initialization from Monte Carlo outer-policy evaluations of
+the frozen reward-only outer Q, hard-copies the distilled value into its target,
+resets adaptation optimizer state, and then applies canonical clipped V-trace
+value targets and likelihood-ratio actor advantages as in
+[IMPALA](https://proceedings.mlr.press/v80/espeholt18a/espeholt18a.pdf).
+Entropy remains a
+separate actor regularizer/temperature objective.  V-trace requires reward-only
+outer/inner value semantics, exact stochastic behavior log probabilities, and
+configures its trace through `inner_return_lambda`,
+`inner_vtrace_rho_clip`, `inner_vtrace_c_clip`, and
+`inner_vtrace_pg_rho_clip`.  `inner_vtrace_distill_updates` and
+`inner_vtrace_distill_action_samples` control the separate prior-fitting phase.
+
+Finite search uses a trajectory-safe replay ring and is intentionally
+action-local.  It rejects explorer populations, persistent component or
+optimizer lifetimes, actor/critic writeback, and inexact behavior distributions
+when policy ratios are required.  Critic LoRA is supported only by the shared
+finite-Q layout; transformed Q layouts and every V-trace value layout use full
+copies. PDIS, Retrace, and V-trace additionally require zero actor-LoRA dropout
+so collection and density evaluation denote the same policy. Replay capacity
+must be an exact multiple of H and hold at least `N*H`
+rows for round retention or `J*N*H` rows for action retention. Without-
+replacement batches must fit the first update's eligible population: `N*H`
+ordinary finite-Q anchors, or `N` complete V-trace trajectories/per-depth hard-
+propagation anchors. Portable outer checkpoints retain their existing model
+keys and may be
+transferred across search variants.  Exact resume metadata includes every
+layout, estimator, replay/correction, leaf, target, EMA, and V-trace choice and
+rejects a semantic change within one lineage.
+
 ### Optional adapted-prior writeback
 
 The reference behavior keeps the outer control priors immutable during action

@@ -11,6 +11,7 @@ from .common.checkpoint import save_checkpoint
 from .common.device import resolve_device
 from .common.layers import api_model_conversion
 from .common.scale import percentile_range
+from .common.search_config import resolve_inner_search_semantics
 from .common.soft_world_model import SoftWorldModel
 from .inner_improvement import InnerImprovementEngine, polyak_update
 from .common.training_state import (
@@ -280,7 +281,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             f"outer={cfg.outer_critic_target}, "
             f"inner_sac={cfg.inner_sac_critic_target}",
         )
-        if cfg.inner_operator in {"sac", "td3"}:
+        if cfg.inner_operator in {"sac", "td3", "vtrace"}:
             nominal_steps = (
                 int(cfg.inner_rounds)
                 * int(cfg.inner_rollouts_per_round)
@@ -293,6 +294,17 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 )
             else:
                 update_schedule = f"G={cfg.inner_updates_per_round}"
+            if (
+                bool(getattr(cfg, "inner_search_active", False))
+                and str(getattr(cfg, "inner_depth_update_order", "mixed"))
+                == "backward"
+            ):
+                update_schedule = (
+                    f"{update_schedule}, critic_depth_stages="
+                    f"{cfg.inner_critic_depth_stages}, "
+                    f"effective_C="
+                    f"{cfg.inner_effective_critic_updates_per_round}"
+                )
             print(
                 "Inner schedule:",
                 f"J={cfg.inner_rounds}, N={cfg.inner_rollouts_per_round}, "
@@ -729,6 +741,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "outer_critic_target": str(self.cfg.outer_critic_target),
             "inner_sac_critic_target": str(self.cfg.inner_sac_critic_target),
         }
+        search = resolve_inner_search_semantics(self.cfg)
+        if search.is_search:
+            # Portable checkpoints intentionally ignore this provenance during
+            # weight transfer. Exact training resumes compare it in full, so a
+            # changed horizon layout, estimator, replay/correction mode, leaf,
+            # or target/EMA strategy cannot silently continue one lineage.
+            spec["inner_search"] = search.exact_spec(self.cfg)
         # Preserve the feature-off checkpoint contract byte-for-byte. Active
         # populations add their complete resolved Bellman/execution identity;
         # their absence itself denotes the legacy single-policy controller.

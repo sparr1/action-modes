@@ -38,6 +38,25 @@ _DEPENDENCIES = (
 _OPERATIONAL_ALGORITHM_FIELDS = frozenset({"eval_csv_path"})
 _AMBI_ALGORITHM = "AMBITDMPC2/AMBITDMPC2"
 _AMBI_RESOLVED_IDENTITY_DEFAULTS = {
+    "inner_operator": "sac",
+    "inner_q_objective": "legacy_continuing",
+    "inner_critic_horizon_mode": "shared",
+    "inner_return_estimator": "td0",
+    "inner_return_steps": None,
+    "inner_return_lambda": None,
+    "inner_leaf_q_source": "outer_target",
+    "inner_leaf_value_samples": 1,
+    "inner_search_replay_retention": "action",
+    "inner_offpolicy_mode": "none",
+    "inner_search_bootstrap_critic": "target",
+    "inner_target_update_event": "optimizer_step",
+    "inner_depth_update_order": "mixed",
+    "inner_vtrace_rho_clip": 1.0,
+    "inner_vtrace_c_clip": 1.0,
+    "inner_vtrace_pg_rho_clip": 1.0,
+    "inner_vtrace_distill_updates": 64,
+    "inner_vtrace_distill_action_samples": 4,
+    "inner_bootstrap_source": "inner_target",
     "inner_actor_writeback_coef": 0.0,
     "inner_critic_writeback_coef": 0.0,
     "inner_explorer_mode": "none",
@@ -200,6 +219,17 @@ def scientific_trial_parameters(
                         value = 0.0
                 algorithm[field] = value
             for field in (
+                "inner_operator",
+                "inner_q_objective",
+                "inner_critic_horizon_mode",
+                "inner_return_estimator",
+                "inner_leaf_q_source",
+                "inner_search_replay_retention",
+                "inner_offpolicy_mode",
+                "inner_search_bootstrap_critic",
+                "inner_target_update_event",
+                "inner_depth_update_order",
+                "inner_bootstrap_source",
                 "inner_explorer_mode",
                 "inner_behavior_action",
                 "inner_execution_policy_source",
@@ -208,6 +238,13 @@ def scientific_trial_parameters(
                 value = algorithm.get(field)
                 if isinstance(value, str):
                     algorithm[field] = value.lower()
+            if (
+                algorithm.get("inner_q_objective") == "finite_horizon"
+                or algorithm.get("inner_operator") == "vtrace"
+            ):
+                # The resolved finite-search config deliberately removes the
+                # legacy continuing-task bootstrap selector.
+                algorithm["inner_bootstrap_source"] = None
             inner_mapping = algorithm.get("inner_log_std_mapping")
             if inner_mapping is None:
                 inner_mapping = algorithm.get(

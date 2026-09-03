@@ -116,6 +116,16 @@ class Ensemble(nn.Module):
 			raise RuntimeError("torch.compile is unavailable in this PyTorch build.")
 		return self
 
+	def disable_compile(self, *, reset_failure=False):
+		"""Disable and release runtime compilation without changing parameters."""
+		self._compile_enabled = False
+		object.__setattr__(self, "_compiled_forward", None)
+		object.__setattr__(self, "_compiled_detached_forward", None)
+		if reset_failure:
+			self._compile_failed = False
+			self._detached_compile_failed = False
+		return self
+
 	@property
 	def compile_failed(self):
 		return self._compile_failed
