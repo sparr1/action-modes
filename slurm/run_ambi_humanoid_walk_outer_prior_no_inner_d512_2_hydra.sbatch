@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --partition=gpus
-#SBATCH --nodelist=gpu2301
+#SBATCH --nodelist=gpu2201
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
 #SBATCH --time=30-00:00:00
@@ -16,7 +16,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly ACTION_LOCK_SHA="f123ba99aadde092401c0e912dbeb88994f00ae420680c69c18003965485efe6"
-readonly EXPECTED_NODE="gpu2301"
+readonly EXPECTED_NODE="gpu2201"
 readonly CONFIG_STEM="ambi_humanoid_walk_outer_prior_no_inner_d512_2_14m"
 readonly MIN_DURABLE_FREE_KIB=$((2 * 1024 * 1024))
 readonly MIN_SCRATCH_FREE_KIB=$((4 * 1024 * 1024))
@@ -332,8 +332,8 @@ if sys.version_info[:2] != (3, 10):
 if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
     raise SystemExit("expected exactly one scheduler-visible CUDA device")
 device_name = torch.cuda.get_device_name()
-if "L40" not in device_name:
-    raise SystemExit(f"expected an L40 on gpu2301, found {device_name}")
+if "RTX A6000" not in device_name:
+    raise SystemExit(f"expected an RTX A6000 on gpu2201, found {device_name}")
 env = gym.make(
     "DMControl-v0",
     task="humanoid-walk",
