@@ -484,6 +484,48 @@ def test_none_operator_executes_outer_policy_with_outer_log_std_mapping(monkeypa
     assert inner_bounds == [False]
 
 
+def test_none_operator_samples_outer_prior_for_training_and_uses_mean_for_eval(
+    monkeypatch,
+):
+    model = _model(
+        inner_operator="none",
+        inner_model_step_budget=0,
+        inner_rounds=0,
+        inner_critic_updates_per_action=0,
+        inner_actor_updates_per_action=0,
+        inner_temperature_updates_per_action=0,
+        inner_execution_action="policy_sample",
+    )
+    engine = model.agent.inner_engine
+    calls = []
+
+    def tracked_policy_action(z, policy, **kwargs):
+        calls.append(
+            {
+                "policy": policy,
+                "mode": kwargs["mode"],
+                "inner_bounds": kwargs["inner_bounds"],
+            }
+        )
+        return z.new_zeros((z.shape[0], model.cfg.action_dim)), None
+
+    monkeypatch.setattr(engine, "_policy_action", tracked_policy_action)
+
+    train_action = model.agent.act(torch.zeros(3), t0=True, eval_mode=False)
+    train_metrics = dict(model.agent.last_inner_metrics)
+    eval_action = model.agent.act(torch.zeros(3), t0=True, eval_mode=True)
+    eval_metrics = dict(model.agent.last_inner_metrics)
+
+    assert train_action.shape == eval_action.shape == (model.cfg.action_dim,)
+    assert [call["mode"] for call in calls] == ["policy_sample", "mean"]
+    assert all(call["policy"] is model.agent.model._pi for call in calls)
+    assert all(call["inner_bounds"] is False for call in calls)
+    for metrics in (train_metrics, eval_metrics):
+        assert metrics["inner_active"] == 0
+        assert metrics["inner_model_steps"] == 0
+        assert metrics["inner_updates"] == 0
+
+
 def test_diagnostics_keep_outer_and_inner_log_std_semantics_separate(monkeypatch):
     model = _model(
         inner_diagnostic_rollouts=1,

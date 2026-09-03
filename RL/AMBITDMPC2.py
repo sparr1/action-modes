@@ -2699,8 +2699,16 @@ class AMBITDMPC2(TDMPC2Baseline):
         self._pending_behavior_policy = None
 
     def _record_action_metrics(self, *, planned, action_seconds):
+        inner_operator = getattr(getattr(self, "cfg", None), "inner_operator", None)
+        no_inner_operator = (
+            isinstance(inner_operator, str) and inner_operator.lower() == "none"
+        )
         outer_policy_action = bool(
-            planned and getattr(self, "_outer_policy_episode_selected", False)
+            planned
+            and (
+                getattr(self, "_outer_policy_episode_selected", False)
+                or no_inner_operator
+            )
         )
         if planned:
             self._wandb_train_window.add_weighted(
