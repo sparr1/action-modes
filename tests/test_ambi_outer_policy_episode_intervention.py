@@ -610,6 +610,49 @@ def test_outer_action_telemetry_has_planned_only_denominator_and_zero_inner_work
     assert timing["time/inner_seconds_per_action"] == pytest.approx(0.3)
 
 
+def test_none_operator_telemetry_classifies_planned_actions_as_outer_prior(
+    monkeypatch,
+):
+    algorithm = object.__new__(AMBITDMPC2)
+    algorithm.cfg = SimpleNamespace(inner_operator="none")
+    algorithm._wandb_train_window = WandbAccumulator()
+    algorithm._outer_policy_episode_selected = False
+    algorithm._inner_steps_total = 0
+    algorithm._inner_updates_total = 0
+    algorithm._wandb_inner_seconds = 0.0
+    algorithm._wandb_inner_actions = 0
+    algorithm._wandb_inner_steps = 0
+    algorithm._wandb_outer_policy_seconds = 0.0
+    algorithm._wandb_outer_policy_actions = 0
+    algorithm._wandb_train_seconds = 0.0
+    algorithm.agent = SimpleNamespace(
+        last_inner_metrics={"inner_active": 0.0},
+        last_inner_rollout_lengths=[],
+    )
+
+    algorithm._record_action_metrics(planned=False, action_seconds=9.0)
+    algorithm._record_action_metrics(planned=True, action_seconds=0.25)
+
+    payload = algorithm._wandb_train_window.pop()
+    assert payload["train/outer_policy_action_fraction"] == pytest.approx(1.0)
+    assert payload["train/outer_policy_actions"] == 1
+    assert payload["train/inner_behavior_actions"] == 0
+    assert payload["train/inner_actions"] == 0
+    assert payload["train/inner_active"] == pytest.approx(0.0)
+    assert payload["train/inner_model_steps"] == 0
+
+    monkeypatch.setattr(
+        TDMPC2Baseline,
+        "_timing_wandb_payload",
+        lambda self, updates_since_log: {},
+    )
+    timing = algorithm._timing_wandb_payload(0)
+    assert timing["time/outer_policy_action_seconds"] == pytest.approx(0.25)
+    assert timing["time/outer_policy_seconds_per_action"] == pytest.approx(0.25)
+    assert timing["time/inner_action_seconds"] == pytest.approx(0.0)
+    assert timing["time/inner_seconds_per_action"] == pytest.approx(0.0)
+
+
 def _logging_stub(*, cadence, extras):
     algorithm = object.__new__(TDMPC2Baseline)
     algorithm._wandb_run = object()

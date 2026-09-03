@@ -40,6 +40,26 @@ and MPPI are auxiliary ablations or comparison operators. In particular, MPPI
 is the TD-MPC-style planning comparator; it is not AMBI's core action-selection
 algorithm.
 
+### Outer-prior execution control
+
+Set `inner_operator="none"` to remove action-local improvement while retaining
+the learned world model and persistent outer actor, critic, and temperature.
+After random replay seeding, each training decision samples the stochastic
+outer policy directly. If invoked, deterministic evaluation or prediction uses
+its mean. The resolved inner rollout, model-step, optimizer-update, and MPPI
+budgets are all zero. Because this changes online collection and therefore
+future replay, it is a system-level training ablation rather than a
+frozen-checkpoint measurement of the immediate benefit of one inner solve.
+
+The maintained 14-million-decision Humanoid Walk control is
+`configs/dmcontrol/experiments/ambi_humanoid_walk_outer_prior_no_inner_d512_2_14m.json`.
+It derives from the single-seed D512-2 configuration. D512-2's inner schedule
+becomes inert by definition, so the variant clears or removes the active J/N/C/A
+schedule controls and retains every outer-learning setting. Remaining inner
+resource fields are provenance-only and inert. It is analogous to direct-policy
+control, not to MPPI with policy-prior candidates removed. No cluster job is
+submitted merely by adding or inspecting this manifest.
+
 ### Optional adapted-prior writeback
 
 AMBI normally discards each action-local learner. An opt-in training ablation

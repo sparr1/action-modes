@@ -1,0 +1,26 @@
+{
+  "study_type": "single_seed_exploratory_no_action_local_improvement_d512_2",
+  "study_note": "Single-seed exploratory 14-million-decision Humanoid Walk no-action-local-improvement control whose configuration and outer-learning recipe derive from ambi_humanoid_walk_base_v2_d512_2. It trains from scratch; D512-2 denotes configuration lineage only. Every planned post-seed training decision bypasses the action-local inner SAC solve and samples one action directly from the persistent stochastic outer policy prior; initial replay-seeding actions remain uniform random. If invoked separately, deterministic evaluation or prediction uses the outer-policy mean. The world model and persistent outer actor, critic, and automatic-temperature architectures, objectives, update rules, replay configuration, 14-million real-environment decision budget, and outer UTD schedule remain unchanged; their learned weights and replay contents evolve under the altered behavior policy. D512-2's J=8, N=512, C=3, and A=1 controls are intentionally removed because the resolved inner model-step, rollout, optimizer-update, and MPPI budgets are all zero. Consequently, D512-2 identifies the parent lineage but does not distinguish this controller from the corresponding base-v2 no-inner control. Because the behavior policy changes throughout online collection, this is a system-level training ablation rather than a frozen-checkpoint estimate of instantaneous inner-SAC gain. Auxiliary evaluations and portable model saves remain disabled exactly as in the parent. This remains a single-seed exploratory run and supports no confidence, significance, or confirmatory claim.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_humanoid_walk_outer_prior_no_inner_d512_2_14m"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": null,
+  "save_strat": "none",
+  "log_info": false,
+  "log_type": "summary"
+}
