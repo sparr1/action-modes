@@ -209,11 +209,13 @@ def test_outer_prior_control_manifest_preserves_d512_2_run_contract():
     assert "single-seed exploratory" in note
 
 
-def test_hydra_launcher_pins_one_seed55_job_to_gpu2301():
+def test_hydra_launcher_pins_one_seed55_job_to_gpu2201():
     contents = LAUNCHER.read_text(encoding="utf-8")
 
     assert "#SBATCH --partition=gpus" in contents
-    assert "#SBATCH --nodelist=gpu2301" in contents
+    assert "#SBATCH --nodelist=gpu2201" in contents
+    assert 'readonly EXPECTED_NODE="gpu2201"' in contents
+    assert 'if "RTX A6000" not in device_name:' in contents
     assert "#SBATCH --gres=gpu:1" in contents
     assert "#SBATCH --cpus-per-task=8" in contents
     assert "#SBATCH --mem=32G" in contents
