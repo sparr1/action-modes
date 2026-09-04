@@ -282,3 +282,49 @@ reported target-Q difference between the MPPI action and policy-prior action at
 the MPPI state is a learned-model diagnostic, not real Monte Carlo improvement.
 Same-state action effects require simulator-state branching or exact seeded
 prefix reconstruction followed by a declared common continuation controller.
+
+### Same-state MPPI action gain by prefix-replay Monte Carlo
+
+Use the action-level evaluator when the question is whether the MPPI action at
+an actually visited native-MPPI state improves real return over the frozen
+policy-prior mean at that same state. It resets the environment, exactly replays
+the recorded native-MPPI prefix, branches once on the action, and executes the
+deterministic frozen policy-prior mean for the remainder of both branches:
+
+```bash
+python evaluate_tdmpc2_mppi_action_mc.py /path/to/tdmpc2-checkpoint \
+  --behavior-json evaluation/paired-mppi.json \
+  --output evaluation/same-state-mppi-action-mc.json \
+  --episodes 12 \
+  --seed 101 \
+  --controller-seed 12345 \
+  --device cuda
+```
+
+The default protocol selects one reproducible seeded offset in every 25-step
+block (20 anchors in a 500-decision episode) and resamples whole reset-seed
+episodes for its bootstrap intervals. It reports both undiscounted task-return
+gain and gain discounted by the checkpoint's own gamma. The learned target-Q
+gain is retained as a calibration diagnostic and compared only with discounted
+Monte Carlo gain.
+
+The paired JSON contains each realized, naturally warm-started MPPI action but
+not the planner's pre-action `_prev_mean`. Therefore `--behavior-json` uses one
+recorded MPPI action per anchor even though `--action-draws` defaults to four;
+the output makes that effective draw count and RNG provenance explicit. Omitting
+`--behavior-json` generates native-MPPI behavior locally and takes the realized
+behavior-stream draw plus three fixed namespaced planner draws from the same
+saved warm start at each anchor. The observational draws are removed before the
+native behavior stream continues. This mode costs an MPPI call throughout the
+behavior episode.
+
+Imported behavior is accepted only when its schema/protocol, checkpoint hash,
+consecutive seed bank, full uncapped fixed-horizon status, finite action/reward
+trace, and controller stream seeds match. Every branch rechecks prefix rewards
+and flags exactly; the recorded anchor action must also reproduce its stored
+reward and flags. The output is written atomically and records the behavior JSON
+path and SHA-256, model/update immutability, controller-state restoration, and
+exact restoration of every global RNG stream that existed on evaluator entry.
+CUDA initialization is irreversible; when the evaluator creates the first CUDA
+stream in the process, that distinction is recorded rather than treated as a
+restoration failure.
