@@ -328,3 +328,27 @@ exact restoration of every global RNG stream that existed on evaluator entry.
 CUDA initialization is irreversible; when the evaluator creates the first CUDA
 stream in the process, that distinction is recorded rather than treated as a
 restoration failure.
+
+### Hydra batch for the 50k--125k checkpoint grid
+
+The tracked Hydra launcher evaluates the matched training-horizon-3 and
+training-horizon-5 checkpoints at 50k, 75k, 100k, and 125k decisions:
+
+```bash
+sbatch slurm/run_tdmpc2_mppi_eval_50k_125k_hydra.sbatch
+```
+
+Each of the eight array cells first writes the 12-episode paired full-controller
+evaluation, then supplies that exact JSON to the same-state prefix-replay
+evaluation. The seed bank, controller seed, 25-decision anchor blocks, and
+20,000-draw bootstrap match the 25k protocol. Results use separate per-step
+directories, and the launcher refuses a dirty checkout, missing checkpoint
+sidecars, or any pre-existing destination file.
+
+The same launcher also maps array tasks 8--9 to the matched 150k checkpoints,
+but leaves them out of its default array until both checkpoint/sidecar pairs are
+published. Add that step later without changing the launcher:
+
+```bash
+sbatch --array=8-9%2 slurm/run_tdmpc2_mppi_eval_50k_125k_hydra.sbatch
+```
