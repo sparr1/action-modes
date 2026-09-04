@@ -26,7 +26,7 @@
     "utd": 1,
     "eval_freq": null,
     "eval_episodes": 10,
-    "train_unroll_horizon": 3,
+    "train_unroll_horizon": 5,
     "outer_planning_horizon": 3,
     "inner_rollout_horizon": 3,
     "temporal_loss_normalization": "reference_weighted_mean",
@@ -64,7 +64,7 @@
       "checkpoint-bank",
       "checkpoints-every-25k",
       "no-online-evaluation",
-      "train-unroll-horizon-3",
+      "train-unroll-horizon-5",
       "1p5m-decisions"
     ]
   },

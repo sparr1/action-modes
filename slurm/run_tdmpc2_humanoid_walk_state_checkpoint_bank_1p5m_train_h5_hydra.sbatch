@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=tdmpc2-hw-ckptbank
+#SBATCH --job-name=tdmpc2-hw-h5-bank
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -30,12 +30,12 @@ if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
   exit 1
 fi
 
-MANIFEST="configs/dmcontrol/experiments/tdmpc2_humanoid_walk_state_checkpoint_bank_1p5m.json"
+MANIFEST="configs/dmcontrol/experiments/tdmpc2_humanoid_walk_state_checkpoint_bank_1p5m_train_h5.json"
 TRIAL_INDEX=0
 SEED=1
-ARTIFACT_ROOT="/cs/home/rgao48/projects/ambi-runs/tdmpc2-checkpoint-bank-1p5m"
+ARTIFACT_ROOT="/cs/home/rgao48/projects/ambi-runs/tdmpc2-checkpoint-bank-1p5m-train-h5"
 RUN_ROOT="$ARTIFACT_ROOT/seed_${SEED}/job_${SLURM_JOB_ID}"
-WANDB_LOCAL_ROOT="${SLURM_TMPDIR:-/tmp}/tdmpc2-ckptbank-wandb-${SLURM_JOB_ID}"
+WANDB_LOCAL_ROOT="${SLURM_TMPDIR:-/tmp}/tdmpc2-h5-ckptbank-wandb-${SLURM_JOB_ID}"
 mkdir -p "$ARTIFACT_ROOT"
 mkdir -p "$WANDB_LOCAL_ROOT" "$WANDB_LOCAL_ROOT/cache" "$WANDB_LOCAL_ROOT/data" "$WANDB_LOCAL_ROOT/artifacts"
 
@@ -63,7 +63,7 @@ echo "Task: humanoid-walk"
 echo "Seed: $SEED"
 echo "Agent decisions: 1500000"
 echo "Raw simulator control steps: 3000000"
-echo "Training unroll horizon: 3"
+echo "Training unroll horizon: 5"
 echo "Outer planning horizon: 3"
 echo "Checkpoint cadence: 25000"
 echo "Expected numbered checkpoints: 60"

@@ -1,0 +1,24 @@
+{
+  "study_type": "tdmpc2_humanoid_walk_state_checkpoint_bank_train_h5",
+  "study_note": "Single-seed exploratory training-unroll-horizon-5 variant of the TD-MPC2 Humanoid Walk state checkpoint bank through 1.5M agent decisions. It differs from the matched horizon-3 bank only by setting train_unroll_horizon=5: MPPI data collection and outer_planning_horizon=3 remain unchanged, and reference_weighted_mean with temporal_loss_reference_horizon=3 preserves the baseline aggregate temporal-loss scale while redistributing weight across five learned-model transitions. This is a compatibility-port-specific decoupled training-horizon ablation: upstream's single legacy horizon=5 would also change MPPI planning depth and use divide-by-horizon loss normalization. Separate online evaluation episodes are disabled. Because the compatibility port's online evaluations consume the shared environment and controller RNG streams, these no-evaluation runs are not expected to reproduce the exact seeded trajectory of the evaluation-enabled benchmark. Sixty portable model snapshots are retained every 25k decisions with adjacent provenance metadata; they support frozen evaluation and weight transfer, not exact training resume.",
+  "overrides_alg": {
+    "env": "DMControl-v0"
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "tdmpc2_humanoid_walk_state_checkpoint_bank_1p5m_train_h5"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": [
+    "all"
+  ],
+  "log_info": false,
+  "log_type": "summary"
+}
