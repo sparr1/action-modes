@@ -1,0 +1,28 @@
+{
+  "study_type": "single_seed_exploratory_no_inner_checkpoint_bank",
+  "study_note": "Single-seed exploratory Humanoid Walk checkpoint bank for measuring post-hoc action-local improvement on priors trained without an inner controller. The learner is an exact 1.5-million-decision derivative of ambi_humanoid_walk_outer_prior_no_inner_d512_2_14m apart from budget and W&B identity: it samples the persistent stochastic outer policy after replay seeding, runs zero inner model steps and zero inner optimizer updates, keeps the distributional five-head AMBI critic, and explicitly retains entropy-augmented outer and inner SAC Bellman targets with learned automatic outer temperature. Separate evaluation episodes are disabled during training. Sixty portable checkpoints are retained at 25,000-decision intervals from 25,000 through 1,500,000; no step-zero checkpoint is produced. Each frozen checkpoint can later support paired outer-policy versus fresh inner-SAC evaluations without changing the learned outer state. This isolates deployment-time improvement conditional on no-inner-trained priors; it does not estimate the replay-distribution feedback of using inner improvement throughout training and remains a single-seed exploratory study.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1500000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_humanoid_walk_outer_prior_no_inner_checkpoint_bank_1p5m"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": [
+    "all"
+  ],
+  "log_info": false,
+  "log_type": "summary"
+}
