@@ -245,3 +245,40 @@ environment, wrapper, and algorithm settings. Existing checkpoints in their
 original `logs/<run>/models` directory are supported through the run's
 `settings.json` and per-trial `alg_settings.json`. For copied legacy files, pass
 `--trial-settings` and `--experiment-settings` explicitly.
+
+### Frozen TD-MPC2 policy-prior versus MPPI evaluation
+
+Use the dedicated paired evaluator to measure the controller-level gain from
+running native TD-MPC2 MPPI at every environment decision instead of executing
+the frozen network policy mean:
+
+```bash
+python evaluate_tdmpc2_mppi_checkpoint.py /path/to/tdmpc2-checkpoint \
+  --output evaluation/paired-mppi.json \
+  --episodes 12 \
+  --seed 101 \
+  --controller-seed 12345 \
+  --device cuda
+```
+
+The two controllers use independent environment instances with identical reset
+seeds. MPPI receives a separate fixed controller RNG stream for every episode;
+`eval_mode=True` suppresses final execution noise but does not remove MPPI's
+candidate, policy-trajectory, critic-pair, or elite-selection sampling. The
+atomic JSON retains raw per-step rewards, cumulative returns, actions, planner
+statistics, paired episode-return deltas, and a whole-episode bootstrap interval.
+It also verifies that the model state and update counter did not change.
+
+Bootstrap intervals are conditional on the one frozen training-seed checkpoint:
+they combine reset-state and fixed one-draw-per-reset MPPI planner variability,
+not uncertainty across independently trained models. Pointwise trajectory bands
+reuse the same whole-episode bootstrap draws at every timestep and are not
+simultaneous confidence bands.
+
+The aligned timestep curves compare two complete controller trajectories. They
+must not be interpreted as the causal contribution of one MPPI action because
+the controllers generally visit different states after the first action. The
+reported target-Q difference between the MPPI action and policy-prior action at
+the MPPI state is a learned-model diagnostic, not real Monte Carlo improvement.
+Same-state action effects require simulator-state branching or exact seeded
+prefix reconstruction followed by a declared common continuation controller.
