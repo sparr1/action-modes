@@ -42,6 +42,15 @@ ways:
   requires `latent_dim == 16 * num_channels` (the model-size-5 default is 512);
 - current official vectorized-critic checkpoints are converted on load.
 
+The maintained port deliberately replaces upstream TD-MPC2's epsilon-floored
+tanh log-Jacobian with the exact stable pre-tanh identity. This changes policy
+log-probabilities, entropy diagnostics, and their gradients, but not sampled
+actions, RNG consumption, or checkpoint structure. Continuing training across
+this boundary is therefore a new experimental lineage, even from a loadable
+older checkpoint. Actor diagnostics report mean and maximum absolute pre-tanh
+values, the fraction beyond the former floor's `7.600902` crossover, and the
+fraction of actions rounded exactly to either tanh bound.
+
 Replay keeps complete overlapping RGB frame stacks as `uint8`, matching
 upstream behavior. Random-shift augmentation remains active during acting and
 evaluation. AMBI isolates the acting-time crop in its private RNG stream, but

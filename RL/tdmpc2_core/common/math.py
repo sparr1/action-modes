@@ -294,13 +294,31 @@ def tanh_log_abs_det_jacobian(pre_tanh_action, *, sum_action_dim=True):
 	return elementwise_log_abs_det
 
 
+def tanh_saturation_statistics(pre_tanh_action, action):
+	"""Return detached scalar diagnostics for tanh action saturation.
+
+	The third statistic marks pre-tanh coordinates for which the historical
+	``+1e-6`` Jacobian floor dominated the true derivative. The fourth records
+	coordinates whose already-squashed action rounded exactly to either bound.
+	"""
+	pre_tanh_abs = pre_tanh_action.detach().abs()
+	action_abs = action.detach().abs()
+	return (
+		pre_tanh_abs.mean(),
+		pre_tanh_abs.amax(),
+		(pre_tanh_abs >= 7.600902).to(dtype=pre_tanh_abs.dtype).mean(),
+		(action_abs == 1.0).to(dtype=action_abs.dtype).mean(),
+	)
+
+
 def squash(mu, pi, log_pi):
-	"""Apply squashing function."""
-	mu = torch.tanh(mu)
-	pi = torch.tanh(pi)
-	squashed_pi = torch.log(F.relu(1 - pi.pow(2)) + 1e-6)
-	log_pi = log_pi - squashed_pi.sum(-1, keepdim=True)
-	return mu, pi, log_pi
+	"""Tanh-squash a mean/sample and apply the exact density correction.
+
+	``pi`` is the pre-tanh sample, so its stable Jacobian must be evaluated
+	before the returned action is transformed.
+	"""
+	log_pi = log_pi - tanh_log_abs_det_jacobian(pi)
+	return torch.tanh(mu), torch.tanh(pi), log_pi
 
 
 def int_to_one_hot(x, num_classes):

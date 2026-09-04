@@ -3097,6 +3097,25 @@ class InnerImprovementEngine:
             dim=-1, keepdim=True
         )
 
+    @staticmethod
+    def _tanh_saturation_metrics(pre_tanh_action, action, *, prefix):
+        (
+            pre_tanh_abs_mean,
+            pre_tanh_abs_max,
+            pre_tanh_abs_ge_7p6_fraction,
+            action_exact_saturation_fraction,
+        ) = td_math.tanh_saturation_statistics(pre_tanh_action, action)
+        return {
+            f"{prefix}pre_tanh_abs_mean": pre_tanh_abs_mean,
+            f"{prefix}pre_tanh_abs_max": pre_tanh_abs_max,
+            f"{prefix}pre_tanh_abs_ge_7p6_fraction": (
+                pre_tanh_abs_ge_7p6_fraction
+            ),
+            f"{prefix}action_exact_saturation_fraction": (
+                action_exact_saturation_fraction
+            ),
+        }
+
     def _sac_actor_kernel(
         self,
         z,
@@ -3115,6 +3134,15 @@ class InnerImprovementEngine:
             log_std_min=cfg.inner_log_std_min,
             log_std_max=cfg.inner_log_std_max,
         )
+        # Surface the exact sample already used by the compiled actor update so
+        # optional diagnostics can run eagerly without another policy forward
+        # or any additional RNG consumption. Lightweight test/downstream policy
+        # stubs that omit pre_tanh_action retain the historical 8-tuple seam.
+        actor_sample = (
+            (info["pre_tanh_action"].detach(), action.detach())
+            if "pre_tanh_action" in info
+            else ()
+        )
         zero = info["log_prob"].new_zeros(())
         if not update_actor:
             return (
@@ -3126,6 +3154,7 @@ class InnerImprovementEngine:
                 zero,
                 zero,
                 zero,
+                *actor_sample,
             )
 
         # Reuse one decoded all-head evaluation for both the configured actor
@@ -3175,6 +3204,7 @@ class InnerImprovementEngine:
             q_pi_mean_all.mean(),
             q_pi_min_all.mean(),
             (q_pi_mean_all - q_pi_min_all).mean(),
+            *actor_sample,
         )
 
     def _scaled_sac_actor_kernel(
@@ -3187,6 +3217,13 @@ class InnerImprovementEngine:
         update_actor,
     ):
         """SAC policy region with one explicit, action-frozen loss scale."""
+        actor_outputs = self._sac_actor_kernel(
+            z,
+            alpha,
+            policy_noise,
+            pair_indices,
+            update_actor,
+        )
         (
             log_prob,
             entropy,
@@ -3196,13 +3233,7 @@ class InnerImprovementEngine:
             q_mean_all,
             q_min_all,
             q_mean_all_minus_min_all,
-        ) = self._sac_actor_kernel(
-            z,
-            alpha,
-            policy_noise,
-            pair_indices,
-            update_actor,
-        )
+        ) = actor_outputs[:8]
         return (
             log_prob,
             entropy,
@@ -3212,6 +3243,7 @@ class InnerImprovementEngine:
             q_mean_all,
             q_min_all,
             q_mean_all_minus_min_all,
+            *actor_outputs[8:],
         )
 
     def _sac_policy_step(
@@ -3247,16 +3279,7 @@ class InnerImprovementEngine:
             # it follows policy/critic dropout in the legacy order.
             pair_indices = None
             if not scale_enabled:
-                (
-                    log_prob,
-                    entropy,
-                    actor_loss,
-                    q_mean,
-                    kl_mean,
-                    q_mean_all,
-                    q_min_all,
-                    q_mean_all_minus_min_all,
-                ) = self._compile_regions["actor"](
+                actor_outputs = self._compile_regions["actor"](
                     batch["z"],
                     alpha,
                     policy_noise,
@@ -3264,22 +3287,29 @@ class InnerImprovementEngine:
                     update_actor,
                 )
             else:
-                (
-                    log_prob,
-                    entropy,
-                    actor_loss,
-                    q_mean,
-                    kl_mean,
-                    q_mean_all,
-                    q_min_all,
-                    q_mean_all_minus_min_all,
-                ) = self._compile_regions["actor"](
+                actor_outputs = self._compile_regions["actor"](
                     batch["z"],
                     alpha,
                     actor_loss_scale,
                     policy_noise,
                     pair_indices,
                     update_actor,
+                )
+            (
+                log_prob,
+                entropy,
+                actor_loss,
+                q_mean,
+                kl_mean,
+                q_mean_all,
+                q_min_all,
+                q_mean_all_minus_min_all,
+            ) = actor_outputs[:8]
+            actor_sample = actor_outputs[8:]
+            if len(actor_sample) not in {0, 2}:
+                raise RuntimeError(
+                    "Inner SAC actor kernel returned an invalid diagnostic "
+                    "sample payload."
                 )
             state.policy_evaluations += batch_size
 
@@ -3308,6 +3338,14 @@ class InnerImprovementEngine:
                     ),
                     actor_entropy=entropy.detach().mean(),
                 )
+                if self._collect_diagnostics and actor_sample:
+                    metrics.update(
+                        self._tanh_saturation_metrics(
+                            actor_sample[0],
+                            actor_sample[1],
+                            prefix="actor_",
+                        )
+                    )
                 if float(cfg.inner_outer_policy_kl_coef) > 0.0:
                     # This is the update-time regularizer statistic. When the
                     # regularizer is disabled, omit it instead of publishing a
@@ -3446,6 +3484,23 @@ class InnerImprovementEngine:
                     actor_entropy=-primary_log_mu.detach().mean(),
                     explorer_actor_entropy=-explorer_log_mu.detach().mean(),
                 )
+                if self._collect_diagnostics:
+                    if "pre_tanh_action" in primary_info:
+                        metrics.update(
+                            self._tanh_saturation_metrics(
+                                primary_info["pre_tanh_action"],
+                                primary_action,
+                                prefix="actor_",
+                            )
+                        )
+                    if "pre_tanh_action" in explorer_info:
+                        metrics.update(
+                            self._tanh_saturation_metrics(
+                                explorer_info["pre_tanh_action"],
+                                explorer_action,
+                                prefix="explorer_actor_",
+                            )
+                        )
             if update_temperature:
                 expected_log_mu = (
                     weight * primary_log_mu
@@ -3560,6 +3615,14 @@ class InnerImprovementEngine:
                         f"{prefix}actor_entropy": info["entropy"].detach().mean(),
                     }
                 )
+                if self._collect_diagnostics and "pre_tanh_action" in info:
+                    metrics.update(
+                        self._tanh_saturation_metrics(
+                            info["pre_tanh_action"],
+                            action,
+                            prefix=f"{prefix}actor_",
+                        )
+                    )
                 if explorer:
                     state.explorer_actor_steps += 1
                     state.explorer_actor_lifetime_steps += 1

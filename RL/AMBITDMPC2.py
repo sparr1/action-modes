@@ -2931,6 +2931,10 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_actor_q_min_all",
             "inner_actor_q_mean_all_minus_min_all",
             "inner_actor_entropy",
+            "inner_actor_pre_tanh_abs_mean",
+            "inner_actor_pre_tanh_abs_max",
+            "inner_actor_pre_tanh_abs_ge_7p6_fraction",
+            "inner_actor_action_exact_saturation_fraction",
             "inner_mixture_log_prob",
             "inner_outer_policy_kl",
             "inner_outer_action_l2",
@@ -2940,6 +2944,10 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_explorer_actor_grad_norm",
             "inner_explorer_actor_q_mean",
             "inner_explorer_actor_entropy",
+            "inner_explorer_actor_pre_tanh_abs_mean",
+            "inner_explorer_actor_pre_tanh_abs_max",
+            "inner_explorer_actor_pre_tanh_abs_ge_7p6_fraction",
+            "inner_explorer_actor_action_exact_saturation_fraction",
         }
         temperature_metrics = {
             "inner_temperature_loss",

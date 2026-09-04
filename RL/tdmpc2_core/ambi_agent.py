@@ -2257,6 +2257,30 @@ class AMBITDMPC2Agent(torch.nn.Module):
         behavior_policy_valid=None,
     ):
         action, policy_info = self.model.pi(zs)
+        actor_saturation_metrics = {}
+        # Real SoftWorldModel policy samples always expose their pre-tanh action.
+        # Keep the established lightweight policy-stub seam usable in tests and
+        # downstream diagnostics that only provide the fields consumed by SAC.
+        if "pre_tanh_action" in policy_info:
+            (
+                actor_pre_tanh_abs_mean,
+                actor_pre_tanh_abs_max,
+                actor_pre_tanh_abs_ge_7p6_fraction,
+                actor_action_exact_saturation_fraction,
+            ) = td_math.tanh_saturation_statistics(
+                policy_info["pre_tanh_action"].detach(),
+                action.detach(),
+            )
+            actor_saturation_metrics = {
+                "actor_pre_tanh_abs_mean": actor_pre_tanh_abs_mean,
+                "actor_pre_tanh_abs_max": actor_pre_tanh_abs_max,
+                "actor_pre_tanh_abs_ge_7p6_fraction": (
+                    actor_pre_tanh_abs_ge_7p6_fraction
+                ),
+                "actor_action_exact_saturation_fraction": (
+                    actor_action_exact_saturation_fraction
+                ),
+            }
         behavior_regularizer = torch.zeros((), device=self.device)
         behavior_regularizer_ready = False
         behavior_regularizer_metrics = {}
@@ -2452,6 +2476,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "actor_q_mean_all_minus_min_all": (
                 q_policy_mean_all - q_policy_min_all
             ).mean(),
+            **actor_saturation_metrics,
             "ent_coef": alpha.detach(),
             "ent_coef_loss": entropy_coefficient_loss.detach(),
         }
