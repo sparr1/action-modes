@@ -1,0 +1,24 @@
+{
+  "study_type": "tdmpc2_humanoid_walk_state_checkpoint_bank",
+  "study_note": "Single-seed exploratory TD-MPC2 Humanoid Walk state checkpoint bank through 1.5M agent decisions. Default TD-MPC2 learning and MPPI training-action settings are retained, while separate online evaluation episodes are disabled so frozen policy-prior, MPPI, and inner-SAC controllers can later be compared once with a common evaluation protocol. Because the compatibility port's online evaluations consume the shared environment and controller RNG streams, this no-evaluation run is not expected to reproduce the exact seeded trajectory of the evaluation-enabled benchmark. The configured six MPPI iterations become eight at runtime through TD-MPC2's action_dim >= 20 heuristic. Sixty portable model snapshots are retained every 25k decisions with adjacent provenance metadata; they support frozen evaluation and weight transfer, not exact training resume.",
+  "overrides_alg": {
+    "env": "DMControl-v0"
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "tdmpc2_humanoid_walk_state_checkpoint_bank_1p5m"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": [
+    "all"
+  ],
+  "log_info": false,
+  "log_type": "summary"
+}
