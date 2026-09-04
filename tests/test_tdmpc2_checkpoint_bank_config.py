@@ -103,11 +103,12 @@ def test_checkpoint_bank_manifest_retains_sixty_numbered_snapshots():
     assert 1_500_000 // manifest["checkpoint_every"] == 60
 
 
-def test_checkpoint_bank_hydra_launcher_is_one_guarded_a6000_job():
+def test_checkpoint_bank_hydra_launcher_is_one_guarded_gpu2501_l40s_job():
     contents = BANK_LAUNCHER.read_text()
 
-    assert "#SBATCH --constraint=rtx_a6000" in contents
-    assert "#SBATCH --gres=gpu:1" in contents
+    assert "#SBATCH --nodelist=gpu2501" in contents
+    assert "#SBATCH --constraint=l40s" in contents
+    assert "#SBATCH --gres=gpu:nvidia_l40s:1" in contents
     assert "#SBATCH --time=5-00:00:00" in contents
     assert "#SBATCH --array" not in contents
     assert "SLURM_ARRAY_" not in contents
@@ -205,8 +206,9 @@ def test_h5_checkpoint_bank_hydra_launcher_is_matched_and_isolated():
     contents = H5_LAUNCHER.read_text()
 
     for contract in (
-        "#SBATCH --constraint=rtx_a6000",
-        "#SBATCH --gres=gpu:1",
+        "#SBATCH --nodelist=gpu2501",
+        "#SBATCH --constraint=l40s",
+        "#SBATCH --gres=gpu:nvidia_l40s:1",
         "#SBATCH --time=5-00:00:00",
         "Agent decisions: 1500000",
         "Raw simulator control steps: 3000000",

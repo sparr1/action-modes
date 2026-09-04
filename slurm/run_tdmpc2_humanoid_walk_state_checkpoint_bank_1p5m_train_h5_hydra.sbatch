@@ -4,8 +4,9 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --partition=gpus
-#SBATCH --constraint=rtx_a6000
-#SBATCH --gres=gpu:1
+#SBATCH --nodelist=gpu2501
+#SBATCH --constraint=l40s
+#SBATCH --gres=gpu:nvidia_l40s:1
 #SBATCH --mem=32G
 #SBATCH --time=5-00:00:00
 #SBATCH --output=/cs/home/rgao48/projects/ambi-runs/slurm/%x-%j.out
