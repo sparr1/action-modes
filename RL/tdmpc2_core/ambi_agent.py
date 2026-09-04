@@ -235,7 +235,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 torch.log(
                     torch.tensor(
                         [initial_kl_coef],
-                        dtype=torch.float32,
+                        # Only this scalar and its Adam moments need the wider
+                        # range: squaring a large finite KL violation can
+                        # overflow float32 and permanently poison Adam state.
+                        dtype=torch.float64,
                         device=self.device,
                     )
                 )
@@ -574,8 +577,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 state["log_coef"],
                 "AMBI behavior-policy KL log coefficient",
                 shape=self.log_behavior_policy_kl_coef.shape,
-                dtype=self.log_behavior_policy_kl_coef.dtype,
+                dtype=self.log_behavior_policy_kl_coef.dtype if exact else None,
             )
+            if log_coef.dtype not in {torch.float32, torch.float64}:
+                raise ValueError(
+                    "AMBI behavior-policy KL log coefficient must have "
+                    "float32 (legacy portable) or float64 dtype."
+                )
             if not bool(torch.isfinite(log_coef).all().item()):
                 raise ValueError(
                     "AMBI behavior-policy KL log coefficient must be finite."
@@ -600,6 +608,25 @@ class AMBITDMPC2Agent(torch.nn.Module):
                     state["optim"],
                     self.behavior_policy_kl_optim,
                 )
+            # Portable loads may promote legacy float32 scalar/moment state.
+            # Widening an already overflowed moment cannot recover its value;
+            # reject it before changing any live model or optimizer state.
+            for parameter_state in state["optim"]["state"].values():
+                for field in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                    if field not in parameter_state:
+                        continue
+                    moment = parameter_state[field]
+                    if moment.dtype != log_coef.dtype:
+                        raise ValueError(
+                            f"AMBI behavior-policy KL optimizer {field} dtype "
+                            "must match the saved log coefficient."
+                        )
+                    if not bool(torch.isfinite(moment).all().item()):
+                        raise ValueError(
+                            f"AMBI behavior-policy KL optimizer {field} must "
+                            "be finite; overflowed moments cannot be recovered "
+                            "by precision promotion."
+                        )
         return state
 
     @torch.no_grad()
@@ -1318,6 +1345,12 @@ class AMBITDMPC2Agent(torch.nn.Module):
             elif self._behavior_policy_kl_schedule == "dual":
                 self.log_behavior_policy_kl_coef.data.copy_(
                     behavior_policy_kl_candidate["log_coef"].to(self.device)
+                )
+                # A legacy float32 endpoint can round just outside the exact
+                # bounds when promoted to float64.
+                self.log_behavior_policy_kl_coef.data.clamp_(
+                    min=math.log(_BEHAVIOR_POLICY_KL_DUAL_MIN),
+                    max=math.log(float(self.cfg.outer_behavior_policy_kl_dual_max)),
                 )
                 load_optimizer_state_preserving_hyperparameters(
                     self.behavior_policy_kl_optim,
@@ -2249,6 +2282,29 @@ class AMBITDMPC2Agent(torch.nn.Module):
             behavior_policy_valid,
         )
 
+    @torch.no_grad()
+    def _clip_actor_grad_norm_(self):
+        """Keep ordinary L2 clipping safe for large finite behavior gradients."""
+        parameters = tuple(self.model._pi.parameters())
+        maximum = float(self.cfg.grad_clip_norm)
+        if not self.behavior_policy_kl_enabled:
+            return torch.nn.utils.clip_grad_norm_(parameters, maximum)
+
+        gradients = [p.grad for p in parameters if p.grad is not None]
+        if not gradients:
+            return torch.zeros((), device=self.device, dtype=torch.float64)
+        # Widen each reduction, not just the final scalar: a float32 per-tensor
+        # sum of squares can overflow even when every gradient is finite.
+        norms = torch.stack([
+            torch.linalg.vector_norm(g, dtype=torch.float64) for g in gradients
+        ])
+        total_norm = torch.linalg.vector_norm(norms)
+        coefficient = (maximum / (total_norm + 1e-6)).clamp(max=1.0)
+        # All actor gradients share the model's dtype/device. Keep the network
+        # and its Adam state in float32; only norm accumulation is widened.
+        torch._foreach_mul_(gradients, coefficient.to(gradients[0]))
+        return total_norm
+
     def _update_actor(
         self,
         zs,
@@ -2335,9 +2391,11 @@ class AMBITDMPC2Agent(torch.nn.Module):
         if self._behavior_policy_kl_schedule == "dual":
             slot_coefficient = self.log_behavior_policy_kl_coef.exp().detach()
             if behavior_regularizer_ready:
-                behavior_regularizer_coefficient = slot_coefficient.reshape(())
+                behavior_regularizer_coefficient = slot_coefficient.to(
+                    behavior_regularizer
+                ).reshape(())
                 behavior_kl_dual_violation = (
-                    behavior_regularizer.detach()
+                    behavior_regularizer.detach().to(slot_coefficient.dtype)
                     - float(self.cfg.outer_behavior_policy_kl_target)
                 )
                 behavior_kl_dual_loss = -(
@@ -2457,9 +2515,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
 
         self.pi_optim.zero_grad(set_to_none=True)
         actor_loss.backward()
-        actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.model._pi.parameters(), float(self.cfg.grad_clip_norm)
-        )
+        actor_grad_norm = self._clip_actor_grad_norm_()
         self.pi_optim.step()
         if (
             self._behavior_policy_kl_schedule == "smooth"

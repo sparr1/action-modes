@@ -209,6 +209,24 @@ modes require stochastic inner SAC execution. Replay and agent states move to
 versions 2 and 5/6 respectively only while this feature is active; exact
 checkpoint metadata rejects cross-objective continuation.
 
+Behavior-regularized outer actor updates accumulate their L2 gradient norm in
+float64. Large finite KL/CE gradients therefore retain the ordinary clipping
+direction instead of overflowing a float32 norm and being zeroed. The actor,
+world model, critics, and their optimizer moments remain float32. The dual
+schedule keeps its single log coefficient and Adam moments in float64 so that
+squaring a large finite constraint violation cannot overflow its second
+moment; the coefficient is cast to the actor loss dtype when used there. This
+changes numerical precision without capping the KL, changing the objective, or
+adding a gradient-clipping threshold for the dual update. Runs with the
+behavior regularizer disabled retain their existing clipping implementation.
+
+Portable loads promote finite legacy float32 dual coefficients and moments.
+Exact resume remains strict about dtype and requires a float64 dual state;
+continuing a legacy dual checkpoint with this precision change is a new
+training lineage. Checkpoints with already non-finite dual moments are rejected
+before any live state is changed, since precision promotion cannot reconstruct
+the lost values. Their model weights can still be transferred to a fresh agent.
+
 Learned outer and inner SAC entropy coefficients have a numerical floor of
 `1e-8`. Fixed entropy coefficients retain their configured values. The floor
 prevents an underflowed outer coefficient from becoming an invalid zero when a
