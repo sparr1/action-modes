@@ -2,13 +2,13 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LAUNCHER = ROOT / "slurm/run_tdmpc2_mppi_eval_50k_125k_hydra.sbatch"
+LAUNCHER = ROOT / "slurm/run_tdmpc2_mppi_eval_50k_150k_hydra.sbatch"
 
 
 def test_newer_checkpoint_launcher_maps_five_steps_and_both_training_horizons():
     contents = LAUNCHER.read_text()
 
-    assert "#SBATCH --array=0-7%4" in contents
+    assert "#SBATCH --array=0-8%9" in contents
     assert "0|1) STEP=50000" in contents
     assert "2|3) STEP=75000" in contents
     assert "4|5) STEP=100000" in contents
@@ -46,12 +46,12 @@ def test_newer_checkpoint_launcher_has_guarded_paired_then_same_state_protocol()
     assert "--action-draws 1" in contents
 
 
-def test_newer_checkpoint_launcher_pins_requested_hydra_resources():
+def test_newer_checkpoint_launcher_uses_all_requested_hydra_gpu_nodes():
     contents = LAUNCHER.read_text()
 
-    assert "#SBATCH --nodelist=gpu2501" in contents
-    assert "#SBATCH --constraint=l40s" in contents
-    assert "#SBATCH --gres=gpu:nvidia_l40s:1" in contents
+    assert "#SBATCH --nodelist=gpu2501,gpu2301,gpu2201" in contents
+    assert "#SBATCH --constraint" not in contents
+    assert "#SBATCH --gres=gpu:1" in contents
     assert "#SBATCH --cpus-per-task=8" in contents
     assert "#SBATCH --mem=32G" in contents
     assert "#SBATCH --time=02:00:00" in contents

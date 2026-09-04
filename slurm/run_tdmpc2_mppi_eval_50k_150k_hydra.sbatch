@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=tdmpc2-mppi-50k125k
+#SBATCH --job-name=tdmpc2-mppi-50k150k
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --partition=gpus
-#SBATCH --nodelist=gpu2501
-#SBATCH --constraint=l40s
-#SBATCH --gres=gpu:nvidia_l40s:1
+#SBATCH --nodelist=gpu2501,gpu2301,gpu2201
+#SBATCH --gres=gpu:1
 #SBATCH --mem=32G
 #SBATCH --time=02:00:00
-#SBATCH --array=0-7%4
+#SBATCH --array=0-8%9
 #SBATCH --output=/cs/home/rgao48/projects/ambi-runs/slurm/%x-%A_%a.out
 #SBATCH --error=/cs/home/rgao48/projects/ambi-runs/slurm/%x-%A_%a.err
 
