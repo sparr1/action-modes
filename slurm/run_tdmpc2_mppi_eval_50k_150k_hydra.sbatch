@@ -4,11 +4,11 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --partition=gpus
-#SBATCH --nodelist=gpu2501,gpu2301,gpu2201
+#SBATCH --nodelist=gpu2501,gpu2201,gpu1901,gpu1902
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
 #SBATCH --time=02:00:00
-#SBATCH --array=0-8%9
+#SBATCH --array=0-9%10
 #SBATCH --output=/cs/home/rgao48/projects/ambi-runs/slurm/%x-%A_%a.out
 #SBATCH --error=/cs/home/rgao48/projects/ambi-runs/slurm/%x-%A_%a.err
 

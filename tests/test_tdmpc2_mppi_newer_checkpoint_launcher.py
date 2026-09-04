@@ -8,7 +8,7 @@ LAUNCHER = ROOT / "slurm/run_tdmpc2_mppi_eval_50k_150k_hydra.sbatch"
 def test_newer_checkpoint_launcher_maps_five_steps_and_both_training_horizons():
     contents = LAUNCHER.read_text()
 
-    assert "#SBATCH --array=0-8%9" in contents
+    assert "#SBATCH --array=0-9%10" in contents
     assert "0|1) STEP=50000" in contents
     assert "2|3) STEP=75000" in contents
     assert "4|5) STEP=100000" in contents
@@ -49,7 +49,8 @@ def test_newer_checkpoint_launcher_has_guarded_paired_then_same_state_protocol()
 def test_newer_checkpoint_launcher_uses_all_requested_hydra_gpu_nodes():
     contents = LAUNCHER.read_text()
 
-    assert "#SBATCH --nodelist=gpu2501,gpu2301,gpu2201" in contents
+    assert "#SBATCH --nodelist=gpu2501,gpu2201,gpu1901,gpu1902" in contents
+    assert "gpu2301" not in contents
     assert "#SBATCH --constraint" not in contents
     assert "#SBATCH --gres=gpu:1" in contents
     assert "#SBATCH --cpus-per-task=8" in contents

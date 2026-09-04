@@ -332,8 +332,7 @@ restoration failure.
 ### Hydra batch for the 50k--150k checkpoint grid
 
 The tracked Hydra launcher evaluates both training horizons at 50k, 75k, 100k,
-and 125k decisions, plus the currently published training-horizon-3 checkpoint
-at 150k:
+125k, and 150k decisions:
 
 ```bash
 sbatch slurm/run_tdmpc2_mppi_eval_50k_150k_hydra.sbatch
@@ -346,10 +345,8 @@ evaluation. The seed bank, controller seed, 25-decision anchor blocks, and
 directories, and the launcher refuses a dirty checkout, missing checkpoint
 sidecars, or any pre-existing destination file.
 
-The default array includes task 8 for the published horizon-3 150k checkpoint.
-Task 9 is mapped to horizon-5 150k but remains out of the default array until
-that checkpoint and sidecar are published. Add it without changing the launcher:
-
-```bash
-sbatch --array=9 slurm/run_tdmpc2_mppi_eval_50k_150k_hydra.sbatch
-```
+All ten cells are eligible to run concurrently. Hydra may schedule them across
+the explicitly allowed `gpu2501`, `gpu2201`, `gpu1901`, and `gpu1902` nodes;
+the known-broken `gpu2301` path is excluded. The generic one-GPU request keeps
+the array compatible with the L40S, RTX A6000, and RTX 2080 Ti workers in that
+set.
