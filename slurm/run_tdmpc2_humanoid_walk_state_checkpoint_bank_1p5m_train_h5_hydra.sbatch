@@ -17,10 +17,10 @@ set -Eeuo pipefail
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 cd "$PROJECT_DIR"
 
-PYTHON="$PROJECT_DIR/environments/dmcontrol/.venv/bin/python"
+PYTHON="${AMBI_DMC_PYTHON:-/cs/home/rgao48/projects/action-modes/environments/dmcontrol/.venv/bin/python}"
 if [[ ! -x "$PYTHON" ]]; then
   echo "Missing locked DMControl interpreter: $PYTHON" >&2
-  echo "Run: uv sync --project environments/dmcontrol --locked" >&2
+  echo "Set AMBI_DMC_PYTHON to a locked DMControl interpreter." >&2
   exit 1
 fi
 
@@ -70,6 +70,7 @@ echo "Expected numbered checkpoints: 60"
 echo "Manifest: $MANIFEST"
 echo "Artifact root: $RUN_ROOT"
 echo "W&B local staging: $WANDB_LOCAL_ROOT"
+echo "Python: $PYTHON"
 "$PYTHON" --version
 echo "SLURM_JOB_GPUS: ${SLURM_JOB_GPUS:-unset}"
 "$PYTHON" -c 'import os, torch; print("torch:", torch.__version__); print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES")); print("visible CUDA devices:", torch.cuda.device_count()); print("cuda:", torch.cuda.get_device_name())'

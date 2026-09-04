@@ -111,7 +111,11 @@ def test_checkpoint_bank_hydra_launcher_is_one_guarded_a6000_job():
     assert "#SBATCH --time=5-00:00:00" in contents
     assert "#SBATCH --array" not in contents
     assert "SLURM_ARRAY_" not in contents
-    assert "environments/dmcontrol/.venv/bin/python" in contents
+    assert "AMBI_DMC_PYTHON" in contents
+    assert (
+        "/cs/home/rgao48/projects/action-modes/environments/dmcontrol/.venv/bin/python"
+        in contents
+    )
     assert "tdmpc2_humanoid_walk_state_checkpoint_bank_1p5m.json" in contents
     assert "Agent decisions: 1500000" in contents
     assert "Raw simulator control steps: 3000000" in contents
@@ -209,6 +213,7 @@ def test_h5_checkpoint_bank_hydra_launcher_is_matched_and_isolated():
         "Checkpoint cadence: 25000",
         "Expected numbered checkpoints: 60",
         "git status --porcelain --untracked-files=normal",
+        "AMBI_DMC_PYTHON",
         "export WANDB_MODE=online",
         "export WANDB_DISABLE_CODE=true",
         "--alg-index 0",
