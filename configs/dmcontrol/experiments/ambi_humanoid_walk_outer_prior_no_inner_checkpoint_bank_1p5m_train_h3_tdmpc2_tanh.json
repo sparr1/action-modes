@@ -1,0 +1,28 @@
+{
+  "study_type": "single_seed_exploratory_no_inner_checkpoint_bank_h3_tdmpc2_tanh_prior",
+  "study_note": "Single-seed exploratory Humanoid Walk checkpoint bank for measuring post-hoc action-local improvement on an AMBI no-inner prior whose outer stochastic policy uses TD-MPC2's tanh log-standard-deviation mapping and upstream bounds. It remains the AMBITDMPC2 no-inner H=3 bank: relative to ambi_humanoid_walk_outer_prior_no_inner_checkpoint_bank_1p5m, the only scientific changes are log_std_mapping=tdmpc2_tanh and log_std_min=-10 with the already-matched log_std_max=2. The AMBI model, distributional five-head critic, entropy-augmented Bellman targets, learned automatic temperature, train_unroll_horizon=3, outer_planning_horizon=3, inner_rollout_horizon=3, reference-weighted temporal-loss settings, stochastic policy collection, and zero-inner-work contract are otherwise unchanged. This condition does not use the native TDMPC2Baseline architecture and does not execute MPPI. Separate evaluation episodes are disabled during training. Sixty portable checkpoints are retained at 25,000-decision intervals from 25,000 through 1,500,000, with no step-zero checkpoint. It isolates the outer policy-prior standard-deviation parameterization and remains a single-seed exploratory study.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1500000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_humanoid_walk_outer_prior_no_inner_checkpoint_bank_1p5m_train_h3_tdmpc2_tanh"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": [
+    "all"
+  ],
+  "log_info": false,
+  "log_type": "summary"
+}

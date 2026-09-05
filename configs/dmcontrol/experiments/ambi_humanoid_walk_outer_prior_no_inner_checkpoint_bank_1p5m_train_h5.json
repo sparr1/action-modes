@@ -1,0 +1,28 @@
+{
+  "study_type": "single_seed_exploratory_no_inner_checkpoint_bank_train_h5",
+  "study_note": "Single-seed exploratory Humanoid Walk checkpoint bank for measuring post-hoc action-local improvement on an AMBI prior trained without an inner controller and with train_unroll_horizon=5. It is an exact scientific derivative of ambi_humanoid_walk_outer_prior_no_inner_checkpoint_bank_1p5m apart from the recurrent training unroll: the stochastic outer policy still collects every post-seed transition, inner_operator=none performs zero inner model steps and zero inner optimizer updates, outer_planning_horizon=3 and inner_rollout_horizon=3 remain fixed, and reference_weighted_mean with temporal_loss_reference_horizon=3 preserves the horizon-3 aggregate temporal-loss scale while redistributing it over five learned-model transitions. The distributional five-head AMBI critic, entropy-augmented Bellman targets, and learned automatic outer temperature are unchanged. Separate evaluation episodes are disabled during training. Sixty portable checkpoints are retained at 25,000-decision intervals from 25,000 through 1,500,000, with no step-zero checkpoint. This isolates learned-prior sensitivity to a longer training unroll while keeping collection and later frozen-controller evaluation roles fixed; it remains a single-seed exploratory study.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1500000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_humanoid_walk_outer_prior_no_inner_checkpoint_bank_1p5m_train_h5"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": [
+    "all"
+  ],
+  "log_info": false,
+  "log_type": "summary"
+}
