@@ -146,6 +146,54 @@ single `AMBI_BENCHMARK_PRESET` remains the fallback when the list is omitted.
 it requires a matching three-decision prior reference, not the full-episode
 reference above.
 
+### The same checkpoint evaluation on Oscar
+
+`slurm/run_ambi_inner_benchmark_oscar.sbatch` supplies Oscar's resource and
+runtime settings, then runs the same launcher body as Hydra. Each array task
+requests one L40S, six CPUs, 32 GB, and six hours in partition `gpu`; the account
+and QoS use the cluster defaults. The array still selects checkpoints 100k
+through 500k. The default interpreter is the existing locked environment at
+`/oscar/home/rgao48/action-modes/environments/dmcontrol/.venv/bin/python`;
+override it with `AMBI_DMC_PYTHON` if needed. It imports code from the submitted
+checkout, not from the environment's source directory.
+
+Synchronize the tested commit through Git and submit from that clean checkout.
+Checkpoint weights and adjacent sidecars, plus prior reference bundles, must be
+accessible on Oscar. Copying them preserves their checkpoint and protocol
+identities, which the evaluator checks before pairing returns. For the current
+C6/C12 full-episode comparison, export these paths using the Oscar copies:
+
+```bash
+export EXPECTED_ACTION_MODES_SHA="$(git rev-parse HEAD)"
+export AMBI_CHECKPOINT_PREFIX=/absolute/Oscar/path/to/checkpoint_
+export AMBI_BENCHMARK_REFERENCE_ROOT=/absolute/Oscar/path/to/original/evaluation
+export AMBI_BENCHMARK_MATRIX=configs/research/ambi_humanoid_inner_critic_sweep.json
+export AMBI_BENCHMARK_PRESETS='critic_budget/inner_target_c6 critic_budget/inner_target_c12'
+export AMBI_BENCHMARK_OUTPUT_ROOT=/oscar/scratch/rgao48/ambi/inner-benchmark/new-campaign/inner-target
+mkdir -p /oscar/scratch/rgao48/ambi/inner-benchmark/new-campaign/slurm
+sbatch --array=1-5%2 \
+  --output=/oscar/scratch/rgao48/ambi/inner-benchmark/new-campaign/slurm/inner-%A_%a.out \
+  --error=/oscar/scratch/rgao48/ambi/inner-benchmark/new-campaign/slurm/inner-%A_%a.err \
+  slurm/run_ambi_inner_benchmark_oscar.sbatch
+```
+
+For fixed outer-Q bootstraps, select `critic_budget/outer_target_c6` and
+`critic_budget/outer_target_c12`, change the output root and log paths, and
+submit separately. Choose concurrency against the account's available GPU
+slots; the example permits two simultaneous tasks per array. Each configuration
+still evaluates seeds 101–105 for up to 500 decisions, with full traces and
+offline HTML reports. W&B uses the same `ambi-inner-bench` project, informative
+configuration/checkpoint names and tags, and completion summaries as Hydra.
+
+The critic-sweep matrix requires a prior reference: it contains only critic
+variants, not the `named_run/prior` preset used when the launcher creates a new
+baseline. If needed, create prior bundles first with
+`ambi_humanoid_inner_benchmark.json` and `named_run/prior`. For a scheduled
+`--array=1 --time=00:30:00` smoke, pass `--smoke` and a fresh output root; use a
+seed-101, three-decision reference or the original benchmark matrix without a
+reference. Smoke runs omit W&B. Full prior references cannot pair with the
+short smoke protocol.
+
 ### More critic updates on shared observations
 
 `ambi_humanoid_inner_critic_sweep.json` holds the D512-4-J6 collection and

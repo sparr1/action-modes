@@ -9,11 +9,21 @@ import sys
 import pytest
 
 
-LAUNCHER = Path(__file__).resolve().parents[1] / "slurm/run_ambi_inner_benchmark_hydra.sbatch"
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(params=["hydra", "oscar"])
+def launcher(request):
+    return ROOT / f"slurm/run_ambi_inner_benchmark_{request.param}.sbatch"
 
 
 @pytest.fixture
 def launch_env(tmp_path):
+    # Oscar delegates to the same evaluated body from the submitted checkout.
+    (tmp_path / "slurm").mkdir()
+    (tmp_path / "slurm/run_ambi_inner_benchmark_hydra.sbatch").symlink_to(
+        ROOT / "slurm/run_ambi_inner_benchmark_hydra.sbatch"
+    )
     binaries = tmp_path / "bin"
     binaries.mkdir()
     git = binaries / "git"
@@ -55,11 +65,11 @@ def launch_env(tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["--bank-only", "--bank-smoke"])
-def test_bank_launch_reuses_roots_and_never_runs_episodes(tmp_path, launch_env, mode):
+def test_bank_launch_reuses_roots_and_never_runs_episodes(tmp_path, launch_env, launcher, mode):
     env = launch_env
     roots = Path(env["AMBI_BENCHMARK_REFERENCE_ROOT"]) / "step_300000/roots.json"
     calls = Path(env["TEST_CALLS"])
-    subprocess.run(["bash", str(LAUNCHER), mode], env=env, check=True, capture_output=True, text=True)
+    subprocess.run(["bash", str(launcher), mode], env=env, check=True, capture_output=True, text=True)
     evaluation, report = [json.loads(line) for line in calls.read_text().splitlines()]
     assert evaluation[0] == "evaluate_ambi_checkpoint.py"
     assert evaluation[evaluation.index("--matrix") + 1] == env["AMBI_BENCHMARK_MATRIX"]
@@ -78,19 +88,19 @@ def test_bank_launch_reuses_roots_and_never_runs_episodes(tmp_path, launch_env, 
     assert report[0] == "report_ambi_benchmark.py"
     assert report[report.index("--bundle") + 1] == str(tmp_path / "output/step_300000/bank")
     # Reusing an output directory must fail before another evaluation starts.
-    repeated = subprocess.run(["bash", str(LAUNCHER), mode], env=env, capture_output=True, text=True)
+    repeated = subprocess.run(["bash", str(launcher), mode], env=env, capture_output=True, text=True)
     assert repeated.returncode != 0
     assert len(calls.read_text().splitlines()) == 2
 
 
 @pytest.mark.parametrize("step_index", [1, 2, 3, 4, 5])
 @pytest.mark.parametrize("bootstrap", ["inner_target", "outer_target"])
-def test_full_launch_evaluates_both_budgets_and_reuses_prior(launch_env, step_index, bootstrap):
+def test_full_launch_evaluates_both_budgets_and_reuses_prior(launch_env, launcher, step_index, bootstrap):
     env = launch_env
     env["SLURM_ARRAY_TASK_ID"] = str(step_index)
     presets = [f"critic_budget/{bootstrap}_c6", f"critic_budget/{bootstrap}_c12"]
     env["AMBI_BENCHMARK_PRESETS"] = " ".join(presets)
-    subprocess.run(["bash", str(LAUNCHER)], env=env, check=True, capture_output=True, text=True)
+    subprocess.run(["bash", str(launcher)], env=env, check=True, capture_output=True, text=True)
     evaluation, report = [json.loads(line) for line in Path(env["TEST_CALLS"]).read_text().splitlines()]
     assert evaluation[0] == "evaluate_ambi_checkpoint.py"
     assert [evaluation[i + 1] for i, arg in enumerate(evaluation) if arg == "--preset"] == presets
@@ -108,7 +118,7 @@ def test_full_launch_evaluates_both_budgets_and_reuses_prior(launch_env, step_in
 
 
 @pytest.mark.parametrize("explicit_single", [False, True])
-def test_existing_single_preset_fallback_remains_compatible(launch_env, explicit_single):
+def test_existing_single_preset_fallback_remains_compatible(launch_env, launcher, explicit_single):
     env = launch_env
     env.pop("AMBI_BENCHMARK_PRESETS")
     preset = "named_run/d512_4_j6_outer_target" if explicit_single else "named_run/d512_4_j6"
@@ -116,14 +126,14 @@ def test_existing_single_preset_fallback_remains_compatible(launch_env, explicit
         env["AMBI_BENCHMARK_PRESET"] = preset
     else:
         env.pop("AMBI_BENCHMARK_PRESET", None)
-    subprocess.run(["bash", str(LAUNCHER)], env=env, check=True, capture_output=True, text=True)
+    subprocess.run(["bash", str(launcher)], env=env, check=True, capture_output=True, text=True)
     evaluation, _ = [json.loads(line) for line in Path(env["TEST_CALLS"]).read_text().splitlines()]
     assert [evaluation[i + 1] for i, arg in enumerate(evaluation) if arg == "--preset"] == [preset]
 
 
-def test_full_smoke_retains_short_protocol_and_multiple_presets(launch_env):
+def test_full_smoke_retains_short_protocol_and_multiple_presets(launch_env, launcher):
     env = launch_env
-    subprocess.run(["bash", str(LAUNCHER), "--smoke"], env=env, check=True, capture_output=True, text=True)
+    subprocess.run(["bash", str(launcher), "--smoke"], env=env, check=True, capture_output=True, text=True)
     evaluation, _ = [json.loads(line) for line in Path(env["TEST_CALLS"]).read_text().splitlines()]
     assert evaluation[evaluation.index("--seeds") + 1:evaluation.index("--seeds") + 3] == ["101", "--max-steps"]
     assert evaluation[evaluation.index("--max-steps") + 1] == "3"
@@ -132,14 +142,27 @@ def test_full_smoke_retains_short_protocol_and_multiple_presets(launch_env):
     assert not {"--wandb", "--bank-only", "--root-bank"} & set(evaluation)
 
 
-def test_original_full_workflow_still_creates_prior_when_reference_omitted(launch_env):
+def test_original_full_workflow_still_creates_prior_when_reference_omitted(launch_env, launcher):
     env = launch_env
     for key in ("AMBI_BENCHMARK_REFERENCE_ROOT", "AMBI_BENCHMARK_PRESETS",
                 "AMBI_BENCHMARK_PRESET", "AMBI_BENCHMARK_MATRIX"):
         env.pop(key, None)
-    subprocess.run(["bash", str(LAUNCHER)], env=env, check=True, capture_output=True, text=True)
+    subprocess.run(["bash", str(launcher)], env=env, check=True, capture_output=True, text=True)
     prior, evaluation, report = [json.loads(line) for line in Path(env["TEST_CALLS"]).read_text().splitlines()]
     assert prior[prior.index("--preset") + 1] == "named_run/prior"
     assert "--save-root-bank" in prior
     assert evaluation[evaluation.index("--preset") + 1] == "named_run/d512_4_j6"
     assert report[0] == "report_ambi_benchmark.py"
+
+
+def test_oscar_resources_leave_account_and_qos_to_cluster_defaults():
+    launcher = ROOT / "slurm/run_ambi_inner_benchmark_oscar.sbatch"
+    subprocess.run(["bash", "-n", str(launcher)], check=True, capture_output=True)
+    directives = [line for line in launcher.read_text().splitlines() if line.startswith("#SBATCH ")]
+    assert "#SBATCH --partition=gpu" in directives
+    assert "#SBATCH --gres=gpu:l40s:1" in directives
+    assert "#SBATCH --cpus-per-task=6" in directives
+    assert "#SBATCH --mem=32G" in directives
+    assert "#SBATCH --array=1-5" in directives
+    assert "#SBATCH --no-requeue" in directives
+    assert not any("--account" in line or "--qos" in line for line in directives)
