@@ -316,6 +316,150 @@ so existing training and experiment configurations remain unchanged. Loss
 sampling is independent of `value_equivalence_mc_samples`, which controls only
 the observational live monitor.
 
+### Finite-horizon inner SAC and real-replay mixing
+
+`inner_finite_horizon=true` makes `inner_rollout_horizon=H` a boundary for
+the inner solve. The final imagined transition, from depth `H-1` to `H`,
+uses the frozen outer policy and value prior for its Bellman continuation:
+
+```text
+depth < H-1: y = r + gamma * (1 - terminated) * V_inner(next_z)
+depth = H-1: y = r + gamma * (1 - terminated) * Q_outer(next_z, a_prior)
+                                             a_prior ~ pi_outer(next_z)
+```
+
+Interior rows retain the configured `inner_bootstrap_source`,
+`inner_q_target_reduction`, and `inner_sac_critic_target`. The boundary follows
+AMBI's TD-MPC2 MPPI terminal score: it samples the stochastic outer policy with
+its outer log-standard-deviation settings and evaluates the outer **online**
+critic with `mppi_terminal_q_reduction` (default `"mean_pair"`). These priors
+remain fixed throughout the inner solve. No additional entropy term is added at
+the boundary. The outer critic retains whichever return semantics it was
+trained with; set both `outer_critic_target` and `inner_sac_critic_target` to
+`"reward_only"` for the TD-MPC2 reward-return interpretation. An
+entropy-augmented outer critic still contributes its learned soft Q tail.
+
+The horizon boundary is stored separately from true environment termination.
+A true termination suppresses every continuation, including a termination on
+the last imagined transition. A collection horizon or real time-limit
+truncation does not by itself suppress bootstrap. The default
+`inner_finite_horizon=false` retains the existing interpretation of `H` as a
+collection cutoff with the same inner continuation on every replay row.
+
+The actor and critic deliberately remain functions of latent state and action,
+without a remaining-horizon input. States revisited at different rollout
+depths can therefore have different desired targets that one stationary critic
+must approximate. This is an intentional experiment rather than an exact
+finite-horizon dynamic-programming solution. The boundary follows the
+blueprint-value handoff in
+[RL Search, Section 3](https://arxiv.org/pdf/2109.15316); that paper also
+describes mixing global replay into its Q-value fine-tuning updates.
+
+`inner_outer_replay_fraction=p` mixes real transitions into critic minibatches,
+with a default of `0.0` and allowed values in `[0, 1]`. The requested number of
+real rows is `floor(p * inner_batch_size + 0.5)`; the remaining rows come from
+imagined replay. Real transitions are sampled uniformly with replacement from
+valid consecutive observations in the same stored episode. Real observations
+and successors are encoded with
+the current frozen encoder at sample time, and their recorded actions and
+rewards are retained. Actor and temperature updates still receive a full
+imagined minibatch. Real transitions have no imaginary rollout depth and use
+the ordinary interior Bellman continuation, even when finite-horizon solving
+is enabled. If no outer replay is attached or no real transitions are
+available, critic sampling falls back to imagined replay and warns once. The
+frozen-checkpoint evaluator rejects a positive fraction because model snapshots
+do not contain replay; evaluate this ablation with a populated training agent.
+When mixing is enabled, `inner_outer_replay_samples` reports the total real rows
+used, `inner_outer_replay_fraction` reports the realized fraction, and
+`inner_outer_replay_available` reports replay availability across critic
+updates. These sampling controls apply only to inner SAC.
+
+This is a valid off-policy critic update: the behavior policy need not match
+the current inner policy, and the actor does not need to update on every
+critic-training state. It can improve coverage and reduce reliance on model
+errors, but it also changes the critic's fitting distribution. Real successor
+latents and imagined successor latents can disagree because the model is
+imperfect, and old real states may provide poor action coverage for a rapidly
+adapted inner policy. Shared critic parameters can still change actor gradients
+at imagined states, so excluding real states from the actor loss does not
+isolate the actor from this change. At `p=1`, the critic learns entirely from
+real data while the actor continues to improve on imagined states; finite
+horizon boundary rows then supply no direct critic loss.
+
+### Inner SAC updates per imagined transition
+
+`inner_steps_per_update` provides an alternative to a fixed number of updates
+after each rollout round. It defaults to `null` and otherwise accepts a finite
+positive number of imagined transitions per joint critic/actor update. For
+example, add these settings to a canonical SAC configuration and omit the
+existing `inner_updates_per_round` setting:
+
+```json
+{
+  "inner_rounds": 3,
+  "inner_rollouts_per_round": 2,
+  "inner_rollout_horizon": 2,
+  "inner_steps_per_update": 5
+}
+```
+
+After each collection round, the cumulative requested update count is
+`floor(imagined_transitions_so_far / inner_steps_per_update)`. The learner runs
+the updates newly due at that round boundary, so this example performs
+`0, 1, 1` joint updates across its three rounds. Every slot updates the critic
+and actor once; automatic temperature tuning follows the actor. A value below
+one permits more than one update per imagined transition. Actual transitions
+count, including early rollout termination; replay draws and real replay rows
+do not earn additional updates. Fractional remainder carries between rounds
+and resets at the next real action. Updates remain grouped after collection
+rounds rather than interrupting a trajectory mid-rollout.
+
+Counts use the configured decimal interval without accumulating floating-point
+remainders: for example, 49 transitions with an interval of `0.07` earn exactly
+700 updates. An explicit `null` for a competing per-round count lets an
+override remove that count before selecting the interval schedule.
+
+This option requires canonical inner SAC with both actor and critic updates
+enabled. It rejects explicit non-null shared or component per-round update
+counts, legacy per-iteration/per-action budget controls, model-step budgets,
+and explicit explorer component update counts. Symmetric explorer schedules
+can inherit the primary update cadence. Use the component schedule below for
+asymmetric actor/critic update counts. Nominal runtime totals are calculated as
+`floor(inner_rounds * inner_rollouts_per_round * H / inner_steps_per_update)`;
+realized totals can be smaller when rollouts terminate early.
+
+The three options can be combined, for example:
+
+```json
+{
+  "inner_operator": "sac",
+  "inner_rounds": 3,
+  "inner_rollouts_per_round": 32,
+  "inner_rollout_horizon": 3,
+  "inner_updates_per_round": null,
+  "inner_steps_per_update": 96,
+  "inner_finite_horizon": true,
+  "inner_outer_replay_fraction": 0.25,
+  "compile": true
+}
+```
+
+With no early terminations this requests one joint update after each round.
+Set any inherited component gradient counts to `null` as well. All options
+are recorded in scientific run identity and active checkpoint target metadata;
+exact resume rejects changed settings. Ordinary weight loading still permits
+inner-solver ablations. Legacy disabled replay layouts remain unchanged.
+
+Horizon flags share packed replay storage; the compiled target uses fixed-size
+masks and never constructs variable-sized boundary batches. Real replay lookup
+metadata is cached until replay changes, and current/successor observations are
+encoded together. The ordinary cloned critic and actor kernels support strict
+graph capture (`compile_strict=true`), including the horizon tail. Custom/LoRA
+detached critics retain the existing general stateless path and may require
+non-strict compilation on the locked PyTorch version. Compile failures remain
+visible through the existing fallback metrics. Benchmark compilation warm-up
+separately from steady-state actions.
+
 ### Separate root-local critic and actor update counts
 
 Canonical SAC and TD3 schedules can give the root-local critic and actor
@@ -447,10 +591,10 @@ with the same `w`, select between deterministic component means with the frozen
 outer target critic, or compare stochastic `H`-step soft handoffs. The handoff
 score averages `inner_execution_handoff_samples` trajectories per actor, uses
 one frozen outer entropy coefficient for both prefixes, and adds exactly one
-outer-prior target value at the final latent. This terminal handoff is only an
-execution selector. The ordinary imagined horizon remains a collection cutoff,
-and its final replay transition receives the same one-step bootstrap as every
-other row.
+outer-prior target value at the final latent. This execution selector is
+independent of `inner_finite_horizon`. With that option disabled, the ordinary
+imagined horizon remains a collection cutoff, and its final replay transition
+receives the same one-step bootstrap as every other row.
 
 Whenever a two-policy random-explorer mode (`frozen_random`, `shared_mixture`,
 or `separate_critics`) is active, execution also records an RNG-free

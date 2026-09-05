@@ -15,6 +15,7 @@ import torch
 
 from RL.TDMPC2 import TDMPC2Baseline, _normalize_horizon_params
 from RL.tdmpc2_core.ambi_agent import AMBITDMPC2Agent
+from RL.tdmpc2_core.common.inner_utils import updates_for_transitions
 from RL.tdmpc2_core.common.soft_world_model import normalize_log_std_mapping
 from utils.utils import setup_logs
 
@@ -105,6 +106,11 @@ _AMBI_DEFAULTS = {
     "inner_rollouts_per_round": 64,
     "inner_rollout_horizon": 3,
     "inner_updates_per_round": "auto",
+    # Alternative joint SAC cadence, measured in generated transitions. Credit
+    # carries across rounds within one action, including fractional intervals.
+    "inner_steps_per_update": None,
+    "inner_finite_horizon": False,
+    "inner_outer_replay_fraction": 0.0,
     # Optional canonical component schedule. Both values must be specified;
     # unlike the shared-G schedule, critic phases precede actor phases.
     "inner_critic_updates_per_round": None,
@@ -485,6 +491,7 @@ def _resolve_random_explorer_config(cfg):
         requested_explorer_updates[component] = value
 
     rounds = int(cfg.inner_rounds)
+    interval_schedule = cfg.inner_steps_per_update is not None
     cfg.inner_primary_updates_per_round_is_auto = bool(
         cfg.inner_schedule_mode == "canonical"
         and not cfg.inner_component_update_schedule
@@ -709,7 +716,7 @@ def _resolve_random_explorer_config(cfg):
         component: getattr(cfg, f"inner_primary_{component}_updates_per_round")
         for component in ("actor", "critic", "temperature")
     }
-    if active and any(
+    if active and not interval_schedule and any(
         not isinstance(value, int) for value in primary_updates.values()
     ):
         raise ValueError(
@@ -798,12 +805,16 @@ def _resolve_random_explorer_config(cfg):
         setattr(
             cfg,
             f"inner_explorer_{component}_updates_per_round",
-            int(per_round),
+            per_round if interval_schedule else int(per_round),
         )
         setattr(
             cfg,
             f"inner_explorer_{component}_updates_per_action",
-            int(per_round) * rounds,
+            (
+                int(getattr(cfg, f"inner_primary_{component}_updates_per_action"))
+                if interval_schedule and explorer_inherits[component]
+                else int(per_round) * rounds
+            ),
         )
     cfg.inner_primary_optimizer_steps_per_action = sum(
         int(getattr(cfg, f"inner_{component}_updates_per_action"))
@@ -823,7 +834,7 @@ def _resolve_random_explorer_config(cfg):
     # the explicit component schedule has a critic phase followed by an
     # actor/temperature phase. R may have a larger explicit dose than P in the
     # separate-critic experiment, so the P-only estimate is insufficient.
-    if active:
+    if active and not interval_schedule:
         if cfg.inner_component_update_schedule:
             critic_slots = max(
                 int(primary_updates["critic"]),
@@ -861,6 +872,27 @@ def _outer_policy_hash(seed, episode_start_step, namespace):
 def _normalize_legacy_params(params):
     """Normalize schedule aliases and identify canonical versus total scheduling."""
     params = copy.deepcopy(params)
+
+    if params.get("inner_steps_per_update") is not None:
+        conflicts = sorted(
+            key for key in (
+                _V1_SCHEDULE_KEYS | _TOTAL_SCHEDULE_KEYS
+                | _COMPONENT_SCHEDULE_KEYS | {"inner_updates_per_round"}
+                | {f"inner_explorer_{component}_updates_per_round"
+                   for component in ("actor", "critic", "temperature")}
+            )
+            if params.get(key) is not None
+        )
+        if conflicts:
+            raise ValueError(
+                "inner_steps_per_update requires the canonical joint SAC schedule "
+                f"without explicit gradient-update controls: {conflicts}."
+            )
+        # Explicit nulls select the interval schedule without activating the
+        # deprecated total-budget or phased component schedule paths.
+        for key in (_V1_SCHEDULE_KEYS | _TOTAL_SCHEDULE_KEYS
+                    | _COMPONENT_SCHEDULE_KEYS | {"inner_updates_per_round"}):
+            params.pop(key, None)
 
     requested_operator = str(
         params.get("inner_operator", _AMBI_DEFAULTS["inner_operator"])
@@ -1037,6 +1069,8 @@ class AMBITDMPC2(TDMPC2Baseline):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if self.cfg.inner_outer_replay_fraction > 0.0:
+            self.agent.set_outer_replay_buffer(self.buffer)
         self._pending_behavior_policy = None
         self._value_calibration_evaluator = None
         self._paired_controller_evaluator = None
@@ -1151,8 +1185,8 @@ class AMBITDMPC2(TDMPC2Baseline):
         # actually supplied while allowing an all-legacy configuration to make
         # its one-release migration cleanly.
         params = _normalize_horizon_params(params, resolve_defaults=False)
-        component_update_schedule = bool(set(params) & _COMPONENT_SCHEDULE_KEYS)
         params, schedule_mode = _normalize_legacy_params(params)
+        component_update_schedule = bool(set(params) & _COMPONENT_SCHEDULE_KEYS)
         params = _normalize_horizon_params(params)
         explicit_num_q = params.get("num_q", None)
         requested_operator = str(
@@ -1206,6 +1240,30 @@ class AMBITDMPC2(TDMPC2Baseline):
         if schedule_mode == "legacy" and requested_operator in {"sac", "td3"}:
             merged.update(_LEGACY_SCHEDULE_DEFAULTS)
         merged.update(params)
+        merged["inner_finite_horizon"] = _strict_bool(
+            merged["inner_finite_horizon"], "inner_finite_horizon"
+        )
+        merged["inner_outer_replay_fraction"] = _strict_probability(
+            merged["inner_outer_replay_fraction"], "inner_outer_replay_fraction"
+        )
+        if merged["inner_steps_per_update"] is not None:
+            interval = _strict_nonnegative_float(
+                merged["inner_steps_per_update"], "inner_steps_per_update"
+            )
+            if interval == 0.0:
+                raise ValueError("inner_steps_per_update must be positive.")
+            merged["inner_steps_per_update"] = interval
+            merged["inner_updates_per_round"] = None
+            actor_frozen = str(merged["inner_actor_adaptation"]).lower() == "frozen"
+            critic_frozen = str(merged["inner_critic_adaptation"]).lower() == "frozen"
+            if actor_frozen or critic_frozen:
+                raise ValueError(
+                    "inner_steps_per_update requires both actor and critic "
+                    "updates; frozen adaptation is incompatible."
+                )
+        for key in ("inner_finite_horizon", "inner_outer_replay_fraction", "inner_steps_per_update"):
+            if merged[key] and (requested_operator != "sac" or schedule_mode != "canonical"):
+                raise ValueError(f"{key} requires the canonical inner SAC schedule.")
         if component_update_schedule:
             # The component schedule has no meaningful shared-G value.
             merged["inner_updates_per_round"] = None
@@ -1396,7 +1454,18 @@ class AMBITDMPC2(TDMPC2Baseline):
                 cfg.inner_rollouts_per_round = int(cfg.inner_rollouts_per_round)
                 if cfg.inner_rollouts_per_round < 0:
                     raise ValueError("inner_rollouts_per_round must be non-negative.")
-                if cfg.inner_component_update_schedule:
+                if cfg.inner_steps_per_update is not None:
+                    nominal_total = updates_for_transitions(
+                        cfg.inner_rounds * cfg.inner_rollouts_per_round
+                        * cfg.inner_rollout_horizon, cfg.inner_steps_per_update
+                    )
+                    cfg.inner_critic_updates_per_action = nominal_total
+                    cfg.inner_actor_updates_per_action = nominal_total
+                    cfg.inner_temperature_updates_per_action = (
+                        nominal_total
+                        if str(cfg.inner_temperature_mode).lower() == "auto" else 0
+                    )
+                elif cfg.inner_component_update_schedule:
                     cfg.inner_critic_updates_per_round = _strict_nonnegative_int(
                         cfg.inner_critic_updates_per_round,
                         "inner_critic_updates_per_round",
@@ -1540,7 +1609,12 @@ class AMBITDMPC2(TDMPC2Baseline):
         )
         if cfg.inner_operator in {"sac", "td3"}:
             if cfg.inner_schedule_mode == "canonical":
-                if cfg.inner_component_update_schedule:
+                if cfg.inner_steps_per_update is not None:
+                    cfg.inner_nominal_updates_per_round = (
+                        cfg.inner_critic_updates_per_action / cfg.inner_rounds
+                        if cfg.inner_rounds > 0 else 0.0
+                    )
+                elif cfg.inner_component_update_schedule:
                     cfg.inner_nominal_updates_per_round = (
                         cfg.inner_critic_updates_per_round
                         + cfg.inner_actor_updates_per_round
@@ -2280,7 +2354,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         cfg.inner_grad_clip_norm = max(
             cfg.inner_actor_grad_clip_norm, cfg.inner_critic_grad_clip_norm
         )
-        if cfg.inner_component_update_schedule:
+        if cfg.inner_component_update_schedule or cfg.inner_steps_per_update is not None:
             # There is no truthful legacy single-G alias for a phased C/A
             # schedule. Keep it explicitly unset instead of reporting zero
             # updates for a solve that may perform nonzero component steps.
@@ -2492,6 +2566,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             self._outer_policy_episode_eligible = False
 
     def _act_agent(self, obs_t, *, t0, eval_mode):
+        if getattr(self.cfg, "inner_outer_replay_fraction", 0.0) > 0.0:
+            self.agent.set_outer_replay_buffer(self.buffer)
         if self._outer_policy_episode_selected and not eval_mode:
             generator = self._outer_policy_action_generator
             if generator is None:
@@ -2569,6 +2645,8 @@ class AMBITDMPC2(TDMPC2Baseline):
         if t0 and hasattr(self.agent, "reset"):
             self.agent.reset()
         obs_t = self._obs_to_tensor(observation)
+        if getattr(self.cfg, "inner_outer_replay_fraction", 0.0) > 0.0:
+            self.agent.set_outer_replay_buffer(self.buffer)
         action_norm = self.agent.act(
             obs_t,
             t0=t0,
@@ -2829,6 +2907,7 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_policy_evaluations",
             "inner_q_evaluations",
             "inner_replay_draws",
+            "inner_outer_replay_samples",
             "inner_primary_replay_samples",
             "inner_explorer_replay_samples",
             "inner_diagnostic_model_steps",
@@ -2906,6 +2985,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             )
 
         critic_metrics = {
+            "inner_outer_replay_fraction",
+            "inner_outer_replay_available",
             "inner_critic_loss",
             "inner_critic_grad_norm",
             "inner_q_mean",
@@ -2958,6 +3039,9 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_explorer_temperature_grad_norm",
         }
         action_gauges = {
+            "inner_steps_per_update",
+            "inner_finite_horizon",
+            "inner_outer_replay_fraction_requested",
             "inner_alpha",
             "inner_alpha_to_abs_q",
             "inner_actor_loss_scale",

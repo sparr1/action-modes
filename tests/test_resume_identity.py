@@ -65,6 +65,9 @@ def test_ambi_inner_comparison_defaults_canonicalize_scientific_lineage():
     assert omitted_projection == scientific_trial_parameters(explicit)
     assert omitted_projection["alg_params"] == {
         "batch_size": 256,
+        "inner_finite_horizon": False,
+        "inner_steps_per_update": None,
+        "inner_outer_replay_fraction": 0.0,
         "eval_inner_comparison": False,
         "eval_inner_comparison_episodes": 5,
         "eval_inner_comparison_seed": 12345,

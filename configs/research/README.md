@@ -1,5 +1,11 @@
 # Frozen-checkpoint AMBI research
 
+The frozen evaluator supports finite-horizon inner SAC and transition-based
+update counts. It rejects `inner_outer_replay_fraction > 0` because these model
+snapshots do not include real replay. Test replay mixing through a populated
+training agent. See the [inner SAC options](../../RL/tdmpc2_core/README.md#finite-horizon-inner-sac-and-real-replay-mixing)
+for the target convention and schedule restrictions.
+
 The active end-to-end configs live directly under `configs/ambi/`.
 The frozen-checkpoint matrix is
 `configs/research/ambi_inner_decoupling.json`, outside the active AMBI training

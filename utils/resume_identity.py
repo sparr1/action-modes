@@ -38,6 +38,9 @@ _DEPENDENCIES = (
 _OPERATIONAL_ALGORITHM_FIELDS = frozenset({"eval_csv_path"})
 _AMBI_ALGORITHM = "AMBITDMPC2/AMBITDMPC2"
 _AMBI_RESOLVED_IDENTITY_DEFAULTS = {
+    "inner_finite_horizon": False,
+    "inner_steps_per_update": None,
+    "inner_outer_replay_fraction": 0.0,
     "inner_actor_writeback_coef": 0.0,
     "inner_critic_writeback_coef": 0.0,
     "inner_explorer_mode": "none",

@@ -475,6 +475,12 @@ def _validate_frozen_selection(matrix, resolved_presets):
 
 def _initialize_frozen_model(resolved, env, checkpoint, controller_seed, device=None):
     run_config = copy.deepcopy(resolved["algorithm_config"])
+    if run_config.get("alg_params", {}).get("inner_outer_replay_fraction", 0.0) > 0:
+        raise ValueError(
+            "Frozen checkpoint evaluation has no real replay: "
+            "inner_outer_replay_fraction must be 0. Evaluate replay mixing with "
+            "a training agent whose outer replay contains usable transitions."
+        )
     run_config["env"] = resolved["environment"]["id"]
     run_config["seed"] = int(controller_seed)
     if device is not None:
