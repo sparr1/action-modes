@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "description": "Full-episode actor-dose sweep at fixed J6/N512/H3/B512, C6 or C12, and T3. Actor updates increase from the earlier A3 control to A6 or A12, using the same overlapping total-budget schedule and checkpoint-derived model/environment.",
+  "base_alg_config": "checkpoint",
+  "source_run": "rwgao_b-brown-university/ambi/u13m14st",
+  "shared_alg_params": {
+    "inner_operator": "sac",
+    "inner_rounds": 6,
+    "inner_rollouts_per_round": null,
+    "inner_rollout_horizon": 3,
+    "inner_updates_per_round": null,
+    "inner_iterations": null,
+    "inner_rollouts": null,
+    "inner_horizon": null,
+    "inner_updates_per_iteration": null,
+    "inner_model_step_budget": 9216,
+    "inner_critic_updates_per_action": null,
+    "inner_actor_updates_per_action": null,
+    "inner_temperature_updates_per_action": 18,
+    "inner_batch_size": 512,
+    "inner_replay_capacity": 9216,
+    "inner_replay_sampling": "with_replacement",
+    "inner_diagnostic_rollouts": 0,
+    "inner_actor_adaptation": "clone",
+    "inner_critic_adaptation": "clone",
+    "inner_temperature_mode": "auto",
+    "inner_temperature_initialization": "inherit_outer",
+    "inner_target_entropy": "inherit_outer",
+    "inner_bootstrap_source": "inner_target",
+    "inner_behavior_action": "policy_sample",
+    "inner_execution_action": "policy_sample",
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_actor_scope": "action",
+    "inner_critic_scope": "action",
+    "inner_temperature_scope": "action",
+    "inner_replay_scope": "action",
+    "inner_actor_optimizer_scope": "action",
+    "inner_critic_optimizer_scope": "action",
+    "inner_temperature_optimizer_scope": "action",
+    "inner_q_target_reduction": "min_pair",
+    "inner_q_actor_reduction": "min_pair",
+    "inner_sac_critic_target": "entropy_augmented",
+    "inner_diagnostics_every": 1000,
+    "inner_actor_lr": 5e-05,
+    "inner_critic_lr": 0.0001,
+    "inner_temperature_lr": 0.0003,
+    "inner_adam_eps": 1e-08,
+    "inner_critic_target_tau": 0.01,
+    "inner_critic_target_update_interval": 1,
+    "inner_critic_updates_per_round": null,
+    "inner_actor_updates_per_round": null,
+    "inner_finite_horizon": false,
+    "inner_steps_per_update": null,
+    "inner_outer_replay_fraction": 0.0
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "default_presets": [
+      "actor_budget/inner_target_c6_a6",
+      "actor_budget/inner_target_c12_a6",
+      "actor_budget/outer_target_c6_a6",
+      "actor_budget/outer_target_c12_a6",
+      "actor_budget/inner_target_c6_a12",
+      "actor_budget/inner_target_c12_a12",
+      "actor_budget/outer_target_c6_a12",
+      "actor_budget/outer_target_c12_a12"
+    ],
+    "bank_decisions": [
+      0,
+      100,
+      200,
+      300,
+      400
+    ],
+    "bank_repetitions": 3,
+    "diagnostic_rollouts": 8,
+    "diagnostic_horizon": 3,
+    "wandb_project": "ambi-inner-bench"
+  },
+  "comparisons": {
+    "actor_budget": {
+      "description": "A6 and A12 for both earlier C6/C12 bootstrap settings. Reuse the five completed prior episode bundles; no bank solves or A3 reruns are required. Temperature remains adaptive with three updates per round.",
+      "reference": "inner_target_c6_a6",
+      "variants": {
+        "inner_target_c6_a6": {
+          "description": "J6/N512/H3/B512, inner_target bootstraps, C6/A6/T3 per round (36/36/18 per decision). Components run in their first allocated slots: critic then actor then temperature within each shared slot. Only actor dose differs from the earlier C6/A3/T3 setting.",
+          "alg_params": {
+            "inner_bootstrap_source": "inner_target",
+            "inner_critic_updates_per_action": 36,
+            "inner_actor_updates_per_action": 36
+          }
+        },
+        "inner_target_c12_a6": {
+          "description": "J6/N512/H3/B512, inner_target bootstraps, C12/A6/T3 per round (72/36/18 per decision). Components run in their first allocated slots: critic then actor then temperature within each shared slot. Only actor dose differs from the earlier C12/A3/T3 setting.",
+          "alg_params": {
+            "inner_bootstrap_source": "inner_target",
+            "inner_critic_updates_per_action": 72,
+            "inner_actor_updates_per_action": 36
+          }
+        },
+        "outer_target_c6_a6": {
+          "description": "J6/N512/H3/B512, outer_target bootstraps, C6/A6/T3 per round (36/36/18 per decision). Components run in their first allocated slots: critic then actor then temperature within each shared slot. Only actor dose differs from the earlier C6/A3/T3 setting.",
+          "alg_params": {
+            "inner_bootstrap_source": "outer_target",
+            "inner_critic_updates_per_action": 36,
+            "inner_actor_updates_per_action": 36
+          }
+        },
+        "outer_target_c12_a6": {
+          "description": "J6/N512/H3/B512, outer_target bootstraps, C12/A6/T3 per round (72/36/18 per decision). Components run in their first allocated slots: critic then actor then temperature within each shared slot. Only actor dose differs from the earlier C12/A3/T3 setting.",
+          "alg_params": {
+            "inner_bootstrap_source": "outer_target",
+            "inner_critic_updates_per_action": 72,
+            "inner_actor_updates_per_action": 36
+          }
+        },
+        "inner_target_c6_a12": {
+          "description": "J6/N512/H3/B512, inner_target bootstraps, C6/A12/T3 per round (36/72/18 per decision). Components run in their first allocated slots: critic then actor then temperature within each shared slot. Only actor dose differs from the earlier C6/A3/T3 setting.",
+          "alg_params": {
+            "inner_bootstrap_source": "inner_target",
+            "inner_critic_updates_per_action": 36,
+            "inner_actor_updates_per_action": 72
+          }
+        },
+        "inner_target_c12_a12": {
+          "description": "J6/N512/H3/B512, inner_target bootstraps, C12/A12/T3 per round (72/72/18 per decision). Components run in their first allocated slots: critic then actor then temperature within each shared slot. Only actor dose differs from the earlier C12/A3/T3 setting.",
+          "alg_params": {
+            "inner_bootstrap_source": "inner_target",
+            "inner_critic_updates_per_action": 72,
+            "inner_actor_updates_per_action": 72
+          }
+        },
+        "outer_target_c6_a12": {
+          "description": "J6/N512/H3/B512, outer_target bootstraps, C6/A12/T3 per round (36/72/18 per decision). Components run in their first allocated slots: critic then actor then temperature within each shared slot. Only actor dose differs from the earlier C6/A3/T3 setting.",
+          "alg_params": {
+            "inner_bootstrap_source": "outer_target",
+            "inner_critic_updates_per_action": 36,
+            "inner_actor_updates_per_action": 72
+          }
+        },
+        "outer_target_c12_a12": {
+          "description": "J6/N512/H3/B512, outer_target bootstraps, C12/A12/T3 per round (72/72/18 per decision). Components run in their first allocated slots: critic then actor then temperature within each shared slot. Only actor dose differs from the earlier C12/A3/T3 setting.",
+          "alg_params": {
+            "inner_bootstrap_source": "outer_target",
+            "inner_critic_updates_per_action": 72,
+            "inner_actor_updates_per_action": 72
+          }
+        }
+      }
+    }
+  }
+}

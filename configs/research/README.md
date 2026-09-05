@@ -194,6 +194,59 @@ seed-101, three-decision reference or the original benchmark matrix without a
 reference. Smoke runs omit W&B. Full prior references cannot pair with the
 short smoke protocol.
 
+### More actor updates for C6/C12 on Oscar
+
+`ambi_humanoid_inner_actor_sweep.json` extends the full-episode comparison with
+six and twelve actor updates per round for each C6/C12 critic budget and each
+inner/outer target-Q bootstrap. Only actor dose changes from the corresponding
+C6/A3 or C12/A3 run. Six rounds, 512 rollouts per round, horizon three, batch
+512, learning rates, and adaptive temperature with **three** updates per round
+stay fixed. The six-round critic/actor/temperature totals are C36 or C72,
+A36 or A72, and T18; collection remains 9,216 imagined transitions per decision.
+
+The existing total-budget schedule keeps each component active in its first
+allocated slots. The first three slots update critic, actor, and temperature;
+later slots update critic and actor until their budgets are exhausted. C6/A12
+ends with six actor-only slots; C12/A6 ends with six critic-only slots. Within
+each shared slot, the critic precedes the actor, then temperature. Explicit
+per-round component scheduling is not enabled because it would change this
+ordering. Temperature remains adaptive even though its update count is held
+fixed; changed actor distributions can still change its fitted value.
+
+Use the same checkpoint prefix and completed five-seed prior reference as
+above. Split the campaign into four arrays: A6/inner Q, A6/outer Q, A12/inner Q,
+and A12/outer Q. Each array covers all five checkpoints, with C6 and C12 run
+sequentially in each task. This is 20 GPU tasks producing 40 configuration runs
+and 200 full episodes, up to 100,000 decisions. It reuses prior results and
+does not run shared-observation banks or repeat A3 controls.
+
+For example, the A6/inner-Q array is:
+
+```bash
+export AMBI_BENCHMARK_MATRIX=configs/research/ambi_humanoid_inner_actor_sweep.json
+export AMBI_BENCHMARK_PRESETS='actor_budget/inner_target_c6_a6 actor_budget/inner_target_c12_a6'
+export AMBI_BENCHMARK_OUTPUT_ROOT=/oscar/scratch/rgao48/ambi/inner-benchmark/new-actor-campaign/a6-inner-target
+sbatch --array=1-5%3 \
+  --output=/absolute/log/path/a6-inner-%A_%a.out \
+  --error=/absolute/log/path/a6-inner-%A_%a.err \
+  slurm/run_ambi_inner_benchmark_oscar.sbatch
+```
+
+For the other arrays substitute `outer_target` and/or `a12` in both selectors
+and use separate fresh output roots and log paths. A cap of three per array
+permits twelve GPUs and 72 CPUs total; lower it when other jobs share the quota.
+The evaluator also accepts `--comparison actor_budget` to select all eight
+settings in one invocation, although the split arrays provide more parallelism.
+For a short scheduled smoke, select all eight presets through
+`AMBI_BENCHMARK_PRESETS`, use array index 3, and pass `--smoke` with a matching
+seed-101, three-decision prior reference and a fresh output root.
+
+W&B names and tags include critic, actor, and temperature counts, bootstrap
+source, checkpoint, and episode mode. Existing checkpoint curves derive actor
+and critic counts from completed results and distinguish configuration selectors,
+so the new settings appear as they finish. Full inner traces and per-decision
+aggregates remain in the portable bundles and generated HTML reports.
+
 ### More critic updates on shared observations
 
 `ambi_humanoid_inner_critic_sweep.json` holds the D512-4-J6 collection and

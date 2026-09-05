@@ -95,14 +95,22 @@ def test_bank_launch_reuses_roots_and_never_runs_episodes(tmp_path, launch_env, 
 
 @pytest.mark.parametrize("step_index", [1, 2, 3, 4, 5])
 @pytest.mark.parametrize("bootstrap", ["inner_target", "outer_target"])
-def test_full_launch_evaluates_both_budgets_and_reuses_prior(launch_env, launcher, step_index, bootstrap):
+@pytest.mark.parametrize("actor_count", [None, 6, 12])
+def test_full_launch_evaluates_both_budgets_and_reuses_prior(
+    launch_env, launcher, step_index, bootstrap, actor_count,
+):
     env = launch_env
     env["SLURM_ARRAY_TASK_ID"] = str(step_index)
-    presets = [f"critic_budget/{bootstrap}_c6", f"critic_budget/{bootstrap}_c12"]
+    if actor_count is None:
+        presets = [f"critic_budget/{bootstrap}_c6", f"critic_budget/{bootstrap}_c12"]
+    else:
+        env["AMBI_BENCHMARK_MATRIX"] = "configs/research/ambi_humanoid_inner_actor_sweep.json"
+        presets = [f"actor_budget/{bootstrap}_c{critic}_a{actor_count}" for critic in (6, 12)]
     env["AMBI_BENCHMARK_PRESETS"] = " ".join(presets)
     subprocess.run(["bash", str(launcher)], env=env, check=True, capture_output=True, text=True)
     evaluation, report = [json.loads(line) for line in Path(env["TEST_CALLS"]).read_text().splitlines()]
     assert evaluation[0] == "evaluate_ambi_checkpoint.py"
+    assert evaluation[evaluation.index("--matrix") + 1] == env["AMBI_BENCHMARK_MATRIX"]
     assert [evaluation[i + 1] for i, arg in enumerate(evaluation) if arg == "--preset"] == presets
     assert evaluation[evaluation.index("--checkpoint") + 1] == f"{env['AMBI_CHECKPOINT_PREFIX']}{step_index * 100000}"
     assert evaluation[evaluation.index("--seeds") + 1:evaluation.index("--seeds") + 6] == ["101", "102", "103", "104", "105"]

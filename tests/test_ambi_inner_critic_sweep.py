@@ -1,4 +1,4 @@
-"""Critic-dose screens retain the existing joint SAC schedule and actor dose."""
+"""Critic/actor dose sweeps preserve the established overlapping SAC schedule."""
 
 from copy import deepcopy
 from pathlib import Path
@@ -11,11 +11,13 @@ from tests.test_ambi_latency_contract import _assert_tree_equal, _clone_tree
 from tests.test_ambi_root_local_sac import _tiny_legacy_model, _tiny_model
 from tests.test_checkpoint_research_configs import _build_cfg, checkpoint_context
 from utils.ambi_research import load_preset_matrix, normalize_selectors, resolve_preset
+from utils.ambi_benchmark import benchmark_run_labels, protocol_for
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MATRIX = ROOT / "configs/research/ambi_humanoid_inner_critic_sweep.json"
 BASE = ROOT / "configs/research/ambi_humanoid_inner_benchmark.json"
+ACTOR_MATRIX = ROOT / "configs/research/ambi_humanoid_inner_actor_sweep.json"
 
 
 def _snapshot(agent):
@@ -138,5 +140,93 @@ def test_higher_critic_dose_keeps_three_joint_slots_then_only_critic_extras(boot
         assert metrics["inner_critic_optimizer_steps"] == critic_count * 2
         assert metrics["inner_actor_optimizer_steps"] == metrics["inner_temperature_optimizer_steps"] == 6
         assert metrics["inner_update_slots"] == critic_count * 2
+    finally:
+        model.env.close()
+
+
+def test_actor_matrix_changes_only_actor_dose_and_labels_each_setting(checkpoint_context):
+    matrix = load_preset_matrix(ACTOR_MATRIX)
+    before = deepcopy(matrix)
+    context_before = deepcopy(checkpoint_context)
+    expected_selectors = [
+        f"actor_budget/{bootstrap}_c{critic}_a{actor}"
+        for actor in (6, 12) for bootstrap in ("inner_target", "outer_target")
+        for critic in (6, 12)
+    ]
+    assert normalize_selectors(matrix) == expected_selectors
+    old_matrix = load_preset_matrix(MATRIX)
+    assert matrix["source_run"] == old_matrix["source_run"]
+    assert {key: value for key, value in matrix["evaluation"].items()
+            if key != "default_presets"} == {
+                key: value for key, value in old_matrix["evaluation"].items()
+                if key != "default_presets"}
+    for actor in (6, 12):
+        for bootstrap in ("inner_target", "outer_target"):
+            for critic in (6, 12):
+                selector = f"actor_budget/{bootstrap}_c{critic}_a{actor}"
+                selected = resolve_preset(ACTOR_MATRIX, selector, matrix,
+                                          checkpoint_context=checkpoint_context)
+                previous = resolve_preset(MATRIX, f"critic_budget/{bootstrap}_c{critic}",
+                                          checkpoint_context=checkpoint_context)
+                expected = deepcopy(previous["algorithm_config"])
+                expected["alg_params"]["inner_actor_updates_per_action"] = actor * 6
+                assert selected["algorithm_config"] == expected
+                assert selected["environment"] == previous["environment"]
+                with pytest.warns(DeprecationWarning):
+                    cfg = _build_cfg(selected["algorithm_config"])
+                assert cfg.inner_schedule_mode == "legacy"
+                assert cfg.inner_component_update_schedule is False
+                assert cfg.inner_rounds == 6
+                assert cfg.inner_rollouts_per_round == cfg.inner_batch_size == 512
+                assert cfg.inner_rollout_horizon == 3
+                assert cfg.inner_model_step_budget == cfg.inner_replay_capacity == 9216
+                assert cfg.inner_expected_update_slots == max(critic, actor) * 6
+                assert cfg.inner_critic_updates_per_action == critic * 6
+                assert cfg.inner_actor_updates_per_action == actor * 6
+                assert cfg.inner_temperature_updates_per_action == 18
+                assert cfg.inner_temperature_mode == "auto"
+                assert cfg.inner_temperature_initialization == "inherit_outer"
+                labels = benchmark_run_labels(
+                    {"metadata": {"checkpoint": {"step": 100000}}},
+                    protocol_for(selected, 55, 500), selected["algorithm_config"],
+                    "episodes", selector=selector)
+                assert f"C{critic} A{actor} T3" in labels["name"]
+                assert {f"C:{critic}", f"A:{actor}", "T:3", f"bootstrap:{bootstrap}",
+                        f"preset:{selector}", "kind:episodes"} <= set(labels["tags"])
+    assert matrix == before
+    assert checkpoint_context == context_before
+
+
+@pytest.mark.parametrize("bootstrap", ["inner_target", "outer_target"])
+@pytest.mark.parametrize("critic_count", [6, 12])
+@pytest.mark.parametrize("actor_count", [6, 12])
+def test_higher_actor_dose_preserves_independent_temperature_and_update_order(
+    bootstrap, critic_count, actor_count,
+):
+    with pytest.warns(DeprecationWarning):
+        model = _tiny_legacy_model(
+            inner_rounds=2, inner_rollout_horizon=2, inner_model_step_budget=8,
+            inner_replay_capacity=8, inner_critic_updates_per_action=critic_count * 2,
+            inner_actor_updates_per_action=actor_count * 2,
+            inner_temperature_updates_per_action=6, inner_bootstrap_source=bootstrap,
+        )
+    try:
+        trace = InnerActionTrace()
+        model.agent.act(torch.zeros(3), t0=True, eval_mode=True, collect_diagnostics=False, trace=trace)
+        for round_index in (1, 2):
+            updates = [event for event in trace.events
+                       if event["phase"] == "update" and event["round_index"] == round_index]
+            assert len(updates) == max(critic_count, actor_count)
+            for slot, event in enumerate(updates, 1):
+                for component, count in (("critic", critic_count), ("actor", actor_count),
+                                         ("temperature", 3)):
+                    assert event[f"{component}_updates"] == (round_index - 1) * count + min(slot, count)
+                    assert (f"{component}_loss" in event["metrics"]) is (slot <= count)
+        metrics = model.agent.last_inner_metrics
+        assert metrics["inner_model_steps"] == 8
+        assert metrics["inner_critic_optimizer_steps"] == critic_count * 2
+        assert metrics["inner_actor_optimizer_steps"] == actor_count * 2
+        assert metrics["inner_temperature_optimizer_steps"] == 6
+        assert metrics["inner_update_slots"] == max(critic_count, actor_count) * 2
     finally:
         model.env.close()
