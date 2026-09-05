@@ -80,7 +80,10 @@ def _root_key(root, protocol):
 
 def _root_probe_signature(root):
     # Probe settings can be absent when no policy-quality probe was requested.
-    return {key: value for key, value in root.items() if key.startswith("probe_")}
+    # Runtime and total model-step cost are measurements, not comparison rules.
+    # Cost can differ with the number of rounds even when each probe is matched.
+    return {key: root[key] for key in ("probe_seed", "probe_rollouts", "probe_horizon")
+            if key in root}
 
 
 def _load_run(directory, manifest, run, run_key):

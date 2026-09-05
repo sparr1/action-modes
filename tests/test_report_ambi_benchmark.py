@@ -105,6 +105,8 @@ def test_baseline_and_episode_only_bundle_can_compare_with_root_bank(tmp_path):
     (lambda manifest: manifest["protocol"].update(action_rule="sample"), "incompatible checkpoint"),
     (lambda manifest: manifest["metric_catalog"]["critic_loss"].update(sampling_phase="after_update"), "incompatible semantics"),
     (lambda manifest: manifest["runs"][0]["roots"][0].update(probe_horizon=9), "incompatible probe protocol"),
+    (lambda manifest: manifest["runs"][0]["roots"][0].update(probe_seed=92), "incompatible probe protocol"),
+    (lambda manifest: manifest["runs"][0]["roots"][0].update(probe_rollouts=8), "incompatible probe protocol"),
 ])
 def test_rejects_semantically_incompatible_comparisons(tmp_path, change, match):
     _bundle(tmp_path / "first")
@@ -123,6 +125,20 @@ def test_different_bank_ids_and_solver_seeds_do_not_join(tmp_path):
     data = report.load_bundles([tmp_path / "first", tmp_path / "second"])
     keys = [next(trace for trace in run["traces"] if trace["mode"] == "bank")["selection_key"] for run in data["runs"]]
     assert keys[0] != keys[1]
+
+
+def test_matched_root_probes_allow_different_runtime_and_total_cost(tmp_path):
+    for name, seconds, steps in (("first", 0.1, 192), ("second", 0.9, 384)):
+        manifest = _bundle(tmp_path / name, evaluation=name)
+        manifest["runs"][0]["roots"][0].update(probe_seconds=seconds, probe_model_steps=steps)
+        _save_manifest(tmp_path / name, manifest)
+    data = report.load_bundles([tmp_path / "first", tmp_path / "second"])
+    roots = [run["roots"][0] for run in data["runs"]]
+    assert [root["probe_seconds"] for root in roots] == [0.1, 0.9]
+    assert [root["probe_model_steps"] for root in roots] == [192, 384]
+    keys = [next(trace["selection_key"] for trace in run["traces"] if trace["mode"] == "bank")
+            for run in data["runs"]]
+    assert keys[0] == keys[1]
 
 
 @pytest.mark.parametrize("transform,match", [
