@@ -161,6 +161,50 @@
             "inner_steps_per_update": null,
             "inner_outer_replay_fraction": 0.0
           }
+        },
+        "d512_4_j6_outer_target": {
+          "description": "D512-4-J6 with only inner_bootstrap_source changed to outer_target: the frozen outer target critic supplies all SAC bootstraps; next actions still come from the adapting inner actor. J6/N512/H3/B512 joint-G3 and adaptive local temperature are unchanged.",
+          "alg_params": {
+            "inner_rollout_horizon": 3,
+            "inner_q_target_reduction": "min_pair",
+            "inner_q_actor_reduction": "min_pair",
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_operator": "sac",
+            "inner_rounds": 6,
+            "inner_rollouts_per_round": 512,
+            "inner_updates_per_round": 3,
+            "inner_batch_size": 512,
+            "inner_replay_capacity": 9216,
+            "inner_replay_sampling": "with_replacement",
+            "inner_diagnostic_rollouts": 0,
+            "inner_diagnostics_every": 1000,
+            "inner_actor_adaptation": "clone",
+            "inner_critic_adaptation": "clone",
+            "inner_temperature_mode": "auto",
+            "inner_temperature_initialization": "inherit_outer",
+            "inner_target_entropy": "inherit_outer",
+            "inner_bootstrap_source": "outer_target",
+            "inner_actor_lr": 5e-05,
+            "inner_critic_lr": 0.0001,
+            "inner_temperature_lr": 0.0003,
+            "inner_adam_eps": 1e-08,
+            "inner_critic_target_tau": 0.01,
+            "inner_critic_target_update_interval": 1,
+            "inner_behavior_action": "policy_sample",
+            "inner_execution_action": "policy_sample",
+            "inner_actor_scope": "action",
+            "inner_critic_scope": "action",
+            "inner_temperature_scope": "action",
+            "inner_replay_scope": "action",
+            "inner_actor_optimizer_scope": "action",
+            "inner_critic_optimizer_scope": "action",
+            "inner_temperature_optimizer_scope": "action",
+            "inner_critic_updates_per_round": null,
+            "inner_actor_updates_per_round": null,
+            "inner_finite_horizon": false,
+            "inner_steps_per_update": null,
+            "inner_outer_replay_fraction": 0.0
+          }
         }
       }
     }

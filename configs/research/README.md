@@ -100,6 +100,17 @@ with script argument `--smoke` tests three decisions per controller, omits W&B,
 and must use a separate output root. Default submissions run five episodes of
 up to 500 decisions per controller.
 
+For the fixed outer-Q comparison, set
+`AMBI_BENCHMARK_PRESET=named_run/d512_4_j6_outer_target` and use a fresh output
+root. This changes only the bootstrap critic to the frozen outer target Q at
+every transition; the next action and entropy term still use the adapting inner
+actor and local temperature. It does not enable finite-horizon handoff.
+Set `AMBI_BENCHMARK_REFERENCE_ROOT` to the previous campaign's `evaluation`
+directory to reuse its five completed prior bundles. A smoke invocation needs
+the corresponding previous `smoke` directory instead, because the three-decision
+protocol differs from the full evaluation protocol. Pairing is validated by the
+evaluator before results are accepted.
+
 ### Traces and portable report
 
 ```bash
@@ -156,6 +167,11 @@ selected configuration gets a separate run, grouped by checkpoint/configuration
 and tagged as episodes, bank, or both. Episode histories and bank summaries use
 stable metric names; full traces live in the portable artifact. Credentials are
 not fetched by the evaluator. Use the execution environment's normal W&B setup.
+
+Run names include the task, checkpoint step, controller/update schedule, and
+bootstrap critic. Tags expose the source run, checkpoint, controller, bootstrap,
+and collection/update settings for filtering. Names and tags are saved in the
+bundle manifest; prior-only runs carry no active SAC schedule labels.
 
 Bank repetitions and probe settings live under the matrix's `evaluation` block;
 `--bank-repetitions` overrides its repetition count. Model initialization, one

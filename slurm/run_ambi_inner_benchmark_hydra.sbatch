@@ -23,6 +23,7 @@ fail() { echo "AMBI benchmark: $*" >&2; exit 2; }
 : "${EXPECTED_ACTION_MODES_SHA:?Set the exact pushed commit.}"
 : "${SLURM_ARRAY_TASK_ID:?Submit as an array with task indices 1 through 5.}"
 PYTHON="${AMBI_DMC_PYTHON:-/cs/home/rgao48/projects/action-modes/environments/dmcontrol/.venv/bin/python}"
+preset="${AMBI_BENCHMARK_PRESET:-named_run/d512_4_j6}"
 cd "${SLURM_SUBMIT_DIR:?}"
 [[ "$(git rev-parse HEAD)" == "$EXPECTED_ACTION_MODES_SHA" ]] || fail "commit mismatch"
 [[ -z "$(git status --porcelain)" ]] || fail "checkout must be clean"
@@ -55,11 +56,18 @@ else
     common+=(--wandb)
 fi
 
+prior="$output/prior"
+if [[ -n "${AMBI_BENCHMARK_REFERENCE_ROOT:-}" ]]; then
+    [[ "$AMBI_BENCHMARK_REFERENCE_ROOT" == /* ]] || fail "reference root must be absolute"
+    prior="$AMBI_BENCHMARK_REFERENCE_ROOT/step_${checkpoint_step}/prior"
+    [[ -f "$prior/manifest.json" ]] || fail "prior reference missing: $prior"
+else
+    "$PYTHON" evaluate_ambi_checkpoint.py "${common[@]}" \
+        --preset named_run/prior --bundle-dir "$prior" \
+        --save-root-bank "$output/roots.json" --output "$output/prior-results.json"
+fi
 "$PYTHON" evaluate_ambi_checkpoint.py "${common[@]}" \
-    --preset named_run/prior --bundle-dir "$output/prior" \
-    --save-root-bank "$output/roots.json" --output "$output/prior-results.json"
-"$PYTHON" evaluate_ambi_checkpoint.py "${common[@]}" \
-    --preset named_run/d512_4_j6 --bundle-dir "$output/inner" \
-    --reference-bundle "$output/prior" --output "$output/inner-results.json"
-"$PYTHON" report_ambi_benchmark.py --bundle "$output/prior" \
+    --preset "$preset" --bundle-dir "$output/inner" \
+    --reference-bundle "$prior" --output "$output/inner-results.json"
+"$PYTHON" report_ambi_benchmark.py --bundle "$prior" \
     --bundle "$output/inner" --output "$output/comparison.html"

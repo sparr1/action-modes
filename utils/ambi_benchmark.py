@@ -18,6 +18,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import numpy as np
 
@@ -53,6 +54,90 @@ def protocol_for(resolved, controller_seed, max_steps):
 
 def episode_protocol(protocol):
     return {key: value for key, value in protocol.items() if key != "root_bank_id"}
+
+
+def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None):
+    """Describe a run from the same saved inputs used by the evaluator.
+
+    ``config`` is the algorithm mapping stored as W&B ``inner_config``. The
+    checkpoint step comes only from its sidecar metadata, never a filename or
+    preset name. Calling this helper performs no I/O and does not mutate inputs.
+    """
+    if kind not in {"episodes", "bank", "both"}:
+        raise ValueError("Benchmark kind must be episodes, bank, or both.")
+    params = config.get("alg_params", {})
+    environment = protocol.get("environment", {})
+    task = environment.get("params", {}).get("task") or environment.get("id") or "task unknown"
+    metadata = checkpoint.get("metadata") or {}
+    step = metadata.get("checkpoint", {}).get("step")
+    known_step = isinstance(step, int) and not isinstance(step, bool) and step >= 0
+    digest = checkpoint.get("sha256")
+    if known_step:
+        step_label = f"{step // 1000}k" if step and step % 1000 == 0 else str(step)
+        checkpoint_label = f"ckpt {step_label}"
+    else:
+        checkpoint_label = f"ckpt {digest[:12]}" if digest else "ckpt unknown"
+
+    operator = params.get("inner_operator")
+    controller = "prior" if operator == "none" else operator or "unknown"
+    tags = ["frozen-inner-benchmark", kind, f"kind:{kind}", f"task:{task}", f"controller:{controller}"]
+    if protocol.get("action_rule"):
+        tags.append(f"action:{protocol['action_rule']}")
+    if known_step:
+        tags.append(f"checkpoint-step:{step}")
+    if digest:
+        tags.append(f"checkpoint-sha:{digest[:12]}")
+    source = checkpoint.get("source_run")
+    if isinstance(source, dict):
+        source = source.get("id") or source.get("path") or source.get("url")
+    if isinstance(source, str) and source.strip():
+        source_path = urlsplit(source).path.rstrip("/")
+        if source_path:
+            tags.append(f"source-run:{source_path.rsplit('/', 1)[-1]}")
+    if selector:
+        tags.append(f"preset:{selector}")
+    tags.append(f"config:{canonical_hash(config)[:12]}")
+
+    parts = [str(task), checkpoint_label]
+    if controller == "prior":
+        parts.append("prior only")
+        tags.append("bootstrap:none")
+    else:
+        schedule = []
+        for symbol, key in (("J", "inner_rounds"), ("N", "inner_rollouts_per_round"),
+                            ("H", "inner_rollout_horizon")):
+            if params.get(key) is not None:
+                schedule.append(f"{symbol}{params[key]}")
+                tags.append(f"{symbol}:{params[key]}")
+        if params.get("inner_steps_per_update") is not None:
+            interval = params["inner_steps_per_update"]
+            schedule.append(f"update/{interval} transitions")
+            tags.extend(("schedule:transitions", f"steps-per-update:{interval}"))
+        elif any(params.get(f"inner_{component}_updates_per_round") is not None
+                 for component in ("critic", "actor")):
+            tags.append("schedule:separate")
+            for symbol, component in (("C", "critic"), ("A", "actor")):
+                value = params.get(f"inner_{component}_updates_per_round")
+                if value is not None:
+                    schedule.append(f"{symbol}{value}")
+                    tags.append(f"{symbol}:{value}")
+        elif params.get("inner_updates_per_round") is not None:
+            updates = params["inner_updates_per_round"]
+            schedule.append(f"G{updates}")
+            tags.extend(("schedule:joint", f"G:{updates}"))
+        controller_label = controller.upper() if controller != "unknown" else "controller unknown"
+        parts.append(" ".join([controller_label, *schedule]))
+        bootstrap = params.get("inner_bootstrap_source")
+        parts.append(f"Q {bootstrap.replace('_', '-')}" if bootstrap else "Q unspecified")
+        tags.append(f"bootstrap:{bootstrap or 'unknown'}")
+        if params.get("inner_finite_horizon") is not None:
+            tags.append(f"finite-horizon:{str(params['inner_finite_horizon']).lower()}")
+        for key, tag in (("inner_batch_size", "batch"), ("inner_temperature_mode", "temperature"),
+                         ("inner_sac_critic_target", "critic-target")):
+            if params.get(key) is not None:
+                tags.append(f"{tag}:{params[key]}")
+    parts.append(kind)
+    return {"name": " | ".join(parts), "tags": tags}
 
 
 def atomic_json(path, value, *, overwrite=False):
@@ -213,8 +298,11 @@ class BenchmarkBundle:
 
     def start_run(self, resolved, kind):
         config = copy.deepcopy(resolved["algorithm_config"])
+        labels = benchmark_run_labels(self.manifest["checkpoint"], self.manifest["protocol"],
+                                      config, kind, selector=resolved["selector"])
         run = {"id": resolved["selector"].replace("/", "__"), "selector": resolved["selector"],
                "config": config, "config_hash": canonical_hash(config), "kind": kind,
+               "wandb_name": labels["name"], "wandb_tags": labels["tags"],
                "episodes": [], "roots": [], "trace_files": [], "status": "running",
                "serialization_seconds": 0.0, "publication_seconds": 0.0}
         self.manifest["runs"].append(run)
@@ -226,8 +314,8 @@ class BenchmarkBundle:
                 "wandb": True, "wandb_project": options["project"],
                 "wandb_entity": options["entity"], "wandb_mode": options["mode"],
                 "wandb_group": f"{self.manifest['checkpoint']['sha256'][:12]}-{run['id']}",
-                "wandb_tags": ["frozen-inner-benchmark", kind],
-            }, default_project="ambi-inner-bench", run_name=f"{run['id']}-{kind}",
+                "wandb_tags": run["wandb_tags"],
+            }, default_project="ambi-inner-bench", run_name=run["wandb_name"],
                 config={"checkpoint": self.manifest["checkpoint"], "protocol": self.manifest["protocol"],
                         "code": self.manifest["code"], "inner_config": config})
             self.remote_runs[run["id"]] = remote

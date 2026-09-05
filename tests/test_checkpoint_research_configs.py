@@ -131,6 +131,20 @@ def test_named_run_preserves_joint_schedule_and_all_source_inner_settings(checkp
     assert cfg.inner_outer_replay_fraction == 0.0
 
 
+def test_fixed_outer_q_variant_changes_only_bootstrap_critic(checkpoint_context):
+    base = resolve_preset(MATRIX, "named_run/d512_4_j6", checkpoint_context=checkpoint_context)
+    fixed = resolve_preset(MATRIX, "named_run/d512_4_j6_outer_target", checkpoint_context=checkpoint_context)
+    expected = deepcopy(base["algorithm_config"])
+    expected["alg_params"]["inner_bootstrap_source"] = "outer_target"
+    assert fixed["algorithm_config"] == expected
+    cfg = _build_cfg(fixed["algorithm_config"])
+    assert cfg.inner_bootstrap_source == "outer_target"
+    assert cfg.inner_actor_adaptation == cfg.inner_critic_adaptation == "clone"
+    assert cfg.inner_updates_per_round == 3
+    assert cfg.inner_finite_horizon is False
+    assert cfg.inner_temperature_mode == "auto"
+
+
 @pytest.mark.parametrize("key", ["model_size", "obs", "num_q", "outer_critic_target", "actor_lr"])
 def test_checkpoint_matrix_rejects_outer_or_architecture_overrides(checkpoint_context, key):
     matrix = load_preset_matrix(MATRIX)

@@ -65,6 +65,118 @@ def _trace_rows(bundle, run):
             for line in gzip.decompress((bundle.path / relative).read_bytes()).decode().splitlines()]
 
 
+def _label_inputs(bootstrap="inner_target", operator="sac"):
+    checkpoint = {**CHECKPOINT, "source_run": "rwgao_b-brown-university/ambi/u13m14st",
+                  "metadata": {"checkpoint": {"step": 100_000}}}
+    config = {"alg_params": {"inner_operator": operator, "inner_rounds": 6,
+              "inner_rollouts_per_round": 512, "inner_rollout_horizon": 3,
+              "inner_updates_per_round": 3, "inner_batch_size": 512,
+              "inner_bootstrap_source": bootstrap, "inner_temperature_mode": "auto",
+              "inner_finite_horizon": False}}
+    return checkpoint, _protocol(), config
+
+
+@pytest.mark.parametrize("bootstrap", ["inner_target", "outer_target"])
+def test_benchmark_labels_expose_actual_checkpoint_schedule_and_bootstrap(bootstrap):
+    checkpoint, protocol, config = _label_inputs(bootstrap)
+    original = deepcopy((checkpoint, protocol, config))
+    labels = storage.benchmark_run_labels(checkpoint, protocol, config, "episodes",
+                                          selector="named_run/d512_4_j6")
+    assert labels["name"] == (
+        f"humanoid-walk | ckpt 100k | SAC J6 N512 H3 G3 | Q {bootstrap.replace('_', '-')} | episodes"
+    )
+    assert {"source-run:u13m14st", "checkpoint-step:100000", "controller:sac",
+            f"bootstrap:{bootstrap}", "J:6", "N:512", "H:3", "G:3", "schedule:joint",
+            "kind:episodes", "preset:named_run/d512_4_j6", "finite-horizon:false",
+            "action:tanh_mean"} <= set(labels["tags"])
+    assert (checkpoint, protocol, config) == original
+    assert storage.benchmark_run_labels(checkpoint, protocol, config, "episodes",
+                                         selector="named_run/d512_4_j6") == labels
+
+
+def test_prior_labels_do_not_describe_inherited_inactive_sac_settings():
+    labels = storage.benchmark_run_labels(*_label_inputs(operator="none"), "episodes")
+    assert labels["name"] == "humanoid-walk | ckpt 100k | prior only | episodes"
+    assert {"controller:prior", "bootstrap:none"} <= set(labels["tags"])
+    assert not any(tag.startswith(("J:", "N:", "H:", "G:", "schedule:", "temperature:"))
+                   for tag in labels["tags"])
+    assert "controller:sac" not in labels["tags"]
+    assert "bootstrap:inner_target" not in labels["tags"]
+    assert "action:tanh_mean" in labels["tags"]
+
+
+def test_labels_do_not_invent_finite_horizon_or_action_metadata():
+    checkpoint, protocol, config = _label_inputs()
+    config["alg_params"]["inner_finite_horizon"] = True
+    assert "finite-horizon:true" in storage.benchmark_run_labels(checkpoint, protocol, config, "bank")["tags"]
+    config["alg_params"].pop("inner_finite_horizon")
+    protocol.pop("action_rule")
+    labels = storage.benchmark_run_labels(checkpoint, protocol, config, "bank")
+    assert not any(tag.startswith(("finite-horizon:", "action:")) for tag in labels["tags"])
+
+
+@pytest.mark.parametrize("source", [
+    "rwgao_b-brown-university/ambi/u13m14st",
+    "https://wandb.ai/rwgao_b-brown-university/ambi/runs/u13m14st?view=overview",
+    "u13m14st", {"id": "u13m14st"},
+])
+def test_source_run_tag_is_stable_across_saved_source_formats(source):
+    checkpoint, protocol, config = _label_inputs()
+    checkpoint["source_run"] = source
+    labels = storage.benchmark_run_labels(checkpoint, protocol, config, "bank")
+    assert "source-run:u13m14st" in labels["tags"]
+    assert labels["name"].endswith(" | bank")
+    assert "kind:bank" in labels["tags"]
+
+
+def test_missing_step_uses_hash_without_guessing_from_path_or_selector():
+    checkpoint, protocol, config = _label_inputs()
+    checkpoint.update(metadata=None, path="/checkpoint_500000_steps.pt", source_run=None)
+    labels = storage.benchmark_run_labels(checkpoint, protocol, config, "episodes",
+                                          selector="misleading/ckpt_1m")
+    assert "ckpt aaaaaaaaaaaa" in labels["name"]
+    assert not any(tag.startswith(("checkpoint-step:", "source-run:")) for tag in labels["tags"])
+    assert "Q inner-target" in labels["name"]
+
+
+def test_separate_and_transition_schedules_are_not_labeled_joint_updates():
+    checkpoint, protocol, config = _label_inputs()
+    params = config["alg_params"]
+    params.update(inner_updates_per_round=None, inner_critic_updates_per_round=6,
+                  inner_actor_updates_per_round=2)
+    labels = storage.benchmark_run_labels(checkpoint, protocol, config, "both")
+    assert "SAC J6 N512 H3 C6 A2" in labels["name"]
+    assert {"schedule:separate", "C:6", "A:2", "kind:both"} <= set(labels["tags"])
+    assert not any(tag.startswith("G:") for tag in labels["tags"])
+    params.update(inner_critic_updates_per_round=None, inner_actor_updates_per_round=None,
+                  inner_steps_per_update=256)
+    labels = storage.benchmark_run_labels(checkpoint, protocol, config, "bank")
+    assert "update/256 transitions" in labels["name"]
+    assert {"schedule:transitions", "steps-per-update:256"} <= set(labels["tags"])
+
+
+def test_new_run_persists_and_publishes_labels_without_changing_groups(tmp_path, monkeypatch):
+    calls = []
+
+    def initialize(params, *, default_project, run_name, config):
+        calls.append({"params": params, "name": run_name, "config": config})
+        return SimpleNamespace(path="entity/ambi-inner-bench/new-run")
+
+    monkeypatch.setattr("utils.wandb_utils.init_wandb", initialize)
+    checkpoint, protocol, config = _label_inputs("outer_target")
+    bundle = storage.BenchmarkBundle(tmp_path / "labels", checkpoint=checkpoint, protocol=protocol,
+                                    wandb={"project": "ambi-inner-bench", "entity": "entity", "mode": "offline"})
+    resolved = {**_resolved(), "selector": "named_run/d512_4_j6_outer_target", "algorithm_config": config}
+    run = bundle.start_run(resolved, "episodes")
+    expected = storage.benchmark_run_labels(checkpoint, protocol, config, "episodes", selector=resolved["selector"])
+    saved = storage.read_json(bundle.path / "manifest.json")["runs"][0]
+    assert saved["wandb_name"] == calls[0]["name"] == expected["name"]
+    assert saved["wandb_tags"] == calls[0]["params"]["wandb_tags"] == expected["tags"]
+    assert calls[0]["params"]["wandb_group"] == f"{'a' * 12}-named_run__d512_4_j6_outer_target"
+    assert calls[0]["config"]["inner_config"] == config
+    assert run["wandb_path"] == "entity/ambi-inner-bench/new-run"
+
+
 def test_atomic_outputs_preserve_existing_data_and_clean_temporary_files(tmp_path, monkeypatch):
     target = tmp_path / "result.json"
     storage.atomic_json(target, {"first": True})
