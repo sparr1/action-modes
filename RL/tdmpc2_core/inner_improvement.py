@@ -144,6 +144,7 @@ class InnerImprovementEngine:
         self.episode_index = 0
         self._mppi_prev_mean = None
         self._collect_diagnostics = True
+        self._active_trace = None
         self._pending_timers = {}
         self._parameter_noise_spec = None
         self._clear_parameter_noise_action_state()
@@ -359,24 +360,42 @@ class InnerImprovementEngine:
         # untouched and ordinary action/episode resets retain their cache.
         self._initialize_compile_regions()
 
-    def reset_for_evaluation(self, seed):
-        """Reset an evaluation-only engine without rebuilding compile regions.
+    def reset_for_evaluation(self, seed, *, reuse_action_pool=False):
+        """Reset evaluation state and RNG, optionally retaining safe allocations.
 
         Paired controller evaluation reuses one engine that is never the live
         training engine.  Each evaluation episode must nevertheless begin from
-        a fresh root-local workspace and an episode-private RNG stream.  Keep
-        the compiled callables intact so a fixed evaluation bank does not pay
-        compilation setup once per episode.
+        a fresh root-local workspace and an episode-private RNG stream. The
+        default discards allocations. Opt-in reuse retains only a single-policy,
+        fully action-scoped allocation pool; ordinary workspace preparation
+        restores priors, target networks, optimizer moments, replay and alpha
+        before use. Keeping module identities also avoids recompiling Dynamo
+        guards after every root. Other lifecycles still discard their pools.
         """
 
         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise ValueError("Evaluation inner-engine seed must be non-negative.")
+        if not isinstance(reuse_action_pool, bool):
+            raise TypeError("reuse_action_pool must be bool.")
         if self.rng._action_fork_depth != 0:
             raise RuntimeError(
                 "Cannot reset the evaluation inner engine during an active action."
             )
+        retain_pool = (
+            reuse_action_pool
+            and str(self.cfg.inner_operator) in {"sac", "td3"}
+            and not self._explorer_active
+            and all(
+                str(getattr(self.cfg, f"inner_{component}_scope")) == "action"
+                for component in (
+                    "actor", "critic", "temperature", "replay",
+                    "actor_optimizer", "critic_optimizer", "temperature_optimizer",
+                )
+            )
+        )
         self.state = InnerWorkspace()
-        self._action_pool = InnerWorkspace()
+        if not retain_pool:
+            self._action_pool = InnerWorkspace()
         self.rng = InnerRNG(seed, self.device)
         self.action_index = 0
         self.episode_index = 0
@@ -4003,6 +4022,13 @@ class InnerImprovementEngine:
                 critic_updated=do_critic,
                 actor_updated=do_actor,
             )
+            if self._active_trace is not None:
+                self._active_trace.record(
+                    "update", self.state, {**slot_metrics, "alpha_used": alpha},
+                    updated_critic=do_critic, updated_actor=do_actor,
+                    updated_temperature=do_temperature,
+                    measurement="pre_update_minibatch",
+                )
             metrics.append(slot_metrics)
         return metrics
 
@@ -5144,6 +5170,11 @@ class InnerImprovementEngine:
             # one immutable snapshot throughout all root-local update slots.
             actor_loss_scale = self.agent.actor_loss_scale.detach().clone()
         alpha_initial = self.alpha.detach().clone()
+        trace = self._active_trace
+        if trace is not None:
+            trace.record("initial", state, {"alpha": alpha_initial})
+            if trace.probes:
+                trace.probe(self, root_z, state.actor)
         explorer_alpha_initial = (
             self.explorer_alpha.detach().clone()
             if self._explorer_mode == "separate_critics"
@@ -5170,9 +5201,17 @@ class InnerImprovementEngine:
         update_slots = 0
         requested_update_slots = 0
         for round_index in range(int(cfg.inner_rounds)):
+            if trace is not None:
+                trace.round_index = round_index + 1
             rollout_start = self._timer_start()
             rollout = self._collect_round(root_z)
             self._timer_stop("inner_rollout_seconds", rollout_start)
+            if trace is not None:
+                trace.record("collection", state, {
+                    "collection_transitions": rollout["transition_count"],
+                    "collection_reward_sum_mean": rollout["reward_sums"].float().mean(),
+                    "collection_discounted_reward_mean": rollout["discounted_rewards"].float().mean(),
+                })
             all_lengths.append(rollout["lengths"])
             reward_sums.append(rollout["reward_sums"])
             discounted_rewards.append(rollout["discounted_rewards"])
@@ -5247,6 +5286,8 @@ class InnerImprovementEngine:
             self._timer_stop("inner_update_seconds", update_start)
             update_history.extend(round_metrics)
             update_slots += len(round_metrics)
+            if trace is not None and trace.probes:
+                trace.probe(self, root_z, state.actor)
 
         execution_start = self._timer_start()
         capture_behavior = bool(return_behavior_policy and not eval_mode)
@@ -5714,6 +5755,46 @@ class InnerImprovementEngine:
         collect_diagnostics=True,
         return_behavior_policy=False,
         apply_inner_writeback=False,
+        trace=None,
+    ):
+        """Run an action with an optional single-use observational recorder."""
+        if trace is not None:
+            from .inner_trace import InnerActionTrace
+
+            if not isinstance(trace, InnerActionTrace):
+                raise TypeError("trace must be an InnerActionTrace.")
+            if self._active_trace is not None:
+                raise RuntimeError("Inner action tracing is not reentrant.")
+            operator = str(self.cfg.inner_operator)
+            if operator not in {"none", "sac", "td3"} or self._explorer_active:
+                raise ValueError(
+                    "Inner tracing supports single-policy none/SAC/TD3 configurations."
+                )
+            if trace.probes and operator == "td3":
+                raise ValueError(
+                    "Fixed-noise trace probes require SAC or no inner optimization."
+                )
+            trace.begin()
+        self._active_trace = trace
+        try:
+            return self._act(
+                root_z, t0=t0, eval_mode=eval_mode,
+                collect_diagnostics=collect_diagnostics,
+                return_behavior_policy=return_behavior_policy,
+                apply_inner_writeback=apply_inner_writeback,
+            )
+        finally:
+            self._active_trace = None
+
+    def _act(
+        self,
+        root_z,
+        *,
+        t0=False,
+        eval_mode=False,
+        collect_diagnostics=True,
+        return_behavior_policy=False,
+        apply_inner_writeback=False,
     ):
         self._pending_timers = {}
         start = self._timer_start()
@@ -5729,6 +5810,14 @@ class InnerImprovementEngine:
                 and int(self.cfg.inner_rounds) == 0
             )
             if inactive:
+                if self._active_trace is not None:
+                    self._active_trace.record(
+                        "initial", self.state, {"alpha": self.agent.alpha.detach()}
+                    )
+                    if self._active_trace.probes:
+                        self._active_trace.probe(
+                            self, root_z, self.model._pi, inner=False
+                        )
                 result = self._act_none(
                     root_z,
                     eval_mode=eval_mode,

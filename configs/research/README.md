@@ -1,5 +1,165 @@
 # Frozen-checkpoint AMBI research
 
+## Humanoid inner-SAC benchmark
+
+`ambi_humanoid_inner_benchmark.json` evaluates a frozen checkpoint using its
+adjacent `.metadata.json` as the source of algorithm, observation, and environment
+settings. The matrix declares source run `rwgao_b-brown-university/ambi/u13m14st`;
+this is provenance supplied by the experiment configuration, not proof that an
+arbitrary checkpoint came from that W&B run. Pin the intended checkpoint file
+and keep its sidecar. Every result records the actual checkpoint SHA256, saved
+settings, code fingerprint (including uncommitted source), and runtime versions.
+
+The workflow has three compute stages. Each can run independently; report
+generation uses saved data and never invokes a model or environment.
+
+```bash
+AMBI_EVAL_PY=environments/dmcontrol/.venv/bin/python
+AMBI_INNER_MATRIX=configs/research/ambi_humanoid_inner_benchmark.json
+AMBI_CHECKPOINT=/absolute/path/to/pinned-checkpoint.pt
+```
+
+**1. Evaluate the prior and save shared observations.** The default selection
+is prior-only: five episodes, seeds 101–105, at most 500 decisions each. Save
+the observation immediately before decisions 0, 100, 200, 300, and 400; an early
+termination simply yields fewer observations. Choose fresh output paths.
+
+```bash
+"$AMBI_EVAL_PY" evaluate_ambi_checkpoint.py \
+  --matrix "$AMBI_INNER_MATRIX" --checkpoint "$AMBI_CHECKPOINT" \
+  --preset inner_budget/prior --device cuda \
+  --bundle-dir results/inner-bench/prior \
+  --save-root-bank results/inner-bench/roots.json --wandb
+```
+
+**2. Screen explicitly selected SAC budgets on those identical observations.**
+Each observation uses three independent, reproducible solver seeds. This does
+not step a simulator: the normal prediction path re-encodes the saved state and
+performs a fresh inner solve. Select only the budgets to screen.
+
+```bash
+"$AMBI_EVAL_PY" evaluate_ambi_checkpoint.py \
+  --matrix "$AMBI_INNER_MATRIX" --checkpoint "$AMBI_CHECKPOINT" \
+  --preset inner_budget/sac_1x --preset inner_budget/sac_2x --device cuda \
+  --root-bank results/inner-bench/roots.json --bank-only \
+  --bundle-dir results/inner-bench/screen --wandb
+```
+
+The SAC presets use eight rounds, 512 rollouts per round, horizon three, batch
+size 512, replay capacity 12,288, cloned action-local learners, and an adaptive
+local temperature initialized from the frozen outer temperature. Learning rates
+come from the checkpoint settings. Per-round critic/actor updates are 3/1 for
+`sac_1x`, 6/2 for `sac_2x`, and 12/4 for `sac_4x`; temperature updates follow actor
+updates. Collection counts are held fixed, but the generated transitions can
+differ as the adapted policies change. Larger budgets are never defaulted in.
+
+**3. Confirm promising configurations with complete episodes.** Inner SAC runs
+at every real decision; matched prior returns come from the saved reference.
+
+```bash
+"$AMBI_EVAL_PY" evaluate_ambi_checkpoint.py \
+  --matrix "$AMBI_INNER_MATRIX" --checkpoint "$AMBI_CHECKPOINT" \
+  --preset inner_budget/sac_1x --device cuda \
+  --reference-bundle results/inner-bench/prior \
+  --bundle-dir results/inner-bench/confirmation --wandb
+```
+
+Both controllers execute `tanh(mu)` in the real environment. Inner imagined
+actions, SAC actor/target sampling, and minibatch selection remain stochastic.
+The evaluator never calls outer learning or applies prior writeback. Episode
+and bank seeds are independent of execution/configuration order. Evaluation
+resets reuse eligible action-local allocations to retain compiled graphs, while
+resetting all scientific state as in a fresh solve.
+
+Five episodes and one trained checkpoint are an exploratory screen. Inspect
+paired per-seed deltas and cost, then expand seeds/checkpoints for stronger
+claims. Bank roots share trajectory context and are not independent episode
+return measurements.
+
+### Traces and portable report
+
+```bash
+"$AMBI_EVAL_PY" report_ambi_benchmark.py \
+  --bundle results/inner-bench/prior \
+  --bundle results/inner-bench/screen \
+  --bundle results/inner-bench/confirmation \
+  --output results/inner-bench/comparison.html
+```
+
+Open the resulting HTML locally in a browser. It contains its scripts and data;
+no server, CDN, plotting package, or W&B login is needed. Rebuild with additional
+`--bundle` inputs as experiments finish. Repeat `--metric` to produce a smaller
+report containing only selected metrics. Existing reports require `--overwrite`.
+
+Each bundle contains a manifest, compressed JSONL traces per episode or bank
+solve, and the observation bank when applicable. Completed shards survive later
+failures. Failed/partial episodes and missing/nonfinite measurements remain
+explicit. A new evaluation requires a new bundle directory; `--overwrite`
+retains its existing meaning for the evaluator's optional legacy `--output`.
+
+The report offers decision/update heatmaps and selected-solve overlays. Critic
+metrics use critic updates; actor metrics use actor updates; fixed policy probes
+use round boundaries. Update losses measure the minibatch *before* that update,
+although the counters name the completed update. Missing metrics and unequal
+budget endpoints are never interpolated. `decision/` metrics retain the existing
+per-solve aggregate statistics and real rewards/timing.
+
+Trajectory positions across configurations can represent different states.
+Shared-root mode instead joins the exact bank, observation, repetition, solver
+seed, and probe protocol. Selecting the same observation allows a controlled
+comparison of inner learning. Incompatible checkpoints, metric meanings, and
+episode protocols are rejected instead of silently overlaid.
+
+Raw traces reuse existing optimizer metrics, including losses, Q/target values,
+entropy, temperature, gradients, and available saturation/KL statistics. They
+add no model calls, random draws, or per-update device synchronization. Detached
+scalars travel with the existing action/metrics CPU transfer; serialization and
+W&B work happen outside the solve.
+
+Extra probes run only on the bank, initially and after every round. They use
+eight fixed-noise rollouts over three model steps and a fixed outer temperature.
+The report separates predicted reward, terminal frozen target-Q bootstrap, and
+entropy contribution, alongside fixed target-Q action gain, action displacement,
+and KL. These are model predictions; a soft-Q bootstrap is not a measured reward
+return. Full-episode returns remain the performance test.
+
+### W&B and timing
+
+`--wandb` explicitly enables summaries and artifacts in project `ambi-inner-bench`
+under `rwgao_b-brown-university`. Omit it for local-only evaluation, or use
+`--wandb-mode offline` to test SDK publication without network access. Each
+selected configuration gets a separate run, grouped by checkpoint/configuration
+and tagged as episodes, bank, or both. Episode histories and bank summaries use
+stable metric names; full traces live in the portable artifact. Credentials are
+not fetched by the evaluator. Use the execution environment's normal W&B setup.
+
+Bank repetitions and probe settings live under the matrix's `evaluation` block;
+`--bank-repetitions` overrides its repetition count. Model initialization, one
+unscored warmup including lazy compilation, control, probe, serialization, and
+publication costs are recorded separately. Total bundle elapsed time includes
+all stages and W&B finish. Probe model steps are additional to optimizer model
+steps. CUDA event timing is resolved only after the normal action transfer.
+
+The raw-trace overhead acceptance target is at most 5% median warmed CUDA time.
+It requires a measurement on the actual checkpoint/hardware; CPU correctness
+tests do not establish it. The opt-in test in `tests/test_ambi_inner_trace.py`
+supports an actual checkpoint and emits matched trace-off/on timings. Run GPU
+validation through the scheduler, not a login-node shell.
+
+```bash
+AMBI_RUN_TRACE_CUDA_BENCHMARK=1 \
+AMBI_TRACE_BENCHMARK_CHECKPOINT="$AMBI_CHECKPOINT" \
+AMBI_TRACE_BENCHMARK_OUTPUT=/tmp/ambi-trace-overhead.json \
+"$AMBI_EVAL_PY" -m pytest -s -q \
+  tests/test_ambi_inner_trace.py::test_cuda_trace_overhead_measurement
+```
+
+The output path must be new and outside the source checkout. The test uses five
+warmup solves and ten alternating trace-off/on pairs. It reports the threshold
+result without imposing a noisy wall-clock assertion on ordinary CI.
+
+### Existing research matrices
+
 The active end-to-end configs live directly under `configs/ambi/`.
 The frozen-checkpoint matrix is
 `configs/research/ambi_inner_decoupling.json`, outside the active AMBI training

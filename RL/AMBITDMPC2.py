@@ -2558,6 +2558,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         episode_start=None,
         *,
         collect_diagnostics=True,
+        trace=None,
     ):
         """Select a direct-call action with full diagnostics by default.
 
@@ -2574,6 +2575,7 @@ class AMBITDMPC2(TDMPC2Baseline):
             t0=t0,
             eval_mode=deterministic,
             collect_diagnostics=collect_diagnostics,
+            **({"trace": trace} if trace is not None else {}),
         ).numpy()
         self._predict_t0 = False
         return self._unscale_action(action_norm), None

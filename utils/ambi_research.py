@@ -16,6 +16,7 @@ from pathlib import Path
 
 _NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _MAX_NUMPY_SEED = 2**32 - 1
+_CHECKPOINT_RUNTIME_PARAMS = {"device", "compile", "compile_strict", "wandb"}
 
 
 class PresetMatrixError(ValueError):
@@ -62,19 +63,40 @@ def _validate_name(value, location):
         )
 
 
+def _validate_checkpoint_overrides(alg_params, run_params, location):
+    """Keep a checkpoint-derived experiment's learned problem fixed."""
+    forbidden = [
+        key for key in alg_params
+        if not key.startswith(("inner_", "wandb_"))
+        and key not in _CHECKPOINT_RUNTIME_PARAMS
+    ]
+    forbidden_run = sorted(set(run_params) - {"device"})
+    if forbidden or forbidden_run:
+        raise PresetMatrixError(
+            f"{location}: checkpoint-based presets may override only inner controls "
+            "and device/compile/W&B runtime settings; incompatible overrides: "
+            f"alg_params={sorted(forbidden)}, run_params={forbidden_run}."
+        )
+
+
 def validate_preset_matrix(matrix):
     """Validate and return ``matrix`` without modifying it."""
     _require_mapping(matrix, "preset matrix")
     if matrix.get("schema_version") != 1:
         raise PresetMatrixError("preset matrix schema_version must be 1.")
     if not isinstance(matrix.get("base_alg_config"), str):
-        raise PresetMatrixError("base_alg_config must be a relative JSON path.")
+        raise PresetMatrixError("base_alg_config must be a relative JSON path or 'checkpoint'.")
     if Path(matrix["base_alg_config"]).is_absolute():
         raise PresetMatrixError("base_alg_config must be relative to the matrix file.")
 
-    _require_mapping(matrix.get("shared_alg_params", {}), "shared_alg_params")
+    checkpoint_base = matrix["base_alg_config"] == "checkpoint"
+    shared = _require_mapping(matrix.get("shared_alg_params", {}), "shared_alg_params")
+    if checkpoint_base:
+        _validate_checkpoint_overrides(shared, {}, "shared_alg_params")
     environment = _require_mapping(matrix.get("environment", {}), "environment")
-    if not isinstance(environment.get("id"), str) or not environment["id"]:
+    if (not checkpoint_base or "environment" in matrix) and (
+        not isinstance(environment.get("id"), str) or not environment["id"]
+    ):
         raise PresetMatrixError("environment.id must be a non-empty string.")
     _require_mapping(environment.get("params", {}), "environment.params")
 
@@ -159,6 +181,11 @@ def validate_preset_matrix(matrix):
                     f"{comparison_name}/{variant_name}.run_params cannot replace alg_params; "
                     "put algorithm overrides in its alg_params object."
                 )
+            if checkpoint_base:
+                _validate_checkpoint_overrides(
+                    variant.get("alg_params", {}), variant.get("run_params", {}),
+                    f"{comparison_name}/{variant_name}",
+                )
             selectors.add(f"{comparison_name}/{variant_name}")
 
     defaults = evaluation.get("default_presets", [])
@@ -222,7 +249,16 @@ def _base_config_path(matrix_path, matrix):
     return base
 
 
-def resolve_preset(matrix_path, selector, matrix=None):
+def _apply_alg_overrides(alg_params, overrides):
+    # Null explicitly removes inherited operator-specific schedule controls.
+    for key, value in copy.deepcopy(overrides).items():
+        if value is None:
+            alg_params.pop(key, None)
+        else:
+            alg_params[key] = value
+
+
+def resolve_preset(matrix_path, selector, matrix=None, *, checkpoint_context=None):
     """Materialize one preset as a normal AMBI algorithm configuration.
 
     Returns metadata plus ``algorithm_config``.  The source matrix and base
@@ -241,22 +277,36 @@ def resolve_preset(matrix_path, selector, matrix=None):
     except KeyError as exc:
         raise PresetMatrixError(f"Unknown preset selector {selector!r}.") from exc
 
-    base_path = _base_config_path(matrix_path, matrix)
-    algorithm_config = _load_json(base_path)
+    if matrix["base_alg_config"] == "checkpoint":
+        if checkpoint_context is None:
+            raise PresetMatrixError(
+                "base_alg_config='checkpoint' requires a checkpoint metadata context."
+            )
+        base_path = checkpoint_context.source
+        algorithm_config = copy.deepcopy(checkpoint_context.trial_run_params)
+        if algorithm_config.get("alg") != "AMBITDMPC2/AMBITDMPC2":
+            raise PresetMatrixError("Checkpoint-based presets require an AMBITDMPC2 checkpoint.")
+        environment = {
+            "id": algorithm_config["env"],
+            "params": copy.deepcopy(checkpoint_context.experiment_params.get("env_params", {})),
+        }
+        if "environment" in matrix and {
+            "id": matrix["environment"]["id"],
+            "params": matrix["environment"].get("params", {}),
+        } != environment:
+            raise PresetMatrixError(
+                "Checkpoint-based presets cannot override the saved environment."
+            )
+    else:
+        base_path = _base_config_path(matrix_path, matrix)
+        algorithm_config = _load_json(base_path)
+        environment = copy.deepcopy(matrix["environment"])
     _require_mapping(algorithm_config, f"base algorithm config {base_path}")
     alg_params = _require_mapping(
         algorithm_config.get("alg_params"), f"{base_path}.alg_params"
     )
-    alg_params.update(copy.deepcopy(matrix.get("shared_alg_params", {})))
-    # A preset normally overlays a small set of values onto the base config.
-    # ``null`` is the explicit deletion marker for operator-specific controls:
-    # for example, an MPPI variant must remove the SAC-only J/N/G schedule it
-    # inherited from the reference AMBI config rather than silently ignore it.
-    for key, value in copy.deepcopy(variant.get("alg_params", {})).items():
-        if value is None:
-            alg_params.pop(key, None)
-        else:
-            alg_params[key] = value
+    _apply_alg_overrides(alg_params, matrix.get("shared_alg_params", {}))
+    _apply_alg_overrides(alg_params, variant.get("alg_params", {}))
     algorithm_config.update(copy.deepcopy(variant.get("run_params", {})))
 
     return {
@@ -266,21 +316,28 @@ def resolve_preset(matrix_path, selector, matrix=None):
         "reference": comparison["reference"],
         "description": variant.get("description", ""),
         "algorithm_config": algorithm_config,
-        "environment": copy.deepcopy(matrix["environment"]),
+        "environment": environment,
         "evaluation": copy.deepcopy(matrix.get("evaluation", {})),
     }
 
 
-def materialize_presets(matrix_path, output_dir, selectors=None, comparisons=None):
+def materialize_presets(
+    matrix_path, output_dir, selectors=None, comparisons=None, *, checkpoint_context=None
+):
     """Write resolved algorithm JSONs plus a matching experiment manifest."""
     matrix_path = Path(matrix_path).resolve()
     matrix = load_preset_matrix(matrix_path)
     selectors = normalize_selectors(matrix, selectors, comparisons)
+    # Resolve before creating any files, including when a required sidecar is missing.
+    resolved_presets = [
+        resolve_preset(matrix_path, selector, matrix=matrix, checkpoint_context=checkpoint_context)
+        for selector in selectors
+    ]
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     written = []
-    for selector in selectors:
-        resolved = resolve_preset(matrix_path, selector, matrix=matrix)
+    for resolved in resolved_presets:
+        selector = resolved["selector"]
         output = output_dir / f"{selector.replace('/', '__')}.json"
         output.write_text(
             json.dumps(
@@ -295,8 +352,8 @@ def materialize_presets(matrix_path, output_dir, selectors=None, comparisons=Non
         written.append(output)
 
     experiment = {
-        "overrides_alg": {"env": matrix["environment"]["id"]},
-        "env_params": copy.deepcopy(matrix["environment"].get("params", {})),
+        "overrides_alg": {"env": resolved_presets[0]["environment"]["id"]},
+        "env_params": copy.deepcopy(resolved_presets[0]["environment"].get("params", {})),
         "trials": 1,
         "configs": [path.stem for path in written],
         "logs": "timestamp",
