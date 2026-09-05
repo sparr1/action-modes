@@ -281,11 +281,11 @@ def test_prior_only_bank_preserves_checkpoint_and_environment_protocol():
     assert actual["save_strat"] == ["all"]
 
 
-def test_prior_only_bank_launcher_uses_one_l40_and_isolated_seed55_artifacts():
+def test_prior_only_bank_launcher_uses_one_a6000_and_isolated_seed55_artifacts():
     contents = PRIOR_LAUNCHER.read_text()
     for contract in (
-        "#SBATCH --constraint=l40\n",
-        "#SBATCH --gres=gpu:nvidia_l40:1\n",
+        "#SBATCH --constraint=rtx_a6000\n",
+        "#SBATCH --gres=gpu:nvidia_rtx_a6000:1\n",
         "#SBATCH --cpus-per-task=8",
         "#SBATCH --mem=32G",
         "#SBATCH --time=5-00:00:00",

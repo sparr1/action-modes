@@ -235,7 +235,7 @@ EXPECTED_ACTION_MODES_SHA=$(git rev-parse HEAD) \
   sbatch --export=ALL slurm/run_tdmpc2_humanoid_walk_state_prior_only_checkpoint_bank_1p5m_hydra.sbatch
 ```
 
-The launcher requests one L40, eight CPUs, and 32 GiB, and writes to an isolated
+The launcher requests one A6000, eight CPUs, and 32 GiB, and writes to an isolated
 job directory under
 `/cs/home/rgao48/projects/ambi-runs/tdmpc2-prior-only-checkpoint-bank-1p5m`.
 These model snapshots support evaluation and weight transfer, not exact training
