@@ -61,19 +61,22 @@ elif [[ "${1:-}" == --bank-smoke ]]; then
     common+=(--bank-repetitions 1)
 else
     common+=(--wandb)
+    if [[ "${1:-}" != --bank-only ]]; then
+        common+=(--seeds 101 102 103 104 105 --max-steps 500)
+    fi
 fi
+read -r -a presets <<< "${AMBI_BENCHMARK_PRESETS:-$preset}"
+selected=()
+for selected_preset in "${presets[@]}"; do
+    selected+=(--preset "$selected_preset")
+done
+[[ ${#selected[@]} -gt 0 ]] || fail "select at least one preset"
 
 if [[ "${1:-}" == --bank-only || "${1:-}" == --bank-smoke ]]; then
     : "${AMBI_BENCHMARK_REFERENCE_ROOT:?Set the original evaluation directory containing shared banks.}"
     [[ "$AMBI_BENCHMARK_REFERENCE_ROOT" == /* ]] || fail "reference root must be absolute"
     bank="$AMBI_BENCHMARK_REFERENCE_ROOT/step_${checkpoint_step}/roots.json"
     [[ -f "$bank" ]] || fail "shared observation bank missing: $bank"
-    read -r -a bank_presets <<< "${AMBI_BENCHMARK_PRESETS:-$preset}"
-    selected=()
-    for bank_preset in "${bank_presets[@]}"; do
-        selected+=(--preset "$bank_preset")
-    done
-    [[ ${#selected[@]} -gt 0 ]] || fail "select at least one bank preset"
     "$PYTHON" evaluate_ambi_checkpoint.py "${common[@]}" "${selected[@]}" \
         --root-bank "$bank" --bank-only --bundle-dir "$output/bank" \
         --output "$output/bank-results.json"
@@ -93,7 +96,7 @@ else
         --save-root-bank "$output/roots.json" --output "$output/prior-results.json"
 fi
 "$PYTHON" evaluate_ambi_checkpoint.py "${common[@]}" \
-    --preset "$preset" --bundle-dir "$output/inner" \
+    "${selected[@]}" --bundle-dir "$output/inner" \
     --reference-bundle "$prior" --output "$output/inner-results.json"
 "$PYTHON" report_ambi_benchmark.py --bundle "$prior" \
     --bundle "$output/inner" --output "$output/comparison.html"

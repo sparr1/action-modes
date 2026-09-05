@@ -111,6 +111,41 @@ the corresponding previous `smoke` directory instead, because the three-decision
 protocol differs from the full evaluation protocol. Pairing is validated by the
 evaluator before results are accepted.
 
+### Higher-critic full-episode evaluation
+
+For full return evaluation of the higher-critic settings, use
+`ambi_humanoid_inner_critic_sweep.json` with the two desired presets and omit
+the launcher's bank flags. Each checkpoint task evaluates C6 followed by C12
+sequentially on one GPU. Each configuration runs five episodes with seeds
+101–105 and at most 500 decisions per episode, with inner SAC at every decision.
+The shared bundle contains separate configuration results and W&B runs; its
+report compares both configurations with the saved prior. No bank solves run.
+
+Set `AMBI_BENCHMARK_REFERENCE_ROOT` to the completed original campaign's
+`evaluation` directory, containing `step_100000/prior/manifest.json` through
+`step_500000/prior/manifest.json`. The existing prior episodes are reused;
+three-update SAC baselines are not selected or rerun. Export the checkpoint
+prefix and exact pushed commit as above, then choose a fresh output root:
+
+```bash
+export AMBI_BENCHMARK_MATRIX=configs/research/ambi_humanoid_inner_critic_sweep.json
+export AMBI_BENCHMARK_PRESETS='critic_budget/inner_target_c6 critic_budget/inner_target_c12'
+export AMBI_BENCHMARK_OUTPUT_ROOT=/absolute/new/inner-target-c6-c12
+sbatch --array=1-5%3 --time=06:00:00 \
+  --output=/absolute/log/path/full-inner-%A_%a.out \
+  --error=/absolute/log/path/full-inner-%A_%a.err \
+  slurm/run_ambi_inner_benchmark_hydra.sbatch
+```
+
+Submit a second array with presets `critic_budget/outer_target_c6` and
+`critic_budget/outer_target_c12`, a different fresh output root, and the same
+prior reference. A concurrency cap of three per array permits six GPUs total.
+`AMBI_BENCHMARK_PRESETS` preserves the listed evaluation order; the existing
+single `AMBI_BENCHMARK_PRESET` remains the fallback when the list is omitted.
+`--smoke` keeps its separate seed-101, three-decision protocol and omits W&B;
+it requires a matching three-decision prior reference, not the full-episode
+reference above.
+
 ### More critic updates on shared observations
 
 `ambi_humanoid_inner_critic_sweep.json` holds the D512-4-J6 collection and
