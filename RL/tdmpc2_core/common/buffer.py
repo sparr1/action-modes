@@ -35,6 +35,8 @@ class Buffer():
 		self._total_transitions = 0
 		self._resident_episode_rows = deque()
 		self._resident_rows = 0
+		self._transition_index_cache = {}
+		self._num_sampleable_transitions = 0
 		self._pin_memory = False
 		self._resumable_storage = False
 		if resumable:
@@ -129,6 +131,11 @@ class Buffer():
 				self._resident_episode_rows.popleft()
 			else:
 				self._resident_episode_rows[0] = [rows, initial_rows, resident_transitions]
+		self._invalidate_transition_index()
+
+	def _invalidate_transition_index(self):
+		self._transition_index_cache.clear()
+		self._num_sampleable_transitions = None
 
 	def _reserve_buffer(self, storage, *, sampler=None, pin_memory=None):
 		"""
@@ -264,6 +271,85 @@ class Buffer():
 		# Keep the historical one-argument seam used by tests and downstream
 		# instrumentation when behavior-policy replay is disabled.
 		return self._prepare_batch(td)
+
+	@property
+	def num_sampleable_transitions(self):
+		"""Count real transitions with both observations still resident.
+
+		An evicted predecessor makes the oldest remaining row of a partial
+		episode unusable, even though that row still contains a recorded action.
+		"""
+		if self._num_sampleable_transitions is None:
+			self._num_sampleable_transitions = sum(
+				max(0, rows - 1) for rows, _, _ in self._resident_episode_rows
+			)
+		return self._num_sampleable_transitions
+
+	def _transition_index(self, device):
+		"""Build episode lookup tensors once per replay mutation and device."""
+		device = torch.device(device)
+		if device not in self._transition_index_cache:
+			counts, starts = [], []
+			row_offset = 0
+			for rows, _, _ in self._resident_episode_rows:
+				if rows > 1:
+					counts.append(rows - 1)
+					starts.append(row_offset)
+				row_offset += rows
+			cumulative = torch.tensor(counts, dtype=torch.long, device=device).cumsum(0)
+			preceding = torch.cat((cumulative.new_zeros(1), cumulative[:-1]))
+			self._transition_index_cache[device] = (
+				cumulative, preceding, torch.tensor(starts, dtype=torch.long, device=device)
+			)
+		return self._transition_index_cache[device]
+
+	def sample_transitions(self, batch_size, *, generator):
+		"""Sample independent real transitions without touching the outer sampler.
+
+		Sampling is uniform with replacement over consecutive resident rows
+		within each episode. Actions, rewards, and true termination flags belong
+		to the successor row. Episode timeouts still retain their successor.
+		The caller supplies an isolated generator; neither TorchRL's sequence
+		sampler nor PyTorch's default RNG is consumed.
+		"""
+		if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+			raise ValueError("Real replay transition batch_size must be a positive integer.")
+		if not isinstance(generator, torch.Generator):
+			raise TypeError("Real replay transition sampling requires a torch.Generator.")
+		total = self.num_sampleable_transitions
+		if total == 0:
+			raise ValueError("Cannot sample real replay without a resident transition pair.")
+		draw_device = generator.device
+		cumulative, preceding, starts = self._transition_index(draw_device)
+		draws = torch.randint(total, (batch_size,), device=draw_device, generator=generator)
+		episodes = torch.searchsorted(cumulative, draws, right=True)
+		logical = starts[episodes] + draws - preceding[episodes]
+		cursor = int(self._buffer._writer._cursor) if self.size == self.capacity else 0
+		indices = (logical + cursor).remainder(self.capacity).to(self._storage_device)
+		next_indices = (indices + 1).remainder(self.capacity)
+		storage = self._buffer._storage
+		current = storage[indices].select("obs", "task", strict=False)
+		successor = storage[next_indices].select("obs", "action", "reward", "terminated", strict=False)
+		if self._pin_memory:
+			current = current.pin_memory()
+			successor = successor.pin_memory()
+		current = current.to(self._device, non_blocking=True)
+		successor = successor.to(self._device, non_blocking=True)
+		reward = successor["reward"].reshape(batch_size, 1).contiguous()
+		terminated = successor.get("terminated", None)
+		terminated = (
+			torch.zeros_like(reward)
+			if terminated is None
+			else terminated.reshape(batch_size, 1).contiguous()
+		)
+		return (
+			current["obs"].contiguous(),
+			successor["action"].contiguous(),
+			reward,
+			successor["obs"].contiguous(),
+			terminated,
+			current.get("task", None),
+		)
 
 	def _behavior_policy_enabled(self):
 		return bool(getattr(self.cfg, "store_behavior_policy", False))
@@ -742,3 +828,4 @@ class Buffer():
 			list(entry) for entry in state["resident_episode_rows"]
 		)
 		self._resident_rows = int(state["resident_rows"])
+		self._invalidate_transition_index()

@@ -158,6 +158,12 @@ The output path must be new and outside the source checkout. The test uses five
 warmup solves and ten alternating trace-off/on pairs. It reports the threshold
 result without imposing a noisy wall-clock assertion on ordinary CI.
 
+The frozen evaluator supports finite-horizon inner SAC and transition-based
+update counts. It rejects `inner_outer_replay_fraction > 0` because these model
+snapshots do not include real replay. Test replay mixing through a populated
+training agent. See the [inner SAC options](../../RL/tdmpc2_core/README.md#finite-horizon-inner-sac-and-real-replay-mixing)
+for the target convention and schedule restrictions.
+
 ### Existing research matrices
 
 The active end-to-end configs live directly under `configs/ambi/`.

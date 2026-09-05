@@ -1,6 +1,7 @@
 """Utilities shared by AMBI inner-improvement strategies."""
 
 from contextlib import contextmanager
+from fractions import Fraction
 import math
 
 import torch
@@ -11,6 +12,16 @@ from .training_state import require_exact_keys, require_tensor
 
 
 _SCOPES = {"action": 0, "episode": 1, "run": 2}
+
+
+def updates_for_transitions(count, interval):
+    """Exact floor for the configured decimal interval, with no float drift.
+
+    Called once per collection round (and during config resolution), never
+    inside compiled kernels. Integer arithmetic also avoids division overflow.
+    """
+    ratio = Fraction(str(interval))
+    return int(count) * ratio.denominator // ratio.numerator
 
 
 def allocate_across_rounds(total, rounds):

@@ -10,6 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, fields as dataclass_fields
 import math
 import time
+import warnings
 
 import torch
 
@@ -19,6 +20,7 @@ from .common.compile_regions import CompileRegion
 from .common.inner_utils import (
     InnerRNG,
     allocate_across_rounds,
+    updates_for_transitions,
     copy_lora_adapters_,
     lora_uses_shared_bases,
     rebase_clone_with_target_,
@@ -185,6 +187,11 @@ class InnerImprovementEngine:
                 strict=strict,
             ),
         }
+        if getattr(self.cfg, "inner_finite_horizon", False):
+            self._compile_regions["prior_value"] = CompileRegion(
+                "inner horizon prior value", self._prior_bootstrap,
+                enabled=enabled, strict=strict,
+            )
 
     @property
     def alpha(self):
@@ -268,6 +275,12 @@ class InnerImprovementEngine:
         )
 
     @property
+    def _uses_steps_per_update(self):
+        return self._uses_canonical_schedule and (
+            getattr(self.cfg, "inner_steps_per_update", None) is not None
+        )
+
+    @property
     def _mppi_iterations(self):
         return int(
             getattr(self.cfg, "inner_mppi_iterations", self.cfg.inner_rounds)
@@ -276,6 +289,8 @@ class InnerImprovementEngine:
     def _canonical_schedule_has_updates(self):
         if not self._uses_canonical_schedule:
             return False
+        if self._uses_steps_per_update:
+            return int(self.cfg.inner_critic_updates_per_action) > 0
         if self._uses_component_update_schedule:
             return any(
                 int(getattr(self.cfg, key, 0)) > 0
@@ -1093,6 +1108,7 @@ class InnerImprovementEngine:
                 latent_dim=self.cfg.latent_dim,
                 action_dim=self.cfg.action_dim,
                 device=self.device,
+                store_horizon=bool(getattr(self.cfg, "inner_finite_horizon", False)),
             )
             candidate.replay.load_training_state_dict(workspace["replay"])
 
@@ -1458,7 +1474,7 @@ class InnerImprovementEngine:
         explorer_actor_optim = pool.explorer_actor_optim
         pool.explorer_actor_optim = None
         if train_actor and int(
-            getattr(cfg, "inner_explorer_actor_updates_per_round", 0)
+            getattr(cfg, "inner_explorer_actor_updates_per_action", 0)
         ) > 0:
             if explorer_actor_optim is None:
                 explorer_actor_optim = self._new_optimizer(explorer_actor, "actor")
@@ -1501,7 +1517,7 @@ class InnerImprovementEngine:
 
             explorer_critic_optim = pool.explorer_critic_optim
             pool.explorer_critic_optim = None
-            if int(getattr(cfg, "inner_explorer_critic_updates_per_round", 0)) > 0:
+            if int(getattr(cfg, "inner_explorer_critic_updates_per_action", 0)) > 0:
                 if explorer_critic_optim is None:
                     explorer_critic_optim = self._new_optimizer(
                         explorer_critic, "critic"
@@ -1529,7 +1545,7 @@ class InnerImprovementEngine:
                         explorer_log_alpha.copy_(initial_log_alpha)
                 explorer_alpha_fixed = None
                 if int(
-                    getattr(cfg, "inner_explorer_temperature_updates_per_round", 0)
+                    getattr(cfg, "inner_explorer_temperature_updates_per_action", 0)
                 ) > 0:
                     if explorer_temperature_optim is None:
                         explorer_temperature_optim = torch.optim.Adam(
@@ -1755,6 +1771,7 @@ class InnerImprovementEngine:
                     action_dim=cfg.action_dim,
                     device=self.device,
                     store_source=self._explorer_active,
+                    store_horizon=bool(getattr(cfg, "inner_finite_horizon", False)),
                 )
         elif outer_changed:
             # Latents are coordinates of the current encoder/dynamics and may
@@ -1830,11 +1847,11 @@ class InnerImprovementEngine:
     ):
         kwargs = {}
         if inner_bounds:
-            kwargs.update(
-                log_std_mapping=self.cfg.inner_log_std_mapping,
-                log_std_min=self.cfg.inner_log_std_min,
-                log_std_max=self.cfg.inner_log_std_max,
-            )
+            kwargs = {
+                "log_std_mapping": self.cfg.inner_log_std_mapping,
+                "log_std_min": self.cfg.inner_log_std_min,
+                "log_std_max": self.cfg.inner_log_std_max,
+            }
         if mode == "policy_sample":
             if hasattr(self.model, "pi_action") and not return_info:
                 return self.model.pi_action(
@@ -1897,13 +1914,14 @@ class InnerImprovementEngine:
         terminated_rollout = torch.zeros(count, dtype=torch.bool, device=self.device)
         discounts = torch.ones(count, device=self.device)
         transition_fields = ([], [], [], [], [])
+        horizon_flags = []
         transition_count = 0
         std_scale = float(cfg.inner_behavior_std_scale)
         behavior_mode = str(cfg.inner_behavior_action)
         if behavior_mode == "policy_sample" and std_scale == 0.0:
             behavior_mode = "mean"
 
-        for _ in range(horizon):
+        for step in range(horizon):
             active = (
                 torch.nonzero(alive, as_tuple=False).squeeze(-1)
                 if cfg.episodic
@@ -1939,6 +1957,8 @@ class InnerImprovementEngine:
                 (active_z, action, reward, next_z, terminated),
             ):
                 field.append(value)
+            if getattr(cfg, "inner_finite_horizon", False):
+                horizon_flags.append(torch.full_like(terminated, float(step == horizon - 1)))
             reward_vector = reward.squeeze(-1)
             lengths[active] += 1
             reward_sums[active] += reward_vector
@@ -1957,6 +1977,7 @@ class InnerImprovementEngine:
             state.replay.add_batch(
                 *flattened_fields,
                 source=int(source),
+                **({"horizon_end": torch.cat(horizon_flags, dim=0)} if horizon_flags else {}),
             )
             transition_rewards = flattened_fields[2].reshape(-1)
             transition_terminated = flattened_fields[4].reshape(-1).to(
@@ -2116,11 +2137,12 @@ class InnerImprovementEngine:
         )
         discounts = torch.ones(count, device=self.device)
         transition_fields = ([], [], [], [], [])
+        horizon_flags = []
         transition_count = 0
         action_dim = int(cfg.action_dim)
         std_scale = max(float(cfg.inner_behavior_std_scale), 1e-12)
 
-        for _ in range(horizon):
+        for step in range(horizon):
             active = (
                 torch.nonzero(alive, as_tuple=False).squeeze(-1)
                 if cfg.episodic
@@ -2214,6 +2236,8 @@ class InnerImprovementEngine:
                 (active_z, action, reward, next_z, terminated),
             ):
                 field.append(value)
+            if getattr(cfg, "inner_finite_horizon", False):
+                horizon_flags.append(torch.full_like(terminated, float(step == horizon - 1)))
             reward_vector = reward.squeeze(-1)
             lengths[active] += 1
             reward_sums[active] += reward_vector
@@ -2229,7 +2253,10 @@ class InnerImprovementEngine:
             flattened_fields = tuple(
                 torch.cat(values, dim=0) for values in transition_fields
             )
-            state.replay.add_batch(*flattened_fields, source=1)
+            state.replay.add_batch(
+                *flattened_fields, source=1,
+                **({"horizon_end": torch.cat(horizon_flags, dim=0)} if horizon_flags else {}),
+            )
             transition_rewards = flattened_fields[2].reshape(-1)
             transition_terminated = flattened_fields[4].reshape(-1).to(
                 dtype=torch.bool
@@ -2449,9 +2476,10 @@ class InnerImprovementEngine:
         state.actor.eval()
         self.model.eval()
         transition_fields = ([], [], [], [], [])
+        horizon_flags = []
         transition_count = 0
         with self.rng.fork("collection") as generator:
-            for _ in range(horizon):
+            for step in range(horizon):
                 active = torch.nonzero(alive, as_tuple=False).squeeze(-1)
                 if active.numel() == 0:
                     break
@@ -2485,6 +2513,8 @@ class InnerImprovementEngine:
                 transition_fields[2].append(reward)
                 transition_fields[3].append(next_z)
                 transition_fields[4].append(terminated)
+                if getattr(cfg, "inner_finite_horizon", False):
+                    horizon_flags.append(torch.full_like(terminated, float(step == horizon - 1)))
                 reward_vector = reward.squeeze(-1)
                 lengths[active] += 1
                 reward_sums[active] += reward_vector
@@ -2496,7 +2526,10 @@ class InnerImprovementEngine:
                 alive[active] = ~just_terminated
 
         if transition_fields[0]:
-            state.replay.add_batch(*(torch.cat(values, dim=0) for values in transition_fields))
+            state.replay.add_batch(
+                *(torch.cat(values, dim=0) for values in transition_fields),
+                **({"horizon_end": torch.cat(horizon_flags, dim=0)} if horizon_flags else {}),
+            )
 
         if cfg.inner_actor_adaptation != "frozen":
             state.actor.train()
@@ -2508,9 +2541,12 @@ class InnerImprovementEngine:
             "transition_count": transition_count,
         }
 
-    @torch.no_grad()
     def _dense_rollout_kernel(self, root_z, policy_noise, reward_support):
-        """Pure fixed-shape rollout; replay/counters are updated by the caller."""
+        """Pure rollout; the collector owns no_grad, replay and counters.
+
+        Keep this compile entrypoint undecorated: the locked PyTorch version
+        cannot capture a no_grad-decorated bound method with fullgraph=True.
+        """
         cfg, state = self.cfg, self.state
         count = int(cfg.inner_rollouts_per_round)
         horizon = int(cfg.inner_rollout_horizon)
@@ -2545,9 +2581,10 @@ class InnerImprovementEngine:
                 reward = td_math.two_hot_inv(reward_prediction, cfg)
             next_z = self.model.next_from_joint(joint)
             terminated = reward.new_zeros(count, 1)
-            transitions.append(
-                torch.cat((z, action, reward, next_z, terminated), dim=-1)
-            )
+            fields = (z, action, reward, next_z, terminated)
+            if getattr(cfg, "inner_finite_horizon", False):
+                fields += (torch.full_like(terminated, float(step == horizon - 1)),)
+            transitions.append(torch.cat(fields, dim=-1))
             reward_vector = reward.squeeze(-1)
             reward_sums = reward_sums + reward_vector
             discounted_rewards = discounted_rewards + (
@@ -2636,6 +2673,74 @@ class InnerImprovementEngine:
             self.state.sampled_sources.append(batch["source"].detach())
         return batch
 
+    @torch.no_grad()
+    def _mix_outer_critic_batch(self, batch):
+        """Replace critic rows with real transitions, retaining actor replay.
+
+        The original imagined minibatch is never mutated. Real observations
+        are encoded anew with the frozen current representation, and real
+        transitions always use the ordinary inner Bellman continuation.
+        """
+        fraction = float(getattr(self.cfg, "inner_outer_replay_fraction", 0.0))
+        if fraction == 0.0:
+            return batch, {}
+        batch_size = int(batch["z"].shape[0])
+        count = int(math.floor(fraction * batch_size + 0.5))
+        replay = getattr(self, "outer_replay_buffer", None)
+        available = (
+            replay is not None and replay.num_sampleable_transitions > 0
+        )
+        metrics = {
+            "outer_replay_available": float(available),
+            "outer_replay_samples": 0.0,
+            "outer_replay_fraction": 0.0,
+        }
+        if not available or count == 0:
+            if not available and not getattr(self, "_warned_empty_outer_replay", False):
+                warnings.warn(
+                    "inner_outer_replay_fraction requested real critic data, but no "
+                    "usable outer replay is available; using imagined data until "
+                    "replay is populated (realized fraction=0).",
+                    RuntimeWarning, stacklevel=2,
+                )
+                self._warned_empty_outer_replay = True
+            return batch, metrics
+        obs, action, reward, next_obs, terminated, task = replay.sample_transitions(
+            count, generator=self.rng.generator("replay")
+        )
+        with self.rng.fork("observation"):
+            encoded = self.model.encode(
+                torch.cat((obs, next_obs), dim=0),
+                None if task is None else torch.cat((task, task), dim=0),
+            )
+            real_z, real_next_z = encoded.split(count, dim=0)
+        real = {
+            "z": real_z,
+            "action": action,
+            "reward": reward,
+            "next_z": real_next_z,
+            "terminated": terminated,
+        }
+        mixed = {}
+        imagined_count = batch_size - count
+        for name, value in batch.items():
+            if name in real:
+                rows = real[name].to(device=value.device, dtype=value.dtype)
+            elif name == "horizon_end":
+                rows = value.new_zeros((count, *value.shape[1:]))
+            elif name == "source":
+                # Primary/explorer source summaries describe imagined data;
+                # label real rows separately so neither inherits their errors.
+                rows = value.new_full((count, *value.shape[1:]), 2)
+            else:
+                # Sample IDs refer to imagined replay and cannot describe real
+                # rows. Critic kernels need neither index metadata field.
+                continue
+            mixed[name] = torch.cat((value[:imagined_count], rows), dim=0)
+        metrics["outer_replay_samples"] = float(count)
+        metrics["outer_replay_fraction"] = float(count) / float(batch_size)
+        return mixed, metrics
+
     def _bootstrap_q(
         self,
         z,
@@ -2668,6 +2773,32 @@ class InnerImprovementEngine:
             generator=generator,
         )
 
+    def _prior_noise(self, next_z):
+        count = int(next_z.shape[0])
+        self.state.policy_evaluations += count
+        self.state.q_evaluations += count
+        return torch.randn(
+            (*next_z.shape[:-1], int(self.cfg.action_dim)),
+            device=next_z.device, dtype=next_z.dtype,
+            generator=self.rng.generator("bootstrap"),
+        )
+
+    def _prior_bootstrap(self, next_z, noise):
+        """The MPPI tail: outer distribution, online Q, no extra entropy."""
+        with torch.no_grad():
+            action, _ = self.model.pi(next_z, noise=noise)
+            return self.model.Q(
+                next_z, action, reduction=self.cfg.mppi_terminal_q_reduction
+            )
+
+    def _sac_target(self, reward, terminated, bootstrap):
+        if (getattr(self.cfg, "inner_finite_horizon", False)
+                or getattr(self.cfg, "inner_outer_replay_fraction", 0.0) > 0):
+            # Multiplication by zero does not mask NaN/Inf. Select first so
+            # a truly terminal row cannot inherit an unused continuation.
+            bootstrap = torch.where(terminated == 1, 0.0, bootstrap)
+        return reward + float(self.agent.discount) * (1.0 - terminated) * bootstrap
+
     def _sac_critic_kernel(
         self,
         z,
@@ -2678,6 +2809,8 @@ class InnerImprovementEngine:
         alpha,
         policy_noise,
         pair_indices,
+        horizon_end=None,
+        prior_noise=None,
     ):
         """Pure SAC critic loss region; the optimizer step stays eager."""
         state, cfg = self.state, self.cfg
@@ -2702,9 +2835,10 @@ class InnerImprovementEngine:
             bootstrap = next_q
             if cfg.inner_sac_critic_target == "entropy_augmented":
                 bootstrap = bootstrap - alpha * next_info["log_prob"]
-            target_q = reward + float(self.agent.discount) * (
-                1.0 - terminated
-            ) * bootstrap
+            if horizon_end is not None:
+                prior_value = self._prior_bootstrap(next_z, prior_noise)
+                bootstrap = torch.where(horizon_end.bool(), prior_value, bootstrap)
+            target_q = self._sac_target(reward, terminated, bootstrap)
 
         predictions = self.model.q_predictions(z, action, qs=state.critic)
         critic_loss = self.model.critic_loss(predictions, target_q)
@@ -2731,6 +2865,9 @@ class InnerImprovementEngine:
         # Keep pair selection inside Q with generator=None. It must follow any
         # forked-default dropout draws exactly as it did in eager execution.
         pair_indices = None
+        horizon_args = ()
+        if getattr(cfg, "inner_finite_horizon", False):
+            horizon_args = (batch["horizon_end"], self._prior_noise(batch["next_z"]))
         critic_loss, values, target_q, clip_fraction = self._compile_regions[
             "critic"
         ](
@@ -2742,6 +2879,7 @@ class InnerImprovementEngine:
             alpha,
             policy_noise,
             pair_indices,
+            *horizon_args,
         )
         state.policy_evaluations += batch_size
         state.q_evaluations += batch_size
@@ -2904,9 +3042,12 @@ class InnerImprovementEngine:
                 raise ValueError(
                     f"Unknown inner mixture target estimator: {estimator!r}"
                 )
-            target_q = batch["reward"] + float(self.agent.discount) * (
-                1.0 - batch["terminated"]
-            ) * bootstrap
+            if getattr(cfg, "inner_finite_horizon", False):
+                prior_value = self._compile_regions["prior_value"](
+                    batch["next_z"], self._prior_noise(batch["next_z"])
+                )
+                bootstrap = torch.where(batch["horizon_end"].bool(), prior_value, bootstrap)
+            target_q = self._sac_target(batch["reward"], batch["terminated"], bootstrap)
 
         state.policy_evaluations += 2 * batch_size
         predictions = self.model.q_predictions(
@@ -2986,11 +3127,15 @@ class InnerImprovementEngine:
                     explorer_bootstrap
                     - self.explorer_alpha.detach() * explorer_info["log_prob"]
                 )
-            continuation = float(self.agent.discount) * (
-                1.0 - batch["terminated"]
-            )
-            primary_target = batch["reward"] + continuation * primary_bootstrap
-            explorer_target = batch["reward"] + continuation * explorer_bootstrap
+            if getattr(cfg, "inner_finite_horizon", False):
+                prior_value = self._compile_regions["prior_value"](
+                    batch["next_z"], self._prior_noise(batch["next_z"])
+                )
+                boundary = batch["horizon_end"].bool()
+                primary_bootstrap = torch.where(boundary, prior_value, primary_bootstrap)
+                explorer_bootstrap = torch.where(boundary, prior_value, explorer_bootstrap)
+            primary_target = self._sac_target(batch["reward"], batch["terminated"], primary_bootstrap)
+            explorer_target = self._sac_target(batch["reward"], batch["terminated"], explorer_bootstrap)
         state.policy_evaluations += 2 * batch_size
         state.q_evaluations += 2 * batch_size
         metrics = {}
@@ -3999,8 +4144,10 @@ class InnerImprovementEngine:
             slot_metrics = {}
             if self.cfg.inner_operator == "sac":
                 if do_critic:
+                    critic_batch, mix_metrics = self._mix_outer_critic_batch(batch)
+                    slot_metrics.update(mix_metrics)
                     with self.rng.fork("bootstrap"):
-                        slot_metrics.update(self._sac_critic_step(batch, alpha))
+                        slot_metrics.update(self._sac_critic_step(critic_batch, alpha))
                 if do_temperature or do_actor:
                     slot_metrics.update(
                         self._sac_policy_step(
@@ -4096,6 +4243,7 @@ class InnerImprovementEngine:
         self,
         *,
         realized_transition_count,
+        scheduled_update_count=None,
         actor_loss_scale=None,
     ):
         """Run critic-first component doses for an active explorer round."""
@@ -4119,8 +4267,11 @@ class InnerImprovementEngine:
                 )
             )
         )
-        if canonical_auto:
-            realized = int(realized_transition_count)
+        if canonical_auto or scheduled_update_count is not None:
+            realized = int(
+                realized_transition_count
+                if scheduled_update_count is None else scheduled_update_count
+            )
             primary_critic = realized
             primary_actor = realized
             primary_temperature = (
@@ -4178,12 +4329,16 @@ class InnerImprovementEngine:
                 update_primary_temperature = slot < primary_temperature
                 update_explorer_temperature = slot < explorer_temperature
                 slot_metrics = {}
+                critic_batch = batch
+                if update_primary_critic or update_explorer_critic:
+                    critic_batch, mix_metrics = self._mix_outer_critic_batch(batch)
+                    slot_metrics.update(mix_metrics)
                 if mode == "shared_mixture":
                     if update_primary_critic:
                         with self.rng.fork("bootstrap"):
                             slot_metrics.update(
                                 self._shared_mixture_critic_step(
-                                    batch, self.alpha.detach()
+                                    critic_batch, self.alpha.detach()
                                 )
                             )
                     if update_primary_actor or update_primary_temperature:
@@ -4204,7 +4359,7 @@ class InnerImprovementEngine:
                         with self.rng.fork("bootstrap"):
                             slot_metrics.update(
                                 self._separate_critics_step(
-                                    batch,
+                                    critic_batch,
                                     update_primary=update_primary_critic,
                                     update_explorer=update_explorer_critic,
                                 )
@@ -4252,6 +4407,7 @@ class InnerImprovementEngine:
         critic_slots = max(primary_critic, explorer_critic)
         for slot in range(critic_slots):
             batch = self._sample_batch()
+            batch, mix_metrics = self._mix_outer_critic_batch(batch)
             update_primary = slot < primary_critic
             update_explorer = slot < explorer_critic
             if mode == "shared_mixture":
@@ -4279,6 +4435,7 @@ class InnerImprovementEngine:
                 )
             else:
                 raise ValueError(f"Unknown explorer mode: {mode!r}")
+            slot_metrics.update(mix_metrics)
             history.append(slot_metrics)
 
         actor_slots = max(
@@ -4870,6 +5027,8 @@ class InnerImprovementEngine:
         """
         rollout_fallback = self._compile_regions["rollout"].failed
         critic_region_fallback = self._compile_regions["critic"].failed
+        if "prior_value" in self._compile_regions:
+            critic_region_fallback |= self._compile_regions["prior_value"].failed
         actor_fallback = self._compile_regions["actor"].failed
         critic_module_fallback = bool(
             self.state.critic is not None
@@ -5029,6 +5188,16 @@ class InnerImprovementEngine:
             "inner_nominal_critic_utd": float(
                 getattr(self.cfg, "inner_nominal_critic_utd", 0.0)
             ),
+            "inner_steps_per_update": float(
+                getattr(self.cfg, "inner_steps_per_update", None) or 0.0
+            ),
+            "inner_finite_horizon": float(
+                getattr(self.cfg, "inner_finite_horizon", False)
+            ),
+            "inner_outer_replay_fraction_requested": float(
+                getattr(self.cfg, "inner_outer_replay_fraction", 0.0)
+            ),
+            "inner_outer_replay_samples": 0.0,
             "inner_horizon_ratio": float(self.cfg.inner_horizon_ratio),
             "inner_requested_rollouts": 0.0,
             "inner_rollouts": 0.0,
@@ -5113,6 +5282,14 @@ class InnerImprovementEngine:
             "inner_explorer_critic_primary_td_error_abs_count": 0.0,
             "inner_explorer_critic_explorer_td_error_abs_count": 0.0,
         }
+        if getattr(self.cfg, "inner_outer_replay_fraction", 0.0) > 0:
+            replay = getattr(self, "outer_replay_buffer", None)
+            metrics.update(
+                inner_outer_replay_fraction=0.0,
+                inner_outer_replay_available=float(
+                    replay is not None and replay.num_sampleable_transitions > 0
+                ),
+            )
         metrics.update(self._compile_fallback_metrics())
         return metrics
 
@@ -5200,6 +5377,8 @@ class InnerImprovementEngine:
         update_history = []
         update_slots = 0
         requested_update_slots = 0
+        collected_transition_count = 0
+        interval_updates_requested = 0
         for round_index in range(int(cfg.inner_rounds)):
             if trace is not None:
                 trace.round_index = round_index + 1
@@ -5224,11 +5403,20 @@ class InnerImprovementEngine:
                 transition_sources.append(rollout["transition_sources"])
 
             update_start = self._timer_start()
+            scheduled_update_count = None
+            if self._uses_steps_per_update:
+                collected_transition_count += int(rollout["transition_count"])
+                cumulative_updates = updates_for_transitions(
+                    collected_transition_count, cfg.inner_steps_per_update
+                )
+                scheduled_update_count = cumulative_updates - interval_updates_requested
+                interval_updates_requested = cumulative_updates
             if self._uses_canonical_schedule:
                 if self._explorer_active or self._uses_component_update_schedule:
                     if self._explorer_active:
                         round_metrics = self._run_two_policy_component_updates(
                             realized_transition_count=rollout["transition_count"],
+                            scheduled_update_count=scheduled_update_count,
                             actor_loss_scale=actor_loss_scale
                         )
                         # The realized history length is the exact number of
@@ -5246,7 +5434,9 @@ class InnerImprovementEngine:
                         requested_update_slots += critic_count + actor_count
                 else:
                     configured_updates = cfg.inner_updates_per_round
-                    if configured_updates == "auto":
+                    if scheduled_update_count is not None:
+                        round_updates = scheduled_update_count
+                    elif configured_updates == "auto":
                         # Episodic branches may terminate before H; UTD=1 tracks
                         # transitions actually appended during this collection.
                         round_updates = int(rollout["transition_count"])
@@ -5556,6 +5746,9 @@ class InnerImprovementEngine:
                 explorer_samples.float() / float(max(1, total_samples))
             )
         metrics.update(self._average_update_metrics(update_history))
+        metrics["inner_outer_replay_samples"] = sum(
+            (item.get("outer_replay_samples", 0.0) for item in update_history), 0.0
+        )
         metrics.update(diagnostic_metrics)
         metrics["inner_total_model_steps"] = (
             metrics["inner_model_steps"]

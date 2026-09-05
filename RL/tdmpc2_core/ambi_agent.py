@@ -655,6 +655,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self._actor_loss_scale_value.lerp_(value, self._actor_loss_scale_tau)
         return value
 
+    def set_outer_replay_buffer(self, buffer):
+        """Expose current real replay to optional critic-only inner sampling."""
+        self.inner_engine.outer_replay_buffer = buffer
+
     def reset(self):
         if self._resume_boundary_prepared:
             # A full checkpoint already advanced the inner episode lifecycle.
@@ -761,6 +765,16 @@ class AMBITDMPC2Agent(torch.nn.Module):
         # their absence itself denotes the legacy single-policy controller.
         if str(getattr(self.cfg, "inner_explorer_mode", "none")) != "none":
             spec["inner_population"] = self._inner_population_spec()
+        options = {
+            "finite_horizon": bool(getattr(self.cfg, "inner_finite_horizon", False)),
+            "steps_per_update": getattr(self.cfg, "inner_steps_per_update", None),
+            "outer_replay_fraction": float(getattr(self.cfg, "inner_outer_replay_fraction", 0.0)),
+        }
+        if any(options.values()):
+            if options["finite_horizon"]:
+                options["horizon"] = int(self.cfg.inner_rollout_horizon)
+                options["terminal_q_reduction"] = self.cfg.mppi_terminal_q_reduction
+            spec["inner_solve"] = options
         return spec
 
     def _inner_population_spec(self):

@@ -27,12 +27,14 @@ def _snapshot(agent):
 
 @pytest.mark.parametrize("probes", [False, True])
 @pytest.mark.parametrize("adaptation", ["clone", "lora"])
-def test_trace_preserves_updates_actions_all_rng_and_modes(probes, adaptation):
+@pytest.mark.parametrize("finite_horizon", [False, True])
+def test_trace_preserves_updates_actions_all_rng_and_modes(probes, adaptation, finite_horizon):
     params = dict(inner_rounds=2, inner_critic_updates_per_round=2,
                   inner_actor_updates_per_round=1, q_representation="distributional",
                   num_q=3, dropout=0.2, inner_actor_adaptation=adaptation,
                   inner_critic_adaptation=adaptation,
-                  inner_actor_lora_dropout=0.3, inner_critic_lora_dropout=0.3)
+                  inner_actor_lora_dropout=0.3, inner_critic_lora_dropout=0.3,
+                  inner_finite_horizon=finite_horizon)
     ordinary = _tiny_component_model(**params)
     observed = _tiny_component_model(**params)
     global_rng = torch.random.get_rng_state().clone()
@@ -105,6 +107,29 @@ def test_trace_only_adds_no_model_calls_or_rng_forks(monkeypatch):
         assert counts == expected
     finally:
         model.env.close()
+
+
+def test_trace_records_finite_horizon_transition_schedule_without_changing_updates():
+    options = dict(inner_finite_horizon=True, inner_rounds=3,
+                   inner_steps_per_update=3, inner_updates_per_round=None)
+    ordinary = _tiny_model(**options)
+    observed = _tiny_model(**options)
+    trace = InnerActionTrace(probes=True, probe_rollouts=2, probe_horizon=2)
+    try:
+        first = ordinary.agent.act(torch.zeros(3), collect_diagnostics=False)
+        second = observed.agent.act(torch.zeros(3), collect_diagnostics=False, trace=trace)
+        torch.testing.assert_close(first, second, rtol=0, atol=0)
+        _assert_tree_equal(_snapshot(observed.agent), _snapshot(ordinary.agent))
+        updates = [event for event in trace.events if event["phase"] == "update"]
+        assert [(event["round_index"], event["critic_updates"]) for event in updates] == [
+            (1, 1), (2, 2), (3, 3), (3, 4),
+        ]
+        assert all(event["critic_updates"] == event["actor_updates"] == event["temperature_updates"]
+                   for event in updates)
+        assert [event["round_index"] for event in trace.events if event["phase"] == "probe"] == [0, 1, 2, 3]
+    finally:
+        ordinary.env.close()
+        observed.env.close()
 
 
 def test_packing_trace_uses_one_host_transfer_and_preserves_other_payloads(monkeypatch):
@@ -249,11 +274,13 @@ def test_root_reset_makes_probes_independent_of_root_order():
 
 
 @pytest.mark.parametrize("adaptation", ["clone", "lora"])
-def test_evaluation_pool_reuse_matches_discarded_scientific_state(adaptation):
+@pytest.mark.parametrize("finite_horizon", [False, True])
+def test_evaluation_pool_reuse_matches_discarded_scientific_state(adaptation, finite_horizon):
     params = dict(inner_rounds=2, inner_critic_updates_per_round=2,
                   inner_actor_updates_per_round=1, inner_actor_adaptation=adaptation,
                   inner_critic_adaptation=adaptation, dropout=0.2,
-                  inner_actor_lora_dropout=0.2, inner_critic_lora_dropout=0.2)
+                  inner_actor_lora_dropout=0.2, inner_critic_lora_dropout=0.2,
+                  inner_finite_horizon=finite_horizon)
     discarded = _tiny_component_model(**params)
     reused = _tiny_component_model(**params)
     try:
@@ -292,7 +319,8 @@ def test_evaluation_pool_reuse_discards_persistent_components():
         model.env.close()
 
 
-def test_evaluation_pool_reuse_preserves_real_dynamo_graphs(monkeypatch):
+@pytest.mark.parametrize("finite_horizon", [False, True])
+def test_evaluation_pool_reuse_preserves_real_dynamo_graphs(monkeypatch, finite_horizon):
     # Count real Dynamo backend invocations, not just calls to torch.compile.
     # Eager graph execution avoids expensive platform-specific code generation.
     torch._dynamo.reset()
@@ -306,7 +334,8 @@ def test_evaluation_pool_reuse_preserves_real_dynamo_graphs(monkeypatch):
     monkeypatch.setattr(torch, "compile", compile_counted)
     model = _tiny_component_model(compile=True, inner_rounds=1,
                                   inner_critic_updates_per_round=1,
-                                  inner_actor_updates_per_round=1)
+                                  inner_actor_updates_per_round=1,
+                                  inner_finite_horizon=finite_horizon)
     engine = model.agent.inner_engine
     try:
         model.agent.act(torch.zeros(3), collect_diagnostics=False)

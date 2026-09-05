@@ -192,15 +192,45 @@ class Ensemble(nn.Module):
 
 	def _forward_detached_eager(self, *args, **kwargs):
 		"""Evaluate Qs with frozen Q parameters while preserving input gradients."""
+		compiling = (
+			hasattr(torch, "compiler")
+			and hasattr(torch.compiler, "is_compiling")
+			and torch.compiler.is_compiling()
+		)
 		outputs = []
 		for module in self.modules_list:
-			detached_parameters = _DETACHED_PARAMETER_VIEWS.get(module)
+			layers = module if isinstance(module, nn.Sequential) else (module,)
+			if compiling and len(args) == 1 and not kwargs and all(
+				type(layer) in (nn.Linear, NormedLinear) for layer in layers
+			):
+				# The locked PyTorch cannot trace functional_call. Express the
+				# standard critic MLP directly, retaining NormedLinear's exact
+				# linear -> dropout -> LayerNorm -> activation order. Eager and
+				# custom/LoRA modules retain the general stateless path below.
+				x = args[0]
+				for layer in layers:
+					x = F.linear(x, layer.weight.detach(),
+						None if layer.bias is None else layer.bias.detach())
+					if isinstance(layer, NormedLinear):
+						if layer.dropout is not None:
+							x = layer.dropout(x)
+						ln = layer.ln
+						x = F.layer_norm(x, ln.normalized_shape,
+							None if ln.weight is None else ln.weight.detach(),
+							None if ln.bias is None else ln.bias.detach(), ln.eps)
+						x = layer.act(x)
+				outputs.append(x)
+				continue
+			# Weak-key cache lookups cannot be traced. During compilation,
+			# detach is a zero-copy tensor operation captured in the graph.
+			detached_parameters = None if compiling else _DETACHED_PARAMETER_VIEWS.get(module)
 			if detached_parameters is None:
 				detached_parameters = {
 					name: parameter.detach()
 					for name, parameter in module.named_parameters()
 				}
-				_DETACHED_PARAMETER_VIEWS[module] = detached_parameters
+				if not compiling:
+					_DETACHED_PARAMETER_VIEWS[module] = detached_parameters
 			outputs.append(
 				functional_call(module, detached_parameters, args, kwargs)
 			)
