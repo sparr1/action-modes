@@ -47,11 +47,20 @@ if [[ ! -x "$SHA_PREFLIGHT" ]]; then
   exit 1
 fi
 readonly SOURCE_COMMIT="$("$SHA_PREFLIGHT")"
-if [[ -z "${SLURM_TMPDIR:-}" || ! -d "$SLURM_TMPDIR" ]]; then
-  echo "A job-local SLURM_TMPDIR is required for this non-durable smoke run." >&2
+# Hydra's GPU partition does not currently populate SLURM_TMPDIR. Its /ltmp
+# mount is node-local and ephemeral, so it is the safe fallback for smoke data.
+if [[ -n "${SLURM_TMPDIR:-}" ]]; then
+  readonly NODE_LOCAL_SCRATCH_BASE="${SLURM_TMPDIR%/}"
+else
+  readonly NODE_LOCAL_SCRATCH_BASE="/ltmp"
+fi
+if [[ "$NODE_LOCAL_SCRATCH_BASE" != /* ]] || \
+  [[ ! -d "$NODE_LOCAL_SCRATCH_BASE" ]] || \
+  [[ ! -w "$NODE_LOCAL_SCRATCH_BASE" ]]; then
+  echo "Missing writable absolute node-local scratch: $NODE_LOCAL_SCRATCH_BASE" >&2
   exit 1
 fi
-readonly SMOKE_ROOT="$(mktemp -d "${SLURM_TMPDIR%/}/ambi-prior-banks-smoke-${SLURM_JOB_ID}-XXXXXX")"
+readonly SMOKE_ROOT="$(mktemp -d "${NODE_LOCAL_SCRATCH_BASE}/rgao48-ambi-prior-banks-smoke-${SLURM_JOB_ID}-XXXXXX")"
 readonly SMOKE_ALGORITHM_ROOT="$SMOKE_ROOT/algs"
 readonly SMOKE_MANIFEST_ROOT="$SMOKE_ROOT/experiments"
 readonly SMOKE_RESULT_ROOT="$SMOKE_ROOT/results"
