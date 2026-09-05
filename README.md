@@ -211,6 +211,36 @@ after explicitly freezing and profiling an inner-loop compute schedule; the
 sparse historical Walker AMBI template inherits a substantially larger default
 inner workload and is not a confirmatory benchmark configuration.
 
+### TD-MPC2 prior-only checkpoint bank
+
+To train a backbone for later frozen policy-prior versus MPPI comparisons, use
+`configs/dmcontrol/experiments/tdmpc2_humanoid_walk_state_prior_only_checkpoint_bank_1p5m.json`
+with `--alg-dir configs/dmcontrol/algs`. It runs Humanoid Walk state observations
+for 1.5 million agent decisions with seed 55 and `mpc=false`. After the existing
+random seed collection, the controller executes stochastic, tanh-squashed
+policy-prior actions. The horizon-3 TD-MPC2 world-model, reward-only critic,
+fixed-entropy actor, replay, and optimizer settings remain unchanged.
+
+The run retains all 60 checkpoints at 25,000-decision intervals, together with
+their `.metadata.json` sidecars. Keep each pair together for frozen evaluation.
+Separate online evaluations are disabled; W&B records training diagnostics and
+episode returns under the descriptive prior-only run name in project `ambi`.
+The saved MPPI settings are inactive during collection and can be used for
+later checkpoint comparisons. No evaluation jobs are launched automatically.
+
+Submit from the clean, synchronized experiment checkout on Hydra:
+
+```bash
+EXPECTED_ACTION_MODES_SHA=$(git rev-parse HEAD) \
+  sbatch --export=ALL slurm/run_tdmpc2_humanoid_walk_state_prior_only_checkpoint_bank_1p5m_hydra.sbatch
+```
+
+The launcher requests one L40, eight CPUs, and 32 GiB, and writes to an isolated
+job directory under
+`/cs/home/rgao48/projects/ambi-runs/tdmpc2-prior-only-checkpoint-bank-1p5m`.
+These model snapshots support evaluation and weight transfer, not exact training
+resume.
+
 ## Rendering a checkpoint
 
 Use the dedicated renderer instead of `init.py`:

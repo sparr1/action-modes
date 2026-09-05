@@ -1,0 +1,24 @@
+{
+  "study_type": "tdmpc2_humanoid_walk_state_prior_only_checkpoint_bank",
+  "study_note": "Single-seed exploratory TD-MPC2 Humanoid Walk state checkpoint bank through 1.5M agent decisions, seed 55. Relative to the horizon-3 TD-MPC2 checkpoint bank, only the training seed, collection controller (mpc=false), and W&B identity change. After the unchanged random seed collection, training executes samples from the stochastic squashed-Gaussian policy prior; no MPPI planning runs. World-model, reward-only critic, fixed-entropy actor, training unroll horizon 3, optimizer, replay, and update settings remain unchanged. Separate online evaluation episodes are disabled. The retained planning parameters are inactive during collection and are available for later frozen prior-versus-MPPI evaluation; no evaluations are launched automatically. Sixty portable model snapshots are retained every 25k decisions with adjacent provenance metadata; they support frozen evaluation and weight transfer, not exact training resume.",
+  "overrides_alg": {
+    "env": "DMControl-v0"
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "tdmpc2_humanoid_walk_state_prior_only_checkpoint_bank_1p5m"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": [
+    "all"
+  ],
+  "log_info": false,
+  "log_type": "summary"
+}

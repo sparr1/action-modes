@@ -31,6 +31,10 @@ H5_LAUNCHER = (
     ROOT
     / "slurm/run_tdmpc2_humanoid_walk_state_checkpoint_bank_1p5m_train_h5_hydra.sbatch"
 )
+PRIOR_NAME = "tdmpc2_humanoid_walk_state_prior_only_checkpoint_bank_1p5m"
+PRIOR_ALGORITHM = ROOT / "configs/dmcontrol/algs" / f"{PRIOR_NAME}.json"
+PRIOR_MANIFEST = ROOT / "configs/dmcontrol/experiments" / f"{PRIOR_NAME}.json"
+PRIOR_LAUNCHER = ROOT / "slurm" / f"run_{PRIOR_NAME}_hydra.sbatch"
 
 
 def _reject_duplicate_keys(pairs):
@@ -230,3 +234,82 @@ def test_h5_checkpoint_bank_hydra_launcher_is_matched_and_isolated():
     assert "Outer planning horizon: 3" in contents
     assert "tdmpc2-checkpoint-bank-1p5m-train-h5" in contents
     assert "TDMPC2_EVAL_CSV" not in contents
+
+
+def test_prior_only_bank_changes_only_collection_seed_and_wandb_identity():
+    baseline = _load_json(BANK_ALGORITHM)
+    actual = _load_json(PRIOR_ALGORITHM)
+    expected = copy.deepcopy(baseline)
+    expected["seed"] = 55
+    params = expected["alg_params"]
+    params["mpc"] = False
+    params["wandb_group"] = (
+        "tdmpc2-humanoid-walk-prior-only-checkpoint-bank-1p5m"
+    )
+    params["wandb_run_name"] = (
+        "TDMPC2-humanoid-walk-prior-only-no-MPPI-checkpoint-bank-1p5m-seed55"
+    )
+    params["wandb_tags"].extend([
+        "prior-only-collection",
+        "no-mppi-training",
+        "stochastic-policy-prior",
+        "seed-55",
+    ])
+
+    assert actual == expected
+    assert actual["total_steps"] == 1_500_000
+    assert actual["alg_params"]["eval_freq"] is None
+
+
+def test_prior_only_bank_preserves_checkpoint_and_environment_protocol():
+    baseline = _load_json(BANK_MANIFEST)
+    actual = _load_json(PRIOR_MANIFEST)
+
+    assert actual["study_type"] == (
+        "tdmpc2_humanoid_walk_state_prior_only_checkpoint_bank"
+    )
+    assert "mpc=false" in actual["study_note"]
+    assert "stochastic squashed-Gaussian policy prior" in actual["study_note"]
+    assert "no MPPI planning runs" in actual["study_note"]
+    assert actual["configs"] == [PRIOR_NAME]
+    for key in (
+        "overrides_alg", "env_params", "trials", "logs", "save_trials",
+        "checkpoint_every", "save_strat", "log_info", "log_type",
+    ):
+        assert actual[key] == baseline[key]
+    assert actual["checkpoint_every"] == 25_000
+    assert actual["save_strat"] == ["all"]
+
+
+def test_prior_only_bank_launcher_uses_one_l40_and_isolated_seed55_artifacts():
+    contents = PRIOR_LAUNCHER.read_text()
+    for contract in (
+        "#SBATCH --constraint=l40\n",
+        "#SBATCH --gres=gpu:nvidia_l40:1\n",
+        "#SBATCH --cpus-per-task=8",
+        "#SBATCH --mem=32G",
+        "#SBATCH --time=5-00:00:00",
+        "git status --porcelain --untracked-files=normal",
+        "EXPECTED_ACTION_MODES_SHA",
+        "SEED=55\n",
+        "TRIAL_INDEX=0\n",
+        "Agent decisions: 1500000",
+        "Checkpoint cadence: 25000",
+        "Expected numbered checkpoints: 60",
+        "Collection: stochastic policy prior (mpc=false; no MPPI)",
+        "Separate online evaluation: disabled",
+        "AVAILABLE_KB < 4 * 1024 * 1024",
+        "export WANDB_MODE=online",
+        "export WANDB_DISABLE_CODE=true",
+        "--num-runs 1",
+        f"{PRIOR_NAME}.json",
+    ):
+        assert contract in contents
+    assert "#SBATCH --nodelist" not in contents
+    assert "#SBATCH --array" not in contents
+    assert "TDMPC2_EVAL_CSV" not in contents
+    assert "evaluate_" not in contents
+    assert (
+        'ARTIFACT_ROOT="/cs/home/rgao48/projects/ambi-runs/'
+        'tdmpc2-prior-only-checkpoint-bank-1p5m"'
+    ) in contents

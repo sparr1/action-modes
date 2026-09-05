@@ -106,6 +106,72 @@ def test_tdmpc2_rejects_inexact_timestep_budgets_before_training(budget):
     assert events == []
 
 
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_tdmpc2_prior_only_prediction_uses_sample_or_squashed_mean(
+    monkeypatch, deterministic
+):
+    env = OneStepTruncationEnv([])
+    model = make_model(TDMPC2Baseline, env, tiny_params(mpc=False))
+    observation, _ = env.reset(seed=3)
+    sampled = torch.tensor([[0.7]])
+    squashed_mean = torch.tensor([[-0.4]])
+
+    def forbidden_plan(*args, **kwargs):
+        raise AssertionError("Prior-only collection must bypass MPPI")
+
+    monkeypatch.setattr(model.agent, "_plan_val", forbidden_plan, raising=False)
+    monkeypatch.setattr(
+        model.agent.model, "pi",
+        lambda _z, _task: (sampled, {"mean": squashed_mean}),
+    )
+    model.agent.last_plan_metrics = {"planner_seconds": 1.0}
+
+    action, _ = model.predict(
+        observation, deterministic=deterministic, episode_start=True
+    )
+
+    expected = squashed_mean if deterministic else sampled
+    np.testing.assert_array_equal(action, expected[0].numpy())
+    assert model.agent.last_plan_metrics == {}
+
+
+def test_tdmpc2_prior_only_training_keeps_stochastic_collection_and_updates(
+    monkeypatch,
+):
+    events = []
+    env = OneStepTruncationEnv(events)
+    model = make_model(
+        TDMPC2Baseline, env,
+        tiny_params(
+            mpc=False, eval_freq=None, seed_steps=0, pretrain_steps=1,
+            train_unroll_horizon=1, outer_planning_horizon=1,
+            batch_size=1, episode_length=1,
+        ),
+        total_steps=2,
+    )
+
+    def forbidden_plan(*args, **kwargs):
+        raise AssertionError("Prior-only training must bypass MPPI and evaluation")
+
+    monkeypatch.setattr(model.agent, "_plan_val", forbidden_plan, raising=False)
+    monkeypatch.setattr(model, "_evaluate_policy", forbidden_plan)
+    original_act = model.agent.act
+
+    def record_act(*args, **kwargs):
+        assert kwargs["eval_mode"] is False
+        events.append("stochastic_prior")
+        return original_act(*args, **kwargs)
+
+    monkeypatch.setattr(model.agent, "act", record_act)
+    model.learn(total_timesteps=2)
+
+    assert events == ["env_step", "stochastic_prior", "env_step"]
+    assert model._num_updates == 2
+    assert model.agent.num_updates == 2
+    assert model.buffer.num_eps == 2
+    assert model.agent.last_plan_metrics == {}
+
+
 def test_ambi_preserves_the_exact_tdmpc2_training_loop_and_ordering():
     assert AMBITDMPC2.learn is TDMPC2Baseline.learn
     events = []
