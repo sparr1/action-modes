@@ -76,6 +76,30 @@ paired per-seed deltas and cost, then expand seeds/checkpoints for stronger
 claims. Bank roots share trajectory context and are not independent episode
 return measurements.
 
+### D512-4-J6 checkpoint progression on Hydra
+
+`named_run/d512_4_j6` reproduces the inner settings from
+[the D512-4-J6 run](https://wandb.ai/rwgao_b-brown-university/ambi/runs/09fdc28b8d304f2f8667d6d10799a792):
+six rounds, 512 rollouts per round, horizon three, batch 512, replay 9,216,
+and three **joint** updates per round (18 critic, actor, and temperature updates).
+The actor/critic/temperature learning rates are explicitly 5e-5/1e-4/3e-4.
+Finite-horizon handoff, transition-based scheduling, and real-replay mixing stay
+disabled to match that run. Real evaluation actions remain `tanh(mu)`.
+
+`slurm/run_ambi_inner_benchmark_hydra.sbatch` evaluates checkpoints 100k through
+500k in increments of 100k, one GPU per array task. Each task saves the five-seed
+prior baseline and shared bank, evaluates the named inner configuration for the
+same five episodes, then generates a report for that checkpoint. It does not
+run extra bank solves. W&B outputs go to `ambi-inner-bench`.
+
+Submit from the clean, synchronized checkout. Export `EXPECTED_ACTION_MODES_SHA`,
+`AMBI_CHECKPOINT_PREFIX` (the absolute filename prefix ending before the step
+number), and a fresh `AMBI_BENCHMARK_OUTPUT_ROOT`. Pass durable `--output` and
+`--error` paths to `sbatch`. A preliminary `--array=1 --time=00:30:00` submission
+with script argument `--smoke` tests three decisions per controller, omits W&B,
+and must use a separate output root. Default submissions run five episodes of
+up to 500 decisions per controller.
+
 ### Traces and portable report
 
 ```bash

@@ -76,7 +76,7 @@ def test_starter_budgets_resolve_from_saved_model_and_preserve_source(checkpoint
     assert matrix["evaluation"]["max_steps"] == 500
     expected = {"prior": (0, 0, 0), "sac_1x": (24, 8, 8),
                 "sac_2x": (48, 16, 16), "sac_4x": (96, 32, 32)}
-    for selector in list_preset_selectors(matrix):
+    for selector in list_preset_selectors(matrix, comparisons=["inner_budget"]):
         resolved = resolve_preset(MATRIX, selector, matrix, checkpoint_context=checkpoint_context)
         run = resolved["algorithm_config"]
         params = run["alg_params"]
@@ -107,6 +107,28 @@ def test_starter_budgets_resolve_from_saved_model_and_preserve_source(checkpoint
             assert cfg.inner_model_step_budget == 0
     assert matrix == before_matrix
     assert checkpoint_context == before_context
+
+
+def test_named_run_preserves_joint_schedule_and_all_source_inner_settings(checkpoint_context):
+    source = json.loads((ROOT / "configs/dmcontrol/algs/ambi_humanoid_walk_base_v2_d512_4_j6.json").read_text())
+    checkpoint_context.trial_run_params["alg_params"].update(
+        inner_actor_lr=0.9, inner_critic_lr=0.8, inner_temperature_lr=0.7,
+    )
+    resolved = resolve_preset(MATRIX, "named_run/d512_4_j6", checkpoint_context=checkpoint_context)
+    params = resolved["algorithm_config"]["alg_params"]
+    for key, value in source["alg_params"].items():
+        if key.startswith("inner_"):
+            assert params[key] == value
+    cfg = _build_cfg(resolved["algorithm_config"])
+    assert not cfg.inner_component_update_schedule
+    assert cfg.inner_updates_per_round == 3
+    assert cfg.inner_rounds == 6
+    assert cfg.inner_model_step_budget == cfg.inner_replay_capacity == 9216
+    assert (cfg.inner_critic_updates_per_action, cfg.inner_actor_updates_per_action,
+            cfg.inner_temperature_updates_per_action) == (18, 18, 18)
+    assert cfg.inner_finite_horizon is False
+    assert cfg.inner_steps_per_update is None
+    assert cfg.inner_outer_replay_fraction == 0.0
 
 
 @pytest.mark.parametrize("key", ["model_size", "obs", "num_q", "outer_critic_target", "actor_lr"])
