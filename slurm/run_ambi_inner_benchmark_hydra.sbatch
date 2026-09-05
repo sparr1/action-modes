@@ -24,12 +24,17 @@ fail() { echo "AMBI benchmark: $*" >&2; exit 2; }
 : "${SLURM_ARRAY_TASK_ID:?Submit as an array with task indices 1 through 5.}"
 PYTHON="${AMBI_DMC_PYTHON:-/cs/home/rgao48/projects/action-modes/environments/dmcontrol/.venv/bin/python}"
 preset="${AMBI_BENCHMARK_PRESET:-named_run/d512_4_j6}"
+matrix="${AMBI_BENCHMARK_MATRIX:-configs/research/ambi_humanoid_inner_benchmark.json}"
 cd "${SLURM_SUBMIT_DIR:?}"
 [[ "$(git rev-parse HEAD)" == "$EXPECTED_ACTION_MODES_SHA" ]] || fail "commit mismatch"
 [[ -z "$(git status --porcelain)" ]] || fail "checkout must be clean"
 [[ "$AMBI_CHECKPOINT_PREFIX" == /* && "$AMBI_BENCHMARK_OUTPUT_ROOT" == /* ]] || fail "paths must be absolute"
 [[ "$SLURM_ARRAY_TASK_ID" =~ ^[1-5]$ ]] || fail "array index must be 1 through 5"
-[[ $# -eq 0 || ( $# -eq 1 && "$1" == --smoke ) ]] || fail "only --smoke is supported"
+[[ $# -le 1 ]] || fail "expected at most one mode"
+case "${1:-}" in
+    ''|--smoke|--bank-only|--bank-smoke) ;;
+    *) fail "supported modes: --smoke, --bank-only, --bank-smoke" ;;
+esac
 checkpoint_step=$((SLURM_ARRAY_TASK_ID * 100000))
 checkpoint="${AMBI_CHECKPOINT_PREFIX}${checkpoint_step}"
 output="${AMBI_BENCHMARK_OUTPUT_ROOT}/step_${checkpoint_step}"
@@ -48,12 +53,33 @@ export WANDB_ARTIFACT_DIR="$WANDB_DIR/artifacts" WANDB_DISABLE_CODE=true
 export TORCHINDUCTOR_CACHE_DIR="${SLURM_TMPDIR:-/tmp}/ambi-inner-compile-${SLURM_JOB_ID}"
 mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$WANDB_DATA_DIR" "$WANDB_ARTIFACT_DIR"
 
-common=(--matrix configs/research/ambi_humanoid_inner_benchmark.json
-        --checkpoint "$checkpoint" --device cuda)
+common=(--matrix "$matrix" --checkpoint "$checkpoint" --device cuda)
 if [[ "${1:-}" == --smoke ]]; then
     common+=(--seeds 101 --max-steps 3)
+elif [[ "${1:-}" == --bank-smoke ]]; then
+    # Keep the bank's 500-decision protocol; shorten repetitions, not episodes.
+    common+=(--bank-repetitions 1)
 else
     common+=(--wandb)
+fi
+
+if [[ "${1:-}" == --bank-only || "${1:-}" == --bank-smoke ]]; then
+    : "${AMBI_BENCHMARK_REFERENCE_ROOT:?Set the original evaluation directory containing shared banks.}"
+    [[ "$AMBI_BENCHMARK_REFERENCE_ROOT" == /* ]] || fail "reference root must be absolute"
+    bank="$AMBI_BENCHMARK_REFERENCE_ROOT/step_${checkpoint_step}/roots.json"
+    [[ -f "$bank" ]] || fail "shared observation bank missing: $bank"
+    read -r -a bank_presets <<< "${AMBI_BENCHMARK_PRESETS:-$preset}"
+    selected=()
+    for bank_preset in "${bank_presets[@]}"; do
+        selected+=(--preset "$bank_preset")
+    done
+    [[ ${#selected[@]} -gt 0 ]] || fail "select at least one bank preset"
+    "$PYTHON" evaluate_ambi_checkpoint.py "${common[@]}" "${selected[@]}" \
+        --root-bank "$bank" --bank-only --bundle-dir "$output/bank" \
+        --output "$output/bank-results.json"
+    "$PYTHON" report_ambi_benchmark.py --bundle "$output/bank" \
+        --output "$output/comparison.html"
+    exit 0
 fi
 
 prior="$output/prior"

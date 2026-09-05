@@ -111,6 +111,50 @@ the corresponding previous `smoke` directory instead, because the three-decision
 protocol differs from the full evaluation protocol. Pairing is validated by the
 evaluator before results are accepted.
 
+### More critic updates on shared observations
+
+`ambi_humanoid_inner_critic_sweep.json` holds the D512-4-J6 collection and
+actor/temperature budgets fixed while increasing critic fitting. Select
+`critic_budget/inner_target_c6` and `critic_budget/inner_target_c12`, or their
+`outer_target_c6` / `outer_target_c12` counterparts. Each round performs the
+original three joint critic/actor/temperature updates, then three or nine
+additional critic-only updates. The six-round totals are 36 or 72 critic updates
+and 18 actor/temperature updates, with 9,216 imagined transitions. Learning
+rates, replay capacity, and bootstrap semantics match the named-run benchmark.
+Extra critic updates in rounds one through five can affect subsequent actor
+updates. The final round's critic-only tail measures fitting but cannot change
+the already-updated actor or its executed action.
+
+This uses the existing total-budget scheduler because explicit per-round
+component budgets would change the update order to all critics before actors.
+The three-update control is available for explicit selection; it is not launched
+by default. Prior episode traces are not substitutes for shared-observation
+controls: only bank solves with matching observation and repetition IDs support
+fixed-input comparisons.
+
+Reuse the original campaign's `evaluation` directory as
+`AMBI_BENCHMARK_REFERENCE_ROOT`; it must contain `step_<step>/roots.json`.
+Export the checkpoint prefix, exact pushed commit, and a fresh output root as
+above. For the inner-target pair:
+
+```bash
+export AMBI_BENCHMARK_MATRIX=configs/research/ambi_humanoid_inner_critic_sweep.json
+export AMBI_BENCHMARK_PRESETS='critic_budget/inner_target_c6 critic_budget/inner_target_c12'
+sbatch --array=3,4 --time=01:00:00 \
+  --output=/absolute/log/path/bank-%A_%a.out \
+  --error=/absolute/log/path/bank-%A_%a.err \
+  slurm/run_ambi_inner_benchmark_hydra.sbatch --bank-only
+```
+
+Submit the outer-target pair separately with its own output root. Each task
+runs the two selected budgets sequentially on one GPU, producing two W&B runs
+and a combined offline HTML report. Each configuration evaluates 25 saved
+observations with three solver seeds: 75 solves and no environment episodes.
+Initial and per-round probes use eight fixed-noise rollouts of horizon three;
+probe model steps are recorded separately from optimization model steps.
+`--bank-smoke` uses one repetition per observation and omits W&B, while keeping
+the bank's original 500-decision protocol. It also requires a fresh output root.
+
 ### Traces and portable report
 
 ```bash
@@ -167,6 +211,14 @@ selected configuration gets a separate run, grouped by checkpoint/configuration
 and tagged as episodes, bank, or both. Episode histories and bank summaries use
 stable metric names; full traces live in the portable artifact. Credentials are
 not fetched by the evaluator. Use the execution environment's normal W&B setup.
+
+Each episode row is an independent seeded evaluation observation from the same
+frozen checkpoint. Its return can vary between seeds without any training
+occurring. `episode/index` identifies evaluation order; `env_step` counts
+cumulative environment decisions evaluated so far. Neither measures training
+progress. Raw episode rows and paired return deltas remain in W&B history, but
+their automatic plots are hidden; their declared x-axis is `episode/index`.
+The cumulative `env_step` metric is also hidden from automatic plots.
 
 Run names include the task, checkpoint step, controller/update schedule, and
 bootstrap critic. Tags expose the source run, checkpoint, controller, bootstrap,

@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "description": "Higher-critic frozen-observation screens at fixed J6/N512/H3/B512 and three actor/temperature updates per round. Existing total-budget controls preserve the original three joint update slots and append only critic updates; no critic-first phase switch. Saved model, outer temperature, and environment come from the checkpoint.",
+  "base_alg_config": "checkpoint",
+  "source_run": "rwgao_b-brown-university/ambi/u13m14st",
+  "shared_alg_params": {
+    "inner_operator": "sac",
+    "inner_rounds": 6,
+    "inner_rollouts_per_round": null,
+    "inner_rollout_horizon": 3,
+    "inner_updates_per_round": null,
+    "inner_iterations": null,
+    "inner_rollouts": null,
+    "inner_horizon": null,
+    "inner_updates_per_iteration": null,
+    "inner_model_step_budget": 9216,
+    "inner_critic_updates_per_action": null,
+    "inner_actor_updates_per_action": 18,
+    "inner_temperature_updates_per_action": 18,
+    "inner_batch_size": 512,
+    "inner_replay_capacity": 9216,
+    "inner_replay_sampling": "with_replacement",
+    "inner_diagnostic_rollouts": 0,
+    "inner_actor_adaptation": "clone",
+    "inner_critic_adaptation": "clone",
+    "inner_temperature_mode": "auto",
+    "inner_temperature_initialization": "inherit_outer",
+    "inner_target_entropy": "inherit_outer",
+    "inner_bootstrap_source": "inner_target",
+    "inner_behavior_action": "policy_sample",
+    "inner_execution_action": "policy_sample",
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_actor_scope": "action",
+    "inner_critic_scope": "action",
+    "inner_temperature_scope": "action",
+    "inner_replay_scope": "action",
+    "inner_actor_optimizer_scope": "action",
+    "inner_critic_optimizer_scope": "action",
+    "inner_temperature_optimizer_scope": "action",
+    "inner_q_target_reduction": "min_pair",
+    "inner_q_actor_reduction": "min_pair",
+    "inner_sac_critic_target": "entropy_augmented",
+    "inner_diagnostics_every": 1000,
+    "inner_actor_lr": 5e-05,
+    "inner_critic_lr": 0.0001,
+    "inner_temperature_lr": 0.0003,
+    "inner_adam_eps": 1e-08,
+    "inner_critic_target_tau": 0.01,
+    "inner_critic_target_update_interval": 1,
+    "inner_critic_updates_per_round": null,
+    "inner_actor_updates_per_round": null,
+    "inner_finite_horizon": false,
+    "inner_steps_per_update": null,
+    "inner_outer_replay_fraction": 0.0
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "default_presets": [
+      "critic_budget/inner_target_c6",
+      "critic_budget/inner_target_c12",
+      "critic_budget/outer_target_c6",
+      "critic_budget/outer_target_c12"
+    ],
+    "bank_decisions": [
+      0,
+      100,
+      200,
+      300,
+      400
+    ],
+    "bank_repetitions": 3,
+    "diagnostic_rollouts": 8,
+    "diagnostic_horizon": 3,
+    "wandb_project": "ambi-inner-bench"
+  },
+  "comparisons": {
+    "critic_budget": {
+      "description": "Inner settings match named_run/d512_4_j6 except critic dose and the explicitly selected bootstrap source. Use saved prior observations for three repetitions per root. C3 controls are optional and never defaulted in.",
+      "reference": "inner_target_c3",
+      "variants": {
+        "inner_target_c3": {
+          "description": "J6/N512/H3/B512 with inner_target bootstraps. Each round runs three joint critic/actor/temperature slots, then 0 critic-only slots: 18/18/18 critic/actor/temperature updates per decision. Optional equivalence control; never selected by default.",
+          "alg_params": {
+            "inner_bootstrap_source": "inner_target",
+            "inner_critic_updates_per_action": 18
+          }
+        },
+        "inner_target_c6": {
+          "description": "J6/N512/H3/B512 with inner_target bootstraps. Each round runs three joint critic/actor/temperature slots, then 3 critic-only slots: 36/18/18 critic/actor/temperature updates per decision. Explicit higher-critic screen.",
+          "alg_params": {
+            "inner_bootstrap_source": "inner_target",
+            "inner_critic_updates_per_action": 36
+          }
+        },
+        "inner_target_c12": {
+          "description": "J6/N512/H3/B512 with inner_target bootstraps. Each round runs three joint critic/actor/temperature slots, then 9 critic-only slots: 72/18/18 critic/actor/temperature updates per decision. Explicit higher-critic screen.",
+          "alg_params": {
+            "inner_bootstrap_source": "inner_target",
+            "inner_critic_updates_per_action": 72
+          }
+        },
+        "outer_target_c3": {
+          "description": "J6/N512/H3/B512 with outer_target bootstraps. Each round runs three joint critic/actor/temperature slots, then 0 critic-only slots: 18/18/18 critic/actor/temperature updates per decision. Optional equivalence control; never selected by default.",
+          "alg_params": {
+            "inner_bootstrap_source": "outer_target",
+            "inner_critic_updates_per_action": 18
+          }
+        },
+        "outer_target_c6": {
+          "description": "J6/N512/H3/B512 with outer_target bootstraps. Each round runs three joint critic/actor/temperature slots, then 3 critic-only slots: 36/18/18 critic/actor/temperature updates per decision. Explicit higher-critic screen.",
+          "alg_params": {
+            "inner_bootstrap_source": "outer_target",
+            "inner_critic_updates_per_action": 36
+          }
+        },
+        "outer_target_c12": {
+          "description": "J6/N512/H3/B512 with outer_target bootstraps. Each round runs three joint critic/actor/temperature slots, then 9 critic-only slots: 72/18/18 critic/actor/temperature updates per decision. Explicit higher-critic screen.",
+          "alg_params": {
+            "inner_bootstrap_source": "outer_target",
+            "inner_critic_updates_per_action": 72
+          }
+        }
+      }
+    }
+  }
+}

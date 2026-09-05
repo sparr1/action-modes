@@ -56,6 +56,35 @@ def episode_protocol(protocol):
     return {key: value for key, value in protocol.items() if key != "root_bank_id"}
 
 
+def _nonnegative_integer(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _legacy_update_labels(params):
+    """Describe front-loaded total allocations without assuming uniform rounds."""
+    totals = [(symbol, params[f"inner_{component}_updates_per_action"])
+              for symbol, component in (("C", "critic"), ("A", "actor"), ("T", "temperature"))
+              if params.get(f"inner_{component}_updates_per_action") is not None]
+    rounds = params.get("inner_rounds")
+    uniform = (_nonnegative_integer(rounds) and rounds > 0 and bool(totals)
+               and all(_nonnegative_integer(value) and value % rounds == 0 for _, value in totals))
+    tags = ["schedule:legacy-total-budget"]
+    tags.extend(f"{symbol}-per-action:{value}" for symbol, value in totals)
+    if uniform:
+        counts = {symbol: value // rounds for symbol, value in totals}
+        labels = [f"{symbol}{value}" for symbol, value in counts.items()]
+        tags.extend(f"{symbol}:{value}" for symbol, value in counts.items())
+        if set(counts) == {"C", "A", "T"} and counts["C"] > counts["A"] == counts["T"] > 0:
+            return labels + ["(joint then critic)"], tags + ["update-order:joint-then-critic"]
+        if set(counts) == {"C", "A", "T"} and counts["C"] == counts["A"] == counts["T"] > 0:
+            return labels + ["(joint)"], tags + ["update-order:joint"]
+    else:
+        labels = [f"{symbol}/action{value}" for symbol, value in totals]
+    # The legacy engine activates each component in the first allocated slots
+    # of its round. Different totals can produce different overlap per round.
+    return labels + ["(overlapping slots)"], tags + ["update-order:overlapping-slots"]
+
+
 def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None):
     """Describe a run from the same saved inputs used by the evaluator.
 
@@ -104,11 +133,26 @@ def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None):
         tags.append("bootstrap:none")
     else:
         schedule = []
+        legacy = (not any(params.get(key) is not None for key in (
+            "inner_steps_per_update", "inner_updates_per_round",
+            "inner_critic_updates_per_round", "inner_actor_updates_per_round",
+        )) and any(params.get(key) is not None for key in (
+            "inner_model_step_budget", "inner_critic_updates_per_action",
+            "inner_actor_updates_per_action", "inner_temperature_updates_per_action",
+        )))
+        rollouts = params.get("inner_rollouts_per_round")
+        if legacy and rollouts is None:
+            rounds, horizon, budget = (params.get(key) for key in (
+                "inner_rounds", "inner_rollout_horizon", "inner_model_step_budget"))
+            if (all(_nonnegative_integer(value) for value in (rounds, horizon, budget))
+                    and rounds > 0 and horizon > 0 and budget % (rounds * horizon) == 0):
+                rollouts = budget // (rounds * horizon)
         for symbol, key in (("J", "inner_rounds"), ("N", "inner_rollouts_per_round"),
                             ("H", "inner_rollout_horizon")):
-            if params.get(key) is not None:
-                schedule.append(f"{symbol}{params[key]}")
-                tags.append(f"{symbol}:{params[key]}")
+            value = rollouts if symbol == "N" else params.get(key)
+            if value is not None:
+                schedule.append(f"{symbol}{value}")
+                tags.append(f"{symbol}:{value}")
         if params.get("inner_steps_per_update") is not None:
             interval = params["inner_steps_per_update"]
             schedule.append(f"update/{interval} transitions")
@@ -125,6 +169,10 @@ def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None):
             updates = params["inner_updates_per_round"]
             schedule.append(f"G{updates}")
             tags.extend(("schedule:joint", f"G:{updates}"))
+        elif legacy:
+            legacy_labels, legacy_tags = _legacy_update_labels(params)
+            schedule.extend(legacy_labels)
+            tags.extend(legacy_tags)
         controller_label = controller.upper() if controller != "unknown" else "controller unknown"
         parts.append(" ".join([controller_label, *schedule]))
         bootstrap = params.get("inner_bootstrap_source")
@@ -319,6 +367,12 @@ class BenchmarkBundle:
                 config={"checkpoint": self.manifest["checkpoint"], "protocol": self.manifest["protocol"],
                         "code": self.manifest["code"], "inner_config": config})
             self.remote_runs[run["id"]] = remote
+            # Each row is a separate seeded evaluation episode. Cumulative
+            # env_step counts evaluation work and is not a training axis.
+            remote.define_metric("episode/index", hidden=True)
+            remote.define_metric("episode/*", step_metric="episode/index", hidden=True)
+            remote.define_metric("eval/paired_return_delta", step_metric="episode/index", hidden=True)
+            remote.define_metric("env_step", hidden=True)
             run["wandb_path"] = remote.path if isinstance(remote.path, str) else "/".join(remote.path)
             run["publication_seconds"] += time.perf_counter() - started
         self.save()
