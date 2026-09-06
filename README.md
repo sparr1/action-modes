@@ -313,6 +313,24 @@ the MPPI state is a learned-model diagnostic, not real Monte Carlo improvement.
 Same-state action effects require simulator-state branching or exact seeded
 prefix reconstruction followed by a declared common continuation controller.
 
+For the seed-55 prior-only backbone, the Oscar launcher
+`slurm/run_tdmpc2_prior_mppi_eval_oscar.sbatch` evaluates checkpoints 100k through
+400k every 50k. Each array task runs five paired episodes, seeds 101–105, capped
+at 500 decisions. It checks each checkpoint's content hash and saved native
+planning settings: horizon 3, 512 candidates, 64 elites, 24 policy trajectories,
+standard-deviation bounds 0.05–2, and temperature 0.5. The official large-action
+heuristic increases six configured iterations to eight for Humanoid. Submit
+from a clean checkout with `CHECKPOINT_MANIFEST` pointing to an absolute JSON
+file containing `{"checkpoints":[{"step":100000,"path":"/absolute/checkpoint",
+"sha256":"..."}, ...]}` in ascending checkpoint order; set `RESULT_ROOT` to a
+new absolute campaign directory and `CAMPAIGN` to its descriptive identifier.
+Supply persistent Slurm `--output` and `--error` paths. `PYTHON_BIN` optionally
+selects an existing locked DMControl interpreter. Results are retained at
+`RESULT_ROOT/step_N/paired.json` and published automatically to `ambi-inner-bench`
+with checkpoint-based comparisons. A short GPU smoke uses `--array=0`,
+`EPISODES=1`, `MAX_STEPS=3`, and `WANDB_MODE=disabled`; production defaults
+remain five full episodes. Existing results are never overwritten.
+
 ### Same-state MPPI action gain by prefix-replay Monte Carlo
 
 Use the action-level evaluator when the question is whether the MPPI action at
