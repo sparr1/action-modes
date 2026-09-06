@@ -21,6 +21,16 @@ BUDGET = {"inner_operator": "xqc", "inner_rounds": 6, "inner_rollouts_per_round"
           "inner_replay_capacity": 9216, "inner_replay_sampling": "with_replacement"}
 COUNTS = {"critic": 18, "actor": 6, "temperature": 6}
 CAPABILITIES = {"decision_metrics": True, "optimizer_traces": False, "shared_observation_probes": False}
+NUMERICAL_SETTINGS = {"device_type": "cuda", "deterministic_algorithms": True, "deterministic_warn_only": False,
+                      "cudnn_deterministic": True, "cudnn_benchmark": False, "cublas_workspace_config": ":4096:8"}
+
+
+def _numerical_settings(provenance, paired, entry):
+    expected_hash = canonical_hash(NUMERICAL_SETTINGS)
+    if any(canonical_hash(record.get("numerical_settings")) != expected_hash for record in (provenance, paired)):
+        raise ValueError("Production numerical settings must record strict deterministic CUDA, deterministic cuDNN without benchmarking, and CuBLAS :4096:8 in both provenance.json and paired.json.")
+    if paired.get("checkpoint_sha256") != entry["sha256"] or paired.get("matrix_sha256") != file_sha256(MATRIX):
+        raise ValueError("Numerical settings belong to a different checkpoint/matrix evaluation payload.")
 
 
 def _identity(manifest, entry, source):
@@ -155,6 +165,7 @@ def summarize(manifest_path, results_root, *, expected_source_sha, reference_roo
         if file_sha256(reference_path / "manifest.json") != entry["reference_manifest_sha256"]:
             raise ValueError("Prior reference manifest differs from the immutable inventory.")
         reference, candidate, provenance = _read(reference_path / "manifest.json"), _read(candidate_path / "manifest.json"), _read(destination / "provenance.json")
+        _numerical_settings(provenance, _read(destination / "paired.json"), entry)
         expected_provenance = {"source_run": SOURCE_RUN, "checkpoint": entry, "checkpoint_manifest_sha256": file_sha256(manifest_path),
                                "matrix_sha256": file_sha256(MATRIX), "mode": "production", "seeds": list(seeds),
                                "max_steps": max_steps, "controller_seed": controller_seed,
@@ -197,6 +208,7 @@ def summarize(manifest_path, results_root, *, expected_source_sha, reference_roo
             raise ValueError("Paired return delta differs from the reference episode.")
         row = {"checkpoint_step": step, "checkpoint_sha256": entry["sha256"], "metadata_sha256": entry["metadata_sha256"],
                "bundle": str(candidate_path), "bundle_manifest_sha256": file_sha256(candidate_path / "manifest.json"),
+               "paired_json_sha256": file_sha256(destination / "paired.json"),
                "reference_bundle": str(reference_path), "reference_manifest_sha256": entry["reference_manifest_sha256"],
                "episode_count": len(seeds), "outer_state_unchanged": True, "actual_optimizer_steps": run["actual_optimizer_steps"],
                "paired": {"delta_mean": _stats(deltas)["mean"], "delta_std": _stats(deltas)["std"], "deltas": deltas}}
@@ -213,6 +225,7 @@ def summarize(manifest_path, results_root, *, expected_source_sha, reference_roo
             "checkpoint_manifest_sha256": file_sha256(manifest_path), "evaluation_source_sha": expected_source_sha, "sources": sources,
             "protocol": protocol, "seeds": list(seeds), "expected_steps": list(STEPS), "missing_steps": missing,
             "inner_settings": BUDGET, "optimizer_steps_per_decision": COUNTS, "model_steps_per_decision": 9216,
+            "numerical_settings": copy.deepcopy(NUMERICAL_SETTINGS), "numerical_settings_scope": "new_inner_xqc_evaluations",
             "statistics": "Raw environment returns; five paired seeds; population SD (ddof=0). XQC values use normalized reward units.", "rows": rows}
 
 

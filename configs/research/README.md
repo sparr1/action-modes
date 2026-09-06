@@ -30,6 +30,14 @@ rates, critic representation, and actor/temperature update rule. Evaluation
 checks complete outer state, including BatchNorm, targets, optimizers,
 temperature, normalization, counters, and the outer learner RNG.
 
+The campaign runner enables strict deterministic PyTorch kernels during
+evaluation and restores the caller's numerical flags afterward. CUDA requires
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` before Python starts; the Oscar launcher sets
+it. This gives repeatable seeded inner solves without changing the XQC
+equations or making imagined actions deterministic. In particular, categorical
+projection uses PyTorch's deterministic reduction instead of unordered CUDA
+atomic sums. These numerical settings are recorded in campaign provenance.
+
 The default selects only `controller/xqc`, with `controller/prior` as its
 reference, environment seeds 101–105, controller seed 12345, and at most 500
 decisions per episode. Reuse a completed prior reference from the paired MPPI
@@ -42,23 +50,17 @@ match this protocol.
 
 ```bash
 XQC_EVAL_PY=environments/dmcontrol/.venv/bin/python
-XQC_J6_MATRIX=configs/research/ambixqc_humanoid_inner_j6_benchmark.json
-XQC_CHECKPOINT=/absolute/path/to/checkpoint.pt
-XQC_PRIOR_BUNDLE=/absolute/path/to/matching/prior-bundle
-
-"$XQC_EVAL_PY" evaluate_ambi_checkpoint.py \
-  --matrix "$XQC_J6_MATRIX" --checkpoint "$XQC_CHECKPOINT" --device cuda \
-  --reference-bundle "$XQC_PRIOR_BUNDLE" \
-  --bundle-dir results/xqc-j6/inner
-
-"$XQC_EVAL_PY" report_ambi_benchmark.py \
-  --bundle "$XQC_PRIOR_BUNDLE" --bundle results/xqc-j6/inner \
-  --output results/xqc-j6/comparison.html
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+"$XQC_EVAL_PY" run_ambixqc_inner_evaluation.py \
+  --manifest /absolute/scratch/campaign/checkpoint-manifest.json --index 0 \
+  --result-root /absolute/scratch/campaign/production --device cuda
 ```
 
-If a matching prior reference is unavailable, select `--preset controller/prior`
-with this same matrix and save it in a fresh bundle first.
-Repeat with separate output paths for each selected checkpoint; the established
+The runner reads matching references from the manifest and writes a paired
+bundle, validation record, and HTML comparison. If a matching prior reference
+is unavailable, use `evaluate_ambi_checkpoint.py` with this matrix and
+`--preset controller/prior` to save it in a fresh bundle first.
+Repeat with a different manifest index for each selected checkpoint; the established
 bank comparison uses all 30 checkpoints at 50,000-decision intervals through
 1.5 million decisions. Commands run on the current host; use scheduler compute
 nodes for full evaluations. Add `--wandb` for explicit publication to

@@ -122,6 +122,8 @@ policy delay 3, so each action has 18 critic and 6 actor/temperature updates.
 The Oscar launcher `slurm/run_ambixqc_inner_eval_oscar.sbatch` reuses the
 completed MPPI campaign's prior-reference bundles at every 50k checkpoint;
 `summarize_ambixqc_inner_eval.py` validates and reports the new paired outcomes.
+The campaign runner enables deterministic evaluation kernels for repeatable
+seeded solves; its launcher sets the required CUDA workspace configuration.
 
 ### AMBI-XQC compiled execution and paired timing
 

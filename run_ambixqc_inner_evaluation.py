@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import gzip
 import json
 import math
+import os
 from pathlib import Path
 
 from run_ambixqc_mppi_evaluation import SOURCE_RUN, file_sha256, select_checkpoint
@@ -21,6 +23,43 @@ INNER_SETTINGS = {
 }
 OPTIMIZER_STEPS = {"critic": 18, "actor": 6, "temperature": 6}
 MODEL_STEPS = 9216
+
+
+@contextmanager
+def deterministic_evaluation(device="cpu"):
+    """Scope deterministic numerical kernels to this evaluation campaign."""
+    import torch
+
+    device_type = torch.device(device).type
+    workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    if device_type == "cuda" and workspace not in {":4096:8", ":16:8"}:
+        raise ValueError(
+            "CUDA evaluation requires CUBLAS_WORKSPACE_CONFIG=:4096:8 or :16:8 "
+            "set before starting Python/CUDA; the runner will not configure it late."
+        )
+    previous = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+        torch.backends.cudnn.deterministic,
+        torch.backends.cudnn.benchmark,
+    )
+    settings = {
+        "device_type": device_type,
+        "deterministic_algorithms": True,
+        "deterministic_warn_only": False,
+        "cudnn_deterministic": True,
+        "cudnn_benchmark": False,
+        "cublas_workspace_config": workspace if device_type == "cuda" else None,
+    }
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=False)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        yield settings
+    finally:
+        torch.use_deterministic_algorithms(previous[0], warn_only=previous[1])
+        torch.backends.cudnn.deterministic = previous[2]
+        torch.backends.cudnn.benchmark = previous[3]
 
 
 def _saved_setting(params, key):
@@ -198,22 +237,25 @@ def run(manifest_path, index, result_root, *, mode="production", device="cuda", 
     destination = Path(result_root).resolve() / f"step_{row['step']}"
     if destination == ROOT or ROOT in destination.parents:
         raise ValueError("Evaluation results must be outside the source checkout.")
-    destination.mkdir(parents=True, exist_ok=False)
-    atomic_json(destination / "provenance.json", {
-        "source_run": SOURCE_RUN, "checkpoint": row,
-        "checkpoint_manifest_sha256": file_sha256(manifest_path),
-        "matrix_sha256": file_sha256(MATRIX), "mode": mode,
-        "seeds": seeds, "max_steps": max_steps, "controller_seed": CONTROLLER_SEED,
-        "reference_bundle": reference["path"], "reference_manifest_sha256": reference["manifest_sha256"],
-    })
-    from evaluate_ambi_checkpoint import evaluate_matrix
-    payload = evaluate_matrix(
-        MATRIX, row["path"], selectors=["controller/xqc"], seeds=seeds,
-        controller_seed=CONTROLLER_SEED, max_steps=max_steps, device=device,
-        bundle_dir=destination / "bundle", reference_bundle=reference["path"],
-        wandb_options={"project": "ambi-inner-bench", "entity": "rwgao_b-brown-university",
-                       "mode": "online"} if wandb else None,
-    )
+    with deterministic_evaluation(device=device) as numerical_settings:
+        destination.mkdir(parents=True, exist_ok=False)
+        atomic_json(destination / "provenance.json", {
+            "source_run": SOURCE_RUN, "checkpoint": row,
+            "checkpoint_manifest_sha256": file_sha256(manifest_path),
+            "matrix_sha256": file_sha256(MATRIX), "mode": mode,
+            "seeds": seeds, "max_steps": max_steps, "controller_seed": CONTROLLER_SEED,
+            "reference_bundle": reference["path"], "reference_manifest_sha256": reference["manifest_sha256"],
+            "numerical_settings": numerical_settings,
+        })
+        from evaluate_ambi_checkpoint import evaluate_matrix
+        payload = evaluate_matrix(
+            MATRIX, row["path"], selectors=["controller/xqc"], seeds=seeds,
+            controller_seed=CONTROLLER_SEED, max_steps=max_steps, device=device,
+            bundle_dir=destination / "bundle", reference_bundle=reference["path"],
+            wandb_options={"project": "ambi-inner-bench", "entity": "rwgao_b-brown-university",
+                           "mode": "online"} if wandb else None,
+        )
+    payload["numerical_settings"] = numerical_settings
     # Preserve evaluated results if validation or HTML generation later fails.
     atomic_json(destination / "paired.json", payload)
     if payload.get("checkpoint_sha256") != row["sha256"]:

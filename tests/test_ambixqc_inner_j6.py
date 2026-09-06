@@ -80,13 +80,21 @@ def test_j6_resolution_preserves_checkpoint_outer_semantics_and_inner_defaults()
     assert cfg.compile is False
 
 
+@pytest.fixture
+def deterministic_xqc_numerics(device):
+    from run_ambixqc_inner_evaluation import deterministic_evaluation
+
+    with deterministic_evaluation(device=device):
+        yield
+
+
 @pytest.mark.parametrize("device", [
     "cpu",
     pytest.param("cuda", marks=pytest.mark.skipif(
         not torch.cuda.is_available(), reason="CUDA hardware is unavailable")),
 ])
 def test_full_j6_budget_has_fresh_learners_exact_steps_and_seeded_frozen_actions(
-    device, tmp_path, monkeypatch
+    device, tmp_path, monkeypatch, deterministic_xqc_numerics
 ):
     # Keep the production rollout/update budget; only the learned network sizes
     # and outer training batch are reduced for this local integration test.
@@ -188,11 +196,14 @@ def test_full_j6_budget_has_fresh_learners_exact_steps_and_seeded_frozen_actions
             return actions
 
         first = episode(12345)
+        first_rng = deepcopy(engine.rng.training_state_dict())
         assert len(set(preparations)) == 1  # Allocation reuse, with fresh state each action.
         alternate = episode(12346)
         assert not np.array_equal(first, alternate)  # Inner adaptation is stochastic.
         np.testing.assert_array_equal(first, episode(12345))
+        assert _tree_equal(first_rng, engine.rng.training_state_dict())
         np.testing.assert_array_equal(first, episode(12345, reuse=False))
+        assert _tree_equal(first_rng, engine.rng.training_state_dict())
         assert torch.equal(cpu_rng, torch.get_rng_state())
         if cuda_rng is not None:
             assert torch.equal(cuda_rng, torch.cuda.get_rng_state(agent.device))

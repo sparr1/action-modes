@@ -98,7 +98,11 @@ def outputs(tmp_path,monkeypatch):
         storage.atomic_json(results/"production"/f'step_{entry["step"]}'/"provenance.json",{
             "checkpoint":entry,"source_run":campaign.SOURCE_RUN,"checkpoint_manifest_sha256":campaign.file_sha256(manifest),
             "matrix_sha256":campaign.file_sha256(campaign.MATRIX),"mode":"production","seeds":SEEDS,"max_steps":2,"controller_seed":12345,
+            "numerical_settings":campaign.NUMERICAL_SETTINGS,
             "reference_bundle":entry["reference_bundle"],"reference_manifest_sha256":entry["reference_manifest_sha256"]})
+        storage.atomic_json(results/"production"/f'step_{entry["step"]}'/"paired.json",{
+            "checkpoint_sha256":entry["sha256"],"matrix_sha256":campaign.file_sha256(campaign.MATRIX),
+            "numerical_settings":campaign.NUMERICAL_SETTINGS})
     return manifest,results,references
 
 
@@ -128,6 +132,10 @@ def test_native_inner_xqc_paired_statistics_and_truthful_html(outputs):
     assert "MPPI" not in rendered and "<script src=" not in rendered
     assert summary["sources"]["reference"]["commit"]==campaign.REFERENCE_SHA
     assert summary["sources"]["inner_xqc"]["commit"]==NEW_SHA
+    assert summary["numerical_settings"]==campaign.NUMERICAL_SETTINGS
+    assert summary["numerical_settings_scope"]=="new_inner_xqc_evaluations"
+    assert "numerical_settings" not in json.loads((outputs[2]/"production/step_50000/bundle/manifest.json").read_text())
+    assert row["paired_json_sha256"]==campaign.file_sha256(outputs[1]/"production/step_50000/paired.json")
     assert "inner_reward_normalization" not in summary["inner_settings"]  # Inherited wrapper default, not an authored override.
     json.dumps(summary,allow_nan=False)
 
@@ -202,6 +210,38 @@ def test_missing_directories_require_partial_but_partial_never_accepts_incomplet
     path.mkdir()
     with pytest.raises(FileNotFoundError):
         _summarize(outputs,allow_partial=True)
+
+
+@pytest.mark.parametrize("filename",["provenance.json","paired.json"])
+@pytest.mark.parametrize("settings",[
+    None,
+    {**campaign.NUMERICAL_SETTINGS,"deterministic_algorithms":False},
+    {**campaign.NUMERICAL_SETTINGS,"deterministic_algorithms":1},
+    {**campaign.NUMERICAL_SETTINGS,"deterministic_warn_only":True},
+    {**campaign.NUMERICAL_SETTINGS,"cudnn_deterministic":False},
+    {**campaign.NUMERICAL_SETTINGS,"cudnn_benchmark":True},
+    {**campaign.NUMERICAL_SETTINGS,"cublas_workspace_config":":16:8"},
+    {**campaign.NUMERICAL_SETTINGS,"device_type":"cpu","cublas_workspace_config":None},
+])
+def test_production_requires_matching_strict_cuda_numerics_in_both_records(outputs,filename,settings):
+    path=outputs[1]/"production/step_100000"/filename
+    record=json.loads(path.read_text())
+    if settings is None:
+        record.pop("numerical_settings")
+    else:
+        record["numerical_settings"]=settings
+    storage.atomic_json(path,record,overwrite=True)
+    with pytest.raises(ValueError,match="Production numerical settings"):
+        _summarize(outputs,allow_partial=True)
+
+
+def test_numerical_record_requires_matching_checkpoint_payload(outputs):
+    path=outputs[1]/"production/step_100000/paired.json"
+    record=json.loads(path.read_text())
+    record["checkpoint_sha256"]="f"*64
+    storage.atomic_json(path,record,overwrite=True)
+    with pytest.raises(ValueError,match="different checkpoint/matrix"):
+        _summarize(outputs)
 
 
 def test_cli_preserves_validated_outputs_when_optional_publication_fails(outputs,tmp_path,monkeypatch):

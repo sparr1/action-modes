@@ -42,8 +42,16 @@ def _reference(directory, row, protocol, seeds, length):
     return path
 
 
+def _numerical_flags():
+    import torch
+    return (torch.are_deterministic_algorithms_enabled(),
+            torch.is_deterministic_algorithms_warn_only_enabled(),
+            torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark)
+
+
 @pytest.fixture
-def case(tmp_path):
+def case(tmp_path, monkeypatch):
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     manifest, rows = checkpoint_manifest(tmp_path)
     for row in rows:
         sidecar = Path(row["path"] + ".metadata.json")
@@ -100,6 +108,7 @@ def _stub_execution(monkeypatch, case):
     calls = {"evaluate": [], "reports": []}
 
     def evaluate(matrix, checkpoint, **kwargs):
+        assert _numerical_flags() == (True, False, True, False)
         calls["evaluate"].append((matrix, checkpoint, kwargs))
         smoke = kwargs["max_steps"] == 3
         reference = _validated_reference(case, smoke=smoke)
@@ -124,7 +133,9 @@ def test_production_reuses_five_full_prior_episodes_and_publishes_only_xqc(case,
     calls = _stub_execution(monkeypatch, case)
     source = json.loads(Path(case.row["path"] + ".metadata.json").read_text())
     assert "inner_reward_normalization" not in source["trial_run_params"]["alg_params"]
+    previous = _numerical_flags()
     destination = runner.run(case.manifest, 0, case.result_root, wandb=True)
+    assert _numerical_flags() == previous
     assert len(calls["evaluate"]) == 1
     kwargs = calls["evaluate"][0][2]
     assert kwargs["selectors"] == ["controller/xqc"]
@@ -136,6 +147,11 @@ def test_production_reuses_five_full_prior_episodes_and_publishes_only_xqc(case,
     assert provenance["reference_manifest_sha256"] == case.row["reference_manifest_sha256"]
     assert provenance["checkpoint_manifest_sha256"] == runner.file_sha256(case.manifest)
     assert provenance["matrix_sha256"] == runner.file_sha256(runner.MATRIX)
+    expected_numerics = {"device_type": "cuda", "deterministic_algorithms": True,
+                        "deterministic_warn_only": False, "cudnn_deterministic": True,
+                        "cudnn_benchmark": False, "cublas_workspace_config": ":4096:8"}
+    assert provenance["numerical_settings"] == expected_numerics
+    assert json.loads((destination / "paired.json").read_text())["numerical_settings"] == expected_numerics
     assert json.loads((destination / "validation.json").read_text())["decision_counts"] == {"controller/xqc": 2500}
     assert [item["controller_type"] for item in calls["report_data"]["runs"]] == ["prior", "xqc"]
     assert calls["report_data"]["metric_catalog"] == {}
@@ -238,3 +254,67 @@ def test_paired_results_survive_later_validation_failure(case, monkeypatch):
     destination = case.result_root / "step_50000"
     assert (destination / "paired.json").is_file()
     assert (destination / "bundle" / "manifest.json").is_file()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("original", [(False, True, False, True), (True, False, True, False)])
+def test_cpu_deterministic_context_restores_all_flags(monkeypatch, fail, original):
+    import torch
+    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+    previous = _numerical_flags()
+    try:
+        torch.use_deterministic_algorithms(original[0], warn_only=original[1])
+        torch.backends.cudnn.deterministic = original[2]
+        torch.backends.cudnn.benchmark = original[3]
+        try:
+            with runner.deterministic_evaluation(device="cpu") as settings:
+                assert _numerical_flags() == (True, False, True, False)
+                assert settings["device_type"] == "cpu" and settings["cublas_workspace_config"] is None
+                if fail:
+                    raise RuntimeError("evaluation failed")
+        except RuntimeError as error:
+            assert fail and str(error) == "evaluation failed"
+        assert _numerical_flags() == original
+    finally:
+        torch.use_deterministic_algorithms(previous[0], warn_only=previous[1])
+        torch.backends.cudnn.deterministic = previous[2]
+        torch.backends.cudnn.benchmark = previous[3]
+
+
+@pytest.mark.parametrize("workspace", [None, "", ":invalid"])
+def test_cuda_workspace_preflight_precedes_outputs_and_evaluation(case, monkeypatch, workspace):
+    if workspace is None:
+        monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG")
+    else:
+        monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", workspace)
+    calls = _stub_execution(monkeypatch, case)
+    previous = _numerical_flags()
+    with pytest.raises(ValueError, match="set before starting Python/CUDA"):
+        runner.run(case.manifest, 0, case.result_root)
+    assert _numerical_flags() == previous
+    assert not case.result_root.exists() and calls["evaluate"] == []
+
+
+@pytest.mark.parametrize("workspace", [":4096:8", ":16:8"])
+def test_cuda_context_accepts_supported_workspace_without_initializing_cuda(monkeypatch, workspace):
+    import torch
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", workspace)
+    initialized = torch.cuda.is_initialized()
+    with runner.deterministic_evaluation(device="cuda:0") as settings:
+        assert settings["cublas_workspace_config"] == workspace
+        assert _numerical_flags() == (True, False, True, False)
+    assert torch.cuda.is_initialized() == initialized
+
+
+def test_runner_restores_numerics_when_evaluator_raises(case, monkeypatch):
+    def fail(*args, **kwargs):
+        assert _numerical_flags() == (True, False, True, False)
+        raise RuntimeError("controller failed")
+
+    monkeypatch.setitem(sys.modules, "evaluate_ambi_checkpoint", SimpleNamespace(evaluate_matrix=fail))
+    previous = _numerical_flags()
+    with pytest.raises(RuntimeError, match="controller failed"):
+        runner.run(case.manifest, 0, case.result_root)
+    assert _numerical_flags() == previous
+    provenance = json.loads((case.result_root / "step_50000" / "provenance.json").read_text())
+    assert provenance["numerical_settings"]["deterministic_algorithms"] is True
