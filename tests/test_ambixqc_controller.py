@@ -321,7 +321,7 @@ def test_cuda_tensor_reward_scale_validation_uses_async_assertion():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_cuda_tensor_reward_scale_does_not_materialize_a_host_scalar(monkeypatch):
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     controller = LatentXQCController(
         3,
         1,
