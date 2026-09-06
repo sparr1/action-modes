@@ -1,6 +1,7 @@
 import copy
 import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -105,11 +106,11 @@ def test_refresh_adds_new_checkpoints_in_step_order_and_preserves_missing_values
     monkeypatch.delenv("WANDB_MODE", raising=False)
     later = write_result(tmp_path, 200000, shift=10)
     sdk = FakeWandb()
-    first = publisher.publish(later, source_run=SOURCE, campaign=CAMPAIGN, wandb_module=sdk)
+    first = publisher.publish(later, source_run=SOURCE, campaign=CAMPAIGN, expected_max_step=400000, wandb_module=sdk)
     assert sdk.plots[0]["ys"][0] == [None, None, 12, None, None, None, None]
     earlier = write_result(tmp_path)
-    second = publisher.publish(earlier, source_run=SOURCE, campaign=CAMPAIGN, wandb_module=sdk)
-    assert sdk.plots[2]["xs"] == list(publisher.STEPS)
+    second = publisher.publish(earlier, source_run=SOURCE, campaign=CAMPAIGN, expected_max_step=400000, wandb_module=sdk)
+    assert sdk.plots[2]["xs"] == list(publisher.STEPS[:7])
     assert sdk.plots[2]["ys"] == [[2, None, 12, None, None, None, None],
                                   [4, None, 14, None, None, None, None]]
     assert sdk.plots[2]["keys"] == ["Policy prior mean", "Paper MPPI (H3, J8)"]
@@ -181,13 +182,87 @@ def test_rejects_republication_of_replaced_result(tmp_path, monkeypatch):
         publisher.publish(path, source_run=SOURCE, campaign=CAMPAIGN)
 
 
-def test_complete_campaign_has_all_seven_actual_points(tmp_path):
+def test_complete_campaign_has_all_actual_points_through_1p5m(tmp_path):
     for index, step in enumerate(reversed(publisher.STEPS)):
         write_result(tmp_path, step, shift=step / 100000)
     loaded, curves = publisher.campaign_data(tmp_path, SOURCE, CAMPAIGN)
-    assert len(loaded) == 7
-    assert curves[0] == [3, 3.5, 4, 4.5, 5, 5.5, 6]
-    assert curves[2] == [2] * 7
+    assert len(loaded) == 29
+    assert curves[0] == [2 + step / 100000 for step in publisher.STEPS]
+    assert curves[2] == [2] * 29
+
+
+def test_extending_campaign_preserves_ids_and_updates_expected_grid(tmp_path, monkeypatch):
+    monkeypatch.delenv("WANDB_MODE", raising=False)
+    sdk = FakeWandb()
+    earlier = write_result(tmp_path, 400000)
+    first = publisher.publish(earlier, source_run=SOURCE, campaign=CAMPAIGN,
+                              expected_max_step=400000, wandb_module=sdk)
+    later = write_result(tmp_path, 1150000)
+    second = publisher.publish(later, source_run=SOURCE, campaign=CAMPAIGN,
+                               expected_max_step=1150000, wandb_module=sdk)
+    assert first["campaign_run_id"] == second["campaign_run_id"]
+    assert sdk.runs[-1].options["allow_val_change"] is True
+    assert sdk.runs[-1].options["config"]["expected_checkpoint_steps"] == list(range(100000, 1150001, 50000))
+    assert sdk.runs[-1].summary["completed_checkpoint_steps"] == [400000, 1150000]
+    assert sdk.plots[-2]["ys"][0][-1] == 2
+    with pytest.raises(ValueError, match="maximum"):
+        publisher.campaign_data(tmp_path, SOURCE, CAMPAIGN, expected_max_step=400000)
+
+
+@pytest.fixture
+def source_revisions(tmp_path):
+    """Real Git objects verify source identity, without relying on fake hashes."""
+    repository = tmp_path / "repo"
+    repository.mkdir()
+
+    def git(*args):
+        return subprocess.check_output(["git", *args], cwd=repository, stderr=subprocess.PIPE).decode().strip()
+
+    git("init")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.invalid")
+    for name in publisher.EVALUATION_SOURCE_PATHS:
+        path = repository / name
+        if "." not in path.name:
+            path /= "example.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("original source\n")
+
+    def commit():
+        git("add", ".")
+        git("commit", "-m", "fixture")
+        return git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}")
+
+    original = commit()
+    (repository / "publish_tdmpc2_mppi_eval.py").write_text("publication change\n")
+    publication = commit()
+    (repository / "RL/example.py").write_text("changed scientific source\n")
+    scientific = commit()
+    return repository, original, publication, scientific
+
+
+@pytest.mark.parametrize("mutation", ["publication", "scientific", "forged_tree", "forged_fingerprint"])
+def test_mixed_commits_require_git_verified_identical_scientific_source(tmp_path, source_revisions, monkeypatch, mutation):
+    repository, original, publication, scientific = source_revisions
+    fingerprint = publisher.evaluation_source_fingerprint
+    monkeypatch.setattr(publisher, "evaluation_source_fingerprint",
+                        lambda sha, tree: fingerprint(sha, tree, repository))
+    first = write_result(tmp_path / "results", 400000)
+    later = write_result(tmp_path / "results", 450000)
+    change(first.parent / "provenance.json", lambda d: d.update(code_sha=original[0], code_tree=original[1]))
+    selected = scientific if mutation == "scientific" else publication
+    change(later.parent / "provenance.json", lambda d: d.update(
+        code_sha=selected[0], code_tree="0" * 40 if mutation == "forged_tree" else selected[1],
+        evaluation_source_sha256="f" * 64 if mutation == "forged_fingerprint"
+        else fingerprint(*selected, repository)))
+    if mutation == "publication":
+        loaded, curves = publisher.campaign_data(tmp_path / "results", SOURCE, CAMPAIGN, expected_max_step=450000)
+        assert len(loaded) == 2 and curves[0][-2:] == [2, 2]
+        assert loaded[0]["provenance"]["code_sha"] == original[0]
+        assert loaded[1]["provenance"]["code_sha"] == publication[0]
+    else:
+        with pytest.raises(ValueError):
+            publisher.campaign_data(tmp_path / "results", SOURCE, CAMPAIGN)
 
 
 def test_installed_wandb_table_preserves_null_gaps():

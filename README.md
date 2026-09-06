@@ -314,22 +314,39 @@ Same-state action effects require simulator-state branching or exact seeded
 prefix reconstruction followed by a declared common continuation controller.
 
 For the seed-55 prior-only backbone, the Oscar launcher
-`slurm/run_tdmpc2_prior_mppi_eval_oscar.sbatch` evaluates checkpoints 100k through
-400k every 50k. Each array task runs five paired episodes, seeds 101–105, capped
+`slurm/run_tdmpc2_prior_mppi_eval_oscar.sbatch` evaluates selected checkpoints on
+the 100k through 1.5M grid, every 50k. Each array task runs five paired episodes, seeds 101–105, capped
 at 500 decisions. It checks each checkpoint's content hash and saved native
 planning settings: horizon 3, 512 candidates, 64 elites, 24 policy trajectories,
 standard-deviation bounds 0.05–2, and temperature 0.5. The official large-action
 heuristic increases six configured iterations to eight for Humanoid. Submit
 from a clean checkout with `CHECKPOINT_MANIFEST` pointing to an absolute JSON
 file containing `{"checkpoints":[{"step":100000,"path":"/absolute/checkpoint",
-"sha256":"..."}, ...]}` in ascending checkpoint order; set `RESULT_ROOT` to a
-new absolute campaign directory and `CAMPAIGN` to its descriptive identifier.
+"sha256":"...","metadata_sha256":"..."}, ...]}` in ascending checkpoint order;
+include only checkpoints that need evaluation. Set `RESULT_ROOT` to an absolute
+campaign directory and `CAMPAIGN` to its existing identifier when extending a
+comparison. Set `EXPECTED_MAX_STEP` to the final checkpoint in this campaign
+(default 1500000), and pass `sbatch --array=0-LAST%CONCURRENCY` for the manifest's
+zero-based row indices and available GPU capacity. The safe default submits only
+row zero; each task requests one L40S for 15 minutes, with six CPUs and 32 GB.
 Supply persistent Slurm `--output` and `--error` paths. `PYTHON_BIN` optionally
 selects an existing locked DMControl interpreter. Results are retained at
 `RESULT_ROOT/step_N/paired.json` and published automatically to `ambi-inner-bench`
 with checkpoint-based comparisons. A short GPU smoke uses `--array=0`,
 `EPISODES=1`, `MAX_STEPS=3`, and `WANDB_MODE=disabled`; production defaults
 remain five full episodes. Existing results are never overwritten.
+
+New checkpoints automatically refresh the same W&B comparison run. Missing
+checkpoints remain gaps, and the expected range can expand without changing
+existing run IDs. Full commit/tree provenance remains in every bundle. Results
+from different commits combine only when Git verifies identical evaluator,
+renderer, algorithm/environment/helper source trees and locked DMControl runtime
+files; launcher/publisher changes therefore do not require repeating episodes.
+Legacy bundles derive this fingerprint from their pinned commit. Mixed-commit
+publication requires those commits in the local Git repository; same-commit
+bundles remain independently portable. To republish saved results, run
+`publish_tdmpc2_mppi_eval.py RESULT --source-run SOURCE --campaign CAMPAIGN
+--expected-max-step STEP`; this performs no evaluation.
 
 ### Same-state MPPI action gain by prefix-replay Monte Carlo
 

@@ -3,10 +3,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
+import shutil
 import subprocess
 import sys
 
 import pytest
+import publish_tdmpc2_mppi_eval as publisher
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,7 +21,7 @@ EXPERIMENT = ROOT / "configs/dmcontrol/experiments/tdmpc2_humanoid_walk_state_pr
 @pytest.fixture
 def launch_input(tmp_path):
     rows = []
-    for step in range(100000, 400001, 50000):
+    for step in (450000, 500000, 600000, 750000, 1000000, 1150000, 1500000):
         checkpoint = tmp_path / f"checkpoint {step}"
         checkpoint.write_bytes(f"immutable checkpoint {step}".encode())
         metadata = {
@@ -36,7 +39,8 @@ def launch_input(tmp_path):
     binaries = tmp_path / "bin"
     binaries.mkdir()
     git = binaries / "git"
-    git.write_text('#!/usr/bin/env bash\nif [[ "$1" == rev-parse ]]; then echo tested-sha; fi\n')
+    git.write_text('#!/usr/bin/env bash\nif [[ "$1" == status ]]; then exit 0; fi\n'
+                   f'exec {shlex.quote(shutil.which("git"))} "$@"\n')
     git.chmod(0o755)
     python = binaries / "python"
     python.write_text(f"#!{sys.executable}\n" + """
@@ -62,10 +66,12 @@ else:
         "SLURM_JOB_ID": "test-job", "SLURM_TMPDIR": str(tmp_path),
         "CHECKPOINT_MANIFEST": str(manifest), "RESULT_ROOT": str(tmp_path / "results"),
         "CAMPAIGN": "prior-mppi-test", "WANDB_MODE": "disabled",
-        "EXPECTED_ACTION_MODES_SHA": "tested-sha", "CALL_LOG": str(tmp_path / "calls.jsonl"),
+        "EXPECTED_ACTION_MODES_SHA": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip(),
+        "CALL_LOG": str(tmp_path / "calls.jsonl"),
     })
     env.pop("EPISODES", None)
     env.pop("MAX_STEPS", None)
+    env.pop("EXPECTED_MAX_STEP", None)
     return env, rows
 
 
@@ -92,10 +98,14 @@ def test_oscar_launches_exact_checkpoint_and_paired_protocol(launch_input, index
     assert publish == [
         "publish_tdmpc2_mppi_eval.py", options["--output"], "--project", "ambi-inner-bench",
         "--source-run", "rwgao_b-brown-university/ambi/xq3zva9u", "--campaign", "prior-mppi-test",
+        "--expected-max-step", "1500000",
     ]
     provenance = json.loads(Path(options["--output"]).with_name("provenance.json").read_text())
+    code_sha = env["EXPECTED_ACTION_MODES_SHA"]
+    code_tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT).decode().strip()
     assert provenance == {
-        "code_sha": "tested-sha", "code_tree": "tested-sha", "campaign": "prior-mppi-test",
+        "code_sha": code_sha, "code_tree": code_tree, "campaign": "prior-mppi-test",
+        "evaluation_source_sha256": publisher.evaluation_source_fingerprint(code_sha, code_tree),
         "source_run": "rwgao_b-brown-university/ambi/xq3zva9u",
         "checkpoint_sha256": rows[index]["sha256"], "metadata_sha256": rows[index]["metadata_sha256"],
     }
@@ -128,7 +138,7 @@ def test_oscar_rejects_incompatible_inputs_before_evaluation(launch_input, failu
         metadata["checkpoint"]["step"] = 125000
         sidecar.write_text(json.dumps(metadata))
     elif failure == "overwrite":
-        output = Path(env["RESULT_ROOT"]) / "step_100000" / "paired.json"
+        output = Path(env["RESULT_ROOT"]) / f"step_{rows[0]['step']}" / "paired.json"
         output.parent.mkdir(parents=True)
         output.write_text("preserve this result")
     elif failure == "source":
@@ -152,8 +162,28 @@ def test_oscar_rejects_incompatible_inputs_before_evaluation(launch_input, failu
 def test_oscar_launcher_requests_bounded_resources():
     contents = LAUNCHER.read_text()
     for directive in ("--partition=gpu", "--qos=pri-gpu+", "--gres=gpu:l40s:1",
-                      "--cpus-per-task=6", "--mem=32G", "--time=02:00:00",
-                      "--array=0-6%7", "--no-requeue"):
+                      "--cpus-per-task=6", "--mem=32G", "--time=00:15:00",
+                      "--array=0", "--no-requeue"):
         assert f"#SBATCH {directive}" in contents
     assert "#SBATCH --account" not in contents
     assert "evaluate_tdmpc2_mppi_action_mc.py" not in contents
+
+
+def test_oscar_extends_existing_campaign_to_explicit_maximum(launch_input):
+    env, rows = launch_input
+    Path(env["CHECKPOINT_MANIFEST"]).write_text(json.dumps({"checkpoints": rows[:-1]}))
+    env.update(EXPECTED_MAX_STEP="1150000", SLURM_ARRAY_TASK_ID="5")
+    result = _run(env)
+    assert result.returncode == 0, result.stderr
+    publish = json.loads(Path(env["CALL_LOG"]).read_text().splitlines()[1])
+    assert publish[-2:] == ["--expected-max-step", "1150000"]
+    assert Path(env["RESULT_ROOT"], "step_1150000", "paired.json").is_file()
+
+
+@pytest.mark.parametrize("steps", [[], [450000, 450000], [450001], [425000], [0], [1550000], [True]])
+def test_oscar_rejects_invalid_manifest_grid(launch_input, steps):
+    env, rows = launch_input
+    changed = [{**rows[0], "step": step} for step in steps]
+    Path(env["CHECKPOINT_MANIFEST"]).write_text(json.dumps({"checkpoints": changed}))
+    assert _run(env).returncode != 0
+    assert not Path(env["CALL_LOG"]).exists()

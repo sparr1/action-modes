@@ -7,8 +7,8 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=32G
-#SBATCH --time=02:00:00
-#SBATCH --array=0-6%7
+#SBATCH --time=00:15:00
+#SBATCH --array=0
 #SBATCH --no-requeue
 #SBATCH --output=/tmp/tdmpc2-prior-mppi-%A_%a.out
 #SBATCH --error=/tmp/tdmpc2-prior-mppi-%A_%a.err
@@ -29,20 +29,22 @@ SOURCE_TREE=$(git rev-parse 'HEAD^{tree}')
 }
 
 : "${CHECKPOINT_MANIFEST:?Supply the absolute checkpoint manifest path.}"
-: "${RESULT_ROOT:?Supply a new absolute campaign result directory.}"
+: "${RESULT_ROOT:?Supply the absolute campaign result directory.}"
 : "${CAMPAIGN:?Supply a descriptive campaign identifier.}"
 : "${SLURM_ARRAY_TASK_ID:?Missing array task ID.}"
 export CHECKPOINT_MANIFEST RESULT_ROOT CAMPAIGN SOURCE_COMMIT SOURCE_TREE
 export EPISODES="${EPISODES:-5}" MAX_STEPS="${MAX_STEPS:-500}"
+export EXPECTED_MAX_STEP="${EXPECTED_MAX_STEP:-1500000}"
 
 # Select one immutable input and check the saved settings; never override the
 # checkpoint's architecture or silently change the native planning protocol.
-CHECKPOINT=$("$PYTHON_BIN" - <<'PY'
+SELECTION=$("$PYTHON_BIN" - <<'PY'
 import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
+from publish_tdmpc2_mppi_eval import STEPS, _expected_steps, evaluation_source_fingerprint
 
 def require(condition, message):
     if not condition:
@@ -51,9 +53,16 @@ def require(condition, message):
 manifest = Path(os.environ["CHECKPOINT_MANIFEST"])
 root = Path(os.environ["RESULT_ROOT"])
 require(manifest.is_absolute() and root.is_absolute(), "Input and result paths must be absolute.")
-rows = json.loads(manifest.read_text())["checkpoints"]
-require([row["step"] for row in rows] == list(range(100000, 400001, 50000)),
-        "Expected checkpoints 100k through 400k every 50k, in order.")
+manifest_data = json.loads(manifest.read_text())
+source_run = "rwgao_b-brown-university/ambi/xq3zva9u"
+require(manifest_data.get("source_run", source_run) == source_run, "Foreign source run in manifest.")
+rows = manifest_data["checkpoints"]
+steps = [row["step"] for row in rows]
+require(bool(steps) and all(type(step) is int and step in STEPS for step in steps)
+        and steps == sorted(set(steps)),
+        "Expected ordered unique checkpoints on the 100k–1.5M 50k grid.")
+expected_steps = _expected_steps(int(os.environ["EXPECTED_MAX_STEP"]))
+require(all(step in expected_steps for step in steps), "Checkpoint exceeds expected campaign maximum.")
 index = int(os.environ["SLURM_ARRAY_TASK_ID"])
 require(0 <= index < len(rows), "Invalid checkpoint array index.")
 require(int(os.environ["EPISODES"]) > 0 and 0 < int(os.environ["MAX_STEPS"]) <= 500,
@@ -89,7 +98,9 @@ require(not (root / f"step_{row['step']}" / "paired.json").exists(), "Evaluation
 directory = root / f"step_{row['step']}"
 directory.mkdir(parents=True, exist_ok=True)
 provenance = {"code_sha": os.environ["SOURCE_COMMIT"], "code_tree": os.environ["SOURCE_TREE"],
-              "source_run": "rwgao_b-brown-university/ambi/xq3zva9u", "campaign": os.environ["CAMPAIGN"],
+              "evaluation_source_sha256": evaluation_source_fingerprint(
+                  os.environ["SOURCE_COMMIT"], os.environ["SOURCE_TREE"]),
+              "source_run": source_run, "campaign": os.environ["CAMPAIGN"],
               "checkpoint_sha256": row["sha256"], "metadata_sha256": metadata_sha256}
 target = directory / "provenance.json"
 if target.exists():
@@ -105,11 +116,13 @@ else:
         os.link(temporary, target)
     finally:
         temporary.unlink()
+print(row["step"])
 print(checkpoint)
 PY
 )
 
-STEP=$((100000 + SLURM_ARRAY_TASK_ID * 50000))
+STEP="${SELECTION%%$'\n'*}"
+CHECKPOINT="${SELECTION#*$'\n'}"
 OUTPUT="$RESULT_ROOT/step_${STEP}/paired.json"
 mkdir -p "$(dirname "$OUTPUT")"
 WANDB_LOCAL_ROOT="${SLURM_TMPDIR:-/tmp}/tdmpc2-prior-mppi-${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}-${SLURM_ARRAY_TASK_ID}"
@@ -131,4 +144,4 @@ echo "Native MPPI: H3, N512, elites64, policy24, configured6/effective8 iteratio
 "$PYTHON_BIN" publish_tdmpc2_mppi_eval.py "$OUTPUT" \
   --project ambi-inner-bench \
   --source-run rwgao_b-brown-university/ambi/xq3zva9u \
-  --campaign "$CAMPAIGN"
+  --campaign "$CAMPAIGN" --expected-max-step "$EXPECTED_MAX_STEP"
