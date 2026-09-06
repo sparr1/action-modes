@@ -109,10 +109,13 @@ with `AMBIXQC_MODE=production`. Production uses one L40S, six CPUs, 48 GB RAM,
 and a 72-hour limit. Each job creates a fresh result directory; production
 publishes to W&B project `ambi` with its source SHA and job ID in the run name.
 
-New XQC checkpoints use version 2 to record the collection operator. Version-1
-checkpoints remain readable as inner-XQC checkpoints. Ordinary loading retains
-strict semantic checks; the evaluator's explicit frozen load permits only
-supported inner/controller changes and records the saved and evaluated settings.
+New XQC checkpoints use version 3 to record both the collection operator and
+`inner_terminal_bootstrap`. Version-1 and version-2 checkpoints remain readable:
+their missing terminal setting means `inner`, and version 1 also defaults to
+inner-XQC collection. Ordinary loading retains strict semantic checks; the
+evaluator's explicit frozen load permits only supported inner/controller changes
+and records the saved and evaluated settings. Existing checkpoint banks do not
+need rewriting.
 
 The [J6 checkpoint campaign](configs/research/README.md#ambi-xqc-inner-j6-checkpoint-campaign)
 uses native inner XQC with the rollout and update-slot budgets from
@@ -124,6 +127,16 @@ completed MPPI campaign's prior-reference bundles at every 50k checkpoint;
 `summarize_ambixqc_inner_eval.py` validates and reports the new paired outcomes.
 The campaign runner enables deterministic evaluation kernels for repeatable
 seeded solves; its launcher sets the required CUDA workspace configuration.
+
+The same runner and summarizer accept `--variant outer_terminal`, using
+`configs/research/ambixqc_humanoid_outer_terminal_j6_benchmark.json`. This changes
+only the bootstrap at the final imagined horizon transition: a sampled frozen
+outer actor action and the online outer critic supply the target using running
+BatchNorm statistics, with the current inner temperature weighting its entropy
+term. Earlier transitions retain the inner actor and target critic. The
+J6/N512/H3/G3/B512 budget, C18/A6/T6 counts, frozen outer state, and paired prior
+references are preserved. See the [outer terminal workflow](configs/research/README.md#outer-terminal-bootstrap-variant)
+for separate output directories, launch selection, and variant-aware reports.
 
 ### AMBI-XQC compiled execution and paired timing
 

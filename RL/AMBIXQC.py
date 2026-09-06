@@ -59,6 +59,7 @@ _AMBIXQC_DEFAULTS = {
     "inner_batch_size": 64,
     "inner_replay_capacity": None,
     "inner_replay_sampling": "with_replacement",
+    "inner_terminal_bootstrap": "inner",
     # Existing experiments retain the real-stream scale snapshot. Heavy
     # inner-data screens can opt into fresh action-local imagined-return
     # moments without contaminating the persistent real-data normalizer.
@@ -77,6 +78,7 @@ _PUBLIC_INNER_KEYS = {
     "inner_batch_size",
     "inner_replay_capacity",
     "inner_replay_sampling",
+    "inner_terminal_bootstrap",
     "inner_reward_normalization",
     "inner_actor_lr",
     "inner_critic_lr",
@@ -307,6 +309,10 @@ class AMBIXQC(AMBITDMPC2):
         }:
             raise ValueError("inner_operator must be 'none' or 'xqc'.")
         cfg.inner_operator = cfg.inner_operator.lower()
+        if (not isinstance(cfg.inner_terminal_bootstrap, str)
+                or cfg.inner_terminal_bootstrap.lower() not in {"inner", "outer"}):
+            raise ValueError("inner_terminal_bootstrap must be 'inner' or 'outer'.")
+        cfg.inner_terminal_bootstrap = cfg.inner_terminal_bootstrap.lower()
         cfg.action_contract = {
             "shape": list(self._action_shape),
             "low": self._action_low.tolist(),

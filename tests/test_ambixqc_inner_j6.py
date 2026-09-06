@@ -93,14 +93,16 @@ def deterministic_xqc_numerics(device):
     pytest.param("cuda", marks=pytest.mark.skipif(
         not torch.cuda.is_available(), reason="CUDA hardware is unavailable")),
 ])
+@pytest.mark.parametrize("terminal_bootstrap", ["inner", "outer"])
 def test_full_j6_budget_has_fresh_learners_exact_steps_and_seeded_frozen_actions(
-    device, tmp_path, monkeypatch, deterministic_xqc_numerics
+    device, terminal_bootstrap, tmp_path, monkeypatch, deterministic_xqc_numerics
 ):
     # Keep the production rollout/update budget; only the learned network sizes
     # and outer training batch are reduced for this local integration test.
     source = _wrapper(device=device, inner_operator="none", xqc_optimizer_backend="auto",
                       train_unroll_horizon=3)
     target = _wrapper(device=device, xqc_optimizer_backend="auto", train_unroll_horizon=3,
+                      inner_terminal_bootstrap=terminal_bootstrap,
                       **BUDGET)
     try:
         source.agent.observe_reward(2.0, False, False)

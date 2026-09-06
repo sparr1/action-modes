@@ -100,6 +100,9 @@ class InnerXQCState:
     replay_draws: int = 0
     policy_evaluations: int = 0
     sampled_ids: list[torch.Tensor] = field(default_factory=list)
+    outer_terminal_flags: torch.Tensor | None = None
+    outer_terminal_boundary_rows: torch.Tensor | float = 0.0
+    outer_terminal_bootstrap_rows: torch.Tensor | float = 0.0
 
 
 class InnerXQCEngine:
@@ -107,6 +110,10 @@ class InnerXQCEngine:
 
     _STATE_SCHEMA = "ambi-xqc-inner-training-state"
     _STATE_VERSION = 1
+
+    @property
+    def _uses_outer_terminal_bootstrap(self):
+        return getattr(self.cfg, "inner_terminal_bootstrap", "inner") == "outer"
 
     def __init__(self, agent):
         self.agent = agent
@@ -477,7 +484,33 @@ class InnerXQCEngine:
             reward_normalizer=reward_normalizer,
             reward_normalizer_count_initial=reward_normalizer_count_initial,
         )
+        if self._uses_outer_terminal_bootstrap:
+            # Sample IDs are action-local append offsets because capacity must
+            # hold every imagined transition. Keep boundary provenance separate
+            # from the shared replay schema and discard it with each solve.
+            self.state.outer_terminal_flags = torch.zeros(
+                replay.capacity, dtype=torch.bool, device=self.device
+            )
+            self.state.outer_terminal_boundary_rows = torch.zeros(
+                (), dtype=torch.long, device=self.device
+            )
+            self.state.outer_terminal_bootstrap_rows = torch.zeros(
+                (), dtype=torch.long, device=self.device
+            )
         self._ensure_rollout_compile_region(workspace.controller)
+
+    def _record_outer_terminal_flags(self, flags):
+        """Record eligible horizon ends before committing matching replay rows."""
+        storage = self.state.outer_terminal_flags
+        if storage is None:
+            return
+        flags = flags.reshape(-1).to(device=self.device, dtype=torch.bool)
+        start = self.state.replay.next_sample_id
+        end = start + flags.numel()
+        if end > storage.numel():
+            raise ValueError("Outer terminal provenance requires replay without eviction.")
+        storage[start:end].copy_(flags)
+        self.state.outer_terminal_boundary_rows.add_(flags.sum())
 
     def _new_branch_return_accumulator(self, count, reference):
         return torch.full(
@@ -564,6 +597,7 @@ class InnerXQCEngine:
         discount_weight = torch.ones_like(reward_sums)
         terminated_rollout = torch.zeros_like(alive)
         transition_fields = ([], [], [], [], [])
+        terminal_flags = []
         normalizer_returns = []
         return_accumulator = (
             self._new_branch_return_accumulator(count, root_z)
@@ -571,7 +605,7 @@ class InnerXQCEngine:
             else None
         )
 
-        for _ in range(horizon):
+        for step in range(horizon):
             active = torch.nonzero(alive, as_tuple=False).squeeze(-1)
             if active.numel() == 0:
                 break
@@ -593,6 +627,11 @@ class InnerXQCEngine:
             transition_fields[2].append(reward)
             transition_fields[3].append(next_z)
             transition_fields[4].append(terminated)
+            if self.state.outer_terminal_flags is not None:
+                terminal_flags.append(
+                    torch.full_like(terminated, step == horizon - 1, dtype=torch.bool)
+                    & (terminated == 0)
+                )
 
             reward_vector = reward.squeeze(-1)
             if return_accumulator is not None:
@@ -614,6 +653,8 @@ class InnerXQCEngine:
             alive[active] = ~just_terminated
 
         if transition_fields[0]:
+            if terminal_flags:
+                self._record_outer_terminal_flags(torch.cat(terminal_flags, dim=0))
             self.state.replay.add_batch(
                 *(torch.cat(values, dim=0) for values in transition_fields)
             )
@@ -721,6 +762,10 @@ class InnerXQCEngine:
 
         # Compilation/fallback above is pure. Replay and counters commit once,
         # only after it returns successfully.
+        if self.state.outer_terminal_flags is not None:
+            flags = torch.zeros((horizon, count), dtype=torch.bool, device=self.device)
+            flags[-1] = True
+            self._record_outer_terminal_flags(flags)
         self.state.replay.add_packed(packed)
         self.state.policy_evaluations += count * horizon
         return {
@@ -767,8 +812,12 @@ class InnerXQCEngine:
             int(self.cfg.inner_batch_size),
             replacement=replacement,
             generator=self.rng.generator("replay"),
-            include_ids=self._collect_diagnostics,
+            include_ids=self._collect_diagnostics or self._uses_outer_terminal_bootstrap,
         )
+        if self.state.outer_terminal_flags is not None:
+            batch["outer_terminal_mask"] = self.state.outer_terminal_flags.index_select(
+                0, batch["sample_ids"]
+            )
         self.state.replay_draws += int(batch["z"].shape[0])
         if self._collect_diagnostics:
             self.state.sampled_ids.append(batch["sample_ids"].detach())
@@ -801,11 +850,20 @@ class InnerXQCEngine:
                 device=self.device,
             ),
         )
+        terminal_kwargs = {}
+        if self.state.outer_terminal_flags is not None:
+            mask = raw["outer_terminal_mask"]
+            self.state.outer_terminal_bootstrap_rows.add_(mask.sum())
+            terminal_kwargs = {
+                "outer_terminal_mask": mask,
+                "outer_controller": self.outer_controller,
+            }
         return self.state.workspace.update(
             batch,
             next_noise=next_noise,
             actor_noise=actor_noise,
             reward_scale=self.state.reward_scale,
+            **terminal_kwargs,
         )
 
     @staticmethod
@@ -970,6 +1028,9 @@ class InnerXQCEngine:
             )
             target_steps = update_slots // target_interval
             update_batch_work = update_slots * int(self.cfg.inner_batch_size)
+            outer_terminal_work = (
+                update_batch_work if self._uses_outer_terminal_bootstrap else 0
+            )
             realized_steps = length_values.sum()
             utd_denominator = realized_steps.clamp_min(1)
             local_reward_normalizer = self.state.reward_normalizer
@@ -1021,9 +1082,9 @@ class InnerXQCEngine:
                 inner_critic_target_updates=float(target_steps),
                 inner_actor_target_updates=0.0,
                 inner_policy_evaluations=float(
-                    self.state.policy_evaluations + 2 * update_batch_work
+                    self.state.policy_evaluations + 2 * update_batch_work + outer_terminal_work
                 ),
-                inner_q_evaluations=float(5 * update_batch_work),
+                inner_q_evaluations=float(5 * update_batch_work + outer_terminal_work),
                 inner_replay_draws=float(self.state.replay_draws),
                 inner_buffer_size=float(self.state.replay.size),
                 inner_buffer_capacity=float(self.state.replay.capacity),
@@ -1068,6 +1129,14 @@ class InnerXQCEngine:
                 inner_termination_rate_min=termination_stats[2],
                 inner_termination_rate_max=termination_stats[3],
             )
+            if self._uses_outer_terminal_bootstrap:
+                metrics.update(
+                    inner_terminal_bootstrap_outer=1.0,
+                    inner_outer_terminal_boundary_rows=self.state.outer_terminal_boundary_rows,
+                    inner_outer_terminal_bootstrap_rows=self.state.outer_terminal_bootstrap_rows,
+                    inner_outer_terminal_policy_evaluations=float(outer_terminal_work),
+                    inner_outer_terminal_q_evaluations=float(outer_terminal_work),
+                )
             metrics.update(self._average_updates(update_history, root_z))
             metrics.update(self._compile_fallback_metrics())
             if self._collect_diagnostics:

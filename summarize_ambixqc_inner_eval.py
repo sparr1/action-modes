@@ -10,6 +10,7 @@ import math
 from pathlib import Path
 
 from report_ambi_benchmark import load_bundles
+from run_ambixqc_inner_evaluation import campaign_profile
 from run_ambixqc_mppi_evaluation import SOURCE_RUN, STEPS, file_sha256
 from summarize_ambixqc_mppi_eval import _finite, _read, _sha, _stats, _validate_run as _validate_prior
 from utils.ambi_benchmark import atomic_json, atomic_write, canonical_hash, episode_protocol, reference_returns, run_controller_type, solver_seed
@@ -25,11 +26,11 @@ NUMERICAL_SETTINGS = {"device_type": "cuda", "deterministic_algorithms": True, "
                       "cudnn_deterministic": True, "cudnn_benchmark": False, "cublas_workspace_config": ":4096:8"}
 
 
-def _numerical_settings(provenance, paired, entry):
+def _numerical_settings(provenance, paired, entry, *, matrix=None):
     expected_hash = canonical_hash(NUMERICAL_SETTINGS)
     if any(canonical_hash(record.get("numerical_settings")) != expected_hash for record in (provenance, paired)):
         raise ValueError("Production numerical settings must record strict deterministic CUDA, deterministic cuDNN without benchmarking, and CuBLAS :4096:8 in both provenance.json and paired.json.")
-    if paired.get("checkpoint_sha256") != entry["sha256"] or paired.get("matrix_sha256") != file_sha256(MATRIX):
+    if paired.get("checkpoint_sha256") != entry["sha256"] or paired.get("matrix_sha256") != file_sha256(matrix or MATRIX):
         raise ValueError("Numerical settings belong to a different checkpoint/matrix evaluation payload.")
 
 
@@ -44,15 +45,27 @@ def _identity(manifest, entry, source):
         raise ValueError("Evaluation runtime provenance is required.")
 
 
-def _configuration(run, prior, metadata, controller_seed):
+def _budget(variant):
+    campaign_profile(variant)  # Validate the selected profile even for direct helper callers.
+    return {**BUDGET, **({"inner_terminal_bootstrap": "outer"} if variant == "outer_terminal" else {})}
+
+
+def _signature(value):
+    result = copy.deepcopy(value or {})
+    result.setdefault("inner_terminal_bootstrap", "inner")
+    return result
+
+
+def _configuration(run, prior, metadata, controller_seed, *, variant="inner"):
     result, reference = run["result"], prior["result"]
     saved = metadata["trial_run_params"]
     if result.get("saved_algorithm_config") != saved or reference.get("saved_algorithm_config") != saved:
         raise ValueError("Saved algorithm configuration differs from checkpoint metadata.")
     expected = copy.deepcopy(prior["config"])
-    expected["alg_params"].update(BUDGET)
+    budget = _budget(variant)
+    expected["alg_params"].update(budget)
     if run["config"] != expected or expected["alg_params"].get("xqc_policy_delay") != 3:
-        raise ValueError("Inner configuration must inherit the prior and change only the J6/N512/H3/G3/B512 budget.")
+        raise ValueError("Inner configuration must inherit the prior and change only the J6/N512/H3/G3/B512 budget and selected terminal bootstrap.")
     evaluated = copy.deepcopy(result.get("evaluated_algorithm_config", {}))
     expected["seed"] = controller_seed
     expected["alg_params"]["wandb"] = False
@@ -62,28 +75,33 @@ def _configuration(run, prior, metadata, controller_seed):
     if evaluated != expected:
         raise ValueError("Evaluated algorithm settings differ from the recorded configuration.")
     resolved = result.get("resolved_config", {})
-    required = {**BUDGET, "inner_reward_normalization": "frozen_real_scale",
+    required = {**budget, "inner_reward_normalization": "frozen_real_scale",
                 "inner_actor_lr": 5e-5, "inner_critic_lr": 5e-5, "xqc_policy_delay": 3}
     if any(resolved.get(key) != value for key, value in required.items()):
         raise ValueError("Resolved XQC defaults/budget must retain frozen normalization and inherited learning rates.")
+    terminal = "outer" if variant == "outer_terminal" else "inner"
+    if resolved.get("inner_terminal_bootstrap", "inner") != terminal:
+        raise ValueError("Resolved terminal bootstrap differs from the selected variant.")
     provenance, prior_provenance = result.get("checkpoint_evaluation_provenance", {}), reference.get("checkpoint_evaluation_provenance", {})
     if (provenance.get("frozen_evaluation") is not True or prior_provenance.get("frozen_evaluation") is not True
-            or provenance.get("saved_semantic_signature") != prior_provenance.get("saved_semantic_signature")):
+            or _signature(provenance.get("saved_semantic_signature")) != _signature(prior_provenance.get("saved_semantic_signature"))):
         raise ValueError("Frozen checkpoint semantic provenance is missing or mismatched.")
-    saved_signature = provenance.get("saved_semantic_signature", {})
+    saved_signature = _signature(provenance.get("saved_semantic_signature"))
     if (saved_signature.get("collection_operator") != "none" or saved_signature.get("algorithm") != "AMBIXQC"
             or saved_signature.get("inner_lifecycle") != "fresh_per_action"
             or saved_signature.get("reward_normalization") != "real_discounted_return_only"
-            or prior_provenance.get("evaluated_semantic_signature") != saved_signature):
+            or saved_signature["inner_terminal_bootstrap"] != "inner"
+            or _signature(prior_provenance.get("evaluated_semantic_signature")) != saved_signature):
         raise ValueError("Reference must retain the unchanged prior-only checkpoint semantics.")
     expected_signature = copy.deepcopy(saved_signature)
     expected_signature["collection_operator"] = "xqc"
+    expected_signature["inner_terminal_bootstrap"] = terminal
     expected_signature["inner_schedule"].update(rounds=6, rollouts=512, horizon=3, updates=3, batch_size=512, replay_capacity=9216)
-    if provenance.get("evaluated_semantic_signature") != expected_signature:
+    if _signature(provenance.get("evaluated_semantic_signature")) != expected_signature:
         raise ValueError("Inner evaluation changed unsupported outer or normalization semantics.")
 
 
-def _validate_xqc(run, traces, *, seeds, max_steps, controller_seed):
+def _validate_xqc(run, traces, *, seeds, max_steps, controller_seed, variant="inner"):
     result = run.get("result", {})
     if (run.get("status") != "complete" or result.get("outer_state_unchanged") is not True
             or run.get("outer_state_unchanged") is not True
@@ -114,6 +132,18 @@ def _validate_xqc(run, traces, *, seeds, max_steps, controller_seed):
                     **{f"inner_{component}_optimizer_steps": count for component, count in COUNTS.items()}}
         if any(metrics.get(f"decision/{key}") != [value] for key, value in required.items()):
             raise ValueError("Measured inner work or frozen reward normalization differs from the campaign.")
+        if variant == "outer_terminal":
+            outer_counts = {"inner_terminal_bootstrap_outer": 1, "inner_outer_terminal_boundary_rows": 3072,
+                            "inner_outer_terminal_policy_evaluations": 9216, "inner_outer_terminal_q_evaluations": 9216}
+            sampled = _finite(metrics.get("decision/inner_outer_terminal_bootstrap_rows", [None])[0], "Outer-terminal sampled rows")
+            if (any(metrics.get(f"decision/{key}") != [value] for key, value in outer_counts.items())
+                    or not 0 <= sampled <= 9216 or int(sampled) != sampled):
+                raise ValueError("Outer-terminal decision measurements differ from the selected variant.")
+        elif any(metrics.get(f"decision/{key}", [0]) != [0] for key in (
+            "inner_terminal_bootstrap_outer", "inner_outer_terminal_boundary_rows", "inner_outer_terminal_bootstrap_rows",
+            "inner_outer_terminal_policy_evaluations", "inner_outer_terminal_q_evaluations",
+        )):
+            raise ValueError("Inner variant cannot report outer-terminal bootstrap work.")
         by_seed[trace["seed"]].append(trace)
     for episode in episodes:
         if (episode.get("status") != "complete" or episode.get("length") != max_steps
@@ -138,7 +168,8 @@ def _validate_xqc(run, traces, *, seeds, max_steps, controller_seed):
 
 
 def summarize(manifest_path, results_root, *, expected_source_sha, reference_root=None,
-              seeds=(101, 102, 103, 104, 105), max_steps=500, controller_seed=12345, allow_partial=False):
+              seeds=(101, 102, 103, 104, 105), max_steps=500, controller_seed=12345, allow_partial=False, variant="inner"):
+    profile = campaign_profile(variant)
     _sha(expected_source_sha, 40, "Expected evaluation commit")
     manifest_path, results_root = Path(manifest_path).resolve(), Path(results_root).resolve()
     inventory = _read(manifest_path)
@@ -165,9 +196,12 @@ def summarize(manifest_path, results_root, *, expected_source_sha, reference_roo
         if file_sha256(reference_path / "manifest.json") != entry["reference_manifest_sha256"]:
             raise ValueError("Prior reference manifest differs from the immutable inventory.")
         reference, candidate, provenance = _read(reference_path / "manifest.json"), _read(candidate_path / "manifest.json"), _read(destination / "provenance.json")
-        _numerical_settings(provenance, _read(destination / "paired.json"), entry)
+        paired = _read(destination / "paired.json")
+        if any(record.get("variant", "inner") != variant for record in (provenance, paired)):
+            raise ValueError("Recorded campaign variant differs from the selected variant.")
+        _numerical_settings(provenance, paired, entry, matrix=profile["matrix"])
         expected_provenance = {"source_run": SOURCE_RUN, "checkpoint": entry, "checkpoint_manifest_sha256": file_sha256(manifest_path),
-                               "matrix_sha256": file_sha256(MATRIX), "mode": "production", "seeds": list(seeds),
+                               "matrix_sha256": file_sha256(profile["matrix"]), "mode": "production", "seeds": list(seeds),
                                "max_steps": max_steps, "controller_seed": controller_seed,
                                "reference_bundle": entry["reference_bundle"], "reference_manifest_sha256": entry["reference_manifest_sha256"]}
         if any(provenance.get(key) != value for key, value in expected_provenance.items()):
@@ -189,7 +223,7 @@ def summarize(manifest_path, results_root, *, expected_source_sha, reference_roo
         prior, run = priors[0], candidate["runs"][0]
         if candidate["checkpoint"]["metadata"] != reference["checkpoint"]["metadata"]:
             raise ValueError("Checkpoint metadata contents differ across reference and candidate.")
-        _configuration(run, prior, candidate["checkpoint"]["metadata"], controller_seed)
+        _configuration(run, prior, candidate["checkpoint"]["metadata"], controller_seed, variant=variant)
         current_sources = {"reference": reference["code"], "inner_xqc": candidate["code"]}
         current_signature = canonical_hash({"protocol": current_protocol, "sources": current_sources, "config": run["config"]})
         if signature is not None and current_signature != signature:
@@ -201,7 +235,7 @@ def summarize(manifest_path, results_root, *, expected_source_sha, reference_roo
                             and item["evaluation_id"] == candidate["evaluation_id"])
         options = {"seeds": seeds, "max_steps": max_steps, "controller_seed": controller_seed}
         episodes = {"prior": _validate_prior(prior, loaded_prior["traces"], "prior", **options),
-                    "inner_xqc": _validate_xqc(run, loaded_inner["traces"], **options)}
+                    "inner_xqc": _validate_xqc(run, loaded_inner["traces"], variant=variant, **options)}
         deltas = [episode["return"] - prior_values[episode["seed"]] for episode in episodes["inner_xqc"]]
         if any(not math.isclose(_finite(episode.get("paired_return_delta"), "Paired delta"), delta, rel_tol=1e-9, abs_tol=1e-8)
                for episode, delta in zip(episodes["inner_xqc"], deltas)):
@@ -224,12 +258,17 @@ def summarize(manifest_path, results_root, *, expected_source_sha, reference_roo
     return {"schema_version": 1, "status": "partial" if missing else "complete", "source_run": SOURCE_RUN,
             "checkpoint_manifest_sha256": file_sha256(manifest_path), "evaluation_source_sha": expected_source_sha, "sources": sources,
             "protocol": protocol, "seeds": list(seeds), "expected_steps": list(STEPS), "missing_steps": missing,
-            "inner_settings": BUDGET, "optimizer_steps_per_decision": COUNTS, "model_steps_per_decision": 9216,
+            "variant": variant, "inner_settings": _budget(variant), "optimizer_steps_per_decision": COUNTS, "model_steps_per_decision": 9216,
             "numerical_settings": copy.deepcopy(NUMERICAL_SETTINGS), "numerical_settings_scope": "new_inner_xqc_evaluations",
             "statistics": "Raw environment returns; five paired seeds; population SD (ddof=0). XQC values use normalized reward units.", "rows": rows}
 
 
 def render_html(summary):
+    outer = campaign_profile(summary.get("variant", "inner"))["variant"] == "outer_terminal"
+    label = "XQC with outer terminal bootstrap" if outer else "inner XQC"
+    title = f"Frozen XQC: prior versus {label}"
+    terminal_description = ("Only the final imagined transition bootstraps with the frozen outer actor and online critic using running BatchNorm statistics; the entropy weight remains the adapting inner temperature. Earlier transitions retain the inner actor and target critic."
+                            if outer else "Imagined transitions bootstrap with the adapting inner actor and inner target critic.")
     rows = summary["rows"]
     def chart(series, title, zero=False):
         xs = [row["checkpoint_step"] for row in rows]
@@ -250,20 +289,23 @@ def render_html(summary):
     for row in rows:
         values = [f'{row[group][key+"_mean"]:.3f} ± {row[group][key+"_std"]:.3f}' for group,key in (("prior","return"),("inner_xqc","return"),("paired","delta"))]
         body.append(f'<tr><td>{row["checkpoint_step"]:,}</td>'+''.join(f'<td>{value}</td>' for value in values)+f'<td>{row["prior"]["control_seconds_per_decision"]:.6f}</td><td>{row["inner_xqc"]["control_seconds_per_decision"]:.6f}</td></tr>')
-    return ('<!doctype html><html><head><meta charset="utf-8"><title>Frozen XQC: prior versus inner XQC</title><style>body{font:16px system-ui;color:#18263b;background:#f7f9fc;max-width:1100px;margin:40px auto;padding:0 24px}p{line-height:1.6}svg{background:white;width:100%;border:1px solid #dbe1ea}svg text{font:12px system-ui}table{width:100%;border-collapse:collapse;background:white}td,th{text-align:right;padding:12px;border-bottom:1px solid #ddd}td:first-child,th:first-child{text-align:left}code{overflow-wrap:anywhere}</style></head><body>'
-            f'<h1>Frozen XQC: prior versus inner XQC</h1><p>{html.escape(summary["status"].capitalize())}: {len(rows)}/{len(summary["expected_steps"])} checkpoints. Seeds {html.escape(str(summary["seeds"]))}. {html.escape(summary["statistics"])}</p>'
-            '<p><span style="color:#2563a6">Blue: persistent prior.</span> <span style="color:#c46722">Orange: inner XQC.</span> Both execute the actor mean. J6/N512/H3/G3/B512, policy delay 3; each decision performs C18/A6/T6 and 9,216 model steps. Full outer state and real reward normalization remain frozen.</p>'
+    return (f'<!doctype html><html><head><meta charset="utf-8"><title>{title}</title><style>body{{font:16px system-ui;color:#18263b;background:#f7f9fc;max-width:1100px;margin:40px auto;padding:0 24px}}p{{line-height:1.6}}svg{{background:white;width:100%;border:1px solid #dbe1ea}}svg text{{font:12px system-ui}}table{{width:100%;border-collapse:collapse;background:white}}td,th{{text-align:right;padding:12px;border-bottom:1px solid #ddd}}td:first-child,th:first-child{{text-align:left}}code{{overflow-wrap:anywhere}}</style></head><body>'
+            f'<h1>{title}</h1><p>{html.escape(summary["status"].capitalize())}: {len(rows)}/{len(summary["expected_steps"])} checkpoints. Seeds {html.escape(str(summary["seeds"]))}. {html.escape(summary["statistics"])}</p>'
+            f'<p><span style="color:#2563a6">Blue: persistent prior.</span> <span style="color:#c46722">Orange: {label}.</span> Both execute the actor mean. J6/N512/H3/G3/B512, policy delay 3; each decision performs C18/A6/T6 and 9,216 model steps. Full outer state and real reward normalization remain frozen.</p><p>{terminal_description}</p>'
             + chart([("prior","return_mean","#2563a6"),("inner_xqc","return_mean","#c46722")],"Mean raw episode return")
-            + chart([("paired","delta_mean","#21836f")],"Mean paired gain: inner XQC minus prior",True)
-            + '<h2>Checkpoint comparisons</h2><table><tr><th>Checkpoint</th><th>Prior return ± SD</th><th>Inner XQC return ± SD</th><th>Paired gain ± SD</th><th>Prior s/decision</th><th>Inner s/decision</th></tr>'+''.join(body)+'</table>'
+            + chart([("paired","delta_mean","#21836f")],f"Mean paired gain: {label} minus prior",True)
+            + f'<h2>Checkpoint comparisons</h2><table><tr><th>Checkpoint</th><th>Prior return ± SD</th><th>{label[0].upper()+label[1:]} return ± SD</th><th>Paired gain ± SD</th><th>Prior s/decision</th><th>Inner s/decision</th></tr>'+''.join(body)+'</table>'
             + f'<p>Missing steps: {html.escape(str(summary["missing_steps"]))}. Reference commit: <code>{REFERENCE_SHA}</code>. New evaluation commit: <code>{html.escape(summary["evaluation_source_sha"])}</code>.</p></body></html>')
 
 
 def publish(summary, *, project, entity, mode="online"):
     from utils.wandb_utils import init_wandb
+    outer = campaign_profile(summary.get("variant", "inner"))["variant"] == "outer_terminal"
+    label = "XQC outer terminal bootstrap" if outer else "inner XQC"
+    extra_tags = ["terminal-bootstrap:outer", "terminal-policy:frozen-outer", "terminal-q:online-outer", "terminal-alpha:inner"] if outer else []
     remote = init_wandb({"wandb": True, "wandb_project": project, "wandb_entity": entity, "wandb_mode": mode,
-                         "wandb_tags": ["frozen-xqc", "prior-vs-inner-xqc", "j6-n512-h3-g3-b512", "C18-A6-T6"]},
-                        default_project="ambi-inner-bench", run_name="AMBI-XQC prior vs inner XQC J6 N512 H3 G3 B512 | C18 A6 T6",
+                         "wandb_tags": ["frozen-xqc", "prior-vs-inner-xqc", "j6-n512-h3-g3-b512", "C18-A6-T6", *extra_tags]},
+                        default_project="ambi-inner-bench", run_name=f"AMBI-XQC prior vs {label} J6 N512 H3 G3 B512 | C18 A6 T6",
                         config={key: value for key,value in summary.items() if key != "rows"})
     failure = None
     try:
@@ -292,6 +334,7 @@ def main(argv=None):
     for name in ("manifest", "results-root", "output"):
         parser.add_argument(f"--{name}", required=True, type=Path)
     parser.add_argument("--expected-source-sha", required=True)
+    parser.add_argument("--variant", choices=("inner", "outer_terminal"), default="inner")
     parser.add_argument("--reference-root", type=Path, help="Relocate downloaded references under ROOT/production/step_N/bundle; hashes stay fixed.")
     parser.add_argument("--html", type=Path)
     for name in ("allow-partial", "overwrite", "wandb"):
@@ -307,7 +350,7 @@ def main(argv=None):
     for path in outputs:
         if path.exists() and not args.overwrite:
             raise FileExistsError(f"Output exists: {path}; use --overwrite.")
-    summary = summarize(args.manifest,args.results_root,expected_source_sha=args.expected_source_sha,reference_root=args.reference_root,allow_partial=args.allow_partial)
+    summary = summarize(args.manifest,args.results_root,expected_source_sha=args.expected_source_sha,reference_root=args.reference_root,allow_partial=args.allow_partial,variant=args.variant)
     atomic_json(args.output,summary,overwrite=args.overwrite)
     if args.html:
         atomic_write(args.html,render_html(summary).encode(),overwrite=args.overwrite)

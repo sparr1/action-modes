@@ -120,6 +120,7 @@ def _change(outputs,change):
 def test_native_inner_xqc_paired_statistics_and_truthful_html(outputs):
     summary=_summarize(outputs)
     assert summary["status"]=="complete" and len(summary["rows"])==2
+    assert summary["variant"]=="inner"
     row=summary["rows"][0]
     assert row["prior"]["return_mean"]==15 and row["prior"]["return_std"]==5
     assert row["inner_xqc"]["return_mean"]==19 and row["inner_xqc"]["return_std"]==6
@@ -279,3 +280,126 @@ def test_optional_publication_uses_native_xqc_curves_and_closes_on_failure(outpu
     with pytest.raises(RuntimeError) as caught:
         campaign.publish(summary,project="test",entity="test")
     assert caught.value is failure and any("close failed" in note for note in failure.__notes__)
+
+
+@pytest.fixture
+def outer_outputs(outputs):
+    matrix=campaign.campaign_profile("outer_terminal")["matrix"]
+    for step in campaign.STEPS:
+        destination=outputs[1]/"production"/f"step_{step}"
+        bundle=destination/"bundle"
+        path=bundle/"manifest.json"
+        manifest=json.loads(path.read_text())
+        run=manifest["runs"][0]
+        run["config"]["alg_params"]["inner_terminal_bootstrap"]="outer"
+        run["config_hash"]=storage.canonical_hash(run["config"])
+        result=run["result"]
+        result["evaluated_algorithm_config"]["alg_params"]["inner_terminal_bootstrap"]="outer"
+        result["resolved_config"]["inner_terminal_bootstrap"]="outer"
+        # A new loader normalizes a v2 checkpoint; its archived prior-reference
+        # signature still lacks the newly introduced default field.
+        result["checkpoint_evaluation_provenance"]["saved_semantic_signature"]["inner_terminal_bootstrap"]="inner"
+        result["checkpoint_evaluation_provenance"]["evaluated_semantic_signature"]["inner_terminal_bootstrap"]="outer"
+        storage.atomic_json(path,manifest,overwrite=True)
+        for relative in run["trace_files"]:
+            with gzip.open(bundle/relative,"rt") as stream:
+                rows=[json.loads(line) for line in stream]
+            for row in rows:
+                row["metrics"].update({"decision/inner_terminal_bootstrap_outer":1,
+                    "decision/inner_outer_terminal_boundary_rows":3072,
+                    "decision/inner_outer_terminal_bootstrap_rows":3000,
+                    "decision/inner_outer_terminal_policy_evaluations":9216,
+                    "decision/inner_outer_terminal_q_evaluations":9216})
+            with gzip.open(bundle/relative,"wt") as stream:
+                stream.writelines(json.dumps(row)+"\n" for row in rows)
+        manifest["metric_catalog"].update(storage.decision_metric_catalog(rows[0]["metrics"],xqc=True))
+        storage.atomic_json(path,manifest,overwrite=True)
+        for filename in ("provenance.json","paired.json"):
+            path=destination/filename
+            record=json.loads(path.read_text())
+            record.update(variant="outer_terminal",matrix_sha256=campaign.file_sha256(matrix))
+            storage.atomic_json(path,record,overwrite=True)
+    return outputs
+
+
+def test_outer_terminal_summary_accepts_legacy_prior_and_has_distinct_labels(outer_outputs,monkeypatch):
+    summary=_summarize(outer_outputs,variant="outer_terminal")
+    assert summary["variant"]=="outer_terminal"
+    assert summary["inner_settings"]["inner_terminal_bootstrap"]=="outer"
+    assert summary["rows"][0]["paired"]["delta_mean"]==4
+    rendered=campaign.render_html(summary)
+    assert "XQC with outer terminal bootstrap" in rendered
+    assert "final imagined transition" in rendered and "online critic" in rendered
+    assert "adapting inner temperature" in rendered and "running BatchNorm" in rendered
+    calls=[]
+    remote=SimpleNamespace(url="https://wandb.ai/test",summary={},define_metric=lambda *a,**k:None,
+                           log=lambda row:None,finish=lambda **k:None)
+    def initialize(params,**kwargs):
+        calls.append((params,kwargs))
+        return remote
+    monkeypatch.setattr("utils.wandb_utils.init_wandb",initialize)
+    campaign.publish(summary,project="test",entity="test")
+    assert "outer terminal bootstrap" in calls[0][1]["run_name"]
+    assert "terminal-bootstrap:outer" in calls[0][0]["wandb_tags"]
+    assert calls[0][1]["config"]["variant"]=="outer_terminal"
+
+
+@pytest.mark.parametrize("filename",["provenance.json","paired.json"])
+def test_outer_terminal_cannot_use_missing_or_inner_variant_records(outer_outputs,filename):
+    path=outer_outputs[1]/"production/step_100000"/filename
+    record=json.loads(path.read_text());record.pop("variant")
+    storage.atomic_json(path,record,overwrite=True)
+    with pytest.raises(ValueError,match="variant"):
+        _summarize(outer_outputs,variant="outer_terminal")
+
+
+def test_outer_campaign_cannot_be_aggregated_as_native_inner(outer_outputs):
+    with pytest.raises(ValueError,match="variant"):
+        _summarize(outer_outputs)
+
+
+@pytest.mark.parametrize("field",["saved_semantic_signature","evaluated_semantic_signature"])
+def test_outer_terminal_rejects_misrecorded_checkpoint_semantics(outer_outputs,field):
+    def change(manifest):
+        manifest["runs"][0]["result"]["checkpoint_evaluation_provenance"][field]["inner_terminal_bootstrap"]="inner" if field.startswith("evaluated") else "outer"
+    _change(outer_outputs,change)
+    with pytest.raises(ValueError,match="provenance|unsupported"):
+        _summarize(outer_outputs,variant="outer_terminal")
+
+
+@pytest.mark.parametrize("metric,value",[
+    ("inner_terminal_bootstrap_outer",0),("inner_outer_terminal_boundary_rows",3000),
+    ("inner_outer_terminal_policy_evaluations",3000),("inner_outer_terminal_q_evaluations",3000),
+    ("inner_outer_terminal_bootstrap_rows",-1),("inner_outer_terminal_bootstrap_rows",9217),
+    ("inner_outer_terminal_bootstrap_rows",1.5),
+])
+def test_outer_terminal_validates_actual_boundary_and_forward_counts(outer_outputs,metric,value):
+    path=outer_outputs[1]/"production/step_100000/bundle/controller__xqc/seed-101.jsonl.gz"
+    with gzip.open(path,"rt") as stream:
+        rows=[json.loads(line) for line in stream]
+    rows[0]["metrics"][f"decision/{metric}"]=value
+    with gzip.open(path,"wt") as stream:
+        stream.writelines(json.dumps(row)+"\n" for row in rows)
+    with pytest.raises(ValueError,match="Outer-terminal decision"):
+        _summarize(outer_outputs,variant="outer_terminal")
+
+
+def test_sampled_terminal_rows_can_be_zero_with_replacement(outer_outputs):
+    path=outer_outputs[1]/"production/step_100000/bundle/controller__xqc/seed-101.jsonl.gz"
+    with gzip.open(path,"rt") as stream:
+        rows=[json.loads(line) for line in stream]
+    rows[0]["metrics"]["decision/inner_outer_terminal_bootstrap_rows"]=0
+    with gzip.open(path,"wt") as stream:
+        stream.writelines(json.dumps(row)+"\n" for row in rows)
+    assert _summarize(outer_outputs,variant="outer_terminal")["status"]=="complete"
+
+
+def test_outer_variant_cli_writes_separate_summary_and_report(outer_outputs,tmp_path,monkeypatch):
+    summarize=campaign.summarize
+    monkeypatch.setattr(campaign,"summarize",lambda *a,**k:summarize(*a,**k,seeds=SEEDS,max_steps=2))
+    output=tmp_path/"outer-summary.json"
+    report=tmp_path/"outer-report.html"
+    assert campaign.main(["--manifest",str(outer_outputs[0]),"--results-root",str(outer_outputs[1]),
+        "--expected-source-sha",NEW_SHA,"--variant","outer_terminal","--output",str(output),"--html",str(report)])==0
+    assert json.loads(output.read_text())["variant"]=="outer_terminal"
+    assert "outer terminal bootstrap" in report.read_text()

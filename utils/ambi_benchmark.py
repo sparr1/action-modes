@@ -131,6 +131,12 @@ def decision_metric_catalog(names, *, xqc=False):
         elif inner.startswith("reward_scale"):
             unit = "raw_reward_scale"
             definition = f"XQC reward-normalization scale statistic: {inner}."
+        elif inner.startswith("outer_terminal_") and inner.endswith(("rows", "evaluations")):
+            unit = "count"
+            definition = f"Measured frozen outer terminal-bootstrap work for this decision: {inner}."
+        elif inner == "terminal_bootstrap_outer":
+            unit = "indicator"
+            definition = "One when the final imagined transition uses frozen outer actor/online critic bootstrap with the inner temperature."
         elif inner.endswith(("fraction", "ratio", "rate")) and "learning_rate" not in inner:
             unit = "fraction"
         elif "kl" in inner or inner in {"policy_entropy", "policy_log_prob"}:
@@ -310,6 +316,10 @@ def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None,
             if params.get(key) is not None:
                 tags.append(f"{tag}:{params[key]}")
         parts.append(" ".join(["XQC", *schedule]))
+        if params.get("inner_terminal_bootstrap", "inner") == "outer":
+            parts.append("outer terminal bootstrap")
+            tags.extend(("terminal-bootstrap:outer", "terminal-policy:frozen-outer",
+                         "terminal-q:online-outer", "terminal-alpha:inner"))
     else:
         schedule = []
         legacy = (not any(params.get(key) is not None for key in (

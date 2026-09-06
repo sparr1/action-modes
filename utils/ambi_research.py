@@ -23,6 +23,7 @@ _XQC_CHECKPOINT_INNER_PARAMS = {
     "inner_rollout_horizon", "inner_updates_per_round", "inner_batch_size",
     "inner_replay_capacity", "inner_replay_sampling", "inner_reward_normalization",
     "inner_actor_lr", "inner_critic_lr", "inner_diagnostics_every",
+    "inner_terminal_bootstrap",
 }
 _MPPI_PARAMETERS = {
     "horizon", "iterations", "num_samples", "num_elites", "num_pi_trajs",

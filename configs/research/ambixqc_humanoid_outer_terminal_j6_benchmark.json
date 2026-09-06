@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "description": "Frozen AMBI-XQC prior versus inner XQC with outer terminal bootstrap. Only the final imagined-horizon transition uses the frozen persistent actor and OUTER ONLINE critic; earlier transitions retain native inner bootstrap and terminal entropy retains the current inner temperature. Preserve J6/N512/H3/G3/batch512 and C18/A6/T6 per real decision.",
+  "base_alg_config": "checkpoint",
+  "budget_source": {
+    "run_name": "AMBITDMPC2-humanoid-walk-base-v2-d512-4-j6-seed55",
+    "config_path": "configs/dmcontrol/algs/ambi_humanoid_walk_base_v2_d512_4_j6.json",
+    "source_commit": "698bd074551bc48128cb34f78adaf8caaab1f188",
+    "config_sha256": "96f16f50207e20b118b5c30f913c89c853e71369a02464777c73062ff6e34ae5",
+    "scope": "Rollout and shared update-slot budgets only; this is native XQC, not SAC."
+  },
+  "evaluation": {
+    "controller_seed": 12345,
+    "seeds": [101, 102, 103, 104, 105],
+    "max_steps": 500,
+    "default_presets": ["controller/xqc"],
+    "wandb_project": "ambi-inner-bench"
+  },
+  "comparisons": {
+    "controller": {
+      "description": "Seed-paired prior versus fresh inner XQC with the frozen outer actor and online critic supplying only final-horizon bootstrap targets.",
+      "reference": "prior",
+      "variants": {
+        "prior": {
+          "description": "Execute the persistent actor tanh mean with no imagined work; reuse matching prior bundles from the MPPI comparison.",
+          "alg_params": {"inner_operator": "none"}
+        },
+        "xqc": {
+          "description": "Outer-terminal XQC: execute the adapted actor tanh mean after J6/N512/H3/G3/batch512. Use the frozen outer actor and online outer critic only for final imagined-horizon bootstrap, retaining the current inner alpha on its entropy term. Earlier bootstrap, learning rates and frozen reward scale retain checkpoint XQC semantics.",
+          "alg_params": {
+            "inner_operator": "xqc",
+            "inner_rounds": 6,
+            "inner_rollouts_per_round": 512,
+            "inner_rollout_horizon": 3,
+            "inner_updates_per_round": 3,
+            "inner_batch_size": 512,
+            "inner_replay_capacity": 9216,
+            "inner_replay_sampling": "with_replacement",
+            "inner_terminal_bootstrap": "outer"
+          }
+        }
+      }
+    }
+  }
+}

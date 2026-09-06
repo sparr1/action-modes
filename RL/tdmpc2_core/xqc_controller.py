@@ -341,6 +341,8 @@ class LatentXQCController(nn.Module):
         *,
         next_noise: torch.Tensor,
         reward_scale: float | torch.Tensor = 1.0,
+        outer_terminal_mask: torch.Tensor | None = None,
+        outer_controller: "LatentXQCController | None" = None,
     ) -> LatentXQCCriticObjective:
         flat = batch.flattened(self.latent_dim, self.action_dim)
         leading = batch.leading_shape
@@ -380,6 +382,36 @@ class LatentXQCController(nn.Module):
             if self._critic_loss_region is None
             else self._critic_loss_region
         )
+        terminal_args = ()
+        if outer_terminal_mask is not None or outer_controller is not None:
+            if outer_terminal_mask is None or outer_controller is None:
+                raise ValueError("Outer terminal bootstrap requires both a row mask and controller.")
+            if not isinstance(outer_controller, LatentXQCController):
+                raise TypeError("Outer terminal bootstrap requires a latent XQC controller.")
+            if (outer_controller.critic_signature != self.critic_signature
+                    or outer_controller.latent_dim != self.latent_dim
+                    or outer_controller.action_dim != self.action_dim):
+                raise ValueError("Outer terminal bootstrap controller is incompatible.")
+            if (not torch.is_tensor(outer_terminal_mask)
+                    or outer_terminal_mask.dtype != torch.bool
+                    or outer_terminal_mask.numel() != count):
+                raise ValueError("Outer terminal bootstrap mask must contain one boolean per row.")
+            mask = outer_terminal_mask.to(device=flat["latents"].device).reshape(count)
+            mask = mask & (flat["bootstrap_mask"] > 0)
+            # This separate, read-only branch must never replace the inner
+            # next-actions in its joined BatchNorm batches. Both actor samples
+            # use the same supplied noise, without advancing another RNG.
+            with torch.no_grad():
+                outer_actions, outer_log_prob = outer_controller.actor.sample(
+                    flat["next_latents"], bn_mode="running", noise=next_noise
+                )
+                outer_log_q = outer_controller.critic.log_probs(
+                    flat["next_latents"], outer_actions, bn_mode="running"
+                )
+                outer_selected, outer_values, outer_head = select_lower_distribution(
+                    outer_log_q, outer_controller.critic.support
+                )
+            terminal_args = (mask, outer_log_prob, outer_selected, outer_values, outer_head)
         outputs = critic_loss(
             flat["latents"],
             flat["actions"],
@@ -390,6 +422,7 @@ class LatentXQCController(nn.Module):
             next_noise,
             scale.reshape(()),
             self.temperature.detach(),
+            *terminal_args,
         )
         (
             loss,
@@ -427,6 +460,11 @@ class LatentXQCController(nn.Module):
         next_noise: torch.Tensor,
         reward_scale: torch.Tensor,
         alpha: torch.Tensor,
+        outer_terminal_mask: torch.Tensor | None = None,
+        outer_next_log_prob: torch.Tensor | None = None,
+        outer_target_log_probs: torch.Tensor | None = None,
+        outer_target_values: torch.Tensor | None = None,
+        outer_target_head: torch.Tensor | None = None,
     ):
         """Fixed-shape critic math; validation and state updates stay eager."""
 
@@ -455,6 +493,40 @@ class LatentXQCController(nn.Module):
                 self.critic.support,
                 validate_support=False,
             )
+            if outer_terminal_mask is not None:
+                outer_probabilities, _ = categorical_td_projection(
+                    outer_target_log_probs,
+                    rewards / reward_scale,
+                    bootstrap_mask,
+                    discount,
+                    alpha * outer_next_log_prob,
+                    self.critic.support,
+                    validate_support=False,
+                )
+                target_probabilities = torch.where(
+                    outer_terminal_mask[:, None], outer_probabilities, target_probabilities
+                )
+                target_values = torch.where(
+                    outer_terminal_mask, outer_target_values, target_values
+                )
+                target_head = torch.where(
+                    outer_terminal_mask, outer_target_head, target_head
+                )
+                # Recompute clipping for the actually selected branch on each
+                # row; averaging two whole-batch clipping fractions is wrong.
+                selected_log_prob = torch.where(
+                    outer_terminal_mask, outer_next_log_prob, next_log_prob
+                )
+                transformed = (rewards / reward_scale)[:, None] + (
+                    discount * bootstrap_mask
+                )[:, None] * (
+                    self.critic.support[None] - (alpha * selected_log_prob)[:, None]
+                )
+                clipped = transformed.clamp(self.critic.support[0], self.critic.support[-1])
+                clip_fraction = (
+                    (clipped == self.critic.support[0])
+                    | (clipped == self.critic.support[-1])
+                ).to(transformed.dtype).mean()
 
         joined_latents = torch.cat(
             (latents, next_latents.detach()), dim=0
@@ -764,9 +836,17 @@ class LatentXQCWorkspace:
         next_noise: torch.Tensor,
         actor_noise: torch.Tensor,
         reward_scale=1.0,
+        outer_terminal_mask: torch.Tensor | None = None,
+        outer_controller: LatentXQCController | None = None,
     ) -> dict[str, Any]:
+        terminal_kwargs = {}
+        if outer_terminal_mask is not None or outer_controller is not None:
+            terminal_kwargs = {
+                "outer_terminal_mask": outer_terminal_mask,
+                "outer_controller": outer_controller,
+            }
         objective = self.controller.critic_objective(
-            batch, next_noise=next_noise, reward_scale=reward_scale
+            batch, next_noise=next_noise, reward_scale=reward_scale, **terminal_kwargs
         )
         self.zero_critic_grad()
         objective.loss.backward()

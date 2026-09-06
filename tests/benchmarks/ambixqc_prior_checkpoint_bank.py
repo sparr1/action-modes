@@ -106,7 +106,7 @@ def validate_checkpoint_bank(root, *, total_steps, cadence):
                 or trial["alg_params"]["inner_operator"] != "none"):
             raise ValueError(f"Invalid checkpoint metadata: {sidecar}")
         state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-        if (state["checkpoint_version"] != 2
+        if (state["checkpoint_version"] not in {2, 3}
                 or state["semantic_signature"]["collection_operator"] != "none"
                 or state["inner"]["action_index"] != 0
                 or state["reward_normalizer"]["count"] != step):

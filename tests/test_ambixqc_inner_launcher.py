@@ -82,7 +82,7 @@ def _validated_reference(case, *, smoke=True):
         expected_manifest_sha256=runner.file_sha256(path), seeds=seeds, max_steps=length, protocol=protocol)
 
 
-def _candidate(directory, case, *, seeds, length, reference):
+def _candidate(directory, case, *, seeds, length, reference, variant="inner"):
     directory.mkdir(parents=True)
     traces = []
     for seed in seeds:
@@ -92,12 +92,20 @@ def _candidate(directory, case, *, seeds, length, reference):
                    "metrics": {"decision/inner_model_steps": 9216, "decision/inner_critic_optimizer_steps": 18,
                                "decision/inner_actor_optimizer_steps": 6, "decision/inner_temperature_optimizer_steps": 6}}
                   for index in range(length)]
+        if variant == "outer_terminal":
+            for event in events:
+                event["metrics"].update({f"decision/{key}": value
+                                         for key, value in runner.OUTER_TERMINAL_METRICS.items()})
+                event["metrics"]["decision/inner_outer_terminal_bootstrap_rows"] = 3072
         with gzip.open(path, "wt") as stream:
             stream.write("\n".join(json.dumps(event) for event in events) + "\n")
         traces.append(path.name)
     run = {"selector": "controller/xqc", "config": {"alg": "AMBIXQC/AMBIXQC", "alg_params": {"inner_operator": "xqc"}},
            "status": "complete", "action_rule": "tanh_mean", "result": _result(seeds, candidate=True),
            "episodes": _episodes(seeds, length, candidate=True), "trace_files": traces}
+    if variant == "outer_terminal":
+        run["config"]["alg_params"]["inner_terminal_bootstrap"] = "outer"
+        run["result"]["resolved_config"]["inner_terminal_bootstrap"] = "outer"
     manifest = {"status": "complete", "checkpoint": case.row, "protocol": reference["manifest"]["protocol"],
                 "reference": {"manifest_sha256": reference["manifest_sha256"]}, "runs": [run]}
     (directory / "manifest.json").write_text(json.dumps(manifest))
@@ -112,7 +120,9 @@ def _stub_execution(monkeypatch, case):
         calls["evaluate"].append((matrix, checkpoint, kwargs))
         smoke = kwargs["max_steps"] == 3
         reference = _validated_reference(case, smoke=smoke)
-        _candidate(kwargs["bundle_dir"], case, seeds=kwargs["seeds"], length=kwargs["max_steps"], reference=reference)
+        variant = "inner" if matrix == runner.MATRIX else "outer_terminal"
+        _candidate(kwargs["bundle_dir"], case, seeds=kwargs["seeds"], length=kwargs["max_steps"],
+                   reference=reference, variant=variant)
         return {"checkpoint_sha256": case.row["sha256"], "results": [{"controller": "xqc"}]}
 
     def load(paths):
@@ -122,6 +132,7 @@ def _stub_execution(monkeypatch, case):
 
     def write(data, output, **kwargs):
         calls["report_data"] = data
+        calls["report_options"] = kwargs
         Path(output).write_text("<html>paired prior/XQC</html>")
 
     monkeypatch.setitem(sys.modules, "evaluate_ambi_checkpoint", SimpleNamespace(evaluate_matrix=evaluate))
@@ -147,6 +158,7 @@ def test_production_reuses_five_full_prior_episodes_and_publishes_only_xqc(case,
     assert provenance["reference_manifest_sha256"] == case.row["reference_manifest_sha256"]
     assert provenance["checkpoint_manifest_sha256"] == runner.file_sha256(case.manifest)
     assert provenance["matrix_sha256"] == runner.file_sha256(runner.MATRIX)
+    assert provenance["variant"] == "inner"
     expected_numerics = {"device_type": "cuda", "deterministic_algorithms": True,
                         "deterministic_warn_only": False, "cudnn_deterministic": True,
                         "cudnn_benchmark": False, "cublas_workspace_config": ":4096:8"}
@@ -318,3 +330,128 @@ def test_runner_restores_numerics_when_evaluator_raises(case, monkeypatch):
     assert _numerical_flags() == previous
     provenance = json.loads((case.result_root / "step_50000" / "provenance.json").read_text())
     assert provenance["numerical_settings"]["deterministic_algorithms"] is True
+
+
+def test_outer_terminal_matrix_changes_only_terminal_bootstrap(case):
+    from utils.ambi_research import load_preset_matrix, normalize_selectors, resolve_preset
+    from utils.checkpoint_context import load_checkpoint_context
+
+    inner = runner.campaign_profile()
+    outer = runner.campaign_profile("outer_terminal")
+    assert inner["matrix"] == runner.MATRIX and inner["inner_settings"] == runner.INNER_SETTINGS
+    assert outer["inner_settings"] == {**runner.INNER_SETTINGS, "inner_terminal_bootstrap": "outer"}
+    matrix = load_preset_matrix(outer["matrix"])
+    baseline = load_preset_matrix(inner["matrix"])
+    assert matrix["base_alg_config"] == "checkpoint"
+    assert matrix["evaluation"] == baseline["evaluation"]
+    assert matrix["budget_source"] == baseline["budget_source"]
+    assert normalize_selectors(matrix) == ["controller/xqc"]
+    context = load_checkpoint_context(case.row["path"])
+    for selector in ("controller/prior", "controller/xqc"):
+        previous = resolve_preset(inner["matrix"], selector, checkpoint_context=context)
+        resolved = resolve_preset(outer["matrix"], selector, checkpoint_context=context)
+        expected = deepcopy(previous["algorithm_config"])
+        if selector == "controller/xqc":
+            expected["alg_params"]["inner_terminal_bootstrap"] = "outer"
+        assert resolved["algorithm_config"] == expected
+        assert resolved["saved_algorithm_config"] == previous["saved_algorithm_config"]
+        assert protocol_for(resolved, 12345, 500) == protocol_for(previous, 12345, 500)
+    outer["inner_settings"]["inner_actor_lr"] = 1
+    assert runner.campaign_profile("outer_terminal")["inner_settings"]["inner_actor_lr"] == 5e-5
+
+
+@pytest.mark.parametrize("mode", ["production", "smoke"])
+def test_outer_terminal_runner_reuses_existing_priors_with_distinct_provenance(case, monkeypatch, mode):
+    calls = _stub_execution(monkeypatch, case)
+    options = {"mode": mode, "variant": "outer_terminal"}
+    if mode == "smoke":
+        options.update(smoke_reference_bundle=case.smoke.parent,
+                       smoke_reference_manifest_sha256=runner.file_sha256(case.smoke))
+    destination = runner.run(case.manifest, 0, case.result_root, **options)
+    profile = runner.campaign_profile("outer_terminal")
+    matrix, checkpoint, kwargs = calls["evaluate"][0]
+    assert matrix == profile["matrix"] and checkpoint == case.row["path"]
+    assert kwargs["selectors"] == ["controller/xqc"]
+    expected_reference = case.smoke if mode == "smoke" else case.production
+    assert kwargs["reference_bundle"] == str(expected_reference.parent)
+    for name in ("provenance.json", "paired.json", "validation.json"):
+        assert json.loads((destination / name).read_text())["variant"] == "outer_terminal"
+    provenance = json.loads((destination / "provenance.json").read_text())
+    assert provenance["matrix_sha256"] == runner.file_sha256(profile["matrix"])
+    assert provenance["checkpoint"] == case.row
+    assert "outer-terminal" in calls["report_options"]["title"]
+    assert [row["controller_type"] for row in calls["report_data"]["runs"]] == ["prior", "xqc"]
+
+
+@pytest.mark.parametrize("key,value", [
+    ("inner_terminal_bootstrap_outer", 0),
+    ("inner_outer_terminal_boundary_rows", 9216),
+    ("inner_outer_terminal_policy_evaluations", 3072),
+    ("inner_outer_terminal_q_evaluations", 3072),
+    ("inner_outer_terminal_bootstrap_rows", -1),
+    ("inner_outer_terminal_bootstrap_rows", 9217),
+    ("inner_outer_terminal_bootstrap_rows", 1.5),
+    ("inner_outer_terminal_bootstrap_rows", None),
+])
+def test_outer_terminal_acceptance_requires_boundary_and_frozen_outer_work(case, tmp_path, key, value):
+    reference = _validated_reference(case)
+    directory = tmp_path / "candidate"
+    manifest = _candidate(directory, case, seeds=[101, 102], length=3,
+                          reference=reference, variant="outer_terminal")
+    trace = directory / manifest["runs"][0]["trace_files"][0]
+    with gzip.open(trace, "rt") as stream:
+        events = [json.loads(line) for line in stream]
+    if value is None:
+        events[0]["metrics"].pop(f"decision/{key}")
+    else:
+        events[0]["metrics"][f"decision/{key}"] = value
+    with gzip.open(trace, "wt") as stream:
+        stream.write("\n".join(json.dumps(event) for event in events) + "\n")
+    with pytest.raises(ValueError, match="Outer-terminal diagnostics"):
+        runner.validate_bundle(directory, checkpoint=case.row, reference=reference,
+                               protocol=case.smoke_protocol, seeds=[101, 102], max_steps=3,
+                               variant="outer_terminal")
+
+
+@pytest.mark.parametrize("sampled", [0, 9216])
+def test_outer_terminal_sampling_accepts_valid_inclusive_row_bounds(case, tmp_path, sampled):
+    reference = _validated_reference(case)
+    directory = tmp_path / "candidate"
+    manifest = _candidate(directory, case, seeds=[101, 102], length=3,
+                          reference=reference, variant="outer_terminal")
+    for relative in manifest["runs"][0]["trace_files"]:
+        path = directory / relative
+        with gzip.open(path, "rt") as stream:
+            events = [json.loads(line) for line in stream]
+        for event in events:
+            event["metrics"]["decision/inner_outer_terminal_bootstrap_rows"] = sampled
+        with gzip.open(path, "wt") as stream:
+            stream.write("\n".join(json.dumps(event) for event in events) + "\n")
+    result = runner.validate_bundle(directory, checkpoint=case.row, reference=reference,
+                                    protocol=case.smoke_protocol, seeds=[101, 102], max_steps=3,
+                                    variant="outer_terminal")
+    assert result["decision_counts"] == {"controller/xqc": 6}
+
+
+@pytest.mark.parametrize("actual,requested", [("inner", "outer_terminal"), ("outer_terminal", "inner")])
+def test_campaign_variants_reject_each_others_candidate(case, tmp_path, actual, requested):
+    reference = _validated_reference(case)
+    directory = tmp_path / "candidate"
+    _candidate(directory, case, seeds=[101, 102], length=3, reference=reference, variant=actual)
+    with pytest.raises(ValueError, match="Resolved inner-XQC settings"):
+        runner.validate_bundle(directory, checkpoint=case.row, reference=reference,
+                               protocol=case.smoke_protocol, seeds=[101, 102], max_steps=3, variant=requested)
+
+
+def test_invalid_campaign_variant_fails_before_source_or_outputs(case):
+    with pytest.raises(ValueError, match="Variant must"):
+        runner.run("nonexistent", 0, case.result_root, variant="outer_target")
+    assert not case.result_root.exists()
+
+
+def test_runner_cli_forwards_explicit_campaign_variant(monkeypatch):
+    calls = []
+    monkeypatch.setattr(runner, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
+    runner.main(["--manifest", "/manifest.json", "--index", "0", "--result-root", "/results",
+                 "--variant", "outer_terminal"])
+    assert calls[0][1]["variant"] == "outer_terminal"

@@ -758,3 +758,16 @@ def test_mppi_runtime_settings_update_remote_labels_without_network(tmp_path, mo
     assert "J8" in remote.name
     assert "action:weighted_elite_gumbel_no_execution_noise" in remote.tags
     assert remote.config == {"evaluation_controller": controller, "action_rule": storage.MPPI_ACTION_RULE}
+
+
+def test_xqc_outer_terminal_bootstrap_has_distinct_labels_without_changing_native_defaults():
+    native = _xqc_resolved()["algorithm_config"]
+    standard = storage.benchmark_run_labels(CHECKPOINT, _protocol(), native, "episodes")
+    outer = deepcopy(native)
+    outer["alg_params"]["inner_terminal_bootstrap"] = "outer"
+    labels = storage.benchmark_run_labels(CHECKPOINT, _protocol(), outer, "episodes")
+    assert "outer terminal bootstrap" not in standard["name"]
+    assert "outer terminal bootstrap" in labels["name"]
+    assert {"terminal-bootstrap:outer", "terminal-policy:frozen-outer", "terminal-q:online-outer", "terminal-alpha:inner"} <= set(labels["tags"])
+    metrics = storage.decision_metric_catalog(["decision/inner_outer_terminal_bootstrap_rows", "decision/inner_outer_terminal_q_evaluations"], xqc=True)
+    assert all(item["unit"] == "count" for item in metrics.values())

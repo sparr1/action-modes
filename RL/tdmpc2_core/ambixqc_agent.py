@@ -39,7 +39,7 @@ from RL.xqc_core import (
 class AMBIXQCAgent(nn.Module):
     """Persistent TOLD model and XQC priors with fresh inner XQC per action."""
 
-    _CHECKPOINT_VERSION = 2
+    _CHECKPOINT_VERSION = 3
 
     def __init__(self, cfg):
         super().__init__()
@@ -591,6 +591,7 @@ class AMBIXQCAgent(nn.Module):
         return {
             "algorithm": "AMBIXQC",
             "collection_operator": str(self.cfg.inner_operator),
+            "inner_terminal_bootstrap": str(getattr(self.cfg, "inner_terminal_bootstrap", "inner")),
             "official_xqc_commit": str(self.cfg.xqc_official_commit),
             "observation": self.observation_signature(),
             "action_dim": int(self.cfg.action_dim),
@@ -714,6 +715,14 @@ class AMBIXQCAgent(nn.Module):
     def _preflight_semantic_signature(self, state, *, frozen_evaluation):
         expected = self.semantic_signature()
         saved = copy.deepcopy(state["semantic_signature"])
+        if state["checkpoint_version"] in {1, 2}:
+            legacy_keys = set(expected) - {"inner_terminal_bootstrap"}
+            if state["checkpoint_version"] == 1:
+                legacy_keys -= {"collection_operator", "action_contract"}
+            require_exact_keys(saved, legacy_keys, "AMBI-XQC legacy checkpoint semantics")
+            # Earlier checkpoints always bootstrapped every imagined row from
+            # the adapting inner actor and its target critic.
+            saved["inner_terminal_bootstrap"] = "inner"
         if state["checkpoint_version"] == 1:
             # Version one always collected with inner XQC and did not record
             # physical action bounds. Preserve precisely its existing checks.
@@ -725,6 +734,8 @@ class AMBIXQCAgent(nn.Module):
         require_exact_keys(saved, expected, "AMBI-XQC checkpoint semantics")
         if saved["collection_operator"] not in {"none", "xqc"}:
             raise ValueError("AMBI-XQC checkpoint collection operator is invalid.")
+        if saved["inner_terminal_bootstrap"] not in {"inner", "outer"}:
+            raise ValueError("AMBI-XQC checkpoint inner terminal bootstrap is invalid.")
         saved_comparison = copy.deepcopy(saved)
         if frozen_evaluation:
             schedule = require_exact_keys(
@@ -763,7 +774,8 @@ class AMBIXQCAgent(nn.Module):
             # architecture, physical action, and outer-learning fields remain
             # strict, including XQC target/optimizer/normalizer semantics.
             for key in (
-                "collection_operator", "inner_schedule", "reward_normalization"
+                "collection_operator", "inner_schedule", "reward_normalization",
+                "inner_terminal_bootstrap",
             ):
                 saved_comparison[key] = expected[key]
         if saved_comparison != expected:
@@ -814,7 +826,7 @@ class AMBIXQCAgent(nn.Module):
         if (
             isinstance(state["checkpoint_version"], bool)
             or not isinstance(state["checkpoint_version"], int)
-            or state["checkpoint_version"] not in {1, self._CHECKPOINT_VERSION}
+            or state["checkpoint_version"] not in {1, 2, self._CHECKPOINT_VERSION}
         ):
             raise ValueError("Unsupported AMBI-XQC checkpoint version.")
         saved_signature = self._preflight_semantic_signature(

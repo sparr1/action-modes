@@ -23,6 +23,25 @@ INNER_SETTINGS = {
 }
 OPTIMIZER_STEPS = {"critic": 18, "actor": 6, "temperature": 6}
 MODEL_STEPS = 9216
+OUTER_TERMINAL_METRICS = {
+    "inner_terminal_bootstrap_outer": 1,
+    "inner_outer_terminal_boundary_rows": 3072,
+    "inner_outer_terminal_policy_evaluations": 9216,
+    "inner_outer_terminal_q_evaluations": 9216,
+}
+
+
+def campaign_profile(variant="inner"):
+    """Return the matrix and acceptance settings for a named XQC campaign."""
+    if variant not in {"inner", "outer_terminal"}:
+        raise ValueError("Variant must be inner or outer_terminal.")
+    settings = dict(INNER_SETTINGS)
+    matrix, label = MATRIX, "inner XQC J6/N512/H3/G3"
+    if variant == "outer_terminal":
+        settings["inner_terminal_bootstrap"] = "outer"
+        matrix = ROOT / "configs/research/ambixqc_humanoid_outer_terminal_j6_benchmark.json"
+        label = "outer-terminal XQC J6/N512/H3/G3"
+    return {"variant": variant, "matrix": matrix, "inner_settings": settings, "label": label}
 
 
 @contextmanager
@@ -140,8 +159,9 @@ def validate_reference_bundle(path, *, checkpoint, expected_manifest_sha256, see
             "path": str(manifest_path.parent.resolve()), "manifest_sha256": expected_manifest_sha256}
 
 
-def validate_bundle(bundle_path, *, checkpoint, reference, protocol, seeds, max_steps):
+def validate_bundle(bundle_path, *, checkpoint, reference, protocol, seeds, max_steps, variant="inner"):
     """Check the full native XQC dose and seed-paired outcomes after evaluation."""
+    profile = campaign_profile(variant)
     bundle_path = Path(bundle_path)
     manifest = _read_json(bundle_path / "manifest.json")
     from utils.ambi_benchmark import episode_protocol, run_controller_type
@@ -160,7 +180,8 @@ def validate_bundle(bundle_path, *, checkpoint, reference, protocol, seeds, max_
     _check_frozen_run(run)
     episodes = _check_episodes(run, seeds=seeds, max_steps=max_steps)
     cfg = run["result"].get("resolved_config", {})
-    if any(cfg.get(key) != value for key, value in INNER_SETTINGS.items()):
+    if (any(cfg.get(key) != value for key, value in profile["inner_settings"].items())
+            or cfg.get("inner_terminal_bootstrap", "inner") != ("outer" if variant == "outer_terminal" else "inner")):
         raise ValueError("Resolved inner-XQC settings differ from the authorized J6/N512/H3/G3/B512 dose.")
     seen = set()
     traces = run.get("trace_files", [])
@@ -187,6 +208,17 @@ def validate_bundle(bundle_path, *, checkpoint, reference, protocol, seeds, max_
                     raise ValueError("Actual inner-XQC work must be 9216 model steps and C18/A6/T6 per decision.")
                 if not all(_finite_number(value) for value in metrics.values()):
                     raise ValueError("Candidate decision metrics must be finite.")
+                sampled = metrics.get("decision/inner_outer_terminal_bootstrap_rows",
+                                      None if variant == "outer_terminal" else 0)
+                if variant == "outer_terminal":
+                    if (any(metrics.get(f"decision/{name}") != value
+                            for name, value in OUTER_TERMINAL_METRICS.items())
+                            or not _finite_number(sampled) or int(sampled) != sampled
+                            or not 0 <= sampled <= MODEL_STEPS):
+                        raise ValueError("Outer-terminal diagnostics must prove boundary rows and frozen outer policy/Q work.")
+                elif sampled != 0 or any(metrics.get(f"decision/{name}", 0) != 0
+                                         for name in OUTER_TERMINAL_METRICS):
+                    raise ValueError("Native inner bootstrap cannot report outer-terminal work.")
     expected = {(f"seed-{seed}", decision) for seed in seeds for decision in range(max_steps)}
     if seen != expected:
         raise ValueError("Candidate per-decision diagnostics are missing, duplicated, or use unexpected episode identities.")
@@ -203,7 +235,9 @@ def validate_bundle(bundle_path, *, checkpoint, reference, protocol, seeds, max_
 
 
 def run(manifest_path, index, result_root, *, mode="production", device="cuda", wandb=False,
-        smoke_reference_bundle=None, smoke_reference_manifest_sha256=None):
+        smoke_reference_bundle=None, smoke_reference_manifest_sha256=None, variant="inner"):
+    profile = campaign_profile(variant)
+    matrix = profile["matrix"]
     if mode not in {"smoke", "production"}:
         raise ValueError("Mode must be smoke or production.")
     if wandb and mode == "smoke":
@@ -222,10 +256,13 @@ def run(manifest_path, index, result_root, *, mode="production", device="cuda", 
                        ("inner_reward_normalization", "inner_actor_lr", "inner_critic_lr", "xqc_policy_delay")}
     if any(_saved_setting(saved, key) != value for key, value in frozen_defaults.items()):
         raise ValueError("Source checkpoint must retain frozen_real_scale, 5e-5 inner learning rates, and XQC policy delay 3.")
-    resolved = resolve_preset(MATRIX, "controller/xqc", checkpoint_context=context)
+    resolved = resolve_preset(matrix, "controller/xqc", checkpoint_context=context)
     if any(_saved_setting(resolved["algorithm_config"]["alg_params"], key) != value
-           for key, value in INNER_SETTINGS.items()):
+           for key, value in profile["inner_settings"].items()):
         raise ValueError("Research matrix differs from the authorized native inner-XQC settings.")
+    if resolved["algorithm_config"]["alg_params"].get("inner_terminal_bootstrap", "inner") != (
+            "outer" if variant == "outer_terminal" else "inner"):
+        raise ValueError("Research matrix terminal bootstrap differs from the selected campaign variant.")
     seeds, max_steps = (list(range(101, 106)), 500) if mode == "production" else ([101, 102], 3)
     reference_path = row.get("reference_bundle") if mode == "production" else smoke_reference_bundle
     reference_sha = row.get("reference_manifest_sha256") if mode == "production" else smoke_reference_manifest_sha256
@@ -242,20 +279,21 @@ def run(manifest_path, index, result_root, *, mode="production", device="cuda", 
         atomic_json(destination / "provenance.json", {
             "source_run": SOURCE_RUN, "checkpoint": row,
             "checkpoint_manifest_sha256": file_sha256(manifest_path),
-            "matrix_sha256": file_sha256(MATRIX), "mode": mode,
+            "matrix_sha256": file_sha256(matrix), "mode": mode, "variant": variant,
             "seeds": seeds, "max_steps": max_steps, "controller_seed": CONTROLLER_SEED,
             "reference_bundle": reference["path"], "reference_manifest_sha256": reference["manifest_sha256"],
             "numerical_settings": numerical_settings,
         })
         from evaluate_ambi_checkpoint import evaluate_matrix
         payload = evaluate_matrix(
-            MATRIX, row["path"], selectors=["controller/xqc"], seeds=seeds,
+            matrix, row["path"], selectors=["controller/xqc"], seeds=seeds,
             controller_seed=CONTROLLER_SEED, max_steps=max_steps, device=device,
             bundle_dir=destination / "bundle", reference_bundle=reference["path"],
             wandb_options={"project": "ambi-inner-bench", "entity": "rwgao_b-brown-university",
                            "mode": "online"} if wandb else None,
         )
     payload["numerical_settings"] = numerical_settings
+    payload["variant"] = variant
     # Preserve evaluated results if validation or HTML generation later fails.
     atomic_json(destination / "paired.json", payload)
     if payload.get("checkpoint_sha256") != row["sha256"]:
@@ -263,16 +301,18 @@ def run(manifest_path, index, result_root, *, mode="production", device="cuda", 
     if file_sha256(Path(reference["path"]) / "manifest.json") != reference["manifest_sha256"]:
         raise ValueError("Prior reference changed during evaluation.")
     validation = validate_bundle(destination / "bundle", checkpoint=row, reference=reference,
-                                 protocol=protocol, seeds=seeds, max_steps=max_steps)
-    atomic_json(destination / "validation.json", {"step": row["step"], "mode": mode, **validation})
+                                 protocol=protocol, seeds=seeds, max_steps=max_steps, variant=variant)
+    atomic_json(destination / "validation.json", {"step": row["step"], "mode": mode,
+                                                  "variant": variant, **validation})
     from report_ambi_benchmark import load_bundles, write_report
     report = load_bundles([reference["path"], destination / "bundle"])
     report["runs"] = [item for item in report["runs"] if item["controller_type"] in {"prior", "xqc"}]
     names = {name for item in report["runs"] for trace in item["traces"] for name in trace["metrics"]}
     report["metric_catalog"] = {key: value for key, value in report["metric_catalog"].items() if key in names}
     write_report(report, destination / "comparison.html",
-                 title=f"AMBI-XQC prior versus inner XQC J6/N512/H3/G3 at {row['step']:,} decisions")
-    print(json.dumps({"step": row["step"], "output": str(destination), **validation}, sort_keys=True))
+                 title=f"AMBI-XQC prior versus {profile['label']} at {row['step']:,} decisions")
+    print(json.dumps({"step": row["step"], "variant": variant,
+                      "output": str(destination), **validation}, sort_keys=True))
     return destination
 
 
@@ -282,12 +322,14 @@ def main(argv=None):
     parser.add_argument("--index", type=int, required=True)
     parser.add_argument("--result-root", type=Path, required=True)
     parser.add_argument("--mode", choices=("smoke", "production"), default="production")
+    parser.add_argument("--variant", choices=("inner", "outer_terminal"), default="inner")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--smoke-reference-bundle", type=Path)
     parser.add_argument("--smoke-reference-manifest-sha256")
     args = parser.parse_args(argv)
     run(args.manifest, args.index, args.result_root, mode=args.mode, device=args.device, wandb=args.wandb,
+        variant=args.variant,
         smoke_reference_bundle=args.smoke_reference_bundle,
         smoke_reference_manifest_sha256=args.smoke_reference_manifest_sha256)
 

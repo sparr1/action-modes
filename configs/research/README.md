@@ -104,13 +104,67 @@ before publishing paired return curves. For local downloads whose reference
 paths have moved, use `--reference-root` pointing to the copied prior campaign
 root; its `production/step_N/bundle` manifests must retain their original hashes.
 
+### Outer terminal bootstrap variant
+
+`ambixqc_humanoid_outer_terminal_j6_benchmark.json` changes one setting:
+`inner_terminal_bootstrap="outer"`. At the final imagined horizon transition,
+the bootstrap target uses a sampled action from the frozen persistent actor and
+the **online outer critic**, both with running BatchNorm statistics. The entropy
+term retains the current adapting **inner temperature**. Earlier imagined
+transitions keep the inner actor and target critic, and true terminal transitions
+keep their zero bootstrap. Ordinary inner training forwards remain intact;
+the frozen outer actor/critic evaluations run separately.
+
+The default `inner_terminal_bootstrap="inner"` retains the native XQC behavior.
+Both variants keep J6/N512/H3/G3, batch 512, replay capacity 9,216, inner learning
+rates `5e-5`, frozen real reward normalization, and 18 critic / six actor / six
+temperature updates per real decision. The outer variant records 3,072 eligible
+horizon-end replay rows, the measured number of sampled terminal rows, and
+9,216 additional outer policy and critic evaluations per decision. Its model
+transition count remains 9,216. Real actions still execute the adapted actor
+mean; imagined actions and replay sampling remain stochastic and seeded.
+
+Select the variant explicitly and use a fresh campaign directory. The manifest
+can reuse the same 30 checkpoint and prior-reference hashes, seeds 101–105,
+controller seed 12345, and 500-decision episodes:
+
+```bash
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+"$XQC_EVAL_PY" run_ambixqc_inner_evaluation.py \
+  --manifest /absolute/scratch/outer-terminal/checkpoint-manifest.json --index 0 \
+  --result-root /absolute/scratch/outer-terminal/production --device cuda \
+  --variant outer_terminal
+
+"$XQC_EVAL_PY" summarize_ambixqc_inner_eval.py \
+  --manifest /absolute/scratch/outer-terminal/checkpoint-manifest.json \
+  --results-root /absolute/scratch/outer-terminal \
+  --expected-source-sha "$EXPECTED_ACTION_MODES_SHA" --variant outer_terminal \
+  --output /absolute/scratch/outer-terminal/summary.json \
+  --html /absolute/scratch/outer-terminal/comparison.html
+```
+
+For the Oscar launcher shown above, set `AMBIXQC_EVAL_VARIANT=outer_terminal`
+alongside `AMBIXQC_EVAL_MODE` and point `RESULT_ROOT` and scheduler logs to the
+new campaign. Run the two endpoint smokes before the full array. Omitting the
+variant still selects `inner`. Append `--wandb` to publish an explicitly selected
+evaluation or aggregate; outer terminal runs have distinct names and tags.
+
+The runner records the selected variant in provenance, paired results, and
+validation. The summarizer requires matching variant/matrix metadata, terminal
+configuration and checkpoint semantics, numerical settings, measured work, and
+unchanged complete outer state. An older record with no variant is interpreted
+as `inner`; it cannot be relabeled as `outer_terminal`. Reports retain raw
+environment returns and normalized XQC value units. New checkpoints use version
+3 to record the terminal setting; version-1/version-2 banks load with the default
+`inner` setting and remain reusable without modifying their files.
+
 ## AMBI-XQC prior versus MPPI
 
 `ambixqc_humanoid_mppi_benchmark.json` compares the persistent policy with an
 evaluation-only MPPI controller on the same AMBI-XQC checkpoint. It defaults to
 both `controller/prior` and `controller/mppi`, seeds 101–105, controller seed
 12345, and at most 500 decisions per episode. It does not run inner XQC updates.
-Training and checkpoint formats are unchanged: the evaluator loads the saved
+MPPI evaluation leaves saved checkpoints unchanged: the evaluator loads the saved
 XQC model as a frozen prior and attaches a separate planner.
 
 ```bash

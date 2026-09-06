@@ -10,6 +10,9 @@ def test_inner_oscar_launcher_preserves_runtime_and_reference_contract():
                   "EXPECTED_ACTION_MODES_SHA", "--untracked-files=all", "LOCK_SHA",
                   "run_ambixqc_inner_evaluation.py", "--wandb", "WANDB_CACHE_DIR",
                   "tests/test_ambixqc_inner_j6.py", "smoke_reference_manifest_sha256",
+                  "tests/test_ambixqc_outer_terminal.py", "tests/test_ambixqc_terminal_checkpoint.py",
+                  'VARIANT="${AMBIXQC_EVAL_VARIANT:-inner}"',
+                  '[[ "$VARIANT" == inner || "$VARIANT" == outer_terminal ]]', '--variant "$VARIANT"',
                   "--smoke-reference-manifest-sha256", "export CUBLAS_WORKSPACE_CONFIG=:4096:8"):
         assert guard in content
     assert "pip install" not in content and "uv sync" not in content

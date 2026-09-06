@@ -85,6 +85,19 @@ The XQC controller semantics reuse the PyTorch port of official XQC commit
 `9a6832bb742ef01bbe9f1e06153a9338e612dae5`; TOLD remains derived from the
 TD-MPC2 source identified above.
 
+The optional `inner_terminal_bootstrap="outer"` ablation changes the Bellman
+target only for a nonterminated transition at the imagined horizon boundary.
+It samples the frozen persistent actor using the existing bootstrap noise,
+queries the frozen online twin critics with running BatchNorm statistics,
+selects the lower-expectation categorical distribution, and applies the same
+XQC projection and current inner-temperature entropy weighting. Earlier
+transitions retain the adapting inner actor and target critics. The original
+joined current/next batches used by inner critic BatchNorm remain intact;
+replacing their next actions would unintentionally change other rows too.
+The default `"inner"` keeps the original target at every transition. Version-3
+checkpoints record this choice; version-1/2 checkpoints load as `"inner"`, with
+an explicit frozen-evaluation override permitting the outer terminal ablation.
+
 `xqc_mppi.py` attaches an evaluation-only MPPI controller to a frozen AMBI-XQC
 checkpoint. It uses running BatchNorm statistics and its own episode-seeded
 RNG, retains a shifted plan mean within an episode, and performs no optimizer
