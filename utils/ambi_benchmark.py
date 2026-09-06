@@ -494,7 +494,8 @@ def code_identity():
         ).decode().strip()
     digest = hashlib.sha256()
     paths = {root / name for name in ("evaluate_ambi_checkpoint.py", "report_ambi_benchmark.py",
-                                     "run_ambixqc_mppi_evaluation.py", "summarize_ambixqc_mppi_eval.py")}
+                                     "run_ambixqc_mppi_evaluation.py", "summarize_ambixqc_mppi_eval.py",
+                                     "run_ambixqc_inner_evaluation.py", "summarize_ambixqc_inner_eval.py")}
     for directory in ("RL", "utils", "domains", "configs/research"):
         paths.update(path for path in (root / directory).rglob("*")
                      if path.is_file() and path.suffix in {".py", ".json", ".js", ".html"})

@@ -114,6 +114,15 @@ checkpoints remain readable as inner-XQC checkpoints. Ordinary loading retains
 strict semantic checks; the evaluator's explicit frozen load permits only
 supported inner/controller changes and records the saved and evaluated settings.
 
+The [J6 checkpoint campaign](configs/research/README.md#ambi-xqc-inner-j6-checkpoint-campaign)
+uses native inner XQC with the rollout and update-slot budgets from
+`AMBITDMPC2-humanoid-walk-base-v2-d512-4-j6-seed55`: J6/N512/H3/G3, batch 512,
+and replay capacity 9,216. It preserves the saved XQC learning rules, including
+policy delay 3, so each action has 18 critic and 6 actor/temperature updates.
+The Oscar launcher `slurm/run_ambixqc_inner_eval_oscar.sbatch` reuses the
+completed MPPI campaign's prior-reference bundles at every 50k checkpoint;
+`summarize_ambixqc_inner_eval.py` validates and reports the new paired outcomes.
+
 ### AMBI-XQC compiled execution and paired timing
 
 The canonical eager Humanoid Walk configuration remains

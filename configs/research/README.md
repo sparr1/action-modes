@@ -1,5 +1,107 @@
 # Frozen-checkpoint AMBI research
 
+## AMBI-XQC inner J6 checkpoint campaign
+
+`ambixqc_humanoid_inner_j6_benchmark.json` evaluates native inner XQC with
+J6/N512/H3/G3, batch 512, replay capacity 9,216, and sampling with replacement.
+It borrows these rollout and update-slot budgets from
+`AMBITDMPC2-humanoid-walk-base-v2-d512-4-j6-seed55`; it retains the XQC learning
+rule. The budget source is the canonical configuration
+`configs/dmcontrol/algs/ambi_humanoid_walk_base_v2_d512_4_j6.json` at commit
+`698bd074551bc48128cb34f78adaf8caaab1f188`, file SHA-256
+`96f16f50207e20b118b5c30f913c89c853e71369a02464777c73062ff6e34ae5`.
+This identifies the budget reference, separately from the evaluated checkpoint.
+
+Each real decision collects 3,072 imagined branches and 9,216 model
+transitions. Eighteen XQC update slots produce **18 critic, six actor, and six
+temperature optimizer steps** with the checkpoint's policy delay of three.
+Actor objectives and BatchNorm training forwards still run in every slot.
+Each decision copies the persistent actor, online critic, and temperature into
+a fresh inner learner with empty optimizer state and replay. The inner target
+starts from the copied online critic. Tensor allocations may be reused. Both real controllers
+execute `tanh(mu)`; imagined behavior and inner adaptation remain stochastic.
+
+The matrix inherits the checkpoint's architecture, XQC optimizer semantics,
+learning rates, and reward normalization. The seed-55 prior bank uses inner
+actor/critic learning rates `5e-5` and `frozen_real_scale`; temperature uses the
+inner actor learning rate. Its real reward scale and return accumulator stay
+frozen. These settings differ from the named SAC configuration's learning
+rates, critic representation, and actor/temperature update rule. Evaluation
+checks complete outer state, including BatchNorm, targets, optimizers,
+temperature, normalization, counters, and the outer learner RNG.
+
+The default selects only `controller/xqc`, with `controller/prior` as its
+reference, environment seeds 101–105, controller seed 12345, and at most 500
+decisions per episode. Reuse a completed prior reference from the paired MPPI
+campaign when its checkpoint hash and full episode protocol match. The
+reference's MPPI rows, if present, are ignored when computing paired gains.
+The campaign runner filters them from its XQC-versus-prior reports; the generic
+report command below displays all runs from its selected bundles.
+The older default XQC matrix uses controller seed 55, so its references do not
+match this protocol.
+
+```bash
+XQC_EVAL_PY=environments/dmcontrol/.venv/bin/python
+XQC_J6_MATRIX=configs/research/ambixqc_humanoid_inner_j6_benchmark.json
+XQC_CHECKPOINT=/absolute/path/to/checkpoint.pt
+XQC_PRIOR_BUNDLE=/absolute/path/to/matching/prior-bundle
+
+"$XQC_EVAL_PY" evaluate_ambi_checkpoint.py \
+  --matrix "$XQC_J6_MATRIX" --checkpoint "$XQC_CHECKPOINT" --device cuda \
+  --reference-bundle "$XQC_PRIOR_BUNDLE" \
+  --bundle-dir results/xqc-j6/inner
+
+"$XQC_EVAL_PY" report_ambi_benchmark.py \
+  --bundle "$XQC_PRIOR_BUNDLE" --bundle results/xqc-j6/inner \
+  --output results/xqc-j6/comparison.html
+```
+
+If a matching prior reference is unavailable, select `--preset controller/prior`
+with this same matrix and save it in a fresh bundle first.
+Repeat with separate output paths for each selected checkpoint; the established
+bank comparison uses all 30 checkpoints at 50,000-decision intervals through
+1.5 million decisions. Commands run on the current host; use scheduler compute
+nodes for full evaluations. Add `--wandb` for explicit publication to
+`ambi-inner-bench`. Reports contain raw episode returns and paired gains,
+decision timing, and aggregate normalized XQC value metrics with actual
+optimizer counts. They do not provide per-update optimizer traces.
+
+The versioned Oscar launcher is `slurm/run_ambixqc_inner_eval_oscar.sbatch`.
+It uses one L40S, six CPUs, 32 GB, and a two-hour limit per checkpoint task,
+with the existing locked runtime. Run from a clean checkout at the pushed
+evaluation commit. The campaign manifest records checkpoint and prior-reference
+hashes; its first and last rows also carry `smoke_reference_bundle` and
+`smoke_reference_manifest_sha256` for matching short smoke episodes. Create the
+durable `slurm` output directory before submission.
+
+```bash
+export EXPECTED_ACTION_MODES_SHA=$(git rev-parse HEAD)
+export CHECKPOINT_MANIFEST=/absolute/scratch/campaign/checkpoint-manifest.json
+export RESULT_ROOT=/absolute/scratch/campaign/smoke
+export AMBIXQC_EVAL_MODE=smoke
+sbatch --array=0,29%2 --output=/absolute/scratch/campaign/slurm/smoke-%A_%a.out \
+  --error=/absolute/scratch/campaign/slurm/smoke-%A_%a.err \
+  slurm/run_ambixqc_inner_eval_oscar.sbatch
+
+# After both endpoint smoke tasks pass, evaluate the full 30-checkpoint bank.
+export RESULT_ROOT=/absolute/scratch/campaign/production
+export AMBIXQC_EVAL_MODE=production
+sbatch --array=0-29%12 --output=/absolute/scratch/campaign/slurm/eval-%A_%a.out \
+  --error=/absolute/scratch/campaign/slurm/eval-%A_%a.err \
+  slurm/run_ambixqc_inner_eval_oscar.sbatch
+
+"$XQC_EVAL_PY" summarize_ambixqc_inner_eval.py \
+  --manifest "$CHECKPOINT_MANIFEST" --results-root /absolute/scratch/campaign \
+  --expected-source-sha "$EXPECTED_ACTION_MODES_SHA" \
+  --output /absolute/scratch/campaign/summary.json \
+  --html /absolute/scratch/campaign/comparison.html --wandb
+```
+
+The summary checks completed checkpoint bundles and matching prior references
+before publishing paired return curves. For local downloads whose reference
+paths have moved, use `--reference-root` pointing to the copied prior campaign
+root; its `production/step_N/bundle` manifests must retain their original hashes.
+
 ## AMBI-XQC prior versus MPPI
 
 `ambixqc_humanoid_mppi_benchmark.json` compares the persistent policy with an
