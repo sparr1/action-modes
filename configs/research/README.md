@@ -247,6 +247,68 @@ and critic counts from completed results and distinguish configuration selectors
 so the new settings appear as they finish. Full inner traces and per-decision
 aggregates remain in the portable bundles and generated HTML reports.
 
+### Joint update intervals without smaller collection rounds
+
+`ambi_humanoid_inner_interval_sweep.json` keeps the existing six collection
+rounds, 512 rollouts per round, horizon three, batch size 512, and cumulative
+replay capacity 9,216. It varies the existing `inner_steps_per_update` control
+and adds one smaller actor-learning-rate setting, mirrored for inner and
+frozen outer target-Q bootstraps:
+
+| Variant suffix | Imagined transitions per joint update | Actor LR | C / A / T per full round | C / A / T per decision |
+| --- | ---: | ---: | --- | --- |
+| `s512` | 512 | 5e-5 | 3 / 3 / 3 | 18 / 18 / 18 |
+| `s256` | 256 | 5e-5 | 6 / 6 / 6 | 36 / 36 / 36 |
+| `s128` | 128 | 5e-5 | 12 / 12 / 12 | 72 / 72 / 72 |
+| `s128_half_actor_lr` | 128 | 2.5e-5 | 12 / 12 / 12 | 72 / 72 / 72 |
+
+Selectors are `interval_budget/{inner_target|outer_target}_<suffix>`. Critic LR
+stays 1e-4 and temperature LR stays 3e-4. Every joint update runs the critic,
+then actor, then automatic temperature fitting. This varies temperature dose
+together with critic and actor dose; it does not hold T3 fixed as the preceding
+actor sweep does. Interval 512 matches the original joint-G3 update count when
+every rollout reaches H3, while interval 128 plus half actor LR isolates the
+actor step size at the same high critic/actor/temperature count.
+
+Updates are released after each complete collection round, using the cumulative
+number of new imagined transitions. Collection is not split into smaller
+blocks. The table assumes full-length imagined rollouts; actual transitions
+determine counts if a rollout terminates early. All inherited legacy aliases,
+model-step/per-action budgets, and shared/component per-round update controls
+are explicitly removed so the canonical interval scheduler is selected.
+Actor, critic, target, temperature, optimizers, and replay remain fresh per
+decision. The frozen evaluator executes `tanh(mu)`, disables outer learning and
+writeback, and preserves full inner traces and per-decision aggregates.
+
+Use checkpoints 100k, 200k, 300k, 400k, and 500k from source `u13m14st`, paired
+seeds 101–105, and up to 500 decisions per episode. Reuse the five completed
+prior reference bundles; this matrix contains no prior preset and does not
+request shared-observation banks. Eight presets across five checkpoints produce
+40 configuration runs and 200 full episodes. Use four five-checkpoint arrays:
+`s512` then `s256`, and `s128` then `s128_half_actor_lr`, for each bootstrap
+source. Each task runs its two presets sequentially with fresh output paths.
+For example, the lower-dose inner-target array is:
+
+```bash
+export AMBI_BENCHMARK_MATRIX=configs/research/ambi_humanoid_inner_interval_sweep.json
+export AMBI_BENCHMARK_PRESETS='interval_budget/inner_target_s512 interval_budget/inner_target_s256'
+export AMBI_BENCHMARK_OUTPUT_ROOT=/oscar/scratch/rgao48/ambi/inner-benchmark/new-interval-campaign/inner-target-s512-s256
+sbatch --array=1-5%3 \
+  --output=/absolute/log/path/inner-s512-s256-%A_%a.out \
+  --error=/absolute/log/path/inner-s512-s256-%A_%a.err \
+  slurm/run_ambi_inner_benchmark_oscar.sbatch
+```
+
+Keep the checkpoint prefix, matching prior reference root, and exact tested
+commit exported as in the Oscar instructions above. Repeat for the other three
+pairs with distinct output roots and log paths. A cap of three per array permits
+twelve GPUs and 72 CPUs; reduce concurrency when other jobs share the quota.
+First run a scheduled
+array-index-3 `--smoke` with all eight selectors, a matching seed-101,
+three-decision prior reference, and a new output root; smoke omits W&B.
+Production runs publish to `ambi-inner-bench`, with the interval, actor LR,
+bootstrap, and checkpoint identifying each setting.
+
 ### More critic updates on shared observations
 
 `ambi_humanoid_inner_critic_sweep.json` holds the D512-4-J6 collection and

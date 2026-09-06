@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from fractions import Fraction
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -157,6 +158,24 @@ def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None):
             interval = params["inner_steps_per_update"]
             schedule.append(f"update/{interval} transitions")
             tags.extend(("schedule:transitions", f"steps-per-update:{interval}"))
+            dimensions = [params.get(key) for key in (
+                "inner_rounds", "inner_rollouts_per_round", "inner_rollout_horizon")]
+            if (controller in {"sac", "td3"}
+                    and params.get("inner_explorer_mode", "none") == "none"
+                    and all(_nonnegative_integer(value) for value in dimensions)
+                    and isinstance(interval, (int, float)) and not isinstance(interval, bool)
+                    and math.isfinite(interval) and interval > 0):
+                # These are planned totals: episodic model termination can
+                # reduce generated transitions and therefore realized updates.
+                total = int(Fraction(math.prod(dimensions)) / Fraction(str(interval)))
+                temperature = total if controller == "sac" and params.get("inner_temperature_mode") == "auto" else 0
+                schedule.append(f"nominal C{total}/A{total}/T{temperature} per action (joint)")
+                tags.extend(("update-order:joint", f"C-nominal-per-action:{total}",
+                             f"A-nominal-per-action:{total}", f"T-nominal-per-action:{temperature}"))
+            if params.get("inner_actor_lr") is not None:
+                actor_lr = params["inner_actor_lr"]
+                schedule.append(f"actor LR {actor_lr:g}")
+                tags.append(f"actor-lr:{actor_lr:g}")
         elif any(params.get(f"inner_{component}_updates_per_round") is not None
                  for component in ("critic", "actor")):
             tags.append("schedule:separate")
