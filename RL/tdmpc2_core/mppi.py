@@ -362,6 +362,7 @@ def mppi_plan(
     eval_mode=False,
     task=None,
     materialize_metrics=True,
+    action_selection="ambi",
 ):
     """Plan one action with model-predictive path integral control.
 
@@ -380,7 +381,12 @@ def mppi_plan(
     may persist the returned ``next_mean`` without any planner-owned state.
     Set ``materialize_metrics=False`` to keep diagnostic scalars on-device for
     packing with another boundary transfer; the default preserves float metrics.
+    ``action_selection='tdmpc2'`` reproduces the upstream weighted-elite Gumbel
+    selection in both modes, adding execution noise only outside evaluation.
+    The default ``'ambi'`` retains deterministic proposal-mean evaluation.
     """
+    if action_selection not in {"ambi", "tdmpc2"}:
+        raise ValueError("action_selection must be 'ambi' or 'tdmpc2'.")
     if (model is None) == (callbacks is None):
         raise ValueError("Supply exactly one of model or callbacks to MPPI.")
     if model is not None and bool(model.training):
@@ -484,33 +490,44 @@ def mppi_plan(
         max_elite_value = elite_value.max(dim=0).values
         weights = torch.exp(temperature * (elite_value - max_elite_value))
         weights = weights / weights.sum(dim=0).clamp_min(1e-9)
-        mean = (weights.unsqueeze(0) * elite_actions).sum(dim=1)
+        normalization = weights.sum(dim=0) + 1e-9 if action_selection == "tdmpc2" else 1.0
+        mean = (weights.unsqueeze(0) * elite_actions).sum(dim=1) / normalization
         variance = (
             weights.unsqueeze(0)
             * (elite_actions - mean.unsqueeze(1)).square()
-        ).sum(dim=1)
+        ).sum(dim=1) / normalization
         std = variance.sqrt().clamp(min_std, max_std)
 
-    if bool(eval_mode):
+    if bool(eval_mode) and action_selection == "ambi":
         # Evaluation is the deterministic optimized proposal. It deliberately
         # consumes no categorical-selection or execution-noise randomness.
         action = mean[0]
     else:
-        selected_elite = torch.multinomial(
-            weights.squeeze(-1),
-            1,
-            replacement=True,
-            generator=generator,
-        )
+        if action_selection == "tdmpc2":
+            # Exact upstream Gumbel-softmax categorical rule, with explicit
+            # private RNG instead of the upstream implicit default generator.
+            probabilities = weights.squeeze(-1)
+            gumbels = -torch.empty_like(probabilities).exponential_(
+                generator=generator
+            ).log()
+            selected_elite = (probabilities.log() + gumbels).softmax(0).argmax(-1).reshape(1)
+        else:
+            selected_elite = torch.multinomial(
+                weights.squeeze(-1),
+                1,
+                replacement=True,
+                generator=generator,
+            )
         selected_actions = elite_actions.index_select(1, selected_elite).squeeze(1)
         action = selected_actions[0]
-        action_noise = torch.randn(
-            (action_dim,),
-            device=root_z.device,
-            dtype=root_z.dtype,
-            generator=generator,
-        )
-        action = action + std[0] * action_noise
+        if not bool(eval_mode):
+            action_noise = torch.randn(
+                (action_dim,),
+                device=root_z.device,
+                dtype=root_z.dtype,
+                generator=generator,
+            )
+            action = action + std[0] * action_noise
     action = action.clamp(-1.0, 1.0)
 
     policy_model_steps = num_pi_trajs * max(0, horizon - 1)

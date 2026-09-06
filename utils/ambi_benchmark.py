@@ -27,11 +27,72 @@ import numpy as np
 SCHEMA_VERSION = 1
 SEED_SCHEME = "sha256-v1"
 ROOT_DECISIONS = (0, 100, 200, 300, 400)
+MPPI_ACTION_RULE = "weighted_elite_gumbel_no_execution_noise"
 
 
 def _is_xqc(config):
     return (config.get("alg") == "AMBIXQC/AMBIXQC"
             or config.get("alg_params", {}).get("inner_operator") == "xqc")
+
+
+def controller_type(config):
+    """Identify the evaluation controller before inspecting collection settings."""
+    explicit = config.get("evaluation_controller")
+    if explicit is not None:
+        if not isinstance(explicit, dict) or explicit.get("type") not in {"prior", "xqc", "mppi"}:
+            raise ValueError("Invalid explicit evaluation controller.")
+        return explicit["type"]
+    operator = config.get("alg_params", {}).get("inner_operator")
+    return "prior" if operator == "none" else operator or "unknown"
+
+
+def run_controller_type(run):
+    config = run.get("config", {})
+    result = controller_type(config)
+    explicit = run.get("evaluation_controller")
+    if explicit is not None:
+        recorded = controller_type({"evaluation_controller": explicit})
+        if recorded != result:
+            raise ValueError("Recorded evaluation controller conflicts with the run configuration.")
+    return result
+
+
+def validate_evaluation_controller(config, controller):
+    """Check authored MPPI settings against the actual adapter metadata."""
+    if controller_type({"evaluation_controller": controller}) != controller_type(config):
+        raise ValueError("Recorded evaluation controller conflicts with the run configuration.")
+    if controller["type"] != "mppi":
+        return
+    settings, protocol = controller.get("settings"), controller.get("protocol")
+    if not isinstance(settings, dict) or not isinstance(protocol, dict):
+        raise ValueError("MPPI requires resolved settings and controller protocol.")
+    for key, value in config.get("evaluation_controller", {}).get("params", {}).items():
+        if settings.get(key) != value:
+            raise ValueError(f"Recorded MPPI setting {key!r} conflicts with the authored configuration.")
+    for key in ("horizon", "iterations", "effective_iterations", "num_samples", "num_elites"):
+        if isinstance(settings.get(key), bool) or not isinstance(settings.get(key), int) or settings[key] <= 0:
+            raise ValueError(f"Invalid resolved MPPI setting {key!r}.")
+    if settings["effective_iterations"] < settings["iterations"]:
+        raise ValueError("Effective MPPI iterations cannot be below configured iterations.")
+    if (not _nonnegative_integer(settings.get("num_pi_trajs"))
+            or settings["num_pi_trajs"] > settings["num_samples"]
+            or settings["num_elites"] > settings["num_samples"]):
+        raise ValueError("MPPI policy trajectories and elites must fit the candidate count.")
+    for key in ("min_std", "max_std", "temperature"):
+        value = settings.get(key)
+        if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"Invalid resolved MPPI setting {key!r}.")
+    if settings["min_std"] > settings["max_std"]:
+        raise ValueError("MPPI minimum standard deviation exceeds its maximum.")
+    if protocol.get("action_rule") != MPPI_ACTION_RULE:
+        raise ValueError("MPPI controller action rule must describe weighted-elite execution.")
+    if protocol.get("terminal_value_source") != "online_xqc_twin_mean":
+        raise ValueError("MPPI terminal value source must use the online XQC twin mean.")
+    if protocol.get("terminal_value_units") != "normalized_xqc_soft_q_times_frozen_real_reward_scale":
+        raise ValueError("MPPI terminal value units must describe the frozen reward-scale conversion.")
+    scale = protocol.get("reward_scale")
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0:
+        raise ValueError("MPPI controller requires a finite positive frozen reward scale.")
 
 
 def decision_metric_catalog(names, *, xqc=False):
@@ -53,6 +114,17 @@ def decision_metric_catalog(names, *, xqc=False):
                           else "Cumulative raw environment return through this decision.")
         elif key.endswith("seconds"):
             unit = "seconds"
+        elif key.startswith(("planner_value_", "planner_elite_value_")):
+            unit = "raw_return_score"
+            definition = ("MPPI final-iteration score statistic: raw predicted rewards plus discounted "
+                          "online mean XQC soft-Q tail times the frozen real reward scale; "
+                          f"no entropy correction. Statistic: {key}." if xqc else
+                          f"MPPI final-iteration predicted score statistic: {key}.")
+        elif key.startswith("planner_std_") or key == "planner_action_l2":
+            unit = "normalized_action"
+        elif key.startswith("planner_"):
+            unit = "count"
+            definition = f"Actual MPPI search measurement for this decision: {key}."
         elif inner.startswith(("behavior_reward_", "behavior_discounted_reward_", "return_")):
             unit = "raw_predicted_reward"
             definition = f"Imagined collection statistic in raw model reward units: {inner}."
@@ -104,6 +176,11 @@ def solver_seed(base, *identity):
 
 
 def protocol_for(resolved, controller_seed, max_steps):
+    """Common pairing contract; action_rule is the prior-reference rule.
+
+    Candidate execution rules live on each run's evaluation_controller. Keeping
+    the reference contract unchanged permits reuse of existing prior bundles.
+    """
     config = resolved["algorithm_config"]
     return {
         "environment": copy.deepcopy(resolved["environment"]),
@@ -150,7 +227,8 @@ def _legacy_update_labels(params):
     return labels + ["(overlapping slots)"], tags + ["update-order:overlapping-slots"]
 
 
-def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None):
+def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None,
+                         evaluation_controller=None):
     """Describe a run from the same saved inputs used by the evaluator.
 
     ``config`` is the algorithm mapping stored as W&B ``inner_config``. The
@@ -172,11 +250,12 @@ def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None):
     else:
         checkpoint_label = f"ckpt {digest[:12]}" if digest else "ckpt unknown"
 
-    operator = params.get("inner_operator")
-    controller = "prior" if operator == "none" else operator or "unknown"
+    controller = controller_type(config)
+    explicit_mppi = config.get("evaluation_controller", {}).get("type") == "mppi"
     tags = ["frozen-inner-benchmark", kind, f"kind:{kind}", f"task:{task}", f"controller:{controller}"]
-    if protocol.get("action_rule"):
-        tags.append(f"action:{protocol['action_rule']}")
+    action_rule = MPPI_ACTION_RULE if explicit_mppi else protocol.get("action_rule")
+    if action_rule:
+        tags.append(f"action:{action_rule}")
     if known_step:
         tags.append(f"checkpoint-step:{step}")
     if digest:
@@ -197,6 +276,25 @@ def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None):
         parts.append("prior only")
         if not _is_xqc(config):
             tags.append("bootstrap:none")
+    elif explicit_mppi:
+        settings = ((evaluation_controller or {}).get("settings")
+                    or config["evaluation_controller"].get("params", {}))
+        schedule = []
+        for symbol, key in (("H", "horizon"), ("N", "num_samples"),
+                            ("E", "num_elites"), ("pi", "num_pi_trajs")):
+            if key in settings:
+                schedule.append(f"{symbol}{settings[key]}")
+                tags.append(f"{symbol}:{settings[key]}")
+        if "effective_iterations" in settings:
+            schedule.append(f"J{settings['effective_iterations']}")
+            tags.append(f"J:{settings['effective_iterations']}")
+        elif "iterations" in settings:
+            schedule.append(f"configured iterations {settings['iterations']}")
+        tags.extend(("algorithm:ambixqc", "schedule:mppi-search", "C:0", "A:0", "T:0",
+                     "terminal-q:online-xqc-twin-mean", "reward-scale:frozen-real"))
+        if "iterations" in settings:
+            tags.append(f"configured-iterations:{settings['iterations']}")
+        parts.extend((" ".join(["MPPI", *schedule]), "weighted elite", "online Q × frozen scale"))
     elif _is_xqc(config):
         schedule = []
         for symbol, key in (("J", "inner_rounds"), ("N", "inner_rollouts_per_round"),
@@ -368,10 +466,12 @@ def reference_returns(path, checkpoint_sha256, protocol):
     if episode_protocol(manifest.get("protocol", {})) != episode_protocol(protocol):
         raise ValueError("Prior reference environment/action/seed protocol does not match.")
     runs = [run for run in manifest["runs"] if
-            run.get("config", {}).get("alg_params", {}).get("inner_operator") == "none"
+            run_controller_type(run) == "prior"
             and run.get("status") == "complete" and run.get("episodes")]
     if len(runs) != 1:
         raise ValueError("Prior reference must contain exactly one completed prior-only episode run.")
+    if runs[0].get("action_rule", protocol.get("action_rule")) != "tanh_mean":
+        raise ValueError("Prior reference must execute the deterministic actor mean.")
     episodes = runs[0]["episodes"]
     values = {episode["seed"]: episode["return"] for episode in episodes}
     if len(values) != len(episodes) or not all(math.isfinite(value) for value in values.values()):
@@ -393,7 +493,8 @@ def code_identity():
             stderr=subprocess.DEVNULL, close_fds=False,
         ).decode().strip()
     digest = hashlib.sha256()
-    paths = {root / "evaluate_ambi_checkpoint.py", root / "report_ambi_benchmark.py"}
+    paths = {root / name for name in ("evaluate_ambi_checkpoint.py", "report_ambi_benchmark.py",
+                                     "run_ambixqc_mppi_evaluation.py", "summarize_ambixqc_mppi_eval.py")}
     for directory in ("RL", "utils", "domains", "configs/research"):
         paths.update(path for path in (root / directory).rglob("*")
                      if path.is_file() and path.suffix in {".py", ".json", ".js", ".html"})
@@ -426,6 +527,7 @@ class BenchmarkBundle:
         self.manifest = {
             "schema_version": SCHEMA_VERSION, "evaluation_id": uuid.uuid4().hex,
             "checkpoint": checkpoint, "code": code_identity(), "protocol": protocol,
+            "protocol_semantics": {"action_rule": "prior_reference", "candidate_action_rule": "per_run"},
             "metric_catalog": {}, "runs": [], "status": "running",
         }
         self.save()
@@ -443,6 +545,8 @@ class BenchmarkBundle:
                "wandb_name": labels["name"], "wandb_tags": labels["tags"],
                "episodes": [], "roots": [], "trace_files": [], "status": "running",
                "serialization_seconds": 0.0, "publication_seconds": 0.0}
+        run["action_rule"] = (MPPI_ACTION_RULE if config.get("evaluation_controller", {}).get("type") == "mppi"
+                              else self.manifest["protocol"]["action_rule"])
         if _is_xqc(config):
             run["diagnostic_capabilities"] = {
                 "decision_metrics": True, "optimizer_traces": False,
@@ -472,6 +576,25 @@ class BenchmarkBundle:
             run["publication_seconds"] += time.perf_counter() - started
         self.save()
         return run
+
+    def set_evaluation_controller(self, run, controller):
+        """Publish resolved search settings before any scored episode is saved."""
+        validate_evaluation_controller(run["config"], controller)
+        run["evaluation_controller"] = copy.deepcopy(controller)
+        run["action_rule"] = controller.get("protocol", {}).get("action_rule", run["action_rule"])
+        run["controller_hash"] = canonical_hash(controller)
+        labels = benchmark_run_labels(
+            self.manifest["checkpoint"], self.manifest["protocol"], run["config"],
+            run["kind"], selector=run["selector"], evaluation_controller=controller,
+        )
+        run["wandb_name"], run["wandb_tags"] = labels["name"], labels["tags"]
+        remote = self.remote_runs.get(run["id"])
+        if remote is not None:
+            remote.name = run["wandb_name"]
+            remote.tags = run["wandb_tags"]
+            remote.config.update({"evaluation_controller": controller,
+                                  "action_rule": run["action_rule"]})
+        self.save()
 
     def write_trace(self, run, name, events):
         if not events:

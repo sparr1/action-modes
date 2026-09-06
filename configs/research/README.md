@@ -1,5 +1,101 @@
 # Frozen-checkpoint AMBI research
 
+## AMBI-XQC prior versus MPPI
+
+`ambixqc_humanoid_mppi_benchmark.json` compares the persistent policy with an
+evaluation-only MPPI controller on the same AMBI-XQC checkpoint. It defaults to
+both `controller/prior` and `controller/mppi`, seeds 101–105, controller seed
+12345, and at most 500 decisions per episode. It does not run inner XQC updates.
+Training and checkpoint formats are unchanged: the evaluator loads the saved
+XQC model as a frozen prior and attaches a separate planner.
+
+```bash
+XQC_EVAL_PY=environments/dmcontrol/.venv/bin/python
+XQC_MPPI_MATRIX=configs/research/ambixqc_humanoid_mppi_benchmark.json
+XQC_CHECKPOINT=/absolute/path/to/checkpoint.pt
+
+"$XQC_EVAL_PY" evaluate_ambi_checkpoint.py \
+  --matrix "$XQC_MPPI_MATRIX" --checkpoint "$XQC_CHECKPOINT" --device cuda \
+  --bundle-dir results/xqc-mppi/paired
+
+"$XQC_EVAL_PY" report_ambi_benchmark.py \
+  --bundle results/xqc-mppi/paired --output results/xqc-mppi/paired.html
+```
+
+To reuse prior outcomes, first select only `--preset controller/prior` and save
+its bundle. Then select only `--preset controller/mppi` with
+`--reference-bundle /path/to/prior-bundle` and a new `--bundle-dir`. The prior
+reference must match this checkpoint hash and the episode protocol, including
+controller seed 12345; a reference generated with the older XQC matrix's
+controller seed 55 is not a match. Add `--wandb` to publish the selected run(s)
+to `ambi-inner-bench`. These commands do not submit scheduler jobs.
+
+The planner uses horizon 3, 512 candidates, 64 elites, 24 policy trajectories,
+standard deviation bounds 0.05–2, and temperature 0.5. Its configured six
+iterations become eight for action dimensions of at least 20, including
+Humanoid Walk's 21 actions. Search uses native stochastic samples and executes
+a native weighted elite action with no additional Gaussian execution noise.
+This differs from the prior's deterministic `tanh(mu)` action; each run records
+its own action rule. The shifted plan mean persists within an episode and is
+cleared after warmup and before every scored episode. Private planner RNG is
+seeded independently of saved training RNG and preset execution order.
+
+Scoring adds raw TOLD predicted rewards and a terminal value from the online
+twin XQC critics, averaged across heads and multiplied by the checkpoint's
+frozen real reward scale. This gives consistent raw reward units while retaining
+the learned soft-Q tail; it does not turn XQC's critic into a separately trained
+reward-only critic. No critic, actor, temperature, BatchNorm statistic, optimizer,
+real reward normalizer, or outer RNG is updated. Decision records report actual
+model work and zero optimizer steps, alongside returns and control time.
+
+Planner settings live in a variant's `evaluation_controller` object, separate
+from training `alg_params`. Only the eight documented planner settings are
+accepted. MPPI presets cannot be materialized into training configurations.
+Use the existing XQC matrix below for an explicitly requested inner-XQC
+comparison.
+
+The Oscar campaign launcher, `slurm/run_ambixqc_mppi_eval_oscar.sbatch`, evaluates
+the seed-55 prior bank at all 30 checkpoints from 50,000 through 1,500,000
+decisions. Its JSON manifest contains the source run and one ordered row per
+checkpoint with `step`, absolute `path`, `sha256`, and `metadata_sha256`.
+`run_ambixqc_mppi_evaluation.py` validates these hashes and training metadata
+before allocating an environment. Each array task writes a fresh `step_N`
+directory containing paired results, decision traces, validation, and HTML.
+
+Use a clean checkout of the pushed evaluation commit and the existing locked
+Oscar runtime. Create the campaign's `slurm` directory before submission:
+
+```bash
+export EXPECTED_ACTION_MODES_SHA=$(git rev-parse HEAD)
+export CHECKPOINT_MANIFEST=/absolute/scratch/campaign/checkpoint-manifest.json
+export RESULT_ROOT=/absolute/scratch/campaign/smoke
+export AMBIXQC_EVAL_MODE=smoke
+sbatch --array=0,29%2 --output=/absolute/scratch/campaign/slurm/smoke-%A_%a.out \
+  --error=/absolute/scratch/campaign/slurm/smoke-%A_%a.err \
+  slurm/run_ambixqc_mppi_eval_oscar.sbatch
+
+# After both GPU smoke tasks pass, evaluate five full episodes per controller.
+export RESULT_ROOT=/absolute/scratch/campaign/production
+export AMBIXQC_EVAL_MODE=production
+sbatch --array=0-29%12 --output=/absolute/scratch/campaign/slurm/eval-%A_%a.out \
+  --error=/absolute/scratch/campaign/slurm/eval-%A_%a.err \
+  slurm/run_ambixqc_mppi_eval_oscar.sbatch
+
+"$XQC_EVAL_PY" summarize_ambixqc_mppi_eval.py \
+  --manifest "$CHECKPOINT_MANIFEST" --results-root /absolute/scratch/campaign \
+  --expected-source-sha "$EXPECTED_ACTION_MODES_SHA" \
+  --output /absolute/scratch/campaign/summary.json \
+  --html /absolute/scratch/campaign/comparison.html --wandb
+```
+
+The smoke uses two seeds and three decisions with the full MPPI search budget,
+runs CUDA regression checks, and disables W&B. Production publishes checkpoint
+runs to `ambi-inner-bench`; the optional final summary publishes one campaign
+run with native curves indexed by training checkpoint. Summary validation
+requires all 30 checkpoints by default. `--allow-partial` can summarize missing
+checkpoint directories but still rejects failed or incomplete results that are
+present. Completed episode bundles are preserved if later evaluation fails.
+
 ## AMBI-XQC episode comparison
 
 This workflow measures deployment-time improvement from fresh inner XQC on an

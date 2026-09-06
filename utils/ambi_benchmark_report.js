@@ -101,7 +101,8 @@
           const ending = episode ? [episode.terminated && "terminated", episode.truncated && "truncated", episode.capped && "capped"].filter(Boolean).join(", ") || "incomplete" : "root-bank only";
           const status = episode && episode.status || run.status || "unknown";
           const complete = episode && (episode.terminated || episode.truncated || episode.capped) && !["failed", "partial", "running"].includes(status);
-          [run.label, episode ? `${episode.episode_id} / ${episode.seed}` : "—", format(episode && episode.return), format(complete ? episode.paired_return_delta : null),
+          [run.label, run.action_rule || data.protocol.action_rule,
+            episode ? `${episode.episode_id} / ${episode.seed}` : "—", format(episode && episode.return), format(complete ? episode.paired_return_delta : null),
             episode ? episode.length : "—", format(episode && episode.control_seconds), ending, status].forEach(value => {
             const cell = document.createElement("td"); cell.textContent = value; row.appendChild(cell);
           }); target.appendChild(row);
@@ -213,7 +214,7 @@
       const mode = $("mode").value, semantic = data.metric_catalog[$("metric").value] || {};
       const visibleRuns = chosen().length ? chosen() : data.runs;
       const xqcUnits = visibleRuns.some(run => (run.config || {}).alg === "AMBIXQC/AMBIXQC")
-        ? " XQC values use normalized reward units; environment returns use raw rewards." : "";
+        ? " XQC network values use normalized reward units; environment returns use raw rewards. MPPI scores convert the frozen soft-Q tail to raw reward units." : "";
       text("diagnostic-description", capabilities(visibleRuns).optimizer
         ? "Frozen-checkpoint outcomes and recorded optimizer events inside each decision."
         : "Frozen-checkpoint outcomes and one aggregate measurement per real decision." + xqcUnits);
@@ -251,8 +252,9 @@
       text("heat-readout", `Decision ${point.decision} · ${axes[$("axis").value]} ${point.x} · ${point.cell ? `${point.cell.nonfinite || format(point.cell.value)} · event ${point.cell.event} · ${point.cell.phase}${point.cell.count > 1 ? ` · final of ${point.cell.count} events at this coordinate` : ""}` : "no logged value"}`);
     });
     $("heatmap").addEventListener("click", event => {const point = heatPoint(event); if (point) {$("decision").value = String(point.decision); render();}});
-    text("provenance", `Checkpoint ${data.checkpoint.sha256} · ${data.runs.length} runs · ${data.protocol.action_rule} · ${data.protocol.max_steps} decision cap`);
-    text("source-details", data.sources.map(source => `${source.evaluation_id} · ${source.status || "unknown status"} · ${JSON.stringify(source.code)} · ${source.directory}`).join("\n"));
+    text("provenance", `Checkpoint ${data.checkpoint.sha256} · ${data.runs.length} runs · prior reference action: ${data.protocol.action_rule} · ${data.protocol.max_steps} decision cap`);
+    text("source-details", data.sources.map(source => `${source.evaluation_id} · ${source.status || "unknown status"} · ${JSON.stringify(source.code)} · ${source.directory}`)
+      .concat(data.runs.filter(run => run.evaluation_controller).map(run => `${run.label} · ${JSON.stringify(run.evaluation_controller)}`)).join("\n"));
     preferred(); refreshOptions();
     const initialHeatRun = chosen().find(run => run.traces.some(trace => series(trace, $("metric").value, $("axis").value).length));
     if (initialHeatRun) $("primary-run").value = initialHeatRun.key;

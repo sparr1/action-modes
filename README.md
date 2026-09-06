@@ -45,9 +45,9 @@ TOLD and its recurrent multi-step BPTT training, replaces the persistent SAC
 control priors with the released XQC actor and twin categorical critics, and
 runs a fresh full-copy inner XQC learner at every non-warmup decision by default.
 Set `inner_operator="none"` to collect directly from the persistent policy while
-retaining normal TOLD/XQC learning. Its
-first implementation is state-observation only and deliberately has no MPPI,
-TD3, LoRA, or persistent-inner switches. The reduced Humanoid Walk integration
+retaining normal TOLD/XQC learning. Training supports state observations and
+the prior or fresh XQC controller. Saved checkpoints also support an
+evaluation-only MPPI comparator described below. The reduced Humanoid Walk integration
 check is
 `configs/dmcontrol/experiments/ambixqc_humanoid_walk_state_smoke.json` and must
 be run with `--alg-dir configs/dmcontrol/algs`; it is not a benchmark.
@@ -90,6 +90,12 @@ See [the checkpoint evaluation workflow](configs/research/README.md#ambi-xqc-epi
 for training, evaluation, and portable HTML report commands. This workflow
 records episode returns and per-decision diagnostics; shared-observation probes
 and per-update optimizer traces are not supported for XQC.
+
+The [prior-versus-MPPI workflow](configs/research/README.md#ambi-xqc-prior-versus-mppi)
+uses TD-MPC2's Humanoid search defaults on the frozen XQC model. It compares
+matched episodes at each selected checkpoint and records the native stochastic
+MPPI action rule, raw environment returns, and control time. Its terminal score
+converts the learned XQC soft-Q tail with the frozen real reward scale.
 
 On Oscar, use `slurm/run_ambixqc_prior_checkpoint_bank_oscar.sbatch` from a
 clean checkout of the exact pushed commit. Export `EXPECTED_ACTION_MODES_SHA`,

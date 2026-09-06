@@ -401,6 +401,23 @@ def _is_xqc(resolved):
     return resolved.get("algorithm_config", {}).get("alg") == "AMBIXQC/AMBIXQC"
 
 
+def _controller_type(resolved):
+    configured = resolved.get("evaluation_controller") or resolved.get("algorithm_config", {}).get("evaluation_controller")
+    if configured is not None:
+        return configured["type"]
+    operator = resolved.get("algorithm_config", {}).get("alg_params", {}).get("inner_operator")
+    return "prior" if operator == "none" else operator or "unknown"
+
+
+def _predict_evaluation_action(model, controller, observation, *, episode_start):
+    if controller is None:
+        return model.predict(observation, deterministic=True, episode_start=episode_start)[0]
+    # The evaluation-only planner produces normalized actions. Retain the
+    # trained wrapper's physical action-bound/shape conversion at deployment.
+    action = controller.act(model._obs_to_tensor(observation))
+    return model._unscale_action(action.numpy())
+
+
 def _reset_evaluation(model, seed, *, reuse_action_pool=False):
     reset = getattr(model, "reset_for_evaluation", None)
     if not callable(reset):
@@ -593,6 +610,7 @@ def evaluate_preset(
 
     env = _make_env(resolved)
     model = None
+    controller = None
     primary_error = None
     pending_events = []
     phase_id = "initialization"
@@ -606,6 +624,15 @@ def evaluate_preset(
         )
         digest_before = _outer_state_digest(model)
         updates_before = int(model.agent.num_updates)
+        evaluation_controller = None
+        if _controller_type(resolved) == "mppi":
+            from RL.tdmpc2_core.xqc_mppi import FrozenXQCMPPIController
+            configured = resolved.get("evaluation_controller") or run_config["evaluation_controller"]
+            controller = FrozenXQCMPPIController(model.agent, settings=configured.get("params", {}))
+            controller.reset(controller_seed)
+            evaluation_controller = {"type": "mppi", "settings": _jsonable(controller.settings),
+                                     "protocol": _jsonable(controller.protocol)}
+        action_rule = ("tanh_mean" if controller is None else controller.protocol["action_rule"])
         metric_values = {}
         nonfinite_metric_counts = {}
         episodes = []
@@ -615,16 +642,20 @@ def evaluate_preset(
             bundle_run["resolved_config"] = _jsonable(vars(model.cfg))
             bundle_run["checkpoint_evaluation_provenance"] = _jsonable(
                 getattr(model.agent, "checkpoint_evaluation_provenance", {}))
+            if evaluation_controller is not None:
+                bundle.set_evaluation_controller(bundle_run, evaluation_controller)
             # Pay lazy compile/allocation cost once, then reset before scoring.
             warm_observation = env.reset(seed=int(seeds[0]))[0]
             started = time.perf_counter()
-            model.predict(warm_observation, deterministic=True, episode_start=True)
+            _predict_evaluation_action(model, controller, warm_observation, episode_start=True)
             bundle_run["warmup_including_compile_seconds"] = time.perf_counter() - started
 
         for seed in seeds:
             seed = int(seed)
             episode_seed = solver_seed(controller_seed, "episode", seed)
             episode_reset = _reset_evaluation(model, episode_seed, reuse_action_pool=bundle is not None)
+            if controller is not None:
+                controller.reset(episode_seed)
             if not episode_reset:
                 # Legacy AMBI retains its constructor-seeded continuous stream.
                 # Do not claim a per-episode reset that its engine cannot perform.
@@ -643,11 +674,8 @@ def evaluate_preset(
 
             while not (terminated or truncated):
                 started = time.perf_counter()
-                action, _ = model.predict(
-                    observation,
-                    deterministic=True,
-                    episode_start=(episode_steps == 0),
-                )
+                action = _predict_evaluation_action(
+                    model, controller, observation, episode_start=(episode_steps == 0))
                 action_seconds = time.perf_counter() - started
                 control_seconds += action_seconds
                 observation, reward, terminated, truncated, _ = env.step(action)
@@ -737,6 +765,10 @@ def evaluate_preset(
             "variant": resolved["variant"],
             "reference_variant": resolved["reference"],
             "description": resolved["description"],
+            "controller": _controller_type(resolved),
+            "evaluation_controller": evaluation_controller,
+            "action_rule": action_rule,
+            "deterministic_execution": controller is None,
             "critic_spec": copy.deepcopy(model.agent.critic_signature if _is_xqc(resolved)
                                          else model.agent.model.critic_signature),
             "controller_seed": int(controller_seed),
@@ -871,7 +903,7 @@ def evaluate_matrix(
         if any(not _is_xqc(resolved) for resolved in resolved_presets):
             raise ValueError("Episode bundles in this checkout support AMBI-XQC only; legacy AMBI JSON evaluation remains available.")
         # Selected priors can supply deltas to later controllers in this bundle.
-        resolved_presets.sort(key=lambda item: item["algorithm_config"]["alg_params"].get("inner_operator") != "none")
+        resolved_presets.sort(key=lambda item: _controller_type(item) != "prior")
         for resolved in resolved_presets:
             params = resolved["algorithm_config"]["alg_params"]
             if _observation_architecture_key(resolved)[0] != "state":
@@ -894,6 +926,8 @@ def evaluate_matrix(
         "path": str(Path(checkpoint).resolve()), "sha256": checkpoint_sha256,
         "source_run": matrix.get("source_run"), "source_run_verified": False,
         "metadata": None if context is None else context.metadata,
+        "metadata_path": None if context is None else str(context.source.resolve()),
+        "metadata_sha256": None if context is None else _file_sha256(context.source),
     }, protocol=protocol, wandb=wandb_options, reference=reference) if bundle_dir is not None else None
     if bundle is not None:
         bundle.started = evaluation_started
@@ -916,7 +950,7 @@ def evaluate_matrix(
                     bundle=bundle, bundle_run=bundle_run,
                 )
                 results.append(result)
-                if bundle is not None and resolved["algorithm_config"]["alg_params"].get("inner_operator") == "none":
+                if bundle is not None and _controller_type(resolved) == "prior":
                     bundle.reference = {episode["seed"]: episode["return"] for episode in result["episodes"]}
                 if bundle is not None:
                     bundle.finish_run(bundle_run, result=result)
@@ -944,7 +978,8 @@ def evaluate_matrix(
         "schema_version": 1, "matrix": str(matrix_path),
         "checkpoint": str(Path(checkpoint).resolve()), "checkpoint_sha256": checkpoint_sha256,
         "matrix_sha256": _file_sha256(matrix_path), "frozen_outer_learning": True,
-        "deterministic_execution": True, "environment": copy.deepcopy(resolved_presets[0]["environment"]),
+        "deterministic_execution": all(result["deterministic_execution"] for result in results),
+        "environment": copy.deepcopy(resolved_presets[0]["environment"]),
         "common_model_metrics": sorted(set.intersection(*metric_sets)) if metric_sets else [],
         "available_model_metrics": sorted(set.union(*metric_sets)) if metric_sets else [],
         "results": results,

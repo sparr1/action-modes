@@ -85,6 +85,15 @@ The XQC controller semantics reuse the PyTorch port of official XQC commit
 `9a6832bb742ef01bbe9f1e06153a9338e612dae5`; TOLD remains derived from the
 TD-MPC2 source identified above.
 
+`xqc_mppi.py` attaches an evaluation-only MPPI controller to a frozen AMBI-XQC
+checkpoint. It uses running BatchNorm statistics and its own episode-seeded
+RNG, retains a shifted plan mean within an episode, and performs no optimizer
+or normalizer updates. Terminal scoring averages the online XQC critics and
+multiplies by the frozen real reward scale before adding raw predicted rewards;
+the resulting tail still includes the learned soft-Q objective. The optional
+`action_selection="tdmpc2"` helper mode reproduces native weighted elite action
+selection, while existing helper callers retain their previous defaults.
+
 On sampled diagnostic actions, AMBI-XQC publishes the same
 `train/inner_final_outer_policy_kl` contract as inner SAC: the closed-form
 `KL(final adapted actor || current outer policy prior)` at the encoded

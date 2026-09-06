@@ -87,7 +87,19 @@ def _root_probe_signature(root):
 
 
 def _load_run(directory, manifest, run, run_key):
+    from utils.ambi_benchmark import canonical_hash, run_controller_type, validate_evaluation_controller
+
     run_id = _identity(run.get("id"), "run.id")
+    controller = run_controller_type(run)
+    controller_metadata = run.get("evaluation_controller")
+    if controller == "mppi" and run.get("config", {}).get("evaluation_controller"):
+        if run.get("status") == "complete" or controller_metadata is not None:
+            validate_evaluation_controller(run["config"], controller_metadata or {})
+        expected_action = (controller_metadata or {}).get("protocol", {}).get("action_rule")
+        if expected_action is not None and run.get("action_rule") != expected_action:
+            raise ValueError(f"Run {run_id}: action rule conflicts with its controller protocol.")
+        if run.get("controller_hash") is not None and run["controller_hash"] != canonical_hash(controller_metadata):
+            raise ValueError(f"Run {run_id}: controller hash conflicts with its recorded settings/protocol.")
     episodes = run.get("episodes", [])
     roots = run.get("roots", [])
     if not isinstance(episodes, list) or not isinstance(roots, list):
@@ -209,13 +221,20 @@ def _load_run(directory, manifest, run, run_key):
         raise ValueError(f"Run {run_id}: decision-only diagnostics require one completed-decision row per solve.")
     if capabilities.get("shared_observation_probes") is False and roots:
         raise ValueError(f"Run {run_id}: shared roots conflict with diagnostic capabilities.")
+    if controller == "mppi" and run.get("config", {}).get("evaluation_controller"):
+        if any(any(value not in (0, None) for value in trace[counter])
+               for trace in traces for counter in ("critic_updates", "actor_updates", "temperature_updates")):
+            raise ValueError(f"Run {run_id}: MPPI cannot report optimizer updates.")
     return {"key": run_key, "id": run_id, "evaluation_id": manifest["evaluation_id"],
             "label": str(run.get("display_name", run.get("wandb_name", run.get("selector", run_id)))),
             "selector": run.get("selector"), "diagnostic_capabilities": capabilities,
+            "controller_type": controller, "evaluation_controller": controller_metadata,
+            "action_rule": run.get("action_rule", manifest["protocol"]["action_rule"]),
             "actual_optimizer_steps": run.get("actual_optimizer_steps"),
             "actual_optimizer_steps_scope": run.get("actual_optimizer_steps_scope"),
             "config": run.get("config", {}), "config_hash": run.get("config_hash"),
             "kind": run.get("kind"), "status": run.get("status", manifest.get("status")),
+            "controller_hash": run.get("controller_hash"),
             "wandb_path": run.get("wandb_path"), "episodes": episodes, "roots": roots, "traces": traces}
 
 

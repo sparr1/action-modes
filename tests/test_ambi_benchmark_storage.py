@@ -648,3 +648,113 @@ def test_code_identity_uses_posix_spawn_compatible_git_invocation(monkeypatch):
         assert command[1:3] == ["-C", str(Path(storage.__file__).resolve().parents[1])]
         assert kwargs["close_fds"] is False
         assert "cwd" not in kwargs
+
+
+def _mppi_resolved():
+    resolved = _xqc_resolved("none")
+    resolved["selector"] = "controller/mppi"
+    resolved["algorithm_config"]["evaluation_controller"] = {"type": "mppi", "params": {
+        "horizon": 3, "iterations": 6, "num_samples": 512, "num_elites": 64,
+        "num_pi_trajs": 24, "min_std": 0.05, "max_std": 2.0, "temperature": 0.5,
+    }}
+    return resolved
+
+
+def _mppi_controller():
+    return {"type": "mppi", "settings": {
+        **_mppi_resolved()["algorithm_config"]["evaluation_controller"]["params"], "effective_iterations": 8,
+    }, "protocol": {
+        "action_rule": storage.MPPI_ACTION_RULE, "terminal_value_source": "online_xqc_twin_mean",
+        "terminal_value_units": "normalized_xqc_soft_q_times_frozen_real_reward_scale", "reward_scale": 2.5,
+    }}
+
+
+def test_mppi_bundle_reuses_old_prior_reference_and_reports_actual_search(tmp_path):
+    from report_ambi_benchmark import load_bundles, render_html
+
+    prior = storage.BenchmarkBundle(tmp_path / "prior", checkpoint=CHECKPOINT, protocol=_protocol())
+    prior_run = prior.start_run(_xqc_resolved("none"), "episodes")
+    prior.episode(prior_run, _episode(), [_event(phase="decision", critic_updates=0,
+                                               metrics={"decision/reward": 50.0})])
+    prior.finish_run(prior_run)
+    prior.finish()
+    # Existing bundles lack explicit candidate-action metadata and still pair.
+    prior.manifest.pop("protocol_semantics")
+    prior_run.pop("action_rule")
+    prior.save()
+    references = storage.reference_returns(prior.path, CHECKPOINT["sha256"], _protocol())
+    bundle = _bundle(tmp_path, reference=references)
+    run = bundle.start_run(_mppi_resolved(), "episodes")
+    assert storage.run_controller_type(run) == "mppi"
+    assert "configured iterations 6" in run["wandb_name"]
+    bundle.set_evaluation_controller(run, _mppi_controller())
+    assert "MPPI H3 N512 E64 pi24 J8" in run["wandb_name"]
+    assert "weighted elite" in run["wandb_name"]
+    assert not any(tag.startswith(("G:", "policy-delay:", "bootstrap:")) for tag in run["wandb_tags"])
+    assert {"J:8", "configured-iterations:6", "C:0", "A:0", "T:0"} <= set(run["wandb_tags"])
+    bundle.episode(run, _episode(value=60), [_event(phase="decision", critic_updates=0, metrics={
+        "decision/reward": 60.0, "decision/planner_value_mean": 1.25,
+        "decision/inner_model_steps": 12336, "decision/planner_candidate_model_steps": 12288,
+    })])
+    bundle.finish_run(run)
+    bundle.finish()
+    assert run["episodes"][0]["paired_return_delta"] == 10
+    assert run["actual_optimizer_steps"] == {"critic": 0, "actor": 0, "temperature": 0}
+    with pytest.raises(ValueError, match="exactly one completed prior"):
+        storage.reference_returns(bundle.path, CHECKPOINT["sha256"], _protocol())
+    data = load_bundles([prior.path, bundle.path])
+    assert data["runs"][0]["action_rule"] == "tanh_mean"
+    assert data["runs"][1]["action_rule"] == storage.MPPI_ACTION_RULE
+    assert data["metric_catalog"]["decision/planner_value_mean"]["unit"] == "raw_return_score"
+    assert data["metric_catalog"]["decision/reward"]["unit"] == "raw_environment_reward"
+    assert data["runs"][1]["traces"][0]["metrics"]["decision/inner_model_steps"] == [12336]
+    html = render_html(data)
+    assert "Executed action rule" in html
+    assert '<option value="bank">' not in html
+    assert '<option value="actor_updates">' not in html
+
+
+@pytest.mark.parametrize("change,match", [
+    (lambda c: c["settings"].update(num_samples=256), "authored configuration"),
+    (lambda c: c["protocol"].update(action_rule="tanh_mean"), "action rule"),
+    (lambda c: c["protocol"].update(reward_scale=float("nan")), "finite positive"),
+])
+def test_mppi_runtime_metadata_must_match_authored_controller(tmp_path, change, match):
+    bundle = _bundle(tmp_path)
+    run = bundle.start_run(_mppi_resolved(), "episodes")
+    controller = _mppi_controller()
+    change(controller)
+    with pytest.raises(ValueError, match=match):
+        bundle.set_evaluation_controller(run, controller)
+    assert "evaluation_controller" not in run
+
+
+@pytest.mark.parametrize("change,match", [
+    (lambda r: r.update(action_rule="tanh_mean"), "action rule"),
+    (lambda r: r["evaluation_controller"]["settings"].update(horizon=4), "authored configuration"),
+    (lambda r: r["evaluation_controller"]["protocol"].update(reward_scale=1.0), "controller hash"),
+])
+def test_report_rejects_misrecorded_mppi_controller(tmp_path, change, match):
+    from report_ambi_benchmark import load_bundles
+
+    bundle = _bundle(tmp_path)
+    run = bundle.start_run(_mppi_resolved(), "episodes")
+    bundle.set_evaluation_controller(run, _mppi_controller())
+    bundle.finish_run(run)
+    bundle.finish()
+    change(run)
+    bundle.save()
+    with pytest.raises(ValueError, match=match):
+        load_bundles([bundle.path])
+
+
+def test_mppi_runtime_settings_update_remote_labels_without_network(tmp_path, monkeypatch):
+    remote = SimpleNamespace(path="entity/project/run", config={}, define_metric=lambda *a, **k: None)
+    monkeypatch.setattr("utils.wandb_utils.init_wandb", lambda *a, **k: remote)
+    bundle = _bundle(tmp_path, wandb={"project": "project", "entity": "entity", "mode": "offline"})
+    run = bundle.start_run(_mppi_resolved(), "episodes")
+    controller = _mppi_controller()
+    bundle.set_evaluation_controller(run, controller)
+    assert "J8" in remote.name
+    assert "action:weighted_elite_gumbel_no_execution_noise" in remote.tags
+    assert remote.config == {"evaluation_controller": controller, "action_rule": storage.MPPI_ACTION_RULE}

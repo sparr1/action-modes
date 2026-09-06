@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 from pathlib import Path
 
@@ -22,6 +23,10 @@ _XQC_CHECKPOINT_INNER_PARAMS = {
     "inner_rollout_horizon", "inner_updates_per_round", "inner_batch_size",
     "inner_replay_capacity", "inner_replay_sampling", "inner_reward_normalization",
     "inner_actor_lr", "inner_critic_lr", "inner_diagnostics_every",
+}
+_MPPI_PARAMETERS = {
+    "horizon", "iterations", "num_samples", "num_elites", "num_pi_trajs",
+    "min_std", "max_std", "temperature",
 }
 
 
@@ -83,6 +88,33 @@ def _validate_checkpoint_overrides(alg_params, run_params, location):
             "and device/compile/W&B runtime settings; incompatible overrides: "
             f"alg_params={sorted(forbidden)}, run_params={forbidden_run}."
         )
+
+
+def _validate_evaluation_controller(value, location):
+    """Validate the separate evaluation-only controller before allocating a model."""
+    value = _require_mapping(value, location)
+    if set(value) - {"type", "params"} or value.get("type") != "mppi":
+        raise PresetMatrixError(f"{location} supports only type='mppi' and a params object.")
+    params = _require_mapping(value.get("params", {}), f"{location}.params")
+    unknown = set(params) - _MPPI_PARAMETERS
+    if unknown:
+        raise PresetMatrixError(f"{location} has unsupported MPPI parameters: {sorted(unknown)}.")
+    defaults = {"horizon": 3, "iterations": 6, "num_samples": 512, "num_elites": 64,
+                "num_pi_trajs": 24, "min_std": 0.05, "max_std": 2.0, "temperature": 0.5}
+    settings = {**defaults, **params}
+    for key in ("horizon", "iterations", "num_samples", "num_elites", "num_pi_trajs"):
+        number = settings[key]
+        if isinstance(number, bool) or not isinstance(number, int) or number < (0 if key == "num_pi_trajs" else 1):
+            raise PresetMatrixError(f"{location}.{key} must be a {'nonnegative' if key == 'num_pi_trajs' else 'positive'} integer.")
+    if settings["num_elites"] > settings["num_samples"] or settings["num_pi_trajs"] > settings["num_samples"]:
+        raise PresetMatrixError(f"{location} elites and policy trajectories cannot exceed num_samples.")
+    for key in ("min_std", "max_std", "temperature"):
+        number = settings[key]
+        if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number) or number <= 0:
+            raise PresetMatrixError(f"{location}.{key} must be positive and finite.")
+    if settings["max_std"] < settings["min_std"]:
+        raise PresetMatrixError(f"{location}.max_std must be at least min_std.")
+    return value
 
 
 def validate_preset_matrix(matrix):
@@ -169,10 +201,16 @@ def validate_preset_matrix(matrix):
             variant = _require_mapping(
                 variant, f"comparisons.{comparison_name}.variants.{variant_name}"
             )
-            unknown = set(variant) - {"description", "alg_params", "run_params"}
+            unknown = set(variant) - {"description", "alg_params", "run_params", "evaluation_controller"}
             if unknown:
                 raise PresetMatrixError(
                     f"Unknown fields in {comparison_name}/{variant_name}: {sorted(unknown)}."
+                )
+            if "evaluation_controller" in variant:
+                if not checkpoint_base:
+                    raise PresetMatrixError("evaluation_controller requires a checkpoint-based matrix.")
+                _validate_evaluation_controller(
+                    variant["evaluation_controller"], f"{comparison_name}/{variant_name}.evaluation_controller"
                 )
             _require_mapping(
                 variant.get("alg_params", {}),
@@ -322,6 +360,20 @@ def resolve_preset(matrix_path, selector, matrix=None, *, checkpoint_context=Non
     _apply_alg_overrides(alg_params, matrix.get("shared_alg_params", {}))
     _apply_alg_overrides(alg_params, variant.get("alg_params", {}))
     algorithm_config.update(copy.deepcopy(variant.get("run_params", {})))
+    evaluation_controller = copy.deepcopy(variant.get("evaluation_controller"))
+    if evaluation_controller is not None:
+        if algorithm_config.get("alg") != "AMBIXQC/AMBIXQC":
+            raise PresetMatrixError("The evaluation-only MPPI controller requires an AMBI-XQC checkpoint.")
+        # The saved model is loaded as a frozen XQC prior. Planner settings
+        # belong to evaluation metadata and never enter the training algorithm.
+        authored = {**matrix.get("shared_alg_params", {}), **variant.get("alg_params", {})}
+        if any(key.startswith("inner_") and (key != "inner_operator" or value != "none")
+               for key, value in authored.items()):
+            raise PresetMatrixError(
+                "MPPI evaluation cannot request inner XQC settings; put planner controls in evaluation_controller.params."
+            )
+        alg_params["inner_operator"] = "none"
+        algorithm_config["evaluation_controller"] = copy.deepcopy(evaluation_controller)
 
     return {
         "selector": selector,
@@ -332,6 +384,7 @@ def resolve_preset(matrix_path, selector, matrix=None, *, checkpoint_context=Non
         "algorithm_config": algorithm_config,
         "environment": environment,
         "evaluation": copy.deepcopy(matrix.get("evaluation", {})),
+        "evaluation_controller": evaluation_controller,
         "saved_algorithm_config": (None if checkpoint_context is None else
                                    copy.deepcopy(checkpoint_context.trial_run_params)),
     }
@@ -349,6 +402,10 @@ def materialize_presets(
         resolve_preset(matrix_path, selector, matrix=matrix, checkpoint_context=checkpoint_context)
         for selector in selectors
     ]
+    if any(resolved.get("evaluation_controller") for resolved in resolved_presets):
+        raise PresetMatrixError(
+            "Evaluation-only MPPI presets cannot be materialized as training configurations; run the checkpoint evaluator."
+        )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     written = []
