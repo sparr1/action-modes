@@ -170,7 +170,7 @@ def test_full_j6_budget_has_fresh_learners_exact_steps_and_seeded_frozen_actions
             assert engine.state.workspace is None and engine.state.replay is None
             assert not _tree_equal(pool.controller.actor.state_dict(), agent.xqc_controller.actor.state_dict())
             with torch.no_grad():
-                z = agent.model.encode(target._obs_to_tensor(observation).unsqueeze(0))
+                z = agent.model.encode(target._obs_to_tensor(observation).to(agent.device).unsqueeze(0))
                 mean, _ = pool.controller.actor.distribution(z, bn_mode="running")
             np.testing.assert_array_equal(action, target._unscale_action(mean.tanh()[0].cpu().numpy()))
             agent.observe_reward(100.0, True, False)
