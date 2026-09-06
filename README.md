@@ -43,7 +43,9 @@ algorithm.
 `AMBIXQC/AMBIXQC` is the XQC-backed form of the same AMBI pattern. It keeps
 TOLD and its recurrent multi-step BPTT training, replaces the persistent SAC
 control priors with the released XQC actor and twin categorical critics, and
-runs a fresh full-copy inner XQC learner at every non-warmup decision. Its
+runs a fresh full-copy inner XQC learner at every non-warmup decision by default.
+Set `inner_operator="none"` to collect directly from the persistent policy while
+retaining normal TOLD/XQC learning. Its
 first implementation is state-observation only and deliberately has no MPPI,
 TD3, LoRA, or persistent-inner switches. The reduced Humanoid Walk integration
 check is
@@ -63,7 +65,7 @@ AMBI-XQC uses the same sparse W&B key as inner SAC for final-policy drift:
 `KL(final adapted actor || outer prior)` and is observational rather than part
 of the XQC actor loss.
 
-AMBI-XQC v1 supports portable model checkpoints for evaluation and weight
+AMBI-XQC supports portable model checkpoints for evaluation and weight
 transfer. It is not allowlisted for exact trainer resume because that stronger
 contract also requires replay and environment state. Eager execution remains
 the canonical one-million-decision screen. CUDA runs may enable five
@@ -73,6 +75,38 @@ rollout. `compile_strict=true` makes any graph or runtime fallback fatal. The
 outer recurrent TOLD computation, optimizer mutations, action-local lifecycle
 orchestration, and episodic rollout path remain eager. A compile request is
 inactive on CPU rather than silently changing the device contract.
+
+### AMBI-XQC prior-only checkpoint evaluation
+
+The prior-only Humanoid Walk configuration trains for 1.5 million decisions
+at seed 55, disables online evaluation, and retains all 60 checkpoint/metadata
+pairs at 25,000-decision intervals. It preserves the standard AMBI-XQC model,
+warmup, outer learning, and dormant J2/N32/H3/G4 inner settings. Frozen evaluation
+compares the persistent actor mean with the mean of a fresh adapted inner actor
+using matched episode seeds. Saved reference bundles avoid repeating the prior
+episodes for each inner budget.
+
+See [the checkpoint evaluation workflow](configs/research/README.md#ambi-xqc-episode-comparison)
+for training, evaluation, and portable HTML report commands. This workflow
+records episode returns and per-decision diagnostics; shared-observation probes
+and per-update optimizer traces are not supported for XQC.
+
+On Oscar, use `slurm/run_ambixqc_prior_checkpoint_bank_oscar.sbatch` from a
+clean checkout of the exact pushed commit. Export `EXPECTED_ACTION_MODES_SHA`,
+`AMBIXQC_ACTION_MODES_DIR`, `AMBIXQC_PYTHON` (the existing locked nested Python),
+and `AMBIXQC_RESULTS_ROOT` (an existing scratch directory outside the checkout).
+First submit with `AMBIXQC_MODE=smoke` and `sbatch --time=02:00:00`. The smoke
+preserves the full architecture and standard warmup, trains 3,000 decisions,
+checks three saved checkpoints, and tests both frozen controllers. After its
+`PASS` marker and `run/validation.json` are verified, submit the same launcher
+with `AMBIXQC_MODE=production`. Production uses one L40S, six CPUs, 48 GB RAM,
+and a 72-hour limit. Each job creates a fresh result directory; production
+publishes to W&B project `ambi` with its source SHA and job ID in the run name.
+
+New XQC checkpoints use version 2 to record the collection operator. Version-1
+checkpoints remain readable as inner-XQC checkpoints. Ordinary loading retains
+strict semantic checks; the evaluator's explicit frozen load permits only
+supported inner/controller changes and records the saved and evaluated settings.
 
 ### AMBI-XQC compiled execution and paired timing
 

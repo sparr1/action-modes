@@ -239,7 +239,13 @@ expected_fields = {
     "outer_version",
     "inner",
 }
-if set(state) != expected_fields or state["checkpoint_version"] != 1:
+checkpoint_version = state.get("checkpoint_version")
+if (
+    set(state) != expected_fields
+    or isinstance(checkpoint_version, bool)
+    or not isinstance(checkpoint_version, int)
+    or checkpoint_version not in {1, 2}
+):
     raise SystemExit(f"unexpected AMBI-XQC checkpoint schema: {set(state)}")
 signature = state["semantic_signature"]
 if (
@@ -247,6 +253,8 @@ if (
     or signature.get("official_xqc_commit")
     != os.environ["AMBIXQC_VALIDATE_OFFICIAL_XQC_SHA"]
     or signature.get("observation", {}).get("mode") != "state"
+    or signature.get("collection_operator", "xqc" if checkpoint_version == 1 else None)
+    != "xqc"
 ):
     raise SystemExit(f"unexpected AMBI-XQC semantics: {signature}")
 

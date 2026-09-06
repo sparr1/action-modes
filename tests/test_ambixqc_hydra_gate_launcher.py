@@ -1,7 +1,10 @@
 import json
+import os
 import stat
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from utils.checkpointing import CheckpointTracker
 
@@ -102,6 +105,39 @@ def test_gate_validates_final_checkpoint_semantics_and_numerics():
     assert "xqc_controller.log_temperature" in contents
 
 
+@pytest.mark.parametrize(
+    "version, collection_operator, accepted",
+    [(1, None, True), (2, "xqc", True), (2, None, False),
+     (2, "none", False), (3, "xqc", False), (True, "xqc", False)],
+)
+def test_gate_accepts_v1_and_v2_inner_xqc_checkpoints(
+    monkeypatch, version, collection_operator, accepted
+):
+    # Execute the launcher's actual schema/semantic gate without a GPU job.
+    contents = _contents()
+    gate = contents.split("expected_fields = {", 1)[1].split(
+        '\nworkspace = state["xqc_workspace"]', 1
+    )[0]
+    gate = "expected_fields = {" + gate
+    signature = {
+        "algorithm": "AMBIXQC", "official_xqc_commit": "test-sha",
+        "observation": {"mode": "state"},
+    }
+    if collection_operator is not None:
+        signature["collection_operator"] = collection_operator
+    state = dict.fromkeys((
+        "module", "world_optimizer", "xqc_workspace", "reward_normalizer",
+        "outer_generator", "num_updates", "outer_version", "inner",
+    ))
+    state.update(checkpoint_version=version, semantic_signature=signature)
+    monkeypatch.setenv("AMBIXQC_VALIDATE_OFFICIAL_XQC_SHA", "test-sha")
+    if accepted:
+        exec(gate, {"state": state, "os": os})
+    else:
+        with pytest.raises(SystemExit, match="unexpected AMBI-XQC"):
+            exec(gate, {"state": state, "os": os})
+
+
 def test_smoke_final_latest_alias_represents_step_502_despite_periodic_step_500():
     algorithm = json.loads(SMOKE_ALGORITHM.read_text(encoding="utf-8"))
     manifest = json.loads(SMOKE_MANIFEST.read_text(encoding="utf-8"))
@@ -127,4 +163,6 @@ def test_smoke_final_latest_alias_represents_step_502_despite_periodic_step_500(
 
 def test_gate_launcher_is_executable_and_has_valid_bash_syntax():
     assert LAUNCHER.stat().st_mode & stat.S_IXUSR
-    subprocess.run(["bash", "-n", str(LAUNCHER)], check=True)
+    # An absolute executable and inherited descriptors let macOS use
+    # posix_spawn after Torch has initialized native worker threads.
+    subprocess.run(["/bin/bash", "-n", str(LAUNCHER)], check=True, close_fds=False)

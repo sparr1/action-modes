@@ -223,6 +223,78 @@ class InnerXQCEngine:
         # advances the serialized diagnostic/lifecycle counter.
         self.episode_index += 1
 
+    def reset_for_evaluation(self, seed, *, reuse_action_pool=False):
+        """Start an independently seeded episode after loading or warmup.
+
+        Pooled tensors are allocations only: ``_prepare_action`` restores all
+        learned state, optimizers, replay, and moments before the next action.
+        """
+        self.prepare_training_resume_boundary()
+        self.state = InnerXQCState()
+        if not reuse_action_pool:
+            self._workspace_pool = None
+            self._replay_pool = None
+            self._invalidate_rollout_compile_region()
+        self.rng = InnerRNG(seed, self.device)
+        self.action_index = 0
+        self.episode_index = 0
+        self._pending_timers = {}
+        self._collect_diagnostics = True
+        return self
+
+    @torch.no_grad()
+    def prior_action(self, root_z, *, eval_mode=False):
+        """Execute the persistent actor without constructing any inner learner."""
+        self._pending_timers = {}
+        noise = None
+        if not eval_mode:
+            noise = torch.randn(
+                (*root_z.shape[:-1], int(self.cfg.action_dim)),
+                dtype=root_z.dtype,
+                device=root_z.device,
+                generator=self.rng.generator("execution"),
+            )
+        action, _ = self.outer_controller.sample_action(
+            root_z, deterministic=bool(eval_mode), noise=noise
+        )
+        metrics = dict.fromkeys(
+            (
+                "inner_active", "inner_rounds", "inner_iterations",
+                "inner_rollouts", "inner_requested_rollouts", "inner_rollout_count",
+                "inner_steps", "inner_model_steps", "inner_model_steps_budget",
+                "inner_nominal_model_steps", "inner_realized_model_steps",
+                "inner_total_model_steps", "inner_updates", "inner_update_slots",
+                "inner_requested_update_slots", "inner_critic_optimizer_steps",
+                "inner_actor_optimizer_steps", "inner_temperature_optimizer_steps",
+                "inner_critic_utd", "inner_actor_utd", "inner_temperature_utd",
+                "inner_target_updates", "inner_critic_target_updates",
+                "inner_actor_target_updates", "inner_policy_evaluations",
+                "inner_q_evaluations", "inner_replay_draws", "inner_buffer_size",
+                "inner_buffer_capacity", "inner_buffer_fill_ratio",
+                "inner_reward_normalizer_imagined_updates", "inner_reward_scale_delta",
+                "inner_alpha_delta", "inner_diagnostics_sampled",
+                "inner_diagnostics_sample_count", "inner_action_seconds",
+                "inner_setup_seconds", "inner_rollout_seconds", "inner_update_seconds",
+                "inner_diagnostic_seconds", "inner_compile_fallback",
+            ),
+            0.0,
+        )
+        metrics["inner_algorithm_xqc"] = 1.0
+        scale = self._real_reward_scale()
+        count = self._real_reward_normalizer_count()
+        alpha = self.outer_controller.temperature.detach().mean()
+        metrics.update(
+            inner_reward_scale=scale,
+            inner_reward_scale_initial=scale,
+            inner_reward_scale_final=scale,
+            inner_reward_normalizer_count_initial=count,
+            inner_reward_normalizer_count_final=count,
+            inner_alpha=alpha,
+            inner_alpha_initial=alpha,
+            inner_alpha_final=alpha,
+        )
+        return action[0], metrics, []
+
     def prepare_training_resume_boundary(self):
         if self.state.workspace is not None or self.state.replay is not None:
             raise RuntimeError("AMBI-XQC cannot checkpoint during an inner action.")

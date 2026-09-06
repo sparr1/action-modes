@@ -388,7 +388,8 @@ def test_oscar_submitter_requires_git_transport_and_new_external_artifacts():
 def test_new_scripts_are_executable_valid_bash_and_documented():
     for path in (LAUNCHER, SUBMITTER):
         assert path.stat().st_mode & stat.S_IXUSR
-        subprocess.run(["bash", "-n", str(path)], check=True)
+        # Use posix_spawn: forking after macOS Torch initializes libomp can abort.
+        subprocess.run(["/bin/bash", "-n", str(path)], check=True, close_fds=False)
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "### AMBI-XQC compiled execution and paired timing" in readme

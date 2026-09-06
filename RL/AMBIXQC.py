@@ -28,6 +28,7 @@ _AMBIXQC_DEFAULTS = {
     "utd": 1,
     "compile": False,
     "compile_strict": False,
+    "inner_operator": "xqc",
 
     # Released XQC architecture and optimizer semantics.  The prefix keeps
     # the critic support distinct from TOLD's reward-model bins/support.
@@ -68,6 +69,7 @@ _AMBIXQC_DEFAULTS = {
 }
 
 _PUBLIC_INNER_KEYS = {
+    "inner_operator",
     "inner_rounds",
     "inner_rollouts_per_round",
     "inner_rollout_horizon",
@@ -136,7 +138,6 @@ _INCOMPATIBLE_EXPLICIT_KEYS = {
     "inner_log_std_mapping",
     "inner_log_std_min",
     "inner_log_std_max",
-    "inner_operator",
     "inner_actor_adaptation",
     "inner_critic_adaptation",
     "inner_temperature_mode",
@@ -301,6 +302,17 @@ class AMBIXQC(AMBITDMPC2):
         cfg.utd = 1
         cfg.compile = bool(cfg.compile)
         cfg.compile_strict = bool(cfg.compile_strict)
+        if not isinstance(cfg.inner_operator, str) or cfg.inner_operator.lower() not in {
+            "none", "xqc"
+        }:
+            raise ValueError("inner_operator must be 'none' or 'xqc'.")
+        cfg.inner_operator = cfg.inner_operator.lower()
+        cfg.action_contract = {
+            "shape": list(self._action_shape),
+            "low": self._action_low.tolist(),
+            "high": self._action_high.tolist(),
+            "dtype": str(self.env.action_space.dtype),
+        }
         cfg.value_coef = _finite_float(cfg.value_coef, "value_coef", positive=True)
 
         cfg.xqc_actor_net_arch = _architecture(
@@ -428,7 +440,6 @@ class AMBIXQC(AMBITDMPC2):
 
         # Fixed AMBI-XQC semantics are recorded on cfg for checkpoint and run
         # metadata, but are intentionally not configurable in the first port.
-        cfg.inner_operator = "xqc"
         cfg.inner_schedule_mode = "canonical"
         cfg.inner_actor_adaptation = "clone"
         cfg.inner_critic_adaptation = "clone"
@@ -479,10 +490,38 @@ class AMBIXQC(AMBITDMPC2):
         cfg.inner_nominal_critic_utd = (
             cfg.inner_expected_update_slots / cfg.inner_model_step_budget
         )
+        if cfg.inner_operator == "none":
+            # Keep the positive configured schedule and replay capacity for
+            # checkpoint evaluation, while accounting for zero collection work.
+            for key in (
+                "inner_model_step_budget",
+                "inner_nominal_transitions_per_round",
+                "inner_nominal_updates_per_round",
+                "inner_expected_update_slots",
+                "inner_critic_updates_per_action",
+                "inner_actor_updates_per_action",
+                "inner_temperature_updates_per_action",
+                "inner_nominal_critic_utd",
+            ):
+                setattr(cfg, key, 0)
         return cfg
 
     def _make_agent(self, cfg):
         return AMBIXQCAgent(cfg)
+
+    def load(self, path, *, frozen_evaluation=False):
+        """Load a checkpoint, optionally selecting a frozen evaluation controller."""
+        self.flush_checkpoints()
+        self._checkpoint_writer.invalidate()
+        self.agent.load(path, frozen_evaluation=frozen_evaluation)
+        self._num_updates = int(self.agent.num_updates)
+        self._predict_t0 = True
+        return self
+
+    def reset_for_evaluation(self, seed, *, reuse_action_pool=False):
+        self.agent.reset_for_evaluation(seed, reuse_action_pool=reuse_action_pool)
+        self._predict_t0 = True
+        return self
 
     def learn(self, total_timesteps=10_000, *, resume_session=None):
         total_timesteps = validate_timestep_budget(total_timesteps)
@@ -491,6 +530,8 @@ class AMBIXQC(AMBITDMPC2):
                 "AMBIXQC total_timesteps must match the construction-time step "
                 "budget so the XQC learning-rate schedule remains exact."
             )
+        if self.agent._frozen_evaluation:
+            raise RuntimeError("A frozen-evaluation AMBI-XQC agent cannot train.")
         return super().learn(
             total_timesteps=total_timesteps,
             resume_session=resume_session,
@@ -498,6 +539,16 @@ class AMBIXQC(AMBITDMPC2):
 
     def _observe_transition(self, reward, terminated, truncated):
         self.agent.observe_reward(reward, terminated, truncated)
+
+    def _record_action_metrics(self, *, planned, action_seconds):
+        # The shared loop calls any post-warmup actor action "planned". Only
+        # XQC adaptation belongs in inner-work counters and inner-time totals.
+        inner_enabled = (
+            getattr(getattr(self, "cfg", None), "inner_operator", "xqc") != "none"
+        )
+        return super()._record_action_metrics(
+            planned=planned and inner_enabled, action_seconds=action_seconds
+        )
 
     def _wandb_run_name(self):
         env_params = self.experiment_params.get("env_params", {})

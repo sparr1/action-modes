@@ -16,6 +16,7 @@ import json
 import math
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import gymnasium as gym
@@ -114,6 +115,17 @@ def build_parser():
         action="store_true",
         help="Record rather than fail on NaN/Inf model diagnostics.",
     )
+    parser.add_argument("--metadata", type=Path, help="Checkpoint sidecar override for checkpoint-based matrices.")
+    parser.add_argument("--bundle-dir", type=Path, help="Create a new portable benchmark bundle with per-decision diagnostics.")
+    parser.add_argument("--save-root-bank", type=Path, help="Unsupported in this episode-only evaluator.")
+    parser.add_argument("--root-bank", type=Path, help="Unsupported in this episode-only evaluator.")
+    parser.add_argument("--bank-only", action="store_true", help="Unsupported in this episode-only evaluator.")
+    parser.add_argument("--bank-repetitions", type=int, help="Unsupported in this episode-only evaluator.")
+    parser.add_argument("--reference-bundle", type=Path, help="Completed prior-only bundle for matched episode return deltas.")
+    parser.add_argument("--wandb", action="store_true", help="Publish benchmark summaries and artifacts (requires --bundle-dir).")
+    parser.add_argument("--wandb-project", default="ambi-inner-bench")
+    parser.add_argument("--wandb-entity", default="rwgao_b-brown-university")
+    parser.add_argument("--wandb-mode", choices=("online", "offline"), default="online")
     return parser
 
 
@@ -290,6 +302,10 @@ def _jsonable(value):
 
 def _outer_state_digest(model):
     agent = model.agent
+    if callable(getattr(agent, "frozen_outer_state", None)):
+        digest = hashlib.sha256()
+        _digest_update(digest, agent.frozen_outer_state())
+        return digest.hexdigest()
     state = {
         "model": agent.model.state_dict(),
         "world_optimizer": agent.optim.state_dict(),
@@ -381,8 +397,27 @@ def _attach_paired_return_deltas(results):
             )
 
 
+def _is_xqc(resolved):
+    return resolved.get("algorithm_config", {}).get("alg") == "AMBIXQC/AMBIXQC"
+
+
+def _reset_evaluation(model, seed, *, reuse_action_pool=False):
+    reset = getattr(model, "reset_for_evaluation", None)
+    if not callable(reset):
+        reset = getattr(getattr(model.agent, "inner_engine", None), "reset_for_evaluation", None)
+    if callable(reset):
+        reset(int(seed), reuse_action_pool=reuse_action_pool)
+        return True
+    return False
+
+
 def _critic_architecture_key(resolved):
     params = resolved["algorithm_config"]["alg_params"]
+    if _is_xqc(resolved):
+        return ("xqc", tuple(params.get("xqc_actor_net_arch", [256] * 4)),
+                tuple(params.get("xqc_critic_net_arch", [512] * 4)),
+                int(params.get("xqc_num_atoms", 101)),
+                float(params.get("xqc_vmin", -5)), float(params.get("xqc_vmax", 5)))
     representation = str(params.get("q_representation", "distributional")).lower()
     num_q = params.get("num_q")
     if num_q is None:
@@ -500,14 +535,17 @@ def _initialize_frozen_model(resolved, env, checkpoint, controller_seed, device=
         {"frozen_checkpoint_evaluation": True},
     )
     try:
-        model.load(str(checkpoint))
+        if _is_xqc(resolved):
+            model.load(str(checkpoint), frozen_evaluation=True)
+        else:
+            model.load(str(checkpoint))
         model.agent.model.eval()
+        _reset_evaluation(model, controller_seed)
     except BaseException as exc:
         if isinstance(exc, Exception):
             error = RuntimeError(
                 f"Preset {resolved['selector']!r} could not load checkpoint {checkpoint}: {exc}. "
-                "Q-representation comparisons require a separately trained checkpoint with the "
-                "matching critic architecture."
+                "The checkpoint must match the saved outer configuration and architecture."
             )
         else:
             error = exc
@@ -516,6 +554,7 @@ def _initialize_frozen_model(resolved, env, checkpoint, controller_seed, device=
             raise
         raise error from exc
     return model, run_config
+
 
 
 def evaluate_preset(
@@ -527,6 +566,8 @@ def evaluate_preset(
     max_steps=None,
     device=None,
     allow_nonfinite_metrics=False,
+    bundle=None,
+    bundle_run=None,
 ):
     """Evaluate one resolved preset and verify outer-state immutability."""
     checkpoint = Path(checkpoint).resolve()
@@ -547,11 +588,19 @@ def evaluate_preset(
         raise ValueError("controller_seed must be a valid NumPy seed integer.")
     if max_steps is not None and int(max_steps) <= 0:
         raise ValueError("max_steps must be positive when provided.")
+    if bundle is not None and not _is_xqc(resolved):
+        raise ValueError("Episode bundles in this checkout support AMBI-XQC only.")
 
     env = _make_env(resolved)
     model = None
     primary_error = None
+    pending_events = []
+    phase_id = "initialization"
+    active_episode = False
+    from utils.ambi_benchmark import solver_seed
+    digest_before = None
     try:
+        started = time.perf_counter()
         model, run_config = _initialize_frozen_model(
             resolved, env, checkpoint, controller_seed, device=device
         )
@@ -561,8 +610,25 @@ def evaluate_preset(
         nonfinite_metric_counts = {}
         episodes = []
 
+        if bundle is not None:
+            bundle_run["initialization_seconds"] = time.perf_counter() - started
+            bundle_run["resolved_config"] = _jsonable(vars(model.cfg))
+            bundle_run["checkpoint_evaluation_provenance"] = _jsonable(
+                getattr(model.agent, "checkpoint_evaluation_provenance", {}))
+            # Pay lazy compile/allocation cost once, then reset before scoring.
+            warm_observation = env.reset(seed=int(seeds[0]))[0]
+            started = time.perf_counter()
+            model.predict(warm_observation, deterministic=True, episode_start=True)
+            bundle_run["warmup_including_compile_seconds"] = time.perf_counter() - started
+
         for seed in seeds:
             seed = int(seed)
+            episode_seed = solver_seed(controller_seed, "episode", seed)
+            episode_reset = _reset_evaluation(model, episode_seed, reuse_action_pool=bundle is not None)
+            if not episode_reset:
+                # Legacy AMBI retains its constructor-seeded continuous stream.
+                # Do not claim a per-episode reset that its engine cannot perform.
+                episode_seed = None
             _seed_spaces(env, seed)
             observation, _ = env.reset(seed=seed)
             terminated = truncated = False
@@ -571,13 +637,19 @@ def evaluate_preset(
             episode_metric_values = {}
             episode_nonfinite_counts = {}
             truncated_by_evaluator = False
+            control_seconds = 0.0
+            phase_id = f"seed-{seed}"
+            active_episode = True
 
             while not (terminated or truncated):
+                started = time.perf_counter()
                 action, _ = model.predict(
                     observation,
                     deterministic=True,
                     episode_start=(episode_steps == 0),
                 )
+                action_seconds = time.perf_counter() - started
+                control_seconds += action_seconds
                 observation, reward, terminated, truncated, _ = env.step(action)
                 episode_return += float(reward)
                 episode_steps += 1
@@ -585,6 +657,20 @@ def evaluate_preset(
                 finite_metrics, nonfinite_metrics = _numeric_metrics(
                     getattr(model.agent, "last_inner_metrics", {})
                 )
+                if bundle is not None:
+                    pending_events.append({
+                        "episode_id": phase_id, "decision_index": episode_steps - 1,
+                        "event_index": 0, "phase": "decision",
+                        "round_index": int(finite_metrics.get("inner_rounds", 0)),
+                        **{f"{component}_updates": int(finite_metrics.get(
+                            f"inner_{component}_optimizer_steps", 0))
+                           for component in ("critic", "actor", "temperature")},
+                        "metrics": {**{f"decision/{key}": value for key, value in finite_metrics.items()},
+                                    **{f"decision/{key}": None for key in nonfinite_metrics},
+                                    "decision/reward": float(reward),
+                                    "decision/control_seconds": action_seconds},
+                        "nonfinite": {f"decision/{key}": value for key, value in nonfinite_metrics.items()},
+                    })
                 for key, value in finite_metrics.items():
                     metric_values.setdefault(key, []).append(value)
                     episode_metric_values.setdefault(key, []).append(value)
@@ -607,11 +693,13 @@ def evaluate_preset(
             episodes.append(
                 {
                     "seed": seed,
+                    "solver_seed": episode_seed,
                     "return": episode_return,
                     "length": episode_steps,
                     "terminated": bool(terminated),
                     "truncated": bool(truncated),
                     "truncated_by_evaluator": truncated_by_evaluator,
+                    "control_seconds": control_seconds,
                     "model_metrics": {
                         key: float(np.mean(values))
                         for key, values in sorted(episode_metric_values.items())
@@ -621,6 +709,10 @@ def evaluate_preset(
                     ),
                 }
             )
+            if bundle is not None:
+                bundle.episode(bundle_run, episodes[-1], pending_events)
+                pending_events = []
+            active_episode = False
 
         digest_after = _outer_state_digest(model)
         updates_after = int(model.agent.num_updates)
@@ -629,10 +721,11 @@ def evaluate_preset(
                 f"Frozen evaluation invariant failed for {resolved['selector']}: "
                 "outer state changed during action selection."
             )
-        if nonfinite_metric_counts and not allow_nonfinite_metrics:
+        trace_nonfinite = bundle_run.get("nonfinite_trace_metrics", {}) if bundle_run is not None else {}
+        if (nonfinite_metric_counts or trace_nonfinite) and not allow_nonfinite_metrics:
             raise RuntimeError(
                 f"Non-finite model metrics for {resolved['selector']}: "
-                f"{dict(sorted(nonfinite_metric_counts.items()))}. Use "
+                f"{dict(sorted(nonfinite_metric_counts.items()))}; trace: {trace_nonfinite}. Use "
                 "--allow-nonfinite-metrics only for diagnostic collection."
             )
 
@@ -644,13 +737,21 @@ def evaluate_preset(
             "variant": resolved["variant"],
             "reference_variant": resolved["reference"],
             "description": resolved["description"],
-            "critic_spec": copy.deepcopy(model.agent.model.critic_signature),
+            "critic_spec": copy.deepcopy(model.agent.critic_signature if _is_xqc(resolved)
+                                         else model.agent.model.critic_signature),
             "controller_seed": int(controller_seed),
             "environment_seeds": [int(seed) for seed in seeds],
+            "seed_scheme": "sha256-v1" if episode_reset else "constructor_seed_continuous_stream",
             "outer_updates_before": updates_before,
             "outer_updates_after": updates_after,
             "outer_state_unchanged": True,
             "resolved_config": _jsonable(vars(model.cfg)),
+            "saved_algorithm_config": copy.deepcopy(resolved.get("saved_algorithm_config")),
+            "evaluated_algorithm_config": _jsonable(run_config),
+            "checkpoint_evaluation_provenance": _jsonable(
+                getattr(model.agent, "checkpoint_evaluation_provenance", {})),
+            "diagnostic_capabilities": {"decision_metrics": True, "optimizer_traces": False,
+                                        "shared_observation_probes": False},
             "resolved_device": str(model.agent.device),
             "return": _summary(returns),
             "episode_length": _summary(lengths),
@@ -659,71 +760,191 @@ def evaluate_preset(
             "model_metric_availability": sorted(metric_values),
             "nonfinite_model_metrics": dict(sorted(nonfinite_metric_counts.items())),
             "alg_params": run_config["alg_params"],
+            "nonfinite_trace_metrics": trace_nonfinite,
         }
     except BaseException as exc:
         primary_error = exc
         raise
     finally:
+        # Verify even failed evaluations; retain the original failure and attach
+        # any invariant violation so cleanup cannot hide either problem.
+        if model is not None and digest_before is not None:
+            try:
+                unchanged = _outer_state_digest(model) == digest_before
+                if bundle_run is not None:
+                    bundle_run["outer_state_unchanged"] = unchanged
+                if not unchanged:
+                    raise RuntimeError("Frozen evaluation invariant failed: outer state changed.")
+            except BaseException as invariant_error:
+                if primary_error is not None:
+                    add_cleanup_notes(primary_error, [invariant_error])
+                else:
+                    _close_resources(model, env, primary_error=invariant_error)
+                    raise
+        if primary_error is not None and bundle is not None and active_episode:
+            if not any(item["episode_id"] == phase_id for item in bundle_run["episodes"]):
+                bundle_run["episodes"].append({
+                    "episode_id": phase_id, "seed": seed, "solver_seed": episode_seed,
+                    "return": episode_return if math.isfinite(episode_return) else None,
+                    "length": episode_steps, "status": "failed",
+                    "terminated": bool(terminated), "truncated": bool(truncated),
+                    "capped": truncated_by_evaluator, "control_seconds": control_seconds,
+                    "inner_metrics_mean": {key: float(np.mean(values))
+                                           for key, values in episode_metric_values.items()},
+                })
+        if bundle is not None and pending_events:
+            try:
+                bundle.write_trace(bundle_run, f"{phase_id}-partial", pending_events)
+            except BaseException as exc:
+                if primary_error is None:
+                    primary_error = exc
+                    _close_resources(model, env, primary_error=exc)
+                    raise
+                add_cleanup_notes(primary_error, [exc])
         _close_resources(model, env, primary_error=primary_error)
 
 
+def _validate_episode_options(evaluation, *, save_root_bank=None, root_bank_path=None,
+                              bank_only=False, bank_repetitions=None):
+    unsupported = {key for key in evaluation if key.startswith(("bank_", "diagnostic_", "probe_"))}
+    if save_root_bank is not None or root_bank_path is not None or bank_only or bank_repetitions is not None or unsupported:
+        raise ValueError(
+            "Shared-observation banks and probes are unsupported by this episode-only "
+            "evaluator, including AMBI-XQC; remove bank/probe options."
+        )
+
+
 def evaluate_matrix(
-    matrix_path,
-    checkpoint,
-    selectors=None,
-    comparisons=None,
-    *,
-    seeds=None,
-    controller_seed=None,
-    max_steps=None,
-    device=None,
-    allow_nonfinite_metrics=False,
+    matrix_path, checkpoint, selectors=None, comparisons=None, *, seeds=None,
+    controller_seed=None, max_steps=None, device=None, allow_nonfinite_metrics=False,
+    metadata_path=None, bundle_dir=None, save_root_bank=None, root_bank_path=None,
+    bank_only=False, bank_repetitions=None, reference_bundle=None, wandb_options=None,
 ):
-    """Evaluate selected presets from a matrix with paired seeds."""
+    """Evaluate saved control priors with paired episode seeds and atomic bundles."""
+    evaluation_started = time.perf_counter()
     matrix_path = Path(matrix_path).resolve()
     matrix = load_preset_matrix(matrix_path)
     selectors = normalize_selectors(matrix, selectors, comparisons)
     evaluation = matrix.get("evaluation", {})
+    _validate_episode_options(evaluation, save_root_bank=save_root_bank,
+                              root_bank_path=root_bank_path, bank_only=bank_only,
+                              bank_repetitions=bank_repetitions)
     seeds = list(evaluation.get("seeds", [])) if seeds is None else list(seeds)
     if not seeds:
         raise PresetMatrixError("No evaluation seeds were supplied by CLI or matrix.")
+    if any(isinstance(seed, bool) or not isinstance(seed, (int, np.integer))
+           or not 0 <= int(seed) <= _MAX_NUMPY_SEED for seed in seeds):
+        raise ValueError("Evaluation seeds must be valid NumPy seed integers.")
+    if len(set(int(seed) for seed in seeds)) != len(seeds):
+        raise ValueError("Evaluation seeds must not contain duplicates.")
     if controller_seed is None:
-        controller_seed = int(evaluation.get("controller_seed", 0))
-    else:
-        if isinstance(controller_seed, bool):
-            raise ValueError("controller_seed must be a valid NumPy seed integer.")
-        controller_seed = int(controller_seed)
+        controller_seed = evaluation.get("controller_seed", 0)
+    if isinstance(controller_seed, bool) or not isinstance(controller_seed, (int, np.integer)) or not 0 <= int(controller_seed) <= _MAX_NUMPY_SEED:
+        raise ValueError("controller_seed must be a valid NumPy seed integer.")
+    controller_seed = int(controller_seed)
     if max_steps is None:
         max_steps = evaluation.get("max_steps")
+    if max_steps is not None and (isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1):
+        raise ValueError("max_steps must be a positive integer when provided.")
 
-    resolved_presets = [
-        resolve_preset(matrix_path, selector, matrix=matrix) for selector in selectors
-    ]
+    from utils.ambi_benchmark import BenchmarkBundle, protocol_for, reference_returns
+    context = None
+    if matrix["base_alg_config"] == "checkpoint":
+        from utils.checkpoint_context import load_checkpoint_context
+        context = load_checkpoint_context(checkpoint, metadata_path=metadata_path)
+    elif metadata_path is not None:
+        raise ValueError("--metadata requires a checkpoint-based preset matrix.")
+    resolved_presets = [resolve_preset(matrix_path, selector, matrix=matrix, checkpoint_context=context)
+                        for selector in selectors]
     _validate_frozen_selection(matrix, resolved_presets)
-    results = []
     for resolved in resolved_presets:
-        results.append(
-            evaluate_preset(
-                resolved,
-                checkpoint,
-                seeds,
-                controller_seed=controller_seed,
-                max_steps=max_steps,
-                device=device,
-                allow_nonfinite_metrics=allow_nonfinite_metrics,
-            )
-        )
-    _attach_paired_return_deltas(results)
+        params = resolved["algorithm_config"]["alg_params"]
+        if params.get("inner_outer_replay_fraction", 0) != 0:
+            raise ValueError("Frozen checkpoint evaluation has no real replay; inner_outer_replay_fraction must be 0.")
+        if _is_xqc(resolved) and int(params.get("inner_diagnostic_rollouts", 0)):
+            raise ValueError("AMBI-XQC shared-observation probes are unsupported.")
+    if (reference_bundle or wandb_options) and bundle_dir is None:
+        raise ValueError("References and W&B require --bundle-dir.")
+    if bundle_dir is not None and Path(bundle_dir).exists():
+        raise FileExistsError(f"Benchmark bundle already exists: {bundle_dir}. Choose a new directory.")
+    if bundle_dir is not None:
+        if any(not _is_xqc(resolved) for resolved in resolved_presets):
+            raise ValueError("Episode bundles in this checkout support AMBI-XQC only; legacy AMBI JSON evaluation remains available.")
+        # Selected priors can supply deltas to later controllers in this bundle.
+        resolved_presets.sort(key=lambda item: item["algorithm_config"]["alg_params"].get("inner_operator") != "none")
+        for resolved in resolved_presets:
+            params = resolved["algorithm_config"]["alg_params"]
+            if _observation_architecture_key(resolved)[0] != "state":
+                raise ValueError("Benchmark bundles currently support state observations only.")
+            scopes = [key for key in params if key.startswith("inner_") and key.endswith("_scope")
+                      and key != "inner_mppi_warm_start_scope"]
+            if any(params[key] != "action" for key in scopes):
+                raise ValueError("Benchmark presets require fresh action-local inner state.")
+            if any(params.get(key, 0) for key in ("inner_actor_writeback_coef", "inner_critic_writeback_coef")):
+                raise ValueError("Benchmark presets must disable prior writeback.")
+    checkpoint_sha256 = _file_sha256(checkpoint)
+    protocols = [protocol_for(resolved, controller_seed, max_steps) for resolved in resolved_presets]
+    if bundle_dir is not None and any(protocol != protocols[0] for protocol in protocols):
+        raise ValueError("A benchmark bundle must use one common environment/action protocol.")
+    protocol = protocols[0]
+    reference = reference_returns(reference_bundle, checkpoint_sha256, protocol) if reference_bundle else None
+    if reference is not None and any(int(seed) not in reference for seed in seeds):
+        raise ValueError("Prior reference is missing requested episode seeds.")
+    bundle = BenchmarkBundle(bundle_dir, checkpoint={
+        "path": str(Path(checkpoint).resolve()), "sha256": checkpoint_sha256,
+        "source_run": matrix.get("source_run"), "source_run_verified": False,
+        "metadata": None if context is None else context.metadata,
+    }, protocol=protocol, wandb=wandb_options, reference=reference) if bundle_dir is not None else None
+    if bundle is not None:
+        bundle.started = evaluation_started
+    results = []
+    primary_error = None
+    try:
+        if reference_bundle is not None:
+            reference_path = Path(reference_bundle)
+            if reference_path.is_dir():
+                reference_path /= "manifest.json"
+            bundle.manifest["reference"] = {"path": str(reference_path.resolve()),
+                                            "manifest_sha256": _file_sha256(reference_path)}
+        for resolved in resolved_presets:
+            bundle_run = bundle.start_run(resolved, "episodes") if bundle is not None else None
+            try:
+                result = evaluate_preset(
+                    resolved, checkpoint, seeds, controller_seed=controller_seed,
+                    max_steps=max_steps, device=device,
+                    allow_nonfinite_metrics=allow_nonfinite_metrics,
+                    bundle=bundle, bundle_run=bundle_run,
+                )
+                results.append(result)
+                if bundle is not None and resolved["algorithm_config"]["alg_params"].get("inner_operator") == "none":
+                    bundle.reference = {episode["seed"]: episode["return"] for episode in result["episodes"]}
+                if bundle is not None:
+                    bundle.finish_run(bundle_run, result=result)
+            except BaseException as exc:
+                if bundle is not None:
+                    try:
+                        bundle.finish_run(bundle_run, error=exc)
+                    except BaseException as cleanup:
+                        add_cleanup_notes(exc, [cleanup])
+                raise
+        _attach_paired_return_deltas(results)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        if bundle is not None:
+            try:
+                bundle.finish(error=primary_error)
+            except BaseException as exc:
+                if primary_error is None:
+                    raise
+                add_cleanup_notes(primary_error, [exc])
     metric_sets = [set(result["model_metric_availability"]) for result in results]
     return {
-        "schema_version": 1,
-        "matrix": str(matrix_path),
-        "checkpoint": str(Path(checkpoint).resolve()),
-        "checkpoint_sha256": _file_sha256(checkpoint),
-        "matrix_sha256": _file_sha256(matrix_path),
-        "frozen_outer_learning": True,
-        "deterministic_execution": True,
-        "environment": copy.deepcopy(matrix["environment"]),
+        "schema_version": 1, "matrix": str(matrix_path),
+        "checkpoint": str(Path(checkpoint).resolve()), "checkpoint_sha256": checkpoint_sha256,
+        "matrix_sha256": _file_sha256(matrix_path), "frozen_outer_learning": True,
+        "deterministic_execution": True, "environment": copy.deepcopy(resolved_presets[0]["environment"]),
         "common_model_metrics": sorted(set.intersection(*metric_sets)) if metric_sets else [],
         "available_model_metrics": sorted(set.union(*metric_sets)) if metric_sets else [],
         "results": results,
@@ -742,19 +963,33 @@ def main(argv=None):
                 selectors if args.presets or args.comparisons else None,
             )
         if args.materialize_dir is not None:
+            context = None
+            if matrix["base_alg_config"] == "checkpoint":
+                if args.checkpoint is None:
+                    parser.error("Checkpoint-based materialization requires --checkpoint and its sidecar.")
+                from utils.checkpoint_context import load_checkpoint_context
+                context = load_checkpoint_context(args.checkpoint, metadata_path=args.metadata)
             written = materialize_presets(
                 args.matrix,
                 args.materialize_dir,
                 selectors=selectors,
+                checkpoint_context=context,
             )
             for path in written:
                 print(f"materialized {path}")
+            if matrix["base_alg_config"] == "checkpoint":
+                # --checkpoint supplies the base configuration here; it is not
+                # an implicit request to execute the materialized workloads.
+                return 0
         if args.checkpoint is None:
             if args.list_presets or args.materialize_dir is not None:
                 return 0
             parser.error("--checkpoint is required for evaluation.")
         if args.overwrite and args.output is None:
             parser.error("--overwrite requires --output.")
+        _validate_episode_options(matrix.get("evaluation", {}),
+                                  save_root_bank=args.save_root_bank, root_bank_path=args.root_bank,
+                                  bank_only=args.bank_only, bank_repetitions=args.bank_repetitions)
         if args.output is not None:
             _preflight_output(args.output, overwrite=args.overwrite)
 
@@ -767,6 +1002,15 @@ def main(argv=None):
             max_steps=args.max_steps,
             device=args.device,
             allow_nonfinite_metrics=args.allow_nonfinite_metrics,
+            metadata_path=args.metadata,
+            bundle_dir=args.bundle_dir,
+            save_root_bank=args.save_root_bank,
+            root_bank_path=args.root_bank,
+            bank_only=args.bank_only,
+            bank_repetitions=args.bank_repetitions,
+            reference_bundle=args.reference_bundle,
+            wandb_options={"project": args.wandb_project, "entity": args.wandb_entity,
+                           "mode": args.wandb_mode} if args.wandb else None,
         )
         serialized = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
         if args.output is None:

@@ -1,0 +1,24 @@
+{
+  "study_type": "ambixqc_single_seed_exploratory_no_inner_checkpoint_bank",
+  "study_note": "Single-seed exploratory Humanoid Walk state checkpoint bank for frozen prior versus inner-XQC evaluation. Seed 55 trains for 1.5 million agent decisions with stochastic persistent-prior collection after the unchanged random warmup, normal TOLD/XQC outer learning, and zero inner work. Online evaluation is disabled. All 60 portable checkpoint/metadata pairs are retained every 25,000 decisions. Dormant J2/N32/H3/G4, batch 64, and frozen-real-scale inner defaults are retained for explicit later evaluation. This isolates deployment-time improvement conditional on no-inner-trained priors and is not confirmatory evidence. Exact trainer resume is not supported.",
+  "overrides_alg": {
+    "env": "DMControl-v0"
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambixqc_humanoid_walk_outer_prior_no_inner_checkpoint_bank_1p5m"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": [
+    "all"
+  ],
+  "log_info": false,
+  "log_type": "summary"
+}

@@ -486,10 +486,13 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
         rounds = int(resolved["inner_rounds"])
         rollouts = int(resolved["inner_rollouts_per_round"])
         horizon = int(resolved["inner_rollout_horizon"])
+        # Prior-only XQC retains a dormant inner schedule for frozen evaluation.
+        # The derived work fields describe the active collection controller.
+        active = resolved.get("inner_operator") != "none"
         inner.update(
-            branches_per_action=rounds * rollouts,
-            transitions_per_round=rollouts * horizon,
-            transitions_per_action=rounds * rollouts * horizon,
+            branches_per_action=rounds * rollouts if active else 0,
+            transitions_per_round=rollouts * horizon if active else 0,
+            transitions_per_action=rounds * rollouts * horizon if active else 0,
         )
     if "inner_expected_update_slots" in resolved and "inner_batch_size" in resolved:
         inner["replay_rows_drawn_per_action"] = int(

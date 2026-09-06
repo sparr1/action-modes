@@ -1,5 +1,104 @@
 # Frozen-checkpoint AMBI research
 
+## AMBI-XQC episode comparison
+
+This workflow measures deployment-time improvement from fresh inner XQC on an
+AMBI-XQC world model and persistent policy trained without inner improvement.
+The checkpoint metadata determines the environment, wrappers, observation and
+action contracts, architecture, and outer learning settings. Keep every model
+file with its adjacent `.metadata.json`. Standalone XQC checkpoints do not
+contain the required TOLD world model.
+
+Run commands from the repository root using the existing locked DMControl
+interpreter. Set `XQC_EVAL_PY` to its absolute path if reusing an environment in
+another worktree. Production training and full evaluations belong on scheduler
+compute nodes; the commands below do not submit jobs themselves.
+
+```bash
+XQC_EVAL_PY=environments/dmcontrol/.venv/bin/python
+XQC_MATRIX=configs/research/ambixqc_humanoid_inner_benchmark.json
+XQC_RESULTS=/absolute/path/to/durable/xqc-checkpoints
+
+"$XQC_EVAL_PY" main.py \
+  --run configs/dmcontrol/experiments/ambixqc_humanoid_walk_outer_prior_no_inner_checkpoint_bank_1p5m.json \
+  --alg-dir configs/dmcontrol/algs --log-dir "$XQC_RESULTS"
+```
+
+The training profile uses Humanoid Walk state, seed 55, 1.5 million decisions,
+and retains all 60 checkpoint/metadata pairs every 25,000 decisions. Online
+evaluation is disabled. After the unchanged random warmup, real collection
+samples the persistent actor. TOLD and outer XQC keep learning, including the
+chronological real reward normalizer; no inner learner or imagination runs.
+Choose durable output storage through the normal training harness. This is a
+single-seed exploratory configuration, and checkpoints are not exact trainer
+resumes.
+
+Choose one checkpoint and fresh result directories. Evaluate the prior once:
+
+```bash
+XQC_CHECKPOINT=/absolute/path/to/checkpoint.pt
+
+"$XQC_EVAL_PY" evaluate_ambi_checkpoint.py \
+  --matrix "$XQC_MATRIX" --checkpoint "$XQC_CHECKPOINT" \
+  --preset controller/prior --device cuda \
+  --bundle-dir results/xqc-eval/prior
+```
+
+Then evaluate inner XQC against those saved prior episodes:
+
+```bash
+"$XQC_EVAL_PY" evaluate_ambi_checkpoint.py \
+  --matrix "$XQC_MATRIX" --checkpoint "$XQC_CHECKPOINT" \
+  --preset controller/xqc --device cuda \
+  --reference-bundle results/xqc-eval/prior \
+  --bundle-dir results/xqc-eval/inner
+
+"$XQC_EVAL_PY" report_ambi_benchmark.py \
+  --bundle results/xqc-eval/prior \
+  --bundle results/xqc-eval/inner \
+  --output results/xqc-eval/comparison.html
+```
+
+Repeat this sequence with separate output paths for each checkpoint. A reference
+must match the checkpoint hash and episode protocol, including the requested
+seeds. Select both presets in one invocation to evaluate them together. Omitting
+`--preset` selects only the prior. The default evaluation is seeds 101–105, at
+most 500 decisions per episode, and controller seed 55. No source W&B run is
+invented by the matrix. Append `--wandb` for explicit publication to
+`ambi-inner-bench`, or `--wandb --wandb-mode offline` for offline SDK output.
+
+Both real controllers execute `tanh(mu)`. Inner imagined behavior, minibatches,
+and learner updates remain stochastic. The evaluation solver is reseeded after
+checkpoint loading and before each episode, independently of checkpoint RNG and
+preset execution order. Every inner action starts from the persistent priors.
+Outer weights, BatchNorm buffers, targets, temperature, optimizers, counters,
+normalizer state, and outer learner RNG are checked for changes.
+
+The inner preset inherits the saved inner settings. For the standard checkpoint
+bank, these are J2/N32/H3/G4, batch 64, replay capacity 192, learning rates
+`5e-5`, and `frozen_real_scale`. To compare another budget, add a variant to a
+separate matrix using the existing `inner_*` override mechanism; keep replay
+capacity large enough for `J*N*H`. Changing outer architecture or learning
+settings is rejected. The checkpoint's real reward scale and return accumulator
+stay frozen throughout evaluation. With `action_local_imagined`, each solve
+seeds its disposable return context from that saved accumulator and adapts only
+its inner normalization statistics.
+
+Each bundle records real returns, seed-paired return gains, per-decision timing
+and aggregate inner diagnostics, checkpoint identity, saved/evaluated settings,
+and a source/runtime fingerprint. Full-episode rewards are raw environment
+rewards; XQC critic values and targets use normalized reward units. Optimizer
+loss metrics summarize update slots, including slots where delayed actor or
+temperature optimizer steps were skipped. The default eight critic slots
+produce three accepted actor and temperature steps, not eight. Reports use the
+actual optimizer counters and offer decision-level plots, without implying
+within-solve learning traces. Shared-observation banks and probes are rejected.
+
+Completed episode shards survive a later failure; partial episodes and nonfinite
+measurements remain explicit. Bundle directories must be new, and report files
+are preserved unless `--overwrite` is requested. Report generation reads saved
+data only and never invokes a model, simulator, or W&B session.
+
 The active end-to-end configs live directly under `configs/ambi/`.
 The frozen-checkpoint matrix is
 `configs/research/ambi_inner_decoupling.json`, outside the active AMBI training

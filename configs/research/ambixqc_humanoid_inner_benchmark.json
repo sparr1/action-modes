@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "description": "Frozen AMBI-XQC episode comparison from checkpoint metadata. Evaluate the prior once, then reuse its paired episode returns for explicit inner-XQC evaluations. This matrix does not define a trained source run.",
+  "base_alg_config": "checkpoint",
+  "shared_alg_params": {},
+  "evaluation": {
+    "controller_seed": 55,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "default_presets": [
+      "controller/prior"
+    ],
+    "wandb_project": "ambi-inner-bench"
+  },
+  "comparisons": {
+    "controller": {
+      "description": "Seed-paired prior versus fresh action-local inner-XQC episode returns with frozen outer state.",
+      "reference": "prior",
+      "variants": {
+        "prior": {
+          "description": "Execute the persistent actor mean with no imagined work.",
+          "alg_params": {
+            "inner_operator": "none"
+          }
+        },
+        "xqc": {
+          "description": "Execute the adapted actor mean after fresh inner XQC using the checkpoint inner budget and normalization settings.",
+          "alg_params": {
+            "inner_operator": "xqc"
+          }
+        }
+      }
+    }
+  }
+}

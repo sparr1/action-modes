@@ -39,7 +39,7 @@ from RL.xqc_core import (
 class AMBIXQCAgent(nn.Module):
     """Persistent TOLD model and XQC priors with fresh inner XQC per action."""
 
-    _CHECKPOINT_VERSION = 1
+    _CHECKPOINT_VERSION = 2
 
     def __init__(self, cfg):
         super().__init__()
@@ -144,6 +144,8 @@ class AMBIXQCAgent(nn.Module):
         self.last_inner_metrics = {}
         self.last_inner_rollout_lengths = []
         self._resume_boundary_prepared = False
+        self._frozen_evaluation = False
+        self._checkpoint_evaluation_provenance = None
         self.inner_engine = InnerXQCEngine(self)
         self.model.eval()
 
@@ -177,7 +179,8 @@ class AMBIXQCAgent(nn.Module):
 
     def observe_reward(self, reward, terminated, truncated):
         """Update one chronological real-return stream; replay stays raw."""
-
+        if self._frozen_evaluation:
+            return
         self.reward_normalizer.update(
             float(reward), bool(terminated) or bool(truncated)
         )
@@ -189,6 +192,51 @@ class AMBIXQCAgent(nn.Module):
         self.last_inner_metrics = {}
         self.last_inner_rollout_lengths = []
         self.inner_engine.reset_episode()
+
+    def reset_for_evaluation(self, seed, *, reuse_action_pool=False):
+        """Freeze outer learning and reset only the private evaluation state."""
+        self.inner_engine.reset_for_evaluation(
+            seed, reuse_action_pool=reuse_action_pool
+        )
+        self._frozen_evaluation = True
+        self.last_inner_metrics = {}
+        self.last_inner_rollout_lengths = []
+        self._resume_boundary_prepared = False
+        return self
+
+    @property
+    def checkpoint_evaluation_provenance(self):
+        return copy.deepcopy(self._checkpoint_evaluation_provenance)
+
+    def frozen_outer_state(self):
+        """Snapshot every persistent learner component for evaluation guards.
+
+        Action RNG and disposable pooled learners are intentionally excluded;
+        XQC is a separate registered controller, including all BatchNorm buffers.
+        CPU snapshots avoid reserving a second full learner on the GPU.
+        """
+        def snapshot(value):
+            if torch.is_tensor(value):
+                return value.detach().cpu().clone()
+            if isinstance(value, dict):
+                return {key: snapshot(item) for key, item in value.items()}
+            if isinstance(value, (tuple, list)):
+                return type(value)(snapshot(item) for item in value)
+            return copy.deepcopy(value)
+
+        return snapshot({
+            "module": self.state_dict(),
+            "buffers": dict(self.named_buffers()),
+            "world_optimizer": self.world_optimizer.state_dict(),
+            "xqc_workspace": self.xqc_workspace.state_dict(),
+            "reward_normalizer": self.reward_normalizer.state_dict(),
+            "outer_generator": self._outer_generator.get_state(),
+            "num_updates": self.num_updates,
+            "outer_version": self.outer_version,
+            "training_modes": {
+                name: module.training for name, module in self.named_modules()
+            },
+        })
 
     def prepare_training_resume_boundary(self):
         if not self._resume_boundary_prepared:
@@ -243,13 +291,18 @@ class AMBIXQCAgent(nn.Module):
         try:
             with torch.no_grad():
                 root_z = self.model.encode(obs).detach()
-            with torch.enable_grad():
-                action, metrics, lengths = self.inner_engine.act(
-                    root_z,
-                    t0=t0,
-                    eval_mode=eval_mode,
-                    collect_diagnostics=collect_diagnostics,
+            if self.cfg.inner_operator == "none":
+                action, metrics, lengths = self.inner_engine.prior_action(
+                    root_z, eval_mode=eval_mode
                 )
+            else:
+                with torch.enable_grad():
+                    action, metrics, lengths = self.inner_engine.act(
+                        root_z,
+                        t0=t0,
+                        eval_mode=eval_mode,
+                        collect_diagnostics=collect_diagnostics,
+                    )
         finally:
             self.model.train(was_training)
         action, metrics, lengths = self._materialize_action_metrics(
@@ -417,6 +470,8 @@ class AMBIXQCAgent(nn.Module):
         }
 
     def _update(self, obs, action, reward, terminated):
+        if self._frozen_evaluation:
+            raise RuntimeError("A frozen-evaluation AMBI-XQC agent cannot update.")
         with torch.no_grad():
             next_z_targets = self.model.encode(obs[1:])
 
@@ -517,6 +572,8 @@ class AMBIXQCAgent(nn.Module):
         return info
 
     def update(self, buffer):
+        if self._frozen_evaluation:
+            raise RuntimeError("A frozen-evaluation AMBI-XQC agent cannot update.")
         obs, action, reward, terminated, task = buffer.sample()
         if task is not None:
             raise NotImplementedError("AMBI-XQC supports single-task training only.")
@@ -533,9 +590,11 @@ class AMBIXQCAgent(nn.Module):
     def semantic_signature(self):
         return {
             "algorithm": "AMBIXQC",
+            "collection_operator": str(self.cfg.inner_operator),
             "official_xqc_commit": str(self.cfg.xqc_official_commit),
             "observation": self.observation_signature(),
             "action_dim": int(self.cfg.action_dim),
+            "action_contract": copy.deepcopy(getattr(self.cfg, "action_contract", None)),
             "told": {
                 "enc_dim": int(self.cfg.enc_dim),
                 "mlp_dim": int(self.cfg.mlp_dim),
@@ -652,7 +711,93 @@ class AMBIXQCAgent(nn.Module):
             ):
                 raise ValueError(f"{name} optimizer state must be finite.")
 
-    def _preflight_checkpoint(self, state):
+    def _preflight_semantic_signature(self, state, *, frozen_evaluation):
+        expected = self.semantic_signature()
+        saved = copy.deepcopy(state["semantic_signature"])
+        if state["checkpoint_version"] == 1:
+            # Version one always collected with inner XQC and did not record
+            # physical action bounds. Preserve precisely its existing checks.
+            legacy_keys = set(expected) - {"collection_operator", "action_contract"}
+            require_exact_keys(saved, legacy_keys, "AMBI-XQC v1 semantics")
+            saved["collection_operator"] = "xqc"
+            saved["action_contract"] = None
+            expected["action_contract"] = None
+        require_exact_keys(saved, expected, "AMBI-XQC checkpoint semantics")
+        if saved["collection_operator"] not in {"none", "xqc"}:
+            raise ValueError("AMBI-XQC checkpoint collection operator is invalid.")
+        saved_comparison = copy.deepcopy(saved)
+        if frozen_evaluation:
+            schedule = require_exact_keys(
+                saved["inner_schedule"], expected["inner_schedule"],
+                "AMBI-XQC checkpoint inner schedule",
+            )
+            for key in (
+                "rounds", "rollouts", "horizon", "updates",
+                "batch_size", "replay_capacity",
+            ):
+                value = schedule[key]
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValueError(f"AMBI-XQC checkpoint inner {key} is invalid.")
+            required_capacity = (
+                schedule["rounds"] * schedule["rollouts"] * schedule["horizon"]
+            )
+            if schedule["replay_capacity"] < required_capacity:
+                raise ValueError("AMBI-XQC checkpoint inner replay capacity is invalid.")
+            for key in ("actor_lr", "critic_lr"):
+                value = schedule[key]
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    or value <= 0
+                ):
+                    raise ValueError(f"AMBI-XQC checkpoint inner {key} is invalid.")
+            if schedule["replay_sampling"] != "with_replacement":
+                raise ValueError("AMBI-XQC checkpoint inner replay sampling is invalid.")
+            if saved["reward_normalization"] not in {
+                "real_discounted_return_only",
+                "real_discounted_return_plus_fresh_action_local_imagined_returns",
+            }:
+                raise ValueError("AMBI-XQC checkpoint reward normalization is invalid.")
+            # These are the complete supported evaluation overrides. All
+            # architecture, physical action, and outer-learning fields remain
+            # strict, including XQC target/optimizer/normalizer semantics.
+            for key in (
+                "collection_operator", "inner_schedule", "reward_normalization"
+            ):
+                saved_comparison[key] = expected[key]
+        if saved_comparison != expected:
+            raise ValueError("AMBI-XQC checkpoint semantics do not match this agent.")
+        return saved
+
+    @staticmethod
+    def _validate_serialized_generator(value, name, device_type):
+        value = require_tensor(value, name, dtype=torch.uint8)
+        if value.ndim != 1 or value.layout != torch.strided or not value.is_contiguous():
+            raise ValueError(f"{name} state must be a contiguous one-dimensional tensor.")
+        if device_type == "cuda" and not torch.cuda.is_available():
+            # PyTorch 2.3.1 get_state emits uint64 seed + int64 Philox offset:
+            # https://github.com/pytorch/pytorch/blob/v2.3.1/aten/src/ATen/cuda/CUDAGeneratorImpl.cpp
+            # Validate its wire structure on a CPU host; the state is discarded
+            # for frozen cross-device evaluation, never installed in a CPU RNG.
+            if value.numel() != 16:
+                raise ValueError(f"{name} CUDA generator state is invalid.")
+            offset = int.from_bytes(
+                bytes(value.detach().cpu().tolist())[8:], "little"
+            )
+            if offset % 4:
+                raise ValueError(f"{name} CUDA Philox offset must be divisible by four.")
+        else:
+            if device_type not in {"cpu", "cuda"}:
+                raise ValueError(f"{name} device type is invalid.")
+            probe = torch.Generator(device=device_type)
+            try:
+                probe.set_state(value.detach().cpu())
+            except RuntimeError as exc:
+                raise ValueError(f"{name} state is invalid.") from exc
+        return value
+
+    def _preflight_checkpoint(self, state, *, frozen_evaluation=False):
         expected = {
             "checkpoint_version",
             "semantic_signature",
@@ -669,11 +814,12 @@ class AMBIXQCAgent(nn.Module):
         if (
             isinstance(state["checkpoint_version"], bool)
             or not isinstance(state["checkpoint_version"], int)
-            or state["checkpoint_version"] != self._CHECKPOINT_VERSION
+            or state["checkpoint_version"] not in {1, self._CHECKPOINT_VERSION}
         ):
             raise ValueError("Unsupported AMBI-XQC checkpoint version.")
-        if state["semantic_signature"] != self.semantic_signature():
-            raise ValueError("AMBI-XQC checkpoint semantics do not match this agent.")
+        saved_signature = self._preflight_semantic_signature(
+            state, frozen_evaluation=frozen_evaluation
+        )
         for key in ("num_updates", "outer_version"):
             value = state[key]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -762,29 +908,63 @@ class AMBIXQCAgent(nn.Module):
         )
         self._validate_finite_state_tensors(state["module"], "AMBI-XQC module")
         self.reward_normalizer._validated_state(state["reward_normalizer"])
-        generator_state = require_tensor(
+        inner_payload = require_exact_keys(
+            state["inner"], {"schema", "version", "action_index", "episode_index", "rng"},
+            "AMBI-XQC inner training state",
+        )
+        rng_payload = require_exact_keys(
+            inner_payload["rng"],
+            {"schema", "version", "device_type", "streams", "phase_streams", "action_fork_depth"},
+            "AMBI-XQC inner RNG state",
+        )
+        source_device = rng_payload["device_type"]
+        if source_device not in {"cpu", "cuda"}:
+            raise ValueError("AMBI-XQC checkpoint RNG device type is invalid.")
+        cross_device = source_device != self.device.type
+        if cross_device and not frozen_evaluation:
+            raise ValueError(
+                "AMBI-XQC training RNG device type is incompatible; use "
+                "frozen_evaluation=True for cross-device evaluation."
+            )
+        generator_state = self._validate_serialized_generator(
             state["outer_generator"],
             "AMBI-XQC outer generator",
-            dtype=torch.uint8,
+            source_device,
         )
-        # Validate opaque generator bytes before mutating any live module.
-        generator_probe = torch.Generator(
-            device=self.device if self.device.type == "cuda" else "cpu"
-        )
-        try:
-            generator_probe.set_state(generator_state.detach().cpu())
-        except RuntimeError as exc:
-            raise ValueError("AMBI-XQC outer generator state is invalid.") from exc
-        inner = self.inner_engine._preflight_training_state_dict(state["inner"])
-        return state, workspace, generator_state, inner
+        if cross_device:
+            # Validate every saved stream before substituting evaluation-only
+            # backend-local generators. Episode seeds subsequently replace the
+            # private streams; the unused outer generator remains frozen.
+            for key, backend in (("streams", source_device), ("phase_streams", "cpu")):
+                streams = require_exact_keys(
+                    rng_payload[key], self.inner_engine.rng.STREAMS,
+                    f"AMBI-XQC RNG {key}",
+                )
+                for name, value in streams.items():
+                    self._validate_serialized_generator(
+                        value, f"AMBI-XQC RNG {name}", backend
+                    )
+            inner_payload = copy.deepcopy(inner_payload)
+            local_rng = self.inner_engine.rng.training_state_dict()
+            for key in ("device_type", "streams", "phase_streams"):
+                inner_payload["rng"][key] = local_rng[key]
+            generator_state = self._outer_generator.get_state()
+        inner = self.inner_engine._preflight_training_state_dict(inner_payload)
+        return state, workspace, generator_state, inner, saved_signature, cross_device
 
-    def load(self, fp):
+    def load(self, fp, *, frozen_evaluation=False):
+        if not isinstance(frozen_evaluation, bool):
+            raise TypeError("frozen_evaluation must be a boolean.")
         state = (
             fp
             if isinstance(fp, Mapping)
             else torch.load(fp, map_location=self.device, weights_only=False)
         )
-        state, workspace, generator_state, inner = self._preflight_checkpoint(state)
+        (
+            state, workspace, generator_state, inner, saved_signature, cross_device
+        ) = self._preflight_checkpoint(
+            state, frozen_evaluation=frozen_evaluation,
+        )
         self.load_state_dict(state["module"])
         load_optimizer_state_preserving_hyperparameters(
             self.world_optimizer, state["world_optimizer"]
@@ -815,6 +995,14 @@ class AMBIXQCAgent(nn.Module):
         self.last_inner_metrics = {}
         self.last_inner_rollout_lengths = []
         self._resume_boundary_prepared = False
+        self._frozen_evaluation = frozen_evaluation
+        self._checkpoint_evaluation_provenance = {
+            "checkpoint_version": state["checkpoint_version"],
+            "saved_semantic_signature": saved_signature,
+            "evaluated_semantic_signature": self.semantic_signature(),
+            "frozen_evaluation": frozen_evaluation,
+            "cross_device_rng_reset": cross_device,
+        }
         self.model.eval()
         return self
 
