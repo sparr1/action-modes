@@ -408,7 +408,7 @@ def test_artifact_paths_cannot_escape_bundle(tmp_path, name):
 
 
 def label_registry(**settings):
-    return {"identity": {"backbone": "entity/train/u13m14st", "planner": {
+    return {"identity": {"backbone": "rwgao_b-brown-university/ambi/u13m14st", "planner": {
         "type": "sac", "settings": {"inner_rounds": 6, "inner_actor_updates_per_action": 72,
         "inner_critic_updates_per_action": 36, "inner_temperature_updates_per_action": 18,
         "inner_actor_lr": 5e-5, "inner_bootstrap_source": "outer_target", **settings}}},
@@ -418,7 +418,7 @@ def label_registry(**settings):
 def test_curve_label_prioritizes_budgets_and_bootstrap():
     registry = label_registry()
     label = series.concise_curve_label(registry)
-    assert label == "SAC C6/A12/T3 outer Q · u13m14st · actor #abcd"
+    assert label == "AMBI original · SAC C6/A12/T3 outer Q · #abcd"
     assert len(label) <= 60
     assert registry["attempt_label"] == "actor-sweep-20260905"
 
@@ -435,9 +435,7 @@ def test_curve_label_distinguishes_repeated_attempts_with_equal_names():
     first, second = label_registry(), label_registry()
     second["run_id"] = "efgh0000111122223333444455556666"
     assert series.concise_curve_label(first) != series.concise_curve_label(second)
-    second["run_id"] = first["run_id"]
-    second["attempt_label"] = "actor-repeat-B-20260906"
-    assert series.concise_curve_label(first) != series.concise_curve_label(second)
+    assert first["attempt_label"] == second["attempt_label"]
 
 
 def test_curve_label_retains_interval_temperature_and_reduced_learning_rate():
@@ -445,25 +443,76 @@ def test_curve_label_retains_interval_temperature_and_reduced_learning_rate():
                               inner_steps_per_update=128, inner_actor_lr=2.5e-5)
     registry["attempt_label"] = "interval-sweep-20260906"
     label = series.concise_curve_label(registry)
-    assert label.startswith("SAC C12/A12/T12 outer Q s128 aLR2.5e-5")
-    assert "u13m14st" in label and len(label) <= 60
+    assert label.startswith("AMBI original · SAC C12/A12/T12 outer Q s128 aLR2.5e-5")
+    assert len(label) <= 70
 
 
 def test_curve_label_marks_xqc_terminal_and_nondefault_collection():
     registry = label_registry(inner_terminal_bootstrap="outer", inner_actor_updates_per_action=6,
                               inner_critic_updates_per_action=18, inner_temperature_updates_per_action=6,
                               inner_rollouts_per_round=256)
-    registry["identity"]["backbone"] = "entity/train/axqc-prior-92441d99-5959199"
+    registry["identity"]["backbone"] = "rwgao_b-brown-university/ambi/axqc-prior-92441d99-5959199"
     registry["identity"]["planner"]["type"] = "xqc"
     label = series.concise_curve_label(registry)
-    assert label.startswith("XQC C3/A1/T1 outer-term N256")
-    assert "92441d99" in label
+    assert label.startswith("AMBI-XQC · XQC C3/A1/T1 outer-term N256")
+    assert "92441d99" not in label
 
 
 def test_prior_label_excludes_inactive_settings_and_mppi_shows_changed_budget():
     registry = label_registry()
     registry["identity"]["planner"]["type"] = "prior"
-    assert series.concise_curve_label(registry).startswith("Prior · u13m14st")
+    assert series.concise_curve_label(registry).startswith("AMBI original · Prior only (no planning)")
     registry["identity"]["planner"] = {"type": "mppi", "settings": {
         "horizon": 5, "effective_iterations": 12, "num_samples": 1024}}
-    assert series.concise_curve_label(registry).startswith("MPPI H5 N1024 I12")
+    assert series.concise_curve_label(registry).startswith("AMBI original · MPPI H5 N1024 I12")
+
+
+@pytest.mark.parametrize("source,expected", [
+    ("u13m14st", "Original AMBI prior-only backbone"),
+    ("axqc-prior-92441d99-5959199", "AMBI-XQC prior-only backbone"),
+    ("xq3zva9u", "TD-MPC2 prior-only backbone"),
+])
+def test_run_name_separates_prior_controller_from_mppi_attempt(source, expected):
+    registry = label_registry()
+    registry["identity"]["backbone"] = "rwgao_b-brown-university/ambi/" + source
+    registry["identity"]["planner"]["type"] = "prior"
+    registry["attempt_label"] = "native-mppi-20260906"
+    before = deepcopy(registry)
+    assert series.evaluation_run_name(registry) == (
+        expected + " | Prior only (no planning) | Attempt: MPPI comparison [abcd]")
+    assert "MPPI" not in series.concise_curve_label(registry)
+    assert registry == before
+
+
+def test_unknown_source_never_uses_known_backbone_alias():
+    first = label_registry()
+    first["identity"]["backbone"] = "another-entity/ambi/u13m14st"
+    second = deepcopy(first)
+    second["identity"]["backbone"] = "another-entity/ambi/u13m14sx"
+    assert "another-entity/ambi/u13m14st" in series.concise_curve_label(first)
+    assert series.concise_curve_label(first) != series.concise_curve_label(second)
+    assert "Original AMBI" not in series.evaluation_run_name(first)
+
+
+def test_new_run_uses_resolved_controller_not_legacy_result_label(tmp_path):
+    value = record(tmp_path)
+    value["identity"]["backbone"] = "rwgao_b-brown-university/ambi/u13m14st"
+    value["identity"]["planner"] = {"type": "prior", "settings": {"unused": 99}}
+    value["label"] = "outdated MPPI alias"
+    registry = series.create_run(tmp_path / "registry", value, "native-mppi-20260906", "eval", "entity", "oscar-owner")
+    assert registry["name"] == series.evaluation_run_name(registry)
+    assert registry["name"].startswith("Original AMBI prior-only backbone | Prior only (no planning) | Attempt:")
+    assert registry["attempt_label"] == "native-mppi-20260906"
+    assert registry["identity"] == value["identity"]
+
+
+def test_resumed_publisher_refreshes_presentation_without_changing_identity(tmp_path):
+    registry = create(tmp_path)
+    registry["name"] = "obsolete alias"
+    series._atomic_json(Path(registry["run_dir"]) / "run.json", registry)
+    backend = FakeWandb()
+    with series.Publisher(registry["run_dir"], wandb_module=backend):
+        pass
+    assert backend.init_calls[0]["name"] == series.evaluation_run_name(registry)
+    assert backend.init_calls[0]["config"]["evaluation_identity_sha256"] == registry["identity_sha256"]
+    assert backend.init_calls[0]["config"]["attempt_label"] == registry["attempt_label"]
