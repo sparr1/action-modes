@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "base_alg_config": "checkpoint",
+  "shared_alg_params": {
+    "inner_operator": "tdambi",
+    "inner_rounds": 6,
+    "inner_rollouts_per_round": 512,
+    "inner_rollout_horizon": 3,
+    "inner_batch_size": 512,
+    "inner_replay_capacity": 12288,
+    "inner_diagnostic_rollouts": 0
+  },
+  "evaluation": {
+    "controller_seed": 12345,
+    "seeds": [101, 102, 103, 104, 105],
+    "max_steps": 500,
+    "default_presets": ["inner_budget/tdambi_3"]
+  },
+  "comparisons": {
+    "inner_budget": {
+      "reference": "tdambi_3",
+      "description": "Native TD-MPC2 actor–critic updates on frozen-model imagined transitions; each update performs critic, actor, and local-target interpolation.",
+      "variants": {
+        "tdambi_3": {
+          "description": "TDAMBI: three paired critic/actor updates per round.",
+          "alg_params": {"inner_updates_per_round": 3}
+        },
+        "tdambi_6": {
+          "description": "TDAMBI: six paired critic/actor updates per round.",
+          "alg_params": {"inner_updates_per_round": 6}
+        },
+        "tdambi_12": {
+          "description": "TDAMBI: twelve paired critic/actor updates per round.",
+          "alg_params": {"inner_updates_per_round": 12}
+        }
+      }
+    }
+  }
+}

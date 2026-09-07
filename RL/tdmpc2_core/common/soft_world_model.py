@@ -513,6 +513,28 @@ class SoftWorldModel(nn.Module):
             "entropy": -log_prob,
         }
 
+    def pi_tdmpc2(self, z, *, policy=None, generator=None, noise=None):
+        """Native TD-MPC2 actor information, without changing SAC's policy API.
+
+        In particular, ``scaled_entropy`` uses the native pre-squash Gaussian
+        log probability times action dimension and its original ratio. It is
+        not SAC's entropy and must not be replaced with ``-log_prob``.
+        """
+        mean_raw, log_std, eps = self._policy_sample(
+            z, policy=policy, generator=generator, noise=noise,
+        )
+        log_prob = math.gaussian_logprob(eps, log_std)
+        scaled_log_prob = log_prob * eps.shape[-1]
+        pre_tanh_action = mean_raw + eps * log_std.exp()
+        mean, action, log_prob = math.squash(mean_raw, pre_tanh_action, log_prob)
+        entropy_scale = scaled_log_prob / (log_prob + 1e-8)
+        return action, {
+            "mean": mean, "pre_tanh_mean": mean_raw,
+            "pre_tanh_action": pre_tanh_action, "log_std": log_std,
+            "log_prob": log_prob, "entropy": -log_prob,
+            "scaled_entropy": -log_prob * entropy_scale,
+        }
+
     @property
     def critic_signature(self):
         """Serializable critic architecture metadata for checkpoint preflight."""
@@ -578,6 +600,10 @@ class SoftWorldModel(nn.Module):
             detach=detach,
             qs=qs,
         )
+        if getattr(self.cfg, "inner_operator", None) == "tdambi":
+            # Native TD-MPC2 uses exp(abs(x)) - 1, whereas AMBI's backend
+            # uses expm1. Preserve native finite-precision values for TDAMBI.
+            return math.two_hot_inv(predictions, self.cfg)
         return self.q_backend.decode(predictions)
 
     def critic_loss(self, predictions, scalar_target, *, reduction="mean"):

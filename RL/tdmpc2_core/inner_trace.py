@@ -15,6 +15,17 @@ from .common import math as td_math
 _DEFINITIONS = {
     "critic_loss": "Critic training loss on the pre-update sampled minibatch.",
     "critic_grad_norm": "Critic gradient norm before gradient clipping.",
+    "critic_value_loss": "Native TD-MPC2 head-averaged distributional cross entropy before value coefficient.",
+    "actor_q_scaled_mean": "Native TD-MPC2 actor mean-pair Q divided by the updated local Q scale.",
+    "actor_native_entropy": "Native TD-MPC2 negative squashed-policy log probability; not SAC temperature.",
+    "actor_native_scaled_entropy": "Native TD-MPC2 scaled entropy including its action-dimension and entropy-ratio expression.",
+    "actor_native_entropy_contribution": "Fixed native entropy coefficient times native scaled entropy in the actor objective.",
+    "actor_q_scale_before": "Local Q scale before the actor minibatch percentile-range EMA update.",
+    "actor_q_scale_after": "Local Q scale after the actor minibatch percentile-range EMA update; used by this actor loss.",
+    "actor_q_percentile_range": "Current actor minibatch P95 minus P5 of mean-pair Q, clamped to at least one.",
+    "tdambi_entropy_coef": "Fixed native TD-MPC2 entropy coefficient; not SAC alpha.",
+    "tdambi_calibration_scale": "Initial Q scale from frozen-prior actions and frozen online mean-pair Q on first-collection replay.",
+    "tdambi_calibration_samples": "Additional replay rows, policy evaluations and Q evaluations used once for local scale initialization.",
     "td_error_abs_mean": "Mean absolute decoded TD error on the pre-update minibatch.",
     "q_mean": "Mean decoded online inner Q on the pre-update critic minibatch.",
     "q_abs_mean": "Mean absolute decoded online inner Q on the critic minibatch.",
@@ -102,6 +113,10 @@ def metric_catalog(metric_names=()):
             phase, axis = "post_update_fixed_probe", "round_index"
         elif name.startswith("collection_"):
             phase, axis = "post_collection", "round_index"
+        elif name.startswith("tdambi_calibration_"):
+            phase, axis = "before_first_optimizer_update", "round_index"
+        elif name == "tdambi_entropy_coef":
+            phase, axis = "initial", "round_index"
         elif name == "alpha":
             phase, axis = "initial_or_post_update_probe", "round_index"
         elif name.startswith("temperature_") or name == "alpha_used":
@@ -245,13 +260,17 @@ class InnerActionTrace:
         )
         entropy_bonus -= discount * continuation * self._alpha * info["log_prob"]
         score = reward_sum + terminal_q
-        return {
+        result = {
             "discounted_reward": reward_sum.mean(),
             "discounted_terminal_q": terminal_q.mean(),
-            "fixed_alpha_entropy_bonus": entropy_bonus.mean(),
             "predicted_score": score.mean(),
-            "fixed_alpha_soft_score": (score + entropy_bonus).mean(),
         }
+        if cfg.inner_operator != "tdambi":
+            result.update(
+                fixed_alpha_entropy_bonus=entropy_bonus.mean(),
+                fixed_alpha_soft_score=(score + entropy_bonus).mean(),
+            )
+        return result
 
     @staticmethod
     def _policy_bounds(cfg):
@@ -302,6 +321,9 @@ class InnerActionTrace:
                 "alpha": engine.alpha.detach() if inner else self._alpha,
                 "probe_model_steps": model_steps,
             }
+            if cfg.inner_operator == "tdambi":
+                metrics.pop("fixed_evaluator_alpha")
+                metrics.pop("alpha")
             for name, value in scores.items():
                 metrics[f"{name}_outer"] = self._outer_probe[name]
                 metrics[f"{name}_inner"] = value

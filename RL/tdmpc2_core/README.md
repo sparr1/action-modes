@@ -72,6 +72,48 @@ from the current outer temperature. Scalar twin critics, LoRA, TD3, no inner
 improvement, and persistent inner scopes are explicit ablations. The MPPI inner
 operator is a compute-matched TD-MPC-style comparator, not AMBI's planner.
 
+### TDAMBI: native inner learning
+
+`RL/TDAMBI.py` adapts native TD-MPC2 checkpoints for frozen evaluation using the
+shared `InnerImprovementEngine`. At each real decision it restores a local
+actor, online critic and the checkpoint's **saved target critic**, clears
+optimizer moments and replay, and resets the local Q scale. Allocated storage
+can be reused. All outer parameters, including encoder, dynamics and reward,
+remain immutable. Only single-task state observations are supported initially;
+the wrapper rejects training and SAC shared-observation probes.
+
+Imagined stochastic-policy transitions are detached and sampled as ordinary
+minibatches, without TD-MPC2's outer timestep batching or rho weighting. A
+paired update performs critic, actor, then target interpolation. Critic learning
+uses native distributional cross entropy averaged across heads, multiplied by
+the native value coefficient. Its target is predicted reward plus discounted
+local target Q (minimum of two random heads) at a sampled local-policy action.
+Rollout cutoffs bootstrap and do not introduce synthetic terminal flags. There
+is no entropy bonus in that target.
+
+Actor learning maximizes average-pair online Q divided by the running scale,
+plus the saved fixed coefficient times native `scaled_entropy`. This preserves
+the native policy standard-deviation mapping and this port's stable tanh
+calculations. Online critic dropout remains active during training; the target
+critic remains in evaluation mode. Native Adam defaults, actor epsilon `1e-5`,
+critic epsilon `1e-8`, clipping and target interpolation are retained. No local
+temperature optimizer is created. The real action is the adapted `tanh(mean)`.
+
+Native weight checkpoints omit the running scale. Before the first optimizer
+update, TDAMBI samples a reproducible minibatch from its first imagined
+collection, evaluates frozen-prior actions with frozen online average-pair Q,
+and initializes `max(P95 - P5, 1)`. Calibration has an isolated RNG stream and
+separate evaluation counts and timing. Subsequent actor minibatches apply the
+native scale EMA. This reset and initialization rule is an explicit TDAMBI
+adaptation; it is not restoration of unavailable outer training scale state.
+
+Detached raw traces include native entropy, its weighted contribution, raw and
+scaled Q, scale before/after, losses, gradients, target statistics and work
+counts. Losses are pre-optimizer measurements. No per-update synchronization,
+extra diagnostic forward, or publication is introduced by tracing. See the
+[frozen TDAMBI workflow](../../configs/research/README.md#tdambi-on-native-td-mpc2-checkpoints)
+for presets, matched native prior references, HTML reports and Oscar smoke use.
+
 ### Optional adapted-prior writeback
 
 The reference behavior keeps the outer control priors immutable during action

@@ -198,7 +198,10 @@ class InnerRNG:
         "observation",
     )
 
-    def __init__(self, seed, device):
+    def __init__(self, seed, device, *, extra_streams=()):
+        self.STREAMS = type(self).STREAMS + tuple(extra_streams)
+        if len(set(self.STREAMS)) != len(self.STREAMS):
+            raise ValueError("Inner RNG stream names must be unique.")
         self.device = torch.device(device)
         generator_device = self.device if self.device.type == "cuda" else torch.device("cpu")
         self.generators = {}
