@@ -51,6 +51,8 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 if inventory.get("source_run") != "rwgao_b-brown-university/ambi/xq3zva9u":
     raise SystemExit("TDAMBI requires the validated native TD-MPC2 xq3zva9u backbone inventory.")
 PY
+# A requested GPU evaluation must never silently fall back to CPU.
+"$AMBI_DMC_PYTHON" -c 'import torch; assert torch.cuda.is_available(), "CUDA unavailable in allocated GPU job"; torch.ones(1, device="cuda").sum().item(); print("Evaluation GPU:", torch.cuda.get_device_name())'
 mkdir -p "$TDAMBI_OUTPUT_ROOT"
 mkdir "$output"
 export MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1

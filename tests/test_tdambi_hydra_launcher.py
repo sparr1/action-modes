@@ -59,8 +59,11 @@ def test_production_maps_checkpoint_and_keeps_fixed_evaluation_protocol(tmp_path
     env = launcher_environment(tmp_path, index)
     subprocess.run(["bash", str(SCRIPT)], env=env, check=True, capture_output=True)
     calls = [json.loads(line) for line in Path(env["CALL_LOG"]).read_text().splitlines()]
-    assert len(calls) == 2
-    evaluate, report = calls
+    assert len(calls) == 3
+    preflight, evaluate, report = calls
+    assert preflight[0] == "-c"
+    assert "assert torch.cuda.is_available()" in preflight[1]
+    assert 'device="cuda"' in preflight[1]
     assert evaluate[0] == "evaluate_ambi_checkpoint.py"
     step = index * 50000
     assert evaluate[evaluate.index("--checkpoint") + 1] == env["TDAMBI_CHECKPOINT_PREFIX"] + str(step)
@@ -119,7 +122,7 @@ def test_production_selects_step_preset_without_changing_episode_protocol(tmp_pa
     env = launcher_environment(tmp_path, 20)
     env["TDAMBI_PRESET"] = "update_timing/step_j5_c1_a1"
     subprocess.run(["bash", str(SCRIPT)], env=env, check=True, capture_output=True)
-    evaluate, report = [json.loads(line) for line in Path(env["CALL_LOG"]).read_text().splitlines()]
+    preflight, evaluate, report = [json.loads(line) for line in Path(env["CALL_LOG"]).read_text().splitlines()]
     assert evaluate[evaluate.index("--preset") + 1] == env["TDAMBI_PRESET"]
     assert evaluate[evaluate.index("--checkpoint") + 1].endswith("1000000")
     assert evaluate[evaluate.index("--device") + 1] == "cuda"
