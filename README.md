@@ -350,6 +350,12 @@ run directories. Every checkpoint task receives the same map; repetitions use
 new run directories. The registry pins backbone, active planner settings,
 action rules, seeds and implementation compatibility.
 
+Run names identify the verified backbone and executed planner. The campaign label
+is shown separately as `Attempt: ...`; the prior arm of an MPPI comparison is
+explicitly named `Prior only (no planning)`. Chart legends use the same backbone
+and planner with a short run suffix to distinguish repetitions. Original source
+IDs and attempt labels remain unchanged in the run configuration.
+
 GPU workers evaluate and save results, copy the exact checkpoint sidecar into
 the result bundle, then stage local pointers. They never initialize W&B. Run
 `eval_series.py publish RUN_DIR --watch --jobs ARRAY_ID` as a separate CPU process for each run;
