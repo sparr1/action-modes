@@ -289,7 +289,12 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 * int(cfg.inner_rollouts_per_round)
                 * int(cfg.inner_rollout_horizon)
             )
-            if cfg.inner_component_update_schedule:
+            if cfg.inner_steps_per_update is not None:
+                update_schedule = (
+                    f"steps_per_update={cfg.inner_steps_per_update:g}, "
+                    f"update_timing={cfg.inner_update_timing}"
+                )
+            elif cfg.inner_component_update_schedule:
                 update_schedule = (
                     f"C={cfg.inner_critic_updates_per_round}, "
                     f"A={cfg.inner_actor_updates_per_round}"
@@ -770,6 +775,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "steps_per_update": getattr(self.cfg, "inner_steps_per_update", None),
             "outer_replay_fraction": float(getattr(self.cfg, "inner_outer_replay_fraction", 0.0)),
         }
+        if getattr(self.cfg, "inner_update_timing", "round") != "round":
+            options["update_timing"] = self.cfg.inner_update_timing
         if any(options.values()):
             if options["finite_horizon"]:
                 options["horizon"] = int(self.cfg.inner_rollout_horizon)
@@ -1388,6 +1395,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         metrics,
         rollout_lengths,
         behavior_policy=None,
+        trace=None,
     ):
         """Copy action, metrics, lengths, and optional policy data together."""
         tensor_items = [
@@ -1419,7 +1427,15 @@ class AMBITDMPC2Agent(torch.nn.Module):
             )
             behavior_shapes = (behavior_mean.shape, behavior_log_std.shape)
             pieces.extend((behavior_mean.reshape(-1), behavior_log_std.reshape(-1)))
+        trace_start = sum(piece.numel() for piece in pieces) if trace is not None else 0
+        trace_items = trace.tensor_items() if trace is not None else []
+        pieces.extend(
+            value.to(device=action.device, dtype=action.dtype).reshape(1)
+            for _, _, value in trace_items
+        )
         packed = torch.cat(pieces).detach().cpu()
+        if trace is not None:
+            trace.materialize(trace_items, packed[trace_start:])
         action_size = int(action.numel())
         cpu_action = packed[:action_size].reshape(action.shape)
         materialized = dict(metrics)
@@ -1565,6 +1581,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         collect_diagnostics=True,
         return_behavior_policy=False,
         apply_inner_writeback=False,
+        trace=None,
     ):
         if task is not None:
             raise ValueError("AMBI-TD-MPC2 currently supports single-task training only.")
@@ -1594,6 +1611,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
                             collect_diagnostics=collect_diagnostics,
                             return_behavior_policy=return_behavior_policy,
                             apply_inner_writeback=apply_inner_writeback,
+                            **({"trace": trace} if trace is not None else {}),
                         )
             else:
                 with torch.no_grad():
@@ -1608,6 +1626,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
                         collect_diagnostics=collect_diagnostics,
                         return_behavior_policy=return_behavior_policy,
                         apply_inner_writeback=apply_inner_writeback,
+                        **({"trace": trace} if trace is not None else {}),
                     )
         finally:
             self.model.train(was_training)
@@ -1618,6 +1637,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
                     action,
                     metrics,
                     lengths,
+                    trace=trace,
                 )
             else:
                 action, metrics, lengths, behavior_policy = (
@@ -1626,12 +1646,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
                         metrics,
                         lengths,
                         behavior_policy=behavior_policy,
+                        trace=trace,
                     )
                 )
         else:
             action, metrics, lengths = result
             action, metrics, lengths = self._materialize_action_metrics(
-                action, metrics, lengths
+                action, metrics, lengths, trace=trace
             )
         metrics = self.inner_engine.finalize_timing_metrics(metrics)
         self.last_inner_metrics = metrics

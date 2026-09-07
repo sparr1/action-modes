@@ -17,7 +17,7 @@ _SCOPES = {"action": 0, "episode": 1, "run": 2}
 def updates_for_transitions(count, interval):
     """Exact floor for the configured decimal interval, with no float drift.
 
-    Called once per collection round (and during config resolution), never
+    Called at collection boundaries (and during config resolution), never
     inside compiled kernels. Integer arithmetic also avoids division overflow.
     """
     ratio = Fraction(str(interval))

@@ -202,6 +202,15 @@ def scientific_trial_parameters(
                     if value == 0.0:
                         value = 0.0
                 algorithm[field] = value
+            # Keep pre-interleaving lineage hashes unchanged: an omitted
+            # or explicit round default has no new scientific field.
+            timing = algorithm.get("inner_update_timing", "round")
+            if isinstance(timing, str):
+                timing = timing.lower()
+            if timing == "round":
+                algorithm.pop("inner_update_timing", None)
+            else:
+                algorithm["inner_update_timing"] = timing
             for field in (
                 "inner_explorer_mode",
                 "inner_behavior_action",

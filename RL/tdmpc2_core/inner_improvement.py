@@ -146,6 +146,7 @@ class InnerImprovementEngine:
         self.episode_index = 0
         self._mppi_prev_mean = None
         self._collect_diagnostics = True
+        self._active_trace = None
         self._pending_timers = {}
         self._parameter_noise_spec = None
         self._clear_parameter_noise_action_state()
@@ -168,8 +169,8 @@ class InnerImprovementEngine:
             actor_kernel = self._sac_actor_kernel
         self._compile_regions = {
             "rollout": CompileRegion(
-                "fixed-shape inner rollout",
-                self._dense_rollout_kernel,
+                ("inner rollout step" if self._interleaves_updates else "fixed-shape inner rollout"),
+                (self._rollout_step_kernel if self._interleaves_updates else self._dense_rollout_kernel),
                 enabled=enabled,
                 strict=strict,
             ),
@@ -278,6 +279,10 @@ class InnerImprovementEngine:
         return self._uses_canonical_schedule and (
             getattr(self.cfg, "inner_steps_per_update", None) is not None
         )
+
+    @property
+    def _interleaves_updates(self):
+        return getattr(self.cfg, "inner_update_timing", "round") == "step"
 
     @property
     def _mppi_iterations(self):
@@ -2424,6 +2429,119 @@ class InnerImprovementEngine:
             + int(explorer["transition_count"])
         }
 
+    def _collection_chunks(self, root_z):
+        """Yield only after replay contains the next eligible collection chunk.
+
+        Step timing suspends the collector while the caller optimizes, keeping
+        branch states alive until their next actions use the updated actor.
+        The last chunk carries the complete round's rollout statistics.
+        """
+        if self._interleaves_updates:
+            yield from self._collect_stepwise_round(root_z)
+        else:
+            start = self._timer_start()
+            rollout = self._collect_round(root_z)
+            self._timer_stop("inner_rollout_seconds", start)
+            yield rollout
+
+    def _rollout_step_kernel(self, z, policy_noise, reward_support):
+        """One pure parallel model step; replay and optimization stay outside."""
+        cfg = self.cfg
+        std_scale = float(cfg.inner_behavior_std_scale)
+        behavior_mode = str(cfg.inner_behavior_action)
+        if behavior_mode == "policy_sample" and std_scale == 0.0:
+            behavior_mode = "mean"
+        action, _ = self._policy_action(
+            z, self.state.actor, mode=behavior_mode, generator=None,
+            noise=policy_noise if policy_noise.numel() else None,
+            std_scale=max(std_scale, 1e-12),
+            noise_std=cfg.inner_behavior_noise_std,
+        )
+        joint = self.model.joint_input(z, action)
+        reward_prediction = self.model.reward_from_joint(joint)
+        if bool(getattr(cfg, "compile", False)):
+            reward = td_math.two_hot_inv(reward_prediction, cfg, support=reward_support)
+        else:
+            reward = td_math.two_hot_inv(reward_prediction, cfg)
+        return action, reward, self.model.next_from_joint(joint)
+
+    @torch.no_grad()
+    def _collect_stepwise_round(self, root_z):
+        cfg, state = self.cfg, self.state
+        count = int(cfg.inner_rollouts_per_round)
+        horizon = int(cfg.inner_rollout_horizon)
+        if count == 0:
+            yield self._collect_round(root_z)
+            return
+
+        start = self._timer_start()
+        z = root_z.expand(count, -1).clone()
+        lengths = torch.zeros(count, dtype=torch.long, device=self.device)
+        reward_sums = root_z.new_zeros(count)
+        discounted_rewards = root_z.new_zeros(count)
+        terminated_rollout = torch.zeros(count, dtype=torch.bool, device=self.device)
+        reward_support = td_math.categorical_support(root_z, cfg)
+        behavior_mode = str(cfg.inner_behavior_action)
+        if behavior_mode == "policy_sample" and float(cfg.inner_behavior_std_scale) == 0.0:
+            behavior_mode = "mean"
+        needs_noise = behavior_mode in {"policy_sample", "mean_plus_gaussian"}
+        for step in range(horizon):
+            if step:
+                start = self._timer_start()
+            active = (
+                torch.nonzero(~terminated_rollout, as_tuple=False).squeeze(-1)
+                if cfg.episodic else None
+            )
+            active_z = z[active] if active is not None else z
+            active_count = int(active_z.shape[0])
+            if active_count == 0:
+                self._timer_stop("inner_rollout_seconds", start)
+                break
+            state.actor.eval()
+            self.model.eval()
+            # Close this RNG fork before yielding to the optimizer. No global
+            # RNG or module-mode context spans a collection/update boundary.
+            with self.rng.fork("collection") as generator:
+                noise = (
+                    torch.randn(
+                        (active_count, int(cfg.action_dim)), device=self.device,
+                        dtype=root_z.dtype, generator=generator,
+                    ) if needs_noise else root_z.new_empty(0)
+                )
+                # Episodic populations compact as trajectories terminate, as
+                # in the existing eager episodic collector.
+                kernel = (
+                    self._rollout_step_kernel if cfg.episodic
+                    else self._compile_regions["rollout"]
+                )
+                action, reward, next_z = kernel(active_z, noise, reward_support)
+                done = (
+                    (self.model.termination(next_z) > float(cfg.inner_termination_threshold)).float()
+                    if cfg.episodic else reward.new_zeros(active_count, 1)
+                )
+            state.replay.add_batch(
+                active_z, action, reward, next_z, done,
+                **({"horizon_end": torch.full_like(done, float(step == horizon - 1))}
+                   if getattr(cfg, "inner_finite_horizon", False) else {}),
+            )
+            state.policy_evaluations += active_count
+            rows = active if active is not None else slice(None)
+            lengths[rows] += 1
+            reward_sums[rows] += reward.squeeze(-1)
+            discounted_rewards[rows] += reward.squeeze(-1) * (float(self.agent.discount) ** step)
+            terminated_rollout[rows] |= done.squeeze(-1) >= 0.5
+            z[rows] = next_z
+            state.actor.train()
+            self._timer_stop("inner_rollout_seconds", start)
+            yield {
+                "lengths": lengths,
+                "reward_sums": reward_sums,
+                "discounted_rewards": discounted_rewards,
+                "terminated": terminated_rollout,
+                "transition_count": active_count,
+                "rollout_step": step + 1,
+            }
+
     @torch.no_grad()
     def _collect_round(self, root_z):
         cfg, state = self.cfg, self.state
@@ -4150,6 +4268,13 @@ class InnerImprovementEngine:
                 critic_updated=do_critic,
                 actor_updated=do_actor,
             )
+            if self._active_trace is not None:
+                self._active_trace.record(
+                    "update", self.state, {**slot_metrics, "alpha_used": alpha},
+                    updated_critic=do_critic, updated_actor=do_actor,
+                    updated_temperature=do_temperature,
+                    measurement="pre_update_minibatch",
+                )
             metrics.append(slot_metrics)
         return metrics
 
@@ -5321,6 +5446,11 @@ class InnerImprovementEngine:
             # one immutable snapshot throughout all root-local update slots.
             actor_loss_scale = self.agent.actor_loss_scale.detach().clone()
         alpha_initial = self.alpha.detach().clone()
+        trace = self._active_trace
+        if trace is not None:
+            trace.record("initial", state, {"alpha": alpha_initial})
+            if trace.probes:
+                trace.probe(self, root_z, state.actor)
         explorer_alpha_initial = (
             self.explorer_alpha.detach().clone()
             if self._explorer_mode == "separate_critics"
@@ -5349,9 +5479,91 @@ class InnerImprovementEngine:
         collected_transition_count = 0
         interval_updates_requested = 0
         for round_index in range(int(cfg.inner_rounds)):
-            rollout_start = self._timer_start()
-            rollout = self._collect_round(root_z)
-            self._timer_stop("inner_rollout_seconds", rollout_start)
+            if trace is not None:
+                trace.round_index = round_index + 1
+            for rollout in self._collection_chunks(root_z):
+                if trace is not None:
+                    trace.record("collection", state, {
+                        "collection_transitions": rollout["transition_count"],
+                        **({"collection_rollout_step": rollout["rollout_step"]}
+                           if "rollout_step" in rollout else {}),
+                        "collection_reward_sum_mean": rollout["reward_sums"].float().mean(),
+                        "collection_discounted_reward_mean": rollout["discounted_rewards"].float().mean(),
+                    })
+                update_start = self._timer_start()
+                scheduled_update_count = None
+                if self._uses_steps_per_update:
+                    collected_transition_count += int(rollout["transition_count"])
+                    cumulative_updates = updates_for_transitions(
+                        collected_transition_count, cfg.inner_steps_per_update
+                    )
+                    scheduled_update_count = cumulative_updates - interval_updates_requested
+                    interval_updates_requested = cumulative_updates
+                if self._uses_canonical_schedule:
+                    if self._explorer_active or self._uses_component_update_schedule:
+                        if self._explorer_active:
+                            round_metrics = self._run_two_policy_component_updates(
+                                realized_transition_count=rollout["transition_count"],
+                                scheduled_update_count=scheduled_update_count,
+                                actor_loss_scale=actor_loss_scale
+                            )
+                            # The realized history length is the exact number of
+                            # critic-first + actor-phase slots actually requested,
+                            # including episodic canonical-auto compaction.
+                            requested_update_slots += len(round_metrics)
+                        else:
+                            critic_count = int(cfg.inner_critic_updates_per_round)
+                            actor_count = int(cfg.inner_actor_updates_per_round)
+                            round_metrics = self._run_component_update_counts(
+                                critic_count=critic_count,
+                                actor_count=actor_count,
+                                actor_loss_scale=actor_loss_scale,
+                            )
+                            requested_update_slots += critic_count + actor_count
+                    else:
+                        configured_updates = cfg.inner_updates_per_round
+                        if scheduled_update_count is not None:
+                            round_updates = scheduled_update_count
+                        elif configured_updates == "auto":
+                            # Episodic branches may terminate before H; UTD=1 tracks
+                            # transitions actually appended during this collection.
+                            round_updates = int(rollout["transition_count"])
+                        else:
+                            round_updates = int(configured_updates)
+                        round_metrics = self._run_update_counts(
+                            critic_count=(
+                                round_updates
+                                if cfg.inner_critic_adaptation != "frozen"
+                                else 0
+                            ),
+                            actor_count=(
+                                round_updates
+                                if cfg.inner_actor_adaptation != "frozen"
+                                else 0
+                            ),
+                            temperature_count=(
+                                round_updates
+                                if cfg.inner_operator == "sac"
+                                and cfg.inner_temperature_mode == "auto"
+                                else 0
+                            ),
+                            actor_loss_scale=actor_loss_scale,
+                        )
+                        requested_update_slots += round_updates
+                else:
+                    round_metrics = self._run_updates(
+                        round_index,
+                        allocations,
+                        actor_loss_scale=actor_loss_scale,
+                    )
+                    requested_update_slots += max(
+                        allocations["critic"][round_index],
+                        allocations["actor"][round_index],
+                        allocations["temperature"][round_index],
+                    )
+                self._timer_stop("inner_update_seconds", update_start)
+                update_history.extend(round_metrics)
+                update_slots += len(round_metrics)
             all_lengths.append(rollout["lengths"])
             reward_sums.append(rollout["reward_sums"])
             discounted_rewards.append(rollout["discounted_rewards"])
@@ -5363,80 +5575,8 @@ class InnerImprovementEngine:
                 )
                 transition_sources.append(rollout["transition_sources"])
 
-            update_start = self._timer_start()
-            scheduled_update_count = None
-            if self._uses_steps_per_update:
-                collected_transition_count += int(rollout["transition_count"])
-                cumulative_updates = updates_for_transitions(
-                    collected_transition_count, cfg.inner_steps_per_update
-                )
-                scheduled_update_count = cumulative_updates - interval_updates_requested
-                interval_updates_requested = cumulative_updates
-            if self._uses_canonical_schedule:
-                if self._explorer_active or self._uses_component_update_schedule:
-                    if self._explorer_active:
-                        round_metrics = self._run_two_policy_component_updates(
-                            realized_transition_count=rollout["transition_count"],
-                            scheduled_update_count=scheduled_update_count,
-                            actor_loss_scale=actor_loss_scale
-                        )
-                        # The realized history length is the exact number of
-                        # critic-first + actor-phase slots actually requested,
-                        # including episodic canonical-auto compaction.
-                        requested_update_slots += len(round_metrics)
-                    else:
-                        critic_count = int(cfg.inner_critic_updates_per_round)
-                        actor_count = int(cfg.inner_actor_updates_per_round)
-                        round_metrics = self._run_component_update_counts(
-                            critic_count=critic_count,
-                            actor_count=actor_count,
-                            actor_loss_scale=actor_loss_scale,
-                        )
-                        requested_update_slots += critic_count + actor_count
-                else:
-                    configured_updates = cfg.inner_updates_per_round
-                    if scheduled_update_count is not None:
-                        round_updates = scheduled_update_count
-                    elif configured_updates == "auto":
-                        # Episodic branches may terminate before H; UTD=1 tracks
-                        # transitions actually appended during this collection.
-                        round_updates = int(rollout["transition_count"])
-                    else:
-                        round_updates = int(configured_updates)
-                    round_metrics = self._run_update_counts(
-                        critic_count=(
-                            round_updates
-                            if cfg.inner_critic_adaptation != "frozen"
-                            else 0
-                        ),
-                        actor_count=(
-                            round_updates
-                            if cfg.inner_actor_adaptation != "frozen"
-                            else 0
-                        ),
-                        temperature_count=(
-                            round_updates
-                            if cfg.inner_operator == "sac"
-                            and cfg.inner_temperature_mode == "auto"
-                            else 0
-                        ),
-                        actor_loss_scale=actor_loss_scale,
-                    )
-                    requested_update_slots += round_updates
-            else:
-                round_metrics = self._run_updates(
-                    round_index,
-                    allocations,
-                    actor_loss_scale=actor_loss_scale,
-                )
-                requested_update_slots += max(
-                    allocations["critic"][round_index],
-                    allocations["actor"][round_index],
-                    allocations["temperature"][round_index],
-                )
-            self._timer_stop("inner_update_seconds", update_start)
-            update_history.extend(round_metrics)
-            update_slots += len(round_metrics)
+            if trace is not None and trace.probes:
+                trace.probe(self, root_z, state.actor)
 
         execution_start = self._timer_start()
         capture_behavior = bool(return_behavior_policy and not eval_mode)
@@ -5907,6 +6047,46 @@ class InnerImprovementEngine:
         collect_diagnostics=True,
         return_behavior_policy=False,
         apply_inner_writeback=False,
+        trace=None,
+    ):
+        """Run an action with an optional single-use observational recorder."""
+        if trace is not None:
+            from .inner_trace import InnerActionTrace
+
+            if not isinstance(trace, InnerActionTrace):
+                raise TypeError("trace must be an InnerActionTrace.")
+            if self._active_trace is not None:
+                raise RuntimeError("Inner action tracing is not reentrant.")
+            operator = str(self.cfg.inner_operator)
+            if operator not in {"none", "sac", "td3"} or self._explorer_active:
+                raise ValueError(
+                    "Inner tracing supports single-policy none/SAC/TD3 configurations."
+                )
+            if trace.probes and operator == "td3":
+                raise ValueError(
+                    "Fixed-noise trace probes require SAC or no inner optimization."
+                )
+            trace.begin()
+        self._active_trace = trace
+        try:
+            return self._act(
+                root_z, t0=t0, eval_mode=eval_mode,
+                collect_diagnostics=collect_diagnostics,
+                return_behavior_policy=return_behavior_policy,
+                apply_inner_writeback=apply_inner_writeback,
+            )
+        finally:
+            self._active_trace = None
+
+    def _act(
+        self,
+        root_z,
+        *,
+        t0=False,
+        eval_mode=False,
+        collect_diagnostics=True,
+        return_behavior_policy=False,
+        apply_inner_writeback=False,
     ):
         self._pending_timers = {}
         start = self._timer_start()
@@ -5922,6 +6102,14 @@ class InnerImprovementEngine:
                 and int(self.cfg.inner_rounds) == 0
             )
             if inactive:
+                if self._active_trace is not None:
+                    self._active_trace.record(
+                        "initial", self.state, {"alpha": self.agent.alpha.detach()}
+                    )
+                    if self._active_trace.probes:
+                        self._active_trace.probe(
+                            self, root_z, self.model._pi, inner=False
+                        )
                 result = self._act_none(
                     root_z,
                     eval_mode=eval_mode,

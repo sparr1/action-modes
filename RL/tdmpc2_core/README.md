@@ -411,8 +411,9 @@ and actor once; automatic temperature tuning follows the actor. A value below
 one permits more than one update per imagined transition. Actual transitions
 count, including early rollout termination; replay draws and real replay rows
 do not earn additional updates. Fractional remainder carries between rounds
-and resets at the next real action. Updates remain grouped after collection
-rounds rather than interrupting a trajectory mid-rollout.
+and resets at the next real action. By default, `inner_update_timing="round"`
+groups these updates after complete collection rounds. The optional step timing
+below applies the same transition interval between imagined timesteps.
 
 Counts use the configured decimal interval without accumulating floating-point
 remainders: for example, 49 transitions with an interval of `0.07` earn exactly
@@ -459,6 +460,69 @@ detached critics retain the existing general stateless path and may require
 non-strict compilation on the locked PyTorch version. Compile failures remain
 visible through the existing fallback metrics. Benchmark compilation warm-up
 separately from steady-state actions.
+
+### Step–update inner SAC
+
+Set `inner_update_timing="step"` together with `inner_steps_per_update` to
+interleave collection and learning inside each rollout round. Each step advances
+all still-live imagined trajectories by one timestep, immediately appends their
+transitions to replay, and runs the joint SAC updates newly earned by those
+transitions. The next timestep continues from those successor latents and samples
+actions with the updated actor. Each new round restarts the trajectories at the
+real decision's root latent, retaining the inner learner and cumulative replay
+until the usual end of that decision.
+
+For example, this collects 512 parallel trajectories and performs one joint
+critic/actor update after each timestep, with automatic temperature tuning
+following the actor:
+
+```json
+{
+  "inner_operator": "sac",
+  "inner_rounds": 6,
+  "inner_rollouts_per_round": 512,
+  "inner_rollout_horizon": 3,
+  "inner_updates_per_round": null,
+  "inner_update_timing": "step",
+  "inner_steps_per_update": 512,
+  "inner_batch_size": 512
+}
+```
+
+Here a **parallel timestep** produces up to 512 **transitions**. An interval of
+512 gives one update per full parallel step; an interval of 1 would give 512
+updates per full step. In the absence of early termination, the example uses
+9,216 transitions and 18 joint updates per real decision. Setting its timing to
+`"round"` preserves those totals and groups three updates after each full round,
+providing a comparison that changes timing alone. Equal sample counts do not
+imply equal sampled transitions: interleaving lets earlier learning change later
+imagined actions and states.
+
+Updates sample minibatches from all currently retained inner replay, including
+earlier rounds. There is no additional implicit warmup. With-replacement sampling
+can train when the first collected batch is smaller than `inner_batch_size`;
+without-replacement sampling requires enough replay rows at the first earned
+update. The configuration checks this for full-length populations; early
+termination can still leave too few rows and produce the existing sampling error.
+Only actual generated transitions earn updates, including those ending in true
+termination. Fractional credit crosses timestep and round boundaries and resets
+per real decision, independently of replay capacity or lifetime. Horizon flags
+and optional real-replay critic mixing retain their existing target semantics.
+
+Step timing currently supports single-policy canonical SAC
+(`inner_explorer_mode="none"`) and requires the explicit transition interval.
+The interval's existing restrictions on shared/component gradient counts and
+frozen actor/critic adaptation still apply. The default `"round"` path retains
+the existing schedules and explorer populations. This is an additional schedule
+ablation; the manuscript's grouped-rollout algorithm remains the default.
+
+Non-episodic collection compiles one model timestep at a time, while the existing
+actor and critic kernels remain separately compiled. Episodic collection keeps
+the existing eager compaction of terminated branches. Traces record a collection
+event per timestep, with `collection_rollout_step`, followed by its update events;
+optional fixed-noise probes remain at initialization and completed round
+boundaries. The resolved configuration and active checkpoint identity record the
+timing, so exact training resume rejects a timing change.
 
 ### Separate root-local critic and actor update counts
 
