@@ -298,35 +298,13 @@ def render_html(summary):
             + f'<p>Missing steps: {html.escape(str(summary["missing_steps"]))}. Reference commit: <code>{REFERENCE_SHA}</code>. New evaluation commit: <code>{html.escape(summary["evaluation_source_sha"])}</code>.</p></body></html>')
 
 
-def publish(summary, *, project, entity, mode="online"):
-    from utils.wandb_utils import init_wandb
-    outer = campaign_profile(summary.get("variant", "inner"))["variant"] == "outer_terminal"
-    label = "XQC outer terminal bootstrap" if outer else "inner XQC"
-    extra_tags = ["terminal-bootstrap:outer", "terminal-policy:frozen-outer", "terminal-q:online-outer", "terminal-alpha:inner"] if outer else []
-    remote = init_wandb({"wandb": True, "wandb_project": project, "wandb_entity": entity, "wandb_mode": mode,
-                         "wandb_tags": ["frozen-xqc", "prior-vs-inner-xqc", "j6-n512-h3-g3-b512", "C18-A6-T6", *extra_tags]},
-                        default_project="ambi-inner-bench", run_name=f"AMBI-XQC prior vs {label} J6 N512 H3 G3 B512 | C18 A6 T6",
-                        config={key: value for key,value in summary.items() if key != "rows"})
-    failure = None
-    try:
-        remote.define_metric("checkpoint_step")
-        for group in ("prior", "inner_xqc", "paired"):
-            remote.define_metric(f"{group}/*", step_metric="checkpoint_step")
-        for row in summary["rows"]:
-            remote.log({"checkpoint_step": row["checkpoint_step"], **{f"{group}/{key}": value for group in ("prior","inner_xqc","paired") for key,value in row[group].items() if isinstance(value,(int,float))}})
-        remote.summary.update({"campaign_status": summary["status"], "completed_checkpoints": len(summary["rows"]), "outer_state_unchanged": True})
-        return remote.url
-    except BaseException as error:
-        failure = error
-        raise
-    finally:
-        try:
-            remote.finish(exit_code=1 if failure else 0)
-        except BaseException as error:
-            if failure is None:
-                raise
-            from utils.cleanup import add_cleanup_notes
-            add_cleanup_notes(failure, [error])
+def publish(summary, *, project=None, entity=None, mode="online", eval_run_map=None, inventory_path=None):
+    """Stage validated raw results for the shared CPU publisher; never create a run."""
+    from utils.ambi_benchmark import resolve_eval_run_map, stage_completed_bundle
+    assigned = resolve_eval_run_map(['controller/xqc'], run_map=eval_run_map, wandb=True)
+    return {str(row["checkpoint_step"]): stage_completed_bundle(
+        row["bundle"], assigned, source_run=summary["source_run"], inventory_path=inventory_path,
+    ) for row in summary["rows"]}
 
 
 def main(argv=None):
@@ -339,6 +317,7 @@ def main(argv=None):
     parser.add_argument("--html", type=Path)
     for name in ("allow-partial", "overwrite", "wandb"):
         parser.add_argument(f"--{name}", action="store_true")
+    parser.add_argument("--eval-run-map", type=Path, help="Explicit selector-to-run-directory mapping for staging completed raw results.")
     parser.add_argument("--wandb-project", default="ambi-inner-bench")
     parser.add_argument("--wandb-entity", default="rwgao_b-brown-university")
     parser.add_argument("--wandb-mode", choices=("online","offline"), default="online")
@@ -354,8 +333,8 @@ def main(argv=None):
     atomic_json(args.output,summary,overwrite=args.overwrite)
     if args.html:
         atomic_write(args.html,render_html(summary).encode(),overwrite=args.overwrite)
-    if args.wandb:
-        summary["wandb_url"] = publish(summary,project=args.wandb_project,entity=args.wandb_entity,mode=args.wandb_mode)
+    if args.wandb or args.eval_run_map:
+        summary["publication"] = publish(summary, eval_run_map=args.eval_run_map, inventory_path=args.manifest)
         atomic_json(args.output,summary,overwrite=True)
     print(json.dumps({"output":str(args.output),"status":summary["status"],"checkpoints":len(summary["rows"]),"wandb_url":summary.get("wandb_url")}))
     return 0

@@ -293,38 +293,13 @@ def render_campaign_html(summary):
             + f'<p>Evaluation commit: <code>{html.escape(summary["evaluation_source_sha"])}</code><br>Checkpoint manifest SHA-256: <code>{summary["checkpoint_manifest_sha256"]}</code></p></body></html>')
 
 
-def publish_campaign(summary, *, project, entity, mode="online"):
-    from utils.wandb_utils import init_wandb
-    remote = init_wandb({"wandb": True, "wandb_project": project, "wandb_entity": entity,
-                         "wandb_mode": mode, "wandb_tags": ["frozen-xqc", "prior-versus-mppi", "checkpoint-campaign"]},
-                        default_project="ambi-inner-bench",
-                        run_name=f'AMBI-XQC humanoid-walk prior vs MPPI H3 N512 E64 pi24 J8 | {len(summary["rows"])} checkpoints',
-                        config={key: value for key, value in summary.items() if key != "rows"})
-    failure = None
-    try:
-        remote.define_metric("checkpoint_step")
-        for group in ("prior", "mppi", "paired"):
-            remote.define_metric(f"{group}/*", step_metric="checkpoint_step")
-        for row in summary["rows"]:
-            payload = {"checkpoint_step": row["checkpoint_step"]}
-            for group in ("prior", "mppi", "paired"):
-                payload.update({f"{group}/{key}": value for key, value in row[group].items()
-                                if isinstance(value, (int, float))})
-            remote.log(payload)
-        remote.summary.update({"campaign_status": summary["status"], "completed_checkpoints": len(summary["rows"]),
-                               "missing_steps": summary["missing_steps"], "outer_state_unchanged": True})
-        return remote.url
-    except BaseException as error:
-        failure = error
-        raise
-    finally:
-        try:
-            remote.finish(exit_code=1 if failure else 0)
-        except BaseException as cleanup_error:
-            if failure is None:
-                raise
-            from utils.cleanup import add_cleanup_notes
-            add_cleanup_notes(failure, [cleanup_error])
+def publish_campaign(summary, *, project=None, entity=None, mode="online", eval_run_map=None, inventory_path=None):
+    """Stage validated raw results for the shared CPU publisher; never create a run."""
+    from utils.ambi_benchmark import resolve_eval_run_map, stage_completed_bundle
+    assigned = resolve_eval_run_map(['controller/prior', 'controller/mppi'], run_map=eval_run_map, wandb=True)
+    return {str(row["checkpoint_step"]): stage_completed_bundle(
+        row["bundle"], assigned, source_run=summary["source_run"], inventory_path=inventory_path,
+    ) for row in summary["rows"]}
 
 
 def main(argv=None):
@@ -337,6 +312,7 @@ def main(argv=None):
     parser.add_argument("--allow-partial", action="store_true", help="Omit absent checkpoint directories; reject any present incomplete/invalid output.")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--eval-run-map", type=Path, help="Explicit selector-to-run-directory mapping for staging completed raw results.")
     parser.add_argument("--wandb-project", default="ambi-inner-bench")
     parser.add_argument("--wandb-entity", default="rwgao_b-brown-university")
     parser.add_argument("--wandb-mode", choices=("online", "offline"), default="online")
@@ -353,9 +329,8 @@ def main(argv=None):
     atomic_json(args.output, summary, overwrite=args.overwrite)
     if args.html:
         atomic_write(args.html, render_campaign_html(summary).encode(), overwrite=args.overwrite)
-    if args.wandb:
-        url = publish_campaign(summary, project=args.wandb_project, entity=args.wandb_entity, mode=args.wandb_mode)
-        summary["wandb_url"] = url
+    if args.wandb or args.eval_run_map:
+        summary["publication"] = publish_campaign(summary, eval_run_map=args.eval_run_map, inventory_path=args.manifest)
         atomic_json(args.output, summary, overwrite=True)
     print(json.dumps({"output": str(args.output), "status": summary["status"], "checkpoints": len(summary["rows"]),
                       "wandb_url": summary.get("wandb_url")}, allow_nan=False))

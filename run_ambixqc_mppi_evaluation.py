@@ -104,11 +104,15 @@ def validate_bundle(bundle_path, *, seeds, max_steps):
             "optimizer_updates": 0, "mppi_model_steps_per_decision": 12_336}
 
 
-def run(manifest_path, index, result_root, *, mode="production", device="cuda", wandb=False):
+def run(manifest_path, index, result_root, *, mode="production", device="cuda", wandb=False,
+        eval_run_dir=None, eval_run_map=None):
     if mode not in {"smoke", "production"}:
         raise ValueError("Mode must be smoke or production.")
     if wandb and mode == "smoke":
         raise ValueError("Smoke evaluation must not publish to W&B.")
+    from utils.ambi_benchmark import resolve_eval_run_map, stage_completed_bundle
+    assigned_runs = resolve_eval_run_map(['controller/prior', 'controller/mppi'], run_dir=eval_run_dir,
+                                         run_map=eval_run_map, wandb=wandb)
     row = select_checkpoint(manifest_path, index)
     destination = Path(result_root).resolve() / f"step_{row['step']}"
     if destination == ROOT or ROOT in destination.parents:
@@ -128,9 +132,8 @@ def run(manifest_path, index, result_root, *, mode="production", device="cuda", 
     payload = evaluate_matrix(
         MATRIX, row["path"], selectors=["controller/prior", "controller/mppi"],
         seeds=seeds, controller_seed=12345, max_steps=max_steps, device=device,
-        bundle_dir=destination / "bundle",
-        wandb_options={"project": "ambi-inner-bench", "entity": "rwgao_b-brown-university",
-                       "mode": "online"} if wandb else None,
+        bundle_dir=destination / "bundle", eval_run_map=assigned_runs or None, stage_results=False,
+        checkpoint_inventory=manifest_path, source_run=SOURCE_RUN,
     )
     # Preserve completed episode results even if an acceptance check/report fails.
     atomic_json(destination / "paired.json", payload)
@@ -138,6 +141,9 @@ def run(manifest_path, index, result_root, *, mode="production", device="cuda", 
         raise ValueError("Evaluated checkpoint hash differs from the preflight manifest.")
     validation = validate_bundle(destination / "bundle", seeds=seeds, max_steps=max_steps)
     atomic_json(destination / "validation.json", {"step": row["step"], "mode": mode, **validation})
+    if assigned_runs:
+        stage_completed_bundle(destination / "bundle", assigned_runs,
+                               source_run=SOURCE_RUN, inventory_path=manifest_path)
     write_report(load_bundles([destination / "bundle"]), destination / "comparison.html",
                  title=f"AMBI-XQC prior versus MPPI at {row['step']:,} decisions")
     print(json.dumps({"step": row["step"], "output": str(destination), **validation}, sort_keys=True))
@@ -151,9 +157,12 @@ def main(argv=None):
     parser.add_argument("--result-root", type=Path, required=True)
     parser.add_argument("--mode", choices=("smoke", "production"), default="production")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb", action="store_true", help="Requires an explicit evaluation run assignment.")
+    parser.add_argument("--eval-run-dir", type=Path)
+    parser.add_argument("--eval-run-map", type=Path)
     args = parser.parse_args(argv)
-    run(args.manifest, args.index, args.result_root, mode=args.mode, device=args.device, wandb=args.wandb)
+    run(args.manifest, args.index, args.result_root, mode=args.mode, device=args.device, wandb=args.wandb,
+        eval_run_dir=args.eval_run_dir, eval_run_map=args.eval_run_map)
 
 
 if __name__ == "__main__":

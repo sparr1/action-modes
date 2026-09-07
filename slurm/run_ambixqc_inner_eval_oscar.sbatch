@@ -24,6 +24,10 @@ PYTHON_BIN="${PYTHON_BIN:-/oscar/home/rgao48/action-modes/environments/dmcontrol
 MODE="${AMBIXQC_EVAL_MODE:-production}"
 VARIANT="${AMBIXQC_EVAL_VARIANT:-inner}"
 [[ "$MODE" == smoke || "$MODE" == production ]] || { echo "Invalid evaluation mode" >&2; exit 2; }
+if [[ "$MODE" == production ]]; then
+  : "${EVAL_RUN_MAP:?Prepare explicit New/Append evaluation runs before submission.}"
+  [[ "$EVAL_RUN_MAP" == /* && -f "$EVAL_RUN_MAP" ]] || exit 2
+fi
 [[ "$VARIANT" == inner || "$VARIANT" == outer_terminal ]] || { echo "Invalid evaluation variant" >&2; exit 2; }
 [[ "$EXPECTED_ACTION_MODES_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 2
 [[ "$CHECKPOINT_MANIFEST" == /* && "$RESULT_ROOT" == /* && "$PYTHON_BIN" == /* ]] || exit 2
@@ -71,7 +75,7 @@ if [[ "$MODE" == smoke ]]; then
     tests/test_ambixqc_prior_checkpoint.py tests/test_ambixqc_checkpoint_evaluation.py \
     tests/test_ambixqc_outer_terminal.py tests/test_ambixqc_terminal_checkpoint.py
 else
-  args+=(--wandb)
+  args+=(--eval-run-map "$EVAL_RUN_MAP")
 fi
 srun --unbuffered --kill-on-bad-exit=1 --ntasks=1 "$PYTHON_BIN" run_ambixqc_inner_evaluation.py "${args[@]}"
 [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || { echo "Source changed during evaluation" >&2; exit 2; }

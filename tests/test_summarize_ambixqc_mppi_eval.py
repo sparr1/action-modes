@@ -211,34 +211,13 @@ def test_cli_atomic_outputs_and_publication_failure_preserve_validated_local_res
     assert not list(tmp_path.rglob("*.tmp"))
 
 
-def test_wandb_campaign_uses_checkpoint_axis_and_native_scalar_curves(outputs, monkeypatch):
-    events, metrics, finished = [], [], []
-    remote = SimpleNamespace(url="https://wandb.ai/entity/project/runs/test", summary={},
-                             define_metric=lambda *a, **k: metrics.append((a, k)),
-                             log=events.append, finish=lambda **k: finished.append(k))
-    monkeypatch.setattr("utils.wandb_utils.init_wandb", lambda *a, **k: remote)
+def test_campaign_stages_both_controllers_without_creating_runs(outputs, monkeypatch):
+    calls = []
+    mapping = {"controller/prior": "/existing/prior", "controller/mppi": "/existing/mppi"}
+    monkeypatch.setattr(storage, "resolve_eval_run_map", lambda *a, **k: mapping)
+    monkeypatch.setattr(storage, "stage_completed_bundle", lambda path, runs, **kwargs: calls.append((path, runs, kwargs)) or {})
+    monkeypatch.setattr("utils.wandb_utils.init_wandb", lambda *a, **k: pytest.fail("summarizer created a run"))
     summary = _summarize(outputs)
-    assert campaign.publish_campaign(summary, project="test", entity="test") == remote.url
-    assert metrics == [(("checkpoint_step",), {}), *(( (group + "/*",), {"step_metric": "checkpoint_step"})
-                                                         for group in ("prior", "mppi", "paired"))]
-    assert [event["checkpoint_step"] for event in events] == [50000, 100000]
-    assert events[0]["prior/return_mean"] == 15 and events[0]["mppi/return_mean"] == 19
-    assert events[0]["paired/delta_mean"] == 4 and events[0]["paired/delta_std"] == 1
-    assert "paired/deltas" not in events[0]
-    assert finished == [{"exit_code": 0}]
-
-
-def test_wandb_campaign_closes_failed_publication_without_masking_primary_error(outputs, monkeypatch):
-    failure = RuntimeError("publish failed")
-    finished = []
-    def finish(**kwargs):
-        finished.append(kwargs)
-        raise OSError("close failed")
-    remote = SimpleNamespace(summary={}, define_metric=lambda *a, **k: None, finish=finish,
-                             log=lambda payload: (_ for _ in ()).throw(failure))
-    monkeypatch.setattr("utils.wandb_utils.init_wandb", lambda *a, **k: remote)
-    with pytest.raises(RuntimeError, match="publish failed") as caught:
-        campaign.publish_campaign(_summarize(outputs), project="test", entity="test")
-    assert caught.value is failure
-    assert finished == [{"exit_code": 1}]
-    assert any("close failed" in note for note in getattr(failure, "__notes__", []))
+    result = campaign.publish_campaign(summary, eval_run_map=mapping, inventory_path=outputs[0])
+    assert list(result) == ["50000", "100000"]
+    assert len(calls) == 2 and all(call[1] == mapping for call in calls)

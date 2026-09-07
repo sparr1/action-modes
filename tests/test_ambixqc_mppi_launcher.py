@@ -107,7 +107,7 @@ def test_oscar_launcher_preserves_science_and_cluster_guards():
     for guard in ("#SBATCH --gres=gpu:l40s:1", "#SBATCH --cpus-per-task=6",
                   "#SBATCH --mem=32G", "#SBATCH --time=00:30:00", "#SBATCH --no-requeue",
                   "EXPECTED_ACTION_MODES_SHA", "--untracked-files=all", "LOCK_SHA",
-                  "CHECKPOINT_MANIFEST", "run_ambixqc_mppi_evaluation.py", "--wandb",
+                  "CHECKPOINT_MANIFEST", "run_ambixqc_mppi_evaluation.py", "--eval-run-map", "EVAL_RUN_MAP",
                   "tests/test_xqc_mppi.py", "WANDB_CACHE_DIR"):
         assert guard in content
     assert "pip install" not in content and "uv sync" not in content

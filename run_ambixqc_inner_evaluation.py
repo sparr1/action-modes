@@ -235,7 +235,8 @@ def validate_bundle(bundle_path, *, checkpoint, reference, protocol, seeds, max_
 
 
 def run(manifest_path, index, result_root, *, mode="production", device="cuda", wandb=False,
-        smoke_reference_bundle=None, smoke_reference_manifest_sha256=None, variant="inner"):
+        smoke_reference_bundle=None, smoke_reference_manifest_sha256=None, variant="inner",
+        eval_run_dir=None, eval_run_map=None):
     profile = campaign_profile(variant)
     matrix = profile["matrix"]
     if mode not in {"smoke", "production"}:
@@ -246,6 +247,9 @@ def run(manifest_path, index, result_root, *, mode="production", device="cuda", 
         raise ValueError("Smoke requires an explicit matching smoke reference bundle and manifest hash.")
     if mode == "production" and (smoke_reference_bundle is not None or smoke_reference_manifest_sha256 is not None):
         raise ValueError("Smoke reference overrides cannot be used for production evaluation.")
+    from utils.ambi_benchmark import resolve_eval_run_map, stage_completed_bundle
+    assigned_runs = resolve_eval_run_map(['controller/xqc'], run_dir=eval_run_dir,
+                                         run_map=eval_run_map, wandb=wandb)
     row = select_checkpoint(manifest_path, index)
     from utils.checkpoint_context import load_checkpoint_context
     from utils.ambi_research import resolve_preset
@@ -289,8 +293,8 @@ def run(manifest_path, index, result_root, *, mode="production", device="cuda", 
             matrix, row["path"], selectors=["controller/xqc"], seeds=seeds,
             controller_seed=CONTROLLER_SEED, max_steps=max_steps, device=device,
             bundle_dir=destination / "bundle", reference_bundle=reference["path"],
-            wandb_options={"project": "ambi-inner-bench", "entity": "rwgao_b-brown-university",
-                           "mode": "online"} if wandb else None,
+            eval_run_map=assigned_runs or None, stage_results=False,
+            checkpoint_inventory=manifest_path, source_run=SOURCE_RUN,
         )
     payload["numerical_settings"] = numerical_settings
     payload["variant"] = variant
@@ -304,6 +308,9 @@ def run(manifest_path, index, result_root, *, mode="production", device="cuda", 
                                  protocol=protocol, seeds=seeds, max_steps=max_steps, variant=variant)
     atomic_json(destination / "validation.json", {"step": row["step"], "mode": mode,
                                                   "variant": variant, **validation})
+    if assigned_runs:
+        stage_completed_bundle(destination / "bundle", assigned_runs,
+                               source_run=SOURCE_RUN, inventory_path=manifest_path)
     from report_ambi_benchmark import load_bundles, write_report
     report = load_bundles([reference["path"], destination / "bundle"])
     report["runs"] = [item for item in report["runs"] if item["controller_type"] in {"prior", "xqc"}]
@@ -324,12 +331,14 @@ def main(argv=None):
     parser.add_argument("--mode", choices=("smoke", "production"), default="production")
     parser.add_argument("--variant", choices=("inner", "outer_terminal"), default="inner")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb", action="store_true", help="Requires an explicit evaluation run assignment.")
+    parser.add_argument("--eval-run-dir", type=Path)
+    parser.add_argument("--eval-run-map", type=Path)
     parser.add_argument("--smoke-reference-bundle", type=Path)
     parser.add_argument("--smoke-reference-manifest-sha256")
     args = parser.parse_args(argv)
     run(args.manifest, args.index, args.result_root, mode=args.mode, device=args.device, wandb=args.wandb,
-        variant=args.variant,
+        variant=args.variant, eval_run_dir=args.eval_run_dir, eval_run_map=args.eval_run_map,
         smoke_reference_bundle=args.smoke_reference_bundle,
         smoke_reference_manifest_sha256=args.smoke_reference_manifest_sha256)
 

@@ -1,5 +1,41 @@
 # Frozen-checkpoint AMBI research
 
+## One W&B run per checkpoint curve
+
+A run contains one backbone and one planning configuration across checkpoints.
+Before submitting workers, explicitly choose `eval_series.py create` for a new
+attempt or `eval_series.py append` with the selected existing run directory.
+Create/append checks the scientific identity; repeating a study means creating
+a separate attempt rather than appending duplicate checkpoint measurements.
+Generate a new planner template first with the ordinary matrix/checkpoint/preset
+arguments plus `--eval-series-spec-dir /absolute/specs --checkpoint-inventory
+/absolute/checkpoint-manifest.json`. This resolves the saved settings without
+constructing a model or running episodes. Then use `eval_series.py create --root
+/absolute/registry --spec /absolute/specs/SELECTOR.json --attempt-label LABEL
+--owner oscar-rgao48`, or `eval_series.py append RUN_DIR --spec SPEC` to validate
+a deliberate extension. The emitted registry gives the run directory to assign.
+
+Pass `--eval-run-dir /absolute/run-directory` for a single selected planner, or
+`--eval-run-map /absolute/run-map.json` for several planners. The map is an object
+from exact preset selectors to existing run directories, and can include other
+selectors needed by the same array. Set `EVAL_RUN_MAP` to that map when using the
+cluster launchers, and set `CHECKPOINT_MANIFEST` to the verified checkpoint
+source inventory for SAC launchers. Assignment is prepared once before submission; checkpoint
+workers never create W&B runs. Legacy `--wandb` also requires this assignment.
+Local-only commands omit both the assignment and `--wandb`.
+
+GPU workers preserve the existing manifests, episode records and diagnostic
+traces, then atomically queue completed results. A separate CPU process on the
+authoritative result owner runs `eval_series.py publish RUN_DIR --watch --jobs ARRAY_ID` and
+checks for new results every 15 seconds. This is the only W&B writer for the run.
+Failed publication never changes evaluation completion or requires repeating
+episodes. Keep the run directory and bundles available to the owner; stage
+cross-cluster results there instead of resuming the same run from two hosts.
+Checkpoint return, paired improvement and runtime use
+`checkpoint/training_decisions` as their x-axis. Detailed diagnostics remain in
+the portable artifact and existing HTML report.
+
+
 ## AMBI-XQC inner J6 checkpoint campaign
 
 `ambixqc_humanoid_inner_j6_benchmark.json` evaluates native inner XQC with
@@ -96,7 +132,7 @@ sbatch --array=0-29%12 --output=/absolute/scratch/campaign/slurm/eval-%A_%a.out 
   --manifest "$CHECKPOINT_MANIFEST" --results-root /absolute/scratch/campaign \
   --expected-source-sha "$EXPECTED_ACTION_MODES_SHA" \
   --output /absolute/scratch/campaign/summary.json \
-  --html /absolute/scratch/campaign/comparison.html --wandb
+  --html /absolute/scratch/campaign/comparison.html --eval-run-map "$EVAL_RUN_MAP"
 ```
 
 The summary checks completed checkpoint bundles and matching prior references
@@ -243,7 +279,7 @@ sbatch --array=0-29%12 --output=/absolute/scratch/campaign/slurm/eval-%A_%a.out 
   --manifest "$CHECKPOINT_MANIFEST" --results-root /absolute/scratch/campaign \
   --expected-source-sha "$EXPECTED_ACTION_MODES_SHA" \
   --output /absolute/scratch/campaign/summary.json \
-  --html /absolute/scratch/campaign/comparison.html --wandb
+  --html /absolute/scratch/campaign/comparison.html --eval-run-map "$EVAL_RUN_MAP"
 ```
 
 The smoke uses two seeds and three decisions with the full MPPI search budget,
@@ -318,8 +354,9 @@ must match the checkpoint hash and episode protocol, including the requested
 seeds. Select both presets in one invocation to evaluate them together. Omitting
 `--preset` selects only the prior. The default evaluation is seeds 101–105, at
 most 500 decisions per episode, and controller seed 55. No source W&B run is
-invented by the matrix. Append `--wandb` for explicit publication to
-`ambi-inner-bench`, or `--wandb --wandb-mode offline` for offline SDK output.
+invented by the matrix. Supply an explicit `--eval-run-map` and verified
+`--checkpoint-inventory` to queue completed episodes for the CPU publisher; its
+prepared run registry determines the W&B project and publication owner.
 
 Both real controllers execute `tanh(mu)`. Inner imagined behavior, minibatches,
 and learner updates remain stochastic. The evaluation solver is reseeded after

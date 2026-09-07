@@ -145,14 +145,23 @@ def test_production_reuses_five_full_prior_episodes_and_publishes_only_xqc(case,
     source = json.loads(Path(case.row["path"] + ".metadata.json").read_text())
     assert "inner_reward_normalization" not in source["trial_run_params"]["alg_params"]
     previous = _numerical_flags()
-    destination = runner.run(case.manifest, 0, case.result_root, wandb=True)
+    staged = []
+    monkeypatch.setitem(sys.modules, "utils.eval_series", SimpleNamespace(
+        load_run=lambda path: {"run_id": "selected"},
+        stage_result=lambda run_dir, path, **kwargs: staged.append((run_dir, path, kwargs))))
+    destination = runner.run(case.manifest, 0, case.result_root, eval_run_dir=case.result_root.parent / "series")
     assert _numerical_flags() == previous
     assert len(calls["evaluate"]) == 1
     kwargs = calls["evaluate"][0][2]
     assert kwargs["selectors"] == ["controller/xqc"]
     assert kwargs["seeds"] == [101, 102, 103, 104, 105] and kwargs["max_steps"] == 500
     assert kwargs["reference_bundle"] == str(case.production.parent)
-    assert kwargs["wandb_options"]["project"] == "ambi-inner-bench"
+    assert kwargs.get("wandb_options") is None
+    assert kwargs["eval_run_map"] == {"controller/xqc": str(case.result_root.parent / "series")}
+    assert kwargs["stage_results"] is False
+    assert kwargs["checkpoint_inventory"] == case.manifest
+    assert len(staged) == 1 and staged[0][2]["selector"] == "controller/xqc"
+    assert staged[0][2]["inventory_path"] == case.manifest
     provenance = json.loads((destination / "provenance.json").read_text())
     assert provenance["checkpoint"] == case.row
     assert provenance["reference_manifest_sha256"] == case.row["reference_manifest_sha256"]
@@ -178,7 +187,7 @@ def test_smoke_uses_explicit_short_reference_and_never_truncates_production_refe
                              smoke_reference_manifest_sha256=smoke_sha)
     kwargs = calls["evaluate"][0][2]
     assert kwargs["seeds"] == [101, 102] and kwargs["max_steps"] == 3
-    assert kwargs["reference_bundle"] == str(case.smoke.parent) and kwargs["wandb_options"] is None
+    assert kwargs["reference_bundle"] == str(case.smoke.parent) and kwargs.get("wandb_options") is None
     provenance = json.loads((destination / "provenance.json").read_text())
     assert provenance["reference_manifest_sha256"] == smoke_sha
     assert provenance["checkpoint"]["reference_manifest_sha256"] == case.row["reference_manifest_sha256"]

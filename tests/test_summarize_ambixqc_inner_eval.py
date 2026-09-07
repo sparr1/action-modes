@@ -262,24 +262,17 @@ def test_cli_preserves_validated_outputs_when_optional_publication_fails(outputs
     assert json.loads(output.read_text())["status"]=="complete" and html.exists()
 
 
-def test_optional_publication_uses_native_xqc_curves_and_closes_on_failure(outputs,monkeypatch):
-    logs,metrics,finished=[],[],[]
-    remote=SimpleNamespace(url="https://wandb.ai/test/project/runs/test",summary={},
-                           define_metric=lambda *a,**k:metrics.append((a,k)),log=logs.append,
-                           finish=lambda **k:finished.append(k))
-    monkeypatch.setattr("utils.wandb_utils.init_wandb",lambda *a,**k:remote)
-    summary=_summarize(outputs)
-    assert campaign.publish(summary,project="test",entity="test")==remote.url
-    assert [row["checkpoint_step"] for row in logs]==[50000,100000]
-    assert logs[0]["inner_xqc/return_mean"]==19 and logs[0]["paired/delta_mean"]==4
-    assert not any(key.startswith("mppi/") for row in logs for key in row)
-    assert (("inner_xqc/*",),{"step_metric":"checkpoint_step"}) in metrics
-    failure=RuntimeError("publication failed")
-    remote.log=lambda row:(_ for _ in ()).throw(failure)
-    remote.finish=lambda **k:(_ for _ in ()).throw(OSError("close failed"))
-    with pytest.raises(RuntimeError) as caught:
-        campaign.publish(summary,project="test",entity="test")
-    assert caught.value is failure and any("close failed" in note for note in failure.__notes__)
+def test_optional_publication_stages_validated_raw_bundles(outputs, monkeypatch):
+    calls = []
+    mapping = {"controller/xqc": "/existing/series"}
+    monkeypatch.setattr(storage, "resolve_eval_run_map", lambda *a, **k: mapping)
+    monkeypatch.setattr(storage, "stage_completed_bundle", lambda path, runs, **kwargs: calls.append((path, runs, kwargs)) or {})
+    monkeypatch.setattr("utils.wandb_utils.init_wandb", lambda *a, **k: pytest.fail("summarizer created a run"))
+    summary = _summarize(outputs)
+    result = campaign.publish(summary, eval_run_map=mapping, inventory_path=outputs[0])
+    assert list(result) == ["50000", "100000"]
+    assert len(calls) == 2 and all(call[1] == mapping for call in calls)
+    assert calls[0][2]["source_run"] == summary["source_run"]
 
 
 @pytest.fixture
@@ -331,17 +324,8 @@ def test_outer_terminal_summary_accepts_legacy_prior_and_has_distinct_labels(out
     assert "XQC with outer terminal bootstrap" in rendered
     assert "final imagined transition" in rendered and "online critic" in rendered
     assert "adapting inner temperature" in rendered and "running BatchNorm" in rendered
-    calls=[]
-    remote=SimpleNamespace(url="https://wandb.ai/test",summary={},define_metric=lambda *a,**k:None,
-                           log=lambda row:None,finish=lambda **k:None)
-    def initialize(params,**kwargs):
-        calls.append((params,kwargs))
-        return remote
-    monkeypatch.setattr("utils.wandb_utils.init_wandb",initialize)
-    campaign.publish(summary,project="test",entity="test")
-    assert "outer terminal bootstrap" in calls[0][1]["run_name"]
-    assert "terminal-bootstrap:outer" in calls[0][0]["wandb_tags"]
-    assert calls[0][1]["config"]["variant"]=="outer_terminal"
+    with pytest.raises(ValueError, match="explicit"):
+        campaign.publish(summary, project="test", entity="test")
 
 
 @pytest.mark.parametrize("filename",["provenance.json","paired.json"])

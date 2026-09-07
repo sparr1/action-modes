@@ -1,0 +1,407 @@
+"""Publication failures must never require repeating scientific evaluation."""
+from copy import deepcopy
+import json
+from pathlib import Path
+from types import SimpleNamespace
+import sys
+
+import pytest
+
+from utils import eval_series as series
+
+
+def record(tmp_path, step=100_000, **changes):
+    source = tmp_path / (str(step) + ".json")
+    if not source.exists():
+        source.write_text(json.dumps({"step": step, "episodes": [1, 3]}))
+    result = {
+        "identity": {"backbone": "entity/train/prior55", "planner": {"operator": "sac", "critic_updates": 6}, "protocol": {"seeds": [101, 102], "max_steps": 500}, "science": {"evaluator": "frozen-v1"}},
+        "checkpoint": {"step": step, "sha256": "a" * 64},
+        "metrics": {"eval/return_mean": 2.0, "eval/return_sample_std": 2 ** 0.5, "eval/episode_count": 2, "runtime/control_seconds": 1.2},
+        "episodes": [{"seed": 101, "return": 1}, {"seed": 102, "return": 3}],
+        "artifact_files": {"result.json": str(source)}, "provenance": {"code_sha": "abc"},
+        "record_id": "record-" + str(step), "source_result_path": str(source), "label": "Prior55 | SAC C6",
+    }
+    result.update(changes)
+    return result
+
+
+def create(tmp_path, value=None):
+    return series.create_run(tmp_path / "registry", value or record(tmp_path), "attempt 1", "eval", "entity", "oscar-owner")
+
+
+def index(registry):
+    return json.loads((Path(registry["run_dir"]) / "publication.json").read_text())
+
+
+class FakeArtifact:
+    def __init__(self, name, **kwargs):
+        self.name = name
+        self.files = {}
+
+    def add_file(self, path, name):
+        self.files[name] = Path(path).read_bytes()
+
+    def wait(self):
+        return self
+
+
+class FakeRun:
+    def __init__(self, backend, run_id, config):
+        self.backend = backend
+        self.id = run_id
+        self.config = config
+        self.rows = []
+        self.pending = []
+        self.step = 0
+        self.definitions = []
+        self.artifacts = []
+        self.used_artifacts = []
+        self.settings = SimpleNamespace(mode="online")
+
+    def define_metric(self, name, **kwargs):
+        self.definitions.append((name, kwargs))
+
+    def log_artifact(self, artifact, aliases):
+        if self.backend.fail_artifact:
+            raise RuntimeError("artifact network failure")
+        self.artifacts.append((artifact, aliases))
+        return artifact
+
+    def use_artifact(self, name):
+        self.used_artifacts.append(name)
+
+    def log(self, row, step, commit):
+        assert commit
+        if self.backend.fail_before_log:
+            raise RuntimeError("crash before SDK accepts row")
+        assert step >= self.step
+        self.pending.append(dict(row, _step=step))
+        self.step = step + 1
+        if self.backend.fail_after_log:
+            raise RuntimeError("crash after SDK accepts row")
+
+    def finish(self, exit_code=0):
+        if self.backend.flush:
+            self.rows.extend(self.pending)
+            self.pending.clear()
+
+    def scan_history(self, page_size):
+        if self.backend.fail_history:
+            raise RuntimeError("history temporarily unavailable")
+        return iter(deepcopy(self.rows))
+
+
+class FakeWandb:
+    Artifact = FakeArtifact
+
+    def __init__(self):
+        self.runs = {}
+        self.init_calls = []
+        self.fail_artifact = self.fail_before_log = self.fail_after_log = self.fail_history = False
+        self.flush = True
+
+    def init(self, **kwargs):
+        self.init_calls.append(kwargs)
+        rid = kwargs["id"]
+        if rid not in self.runs:
+            assert kwargs["resume"] in ("never", "allow")
+            self.runs[rid] = FakeRun(self, rid, kwargs["config"])
+        else:
+            assert kwargs["resume"] in ("must", "allow")
+        return self.runs[rid]
+
+    def Api(self, timeout):
+        return SimpleNamespace(run=lambda path: self.runs[path.split("/")[-1]])
+
+
+def publish(registry, backend):
+    return series.publish_run(registry["run_dir"], owner="oscar-owner", wandb_module=backend, acknowledgement_timeout=0)
+
+
+def test_new_attempt_always_allocates_distinct_id_before_results(tmp_path):
+    value = record(tmp_path)
+    template = {"identity": value["identity"], "label": value["label"]}
+    first, second = create(tmp_path, template), create(tmp_path, template)
+    assert first["run_id"] != second["run_id"]
+    assert len(first["run_id"]) == 32
+    assert index(first)["records"] == {}
+    assert series.load_run(first["run_dir"]) == first
+
+
+@pytest.mark.parametrize("part", ["backbone", "planner", "protocol", "science"])
+def test_incompatible_append_rejected_before_sdk(tmp_path, part):
+    registry = create(tmp_path)
+    value = record(tmp_path)
+    value["identity"][part] = "another" if part == "backbone" else {"changed": True}
+    with pytest.raises(series.SeriesError, match="Incompatible append"):
+        series.stage_record(registry["run_dir"], value)
+    assert not index(registry)["records"]
+
+
+def test_duplicate_retry_does_not_create_second_point(tmp_path):
+    registry = create(tmp_path)
+    value = record(tmp_path)
+    assert series.stage_record(registry["run_dir"], value)["status"] == "staged"
+    assert series.stage_record(registry["run_dir"], value)["status"] == "already_staged"
+    backend = FakeWandb()
+    assert publish(registry, backend)["published"] == 1
+    assert series.stage_record(registry["run_dir"], value)["status"] == "published"
+    publish(registry, backend)
+    assert len(backend.runs[registry["run_id"]].rows) == 1
+
+
+@pytest.mark.parametrize("change", ["record_id", "metrics", "checkpoint_hash", "artifact"])
+def test_conflicting_checkpoint_requires_new_attempt(tmp_path, change):
+    registry = create(tmp_path)
+    value = record(tmp_path)
+    series.stage_record(registry["run_dir"], value)
+    if change == "record_id":
+        value["record_id"] = "independent-repeat"
+    elif change == "metrics":
+        value["metrics"]["eval/return_mean"] = 9
+    elif change == "checkpoint_hash":
+        value["checkpoint"]["sha256"] = "b" * 64
+    else:
+        Path(value["source_result_path"]).write_text("changed")
+    with pytest.raises(series.SeriesError, match="different accepted result"):
+        series.stage_record(registry["run_dir"], value)
+
+
+def test_out_of_order_checkpoint_axis_and_internal_steps(tmp_path):
+    registry = create(tmp_path)
+    for step in (300_000, 100_000, 200_000, 400_000):
+        series.stage_record(registry["run_dir"], record(tmp_path, step))
+    backend = FakeWandb()
+    publish(registry, backend)
+    remote = backend.runs[registry["run_id"]]
+    assert [row[series.X_AXIS] for row in remote.rows] == [300_000, 100_000, 200_000, 400_000]
+    assert [row["_step"] for row in remote.rows] == [0, 1, 2, 3]
+    assert ("*", {"step_metric": series.X_AXIS, "step_sync": False, "hidden": True}) in remote.definitions
+    assert ("eval/return_mean", {"step_metric": series.X_AXIS, "step_sync": False, "hidden": False}) in remote.definitions
+    assert len(remote.artifacts) == 4
+    assert all("evaluation-series-record.json" in item[0].files for item in remote.artifacts)
+
+
+def test_open_publisher_reuses_sdk_and_does_not_resend_queued(tmp_path):
+    registry = create(tmp_path)
+    backend = FakeWandb()
+    with series.Publisher(registry["run_dir"], wandb_module=backend) as publisher:
+        series.stage_record(registry["run_dir"], record(tmp_path, 300_000))
+        assert publisher.publish_pending()["queued"] == 1
+        publisher.publish_pending()
+        series.stage_record(registry["run_dir"], record(tmp_path, 100_000))
+        assert publisher.publish_pending()["queued"] == 2
+    assert len(backend.init_calls) == 1
+    assert len(backend.runs[registry["run_id"]].rows) == 2
+
+
+def test_crash_before_row_log_reuses_assigned_slot(tmp_path):
+    registry = create(tmp_path)
+    series.stage_record(registry["run_dir"], record(tmp_path))
+    backend = FakeWandb()
+    backend.fail_before_log = True
+    with pytest.raises(RuntimeError, match="before SDK"):
+        publish(registry, backend)
+    assert index(registry)["records"]["record-100000"]["status"] == "row_inflight"
+    backend.fail_before_log = False
+    assert publish(registry, backend)["published"] == 1
+    assert backend.runs[registry["run_id"]].rows[0]["_step"] == 0
+
+
+def test_crash_after_row_log_reconciles_without_duplicate(tmp_path):
+    registry = create(tmp_path)
+    series.stage_record(registry["run_dir"], record(tmp_path))
+    backend = FakeWandb()
+    backend.fail_after_log = True
+    with pytest.raises(RuntimeError, match="after SDK"):
+        publish(registry, backend)
+    backend.fail_after_log = False
+    assert publish(registry, backend)["published"] == 1
+    assert len(backend.runs[registry["run_id"]].rows) == 1
+
+
+def test_crash_after_remote_receipt_before_local_index_recovers(tmp_path, monkeypatch):
+    registry = create(tmp_path)
+    series.stage_record(registry["run_dir"], record(tmp_path))
+    backend = FakeWandb()
+    original = series._atomic_json
+
+    def fail_receipt(path, value):
+        if Path(path).name == "publication.json" and any(entry["status"] == "published" for entry in value.get("records", {}).values()):
+            raise OSError("local receipt disk failure")
+        return original(path, value)
+
+    monkeypatch.setattr(series, "_atomic_json", fail_receipt)
+    with pytest.raises(OSError, match="receipt disk"):
+        publish(registry, backend)
+    assert index(registry)["records"]["record-100000"]["status"] == "queued"
+    assert len(backend.runs[registry["run_id"]].rows) == 1
+    monkeypatch.setattr(series, "_atomic_json", original)
+    assert publish(registry, backend)["published"] == 1
+    assert len(backend.runs[registry["run_id"]].rows) == 1
+
+
+def test_uncertain_remote_visibility_fails_closed_then_recovers(tmp_path):
+    registry = create(tmp_path)
+    series.stage_record(registry["run_dir"], record(tmp_path))
+    backend = FakeWandb()
+    backend.flush = False
+    with pytest.raises(series.PublicationUncertainError, match="acknowledged"):
+        publish(registry, backend)
+    with pytest.raises(series.PublicationUncertainError, match="slot may be occupied"):
+        publish(registry, backend)
+    remote = backend.runs[registry["run_id"]]
+    assert len(remote.pending) == 1
+    backend.flush = True
+    remote.finish()
+    assert publish(registry, backend)["published"] == 1
+    assert len(remote.rows) == 1
+
+
+def test_network_failure_does_not_modify_scientific_result(tmp_path):
+    registry = create(tmp_path)
+    value = record(tmp_path)
+    series.stage_record(registry["run_dir"], value)
+    before = Path(value["source_result_path"]).read_bytes()
+    backend = FakeWandb()
+    backend.fail_artifact = True
+    with pytest.raises(RuntimeError, match="artifact network"):
+        publish(registry, backend)
+    assert Path(value["source_result_path"]).read_bytes() == before
+    assert index(registry)["records"][value["record_id"]]["status"] == "staged"
+    backend.fail_artifact = False
+    assert publish(registry, backend)["published"] == 1
+
+
+def test_remote_history_failure_never_retransmits(tmp_path):
+    registry = create(tmp_path)
+    series.stage_record(registry["run_dir"], record(tmp_path))
+    backend = FakeWandb()
+    publish(registry, backend)
+    backend.fail_history = True
+    with pytest.raises(series.PublicationUncertainError, match="verify remote history"):
+        publish(registry, backend)
+    assert len(backend.init_calls) == 1
+
+
+@pytest.mark.parametrize("corruption", ["duplicate", "unknown", "changed_hash", "changed_identity", "removed"])
+def test_remote_divergence_rejected(tmp_path, corruption):
+    registry = create(tmp_path)
+    series.stage_record(registry["run_dir"], record(tmp_path))
+    backend = FakeWandb()
+    publish(registry, backend)
+    remote = backend.runs[registry["run_id"]]
+    if corruption == "duplicate":
+        remote.rows.append(dict(remote.rows[0]))
+    elif corruption == "unknown":
+        remote.rows[0][series.RECORD_KEY] = "unknown"
+    elif corruption == "changed_hash":
+        remote.rows[0][series.HASH_KEY] = "x"
+    elif corruption == "changed_identity":
+        remote.config["evaluation_identity_sha256"] = "x"
+    else:
+        remote.rows.clear()
+    with pytest.raises(series.SeriesError):
+        publish(registry, backend)
+
+
+def test_exclusive_owner_and_shared_filesystem_lock(tmp_path):
+    registry = create(tmp_path)
+    with pytest.raises(series.SeriesError, match="registered publication owner"):
+        series.Publisher(registry["run_dir"], owner="different-host")
+    with series.Publisher(registry["run_dir"], wandb_module=FakeWandb()):
+        with pytest.raises(series.SeriesError, match="already owns"):
+            with series.Publisher(registry["run_dir"], wandb_module=FakeWandb()):
+                pass
+
+
+def test_copied_registry_is_not_a_second_publication_owner(tmp_path):
+    registry = create(tmp_path)
+    copied = tmp_path / "copied"
+    copied.mkdir()
+    (copied / "run.json").write_text(json.dumps(registry))
+    with pytest.raises(series.SeriesError, match="authoritative owner directory"):
+        series.load_run(copied)
+
+
+def test_nonfinite_and_missing_remain_distinct(tmp_path):
+    registry = create(tmp_path)
+    value = record(tmp_path)
+    value["metrics"].update({"diagnostic/missing": None, "diagnostic/nonfinite": {"nonfinite": "nan"}})
+    series.stage_record(registry["run_dir"], value)
+    backend = FakeWandb()
+    publish(registry, backend)
+    row = backend.runs[registry["run_id"]].rows[0]
+    assert row["diagnostic/missing"] is None
+    assert "diagnostic/nonfinite" not in row
+    assert row["measurement_status/diagnostic/nonfinite"] == "nan"
+    value["metrics"]["bad"] = float("nan")
+    with pytest.raises(series.SeriesError, match="finite JSON"):
+        series.validate_record(value)
+
+
+def test_accepted_artifact_must_remain_immutable(tmp_path):
+    registry = create(tmp_path)
+    value = record(tmp_path)
+    series.stage_record(registry["run_dir"], value)
+    Path(value["source_result_path"]).write_text("changed")
+    with pytest.raises(series.SeriesError, match="changed before publication"):
+        publish(registry, FakeWandb())
+
+
+def test_legacy_artifact_dependency_is_linked(tmp_path):
+    registry = create(tmp_path)
+    value = record(tmp_path)
+    value["provenance"]["legacy_artifacts"] = ["entity/project/full-trace:v0"]
+    series.stage_record(registry["run_dir"], value)
+    backend = FakeWandb()
+    publish(registry, backend)
+    assert backend.runs[registry["run_id"]].used_artifacts == ["entity/project/full-trace:v0"]
+
+
+def test_worker_pointer_is_atomic_idempotent_and_does_not_load_sdk(tmp_path, monkeypatch):
+    registry = create(tmp_path)
+    source = record(tmp_path)["source_result_path"]
+    first = series.stage_result(registry["run_dir"], source, selector="prior")
+    assert series.stage_result(registry["run_dir"], source, selector="prior") == first
+    assert len(list((Path(registry["run_dir"]) / "incoming").glob("*.json"))) == 1
+    assert index(registry)["records"] == {}
+
+
+def test_cpu_publisher_resolves_pointer_and_selects_controller(tmp_path, monkeypatch):
+    value = record(tmp_path)
+    value["controller"] = "native_mppi"
+    registry = create(tmp_path, value)
+    series.stage_result(registry["run_dir"], value["source_result_path"], selector="native_mppi", format="tdmpc2-paired", source_run=value["identity"]["backbone"])
+    calls = []
+
+    def load_records(path, **kwargs):
+        calls.append((path, kwargs))
+        return [dict(value, controller="policy_prior", record_id="prior"), value]
+
+    monkeypatch.setitem(sys.modules, "utils.eval_series_data", SimpleNamespace(load_records=load_records))
+    backend = FakeWandb()
+    assert publish(registry, backend)["published"] == 1
+    assert calls[0][1]["source_run"] == value["identity"]["backbone"]
+    assert list((Path(registry["run_dir"]) / "incoming").glob("*.json")) == []
+    assert len(list((Path(registry["run_dir"]) / "accepted-pointers").glob("*.json"))) == 1
+
+
+def test_copied_artifact_bytes_are_idempotent(tmp_path):
+    registry = create(tmp_path)
+    value = record(tmp_path)
+    series.stage_record(registry["run_dir"], value)
+    copied = tmp_path / "copied.json"
+    copied.write_bytes(Path(value["source_result_path"]).read_bytes())
+    value["source_result_path"] = str(copied)
+    value["artifact_files"] = {"result.json": str(copied)}
+    assert series.stage_record(registry["run_dir"], value)["status"] == "already_staged"
+
+
+@pytest.mark.parametrize("name", ["../secret", "/absolute", "a/../../secret", "bad\\path", "evaluation-series-record.json"])
+def test_artifact_paths_cannot_escape_bundle(tmp_path, name):
+    value = record(tmp_path)
+    value["artifact_files"] = {name: value["source_result_path"]}
+    with pytest.raises(series.SeriesError, match="safe relative paths"):
+        series.validate_record(value)

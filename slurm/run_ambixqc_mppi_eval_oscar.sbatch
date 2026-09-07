@@ -23,6 +23,10 @@ cd "${SLURM_SUBMIT_DIR:?Submit from the clean repository root.}"
 PYTHON_BIN="${PYTHON_BIN:-/oscar/home/rgao48/action-modes/environments/dmcontrol/.venv/bin/python}"
 MODE="${AMBIXQC_EVAL_MODE:-production}"
 [[ "$MODE" == smoke || "$MODE" == production ]] || { echo "Invalid evaluation mode" >&2; exit 2; }
+if [[ "$MODE" == production ]]; then
+  : "${EVAL_RUN_MAP:?Prepare explicit New/Append evaluation runs before submission.}"
+  [[ "$EVAL_RUN_MAP" == /* && -f "$EVAL_RUN_MAP" ]] || exit 2
+fi
 [[ "$EXPECTED_ACTION_MODES_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 2
 [[ "$CHECKPOINT_MANIFEST" == /* && "$RESULT_ROOT" == /* && "$PYTHON_BIN" == /* ]] || exit 2
 [[ -f "$CHECKPOINT_MANIFEST" && -x "$PYTHON_BIN" ]] || exit 2
@@ -64,7 +68,9 @@ if [[ "$MODE" == smoke ]]; then
     tests/test_ambixqc_controller.py tests/test_ambixqc_prior_checkpoint.py
 fi
 args=(--manifest "$CHECKPOINT_MANIFEST" --index "$SLURM_ARRAY_TASK_ID" --result-root "$RESULT_ROOT" --mode "$MODE" --device cuda)
-[[ "$MODE" != production ]] || args+=(--wandb)
+if [[ "$MODE" == production ]]; then
+  args+=(--eval-run-map "$EVAL_RUN_MAP")
+fi
 srun --unbuffered --kill-on-bad-exit=1 --ntasks=1 "$PYTHON_BIN" run_ambixqc_mppi_evaluation.py "${args[@]}"
 [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || { echo "Source changed during evaluation" >&2; exit 2; }
 echo "AMBI-XQC paired MPPI $MODE completed successfully."

@@ -230,26 +230,17 @@ def test_legacy_order_label_respects_all_three_component_totals(
     assert "(joint then critic)" not in labels["name"]
 
 
-def test_new_run_persists_and_publishes_labels_without_changing_groups(tmp_path, monkeypatch):
-    calls = []
-
-    def initialize(params, *, default_project, run_name, config):
-        calls.append({"params": params, "name": run_name, "config": config})
-        return SimpleNamespace(path="entity/ambi-inner-bench/new-run", define_metric=lambda *args, **kwargs: None)
-
-    monkeypatch.setattr("utils.wandb_utils.init_wandb", initialize)
+def test_new_run_persists_labels_without_initializing_wandb(tmp_path, monkeypatch):
+    monkeypatch.setattr("utils.wandb_utils.init_wandb", lambda *a, **k: pytest.fail("GPU W&B initialization"))
     checkpoint, protocol, config = _label_inputs("outer_target")
-    bundle = storage.BenchmarkBundle(tmp_path / "labels", checkpoint=checkpoint, protocol=protocol,
-                                    wandb={"project": "ambi-inner-bench", "entity": "entity", "mode": "offline"})
+    bundle = storage.BenchmarkBundle(tmp_path / "labels", checkpoint=checkpoint, protocol=protocol)
     resolved = {**_resolved(), "selector": "named_run/d512_4_j6_outer_target", "algorithm_config": config}
     run = bundle.start_run(resolved, "episodes")
     expected = storage.benchmark_run_labels(checkpoint, protocol, config, "episodes", selector=resolved["selector"])
     saved = storage.read_json(bundle.path / "manifest.json")["runs"][0]
-    assert saved["wandb_name"] == calls[0]["name"] == expected["name"]
-    assert saved["wandb_tags"] == calls[0]["params"]["wandb_tags"] == expected["tags"]
-    assert calls[0]["params"]["wandb_group"] == f"{'a' * 12}-named_run__d512_4_j6_outer_target"
-    assert calls[0]["config"]["inner_config"] == config
-    assert run["wandb_path"] == "entity/ambi-inner-bench/new-run"
+    assert saved["wandb_name"] == expected["name"]
+    assert saved["wandb_tags"] == expected["tags"]
+    assert "wandb_path" not in run
 
 
 def test_atomic_outputs_preserve_existing_data_and_clean_temporary_files(tmp_path, monkeypatch):
@@ -375,167 +366,79 @@ def test_episode_deltas_are_explicit_seed_matches(tmp_path):
     bundle.finish()
 
 
-def _fake_wandb(monkeypatch, *, artifact_error=None, finish_error=None, define_error=None):
-    events, runs = [], []
-
-    class Artifact:
-        def __init__(self, name, type):
-            self.name, self.type, self.files = name, type, []
-
-        def add_file(self, path, name):
-            self.files.append((path, name))
-
-    class Run:
-        def __init__(self, name):
-            self.name, self.path = name, f"entity/project/{name}"
-            self.summary, self.logs, self.artifacts = {}, [], []
-            self.closed = False
-            # The generic helper initially associates both metric families
-            # with cumulative environment steps. Benchmark setup overrides it.
-            self.definitions = {
-                "episode/*": {"step_metric": "env_step"},
-                "eval/*": {"step_metric": "env_step"},
-            }
-
-        def define_metric(self, name, **kwargs):
-            assert not self.closed
-            if define_error:
-                raise define_error
-            self.definitions.setdefault(name, {}).update(kwargs)
-
-        def log(self, value):
-            assert not self.closed
-            self.logs.append(value)
-
-        def log_artifact(self, artifact):
-            self.artifacts.append(artifact)
-            events.append((self.name, "artifact"))
-            if artifact_error:
-                raise artifact_error
-
-        def finish(self, exit_code):
-            self.closed = True
-            self.exit_code = exit_code
-            events.append((self.name, "finish"))
-            if finish_error:
-                raise finish_error
-
-    def initialize(params, *, default_project, run_name, config):
-        assert not any(not run.closed for run in runs), "W&B runs must be finished sequentially"
-        assert params["wandb_project"] == "ambi-inner-bench"
-        run = Run(run_name)
-        events.append((run_name, "init"))
-        runs.append(run)
-        return run
-
-    monkeypatch.setattr("utils.wandb_utils.init_wandb", initialize)
-    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Artifact=Artifact))
-    return runs, events
+def _fake_series(monkeypatch, *, error=None):
+    calls = []
+    def stage(run_dir, path, **kwargs):
+        calls.append((run_dir, Path(path), kwargs, storage.read_json(path)))
+        if error:
+            raise error
+    monkeypatch.setitem(sys.modules, "utils.eval_series", SimpleNamespace(
+        stage_result=stage, load_run=lambda path: {"run_id": Path(path).name}))
+    monkeypatch.setattr("utils.wandb_utils.init_wandb", lambda *a, **k: pytest.fail("GPU W&B initialization"))
+    return calls
 
 
-def test_wandb_runs_are_sequential_and_artifacts_independently_readable(tmp_path, monkeypatch):
-    from report_ambi_benchmark import load_bundles
-
-    remotes, events = _fake_wandb(monkeypatch)
-    options = {"project": "ambi-inner-bench", "entity": "entity", "mode": "offline"}
-    bundle = _bundle(tmp_path, wandb=options)
+def test_finished_bundle_queues_only_after_all_results_are_durable(tmp_path, monkeypatch):
+    calls = _fake_series(monkeypatch)
+    mapping = {"inner_budget/prior": str(tmp_path / "prior"), "inner_budget/sac": str(tmp_path / "sac")}
+    bundle = _bundle(tmp_path, eval_run_map=mapping)
     for variant in ("prior", "sac"):
         run = bundle.start_run(_resolved(variant), "episodes")
         bundle.episode(run, _episode(), [_event()])
-        bundle.finish_run(run)
+        bundle.finish_run(run, result={"outer_state_unchanged": True})
+        assert calls == []
     bundle.finish()
-    assert [phase for _, phase in events] == ["init", "artifact", "finish", "init", "artifact", "finish"]
-    assert all(remote.exit_code == 0 for remote in remotes)
-    for remote in remotes:
-        assert remote.logs[0]["episode/return"] == 50.0
-        artifact = remote.artifacts[0]
-        destination = tmp_path / remote.name
-        for source, name in artifact.files:
-            target = destination / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(Path(source).read_bytes())
-        report = load_bundles([destination])
-        assert len(report["runs"]) == 1
-        assert report["runs"][0]["status"] == "complete"
+    assert len(calls) == 2
+    assert all(call[3]["status"] == "complete" for call in calls)
+    assert [call[2]["selector"] for call in calls] == list(mapping)
+    assert all(call[2]["format"] == "ambi-bundle" for call in calls)
+    from report_ambi_benchmark import load_bundles
+    assert len(load_bundles([bundle.path])["runs"]) == 2
 
 
-def test_episode_metric_definitions_hide_seed_observations_without_changing_history(tmp_path, monkeypatch):
-    remotes, _ = _fake_wandb(monkeypatch)
-    bundle = _bundle(tmp_path, reference={101: 40.0, 102: 80.0},
-                     wandb={"project": "ambi-inner-bench", "entity": "entity", "mode": "offline"})
-    run = bundle.start_run(_resolved(), "episodes")
-    remote = remotes[0]
-    assert remote.definitions["episode/*"] == {"step_metric": "episode/index", "hidden": True}
-    assert remote.definitions["eval/paired_return_delta"] == {
-        "step_metric": "episode/index", "hidden": True,
-    }
-    assert remote.definitions["episode/index"] == {"hidden": True}
-    assert remote.definitions["env_step"] == {"hidden": True}
-    assert remote.definitions["eval/*"] == {"step_metric": "env_step"}
-    bundle.episode(run, {**_episode(101, 50.0), "length": 3}, [])
-    bundle.episode(run, {**_episode(102, 60.0), "length": 5}, [])
-    assert [row["episode/index"] for row in remote.logs] == [1, 2]
-    assert [row["episode/seed"] for row in remote.logs] == [101, 102]
-    assert [row["episode/return"] for row in remote.logs] == [50.0, 60.0]
-    assert [row["env_step"] for row in remote.logs] == [3, 8]
-    assert [row["eval/paired_return_delta"] for row in remote.logs] == [10.0, -20.0]
-    bundle.finish_run(run)
-    bundle.finish()
-
-
-def test_metric_definition_failure_keeps_remote_registered_for_cleanup(tmp_path, monkeypatch):
-    error = RuntimeError("benchmark metric definition failed")
-    remotes, _ = _fake_wandb(monkeypatch, define_error=error)
-    bundle = _bundle(tmp_path, wandb={"project": "ambi-inner-bench", "entity": "entity", "mode": "offline"})
-    with pytest.raises(RuntimeError, match="metric definition failed"):
-        bundle.start_run(_resolved(), "episodes")
-    bundle.finish(error=error)
-    assert remotes[0].closed and remotes[0].exit_code == 1
-    assert not bundle.remote_runs
-    assert storage.read_json(bundle.path / "manifest.json")["runs"][0]["status"] == "failed"
-
-
-def test_wandb_publication_failure_closes_as_failed_and_retains_local_data(tmp_path, monkeypatch):
-    publication_error = RuntimeError("artifact upload failed")
-    remotes, _ = _fake_wandb(monkeypatch, artifact_error=publication_error)
-    bundle = _bundle(tmp_path, wandb={"project": "ambi-inner-bench", "entity": "entity", "mode": "offline"})
+def test_staging_failure_retains_complete_science_and_trace_data(tmp_path, monkeypatch):
+    _fake_series(monkeypatch, error=OSError("registry unavailable"))
+    bundle = _bundle(tmp_path, eval_run_map={"inner_budget/sac": str(tmp_path / "series")})
     run = bundle.start_run(_resolved(), "episodes")
     bundle.episode(run, _episode(), [_event()])
-    with pytest.raises(RuntimeError, match="artifact upload failed"):
-        bundle.finish_run(run)
-    assert remotes[0].closed and remotes[0].exit_code == 1
-    assert not bundle.remote_runs
+    bundle.finish_run(run, result={"outer_state_unchanged": True})
+    bundle.finish()
     manifest = storage.read_json(bundle.path / "manifest.json")
-    assert manifest["runs"][0]["episodes"][0]["return"] == 50.0
+    assert manifest["status"] == manifest["runs"][0]["status"] == "complete"
+    assert manifest["runs"][0]["episodes"][0]["return"] == 50
     assert len(_trace_rows(bundle, run)) == 1
+    publication = storage.read_json(bundle.path / ".series-staging.json")
+    assert publication["inner_budget/sac"]["status"] == "failed"
+    assert "registry unavailable" in publication["inner_budget/sac"]["error"]
 
 
-def test_wandb_finish_failure_does_not_mask_publication_error(tmp_path, monkeypatch):
-    publication_error = RuntimeError("artifact upload failed")
-    _fake_wandb(monkeypatch, artifact_error=publication_error, finish_error=OSError("finish failed"))
-    bundle = _bundle(tmp_path, wandb={"project": "ambi-inner-bench", "entity": "entity", "mode": "offline"})
-    run = bundle.start_run(_resolved(), "episodes")
-    with pytest.raises(RuntimeError, match="artifact upload failed") as caught:
-        bundle.finish_run(run)
-    assert caught.value is publication_error
-    assert any("finish failed" in note for note in getattr(caught.value, "__notes__", []))
+def test_later_config_failure_still_queues_completed_config(tmp_path, monkeypatch):
+    calls = _fake_series(monkeypatch)
+    bundle = _bundle(tmp_path, eval_run_map={key: str(tmp_path / key.replace("/", "_"))
+                                           for key in ("inner_budget/prior", "inner_budget/sac")})
+    prior = bundle.start_run(_resolved("prior"), "episodes")
+    bundle.episode(prior, _episode(), [])
+    bundle.finish_run(prior, result={"outer_state_unchanged": True})
+    failed = bundle.start_run(_resolved(), "episodes")
+    bundle.finish(error=RuntimeError("second planner failed"))
+    assert len(calls) == 1 and calls[0][2]["selector"] == "inner_budget/prior"
+    assert failed["status"] == "failed" and prior["status"] == "complete"
 
 
-def test_failed_wandb_initialization_marks_local_run_failed(tmp_path, monkeypatch):
-    initialization_error = RuntimeError("W&B initialization failed")
-
-    def initialize(*args, **kwargs):
-        raise initialization_error
-
-    monkeypatch.setattr("utils.wandb_utils.init_wandb", initialize)
-    bundle = _bundle(tmp_path, wandb={"project": "ambi-inner-bench", "entity": "entity", "mode": "offline"})
-    with pytest.raises(RuntimeError, match="initialization failed"):
-        bundle.start_run(_resolved(), "episodes")
-    bundle.finish(error=initialization_error)
-    manifest = storage.read_json(bundle.path / "manifest.json")
-    assert manifest["status"] == "failed"
-    assert manifest["runs"][0]["status"] == "failed"
-    assert "initialization failed" in manifest["runs"][0]["error"]
+def test_explicit_selection_is_required_before_creating_output(tmp_path, monkeypatch):
+    _fake_series(monkeypatch)
+    with pytest.raises(ValueError, match="explicit"):
+        _bundle(tmp_path, wandb={"project": "test"})
+    assert not (tmp_path / "bundle").exists()
+    with pytest.raises(ValueError, match="explicit"):
+        storage.resolve_eval_run_map(["a"], wandb=True)
+    with pytest.raises(ValueError, match="exactly one"):
+        storage.resolve_eval_run_map(["a", "b"], run_dir=tmp_path / "run")
+    with pytest.raises(ValueError, match="every selected"):
+        storage.resolve_eval_run_map(["a", "b"], run_map={"a": "one"})
+    with pytest.raises(ValueError, match="distinct"):
+        storage.resolve_eval_run_map(["a", "b"], run_map={"a": "one", "b": "one"})
+    assert storage.resolve_eval_run_map(["a"], run_dir=tmp_path / "run") == {"a": str(tmp_path / "run")}
 
 
 def _xqc_resolved(operator="xqc"):
@@ -748,16 +651,15 @@ def test_report_rejects_misrecorded_mppi_controller(tmp_path, change, match):
         load_bundles([bundle.path])
 
 
-def test_mppi_runtime_settings_update_remote_labels_without_network(tmp_path, monkeypatch):
-    remote = SimpleNamespace(path="entity/project/run", config={}, define_metric=lambda *a, **k: None)
-    monkeypatch.setattr("utils.wandb_utils.init_wandb", lambda *a, **k: remote)
-    bundle = _bundle(tmp_path, wandb={"project": "project", "entity": "entity", "mode": "offline"})
+def test_mppi_runtime_settings_are_saved_without_remote_access(tmp_path, monkeypatch):
+    monkeypatch.setattr("utils.wandb_utils.init_wandb", lambda *a, **k: pytest.fail("GPU W&B initialization"))
+    bundle = _bundle(tmp_path)
     run = bundle.start_run(_mppi_resolved(), "episodes")
     controller = _mppi_controller()
     bundle.set_evaluation_controller(run, controller)
-    assert "J8" in remote.name
-    assert "action:weighted_elite_gumbel_no_execution_noise" in remote.tags
-    assert remote.config == {"evaluation_controller": controller, "action_rule": storage.MPPI_ACTION_RULE}
+    assert "J8" in run["wandb_name"]
+    assert "action:weighted_elite_gumbel_no_execution_noise" in run["wandb_tags"]
+    assert run["evaluation_controller"] == controller
 
 
 def test_xqc_outer_terminal_bootstrap_has_distinct_labels_without_changing_native_defaults():
@@ -771,3 +673,50 @@ def test_xqc_outer_terminal_bootstrap_has_distinct_labels_without_changing_nativ
     assert {"terminal-bootstrap:outer", "terminal-policy:frozen-outer", "terminal-q:online-outer", "terminal-alpha:inner"} <= set(labels["tags"])
     metrics = storage.decision_metric_catalog(["decision/inner_outer_terminal_bootstrap_rows", "decision/inner_outer_terminal_q_evaluations"], xqc=True)
     assert all(item["unit"] == "count" for item in metrics.values())
+
+
+def test_prepare_specs_resolves_before_writing_and_never_initializes_wandb(tmp_path, monkeypatch):
+    calls = []
+    def identity(checkpoint, resolved, protocol, seeds, code, **kwargs):
+        calls.append((resolved["selector"], seeds, kwargs))
+        return {"backbone": "entity/project/backbone", "planner": {"type": "prior" if resolved["selector"].endswith("prior") else "sac"}}
+    monkeypatch.setitem(sys.modules, "utils.eval_series_data", SimpleNamespace(identity_for_ambi_checkpoint=identity, descriptive_label=lambda identity, selector: "Policy prior" if identity["planner"]["type"] == "prior" else selector))
+    monkeypatch.setattr("utils.wandb_utils.init_wandb", lambda *a, **k: pytest.fail("spec initialization contacted W&B"))
+    directory = tmp_path / "specs"
+    checkpoint = {**CHECKPOINT, "path": str(tmp_path / "checkpoint")}
+    prepared = storage.write_eval_series_specs(directory, checkpoint, [_resolved("prior"), _resolved()],
+                                               _protocol(), [101, 102], inventory_path="inventory.json")
+    assert list(prepared["specs"]) == ["inner_budget/prior", "inner_budget/sac"]
+    assert storage.read_json(Path(prepared["specs"]["inner_budget/prior"]))["label"] == "Policy prior"
+    assert all(call[2]["inventory_path"] == "inventory.json" for call in calls)
+    with pytest.raises(FileExistsError):
+        storage.write_eval_series_specs(directory, checkpoint, [_resolved()], _protocol(), [101])
+
+
+def test_spec_error_leaves_no_partial_output_and_dirty_sources_are_rejected(tmp_path, monkeypatch):
+    def fail(*args, **kwargs):
+        raise ValueError("incompatible checkpoint")
+    monkeypatch.setitem(sys.modules, "utils.eval_series_data", SimpleNamespace(identity_for_ambi_checkpoint=fail, descriptive_label=lambda *a: "unused"))
+    with pytest.raises(ValueError, match="incompatible checkpoint"):
+        storage.write_eval_series_specs(tmp_path / "specs", CHECKPOINT, [_resolved()], _protocol(), [101])
+    assert not (tmp_path / "specs").exists()
+    monkeypatch.setattr(storage, "code_identity", lambda: {"dirty": True})
+    with pytest.raises(ValueError, match="clean checkout"):
+        storage.write_eval_series_specs(tmp_path / "specs", CHECKPOINT, [_resolved()], _protocol(), [101])
+
+
+def test_preflight_rejects_incompatible_assigned_identity_before_staging(tmp_path, monkeypatch):
+    calls = []
+    expected = {"backbone": "source", "planner": {"type": "sac", "updates": 3}}
+    from utils.eval_series import validate_identity
+    def check(run_dir, actual):
+        calls.append(run_dir)
+        return validate_identity({"identity": expected}, actual)
+    monkeypatch.setitem(sys.modules, "utils.eval_series", SimpleNamespace(validate_identity=check))
+    monkeypatch.setitem(sys.modules, "utils.eval_series_data", SimpleNamespace(
+        identity_for_ambi_checkpoint=lambda *a, **k: {**expected, "planner": {"type": "sac", "updates": 12}}))
+    with pytest.raises(ValueError, match="planner"):
+        storage.preflight_eval_runs({"inner_budget/sac": str(tmp_path / "selected")}, CHECKPOINT,
+                                     [_resolved()], _protocol(), [101], result_path=tmp_path / "manifest.json")
+    assert calls == [str(tmp_path / "selected")]
+    assert not (tmp_path / "manifest.json").exists()
