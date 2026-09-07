@@ -46,6 +46,8 @@ def launch_env(tmp_path):
         (prior / "manifest.json").write_text("{}")
         (prior.parent / "roots.json").write_text("{}")
     calls = tmp_path / "calls.jsonl"
+    run_map = tmp_path / "run-map.json"
+    run_map.write_text("{}")  # Worker arguments are recorded; registry checks have separate tests.
     return {
         **os.environ,
         "PATH": f"{binaries}:{os.environ['PATH']}",
@@ -61,12 +63,16 @@ def launch_env(tmp_path):
         "SLURM_SUBMIT_DIR": str(tmp_path),
         "SLURM_TMPDIR": str(tmp_path / "scratch"),
         "TEST_CALLS": str(calls),
+        "EVAL_RUN_MAP": str(run_map),
+        "CHECKPOINT_MANIFEST": str(run_map),
     }
 
 
 @pytest.mark.parametrize("mode", ["--bank-only", "--bank-smoke"])
 def test_bank_launch_reuses_roots_and_never_runs_episodes(tmp_path, launch_env, launcher, mode):
     env = launch_env
+    env.pop("EVAL_RUN_MAP")
+    env.pop("CHECKPOINT_MANIFEST")
     roots = Path(env["AMBI_BENCHMARK_REFERENCE_ROOT"]) / "step_300000/roots.json"
     calls = Path(env["TEST_CALLS"])
     subprocess.run(["bash", str(launcher), mode], env=env, check=True, capture_output=True, text=True)
@@ -84,7 +90,8 @@ def test_bank_launch_reuses_roots_and_never_runs_episodes(tmp_path, launch_env, 
         assert "--wandb" not in evaluation
     else:
         assert "--bank-repetitions" not in evaluation  # Matrix default: three.
-        assert "--wandb" in evaluation
+        assert "--wandb" not in evaluation
+        assert "--eval-run-map" not in evaluation
     assert report[0] == "report_ambi_benchmark.py"
     assert report[report.index("--bundle") + 1] == str(tmp_path / "output/step_300000/bank")
     # Reusing an output directory must fail before another evaluation starts.
@@ -117,7 +124,8 @@ def test_full_launch_evaluates_both_budgets_and_reuses_prior(
     assert evaluation[evaluation.index("--max-steps") + 1] == "500"
     prior = f"{env['AMBI_BENCHMARK_REFERENCE_ROOT']}/step_{step_index * 100000}/prior"
     assert evaluation[evaluation.index("--reference-bundle") + 1] == prior
-    assert "--wandb" in evaluation
+    assert "--wandb" not in evaluation
+    assert evaluation[evaluation.index("--eval-run-map") + 1] == env["EVAL_RUN_MAP"]
     assert not {"--bank-only", "--root-bank", "--save-root-bank", "--bank-repetitions"} & set(evaluation)
     assert report[0] == "report_ambi_benchmark.py"
     assert [report[i + 1] for i, arg in enumerate(report) if arg == "--bundle"] == [
@@ -174,3 +182,12 @@ def test_oscar_resources_leave_account_and_qos_to_cluster_defaults():
     assert "#SBATCH --array=1-5" in directives
     assert "#SBATCH --no-requeue" in directives
     assert not any("--account" in line or "--qos" in line for line in directives)
+
+
+def test_production_requires_run_assignment_before_evaluation(launch_env, launcher):
+    env = launch_env
+    env.pop("EVAL_RUN_MAP")
+    result = subprocess.run(["bash", str(launcher)], env=env, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "New/Append" in result.stderr
+    assert not Path(env["TEST_CALLS"]).exists()

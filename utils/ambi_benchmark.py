@@ -1,7 +1,7 @@
 """Portable data and publication for frozen AMBI benchmarks.
 
 This module owns no environment or optimizer loop. Recording stays on the CPU;
-serialization and W&B publication happen only at completed episode/root boundaries.
+serialization happens only at completed episode/root boundaries; W&B is owned by a CPU publisher.
 """
 
 from __future__ import annotations
@@ -342,16 +342,113 @@ def code_identity():
         return {**result, "commit": None, "dirty": None, "diff_sha256": None}
 
 
+def resolve_eval_run_map(selectors, *, run_dir=None, run_map=None, wandb=None):
+    """Validate an explicitly prepared run assignment without contacting W&B."""
+    if run_dir is not None and run_map is not None:
+        raise ValueError("Use only one of --eval-run-dir and --eval-run-map.")
+    if run_dir is not None:
+        if len(selectors) != 1:
+            raise ValueError("--eval-run-dir requires exactly one selected planner; use --eval-run-map.")
+        run_map = {selectors[0]: run_dir}
+    if isinstance(run_map, (str, Path)):
+        run_map = read_json(run_map)
+    if run_map is None:
+        if wandb:
+            raise ValueError("--wandb requires an explicit --eval-run-dir or --eval-run-map prepared by eval_series.py create/append.")
+        return {}
+    if not isinstance(run_map, dict) or any(selector not in run_map for selector in selectors):
+        raise ValueError("The evaluation run map must assign every selected planner to an existing run directory.")
+    from utils.eval_series import load_run
+    assigned = {}
+    for selector in selectors:
+        path = Path(run_map[selector]).resolve()
+        load_run(path)
+        assigned[selector] = str(path)
+    if len(set(assigned.values())) != len(assigned):
+        raise ValueError("Distinct selected planners require distinct evaluation run directories.")
+    return assigned
+
+
+def preflight_eval_runs(run_map, checkpoint, resolved_presets, protocol, seeds, *,
+                        result_path, inventory_path=None, source_run=None):
+    """Reject an assignment whose actual resolved controller would change a curve."""
+    if not run_map:
+        return
+    from utils.eval_series import validate_identity
+    from utils.eval_series_data import identity_for_ambi_checkpoint
+    code = code_identity()
+    for resolved in resolved_presets:
+        identity = identity_for_ambi_checkpoint(
+            checkpoint, resolved, protocol, seeds, code, path=result_path,
+            inventory_path=inventory_path, source_run=source_run,
+        )
+        validate_identity(run_map[resolved["selector"]], identity)
+
+
+def write_eval_series_specs(directory, checkpoint, resolved_presets, protocol, seeds, *,
+                            inventory_path=None, source_run=None):
+    """Prepare reviewable New/Append identities without constructing a learner."""
+    from utils.eval_series_data import identity_for_ambi_checkpoint, descriptive_label
+    code = code_identity()
+    if code.get("dirty") is not False:
+        raise ValueError("Prepare evaluation series specifications from a clean checkout.")
+    directory = Path(directory).resolve()
+    if directory.exists():
+        raise FileExistsError(f"Specification directory already exists: {directory}")
+    prepared = {}
+    for resolved in resolved_presets:
+        selector = resolved["selector"]
+        identity = identity_for_ambi_checkpoint(
+            checkpoint, resolved, protocol, seeds, code, path=checkpoint["path"],
+            inventory_path=inventory_path, source_run=source_run,
+        )
+        label = descriptive_label(identity, selector)
+        prepared[selector] = {"identity": identity, "label": label, "selector": selector}
+    directory.mkdir(parents=True, exist_ok=False)
+    paths = {}
+    for selector, spec in prepared.items():
+        path = directory / (selector.replace("/", "__") + ".json")
+        atomic_json(path, spec)
+        paths[selector] = str(path)
+    return {"mode": "evaluation_series_specifications", "specs": paths}
+
+
+def stage_completed_bundle(path, run_map, *, source_run=None, inventory_path=None):
+    """Queue completed local results; publication failures never change science status."""
+    from utils.eval_series import stage_result
+    path = Path(path)
+    manifest_path = path / "manifest.json" if path.is_dir() else path
+    manifest = read_json(manifest_path)
+    status = {}
+    for run in manifest["runs"]:
+        selector = run["selector"]
+        if selector not in run_map or run["status"] != "complete":
+            continue
+        try:
+            stage_result(run_map[selector], manifest_path, selector=selector,
+                         format="ambi-bundle", source_run=source_run,
+                         inventory_path=inventory_path)
+            status[selector] = {"status": "queued", "run_dir": run_map[selector]}
+        except Exception as error:
+            status[selector] = {"status": "failed", "run_dir": run_map[selector],
+                                "error": f"{type(error).__name__}: {error}"}
+    atomic_json(manifest_path.parent / ".series-staging.json", status, overwrite=True)
+    return status
+
+
 class BenchmarkBundle:
     """One invocation's durable manifest and bounded, per-episode trace shards."""
 
-    def __init__(self, path, *, checkpoint, protocol, wandb=None, reference=None):
+    def __init__(self, path, *, checkpoint, protocol, wandb=None, reference=None, eval_run_map=None,
+                 checkpoint_inventory=None):
+        if wandb and not eval_run_map:
+            raise ValueError("W&B publication requires explicitly prepared evaluation run directories.")
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=False)
         self.started = time.perf_counter()
-        self.wandb_options = wandb
+        self.eval_run_map = eval_run_map or {}
+        self.checkpoint_inventory = checkpoint_inventory
         self.reference = reference or {}
-        self.remote_runs = {}
         self.manifest = {
             "schema_version": SCHEMA_VERSION, "evaluation_id": uuid.uuid4().hex,
             "checkpoint": checkpoint, "code": code_identity(), "protocol": protocol,
@@ -373,27 +470,6 @@ class BenchmarkBundle:
                "episodes": [], "roots": [], "trace_files": [], "status": "running",
                "serialization_seconds": 0.0, "publication_seconds": 0.0}
         self.manifest["runs"].append(run)
-        if self.wandb_options:
-            from utils.wandb_utils import init_wandb
-            options = self.wandb_options
-            started = time.perf_counter()
-            remote = init_wandb({
-                "wandb": True, "wandb_project": options["project"],
-                "wandb_entity": options["entity"], "wandb_mode": options["mode"],
-                "wandb_group": f"{self.manifest['checkpoint']['sha256'][:12]}-{run['id']}",
-                "wandb_tags": run["wandb_tags"],
-            }, default_project="ambi-inner-bench", run_name=run["wandb_name"],
-                config={"checkpoint": self.manifest["checkpoint"], "protocol": self.manifest["protocol"],
-                        "code": self.manifest["code"], "inner_config": config})
-            self.remote_runs[run["id"]] = remote
-            # Each row is a separate seeded evaluation episode. Cumulative
-            # env_step counts evaluation work and is not a training axis.
-            remote.define_metric("episode/index", hidden=True)
-            remote.define_metric("episode/*", step_metric="episode/index", hidden=True)
-            remote.define_metric("eval/paired_return_delta", step_metric="episode/index", hidden=True)
-            remote.define_metric("env_step", hidden=True)
-            run["wandb_path"] = remote.path if isinstance(remote.path, str) else "/".join(remote.path)
-            run["publication_seconds"] += time.perf_counter() - started
         self.save()
         return run
 
@@ -439,18 +515,6 @@ class BenchmarkBundle:
             result["paired_return_delta"] = result["return"] - self.reference[result["seed"]]
         run["episodes"].append(result)
         self.write_trace(run, result["episode_id"], events)
-        remote = self.remote_runs.get(run["id"])
-        if remote is not None:
-            started = time.perf_counter()
-            payload = {"episode/index": len(run["episodes"]), "episode/seed": result["seed"],
-                       "env_step": sum(item["length"] for item in run["episodes"]),
-                       "episode/return": result["return"], "episode/length": result["length"],
-                       "time/control_seconds": result["control_seconds"]}
-            payload.update({f"eval/{key}": value for key, value in result["model_metrics"].items()})
-            if "paired_return_delta" in result:
-                payload["eval/paired_return_delta"] = result["paired_return_delta"]
-            remote.log(payload)
-            run["publication_seconds"] += time.perf_counter() - started
         self.save()
 
     def finish_run(self, run, result=None, error=None):
@@ -467,53 +531,12 @@ class BenchmarkBundle:
                     "std": float(np.std(deltas)), "min": min(deltas), "max": max(deltas),
                 }
         self.save()
-        remote = self.remote_runs.pop(run["id"], None)
-        if remote is not None:
-            self._publish_run(run, remote, error)
-        self.save()
-
-    def _publish_run(self, run, remote, error):
-        started = time.perf_counter()
-        primary_error = None
-        try:
-            import wandb
-            remote.summary.update({"status": run["status"], "result": run.get("result", {}),
-                                   "serialization_seconds": run["serialization_seconds"]})
-            # Each W&B artifact is independently readable, including when this
-            # invocation selected several configurations.
-            manifest = {**self.manifest, "runs": [run], "status": run["status"]}
-            manifest_path = self.path / run["id"] / "manifest.json"
-            atomic_json(manifest_path, manifest)
-            artifact = wandb.Artifact(f"inner-benchmark-{self.manifest['evaluation_id']}-{run['id']}",
-                                      type="inner-benchmark")
-            artifact.add_file(str(manifest_path), name="manifest.json")
-            for relative in run["trace_files"]:
-                artifact.add_file(str(self.path / relative), name=relative)
-            if (self.path / "root_bank.json").exists():
-                artifact.add_file(str(self.path / "root_bank.json"), name="root_bank.json")
-            remote.log_artifact(artifact)
-        except BaseException as exc:
-            primary_error = exc
-            run["status"] = "failed"
-            run["publication_error"] = f"{type(exc).__name__}: {exc}"
-            raise
-        finally:
-            try:
-                remote.finish(exit_code=1 if error is not None or primary_error is not None else 0)
-            except BaseException as exc:
-                run["status"] = "failed"
-                run["publication_error"] = run.get("publication_error", f"{type(exc).__name__}: {exc}")
-                if primary_error is None:
-                    raise
-                from utils.cleanup import add_cleanup_notes
-                add_cleanup_notes(primary_error, [exc])
-            finally:
-                run["publication_seconds"] += time.perf_counter() - started
-                self.save()
 
     def finish(self, error=None):
         self.manifest["status"] = "failed" if error is not None else "complete"
         for run in self.manifest["runs"]:
-            if run["status"] == "running" or run["id"] in self.remote_runs:
+            if run["status"] == "running":
                 self.finish_run(run, error=error or RuntimeError("Evaluation did not finish."))
         self.save()
+        if self.eval_run_map:
+            stage_completed_bundle(self.path, self.eval_run_map, inventory_path=self.checkpoint_inventory)

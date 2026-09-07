@@ -1,5 +1,41 @@
 # Frozen-checkpoint AMBI research
 
+## One W&B run per checkpoint curve
+
+A run contains one backbone and one planning configuration across checkpoints.
+Before submitting workers, explicitly choose `eval_series.py create` for a new
+attempt or `eval_series.py append` with the selected existing run directory.
+Create/append checks the scientific identity; repeating a study means creating
+a separate attempt rather than appending duplicate checkpoint measurements.
+Generate a new planner template first with the ordinary matrix/checkpoint/preset
+arguments plus `--eval-series-spec-dir /absolute/specs --checkpoint-inventory
+/absolute/checkpoint-manifest.json`. This resolves the saved settings without
+constructing a model or running episodes. Then use `eval_series.py create --root
+/absolute/registry --spec /absolute/specs/SELECTOR.json --attempt-label LABEL
+--owner oscar-rgao48`, or `eval_series.py append RUN_DIR --spec SPEC` to validate
+a deliberate extension. The emitted registry gives the run directory to assign.
+
+Pass `--eval-run-dir /absolute/run-directory` for a single selected planner, or
+`--eval-run-map /absolute/run-map.json` for several planners. The map is an object
+from exact preset selectors to existing run directories, and can include other
+selectors needed by the same array. Set `EVAL_RUN_MAP` to that map when using the
+cluster launchers, and set `CHECKPOINT_MANIFEST` to the verified checkpoint
+source inventory for SAC launchers. Assignment is prepared once before submission; checkpoint
+workers never create W&B runs. Legacy `--wandb` also requires this assignment.
+Local-only commands omit both the assignment and `--wandb`.
+
+GPU workers preserve the existing manifests, episode records and diagnostic
+traces, then atomically queue completed results. A separate CPU process on the
+authoritative result owner runs `eval_series.py publish RUN_DIR --watch --jobs ARRAY_ID` and
+checks for new results every 15 seconds. This is the only W&B writer for the run.
+Failed publication never changes evaluation completion or requires repeating
+episodes. Keep the run directory and bundles available to the owner; stage
+cross-cluster results there instead of resuming the same run from two hosts.
+Checkpoint return, paired improvement and runtime use
+`checkpoint/training_decisions` as their x-axis. Detailed diagnostics remain in
+the portable artifact and existing HTML report.
+
+
 ## Humanoid inner-SAC benchmark
 
 `ambi_humanoid_inner_benchmark.json` evaluates a frozen checkpoint using its
@@ -29,7 +65,7 @@ termination simply yields fewer observations. Choose fresh output paths.
   --matrix "$AMBI_INNER_MATRIX" --checkpoint "$AMBI_CHECKPOINT" \
   --preset inner_budget/prior --device cuda \
   --bundle-dir results/inner-bench/prior \
-  --save-root-bank results/inner-bench/roots.json --wandb
+  --save-root-bank results/inner-bench/roots.json --eval-run-map "$EVAL_RUN_MAP"
 ```
 
 **2. Screen explicitly selected SAC budgets on those identical observations.**
@@ -42,7 +78,7 @@ performs a fresh inner solve. Select only the budgets to screen.
   --matrix "$AMBI_INNER_MATRIX" --checkpoint "$AMBI_CHECKPOINT" \
   --preset inner_budget/sac_1x --preset inner_budget/sac_2x --device cuda \
   --root-bank results/inner-bench/roots.json --bank-only \
-  --bundle-dir results/inner-bench/screen --wandb
+  --bundle-dir results/inner-bench/screen
 ```
 
 The SAC presets use eight rounds, 512 rollouts per round, horizon three, batch
@@ -61,7 +97,7 @@ at every real decision; matched prior returns come from the saved reference.
   --matrix "$AMBI_INNER_MATRIX" --checkpoint "$AMBI_CHECKPOINT" \
   --preset inner_budget/sac_1x --device cuda \
   --reference-bundle results/inner-bench/prior \
-  --bundle-dir results/inner-bench/confirmation --wandb
+  --bundle-dir results/inner-bench/confirmation --eval-run-map "$EVAL_RUN_MAP"
 ```
 
 Both controllers execute `tanh(mu)` in the real environment. Inner imagined
@@ -118,7 +154,7 @@ For full return evaluation of the higher-critic settings, use
 the launcher's bank flags. Each checkpoint task evaluates C6 followed by C12
 sequentially on one GPU. Each configuration runs five episodes with seeds
 101–105 and at most 500 decisions per episode, with inner SAC at every decision.
-The shared bundle contains separate configuration results and W&B runs; its
+The shared bundle contains separate configuration results and prepared evaluation-run assignments; its
 report compares both configurations with the saved prior. No bank solves run.
 
 Set `AMBI_BENCHMARK_REFERENCE_ROOT` to the completed original campaign's
@@ -345,8 +381,9 @@ sbatch --array=3,4 --time=01:00:00 \
 ```
 
 Submit the outer-target pair separately with its own output root. Each task
-runs the two selected budgets sequentially on one GPU, producing two W&B runs
-and a combined offline HTML report. Each configuration evaluates 25 saved
+runs the two selected budgets sequentially on one GPU, producing local
+diagnostic bundles and a combined offline HTML report. Observation-bank solves
+are not checkpoint episode-return curves and do not create W&B runs. Each configuration evaluates 25 saved
 observations with three solver seeds: 75 solves and no environment episodes.
 Initial and per-round probes use eight fixed-noise rollouts of horizon three;
 probe model steps are recorded separately from optimization model steps.

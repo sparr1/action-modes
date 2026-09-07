@@ -35,6 +35,12 @@ case "${1:-}" in
     ''|--smoke|--bank-only|--bank-smoke) ;;
     *) fail "supported modes: --smoke, --bank-only, --bank-smoke" ;;
 esac
+if [[ "${1:-}" != --smoke && "${1:-}" != --bank-smoke && "${1:-}" != --bank-only ]]; then
+    : "${EVAL_RUN_MAP:?Prepare explicit New/Append evaluation runs before submission.}"
+    : "${CHECKPOINT_MANIFEST:?Supply the verified checkpoint/source-run inventory.}"
+    [[ "$CHECKPOINT_MANIFEST" == /* && -f "$CHECKPOINT_MANIFEST" ]] || fail "checkpoint inventory must be an existing absolute path"
+    [[ "$EVAL_RUN_MAP" == /* && -f "$EVAL_RUN_MAP" ]] || fail "run map must be an existing absolute path"
+fi
 checkpoint_step=$((SLURM_ARRAY_TASK_ID * 100000))
 checkpoint="${AMBI_CHECKPOINT_PREFIX}${checkpoint_step}"
 output="${AMBI_BENCHMARK_OUTPUT_ROOT}/step_${checkpoint_step}"
@@ -59,8 +65,10 @@ if [[ "${1:-}" == --smoke ]]; then
 elif [[ "${1:-}" == --bank-smoke ]]; then
     # Keep the bank's 500-decision protocol; shorten repetitions, not episodes.
     common+=(--bank-repetitions 1)
+elif [[ "${1:-}" == --bank-only ]]; then
+    : # Bank diagnostics remain local and do not use a checkpoint-curve assignment.
 else
-    common+=(--wandb)
+    common+=(--eval-run-map "$EVAL_RUN_MAP" --checkpoint-inventory "$CHECKPOINT_MANIFEST")
     if [[ "${1:-}" != --bank-only ]]; then
         common+=(--seeds 101 102 103 104 105 --max-steps 500)
     fi

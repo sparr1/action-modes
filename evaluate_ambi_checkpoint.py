@@ -122,7 +122,11 @@ def build_parser():
     parser.add_argument("--bank-only", action="store_true", help="Run shared-observation solves without full episodes.")
     parser.add_argument("--bank-repetitions", type=int, help="Solver repetitions per shared observation (matrix default: 3).")
     parser.add_argument("--reference-bundle", type=Path, help="Completed prior-only bundle for matched episode return deltas.")
-    parser.add_argument("--wandb", action="store_true", help="Publish benchmark summaries and artifacts (requires --bundle-dir).")
+    parser.add_argument("--eval-series-spec-dir", type=Path, help="Write New/Append identity templates from checkpoint settings without running evaluation.")
+    parser.add_argument("--checkpoint-inventory", type=Path, help="Verified checkpoint/source-run inventory for curve publication.")
+    parser.add_argument("--eval-run-dir", type=Path, help="Existing evaluation run directory for one selected planner.")
+    parser.add_argument("--eval-run-map", type=Path, help="JSON selector-to-run-directory map prepared before launching workers.")
+    parser.add_argument("--wandb", action="store_true", help="Queue results for CPU publication; requires explicit evaluation run selection.")
     parser.add_argument("--wandb-project", default="ambi-inner-bench")
     parser.add_argument("--wandb-entity", default="rwgao_b-brown-university")
     parser.add_argument("--wandb-mode", choices=("online", "offline"), default="online")
@@ -838,12 +842,22 @@ def evaluate_matrix(
     bank_repetitions=None,
     reference_bundle=None,
     wandb_options=None,
+    eval_run_dir=None,
+    eval_run_map=None,
+    checkpoint_inventory=None,
+    source_run=None,
+    stage_results=True,
+    eval_series_spec_dir=None,
 ):
     """Evaluate selected presets from a matrix with paired seeds."""
     evaluation_started = time.perf_counter()
     matrix_path = Path(matrix_path).resolve()
     matrix = load_preset_matrix(matrix_path)
     selectors = normalize_selectors(matrix, selectors, comparisons)
+    from utils.ambi_benchmark import resolve_eval_run_map
+    assigned_runs = resolve_eval_run_map(selectors, run_dir=eval_run_dir, run_map=eval_run_map, wandb=wandb_options)
+    if bank_only and assigned_runs:
+        raise ValueError("Observation-bank diagnostics remain in local bundles; evaluation curves require full episodes.")
     evaluation = matrix.get("evaluation", {})
     if bank_repetitions is None:
         bank_repetitions = evaluation.get("bank_repetitions", 3)
@@ -883,7 +897,7 @@ def evaluate_matrix(
     _validate_frozen_selection(matrix, resolved_presets)
     if not isinstance(bank_repetitions, int) or isinstance(bank_repetitions, bool) or bank_repetitions < 1:
         raise ValueError("bank_repetitions must be a positive integer.")
-    if (save_root_bank or root_bank_path or bank_only or reference_bundle or wandb_options) and bundle_dir is None:
+    if (save_root_bank or root_bank_path or bank_only or reference_bundle or wandb_options or assigned_runs) and bundle_dir is None:
         raise ValueError("Banks, references, and W&B require --bundle-dir.")
     if bank_only and not root_bank_path:
         raise ValueError("--bank-only requires --root-bank.")
@@ -925,12 +939,28 @@ def evaluate_matrix(
         raise ValueError("Prior reference is missing requested episode seeds.")
     if root_bank is not None:
         protocol["root_bank_id"] = root_bank["id"]
-    bundle = BenchmarkBundle(bundle_dir, checkpoint={
+    checkpoint_identity = {
         "path": str(Path(checkpoint).resolve()), "sha256": checkpoint_sha256,
-        "source_run": matrix.get("source_run"),
+        "source_run": source_run or matrix.get("source_run"),
         "source_run_verified": False,
         "metadata": None if context is None else context.metadata,
-    }, protocol=protocol, wandb=wandb_options, reference=reference) if bundle_dir is not None else None
+    }
+    if eval_series_spec_dir is not None:
+        if assigned_runs:
+            raise ValueError("Prepare specifications separately from assigning an existing evaluation run.")
+        from utils.ambi_benchmark import write_eval_series_specs
+        return write_eval_series_specs(eval_series_spec_dir, checkpoint_identity, resolved_presets,
+                                       protocol, seeds, inventory_path=checkpoint_inventory,
+                                       source_run=source_run)
+    if assigned_runs:
+        from utils.ambi_benchmark import preflight_eval_runs
+        preflight_eval_runs(assigned_runs, checkpoint_identity, resolved_presets, protocol, seeds,
+                           result_path=Path(bundle_dir) / "manifest.json",
+                           inventory_path=checkpoint_inventory, source_run=source_run)
+    bundle = BenchmarkBundle(
+        bundle_dir, checkpoint=checkpoint_identity, protocol=protocol, reference=reference,
+        eval_run_map=assigned_runs if stage_results else {}, checkpoint_inventory=checkpoint_inventory,
+    ) if bundle_dir is not None else None
     if bundle is not None:
         bundle.started = evaluation_started
     results = []
@@ -1065,6 +1095,8 @@ def main(argv=None):
             bank_only=args.bank_only,
             bank_repetitions=args.bank_repetitions,
             reference_bundle=args.reference_bundle,
+            eval_run_dir=args.eval_run_dir, eval_run_map=args.eval_run_map,
+            checkpoint_inventory=args.checkpoint_inventory, eval_series_spec_dir=args.eval_series_spec_dir,
             wandb_options={"project": args.wandb_project, "entity": args.wandb_entity,
                            "mode": args.wandb_mode} if args.wandb else None,
         )
