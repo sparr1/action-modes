@@ -161,17 +161,27 @@ def validate_identity(registry, identity):
     return registry
 
 
-def concise_curve_label(registry):
-    """Budget-first legend text; complete identity remains in the run config."""
-    identity = registry["identity"]
-    planner = identity["planner"]
+def backbone_display_label(identity, *, compact=False):
+    """Readable aliases for verified source IDs, never scientific identity."""
+    known = {
+        "rwgao_b-brown-university/ambi/u13m14st": ("Original AMBI prior-only backbone", "AMBI original"),
+        "rwgao_b-brown-university/ambi/axqc-prior-92441d99-5959199": ("AMBI-XQC prior-only backbone", "AMBI-XQC"),
+        "rwgao_b-brown-university/ambi/xq3zva9u": ("TD-MPC2 prior-only backbone", "TD-MPC2"),
+    }
+    source = identity["backbone"]
+    if source in known:
+        return known[source][bool(compact)]
+    # Unknown sources must not acquire a misleading alias or collapse into a
+    # known backbone merely because their last path component happens to match.
+    return source if compact else "Backbone " + source
+
+
+def _planner_display_label(planner, *, compact=False):
+    """Describe executed behavior rather than the campaign that measured it."""
     settings = planner.get("settings", {})
     kind = planner.get("type", planner.get("operator", "planner"))
-    source = identity["backbone"].rsplit("/", 1)[-1]
-    embedded_id = re.search(r"(?:^|-)([0-9a-f]{8})(?:-|$)", source)
-    source = embedded_id.group(1) if embedded_id else source[:8]
     number = lambda value: format(value, "g").replace("e-0", "e-").replace("e+0", "e+")
-    parts = ["Prior" if kind == "prior" else str(kind).upper()]
+    parts = ["Prior only (no planning)" if kind == "prior" else str(kind).upper()]
     if kind in ("sac", "xqc"):
         rounds = settings.get("inner_rounds")
         doses = []
@@ -183,34 +193,60 @@ def concise_curve_label(registry):
             doses.append("?" if dose is None else number(dose))
         parts.append("/".join(prefix + dose for prefix, dose in zip("CAT", doses)))
         if settings.get("inner_terminal_bootstrap") == "outer":
-            parts.append("outer-term")
+            parts.append("outer-term" if compact else "outer terminal Q")
         else:
             bootstrap = settings.get("inner_bootstrap_source", "inner_target")
             parts.append("outer Q" if bootstrap.startswith("outer") else "inner Q")
         interval = settings.get("inner_steps_per_update")
         if interval:
-            parts.append("s" + number(interval))
+            parts.append(("s" if compact else "interval") + number(interval))
         if settings.get("inner_component_update_schedule"):
             parts.append("split")
         rate = settings.get("inner_actor_lr")
-        if rate is not None and rate != 5e-5:
+        if rate is not None and (not compact or rate != 5e-5):
             parts.append("aLR" + number(rate))
         for key, prefix, default in (("inner_rounds", "J", 6), ("inner_rollouts_per_round", "N", 512), ("inner_rollout_horizon", "H", 3)):
             value = settings.get(key)
-            if value is not None and value != default:
+            if value is not None and (not compact or value != default):
                 parts.append(prefix + number(value))
     elif kind == "mppi":
-        for value, prefix, default in ((settings.get("planning_horizon", settings.get("horizon")), "H", 3),
-                                       (settings.get("num_samples"), "N", 512),
-                                       (settings.get("effective_iterations"), "I", 8)):
-            if value is not None and value != default:
+        for value, prefix in ((settings.get("planning_horizon", settings.get("horizon")), "H"),
+                              (settings.get("num_samples"), "N"),
+                              (settings.get("num_elites"), "E"),
+                              (settings.get("num_pi_trajs"), "pi"),
+                              (settings.get("effective_iterations"), "I")):
+            if value is not None and (not compact or prefix in ("H", "N", "I")):
                 parts.append(prefix + number(value))
+        if not compact:
+            backend = planner.get("backend")
+            if backend == "tdmpc2_mppi_over_frozen_xqc":
+                parts.append("online XQC Q × frozen scale")
+            elif backend == "native_tdmpc2":
+                parts.append("online TD-MPC2 Q")
+    return " ".join(parts)
+
+
+def _attempt_display_label(registry):
     attempt = re.sub(r"[-_ ]?20\d{2}[-_]?\d{2}[-_]?\d{2}", "", registry["attempt_label"]).strip("-_ ")
-    attempt = attempt.replace("-sweep", "")
-    front = " ".join(parts) + " · " + source + " · "
-    suffix = "#" + registry["run_id"][:4]
-    room = max(0, 60 - len(front) - len(suffix) - 1)
-    return front + (attempt[:room].rstrip("-_ ") + " " if room and attempt else "") + suffix
+    labels = {"baseline": "baseline comparison", "critic-sweep": "critic sweep",
+              "actor-sweep": "actor sweep", "interval-sweep": "interval sweep",
+              "native-mppi": "MPPI comparison", "paper-mppi": "MPPI comparison",
+              "inner-j6": "inner-Q comparison", "outer-terminal-j6": "outer-terminal comparison"}
+    return labels.get(attempt, attempt.replace("_", " ").replace("-", " ")) or "evaluation"
+
+
+def evaluation_run_name(registry):
+    """Descriptive name with campaign context explicitly separated as an attempt."""
+    identity = registry["identity"]
+    return (backbone_display_label(identity) + " | " + _planner_display_label(identity["planner"]) +
+            " | Attempt: " + _attempt_display_label(registry) + " [" + registry["run_id"][:4] + "]")
+
+
+def concise_curve_label(registry):
+    """Readable backbone and actual controller, with a suffix for repetitions."""
+    identity = registry["identity"]
+    return (backbone_display_label(identity, compact=True) + " · " +
+            _planner_display_label(identity["planner"], compact=True) + " · #" + registry["run_id"][:4])
 
 
 def create_run(registry_root, record, attempt_label, project, entity, owner):
@@ -234,10 +270,11 @@ def create_run(registry_root, record, attempt_label, project, entity, owner):
     registry = {
         "schema_version": SCHEMA_VERSION, "run_id": run_id, "run_dir": str(run_dir),
         "identity": record["identity"], "identity_sha256": _digest(record["identity"]),
-        "attempt_label": attempt_label, "name": record["label"] + " | " + attempt_label,
+        "attempt_label": attempt_label,
         "project": project, "entity": entity, "owner": owner,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    registry["name"] = evaluation_run_name(registry)
     _atomic_json(run_dir / "run.json", registry)
     _atomic_json(run_dir / "publication.json", {"schema_version": SCHEMA_VERSION, "records": {}, "next_step": 0, "remote_initialized": False})
     return registry
@@ -328,7 +365,7 @@ class Publisher:
                 index["init_started"] = True
                 _atomic_json(self.run_dir / "publication.json", index)
             cfg = {"eval_series_schema": SCHEMA_VERSION, "evaluation_identity": self.registry["identity"], "evaluation_identity_sha256": self.registry["identity_sha256"], "attempt_label": self.registry["attempt_label"], "publication_owner": self.registry["owner"], "source_run": self.registry["identity"]["backbone"], "backbone_id": self.registry["identity"]["backbone"], "planner": self.registry["identity"]["planner"], "curve_label": concise_curve_label(self.registry)}
-            self.run = self.wandb.init(id=self.registry["run_id"], entity=self.registry["entity"], project=self.registry["project"], name=self.registry["name"], config=cfg, tags=["evaluation-curve", "eval-series-v1"], job_type="evaluation-curve", resume=resume, dir=str(self.run_dir), reinit=True)
+            self.run = self.wandb.init(id=self.registry["run_id"], entity=self.registry["entity"], project=self.registry["project"], name=evaluation_run_name(self.registry), config=cfg, tags=["evaluation-curve", "eval-series-v1"], job_type="evaluation-curve", resume=resume, dir=str(self.run_dir), reinit=True)
             if getattr(self.run, "disabled", False) or getattr(getattr(self.run, "settings", None), "mode", "online") != "online":
                 raise SeriesError("Durable publication requires online W&B; use stage-only validation for offline work")
             with _lock(self.run_dir / ".records.lock"):
