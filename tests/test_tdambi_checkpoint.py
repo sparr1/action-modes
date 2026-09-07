@@ -10,6 +10,7 @@ import torch
 
 from RL.TDAMBI import TDAMBI, native_evaluation_params
 from RL.TDMPC2 import TDMPC2Baseline
+from RL.tdmpc2_core.inner_trace import InnerActionTrace
 from utils.ambi_research import PresetMatrixError, load_preset_matrix, normalize_selectors, resolve_preset
 from utils.checkpoint_context import load_checkpoint_context
 
@@ -154,6 +155,51 @@ def test_tdambi_rejects_non_native_or_unsupported_controls(override):
         env.close()
 
 
+def test_tdambi_step_configuration_uses_one_native_pair_per_vector_step():
+    instance = make_tdambi(inner_update_timing="step", inner_steps_per_update=512,
+                          inner_updates_per_round=None, inner_rounds=5,
+                          inner_rollouts_per_round=512, inner_rollout_horizon=3,
+                          train_unroll_horizon=3, inner_batch_size=512,
+                          inner_replay_capacity=12288)
+    try:
+        cfg = instance.cfg
+        assert cfg.inner_operator == "tdambi"
+        assert cfg.inner_update_timing == "step"
+        assert cfg.inner_actor_updates_per_action == cfg.inner_critic_updates_per_action == 15
+        assert cfg.inner_temperature_updates_per_action == 0
+        assert cfg.inner_model_step_budget == 7680
+        assert cfg.inner_total_optimizer_steps_per_action == 30
+        trace = InnerActionTrace()
+        instance.predict([0.2, -0.3, 0.7], collect_diagnostics=False, trace=trace)
+        metrics = instance.agent.last_inner_metrics
+        assert metrics["inner_critic_optimizer_steps"] == metrics["inner_actor_optimizer_steps"] == 15
+        assert metrics["inner_critic_target_updates"] == 15
+        assert metrics["inner_temperature_optimizer_steps"] == 0
+        assert metrics["inner_model_steps"] == 7680
+        calibration = next(event for event in trace.events if event["phase"] == "calibration")
+        assert calibration["replay_size"] == 512
+    finally:
+        instance.close()
+        instance.env.close()
+
+
+@pytest.mark.parametrize("overrides", [
+    {"inner_update_timing": "step", "inner_steps_per_update": None},
+    {"inner_update_timing": "step", "inner_steps_per_update": 512, "inner_updates_per_round": 3},
+    {"inner_update_timing": "round", "inner_steps_per_update": 512},
+])
+def test_tdambi_step_rejects_missing_interval_and_conflicting_schedules(overrides):
+    env = gym.make("Pendulum-v1", max_episode_steps=5)
+    instance = object.__new__(TDAMBI)
+    instance.env = env
+    instance.run_params = {"device": "cpu"}
+    try:
+        with pytest.raises(ValueError, match="inner_steps_per_update"):
+            instance._build_cfg({**tiny_native_params(), **overrides})
+    finally:
+        env.close()
+
+
 def _native_context(tmp_path):
     checkpoint = tmp_path / "checkpoint.pt"
     checkpoint.write_bytes(b"metadata-only")
@@ -168,13 +214,15 @@ def _native_context(tmp_path):
     return load_checkpoint_context(checkpoint)
 
 
-def test_checkpoint_matrix_inherits_native_settings_and_expands_three_budgets(tmp_path):
+def test_checkpoint_matrix_inherits_native_settings_and_expands_budgets_and_step_timing(tmp_path):
     context = _native_context(tmp_path)
     before = copy.deepcopy(context)
     matrix = load_preset_matrix(MATRIX)
     assert normalize_selectors(matrix) == ["inner_budget/tdambi_3"]
-    for budget in (3, 6, 12):
-        resolved = resolve_preset(MATRIX, f"inner_budget/tdambi_{budget}", checkpoint_context=context)
+    variants = [(f"inner_budget/tdambi_{budget}", 6, 6 * budget, "round") for budget in (3, 6, 12)]
+    variants.append(("update_timing/step_j5_c1_a1", 5, 15, "step"))
+    for selector, rounds, updates, timing in variants:
+        resolved = resolve_preset(MATRIX, selector, checkpoint_context=context)
         assert resolved["algorithm_config"]["alg"] == "TDAMBI/TDAMBI"
         assert resolved["source_algorithm"] == "TDMPC2/TDMPC2Baseline"
         params = resolved["algorithm_config"]["alg_params"]
@@ -186,12 +234,14 @@ def test_checkpoint_matrix_inherits_native_settings_and_expands_three_budgets(tm
         finally:
             instance.env.close()
         assert cfg.inner_operator == "tdambi"
-        assert cfg.inner_rounds == 6
+        assert cfg.inner_rounds == rounds
+        assert cfg.inner_update_timing == timing
+        assert cfg.inner_steps_per_update == (512 if timing == "step" else None)
         assert cfg.inner_rollouts_per_round == 512
         assert cfg.inner_rollout_horizon == 3
         assert cfg.inner_batch_size == 512
         assert cfg.inner_replay_capacity == 12288
-        assert cfg.inner_actor_updates_per_action == cfg.inner_critic_updates_per_action == 6 * budget
+        assert cfg.inner_actor_updates_per_action == cfg.inner_critic_updates_per_action == updates
         assert cfg.inner_temperature_updates_per_action == 0
         assert cfg.inner_actor_lr == cfg.inner_critic_lr == 0.0002
         assert cfg.tdambi_entropy_coef == 0.0003

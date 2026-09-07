@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tdambi-native-inner-g3
 #SBATCH --partition=gpus
-#SBATCH --constraint=rtx_a6000
-#SBATCH --gres=gpu:nvidia_rtx_a6000:1
+#SBATCH --nodelist=gpu2501
+#SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=06:00:00
-#SBATCH --array=2-10
+#SBATCH --array=2-20
 #SBATCH --no-requeue
 #SBATCH --output=/tmp/tdambi-eval-%A_%a.out
 #SBATCH --error=/tmp/tdambi-eval-%A_%a.err
 
-# One frozen checkpoint per worker: 100k–500k every 50k. Supply durable
+# One frozen checkpoint per worker: 100k–1M every 50k. Supply durable
 # scheduler logs and an explicitly prepared evaluation-curve run directory.
 set -Eeuo pipefail
 umask 077
@@ -26,14 +26,15 @@ cd "${SLURM_SUBMIT_DIR:?Submit from the repository root}"
 : "${TDAMBI_OUTPUT_ROOT:?Supply an absolute campaign output directory}"
 : "${CHECKPOINT_INVENTORY:?Supply the validated native checkpoint inventory}"
 : "${EVAL_RUN_DIR:?Supply the explicitly prepared evaluation curve run directory}"
-: "${SLURM_ARRAY_TASK_ID:?Use array indices 2 through 10}"
+: "${SLURM_ARRAY_TASK_ID:?Use array indices 2 through 20}"
 [[ "$(git rev-parse HEAD)" == "$EXPECTED_ACTION_MODES_SHA" ]] || fail "Checkout does not match tested commit."
 [[ -z "$(git status --porcelain --untracked-files=normal)" ]] || fail "Evaluation requires a clean checkout."
-[[ "$SLURM_ARRAY_TASK_ID" =~ ^([2-9]|10)$ ]] || fail "Array index must be 2 through 10."
+[[ "$SLURM_ARRAY_TASK_ID" =~ ^([2-9]|1[0-9]|20)$ ]] || fail "Array index must be 2 through 20."
 [[ "$AMBI_DMC_PYTHON" == /* && -x "$AMBI_DMC_PYTHON" ]] || fail "Locked Python must be executable at an absolute path."
 for variable in TDAMBI_CHECKPOINT_PREFIX TDAMBI_REFERENCE_ROOT TDAMBI_OUTPUT_ROOT CHECKPOINT_INVENTORY EVAL_RUN_DIR; do
     [[ "${!variable}" == /* ]] || fail "$variable must be absolute."
 done
+TDAMBI_PRESET="${TDAMBI_PRESET:-inner_budget/tdambi_3}"
 step=$((50000 * SLURM_ARRAY_TASK_ID))
 checkpoint="${TDAMBI_CHECKPOINT_PREFIX}${step}"
 reference="$TDAMBI_REFERENCE_ROOT/step_${step}/paired.json"
@@ -56,11 +57,11 @@ export MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBY
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}" TORCHINDUCTOR_COMPILE_THREADS=1
 "$AMBI_DMC_PYTHON" evaluate_ambi_checkpoint.py \
     --matrix configs/research/tdambi_humanoid_inner_benchmark.json \
-    --preset inner_budget/tdambi_3 --checkpoint "$checkpoint" \
+    --preset "$TDAMBI_PRESET" --checkpoint "$checkpoint" \
     --checkpoint-inventory "$CHECKPOINT_INVENTORY" \
     --controller-seed 12345 --seeds 101 102 103 104 105 --max-steps 500 --device cuda \
     --reference-bundle "$reference" --eval-run-dir "$EVAL_RUN_DIR" \
     --bundle-dir "$output/bundle" --output "$output/results.json"
 "$AMBI_DMC_PYTHON" report_ambi_benchmark.py \
     --bundle "$output/bundle" --output "$output/report.html" \
-    --title "TDAMBI G3 on TD-MPC2 prior — checkpoint ${step}"
+    --title "TDAMBI ${TDAMBI_PRESET} on TD-MPC2 prior — checkpoint ${step}"

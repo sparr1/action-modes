@@ -210,9 +210,18 @@ def _planner_display_label(planner, *, compact=False):
             if value is not None and (not compact or value != default):
                 parts.append(prefix + number(value))
     elif kind == "tdambi":
-        dose = settings.get("inner_updates_per_round")
-        dose = "?" if dose is None else number(dose)
-        parts.append(f"C{dose}/A{dose}")
+        if settings.get("inner_update_timing") == "step":
+            interval = settings.get("inner_steps_per_update")
+            count = settings.get("inner_rollouts_per_round")
+            if isinstance(interval, (int, float)) and interval > 0 and isinstance(count, (int, float)) and count % interval == 0:
+                dose = number(count / interval)
+                parts.append(f"C{dose}/A{dose} per step")
+            else:
+                parts.append("step interval" + ("?" if interval is None else number(interval)))
+        else:
+            dose = settings.get("inner_updates_per_round")
+            dose = "?" if dose is None else number(dose)
+            parts.append(f"C{dose}/A{dose}")
         for key, prefix, default in (("inner_rounds", "J", 6),
                                      ("inner_rollouts_per_round", "N", 512),
                                      ("inner_rollout_horizon", "H", 3),
@@ -284,6 +293,8 @@ def _evaluation_run_tags(registry):
         dose = planner.get("settings", {}).get("inner_updates_per_round")
         if isinstance(dose, (int, float)):
             tags.append(f"C{dose:g}/A{dose:g}")
+        if planner.get("settings", {}).get("inner_update_timing") == "step":
+            tags.append("step-updates")
     return tags
 
 

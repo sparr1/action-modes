@@ -12,26 +12,55 @@
   },
   "evaluation": {
     "controller_seed": 12345,
-    "seeds": [101, 102, 103, 104, 105],
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
     "max_steps": 500,
-    "default_presets": ["inner_budget/tdambi_3"]
+    "default_presets": [
+      "inner_budget/tdambi_3"
+    ]
   },
   "comparisons": {
     "inner_budget": {
       "reference": "tdambi_3",
-      "description": "Native TD-MPC2 actor–critic updates on frozen-model imagined transitions; each update performs critic, actor, and local-target interpolation.",
+      "description": "Native TD-MPC2 actor\u2013critic updates on frozen-model imagined transitions; each update performs critic, actor, and local-target interpolation.",
       "variants": {
         "tdambi_3": {
           "description": "TDAMBI: three paired critic/actor updates per round.",
-          "alg_params": {"inner_updates_per_round": 3}
+          "alg_params": {
+            "inner_updates_per_round": 3
+          }
         },
         "tdambi_6": {
           "description": "TDAMBI: six paired critic/actor updates per round.",
-          "alg_params": {"inner_updates_per_round": 6}
+          "alg_params": {
+            "inner_updates_per_round": 6
+          }
         },
         "tdambi_12": {
           "description": "TDAMBI: twelve paired critic/actor updates per round.",
-          "alg_params": {"inner_updates_per_round": 12}
+          "alg_params": {
+            "inner_updates_per_round": 12
+          }
+        }
+      }
+    },
+    "update_timing": {
+      "reference": "step_j5_c1_a1",
+      "description": "Interleave native paired updates with each vectorized imagined rollout step.",
+      "variants": {
+        "step_j5_c1_a1": {
+          "description": "Five rounds; one paired critic/actor update after every 512 imagined transitions (one vector step). H3 gives 15 updates each per decision.",
+          "alg_params": {
+            "inner_rounds": 5,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 512,
+            "inner_updates_per_round": null
+          }
         }
       }
     }

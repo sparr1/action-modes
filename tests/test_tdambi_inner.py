@@ -209,14 +209,20 @@ def _snapshot(holder):
 
 
 @pytest.mark.parametrize("probes", [False, True])
+@pytest.mark.parametrize("timing", ["round", "step"])
 @pytest.mark.parametrize("device", [
     "cpu", pytest.param("cuda", marks=pytest.mark.skipif(
         not torch.cuda.is_available(), reason="CUDA unavailable",
     )),
 ])
-def test_trace_non_interference_with_dropout_and_round_fidelity(probes, device):
-    ordinary = _tdambi_model(dropout=0.25, device=device)
-    observed = _tdambi_model(dropout=0.25, device=device)
+def test_trace_non_interference_with_dropout_and_round_fidelity(probes, device, timing):
+    options = ({"inner_update_timing": "step", "inner_steps_per_update": 3,
+                "inner_updates_per_round": None, "inner_rounds": 5,
+                "inner_rollout_horizon": 3, "train_unroll_horizon": 3,
+                "inner_replay_capacity": 45}
+               if timing == "step" else {})
+    ordinary = _tdambi_model(dropout=0.25, device=device, **options)
+    observed = _tdambi_model(dropout=0.25, device=device, **options)
     try:
         rng = torch.random.get_rng_state().clone()
         cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
@@ -235,9 +241,9 @@ def test_trace_non_interference_with_dropout_and_round_fidelity(probes, device):
             assert repr(np.random.get_state()) == numpy_rng
             assert [m.training for m in observed.agent.model.modules()] == [m.training for m in ordinary.agent.model.modules()]
             updates = [event for event in trace.events if event["phase"] == "update"]
+            expected_updates = 15 if timing == "step" else 4
             assert [(event["critic_updates"], event["actor_updates"], event["temperature_updates"]) for event in updates] == [
-                (1, 1, 0), (2, 2, 0), (3, 3, 0), (4, 4, 0),
-            ]
+                (i, i, 0) for i in range(1, expected_updates + 1)]
             assert all(event["measurement"] == "pre_update_minibatch" for event in updates)
             assert len([event for event in trace.events if event["phase"] == "calibration"]) == 1
             assert all(not torch.is_tensor(value) for event in trace.events for value in event["metrics"].values())
@@ -245,7 +251,17 @@ def test_trace_non_interference_with_dropout_and_round_fidelity(probes, device):
             reconstructed = observed.agent.inner_engine._average_update_metrics([event["metrics"] for event in updates])
             for key, value in reconstructed.items():
                 assert observed.agent.last_inner_metrics[key] == pytest.approx(float(value), abs=1e-5)
-            assert observed.agent.last_inner_metrics["inner_model_steps"] == 12
+            assert observed.agent.last_inner_metrics["inner_model_steps"] == (45 if timing == "step" else 12)
+            assert observed.agent.last_inner_metrics["inner_critic_target_updates"] == expected_updates
+            assert observed.cfg.inner_expected_update_slots == expected_updates
+            if timing == "step":
+                assert [event["phase"] for event in trace.events if event["phase"] != "probe"] == (
+                    ["initial", "collection", "calibration", "update"]
+                    + ["collection", "update"] * 14)
+                collections = [event for event in trace.events if event["phase"] == "collection"]
+                assert [event["metrics"]["collection_rollout_step"] for event in collections] == [1, 2, 3] * 5
+                calibration = next(event for event in trace.events if event["phase"] == "calibration")
+                assert calibration["replay_size"] == 3
             assert observed.agent.last_inner_metrics["inner_tdambi_calibration_samples"] == 4
             assert observed.agent.last_inner_metrics["inner_tdambi_calibration_seconds"] >= 0
             assert all("alpha" not in key for key in observed.agent.last_inner_metrics)

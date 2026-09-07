@@ -24,4 +24,9 @@ if [[ -n "${EVAL_PUBLICATION_OWNER:-}" ]]; then
   publisher_args+=(--owner "$EVAL_PUBLICATION_OWNER")
 fi
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+# Keep artifact cache and upload staging with the authoritative results, rather
+# than filling a separate home-directory quota. Explicit storage overrides win.
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$EVAL_RUN_DIR/wandb-cache}"
+export WANDB_DATA_DIR="${WANDB_DATA_DIR:-$EVAL_RUN_DIR/wandb-data}"
+mkdir -p "$WANDB_CACHE_DIR" "$WANDB_DATA_DIR"
 exec "$PYTHON_BIN" eval_series.py publish "$EVAL_RUN_DIR" "${publisher_args[@]}" --watch --poll-seconds 15 --jobs "${compute_jobs[@]}"

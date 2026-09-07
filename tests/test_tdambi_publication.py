@@ -156,7 +156,31 @@ def test_old_round_default_preserves_sac_identity_and_step_is_distinct():
     assert data.planner_identity(config, {}, "AMBITDMPC2/AMBITDMPC2", "tanh_mean") != legacy
 
 
-def test_resolved_tdambi_preflight_matches_executed_configuration(native_reference, monkeypatch):
+def test_tdambi_step_identity_and_legends_preserve_round_identity():
+    config = _config()
+    original = _identity(config)
+    config.update(inner_update_timing="round", inner_steps_per_update=None)
+    assert _identity(config) == original
+    config.update(inner_update_timing="step", inner_steps_per_update=512,
+                  inner_updates_per_round=None, inner_rounds=5)
+    step = _identity(config)
+    assert step != original
+    assert step["semantics"]["update_timing"] == "after_each_parallel_model_step"
+    assert "inner_updates_per_round" not in step["settings"]
+    config["inner_updates_per_round"] = 999  # Inactive resolved compatibility field.
+    assert _identity(config) == step
+    config["inner_steps_per_update"] = 256
+    assert _identity(config) != step
+    registry = {"run_id": "abcd1234", "attempt_label": "step-test",
+                "identity": {"planner": step, "backbone": SOURCE,
+                             "science": {"algorithm": "TDAMBI/TDAMBI"}}}
+    assert series.concise_curve_label(registry) == "TD-MPC2 · TDAMBI C1/A1 per step J5 · #abcd"
+    assert "step-updates" in series._evaluation_run_tags(registry)
+    assert "step interval512" in data.descriptive_label(registry["identity"])
+
+
+@pytest.mark.parametrize("timing", ["round", "step"])
+def test_resolved_tdambi_preflight_matches_executed_configuration(native_reference, monkeypatch, timing):
     import gymnasium as gym
     from RL.TDAMBI import TDAMBI
 
@@ -169,6 +193,9 @@ def test_resolved_tdambi_preflight_matches_executed_configuration(native_referen
               "wandb": False, "inner_rounds": 1, "inner_rollouts_per_round": 4,
               "inner_rollout_horizon": 1, "inner_updates_per_round": 1,
               "inner_batch_size": 4, "inner_replay_capacity": 8, "inner_diagnostics_every": 1}
+    if timing == "step":
+        params.update(inner_update_timing="step", inner_steps_per_update=4,
+                      inner_updates_per_round=None)
     config = {"alg": "TDAMBI/TDAMBI", "env": "DMControl-v0", "seed": 12345,
               "device": "cpu", "total_steps": 10, "alg_params": params}
     resolved = {"selector": "inner_budget/tdambi_1", "algorithm_config": config,

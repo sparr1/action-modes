@@ -266,11 +266,19 @@ def _tdambi_planner(config, algorithm, action_rule):
         "inner_q_actor_reduction", "inner_q_target_reduction", "q_pair_size",
     )
     settings = {key: copy.deepcopy(config[key]) for key in keys if key in config}
+    step_timing = config.get("inner_update_timing", "round") == "step"
+    if step_timing:
+        # The interval is authoritative in step mode; the resolved per-round
+        # compatibility default is inactive. Keep existing round identities.
+        settings.pop("inner_updates_per_round", None)
+        settings["inner_update_timing"] = "step"
+        settings["inner_steps_per_update"] = config.get("inner_steps_per_update")
     # These are the resolved TDAMBI operator contract, not unconsumed SAC
     # options or checkpoint-dependent values of the calibrated scale.
     semantics = {
         "update_order": "critic_actor_target_same_minibatch",
-        "update_timing": "after_each_collection_round",
+        "update_timing": ("after_each_parallel_model_step" if step_timing
+                          else "after_each_collection_round"),
         "actor_objective": "-(q/scale+eta*native_scaled_entropy)",
         "critic_target": "reward_only_local_target_min_pair",
         "bootstrap_action": "adapted_actor_sample_at_all_collection_depths",
@@ -482,7 +490,10 @@ def descriptive_label(identity, selector=None):
     settings = planner.get("settings", {})
     if planner["type"] == "tdambi":
         backbone = "TD-MPC2" if source == "xq3zva9u" else f"TD-MPC2 {source}"
-        return (f"{backbone} · TDAMBI G{settings.get('inner_updates_per_round')} "
+        budget = (f"step interval{settings.get('inner_steps_per_update')}"
+                  if settings.get("inner_update_timing") == "step"
+                  else f"G{settings.get('inner_updates_per_round')}")
+        return (f"{backbone} · TDAMBI {budget} "
                 f"J{settings.get('inner_rounds')} N{settings.get('inner_rollouts_per_round')} "
                 f"H{settings.get('inner_rollout_horizon')} B{settings.get('inner_batch_size')}")
     if planner["type"] == "mppi":

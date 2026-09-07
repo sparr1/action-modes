@@ -34,7 +34,6 @@ _NATIVE_CONTRACT = {
     "inner_q_actor_reduction": "mean_pair",
     "inner_sac_critic_target": "reward_only",
     "outer_critic_target": "reward_only",
-    "inner_update_timing": "round",
     "inner_finite_horizon": False,
     "inner_outer_replay_fraction": 0.0,
     "inner_explorer_mode": "none",
@@ -100,7 +99,8 @@ def native_evaluation_params(params):
     result.setdefault("inner_rounds", 6)
     result.setdefault("inner_rollouts_per_round", 512)
     result.setdefault("inner_rollout_horizon", 3)
-    result.setdefault("inner_updates_per_round", 3)
+    result.setdefault("inner_update_timing", "round")
+    result.setdefault("inner_updates_per_round", None if result.get("inner_steps_per_update") is not None else 3)
     result.setdefault("inner_batch_size", 512)
     result.setdefault("inner_replay_capacity", 12_288)
     return result
@@ -182,8 +182,10 @@ class TDAMBI(AMBITDMPC2):
                 raise ValueError(f"TDAMBI requires {key}={required!r}.")
         if params.get("obs", "state") != "state" or params.get("multitask", False):
             raise ValueError("TDAMBI currently supports single-task state observations only.")
+        if params.get("inner_steps_per_update") is not None and params["inner_update_timing"] != "step":
+            raise ValueError("TDAMBI inner_steps_per_update requires inner_update_timing='step'.")
         unsupported = [key for key in params if (
-            key in {"inner_steps_per_update", "inner_critic_updates_per_round",
+            key in {"inner_critic_updates_per_round",
                     "inner_actor_updates_per_round", "inner_model_step_budget",
                     "inner_critic_updates_per_action", "inner_actor_updates_per_action",
                     "inner_temperature_updates_per_action", "inner_iterations",

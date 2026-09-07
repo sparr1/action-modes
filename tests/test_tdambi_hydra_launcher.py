@@ -54,7 +54,7 @@ def launcher_environment(tmp_path, index=2):
             "CALL_LOG": str(tmp_path / "calls.jsonl"), "FAKE_DIRTY": ""}
 
 
-@pytest.mark.parametrize("index", [2, 3, 6, 9, 10])
+@pytest.mark.parametrize("index", [2, 3, 6, 9, 10, 19, 20])
 def test_production_maps_checkpoint_and_keeps_fixed_evaluation_protocol(tmp_path, index):
     env = launcher_environment(tmp_path, index)
     subprocess.run(["bash", str(SCRIPT)], env=env, check=True, capture_output=True)
@@ -86,7 +86,7 @@ def test_production_rejects_invalid_launch_without_starting_evaluation(tmp_path,
     elif invalid == "dirty":
         env["FAKE_DIRTY"] = " M source.py"
     elif invalid == "index":
-        env["SLURM_ARRAY_TASK_ID"] = "11"
+        env["SLURM_ARRAY_TASK_ID"] = "21"
     elif invalid == "sidecar":
         Path(env["TDAMBI_CHECKPOINT_PREFIX"] + "100000.metadata.json").unlink()
     elif invalid == "reference":
@@ -108,8 +108,20 @@ def test_production_rejects_invalid_launch_without_starting_evaluation(tmp_path,
         assert not Path(env["TDAMBI_OUTPUT_ROOT"]).exists()
 
 
-def test_production_requests_one_a6000_per_checkpoint_and_matches_user_grid():
+def test_production_defaults_to_preferred_node_and_one_gpu_per_checkpoint():
     text = SCRIPT.read_text()
-    for directive in ("--partition=gpus", "--constraint=rtx_a6000", "--gres=gpu:nvidia_rtx_a6000:1",
-                      "--cpus-per-task=8", "--mem=32G", "--time=06:00:00", "--array=2-10"):
+    for directive in ("--partition=gpus", "--nodelist=gpu2501", "--gres=gpu:1",
+                      "--cpus-per-task=8", "--mem=32G", "--time=06:00:00", "--array=2-20"):
         assert f"#SBATCH {directive}" in text
+
+
+def test_production_selects_step_preset_without_changing_episode_protocol(tmp_path):
+    env = launcher_environment(tmp_path, 20)
+    env["TDAMBI_PRESET"] = "update_timing/step_j5_c1_a1"
+    subprocess.run(["bash", str(SCRIPT)], env=env, check=True, capture_output=True)
+    evaluate, report = [json.loads(line) for line in Path(env["CALL_LOG"]).read_text().splitlines()]
+    assert evaluate[evaluate.index("--preset") + 1] == env["TDAMBI_PRESET"]
+    assert evaluate[evaluate.index("--checkpoint") + 1].endswith("1000000")
+    assert evaluate[evaluate.index("--device") + 1] == "cuda"
+    assert evaluate[evaluate.index("--max-steps") + 1] == "500"
+    assert env["TDAMBI_PRESET"] in report[report.index("--title") + 1]

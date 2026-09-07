@@ -16,6 +16,18 @@ critic/actor updates per round. Select `inner_budget/tdambi_6` or
 entropy coefficient, value coefficient, discount, target interpolation, and
 gradient clipping inherit the saved native settings. No sweep is launched.
 
+Select `update_timing/step_j5_c1_a1` for five rounds with an update after each
+imagined rollout step. Each vector step adds 512 transitions, then performs
+one critic→actor→target update before collecting the next depth with the
+adapted policy. Horizon three gives 15 critic and 15 actor updates per real
+decision. This uses the shared step scheduler (`inner_steps_per_update=512`)
+and calibrates the native Q scale from the first collection before updating.
+The default round-end preset remains unchanged.
+
+The Hydra launcher accepts `TDAMBI_PRESET` and array indices 2–20 for the
+100k–1M checkpoint grid. It defaults to one GPU on `gpu2501`; override
+`--nodelist` explicitly for `gpu2301`, then `gpu2201`, according to availability.
+
 Choose a checkpoint and fresh output paths. This command evaluates five
 episodes (environment seeds 101–105, controller seed 12345, at most 500 decisions
 each), saving all inner-update traces locally:

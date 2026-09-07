@@ -1,7 +1,9 @@
 """Explicit curve selection and accounting-aware CPU publication watching."""
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -225,3 +227,39 @@ def test_cpu_launcher_never_requests_gpu_and_passes_fixed_interval():
     assert not any("gres" in line or "--gpus" in line for line in directives)
     assert "#SBATCH --signal=B:TERM@60" in script
     assert '--watch --poll-seconds 15 --jobs "${compute_jobs[@]}"' in script
+
+
+@pytest.mark.parametrize("override_storage", [False, True])
+def test_cpu_launcher_routes_artifact_storage_before_python(tmp_path, override_storage):
+    launcher = Path("slurm/run_eval_series_publisher_oscar.sbatch").resolve()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    run_dir = tmp_path / "authoritative results" / "curve"
+    receipt = tmp_path / "launched.json"
+    python = tmp_path / "python"
+    python.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, sys\n"
+        "paths = {key: os.environ[key] for key in ['WANDB_CACHE_DIR', 'WANDB_DATA_DIR']}\n"
+        "assert all(pathlib.Path(path).is_dir() for path in paths.values())\n"
+        f"pathlib.Path({str(receipt)!r}).write_text(json.dumps(dict(paths=paths, args=sys.argv[1:])))\n"
+    )
+    python.chmod(0o755)
+    environment = dict(os.environ)
+    for key in ("WANDB_CACHE_DIR", "WANDB_DATA_DIR", "EXPECTED_ACTION_MODES_SHA"):
+        environment.pop(key, None)
+    environment.update(SLURM_SUBMIT_DIR=str(checkout), EVAL_RUN_DIR=str(run_dir),
+                       EVAL_COMPUTE_JOBS="12345 12346", EVAL_PUBLICATION_OWNER="owner",
+                       PYTHON_BIN=str(python))
+    if override_storage:
+        environment.update(WANDB_CACHE_DIR=str(tmp_path / "shared cache"),
+                           WANDB_DATA_DIR=str(tmp_path / "scratch upload staging"))
+    subprocess.run(["bash", str(launcher)], env=environment, check=True, capture_output=True, text=True)
+    launched = json.loads(receipt.read_text())
+    assert launched["paths"] == {
+        "WANDB_CACHE_DIR": environment.get("WANDB_CACHE_DIR", str(run_dir / "wandb-cache")),
+        "WANDB_DATA_DIR": environment.get("WANDB_DATA_DIR", str(run_dir / "wandb-data")),
+    }
+    assert launched["args"] == ["eval_series.py", "publish", str(run_dir), "--owner", "owner",
+                                "--watch", "--poll-seconds", "15", "--jobs", "12345", "12346"]
