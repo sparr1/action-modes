@@ -24,6 +24,12 @@ source inventory for SAC launchers. Assignment is prepared once before submissio
 workers never create W&B runs. Legacy `--wandb` also requires this assignment.
 Local-only commands omit both the assignment and `--wandb`.
 
+Run names identify the verified backbone and executed planner. The campaign label
+is shown separately as `Attempt: ...`; a prior arm of an MPPI comparison is
+explicitly named `Prior only (no planning)`. Chart legends use the same backbone
+and planner with a short run suffix to distinguish repetitions. Original source
+IDs and attempt labels remain unchanged in the run configuration.
+
 GPU workers preserve the existing manifests, episode records and diagnostic
 traces, then atomically queue completed results. A separate CPU process on the
 authoritative result owner runs `eval_series.py publish RUN_DIR --watch --jobs ARRAY_ID` and
