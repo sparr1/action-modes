@@ -331,22 +331,45 @@ zero-based row indices and available GPU capacity. The safe default submits only
 row zero; each task requests one L40S for 15 minutes, with six CPUs and 32 GB.
 Supply persistent Slurm `--output` and `--error` paths. `PYTHON_BIN` optionally
 selects an existing locked DMControl interpreter. Results are retained at
-`RESULT_ROOT/step_N/paired.json` and published automatically to `ambi-inner-bench`
+`RESULT_ROOT/step_N/paired.json` and queued for the shared CPU publisher in `ambi-inner-bench`
 with checkpoint-based comparisons. A short GPU smoke uses `--array=0`,
 `EPISODES=1`, `MAX_STEPS=3`, and `WANDB_MODE=disabled`; production defaults
 remain five full episodes. Existing results are never overwritten.
 
-New checkpoints automatically refresh the same W&B comparison run. Missing
-checkpoints remain gaps, and the expected range can expand without changing
-existing run IDs. Full commit/tree provenance remains in every bundle. Results
-from different commits combine only when Git verifies identical evaluator,
-renderer, algorithm/environment/helper source trees and locked DMControl runtime
-files; launcher/publisher changes therefore do not require repeating episodes.
-Legacy bundles derive this fingerprint from their pinned commit. Mixed-commit
-publication requires those commits in the local Git repository; same-commit
-bundles remain independently portable. To republish saved results, run
+Each planning configuration now owns one W&B run across checkpoints. Before
+submitting an array, explicitly select `eval_series.py create` for a new attempt
+or `eval_series.py append` for an existing run. Generate both templates without
+episodes using `evaluate_tdmpc2_mppi_checkpoint.py CHECKPOINT --episodes 5
+--seed 101 --max-steps 500 --eval-series-spec-dir SPECS
+--checkpoint-inventory INVENTORY --source-run SOURCE`. Use
+`eval_series.py create --root REGISTRY --spec SPECS/policy_prior.json
+--attempt-label LABEL --owner oscar-rgao48` and repeat for `native_mppi.json`;
+an extension instead uses `eval_series.py append RUN_DIR --spec SPEC`. Prepare an absolute
+`EVAL_RUN_MAP` JSON file mapping `policy_prior` and `native_mppi` to those existing
+run directories. Every checkpoint task receives the same map; repetitions use
+new run directories. The registry pins backbone, active planner settings,
+action rules, seeds and implementation compatibility.
+
+GPU workers evaluate and save results, copy the exact checkpoint sidecar into
+the result bundle, then stage local pointers. They never initialize W&B. Run
+`eval_series.py publish RUN_DIR --watch --jobs ARRAY_ID` as a separate CPU process for each run;
+it checks for completed checkpoints every 15 seconds. Keep a single publication
+owner for each run, and transfer cross-cluster results to that owner. The old
 `publish_tdmpc2_mppi_eval.py RESULT --source-run SOURCE --campaign CAMPAIGN
---expected-max-step STEP`; this performs no evaluation.
+--eval-run-map MAP` command is retained as a validation/staging adapter, without
+creating checkpoint or campaign runs. A failed upload leaves the completed
+episodes available for publication-only retry. `WANDB_MODE=disabled` keeps the
+short smoke local and does not require a run map.
+
+The prior and MPPI runs log checkpoint mean return, sample standard deviation,
+episode count and runtime; MPPI also logs seed-paired improvement. The x-axis is
+`checkpoint/training_decisions`, so checkpoints may finish in any order. Raw
+results, exact sidecars and commit/tree provenance remain attached as artifacts.
+Missing checkpoints do not create points. Older saved results can be imported
+through the common CPU publisher without rerunning any episodes. Legacy TD-MPC2
+files contain episode wall time, retained as `runtime/evaluation_seconds`;
+prediction-only `runtime/control_seconds` is unavailable for those files and
+stays missing. New evaluations measure prediction time separately.
 
 ### Same-state MPPI action gain by prefix-replay Monte Carlo
 

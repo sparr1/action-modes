@@ -187,3 +187,13 @@ def test_oscar_rejects_invalid_manifest_grid(launch_input, steps):
     Path(env["CHECKPOINT_MANIFEST"]).write_text(json.dumps({"checkpoints": changed}))
     assert _run(env).returncode != 0
     assert not Path(env["CALL_LOG"]).exists()
+
+
+def test_online_launch_requires_explicit_prior_and_mppi_runs(launch_input):
+    env, _ = launch_input
+    env["WANDB_MODE"] = "online"
+    env.pop("EVAL_RUN_MAP", None)
+    result = _run(env)
+    assert result.returncode != 0
+    assert "New/Append" in result.stderr
+    assert not Path(env["CALL_LOG"]).exists()

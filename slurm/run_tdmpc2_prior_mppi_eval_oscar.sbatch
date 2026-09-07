@@ -33,6 +33,11 @@ SOURCE_TREE=$(git rev-parse 'HEAD^{tree}')
 : "${CAMPAIGN:?Supply a descriptive campaign identifier.}"
 : "${SLURM_ARRAY_TASK_ID:?Missing array task ID.}"
 export CHECKPOINT_MANIFEST RESULT_ROOT CAMPAIGN SOURCE_COMMIT SOURCE_TREE
+if [[ "${WANDB_MODE:-online}" != disabled ]]; then
+  : "${EVAL_RUN_MAP:?Prepare explicit New/Append prior and MPPI runs before submission.}"
+  [[ "$EVAL_RUN_MAP" == /* && -f "$EVAL_RUN_MAP" ]] || exit 2
+  export EVAL_RUN_MAP
+fi
 export EPISODES="${EPISODES:-5}" MAX_STEPS="${MAX_STEPS:-500}"
 export EXPECTED_MAX_STEP="${EXPECTED_MAX_STEP:-1500000}"
 
@@ -49,6 +54,14 @@ from publish_tdmpc2_mppi_eval import STEPS, _expected_steps, evaluation_source_f
 def require(condition, message):
     if not condition:
         raise SystemExit(message)
+
+if os.environ.get("EVAL_RUN_MAP"):
+    from utils.eval_series import load_run
+    assignments = json.loads(Path(os.environ["EVAL_RUN_MAP"]).read_text())
+    require(set(assignments) == {"policy_prior", "native_mppi"}, "Run map must assign prior and MPPI")
+    require(len(set(assignments.values())) == 2, "Prior and MPPI require distinct runs")
+    for run_dir in assignments.values():
+        load_run(run_dir)
 
 manifest = Path(os.environ["CHECKPOINT_MANIFEST"])
 root = Path(os.environ["RESULT_ROOT"])
@@ -94,6 +107,18 @@ expected = {"obs": "state", "model_size": 5, "mpc": False, "episodic": False,
             "num_pi_trajs": 24, "min_std": 0.05, "max_std": 2.0, "temperature": 0.5}
 for key, value in expected.items():
     require(params.get(key) == value, f"Saved {key} must equal {value!r}; received {params.get(key)!r}.")
+if os.environ.get("EVAL_RUN_MAP"):
+    from utils.eval_series import validate_identity
+    from utils.eval_series_data import identity_for_tdmpc2_checkpoint
+    protocol = {"environment_seeds": list(range(101, 101 + int(os.environ["EPISODES"]))),
+                "max_steps": int(os.environ["MAX_STEPS"]), "controller_seed": 12345}
+    for controller, run_dir in assignments.items():
+        identity = identity_for_tdmpc2_checkpoint(
+            {**row, "source_run": source_run}, metadata, controller, protocol,
+            {"code_sha": os.environ["SOURCE_COMMIT"]}, path=checkpoint,
+            inventory_path=manifest, source_run=source_run,
+        )
+        validate_identity(run_dir, identity)
 require(not (root / f"step_{row['step']}" / "paired.json").exists(), "Evaluation output already exists.")
 directory = root / f"step_{row['step']}"
 directory.mkdir(parents=True, exist_ok=True)
@@ -141,7 +166,9 @@ echo "Native MPPI: H3, N512, elites64, policy24, configured6/effective8 iteratio
   --output "$OUTPUT" --episodes "$EPISODES" --max-steps "$MAX_STEPS" \
   --seed 101 --controller-seed 12345 --bootstrap-samples 20000 --device cuda
 
-"$PYTHON_BIN" publish_tdmpc2_mppi_eval.py "$OUTPUT" \
+staging=("$PYTHON_BIN" publish_tdmpc2_mppi_eval.py "$OUTPUT")
+[[ -z "${EVAL_RUN_MAP:-}" ]] || staging+=(--eval-run-map "$EVAL_RUN_MAP")
+"${staging[@]}" \
   --project ambi-inner-bench \
   --source-run rwgao_b-brown-university/ambi/xq3zva9u \
   --campaign "$CAMPAIGN" --expected-max-step "$EXPECTED_MAX_STEP"

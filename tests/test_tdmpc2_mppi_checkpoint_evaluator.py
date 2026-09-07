@@ -473,3 +473,54 @@ def test_parser_defaults_to_twelve_paired_episodes(tmp_path):
     assert args.episodes == 12
     assert args.controller_seed == 12345
     assert args.bootstrap_samples == 20000
+
+
+def test_control_timing_excludes_environment_and_probe_work(monkeypatch):
+    clock = {"seconds": 0.0}
+    model = _FakeModel()
+    predict = model.predict
+    def timed_predict(*args, **kwargs):
+        clock["seconds"] += 2.0
+        return predict(*args, **kwargs)
+    model.predict = timed_predict
+    class Environment:
+        def step(self, action):
+            clock["seconds"] += 10.0
+            return np.zeros(1, dtype=np.float32), 1.0, False, True, {}
+    def probe(*args):
+        clock["seconds"] += 5.0
+        return {}
+    monkeypatch.setattr(evaluator.time, "perf_counter", lambda: clock["seconds"])
+    monkeypatch.setattr(evaluator, "_predicted_action_gain", probe)
+    result = evaluator._run_arm(model, Environment(), np.zeros(1, dtype=np.float32),
+                                controller="native_mppi", controller_seed=1, max_steps=500)
+    assert result["control_seconds"] == 2.0
+    assert result["seconds"] == 17.0
+    assert result["return"] == 1.0 and result["length"] == 1
+
+
+def test_spec_preparation_requires_no_environment_or_evaluation(tmp_path, monkeypatch, capsys):
+    import subprocess
+    from utils import eval_series_data
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.write_bytes(b"weights")
+    metadata = {"trial_run_params": {"alg": "TDMPC2/TDMPC2Baseline", "seed": 55,
+                "resolved_runtime": {"observation": {"episode_length": 500}}}}
+    context = SimpleNamespace(trial_run_params=metadata["trial_run_params"], metadata=metadata)
+    monkeypatch.setattr(evaluator, "resolve_render_context", lambda *a, **k: context)
+    monkeypatch.setattr(evaluator, "evaluate_tdmpc2_mppi_checkpoint", lambda *a, **k: pytest.fail("spec preparation evaluated a model"))
+    monkeypatch.setattr(subprocess, "check_output", lambda args, **kwargs: b"" if "status" in args else b"a" * 40)
+    seen = []
+    def identity(cp, metadata, controller, protocol, code, **kwargs):
+        seen.append((controller, protocol, kwargs))
+        return {"planner": {"type": "prior" if controller == "policy_prior" else "mppi"}}
+    monkeypatch.setattr(eval_series_data, "identity_for_tdmpc2_checkpoint", identity)
+    monkeypatch.setattr(eval_series_data, "descriptive_label", lambda identity, selector: selector)
+    directory = tmp_path / "specs"
+    assert evaluator.main([str(checkpoint), "--eval-series-spec-dir", str(directory),
+                           "--checkpoint-inventory", str(tmp_path / "inventory.json"),
+                           "--episodes", "5", "--seed", "101", "--max-steps", "500"]) == 0
+    assert [item[0] for item in seen] == ["policy_prior", "native_mppi"]
+    assert all(item[1]["environment_seeds"] == [101, 102, 103, 104, 105] for item in seen)
+    assert {path.name for path in directory.iterdir()} == {"policy_prior.json", "native_mppi.json"}
+    assert "evaluation_series_specifications" in capsys.readouterr().out

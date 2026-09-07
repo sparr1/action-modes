@@ -61,67 +61,39 @@ def change(path, mutate):
     path.write_text(json.dumps(value))
 
 
-class FakeWandb:
-    def __init__(self):
-        self.runs = []
-        self.plots = []
-        self.artifacts = []
-        self.plot = SimpleNamespace(line_series=self.line_series)
-
-    def init(self, **kwargs):
-        parent = self
-
-        class Run:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def log(self, data):
-                self.logged.append(data)
-
-            def log_artifact(self, artifact):
-                parent.artifacts.append(artifact)
-
-        run = Run()
-        run.options, run.summary, run.logged = kwargs, {}, []
-        self.runs.append(run)
-        return run
-
-    def line_series(self, **kwargs):
-        self.plots.append(kwargs)
-        return kwargs
-
-    def Table(self, **kwargs):
-        return kwargs
-
-    def Artifact(self, *args, **kwargs):
-        artifact = SimpleNamespace(files=[], metadata=kwargs["metadata"])
-        artifact.add_file = lambda path, name: artifact.files.append((path, name))
-        return artifact
-
-
-def test_refresh_adds_new_checkpoints_in_step_order_and_preserves_missing_values(tmp_path, monkeypatch):
+def test_finished_checkpoints_stage_to_same_two_explicit_runs(tmp_path, monkeypatch):
+    import sys
+    calls = []
     monkeypatch.delenv("WANDB_MODE", raising=False)
+    monkeypatch.setitem(sys.modules, "utils.eval_series", SimpleNamespace(
+        load_run=lambda path: {"run_id": Path(path).name},
+        stage_result=lambda run_dir, path, **kwargs: calls.append((run_dir, path, kwargs))))
+    mapping = {"policy_prior": str(tmp_path / "prior"), "native_mppi": str(tmp_path / "mppi")}
     later = write_result(tmp_path, 200000, shift=10)
-    sdk = FakeWandb()
-    first = publisher.publish(later, source_run=SOURCE, campaign=CAMPAIGN, expected_max_step=400000, wandb_module=sdk)
-    assert sdk.plots[0]["ys"][0] == [None, None, 12, None, None, None, None]
+    first = publisher.publish(later, source_run=SOURCE, campaign=CAMPAIGN, eval_run_map=mapping)
     earlier = write_result(tmp_path)
-    second = publisher.publish(earlier, source_run=SOURCE, campaign=CAMPAIGN, expected_max_step=400000, wandb_module=sdk)
-    assert sdk.plots[2]["xs"] == list(publisher.STEPS[:7])
-    assert sdk.plots[2]["ys"] == [[2, None, 12, None, None, None, None],
-                                  [4, None, 14, None, None, None, None]]
-    assert sdk.plots[2]["keys"] == ["Policy prior mean", "Paper MPPI (H3, J8)"]
-    assert sdk.plots[3]["ys"] == [[2, None, 2, None, None, None, None]]
-    assert first["campaign_run_id"] == second["campaign_run_id"]
-    assert first["checkpoint_run_id"] != second["checkpoint_run_id"]
-    assert sdk.runs[-1].summary["completed_checkpoint_steps"] == [100000, 200000]
-    assert sdk.runs[-1].summary["status"] == "partial"
-    assert {name for _, name in sdk.artifacts[-1].files} == {
-        "paired.json", "checkpoint.metadata.json", "provenance.json"}
-    assert sdk.runs[-2].summary["runtime/mppi_seconds"] == 7.5
+    second = publisher.publish(earlier, source_run=SOURCE, campaign=CAMPAIGN, eval_run_map=mapping)
+    assert first["status"] == second["status"] == "queued"
+    assert [call[0] for call in calls] == list(mapping.values()) * 2
+    assert [call[2]["selector"] for call in calls] == list(mapping) * 2
+    assert all(call[2]["format"] == "tdmpc2-paired" for call in calls)
+    assert not (earlier.parent / ".publication.json").exists()
+
+
+def test_publication_requires_explicit_selection_and_preserves_result_on_staging_failure(tmp_path, monkeypatch):
+    import sys
+    monkeypatch.delenv("WANDB_MODE", raising=False)
+    path = write_result(tmp_path)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="explicit New/Append"):
+        publisher.publish(path, source_run=SOURCE, campaign=CAMPAIGN)
+    def fail(*args, **kwargs):
+        raise OSError("owner offline")
+    monkeypatch.setitem(sys.modules, "utils.eval_series", SimpleNamespace(load_run=lambda p: {}, stage_result=fail))
+    record = publisher.publish(path, source_run=SOURCE, campaign=CAMPAIGN,
+                               eval_run_map={"policy_prior": "prior", "native_mppi": "mppi"})
+    assert record["status"] == "failed"
+    assert path.read_bytes() == before
 
 
 def test_disabled_smoke_preserves_sidecar_hash_and_is_portable(tmp_path, monkeypatch):
@@ -191,22 +163,11 @@ def test_complete_campaign_has_all_actual_points_through_1p5m(tmp_path):
     assert curves[2] == [2] * 29
 
 
-def test_extending_campaign_preserves_ids_and_updates_expected_grid(tmp_path, monkeypatch):
-    monkeypatch.delenv("WANDB_MODE", raising=False)
-    sdk = FakeWandb()
-    earlier = write_result(tmp_path, 400000)
-    first = publisher.publish(earlier, source_run=SOURCE, campaign=CAMPAIGN,
-                              expected_max_step=400000, wandb_module=sdk)
+def test_expected_grid_rejects_result_beyond_selected_maximum(tmp_path, monkeypatch):
+    monkeypatch.setenv("WANDB_MODE", "disabled")
     later = write_result(tmp_path, 1150000)
-    second = publisher.publish(later, source_run=SOURCE, campaign=CAMPAIGN,
-                               expected_max_step=1150000, wandb_module=sdk)
-    assert first["campaign_run_id"] == second["campaign_run_id"]
-    assert sdk.runs[-1].options["allow_val_change"] is True
-    assert sdk.runs[-1].options["config"]["expected_checkpoint_steps"] == list(range(100000, 1150001, 50000))
-    assert sdk.runs[-1].summary["completed_checkpoint_steps"] == [400000, 1150000]
-    assert sdk.plots[-2]["ys"][0][-1] == 2
     with pytest.raises(ValueError, match="maximum"):
-        publisher.campaign_data(tmp_path, SOURCE, CAMPAIGN, expected_max_step=400000)
+        publisher.publish(later, source_run=SOURCE, campaign=CAMPAIGN, expected_max_step=400000)
 
 
 @pytest.fixture

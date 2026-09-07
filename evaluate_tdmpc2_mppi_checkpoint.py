@@ -84,7 +84,10 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("checkpoint", type=Path, help="TD-MPC2 checkpoint to load.")
-    parser.add_argument("--output", type=Path, required=True, help="Result JSON path.")
+    parser.add_argument("--output", type=Path, help="Result JSON path (required for evaluation).")
+    parser.add_argument("--eval-series-spec-dir", type=Path, help="Prepare prior/MPPI run identity templates without evaluation.")
+    parser.add_argument("--checkpoint-inventory", type=Path, help="Verified inventory identifying the source backbone.")
+    parser.add_argument("--source-run", help="Source entity/project/run-id, checked against inventory evidence.")
     parser.add_argument(
         "--episodes",
         type=_positive_int,
@@ -340,14 +343,17 @@ def _run_arm(
     terminated = False
     truncated = False
     capped = False
+    control_seconds = 0.0
     started = time.perf_counter()
     while not (terminated or truncated):
         current_observation = observation
+        prediction_started = time.perf_counter()
         prediction = model.predict(
             current_observation,
             deterministic=True,
             episode_start=(len(steps) == 0),
         )
+        control_seconds += time.perf_counter() - prediction_started
         action = prediction[0] if isinstance(prediction, tuple) else prediction
         action_array = np.asarray(action, dtype=np.float64).reshape(-1)
         if action_array.size == 0 or not bool(np.isfinite(action_array).all()):
@@ -393,6 +399,7 @@ def _run_arm(
         "truncated": bool(truncated),
         "capped": bool(capped),
         "seconds": max(0.0, time.perf_counter() - started),
+        "control_seconds": control_seconds,
         "steps": steps,
     }
 
@@ -921,9 +928,50 @@ def evaluate_tdmpc2_mppi_checkpoint(
                 raise_cleanup_errors(cleanup_errors)
 
 
+def _prepare_eval_series_specs(args):
+    from utils.eval_series_data import identity_for_tdmpc2_checkpoint, descriptive_label
+    from publish_tdmpc2_mppi_eval import _atomic_json
+    import subprocess
+
+    checkpoint = resolve_checkpoint_path(args.checkpoint)
+    context = resolve_render_context(checkpoint, metadata_path=args.metadata,
+                                     trial_settings=args.trial_settings,
+                                     experiment_settings=args.experiment_settings)
+    if context.trial_run_params["alg"] != "TDMPC2/TDMPC2Baseline" or not context.metadata:
+        raise ValueError("Series preparation requires a native TD-MPC2 checkpoint sidecar.")
+    repository = Path(__file__).resolve().parent
+    if subprocess.check_output(["git", "status", "--porcelain"], cwd=repository).strip():
+        raise ValueError("Prepare evaluation series specifications from a clean checkout.")
+    code = {"commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository).decode().strip()}
+    first_seed = args.seed if args.seed is not None else _saved_seed(context.trial_run_params)
+    maximum = args.max_steps or context.metadata["trial_run_params"]["resolved_runtime"]["observation"]["episode_length"]
+    _validate_rollout_options(episodes=args.episodes, seed=first_seed, max_steps=maximum)
+    protocol = {"environment_seeds": list(range(first_seed, first_seed + args.episodes)),
+                "max_steps": maximum, "controller_seed": args.controller_seed}
+    cp = {"sha256": _file_sha256(checkpoint), "source_run": args.source_run}
+    prepared = {}
+    for controller, label in (("policy_prior", "Policy prior"), ("native_mppi", "Native MPPI")):
+        identity = identity_for_tdmpc2_checkpoint(
+            cp, context.metadata, controller, protocol, code, path=checkpoint,
+            inventory_path=args.checkpoint_inventory, source_run=args.source_run,
+        )
+        prepared[controller] = {"identity": identity, "label": descriptive_label(identity, controller), "selector": controller}
+    directory = args.eval_series_spec_dir.resolve()
+    directory.mkdir(parents=True, exist_ok=False)
+    for controller, spec in prepared.items():
+        _atomic_json(directory / (controller + ".json"), spec)
+    print(json.dumps({"mode": "evaluation_series_specifications", "specs": {
+        controller: str(directory / (controller + ".json")) for controller in prepared}}))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.eval_series_spec_dir:
+            _prepare_eval_series_specs(args)
+            return 0
+        if args.output is None:
+            raise TDMPC2MPPIEvaluationError("--output is required for evaluation.")
         evaluate_tdmpc2_mppi_checkpoint(
             args.checkpoint,
             output=args.output,
@@ -938,7 +986,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             experiment_settings=args.experiment_settings,
             overwrite=args.overwrite,
         )
-    except (RenderCheckpointError, TDMPC2MPPIEvaluationError) as exc:
+    except (RenderCheckpointError, TDMPC2MPPIEvaluationError, ValueError, OSError) as exc:
         raise SystemExit(str(exc)) from exc
     return 0
 

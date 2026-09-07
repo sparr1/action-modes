@@ -1,4 +1,4 @@
-"""Publish saved prior/MPPI evaluations and refresh native W&B campaign curves.
+"""Validate and stage saved prior/MPPI evaluations for one W&B run per curve.
 
 No evaluation is performed here. A campaign consists of step_N/paired.json and
 step_N/provenance.json files. The latter pins the source run, checkpoint hash,
@@ -8,7 +8,6 @@ and evaluation code SHA/tree before evaluation starts.
 from __future__ import annotations
 
 import argparse
-import fcntl
 from functools import lru_cache
 import hashlib
 import json
@@ -221,88 +220,63 @@ def campaign_data(root, source_run, campaign, expected_max_step=1_500_000):
 
 
 def publish(path, *, source_run, campaign, project="ambi-inner-bench",
-            entity="rwgao_b-brown-university", expected_max_step=1_500_000, wandb_module=None):
-    steps = _expected_steps(expected_max_step)
+            entity="rwgao_b-brown-university", expected_max_step=1_500_000,
+            eval_run_map=None, wandb_module=None):
+    """Validate and stage a paired result for its two preselected curve runs.
+
+    The historical command name is retained, but GPU workers never initialize
+    W&B. Run ``eval_series.py publish RUN_DIR`` on the publication owner.
+    """
+    _expected_steps(expected_max_step)
     item = load_result(path, source_run, campaign)
+    _require(item["step"] <= expected_max_step, "Completed checkpoint exceeds expected maximum")
     path = item["path"]
-    root = path.parent.parent
-    record_path = path.parent / ".publication.json"
-    record = {**item["provenance"], "result_sha256": _hash(path),
-              "checkpoint_step": item["step"], "project": project, "entity": entity,
-              "checkpoint_run_id": _run_id(source_run, campaign, item["step"]),
-              "campaign_run_id": _run_id(source_run, campaign, "curves")}
+    record_path = path.parent / ".series-staging.json"
+    record = {"result_sha256": _hash(path), "checkpoint_step": item["step"],
+              "source_run": source_run, "campaign": campaign, "controllers": {}}
     if record_path.exists():
         previous = _read(record_path)
-        _require(all(previous.get(key) == record[key] for key in
-                     ("source_run", "campaign", "checkpoint_sha256", "result_sha256")),
-                 "Existing publication belongs to a different result")
-    # Copy the sidecar into the result bundle so publication can be repeated off-cluster.
-    copied_metadata = path.parent / "checkpoint.metadata.json"
-    if item["metadata_path"].resolve() != copied_metadata:
+        _require(previous.get("result_sha256") == record["result_sha256"],
+                 "Existing staging belongs to a different result")
+    # Preserve exact checkpoint sidecar bytes for publication on another host.
+    copied = path.parent / "checkpoint.metadata.json"
+    if item["metadata_path"].resolve() != copied:
         descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".metadata.")
         os.close(descriptor)
         try:
             shutil.copyfile(item["metadata_path"], temporary)
-            os.replace(temporary, copied_metadata)
+            os.replace(temporary, copied)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
-    disabled = os.environ.get("WANDB_MODE", "").lower() == "disabled"
-    with (root / ".wandb-publication.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        loaded, curves = campaign_data(root, source_run, campaign, expected_max_step)
-        if disabled:
-            record["status"] = "validated_upload_disabled"
-        else:
-            if wandb_module is None:
-                import wandb as wandb_module
-            wandb = wandb_module
-            shared = {"entity": entity, "project": project, "group": campaign,
-                      "resume": "allow", "reinit": True,
-                      "tags": ["tdmpc2", "humanoid-walk", "prior-only-backbone", "paper-default-mppi"]}
-            config = {**item["provenance"], "checkpoint_step": item["step"],
-                      "protocol": item["result"]["protocol"], "planner": PLANNER}
-            with wandb.init(**shared, id=record["checkpoint_run_id"], job_type="checkpoint-evaluation",
-                            name=f"TD-MPC2 prior vs MPPI | ckpt {item['step']//1000}k | H3 J8 N512 Pi24 | seed55",
-                            config=config) as run:
-                run.summary.update({f"eval/{key}": value for key, value in item["result"]["summary"].items()})
-                run.summary.update({"eval/frozen_state_unchanged": True,
-                                    "checkpoint/training_decisions": item["step"],
-                                    "runtime/prior_seconds": sum(row[4] for row in item["rows"]),
-                                    "runtime/mppi_seconds": sum(row[5] for row in item["rows"])})
-                run.log({"eval/episode_table": wandb.Table(columns=["environment_seed", "prior_return",
-                         "mppi_return", "paired_gain", "prior_seconds", "mppi_seconds"], data=item["rows"])})
-                artifact = wandb.Artifact(f"tdmpc2-paired-{record['checkpoint_run_id']}", type="evaluation",
-                                         metadata=config)
-                for filename in ("paired.json", "checkpoint.metadata.json", "provenance.json"):
-                    artifact.add_file(str(path.parent / filename), name=filename)
-                run.log_artifact(artifact)
-            with wandb.init(**shared, id=record["campaign_run_id"], job_type="checkpoint-comparison",
-                            name=f"TD-MPC2 prior vs MPPI | checkpoint curves | {campaign}",
-                            allow_val_change=True,
-                            config={"source_run": source_run, "campaign": campaign,
-                                    "expected_checkpoint_steps": list(steps), "planner": PLANNER,
-                                    "protocol": item["result"]["protocol"]}) as run:
-                run.log({"comparison/return_curves": wandb.plot.line_series(
-                    xs=list(steps), ys=curves[:2], keys=["Policy prior mean", "Paper MPPI (H3, J8)"],
-                    title=f"Mean episode return — {len(loaded)}/{len(steps)} checkpoints complete",
-                    xname="Training checkpoint (agent decisions)"),
-                    "comparison/paired_gain_curve": wandb.plot.line_series(
-                    xs=list(steps), ys=curves[2:], keys=["MPPI − policy prior"],
-                    title="Mean paired return gain", xname="Training checkpoint (agent decisions)")})
-                run.summary.update({"completed_checkpoints": len(loaded),
-                                    "completed_checkpoint_steps": sorted(entry["step"] for entry in loaded),
-                                    "missing_checkpoint_steps": sorted(set(steps) - {entry["step"] for entry in loaded}),
-                                    "status": "complete" if len(loaded) == len(steps) else "partial"})
-            record["status"] = "published"
-        record["completed_checkpoint_steps"] = sorted(entry["step"] for entry in loaded)
-        _atomic_json(record_path, record)
+    if os.environ.get("WANDB_MODE", "").lower() == "disabled" and eval_run_map is None:
+        record["status"] = "validated_upload_disabled"
+    else:
+        if isinstance(eval_run_map, (str, Path)):
+            eval_run_map = _read(eval_run_map)
+        _require(isinstance(eval_run_map, dict) and set(eval_run_map) == {"policy_prior", "native_mppi"},
+                 "Choose explicit New/Append runs before evaluation and supply --eval-run-map with policy_prior/native_mppi directories")
+        _require(len(set(map(str, eval_run_map.values()))) == 2,
+                 "Prior and MPPI require distinct evaluation run directories")
+        from utils.eval_series import load_run, stage_result
+        for controller, run_dir in eval_run_map.items():
+            load_run(run_dir)
+            try:
+                stage_result(run_dir, path, selector=controller, format="tdmpc2-paired",
+                             source_run=source_run)
+                record["controllers"][controller] = {"status": "queued", "run_dir": str(run_dir)}
+            except Exception as error:
+                record["controllers"][controller] = {"status": "failed", "run_dir": str(run_dir),
+                                                     "error": f"{type(error).__name__}: {error}"}
+        record["status"] = "queued" if all(row["status"] == "queued" for row in record["controllers"].values()) else "failed"
+    _atomic_json(record_path, record)
     return record
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("result", type=Path)
+    parser.add_argument("--eval-run-map", type=Path, help="Explicit policy_prior/native_mppi to existing-run-directory mapping.")
     parser.add_argument("--project", default="ambi-inner-bench")
     parser.add_argument("--entity", default="rwgao_b-brown-university")
     parser.add_argument("--source-run", required=True)
@@ -312,7 +286,7 @@ def main():
     args = parser.parse_args()
     record = publish(args.result, project=args.project, entity=args.entity,
                      source_run=args.source_run, campaign=args.campaign,
-                     expected_max_step=args.expected_max_step)
+                     expected_max_step=args.expected_max_step, eval_run_map=args.eval_run_map)
     print(json.dumps(record, sort_keys=True))
 
 
