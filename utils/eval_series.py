@@ -223,6 +223,8 @@ def _planner_display_label(planner, *, compact=False):
                 parts.append("online XQC Q × frozen scale")
             elif backend == "native_tdmpc2":
                 parts.append("online TD-MPC2 Q")
+            elif backend == "tdmpc2_mppi_over_frozen_ambi":
+                parts.append("online AMBI soft Q")
     return " ".join(parts)
 
 

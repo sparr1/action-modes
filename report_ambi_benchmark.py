@@ -201,6 +201,8 @@ def _load_run(directory, manifest, run, run_key):
     return {"key": run_key, "id": run_id, "evaluation_id": manifest["evaluation_id"],
             "label": str(run.get("selector", run_id)), "selector": run.get("selector"),
             "config": run.get("config", {}), "config_hash": run.get("config_hash"),
+            **({"action_rule": run["action_rule"], "evaluation_controller": run["evaluation_controller"]}
+               if run.get("evaluation_controller") else {}),
             "kind": run.get("kind"), "status": run.get("status", manifest.get("status")),
             "wandb_path": run.get("wandb_path"), "episodes": episodes, "roots": roots, "traces": traces}
 

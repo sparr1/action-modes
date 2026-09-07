@@ -207,6 +207,8 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
     elif "AMBI" in algorithm:
         paths = ["RL/AMBITDMPC2.py", "RL/tdmpc2_core/ambi_agent.py",
                  "RL/tdmpc2_core/inner_improvement.py"]
+        if controller == "mppi":
+            paths += ["RL/tdmpc2_core/ambi_mppi.py", "RL/tdmpc2_core/mppi.py"]
     else:
         paths = ["RL/TDMPC2.py", "RL/tdmpc2_core/agent.py", "RL/tdmpc2_core/mppi.py"]
     paths += ["RL/tdmpc2_core/common", "domains", "environments/dmcontrol/uv.lock"]
@@ -254,8 +256,9 @@ def planner_identity(config, result, algorithm, action_rule):
         settings = copy.deepcopy(evaluation["settings"])
         settings.pop("iterations", None)  # Effective iterations determine executed work.
         semantics = copy.deepcopy(evaluation["protocol"])
-        semantics.pop("reward_scale", None)
-        semantics["reward_scale_initialization"] = "frozen_checkpoint_real_scale"
+        if "reward_scale" in semantics:
+            semantics.pop("reward_scale")
+            semantics["reward_scale_initialization"] = "frozen_checkpoint_real_scale"
         return {"type": "mppi", "backend": semantics.pop("algorithm"),
                 "settings": settings, "semantics": semantics, "action_rule": action_rule}
     operator = config.get("inner_operator")
@@ -385,14 +388,13 @@ def identity_for_ambi_checkpoint(checkpoint, resolved, protocol, seeds, code, *,
     algorithm = resolved["algorithm_config"]["alg"]
     if evaluation_controller is None and resolved.get("evaluation_controller"):
         from types import SimpleNamespace
-        from RL.tdmpc2_core.ambixqc_agent import AMBIXQCAgent
-        from RL.tdmpc2_core.xqc_mppi import FrozenXQCMPPIController, resolve_mppi_settings
+        from RL.tdmpc2_core.ambi_agent import AMBITDMPC2Agent
+        from RL.tdmpc2_core.ambi_mppi import FrozenAMBIMPPIController, resolve_mppi_settings
         configured = resolved["evaluation_controller"]
         _require(configured.get("type") == "mppi", "Unknown preflight evaluation controller")
-        agent = AMBIXQCAgent.__new__(AMBIXQCAgent)
+        agent = AMBITDMPC2Agent.__new__(AMBITDMPC2Agent)
         agent.cfg = SimpleNamespace(**config)
-        description = FrozenXQCMPPIController.__new__(FrozenXQCMPPIController)
-        description.reward_scale = 1.0  # Only the initialization rule enters identity.
+        description = FrozenAMBIMPPIController.__new__(FrozenAMBIMPPIController)
         description.discount = agent._get_discount(config["episode_length"])
         evaluation_controller = {"type": "mppi", "protocol": description.protocol,
                                  "settings": resolve_mppi_settings(configured.get("params"),
@@ -445,6 +447,8 @@ def descriptive_label(identity, selector=None):
             title += " | online XQC Q × frozen scale"
         elif planner.get("backend") == "native_tdmpc2":
             title += " | online TD-MPC2 Q"
+        elif planner.get("backend") == "tdmpc2_mppi_over_frozen_ambi":
+            title += " | online AMBI soft Q"
         return prefix + title
     rounds = settings.get("inner_rounds")
     budgets = []

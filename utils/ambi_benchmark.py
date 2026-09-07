@@ -108,11 +108,13 @@ def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None):
     else:
         checkpoint_label = f"ckpt {digest[:12]}" if digest else "ckpt unknown"
 
-    operator = params.get("inner_operator")
+    operator = "mppi" if config.get("evaluation_controller") else params.get("inner_operator")
     controller = "prior" if operator == "none" else operator or "unknown"
     tags = ["frozen-inner-benchmark", kind, f"kind:{kind}", f"task:{task}", f"controller:{controller}"]
-    if protocol.get("action_rule"):
-        tags.append(f"action:{protocol['action_rule']}")
+    action_rule = ("weighted_elite_gumbel_no_execution_noise" if config.get("evaluation_controller")
+                   else protocol.get("action_rule"))
+    if action_rule:
+        tags.append(f"action:{action_rule}")
     if known_step:
         tags.append(f"checkpoint-step:{step}")
     if digest:
@@ -132,6 +134,9 @@ def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None):
     if controller == "prior":
         parts.append("prior only")
         tags.append("bootstrap:none")
+    elif config.get("evaluation_controller"):
+        parts.extend(("native MPPI", "online AMBI soft Q"))
+        tags.append("bootstrap:online-ambi-q-mean-pair")
     else:
         schedule = []
         legacy = (not any(params.get(key) is not None for key in (
@@ -307,6 +312,7 @@ def reference_returns(path, checkpoint_sha256, protocol):
         raise ValueError("Prior reference environment/action/seed protocol does not match.")
     runs = [run for run in manifest["runs"] if
             run.get("config", {}).get("alg_params", {}).get("inner_operator") == "none"
+            and not run.get("config", {}).get("evaluation_controller")
             and run.get("status") == "complete" and run.get("episodes")]
     if len(runs) != 1:
         raise ValueError("Prior reference must contain exactly one completed prior-only episode run.")

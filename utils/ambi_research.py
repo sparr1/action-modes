@@ -163,11 +163,20 @@ def validate_preset_matrix(matrix):
             variant = _require_mapping(
                 variant, f"comparisons.{comparison_name}.variants.{variant_name}"
             )
-            unknown = set(variant) - {"description", "alg_params", "run_params"}
+            unknown = set(variant) - {"description", "alg_params", "run_params", "evaluation_controller"}
             if unknown:
                 raise PresetMatrixError(
                     f"Unknown fields in {comparison_name}/{variant_name}: {sorted(unknown)}."
                 )
+            if "evaluation_controller" in variant:
+                controller = _require_mapping(variant["evaluation_controller"], "evaluation_controller")
+                if not checkpoint_base or set(controller) - {"type", "params"} or controller.get("type") != "mppi":
+                    raise PresetMatrixError("Evaluation-only MPPI requires a checkpoint matrix and type='mppi'.")
+                from RL.tdmpc2_core.ambi_mppi import resolve_mppi_settings
+                try:
+                    resolve_mppi_settings(controller.get("params"), action_dim=1)
+                except (ValueError, TypeError) as error:
+                    raise PresetMatrixError(str(error)) from error
             _require_mapping(
                 variant.get("alg_params", {}),
                 f"comparisons.{comparison_name}.variants.{variant_name}.alg_params",
@@ -308,6 +317,11 @@ def resolve_preset(matrix_path, selector, matrix=None, *, checkpoint_context=Non
     _apply_alg_overrides(alg_params, matrix.get("shared_alg_params", {}))
     _apply_alg_overrides(alg_params, variant.get("alg_params", {}))
     algorithm_config.update(copy.deepcopy(variant.get("run_params", {})))
+    evaluation_controller = copy.deepcopy(variant.get("evaluation_controller"))
+    if evaluation_controller is not None:
+        if alg_params.get("inner_operator") != "none":
+            raise PresetMatrixError("Evaluation-only MPPI requires inner_operator='none'; no inner learner is run.")
+        algorithm_config["evaluation_controller"] = evaluation_controller
 
     return {
         "selector": selector,
@@ -316,6 +330,7 @@ def resolve_preset(matrix_path, selector, matrix=None, *, checkpoint_context=Non
         "reference": comparison["reference"],
         "description": variant.get("description", ""),
         "algorithm_config": algorithm_config,
+        **({"evaluation_controller": evaluation_controller} if evaluation_controller else {}),
         "environment": environment,
         "evaluation": copy.deepcopy(matrix.get("evaluation", {})),
     }
@@ -333,6 +348,8 @@ def materialize_presets(
         resolve_preset(matrix_path, selector, matrix=matrix, checkpoint_context=checkpoint_context)
         for selector in selectors
     ]
+    if any(item.get("evaluation_controller") for item in resolved_presets):
+        raise PresetMatrixError("Evaluation-only MPPI cannot be materialized as a training configuration.")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     written = []

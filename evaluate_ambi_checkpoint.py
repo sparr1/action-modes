@@ -593,6 +593,16 @@ def evaluate_preset(
         )
         digest_before = _outer_state_digest(model)
         updates_before = int(model.agent.num_updates)
+        controller = None
+        evaluation_controller = None
+        if resolved.get("evaluation_controller"):
+            from RL.tdmpc2_core.ambi_mppi import FrozenAMBIMPPIController
+            controller = FrozenAMBIMPPIController(model.agent,
+                resolved["evaluation_controller"].get("params"))
+            controller.reset(controller_seed)
+            evaluation_controller = {"type": "mppi", "settings": controller.settings,
+                                     "protocol": controller.protocol}
+        action_rule = controller.protocol["action_rule"] if controller else "tanh_mean"
         metric_values = {}
         nonfinite_metric_counts = {}
         episodes = []
@@ -602,6 +612,11 @@ def evaluate_preset(
             from RL.tdmpc2_core.inner_trace import InnerActionTrace
             bundle_run["initialization_seconds"] = time.perf_counter() - started
             bundle_run["resolved_config"] = _jsonable(vars(model.cfg))
+            if controller is not None:
+                bundle_run["action_rule"] = action_rule
+                bundle_run["evaluation_controller"] = evaluation_controller
+                bundle.manifest["protocol_semantics"] = {
+                    "action_rule": "prior_reference", "candidate_action_rule": "per_run"}
             if root_bank is not None:
                 for root in root_bank["roots"]:
                     if tuple(root["shape"]) != tuple(env.observation_space.shape):
@@ -611,7 +626,10 @@ def evaluate_preset(
             warm_observation = (np.asarray(root_bank["roots"][0]["observation"], dtype=np.float32)
                                 if root_bank is not None else env.reset(seed=int(seeds[0]))[0])
             started = time.perf_counter()
-            model.predict(warm_observation, deterministic=True, episode_start=True)
+            if controller is None:
+                model.predict(warm_observation, deterministic=True, episode_start=True)
+            else:
+                controller.act(warm_observation)
             bundle_run["warmup_including_compile_seconds"] = time.perf_counter() - started
 
         if root_bank is not None:
@@ -659,6 +677,8 @@ def evaluate_preset(
             seed = int(seed)
             episode_seed = solver_seed(controller_seed, "episode", seed)
             engine = getattr(model.agent, "inner_engine", None)
+            if controller is not None:
+                controller.reset(episode_seed)
             if engine is not None:
                 engine.reset_for_evaluation(episode_seed, reuse_action_pool=bundle is not None)
             _seed_spaces(env, seed)
@@ -679,12 +699,15 @@ def evaluate_preset(
                 trace = InnerActionTrace() if bundle is not None else None
                 predict_options = {"trace": trace} if trace is not None else {}
                 started = time.perf_counter()
-                action, _ = model.predict(
-                    observation,
-                    deterministic=True,
-                    episode_start=(episode_steps == 0),
-                    **predict_options,
-                )
+                if controller is None:
+                    action, _ = model.predict(
+                        observation,
+                        deterministic=True,
+                        episode_start=(episode_steps == 0),
+                        **predict_options,
+                    )
+                else:
+                    action = model._unscale_action(controller.act(observation).numpy())
                 action_seconds = time.perf_counter() - started
                 control_seconds += action_seconds
                 if trace is not None:
@@ -777,6 +800,8 @@ def evaluate_preset(
             "reference_variant": resolved["reference"],
             "description": resolved["description"],
             "critic_spec": copy.deepcopy(model.agent.model.critic_signature),
+            **({"evaluation_controller": evaluation_controller, "action_rule": action_rule}
+               if controller is not None else {}),
             "controller_seed": int(controller_seed),
             "environment_seeds": [int(seed) for seed in seeds],
             "seed_scheme": "sha256-v1",
@@ -895,6 +920,9 @@ def evaluate_matrix(
     resolved_presets = [resolve_preset(matrix_path, selector, matrix=matrix, checkpoint_context=context)
                         for selector in selectors]
     _validate_frozen_selection(matrix, resolved_presets)
+    if any(item.get("evaluation_controller") for item in resolved_presets) and (
+            save_root_bank or root_bank_path or bank_only):
+        raise ValueError("Evaluation-only MPPI supports full episodes; observation-bank probes are unsupported.")
     if not isinstance(bank_repetitions, int) or isinstance(bank_repetitions, bool) or bank_repetitions < 1:
         raise ValueError("bank_repetitions must be a positive integer.")
     if (save_root_bank or root_bank_path or bank_only or reference_bundle or wandb_options or assigned_runs) and bundle_dir is None:
@@ -913,7 +941,8 @@ def evaluate_matrix(
     if bundle_dir is not None:
         # A selected prior supplies reference outcomes to subsequent runs and
         # their artifacts. Never add an unselected baseline or SAC workload.
-        resolved_presets.sort(key=lambda item: item["algorithm_config"]["alg_params"].get("inner_operator") != "none")
+        resolved_presets.sort(key=lambda item: (item["algorithm_config"]["alg_params"].get("inner_operator") != "none"
+                                             or bool(item.get("evaluation_controller"))))
         for resolved in resolved_presets:
             params = resolved["algorithm_config"]["alg_params"]
             if _observation_architecture_key(resolved)[0] != "state":
@@ -989,7 +1018,8 @@ def evaluate_matrix(
                     probe_rollouts=probe_rollouts, probe_horizon=probe_horizon,
                 )
                 results.append(result)
-                if bundle is not None and resolved["algorithm_config"]["alg_params"].get("inner_operator") == "none":
+                if (bundle is not None and resolved["algorithm_config"]["alg_params"].get("inner_operator") == "none"
+                        and not resolved.get("evaluation_controller")):
                     bundle.reference = {episode["seed"]: episode["return"] for episode in result["episodes"]}
                 if save_root_bank:
                     bank = make_bank(checkpoint_sha256, protocol, captured_roots, complete=True)

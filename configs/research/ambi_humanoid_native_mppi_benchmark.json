@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "description": "Native TD-MPC2 MPPI over original AMBI no-inner prior u13m14st, compared to its existing policy-mean episodes. No inner SAC or outer learning.",
+  "base_alg_config": "checkpoint",
+  "source_run": "rwgao_b-brown-university/ambi/u13m14st",
+  "shared_alg_params": {
+    "inner_operator": "none",
+    "inner_rounds": null,
+    "inner_rollouts_per_round": null,
+    "inner_rollout_horizon": 3,
+    "inner_updates_per_round": null,
+    "inner_iterations": null,
+    "inner_rollouts": null,
+    "inner_horizon": null,
+    "inner_updates_per_iteration": null,
+    "inner_model_step_budget": null,
+    "inner_critic_updates_per_action": null,
+    "inner_actor_updates_per_action": null,
+    "inner_temperature_updates_per_action": null,
+    "inner_batch_size": 512,
+    "inner_replay_capacity": 12288,
+    "inner_replay_sampling": "with_replacement",
+    "inner_diagnostic_rollouts": 0,
+    "inner_actor_adaptation": "clone",
+    "inner_critic_adaptation": "clone",
+    "inner_temperature_mode": "inherit_outer",
+    "inner_temperature_initialization": "inherit_outer",
+    "inner_target_entropy": "inherit_outer",
+    "inner_bootstrap_source": "inner_target",
+    "inner_behavior_action": "policy_sample",
+    "inner_execution_action": "mean",
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_actor_scope": "action",
+    "inner_critic_scope": "action",
+    "inner_temperature_scope": "action",
+    "inner_replay_scope": "action",
+    "inner_actor_optimizer_scope": "action",
+    "inner_critic_optimizer_scope": "action",
+    "inner_temperature_optimizer_scope": "action",
+    "inner_critic_updates_per_round": null,
+    "inner_actor_updates_per_round": null,
+    "inner_temperature_updates_per_round": null
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "default_presets": [
+      "controller/mppi"
+    ],
+    "wandb_project": "ambi-inner-bench"
+  },
+  "comparisons": {
+    "controller": {
+      "reference": "prior",
+      "description": "Raw predicted rewards plus learned online AMBI soft-Q tail without explicit entropy correction.",
+      "variants": {
+        "prior": {
+          "description": "Frozen prior tanh mean; reuse existing matching reference episodes.",
+          "alg_params": {}
+        },
+        "mppi": {
+          "description": "Native weighted-elite MPPI H3/N512/E64/pi24, eight effective Humanoid iterations, episode warm start, online Q mean pair.",
+          "evaluation_controller": {
+            "type": "mppi",
+            "params": {
+              "horizon": 3,
+              "iterations": 6,
+              "num_samples": 512,
+              "num_elites": 64,
+              "num_pi_trajs": 24,
+              "min_std": 0.05,
+              "max_std": 2.0,
+              "temperature": 0.5
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -593,3 +593,42 @@ axes. Deterministic evaluation returns the policy mean, which collapses the
 execution-noise variants. Prior writeback is deliberately disabled outside
 training, so its variants would likewise collapse under a frozen outer
 checkpoint. Materialize and train those axes instead.
+
+
+## Native MPPI on the original AMBI prior
+
+`ambi_humanoid_native_mppi_benchmark.json` evaluates source `ambi/u13m14st`
+with native TD-MPC2 MPPI: H3/N512/E64/pi24, configured six/effective eight
+Humanoid iterations, std 0.05–2, temperature 0.5, shifted episode warm starts,
+and weighted elite execution without additional noise. The controller is an
+evaluation-only adapter; the loaded AMBI checkpoint has `inner_operator=none`.
+No SAC, temperature, critic, model, or optimizer updates run.
+
+Its score is discounted **raw decoded TOLD reward plus the online AMBI Q mean
+pair at a sampled frozen-prior terminal action**. The learned AMBI Q retains its
+soft-return semantics. No extra trajectory or terminal entropy correction is
+added, and no XQC reward-scale conversion applies. This tests MPPI search with
+the existing AMBI critic; it does not reinterpret that critic as reward-only.
+
+Five full episodes use seeds 101–105, controller seed 55, and 500 decisions at
+each of 100k/200k/300k/400k/500k. These protocol settings allow exact reuse of
+the existing AMBI prior bundles. Only MPPI receives a new curve run. The bundle
+records its executed action rule separately from the prior-reference protocol.
+Existing SAC/prior prediction and trace paths remain unchanged.
+
+Use the ordinary `evaluate_ambi_checkpoint.py --matrix
+configs/research/ambi_humanoid_native_mppi_benchmark.json --checkpoint CHECKPOINT
+--checkpoint-inventory INVENTORY --eval-series-spec-dir SPECS` metadata-only
+preflight, then explicitly create the new run and its `controller/mppi` run map.
+The Oscar launcher `slurm/run_ambi_prior_mppi_eval_oscar.sbatch` takes
+`EXPECTED_ACTION_MODES_SHA`, `AMBI_CHECKPOINT_PREFIX`, `CHECKPOINT_MANIFEST`,
+`AMBI_BENCHMARK_OUTPUT_ROOT`, `AMBI_BENCHMARK_REFERENCE_ROOT`, and `EVAL_RUN_MAP`.
+Production requires references and never repeats full prior episodes. Its
+`--smoke` mode runs both controllers for two seeds and three decisions, without
+publication. Submit from a clean checkout with durable scheduler log paths;
+use the existing CPU publisher for the explicitly selected MPPI run.
+
+Per-decision search diagnostics, actual model work, episode records, and HTML
+remain in each bundle. This controller performs zero optimizer updates and
+therefore has no per-update SAC traces. Observation-bank probes and training
+configuration materialization are rejected for evaluation-only MPPI.
