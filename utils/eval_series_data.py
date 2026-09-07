@@ -465,6 +465,8 @@ def descriptive_label(identity, selector=None):
         bootstrap = "outer Q throughout"
     else:
         bootstrap = "inner Q"
+    if planner["type"] == "sac" and settings.get("inner_finite_horizon", False):
+        bootstrap = bootstrap.removesuffix(" throughout") + " interior; prior policy + Q tail"
     title = f"{planner['type'].upper()} {'/'.join(budgets)} {bootstrap}"
     title += f" J{rounds}/N{settings.get('inner_rollouts_per_round')}/H{settings.get('inner_rollout_horizon')}"
     if settings.get("inner_steps_per_update") is not None:

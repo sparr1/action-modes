@@ -197,6 +197,8 @@ def _planner_display_label(planner, *, compact=False):
         else:
             bootstrap = settings.get("inner_bootstrap_source", "inner_target")
             parts.append("outer Q" if bootstrap.startswith("outer") else "inner Q")
+        if kind == "sac" and settings.get("inner_finite_horizon", False):
+            parts[-1] += " interior; prior policy + Q tail"
         interval = settings.get("inner_steps_per_update")
         if interval:
             parts.append(("s" if compact else "interval") + number(interval))

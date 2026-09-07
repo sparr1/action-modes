@@ -198,6 +198,35 @@ def test_descriptive_label_identifies_backbone_and_planner(bundle):
     assert "100000" not in record["label"]
 
 
+@pytest.mark.parametrize("source,label", [("inner_target", "inner Q"),
+                                         ("outer_target", "outer Q")])
+def test_finite_horizon_label_and_planner_identity(bundle, source, label):
+    path, value = bundle
+    config = value["runs"][0]["resolved_config"]
+    config.update(inner_bootstrap_source=source, inner_finite_horizon=False)
+    existing, = data.load_records(dump(path, value))
+    expected_identity = copy.deepcopy(existing["identity"])
+    expected_identity["planner"]["settings"]["inner_finite_horizon"] = True
+    config["inner_finite_horizon"] = True
+    finite, = data.load_records(dump(path, value))
+    assert finite["identity"] == expected_identity
+    assert label + " interior; prior policy + Q tail" in finite["label"]
+    assert "H3" in finite["label"]
+    assert "prior policy + Q tail" not in existing["label"]
+    config["inner_finite_horizon"] = False
+    restored, = data.load_records(dump(path, value))
+    assert restored["identity"] == existing["identity"]
+    assert restored["label"] == existing["label"]
+
+
+def test_disabled_finite_horizon_preserves_existing_descriptive_label(bundle):
+    path, value = bundle
+    legacy, = data.load_records(path)
+    value["runs"][0]["resolved_config"]["inner_finite_horizon"] = False
+    explicit, = data.load_records(dump(path, value))
+    assert explicit["label"] == legacy["label"]
+
+
 def test_labels_distinguish_outer_terminal_from_every_transition_bootstrap(bundle):
     path, _ = bundle
     record, = data.load_records(path)

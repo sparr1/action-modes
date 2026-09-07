@@ -395,6 +395,36 @@ A fresh `--smoke` output uses seeds 101/102 and three decisions for all selected
 settings and its own short prior reference, without curve publication. Override
 `--array=6` for a single 300k smoke task and supply durable Slurm output paths.
 
+### Matched round sweep with a frozen prior policy/value tail
+
+`ambi_humanoid_inner_prior_tail_step_rounds.json` repeats the preceding
+J1/J3/J6 step-update experiment with exactly one algorithmic change:
+`inner_finite_horizon=true`. Select `prior_tail_rounds/j1`,
+`prior_tail_rounds/j3`, and `prior_tail_rounds/j6`. The final imagined transition
+at H=3 bootstraps from a sampled frozen outer policy action and frozen outer
+online Q, using the checkpoint's `mppi_terminal_q_reduction` (mean_pair for
+the original AMBI backbone). No additional entropy term is added at this
+boundary; the learned outer critic keeps its original soft-Q semantics.
+Interior transitions retain the adapting inner actor, inner target critic,
+and entropy-augmented SAC target. See the [finite-horizon convention](../../RL/tdmpc2_core/README.md#finite-horizon-inner-sac-and-real-replay-mixing).
+
+N512/H3/B512, one joint update per parallel timestep, 1/3/6 rounds, learning
+rates, replay capacity, action-local resets, controller seed 55, environment
+seeds 101–105, and 500 real decisions remain matched to `step_rounds`.
+The nominal update totals remain 3/9/18 per component; horizon-tail computation
+adds policy/Q overhead and consumes additional bootstrap randomness. The
+first boundary rows become available at the third parallel step, so J1 gets
+its first boundary-informed update at its final update.
+
+Use `slurm/run_ambi_inner_prior_tail_step_rounds_oscar.sbatch` with the same
+environment variables, checkpoint grid, resource limits, and explicit New
+curve/publisher workflow described above. This launcher requires complete
+prior references for **every** production checkpoint, including 50k, and never
+reevaluates a full prior episode. `--smoke` still creates a separate three-step
+prior for seeds 101/102. All production SAC evaluations are fresh; the original
+step-round curves remain available for paired comparison. Curve labels identify
+the prior policy and Q tail.
+
 ### More critic updates on shared observations
 
 `ambi_humanoid_inner_critic_sweep.json` holds the D512-4-J6 collection and

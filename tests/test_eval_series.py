@@ -423,6 +423,27 @@ def test_curve_label_prioritizes_budgets_and_bootstrap():
     assert registry["attempt_label"] == "actor-sweep-20260905"
 
 
+@pytest.mark.parametrize("source,label", [("inner_target", "inner Q"), ("outer_target", "outer Q")])
+def test_finite_horizon_names_show_prior_policy_and_q_tail(source, label):
+    registry = label_registry(inner_bootstrap_source=source, inner_finite_horizon=True,
+                              inner_rollout_horizon=3, inner_update_timing="step",
+                              inner_steps_per_update=512)
+    before = deepcopy(registry)
+    expected = label + " interior; prior policy + Q tail"
+    assert expected in series.concise_curve_label(registry)
+    assert expected in series.evaluation_run_name(registry)
+    assert "step updates J6" in series.concise_curve_label(registry)
+    assert "H3" in series.evaluation_run_name(registry)
+    assert registry == before
+
+
+def test_disabled_finite_horizon_preserves_existing_names():
+    registry = label_registry()
+    names = series.concise_curve_label(registry), series.evaluation_run_name(registry)
+    registry["identity"]["planner"]["settings"]["inner_finite_horizon"] = False
+    assert (series.concise_curve_label(registry), series.evaluation_run_name(registry)) == names
+
+
 def test_curve_label_aliases_and_cosmetic_names_do_not_change_semantics():
     registry = label_registry()
     original = series.concise_curve_label(registry)
