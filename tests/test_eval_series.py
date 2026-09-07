@@ -405,3 +405,65 @@ def test_artifact_paths_cannot_escape_bundle(tmp_path, name):
     value["artifact_files"] = {name: value["source_result_path"]}
     with pytest.raises(series.SeriesError, match="safe relative paths"):
         series.validate_record(value)
+
+
+def label_registry(**settings):
+    return {"identity": {"backbone": "entity/train/u13m14st", "planner": {
+        "type": "sac", "settings": {"inner_rounds": 6, "inner_actor_updates_per_action": 72,
+        "inner_critic_updates_per_action": 36, "inner_temperature_updates_per_action": 18,
+        "inner_actor_lr": 5e-5, "inner_bootstrap_source": "outer_target", **settings}}},
+        "attempt_label": "actor-sweep-20260905", "run_id": "abcd0000111122223333444455556666"}
+
+
+def test_curve_label_prioritizes_budgets_and_bootstrap():
+    registry = label_registry()
+    label = series.concise_curve_label(registry)
+    assert label == "SAC C6/A12/T3 outer Q · u13m14st · actor #abcd"
+    assert len(label) <= 60
+    assert registry["attempt_label"] == "actor-sweep-20260905"
+
+
+def test_curve_label_aliases_and_cosmetic_names_do_not_change_semantics():
+    registry = label_registry()
+    original = series.concise_curve_label(registry)
+    registry.update(name="renamed arbitrary checkpoint campaign", label="obsolete alias")
+    registry["identity"]["planner"]["selector"] = "a/different_alias"
+    assert series.concise_curve_label(registry) == original
+
+
+def test_curve_label_distinguishes_repeated_attempts_with_equal_names():
+    first, second = label_registry(), label_registry()
+    second["run_id"] = "efgh0000111122223333444455556666"
+    assert series.concise_curve_label(first) != series.concise_curve_label(second)
+    second["run_id"] = first["run_id"]
+    second["attempt_label"] = "actor-repeat-B-20260906"
+    assert series.concise_curve_label(first) != series.concise_curve_label(second)
+
+
+def test_curve_label_retains_interval_temperature_and_reduced_learning_rate():
+    registry = label_registry(inner_critic_updates_per_action=72, inner_temperature_updates_per_action=72,
+                              inner_steps_per_update=128, inner_actor_lr=2.5e-5)
+    registry["attempt_label"] = "interval-sweep-20260906"
+    label = series.concise_curve_label(registry)
+    assert label.startswith("SAC C12/A12/T12 outer Q s128 aLR2.5e-5")
+    assert "u13m14st" in label and len(label) <= 60
+
+
+def test_curve_label_marks_xqc_terminal_and_nondefault_collection():
+    registry = label_registry(inner_terminal_bootstrap="outer", inner_actor_updates_per_action=6,
+                              inner_critic_updates_per_action=18, inner_temperature_updates_per_action=6,
+                              inner_rollouts_per_round=256)
+    registry["identity"]["backbone"] = "entity/train/axqc-prior-92441d99-5959199"
+    registry["identity"]["planner"]["type"] = "xqc"
+    label = series.concise_curve_label(registry)
+    assert label.startswith("XQC C3/A1/T1 outer-term N256")
+    assert "92441d99" in label
+
+
+def test_prior_label_excludes_inactive_settings_and_mppi_shows_changed_budget():
+    registry = label_registry()
+    registry["identity"]["planner"]["type"] = "prior"
+    assert series.concise_curve_label(registry).startswith("Prior · u13m14st")
+    registry["identity"]["planner"] = {"type": "mppi", "settings": {
+        "horizon": 5, "effective_iterations": 12, "num_samples": 1024}}
+    assert series.concise_curve_label(registry).startswith("MPPI H5 N1024 I12")
