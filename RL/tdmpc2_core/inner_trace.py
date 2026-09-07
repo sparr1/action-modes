@@ -51,12 +51,13 @@ _DEFINITIONS = {
     "probe_seconds": (
         "Probe elapsed time; CUDA events resolved after the action's existing host transfer."
     ),
-    "collection_transitions": "Imagined transitions appended during this collection round.",
+    "collection_transitions": "Imagined transitions appended in this collection event (a round or parallel step).",
+    "collection_rollout_step": "One-based depth of this parallel collection step within its round.",
     "collection_reward_sum_mean": (
-        "Mean undiscounted imagined return of this round's collection policy."
+        "Mean accumulated undiscounted imagined reward in this round through this collection event."
     ),
     "collection_discounted_reward_mean": (
-        "Mean discounted imagined reward of this round's collection policy."
+        "Mean accumulated discounted imagined reward in this round through this collection event."
     ),
 }
 

@@ -200,6 +200,9 @@ def _planner_display_label(planner, *, compact=False):
         interval = settings.get("inner_steps_per_update")
         if interval:
             parts.append(("s" if compact else "interval") + number(interval))
+        step_timing = settings.get("inner_update_timing") == "step"
+        if step_timing:
+            parts.append("step updates")
         if settings.get("inner_component_update_schedule"):
             parts.append("split")
         rate = settings.get("inner_actor_lr")
@@ -207,7 +210,7 @@ def _planner_display_label(planner, *, compact=False):
             parts.append("aLR" + number(rate))
         for key, prefix, default in (("inner_rounds", "J", 6), ("inner_rollouts_per_round", "N", 512), ("inner_rollout_horizon", "H", 3)):
             value = settings.get(key)
-            if value is not None and (not compact or value != default):
+            if value is not None and (not compact or value != default or (step_timing and prefix == "J")):
                 parts.append(prefix + number(value))
     elif kind == "mppi":
         for value, prefix in ((settings.get("planning_horizon", settings.get("horizon")), "H"),

@@ -9,6 +9,7 @@ import hashlib
 import math
 import warnings
 from collections.abc import Mapping
+from fractions import Fraction
 
 import numpy as np
 import torch
@@ -109,6 +110,9 @@ _AMBI_DEFAULTS = {
     # Alternative joint SAC cadence, measured in generated transitions. Credit
     # carries across rounds within one action, including fractional intervals.
     "inner_steps_per_update": None,
+    # With an explicit transition interval, optionally update between parallel
+    # rollout timesteps so the next imagined action uses the adapted actor.
+    "inner_update_timing": "round",
     "inner_finite_horizon": False,
     "inner_outer_replay_fraction": 0.0,
     # Optional canonical component schedule. Both values must be specified;
@@ -1240,6 +1244,25 @@ class AMBITDMPC2(TDMPC2Baseline):
         if schedule_mode == "legacy" and requested_operator in {"sac", "td3"}:
             merged.update(_LEGACY_SCHEDULE_DEFAULTS)
         merged.update(params)
+        timing = merged["inner_update_timing"]
+        if not isinstance(timing, str) or timing.lower() not in {"round", "step"}:
+            raise ValueError("inner_update_timing must be 'round' or 'step'.")
+        merged["inner_update_timing"] = timing.lower()
+        if merged["inner_update_timing"] == "step":
+            if (
+                requested_operator != "sac"
+                or schedule_mode != "canonical"
+                or merged["inner_steps_per_update"] is None
+            ):
+                raise ValueError(
+                    "inner_update_timing='step' requires canonical inner SAC "
+                    "with an explicit inner_steps_per_update interval."
+                )
+            if str(merged["inner_explorer_mode"]).lower() != "none":
+                raise ValueError(
+                    "inner_update_timing='step' currently requires "
+                    "inner_explorer_mode='none'."
+                )
         merged["inner_finite_horizon"] = _strict_bool(
             merged["inner_finite_horizon"], "inner_finite_horizon"
         )
@@ -1719,16 +1742,26 @@ class AMBITDMPC2(TDMPC2Baseline):
                 "without-replacement inner replay requires inner_replay_capacity "
                 ">= inner_batch_size."
             )
+        first_collection_size = (
+            cfg.inner_model_step_budget // cfg.inner_rounds
+            if cfg.inner_rounds > 0 else 0
+        )
+        if cfg.inner_update_timing == "step" and cfg.inner_rollouts_per_round > 0:
+            # Earliest vector step that earns an update, assuming no early
+            # termination. Use the same exact decimal interval as scheduling.
+            first_collection_size = cfg.inner_rollouts_per_round * math.ceil(
+                Fraction(str(cfg.inner_steps_per_update)) / cfg.inner_rollouts_per_round
+            )
         if (
             cfg.inner_operator in {"sac", "td3"}
             and cfg.inner_replay_sampling == "without_replacement"
             and has_inner_updates
             and cfg.inner_rounds > 0
-            and cfg.inner_batch_size > cfg.inner_model_step_budget // cfg.inner_rounds
+            and cfg.inner_batch_size > first_collection_size
         ):
             raise ValueError(
                 "without-replacement inner replay cannot fill inner_batch_size before the "
-                "first update round; reduce the batch or increase the model-step budget."
+                "first update; reduce the batch or increase collection before updating."
             )
 
         for key in ("inner_actor_adaptation", "inner_critic_adaptation"):

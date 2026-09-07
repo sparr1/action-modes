@@ -351,6 +351,50 @@ three-decision prior reference, and a new output root; smoke omits W&B.
 Production runs publish to `ambi-inner-bench`, with the interval, actor LR,
 bootstrap, and checkpoint identifying each setting.
 
+### One update per parallel timestep, varying inner rounds
+
+`ambi_humanoid_inner_step_rounds.json` is a small exploratory screen on the
+original AMBI prior-only backbone `ambi/u13m14st`. Its three presets are
+`step_rounds/j1`, `step_rounds/j3`, and `step_rounds/j6`. All use
+`inner_update_timing="step"`, `inner_steps_per_update=512`, 512 parallel
+trajectories, horizon 3, and minibatch 512. After each parallel timestep, one
+joint critic/actor/automatic-temperature update runs before the next timestep.
+
+| Inner rounds | Imagined transitions per real action | Updates per component per real action |
+| --- | --- | --- |
+| 1 | 1,536 | 3 |
+| 3 | 4,608 | 9 |
+| 6 | 9,216 | 18 |
+
+These are nominal counts; terminated branches earn credit only for actual
+transitions. Increasing rounds increases both collection and optimizer work.
+The comparison does not hold total compute fixed. Replay capacity stays at
+9,216 for every setting, with cumulative sampling with replacement. Actor,
+critic, temperature, replay, and optimizers reset for each real decision.
+Actor/critic/temperature learning rates are 5e-5/1e-4/3e-4. Inner-target Q,
+ordinary discounted targets (`inner_finite_horizon=false`), and zero real-replay
+mixing remain fixed. Frozen evaluation executes `tanh(mu)` and checks that outer
+learning state remains unchanged.
+
+`slurm/run_ambi_inner_step_rounds_oscar.sbatch` maps array indices 1–10 to
+50k, 100k, ..., 500k checkpoints. Production uses controller seed 55,
+environment seeds 101–105, and 500 decisions per episode: 150 new SAC episodes.
+It requests one L40S, six CPUs, 32 GiB and one hour per task, with at most three
+tasks active by default. Each checkpoint task evaluates all three presets.
+Supply `AMBI_CHECKPOINT_PREFIX`, `AMBI_BENCHMARK_OUTPUT_ROOT`,
+`EXPECTED_ACTION_MODES_SHA`, and `CHECKPOINT_MANIFEST` before submission.
+Prepare three explicit **New** evaluation-series assignments and export
+`EVAL_RUN_MAP`; run one CPU publisher per assigned run. Curve names distinguish
+step timing and include every round count, including J6.
+
+Set `AMBI_BENCHMARK_REFERENCE_ROOT` to a directory containing verified
+`step_N/prior` reference bundles (symlinks to existing bundles are sufficient).
+The launcher reuses those complete references. Only a missing 50k reference is
+generated locally; it does not resume or overwrite an existing prior curve.
+A fresh `--smoke` output uses seeds 101/102 and three decisions for all selected
+settings and its own short prior reference, without curve publication. Override
+`--array=6` for a single 300k smoke task and supply durable Slurm output paths.
+
 ### More critic updates on shared observations
 
 `ambi_humanoid_inner_critic_sweep.json` holds the D512-4-J6 collection and

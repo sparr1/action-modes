@@ -263,6 +263,10 @@ def planner_identity(config, result, algorithm, action_rule):
         return {"type": "prior", "action_rule": action_rule}
     _require(operator in {"sac", "td3", "xqc", "mppi"}, "Unknown resolved inner operator")
     active = {key: value for key, value in config.items() if key.startswith("inner_")}
+    # Old resolved artifacts predate the explicit default. Preserve their
+    # identity while recording opt-in step timing as a distinct planner.
+    if active.get("inner_update_timing", "round") == "round":
+        active.pop("inner_update_timing", None)
     if operator == "xqc":
         # Before the outer-terminal ablation existed, every XQC terminal
         # bootstrap used the inner learner. The new resolver makes that
@@ -465,6 +469,8 @@ def descriptive_label(identity, selector=None):
     title += f" J{rounds}/N{settings.get('inner_rollouts_per_round')}/H{settings.get('inner_rollout_horizon')}"
     if settings.get("inner_steps_per_update") is not None:
         title += f" interval{settings['inner_steps_per_update']}"
+    if settings.get("inner_update_timing") == "step":
+        title += " step updates"
     if settings.get("inner_actor_lr") is not None:
         title += f" actorLR{settings['inner_actor_lr']:g}"
     return prefix + title

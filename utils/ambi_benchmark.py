@@ -158,6 +158,9 @@ def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None):
             interval = params["inner_steps_per_update"]
             schedule.append(f"update/{interval} transitions")
             tags.extend(("schedule:transitions", f"steps-per-update:{interval}"))
+            if params.get("inner_update_timing") == "step":
+                schedule.append("step updates")
+                tags.append("update-timing:step")
             dimensions = [params.get(key) for key in (
                 "inner_rounds", "inner_rollouts_per_round", "inner_rollout_horizon")]
             if (controller in {"sac", "td3"}

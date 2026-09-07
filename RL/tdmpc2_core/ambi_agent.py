@@ -289,7 +289,12 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 * int(cfg.inner_rollouts_per_round)
                 * int(cfg.inner_rollout_horizon)
             )
-            if cfg.inner_component_update_schedule:
+            if cfg.inner_steps_per_update is not None:
+                update_schedule = (
+                    f"steps_per_update={cfg.inner_steps_per_update:g}, "
+                    f"update_timing={cfg.inner_update_timing}"
+                )
+            elif cfg.inner_component_update_schedule:
                 update_schedule = (
                     f"C={cfg.inner_critic_updates_per_round}, "
                     f"A={cfg.inner_actor_updates_per_round}"
@@ -770,6 +775,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "steps_per_update": getattr(self.cfg, "inner_steps_per_update", None),
             "outer_replay_fraction": float(getattr(self.cfg, "inner_outer_replay_fraction", 0.0)),
         }
+        if getattr(self.cfg, "inner_update_timing", "round") != "round":
+            options["update_timing"] = self.cfg.inner_update_timing
         if any(options.values()):
             if options["finite_horizon"]:
                 options["horizon"] = int(self.cfg.inner_rollout_horizon)
