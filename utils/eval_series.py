@@ -161,6 +161,58 @@ def validate_identity(registry, identity):
     return registry
 
 
+def concise_curve_label(registry):
+    """Budget-first legend text; complete identity remains in the run config."""
+    identity = registry["identity"]
+    planner = identity["planner"]
+    settings = planner.get("settings", {})
+    kind = planner.get("type", planner.get("operator", "planner"))
+    source = identity["backbone"].rsplit("/", 1)[-1]
+    embedded_id = re.search(r"(?:^|-)([0-9a-f]{8})(?:-|$)", source)
+    source = embedded_id.group(1) if embedded_id else source[:8]
+    number = lambda value: format(value, "g").replace("e-0", "e-").replace("e+0", "e+")
+    parts = ["Prior" if kind == "prior" else str(kind).upper()]
+    if kind in ("sac", "xqc"):
+        rounds = settings.get("inner_rounds")
+        doses = []
+        for component in ("critic", "actor", "temperature"):
+            dose = settings.get(f"inner_{component}_updates_per_round")
+            total = settings.get(f"inner_{component}_updates_per_action")
+            if dose is None and isinstance(total, (int, float)) and rounds:
+                dose = total / rounds
+            doses.append("?" if dose is None else number(dose))
+        parts.append("/".join(prefix + dose for prefix, dose in zip("CAT", doses)))
+        if settings.get("inner_terminal_bootstrap") == "outer":
+            parts.append("outer-term")
+        else:
+            bootstrap = settings.get("inner_bootstrap_source", "inner_target")
+            parts.append("outer Q" if bootstrap.startswith("outer") else "inner Q")
+        interval = settings.get("inner_steps_per_update")
+        if interval:
+            parts.append("s" + number(interval))
+        if settings.get("inner_component_update_schedule"):
+            parts.append("split")
+        rate = settings.get("inner_actor_lr")
+        if rate is not None and rate != 5e-5:
+            parts.append("aLR" + number(rate))
+        for key, prefix, default in (("inner_rounds", "J", 6), ("inner_rollouts_per_round", "N", 512), ("inner_rollout_horizon", "H", 3)):
+            value = settings.get(key)
+            if value is not None and value != default:
+                parts.append(prefix + number(value))
+    elif kind == "mppi":
+        for value, prefix, default in ((settings.get("planning_horizon", settings.get("horizon")), "H", 3),
+                                       (settings.get("num_samples"), "N", 512),
+                                       (settings.get("effective_iterations"), "I", 8)):
+            if value is not None and value != default:
+                parts.append(prefix + number(value))
+    attempt = re.sub(r"[-_ ]?20\d{2}[-_]?\d{2}[-_]?\d{2}", "", registry["attempt_label"]).strip("-_ ")
+    attempt = attempt.replace("-sweep", "")
+    front = " ".join(parts) + " · " + source + " · "
+    suffix = "#" + registry["run_id"][:4]
+    room = max(0, 60 - len(front) - len(suffix) - 1)
+    return front + (attempt[:room].rstrip("-_ ") + " " if room and attempt else "") + suffix
+
+
 def create_run(registry_root, record, attempt_label, project, entity, owner):
     """Explicitly allocate a new attempt before launching its checkpoint jobs.
 
@@ -275,7 +327,7 @@ class Publisher:
                 resume = "must" if index["remote_initialized"] else ("allow" if index.get("init_started") else "never")
                 index["init_started"] = True
                 _atomic_json(self.run_dir / "publication.json", index)
-            cfg = {"eval_series_schema": SCHEMA_VERSION, "evaluation_identity": self.registry["identity"], "evaluation_identity_sha256": self.registry["identity_sha256"], "attempt_label": self.registry["attempt_label"], "publication_owner": self.registry["owner"], "source_run": self.registry["identity"]["backbone"], "backbone_id": self.registry["identity"]["backbone"], "planner": self.registry["identity"]["planner"]}
+            cfg = {"eval_series_schema": SCHEMA_VERSION, "evaluation_identity": self.registry["identity"], "evaluation_identity_sha256": self.registry["identity_sha256"], "attempt_label": self.registry["attempt_label"], "publication_owner": self.registry["owner"], "source_run": self.registry["identity"]["backbone"], "backbone_id": self.registry["identity"]["backbone"], "planner": self.registry["identity"]["planner"], "curve_label": concise_curve_label(self.registry)}
             self.run = self.wandb.init(id=self.registry["run_id"], entity=self.registry["entity"], project=self.registry["project"], name=self.registry["name"], config=cfg, tags=["evaluation-curve", "eval-series-v1"], job_type="evaluation-curve", resume=resume, dir=str(self.run_dir), reinit=True)
             if getattr(self.run, "disabled", False) or getattr(getattr(self.run, "settings", None), "mode", "online") != "online":
                 raise SeriesError("Durable publication requires online W&B; use stage-only validation for offline work")
