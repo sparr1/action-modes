@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "description": "Exploratory step-interleaved inner SAC on the AMBI prior-only backbone trained with horizon 10 (train H10): one joint update per parallel timestep, varying only the number of inner rounds (1, 3, 6), with evaluation inner horizon fixed at 3.",
+  "base_alg_config": "checkpoint",
+  "source_run": "rwgao_b-brown-university/ambi/gky2rxlf",
+  "shared_alg_params": {
+    "inner_operator": "sac",
+    "inner_rounds": 6,
+    "inner_rollouts_per_round": 512,
+    "inner_rollout_horizon": 3,
+    "inner_updates_per_round": null,
+    "inner_iterations": null,
+    "inner_rollouts": null,
+    "inner_horizon": null,
+    "inner_updates_per_iteration": null,
+    "inner_model_step_budget": null,
+    "inner_critic_updates_per_action": null,
+    "inner_actor_updates_per_action": null,
+    "inner_temperature_updates_per_action": null,
+    "inner_batch_size": 512,
+    "inner_replay_capacity": 9216,
+    "inner_replay_sampling": "with_replacement",
+    "inner_diagnostic_rollouts": 0,
+    "inner_actor_adaptation": "clone",
+    "inner_critic_adaptation": "clone",
+    "inner_temperature_mode": "auto",
+    "inner_temperature_initialization": "inherit_outer",
+    "inner_target_entropy": "inherit_outer",
+    "inner_bootstrap_source": "inner_target",
+    "inner_behavior_action": "policy_sample",
+    "inner_execution_action": "policy_sample",
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_actor_scope": "action",
+    "inner_critic_scope": "action",
+    "inner_temperature_scope": "action",
+    "inner_replay_scope": "action",
+    "inner_actor_optimizer_scope": "action",
+    "inner_critic_optimizer_scope": "action",
+    "inner_temperature_optimizer_scope": "action",
+    "inner_q_target_reduction": "min_pair",
+    "inner_q_actor_reduction": "min_pair",
+    "inner_sac_critic_target": "entropy_augmented",
+    "inner_diagnostics_every": 1000,
+    "inner_actor_lr": 5e-05,
+    "inner_critic_lr": 0.0001,
+    "inner_temperature_lr": 0.0003,
+    "inner_adam_eps": 1e-08,
+    "inner_critic_target_tau": 0.01,
+    "inner_critic_target_update_interval": 1,
+    "inner_critic_updates_per_round": null,
+    "inner_actor_updates_per_round": null,
+    "inner_finite_horizon": false,
+    "inner_steps_per_update": 512,
+    "inner_outer_replay_fraction": 0.0,
+    "inner_explorer_actor_updates_per_round": null,
+    "inner_explorer_critic_updates_per_round": null,
+    "inner_explorer_temperature_updates_per_round": null,
+    "inner_update_timing": "step",
+    "inner_explorer_mode": "none"
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "default_presets": [
+      "step_rounds/j1",
+      "step_rounds/j3",
+      "step_rounds/j6"
+    ],
+    "bank_decisions": [
+      0,
+      100,
+      200,
+      300,
+      400
+    ],
+    "bank_repetitions": 3,
+    "diagnostic_rollouts": 8,
+    "diagnostic_horizon": 3,
+    "wandb_project": "ambi-inner-bench"
+  },
+  "comparisons": {
+    "step_rounds": {
+      "description": "Train H10 backbone; one update after each N512 parallel timestep, evaluation inner horizon 3 and B512, inner-target Q. Model and optimizer budgets both grow with rounds; use paired prior references from this same backbone.",
+      "reference": "j1",
+      "variants": {
+        "j1": {
+          "description": "1 inner rounds; 1536 imagined transitions and 3 critic/actor/automatic-temperature updates per real action. Fresh action-local adaptation; step timing, interval512, N512/H3/B512.",
+          "alg_params": {
+            "inner_rounds": 1
+          }
+        },
+        "j3": {
+          "description": "3 inner rounds; 4608 imagined transitions and 9 critic/actor/automatic-temperature updates per real action. Fresh action-local adaptation; step timing, interval512, N512/H3/B512.",
+          "alg_params": {
+            "inner_rounds": 3
+          }
+        },
+        "j6": {
+          "description": "6 inner rounds; 9216 imagined transitions and 18 critic/actor/automatic-temperature updates per real action. Fresh action-local adaptation; step timing, interval512, N512/H3/B512.",
+          "alg_params": {
+            "inner_rounds": 6
+          }
+        }
+      }
+    }
+  }
+}

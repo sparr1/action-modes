@@ -165,6 +165,8 @@ def backbone_display_label(identity, *, compact=False):
     """Readable aliases for verified source IDs, never scientific identity."""
     known = {
         "rwgao_b-brown-university/ambi/u13m14st": ("Original AMBI prior-only backbone", "AMBI original"),
+        "rwgao_b-brown-university/ambi/8vlf8z3w": ("AMBI prior-only backbone (train H5)", "AMBI train H5"),
+        "rwgao_b-brown-university/ambi/gky2rxlf": ("AMBI prior-only backbone (train H10)", "AMBI train H10"),
         "rwgao_b-brown-university/ambi/axqc-prior-92441d99-5959199": ("AMBI-XQC prior-only backbone", "AMBI-XQC"),
         "rwgao_b-brown-university/ambi/xq3zva9u": ("TD-MPC2 prior-only backbone", "TD-MPC2"),
     }

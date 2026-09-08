@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "description": "Frozen AMBI prior-only benchmark for the backbone trained with horizon 5 (train H5). Evaluate the central prior action without imagined work to provide same-backbone paired references for inner-horizon-3 step-interleaved SAC.",
+  "base_alg_config": "checkpoint",
+  "source_run": "rwgao_b-brown-university/ambi/8vlf8z3w",
+  "shared_alg_params": {
+    "inner_operator": "sac",
+    "inner_rounds": 8,
+    "inner_rollouts_per_round": 512,
+    "inner_rollout_horizon": 3,
+    "inner_updates_per_round": null,
+    "inner_iterations": null,
+    "inner_rollouts": null,
+    "inner_horizon": null,
+    "inner_updates_per_iteration": null,
+    "inner_model_step_budget": null,
+    "inner_critic_updates_per_action": null,
+    "inner_actor_updates_per_action": null,
+    "inner_temperature_updates_per_action": null,
+    "inner_batch_size": 512,
+    "inner_replay_capacity": 12288,
+    "inner_replay_sampling": "with_replacement",
+    "inner_diagnostic_rollouts": 0,
+    "inner_actor_adaptation": "clone",
+    "inner_critic_adaptation": "clone",
+    "inner_temperature_mode": "auto",
+    "inner_temperature_initialization": "inherit_outer",
+    "inner_target_entropy": "inherit_outer",
+    "inner_bootstrap_source": "inner_target",
+    "inner_behavior_action": "policy_sample",
+    "inner_execution_action": "mean",
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_actor_scope": "action",
+    "inner_critic_scope": "action",
+    "inner_temperature_scope": "action",
+    "inner_replay_scope": "action",
+    "inner_actor_optimizer_scope": "action",
+    "inner_critic_optimizer_scope": "action",
+    "inner_temperature_optimizer_scope": "action"
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "default_presets": [
+      "named_run/prior"
+    ],
+    "bank_decisions": [
+      0,
+      100,
+      200,
+      300,
+      400
+    ],
+    "bank_repetitions": 3,
+    "diagnostic_rollouts": 8,
+    "diagnostic_horizon": 3,
+    "wandb_project": "ambi-inner-bench"
+  },
+  "comparisons": {
+    "named_run": {
+      "description": "Prior-only reference from the train H5 backbone rwgao_b-brown-university/ambi/8vlf8z3w. Frozen evaluation executes the central action; saved training horizon, outer horizon, and temporal losses remain checkpoint-derived.",
+      "reference": "prior",
+      "variants": {
+        "prior": {
+          "description": "Execute the frozen prior's central action with no imagined work.",
+          "alg_params": {
+            "inner_operator": "none",
+            "inner_rounds": null,
+            "inner_rollouts_per_round": null,
+            "inner_critic_updates_per_round": null,
+            "inner_actor_updates_per_round": null,
+            "inner_temperature_mode": "inherit_outer"
+          }
+        }
+      }
+    }
+  }
+}

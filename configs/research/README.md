@@ -395,6 +395,46 @@ A fresh `--smoke` output uses seeds 101/102 and three decisions for all selected
 settings and its own short prior reference, without curve publication. Override
 `--array=6` for a single 300k smoke task and supply durable Slurm output paths.
 
+### One update per timestep on train-H5 and train-H10 backbones
+
+`ambi_humanoid_h5_inner_step_rounds.json` and
+`ambi_humanoid_h10_inner_step_rounds.json` apply the same `step_rounds/j1`,
+`step_rounds/j3`, and `step_rounds/j6` protocol above to sources
+`rwgao_b-brown-university/ambi/8vlf8z3w` and
+`rwgao_b-brown-university/ambi/gky2rxlf`, respectively. H5/H10 identify the
+backbone's **training horizon**; evaluation inner horizon stays at 3, with N512,
+B512, one joint update after each parallel timestep, and the same learning
+rates, reset rules, seeds, and full-episode protocol. Saved training and outer
+planning horizons and temporal losses remain checkpoint-derived.
+
+Create matching prior references with
+`ambi_humanoid_h5_prior_benchmark.json` or
+`ambi_humanoid_h10_prior_benchmark.json`, selecting `named_run/prior`. Each
+contains only that prior preset and preserves the original prior benchmark's
+shared settings. Prior references must match the backbone, checkpoint hash,
+and episode protocol; original-backbone references cannot be reused. Prepare
+explicit **New** evaluation-series assignments for each backbone and planner,
+including its prior, before workers start. Curve labels distinguish `AMBI train
+H5` and `AMBI train H10` independently of the evaluation inner horizon.
+
+`slurm/run_ambi_h5h10_step_rounds_oscar.sbatch` uses one manifest row per complete
+checkpoint/planner result, allowing independent five-seed evaluations to run in
+parallel. Export `EXPECTED_ACTION_MODES_SHA`, `AMBI_EVAL_MANIFEST` (an absolute
+JSON path), and a fresh absolute `AMBI_BENCHMARK_OUTPUT_ROOT`; optionally set
+`AMBI_DMC_PYTHON`. The manifest has `schema_version: 1` and a `rows` array. Each
+row gives `backbone` (`h5` or `h10`), `stage` (`prior` or `inner`), `step`
+(50k–500k every 50k), absolute `checkpoint`, `checkpoint_inventory`, and
+`eval_run_dir` paths, plus the exact `selector` (`named_run/prior` or one of the
+three `step_rounds` presets). Array indices directly select rows. Submit prior
+rows first and make inner rows depend on their required completed priors. Choose
+concurrency from live GPU/CPU/memory allowance across both backbones and CPU
+publishers; each worker owns a complete result rather than a seed shard.
+
+Bundles live below the output root at `h5/step_N/prior` or
+`h5/step_N/jJ/inner`, with the corresponding `h10` paths for train H10. Run one
+CPU publisher per assigned curve. A scheduled inner-row `--smoke` uses its own
+two-seed, three-decision prior and fresh output root, without publication.
+
 ### More critic updates on shared observations
 
 `ambi_humanoid_inner_critic_sweep.json` holds the D512-4-J6 collection and
