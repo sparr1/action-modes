@@ -197,6 +197,10 @@ def _planner_display_label(planner, *, compact=False):
         else:
             bootstrap = settings.get("inner_bootstrap_source", "inner_target")
             parts.append("outer Q" if bootstrap.startswith("outer") else "inner Q")
+            target_tau = settings.get("inner_critic_target_tau")
+            if (kind == "sac" and bootstrap == "inner_target"
+                    and target_tau is not None and target_tau != 0.01):
+                parts.append("qTau" + number(target_tau))
         interval = settings.get("inner_steps_per_update")
         if interval:
             parts.append(("s" if compact else "interval") + number(interval))

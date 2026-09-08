@@ -468,6 +468,37 @@ For smoke, submit `--array=5,15,25 --smoke` against a separate fresh output
 root: each 300k J cell runs seeds 101/102 for three decisions with a private
 short prior and no publication.
 
+### Faster target tracking with one update per timestep
+
+`ambi_humanoid_inner_fast_target_step_rounds.json` repeats the original N512
+one-update sweep with **`inner_critic_target_tau=0.1` instead of 0.01**. Select
+`fast_target_step_rounds/j1`, `fast_target_step_rounds/j3`, and
+`fast_target_step_rounds/j6`. N512/H3/B512 and `inner_steps_per_update=512`
+remain fixed. J1/J3/J6 still collect 1,536/4,608/9,216 imagined transitions and
+perform 3/9/18 updates per component per real action.
+
+The implementation uses `target = (1 - tau) * target + tau * updated_critic`:
+larger tau means faster tracking. Each joint update is followed by one target
+update. Targets initialize from the frozen outer **online** critic and reset
+each real action; the outer target-update parameter and all learning rates
+remain unchanged. This uses ordinary inner-target SAC continuation, with
+`inner_finite_horizon=false`, not the prior-policy horizon bootstrap.
+
+After 3/9/18 target updates, the coefficient of the initial target is
+72.9%/38.7%/15.0% with tau0.1, versus 97.0%/91.4%/83.5% with tau0.01. These
+are interpolation coefficients, not a measured lag behind the evolving critic.
+The experiment tests whether slow target tracking constrains these short inner
+solves. More responsive targets may also propagate inaccurate critic updates.
+
+`slurm/run_ambi_inner_fast_target_step_rounds_oscar.sbatch` uses the same
+30-cell checkpoint/J mapping, complete five-seed bundles, private smoke cells,
+and explicit New run/publisher workflow as the N256 launcher above. The
+checkpoints are 50k through 500k every 50k, controller seed 55, environment
+seeds 101–105, and 500 decisions: 150 new SAC episodes. All full prior references
+are reused. Retain L40S hardware and set concurrency from live combined
+account/QOS limits; the launcher has no fixed low throttle. Compare against the
+original N512 tau0.01 results, with all other scientific settings held fixed.
+
 ### More critic updates on shared observations
 
 `ambi_humanoid_inner_critic_sweep.json` holds the D512-4-J6 collection and
