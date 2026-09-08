@@ -254,13 +254,15 @@ def test_zero_writeback_does_not_restrict_existing_inner_modes():
     assert no_inner.inner_operator == "none"
 
     lora = _build_cfg(
-        inner_actor_adaptation="lora",
-        inner_critic_adaptation="lora",
+        inner_actor_adaptation="clone",
+        inner_critic_adaptation="lora_rl",
+        inner_critic_lora_rank=4,
+        inner_critic_lora_layers="input_hidden",
         inner_actor_writeback_coef=0.0,
         inner_critic_writeback_coef=0.0,
     )
-    assert lora.inner_actor_adaptation == "lora"
-    assert lora.inner_critic_adaptation == "lora"
+    assert lora.inner_actor_adaptation == "clone"
+    assert lora.inner_critic_adaptation == "lora_rl"
 
 
 @pytest.mark.parametrize(
@@ -281,9 +283,9 @@ def test_each_zero_coefficient_skips_its_foreach_update(
     calls = []
     original = inner_improvement.polyak_update
 
-    def tracked(source, target, tau, *, adapters_only=False):
+    def tracked(source, target, tau):
         calls.append(target)
-        return original(source, target, tau, adapters_only=adapters_only)
+        return original(source, target, tau)
 
     monkeypatch.setattr(inner_improvement, "polyak_update", tracked)
     model.agent.act(
@@ -319,7 +321,7 @@ def test_each_zero_coefficient_skips_its_foreach_update(
         ),
         (
             {
-                "inner_actor_adaptation": "lora",
+                "inner_actor_adaptation": "lora_rl",
                 "inner_actor_writeback_coef": 0.1,
             },
             "inner_actor_adaptation",
@@ -340,7 +342,8 @@ def test_each_zero_coefficient_skips_its_foreach_update(
         ),
         (
             {
-                "inner_critic_adaptation": "lora",
+                "inner_critic_adaptation": "lora_rl",
+                "inner_critic_lora_rank": 4,
                 "inner_critic_writeback_coef": 0.1,
             },
             "inner_critic_adaptation",

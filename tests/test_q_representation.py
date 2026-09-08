@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from RL.tdmpc2_core.common import math as td_math
 from RL.tdmpc2_core.common.compile_regions import CompileRegion
 from RL.tdmpc2_core.common.layers import detached_module_forward
-from RL.tdmpc2_core.common.lora import LoRALinear, lorafy_copy
+from RL.tdmpc2_core.common.lora import LoRARLLinear, make_lora_rl_critic
 from RL.tdmpc2_core.common.q_representation import QRepresentation
 from RL.tdmpc2_core.common.soft_world_model import SoftWorldModel
 
@@ -561,13 +561,16 @@ def test_invalid_q_architectures_fail_before_network_construction(kwargs, messag
 
 
 @pytest.mark.parametrize("rank", [2, 4, 8])
-def test_lora_scale_is_the_direct_multiplier_independent_of_requested_rank(rank):
-    # The one-unit output also verifies that effective-rank clipping does not
-    # accidentally change the configured multiplier.
-    adapted = lorafy_copy(nn.Sequential(nn.Linear(8, 1)), rank=rank, scale=0.75)
-    layer = next(module for module in adapted.modules() if isinstance(module, LoRALinear))
-    assert layer.rank == 1
-    assert layer.scaling == pytest.approx(0.75)
+def test_lora_rl_scale_is_direct_and_scalar_output_does_not_clip_hidden_rank(rank):
+    critic = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8), nn.Linear(8, 1))
+    adapted = make_lora_rl_critic(critic, rank=rank, scale=0.75)
+    layers = [module for module in adapted.modules() if isinstance(module, LoRARLLinear)]
+    assert len(layers) == 2
+    for layer in layers:
+        assert layer.rank == rank
+        assert layer.scaling == pytest.approx(0.75)
+    assert type(adapted[-1]) is nn.Linear
+    assert adapted[-1].weight.requires_grad
 
 
 def test_trusted_internal_pair_reduction_matches_validated_public_path():

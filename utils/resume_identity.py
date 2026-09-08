@@ -14,6 +14,8 @@ from typing import Any
 
 import numpy as np
 
+from utils.lora_identity import normalize_lora_rl_identity
+
 
 LINEAGE_IDENTITY_SCHEMA_VERSION = 1
 SUPPORTED_RESUME_ALGORITHMS = {
@@ -182,6 +184,7 @@ def scientific_trial_parameters(
         for field in _OPERATIONAL_ALGORITHM_FIELDS:
             algorithm.pop(field, None)
         if projected.get("alg") == _AMBI_ALGORITHM:
+            algorithm = normalize_lora_rl_identity(algorithm)
             # These controls are resolved by AMBI even when omitted. Preserve
             # each default's scalar kind so omitted and explicit defaults
             # describe the same scientific lineage.

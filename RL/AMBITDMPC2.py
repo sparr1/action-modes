@@ -27,7 +27,8 @@ _SAC_ACTOR_LOSS_SCALE_MODES = {"none", "tdmpc2_percentile_range"}
 _BEHAVIOR_POLICY_OBJECTIVES = {"reverse_kl", "action_space_cross_entropy"}
 _BEHAVIOR_POLICY_KL_SCHEDULES = {"none", "smooth", "quantile_gate", "dual"}
 _VALUE_EVAL_PROTOCOLS = {"paper_deterministic", "stochastic_bellman"}
-_ADAPTATION_MODES = {"frozen", "clone", "lora"}
+_ACTOR_ADAPTATION_MODES = {"frozen", "clone"}
+_CRITIC_ADAPTATION_MODES = {"frozen", "clone", "lora_rl"}
 _LIFECYCLE_SCOPES = {"action", "episode", "run"}
 _SCOPE_RANK = {"action": 0, "episode": 1, "run": 2}
 _INNER_EXPLORER_MODES = {
@@ -198,14 +199,11 @@ _AMBI_DEFAULTS = {
     "inner_log_std_min": None,
     "inner_log_std_max": None,
 
-    # LoRA rank controls capacity; scale is the actual, rank-independent output
-    # multiplier (legacy alpha/r is normalized to this value).
-    "inner_actor_lora_rank": 8,
-    "inner_actor_lora_scale": 1.0,
-    "inner_actor_lora_dropout": 0.0,
-    "inner_critic_lora_rank": 8,
+    # Critic-only LoRA_RL regularization; opt-in, with a direct residual multiplier.
+    "inner_critic_lora_layers": "input_hidden",
+    "inner_critic_lora_rank": 96,
     "inner_critic_lora_scale": 1.0,
-    "inner_critic_lora_dropout": 0.0,
+    "inner_critic_lora_weight_decay": 2e-4,
 
     # Inner state lifetime. Action-local remains the safe reference behavior.
     "inner_actor_scope": "action",
@@ -877,6 +875,43 @@ def _normalize_legacy_params(params):
     """Normalize schedule aliases and identify canonical versus total scheduling."""
     params = copy.deepcopy(params)
 
+    # An old active LoRA configuration describes a different scientific
+    # protocol. Never reinterpret it as the new critic regularizer.
+    for key in ("inner_adaptation", "inner_actor_adaptation", "inner_critic_adaptation"):
+        if str(params.get(key, "")).lower() == "lora":
+            raise ValueError(
+                f"Legacy {key}='lora' has been retired. Explicitly migrate to "
+                "inner_actor_adaptation='clone', inner_critic_adaptation='lora_rl' "
+                "and the new critic LoRA settings; old exact resumes are incompatible."
+            )
+    new_lora = str(params.get("inner_critic_adaptation", "")).lower() == "lora_rl"
+    generic_lora = {"lora_rank", "lora_alpha", "lora_dropout"} & params.keys()
+    if new_lora and generic_lora:
+        raise ValueError(
+            f"Retired LoRA aliases {sorted(generic_lora)} cannot configure lora_rl; "
+            "use inner_critic_lora_rank, inner_critic_lora_scale and "
+            "inner_critic_lora_weight_decay."
+        )
+    if new_lora and params.get("inner_critic_lora_dropout", 0.0) != 0.0:
+        raise ValueError(
+            "inner_critic_lora_dropout is retired: lora_rl has no adapter dropout. "
+            "Use the ordinary critic dropout controls."
+        )
+    obsolete_lora = {
+        key for key in params
+        if key.startswith("inner_actor_lora_") or key in generic_lora
+        or key == "inner_critic_lora_dropout"
+        or (not new_lora and key.startswith("inner_critic_lora_"))
+    }
+    if obsolete_lora:
+        warnings.warn(
+            "Discarding inactive/retired LoRA settings: " + ", ".join(sorted(obsolete_lora)),
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        for key in obsolete_lora:
+            params.pop(key)
+
     if params.get("inner_steps_per_update") is not None:
         conflicts = sorted(
             key for key in (
@@ -1021,12 +1056,6 @@ def _normalize_legacy_params(params):
             ("inner_actor_grad_clip_norm", "inner_critic_grad_clip_norm"),
             lambda value, _: value,
         ),
-        ("lora_rank", ("inner_actor_lora_rank", "inner_critic_lora_rank"), lambda value, _: value),
-        (
-            "lora_dropout",
-            ("inner_actor_lora_dropout", "inner_critic_lora_dropout"),
-            lambda value, _: value,
-        ),
     )
     for legacy, canonical, convert in direct_groups:
         if legacy not in params:
@@ -1040,24 +1069,6 @@ def _normalize_legacy_params(params):
         value = params.pop(legacy)
         for key in canonical:
             params[key] = convert(value, params)
-
-    if "lora_alpha" in params:
-        conflicts = [
-            key for key in ("inner_actor_lora_scale", "inner_critic_lora_scale")
-            if key in params
-        ]
-        if conflicts:
-            raise ValueError(
-                f"Cannot mix legacy 'lora_alpha' with canonical key(s) {conflicts}."
-            )
-        _legacy_warning(["lora_alpha"])
-        alpha = float(params.pop("lora_alpha"))
-        actor_rank = int(params.get("inner_actor_lora_rank", 8))
-        critic_rank = int(params.get("inner_critic_lora_rank", 8))
-        if actor_rank <= 0 or critic_rank <= 0:
-            raise ValueError("LoRA rank must be positive when converting legacy lora_alpha.")
-        params["inner_actor_lora_scale"] = alpha / actor_rank
-        params["inner_critic_lora_scale"] = alpha / critic_rank
 
     if "allow_long_inner_horizon" in params:
         _legacy_warning(["allow_long_inner_horizon"])
@@ -1764,11 +1775,20 @@ class AMBITDMPC2(TDMPC2Baseline):
                 "first update; reduce the batch or increase collection before updating."
             )
 
-        for key in ("inner_actor_adaptation", "inner_critic_adaptation"):
+        for key, modes in (
+            ("inner_actor_adaptation", _ACTOR_ADAPTATION_MODES),
+            ("inner_critic_adaptation", _CRITIC_ADAPTATION_MODES),
+        ):
             value = str(getattr(cfg, key)).lower()
-            if value not in _ADAPTATION_MODES:
-                raise ValueError(f"{key} must be one of {sorted(_ADAPTATION_MODES)}.")
+            if value not in modes:
+                raise ValueError(f"{key} must be one of {sorted(modes)}.")
             setattr(cfg, key, value)
+        if cfg.inner_critic_adaptation == "lora_rl":
+            if cfg.inner_operator != "sac" or cfg.inner_actor_adaptation != "clone":
+                raise ValueError(
+                    "lora_rl requires inner_operator='sac' and "
+                    "inner_actor_adaptation='clone'."
+                )
         cfg.inner_critic_dropout_enabled = _strict_bool(
             cfg.inner_critic_dropout_enabled,
             "inner_critic_dropout_enabled",
@@ -1827,27 +1847,29 @@ class AMBITDMPC2(TDMPC2Baseline):
                 "inner_bootstrap_source must be 'inner_target', 'outer_target', or 'outer_online'."
             )
 
-        for component in ("actor", "critic"):
-            rank_key = f"inner_{component}_lora_rank"
-            scale_key = f"inner_{component}_lora_scale"
-            dropout_key = f"inner_{component}_lora_dropout"
-            setattr(cfg, rank_key, int(getattr(cfg, rank_key)))
-            setattr(
-                cfg,
-                scale_key,
-                _finite_float(getattr(cfg, scale_key), scale_key),
-            )
-            setattr(
-                cfg,
-                dropout_key,
-                _finite_float(getattr(cfg, dropout_key), dropout_key),
-            )
-            if getattr(cfg, rank_key) <= 0:
-                raise ValueError(f"{rank_key} must be positive.")
-            if getattr(cfg, scale_key) <= 0.0:
-                raise ValueError(f"{scale_key} must be positive.")
-            if not 0.0 <= getattr(cfg, dropout_key) < 1.0:
-                raise ValueError(f"{dropout_key} must be in [0, 1).")
+        cfg.inner_critic_lora_layers = str(cfg.inner_critic_lora_layers).lower()
+        if cfg.inner_critic_lora_layers not in {"input_hidden", "hidden"}:
+            raise ValueError("inner_critic_lora_layers must be 'input_hidden' or 'hidden'.")
+        cfg.inner_critic_lora_rank = _strict_positive_int(
+            cfg.inner_critic_lora_rank, "inner_critic_lora_rank"
+        )
+        cfg.inner_critic_lora_scale = _strict_nonnegative_float(
+            cfg.inner_critic_lora_scale, "inner_critic_lora_scale"
+        )
+        if cfg.inner_critic_lora_scale <= 0.0:
+            raise ValueError("inner_critic_lora_scale must be positive.")
+        cfg.inner_critic_lora_weight_decay = _strict_nonnegative_float(
+            cfg.inner_critic_lora_weight_decay, "inner_critic_lora_weight_decay"
+        )
+        if cfg.inner_critic_adaptation == "lora_rl":
+            max_rank = int(cfg.mlp_dim)
+            if cfg.inner_critic_lora_layers == "input_hidden":
+                max_rank = min(max_rank, int(cfg.latent_dim) + int(cfg.action_dim))
+            if cfg.inner_critic_lora_rank > max_rank:
+                raise ValueError(
+                    "inner_critic_lora_rank exceeds a selected critic matrix dimension: "
+                    f"rank={cfg.inner_critic_lora_rank}, maximum={max_rank}."
+                )
 
         for key in (
             "inner_actor_lr",
@@ -2053,6 +2075,12 @@ class AMBITDMPC2(TDMPC2Baseline):
             if value not in _LIFECYCLE_SCOPES:
                 raise ValueError(f"{key} must be one of {sorted(_LIFECYCLE_SCOPES)}.")
             setattr(cfg, key, value)
+        if cfg.inner_critic_adaptation == "lora_rl":
+            for key in scope_keys[:-1]:
+                if getattr(cfg, key) != "action":
+                    raise ValueError(
+                        f"lora_rl requires fresh per-decision state; {key} must be 'action'."
+                    )
         if (
             cfg.inner_operator in {"sac", "td3"}
             and cfg.inner_replay_scope == "action"
@@ -2381,9 +2409,6 @@ class AMBITDMPC2(TDMPC2Baseline):
             if cfg.inner_actor_adaptation == cfg.inner_critic_adaptation
             else "mixed"
         )
-        cfg.lora_rank = cfg.inner_actor_lora_rank
-        cfg.lora_alpha = cfg.inner_actor_lora_scale * cfg.inner_actor_lora_rank
-        cfg.lora_dropout = cfg.inner_actor_lora_dropout
         cfg.inner_grad_clip_norm = max(
             cfg.inner_actor_grad_clip_norm, cfg.inner_critic_grad_clip_norm
         )

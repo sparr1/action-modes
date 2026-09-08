@@ -80,6 +80,35 @@ def test_every_checked_in_preset_materializes_to_a_valid_ambi_config():
         assert cfg.inner_operator in {"none", "sac", "td3", "mppi"}
 
 
+def test_critic_lora_comparisons_use_distinct_critic_only_paper_transfer_settings():
+    matrix = load_preset_matrix(MATRIX)
+    assert "adaptation_mechanism" not in matrix["comparisons"]
+    assert "lora_capacity" not in matrix["comparisons"]
+    expected = {
+        "critic_lora_placement/input_hidden_r96": ("input_hidden", 96),
+        "critic_lora_placement/hidden_r96": ("hidden", 96),
+        "critic_lora_rank/rank_64": ("input_hidden", 64),
+        "critic_lora_rank/rank_96": ("input_hidden", 96),
+        "critic_lora_rank/rank_128": ("input_hidden", 128),
+    }
+    for selector, (layers, rank) in expected.items():
+        resolved = resolve_preset(MATRIX, selector, matrix=matrix)
+        params = resolved["algorithm_config"]["alg_params"]
+        assert params["inner_actor_adaptation"] == "clone"
+        assert params["inner_critic_adaptation"] == "lora_rl"
+        assert params["inner_critic_lora_layers"] == layers
+        assert params["inner_critic_lora_rank"] == rank
+        assert params["inner_critic_lora_scale"] == 1.0
+        assert params["inner_critic_lora_weight_decay"] == 0.0002
+        assert not any(key.startswith("inner_actor_lora_") for key in params)
+        assert "inner_critic_lora_dropout" not in params
+        for component in ("actor", "critic", "temperature", "replay", "actor_optimizer",
+                          "critic_optimizer", "temperature_optimizer"):
+            assert params[f"inner_{component}_scope"] == "action"
+    dense = resolve_preset(MATRIX, "critic_lora_placement/clone", matrix=matrix)
+    assert dense["algorithm_config"]["alg_params"]["inner_critic_adaptation"] == "clone"
+
+
 def test_resolution_is_complete_and_does_not_mutate_base_or_matrix():
     matrix = load_preset_matrix(MATRIX)
     before = json.dumps(matrix, sort_keys=True)

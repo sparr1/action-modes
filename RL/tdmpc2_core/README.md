@@ -72,6 +72,95 @@ from the current outer temperature. Scalar twin critics, LoRA, TD3, no inner
 improvement, and persistent inner scopes are explicit ablations. The MPPI inner
 operator is a compute-matched TD-MPC-style comparator, not AMBI's planner.
 
+### Critic-only LoRA-RL
+
+Set `inner_critic_adaptation="lora_rl"` and retain
+`inner_actor_adaptation="clone"` for the paper-inspired inner SAC variant.
+Dense actor/critic adaptation remains the reference default. The replacement
+is based on [LoRA-RL](https://arxiv.org/abs/2604.18978) and its released
+[implementation at commit `0395bb27b24016f6c680ca12c6d5e367f77db054`](https://github.com/paulzyzy/LoRA_RL/tree/0395bb27b24016f6c680ca12c6d5e367f77db054).
+It borrows critic update regularization while retaining AMBI's learned priors,
+architecture, actor loss, critic representation, target reduction, and budgets.
+
+```json
+{
+  "inner_actor_adaptation": "clone",
+  "inner_critic_adaptation": "lora_rl",
+  "inner_critic_lora_layers": "input_hidden",
+  "inner_critic_lora_rank": 96,
+  "inner_critic_lora_scale": 1.0,
+  "inner_critic_lora_weight_decay": 0.0002
+}
+```
+
+Each selected inner-critic matrix uses `W = W_outer + scale * B @ A`.
+`W_outer` is frozen during the solve; both adapter factors train. The output
+heads, biases, and LayerNorm parameters remain normally trainable in separate
+inner copies. There is no adapter dropout. The ordinary configured critic
+dropout still follows `inner_critic_dropout_enabled`. Actor updates remain
+dense, and gradients through the adapted critic reach actor actions without
+updating any outer model parameter.
+
+`inner_critic_lora_layers="input_hidden"` selects the input and hidden-to-hidden
+matrices in each critic. `"hidden"` selects only hidden-to-hidden matrices and
+leaves the input projection normally trainable. AMBI's input is a learned latent
+plus action: at model size 5, its input matrix is similar in size to its
+512-by-512 hidden matrix. The default therefore constrains both; hidden-only is
+the closer placement analogue to the paper's residual-block-only adapters.
+Neither placement changes the network architecture or adapts the value head
+with LoRA.
+
+The DMC [SimbaV2 launcher](https://github.com/paulzyzy/LoRA_RL/blob/0395bb27b24016f6c680ca12c6d5e367f77db054/SAC_SimbaV2/scripts/run_lora_example.sh)
+uses rank 96, alpha 96, and adapter weight decay `2e-4`; the DMC
+[BRC launcher](https://github.com/paulzyzy/LoRA_RL/blob/0395bb27b24016f6c680ca12c6d5e367f77db054/SAC_BRC/scripts/run_lora_example.sh)
+uses rank 128, alpha 128, and `6e-4`. Our direct scale is alpha/rank, so scale
+one follows both settings without changing scale when rank changes. The default
+decay borrows the SimbaV2 setting; it is not a claim that AMBI matches SimbaV2's
+effective capacity or hyperspherical normalization. Adapters use AdamW at the
+existing inner critic learning rate and epsilon; other trainable critic
+parameters retain AMBI's ordinary Adam behavior through an AdamW group with
+zero weight decay. BRC instead preserves its own baseline AdamW decay of
+`1e-4` on those parameters, as shown in its
+[optimizer groups](https://github.com/paulzyzy/LoRA_RL/blob/0395bb27b24016f6c680ca12c6d5e367f77db054/SAC_BRC/jaxrl/agent/brc_learner.py).
+This difference deliberately preserves each baseline's dense optimization.
+Frozen matrices never enter an optimizer.
+
+Target updates follow the released
+[BRC effective-weight rule](https://github.com/paulzyzy/LoRA_RL/blob/0395bb27b24016f6c680ca12c6d5e367f77db054/SAC_BRC/jaxrl/lora.py):
+Polyak-average the merged online weights into an independent dense target,
+including the normally trainable parameters. Averaging A and B separately
+does not implement this rule. The target follows the existing inner target
+cadence and tau. Frozen outer bootstrap choices retain their existing meaning.
+
+All actor, critic, replay, temperature, and optimizer scopes are action-local
+for this variant. Every decision restores the latest learned prior, initializes
+fresh A from a normal distribution with standard deviation `1/sqrt(rank)` and
+zero B, and resets target, optimizer, and replay state in reused storage.
+Zero B makes the initial adapted critic exactly reproduce its prior. This is
+an intentional departure from the paper's main random-base initialization,
+which would change a trained checkpoint's predictions at the start of a solve.
+The public SimbaV2 snapshot contains its launcher/configuration but lacks the
+`simbaV2` implementation imported by its agent factory; detailed target and
+trainable-parameter behavior is checked against BRC, not an unavailable SimbaV2
+module. We make no latency or return-improvement claim without AMBI experiments.
+
+The retired `inner_actor_adaptation="lora"`,
+`inner_critic_adaptation="lora"`, and joint `inner_adaptation="lora"` requests
+fail with migration guidance; they are not aliases for the replacement.
+Historical results retain their old identities. Inactive legacy LoRA fields in
+dense saved configurations can be ignored with a deprecation warning. To use
+the new method, explicitly select `lora_rl`, remove old actor/adapter-dropout
+options, and choose a new experimental lineage. The old Humanoid rank-8/rank-16
+and AntLegAdapt joint-LoRA preset names are retired. See the
+[new research selectors and Humanoid configurations](../../configs/research/README.md#critic-only-lora-rl-comparisons).
+
+New exact resumes record and validate the method, placement, rank, scale, and
+decay before loading live state, even though the action-local workspace is empty
+at the checkpoint boundary. Historical action-local payloads did not record the
+adapter method; their saved configuration is required to identify and reject an
+obsolete active LoRA run. Portable outer-model weights remain usable for a new
+study with an explicitly selected adaptation method.
+
 ### Optional adapted-prior writeback
 
 The reference behavior keeps the outer control priors immutable during action
@@ -676,9 +765,9 @@ Inner-critic dropout is independently switchable with
 configured critic dropout during trainable inner critic and actor-Q updates.
 Set it to `false` for dropout-free, deterministic per-head forwards while
 leaving outer critic training unchanged. Ensemble-pair selection and SAC action
-sampling remain stochastic. The switch disables all dropout in the adapted
-critic, including a nonzero `inner_critic_lora_dropout`; target critics remain
-in eval mode in either setting.
+sampling remain stochastic. The switch disables the configured dropout in the
+adapted critic; LoRA-RL introduces no separate adapter dropout. Target critics
+remain in eval mode in either setting.
 
 AMBI can optionally use TD-MPC2's running P95-P5 actor-value scale through
 `sac_actor_loss_scale_mode="tdmpc2_percentile_range"` (the default is

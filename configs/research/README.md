@@ -549,6 +549,47 @@ The frozen-checkpoint matrix is
 tree so it cannot be confused with the independently trained branch and horizon
 comparisons.
 
+### Critic-only LoRA-RL comparisons
+
+The [LoRA-RL implementation contract](../../RL/tdmpc2_core/README.md#critic-only-lora-rl)
+keeps the actor dense and applies low-rank updates only to selected critic
+matrices. The initial reference is rank 96, direct scale one, and AdamW adapter
+weight decay `2e-4`. Output heads, biases, and normalization parameters remain
+trainable. All scientific inner state resets at each real decision.
+
+The frozen-checkpoint matrix `ambi_inner_decoupling.json` provides these
+explicit selectors without changing its default operator comparison:
+
+- `critic_lora_placement/clone`: full actor and critic adaptation.
+- `critic_lora_placement/input_hidden_r96`: LoRA on the critic input and hidden
+  matrices; the default placement for AMBI's learned-latent input.
+- `critic_lora_placement/hidden_r96`: LoRA on hidden matrices only, closer to
+  the paper's placement, with a normally trainable input projection.
+- `critic_lora_rank/rank_64`, `rank_96`, and `rank_128`: input-and-hidden
+  placement with identical scale, decay, actor adaptation, and SAC budgets.
+
+These replace the old `adaptation_mechanism` and `lora_capacity` axes. Old
+selectors and active `"lora"` configurations do not silently select the new
+method. Reproducing a historical run requires its historical source; start a
+new evaluation attempt when adopting `"lora_rl"`.
+
+Four matching algorithm/experiment pairs under `configs/dmcontrol/` provide
+single-seed Humanoid Walk training screens:
+
+- `ambi_humanoid_walk_base_v2_lora_rl_input_hidden_r64`
+- `ambi_humanoid_walk_base_v2_lora_rl_input_hidden_r96`
+- `ambi_humanoid_walk_base_v2_lora_rl_input_hidden_r128`
+- `ambi_humanoid_walk_base_v2_lora_rl_hidden_r96`
+
+Each retains the base-v2 recipe: seed 55, 14 million real decisions, J=8, N=32,
+H=3, G=1, replay capacity 768, and the original evaluation/checkpoint settings.
+Only critic adaptation and descriptive run identity change. These are full
+training configurations, not smoke tests; no sweep runs by adding them. Rank 96
+and decay `2e-4` borrow the paper's DMC SimbaV2 settings, while the rank and
+placement alternatives test the transfer to AMBI. The trained prior and zero-B
+initialization deliberately differ from the paper's main setup. Neither a
+return improvement nor a speedup has been established for these configurations.
+
 # Frozen-checkpoint preset workflow
 
 `ambi_inner_decoupling.json` is a compact matrix of one-axis-at-a-time overrides
@@ -566,7 +607,7 @@ AMBI. The matrix covers:
 - temperature, imagined behavior, and returned-action exploration;
 - explicit J/N/H/G collection and joint-update schedules;
 - action, episode, and run lifecycles;
-- replay sampling, bootstrap source, rollout horizon, clone/LoRA, LoRA rank,
+- replay sampling, bootstrap source, rollout horizon, critic-only LoRA-RL placement and rank,
   and outer-policy anchoring controls.
 
 Within a variant's `alg_params`, `null` removes an inherited base key. The

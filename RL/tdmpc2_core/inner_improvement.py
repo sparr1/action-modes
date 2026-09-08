@@ -21,15 +21,18 @@ from .common.inner_utils import (
     InnerRNG,
     allocate_across_rounds,
     updates_for_transitions,
-    copy_lora_adapters_,
-    lora_uses_shared_bases,
     rebase_clone_with_target_,
-    rebase_lora_base_,
-    reset_lora_adapters_,
     trainable_parameter_count,
 )
 from .common.latent_buffer import LatentReplayBuffer
-from .common.lora import lorafy_copy, lorafy_shared, trainable_parameters
+from .common.lora import (
+    dense_lora_rl_critic,
+    lora_rl_parameter_groups,
+    make_lora_rl_critic,
+    reset_lora_rl_critic_,
+    trainable_parameters,
+    update_lora_rl_target_,
+)
 from .common.parameter_noise import (
     adapt_parameter_noise_stddev,
     classify_parameter_noise_actor,
@@ -53,11 +56,8 @@ _PARAMETER_NOISE_FUNCTIONAL_CHUNK_SIZE = 8
 
 
 @torch.no_grad()
-def polyak_update(source, target, tau, *, adapters_only=False):
+def polyak_update(source, target, tau):
     tau = float(tau)
-    if adapters_only:
-        copy_lora_adapters_(source, target, tau=tau)
-        return
     source_parameters = [parameter.detach() for parameter in source.parameters()]
     target_parameters = list(target.parameters())
     if tau == 1.0:
@@ -585,22 +585,11 @@ class InnerImprovementEngine:
         temperature_run = str(cfg.inner_temperature_scope) == "run"
         if actor_run:
             fields["actor"] = True
-            shared_lora = (
-                str(cfg.inner_actor_adaptation) == "lora"
-                and bool(cfg.inner_rebase_persistent)
-            )
-            needs_anchor = (
-                float(cfg.inner_outer_policy_kl_coef) > 0.0
-                or float(cfg.inner_outer_action_l2_coef) > 0.0
-            )
-            fields["actor_anchor"] = not shared_lora or needs_anchor
+            fields["actor_anchor"] = True
             fields["actor_target"] = str(cfg.inner_operator) == "td3"
         if critic_run:
             fields["critic"] = True
-            fields["critic_anchor"] = not (
-                str(cfg.inner_critic_adaptation) == "lora"
-                and bool(cfg.inner_rebase_persistent)
-            )
+            fields["critic_anchor"] = True
             fields["critic_target"] = (
                 str(cfg.inner_bootstrap_source) == "inner_target"
             )
@@ -749,6 +738,18 @@ class InnerImprovementEngine:
                 "lifetime and action history."
             )
 
+    def _lora_rl_spec(self):
+        if self.cfg.inner_critic_adaptation != "lora_rl":
+            return None
+        return {
+            "method": "lora_rl",
+            "protocol_version": 1,
+            "layers": str(self.cfg.inner_critic_lora_layers),
+            "rank": int(self.cfg.inner_critic_lora_rank),
+            "scale": float(self.cfg.inner_critic_lora_scale),
+            "weight_decay": float(self.cfg.inner_critic_lora_weight_decay),
+        }
+
     def training_state_dict(self):
         """Return persistent inner scientific state at an episode boundary."""
         self._require_resume_boundary()
@@ -758,7 +759,11 @@ class InnerImprovementEngine:
             # Version 1 remains byte-for-byte compatible for feature-off runs.
             # Version 2 records the active population identity; all R modules
             # are action-local and are therefore intentionally absent here.
-            "version": 2 if self._explorer_active else 1,
+            # Version 3 identifies the LoRA-RL solve even at an empty boundary.
+            "version": (
+                3 if self._lora_rl_spec() is not None
+                else 2 if self._explorer_active else 1
+            ),
             "action_index": int(self.action_index),
             "episode_index": int(self.episode_index),
             "rng": self.rng.training_state_dict(),
@@ -802,6 +807,9 @@ class InnerImprovementEngine:
         }
         if self._explorer_active:
             payload["explorer_mode"] = self._explorer_mode
+        lora_rl_spec = self._lora_rl_spec()
+        if lora_rl_spec is not None:
+            payload["lora_rl_spec"] = lora_rl_spec
         return payload
 
     def _load_module_candidate(
@@ -868,6 +876,11 @@ class InnerImprovementEngine:
                 "workspace",
                 "mppi_prev_mean",
         }
+        lora_rl_spec = self._lora_rl_spec()
+        if version != 3 and lora_rl_spec is not None:
+            raise ValueError(
+                "LoRA-RL exact resume is incompatible with legacy AMBI inner-engine state."
+            )
         if version == 1:
             if self._explorer_active:
                 raise ValueError(
@@ -888,6 +901,23 @@ class InnerImprovementEngine:
                     f"checkpoint={state.get('explorer_mode')!r}, "
                     f"configured={self._explorer_mode!r}."
                 )
+        elif version == 3:
+            expected_keys = common_keys | {"lora_rl_spec"}
+            if lora_rl_spec is None or self._explorer_active:
+                raise ValueError(
+                    "LoRA-RL inner-engine state is incompatible with the configured method."
+                )
+            saved_spec = require_exact_keys(
+                state.get("lora_rl_spec"), set(lora_rl_spec), "LoRA-RL protocol specification"
+            )
+            if any(
+                type(saved_spec[key]) is not type(value) or saved_spec[key] != value
+                for key, value in lora_rl_spec.items()
+            ):
+                raise ValueError(
+                    "LoRA-RL inner-engine protocol specification is incompatible: "
+                    f"checkpoint={saved_spec!r}, configured={lora_rl_spec!r}."
+                )
         else:
             raise ValueError("Unsupported AMBI inner-engine training-state version.")
         state = require_exact_keys(
@@ -897,7 +927,7 @@ class InnerImprovementEngine:
         )
         if (
             state["schema"] != "ambi-inner-engine-training-state"
-            or state["version"] not in {1, 2}
+            or state["version"] not in {1, 2, 3}
         ):
             raise ValueError("Unsupported AMBI inner-engine training-state version.")
         action_index = self._validate_index(state["action_index"], "action_index")
@@ -995,9 +1025,7 @@ class InnerImprovementEngine:
                     ),
                     (
                         "critic_target",
-                        lambda: deepcopy(candidate.critic)
-                        .to(self.device)
-                        .requires_grad_(False),
+                        lambda: self._new_critic_target(candidate.critic),
                         None,
                     ),
                 )
@@ -1332,9 +1360,8 @@ class InnerImprovementEngine:
 
     def _reset_action_component(self, component, module, outer):
         mode = str(getattr(self.cfg, f"inner_{component}_adaptation"))
-        if mode == "lora":
-            rebase_lora_base_(module, outer)
-            reset_lora_adapters_(module)
+        if mode == "lora_rl":
+            reset_lora_rl_critic_(module, outer)
         else:
             module.load_state_dict(outer.state_dict())
             module.requires_grad_(mode != "frozen")
@@ -1367,9 +1394,8 @@ class InnerImprovementEngine:
         setattr(pool, target_name, None)
         if target is not None:
             mode = str(getattr(self.cfg, f"inner_{component}_adaptation"))
-            if mode == "lora":
-                rebase_lora_base_(target, outer)
-                copy_lora_adapters_(module, target)
+            if mode == "lora_rl":
+                update_lora_rl_target_(module, target, tau=1.0)
             else:
                 target.load_state_dict(module.state_dict())
             target.requires_grad_(False)
@@ -1383,21 +1409,12 @@ class InnerImprovementEngine:
         elif mode == "clone":
             module = deepcopy(base).to(self.device)
             module.requires_grad_(True)
-        elif mode == "lora":
-            scope = str(getattr(self.cfg, f"inner_{component}_scope"))
-            # Action-local LoRA always follows the current outer head. A
-            # persistent adapter may share as well when rebasing is enabled;
-            # the opt-out retains the historical frozen-base snapshot.
-            factory = (
-                lorafy_shared
-                if scope == "action" or bool(self.cfg.inner_rebase_persistent)
-                else lorafy_copy
-            )
-            module = factory(
+        elif mode == "lora_rl" and component == "critic":
+            module = make_lora_rl_critic(
                 base,
-                rank=getattr(self.cfg, f"inner_{component}_lora_rank"),
-                scale=getattr(self.cfg, f"inner_{component}_lora_scale"),
-                dropout=getattr(self.cfg, f"inner_{component}_lora_dropout"),
+                rank=self.cfg.inner_critic_lora_rank,
+                scale=self.cfg.inner_critic_lora_scale,
+                placement=self.cfg.inner_critic_lora_layers,
             ).to(self.device)
         else:
             raise ValueError(f"Unknown {component} adaptation mode: {mode!r}")
@@ -1407,7 +1424,13 @@ class InnerImprovementEngine:
         params = trainable_parameters(module)
         if not params:
             return None
-        return torch.optim.Adam(
+        lora_rl = component == "critic" and self.cfg.inner_critic_adaptation == "lora_rl"
+        optimizer_type = torch.optim.AdamW if lora_rl else torch.optim.Adam
+        if lora_rl:
+            params = lora_rl_parameter_groups(
+                module, self.cfg.inner_critic_lora_weight_decay
+            )
+        return optimizer_type(
             params,
             lr=float(getattr(self.cfg, f"inner_{component}_lr")),
             eps=float(self.cfg.inner_adam_eps),
@@ -1424,13 +1447,6 @@ class InnerImprovementEngine:
         target = getattr(state, f"{component}_target", None)
         mode = str(getattr(self.cfg, f"inner_{component}_adaptation"))
         if adapted is None:
-            return
-        if mode == "lora":
-            rebase_lora_base_(adapted, outer)
-            if target is not None:
-                rebase_lora_base_(target, outer)
-            if anchor is not None and anchor is not outer:
-                anchor.load_state_dict(outer.state_dict())
             return
         if anchor is None:
             return
@@ -1608,14 +1624,6 @@ class InnerImprovementEngine:
             if str(cfg.inner_actor_scope) == "action":
                 # The immutable outer policy is the exact action-local anchor.
                 state.actor_anchor = self.model._pi if needs_actor_anchor else None
-            elif (
-                str(cfg.inner_actor_adaptation) == "lora"
-                and lora_uses_shared_bases(state.actor)
-            ):
-                # Shared LoRA reads the live outer policy directly. Keeping a
-                # second full anchor would defeat the memory/transfer saving;
-                # only regularizers need a reference at all.
-                state.actor_anchor = self.model._pi if needs_actor_anchor else None
             elif not actor_restored or state.actor_anchor is None:
                 state.actor_anchor = (
                     deepcopy(self.model._pi).to(self.device).requires_grad_(False)
@@ -1629,11 +1637,6 @@ class InnerImprovementEngine:
             if not critic_restored:
                 state.critic = self._adapt_module(self.model._Qs, "critic")
             if str(cfg.inner_critic_scope) == "action":
-                state.critic_anchor = None
-            elif (
-                str(cfg.inner_critic_adaptation) == "lora"
-                and lora_uses_shared_bases(state.critic)
-            ):
                 state.critic_anchor = None
             elif not critic_restored or state.critic_anchor is None:
                 state.critic_anchor = (
@@ -1659,7 +1662,7 @@ class InnerImprovementEngine:
             cfg.inner_bootstrap_source == "inner_target"
             and state.critic_target is None
         ):
-            state.critic_target = deepcopy(state.critic).to(self.device).requires_grad_(False)
+            state.critic_target = self._new_critic_target(state.critic)
         if (
             state.critic_target is not None
             and bool(getattr(cfg, "compile", False))
@@ -1819,11 +1822,16 @@ class InnerImprovementEngine:
         self._prepare_explorer_workspace()
         self._reset_parameter_noise_action_state()
 
+    def _new_critic_target(self, critic):
+        if self.cfg.inner_critic_adaptation == "lora_rl":
+            return dense_lora_rl_critic(critic).to(self.device)
+        return deepcopy(critic).to(self.device).requires_grad_(False)
+
     def make_modules_for_compatibility(self):
         """Legacy test/debug hook returning freshly created inner modules."""
         actor = self._adapt_module(self.model._pi, "actor")
         critic = self._adapt_module(self.model._Qs, "critic")
-        target = deepcopy(critic).to(self.device).requires_grad_(False)
+        target = self._new_critic_target(critic)
         actor_optim = self._new_optimizer(actor, "actor")
         critic_optim = self._new_optimizer(critic, "critic")
         return (
@@ -4167,12 +4175,12 @@ class InnerImprovementEngine:
             == 0
             and cfg.inner_bootstrap_source == "inner_target"
         ):
-            polyak_update(
-                state.critic,
-                state.critic_target,
-                cfg.inner_critic_target_tau,
-                adapters_only=cfg.inner_critic_adaptation == "lora",
+            update = (
+                update_lora_rl_target_
+                if cfg.inner_critic_adaptation == "lora_rl"
+                else polyak_update
             )
+            update(state.critic, state.critic_target, cfg.inner_critic_target_tau)
             state.target_steps += 1
             state.critic_target_steps += 1
         if (
@@ -4188,7 +4196,6 @@ class InnerImprovementEngine:
                 state.actor,
                 state.actor_target,
                 cfg.inner_actor_target_tau,
-                adapters_only=cfg.inner_actor_adaptation == "lora",
             )
             state.target_steps += 1
             state.actor_target_steps += 1

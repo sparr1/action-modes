@@ -777,6 +777,16 @@ class AMBITDMPC2Agent(torch.nn.Module):
         }
         if getattr(self.cfg, "inner_update_timing", "round") != "round":
             options["update_timing"] = self.cfg.inner_update_timing
+        if getattr(self.cfg, "inner_critic_adaptation", "clone") == "lora_rl":
+            # Action-local adapters are absent at checkpoint boundaries, but
+            # their learning protocol must still constrain exact continuation.
+            options["critic_adaptation"] = {
+                "method": "lora_rl",
+                "layers": self.cfg.inner_critic_lora_layers,
+                "rank": int(self.cfg.inner_critic_lora_rank),
+                "scale": float(self.cfg.inner_critic_lora_scale),
+                "weight_decay": float(self.cfg.inner_critic_lora_weight_decay),
+            }
         if any(options.values()):
             if options["finite_horizon"]:
                 options["horizon"] = int(self.cfg.inner_rollout_horizon)

@@ -10,20 +10,18 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=6
 #SBATCH --constraint=geforce3090
-#SBATCH --array=0-3
+#SBATCH --array=0-2
 
 # Each array index runs a separate LegAdaptAnt-v0 experiment config, so all
-# four algorithms train concurrently as independent SLURM jobs, each logging
+# three algorithms train concurrently as independent SLURM jobs, each logging
 # its own wandb run:
 #   0 -> AntLegAdaptSAC
 #   1 -> AntLegAdaptTDMPC2
 #   2 -> AntLegAdaptAMBITDMPC2
-#   3 -> AntLegAdaptAMBITDMPC2LoRA
 CONFIGS=(
   "AntLegAdaptSAC"
   "AntLegAdaptTDMPC2"
   "AntLegAdaptAMBITDMPC2"
-  "AntLegAdaptAMBITDMPC2LoRA"
 )
 CONFIG_NAME="${CONFIGS[$SLURM_ARRAY_TASK_ID]}"
 

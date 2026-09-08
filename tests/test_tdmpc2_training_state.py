@@ -766,21 +766,23 @@ def test_latent_replay_exact_preflight_is_transactional(corruption):
     _assert_tree_equal(target.training_state_dict(), pristine)
 
 
-@pytest.mark.parametrize("adaptation", ["clone", "lora"])
-def test_ambi_exact_training_state_restores_all_run_scoped_workspace(adaptation):
+@pytest.mark.parametrize("adaptation,scope", [("clone", "run"), ("lora_rl", "action")])
+def test_ambi_exact_training_state_restores_supported_workspace_lifetimes(adaptation, scope):
     overrides = dict(
-        inner_actor_adaptation=adaptation,
+        inner_actor_adaptation="clone",
         inner_critic_adaptation=adaptation,
+        inner_critic_lora_rank=4,
+        inner_critic_lora_layers="input_hidden",
         inner_temperature_mode="auto",
         inner_temperature_initialization="fixed",
         inner_temperature_updates_per_action=1,
-        inner_actor_scope="run",
-        inner_critic_scope="run",
-        inner_temperature_scope="run",
-        inner_replay_scope="run",
-        inner_actor_optimizer_scope="run",
-        inner_critic_optimizer_scope="run",
-        inner_temperature_optimizer_scope="run",
+        inner_actor_scope=scope,
+        inner_critic_scope=scope,
+        inner_temperature_scope=scope,
+        inner_replay_scope=scope,
+        inner_actor_optimizer_scope=scope,
+        inner_critic_optimizer_scope=scope,
+        inner_temperature_optimizer_scope=scope,
         inner_mppi_warm_start_scope="run",
     )
     source = ambi_model(**overrides)
@@ -806,6 +808,46 @@ def test_ambi_exact_training_state_restores_all_run_scoped_workspace(adaptation)
         torch.full((3,), 0.2), t0=True, collect_diagnostics=False
     )
     torch.testing.assert_close(source_action, restored_action, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("source_mode,changes", [
+    ("clone", {"inner_critic_adaptation": "lora_rl"}),
+    ("lora_rl", {"inner_critic_adaptation": "clone"}),
+    ("lora_rl", {"inner_critic_lora_rank": 2}),
+    ("lora_rl", {"inner_critic_lora_layers": "hidden"}),
+    ("lora_rl", {"inner_critic_lora_scale": 0.5}),
+    ("lora_rl", {"inner_critic_lora_weight_decay": 0.0004}),
+])
+def test_lora_rl_checkpoint_protocol_mismatch_rejects_before_live_mutation(source_mode, changes):
+    params = {
+        "inner_actor_adaptation": "clone",
+        "inner_critic_adaptation": source_mode,
+        "inner_critic_lora_rank": 4,
+        "inner_critic_lora_layers": "input_hidden",
+    }
+    source = ambi_model(**params)
+    source.agent.act(torch.zeros(3), t0=True, collect_diagnostics=False)
+    source.agent.prepare_training_resume_boundary()
+    saved = _clone_tree(source.agent.training_state_dict())
+
+    target = ambi_model(**(params | changes))
+    target.agent.act(torch.full((3,), 0.5), t0=True, collect_diagnostics=False)
+    target.agent.prepare_training_resume_boundary()
+    pristine = _clone_tree(target.agent.training_state_dict())
+    # Make a premature outer load observable even when constructors use the
+    # same seed. Rejection must precede copying any model, optimizer, or RNG.
+    key = next(key for key, value in saved["outer"]["model"].items()
+               if value.is_floating_point())
+    saved["outer"]["model"][key].add_(1.0)
+    with pytest.raises(ValueError, match="critic-target specification"):
+        target.agent.load_training_state_dict(saved)
+    _assert_tree_equal(target.agent.training_state_dict(), pristine)
+
+    engine = target.agent.inner_engine
+    before_inner = _clone_tree(engine.training_state_dict())
+    with pytest.raises(ValueError, match="LoRA-RL"):
+        engine.load_training_state_dict(saved["inner"])
+    _assert_tree_equal(engine.training_state_dict(), before_inner)
 
 
 def test_ambi_episode_state_must_expire_before_snapshot_and_mppi_run_state_restores():
@@ -965,7 +1007,7 @@ def test_ambi_mixed_lifetimes_resume_from_a_canonical_transient_free_boundary():
 @pytest.mark.parametrize(
     "changes",
     (
-        {"inner_actor_adaptation": "lora"},
+        {"inner_actor_adaptation": "frozen", "inner_actor_updates_per_action": 0},
         {"inner_replay_capacity": 17},
         {
             "inner_actor_scope": "episode",

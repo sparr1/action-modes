@@ -533,65 +533,118 @@
         }
       }
     },
-    "adaptation_mechanism": {
-      "description": "Compare full cloned modules with LoRA while keeping the adaptation algorithm and optimizer counts fixed.",
+    "critic_lora_placement": {
+      "description": "Compare dense critic adaptation with LoRA-RL placement at rank 96, retaining a fully cloned actor and identical SAC budgets.",
       "reference": "clone",
       "variants": {
         "clone": {
-          "description": "Adapt full actor and critic copies.",
+          "description": "Adapt the complete cloned actor and critic.",
           "alg_params": {
             "inner_actor_adaptation": "clone",
-            "inner_critic_adaptation": "clone"
+            "inner_critic_adaptation": "clone",
+            "inner_actor_scope": "action",
+            "inner_critic_scope": "action",
+            "inner_temperature_scope": "action",
+            "inner_replay_scope": "action",
+            "inner_actor_optimizer_scope": "action",
+            "inner_critic_optimizer_scope": "action",
+            "inner_temperature_optimizer_scope": "action"
           }
         },
-        "lora": {
-          "description": "Adapt rank-eight LoRA actor and critic deltas.",
+        "input_hidden_r96": {
+          "description": "Adapt critic input and hidden-to-hidden matrices at rank 96; output, bias, and normalization parameters remain trainable.",
           "alg_params": {
-            "inner_actor_adaptation": "lora",
-            "inner_critic_adaptation": "lora",
-            "inner_actor_lora_rank": 8,
-            "inner_critic_lora_rank": 8,
-            "inner_actor_lora_scale": 1.0,
-            "inner_critic_lora_scale": 1.0
+            "inner_actor_adaptation": "clone",
+            "inner_critic_adaptation": "lora_rl",
+            "inner_critic_lora_layers": "input_hidden",
+            "inner_critic_lora_rank": 96,
+            "inner_critic_lora_scale": 1.0,
+            "inner_critic_lora_weight_decay": 0.0002,
+            "inner_actor_scope": "action",
+            "inner_critic_scope": "action",
+            "inner_temperature_scope": "action",
+            "inner_replay_scope": "action",
+            "inner_actor_optimizer_scope": "action",
+            "inner_critic_optimizer_scope": "action",
+            "inner_temperature_optimizer_scope": "action"
+          }
+        },
+        "hidden_r96": {
+          "description": "Apply rank-96 LoRA only to critic hidden-to-hidden matrices, retaining ordinary trainable input projections and output heads.",
+          "alg_params": {
+            "inner_actor_adaptation": "clone",
+            "inner_critic_adaptation": "lora_rl",
+            "inner_critic_lora_layers": "hidden",
+            "inner_critic_lora_rank": 96,
+            "inner_critic_lora_scale": 1.0,
+            "inner_critic_lora_weight_decay": 0.0002,
+            "inner_actor_scope": "action",
+            "inner_critic_scope": "action",
+            "inner_temperature_scope": "action",
+            "inner_replay_scope": "action",
+            "inner_actor_optimizer_scope": "action",
+            "inner_critic_optimizer_scope": "action",
+            "inner_temperature_optimizer_scope": "action"
           }
         }
       }
     },
-    "lora_capacity": {
-      "description": "Vary LoRA rank while holding its direct output scale fixed at one.",
-      "reference": "rank_8",
+    "critic_lora_rank": {
+      "description": "Vary input-and-hidden critic LoRA-RL rank at direct scale one and adapter weight decay 2e-4; the actor remains a full clone.",
+      "reference": "rank_96",
       "variants": {
-        "rank_4": {
-          "description": "Rank-four actor and critic adapters at scale one.",
+        "rank_64": {
+          "description": "Rank-64 critic adapters on input and hidden-to-hidden matrices with dense actor adaptation.",
           "alg_params": {
-            "inner_actor_adaptation": "lora",
-            "inner_critic_adaptation": "lora",
-            "inner_actor_lora_rank": 4,
-            "inner_critic_lora_rank": 4,
-            "inner_actor_lora_scale": 1.0,
-            "inner_critic_lora_scale": 1.0
+            "inner_actor_adaptation": "clone",
+            "inner_critic_adaptation": "lora_rl",
+            "inner_critic_lora_layers": "input_hidden",
+            "inner_critic_lora_rank": 64,
+            "inner_critic_lora_scale": 1.0,
+            "inner_critic_lora_weight_decay": 0.0002,
+            "inner_actor_scope": "action",
+            "inner_critic_scope": "action",
+            "inner_temperature_scope": "action",
+            "inner_replay_scope": "action",
+            "inner_actor_optimizer_scope": "action",
+            "inner_critic_optimizer_scope": "action",
+            "inner_temperature_optimizer_scope": "action"
           }
         },
-        "rank_8": {
-          "description": "Rank-eight actor and critic adapters at scale one.",
+        "rank_96": {
+          "description": "Rank-96 critic adapters on input and hidden-to-hidden matrices with dense actor adaptation.",
           "alg_params": {
-            "inner_actor_adaptation": "lora",
-            "inner_critic_adaptation": "lora",
-            "inner_actor_lora_rank": 8,
-            "inner_critic_lora_rank": 8,
-            "inner_actor_lora_scale": 1.0,
-            "inner_critic_lora_scale": 1.0
+            "inner_actor_adaptation": "clone",
+            "inner_critic_adaptation": "lora_rl",
+            "inner_critic_lora_layers": "input_hidden",
+            "inner_critic_lora_rank": 96,
+            "inner_critic_lora_scale": 1.0,
+            "inner_critic_lora_weight_decay": 0.0002,
+            "inner_actor_scope": "action",
+            "inner_critic_scope": "action",
+            "inner_temperature_scope": "action",
+            "inner_replay_scope": "action",
+            "inner_actor_optimizer_scope": "action",
+            "inner_critic_optimizer_scope": "action",
+            "inner_temperature_optimizer_scope": "action"
           }
         },
-        "rank_16": {
-          "description": "Rank-sixteen actor and critic adapters at scale one.",
+        "rank_128": {
+          "description": "Rank-128 critic adapters on input and hidden-to-hidden matrices with dense actor adaptation.",
           "alg_params": {
-            "inner_actor_adaptation": "lora",
-            "inner_critic_adaptation": "lora",
-            "inner_actor_lora_rank": 16,
-            "inner_critic_lora_rank": 16,
-            "inner_actor_lora_scale": 1.0,
-            "inner_critic_lora_scale": 1.0
+            "inner_actor_adaptation": "clone",
+            "inner_critic_adaptation": "lora_rl",
+            "inner_critic_lora_layers": "input_hidden",
+            "inner_critic_lora_rank": 128,
+            "inner_critic_lora_scale": 1.0,
+            "inner_critic_lora_weight_decay": 0.0002,
+            "inner_actor_scope": "action",
+            "inner_critic_scope": "action",
+            "inner_temperature_scope": "action",
+            "inner_replay_scope": "action",
+            "inner_actor_optimizer_scope": "action",
+            "inner_critic_optimizer_scope": "action",
+            "inner_temperature_optimizer_scope": "action"
           }
         }
       }

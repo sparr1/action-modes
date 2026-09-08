@@ -62,7 +62,7 @@ def _tiny_params(**overrides):
         "inner_replay_capacity": 4,
         "inner_actor_adaptation": "clone",
         "inner_critic_adaptation": "clone",
-        "inner_critic_lora_dropout": 0.65,
+        "inner_critic_lora_rank": 4,
         "inner_temperature_mode": "inherit_outer",
         "inner_critic_target_tau": 1.0,
         "inner_critic_target_update_interval": 1,
@@ -130,7 +130,7 @@ def test_inner_critic_dropout_flag_is_strict_and_defaults_enabled():
             _build_cfg(inner_critic_dropout_enabled=invalid)
 
 
-@pytest.mark.parametrize("adaptation", ["clone", "lora"])
+@pytest.mark.parametrize("adaptation", ["clone", "lora_rl"])
 @pytest.mark.parametrize("enabled", [True, False])
 def test_inner_critic_dropout_flag_controls_q_forwards_and_keeps_autograd(
     adaptation,
@@ -201,15 +201,15 @@ def test_inner_critic_dropout_flag_controls_q_forwards_and_keeps_autograd(
         model.env.close()
 
 
-@pytest.mark.parametrize("adaptation", ["clone", "lora"])
+@pytest.mark.parametrize("adaptation", ["clone", "lora_rl"])
 def test_dropout_free_inner_critic_updates_and_stays_eval_across_actions(adaptation):
     model = _tiny_model(
         inner_critic_adaptation=adaptation,
         inner_critic_dropout_enabled=False,
         inner_critic_lr=1e-2,
-        inner_critic_scope="run",
-        inner_critic_optimizer_scope="run",
-        inner_replay_scope="run",
+        inner_critic_scope="run" if adaptation == "clone" else "action",
+        inner_critic_optimizer_scope="run" if adaptation == "clone" else "action",
+        inner_replay_scope="run" if adaptation == "clone" else "action",
     )
     try:
         engine = _prepare_inner_critic(model)
@@ -219,24 +219,26 @@ def test_dropout_free_inner_critic_updates_and_stays_eval_across_actions(adaptat
         model.agent.model.train()
         model.agent.act(torch.zeros(3), t0=True, eval_mode=False)
 
-        assert engine.state.critic is critic
+        workspace = engine.state if adaptation == "clone" else engine._action_pool
+        assert workspace.critic is critic
         assert critic.training is False
-        assert engine.state.critic_target.training is False
+        assert workspace.critic_target.training is False
         assert model.agent.model.training is True
         assert model.agent.model._target_Qs.training is False
         assert any(
             not torch.equal(parameter, initial)
-            for parameter, initial in zip(engine.state.critic_params, before)
+            for parameter, initial in zip(workspace.critic_params, before)
         )
         assert any(
             parameter.grad is not None
             and torch.isfinite(parameter.grad).all()
             and torch.count_nonzero(parameter.grad).item()
-            for parameter in engine.state.critic_params
+            for parameter in workspace.critic_params
         )
 
         model.agent.act(torch.zeros(3), t0=False, eval_mode=False)
-        assert engine.state.critic is critic
+        workspace = engine.state if adaptation == "clone" else engine._action_pool
+        assert workspace.critic is critic
         assert critic.training is False
         assert all(
             not module.training
