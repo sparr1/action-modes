@@ -395,6 +395,39 @@ A fresh `--smoke` output uses seeds 101/102 and three decisions for all selected
 settings and its own short prior reference, without curve publication. Override
 `--array=6` for a single 300k smoke task and supply durable Slurm output paths.
 
+### Two updates per parallel timestep, matching the original round sweep
+
+`ambi_humanoid_inner_step_double_updates.json` repeats the original
+`step_rounds/j1`, `step_rounds/j3`, and `step_rounds/j6` comparison with one
+configuration change: `inner_steps_per_update=256` instead of 512. Select
+`step_double_updates/j1`, `step_double_updates/j3`, and
+`step_double_updates/j6`. With 512 trajectories advancing together, each
+parallel timestep collects 512 transitions, then performs **two** joint
+critic/actor/automatic-temperature updates before the next timestep.
+Each update samples a minibatch of 512 from accumulated imagined replay.
+
+| Rounds | Imagined transitions per real action | Updates per component per real action |
+| --- | ---: | ---: |
+| 1 | 1,536 | 6 |
+| 3 | 4,608 | 18 |
+| 6 | 9,216 | 36 |
+
+The imagined-transition budgets remain matched; optimizer and target-network
+update counts double. Actual early terminations earn credit only for collected
+transitions. N512/H3/B512, replay capacity 9,216, action-local resets, learning
+rates 5e-5/1e-4/3e-4, and all evaluation seeds remain unchanged. This experiment
+uses the original inner-target SAC continuation throughout;
+`inner_finite_horizon=false`, with no prior-policy horizon handoff.
+
+Use `slurm/run_ambi_inner_step_double_updates_oscar.sbatch` with the same
+checkpoint prefix, inventory, explicit New run map, reference root, and CPU
+publisher workflow described above. It evaluates 50k through 500k every 50k,
+five seeds and 500 decisions per episode: 150 fresh SAC episodes. All ten
+completed prior references, including 50k, are required and reused. A separate
+`--smoke` creates only a short two-seed, three-decision prior reference. Each
+checkpoint task receives one L40S, six CPUs, 32 GiB, and one hour; concurrency
+defaults to three. Curve labels identify interval256, step updates, and J1/J3/J6.
+
 ### More critic updates on shared observations
 
 `ambi_humanoid_inner_critic_sweep.json` holds the D512-4-J6 collection and
