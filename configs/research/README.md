@@ -428,6 +428,46 @@ completed prior references, including 50k, are required and reused. A separate
 checkpoint task receives one L40S, six CPUs, 32 GiB, and one hour; concurrency
 defaults to three. Curve labels identify interval256, step updates, and J1/J3/J6.
 
+### Fewer parallel rollouts with one update per timestep
+
+`ambi_humanoid_inner_n256_step_rounds.json` repeats the original one-update
+round sweep with 256 parallel trajectories. Select `n256_step_rounds/j1`,
+`n256_step_rounds/j3`, and `n256_step_rounds/j6`. Both
+`inner_rollouts_per_round` and `inner_steps_per_update` are 256, so each parallel
+timestep collects 256 transitions and then performs one joint
+critic/actor/automatic-temperature update.
+
+| Rounds | Imagined transitions per real action | Updates per component per real action |
+| --- | ---: | ---: |
+| 1 | 768 | 3 |
+| 3 | 2,304 | 9 |
+| 6 | 4,608 | 18 |
+
+Compared with `step_rounds`, imagined data halves while the optimizer dose
+stays fixed. H3, minibatch 512, replay capacity 9,216, learning rates,
+action-local resets, and ordinary inner-target continuation remain unchanged.
+Sampling with replacement permits the first 512-row minibatch immediately
+after collecting the first 256 transitions. This is one update per timestep;
+the N512 `step_double_updates` sweep uses two despite sharing interval256.
+
+`slurm/run_ambi_inner_n256_step_rounds_oscar.sbatch` splits the campaign into
+30 independent checkpoint/preset tasks, each keeping the complete five-seed
+bundle. Indices 0–9 cover J6, 10–19 J3, and 20–29 J1; within each group they
+cover 50k through 500k every 50k. Each writes to `step_N/jJ`, reuses its complete
+prior reference, and requests one L40S, six CPUs, 32 GiB, and one hour.
+The total is 150 fresh SAC episodes with seeds 101–105, controller seed 55,
+and 500 decisions. Prepare three explicit New run assignments and one CPU
+publisher per J using the same workflow above.
+
+Set array concurrency from live account/QOS GPU, CPU, and memory limits,
+considering all active campaigns. The launcher has no fixed low throttle;
+for example, use `--array=0-29%12` when the account permits twelve such jobs.
+Slurm enforces aggregate limits while older jobs finish. The larger-J index
+groups offer longer tasks first but do not guarantee Slurm start order.
+For smoke, submit `--array=5,15,25 --smoke` against a separate fresh output
+root: each 300k J cell runs seeds 101/102 for three decisions with a private
+short prior and no publication.
+
 ### More critic updates on shared observations
 
 `ambi_humanoid_inner_critic_sweep.json` holds the D512-4-J6 collection and
