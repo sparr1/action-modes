@@ -111,11 +111,13 @@ def test_production_rejects_invalid_launch_without_starting_evaluation(tmp_path,
         assert not Path(env["TDAMBI_OUTPUT_ROOT"]).exists()
 
 
-def test_production_defaults_to_preferred_node_and_one_gpu_per_checkpoint():
+def test_production_defaults_to_fast_gpu_pool_without_array_throttle():
     text = SCRIPT.read_text()
-    for directive in ("--partition=gpus", "--nodelist=gpu2501", "--gres=gpu:1",
+    for directive in ("--partition=gpus", "--constraint=l40s|rtx_a6000", "--gres=gpu:1",
                       "--cpus-per-task=8", "--mem=32G", "--time=06:00:00", "--array=2-20"):
         assert f"#SBATCH {directive}" in text
+    assert "#SBATCH --nodelist" not in text
+    assert "#SBATCH --array=2-20%" not in text
 
 
 def test_production_selects_step_preset_without_changing_episode_protocol(tmp_path):

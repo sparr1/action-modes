@@ -24,9 +24,15 @@ decision. This uses the shared step scheduler (`inner_steps_per_update=512`)
 and calibrates the native Q scale from the first collection before updating.
 The default round-end preset remains unchanged.
 
+Select `update_timing/step_j5_c2_a2` for two critic→actor→target updates after
+each vector step, using `inner_steps_per_update=256`. Collection still adds
+512 transitions at once. This gives 30 critic, actor, and target updates per
+real decision, with the same 7,680 imagined model steps and inherited settings.
+
 The Hydra launcher accepts `TDAMBI_PRESET` and array indices 2–20 for the
-100k–1M checkpoint grid. It defaults to one GPU on `gpu2501`; override
-`--nodelist` explicitly for `gpu2301`, then `gpu2201`, according to availability.
+100k–1M checkpoint grid. It requests one GPU per checkpoint from the L40S/A6000 pool with no array
+throttle or fixed node, so pending checkpoints can use either node as slots
+free. Override resource constraints explicitly for other validated hardware.
 
 Choose a checkpoint and fresh output paths. This command evaluates five
 episodes (environment seeds 101–105, controller seed 12345, at most 500 decisions

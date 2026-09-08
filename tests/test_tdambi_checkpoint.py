@@ -155,8 +155,10 @@ def test_tdambi_rejects_non_native_or_unsupported_controls(override):
         env.close()
 
 
-def test_tdambi_step_configuration_uses_one_native_pair_per_vector_step():
-    instance = make_tdambi(inner_update_timing="step", inner_steps_per_update=512,
+@pytest.mark.parametrize("pairs_per_step", [1, 2])
+def test_tdambi_step_configuration_uses_native_pairs_per_vector_step(pairs_per_step):
+    updates = 15 * pairs_per_step
+    instance = make_tdambi(inner_update_timing="step", inner_steps_per_update=512 // pairs_per_step,
                           inner_updates_per_round=None, inner_rounds=5,
                           inner_rollouts_per_round=512, inner_rollout_horizon=3,
                           train_unroll_horizon=3, inner_batch_size=512,
@@ -165,15 +167,15 @@ def test_tdambi_step_configuration_uses_one_native_pair_per_vector_step():
         cfg = instance.cfg
         assert cfg.inner_operator == "tdambi"
         assert cfg.inner_update_timing == "step"
-        assert cfg.inner_actor_updates_per_action == cfg.inner_critic_updates_per_action == 15
+        assert cfg.inner_actor_updates_per_action == cfg.inner_critic_updates_per_action == updates
         assert cfg.inner_temperature_updates_per_action == 0
         assert cfg.inner_model_step_budget == 7680
-        assert cfg.inner_total_optimizer_steps_per_action == 30
+        assert cfg.inner_total_optimizer_steps_per_action == 2 * updates
         trace = InnerActionTrace()
         instance.predict([0.2, -0.3, 0.7], collect_diagnostics=False, trace=trace)
         metrics = instance.agent.last_inner_metrics
-        assert metrics["inner_critic_optimizer_steps"] == metrics["inner_actor_optimizer_steps"] == 15
-        assert metrics["inner_critic_target_updates"] == 15
+        assert metrics["inner_critic_optimizer_steps"] == metrics["inner_actor_optimizer_steps"] == updates
+        assert metrics["inner_critic_target_updates"] == updates
         assert metrics["inner_temperature_optimizer_steps"] == 0
         assert metrics["inner_model_steps"] == 7680
         calibration = next(event for event in trace.events if event["phase"] == "calibration")
@@ -219,9 +221,11 @@ def test_checkpoint_matrix_inherits_native_settings_and_expands_budgets_and_step
     before = copy.deepcopy(context)
     matrix = load_preset_matrix(MATRIX)
     assert normalize_selectors(matrix) == ["inner_budget/tdambi_3"]
-    variants = [(f"inner_budget/tdambi_{budget}", 6, 6 * budget, "round") for budget in (3, 6, 12)]
-    variants.append(("update_timing/step_j5_c1_a1", 5, 15, "step"))
-    for selector, rounds, updates, timing in variants:
+    variants = [(f"inner_budget/tdambi_{budget}", 6, 6 * budget, "round", None)
+                for budget in (3, 6, 12)]
+    variants.extend((f"update_timing/step_j5_c{pairs}_a{pairs}", 5, 15 * pairs,
+                     "step", 512 // pairs) for pairs in (1, 2))
+    for selector, rounds, updates, timing, interval in variants:
         resolved = resolve_preset(MATRIX, selector, checkpoint_context=context)
         assert resolved["algorithm_config"]["alg"] == "TDAMBI/TDAMBI"
         assert resolved["source_algorithm"] == "TDMPC2/TDMPC2Baseline"
@@ -236,13 +240,14 @@ def test_checkpoint_matrix_inherits_native_settings_and_expands_budgets_and_step
         assert cfg.inner_operator == "tdambi"
         assert cfg.inner_rounds == rounds
         assert cfg.inner_update_timing == timing
-        assert cfg.inner_steps_per_update == (512 if timing == "step" else None)
+        assert cfg.inner_steps_per_update == interval
         assert cfg.inner_rollouts_per_round == 512
         assert cfg.inner_rollout_horizon == 3
         assert cfg.inner_batch_size == 512
         assert cfg.inner_replay_capacity == 12288
         assert cfg.inner_actor_updates_per_action == cfg.inner_critic_updates_per_action == updates
         assert cfg.inner_temperature_updates_per_action == 0
+        assert cfg.inner_model_step_budget == rounds * 512 * 3
         assert cfg.inner_actor_lr == cfg.inner_critic_lr == 0.0002
         assert cfg.tdambi_entropy_coef == 0.0003
         assert cfg.tdambi_value_coef == 0.17

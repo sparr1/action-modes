@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=tdambi-native-inner-g3
+#SBATCH --job-name=tdambi-checkpoint-eval
 #SBATCH --partition=gpus
-#SBATCH --nodelist=gpu2501
+#SBATCH --constraint=l40s|rtx_a6000
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
