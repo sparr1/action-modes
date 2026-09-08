@@ -28,10 +28,12 @@ def test_compiled_detached_critic_preserves_input_gradients_and_dropout(dropout)
 
 
 @pytest.mark.parametrize("representation", ["scalar", "distributional"])
-def test_inductor_horizon_targets_gradients_and_optimizer_match_eager(representation):
+@pytest.mark.parametrize("adaptation", ["clone", "lora_rl"])
+def test_inductor_horizon_targets_gradients_and_optimizer_match_eager(representation, adaptation):
     torch._dynamo.reset()
     options = dict(
         inner_finite_horizon=True, q_representation=representation,
+        inner_critic_adaptation=adaptation, inner_critic_lora_rank=4,
         mppi_terminal_q_reduction="mean_all", inner_q_target_reduction="min_all",
     )
     eager = _tiny_model(**options)

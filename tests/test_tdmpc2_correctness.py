@@ -174,16 +174,19 @@ def test_small_end_to_end_training_and_truncation_bootstrap(algorithm):
         assert torch.isfinite(torch.as_tensor(value)).all()
 
 
-def test_inner_clone_and_lora_do_not_mutate_outer_heads():
-    for adaptation in ("clone", "lora"):
-        env = gym.make("Pendulum-v1", max_episode_steps=5)
-        model = make_model(AMBITDMPC2, env, tiny_params(inner_adaptation=adaptation))
-        obs, _ = env.reset(seed=3)
-        before = {key: value.detach().clone() for key, value in model.agent.model.state_dict().items()}
-        action, _ = model.predict(obs, deterministic=False, episode_start=True)
-        assert action.shape == env.action_space.shape
-        for key, value in model.agent.model.state_dict().items():
-            torch.testing.assert_close(value, before[key], rtol=0, atol=0)
+@pytest.mark.parametrize("adaptation", ["clone", "lora_rl"])
+def test_inner_clone_and_lora_rl_do_not_mutate_outer_heads(adaptation):
+    env = gym.make("Pendulum-v1", max_episode_steps=5)
+    params = tiny_params(inner_actor_adaptation="clone", inner_critic_adaptation=adaptation,
+                         inner_critic_lora_rank=4, inner_critic_lora_layers="input_hidden")
+    params.pop("inner_adaptation")
+    model = make_model(AMBITDMPC2, env, params)
+    obs, _ = env.reset(seed=3)
+    before = {key: value.detach().clone() for key, value in model.agent.model.state_dict().items()}
+    action, _ = model.predict(obs, deterministic=False, episode_start=True)
+    assert action.shape == env.action_space.shape
+    for key, value in model.agent.model.state_dict().items():
+        torch.testing.assert_close(value, before[key], rtol=0, atol=0)
 
 
 def test_ephemeral_inner_target_hard_syncs_after_each_update():

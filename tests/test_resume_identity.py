@@ -1,3 +1,5 @@
+import hashlib
+
 import pytest
 
 import utils.resume_identity as resume_identity
@@ -248,3 +250,67 @@ def test_resume_selection_is_strict_and_resource_neutral():
                 checkpoint_minutes=60,
                 drain_after_seconds=None,
             )
+
+
+def _lora_trial(params):
+    return {"alg": "AMBITDMPC2/AMBITDMPC2", "seed": 7, "alg_params": params}
+
+
+@pytest.mark.parametrize("adaptation,actor_scale,critic_rank,expected", [
+    ("clone", 1.0, 8, "82d9ca518cd512c7d324cf761e0daa783408d648f1db588badaf7aa181cedbcc"),
+    ("lora", 2.0, 16, "01ada266adb16675cb559dd0461dbc6e54bf7c7e53d52c69023c2ede7238f95d"),
+])
+def test_pre_lora_rl_lineage_projection_hashes_are_unchanged(
+    adaptation, actor_scale, critic_rank, expected
+):
+    # These hashes were captured before adding lora_rl. Raw dense configurations
+    # sometimes contained inactive adapter defaults and must keep their lineage.
+    trial = _lora_trial({
+        "inner_operator": "sac",
+        "inner_actor_adaptation": adaptation,
+        "inner_critic_adaptation": adaptation,
+        "inner_actor_lora_rank": 8,
+        "inner_actor_lora_scale": actor_scale,
+        "inner_actor_lora_dropout": 0.0,
+        "inner_critic_lora_rank": critic_rank,
+        "inner_critic_lora_scale": actor_scale,
+        "inner_critic_lora_dropout": 0.0,
+    })
+    projected = scientific_trial_parameters(trial)
+    assert hashlib.sha256(canonical_json(projected).encode()).hexdigest() == expected
+
+
+def test_lora_rl_lineage_omitted_and_explicit_defaults_match():
+    params = {"inner_operator": "sac", "inner_critic_adaptation": "lora_rl"}
+    explicit = {
+        **params,
+        "inner_actor_adaptation": "CLONE",
+        "inner_critic_adaptation": "LORA_RL",
+        "inner_critic_lora_layers": "INPUT_HIDDEN",
+        "inner_critic_lora_rank": 96,
+        "inner_critic_lora_scale": 1,
+        "inner_critic_lora_weight_decay": 0.0002,
+        "inner_actor_lora_rank": 8,
+        "inner_actor_lora_scale": 1.0,
+        "inner_actor_lora_dropout": 0.0,
+        "inner_critic_lora_dropout": 0.0,
+        "lora_alpha": 8.0,
+    }
+    assert scientific_trial_parameters(_lora_trial(params)) == scientific_trial_parameters(
+        _lora_trial(explicit)
+    )
+    assert params == {"inner_operator": "sac", "inner_critic_adaptation": "lora_rl"}
+
+
+@pytest.mark.parametrize("field,value", [
+    ("inner_critic_adaptation", "lora"),
+    ("inner_critic_lora_layers", "hidden"),
+    ("inner_critic_lora_rank", 48),
+    ("inner_critic_lora_scale", 2.0),
+    ("inner_critic_lora_weight_decay", 0.0),
+])
+def test_lora_rl_scientific_choices_split_lineages(field, value):
+    params = {"inner_operator": "sac", "inner_critic_adaptation": "lora_rl"}
+    baseline = scientific_trial_parameters(_lora_trial(params))
+    changed = scientific_trial_parameters(_lora_trial({**params, field: value}))
+    assert canonical_json(baseline) != canonical_json(changed)

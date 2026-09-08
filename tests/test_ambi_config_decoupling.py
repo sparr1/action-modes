@@ -549,11 +549,11 @@ def test_sac_actor_loss_scale_tau_is_strict(tau):
         _build_cfg(sac_actor_loss_scale_tau=tau)
 
 
-def test_legacy_ant_compute_and_lora_resolve_exactly():
+def test_legacy_ant_compute_still_resolves_without_retired_lora():
     with pytest.warns(DeprecationWarning):
         cfg = _build_cfg(
             model_size=5,
-            inner_adaptation="lora",
+            inner_adaptation="clone",
             inner_iterations=2,
             inner_rollouts=32,
             inner_horizon=3,
@@ -571,10 +571,9 @@ def test_legacy_ant_compute_and_lora_resolve_exactly():
     assert cfg.inner_rollouts_per_round == 32
     assert cfg.inner_actor_updates_per_action == 4
     assert cfg.inner_critic_updates_per_action == 4
-    assert cfg.inner_actor_adaptation == "lora"
-    assert cfg.inner_critic_adaptation == "lora"
-    assert cfg.inner_actor_lora_scale == 1.0
-    assert cfg.inner_critic_lora_scale == 1.0
+    assert cfg.inner_actor_adaptation == "clone"
+    assert cfg.inner_critic_adaptation == "clone"
+    assert not hasattr(cfg, "inner_actor_lora_rank")
     # One-release aliases preserve old integrations.
     assert cfg.inner_iterations == 2
     assert cfg.inner_rollouts == 32
@@ -585,9 +584,73 @@ def test_conflicting_legacy_and_canonical_keys_fail_before_resolution():
     with pytest.raises(ValueError, match="Cannot mix legacy and canonical compute"):
         _build_cfg(inner_iterations=2, inner_rounds=2)
     with pytest.raises(ValueError, match="inner_adaptation"):
-        _build_cfg(inner_adaptation="clone", inner_actor_adaptation="lora")
+        _build_cfg(inner_adaptation="clone", inner_actor_adaptation="clone")
     with pytest.raises(ValueError, match="lora_alpha"):
-        _build_cfg(lora_alpha=8.0, inner_actor_lora_scale=1.0)
+        _build_cfg(inner_critic_adaptation="lora_rl", lora_alpha=8.0)
+
+
+@pytest.mark.parametrize("key", ["inner_adaptation", "inner_actor_adaptation", "inner_critic_adaptation"])
+def test_active_legacy_lora_requires_explicit_migration(key):
+    with pytest.raises(ValueError, match="retired.*Explicitly migrate"):
+        _build_cfg(**{key: "lora"})
+
+
+def test_lora_rl_defaults_and_inactive_legacy_settings():
+    cfg = _build_cfg(inner_critic_adaptation="lora_rl")
+    assert cfg.inner_actor_adaptation == "clone"
+    assert cfg.inner_critic_lora_rank == 96
+    assert cfg.inner_critic_lora_layers == "input_hidden"
+    assert cfg.inner_critic_lora_scale == 1.0
+    assert cfg.inner_critic_lora_weight_decay == 2e-4
+    with pytest.warns(DeprecationWarning, match="Discarding"):
+        dense = _build_cfg(inner_actor_lora_rank=8, inner_actor_lora_scale=2,
+                           inner_actor_lora_dropout=0.1, inner_critic_lora_rank=8,
+                           inner_critic_lora_scale=2, inner_critic_lora_dropout=0.2,
+                           lora_rank=8, lora_alpha=16, lora_dropout=0.2)
+    assert dense.inner_critic_adaptation == "clone"
+    assert not hasattr(dense, "inner_actor_lora_rank")
+    assert not hasattr(dense, "inner_critic_lora_dropout")
+    assert not hasattr(dense, "lora_alpha")
+
+
+@pytest.mark.parametrize("key,value", [
+    ("inner_critic_lora_rank", True), ("inner_critic_lora_rank", 0),
+    ("inner_critic_lora_rank", 3.5), ("inner_critic_lora_rank", "96"),
+    ("inner_critic_lora_rank", 513),
+    ("inner_critic_lora_scale", True), ("inner_critic_lora_scale", 0),
+    ("inner_critic_lora_scale", float("nan")),
+    ("inner_critic_lora_weight_decay", -1),
+    ("inner_critic_lora_weight_decay", float("inf")),
+    ("inner_critic_lora_layers", "all"), ("inner_critic_lora_dropout", 0.1),
+])
+def test_lora_rl_settings_are_strict(key, value):
+    with pytest.raises(ValueError, match=key):
+        _build_cfg(inner_critic_adaptation="lora_rl", **{key: value})
+
+
+@pytest.mark.parametrize("key", [
+    "inner_actor_scope", "inner_critic_scope", "inner_temperature_scope",
+    "inner_replay_scope", "inner_actor_optimizer_scope",
+    "inner_critic_optimizer_scope", "inner_temperature_optimizer_scope",
+])
+def test_lora_rl_requires_fresh_lifetimes(key):
+    with pytest.raises(ValueError, match="lora_rl.*per-decision"):
+        _build_cfg(inner_critic_adaptation="lora_rl", **{key: "run"})
+
+
+@pytest.mark.parametrize("operator", ["td3", "none", "mppi"])
+def test_lora_rl_requires_sac(operator):
+    with pytest.raises(ValueError, match="lora_rl requires inner_operator"):
+        _build_cfg(inner_critic_adaptation="lora_rl", inner_operator=operator)
+
+
+def test_lora_rl_rejects_actor_adaptation_and_preserves_existing_exclusions():
+    with pytest.raises(ValueError, match="inner_actor_adaptation"):
+        _build_cfg(inner_actor_adaptation="lora_rl")
+    with pytest.raises(ValueError, match="lora_rl requires"):
+        _build_cfg(inner_critic_adaptation="lora_rl", inner_actor_adaptation="frozen")
+    with pytest.raises(ValueError, match="full-clone"):
+        _build_cfg(inner_critic_adaptation="lora_rl", inner_critic_writeback_coef=0.1)
 
 
 def test_compute_and_component_controls_validate_independently():

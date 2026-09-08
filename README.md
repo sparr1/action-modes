@@ -40,6 +40,14 @@ and MPPI are auxiliary ablations or comparison operators. In particular, MPPI
 is the TD-MPC-style planning comparator; it is not AMBI's core action-selection
 algorithm.
 
+The optional [critic-only LoRA-RL adapter](RL/tdmpc2_core/README.md#critic-only-lora-rl)
+uses `inner_critic_adaptation="lora_rl"` with a fully cloned actor. The default
+rank is 96, direct adapter scale is one, and AdamW adapter weight decay is
+`2e-4`. Its explicitly named Humanoid base-v2 presets compare input-and-hidden
+versus hidden-only placement and ranks 64, 96, and 128; they retain the base
+training and evaluation budgets. They replace the retired joint actor/critic
+LoRA presets without reusing their configuration or run names.
+
 ### Optional adapted-prior writeback
 
 AMBI normally discards each action-local learner. An opt-in training ablation

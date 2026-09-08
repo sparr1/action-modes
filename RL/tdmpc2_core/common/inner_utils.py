@@ -5,9 +5,7 @@ from fractions import Fraction
 import math
 
 import torch
-import torch.nn as nn
 
-from .lora import LoRALinear, LoRANormedLinear
 from .training_state import require_exact_keys, require_tensor
 
 
@@ -116,71 +114,6 @@ def rebase_clone_with_target_(adapted, target, anchor, new_base):
         raise ValueError("Cannot rebase a target with a different state layout.")
 
     _rebase_clone_state_(adapted_state, target_state, anchor_state, new_state)
-
-
-@torch.no_grad()
-def rebase_lora_base_(adapted, new_base):
-    """Refresh owned bases or rebind zero-copy shared bases in-place."""
-    found = False
-    for path, module in adapted.named_modules():
-        if not isinstance(module, (LoRALinear, LoRANormedLinear)):
-            continue
-        source = new_base.get_submodule(path)
-        if module.shares_base:
-            module.share_base_(source)
-        else:
-            module.base.load_state_dict(source.state_dict())
-        found = True
-    if not found:
-        raise ValueError("No LoRA adapters were found to rebase.")
-
-
-def lora_uses_shared_bases(module):
-    """Return whether every adapter references an unregistered outer base."""
-    adapters = [
-        child
-        for child in module.modules()
-        if isinstance(child, (LoRALinear, LoRANormedLinear))
-    ]
-    return bool(adapters) and all(child.shares_base for child in adapters)
-
-
-@torch.no_grad()
-def reset_lora_adapters_(module):
-    """Reset LoRA tensors exactly like constructing fresh adapters."""
-    found = False
-    for child in module.modules():
-        if not isinstance(child, (LoRALinear, LoRANormedLinear)):
-            continue
-        nn.init.kaiming_uniform_(child.lora_A, a=math.sqrt(5))
-        child.lora_B.zero_()
-        found = True
-    if not found:
-        raise ValueError("No LoRA adapters were found to reset.")
-
-
-@torch.no_grad()
-def copy_lora_adapters_(source, target, tau=1.0):
-    """Synchronize only trainable LoRA tensors between compatible modules."""
-    source_values = {
-        name: value
-        for name, value in source.named_parameters()
-        if name.endswith(("lora_A", "lora_B"))
-    }
-    target_values = {
-        name: value
-        for name, value in target.named_parameters()
-        if name.endswith(("lora_A", "lora_B"))
-    }
-    if source_values.keys() != target_values.keys() or not source_values:
-        raise ValueError("LoRA source and target adapter layouts must match.")
-    source_tensors = [source_values[name].detach() for name in source_values]
-    target_tensors = [target_values[name] for name in source_values]
-    tau = float(tau)
-    if tau == 1.0:
-        torch._foreach_copy_(target_tensors, source_tensors)
-    else:
-        torch._foreach_lerp_(target_tensors, source_tensors, tau)
 
 
 class InnerRNG:

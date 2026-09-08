@@ -201,10 +201,10 @@ def test_without_replacement_validates_first_eligible_step():
         model.env.close()
 
 
-@pytest.mark.parametrize("adaptation", ["clone", "lora"])
+@pytest.mark.parametrize("adaptation", ["clone", "lora_rl"])
 def test_step_tracing_preserves_rng_updates_and_outer_state(adaptation):
-    options = dict(inner_actor_adaptation=adaptation, inner_critic_adaptation=adaptation,
-                   dropout=.2, inner_actor_lora_dropout=.2, inner_critic_lora_dropout=.2)
+    options = dict(inner_actor_adaptation="clone", inner_critic_adaptation=adaptation,
+                   dropout=.2, inner_critic_lora_rank=4)
     ordinary, traced = _step_model(**options), _step_model(**options)
     outer = deepcopy(ordinary.agent.model.state_dict())
     rng = torch.random.get_rng_state().clone()

@@ -7,8 +7,7 @@ import pytest
 import torch
 
 from RL.AMBITDMPC2 import AMBITDMPC2
-from RL.tdmpc2_core.common.inner_utils import lora_uses_shared_bases
-from RL.tdmpc2_core.common.lora import LoRALinear, LoRANormedLinear
+from RL.tdmpc2_core.common.lora import LoRARLLinear, LoRARLNormedLinear
 
 
 def _params(**overrides):
@@ -51,6 +50,7 @@ def _params(**overrides):
         "inner_replay_capacity": 32,
         "inner_actor_adaptation": "clone",
         "inner_critic_adaptation": "clone",
+        "inner_critic_lora_rank": 4,
         "inner_temperature_mode": "inherit_outer",
         "inner_critic_target_tau": 1.0,
         "inner_critic_target_update_interval": 1,
@@ -697,10 +697,8 @@ def test_lora_dropout_diagnostics_leave_cpu_rng_bitwise_unchanged():
         q_representation="distributional",
         num_q=5,
         dropout=0.2,
-        inner_actor_adaptation="lora",
-        inner_critic_adaptation="lora",
-        inner_actor_lora_dropout=0.3,
-        inner_critic_lora_dropout=0.3,
+        inner_actor_adaptation="clone",
+        inner_critic_adaptation="lora_rl",
         inner_diagnostic_rollouts=2,
     )
     before = torch.random.get_rng_state().clone()
@@ -1120,10 +1118,10 @@ def test_ambi_observation_mismatch_fails_before_outer_state_mutation():
     [
         ("scalar", 2, "frozen"),
         ("scalar", 2, "clone"),
-        ("scalar", 2, "lora"),
+        ("scalar", 2, "lora_rl"),
         ("distributional", 5, "frozen"),
         ("distributional", 5, "clone"),
-        ("distributional", 5, "lora"),
+        ("distributional", 5, "lora_rl"),
     ],
 )
 def test_tiny_pendulum_end_to_end_across_q_and_adaptation_modes(
@@ -1133,7 +1131,7 @@ def test_tiny_pendulum_end_to_end_across_q_and_adaptation_modes(
     model = _model(
         q_representation=representation,
         num_q=num_q,
-        inner_actor_adaptation=adaptation,
+        inner_actor_adaptation="clone" if adaptation == "lora_rl" else adaptation,
         inner_critic_adaptation=adaptation,
         inner_actor_updates_per_action=update_count,
         inner_critic_updates_per_action=update_count,
@@ -1609,10 +1607,8 @@ def test_cuda_act_preserves_all_global_rng_streams_and_outer_state():
         q_representation="distributional",
         num_q=5,
         dropout=0.1,
-        inner_actor_adaptation="lora",
-        inner_critic_adaptation="lora",
-        inner_actor_lora_dropout=0.2,
-        inner_critic_lora_dropout=0.2,
+        inner_actor_adaptation="clone",
+        inner_critic_adaptation="lora_rl",
         inner_diagnostic_rollouts=2,
     )
     agent = model.agent
@@ -1626,10 +1622,10 @@ def test_cuda_act_preserves_all_global_rng_streams_and_outer_state():
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_action_lora_workspace_reuses_adapters_and_shares_outer_bases():
+def test_action_lora_workspace_reuses_adapters_and_owns_outer_copies():
     model = _model(
-        inner_actor_adaptation="lora",
-        inner_critic_adaptation="lora",
+        inner_actor_adaptation="clone",
+        inner_critic_adaptation="lora_rl",
         inner_actor_updates_per_action=0,
         inner_critic_updates_per_action=0,
     )
@@ -1646,9 +1642,9 @@ def test_action_lora_workspace_reuses_adapters_and_shares_outer_bases():
     actor = engine.state.actor
     critic = engine.state.critic
     critic_target = engine.state.critic_target
-    assert lora_uses_shared_bases(actor)
-    assert lora_uses_shared_bases(critic)
-    assert lora_uses_shared_bases(critic_target)
+    assert not any(isinstance(layer, LoRARLLinear) for layer in actor.modules())
+    assert any(isinstance(layer, LoRARLLinear) for layer in critic.modules())
+    assert not any(isinstance(layer, LoRARLLinear) for layer in critic_target.modules())
     assert engine.state.actor_anchor is None
     assert engine.state.critic_anchor is None
     assert outer_parameter_ids.isdisjoint(id(parameter) for parameter in actor.parameters())
@@ -1656,8 +1652,11 @@ def test_action_lora_workspace_reuses_adapters_and_shares_outer_bases():
 
     for component, source in ((actor, outer._pi), (critic, outer._Qs)):
         for path, adapter in component.named_modules():
-            if isinstance(adapter, (LoRALinear, LoRANormedLinear)):
-                assert adapter.base is source.get_submodule(path)
+            if isinstance(adapter, (LoRARLLinear, LoRARLNormedLinear)):
+                prior = source.get_submodule(path)
+                assert adapter.base is not prior
+                assert adapter.base.weight.data_ptr() != prior.weight.data_ptr()
+                torch.testing.assert_close(adapter.base.weight, prior.weight, rtol=0, atol=0)
 
     engine._clear_expired(t0=False, include_action=True)
     with engine.rng.fork("initialization"):
@@ -1673,37 +1672,23 @@ def test_action_lora_workspace_reuses_adapters_and_shares_outer_bases():
 
 
 @pytest.mark.parametrize("rebase", [False, True])
-def test_persistent_lora_shares_only_when_live_rebasing_preserves_semantics(rebase):
+def test_persistent_lora_is_rejected_even_with_rebasing(rebase):
+    with pytest.raises(ValueError, match="fresh per-decision"):
+        _model(
+            inner_actor_adaptation="clone",
+            inner_critic_adaptation="lora_rl",
+            inner_actor_scope="run",
+            inner_critic_scope="run",
+            inner_actor_optimizer_scope="run",
+            inner_critic_optimizer_scope="run",
+            inner_rebase_persistent=rebase,
+        )
+
+
+def test_lora_rl_outer_regularizer_cannot_accumulate_outer_gradients():
     model = _model(
-        inner_actor_adaptation="lora",
-        inner_critic_adaptation="lora",
-        inner_actor_updates_per_action=0,
-        inner_critic_updates_per_action=0,
-        inner_actor_scope="run",
-        inner_critic_scope="run",
-        inner_actor_optimizer_scope="run",
-        inner_critic_optimizer_scope="run",
-        inner_rebase_persistent=rebase,
-    )
-    engine = model.agent.inner_engine
-    with engine.rng.fork("initialization"):
-        engine._prepare_workspace(t0=True)
-
-    assert lora_uses_shared_bases(engine.state.actor) is rebase
-    assert lora_uses_shared_bases(engine.state.critic) is rebase
-    assert lora_uses_shared_bases(engine.state.critic_target) is rebase
-    if rebase:
-        assert engine.state.actor_anchor is None
-        assert engine.state.critic_anchor is None
-    else:
-        assert engine.state.actor_anchor is not None
-        assert engine.state.critic_anchor is not None
-
-
-def test_shared_lora_outer_regularizer_cannot_accumulate_outer_gradients():
-    model = _model(
-        inner_actor_adaptation="lora",
-        inner_critic_adaptation="lora",
+        inner_actor_adaptation="clone",
+        inner_critic_adaptation="lora_rl",
         inner_outer_policy_kl_coef=0.3,
     )
     outer = model.agent.model

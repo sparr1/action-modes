@@ -1,271 +1,214 @@
-"""LoRA adapters that preserve TD-MPC2's NormedLinear computation order."""
+"""Critic-only low-rank updates inspired by LoRA-RL (arXiv:2604.18978).
+
+AMBI adapts a learned prior, so B starts at zero instead of perturbing and
+renormalizing the prior as in the upstream from-scratch BRC initialization.
+Selected kernels are frozen; biases, LayerNorm, and the value head train normally.
+"""
 
 from copy import deepcopy
 import math
-import weakref
+from numbers import Integral
 
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .layers import NormedLinear
+from .layers import Ensemble, NormedLinear
 
 
-class _LoRABaseReference:
-    """Support either an owned base module or an unregistered shared one."""
+class LoRARLLinear(nn.Module):
+    """An owned frozen kernel with trainable BA and an ordinary trainable bias."""
 
-    def __getattr__(self, name):
-        if name == "base":
-            reference = self.__dict__.get("_shared_base_ref")
-            if reference is not None:
-                base = reference()
-                if base is None:
-                    raise RuntimeError("The shared LoRA base module no longer exists.")
-                return base
-        return super().__getattr__(name)
-
-    @property
-    def shares_base(self):
-        return "_shared_base_ref" in self.__dict__
-
-    def _set_base(self, base, *, share_base):
-        if share_base:
-            # Bypass ``nn.Module.__setattr__`` so the outer module does not
-            # become a child of the inner adapter. This keeps it out of
-            # parameters(), state_dict(), train()/eval(), to(), and deepcopy().
-            self.__dict__["_shared_base_ref"] = weakref.ref(base)
-        else:
-            self.base = base
-            self.base.requires_grad_(False)
-
-
-class LoRALinear(_LoRABaseReference, nn.Module):
-    """LoRA around a plain Linear layer: base(x) + scale * B(A(x))."""
-
-    def __init__(self, base, rank, alpha, dropout=0.0, *, share_base=False):
+    def __init__(self, base, rank, scale=1.0):
         super().__init__()
         if not isinstance(base, nn.Linear):
             raise TypeError(f"Expected nn.Linear, got {type(base)}")
-        self._set_base(base, share_base=bool(share_base))
-        requested_rank = int(rank)
-        self.rank = max(1, min(requested_rank, base.in_features, base.out_features))
-        # Keep the user-selected alpha/r scaling even when a narrow output
-        # layer forces the effective matrix rank below r.
-        self.scaling = float(alpha) / float(requested_rank)
-        self.dropout = nn.Dropout(float(dropout)) if dropout > 0 else nn.Identity()
-
-        self.lora_A = nn.Parameter(base.weight.new_empty(self.rank, base.in_features))
-        self.lora_B = nn.Parameter(base.weight.new_zeros(base.out_features, self.rank))
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-
-    def share_base_(self, base):
-        """Rebind a shared adapter after an outer module identity change."""
-        if not self.shares_base:
-            raise RuntimeError("Cannot rebind an owned LoRA base as shared.")
-        if not isinstance(base, nn.Linear):
-            raise TypeError(f"Expected nn.Linear, got {type(base)}")
-        if (
-            base.in_features != self.lora_A.shape[1]
-            or base.out_features != self.lora_B.shape[0]
+        if isinstance(rank, bool) or not isinstance(rank, Integral) or not 0 < rank <= min(
+            base.in_features, base.out_features
         ):
-            raise ValueError("Shared LoRA base shape does not match its adapters.")
-        self.__dict__["_shared_base_ref"] = weakref.ref(base)
-        return self
+            raise ValueError(
+                "LoRA-RL rank must be a positive integer no larger than either "
+                f"selected matrix dimension ({base.out_features}, {base.in_features})."
+            )
+        if not math.isfinite(float(scale)) or float(scale) <= 0:
+            raise ValueError("LoRA-RL scale must be finite and positive.")
+        self.base = base
+        self.base.requires_grad_(True)
+        self.base.weight.requires_grad_(False)
+        self.rank = int(rank)
+        self.scaling = float(scale)
+        self.lora_A = nn.Parameter(base.weight.new_empty(self.rank, base.in_features))
+        self.lora_B = nn.Parameter(base.weight.new_empty(base.out_features, self.rank))
+        self.reset_adapters_()
+
+    @torch.no_grad()
+    def reset_adapters_(self):
+        nn.init.normal_(self.lora_A, mean=0.0, std=1.0 / math.sqrt(self.rank))
+        self.lora_B.zero_()
+
+    def effective_weight(self):
+        return self.base.weight + self.scaling * (self.lora_B @ self.lora_A)
 
     def forward(self, x):
-        delta = F.linear(F.linear(self.dropout(x), self.lora_A), self.lora_B)
-        if self.shares_base:
-            base = self.base
-            linear = F.linear(
-                x,
-                base.weight.detach(),
-                None if base.bias is None else base.bias.detach(),
-            )
-        else:
-            linear = self.base(x)
-        return linear + self.scaling * delta
+        delta = F.linear(F.linear(x, self.lora_A), self.lora_B)
+        return F.linear(x, self.base.weight, self.base.bias) + self.scaling * delta
 
 
-class LoRANormedLinear(_LoRABaseReference, nn.Module):
-    """LoRA inserted before TD-MPC2's dropout -> LayerNorm -> activation."""
+class LoRARLNormedLinear(LoRARLLinear):
+    """Insert BA before the inherited dropout, LayerNorm, and activation."""
 
-    def __init__(self, base, rank, alpha, dropout=0.0, *, share_base=False):
-        super().__init__()
+    def __init__(self, base, rank, scale=1.0):
         if not isinstance(base, NormedLinear):
             raise TypeError(f"Expected NormedLinear, got {type(base)}")
-        self._set_base(base, share_base=bool(share_base))
-        requested_rank = int(rank)
-        self.rank = max(1, min(requested_rank, base.in_features, base.out_features))
-        # Keep the user-selected alpha/r scaling even when a narrow output
-        # layer forces the effective matrix rank below r.
-        self.scaling = float(alpha) / float(requested_rank)
-        self.lora_dropout = nn.Dropout(float(dropout)) if dropout > 0 else nn.Identity()
-
-        self.lora_A = nn.Parameter(base.weight.new_empty(self.rank, base.in_features))
-        self.lora_B = nn.Parameter(base.weight.new_zeros(base.out_features, self.rank))
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        if self.shares_base:
-            # The shared outer module must not be switched between train/eval
-            # by the inner lifecycle. Keep only the stateless architecture and
-            # a private dropout/activation mode in this adapter.
-            self.shared_base_dropout = (
-                nn.Dropout(base.dropout.p, inplace=base.dropout.inplace)
-                if base.dropout is not None
-                else None
-            )
-            self.shared_base_act = deepcopy(base.act)
-
-    def share_base_(self, base):
-        """Rebind a shared adapter after an outer module identity change."""
-        if not self.shares_base:
-            raise RuntimeError("Cannot rebind an owned LoRA base as shared.")
-        if not isinstance(base, NormedLinear):
-            raise TypeError(f"Expected NormedLinear, got {type(base)}")
-        if (
-            base.in_features != self.lora_A.shape[1]
-            or base.out_features != self.lora_B.shape[0]
-            or tuple(base.ln.normalized_shape) != (self.lora_B.shape[0],)
-        ):
-            raise ValueError("Shared LoRA base shape does not match its adapters.")
-        self.__dict__["_shared_base_ref"] = weakref.ref(base)
-        return self
+        super().__init__(base, rank, scale)
 
     def forward(self, x):
-        base = self.base
-        weight = base.weight.detach() if self.shares_base else base.weight
-        bias = base.bias
-        if bias is not None and self.shares_base:
-            bias = bias.detach()
-        linear = F.linear(x, weight, bias)
-        delta = F.linear(F.linear(self.lora_dropout(x), self.lora_A), self.lora_B)
-        out = linear + self.scaling * delta
-        if self.shares_base:
-            if self.shared_base_dropout is not None:
-                out = self.shared_base_dropout(out)
-            layer_norm = base.ln
-            out = F.layer_norm(
-                out,
-                layer_norm.normalized_shape,
-                None if layer_norm.weight is None else layer_norm.weight.detach(),
-                None if layer_norm.bias is None else layer_norm.bias.detach(),
-                layer_norm.eps,
-            )
-            return self.shared_base_act(out)
-        if base.dropout is not None:
-            out = base.dropout(out)
-        return base.act(base.ln(out))
+        out = super().forward(x)
+        if self.base.dropout is not None:
+            out = self.base.dropout(out)
+        return self.base.act(self.base.ln(out))
 
 
-def _resolve_lora_scale(rank, alpha, scale):
-    rank = int(rank)
-    if rank <= 0:
-        raise ValueError("LoRA rank must be positive.")
-    if scale is not None:
-        scale = float(scale)
-        if scale <= 0:
-            raise ValueError("LoRA scale must be positive.")
-        alpha = scale * rank
-    return rank, alpha
-
-
-def lorafy_copy(module, rank=8, alpha=8.0, dropout=0.0, *, scale=None):
-    """Deep-copy a module and add trainable LoRA adapters.
-
-    ``alpha`` retains the legacy ``alpha / requested_rank`` convention. New
-    callers should pass ``scale`` to specify the actual multiplier directly,
-    keeping update magnitude independent from adapter rank.
-    """
-    rank, alpha = _resolve_lora_scale(rank, alpha, scale)
-
-    clone = deepcopy(module)
-    clone.requires_grad_(False)
-    adapted = 0
-
-    def recurse(parent):
-        nonlocal adapted
-        for name, child in list(parent.named_children()):
-            if isinstance(child, NormedLinear):
-                setattr(parent, name, LoRANormedLinear(child, rank, alpha, dropout))
-                adapted += 1
-            elif isinstance(child, nn.Linear):
-                setattr(parent, name, LoRALinear(child, rank, alpha, dropout))
-                adapted += 1
-            else:
-                recurse(child)
-
-    recurse(clone)
-    if adapted == 0:
-        raise ValueError("No Linear layers were found for LoRA adaptation.")
-    return clone
-
-
-def lorafy_shared(module, rank=8, alpha=8.0, dropout=0.0, *, scale=None):
-    """Clone module structure while sharing detached immutable base weights.
-
-    Only the LoRA tensors are registered parameters of the returned module.
-    Linear and LayerNorm weights stay owned by ``module`` and are referenced
-    weakly, so target copies own independent adapters without copying bases.
-    """
-    rank, alpha = _resolve_lora_scale(rank, alpha, scale)
-
-    # Reuse adaptable leaves while copying the cheap container structure.
-    # Every shared leaf is replaced before parameters are inspected or modes
-    # are changed, so this temporary registration cannot mutate the source.
-    shared_leaves = {
-        id(child): child
-        for child in module.modules()
-        if isinstance(child, (NormedLinear, nn.Linear))
+def _adapters(module):
+    return {
+        path: child for path, child in module.named_modules()
+        if isinstance(child, LoRARLLinear)
     }
-    clone = deepcopy(module, shared_leaves)
-    adapted = 0
 
-    def recurse(source_parent, clone_parent):
-        nonlocal adapted
-        for name, source_child in list(source_parent.named_children()):
-            if isinstance(source_child, NormedLinear):
-                setattr(
-                    clone_parent,
-                    name,
-                    LoRANormedLinear(
-                        source_child,
-                        rank,
-                        alpha,
-                        dropout,
-                        share_base=True,
-                    ),
-                )
-                adapted += 1
-            elif isinstance(source_child, nn.Linear):
-                setattr(
-                    clone_parent,
-                    name,
-                    LoRALinear(
-                        source_child,
-                        rank,
-                        alpha,
-                        dropout,
-                        share_base=True,
-                    ),
-                )
-                adapted += 1
-            else:
-                recurse(source_child, getattr(clone_parent, name))
 
-    recurse(module, clone)
-    if adapted == 0:
-        raise ValueError("No Linear layers were found for LoRA adaptation.")
+def make_lora_rl_critic(critic, *, rank=96, scale=1.0, placement="input_hidden"):
+    """Own a prior copy and adapt selected non-output layers of every Q head.
 
-    source_parameter_ids = {id(parameter) for parameter in module.parameters()}
-    if any(id(parameter) in source_parameter_ids for parameter in clone.parameters()):
-        raise RuntimeError("A shared LoRA base was accidentally registered as inner state.")
-
-    clone.requires_grad_(False)
-    for child in clone.modules():
-        if isinstance(child, (LoRALinear, LoRANormedLinear)):
-            child.lora_A.requires_grad_(True)
-            child.lora_B.requires_grad_(True)
+    ``input_hidden`` adapts input and hidden matrices. ``hidden`` leaves the
+    input projection trainable, following the paper's placement more closely.
+    Rank is never silently clipped, including on smaller test architectures.
+    """
+    if placement not in {"input_hidden", "hidden"}:
+        raise ValueError("LoRA-RL placement must be 'input_hidden' or 'hidden'.")
+    if not isinstance(critic, (Ensemble, nn.Sequential)):
+        raise TypeError("LoRA-RL requires a critic Ensemble or Sequential Q head.")
+    clone = deepcopy(critic).requires_grad_(True)
+    heads = list(clone) if isinstance(clone, Ensemble) else [clone]
+    for head in heads:
+        if not isinstance(head, nn.Sequential) or len(head) < 3 or not all(
+            isinstance(layer, nn.Linear) for layer in head
+        ):
+            raise ValueError(
+                "LoRA-RL requires Sequential Q heads with input, hidden, and output Linear layers."
+            )
+        start = 0 if placement == "input_hidden" else 1
+        for index in range(start, len(head) - 1):
+            layer = head[index]
+            adapter_type = LoRARLNormedLinear if isinstance(layer, NormedLinear) else LoRARLLinear
+            head[index] = adapter_type(layer, rank=rank, scale=scale)
     return clone
+
+
+def _dense_state(module, *, effective):
+    """Return dense-layout state, referencing owned tensors except BA kernels."""
+    adapters = _adapters(module)
+    if not adapters:
+        raise ValueError("No LoRA-RL adapters were found.")
+    state = module.state_dict()
+    result = {}
+    for name, value in state.items():
+        matched = False
+        for path, adapter in adapters.items():
+            prefix = f"{path}." if path else ""
+            if name in {prefix + "lora_A", prefix + "lora_B"}:
+                matched = True
+                break
+            if name.startswith(prefix + "base."):
+                suffix = name[len(prefix + "base."):]
+                result[prefix + suffix] = (
+                    adapter.effective_weight().detach()
+                    if effective and suffix == "weight" else value
+                )
+                matched = True
+                break
+        if not matched:
+            result[name] = value
+    return result
+
+
+def _validate_dense_state(source, target):
+    if source.keys() != target.keys():
+        raise ValueError("LoRA-RL source and dense destination state layouts must match.")
+    for name, value in source.items():
+        if value.shape != target[name].shape:
+            raise ValueError(f"LoRA-RL dense state shape mismatch for {name}.")
+        if value.dtype != target[name].dtype or value.device != target[name].device:
+            raise ValueError(f"LoRA-RL dense state device/dtype mismatch for {name}.")
+
+
+@torch.no_grad()
+def reset_lora_rl_critic_(adapted, dense_prior):
+    """Restore every prior tensor and fresh adapters without replacing parameters."""
+    destination = _dense_state(adapted, effective=False)
+    source = dense_prior.state_dict()
+    _validate_dense_state(source, destination)
+    torch._foreach_copy_(
+        list(destination.values()), [source[name] for name in destination]
+    )
+    for adapter in _adapters(adapted).values():
+        adapter.reset_adapters_()
+
+
+@torch.no_grad()
+def dense_lora_rl_critic(adapted):
+    """Create an independent, frozen dense target with effective online weights."""
+    source = _dense_state(adapted, effective=True)
+    target = deepcopy(adapted)
+    for path, adapter in _adapters(target).items():
+        if not path:
+            target = adapter.base
+        else:
+            parent_path, _, name = path.rpartition(".")
+            parent = target.get_submodule(parent_path)
+            setattr(parent, name, adapter.base)
+    _validate_dense_state(source, target.state_dict())
+    target.load_state_dict(source, strict=True)
+    return target.requires_grad_(False).eval()
+
+
+@torch.no_grad()
+def update_lora_rl_target_(adapted, dense_target, tau):
+    """Polyak-average effective kernels and dense auxiliaries in weight space."""
+    tau = float(tau)
+    if not math.isfinite(tau) or not 0 <= tau <= 1:
+        raise ValueError("LoRA-RL target tau must be in [0, 1].")
+    source = _dense_state(adapted, effective=True)
+    destination = dense_target.state_dict()
+    _validate_dense_state(source, destination)
+    floating_names = [name for name, value in source.items() if value.is_floating_point()]
+    target_values = [destination[name] for name in floating_names]
+    source_values = [source[name] for name in floating_names]
+    if tau == 1:
+        torch._foreach_copy_(target_values, source_values)
+    else:
+        torch._foreach_lerp_(target_values, source_values, tau)
+    for name, value in source.items():
+        if not value.is_floating_point():
+            destination[name].copy_(value)
+
+
+def lora_rl_parameter_groups(adapted, weight_decay):
+    """Use decoupled decay only for adapter factors; retain ordinary Adam elsewhere."""
+    weight_decay = float(weight_decay)
+    if not math.isfinite(weight_decay) or weight_decay < 0:
+        raise ValueError("LoRA-RL adapter weight decay must be finite and nonnegative.")
+    adapters = _adapters(adapted)
+    if not adapters:
+        raise ValueError("No LoRA-RL adapters were found.")
+    factors = [value for adapter in adapters.values() for value in (adapter.lora_A, adapter.lora_B)]
+    factor_ids = {id(value) for value in factors}
+    ordinary = [value for value in trainable_parameters(adapted) if id(value) not in factor_ids]
+    return [
+        {"params": factors, "weight_decay": weight_decay},
+        {"params": ordinary, "weight_decay": 0.0},
+    ]
 
 
 def trainable_parameters(module):
     """Return only parameters that an inner optimizer is allowed to update."""
-    return [p for p in module.parameters() if p.requires_grad]
+    return [parameter for parameter in module.parameters() if parameter.requires_grad]

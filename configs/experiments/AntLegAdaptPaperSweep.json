@@ -19,8 +19,7 @@
     "configs": [
         "AntLegAdaptSAC",
         "AntLegAdaptTDMPC2",
-        "AntLegAdaptAMBITDMPC2",
-        "AntLegAdaptAMBITDMPC2LoRA"
+        "AntLegAdaptAMBITDMPC2"
     ],
     "logs": "timestamp",
     "save_trials": "best",
