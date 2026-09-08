@@ -134,6 +134,15 @@ def decision_metric_catalog(names, *, xqc=False):
         elif inner.startswith("outer_terminal_") and inner.endswith(("rows", "evaluations")):
             unit = "count"
             definition = f"Measured frozen outer terminal-bootstrap work for this decision: {inner}."
+        elif inner == "update_timing_step":
+            unit = "indicator"
+            definition = "One indicates updates follow each imagined parallel timestep; zero indicates updates after a complete rollout round."
+        elif inner == "policy_delay":
+            unit = "count"
+            definition = "Effective inner actor/temperature update interval in critic update slots; the frozen outer learner keeps its own delay."
+        elif inner in {"updates_per_rollout_step", "collection_steps"}:
+            unit = "count"
+            definition = "Measured step-interleaved XQC work: update slots per nonempty parallel timestep, or number of collected parallel timesteps."
         elif inner == "terminal_bootstrap_outer":
             unit = "indicator"
             definition = "One when the final imagined transition uses frozen outer actor/online critic bootstrap with the inner temperature."
@@ -308,7 +317,7 @@ def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None,
             if params.get(key) is not None:
                 schedule.append(f"{symbol}{params[key]}")
                 tags.append(f"{symbol}:{params[key]}")
-        delay = params.get("xqc_policy_delay", 3)
+        delay = params.get("inner_policy_delay") or params.get("xqc_policy_delay", 3)
         schedule.append(f"policy delay {delay}")
         tags.extend(("algorithm:ambixqc", "schedule:xqc-slots", f"policy-delay:{delay}"))
         for key, tag in (("inner_batch_size", "batch"),
@@ -316,6 +325,9 @@ def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None,
             if params.get(key) is not None:
                 tags.append(f"{tag}:{params[key]}")
         parts.append(" ".join(["XQC", *schedule]))
+        timing = params.get("inner_update_timing", "round")
+        parts.append(f"{timing} updates")
+        tags.append(f"update-timing:{timing}")
         if params.get("inner_terminal_bootstrap", "inner") == "outer":
             parts.append("outer terminal bootstrap")
             tags.extend(("terminal-bootstrap:outer", "terminal-policy:frozen-outer",

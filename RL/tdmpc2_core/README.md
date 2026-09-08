@@ -95,8 +95,23 @@ transitions retain the adapting inner actor and target critics. The original
 joined current/next batches used by inner critic BatchNorm remain intact;
 replacing their next actions would unintentionally change other rows too.
 The default `"inner"` keeps the original target at every transition. Version-3
-checkpoints record this choice; version-1/2 checkpoints load as `"inner"`, with
-an explicit frozen-evaluation override permitting the outer terminal ablation.
+introduced this choice; version-1/2 checkpoints load as `"inner"`, with an
+explicit frozen-evaluation override permitting the outer terminal ablation.
+
+`inner_update_timing="round"` preserves collection of a complete rollout round
+before its G updates. The eager-only `"step"` option divides G evenly across H
+depths, appending each nonempty parallel timestep before its update slots and
+continuing from the current latent states. Imagined replay accumulates within
+the real action. `inner_policy_delay` defaults to the outer delay but can be
+overridden for the disposable inner learner; it does not alter outer XQC rules.
+The outer-terminal step campaign uses H3/G3 and inner delay 1, so every depth
+performs one critic, actor, and temperature update (J6 totals C18/A18/T18).
+The preceding round campaign retains inner delay 3 and totals C18/A6/T6.
+Reward-normalizer state remains frozen under the campaign's `frozen_real_scale`
+setting, and separate rollout/update timers exclude each other's work.
+Version-4 checkpoints record timing and effective inner delay. Older versions
+load with round timing and their saved outer delay; strict loads reject changed
+semantics while explicit frozen evaluation permits these supported inner changes.
 
 `xqc_mppi.py` attaches an evaluation-only MPPI controller to a frozen AMBI-XQC
 checkpoint. It uses running BatchNorm statistics and its own episode-seeded

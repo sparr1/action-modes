@@ -10,7 +10,7 @@ executes it once, and then logically discards it.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 import time
 from typing import Any
@@ -114,6 +114,10 @@ class InnerXQCEngine:
     @property
     def _uses_outer_terminal_bootstrap(self):
         return getattr(self.cfg, "inner_terminal_bootstrap", "inner") == "outer"
+
+    @property
+    def _interleaves_updates(self):
+        return getattr(self.cfg, "inner_update_timing", "round") == "step"
 
     def __init__(self, agent):
         self.agent = agent
@@ -440,6 +444,16 @@ class InnerXQCEngine:
             self._workspace_pool = None
             workspace.reset_from_(self.outer_controller)
 
+        # The outer learner retains its original delay. An evaluation override
+        # belongs only to this disposable controller, including reused pools.
+        inner_policy_delay = getattr(cfg, "inner_policy_delay", None)
+        if inner_policy_delay is None:
+            inner_policy_delay = cfg.xqc_policy_delay
+        if workspace.controller.config.policy_delay != int(inner_policy_delay):
+            workspace.controller.config = replace(
+                workspace.controller.config, policy_delay=int(inner_policy_delay)
+            )
+
         if self._replay_pool is None:
             replay = LatentReplayBuffer(
                 capacity=int(cfg.inner_replay_capacity),
@@ -583,6 +597,96 @@ class InnerXQCEngine:
             count=count,
             horizon=horizon,
         )
+
+    def _collect_stepwise_round(self, root_z):
+        """Advance the same branches one depth, then optimize on available replay.
+
+        G remains a total round budget, shared equally across H reached depths.
+        Collection tensors are detached before optimization; later actions use
+        the adapted actor and its current running BatchNorm statistics.
+        """
+        cfg, state = self.cfg, self.state
+        count, horizon = int(cfg.inner_rollouts_per_round), int(cfg.inner_rollout_horizon)
+        updates = int(cfg.inner_updates_per_round)
+        if bool(getattr(cfg, "compile", False)):
+            raise ValueError("Step-interleaved XQC currently requires compile=False.")
+        if updates < horizon or updates % horizon:
+            raise ValueError("Step-interleaved XQC requires G >= H and G divisible by H.")
+        updates_per_step = updates // horizon
+        rollout_start = self._timer_start()
+        with torch.no_grad():
+            z = root_z.expand(count, -1).clone()
+            lengths = torch.zeros(count, dtype=torch.long, device=self.device)
+            reward_sums = root_z.new_zeros(count)
+            discounted_rewards = root_z.new_zeros(count)
+            discount_weight = root_z.new_ones(count)
+            terminated_rollout = torch.zeros(count, dtype=torch.bool, device=self.device)
+            support = td_math.categorical_support(root_z, cfg)
+            return_accumulator = (
+                self._new_branch_return_accumulator(count, root_z)
+                if state.reward_normalizer is not None else None
+            )
+        history = []
+        collection_steps = 0
+        for step in range(horizon):
+            if step:
+                rollout_start = self._timer_start()
+            with torch.no_grad():
+                active = (
+                    torch.nonzero(~terminated_rollout, as_tuple=False).squeeze(-1)
+                    if bool(cfg.episodic) else None
+                )
+                active_z = z.index_select(0, active) if active is not None else z
+                active_count = int(active_z.shape[0])
+                if not active_count:
+                    self._timer_stop("inner_rollout_seconds", rollout_start)
+                    break
+                action = self._sample_actor(active_z, stream="collection")
+                joint = self.model.joint_input(active_z, action)
+                reward = td_math.two_hot_inv(self.model.reward_from_joint(joint), cfg, support=support)
+                next_z = self.model.next_from_joint(joint)
+                done = (
+                    (self.model.termination(next_z) > float(cfg.inner_termination_threshold)).to(reward.dtype)
+                    if bool(cfg.episodic) else reward.new_zeros(active_count, 1)
+                )
+                if state.outer_terminal_flags is not None:
+                    self._record_outer_terminal_flags(
+                        torch.full_like(done, step == horizon - 1, dtype=torch.bool) & (done == 0)
+                    )
+                # Commit provenance and transition data before the next slot
+                # draws from all transitions collected so far in this action.
+                state.replay.add_batch(active_z, action, reward, next_z, done)
+                rows = active if active is not None else slice(None)
+                if return_accumulator is not None:
+                    returns = (float(self.agent.discount) * (1.0 - done.squeeze(-1))
+                               * return_accumulator[rows] + reward.squeeze(-1))
+                    return_accumulator[rows] = returns
+                    self._update_reward_normalizer(returns)
+                lengths[rows] += 1
+                reward_sums[rows] += reward.squeeze(-1)
+                discounted_rewards[rows] += discount_weight[rows] * reward.squeeze(-1)
+                discount_weight[rows] *= float(self.agent.discount)
+                terminated_rollout[rows] |= done.squeeze(-1) >= 0.5
+                # Replacing z in the dense case avoids modifying active_z,
+                # which also describes the transition just appended to replay.
+                if active is None:
+                    z = next_z
+                else:
+                    z[active] = next_z
+                collection_steps += 1
+            self._timer_stop("inner_rollout_seconds", rollout_start)
+
+            update_start = self._timer_start()
+            for _ in range(updates_per_step):
+                history.append(self._update_slot())
+            self._timer_stop("inner_update_seconds", update_start)
+        return {
+            "lengths": lengths,
+            "reward_sums": reward_sums,
+            "discounted_rewards": discounted_rewards,
+            "terminated": terminated_rollout,
+            "collection_steps": collection_steps,
+        }, history
 
     @torch.no_grad()
     def _collect_dynamic_round(self, root_z, *, count, horizon):
@@ -980,8 +1084,18 @@ class InnerXQCEngine:
             discounted_rewards = []
             terminated = []
             update_history = []
+            collection_steps = 0
 
             for _ in range(int(self.cfg.inner_rounds)):
+                if self._interleaves_updates:
+                    rollout, step_updates = self._collect_stepwise_round(root_z)
+                    all_lengths.append(rollout["lengths"])
+                    reward_sums.append(rollout["reward_sums"])
+                    discounted_rewards.append(rollout["discounted_rewards"])
+                    terminated.append(rollout["terminated"])
+                    collection_steps += rollout["collection_steps"]
+                    update_history.extend(step_updates)
+                    continue
                 rollout_start = self._timer_start()
                 rollout = self._collect_round(root_z)
                 # Collection is the data-generating event. Update running
@@ -1066,6 +1180,7 @@ class InnerXQCEngine:
                 inner_critic_optimizer_steps=float(update_slots),
                 inner_actor_optimizer_steps=float(actor_steps),
                 inner_temperature_optimizer_steps=float(temperature_steps),
+                inner_policy_delay=float(workspace.controller.config.policy_delay),
                 inner_critic_utd=(
                     torch.as_tensor(float(update_slots), device=self.device)
                     / utd_denominator
@@ -1136,6 +1251,14 @@ class InnerXQCEngine:
                     inner_outer_terminal_bootstrap_rows=self.state.outer_terminal_bootstrap_rows,
                     inner_outer_terminal_policy_evaluations=float(outer_terminal_work),
                     inner_outer_terminal_q_evaluations=float(outer_terminal_work),
+                )
+            if self._interleaves_updates:
+                metrics.update(
+                    inner_update_timing_step=1.0,
+                    inner_updates_per_rollout_step=float(
+                        int(self.cfg.inner_updates_per_round) // int(self.cfg.inner_rollout_horizon)
+                    ),
+                    inner_collection_steps=float(collection_steps),
                 )
             metrics.update(self._average_updates(update_history, root_z))
             metrics.update(self._compile_fallback_metrics())

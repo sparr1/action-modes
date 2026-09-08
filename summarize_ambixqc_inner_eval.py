@@ -46,13 +46,17 @@ def _identity(manifest, entry, source):
 
 
 def _budget(variant):
-    campaign_profile(variant)  # Validate the selected profile even for direct helper callers.
-    return {**BUDGET, **({"inner_terminal_bootstrap": "outer"} if variant == "outer_terminal" else {})}
+    profile = campaign_profile(variant)
+    return {**BUDGET,
+            **({"inner_terminal_bootstrap": "outer"} if profile["terminal_bootstrap"] == "outer" else {}),
+            **({"inner_update_timing": "step", "inner_policy_delay": 1} if profile["update_timing"] == "step" else {})}
 
 
 def _signature(value):
     result = copy.deepcopy(value or {})
     result.setdefault("inner_terminal_bootstrap", "inner")
+    result.setdefault("inner_update_timing", "round")
+    result.setdefault("inner_policy_delay", result.get("policy_delay", 3))
     return result
 
 
@@ -65,7 +69,7 @@ def _configuration(run, prior, metadata, controller_seed, *, variant="inner"):
     budget = _budget(variant)
     expected["alg_params"].update(budget)
     if run["config"] != expected or expected["alg_params"].get("xqc_policy_delay") != 3:
-        raise ValueError("Inner configuration must inherit the prior and change only the J6/N512/H3/G3/B512 budget and selected terminal bootstrap.")
+        raise ValueError("Inner configuration must inherit the prior and change only the J6/N512/H3/G3/B512 budget, terminal bootstrap, update timing, and inner policy delay.")
     evaluated = copy.deepcopy(result.get("evaluated_algorithm_config", {}))
     expected["seed"] = controller_seed
     expected["alg_params"]["wandb"] = False
@@ -79,9 +83,15 @@ def _configuration(run, prior, metadata, controller_seed, *, variant="inner"):
                 "inner_actor_lr": 5e-5, "inner_critic_lr": 5e-5, "xqc_policy_delay": 3}
     if any(resolved.get(key) != value for key, value in required.items()):
         raise ValueError("Resolved XQC defaults/budget must retain frozen normalization and inherited learning rates.")
-    terminal = "outer" if variant == "outer_terminal" else "inner"
+    profile = campaign_profile(variant)
+    terminal, timing = profile["terminal_bootstrap"], profile["update_timing"]
     if resolved.get("inner_terminal_bootstrap", "inner") != terminal:
         raise ValueError("Resolved terminal bootstrap differs from the selected variant.")
+    if resolved.get("inner_update_timing", "round") != timing:
+        raise ValueError("Resolved update timing differs from the selected variant.")
+    delay = 1 if timing == "step" else 3
+    if resolved.get("inner_policy_delay", resolved.get("xqc_policy_delay")) != delay:
+        raise ValueError("Resolved inner policy delay differs from the selected variant.")
     provenance, prior_provenance = result.get("checkpoint_evaluation_provenance", {}), reference.get("checkpoint_evaluation_provenance", {})
     if (provenance.get("frozen_evaluation") is not True or prior_provenance.get("frozen_evaluation") is not True
             or _signature(provenance.get("saved_semantic_signature")) != _signature(prior_provenance.get("saved_semantic_signature"))):
@@ -91,17 +101,23 @@ def _configuration(run, prior, metadata, controller_seed, *, variant="inner"):
             or saved_signature.get("inner_lifecycle") != "fresh_per_action"
             or saved_signature.get("reward_normalization") != "real_discounted_return_only"
             or saved_signature["inner_terminal_bootstrap"] != "inner"
+            or saved_signature["inner_update_timing"] != "round"
+            or saved_signature["inner_policy_delay"] != 3
             or _signature(prior_provenance.get("evaluated_semantic_signature")) != saved_signature):
         raise ValueError("Reference must retain the unchanged prior-only checkpoint semantics.")
     expected_signature = copy.deepcopy(saved_signature)
     expected_signature["collection_operator"] = "xqc"
     expected_signature["inner_terminal_bootstrap"] = terminal
+    expected_signature["inner_update_timing"] = timing
+    expected_signature["inner_policy_delay"] = delay
     expected_signature["inner_schedule"].update(rounds=6, rollouts=512, horizon=3, updates=3, batch_size=512, replay_capacity=9216)
     if _signature(provenance.get("evaluated_semantic_signature")) != expected_signature:
         raise ValueError("Inner evaluation changed unsupported outer or normalization semantics.")
 
 
 def _validate_xqc(run, traces, *, seeds, max_steps, controller_seed, variant="inner"):
+    profile = campaign_profile(variant)
+    counts = profile["optimizer_steps"]
     result = run.get("result", {})
     if (run.get("status") != "complete" or result.get("outer_state_unchanged") is not True
             or run.get("outer_state_unchanged") is not True
@@ -125,14 +141,23 @@ def _validate_xqc(run, traces, *, seeds, max_steps, controller_seed, variant="in
         if (trace["mode"] != "episodes" or trace["seed"] not in by_seed or trace["phase"] != ["decision"]
                 or trace["nonfinite"] or any(value is None for values in trace["metrics"].values() for value in values)):
             raise ValueError("Invalid, null, or nonfinite inner decision diagnostics.")
-        if any(trace[f"{component}_updates"] != [count] for component, count in COUNTS.items()):
-            raise ValueError("Each inner decision must perform C18/A6/T6 accepted optimizer updates.")
+        if any(trace[f"{component}_updates"] != [count] for component, count in counts.items()):
+            raise ValueError(f"Each inner decision must perform C{counts['critic']}/A{counts['actor']}/T{counts['temperature']} accepted optimizer updates.")
         metrics = trace["metrics"]
+        if metrics.get("decision/inner_policy_delay", [3]) != [profile["inner_policy_delay"]]:
+            raise ValueError("Measured inner policy delay differs from the selected variant.")
         required = {"inner_model_steps": 9216, "inner_reward_normalizer_imagined_updates": 0,
-                    **{f"inner_{component}_optimizer_steps": count for component, count in COUNTS.items()}}
+                    **{f"inner_{component}_optimizer_steps": count for component, count in counts.items()}}
         if any(metrics.get(f"decision/{key}") != [value] for key, value in required.items()):
             raise ValueError("Measured inner work or frozen reward normalization differs from the campaign.")
-        if variant == "outer_terminal":
+        step_counts = {"inner_update_timing_step": 1, "inner_updates_per_rollout_step": 1,
+                       "inner_collection_steps": 18}
+        if profile["update_timing"] == "step":
+            if any(metrics.get(f"decision/{key}") != [value] for key, value in step_counts.items()):
+                raise ValueError("Step-update decision measurements must record 18 collection steps and one update slot per step.")
+        elif any(metrics.get(f"decision/{key}", [0]) != [0] for key in step_counts):
+            raise ValueError("Round-update variant cannot report step-update work.")
+        if profile["terminal_bootstrap"] == "outer":
             outer_counts = {"inner_terminal_bootstrap_outer": 1, "inner_outer_terminal_boundary_rows": 3072,
                             "inner_outer_terminal_policy_evaluations": 9216, "inner_outer_terminal_q_evaluations": 9216}
             sampled = _finite(metrics.get("decision/inner_outer_terminal_bootstrap_rows", [None])[0], "Outer-terminal sampled rows")
@@ -149,7 +174,7 @@ def _validate_xqc(run, traces, *, seeds, max_steps, controller_seed, variant="in
         if (episode.get("status") != "complete" or episode.get("length") != max_steps
                 or episode.get("solver_seed") != solver_seed(controller_seed, "episode", episode["seed"])
                 or episode.get("nonfinite_model_metrics")
-                or episode.get("actual_optimizer_steps") != {key: value * max_steps for key, value in COUNTS.items()}):
+                or episode.get("actual_optimizer_steps") != {key: value * max_steps for key, value in counts.items()}):
             raise ValueError("Incomplete inner episode or mismatched seeds/optimizer totals.")
         decisions = sorted(by_seed[episode["seed"]], key=lambda trace: trace["decision_index"])
         if [trace["decision_index"] for trace in decisions] != list(range(max_steps)):
@@ -162,7 +187,7 @@ def _validate_xqc(run, traces, *, seeds, max_steps, controller_seed, variant="in
             if not math.isclose(math.fsum(values), measured, rel_tol=1e-9, abs_tol=1e-8):
                 raise ValueError(f"Episode {field} differs from its real-decision measurements.")
     if (run.get("actual_optimizer_steps_scope") != "completed_episodes"
-            or run.get("actual_optimizer_steps") != {key: value * len(seeds) * max_steps for key, value in COUNTS.items()}):
+            or run.get("actual_optimizer_steps") != {key: value * len(seeds) * max_steps for key, value in counts.items()}):
         raise ValueError("Completed-episode optimizer totals do not match measured decisions.")
     return episodes
 
@@ -258,17 +283,24 @@ def summarize(manifest_path, results_root, *, expected_source_sha, reference_roo
     return {"schema_version": 1, "status": "partial" if missing else "complete", "source_run": SOURCE_RUN,
             "checkpoint_manifest_sha256": file_sha256(manifest_path), "evaluation_source_sha": expected_source_sha, "sources": sources,
             "protocol": protocol, "seeds": list(seeds), "expected_steps": list(STEPS), "missing_steps": missing,
-            "variant": variant, "inner_settings": _budget(variant), "optimizer_steps_per_decision": COUNTS, "model_steps_per_decision": 9216,
+            "variant": variant, "inner_settings": _budget(variant), "optimizer_steps_per_decision": profile["optimizer_steps"], "model_steps_per_decision": 9216,
             "numerical_settings": copy.deepcopy(NUMERICAL_SETTINGS), "numerical_settings_scope": "new_inner_xqc_evaluations",
             "statistics": "Raw environment returns; five paired seeds; population SD (ddof=0). XQC values use normalized reward units.", "rows": rows}
 
 
 def render_html(summary):
-    outer = campaign_profile(summary.get("variant", "inner"))["variant"] == "outer_terminal"
+    profile = campaign_profile(summary.get("variant", "inner"))
+    outer, step = profile["terminal_bootstrap"] == "outer", profile["update_timing"] == "step"
     label = "XQC with outer terminal bootstrap" if outer else "inner XQC"
+    if step:
+        label += " and step updates"
     title = f"Frozen XQC: prior versus {label}"
     terminal_description = ("Only the final imagined transition bootstraps with the frozen outer actor and online critic using running BatchNorm statistics; the entropy weight remains the adapting inner temperature. Earlier transitions retain the inner actor and target critic."
                             if outer else "Imagined transitions bootstrap with the adapting inner actor and inner target critic.")
+    schedule_description = ("After each parallel imagined timestep, append its 512 transitions and run one critic, actor, and temperature update before advancing the current latent states. G3 is the total per round, distributed across H3; replay accumulates within the action. The inner policy delay is 1; the frozen outer learner retains delay 3."
+                            if step else "After each complete H3 imagined rollout round, run G3 XQC update slots on accumulated action-local replay.")
+    counts = profile["optimizer_steps"]
+    dose = f"C{counts['critic']}/A{counts['actor']}/T{counts['temperature']}"
     rows = summary["rows"]
     def chart(series, title, zero=False):
         xs = [row["checkpoint_step"] for row in rows]
@@ -291,7 +323,7 @@ def render_html(summary):
         body.append(f'<tr><td>{row["checkpoint_step"]:,}</td>'+''.join(f'<td>{value}</td>' for value in values)+f'<td>{row["prior"]["control_seconds_per_decision"]:.6f}</td><td>{row["inner_xqc"]["control_seconds_per_decision"]:.6f}</td></tr>')
     return (f'<!doctype html><html><head><meta charset="utf-8"><title>{title}</title><style>body{{font:16px system-ui;color:#18263b;background:#f7f9fc;max-width:1100px;margin:40px auto;padding:0 24px}}p{{line-height:1.6}}svg{{background:white;width:100%;border:1px solid #dbe1ea}}svg text{{font:12px system-ui}}table{{width:100%;border-collapse:collapse;background:white}}td,th{{text-align:right;padding:12px;border-bottom:1px solid #ddd}}td:first-child,th:first-child{{text-align:left}}code{{overflow-wrap:anywhere}}</style></head><body>'
             f'<h1>{title}</h1><p>{html.escape(summary["status"].capitalize())}: {len(rows)}/{len(summary["expected_steps"])} checkpoints. Seeds {html.escape(str(summary["seeds"]))}. {html.escape(summary["statistics"])}</p>'
-            f'<p><span style="color:#2563a6">Blue: persistent prior.</span> <span style="color:#c46722">Orange: {label}.</span> Both execute the actor mean. J6/N512/H3/G3/B512, policy delay 3; each decision performs C18/A6/T6 and 9,216 model steps. Full outer state and real reward normalization remain frozen.</p><p>{terminal_description}</p>'
+            f'<p><span style="color:#2563a6">Blue: persistent prior.</span> <span style="color:#c46722">Orange: {label}.</span> Both execute the actor mean. J6/N512/H3/G3/B512, inner policy delay {1 if step else 3}; each decision performs {dose} and 9,216 model steps. Full outer state and real reward normalization remain frozen.</p><p>{schedule_description}</p><p>{terminal_description}</p>'
             + chart([("prior","return_mean","#2563a6"),("inner_xqc","return_mean","#c46722")],"Mean raw episode return")
             + chart([("paired","delta_mean","#21836f")],f"Mean paired gain: {label} minus prior",True)
             + f'<h2>Checkpoint comparisons</h2><table><tr><th>Checkpoint</th><th>Prior return ± SD</th><th>{label[0].upper()+label[1:]} return ± SD</th><th>Paired gain ± SD</th><th>Prior s/decision</th><th>Inner s/decision</th></tr>'+''.join(body)+'</table>'
@@ -312,7 +344,7 @@ def main(argv=None):
     for name in ("manifest", "results-root", "output"):
         parser.add_argument(f"--{name}", required=True, type=Path)
     parser.add_argument("--expected-source-sha", required=True)
-    parser.add_argument("--variant", choices=("inner", "outer_terminal"), default="inner")
+    parser.add_argument("--variant", choices=("inner", "outer_terminal", "outer_terminal_step"), default="inner")
     parser.add_argument("--reference-root", type=Path, help="Relocate downloaded references under ROOT/production/step_N/bundle; hashes stay fixed.")
     parser.add_argument("--html", type=Path)
     for name in ("allow-partial", "overwrite", "wandb"):

@@ -39,7 +39,7 @@ from RL.xqc_core import (
 class AMBIXQCAgent(nn.Module):
     """Persistent TOLD model and XQC priors with fresh inner XQC per action."""
 
-    _CHECKPOINT_VERSION = 3
+    _CHECKPOINT_VERSION = 4
 
     def __init__(self, cfg):
         super().__init__()
@@ -592,6 +592,8 @@ class AMBIXQCAgent(nn.Module):
             "algorithm": "AMBIXQC",
             "collection_operator": str(self.cfg.inner_operator),
             "inner_terminal_bootstrap": str(getattr(self.cfg, "inner_terminal_bootstrap", "inner")),
+            "inner_update_timing": str(getattr(self.cfg, "inner_update_timing", "round")),
+            "inner_policy_delay": int(getattr(self.cfg, "inner_policy_delay", self.cfg.xqc_policy_delay)),
             "official_xqc_commit": str(self.cfg.xqc_official_commit),
             "observation": self.observation_signature(),
             "action_dim": int(self.cfg.action_dim),
@@ -715,27 +717,37 @@ class AMBIXQCAgent(nn.Module):
     def _preflight_semantic_signature(self, state, *, frozen_evaluation):
         expected = self.semantic_signature()
         saved = copy.deepcopy(state["semantic_signature"])
-        if state["checkpoint_version"] in {1, 2}:
-            legacy_keys = set(expected) - {"inner_terminal_bootstrap"}
-            if state["checkpoint_version"] == 1:
-                legacy_keys -= {"collection_operator", "action_contract"}
-            require_exact_keys(saved, legacy_keys, "AMBI-XQC legacy checkpoint semantics")
-            # Earlier checkpoints always bootstrapped every imagined row from
-            # the adapting inner actor and its target critic.
-            saved["inner_terminal_bootstrap"] = "inner"
-        if state["checkpoint_version"] == 1:
-            # Version one always collected with inner XQC and did not record
-            # physical action bounds. Preserve precisely its existing checks.
-            legacy_keys = set(expected) - {"collection_operator", "action_contract"}
-            require_exact_keys(saved, legacy_keys, "AMBI-XQC v1 semantics")
+        version = state["checkpoint_version"]
+        legacy_defaults = {}
+        if version <= 3:
+            legacy_defaults["inner_update_timing"] = "round"
+            legacy_defaults["inner_policy_delay"] = saved.get("policy_delay")
+        if version <= 2:
+            legacy_defaults["inner_terminal_bootstrap"] = "inner"
+        if version == 1:
+            legacy_defaults.update(collection_operator="xqc", action_contract=None)
+        if legacy_defaults:
+            require_exact_keys(
+                saved, set(expected) - set(legacy_defaults),
+                "AMBI-XQC legacy checkpoint semantics",
+            )
+            saved.update(legacy_defaults)
+        if version == 1:
+            # Preserve the original v1 physical-action compatibility contract.
             saved["collection_operator"] = "xqc"
             saved["action_contract"] = None
             expected["action_contract"] = None
         require_exact_keys(saved, expected, "AMBI-XQC checkpoint semantics")
         if saved["collection_operator"] not in {"none", "xqc"}:
             raise ValueError("AMBI-XQC checkpoint collection operator is invalid.")
-        if saved["inner_terminal_bootstrap"] not in {"inner", "outer"}:
+        if (not isinstance(saved["inner_terminal_bootstrap"], str)
+                or saved["inner_terminal_bootstrap"] not in {"inner", "outer"}):
             raise ValueError("AMBI-XQC checkpoint inner terminal bootstrap is invalid.")
+        if (not isinstance(saved["inner_update_timing"], str)
+                or saved["inner_update_timing"] not in {"round", "step"}):
+            raise ValueError("AMBI-XQC checkpoint inner update timing is invalid.")
+        if type(saved["inner_policy_delay"]) is not int or saved["inner_policy_delay"] <= 0:
+            raise ValueError("AMBI-XQC checkpoint inner policy delay is invalid.")
         saved_comparison = copy.deepcopy(saved)
         if frozen_evaluation:
             schedule = require_exact_keys(
@@ -765,6 +777,9 @@ class AMBIXQCAgent(nn.Module):
                     raise ValueError(f"AMBI-XQC checkpoint inner {key} is invalid.")
             if schedule["replay_sampling"] != "with_replacement":
                 raise ValueError("AMBI-XQC checkpoint inner replay sampling is invalid.")
+            if (saved["inner_update_timing"] == "step"
+                    and schedule["updates"] % schedule["horizon"]):
+                raise ValueError("AMBI-XQC checkpoint step update budget is invalid.")
             if saved["reward_normalization"] not in {
                 "real_discounted_return_only",
                 "real_discounted_return_plus_fresh_action_local_imagined_returns",
@@ -775,7 +790,7 @@ class AMBIXQCAgent(nn.Module):
             # strict, including XQC target/optimizer/normalizer semantics.
             for key in (
                 "collection_operator", "inner_schedule", "reward_normalization",
-                "inner_terminal_bootstrap",
+                "inner_terminal_bootstrap", "inner_update_timing", "inner_policy_delay",
             ):
                 saved_comparison[key] = expected[key]
         if saved_comparison != expected:
@@ -826,7 +841,7 @@ class AMBIXQCAgent(nn.Module):
         if (
             isinstance(state["checkpoint_version"], bool)
             or not isinstance(state["checkpoint_version"], int)
-            or state["checkpoint_version"] not in {1, 2, self._CHECKPOINT_VERSION}
+            or state["checkpoint_version"] not in {1, 2, 3, self._CHECKPOINT_VERSION}
         ):
             raise ValueError("Unsupported AMBI-XQC checkpoint version.")
         saved_signature = self._preflight_semantic_signature(

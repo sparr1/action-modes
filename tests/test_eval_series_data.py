@@ -253,6 +253,42 @@ def test_xqc_legacy_inner_terminal_default_matches_explicit_resolver_default(bun
     assert old["identity"] != outer["identity"]
 
 
+def test_xqc_round_timing_preserves_registry_identity_and_step_rejects_append(bundle):
+    from utils.eval_series import SeriesError, validate_record
+    path, value = bundle
+    run = value["runs"][0]
+    run["config"]["alg"] = "AMBIXQC/AMBIXQC"
+    run["resolved_config"].update(inner_operator="xqc", inner_terminal_bootstrap="outer")
+    old, = data.load_records(dump(path, value))
+    assert "inner_update_timing" not in old["identity"]["planner"]["settings"]
+    run["resolved_config"]["inner_update_timing"] = "round"
+    run["resolved_config"]["inner_policy_delay"] = run["resolved_config"].get("xqc_policy_delay", 3)
+    explicit, = data.load_records(dump(path, value))
+    assert explicit["identity"] == old["identity"]
+    run["resolved_config"]["inner_update_timing"] = "step"
+    run["resolved_config"]["inner_policy_delay"] = 1
+    step, = data.load_records(dump(path, value))
+    assert step["identity"]["planner"]["settings"]["inner_update_timing"] == "step"
+    assert step["identity"]["planner"]["settings"]["inner_policy_delay"] == 1
+    with pytest.raises(SeriesError, match="Incompatible append: planner"):
+        validate_record(step, old["identity"])
+
+
+def test_xqc_timing_default_normalization_does_not_change_sac_identity():
+    cfg = {"inner_operator": "sac", "inner_update_timing": "round"}
+    planner = data.planner_identity(cfg, {}, "AMBITDMPC2/AMBITDMPC2", "tanh_mean")
+    assert planner["settings"]["inner_update_timing"] == "round"
+
+
+def test_xqc_policy_delay_alone_is_a_distinct_planner():
+    cfg = {"inner_operator":"xqc","xqc_policy_delay":3}
+    original = data.planner_identity(cfg, {}, "AMBIXQC/AMBIXQC", "tanh_mean")
+    explicit = data.planner_identity({**cfg,"inner_policy_delay":3}, {}, "AMBIXQC/AMBIXQC", "tanh_mean")
+    changed = data.planner_identity({**cfg,"inner_policy_delay":1}, {}, "AMBIXQC/AMBIXQC", "tanh_mean")
+    assert original == explicit
+    assert changed != original and changed["settings"]["xqc_policy_delay"] == 3
+
+
 def test_missing_and_nonfinite_diagnostics_remain_distinct(bundle):
     path, value = bundle
     value["runs"][0]["episodes"][0]["model_metrics"]["nan_metric"] = float("nan")

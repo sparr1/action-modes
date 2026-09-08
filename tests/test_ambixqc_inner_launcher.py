@@ -83,29 +83,39 @@ def _validated_reference(case, *, smoke=True):
 
 
 def _candidate(directory, case, *, seeds, length, reference, variant="inner"):
+    profile = runner.campaign_profile(variant)
+    counts = profile["optimizer_steps"]
     directory.mkdir(parents=True)
     traces = []
     for seed in seeds:
         path = directory / f"seed-{seed}.jsonl.gz"
         events = [{"episode_id": f"seed-{seed}", "decision_index": index, "event_index": 0, "phase": "decision",
-                   "critic_updates": 18, "actor_updates": 6, "temperature_updates": 6,
-                   "metrics": {"decision/inner_model_steps": 9216, "decision/inner_critic_optimizer_steps": 18,
-                               "decision/inner_actor_optimizer_steps": 6, "decision/inner_temperature_optimizer_steps": 6}}
+                   **{f"{component}_updates": count for component, count in counts.items()},
+                   "metrics": {"decision/inner_model_steps": 9216,
+                               **{f"decision/inner_{component}_optimizer_steps": count
+                                  for component, count in counts.items()}}}
                   for index in range(length)]
-        if variant == "outer_terminal":
+        if profile["terminal_bootstrap"] == "outer":
             for event in events:
                 event["metrics"].update({f"decision/{key}": value
                                          for key, value in runner.OUTER_TERMINAL_METRICS.items()})
                 event["metrics"]["decision/inner_outer_terminal_bootstrap_rows"] = 3072
+        if profile["update_timing"] == "step":
+            for event in events:
+                event["metrics"]["decision/inner_policy_delay"] = 1
+                event["metrics"].update({f"decision/{key}": value
+                                         for key, value in runner.STEP_UPDATE_METRICS.items()})
         with gzip.open(path, "wt") as stream:
             stream.write("\n".join(json.dumps(event) for event in events) + "\n")
         traces.append(path.name)
     run = {"selector": "controller/xqc", "config": {"alg": "AMBIXQC/AMBIXQC", "alg_params": {"inner_operator": "xqc"}},
            "status": "complete", "action_rule": "tanh_mean", "result": _result(seeds, candidate=True),
            "episodes": _episodes(seeds, length, candidate=True), "trace_files": traces}
-    if variant == "outer_terminal":
+    run["result"]["resolved_config"].update(profile["inner_settings"])
+    if profile["terminal_bootstrap"] == "outer":
         run["config"]["alg_params"]["inner_terminal_bootstrap"] = "outer"
-        run["result"]["resolved_config"]["inner_terminal_bootstrap"] = "outer"
+    if profile["update_timing"] == "step":
+        run["config"]["alg_params"].update(inner_update_timing="step", inner_policy_delay=1)
     manifest = {"status": "complete", "checkpoint": case.row, "protocol": reference["manifest"]["protocol"],
                 "reference": {"manifest_sha256": reference["manifest_sha256"]}, "runs": [run]}
     (directory / "manifest.json").write_text(json.dumps(manifest))
@@ -120,7 +130,8 @@ def _stub_execution(monkeypatch, case):
         calls["evaluate"].append((matrix, checkpoint, kwargs))
         smoke = kwargs["max_steps"] == 3
         reference = _validated_reference(case, smoke=smoke)
-        variant = "inner" if matrix == runner.MATRIX else "outer_terminal"
+        variant = next(name for name in runner.CAMPAIGN_VARIANTS
+                       if runner.campaign_profile(name)["matrix"] == matrix)
         _candidate(kwargs["bundle_dir"], case, seeds=kwargs["seeds"], length=kwargs["max_steps"],
                    reference=reference, variant=variant)
         return {"checkpoint_sha256": case.row["sha256"], "results": [{"controller": "xqc"}]}
@@ -140,7 +151,8 @@ def _stub_execution(monkeypatch, case):
     return calls
 
 
-def test_production_reuses_five_full_prior_episodes_and_publishes_only_xqc(case, monkeypatch):
+@pytest.mark.parametrize("variant", runner.CAMPAIGN_VARIANTS)
+def test_production_reuses_five_full_prior_episodes_and_publishes_only_xqc(case, monkeypatch, variant):
     calls = _stub_execution(monkeypatch, case)
     source = json.loads(Path(case.row["path"] + ".metadata.json").read_text())
     assert "inner_reward_normalization" not in source["trial_run_params"]["alg_params"]
@@ -149,7 +161,8 @@ def test_production_reuses_five_full_prior_episodes_and_publishes_only_xqc(case,
     monkeypatch.setitem(sys.modules, "utils.eval_series", SimpleNamespace(
         load_run=lambda path: {"run_id": "selected"},
         stage_result=lambda run_dir, path, **kwargs: staged.append((run_dir, path, kwargs))))
-    destination = runner.run(case.manifest, 0, case.result_root, eval_run_dir=case.result_root.parent / "series")
+    destination = runner.run(case.manifest, 0, case.result_root, variant=variant,
+                             eval_run_dir=case.result_root.parent / "series")
     assert _numerical_flags() == previous
     assert len(calls["evaluate"]) == 1
     kwargs = calls["evaluate"][0][2]
@@ -166,8 +179,8 @@ def test_production_reuses_five_full_prior_episodes_and_publishes_only_xqc(case,
     assert provenance["checkpoint"] == case.row
     assert provenance["reference_manifest_sha256"] == case.row["reference_manifest_sha256"]
     assert provenance["checkpoint_manifest_sha256"] == runner.file_sha256(case.manifest)
-    assert provenance["matrix_sha256"] == runner.file_sha256(runner.MATRIX)
-    assert provenance["variant"] == "inner"
+    assert provenance["matrix_sha256"] == runner.file_sha256(runner.campaign_profile(variant)["matrix"])
+    assert provenance["variant"] == variant
     expected_numerics = {"device_type": "cuda", "deterministic_algorithms": True,
                         "deterministic_warn_only": False, "cudnn_deterministic": True,
                         "cudnn_benchmark": False, "cublas_workspace_config": ":4096:8"}
@@ -370,21 +383,22 @@ def test_outer_terminal_matrix_changes_only_terminal_bootstrap(case):
 
 
 @pytest.mark.parametrize("mode", ["production", "smoke"])
-def test_outer_terminal_runner_reuses_existing_priors_with_distinct_provenance(case, monkeypatch, mode):
+@pytest.mark.parametrize("variant", ["outer_terminal", "outer_terminal_step"])
+def test_outer_terminal_runner_reuses_existing_priors_with_distinct_provenance(case, monkeypatch, mode, variant):
     calls = _stub_execution(monkeypatch, case)
-    options = {"mode": mode, "variant": "outer_terminal"}
+    options = {"mode": mode, "variant": variant}
     if mode == "smoke":
         options.update(smoke_reference_bundle=case.smoke.parent,
                        smoke_reference_manifest_sha256=runner.file_sha256(case.smoke))
     destination = runner.run(case.manifest, 0, case.result_root, **options)
-    profile = runner.campaign_profile("outer_terminal")
+    profile = runner.campaign_profile(variant)
     matrix, checkpoint, kwargs = calls["evaluate"][0]
     assert matrix == profile["matrix"] and checkpoint == case.row["path"]
     assert kwargs["selectors"] == ["controller/xqc"]
     expected_reference = case.smoke if mode == "smoke" else case.production
     assert kwargs["reference_bundle"] == str(expected_reference.parent)
     for name in ("provenance.json", "paired.json", "validation.json"):
-        assert json.loads((destination / name).read_text())["variant"] == "outer_terminal"
+        assert json.loads((destination / name).read_text())["variant"] == variant
     provenance = json.loads((destination / "provenance.json").read_text())
     assert provenance["matrix_sha256"] == runner.file_sha256(profile["matrix"])
     assert provenance["checkpoint"] == case.row
@@ -442,7 +456,8 @@ def test_outer_terminal_sampling_accepts_valid_inclusive_row_bounds(case, tmp_pa
     assert result["decision_counts"] == {"controller/xqc": 6}
 
 
-@pytest.mark.parametrize("actual,requested", [("inner", "outer_terminal"), ("outer_terminal", "inner")])
+@pytest.mark.parametrize("actual,requested", [(actual, requested) for actual in runner.CAMPAIGN_VARIANTS
+                                              for requested in runner.CAMPAIGN_VARIANTS if actual != requested])
 def test_campaign_variants_reject_each_others_candidate(case, tmp_path, actual, requested):
     reference = _validated_reference(case)
     directory = tmp_path / "candidate"
@@ -458,9 +473,105 @@ def test_invalid_campaign_variant_fails_before_source_or_outputs(case):
     assert not case.result_root.exists()
 
 
-def test_runner_cli_forwards_explicit_campaign_variant(monkeypatch):
+@pytest.mark.parametrize("variant", ["outer_terminal", "outer_terminal_step"])
+def test_runner_cli_forwards_explicit_campaign_variant(monkeypatch, variant):
     calls = []
     monkeypatch.setattr(runner, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
     runner.main(["--manifest", "/manifest.json", "--index", "0", "--result-root", "/results",
-                 "--variant", "outer_terminal"])
-    assert calls[0][1]["variant"] == "outer_terminal"
+                 "--variant", variant])
+    assert calls[0][1]["variant"] == variant
+
+
+def test_step_matrix_preserves_outer_terminal_protocol_and_sets_one_actor_and_critic_per_depth(case):
+    from utils.ambi_research import load_preset_matrix, resolve_preset
+    from utils.checkpoint_context import load_checkpoint_context
+
+    outer = runner.campaign_profile("outer_terminal")
+    step = runner.campaign_profile("outer_terminal_step")
+    assert step["terminal_bootstrap"] == "outer" and step["update_timing"] == "step"
+    assert step["inner_policy_delay"] == 1 and outer["inner_policy_delay"] == 3
+    assert outer["update_timing"] == "round"
+    assert runner.campaign_profile()["terminal_bootstrap"] == "inner"
+    assert step["inner_settings"] == {**outer["inner_settings"], "inner_update_timing": "step",
+                                      "inner_policy_delay": 1}
+    assert step["optimizer_steps"] == {"critic": 18, "actor": 18, "temperature": 18}
+    assert outer["optimizer_steps"] == runner.OPTIMIZER_STEPS == {"critic": 18, "actor": 6, "temperature": 6}
+    matrix, baseline = load_preset_matrix(step["matrix"]), load_preset_matrix(outer["matrix"])
+    assert matrix["evaluation"] == baseline["evaluation"]
+    assert matrix["budget_source"] == baseline["budget_source"]
+    context = load_checkpoint_context(case.row["path"])
+    for selector in ("controller/prior", "controller/xqc"):
+        previous = resolve_preset(outer["matrix"], selector, checkpoint_context=context)
+        resolved = resolve_preset(step["matrix"], selector, checkpoint_context=context)
+        expected = deepcopy(previous["algorithm_config"])
+        if selector == "controller/xqc":
+            expected["alg_params"].update(inner_update_timing="step", inner_policy_delay=1)
+        assert resolved["algorithm_config"] == expected
+        assert resolved["saved_algorithm_config"] == previous["saved_algorithm_config"]
+        assert protocol_for(resolved, 12345, 500) == protocol_for(previous, 12345, 500)
+    assert expected["alg_params"]["inner_updates_per_round"] // expected["alg_params"]["inner_rollout_horizon"] == 1
+    assert expected["alg_params"]["xqc_policy_delay"] == 3
+
+
+@pytest.mark.parametrize("key,value", [
+    ("inner_update_timing_step", 0), ("inner_update_timing_step", None),
+    ("inner_updates_per_rollout_step", 3), ("inner_updates_per_rollout_step", None),
+    ("inner_collection_steps", 6), ("inner_collection_steps", None),
+])
+def test_step_acceptance_requires_depth_timing_metrics(case, tmp_path, key, value):
+    reference = _validated_reference(case)
+    directory = tmp_path / "candidate"
+    manifest = _candidate(directory, case, seeds=[101, 102], length=3,
+                          reference=reference, variant="outer_terminal_step")
+    path = directory / manifest["runs"][0]["trace_files"][0]
+    with gzip.open(path, "rt") as stream:
+        events = [json.loads(line) for line in stream]
+    if value is None:
+        events[0]["metrics"].pop(f"decision/{key}")
+    else:
+        events[0]["metrics"][f"decision/{key}"] = value
+    with gzip.open(path, "wt") as stream:
+        stream.write("\n".join(json.dumps(event) for event in events) + "\n")
+    with pytest.raises(ValueError, match="Step-update diagnostics"):
+        runner.validate_bundle(directory, checkpoint=case.row, reference=reference,
+                               protocol=case.smoke_protocol, seeds=[101, 102], max_steps=3,
+                               variant="outer_terminal_step")
+
+
+def test_step_acceptance_rejects_delayed_actor_counts_even_with_correct_timing(case, tmp_path):
+    reference = _validated_reference(case)
+    directory = tmp_path / "candidate"
+    manifest = _candidate(directory, case, seeds=[101, 102], length=3,
+                          reference=reference, variant="outer_terminal_step")
+    path = directory / manifest["runs"][0]["trace_files"][0]
+    with gzip.open(path, "rt") as stream:
+        events = [json.loads(line) for line in stream]
+    events[0]["actor_updates"] = 6
+    events[0]["metrics"]["decision/inner_actor_optimizer_steps"] = 6
+    with gzip.open(path, "wt") as stream:
+        stream.write("\n".join(json.dumps(event) for event in events) + "\n")
+    with pytest.raises(ValueError, match="C18/A18/T18"):
+        runner.validate_bundle(directory, checkpoint=case.row, reference=reference,
+                               protocol=case.smoke_protocol, seeds=[101, 102], max_steps=3,
+                               variant="outer_terminal_step")
+
+
+@pytest.mark.parametrize("delay", [None, 3])
+def test_step_acceptance_requires_inner_policy_delay_one(case, tmp_path, delay):
+    reference = _validated_reference(case)
+    directory = tmp_path / "candidate"
+    manifest = _candidate(directory, case, seeds=[101, 102], length=3,
+                          reference=reference, variant="outer_terminal_step")
+    path = directory / manifest["runs"][0]["trace_files"][0]
+    with gzip.open(path, "rt") as stream:
+        events = [json.loads(line) for line in stream]
+    if delay is None:
+        events[0]["metrics"].pop("decision/inner_policy_delay")
+    else:
+        events[0]["metrics"]["decision/inner_policy_delay"] = delay
+    with gzip.open(path, "wt") as stream:
+        stream.write("\n".join(json.dumps(event) for event in events) + "\n")
+    with pytest.raises(ValueError, match="Inner policy-delay diagnostic"):
+        runner.validate_bundle(directory, checkpoint=case.row, reference=reference,
+                               protocol=case.smoke_protocol, seeds=[101, 102], max_steps=3,
+                               variant="outer_terminal_step")

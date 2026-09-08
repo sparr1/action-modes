@@ -200,6 +200,9 @@ def _planner_display_label(planner, *, compact=False):
         interval = settings.get("inner_steps_per_update")
         if interval:
             parts.append(("s" if compact else "interval") + number(interval))
+        if kind == "xqc":
+            step_timing = settings.get("inner_update_timing", "round") == "step"
+            parts.append(("step" if step_timing else "round") + ("" if compact else " updates"))
         if settings.get("inner_component_update_schedule"):
             parts.append("split")
         rate = settings.get("inner_actor_lr")

@@ -454,8 +454,19 @@ def test_curve_label_marks_xqc_terminal_and_nondefault_collection():
     registry["identity"]["backbone"] = "rwgao_b-brown-university/ambi/axqc-prior-92441d99-5959199"
     registry["identity"]["planner"]["type"] = "xqc"
     label = series.concise_curve_label(registry)
-    assert label.startswith("AMBI-XQC · XQC C3/A1/T1 outer-term N256")
+    assert label.startswith("AMBI-XQC · XQC C3/A1/T1 outer-term round N256")
     assert "92441d99" not in label
+
+
+def test_xqc_step_curve_label_distinguishes_matched_optimizer_dose():
+    registry = label_registry(inner_terminal_bootstrap="outer", inner_actor_updates_per_action=6,
+                              inner_critic_updates_per_action=18, inner_temperature_updates_per_action=6)
+    registry["identity"]["planner"]["type"] = "xqc"
+    assert "outer-term round" in series.concise_curve_label(registry)
+    registry["identity"]["planner"]["settings"].update(inner_update_timing="step",inner_policy_delay=1,
+        inner_actor_updates_per_action=18,inner_temperature_updates_per_action=18)
+    assert "C3/A3/T3 outer-term step" in series.concise_curve_label(registry)
+    assert "step updates" in series.evaluation_run_name(registry)
 
 
 def test_prior_label_excludes_inactive_settings_and_mppi_shows_changed_budget():

@@ -24,6 +24,8 @@ _XQC_CHECKPOINT_INNER_PARAMS = {
     "inner_replay_capacity", "inner_replay_sampling", "inner_reward_normalization",
     "inner_actor_lr", "inner_critic_lr", "inner_diagnostics_every",
     "inner_terminal_bootstrap",
+    "inner_update_timing",
+    "inner_policy_delay",
 }
 _MPPI_PARAMETERS = {
     "horizon", "iterations", "num_samples", "num_elites", "num_pi_trajs",

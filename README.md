@@ -109,10 +109,12 @@ with `AMBIXQC_MODE=production`. Production uses one L40S, six CPUs, 48 GB RAM,
 and a 72-hour limit. Each job creates a fresh result directory; production
 publishes to W&B project `ambi` with its source SHA and job ID in the run name.
 
-New XQC checkpoints use version 3 to record both the collection operator and
-`inner_terminal_bootstrap`. Version-1 and version-2 checkpoints remain readable:
-their missing terminal setting means `inner`, and version 1 also defaults to
-inner-XQC collection. Ordinary loading retains strict semantic checks; the
+New XQC checkpoints use version 4 to record the collection operator,
+`inner_terminal_bootstrap`, `inner_update_timing`, and effective
+`inner_policy_delay`. Version-1 through version-3 checkpoints remain readable:
+missing timing means `round`, missing inner delay inherits the saved outer
+policy delay, missing terminal setting means `inner`, and version 1 also
+defaults to inner-XQC collection. Ordinary loading retains strict semantic checks; the
 evaluator's explicit frozen load permits only supported inner/controller changes
 and records the saved and evaluated settings. Existing checkpoint banks do not
 need rewriting.
@@ -137,6 +139,15 @@ term. Earlier transitions retain the inner actor and target critic. The
 J6/N512/H3/G3/B512 budget, C18/A6/T6 counts, frozen outer state, and paired prior
 references are preserved. See the [outer terminal workflow](configs/research/README.md#outer-terminal-bootstrap-variant)
 for separate output directories, launch selection, and variant-aware reports.
+
+`--variant outer_terminal_step` keeps that terminal bootstrap and collects one
+parallel imagined timestep before each update. With J6/N512/H3/G3/B512 and
+`inner_policy_delay=1`, every timestep performs one critic, actor, and temperature
+update: C18/A18/T18 per real decision, with the same 9,216 model transitions.
+The frozen outer learner retains policy delay 3. This eager-only variant uses
+`configs/research/ambixqc_humanoid_outer_terminal_step_j6_benchmark.json` and a
+new evaluation curve; its step schedule and increased actor/temperature dose
+are explicit in the [step-update workflow](configs/research/README.md#outer-terminal-step-updates).
 
 ### AMBI-XQC compiled execution and paired timing
 

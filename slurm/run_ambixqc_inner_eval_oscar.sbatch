@@ -28,7 +28,7 @@ if [[ "$MODE" == production ]]; then
   : "${EVAL_RUN_MAP:?Prepare explicit New/Append evaluation runs before submission.}"
   [[ "$EVAL_RUN_MAP" == /* && -f "$EVAL_RUN_MAP" ]] || exit 2
 fi
-[[ "$VARIANT" == inner || "$VARIANT" == outer_terminal ]] || { echo "Invalid evaluation variant" >&2; exit 2; }
+[[ "$VARIANT" == inner || "$VARIANT" == outer_terminal || "$VARIANT" == outer_terminal_step ]] || { echo "Invalid evaluation variant" >&2; exit 2; }
 [[ "$EXPECTED_ACTION_MODES_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 2
 [[ "$CHECKPOINT_MANIFEST" == /* && "$RESULT_ROOT" == /* && "$PYTHON_BIN" == /* ]] || exit 2
 [[ -f "$CHECKPOINT_MANIFEST" && -x "$PYTHON_BIN" ]] || exit 2
@@ -73,7 +73,8 @@ if [[ "$MODE" == smoke ]]; then
   srun --unbuffered --kill-on-bad-exit=1 --ntasks=1 "$PYTHON_BIN" -m pytest -q -rs -p no:cacheprovider \
     tests/test_ambixqc_inner_j6.py tests/test_ambixqc_inner.py tests/test_ambixqc_controller.py \
     tests/test_ambixqc_prior_checkpoint.py tests/test_ambixqc_checkpoint_evaluation.py \
-    tests/test_ambixqc_outer_terminal.py tests/test_ambixqc_terminal_checkpoint.py
+    tests/test_ambixqc_outer_terminal.py tests/test_ambixqc_terminal_checkpoint.py \
+    tests/test_ambixqc_step_updates.py tests/test_ambixqc_timing_checkpoint.py
 else
   args+=(--eval-run-map "$EVAL_RUN_MAP")
 fi

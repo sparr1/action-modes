@@ -56,6 +56,8 @@ _AMBIXQC_DEFAULTS = {
     "inner_rollouts_per_round": 32,
     "inner_rollout_horizon": 3,
     "inner_updates_per_round": 4,
+    "inner_update_timing": "round",
+    "inner_policy_delay": None,
     "inner_batch_size": 64,
     "inner_replay_capacity": None,
     "inner_replay_sampling": "with_replacement",
@@ -75,6 +77,8 @@ _PUBLIC_INNER_KEYS = {
     "inner_rollouts_per_round",
     "inner_rollout_horizon",
     "inner_updates_per_round",
+    "inner_update_timing",
+    "inner_policy_delay",
     "inner_batch_size",
     "inner_replay_capacity",
     "inner_replay_sampling",
@@ -399,6 +403,23 @@ class AMBIXQC(AMBITDMPC2):
         cfg.inner_updates_per_round = _positive_int(
             cfg.inner_updates_per_round, "inner_updates_per_round"
         )
+        if not isinstance(cfg.inner_update_timing, str):
+            raise ValueError("inner_update_timing must be 'round' or 'step'.")
+        cfg.inner_update_timing = cfg.inner_update_timing.lower()
+        if cfg.inner_update_timing not in {"round", "step"}:
+            raise ValueError("inner_update_timing must be 'round' or 'step'.")
+        if cfg.inner_update_timing == "step":
+            if cfg.inner_updates_per_round % cfg.inner_rollout_horizon:
+                raise ValueError(
+                    "Step-timed XQC requires inner_updates_per_round divisible "
+                    "by inner_rollout_horizon, with at least one slot per step."
+                )
+            if cfg.compile:
+                raise ValueError("Step-timed XQC currently requires compile=false.")
+        cfg.inner_policy_delay = (
+            cfg.xqc_policy_delay if cfg.inner_policy_delay is None
+            else _positive_int(cfg.inner_policy_delay, "inner_policy_delay")
+        )
         cfg.inner_batch_size = _positive_int(cfg.inner_batch_size, "inner_batch_size")
         cfg.inner_model_step_budget = (
             cfg.inner_rounds
@@ -489,7 +510,7 @@ class AMBIXQC(AMBITDMPC2):
         )
         cfg.inner_critic_updates_per_action = cfg.inner_expected_update_slots
         accepted_actor_steps = (
-            (cfg.inner_expected_update_slots - 1) // cfg.xqc_policy_delay + 1
+            (cfg.inner_expected_update_slots - 1) // cfg.inner_policy_delay + 1
         )
         cfg.inner_actor_updates_per_action = accepted_actor_steps
         cfg.inner_temperature_updates_per_action = accepted_actor_steps

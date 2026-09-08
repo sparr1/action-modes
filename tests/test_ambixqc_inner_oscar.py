@@ -8,15 +8,18 @@ def test_inner_oscar_launcher_preserves_runtime_and_reference_contract():
     for guard in ("#SBATCH --gres=gpu:l40s:1", "#SBATCH --cpus-per-task=6",
                   "#SBATCH --mem=32G", "#SBATCH --time=02:00:00", "#SBATCH --no-requeue",
                   "EXPECTED_ACTION_MODES_SHA", "--untracked-files=all", "LOCK_SHA",
-                  "run_ambixqc_inner_evaluation.py", "--wandb", "WANDB_CACHE_DIR",
+                  "run_ambixqc_inner_evaluation.py", '--eval-run-map "$EVAL_RUN_MAP"', "WANDB_CACHE_DIR",
                   "tests/test_ambixqc_inner_j6.py", "smoke_reference_manifest_sha256",
                   "tests/test_ambixqc_outer_terminal.py", "tests/test_ambixqc_terminal_checkpoint.py",
                   'VARIANT="${AMBIXQC_EVAL_VARIANT:-inner}"',
-                  '[[ "$VARIANT" == inner || "$VARIANT" == outer_terminal ]]', '--variant "$VARIANT"',
+                  '[[ "$VARIANT" == inner || "$VARIANT" == outer_terminal || "$VARIANT" == outer_terminal_step ]]',
+                  '--variant "$VARIANT"', "tests/test_ambixqc_step_updates.py",
+                  "tests/test_ambixqc_timing_checkpoint.py",
                   "--smoke-reference-manifest-sha256", "export CUBLAS_WORKSPACE_CONFIG=:4096:8"):
         assert guard in content
     assert "pip install" not in content and "uv sync" not in content
     assert "run_ambixqc_mppi_evaluation.py" not in content
+    assert "--wandb" not in content
     subprocess.run(["/bin/bash", "-n", str(path)], check=True, close_fds=False)
 
 

@@ -387,3 +387,99 @@ def test_outer_variant_cli_writes_separate_summary_and_report(outer_outputs,tmp_
         "--expected-source-sha",NEW_SHA,"--variant","outer_terminal","--output",str(output),"--html",str(report)])==0
     assert json.loads(output.read_text())["variant"]=="outer_terminal"
     assert "outer terminal bootstrap" in report.read_text()
+
+
+@pytest.fixture
+def step_outputs(outer_outputs):
+    profile = campaign.campaign_profile("outer_terminal_step")
+    for step in campaign.STEPS:
+        destination = outer_outputs[1]/"production"/f"step_{step}"
+        bundle = destination/"bundle"
+        path = bundle/"manifest.json"
+        manifest = json.loads(path.read_text())
+        run = manifest["runs"][0]
+        settings = {"inner_update_timing": "step", "inner_policy_delay": 1}
+        run["config"]["alg_params"].update(settings)
+        run["config_hash"] = storage.canonical_hash(run["config"])
+        result = run["result"]
+        result["evaluated_algorithm_config"]["alg_params"].update(settings)
+        result["resolved_config"].update(settings)
+        provenance = result["checkpoint_evaluation_provenance"]
+        provenance["saved_semantic_signature"].update(inner_update_timing="round", inner_policy_delay=3)
+        provenance["evaluated_semantic_signature"].update(settings)
+        run["actual_optimizer_steps"] = {key: value*len(SEEDS)*2 for key,value in profile["optimizer_steps"].items()}
+        for episode in run["episodes"]:
+            episode["actual_optimizer_steps"] = {key: value*2 for key,value in profile["optimizer_steps"].items()}
+        for relative in run["trace_files"]:
+            with gzip.open(bundle/relative,"rt") as stream:
+                rows = [json.loads(line) for line in stream]
+            for row in rows:
+                row.update(actor_updates=18, temperature_updates=18)
+                row["metrics"].update({"decision/inner_update_timing_step":1,
+                    "decision/inner_policy_delay":1,
+                    "decision/inner_updates_per_rollout_step":1, "decision/inner_collection_steps":18,
+                    "decision/inner_actor_optimizer_steps":18,"decision/inner_temperature_optimizer_steps":18})
+            with gzip.open(bundle/relative,"wt") as stream:
+                stream.writelines(json.dumps(row)+"\n" for row in rows)
+        manifest["metric_catalog"].update(storage.decision_metric_catalog(rows[0]["metrics"],xqc=True))
+        storage.atomic_json(path,manifest,overwrite=True)
+        for filename in ("provenance.json","paired.json"):
+            path = destination/filename
+            record = json.loads(path.read_text())
+            record.update(variant="outer_terminal_step",matrix_sha256=campaign.file_sha256(profile["matrix"]))
+            storage.atomic_json(path,record,overwrite=True)
+    return outer_outputs
+
+
+def test_step_summary_accepts_old_prior_and_reports_actor_update_every_depth(step_outputs):
+    summary = _summarize(step_outputs,variant="outer_terminal_step")
+    assert summary["inner_settings"]["inner_update_timing"] == "step"
+    assert summary["inner_settings"]["inner_policy_delay"] == 1
+    assert summary["optimizer_steps_per_decision"] == {"critic":18,"actor":18,"temperature":18}
+    assert summary["rows"][0]["paired"]["delta_mean"] == 4
+    rendered = campaign.render_html(summary)
+    assert "outer terminal bootstrap and step updates" in rendered
+    assert "C18/A18/T18" in rendered and "C18/A6/T6" not in rendered
+    assert "one critic, actor, and temperature update" in rendered
+    assert "G3 is the total per round" in rendered
+    assert "frozen outer learner retains delay 3" in rendered
+
+
+@pytest.mark.parametrize("metric,value",[("inner_update_timing_step",0),
+    ("inner_updates_per_rollout_step",3),("inner_collection_steps",6),
+    ("inner_actor_optimizer_steps",6),("inner_policy_delay",3)])
+def test_step_summary_requires_actual_interleaving_and_full_actor_dose(step_outputs,metric,value):
+    path = step_outputs[1]/"production/step_100000/bundle/controller__xqc/seed-101.jsonl.gz"
+    with gzip.open(path,"rt") as stream:
+        rows = [json.loads(line) for line in stream]
+    rows[0]["metrics"][f"decision/{metric}"] = value
+    with gzip.open(path,"wt") as stream:
+        stream.writelines(json.dumps(row)+"\n" for row in rows)
+    with pytest.raises(ValueError,match="Step-update decision|Measured inner work|Measured inner policy delay"):
+        _summarize(step_outputs,variant="outer_terminal_step")
+
+
+@pytest.mark.parametrize("field",["saved_semantic_signature","evaluated_semantic_signature"])
+@pytest.mark.parametrize("setting,wrong",[("inner_update_timing","round"),("inner_policy_delay",3)])
+def test_step_summary_rejects_incompatible_saved_or_evaluated_semantics(step_outputs,field,setting,wrong):
+    def change(manifest):
+        value = wrong if field.startswith("evaluated") else ("step" if setting=="inner_update_timing" else 1)
+        manifest["runs"][0]["result"]["checkpoint_evaluation_provenance"][field][setting] = value
+    _change(step_outputs,change)
+    with pytest.raises(ValueError,match="provenance|unsupported"):
+        _summarize(step_outputs,variant="outer_terminal_step")
+
+
+def test_step_and_round_cannot_be_mislabeled(step_outputs):
+    with pytest.raises(ValueError,match="variant"):
+        _summarize(step_outputs,variant="outer_terminal")
+
+
+def test_step_variant_cli_writes_distinct_report(step_outputs,tmp_path,monkeypatch):
+    summarize = campaign.summarize
+    monkeypatch.setattr(campaign,"summarize",lambda *a,**k:summarize(*a,**k,seeds=SEEDS,max_steps=2))
+    output, report = tmp_path/"step-summary.json", tmp_path/"step-report.html"
+    campaign.main(["--manifest",str(step_outputs[0]),"--results-root",str(step_outputs[1]),
+        "--expected-source-sha",NEW_SHA,"--variant","outer_terminal_step","--output",str(output),"--html",str(report)])
+    assert json.loads(output.read_text())["variant"] == "outer_terminal_step"
+    assert "C18/A18/T18" in report.read_text()

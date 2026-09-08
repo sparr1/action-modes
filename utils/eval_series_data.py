@@ -268,6 +268,12 @@ def planner_identity(config, result, algorithm, action_rule):
         # bootstrap used the inner learner. The new resolver makes that
         # existing behavior explicit; absence is not a distinct planner.
         active.setdefault("inner_terminal_bootstrap", "inner")
+        # Migrated XQC round-update registry identities predate this setting.
+        # Keep their exact identity; step timing is an explicit new planner.
+        if active.get("inner_update_timing", "round") == "round":
+            active.pop("inner_update_timing", None)
+        if active.get("inner_policy_delay") in (None, config.get("xqc_policy_delay", 3)):
+            active.pop("inner_policy_delay", None)
     ignored = {"inner_execution_action", "inner_execution_noise_std", "inner_execution_std_scale",
                "inner_diagnostic_rollouts", "inner_diagnostics_every", "inner_horizon_ratio",
                "inner_nominal_critic_utd", "inner_nominal_transitions_per_round",

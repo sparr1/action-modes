@@ -29,19 +29,38 @@ OUTER_TERMINAL_METRICS = {
     "inner_outer_terminal_policy_evaluations": 9216,
     "inner_outer_terminal_q_evaluations": 9216,
 }
+STEP_UPDATE_METRICS = {
+    "inner_update_timing_step": 1,
+    "inner_updates_per_rollout_step": 1,
+    "inner_collection_steps": 18,
+}
+CAMPAIGN_VARIANTS = ("inner", "outer_terminal", "outer_terminal_step")
 
 
 def campaign_profile(variant="inner"):
     """Return the matrix and acceptance settings for a named XQC campaign."""
-    if variant not in {"inner", "outer_terminal"}:
-        raise ValueError("Variant must be inner or outer_terminal.")
+    if variant not in CAMPAIGN_VARIANTS:
+        raise ValueError("Variant must be inner, outer_terminal, or outer_terminal_step.")
     settings = dict(INNER_SETTINGS)
+    optimizer_steps = dict(OPTIMIZER_STEPS)
     matrix, label = MATRIX, "inner XQC J6/N512/H3/G3"
-    if variant == "outer_terminal":
+    terminal_bootstrap, update_timing = "inner", "round"
+    if variant in {"outer_terminal", "outer_terminal_step"}:
+        terminal_bootstrap = "outer"
         settings["inner_terminal_bootstrap"] = "outer"
         matrix = ROOT / "configs/research/ambixqc_humanoid_outer_terminal_j6_benchmark.json"
         label = "outer-terminal XQC J6/N512/H3/G3"
-    return {"variant": variant, "matrix": matrix, "inner_settings": settings, "label": label}
+    if variant == "outer_terminal_step":
+        update_timing = "step"
+        settings["inner_update_timing"] = "step"
+        settings["inner_policy_delay"] = 1
+        optimizer_steps = {"critic": 18, "actor": 18, "temperature": 18}
+        matrix = ROOT / "configs/research/ambixqc_humanoid_outer_terminal_step_j6_benchmark.json"
+        label = "outer-terminal XQC J6/N512/H3/G3 with one critic/actor/temperature update per depth"
+    return {"variant": variant, "matrix": matrix, "inner_settings": settings, "label": label,
+            "terminal_bootstrap": terminal_bootstrap, "update_timing": update_timing,
+            "optimizer_steps": optimizer_steps,
+            "inner_policy_delay": settings.get("inner_policy_delay", settings["xqc_policy_delay"])}
 
 
 @contextmanager
@@ -180,8 +199,13 @@ def validate_bundle(bundle_path, *, checkpoint, reference, protocol, seeds, max_
     _check_frozen_run(run)
     episodes = _check_episodes(run, seeds=seeds, max_steps=max_steps)
     cfg = run["result"].get("resolved_config", {})
+    inner_delay = cfg.get("inner_policy_delay")
+    if inner_delay is None:
+        inner_delay = cfg.get("xqc_policy_delay")
     if (any(cfg.get(key) != value for key, value in profile["inner_settings"].items())
-            or cfg.get("inner_terminal_bootstrap", "inner") != ("outer" if variant == "outer_terminal" else "inner")):
+            or cfg.get("inner_terminal_bootstrap", "inner") != profile["terminal_bootstrap"]
+            or cfg.get("inner_update_timing", "round") != profile["update_timing"]
+            or inner_delay != profile["inner_policy_delay"]):
         raise ValueError("Resolved inner-XQC settings differ from the authorized J6/N512/H3/G3/B512 dose.")
     seen = set()
     traces = run.get("trace_files", [])
@@ -204,13 +228,17 @@ def validate_bundle(bundle_path, *, checkpoint, reference, protocol, seeds, max_
                 if (metrics.get("decision/inner_model_steps") != MODEL_STEPS
                         or any(event.get(f"{component}_updates") != value
                                or metrics.get(f"decision/inner_{component}_optimizer_steps") != value
-                               for component, value in OPTIMIZER_STEPS.items())):
-                    raise ValueError("Actual inner-XQC work must be 9216 model steps and C18/A6/T6 per decision.")
+                               for component, value in profile["optimizer_steps"].items())):
+                    counts = profile["optimizer_steps"]
+                    raise ValueError(f"Actual inner-XQC work must be 9216 model steps and "
+                                     f"C{counts['critic']}/A{counts['actor']}/T{counts['temperature']} per decision.")
                 if not all(_finite_number(value) for value in metrics.values()):
                     raise ValueError("Candidate decision metrics must be finite.")
+                if metrics.get("decision/inner_policy_delay", None if profile["update_timing"] == "step" else 3) != profile["inner_policy_delay"]:
+                    raise ValueError("Inner policy-delay diagnostic differs from the requested update frequency.")
                 sampled = metrics.get("decision/inner_outer_terminal_bootstrap_rows",
-                                      None if variant == "outer_terminal" else 0)
-                if variant == "outer_terminal":
+                                      None if profile["terminal_bootstrap"] == "outer" else 0)
+                if profile["terminal_bootstrap"] == "outer":
                     if (any(metrics.get(f"decision/{name}") != value
                             for name, value in OUTER_TERMINAL_METRICS.items())
                             or not _finite_number(sampled) or int(sampled) != sampled
@@ -219,6 +247,12 @@ def validate_bundle(bundle_path, *, checkpoint, reference, protocol, seeds, max_
                 elif sampled != 0 or any(metrics.get(f"decision/{name}", 0) != 0
                                          for name in OUTER_TERMINAL_METRICS):
                     raise ValueError("Native inner bootstrap cannot report outer-terminal work.")
+                if profile["update_timing"] == "step":
+                    if any(metrics.get(f"decision/{name}") != value
+                           for name, value in STEP_UPDATE_METRICS.items()):
+                        raise ValueError("Step-update diagnostics must prove one slot at each of 18 collection depths.")
+                elif any(metrics.get(f"decision/{name}", 0) != 0 for name in STEP_UPDATE_METRICS):
+                    raise ValueError("Round-update evaluation cannot report step-update work.")
     expected = {(f"seed-{seed}", decision) for seed in seeds for decision in range(max_steps)}
     if seen != expected:
         raise ValueError("Candidate per-decision diagnostics are missing, duplicated, or use unexpected episode identities.")
@@ -229,7 +263,7 @@ def validate_bundle(bundle_path, *, checkpoint, reference, protocol, seeds, max_
             raise ValueError("Paired return delta does not match the immutable prior reference.")
         gains.append(gain)
     return {"outer_state_unchanged": True, "decision_counts": {"controller/xqc": len(seen)},
-            "optimizer_updates_per_decision": dict(OPTIMIZER_STEPS),
+            "optimizer_updates_per_decision": dict(profile["optimizer_steps"]),
             "inner_model_steps_per_decision": MODEL_STEPS,
             "paired_return_delta_mean": sum(gains) / len(gains)}
 
@@ -264,9 +298,15 @@ def run(manifest_path, index, result_root, *, mode="production", device="cuda", 
     if any(_saved_setting(resolved["algorithm_config"]["alg_params"], key) != value
            for key, value in profile["inner_settings"].items()):
         raise ValueError("Research matrix differs from the authorized native inner-XQC settings.")
-    if resolved["algorithm_config"]["alg_params"].get("inner_terminal_bootstrap", "inner") != (
-            "outer" if variant == "outer_terminal" else "inner"):
+    if resolved["algorithm_config"]["alg_params"].get("inner_terminal_bootstrap", "inner") != profile["terminal_bootstrap"]:
         raise ValueError("Research matrix terminal bootstrap differs from the selected campaign variant.")
+    if resolved["algorithm_config"]["alg_params"].get("inner_update_timing", "round") != profile["update_timing"]:
+        raise ValueError("Research matrix update timing differs from the selected campaign variant.")
+    inner_delay = resolved["algorithm_config"]["alg_params"].get("inner_policy_delay")
+    if inner_delay is None:
+        inner_delay = resolved["algorithm_config"]["alg_params"].get("xqc_policy_delay")
+    if inner_delay != profile["inner_policy_delay"]:
+        raise ValueError("Research matrix inner policy delay differs from the selected campaign variant.")
     seeds, max_steps = (list(range(101, 106)), 500) if mode == "production" else ([101, 102], 3)
     reference_path = row.get("reference_bundle") if mode == "production" else smoke_reference_bundle
     reference_sha = row.get("reference_manifest_sha256") if mode == "production" else smoke_reference_manifest_sha256
@@ -329,7 +369,7 @@ def main(argv=None):
     parser.add_argument("--index", type=int, required=True)
     parser.add_argument("--result-root", type=Path, required=True)
     parser.add_argument("--mode", choices=("smoke", "production"), default="production")
-    parser.add_argument("--variant", choices=("inner", "outer_terminal"), default="inner")
+    parser.add_argument("--variant", choices=CAMPAIGN_VARIANTS, default="inner")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--wandb", action="store_true", help="Requires an explicit evaluation run assignment.")
     parser.add_argument("--eval-run-dir", type=Path)

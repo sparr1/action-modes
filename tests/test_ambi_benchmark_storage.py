@@ -675,6 +675,23 @@ def test_xqc_outer_terminal_bootstrap_has_distinct_labels_without_changing_nativ
     assert all(item["unit"] == "count" for item in metrics.values())
 
 
+def test_xqc_step_schedule_labels_and_measurements_are_truthful():
+    config = _xqc_resolved()["algorithm_config"]
+    config["alg_params"].update(inner_terminal_bootstrap="outer")
+    original = storage.benchmark_run_labels(CHECKPOINT, _protocol(), config, "episodes")
+    assert "round updates" in original["name"]
+    config["alg_params"].update(inner_update_timing="step",inner_policy_delay=1)
+    stepped = storage.benchmark_run_labels(CHECKPOINT, _protocol(), config, "episodes")
+    assert "step updates" in stepped["name"] and "outer terminal bootstrap" in stepped["name"]
+    assert "update-timing:step" in stepped["tags"]
+    assert "policy delay 1" in stepped["name"] and config["alg_params"]["xqc_policy_delay"] == 3
+    metrics = storage.decision_metric_catalog(["decision/inner_update_timing_step",
+        "decision/inner_updates_per_rollout_step", "decision/inner_collection_steps"], xqc=True)
+    assert metrics["decision/inner_update_timing_step"]["unit"] == "indicator"
+    assert metrics["decision/inner_collection_steps"]["unit"] == "count"
+    assert metrics["decision/inner_updates_per_rollout_step"]["unit"] == "count"
+
+
 def test_prepare_specs_resolves_before_writing_and_never_initializes_wandb(tmp_path, monkeypatch):
     calls = []
     def identity(checkpoint, resolved, protocol, seeds, code, **kwargs):

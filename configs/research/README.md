@@ -188,17 +188,84 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 For the Oscar launcher shown above, set `AMBIXQC_EVAL_VARIANT=outer_terminal`
 alongside `AMBIXQC_EVAL_MODE` and point `RESULT_ROOT` and scheduler logs to the
 new campaign. Run the two endpoint smokes before the full array. Omitting the
-variant still selects `inner`. Append `--wandb` to publish an explicitly selected
-evaluation or aggregate; outer terminal runs have distinct names and tags.
+variant still selects `inner`. Assign the intended curve with `--eval-run-map`
+and use the shared CPU publisher described above; outer terminal runs have
+distinct names and tags. The summarizer stages completed results and never
+creates an aggregate W&B run.
 
 The runner records the selected variant in provenance, paired results, and
 validation. The summarizer requires matching variant/matrix metadata, terminal
 configuration and checkpoint semantics, numerical settings, measured work, and
 unchanged complete outer state. An older record with no variant is interpreted
 as `inner`; it cannot be relabeled as `outer_terminal`. Reports retain raw
-environment returns and normalized XQC value units. New checkpoints use version
-3 to record the terminal setting; version-1/version-2 banks load with the default
-`inner` setting and remain reusable without modifying their files.
+environment returns and normalized XQC value units. Version-4 checkpoints record
+terminal selection, update timing, and effective inner policy delay. Version-1
+through version-3 banks default to round updates and the saved outer policy
+delay; missing terminal selection defaults to `inner`. Their files remain reusable.
+
+### Outer terminal step updates
+
+`ambixqc_humanoid_outer_terminal_step_j6_benchmark.json` retains the preceding
+outer-terminal bootstrap and J6/N512/H3/G3/B512 rollout budget, and sets
+`inner_update_timing="step"`, `inner_policy_delay=1`. At each depth, advance
+the 512 current latent states once, append those transitions to cumulative
+action-local replay, and perform one critic, actor, and automatic-temperature
+update before the next depth. Each update samples a batch of 512 with
+replacement. G3 remains the **total update slots per round**, divided across
+H3; it does not become three slots per depth. Step timing requires G divisible
+by H and eager execution (`compile=false`). Early termination counts only
+nonempty collected timesteps and their executed slots.
+
+The full Humanoid schedule performs 18 collection timesteps, 9,216 imagined
+transitions, and **C18/A18/T18** per real decision. The previous round variant
+has C18/A6/T6: this requested comparison changes both update timing and the
+actor/temperature dose. The outer learner retains `xqc_policy_delay=3` and
+remains frozen. All learning rates, real reward scale, initialization/reset
+rules, checkpoint grid, paired seeds, and prior references remain unchanged.
+Per-decision diagnostics record the timing flag, collection-step count,
+updates per step, effective inner delay, and actual optimizer counts. These
+are aggregate measurements; no optimizer traces are fabricated.
+
+Use an explicit **New** curve attempt: step timing and inner delay are distinct
+planner identity fields and must not append to an existing round-update curve.
+Resolve the prospective specification without constructing a learner:
+
+```bash
+"$XQC_EVAL_PY" evaluate_ambi_checkpoint.py \
+  --matrix configs/research/ambixqc_humanoid_outer_terminal_step_j6_benchmark.json \
+  --checkpoint "$XQC_CHECKPOINT" --preset controller/xqc \
+  --checkpoint-inventory "$CHECKPOINT_MANIFEST" \
+  --eval-series-spec-dir /absolute/scratch/outer-terminal-step/specs
+```
+
+Create the run from the emitted spec with `eval_series.py create` and map
+`controller/xqc` to that run directory in `EVAL_RUN_MAP`. Set
+`AMBIXQC_EVAL_VARIANT=outer_terminal_step` for endpoint smokes and production
+with the existing Oscar launcher. Select concurrency from current allocation
+headroom, including the CPU publisher, rather than copying a historical cap.
+Use a fresh campaign root; retain the existing checkpoint/reference manifest:
+
+```bash
+"$XQC_EVAL_PY" run_ambixqc_inner_evaluation.py \
+  --manifest "$CHECKPOINT_MANIFEST" --index 0 --device cuda \
+  --variant outer_terminal_step \
+  --result-root /absolute/scratch/outer-terminal-step/production \
+  --eval-run-map "$EVAL_RUN_MAP"
+
+"$XQC_EVAL_PY" summarize_ambixqc_inner_eval.py \
+  --manifest "$CHECKPOINT_MANIFEST" \
+  --results-root /absolute/scratch/outer-terminal-step \
+  --expected-source-sha "$EXPECTED_ACTION_MODES_SHA" --variant outer_terminal_step \
+  --output /absolute/scratch/outer-terminal-step/summary.json \
+  --html /absolute/scratch/outer-terminal-step/comparison.html
+```
+
+The summary requires all 30 complete checkpoint results and exact step-variant
+provenance. Its JSON/HTML are local reports; the sole-owner CPU publisher
+uploads staged checkpoint records into the explicitly selected curve in
+`rwgao_b-brown-university/ambi-inner-bench`. It uses sample SD for native curve
+metrics; the existing portable summary states its population SD convention.
+Existing prior and round-update curves remain separate.
 
 ## AMBI-XQC prior versus MPPI
 

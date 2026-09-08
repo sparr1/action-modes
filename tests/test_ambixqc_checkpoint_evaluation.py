@@ -94,7 +94,7 @@ def test_paired_controllers_frozen_bundle_and_actual_delayed_counts(checkpoint_c
         assert result["environment_seeds"] == [101, 102]
         assert result["paired_return_delta_vs_reference"]["count"] == 2
         assert result["saved_algorithm_config"]["alg_params"]["inner_operator"] == "none"
-        assert result["checkpoint_evaluation_provenance"]["checkpoint_version"] == 3
+        assert result["checkpoint_evaluation_provenance"]["checkpoint_version"] == 4
     manifest = json.loads((bundle / "manifest.json").read_text())
     assert manifest["status"] == "complete"
     for run in manifest["runs"]:
