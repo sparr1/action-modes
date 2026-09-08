@@ -212,6 +212,11 @@ def _planner_display_label(planner, *, compact=False):
             value = settings.get(key)
             if value is not None and (not compact or value != default or (step_timing and prefix == "J")):
                 parts.append(prefix + number(value))
+        if settings.get("inner_critic_adaptation") == "lora_rl":
+            parts.append(f"LoRA-RL critic {settings['inner_critic_lora_layers']}"
+                         f" r{settings['inner_critic_lora_rank']}"
+                         f" scale{number(settings['inner_critic_lora_scale'])}"
+                         f" decay{number(settings['inner_critic_lora_weight_decay'])}")
     elif kind == "mppi":
         for value, prefix in ((settings.get("planning_horizon", settings.get("horizon")), "H"),
                               (settings.get("num_samples"), "N"),

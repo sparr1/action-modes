@@ -395,6 +395,35 @@ A fresh `--smoke` output uses seeds 101/102 and three decisions for all selected
 settings and its own short prior reference, without curve publication. Override
 `--array=6` for a single 300k smoke task and supply durable Slurm output paths.
 
+### Critic-only LoRA on the step-round comparison
+
+`ambi_humanoid_inner_lora_step_rounds.json` repeats the original N512/H3/B512
+step-round protocol with `lora_step_rounds/j1`, `lora_step_rounds/j3`, and
+`lora_step_rounds/j6`. Its only algorithm changes are critic adaptation
+`lora_rl`, input-and-hidden placement, rank 96, direct scale one, and adapter
+weight decay `2e-4`. The actor remains fully cloned; the value heads, biases,
+and normalization parameters remain trainable. Every real decision resets the
+learned critic base and zero-B adapters, dense effective-weight target, and
+optimizer state. Learning rates, inner tau `0.01`, collection/update budgets,
+prior source `ambi/u13m14st`, and paired evaluation protocol remain unchanged.
+
+`slurm/run_ambi_inner_lora_step_rounds_oscar.sbatch` assigns one complete
+five-seed checkpoint/J cell to each task. Default `AMBI_ROUND_VALUES='6 3 1'`
+places the longer cells first: indices 0–9 are J6, 10–19 are J3, and 20–29 are
+J1, each covering 50k–500k every 50k. There is no fixed concurrency cap; choose
+it from current account limits. For J6 only, set `AMBI_ROUND_VALUES='6'` and
+override the array to `0-9`. Each task owns `step_N/jJ/inner` beneath a fresh
+`AMBI_BENCHMARK_OUTPUT_ROOT`. Supply the checkpoint prefix, verified checkpoint
+inventory, exact tested commit, and explicit New/Append `EVAL_RUN_MAP` as above.
+
+Production requires a verified existing `step_N/prior/manifest.json` under
+`AMBI_BENCHMARK_REFERENCE_ROOT` for every checkpoint, including 50k; missing
+references fail before evaluation, and full prior episodes are never regenerated.
+The smoke indices `5,15,25` test all three round counts at 300k, using seeds
+101/102, three decisions, and separate private short priors without publication.
+Production retains seeds 101–105, controller seed 55, and 500 decisions. These
+remain exploratory LoRA transfers; no return or latency advantage is assumed.
+
 ### More critic updates on shared observations
 
 `ambi_humanoid_inner_critic_sweep.json` holds the D512-4-J6 collection and

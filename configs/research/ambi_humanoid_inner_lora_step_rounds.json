@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "description": "Exploratory critic-only LoRA-RL transfer on the original AMBI prior-only backbone: preserve the N512/H3/B512 step-interleaved SAC round sweep while replacing only critic adaptation with input-and-hidden rank-96 LoRA.",
+  "base_alg_config": "checkpoint",
+  "source_run": "rwgao_b-brown-university/ambi/u13m14st",
+  "shared_alg_params": {
+    "inner_operator": "sac",
+    "inner_rounds": 6,
+    "inner_rollouts_per_round": 512,
+    "inner_rollout_horizon": 3,
+    "inner_updates_per_round": null,
+    "inner_iterations": null,
+    "inner_rollouts": null,
+    "inner_horizon": null,
+    "inner_updates_per_iteration": null,
+    "inner_model_step_budget": null,
+    "inner_critic_updates_per_action": null,
+    "inner_actor_updates_per_action": null,
+    "inner_temperature_updates_per_action": null,
+    "inner_batch_size": 512,
+    "inner_replay_capacity": 9216,
+    "inner_replay_sampling": "with_replacement",
+    "inner_diagnostic_rollouts": 0,
+    "inner_actor_adaptation": "clone",
+    "inner_critic_adaptation": "lora_rl",
+    "inner_temperature_mode": "auto",
+    "inner_temperature_initialization": "inherit_outer",
+    "inner_target_entropy": "inherit_outer",
+    "inner_bootstrap_source": "inner_target",
+    "inner_behavior_action": "policy_sample",
+    "inner_execution_action": "policy_sample",
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_actor_scope": "action",
+    "inner_critic_scope": "action",
+    "inner_temperature_scope": "action",
+    "inner_replay_scope": "action",
+    "inner_actor_optimizer_scope": "action",
+    "inner_critic_optimizer_scope": "action",
+    "inner_temperature_optimizer_scope": "action",
+    "inner_q_target_reduction": "min_pair",
+    "inner_q_actor_reduction": "min_pair",
+    "inner_sac_critic_target": "entropy_augmented",
+    "inner_diagnostics_every": 1000,
+    "inner_actor_lr": 5e-05,
+    "inner_critic_lr": 0.0001,
+    "inner_temperature_lr": 0.0003,
+    "inner_adam_eps": 1e-08,
+    "inner_critic_target_tau": 0.01,
+    "inner_critic_target_update_interval": 1,
+    "inner_critic_updates_per_round": null,
+    "inner_actor_updates_per_round": null,
+    "inner_finite_horizon": false,
+    "inner_steps_per_update": 512,
+    "inner_outer_replay_fraction": 0.0,
+    "inner_explorer_actor_updates_per_round": null,
+    "inner_explorer_critic_updates_per_round": null,
+    "inner_explorer_temperature_updates_per_round": null,
+    "inner_update_timing": "step",
+    "inner_explorer_mode": "none",
+    "inner_critic_lora_layers": "input_hidden",
+    "inner_critic_lora_rank": 96,
+    "inner_critic_lora_scale": 1.0,
+    "inner_critic_lora_weight_decay": 0.0002
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "default_presets": [
+      "lora_step_rounds/j1",
+      "lora_step_rounds/j3",
+      "lora_step_rounds/j6"
+    ],
+    "bank_decisions": [
+      0,
+      100,
+      200,
+      300,
+      400
+    ],
+    "bank_repetitions": 3,
+    "diagnostic_rollouts": 8,
+    "diagnostic_horizon": 3,
+    "wandb_project": "ambi-inner-bench"
+  },
+  "comparisons": {
+    "lora_step_rounds": {
+      "description": "Critic-only LoRA-RL rank96/input_hidden at direct scale1 and adapter decay2e-4; dense actor and all N512/H3/B512 step-round SAC settings remain unchanged. Reuse paired prior references.",
+      "reference": "j1",
+      "variants": {
+        "j1": {
+          "description": "1 inner rounds; 1536 imagined transitions and 3 critic/actor/automatic-temperature updates per real action. Fresh action-local adaptation; step timing, interval512, N512/H3/B512. Critic-only input-and-hidden rank-96 LoRA-RL; cloned actor, trainable value heads/biases/normalization, learned frozen bases and zero-B initialization.",
+          "alg_params": {
+            "inner_rounds": 1
+          }
+        },
+        "j3": {
+          "description": "3 inner rounds; 4608 imagined transitions and 9 critic/actor/automatic-temperature updates per real action. Fresh action-local adaptation; step timing, interval512, N512/H3/B512. Critic-only input-and-hidden rank-96 LoRA-RL; cloned actor, trainable value heads/biases/normalization, learned frozen bases and zero-B initialization.",
+          "alg_params": {
+            "inner_rounds": 3
+          }
+        },
+        "j6": {
+          "description": "6 inner rounds; 9216 imagined transitions and 18 critic/actor/automatic-temperature updates per real action. Fresh action-local adaptation; step timing, interval512, N512/H3/B512. Critic-only input-and-hidden rank-96 LoRA-RL; cloned actor, trainable value heads/biases/normalization, learned frozen bases and zero-B initialization.",
+          "alg_params": {
+            "inner_rounds": 6
+          }
+        }
+      }
+    }
+  }
+}

@@ -96,6 +96,29 @@ def test_prior_ignores_all_inactive_inner_settings(bundle):
         "type": "prior", "action_rule": "tanh_mean"}
 
 
+@pytest.mark.parametrize("field,value", [
+    ("inner_critic_lora_layers", "hidden"),
+    ("inner_critic_lora_rank", 64),
+    ("inner_critic_lora_scale", 2.0),
+    ("inner_critic_lora_weight_decay", 0.0),
+])
+def test_lora_rl_publication_defaults_and_active_choices(bundle, field, value):
+    path, payload = bundle
+    config = payload["runs"][0]["resolved_config"]
+    dense, = data.load_records(path)
+    config["inner_critic_adaptation"] = "lora_rl"
+    implicit, = data.load_records(dump(path, payload))
+    config.update(inner_critic_lora_layers="input_hidden", inner_critic_lora_rank=96,
+                  inner_critic_lora_scale=1.0, inner_critic_lora_weight_decay=0.0002)
+    explicit, = data.load_records(dump(path, payload))
+    assert implicit["identity"] == explicit["identity"]
+    assert implicit["identity"] != dense["identity"]
+    assert "LoRA-RL critic input_hidden r96 scale1 decay0.0002" in explicit["label"]
+    config[field] = value
+    changed, = data.load_records(dump(path, payload))
+    assert changed["identity"] != explicit["identity"]
+
+
 def test_record_id_deduplicates_upload_retries_but_not_changed_measurements(bundle):
     path, value = bundle
     first, = data.load_records(path)

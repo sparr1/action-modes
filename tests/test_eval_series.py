@@ -423,6 +423,17 @@ def test_curve_label_prioritizes_budgets_and_bootstrap():
     assert registry["attempt_label"] == "actor-sweep-20260905"
 
 
+def test_curve_and_run_names_identify_lora_critic_choices():
+    registry = label_registry(inner_critic_adaptation="lora_rl",
+                              inner_critic_lora_layers="input_hidden", inner_critic_lora_rank=96,
+                              inner_critic_lora_scale=1.0, inner_critic_lora_weight_decay=0.0002)
+    expected = "LoRA-RL critic input_hidden r96 scale1 decay0.0002"
+    assert expected in series.concise_curve_label(registry)
+    assert expected in series.evaluation_run_name(registry)
+    registry["identity"]["planner"]["settings"]["inner_critic_lora_layers"] = "hidden"
+    assert expected not in series.concise_curve_label(registry)
+
+
 def test_curve_label_aliases_and_cosmetic_names_do_not_change_semantics():
     registry = label_registry()
     original = series.concise_curve_label(registry)

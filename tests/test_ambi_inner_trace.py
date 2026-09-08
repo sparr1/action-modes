@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from RL.tdmpc2_core.inner_trace import InnerActionTrace, metric_catalog, metric_definitions
+from RL.tdmpc2_core.common.lora import LoRARLLinear
 from tests.test_ambi_latency_contract import _assert_tree_equal, _clone_tree, _pool_snapshot
 from tests.test_ambi_root_local_sac import _tiny_component_model, _tiny_model
 
@@ -26,15 +27,16 @@ def _snapshot(agent):
 
 
 @pytest.mark.parametrize("probes", [False, True])
-@pytest.mark.parametrize("adaptation", ["clone", "lora"])
+@pytest.mark.parametrize("adaptation", ["clone", "lora_rl"])
 @pytest.mark.parametrize("finite_horizon", [False, True])
 def test_trace_preserves_updates_actions_all_rng_and_modes(probes, adaptation, finite_horizon):
     params = dict(inner_rounds=2, inner_critic_updates_per_round=2,
                   inner_actor_updates_per_round=1, q_representation="distributional",
-                  num_q=3, dropout=0.2, inner_actor_adaptation=adaptation,
+                  num_q=3, dropout=0.2, inner_actor_adaptation="clone",
                   inner_critic_adaptation=adaptation,
-                  inner_actor_lora_dropout=0.3, inner_critic_lora_dropout=0.3,
                   inner_finite_horizon=finite_horizon)
+    if adaptation == "lora_rl":
+        params["inner_critic_lora_rank"] = 4
     ordinary = _tiny_component_model(**params)
     observed = _tiny_component_model(**params)
     global_rng = torch.random.get_rng_state().clone()
@@ -131,6 +133,99 @@ def test_trace_records_finite_horizon_transition_schedule_without_changing_updat
         ordinary.env.close()
         observed.env.close()
 
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_stepwise_lora_trace_updates_once_per_512_parallel_transitions(monkeypatch, compiled):
+    torch._dynamo.reset()
+    compiled_regions = []
+    original_compile = torch.compile
+
+    def graph_backend(function, **kwargs):
+        compiled_regions.append(function.__name__)
+        return original_compile(function, backend="eager", **kwargs)
+
+    if compiled:
+        monkeypatch.setattr(torch, "compile", graph_backend)
+    model = _tiny_model(
+        compile=compiled, compile_strict=False,
+        inner_actor_adaptation="clone", inner_critic_adaptation="lora_rl",
+        inner_critic_lora_rank=4, inner_critic_lora_layers="input_hidden",
+        inner_update_timing="step", inner_steps_per_update=512,
+        inner_updates_per_round=None, inner_rounds=2,
+        inner_rollouts_per_round=512, inner_rollout_horizon=3,
+        inner_batch_size=512, inner_replay_capacity=3072,
+        train_unroll_horizon=3, inner_finite_horizon=True, q_representation="distributional", num_q=3,
+    )
+    engine = model.agent.inner_engine
+    calls, collection_actor_steps = [], []
+    original_updates = engine._run_update_counts
+    original_policy = engine._policy_action
+
+    def record_updates(**kwargs):
+        calls.append((engine.state.replay.next_sample_id, kwargs["critic_count"],
+                      kwargs["actor_count"], kwargs["temperature_count"]))
+        return original_updates(**kwargs)
+
+    def record_collection(z, actor, **kwargs):
+        if z.shape[0] == 512 and kwargs.get("noise") is not None:
+            collection_actor_steps.append(engine.state.actor_steps)
+        return original_policy(z, actor, **kwargs)
+
+    monkeypatch.setattr(engine, "_run_update_counts", record_updates)
+    # Observe eager collection calls only: recording from inside a compiled
+    # tensor kernel would itself add a graph break and distort this check.
+    if not compiled:
+        monkeypatch.setattr(engine, "_policy_action", record_collection)
+    outer = _clone_tree(model.agent.model.state_dict())
+    global_rng = torch.random.get_rng_state().clone()
+    graphs_before = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+    try:
+        for _ in range(2):
+            trace = InnerActionTrace()
+            model.agent.act(torch.zeros(3), collect_diagnostics=False, trace=trace)
+            assert calls[-6:] == [(512 * (index + 1), 1, 1, 1) for index in range(6)]
+            assert [event["phase"] for event in trace.events] == ["initial"] + ["collection", "update"] * 6
+            collections = [event for event in trace.events if event["phase"] == "collection"]
+            assert [event["metrics"]["collection_transitions"] for event in collections] == [512] * 6
+            assert [event["metrics"]["collection_rollout_step"] for event in collections] == [1, 2, 3] * 2
+            updates = [event for event in trace.events if event["phase"] == "update"]
+            assert [(event["critic_updates"], event["actor_updates"], event["temperature_updates"])
+                    for event in updates] == [(index, index, index) for index in range(1, 7)]
+            metrics = model.agent.last_inner_metrics
+            assert metrics["inner_model_steps"] == 3072
+            assert metrics["inner_requested_update_slots"] == 6
+            assert metrics["inner_critic_optimizer_steps"] == 6
+            assert metrics["inner_actor_optimizer_steps"] == 6
+            assert metrics["inner_temperature_optimizer_steps"] == 6
+            assert metrics["inner_compile_fallback"] == 0
+            pool = engine._action_pool
+            assert type(pool.actor_optim) is torch.optim.Adam
+            assert type(pool.critic_optim) is torch.optim.AdamW
+            adapters = [(path, layer) for path, layer in pool.critic.named_modules()
+                        if isinstance(layer, LoRARLLinear)]
+            assert len(adapters) == 6
+            assert any(torch.count_nonzero(layer.lora_B) for _, layer in adapters)
+            for path, layer in adapters:
+                assert not layer.base.weight.requires_grad
+                assert layer.base.weight.grad is None
+                torch.testing.assert_close(layer.base.weight, model.agent.model._Qs.get_submodule(path).weight,
+                                           rtol=0, atol=0)
+            assert not any(isinstance(layer, LoRARLLinear) for layer in pool.actor.modules())
+            assert not any(isinstance(layer, LoRARLLinear) for layer in pool.critic_target.modules())
+            for start in (0, 1536):
+                torch.testing.assert_close(pool.replay.z[start + 512:start + 1536],
+                                           pool.replay.next_z[start:start + 1024], rtol=0, atol=0)
+            _assert_tree_equal(model.agent.model.state_dict(), outer)
+            torch.testing.assert_close(torch.random.get_rng_state(), global_rng, rtol=0, atol=0)
+        if compiled:
+            assert torch._dynamo.utils.counters["stats"]["unique_graphs"] > graphs_before
+            assert {"_rollout_step_kernel", "_sac_critic_kernel", "_sac_actor_kernel"} <= set(compiled_regions)
+        else:
+            assert collection_actor_steps == list(range(6)) * 2
+    finally:
+        model.env.close()
+        torch._dynamo.reset()
 
 def test_packing_trace_uses_one_host_transfer_and_preserves_other_payloads(monkeypatch):
     model = _tiny_model()
@@ -273,14 +368,15 @@ def test_root_reset_makes_probes_independent_of_root_order():
         model.env.close()
 
 
-@pytest.mark.parametrize("adaptation", ["clone", "lora"])
+@pytest.mark.parametrize("adaptation", ["clone", "lora_rl"])
 @pytest.mark.parametrize("finite_horizon", [False, True])
 def test_evaluation_pool_reuse_matches_discarded_scientific_state(adaptation, finite_horizon):
     params = dict(inner_rounds=2, inner_critic_updates_per_round=2,
-                  inner_actor_updates_per_round=1, inner_actor_adaptation=adaptation,
+                  inner_actor_updates_per_round=1, inner_actor_adaptation="clone",
                   inner_critic_adaptation=adaptation, dropout=0.2,
-                  inner_actor_lora_dropout=0.2, inner_critic_lora_dropout=0.2,
                   inner_finite_horizon=finite_horizon)
+    if adaptation == "lora_rl":
+        params["inner_critic_lora_rank"] = 4
     discarded = _tiny_component_model(**params)
     reused = _tiny_component_model(**params)
     try:

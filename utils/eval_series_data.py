@@ -20,6 +20,8 @@ import shutil
 import statistics
 import subprocess
 
+from utils.lora_identity import publication_lora_identity
+
 
 def _require(condition, message):
     if not condition:
@@ -298,11 +300,7 @@ def planner_identity(config, result, algorithm, action_rule):
         for key in list(active):
             if key.startswith("inner_td3_") or key.startswith("inner_actor_target_"):
                 active.pop(key)
-    for component in ("actor", "critic"):
-        if config.get(f"inner_{component}_adaptation") != "lora":
-            for key in list(active):
-                if key.startswith(f"inner_{component}_lora_"):
-                    active.pop(key)
+    active = publication_lora_identity(active)
     if config.get("inner_execution_policy_source", "primary") == "primary":
         active.pop("inner_execution_handoff_samples", None)
     if all(config.get(f"inner_{component}_scope", "action") == "action"
@@ -473,6 +471,11 @@ def descriptive_label(identity, selector=None):
         title += " step updates"
     if settings.get("inner_actor_lr") is not None:
         title += f" actorLR{settings['inner_actor_lr']:g}"
+    if settings.get("inner_critic_adaptation") == "lora_rl":
+        title += (f" | LoRA-RL critic {settings['inner_critic_lora_layers']}"
+                  f" r{settings['inner_critic_lora_rank']}"
+                  f" scale{settings['inner_critic_lora_scale']:g}"
+                  f" decay{settings['inner_critic_lora_weight_decay']:g}")
     return prefix + title
 
 
