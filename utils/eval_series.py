@@ -210,6 +210,8 @@ def _planner_display_label(planner, *, compact=False):
             if value is not None and (not compact or value != default):
                 parts.append(prefix + number(value))
     elif kind == "mppi":
+        if planner.get("semantics", {}).get("warm_start") == "none":
+            parts.append("no warm start")
         for value, prefix in ((settings.get("planning_horizon", settings.get("horizon")), "H"),
                               (settings.get("num_samples"), "N"),
                               (settings.get("num_elites"), "E"),

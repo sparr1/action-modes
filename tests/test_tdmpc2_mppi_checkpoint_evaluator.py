@@ -135,8 +135,9 @@ def _predicted_gain(*args, **kwargs):
     }
 
 
+@pytest.mark.parametrize("reuse_prior", [False, True])
 def test_paired_checkpoint_evaluation_writes_raw_trajectories_and_restores_state(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, reuse_prior
 ):
     checkpoint = tmp_path / "checkpoint"
     checkpoint.write_bytes(b"checkpoint bytes")
@@ -187,6 +188,26 @@ def test_paired_checkpoint_evaluation_writes_raw_trajectories_and_restores_state
     )
     monkeypatch.setattr(evaluator, "_predicted_action_gain", _predicted_gain)
 
+    if reuse_prior:
+        arms = {
+            seed: {"controller": "policy_prior_mean", "controller_seed": 1,
+                   "return": 2.0, "length": 2, "terminated": False,
+                   "truncated": True, "capped": False, "seconds": 0.01,
+                   "control_seconds": 0.001,
+                   "steps": [{"reward": 1.0, "cumulative_return": float(i + 1)}
+                             for i in range(2)]}
+            for seed in (101, 102)
+        }
+        monkeypatch.setattr(evaluator, "_load_prior_reference",
+                            lambda *args, **kwargs: (arms, {"reused": True}))
+        run_arm = evaluator._run_arm
+
+        def only_evaluate_mppi(*args, **kwargs):
+            assert kwargs["controller"] == "native_mppi"
+            return run_arm(*args, **kwargs)
+
+        monkeypatch.setattr(evaluator, "_run_arm", only_evaluate_mppi)
+
     random.seed(701)
     np.random.seed(702)
     torch.manual_seed(703)
@@ -201,10 +222,14 @@ def test_paired_checkpoint_evaluation_writes_raw_trajectories_and_restores_state
         controller_seed=12345,
         bootstrap_samples=100,
         device="cpu",
+        prior_reference=tmp_path / "prior.json" if reuse_prior else None,
     )
 
     saved = json.loads(output.read_text())
     assert saved == payload
+    if reuse_prior:
+        assert payload["prior_reference"]["reused"] is True
+        assert payload["episodes"][0]["policy_prior_mean"] == arms[101]
     assert payload["summary"]["policy_prior_return_mean"] == 2.0
     assert payload["summary"]["native_mppi_return_mean"] == 4.0
     assert payload["summary"]["paired_return_delta_mean"] == 2.0
@@ -473,6 +498,61 @@ def test_parser_defaults_to_twelve_paired_episodes(tmp_path):
     assert args.episodes == 12
     assert args.controller_seed == 12345
     assert args.bootstrap_samples == 20000
+    assert args.no_warm_start is False and args.prior_reference is None
+
+
+@pytest.mark.parametrize("warm_start", [True, False])
+def test_cold_start_clears_only_carried_mean_and_preserves_episode_boundaries(monkeypatch, warm_start):
+    model = _FakeModel()
+    model.agent._prev_mean = torch.full((3, 1), 9.0)
+    model.reset = lambda: model.agent._prev_mean.zero_()
+    starts, means, draws = [], [], []
+    def predict(observation, *, deterministic, episode_start):
+        starts.append(episode_start)
+        means.append(model.agent._prev_mean.clone())
+        draws.append(torch.rand(1).item())
+        model.agent._prev_mean.fill_(0.75)
+        model.agent.last_plan_metrics = {}
+        return np.zeros(1, dtype=np.float32), None
+    model.predict = predict
+    monkeypatch.setattr(evaluator, "_predicted_action_gain", lambda *a: {})
+    result = evaluator._run_arm(model, _FakeEnv(), np.zeros(1), controller="native_mppi",
+                               controller_seed=13, max_steps=500, warm_start=warm_start)
+    assert starts == [True, False]
+    assert torch.count_nonzero(means[0]) == 0
+    assert torch.equal(means[1], torch.full_like(means[1], .75 if warm_start else 0))
+    evaluator._seed_controller(13)
+    assert draws == [torch.rand(1).item(), torch.rand(1).item()]
+    assert model.cfg.num_pi_trajs == 24 and model.cfg.iterations == 8
+    if not warm_start:
+        assert all(row["planner"]["planner_warm_start_used"] == 0 for row in result["steps"])
+
+
+def test_saved_prior_reference_matches_identity_and_rejects_changed_protocol(monkeypatch):
+    from utils import eval_series_data
+    path = ROOT.parent / "benchmark-results/tdmpc2-prior-mppi-eval-20260906/results/step_1000000/paired.json"
+    if not path.is_file():
+        pytest.skip("Saved historical prior bundle is a local integration fixture")
+    raw = json.loads(path.read_text())
+    metadata_path = path.parent / "checkpoint.metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    context = SimpleNamespace(source=metadata_path, trial_run_params=metadata["trial_run_params"],
+                              experiment_params=metadata["experiment_params"])
+    real_hash = evaluator._file_sha256
+    fake_checkpoint = Path("/unused/test/checkpoint")
+    monkeypatch.setattr(evaluator, "_file_sha256", lambda p: raw["checkpoint_sha256"] if p == fake_checkpoint else real_hash(p))
+    arms, provenance = evaluator._load_prior_reference(
+        path, fake_checkpoint, context, seeds=range(101, 106), max_steps=500, controller_seed=12345)
+    assert arms == {row["environment_seed"]: row["policy_prior_mean"] for row in raw["episodes"]}
+    assert provenance["reused"] and provenance["sha256"] == real_hash(path)
+    for options in ({"seeds": range(102, 107)}, {"max_steps": 3}, {"controller_seed": 7}):
+        kw = {"seeds": range(101, 106), "max_steps": 500, "controller_seed": 12345, **options}
+        with pytest.raises(evaluator.TDMPC2MPPIEvaluationError, match="protocol"):
+            evaluator._load_prior_reference(path, fake_checkpoint, context, **kw)
+    monkeypatch.setattr(eval_series_data, "_git_output", lambda *a: b"RL/TDMPC2.py\n")
+    with pytest.raises(evaluator.TDMPC2MPPIEvaluationError, match="source differs"):
+        evaluator._load_prior_reference(path, fake_checkpoint, context,
+                                        seeds=range(101, 106), max_steps=500, controller_seed=12345)
 
 
 def test_control_timing_excludes_environment_and_probe_work(monkeypatch):

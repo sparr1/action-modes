@@ -79,6 +79,20 @@ def _run(env):
     return subprocess.run(["bash", str(LAUNCHER)], env=env, text=True, capture_output=True)
 
 
+def test_no_warm_start_launcher_passes_reference_without_changing_native_budget(launch_input):
+    env, rows = launch_input
+    ref = Path(env["RESULT_ROOT"]).parent / "prior refs"
+    (ref / "step_450000").mkdir(parents=True)
+    (ref / "step_450000/paired.json").write_text("{}")
+    env.update(NO_WARM_START="1", REQUIRE_CUDA="0", PRIOR_REFERENCE_ROOT=str(ref))
+    result = _run(env)
+    assert result.returncode == 0, result.stderr
+    evaluation = json.loads(Path(env["CALL_LOG"]).read_text().splitlines()[0])
+    assert evaluation[-3:] == ["--no-warm-start", "--prior-reference", str(ref / "step_450000/paired.json")]
+    assert evaluation[evaluation.index("--max-steps") + 1] == "500"
+    assert evaluation[evaluation.index("--episodes") + 1] == "5"
+
+
 @pytest.mark.parametrize("index", range(7))
 def test_oscar_launches_exact_checkpoint_and_paired_protocol(launch_input, index):
     env, rows = launch_input

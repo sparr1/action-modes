@@ -88,6 +88,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-series-spec-dir", type=Path, help="Prepare prior/MPPI run identity templates without evaluation.")
     parser.add_argument("--checkpoint-inventory", type=Path, help="Verified inventory identifying the source backbone.")
     parser.add_argument("--source-run", help="Source entity/project/run-id, checked against inventory evidence.")
+    parser.add_argument("--no-warm-start", action="store_true",
+                        help="Clear the previous MPPI mean before every decision; retain policy trajectories.")
+    parser.add_argument("--prior-reference", type=Path,
+                        help="Reuse a validated paired.json prior arm with identical checkpoint and episode protocol.")
     parser.add_argument(
         "--episodes",
         type=_positive_int,
@@ -333,6 +337,7 @@ def _run_arm(
     controller: str,
     controller_seed: int,
     max_steps: int | None,
+    warm_start: bool = True,
 ) -> dict[str, Any]:
     _set_controller(model, controller)
     _seed_controller(controller_seed)
@@ -348,6 +353,13 @@ def _run_arm(
     while not (terminated or truncated):
         current_observation = observation
         prediction_started = time.perf_counter()
+        if controller == "native_mppi" and not warm_start:
+            # Evaluation-only ablation: reset only the carried mean, without
+            # changing episode boundaries, RNG streams, or native MPPI updates.
+            previous_mean = getattr(model.agent, "_prev_mean", None)
+            if not torch.is_tensor(previous_mean):
+                raise TDMPC2MPPIEvaluationError("Native MPPI warm-start buffer is unavailable.")
+            previous_mean.zero_()
         prediction = model.predict(
             current_observation,
             deterministic=True,
@@ -367,6 +379,8 @@ def _run_arm(
         }
         if controller == "native_mppi":
             record["planner"] = _numeric_metrics(model.agent.last_plan_metrics)
+            if not warm_start:
+                record["planner"]["planner_warm_start_used"] = 0.0
             record["predicted_action_gain"] = _predicted_action_gain(
                 model, current_observation, action
             )
@@ -619,6 +633,47 @@ def _write_json(path: Path, payload: Mapping[str, Any], *, overwrite: bool) -> N
                 pass
 
 
+def _load_prior_reference(path, checkpoint, context, *, seeds, max_steps, controller_seed):
+    """Validate and preserve exact saved prior episodes before any rollout."""
+    from utils.eval_series_data import normalize_tdmpc2, _git_output
+
+    path = Path(path).expanduser().resolve()
+    prior, = [r for r in normalize_tdmpc2(path) if r["controller"] == "policy_prior"]
+    if prior["checkpoint"]["sha256"] != _file_sha256(checkpoint):
+        raise TDMPC2MPPIEvaluationError("Prior reference checkpoint hash differs.")
+    metadata = Path(prior["artifact_files"]["checkpoint.metadata.json"])
+    if _file_sha256(metadata) != _file_sha256(context.source):
+        raise TDMPC2MPPIEvaluationError("Prior reference checkpoint metadata differs.")
+    expected = {"environment_seeds": list(seeds), "max_steps": max_steps,
+                "controller_seed": controller_seed, "action_rule": "tanh_mean",
+                "environment": {"id": context.trial_run_params["env"],
+                                "params": context.experiment_params.get("env_params", {})}}
+    protocol = prior["identity"]["protocol"]
+    if any(protocol.get(key) != value for key, value in expected.items()):
+        raise TDMPC2MPPIEvaluationError("Prior reference episode protocol differs.")
+    # The controller, environment and checkpoint loader must remain equivalent.
+    # Evaluation orchestration and publication changes do not retrain the prior.
+    source_code = prior["provenance"]["launch_provenance"]["code_sha"]
+    repo = Path(__file__).resolve().parent
+    differences = _git_output(repo, "diff", "--name-only", source_code, "--",
+                              "RL", "domains", "render_checkpoint.py", "utils/core.py",
+                              "environments/dmcontrol/pyproject.toml", "environments/dmcontrol/uv.lock")
+    if differences.strip():
+        raise TDMPC2MPPIEvaluationError("Prior reference controller/environment source differs.")
+    saved = json.loads(path.read_text())
+    arms = {}
+    for row in saved["episodes"]:
+        seed = row["environment_seed"]
+        arm = row["policy_prior_mean"]
+        if arm["controller_seed"] != _namespaced_seed(controller_seed, "policy_prior_mean", seed):
+            raise TDMPC2MPPIEvaluationError("Prior reference controller seed differs.")
+        arms[seed] = copy.deepcopy(arm)
+    return arms, {"path": str(path), "sha256": _file_sha256(path),
+                  "record_id": prior["record_id"], "source_science": prior["identity"]["science"],
+                  "source_provenance": prior["provenance"]["launch_provenance"],
+                  "reused": True}
+
+
 def evaluate_tdmpc2_mppi_checkpoint(
     checkpoint: Path,
     *,
@@ -633,6 +688,8 @@ def evaluate_tdmpc2_mppi_checkpoint(
     trial_settings: Path | None = None,
     experiment_settings: Path | None = None,
     overwrite: bool = False,
+    warm_start: bool = True,
+    prior_reference: Path | None = None,
 ) -> dict[str, Any]:
     """Run a frozen, seed-paired policy-prior-versus-MPPI comparison."""
 
@@ -696,6 +753,14 @@ def evaluate_tdmpc2_mppi_checkpoint(
         or int(bootstrap_samples) <= 0
     ):
         raise TDMPC2MPPIEvaluationError("bootstrap_samples must be positive.")
+    if type(warm_start) is not bool:
+        raise TDMPC2MPPIEvaluationError("warm_start must be boolean.")
+    reference_arms, reference_provenance = None, None
+    if prior_reference is not None:
+        reference_arms, reference_provenance = _load_prior_reference(
+            prior_reference, checkpoint, context,
+            seeds=range(int(first_seed), int(first_seed) + int(episodes)),
+            max_steps=max_steps, controller_seed=int(controller_seed))
 
     run_params, experiment_params = _prepare_run_params(
         context,
@@ -750,7 +815,7 @@ def evaluate_tdmpc2_mppi_checkpoint(
             mppi_controller_seed = _namespaced_seed(
                 int(controller_seed), "native_mppi", environment_seed
             )
-            prior_result = _run_arm(
+            prior_result = copy.deepcopy(reference_arms[environment_seed]) if reference_arms is not None else _run_arm(
                 model,
                 prior_env,
                 prior_observation,
@@ -765,6 +830,7 @@ def evaluate_tdmpc2_mppi_checkpoint(
                 controller="native_mppi",
                 controller_seed=mppi_controller_seed,
                 max_steps=max_steps,
+                warm_start=warm_start,
             )
             record = {
                 "episode": episode + 1,
@@ -878,6 +944,10 @@ def evaluate_tdmpc2_mppi_checkpoint(
             ),
             "episodes": records,
         }
+        if not warm_start:
+            payload["planner"]["warm_start"] = "none"
+        if reference_provenance is not None:
+            payload["prior_reference"] = reference_provenance
         if context.metadata is not None:
             payload["checkpoint_metadata"] = copy.deepcopy(
                 context.metadata.get("checkpoint", {})
@@ -951,9 +1021,12 @@ def _prepare_eval_series_specs(args):
     cp = {"sha256": _file_sha256(checkpoint), "source_run": args.source_run}
     prepared = {}
     for controller, label in (("policy_prior", "Policy prior"), ("native_mppi", "Native MPPI")):
+        if args.prior_reference is not None and controller == "policy_prior":
+            continue
         identity = identity_for_tdmpc2_checkpoint(
             cp, context.metadata, controller, protocol, code, path=checkpoint,
             inventory_path=args.checkpoint_inventory, source_run=args.source_run,
+            warm_start=not args.no_warm_start,
         )
         prepared[controller] = {"identity": identity, "label": descriptive_label(identity, controller), "selector": controller}
     directory = args.eval_series_spec_dir.resolve()
@@ -985,6 +1058,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             trial_settings=args.trial_settings,
             experiment_settings=args.experiment_settings,
             overwrite=args.overwrite,
+            warm_start=not args.no_warm_start,
+            prior_reference=args.prior_reference,
         )
     except (RenderCheckpointError, TDMPC2MPPIEvaluationError, ValueError, OSError) as exc:
         raise SystemExit(str(exc)) from exc

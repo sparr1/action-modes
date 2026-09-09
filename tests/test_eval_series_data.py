@@ -301,6 +301,31 @@ def test_local_tdmpc2_legacy_fixtures_are_compatible():
         assert actual == record["identity"]
 
 
+def test_tdmpc2_cold_start_has_distinct_identity_matching_preflight(tmp_path):
+    root = Path(__file__).resolve().parents[2] / "benchmark-results/tdmpc2-prior-mppi-eval-20260906/results/step_100000"
+    source = root / "paired.json"
+    if not source.is_file():
+        pytest.skip("Optional legacy artifact fixtures are not available")
+    _, warm = data.load_records(source)
+    payload = json.loads(source.read_text())
+    payload["planner"]["warm_start"] = "none"
+    for name in ("checkpoint.metadata.json", "provenance.json"):
+        (tmp_path / name).write_bytes((root / name).read_bytes())
+    path = dump(tmp_path / "paired.json", payload)
+    _, cold = data.load_records(path)
+    expected = copy.deepcopy(warm["identity"])
+    expected["planner"]["semantics"]["warm_start"] = "none"
+    assert cold["identity"] == expected
+    assert cold["identity"] != warm["identity"]
+    actual = data.identity_for_tdmpc2_checkpoint(
+        cold["checkpoint"], json.loads((root / "checkpoint.metadata.json").read_text()),
+        "native_mppi", cold["identity"]["protocol"],
+        json.loads((root / "provenance.json").read_text()), path=path, warm_start=False,
+    )
+    assert actual == cold["identity"]
+    assert "no warm start" in data.descriptive_label(actual)
+
+
 def test_local_xqc_legacy_fixtures_recover_source_and_mppi():
     root = Path(__file__).resolve().parents[2] / "benchmark-results/ambixqc-mppi-eval-20260906/oscar/production"
     paths = sorted(root.glob("step_*/bundle/manifest.json"))

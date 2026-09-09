@@ -299,6 +299,28 @@ atomic JSON retains raw per-step rewards, cumulative returns, actions, planner
 statistics, paired episode-return deltas, and a whole-episode bootstrap interval.
 It also verifies that the model state and update counter did not change.
 
+For the evaluation-only **no-warm-start** ablation, add `--no-warm-start`.
+This zeros the native planner's carried mean before every prediction, while
+preserving actual episode boundaries, controller RNG seeding, all MPPI update
+equations, the fresh maximum-standard-deviation initialization, and policy
+candidate trajectories. The result and curve identity explicitly record
+`warm_start="none"`; the default still shifts the previous mean within episodes.
+
+Use `--prior-reference /absolute/step_N/paired.json` to reuse completed native
+prior episodes. Checkpoint and sidecar hashes, episode/seed protocol, and prior
+controller/environment source must match. The exact prior arms and their source
+provenance are retained in the new paired result. Only the new MPPI controller
+is published, using a run map containing `native_mppi` alone. Old prior and
+warm-start curves remain available for comparison. A different warm-start mode
+requires an explicit new curve, not an append to the old planner identity.
+
+The Oscar launcher accepts `NO_WARM_START=1` and
+`PRIOR_REFERENCE_ROOT=/absolute/previous/production`. Set both for production
+with existing references. The no-warm-start mode requires a working CUDA device
+before evaluation. Short smoke tests can omit the prior reference and run a
+small paired comparison. Metadata-only specification preparation also accepts
+`--no-warm-start --prior-reference PATH`, producing only the new MPPI template.
+
 Bootstrap intervals are conditional on the one frozen training-seed checkpoint:
 they combine reset-state and fixed one-draw-per-reset MPPI planner variability,
 not uncertainty across independently trained models. Pointwise trajectory bands

@@ -413,14 +413,17 @@ def _native_planner(settings, planner_result, controller):
     action = "tanh_mean" if controller == "policy_prior" else "weighted_elite_no_execution_noise"
     if controller == "policy_prior":
         return {"type": "prior", "action_rule": action}
+    warm_start = planner_result.get("warm_start", "shift_previous_mean_within_episode")
+    _require(warm_start in {"none", "shift_previous_mean_within_episode"},
+             "Unknown native MPPI warm-start mode")
     return {"type": "mppi", "backend": "native_tdmpc2", "action_rule": action,
             "settings": {**{key: value for key, value in planner_result.items()
-                            if key not in {"configured_iterations", "model_transitions_per_action"}},
+                            if key not in {"configured_iterations", "model_transitions_per_action", "warm_start"}},
                          **{key: settings[key] for key in ("min_std", "max_std", "temperature",
                             "discount", "discount_denom", "discount_min", "discount_max", "episodic")
                             if key in settings}},
             "semantics": {"terminal_value_source": "online_q_mean_pair", "terminal_action": "prior_sample",
-                          "warm_start": "shift_previous_mean_within_episode", "std_reset": "max_std"}}
+                          "warm_start": warm_start, "std_reset": "max_std"}}
 
 
 def descriptive_label(identity, selector=None):
@@ -445,6 +448,8 @@ def descriptive_label(identity, selector=None):
             title += " | online XQC Q × frozen scale"
         elif planner.get("backend") == "native_tdmpc2":
             title += " | online TD-MPC2 Q"
+        if planner.get("semantics", {}).get("warm_start") == "none":
+            title += " | no warm start"
         return prefix + title
     rounds = settings.get("inner_rounds")
     budgets = []
@@ -471,7 +476,7 @@ def descriptive_label(identity, selector=None):
 
 
 def identity_for_tdmpc2_checkpoint(checkpoint, metadata, controller, protocol, code, *, path,
-                                   inventory_path=None, source_run=None):
+                                   inventory_path=None, source_run=None, warm_start=True):
     """Native TD-MPC2 preflight using its sidecar and requested episode protocol.
 
     ``protocol`` supplies environment_seeds, max_steps, and controller_seed;
@@ -486,6 +491,9 @@ def identity_for_tdmpc2_checkpoint(checkpoint, metadata, controller, protocol, c
     planner_result = {"effective_iterations": settings["iterations"] + (2 if observation["action_dim"] >= 20 else 0),
                       "num_samples": settings["num_samples"], "num_elites": settings["num_elites"],
                       "num_pi_trajs": settings["num_pi_trajs"], "planning_horizon": settings["outer_planning_horizon"]}
+    _require(type(warm_start) is bool, "warm_start must be boolean")
+    if not warm_start:
+        planner_result["warm_start"] = "none"
     planner = _native_planner(settings, planner_result, controller)
     normalized_protocol = {"mode": "episodes", "environment": {
         "id": metadata["trial_run_params"]["env"], "params": metadata["experiment_params"]["env_params"]},

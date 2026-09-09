@@ -108,6 +108,27 @@ def test_disabled_smoke_preserves_sidecar_hash_and_is_portable(tmp_path, monkeyp
     assert publisher.publish(path, source_run=SOURCE, campaign=CAMPAIGN)["result_sha256"] == record["result_sha256"]
 
 
+def test_cold_start_with_reused_prior_stages_only_new_mppi_curve(tmp_path, monkeypatch):
+    import sys
+    calls = []
+    path = write_result(tmp_path)
+    def cold(result):
+        result["planner"]["warm_start"] = "none"
+        result["prior_reference"] = {"reused": True, "sha256": "c" * 64}
+        for episode in result["episodes"]:
+            episode["native_mppi"]["steps"] = [{"planner": {"planner_warm_start_used": 0.0}}] * 500
+    change(path, cold)
+    monkeypatch.setitem(sys.modules, "utils.eval_series", SimpleNamespace(
+        load_run=lambda p: {}, stage_result=lambda *a, **kw: calls.append((a, kw))))
+    result = publisher.publish(path, source_run=SOURCE, campaign=CAMPAIGN,
+                               eval_run_map={"native_mppi": "new-cold-curve"})
+    assert result["status"] == "queued" and len(calls) == 1
+    assert calls[0][1]["selector"] == "native_mppi"
+    change(path, lambda d: d["episodes"][0]["native_mppi"]["steps"][0]["planner"].update(planner_warm_start_used=1.0))
+    with pytest.raises(ValueError, match="cold-start evidence"):
+        publisher.load_result(path, SOURCE, CAMPAIGN)
+
+
 @pytest.mark.parametrize("mutate", [
     lambda d: d["frozen_state"].update(unchanged=False),
     lambda d: d["frozen_state"].update(num_updates_after=101),

@@ -147,7 +147,14 @@ def load_result(path, source_run, campaign):
                        "num_pi_trajs": 24, "outer_planning_horizon": 3,
                        "min_std": .05, "max_std": 2, "temperature": .5}.items():
         _require(settings.get(key) == value, f"Nondefault MPPI setting: {key}")
-    _require(result.get("planner") == PLANNER, "Nondefault resolved MPPI planner")
+    planner = dict(result.get("planner", {}))
+    warm_start = planner.pop("warm_start", "shift_previous_mean_within_episode")
+    _require(warm_start in {"none", "shift_previous_mean_within_episode"}, "Unknown MPPI warm start")
+    _require(planner == PLANNER, "Nondefault resolved MPPI planner")
+    if warm_start == "none":
+        _require(all(step.get("planner", {}).get("planner_warm_start_used") == 0.0
+                     for episode in result["episodes"] for step in episode["native_mppi"]["steps"]),
+                 "Missing per-decision cold-start evidence")
     frozen = result["frozen_state"]
     _require(frozen.get("unchanged") is True
              and bool(frozen.get("model_digest_before"))
@@ -254,9 +261,10 @@ def publish(path, *, source_run, campaign, project="ambi-inner-bench",
     else:
         if isinstance(eval_run_map, (str, Path)):
             eval_run_map = _read(eval_run_map)
-        _require(isinstance(eval_run_map, dict) and set(eval_run_map) == {"policy_prior", "native_mppi"},
+        required_controllers = {"native_mppi"} if item["result"].get("prior_reference", {}).get("reused") else {"policy_prior", "native_mppi"}
+        _require(isinstance(eval_run_map, dict) and set(eval_run_map) == required_controllers,
                  "Choose explicit New/Append runs before evaluation and supply --eval-run-map with policy_prior/native_mppi directories")
-        _require(len(set(map(str, eval_run_map.values()))) == 2,
+        _require(len(set(map(str, eval_run_map.values()))) == len(required_controllers),
                  "Prior and MPPI require distinct evaluation run directories")
         from utils.eval_series import load_run, stage_result
         for controller, run_dir in eval_run_map.items():

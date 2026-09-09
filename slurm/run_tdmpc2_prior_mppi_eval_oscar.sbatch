@@ -33,6 +33,10 @@ SOURCE_TREE=$(git rev-parse 'HEAD^{tree}')
 : "${CAMPAIGN:?Supply a descriptive campaign identifier.}"
 : "${SLURM_ARRAY_TASK_ID:?Missing array task ID.}"
 export CHECKPOINT_MANIFEST RESULT_ROOT CAMPAIGN SOURCE_COMMIT SOURCE_TREE
+export NO_WARM_START="${NO_WARM_START:-0}"
+export PRIOR_REFERENCE_ROOT="${PRIOR_REFERENCE_ROOT:-}"
+[[ "$NO_WARM_START" == 0 || "$NO_WARM_START" == 1 ]] || { echo "NO_WARM_START must be 0 or 1" >&2; exit 2; }
+export REQUIRE_CUDA="${REQUIRE_CUDA:-$NO_WARM_START}"
 if [[ "${WANDB_MODE:-online}" != disabled ]]; then
   : "${EVAL_RUN_MAP:?Prepare explicit New/Append prior and MPPI runs before submission.}"
   [[ "$EVAL_RUN_MAP" == /* && -f "$EVAL_RUN_MAP" ]] || exit 2
@@ -58,8 +62,9 @@ def require(condition, message):
 if os.environ.get("EVAL_RUN_MAP"):
     from utils.eval_series import load_run
     assignments = json.loads(Path(os.environ["EVAL_RUN_MAP"]).read_text())
-    require(set(assignments) == {"policy_prior", "native_mppi"}, "Run map must assign prior and MPPI")
-    require(len(set(assignments.values())) == 2, "Prior and MPPI require distinct runs")
+    expected_controllers = {"native_mppi"} if os.environ["PRIOR_REFERENCE_ROOT"] else {"policy_prior", "native_mppi"}
+    require(set(assignments) == expected_controllers, "Run map must assign exactly the evaluated controllers")
+    require(len(set(assignments.values())) == len(expected_controllers), "Prior and MPPI require distinct runs")
     for run_dir in assignments.values():
         load_run(run_dir)
 
@@ -81,6 +86,10 @@ require(0 <= index < len(rows), "Invalid checkpoint array index.")
 require(int(os.environ["EPISODES"]) > 0 and 0 < int(os.environ["MAX_STEPS"]) <= 500,
         "Episodes must be positive and max steps must be between 1 and 500.")
 row = rows[index]
+if os.environ["PRIOR_REFERENCE_ROOT"]:
+    reference_root = Path(os.environ["PRIOR_REFERENCE_ROOT"])
+    require(reference_root.is_absolute() and (reference_root / f"step_{row['step']}" / "paired.json").is_file(),
+            "Missing absolute prior-reference bundle")
 checkpoint = Path(row["path"])
 require(checkpoint.is_absolute() and checkpoint.is_file(), "Checkpoint must be an existing absolute file.")
 require("\n" not in str(checkpoint), "Checkpoint path must not contain a newline.")
@@ -117,6 +126,7 @@ if os.environ.get("EVAL_RUN_MAP"):
             {**row, "source_run": source_run}, metadata, controller, protocol,
             {"code_sha": os.environ["SOURCE_COMMIT"]}, path=checkpoint,
             inventory_path=manifest, source_run=source_run,
+            warm_start=os.environ["NO_WARM_START"] == "0",
         )
         validate_identity(run_dir, identity)
 require(not (root / f"step_{row['step']}" / "paired.json").exists(), "Evaluation output already exists.")
@@ -161,10 +171,18 @@ echo "Source commit: $SOURCE_COMMIT"
 echo "Checkpoint: $CHECKPOINT"
 echo "Result: $OUTPUT"
 echo "Native MPPI: H3, N512, elites64, policy24, configured6/effective8 iterations"
+echo "Previous-plan warm start disabled: $NO_WARM_START"
+
+if [[ "$REQUIRE_CUDA" == 1 ]]; then
+  "$PYTHON_BIN" -c 'import torch; assert torch.cuda.is_available(), "CUDA unavailable"; x=torch.ones(2, 2, device="cuda"); assert (x @ x).sum().item() == 8'
+fi
+evaluation_options=(--device cuda)
+[[ "$NO_WARM_START" == 0 ]] || evaluation_options+=(--no-warm-start)
+[[ -z "$PRIOR_REFERENCE_ROOT" ]] || evaluation_options+=(--prior-reference "$PRIOR_REFERENCE_ROOT/step_${STEP}/paired.json")
 
 "$PYTHON_BIN" evaluate_tdmpc2_mppi_checkpoint.py "$CHECKPOINT" \
   --output "$OUTPUT" --episodes "$EPISODES" --max-steps "$MAX_STEPS" \
-  --seed 101 --controller-seed 12345 --bootstrap-samples 20000 --device cuda
+  --seed 101 --controller-seed 12345 --bootstrap-samples 20000 "${evaluation_options[@]}"
 
 staging=("$PYTHON_BIN" publish_tdmpc2_mppi_eval.py "$OUTPUT")
 [[ -z "${EVAL_RUN_MAP:-}" ]] || staging+=(--eval-run-map "$EVAL_RUN_MAP")
