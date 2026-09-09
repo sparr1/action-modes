@@ -130,3 +130,22 @@ def test_production_selects_step_preset_without_changing_episode_protocol(tmp_pa
     assert evaluate[evaluate.index("--device") + 1] == "cuda"
     assert evaluate[evaluate.index("--max-steps") + 1] == "500"
     assert env["TDAMBI_PRESET"] in report[report.index("--title") + 1]
+
+
+@pytest.mark.parametrize("rounds", [7, 10])
+def test_oscar_production_reuses_protocol_with_rounds_preset(tmp_path, rounds):
+    env = launcher_environment(tmp_path, 20)
+    env["TDAMBI_PRESET"] = f"update_timing/step_j{rounds}_c1_a1"
+    oscar = ROOT / "slurm/run_tdambi_checkpoint_eval_oscar.sbatch"
+    subprocess.run(["bash", str(oscar)], env=env, check=True, capture_output=True)
+    preflight, evaluate, report = [json.loads(line) for line in Path(env["CALL_LOG"]).read_text().splitlines()]
+    assert "assert torch.cuda.is_available()" in preflight[1]
+    assert evaluate[evaluate.index("--preset") + 1] == env["TDAMBI_PRESET"]
+    assert evaluate[evaluate.index("--checkpoint") + 1].endswith("1000000")
+    assert evaluate[evaluate.index("--seeds") + 1:evaluate.index("--max-steps")] == ["101", "102", "103", "104", "105"]
+    assert evaluate[evaluate.index("--max-steps") + 1] == "500"
+    assert evaluate[evaluate.index("--reference-bundle") + 1].endswith("step_1000000/paired.json")
+    text = oscar.read_text()
+    for directive in ("--partition=gpu", "--qos=pri-gpu+", "--gres=gpu:l40s:1", "--cpus-per-task=6", "--mem=32G"):
+        assert f"#SBATCH {directive}" in text
+    assert "#SBATCH --array=2-20%" not in text

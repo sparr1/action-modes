@@ -23,6 +23,7 @@ cd "${SLURM_SUBMIT_DIR:?Submit from the repository root}"
 [[ "$TDAMBI_SMOKE_OUTPUT_ROOT" == /* && ! -e "$TDAMBI_SMOKE_OUTPUT_ROOT" ]] || fail "Output directory must be fresh and absolute."
 [[ "${TDAMBI_MEASURE_TRACE:-0}" == 0 || "${TDAMBI_MEASURE_TRACE:-0}" == 1 ]] || fail "TDAMBI_MEASURE_TRACE must be 0 or 1."
 PYTHON_BIN="${AMBI_DMC_PYTHON:-/oscar/home/rgao48/action-modes/environments/dmcontrol/.venv/bin/python}"
+TDAMBI_PRESET="${TDAMBI_PRESET:-inner_budget/tdambi_3}"
 [[ -x "$PYTHON_BIN" ]] || fail "Locked Python runtime is not executable."
 mkdir -p "$(dirname "$TDAMBI_SMOKE_OUTPUT_ROOT")"
 mkdir "$TDAMBI_SMOKE_OUTPUT_ROOT"
@@ -30,11 +31,12 @@ export MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBY
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-6}" TORCHINDUCTOR_COMPILE_THREADS=1
 export TORCHINDUCTOR_CACHE_DIR="${SLURM_TMPDIR:-/tmp}/tdambi-${SLURM_JOB_ID}"
 
+"$PYTHON_BIN" -c 'import torch; assert torch.cuda.is_available(), "CUDA unavailable in allocated GPU job"; torch.ones(1, device="cuda").sum().item(); print("Smoke GPU:", torch.cuda.get_device_name())'
 "$PYTHON_BIN" -m pytest -q tests/test_tdambi_inner.py tests/test_tdambi_checkpoint.py \
     tests/test_tdambi_publication.py
 "$PYTHON_BIN" evaluate_ambi_checkpoint.py \
     --matrix configs/research/tdambi_humanoid_inner_benchmark.json \
-    --preset inner_budget/tdambi_3 --checkpoint "$TDAMBI_CHECKPOINT" \
+    --preset "$TDAMBI_PRESET" --checkpoint "$TDAMBI_CHECKPOINT" \
     --controller-seed 12345 --seeds 101 --max-steps 3 --device cuda \
     --bundle-dir "$TDAMBI_SMOKE_OUTPUT_ROOT/bundle" \
     --output "$TDAMBI_SMOKE_OUTPUT_ROOT/results.json"
@@ -46,7 +48,7 @@ if [[ "${TDAMBI_MEASURE_TRACE:-0}" == 1 ]]; then
     export AMBI_RUN_TRACE_CUDA_BENCHMARK=1
     export AMBI_TRACE_BENCHMARK_CHECKPOINT="$TDAMBI_CHECKPOINT"
     export AMBI_TRACE_BENCHMARK_MATRIX="$PWD/configs/research/tdambi_humanoid_inner_benchmark.json"
-    export AMBI_TRACE_BENCHMARK_PRESET=inner_budget/tdambi_3
+    export AMBI_TRACE_BENCHMARK_PRESET="$TDAMBI_PRESET"
     export AMBI_TRACE_BENCHMARK_CONTROLLER_SEED=12345
     export AMBI_TRACE_BENCHMARK_OUTPUT="$TDAMBI_SMOKE_OUTPUT_ROOT/trace-overhead.json"
     "$PYTHON_BIN" -m pytest -s -q tests/test_ambi_inner_trace.py::test_cuda_trace_overhead_measurement

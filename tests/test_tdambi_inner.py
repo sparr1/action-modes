@@ -272,6 +272,32 @@ def test_trace_non_interference_with_dropout_and_round_fidelity(probes, device, 
         observed.env.close()
 
 
+def test_unused_replay_capacity_preserves_j5_actions_learning_and_rng():
+    options = dict(inner_update_timing="step", inner_steps_per_update=512,
+                   inner_updates_per_round=None, inner_rounds=5,
+                   inner_rollouts_per_round=512, inner_rollout_horizon=3,
+                   train_unroll_horizon=3, inner_batch_size=512, dropout=0.25)
+    original = _tdambi_model(inner_replay_capacity=12288, **options)
+    expanded = _tdambi_model(inner_replay_capacity=32768, **options)
+    try:
+        for decision in range(2):
+            obs = torch.full((3,), 0.1 * decision)
+            expected = original.agent.act(obs, eval_mode=True, collect_diagnostics=False)
+            actual = expanded.agent.act(obs, eval_mode=True, collect_diagnostics=False)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            before, after = _snapshot(original), _snapshot(expanded)
+            before.pop("replay")
+            after.pop("replay")
+            _assert_tree_equal(after, before)
+            a = original.agent.inner_engine._action_pool.replay
+            b = expanded.agent.inner_engine._action_pool.replay
+            assert a.size == b.size == 7680
+            torch.testing.assert_close(a._storage[:a.size], b._storage[:b.size], rtol=0, atol=0)
+    finally:
+        original.env.close()
+        expanded.env.close()
+
+
 def test_decision_reset_restores_saved_target_scale_replay_and_adam_allocations():
     holder = _tdambi_model(dropout=0.25)
     try:

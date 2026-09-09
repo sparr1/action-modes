@@ -29,6 +29,23 @@ each vector step, using `inner_steps_per_update=256`. Collection still adds
 512 transitions at once. This gives 30 critic, actor, and target updates per
 real decision, with the same 7,680 imagined model steps and inherited settings.
 
+Select `update_timing/step_j7_c1_a1` or `update_timing/step_j10_c1_a1` to
+increase fresh rollout rounds at one paired update per vector step. These use
+21/30 actor, critic and target updates and 10,752/15,360 imagined transitions
+per decision, respectively. Both allocate replay capacity 32,768 so the J10
+solve retains every transition; the older 12,288 capacity would evict data.
+This capacity change is explicit in each new planner identity. Increasing
+unused capacity preserves the J5 behavior because sampling uses populated
+replay entries. Other native learning settings remain inherited unchanged.
+
+On Oscar, use `slurm/run_tdambi_checkpoint_eval_oscar.sbatch` with the same
+input variables as the Hydra launcher and the desired `TDAMBI_PRESET`.
+It uses one L40S, six CPUs and 32 GiB per checkpoint, with no array throttle;
+choose parallelism from live account/QOS and memory headroom. The Oscar smoke
+launcher also accepts `TDAMBI_PRESET`, defaulting to the original round-end
+preset. Give different planner settings separate output roots and explicitly
+created curve registries.
+
 The Hydra launcher accepts `TDAMBI_PRESET` and array indices 2–20 for the
 100k–1M checkpoint grid. It requests one GPU per checkpoint from the L40S/A6000 pool with no array
 throttle or fixed node, so pending checkpoints can use either node as slots

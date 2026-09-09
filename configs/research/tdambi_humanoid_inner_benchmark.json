@@ -70,6 +70,26 @@
             "inner_steps_per_update": 256,
             "inner_updates_per_round": null
           }
+        },
+        "step_j7_c1_a1": {
+          "description": "Seven rounds; one paired update per vector step. H3 gives 21 updates each and 10,752 imagined transitions per decision; replay retains all transitions.",
+          "alg_params": {
+            "inner_rounds": 7,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 512,
+            "inner_updates_per_round": null,
+            "inner_replay_capacity": 32768
+          }
+        },
+        "step_j10_c1_a1": {
+          "description": "Ten rounds; one paired update per vector step. H3 gives 30 updates each and 15,360 imagined transitions per decision; replay retains all transitions.",
+          "alg_params": {
+            "inner_rounds": 10,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 512,
+            "inner_updates_per_round": null,
+            "inner_replay_capacity": 32768
+          }
         }
       }
     }

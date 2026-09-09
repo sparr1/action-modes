@@ -156,20 +156,21 @@ def test_tdambi_rejects_non_native_or_unsupported_controls(override):
 
 
 @pytest.mark.parametrize("pairs_per_step", [1, 2])
-def test_tdambi_step_configuration_uses_native_pairs_per_vector_step(pairs_per_step):
-    updates = 15 * pairs_per_step
+@pytest.mark.parametrize("rounds", [5, 7, 10])
+def test_tdambi_step_configuration_uses_native_pairs_per_vector_step(pairs_per_step, rounds):
+    updates = 3 * rounds * pairs_per_step
     instance = make_tdambi(inner_update_timing="step", inner_steps_per_update=512 // pairs_per_step,
-                          inner_updates_per_round=None, inner_rounds=5,
+                          inner_updates_per_round=None, inner_rounds=rounds,
                           inner_rollouts_per_round=512, inner_rollout_horizon=3,
                           train_unroll_horizon=3, inner_batch_size=512,
-                          inner_replay_capacity=12288)
+                          inner_replay_capacity=32768 if rounds > 5 else 12288)
     try:
         cfg = instance.cfg
         assert cfg.inner_operator == "tdambi"
         assert cfg.inner_update_timing == "step"
         assert cfg.inner_actor_updates_per_action == cfg.inner_critic_updates_per_action == updates
         assert cfg.inner_temperature_updates_per_action == 0
-        assert cfg.inner_model_step_budget == 7680
+        assert cfg.inner_model_step_budget == rounds * 512 * 3
         assert cfg.inner_total_optimizer_steps_per_action == 2 * updates
         trace = InnerActionTrace()
         instance.predict([0.2, -0.3, 0.7], collect_diagnostics=False, trace=trace)
@@ -177,7 +178,7 @@ def test_tdambi_step_configuration_uses_native_pairs_per_vector_step(pairs_per_s
         assert metrics["inner_critic_optimizer_steps"] == metrics["inner_actor_optimizer_steps"] == updates
         assert metrics["inner_critic_target_updates"] == updates
         assert metrics["inner_temperature_optimizer_steps"] == 0
-        assert metrics["inner_model_steps"] == 7680
+        assert metrics["inner_model_steps"] == rounds * 512 * 3
         calibration = next(event for event in trace.events if event["phase"] == "calibration")
         assert calibration["replay_size"] == 512
     finally:
@@ -225,6 +226,8 @@ def test_checkpoint_matrix_inherits_native_settings_and_expands_budgets_and_step
                 for budget in (3, 6, 12)]
     variants.extend((f"update_timing/step_j5_c{pairs}_a{pairs}", 5, 15 * pairs,
                      "step", 512 // pairs) for pairs in (1, 2))
+    variants.extend((f"update_timing/step_j{rounds}_c1_a1", rounds, 3 * rounds,
+                     "step", 512) for rounds in (7, 10))
     for selector, rounds, updates, timing, interval in variants:
         resolved = resolve_preset(MATRIX, selector, checkpoint_context=context)
         assert resolved["algorithm_config"]["alg"] == "TDAMBI/TDAMBI"
@@ -244,7 +247,8 @@ def test_checkpoint_matrix_inherits_native_settings_and_expands_budgets_and_step
         assert cfg.inner_rollouts_per_round == 512
         assert cfg.inner_rollout_horizon == 3
         assert cfg.inner_batch_size == 512
-        assert cfg.inner_replay_capacity == 12288
+        assert cfg.inner_replay_capacity == (32768 if rounds in (7, 10) else 12288)
+        assert cfg.inner_replay_capacity >= rounds * 512 * 3
         assert cfg.inner_actor_updates_per_action == cfg.inner_critic_updates_per_action == updates
         assert cfg.inner_temperature_updates_per_action == 0
         assert cfg.inner_model_step_budget == rounds * 512 * 3
