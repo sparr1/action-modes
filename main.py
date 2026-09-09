@@ -243,7 +243,6 @@ _RUNTIME_CONFIG_FIELDS = (
     "outer_planning_horizon",
     "inner_rollout_horizon",
     "temporal_loss_normalization",
-    "temporal_loss_reference_horizon",
     "rho",
     "model_size",
     "num_q",
@@ -261,6 +260,12 @@ _RUNTIME_CONFIG_FIELDS = (
     "inner_sac_critic_target",
     "sac_actor_loss_scale_mode",
     "sac_actor_loss_scale_tau",
+    "outer_actor_entropy_mode",
+    "inner_actor_entropy_mode",
+    "ent_coef",
+    "target_entropy",
+    "inner_temperature_mode",
+    "inner_target_entropy",
     "compile",
     "compile_strict",
     "inner_operator",
@@ -440,7 +445,6 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
         key: resolved[key]
         for key in (
             "temporal_loss_normalization",
-            "temporal_loss_reference_horizon",
             "rho",
         )
         if key in resolved
@@ -458,6 +462,8 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
             "mode": resolved["sac_actor_loss_scale_mode"],
             "tau": resolved["sac_actor_loss_scale_tau"],
         }
+        if resolved["sac_actor_loss_scale_mode"] == "tdmpc2_percentile_range":
+            actor_loss_scale["application"] = "q_only"
 
     observation = {}
     observation_mode = resolved.get("obs")
@@ -636,7 +642,67 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
         metadata["collection"] = collection
     if actor_loss_scale:
         metadata["actor_loss_scale"] = actor_loss_scale
+    if trial_run_params.get("alg") == "AMBITDMPC2/AMBITDMPC2":
+        from RL.tdmpc2_core.common.entropy import critic_entropy_spec
+
+        metadata["actor_entropy"] = _resolved_actor_entropy_metadata(
+            resolved, agent
+        )
+        metadata["critic_entropy"] = critic_entropy_spec(resolved)
     return _json_safe_metadata(metadata)
+
+
+def _resolved_actor_entropy_metadata(resolved, agent):
+    """Record each actor objective and the units/source of its tuning target."""
+
+    action_dim = resolved.get("action_dim")
+    automatic_target = -float(action_dim) if action_dim is not None else None
+    outer_target_setting = resolved.get("target_entropy", "auto")
+    outer_target = getattr(agent, "target_entropy", None)
+    if outer_target is None:
+        outer_target = (
+            automatic_target
+            if outer_target_setting == "auto"
+            else outer_target_setting
+        )
+    coefficient = resolved.get("ent_coef", "auto")
+    outer_temperature_mode = (
+        "auto"
+        if isinstance(coefficient, str) and coefficient.startswith("auto")
+        else "fixed"
+    )
+    inner_target_setting = resolved.get("inner_target_entropy", "inherit_outer")
+    if inner_target_setting == "inherit_outer":
+        inner_target = outer_target
+    elif inner_target_setting == "auto":
+        inner_target = automatic_target
+    else:
+        inner_target = inner_target_setting
+    inner_temperature_mode = resolved.get("inner_temperature_mode")
+    if inner_temperature_mode is None:
+        inner_temperature_mode = (
+            "auto" if resolved.get("inner_operator", "sac") == "sac"
+            else "inherit_outer"
+        )
+
+    metadata = {}
+    for learner, temperature_mode, target_setting, target in (
+        ("outer", outer_temperature_mode, outer_target_setting, outer_target),
+        ("inner", inner_temperature_mode, inner_target_setting, inner_target),
+    ):
+        mode = resolved.get(f"{learner}_actor_entropy_mode", "squashed")
+        metadata[learner] = {
+            "actor_entropy_mode": mode,
+            "target_entropy_semantics": (
+                "tdmpc2_scaled_entropy" if mode == "tdmpc2_scaled"
+                else "squashed_action_entropy"
+            ),
+            "temperature_mode": temperature_mode,
+            "target_entropy_setting": target_setting,
+            "target_entropy": float(target) if target is not None else None,
+            "target_active": temperature_mode == "auto",
+        }
+    return metadata
 
 
 def _run_resumable_experiment(

@@ -21,6 +21,63 @@ def _build_cfg(**params):
         algorithm.env.close()
 
 
+def test_temporal_rule_is_canonical_with_configurable_rho():
+    default = _build_cfg()
+    assert default.rho == 0.5
+    assert default.temporal_loss_normalization == "divide_horizon"
+    assert not hasattr(default, "temporal_loss_reference_horizon")
+    explicit = _build_cfg(rho=0.7, train_unroll_horizon=6)
+    assert explicit.rho == 0.7
+    assert explicit.temporal_loss_normalization == "divide_horizon"
+
+
+@pytest.mark.parametrize(
+    "legacy_fields",
+    [
+        {"temporal_loss_normalization": "reference_weighted_mean"},
+        {"temporal_loss_normalization": "divide_horizon"},
+        {"temporal_loss_normalization": "DIVIDE_HORIZON"},
+        {"temporal_loss_reference_horizon": 6},
+        {"temporal_loss_reference_horizon": "3"},
+        {"temporal_loss_reference_horizon": 3.0},
+        {
+            "temporal_loss_normalization": "reference_weighted_mean",
+            "temporal_loss_reference_horizon": 3,
+        },
+    ],
+)
+def test_valid_legacy_temporal_fields_warn_and_canonicalize_without_mutation(
+    legacy_fields,
+):
+    original = dict(legacy_fields)
+    with pytest.warns(FutureWarning, match="deprecated"):
+        cfg = _build_cfg(rho=0.7, **legacy_fields)
+    assert cfg.temporal_loss_normalization == "divide_horizon"
+    assert not hasattr(cfg, "temporal_loss_reference_horizon")
+    assert cfg.rho == 0.7
+    assert legacy_fields == original
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("temporal_loss_normalization", None),
+        ("temporal_loss_normalization", True),
+        ("temporal_loss_normalization", "weighted_mean"),
+        ("temporal_loss_reference_horizon", None),
+        ("temporal_loss_reference_horizon", True),
+        ("temporal_loss_reference_horizon", 0),
+        ("temporal_loss_reference_horizon", -1),
+        ("temporal_loss_reference_horizon", 1.5),
+        ("rho", float("nan")),
+        ("rho", float("inf")),
+    ],
+)
+def test_invalid_temporal_inputs_remain_rejected(key, value):
+    with pytest.raises(ValueError, match=key):
+        _build_cfg(**{key: value})
+
+
 def test_q_representation_is_independent_of_model_size_expansion():
     scalar = _build_cfg(model_size=5, q_representation="scalar")
     assert scalar.num_q == 2
@@ -49,6 +106,8 @@ def test_sac_actor_loss_scale_defaults_and_normalizes_explicit_mode():
     enabled = _build_cfg(
         sac_actor_loss_scale_mode="TDMPC2_PERCENTILE_RANGE",
         sac_actor_loss_scale_tau=0.2,
+        ent_coef=0.25, inner_temperature_mode="inherit_outer",
+        outer_critic_target="reward_only", inner_sac_critic_target="reward_only",
     )
     assert enabled.sac_actor_loss_scale_mode == "tdmpc2_percentile_range"
     assert enabled.sac_actor_loss_scale_tau == pytest.approx(0.2)
@@ -726,14 +785,22 @@ def test_actor_and_critic_target_controls_resolve_independently():
     assert cfg.inner_critic_target_update_interval == 5
 
 
-def test_actor_adam_epsilon_defaults_to_main_and_validates_independent_override():
-    inherited = _build_cfg(adam_eps=2e-8)
+def test_actor_adam_epsilon_defaults_to_tdmpc2_and_preserves_overrides():
+    default = _build_cfg()
+    assert default.adam_eps == pytest.approx(1e-8)
+    assert default.actor_adam_eps == pytest.approx(1e-5)
+
+    independent = _build_cfg(adam_eps=2e-8)
+    assert independent.adam_eps == pytest.approx(2e-8)
+    assert independent.actor_adam_eps == pytest.approx(1e-5)
+
+    inherited = _build_cfg(adam_eps=2e-8, actor_adam_eps=None)
     assert inherited.adam_eps == pytest.approx(2e-8)
     assert inherited.actor_adam_eps == pytest.approx(2e-8)
 
-    split = _build_cfg(adam_eps=1e-8, actor_adam_eps=1e-5)
+    split = _build_cfg(adam_eps=1e-8, actor_adam_eps=3e-5)
     assert split.adam_eps == pytest.approx(1e-8)
-    assert split.actor_adam_eps == pytest.approx(1e-5)
+    assert split.actor_adam_eps == pytest.approx(3e-5)
 
     with pytest.raises(ValueError, match="actor_adam_eps"):
         _build_cfg(actor_adam_eps=float("nan"))

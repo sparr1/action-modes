@@ -73,6 +73,18 @@ def _model(**overrides):
     )
 
 
+def _fixed_reward_model(**overrides):
+    """Fixed-temperature, reward-only fixture for Q-scaling compatibility tests."""
+    params = {
+        "ent_coef": 0.5,
+        "outer_critic_target": "reward_only",
+        "inner_sac_critic_target": "reward_only",
+        "inner_temperature_mode": "inherit_outer",
+    }
+    params.update(overrides)
+    return _model(**params)
+
+
 def _assert_finite(metrics):
     for value in metrics.values():
         if isinstance(value, (int, float)):
@@ -777,7 +789,7 @@ def test_checkpoint_policy_spec_records_and_rejects_mapping_mismatch():
 def test_pre_mapping_policy_spec_preserves_direct_clamp_checkpoint_compatibility(
     actor_loss_scale_mode, checkpoint_version
 ):
-    source = _model(
+    source = _fixed_reward_model(
         log_std_mapping="direct_clamp",
         sac_actor_loss_scale_mode=actor_loss_scale_mode,
     )
@@ -785,7 +797,7 @@ def test_pre_mapping_policy_spec_preserves_direct_clamp_checkpoint_compatibility
     assert checkpoint["checkpoint_version"] == checkpoint_version
     checkpoint["policy_spec"].pop("log_std_mapping")
 
-    restored = _model(
+    restored = _fixed_reward_model(
         log_std_mapping="direct_clamp",
         sac_actor_loss_scale_mode=actor_loss_scale_mode,
     )
@@ -794,7 +806,7 @@ def test_pre_mapping_policy_spec_preserves_direct_clamp_checkpoint_compatibility
         restored.agent.model.state_dict(), source.agent.model.state_dict()
     )
 
-    incompatible = _model(
+    incompatible = _fixed_reward_model(
         log_std_mapping="tdmpc2_tanh",
         sac_actor_loss_scale_mode=actor_loss_scale_mode,
     )
@@ -803,7 +815,7 @@ def test_pre_mapping_policy_spec_preserves_direct_clamp_checkpoint_compatibility
 
     exact = _clone_tree(source.agent.training_state_dict())
     exact["outer"]["policy_spec"].pop("log_std_mapping")
-    exact_restored = _model(
+    exact_restored = _fixed_reward_model(
         log_std_mapping="direct_clamp",
         sac_actor_loss_scale_mode=actor_loss_scale_mode,
     )
@@ -1002,6 +1014,7 @@ def test_version_three_checkpoint_records_observation_contract():
     assert checkpoint["critic_target_spec"] == {
         "outer_critic_target": "entropy_augmented",
         "inner_sac_critic_target": "entropy_augmented",
+        "entropy_semantics": {"outer": "squashed_action_entropy", "inner": "squashed_action_entropy"},
     }
 
 
@@ -1021,6 +1034,7 @@ def test_portable_checkpoint_allows_intentional_critic_target_ablation():
     assert reward_return.agent._critic_target_spec() == {
         "outer_critic_target": "reward_only",
         "inner_sac_critic_target": "reward_only",
+        "entropy_semantics": {"outer": "none", "inner": "none"},
     }
     _assert_tree_equal(
         reward_return.agent.model.state_dict(), source.agent.model.state_dict()
@@ -1034,12 +1048,12 @@ def test_portable_checkpoint_allows_intentional_critic_target_ablation():
 def test_pre_target_spec_portable_checkpoint_still_loads(
     actor_loss_scale_mode, checkpoint_version
 ):
-    source = _model(sac_actor_loss_scale_mode=actor_loss_scale_mode)
+    source = _fixed_reward_model(sac_actor_loss_scale_mode=actor_loss_scale_mode)
     checkpoint = _clone_tree(source.agent.checkpoint_state())
     assert checkpoint["checkpoint_version"] == checkpoint_version
     checkpoint.pop("critic_target_spec")
 
-    restored = _model(
+    restored = _fixed_reward_model(
         sac_actor_loss_scale_mode=actor_loss_scale_mode,
         outer_critic_target="reward_only",
         inner_sac_critic_target="reward_only",
@@ -1294,15 +1308,15 @@ def test_sac_inner_target_and_actor_objective_match_hand_computation(
     assert actor_metrics["actor_q_mean_all_minus_min_all"] == pytest.approx(2.0)
 
 
-def test_scaled_sac_inner_actor_divides_full_objective_but_not_temperature(
+def test_scaled_sac_inner_actor_divides_only_q_not_entropy_or_kl(
     monkeypatch,
 ):
-    model = _model(
+    model = _fixed_reward_model(
         inner_rounds=1,
         inner_model_step_budget=8,
         inner_outer_policy_kl_coef=0.5,
-        inner_temperature_mode="auto",
-        inner_temperature_updates_per_action=1,
+        inner_temperature_mode="fixed",
+        inner_temperature_updates_per_action=0,
         inner_temperature_initialization="fixed",
         inner_temperature=0.25,
         sac_actor_loss_scale_mode="tdmpc2_percentile_range",
@@ -1336,28 +1350,186 @@ def test_scaled_sac_inner_actor_divides_full_objective_but_not_temperature(
     )
 
     alpha = torch.tensor(0.25)
-    expected_temperature_loss = -(
-        engine.state.log_alpha.detach()
-        * (-0.5 + engine._resolved_inner_target_entropy())
-    ).mean()
     metrics = engine._sac_policy_step(
         batch,
-        update_temperature=True,
+        update_temperature=False,
         update_actor=True,
         alpha=alpha,
         actor_loss_scale=torch.tensor(2.0),
     )
 
-    # The raw full objective is 0.25*(-0.5) - 2 + 0.5*4 = -0.125.
-    assert metrics["actor_loss"] == pytest.approx(-0.125 / 2.0)
+    # Only Q is normalized: 0.25*(-0.5) - 2/2 + 0.5*4 = 0.875.
+    assert metrics["actor_loss"] == pytest.approx(0.875)
     assert metrics["outer_policy_kl"] == pytest.approx(4.0)
-    torch.testing.assert_close(
-        metrics["temperature_loss"], expected_temperature_loss
+    assert engine.state.log_alpha is None
+    assert "temperature_loss" not in metrics
+
+
+@pytest.mark.parametrize("scale", [1.0, 2.0, 4.0])
+def test_scaled_sac_actor_preserves_entropy_and_kl_gradients(monkeypatch, scale):
+    model = _fixed_reward_model(
+        inner_outer_policy_kl_coef=0.5,
+        sac_actor_loss_scale_mode="tdmpc2_percentile_range",
     )
+    try:
+        engine = model.agent.inner_engine
+        with engine.rng.fork("initialization"):
+            engine._prepare_workspace(t0=True)
+        # Independent policy directions expose each term's gradient directly.
+        parameters = torch.tensor([2.0, -0.5, 4.0], requires_grad=True)
+
+        def policy(z, **kwargs):
+            action = parameters[0].expand(z.shape[0], model.cfg.action_dim)
+            log_prob = parameters[1].expand(z.shape[0], 1)
+            return action, {
+                "log_prob": log_prob,
+                "entropy": -log_prob,
+                "kl": parameters[2].expand_as(log_prob),
+            }
+
+        def critic(z, action, **kwargs):
+            return action[:, :1].unsqueeze(0).expand(2, -1, -1)
+
+        monkeypatch.setattr(engine.model, "pi", policy)
+        monkeypatch.setattr(engine.model, "Q", critic)
+        monkeypatch.setattr(engine, "_gaussian_kl", lambda info, anchor: info["kl"])
+        q_scale = torch.tensor(scale, requires_grad=True)
+        outputs = engine._scaled_sac_actor_kernel(
+            torch.zeros(4, model.cfg.latent_dim),
+            torch.tensor(0.25),
+            q_scale,
+            None,
+            None,
+            True,
+        )
+        loss = outputs[2]
+        loss.backward()
+        torch.testing.assert_close(
+            parameters.grad, torch.tensor([-1.0 / scale, 0.25, 0.5])
+        )
+        assert q_scale.grad is None
+        assert float(loss.detach()) == pytest.approx(-0.125 - 2.0 / scale + 2.0)
+        assert float(outputs[3].detach()) == pytest.approx(2.0)
+    finally:
+        model.env.close()
+
+
+@pytest.mark.parametrize("mode,scale", [
+    ("shared_mixture", None), ("separate_critics", None),
+    ("separate_critics", 2.0), ("separate_critics", 4.0),
+])
+def test_explorer_actor_scales_only_q_and_keeps_temperature_unscaled(
+    monkeypatch, mode, scale
+):
+    from tests.test_ambi_random_explorer_engine_invariants import _explorer_model
+
+    model = _explorer_model(
+        mode,
+        ent_coef=0.5,
+        outer_critic_target="reward_only",
+        inner_sac_critic_target="entropy_augmented" if scale is None else "reward_only",
+        inner_temperature_mode="auto" if scale is None else "fixed",
+        inner_temperature_initialization="fixed",
+        inner_temperature=0.25,
+        sac_actor_loss_scale_mode=(
+            "none" if scale is None else "tdmpc2_percentile_range"
+        ),
+    )
+    try:
+        engine = model.agent.inner_engine
+        with engine.rng.fork("initialization"):
+            engine._prepare_workspace(t0=True)
+        primary = torch.nn.Parameter(torch.tensor([2.0, -0.5]))
+        explorer = torch.nn.Parameter(torch.tensor([3.0, -0.75]))
+        state = engine.state
+        state.actor_params = [primary]
+        state.explorer_actor_params = [explorer]
+        # Keep parameter values fixed while exercising the actual step paths.
+        state.actor_optim = torch.optim.SGD([primary], lr=0.0)
+        state.explorer_actor_optim = torch.optim.SGD([explorer], lr=0.0)
+
+        def policy(z, *, policy, **kwargs):
+            params = primary if policy is state.actor else explorer
+            action = params[0].expand(z.shape[0], model.cfg.action_dim)
+            log_prob = params[1].expand(z.shape[0], 1)
+            return action, {
+                "log_prob": log_prob,
+                "entropy": -log_prob,
+                "pre_tanh_action": action,
+            }
+
+        def critic(z, action, **kwargs):
+            return action[:, :1].unsqueeze(0).expand(2, -1, -1)
+
+        # Controlled mixture density retains cross-component entropy gradients.
+        def log_mixture(action, primary_info, explorer_info, weight):
+            return primary_info["log_prob"] + explorer_info["log_prob"]
+
+        monkeypatch.setattr(engine.model, "pi", policy)
+        monkeypatch.setattr(engine.model, "Q", critic)
+        monkeypatch.setattr(engine.model, "mixture_log_prob", log_mixture)
+        batch = {"z": torch.zeros(4, model.cfg.latent_dim)}
+        q_scale = None if scale is None else torch.tensor(scale, requires_grad=True)
+        divisor = 1.0 if scale is None else scale
+        alpha = float(engine.alpha.detach())
+        target_entropy = engine._resolved_inner_target_entropy()
+        if mode == "shared_mixture":
+            weight = float(model.cfg.inner_prior_rollout_weight)
+            expected_temperature_loss = -state.log_alpha.detach() * (
+                -1.25 + target_entropy
+            )
+            metrics = engine._shared_mixture_policy_step(
+                batch,
+                update_actor=True,
+                update_temperature=True,
+                actor_loss_scale=q_scale,
+            )
+            expected_gradients = (
+                [-weight / divisor, alpha],
+                [-(1.0 - weight) / divisor, alpha],
+            )
+        else:
+            explorer_alpha = float(engine.explorer_alpha.detach())
+            expected_temperature_loss = -state.log_alpha.detach() * (
+                -0.5 + target_entropy
+            ) if scale is None else torch.tensor(0.0)
+            expected_explorer_temperature_loss = -state.explorer_log_alpha.detach() * (
+                -0.75 + target_entropy
+            ) if scale is None else torch.tensor(0.0)
+            metrics = engine._separate_policy_step(
+                batch,
+                update_primary_actor=True,
+                update_explorer_actor=True,
+                update_primary_temperature=scale is None,
+                update_explorer_temperature=scale is None,
+                actor_loss_scale=q_scale,
+            )
+            expected_gradients = (
+                [-1.0 / divisor, alpha],
+                [-1.0 / divisor, explorer_alpha],
+            )
+            if scale is None:
+                torch.testing.assert_close(
+                    metrics["explorer_temperature_loss"], expected_explorer_temperature_loss
+                )
+            else:
+                assert "explorer_temperature_loss" not in metrics
+        for parameter, expected in zip((primary, explorer), expected_gradients):
+            torch.testing.assert_close(parameter.grad, torch.tensor(expected))
+        if q_scale is not None:
+            assert q_scale.grad is None
+        if scale is None:
+            torch.testing.assert_close(metrics["temperature_loss"], expected_temperature_loss)
+        else:
+            assert "temperature_loss" not in metrics
+        assert float(metrics["actor_q_mean"]) == pytest.approx(2.0)
+        assert float(metrics["explorer_actor_q_mean"]) == pytest.approx(3.0)
+    finally:
+        model.env.close()
 
 
 def test_scaled_sac_actor_compile_region_caches_explicit_scale_argument(monkeypatch):
-    model = _model(
+    model = _fixed_reward_model(
         inner_rounds=1,
         inner_model_step_budget=8,
         sac_actor_loss_scale_mode="tdmpc2_percentile_range",
@@ -1413,7 +1585,7 @@ def test_sac_policy_step_rejects_actor_loss_scale_mode_mismatch(
     actor_loss_scale,
     message,
 ):
-    model = _model(sac_actor_loss_scale_mode=mode)
+    model = _fixed_reward_model(sac_actor_loss_scale_mode=mode)
     engine = model.agent.inner_engine
 
     with pytest.raises(RuntimeError, match=message):
@@ -1427,7 +1599,7 @@ def test_sac_policy_step_rejects_actor_loss_scale_mode_mismatch(
 
 
 def test_sac_actor_loss_scale_is_snapshotted_once_per_real_action(monkeypatch):
-    model = _model(sac_actor_loss_scale_mode="tdmpc2_percentile_range")
+    model = _fixed_reward_model(sac_actor_loss_scale_mode="tdmpc2_percentile_range")
     agent = model.agent
     engine = agent.inner_engine
     scale_reads = 0
@@ -1469,7 +1641,7 @@ def test_sac_actor_loss_scale_is_snapshotted_once_per_real_action(monkeypatch):
         metrics = action_metrics[action_index]
         assert metrics["inner_actor_loss_scale"] == pytest.approx(expected_scale)
         assert metrics["inner_effective_alpha"] == pytest.approx(
-            metrics["inner_alpha_final"] / expected_scale
+            metrics["inner_alpha_final"]
         )
 
 
@@ -1575,8 +1747,6 @@ def test_outer_scalar_target_and_optimizer_partition_are_preserved(
 
 def test_outer_actor_and_inner_sac_adam_epsilons_are_wired_independently():
     model = _model(
-        adam_eps=1e-8,
-        actor_adam_eps=1e-5,
         inner_adam_eps=3e-8,
         inner_temperature_mode="auto",
         inner_temperature_updates_per_action=2,
@@ -1586,6 +1756,13 @@ def test_outer_actor_and_inner_sac_adam_epsilons_are_wired_independently():
     assert {group["eps"] for group in agent.optim.param_groups} == {1e-8}
     assert {group["eps"] for group in agent.pi_optim.param_groups} == {1e-5}
     assert {group["eps"] for group in agent.ent_coef_optim.param_groups} == {1e-8}
+
+    for optimizer in (agent.optim, agent.pi_optim):
+        assert optimizer.defaults["lr"] == pytest.approx(3e-4)
+        for group in optimizer.param_groups:
+            assert group["betas"] == (0.9, 0.999)
+            assert group["weight_decay"] == 0
+            assert group["amsgrad"] is False
 
     engine = agent.inner_engine
     with engine.rng.fork("initialization"):

@@ -174,12 +174,16 @@ def _model(
             inner_rollout_horizon=1,
             inner_critic_updates_per_action=1,
             inner_actor_updates_per_action=1,
-            inner_temperature_updates_per_action=1,
+            inner_temperature_updates_per_action=param_overrides.get(
+                "inner_temperature_updates_per_action", 1
+            ),
             inner_batch_size=1,
             inner_replay_capacity=4,
             inner_actor_adaptation="clone",
             inner_critic_adaptation="clone",
-            inner_temperature_mode="auto",
+            inner_temperature_mode=param_overrides.get(
+                "inner_temperature_mode", "auto"
+            ),
             inner_temperature_initialization="fixed",
             inner_actor_scope=inner_scope,
             inner_critic_scope=inner_scope,

@@ -1,0 +1,26 @@
+{
+  "study_type": "single_seed_exploratory_td_ambi_objective_study",
+  "study_note": "TD-AMBI full entropy autotemp objective-family variant. The outer temperature is learned from initial alpha 1e-4 toward explicit scaled-entropy target -441; Q normalization is disabled. Entropy-augmented critics bootstrap with Q + alpha * H_scaled because Q normalization is disabled. Actors use literal TD-MPC2 scaled entropy, smooth tanh log-standard-deviation mapping over [-10, 2], and mean-pair Q; critics use min-pair targets and distributional cross-entropy coefficient 0.1. Each real decision uses J=6, N=512, H=3, inner minibatch 512, and replay capacity 9,216 retaining the complete solve. After every batched imagined depth step, 512 new transitions earn one paired critic-then-actor update and target interpolation; this gives 18 paired updates and 9,216 imagined transitions per decision. Minibatches sample accumulated imagined replay, and inner losses use ordinary transition means without sequence-level rho weighting. Inner targets initialize from the outer target critic. The inner temperature is learned toward target -441 after every paired update and initializes from the current outer temperature at each real action. Its temperature gradient is not clipped, matching outer alpha training. Q normalization is disabled inside the solve. All step checkpoints and adjacent metadata are retained every 25,000 decisions; separate final trial saves are disabled. All variants retain Humanoid Walk state observations, seed 55, 2 million decisions, outer batch 256, UTD=1, H=3, rho=0.5, model-size 5, and the other TD-AMBI backbone settings. Controller evaluation, paired controller evaluation, real-environment value evaluation, value-equivalence diagnostics/loss, and imagined diagnostics are disabled. This is a single-seed exploratory comparison, not confirmatory evidence. Each completed run produces 80 scheduled checkpoints.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 2000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "td_ambi_full_entropy_autotemp"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

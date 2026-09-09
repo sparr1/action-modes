@@ -4,6 +4,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import gymnasium as gym
+import numpy as np
 import pytest
 
 import evaluate_ambi_checkpoint as evaluator
@@ -13,6 +14,7 @@ from evaluate_ambi_checkpoint import (
     build_parser,
 )
 from RL.AMBITDMPC2 import AMBITDMPC2
+from RL.TDMPC2 import TDMPC2Baseline
 from utils.ambi_research import (
     PresetMatrixError,
     list_preset_selectors,
@@ -27,10 +29,14 @@ ROOT = Path(__file__).resolve().parents[1]
 MATRIX = ROOT / "configs/research/ambi_inner_decoupling.json"
 
 
-def _build_cfg(resolved):
+def _build_cfg(resolved, algorithm_class=AMBITDMPC2):
     run_config = resolved["algorithm_config"]
-    algorithm = object.__new__(AMBITDMPC2)
+    algorithm = object.__new__(algorithm_class)
     algorithm.env = gym.make("Pendulum-v1", max_episode_steps=5)
+    if run_config["alg_params"].get("obs") == "rgb":
+        algorithm.env.observation_space = gym.spaces.Box(
+            low=0, high=255, shape=(9, 64, 64), dtype=np.uint8
+        )
     algorithm.run_params = {
         **run_config,
         "seed": 3,
@@ -78,6 +84,30 @@ def test_every_checked_in_preset_materializes_to_a_valid_ambi_config():
         cfg = _build_cfg(resolved)
         assert cfg.mpc is False
         assert cfg.inner_operator in {"none", "sac", "td3", "mppi"}
+        assert cfg.rho == 0.5
+        assert cfg.temporal_loss_normalization == "divide_horizon"
+        assert not hasattr(cfg, "temporal_loss_reference_horizon")
+
+
+def test_maintained_training_presets_resolve_tdmpc2_temporal_weighting():
+    algorithm_classes = {
+        "AMBITDMPC2/AMBITDMPC2": AMBITDMPC2,
+        "TDMPC2/TDMPC2Baseline": TDMPC2Baseline,
+    }
+    for path in sorted((ROOT / "configs").rglob("*.json")):
+        config = json.loads(path.read_text())
+        algorithm_class = algorithm_classes.get(config.get("alg"))
+        if algorithm_class is None:
+            continue
+        if path == ROOT / "configs/dmcontrol/algs/ambi_humanoid_walk_base_percentile_normalized.json":
+            # Preserve the historical experiment while enforcing today's contract.
+            with pytest.raises(ValueError, match="requires fixed temperatures"):
+                _build_cfg({"algorithm_config": config}, algorithm_class)
+            continue
+        cfg = _build_cfg({"algorithm_config": config}, algorithm_class)
+        assert cfg.rho == 0.5, path
+        assert cfg.temporal_loss_normalization == "divide_horizon", path
+        assert not hasattr(cfg, "temporal_loss_reference_horizon"), path
 
 
 def test_critic_lora_comparisons_use_distinct_critic_only_paper_transfer_settings():

@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from .common import math
-from .common.scale import RunningScale
+from .common.scale import RunningScale, preflight_scale_state
 from .common.world_model import WorldModel
 from .common.layers import api_model_conversion
 from .common.device import resolve_device
@@ -73,34 +73,6 @@ class TDMPC2(torch.nn.Module):
 				device=self.device,
 			),
 		)
-		self.register_buffer(
-			'_transition_temporal_weights',
-			math.temporal_loss_weights(
-				self.cfg.train_unroll_horizon,
-				self.cfg.rho,
-				normalization=self.cfg.temporal_loss_normalization,
-				reference_horizon=self.cfg.temporal_loss_reference_horizon,
-				device=self.device,
-			),
-			persistent=False,
-		)
-		self.register_buffer(
-			'_actor_temporal_weights',
-			math.temporal_loss_weights(
-				self.cfg.train_unroll_horizon,
-				self.cfg.rho,
-				normalization=self.cfg.temporal_loss_normalization,
-				reference_horizon=self.cfg.temporal_loss_reference_horizon,
-				include_terminal=True,
-				device=self.device,
-			),
-			persistent=False,
-		)
-		self._legacy_temporal_reduction = math.temporal_loss_uses_legacy_order(
-			self.cfg.temporal_loss_normalization,
-			self.cfg.train_unroll_horizon,
-			self.cfg.temporal_loss_reference_horizon,
-		)
 
 	@property
 	def plan(self):
@@ -163,6 +135,7 @@ class TDMPC2(torch.nn.Module):
 		return {
 			"observation_spec": self.observation_signature(),
 			"model": self.model.state_dict(),
+			"scale": self.scale.state_dict(),
 			"num_updates": self.num_updates,
 		}
 
@@ -246,6 +219,7 @@ class TDMPC2(torch.nn.Module):
 			raise ValueError(
 				"training-state scale percentiles differ from the configured policy."
 			)
+		preflight_scale_state(scale)
 		planning = require_exact_keys(
 			state["planning"],
 			{"prev_mean", "last_plan_metrics"},
@@ -340,7 +314,20 @@ class TDMPC2(torch.nn.Module):
 				f"missing={missing[:5]}, unexpected={unexpected[:5]}, "
 				f"shape_mismatches={shape_mismatches[:5]}."
 			)
+		saved_scale = (
+			preflight_scale_state(state["scale"])
+			if "model" in state and "scale" in state
+			else None
+		)
 		self.model.load_state_dict(state_dict)
+		with torch.no_grad():
+			if saved_scale is None:
+				# Legacy model-only checkpoints never recorded S. Reset explicitly
+				# instead of inheriting an unrelated receiver's training history.
+				self.scale.value.fill_(1.0)
+				self.scale._percentiles.copy_(self.scale._percentiles.new_tensor([5.0, 95.0]))
+			else:
+				self.scale.load_state_dict(saved_scale)
 		self.num_updates = int(state.get("num_updates", 0))
 		self._resume_boundary_prepared = False
 		return
@@ -372,6 +359,43 @@ class TDMPC2(torch.nn.Module):
 		return action[0].cpu()
 
 	@torch.no_grad()
+	def act_policy_mean(self, obs, task=None):
+		"""Act with the deterministic network-policy mean, independent of ``cfg.mpc``."""
+		obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
+		if task is not None:
+			task = torch.tensor([task], device=self.device)
+		self.last_plan_metrics = {}
+		z = self.model.encode(obs, task)
+		_, info = self.model.pi(z, task)
+		return info["mean"][0].cpu()
+
+	@torch.no_grad()
+	def act_mpc(
+		self,
+		obs,
+		*,
+		t0=False,
+		eval_mode=False,
+		task=None,
+		collect_comparison_diagnostics=False,
+	):
+		"""Act with MPPI, independent of ``cfg.mpc``.
+
+		The optional comparison diagnostic is reserved for the isolated paired
+		evaluator. Ordinary planning retains the historical forward and RNG order.
+		"""
+		obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
+		if task is not None:
+			task = torch.tensor([task], device=self.device)
+		return self.plan(
+			obs,
+			t0=t0,
+			eval_mode=eval_mode,
+			task=task,
+			collect_comparison_diagnostics=collect_comparison_diagnostics,
+		).cpu()
+
+	@torch.no_grad()
 	def _estimate_value(self, z, actions, task):
 		"""Estimate value of a trajectory starting at latent state z and executing given actions."""
 		G, discount = 0, 1
@@ -388,7 +412,14 @@ class TDMPC2(torch.nn.Module):
 		return G + discount * (1-termination) * self.model.Q(z, action, task, return_type='avg')
 
 	@torch.no_grad()
-	def _plan(self, obs, t0=False, eval_mode=False, task=None):
+	def _plan(
+		self,
+		obs,
+		t0=False,
+		eval_mode=False,
+		task=None,
+		collect_comparison_diagnostics=False,
+	):
 		"""
 		Plan a sequence of actions using the learned world model.
 
@@ -401,17 +432,35 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			torch.Tensor: Action to take in the environment.
 		"""
+		if collect_comparison_diagnostics and self.cfg.num_pi_trajs <= 0:
+			raise ValueError(
+				"TD-MPC2 comparison diagnostics require num_pi_trajs > 0 so the "
+				"network-policy mean can be reused from the planner prior."
+			)
 		plan_start = time.perf_counter()
 
 		# Sample policy trajectories
 		z = self.model.encode(obs, task)
+		root_z = z if collect_comparison_diagnostics else None
+		root_policy_mean = None
 		if self.cfg.num_pi_trajs > 0:
 			pi_actions = torch.empty(self.cfg.outer_planning_horizon, self.cfg.num_pi_trajs, self.cfg.action_dim, device=self.device)
 			_z = z.repeat(self.cfg.num_pi_trajs, 1)
-			for t in range(self.cfg.outer_planning_horizon-1):
-				pi_actions[t], _ = self.model.pi(_z, task)
-				_z = self.model.next(_z, pi_actions[t], task)
-			pi_actions[-1], _ = self.model.pi(_z, task)
+			if collect_comparison_diagnostics:
+				for t in range(self.cfg.outer_planning_horizon-1):
+					pi_actions[t], pi_info = self.model.pi(_z, task)
+					if t == 0:
+						root_policy_mean = pi_info["mean"][0]
+					_z = self.model.next(_z, pi_actions[t], task)
+				pi_actions[-1], pi_info = self.model.pi(_z, task)
+				if self.cfg.outer_planning_horizon == 1:
+					root_policy_mean = pi_info["mean"][0]
+			else:
+				# Preserve the ordinary planner's exact forward and RNG order.
+				for t in range(self.cfg.outer_planning_horizon-1):
+					pi_actions[t], _ = self.model.pi(_z, task)
+					_z = self.model.next(_z, pi_actions[t], task)
+				pi_actions[-1], _ = self.model.pi(_z, task)
 
 		# Initialize state and parameters
 		z = z.repeat(self.cfg.num_samples, 1)
@@ -473,6 +522,39 @@ class TDMPC2(torch.nn.Module):
 			"planner_std_max": float(std.max().cpu()),
 			"planner_action_l2": float(torch.linalg.vector_norm(a).cpu()),
 		}
+		if collect_comparison_diagnostics:
+			diagnostic_start = time.perf_counter()
+			if root_z is None or root_policy_mean is None:
+				raise RuntimeError(
+					"TD-MPC2 comparison diagnostics did not retain the encoded root "
+					"and network-policy mean."
+				)
+			root_actions = torch.stack((a, root_policy_mean), dim=0)
+			root_batch = root_z.expand(root_actions.shape[0], -1)
+			root_q_logits = self.model.Q(
+				root_batch,
+				root_actions,
+				task,
+				return_type="all",
+				target=True,
+			)
+			root_q_mean_all = math.two_hot_inv(
+				root_q_logits, self.cfg
+			).mean(dim=0)
+			q_gain = root_q_mean_all[0].mean() - root_q_mean_all[1].mean()
+			self.last_plan_metrics.update({
+				"inner_fixed_target_q_action_gain": float(q_gain.cpu()),
+				"planner_model_steps": float(
+					self.cfg.num_pi_trajs
+					* (self.cfg.outer_planning_horizon - 1)
+					+ self.cfg.iterations
+					* self.cfg.num_samples
+					* self.cfg.outer_planning_horizon
+				),
+				"planner_diagnostic_seconds": max(
+					0.0, time.perf_counter() - diagnostic_start
+				),
+			})
 		self.last_plan_metrics["planner_seconds"] = time.perf_counter() - plan_start
 		return a
 
@@ -499,11 +581,8 @@ class TDMPC2(torch.nn.Module):
 		pi_loss = math.reduce_temporal_loss(
 			actor_per_time,
 			self.cfg.rho,
-			normalization=self.cfg.temporal_loss_normalization,
-			reference_horizon=self.cfg.temporal_loss_reference_horizon,
 			include_terminal=True,
 			legacy_order="vector_mean",
-			weights=self._actor_temporal_weights,
 		)
 		pi_loss.backward()
 		pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
@@ -562,10 +641,7 @@ class TDMPC2(torch.nn.Module):
 		consistency_loss = math.reduce_temporal_loss(
 			consistency_terms,
 			self.cfg.rho,
-			normalization=self.cfg.temporal_loss_normalization,
-			reference_horizon=self.cfg.temporal_loss_reference_horizon,
 			legacy_order="sequential",
-			weights=self._transition_temporal_weights,
 		)
 
 		# Predictions
@@ -578,11 +654,7 @@ class TDMPC2(torch.nn.Module):
 		# Compute losses
 		reward_terms, value_loss = [], 0
 		for t, (rew_pred_unbind, rew_unbind, td_targets_unbind, qs_unbind) in enumerate(zip(reward_preds.unbind(0), reward.unbind(0), td_targets.unbind(0), qs.unbind(1))):
-			temporal_weight = (
-				self.cfg.rho**t
-				if self._legacy_temporal_reduction
-				else self._transition_temporal_weights[t]
-			)
+			temporal_weight = self.cfg.rho**t
 			reward_terms.append(math.soft_ce(
 				rew_pred_unbind, rew_unbind, self.cfg
 			).mean())
@@ -593,18 +665,12 @@ class TDMPC2(torch.nn.Module):
 		reward_loss = math.reduce_temporal_loss(
 			reward_terms,
 			self.cfg.rho,
-			normalization=self.cfg.temporal_loss_normalization,
-			reference_horizon=self.cfg.temporal_loss_reference_horizon,
 			legacy_order="sequential",
-			weights=self._transition_temporal_weights,
 		)
 
-		if self._legacy_temporal_reduction:
-			value_loss = value_loss / (
-				self.cfg.train_unroll_horizon * self.cfg.num_q
-			)
-		else:
-			value_loss = value_loss / self.cfg.num_q
+		value_loss = value_loss / (
+			self.cfg.train_unroll_horizon * self.cfg.num_q
+		)
 		if self.cfg.episodic:
 			termination_loss = F.binary_cross_entropy_with_logits(termination_pred, terminated)
 		else:

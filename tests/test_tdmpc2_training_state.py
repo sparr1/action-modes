@@ -96,7 +96,7 @@ def _corrupt_optimizer_state(optimizer, serialized, corruption):
     raise AssertionError(f"Unknown optimizer corruption {corruption!r}.")
 
 
-def test_baseline_exact_training_state_roundtrip_and_transfer_checkpoint_unchanged():
+def test_baseline_exact_training_state_roundtrip_and_portable_checkpoint_scale():
     source = make_model(
         TDMPC2Baseline,
         gym.make("Pendulum-v1", max_episode_steps=5),
@@ -117,12 +117,15 @@ def test_baseline_exact_training_state_roundtrip_and_transfer_checkpoint_unchang
     restored.agent.load_training_state_dict(saved)
     _assert_tree_equal(restored.agent.training_state_dict(), saved)
 
-    # The portable model-checkpoint contract must remain deliberately partial.
+    # Portable checkpoints carry the learned scale for evaluation, but still
+    # omit optimizer, replay, and planning state needed for exact continuation.
     assert set(source.agent.checkpoint_state()) == {
         "observation_spec",
         "model",
+        "scale",
         "num_updates",
     }
+    _assert_tree_equal(source.agent.checkpoint_state()["scale"], saved["scale"])
 
 
 def test_baseline_training_state_mismatch_fails_before_live_model_mutation():

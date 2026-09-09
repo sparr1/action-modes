@@ -1,0 +1,26 @@
+{
+  "study_type": "single_seed_exploratory_td_ambi_objective_study",
+  "study_note": "Full TD-AMBI reward/Q-scale family with inner Q scale updated locally from each actor minibatch with the percentile-range EMA before its loss. Both actors use literal TD-MPC2 scaled entropy with fixed coefficient 1e-4, Q-only percentile normalization, and mean-pair Q; both critics use reward-only min-pair targets and distributional cross-entropy coefficient 0.1. Every real decision uses J=6, N=512, H=3, inner minibatch 512, and replay capacity 9,216 retaining the complete solve. After each batched imagined depth step, 512 new transitions earn one paired critic-then-actor update, followed by target interpolation. This yields 18 paired update slots and 9,216 imagined transitions per real decision. Updates sample accumulated imagined replay; inner losses average individual transitions without sequence-level rho weighting. Each fresh inner scale starts from the current outer scale, and each inner target starts from the outer target critic. All step checkpoints and adjacent metadata are retained every 25,000 decisions; separate final trial saves are disabled. All variants retain Humanoid Walk state observations, seed 55, 2 million decisions, outer batch 256, UTD=1, H=3, rho=0.5, model-size 5, and the other TD-AMBI backbone settings. Controller evaluation, paired controller evaluation, real-environment value evaluation, value-equivalence diagnostics/loss, and imagined diagnostics are disabled. This is a single-seed exploratory comparison, not confirmatory evidence. Each completed run produces 80 scheduled checkpoints.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 2000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "td_ambi_full_reward_qscale_adaptive"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

@@ -162,9 +162,8 @@ def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
         train_unroll_horizon=6,
         outer_planning_horizon=3,
         inner_rollout_horizon=6,
-        temporal_loss_normalization="reference_weighted_mean",
-        temporal_loss_reference_horizon=3,
-        rho=0.7,
+        temporal_loss_normalization="divide_horizon",
+        rho=0.5,
         outer_critic_target="reward_only",
         inner_sac_critic_target="entropy_augmented",
         sac_actor_loss_scale_mode="tdmpc2_percentile_range",
@@ -240,6 +239,11 @@ def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
         "outer_planning_horizon": 3,
         "inner_rollout_horizon": 6,
     }
+    assert metadata["temporal_loss"] == {
+        "temporal_loss_normalization": "divide_horizon",
+        "rho": 0.5,
+    }
+    assert "temporal_loss_reference_horizon" not in json.dumps(metadata)
     assert metadata["critic"] == {
         **critic_signature,
         "outer_critic_target": "reward_only",
@@ -248,6 +252,7 @@ def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():
     assert metadata["actor_loss_scale"] == {
         "mode": "tdmpc2_percentile_range",
         "tau": 0.01,
+        "application": "q_only",
     }
     assert metadata["compilation"] == {"enabled": True, "strict": False}
     assert metadata["training"] == {

@@ -185,6 +185,18 @@ def test_inner_comparison_valid_configuration_resolves():
     assert cfg.eval_inner_comparison_episodes == 7
     assert cfg.eval_inner_comparison_seed == 24680
     assert cfg.eval_freq == 50_000
+    assert cfg.mpc is False
+
+
+def test_baseline_pairing_validation_does_not_reject_ambi_mpc_false():
+    cfg = _resolved_ambi_cfg(
+        eval_inner_comparison=True,
+        eval_freq=50_000,
+        mpc=False,
+    )
+
+    assert cfg.eval_inner_comparison is True
+    assert cfg.mpc is False
 
 
 @pytest.mark.parametrize(

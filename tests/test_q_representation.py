@@ -99,7 +99,14 @@ def test_distributional_backend_separates_q_bins_and_decodes_every_head():
     assert model._reward[-1].out_features == 7
     assert raw.shape == (4, 3, 5)
     assert values.shape == (4, 3, 1)
-    torch.testing.assert_close(values, torch.zeros_like(values), atol=1e-7, rtol=0)
+    final_biases = torch.stack([critic[-1].bias for critic in model._Qs])
+    torch.testing.assert_close(raw, final_biases[:, None, :].expand_as(raw))
+    support = torch.linspace(-2.0, 2.0, 5)
+    expected_symlog = (final_biases.softmax(dim=-1) * support).sum(
+        dim=-1, keepdim=True
+    )
+    expected_values = expected_symlog.sign() * expected_symlog.abs().expm1()
+    torch.testing.assert_close(values, expected_values[:, None, :].expand_as(values))
     assert model.critic_signature == {
         "q_representation": "distributional",
         "num_q": 4,

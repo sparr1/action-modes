@@ -39,6 +39,7 @@ _DEPENDENCIES = (
 # inputs must remain fingerprinted.
 _OPERATIONAL_ALGORITHM_FIELDS = frozenset({"eval_csv_path"})
 _AMBI_ALGORITHM = "AMBITDMPC2/AMBITDMPC2"
+_TDMPC2_ALGORITHM = "TDMPC2/TDMPC2Baseline"
 _AMBI_RESOLVED_IDENTITY_DEFAULTS = {
     "inner_finite_horizon": False,
     "inner_steps_per_update": None,
@@ -66,6 +67,11 @@ _AMBI_RESOLVED_IDENTITY_DEFAULTS = {
     "inner_param_noise_calibration_max_probes": 8,
     "inner_execution_policy_source": "primary",
     "inner_execution_handoff_samples": 8,
+    "eval_inner_comparison": False,
+    "eval_inner_comparison_episodes": 5,
+    "eval_inner_comparison_seed": 12345,
+}
+_TDMPC2_RESOLVED_IDENTITY_DEFAULTS = {
     "eval_inner_comparison": False,
     "eval_inner_comparison_episodes": 5,
     "eval_inner_comparison_seed": 12345,
@@ -183,12 +189,16 @@ def scientific_trial_parameters(
         algorithm = dict(raw_algorithm)
         for field in _OPERATIONAL_ALGORITHM_FIELDS:
             algorithm.pop(field, None)
+        resolved_defaults = None
         if projected.get("alg") == _AMBI_ALGORITHM:
-            algorithm = normalize_lora_rl_identity(algorithm)
-            # These controls are resolved by AMBI even when omitted. Preserve
-            # each default's scalar kind so omitted and explicit defaults
-            # describe the same scientific lineage.
-            for field, default in _AMBI_RESOLVED_IDENTITY_DEFAULTS.items():
+            resolved_defaults = _AMBI_RESOLVED_IDENTITY_DEFAULTS
+        elif projected.get("alg") == _TDMPC2_ALGORITHM:
+            resolved_defaults = _TDMPC2_RESOLVED_IDENTITY_DEFAULTS
+        if resolved_defaults is not None:
+            # These controls are resolved by the learner even when omitted.
+            # Preserve each default's scalar kind so omitted and explicit
+            # defaults describe the same scientific lineage.
+            for field, default in resolved_defaults.items():
                 value = algorithm.get(field, default)
                 if isinstance(default, bool) and isinstance(
                     value, (bool, np.bool_)
@@ -205,46 +215,82 @@ def scientific_trial_parameters(
                     if value == 0.0:
                         value = 0.0
                 algorithm[field] = value
-            # Keep pre-interleaving lineage hashes unchanged: an omitted
-            # or explicit round default has no new scientific field.
-            timing = algorithm.get("inner_update_timing", "round")
-            if isinstance(timing, str):
-                timing = timing.lower()
-            if timing == "round":
-                algorithm.pop("inner_update_timing", None)
-            else:
-                algorithm["inner_update_timing"] = timing
-            for field in (
-                "inner_explorer_mode",
-                "inner_behavior_action",
-                "inner_execution_policy_source",
-                "inner_mixture_target_estimator",
-            ):
-                value = algorithm.get(field)
-                if isinstance(value, str):
-                    algorithm[field] = value.lower()
-            inner_mapping = algorithm.get("inner_log_std_mapping")
-            if inner_mapping is None:
-                inner_mapping = algorithm.get(
-                    "log_std_mapping", "direct_clamp"
-                )
-            if isinstance(inner_mapping, str):
-                inner_mapping = inner_mapping.lower()
-            algorithm["inner_log_std_mapping"] = inner_mapping
-            if algorithm.get("inner_log_std_min") is None:
-                algorithm["inner_log_std_min"] = algorithm.get(
-                    "log_std_min", -20
-                )
-            if algorithm.get("inner_log_std_max") is None:
-                algorithm["inner_log_std_max"] = algorithm.get(
-                    "log_std_max", 2
-                )
-            for field in ("inner_log_std_min", "inner_log_std_max"):
-                value = algorithm[field]
-                if isinstance(
-                    value, (int, float, np.integer, np.floating)
-                ) and not isinstance(value, (bool, np.bool_)):
-                    algorithm[field] = float(value)
+            if projected.get("alg") == _AMBI_ALGORITHM:
+                algorithm = normalize_lora_rl_identity(algorithm)
+                # Keep pre-interleaving lineage hashes unchanged: an omitted
+                # or explicit round default has no new scientific field.
+                timing = algorithm.get("inner_update_timing", "round")
+                if isinstance(timing, str):
+                    timing = timing.lower()
+                if timing == "round":
+                    algorithm.pop("inner_update_timing", None)
+                else:
+                    algorithm["inner_update_timing"] = timing
+                # Preserve historical identities for unchanged inner SAC.
+                # TD-AMBI's explicit loss/initialization changes remain part
+                # of the scientific configuration even though state is local.
+                for field, default in (
+                    ("inner_critic_loss_coef", 1.0),
+                    ("inner_actor_loss_scale_update", "per_action"),
+                    ("inner_critic_target_initialization", "online"),
+                ):
+                    value = algorithm.get(field, default)
+                    if isinstance(value, str) and isinstance(default, str):
+                        value = value.lower()
+                    if value == default:
+                        algorithm.pop(field, None)
+                    else:
+                        algorithm[field] = value
+                inner_actor_eps = algorithm.get("inner_actor_adam_eps")
+                if inner_actor_eps is None or inner_actor_eps == algorithm.get(
+                    "inner_adam_eps", 1e-8
+                ):
+                    algorithm.pop("inner_actor_adam_eps", None)
+                # Historical actors used squashed action entropy. Omit that
+                # default so spelling it explicitly preserves the old identity;
+                # each nondefault objective remains independently scientific.
+                for field in (
+                    "outer_actor_entropy_mode",
+                    "inner_actor_entropy_mode",
+                ):
+                    value = algorithm.get(field, "squashed")
+                    if isinstance(value, str):
+                        value = value.lower()
+                    if value == "squashed":
+                        algorithm.pop(field, None)
+                    else:
+                        algorithm[field] = value
+                for field in (
+                    "inner_explorer_mode",
+                    "inner_behavior_action",
+                    "inner_execution_policy_source",
+                    "inner_mixture_target_estimator",
+                ):
+                    value = algorithm.get(field)
+                    if isinstance(value, str):
+                        algorithm[field] = value.lower()
+                inner_mapping = algorithm.get("inner_log_std_mapping")
+                if inner_mapping is None:
+                    inner_mapping = algorithm.get(
+                        "log_std_mapping", "direct_clamp"
+                    )
+                if isinstance(inner_mapping, str):
+                    inner_mapping = inner_mapping.lower()
+                algorithm["inner_log_std_mapping"] = inner_mapping
+                if algorithm.get("inner_log_std_min") is None:
+                    algorithm["inner_log_std_min"] = algorithm.get(
+                        "log_std_min", -20
+                    )
+                if algorithm.get("inner_log_std_max") is None:
+                    algorithm["inner_log_std_max"] = algorithm.get(
+                        "log_std_max", 2
+                    )
+                for field in ("inner_log_std_min", "inner_log_std_max"):
+                    value = algorithm[field]
+                    if isinstance(
+                        value, (int, float, np.integer, np.floating)
+                    ) and not isinstance(value, (bool, np.bool_)):
+                        algorithm[field] = float(value)
         projected["alg_params"] = algorithm
     return _json_safe(projected)
 

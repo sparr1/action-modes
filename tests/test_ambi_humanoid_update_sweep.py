@@ -2,6 +2,8 @@ import copy
 import json
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 ANCHOR = ROOT / "configs/ambi/algs/ambi_anchor.json"
@@ -35,10 +37,10 @@ BASE_V1_MIN_ALL_STUDY_NOTE = (
 )
 BASE_V1_PERCENTILE_NORMALIZED_STUDY_NOTE = (
     "Single-seed exploratory 14-million-decision Humanoid Walk base-v1 G4 "
-    "run changing only SAC actor-loss preconditioning to the TD-MPC2 P5-P95 "
-    "running range with tau=0.01; rewards, soft Bellman targets, and automatic "
-    "entropy losses remain in raw units. Make no confidence, significance, or "
-    "confirmatory claims."
+    "run applying TD-MPC2 Q-only actor normalization with the P5-P95 running "
+    "range and tau=0.01; actor entropy and policy regularizers are unscaled, "
+    "and rewards, soft Bellman targets, and automatic entropy losses remain "
+    "in raw units. Make no confidence, significance, or confirmatory claims."
 )
 BASE_V1_TAGS = [
     "ambi",
@@ -474,6 +476,16 @@ def test_humanoid_base_v1_percentile_variant_changes_only_actor_loss_scaling():
     assert actual == expected
     assert actual["seed"] == 55
     assert actual["total_steps"] == 14_000_000
+
+
+def test_historical_percentile_preset_is_rejected_by_current_training_rules():
+    from tests.test_ambi_config_decoupling import _build_cfg
+
+    actual = _load(ALGORITHM_ROOT / f"{BASE_V1_PERCENTILE_NORMALIZED}.json")
+    params = actual["alg_params"]
+    assert params["ent_coef"] == params["inner_temperature_mode"] == "auto"
+    with pytest.raises(ValueError, match="requires fixed temperatures"):
+        _build_cfg(**{**params, "device": "cpu"})
 
 
 def test_humanoid_base_v1_percentile_variant_has_a_matching_manifest():

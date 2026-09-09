@@ -40,6 +40,18 @@ and MPPI are auxiliary ablations or comparison operators. In particular, MPPI
 is the TD-MPC-style planning comparator; it is not AMBI's core action-selection
 algorithm.
 
+The [TD-AMBI training preset](RL/tdmpc2_core/README.md#td-ambi-training-preset)
+uses TD-MPC2's actor and critic loss formulas in both the outer and inner
+learners, with fixed entropy coefficients and Q percentile scaling. It keeps
+AMBI's inner transition minibatches and action-local adaptation. Its matching
+Humanoid Walk algorithm and experiment files are named `TD-AMBI.json`.
+
+The [TD-AMBI objective study](configs/dmcontrol/TD-AMBI-STUDY.md) extends that
+base into four prior-only checkpoint runs and six full AMBI runs. It compares
+reward-only and entropy-augmented critics, Q scaling and learned temperatures,
+and fixed versus adaptive inner Q scales. Full runs use one paired actor/critic
+update per batched imagined step with six rounds and 512 branches.
+
 The optional [critic-only LoRA-RL adapter](RL/tdmpc2_core/README.md#critic-only-lora-rl)
 uses `inner_critic_adaptation="lora_rl"` with a fully cloned actor. The default
 rank is 96, direct adapter scale is one, and AdamW adapter weight decay is
@@ -104,6 +116,11 @@ for `latest`; `none` must be used alone. If `save_strat` is omitted, a positive
 Checkpoint files are model snapshots and do not universally contain replay or
 environment state for full training resume.
 
+Native TD-MPC2 periodic and final checkpoints also save the learned Q percentile
+scale `S`, frozen at the same step as the networks. AMBI preserves its actor Q
+scale when scaling is enabled. Older native snapshots without `S` reset the
+unavailable scale to one when loaded into the native learner.
+
 ### Oscar durable checkpoint storage
 
 AMBI jobs submitted by `rgao48` on Oscar store resumable state under
@@ -131,6 +148,14 @@ The compact AMBI branch-count and imagination-horizon suite lives under
 manifest under `configs/ambi/experiments/`; the anchor entry point is
 `configs/ambi/experiments/ambi_anchor.json`, used with
 `--alg-dir configs/ambi/algs`.
+
+AMBI and the local TD-MPC2 baseline now use TD-MPC2's temporal weighting with
+`rho=0.5` in defaults and maintained presets: model losses average `rho**t`
+weighted terms over the `H` transitions, while the outer actor averages over
+all `H+1` latents. There is no reference-horizon rescaling. Historical temporal
+configuration fields still parse with a deprecation warning for checkpoint
+evaluation; weight transfer into this training rule starts a new lineage.
+See [the exact reductions and compatibility contract](RL/tdmpc2_core/README.md#temporal-training-weights).
 
 ## Single-task DMControl
 

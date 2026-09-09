@@ -516,6 +516,7 @@ def test_no_q_diagnostic_is_fabricated_when_no_q_evaluation_ran():
 def test_scaled_sac_gauges_do_not_require_an_inner_q_evaluation():
     model = _model(
         sac_actor_loss_scale_mode="tdmpc2_percentile_range",
+        ent_coef=0.5, outer_critic_target="reward_only", inner_sac_critic_target="reward_only",
         inner_critic_updates_per_action=0,
         inner_actor_updates_per_action=0,
         inner_temperature_updates_per_action=0,

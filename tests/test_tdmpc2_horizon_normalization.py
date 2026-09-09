@@ -7,6 +7,7 @@ import torch
 from RL.AMBITDMPC2 import AMBITDMPC2
 from RL.TDMPC2 import TDMPC2Baseline, _normalize_horizon_params
 from RL.tdmpc2_core.agent import TDMPC2
+from RL.tdmpc2_core.ambi_agent import AMBITDMPC2Agent
 from RL.tdmpc2_core.common import math as td_math
 from RL.tdmpc2_core.common.buffer import Buffer
 
@@ -79,72 +80,40 @@ def test_horizon_resolution_defaults_legacy_mapping_and_ambiguity_rejection():
             _normalize_horizon_params({"horizon": 3, explicit: 3})
 
 
-def test_temporal_transition_weights_match_anchor_and_fixed_horizon_six_target():
-    expected_h6 = torch.tensor(
-        [0.248201, 0.173740, 0.121618, 0.085133, 0.059593, 0.041715]
+@pytest.mark.parametrize("horizon", [1, 2, 3, 4, 6])
+@pytest.mark.parametrize("rho", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("include_terminal", [False, True])
+def test_temporal_weights_use_actual_term_count(horizon, rho, include_terminal):
+    count = horizon + int(include_terminal)
+    expected = torch.tensor([rho**t / count for t in range(count)])
+    actual = td_math.temporal_loss_weights(
+        horizon, rho, include_terminal=include_terminal
     )
-    h6 = td_math.temporal_loss_weights(
-        6,
-        0.7,
-        normalization="reference_weighted_mean",
-        reference_horizon=3,
-    )
-    torch.testing.assert_close(h6, expected_h6, rtol=2e-6, atol=5e-7)
-    for horizon in (1, 2, 3, 4, 6):
-        weights = td_math.temporal_loss_weights(
-            horizon,
-            0.7,
-            normalization="reference_weighted_mean",
-            reference_horizon=3,
-        )
-        torch.testing.assert_close(
-            weights.sum(), torch.tensor(0.73), rtol=0, atol=1e-7
-        )
-
-    anchor = td_math.temporal_loss_weights(
-        3,
-        0.7,
-        normalization="reference_weighted_mean",
-        reference_horizon=3,
-    )
-    torch.testing.assert_close(
-        anchor,
-        torch.pow(torch.tensor(0.7), torch.arange(3)) / 3,
-        rtol=0,
-        atol=0,
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.sum().item() == pytest.approx(
+        sum(rho**t for t in range(count)) / count
     )
 
 
-def test_temporal_actor_aggregate_is_constant_and_rho_one_is_safe():
-    expected_actor_total = sum(0.7**index for index in range(4)) / 4
-    for horizon in (1, 2, 3, 4, 6):
-        weights = td_math.temporal_loss_weights(
-            horizon,
-            0.7,
-            normalization="reference_weighted_mean",
-            reference_horizon=3,
-            include_terminal=True,
-        )
-        assert float(weights.sum()) == pytest.approx(expected_actor_total, abs=1e-7)
-
-    transition = td_math.temporal_loss_weights(
-        6,
-        1.0,
-        normalization="reference_weighted_mean",
-        reference_horizon=3,
-    )
-    actor = td_math.temporal_loss_weights(
-        6,
-        1.0,
-        normalization="reference_weighted_mean",
-        reference_horizon=3,
-        include_terminal=True,
-    )
-    torch.testing.assert_close(transition, torch.full((6,), 1 / 6))
-    torch.testing.assert_close(actor, torch.full((7,), 1 / 7))
+def test_total_weight_follows_tdmpc2_as_horizon_changes():
+    horizons = (1, 2, 3, 4, 6)
+    for include_terminal in (False, True):
+        totals = [
+            td_math.temporal_loss_weights(
+                horizon, 0.5, include_terminal=include_terminal
+            ).sum().item()
+            for horizon in horizons
+        ]
+        assert all(left > right for left, right in zip(totals, totals[1:]))
+        assert totals == pytest.approx([
+            sum(0.5**t for t in range(horizon + int(include_terminal)))
+            / (horizon + int(include_terminal))
+            for horizon in horizons
+        ])
 
 
-def _historical_reduce(losses, rho, order):
+def _upstream_reduce(losses, rho, order):
+    # Spell out upstream arithmetic independently of the shared AMBI helper.
     if order == "sequential":
         total = 0
         for index, loss in enumerate(losses.unbind(0)):
@@ -157,56 +126,187 @@ def _historical_reduce(losses, rho, order):
     return weighted.sum() / len(losses)
 
 
+@pytest.mark.parametrize("horizon", [1, 2, 3, 4, 6])
+@pytest.mark.parametrize("rho", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize(
-    ("order", "include_terminal", "term_count"),
-    [
-        ("sequential", False, 3),
-        ("vector_sum_divide", False, 3),
-        ("vector_mean", True, 4),
-    ],
+    ("order", "include_terminal"),
+    [("sequential", False), ("vector_sum_divide", False), ("vector_mean", True)],
 )
-@pytest.mark.parametrize("normalization", ["reference_weighted_mean", "divide_horizon"])
-def test_reference_reducer_exactly_preserves_h3_loss_and_parameter_gradients(
-    order,
-    include_terminal,
-    term_count,
-    normalization,
+def test_reducer_preserves_upstream_loss_and_parameter_gradients(
+    horizon, rho, order, include_terminal
 ):
-    expected_parameter = torch.tensor(
-        [0.25, -0.5, 1.25, -1.5][:term_count], requires_grad=True
-    )
+    count = horizon + int(include_terminal)
+    expected_parameter = torch.linspace(-1.5, 1.25, count, requires_grad=True)
     actual_parameter = expected_parameter.detach().clone().requires_grad_(True)
     expected_terms = expected_parameter.square() + 0.125 * expected_parameter
     actual_terms = actual_parameter.square() + 0.125 * actual_parameter
 
-    expected = _historical_reduce(expected_terms, 0.7, order)
+    expected = _upstream_reduce(expected_terms, rho, order)
     actual = td_math.reduce_temporal_loss(
-        actual_terms,
-        0.7,
-        normalization=normalization,
-        reference_horizon=3,
-        include_terminal=include_terminal,
-        legacy_order=order,
+        actual_terms, rho, include_terminal=include_terminal, legacy_order=order
     )
     assert torch.equal(actual, expected)
-
     expected.backward()
     actual.backward()
     assert torch.equal(actual_parameter.grad, expected_parameter.grad)
+    if include_terminal:
+        assert actual_parameter.grad[-1].item() == pytest.approx(
+            rho**horizon * (2 * actual_parameter[-1].item() + 0.125) / count
+        )
 
 
-def test_reference_weighted_reducer_sends_gradient_to_every_depth():
-    parameter = torch.linspace(0.5, 1.0, 6, requires_grad=True)
-    losses = parameter.square()
-    reduced = td_math.reduce_temporal_loss(
-        losses,
-        0.7,
-        normalization="reference_weighted_mean",
-        reference_horizon=3,
-        weights=td_math.temporal_loss_weights(6, 0.7),
+class _TemporalLossModel(torch.nn.Module):
+    """Distinct trainable predictions at each time, sample, and critic head."""
+
+    def __init__(self, horizon, heads, batch=2):
+        super().__init__()
+        self.latents = torch.nn.Parameter(
+            torch.linspace(0.2, 1.4, horizon * batch).reshape(horizon, batch, 1)
+        )
+        reward_grid = torch.arange(horizon * batch * 3, dtype=torch.float32)
+        self.rewards = torch.nn.Parameter(
+            (reward_grid.square() / 53).reshape(horizon, batch, 3)
+        )
+        q_grid = torch.arange(heads * horizon * batch * 3, dtype=torch.float32)
+        self.qs = torch.nn.Parameter(
+            (torch.sin(q_grid / 4) + q_grid / 13).reshape(heads, horizon, batch, 3)
+        )
+
+    def encode(self, obs, task=None):
+        return obs
+
+    def next(self, z, action, task=None):
+        return self.latents[int(action[0, 0])]
+
+    def joint_input(self, z, action):
+        return z
+
+    def reward(self, z, action, task=None):
+        return self.rewards
+
+    def reward_from_joint(self, joint):
+        return self.rewards
+
+    def Q(self, z, action, task=None, return_type=None):
+        assert return_type == "all"
+        return self.qs
+
+    def q_predictions_from_joint(self, joint):
+        return self.qs
+
+    def critic_loss(self, predictions, targets, reduction):
+        assert reduction == "none"
+        # Zero target lies exactly on the middle of the three symlog bins.
+        return -predictions.log_softmax(-1)[..., 1:2]
+
+    def soft_update_target_Q(self):
+        pass
+
+
+@pytest.mark.parametrize("horizon", [1, 2, 3, 4, 6])
+@pytest.mark.parametrize("rho", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("algorithm", ["ambi", "tdmpc2"])
+@pytest.mark.parametrize("heads", [2, 5])
+def test_training_losses_and_gradients_use_tdmpc2_time_and_head_averages(
+    horizon, rho, algorithm, heads
+):
+    model = _TemporalLossModel(horizon, heads)
+    cfg = SimpleNamespace(
+        train_unroll_horizon=horizon, rho=rho, batch_size=2, latent_dim=1,
+        num_q=heads, num_bins=3, vmin=-1, vmax=1, bin_size=1,
+        episodic=False, consistency_coef=0.3, reward_coef=0.6,
+        value_coef=0.9, critic_coef=0.9, termination_coef=1.0,
+        grad_clip_norm=1e6,
     )
-    reduced.backward()
-    assert torch.all(parameter.grad != 0)
+    agent = SimpleNamespace(
+        cfg=cfg, model=model, device=torch.device("cpu"), num_updates=0,
+        optim=SimpleNamespace(step=lambda: None, zero_grad=lambda **_: None),
+        _td_target=lambda next_z, reward, terminated, task: torch.zeros_like(reward),
+        update_pi=lambda zs, task: {},
+    )
+    obs = torch.zeros(horizon + 1, 2, 1)
+    action = torch.arange(horizon).reshape(horizon, 1, 1).expand(-1, 2, -1)
+    reward = torch.zeros(horizon, 2, 1)
+    terminated = torch.zeros_like(reward)
+
+    reference_parameters = [
+        parameter.detach().clone().requires_grad_() for parameter in model.parameters()
+    ]
+    latent, reward_logits, q_logits = reference_parameters
+    # Independent upstream equations: each transition gets rho**t, each model
+    # loss divides by H, and the critic additionally divides by every head.
+    consistency = sum(
+        rho**t * latent[t].square().mean() for t in range(horizon)
+    ) / horizon
+    reward_loss = sum(
+        rho**t * -reward_logits[t].log_softmax(-1)[..., 1].mean()
+        for t in range(horizon)
+    ) / horizon
+    critic_loss = sum(
+        rho**t * -q_logits[head, t].log_softmax(-1)[..., 1].mean()
+        for t in range(horizon) for head in range(heads)
+    ) / (horizon * heads)
+    expected_total = 0.3 * consistency + 0.6 * reward_loss + 0.9 * critic_loss
+    expected_total.backward()
+
+    if algorithm == "ambi":
+        result = AMBITDMPC2Agent._outer_update_kernel(
+            agent, obs[0], action, reward, terminated, obs[1:], reward
+        )
+        actual_losses = result[5:8]
+        result[-1].backward()
+    else:
+        metrics = TDMPC2._update(agent, obs, action, reward, terminated)
+        actual_losses = [metrics[key] for key in (
+            "consistency_loss", "reward_loss", "value_loss"
+        )]
+    for actual, expected in zip(actual_losses, (consistency, reward_loss, critic_loss)):
+        torch.testing.assert_close(actual, expected.detach())
+    for actual, expected in zip(model.parameters(), reference_parameters):
+        torch.testing.assert_close(actual.grad, expected.grad)
+
+
+@pytest.mark.parametrize("horizon", [1, 2, 3, 4, 6])
+@pytest.mark.parametrize("rho", [0.0, 0.5, 1.0])
+def test_tdmpc2_actor_loss_and_gradients_include_terminal_latent(horizon, rho):
+    actor = torch.nn.Linear(1, horizon + 1, bias=False)
+    with torch.no_grad():
+        actor.weight.copy_(torch.linspace(0.2, 1.1, horizon + 1).reshape(-1, 1))
+    initial = actor.weight.detach().clone().requires_grad_()
+
+    def pi(zs, task):
+        action = actor.weight.reshape(horizon + 1, 1, 1).expand(-1, 2, -1)
+        entropy = action.square() + 0.1
+        return action, {"entropy": entropy, "scaled_entropy": entropy}
+
+    class Scale:
+        value = torch.tensor([2.0])
+
+        def update(self, qs):
+            torch.testing.assert_close(qs, (3 * initial[0]).expand(2, 1))
+
+        def __call__(self, qs):
+            return qs / self.value
+
+    model = SimpleNamespace(
+        pi=pi, _pi=actor,
+        Q=lambda zs, action, task, **kwargs: 3 * action,
+    )
+    agent = SimpleNamespace(
+        cfg=SimpleNamespace(rho=rho, entropy_coef=0.2, grad_clip_norm=1e6),
+        model=model, scale=Scale(),
+        pi_optim=SimpleNamespace(step=lambda: None, zero_grad=lambda **_: None),
+    )
+    expected = sum(
+        rho**t * -(0.2 * (initial[t].square() + 0.1) + 3 * initial[t] / 2)
+        for t in range(horizon + 1)
+    ).sum() / (horizon + 1)
+    expected.backward()
+    metrics = TDMPC2.update_pi(agent, torch.zeros(horizon + 1, 2, 1), None)
+    torch.testing.assert_close(metrics["pi_loss"], expected.detach())
+    torch.testing.assert_close(actor.weight.grad, initial.grad)
+    if rho > 0:
+        assert actor.weight.grad[-1].abs().item() > 0
 
 
 def test_ambi_train_six_plan_three_inner_three_resolves_independently():

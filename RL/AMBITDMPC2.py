@@ -23,6 +23,7 @@ from utils.utils import setup_logs
 
 _Q_REDUCTIONS = {"min_pair", "mean_pair", "min_all", "mean_all"}
 _CRITIC_TARGETS = {"entropy_augmented", "reward_only"}
+_ACTOR_ENTROPY_MODES = {"squashed", "tdmpc2_scaled"}
 _SAC_ACTOR_LOSS_SCALE_MODES = {"none", "tdmpc2_percentile_range"}
 _BEHAVIOR_POLICY_OBJECTIVES = {"reverse_kl", "action_space_cross_entropy"}
 _BEHAVIOR_POLICY_KL_SCHEDULES = {"none", "smooth", "quantile_gate", "dual"}
@@ -64,8 +65,15 @@ _AMBI_DEFAULTS = {
     "mppi_terminal_q_reduction": "mean_pair",
     "outer_critic_target": "entropy_augmented",
     "inner_sac_critic_target": "entropy_augmented",
+    # Actor, temperature, and entropy-augmented critic objectives share a statistic.
+    "outer_actor_entropy_mode": "squashed",
+    "inner_actor_entropy_mode": "squashed",
+    # Optional TD-MPC2 Q-only normalization in the SAC actor objective.
     "sac_actor_loss_scale_mode": "none",
     "sac_actor_loss_scale_tau": 0.01,
+    # Inner SAC normally freezes the outer scale for one real action. The
+    # TD-AMBI recipe updates its local copy from each actor minibatch instead.
+    "inner_actor_loss_scale_update": "per_action",
     # Optional behavior-policy regularizer from the outer actor to the replayed
     # action-generating policy. ``none`` preserves the historical runtime and
     # replay schema; active schedules require stochastic inner SAC execution.
@@ -83,7 +91,7 @@ _AMBI_DEFAULTS = {
     "actor_lr": 3e-4,
     "critic_lr": 3e-4,
     "adam_eps": 1e-8,
-    "actor_adam_eps": None,
+    "actor_adam_eps": 1e-5,
     "log_std_mapping": "direct_clamp",
     "log_std_min": -20,
     "log_std_max": 2,
@@ -168,6 +176,9 @@ _AMBI_DEFAULTS = {
     "inner_critic_lr": 5e-5,
     "inner_temperature_lr": 5e-5,
     "inner_adam_eps": 1e-8,
+    "inner_actor_adam_eps": None,
+    "inner_critic_loss_coef": 1.0,
+    "inner_critic_target_initialization": "online",
     "inner_critic_target_tau": 0.005,
     "inner_critic_target_update_interval": 1,
     "inner_actor_target_tau": None,
@@ -1194,6 +1205,11 @@ class AMBITDMPC2(TDMPC2Baseline):
             td["behavior_policy_valid"] = torch.zeros((1,), dtype=torch.bool)
         return td
 
+    def _validate_paired_controller_config(self, cfg, observation_type):
+        """Defer to AMBI's SAC-specific validation after base resolution."""
+
+        del cfg, observation_type
+
     def _build_cfg(self, params):
         # Resolve the outer legacy alias before translating AMBI's separate
         # legacy inner-loop aliases. This rejects only combinations the caller
@@ -1419,6 +1435,11 @@ class AMBITDMPC2(TDMPC2Baseline):
                     f"{key} must be one of {sorted(_CRITIC_TARGETS)}, got {value!r}."
                 )
             setattr(cfg, key, value)
+
+        for key in ("outer_actor_entropy_mode", "inner_actor_entropy_mode"):
+            setattr(cfg, key, _normalize_choice(
+                getattr(cfg, key), key, _ACTOR_ENTROPY_MODES,
+            ))
 
         if not isinstance(cfg.sac_actor_loss_scale_mode, str):
             raise ValueError(
@@ -1879,6 +1900,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_critic_grad_clip_norm",
             "inner_temperature_grad_clip_norm",
         ):
+            if key == "inner_temperature_grad_clip_norm" and getattr(cfg, key) is None:
+                continue
             value = _finite_float(getattr(cfg, key), key)
             if value <= 0.0:
                 raise ValueError(f"{key} must be positive.")
@@ -2360,9 +2383,56 @@ class AMBITDMPC2(TDMPC2Baseline):
             "actor_adam_eps",
         )
         cfg.inner_adam_eps = _finite_float(cfg.inner_adam_eps, "inner_adam_eps")
-        if min(cfg.adam_eps, cfg.actor_adam_eps, cfg.inner_adam_eps) <= 0.0:
+        cfg.inner_actor_adam_eps = _finite_float(
+            cfg.inner_adam_eps
+            if cfg.inner_actor_adam_eps is None else cfg.inner_actor_adam_eps,
+            "inner_actor_adam_eps",
+        )
+        if min(
+            cfg.adam_eps, cfg.actor_adam_eps,
+            cfg.inner_adam_eps, cfg.inner_actor_adam_eps,
+        ) <= 0.0:
             raise ValueError(
-                "adam_eps, actor_adam_eps, and inner_adam_eps must be positive."
+                "adam_eps, actor_adam_eps, inner_adam_eps, and "
+                "inner_actor_adam_eps must be positive."
+            )
+
+        cfg.inner_critic_loss_coef = _finite_float(
+            cfg.inner_critic_loss_coef, "inner_critic_loss_coef"
+        )
+        if cfg.inner_critic_loss_coef <= 0.0:
+            raise ValueError("inner_critic_loss_coef must be positive.")
+        for key, choices in (
+            ("inner_actor_loss_scale_update", {"per_action", "per_update"}),
+            ("inner_critic_target_initialization", {"online", "outer_target"}),
+        ):
+            value = str(getattr(cfg, key)).lower()
+            if value not in choices:
+                raise ValueError(f"{key} must be one of {sorted(choices)}.")
+            setattr(cfg, key, value)
+        if (
+            cfg.inner_critic_loss_coef != 1.0
+            or cfg.inner_actor_loss_scale_update == "per_update"
+            or cfg.inner_critic_target_initialization == "outer_target"
+        ) and (cfg.inner_operator != "sac" or cfg.inner_explorer_mode != "none"):
+            raise ValueError(
+                "Nondefault inner loss scaling or target initialization requires "
+                "inner_operator='sac' and inner_explorer_mode='none'."
+            )
+        if (
+            cfg.inner_actor_loss_scale_update == "per_update"
+            and cfg.sac_actor_loss_scale_mode != "tdmpc2_percentile_range"
+        ):
+            raise ValueError(
+                "inner_actor_loss_scale_update='per_update' requires "
+                "sac_actor_loss_scale_mode='tdmpc2_percentile_range'."
+            )
+        if cfg.inner_critic_target_initialization == "outer_target" and (
+            cfg.inner_critic_adaptation != "clone" or cfg.inner_critic_scope != "action"
+        ):
+            raise ValueError(
+                "inner_critic_target_initialization='outer_target' requires an "
+                "action-local cloned critic."
             )
 
         for key in ("actor_lr", "critic_lr", "ent_coef_lr"):
@@ -2370,6 +2440,17 @@ class AMBITDMPC2(TDMPC2Baseline):
             if value <= 0.0:
                 raise ValueError(f"{key} must be positive.")
             setattr(cfg, key, value)
+        if (
+            cfg.outer_actor_entropy_mode == "tdmpc2_scaled"
+            and isinstance(cfg.ent_coef, str)
+            and cfg.ent_coef.startswith("auto")
+            and isinstance(cfg.target_entropy, str)
+            and cfg.target_entropy.lower() in {"auto", "inherit_outer"}
+        ):
+            raise ValueError(
+                "outer_actor_entropy_mode='tdmpc2_scaled' with automatic ent_coef "
+                "requires an explicit numeric target_entropy."
+            )
         if isinstance(cfg.target_entropy, str):
             cfg.target_entropy = cfg.target_entropy.lower()
             if cfg.target_entropy != "auto":
@@ -2391,6 +2472,63 @@ class AMBITDMPC2(TDMPC2Baseline):
             cfg.ent_coef = _finite_float(cfg.ent_coef, "ent_coef")
             if cfg.ent_coef <= 0.0:
                 raise ValueError("ent_coef must be positive.")
+
+        if cfg.inner_actor_entropy_mode == "tdmpc2_scaled":
+            if cfg.inner_operator != "sac":
+                raise ValueError(
+                    "inner_actor_entropy_mode='tdmpc2_scaled' requires inner_operator='sac'."
+                )
+            if cfg.inner_explorer_mode == "shared_mixture":
+                raise ValueError(
+                    "inner_actor_entropy_mode='tdmpc2_scaled' does not support "
+                    "inner_explorer_mode='shared_mixture'."
+                )
+            if (
+                cfg.inner_temperature_mode == "auto"
+                and cfg.inner_target_entropy in {"auto", "inherit_outer"}
+            ):
+                raise ValueError(
+                    "inner_actor_entropy_mode='tdmpc2_scaled' with automatic "
+                    "temperature requires an explicit numeric inner_target_entropy."
+                )
+        elif (
+            cfg.inner_temperature_mode == "auto"
+            and cfg.inner_target_entropy == "inherit_outer"
+            and cfg.outer_actor_entropy_mode != cfg.inner_actor_entropy_mode
+        ):
+            raise ValueError(
+                "Automatic inner temperature can inherit_outer target entropy only "
+                "when outer_actor_entropy_mode and inner_actor_entropy_mode match; "
+                "set inner_target_entropy to 'auto' or an explicit numeric target."
+            )
+
+        if cfg.sac_actor_loss_scale_mode != "none":
+            conflicts = []
+            if isinstance(cfg.ent_coef, str):
+                conflicts.append(
+                    f"ent_coef={cfg.ent_coef!r} (set a fixed numeric coefficient)"
+                )
+            if cfg.inner_operator == "sac":
+                if cfg.inner_temperature_mode == "auto":
+                    conflicts.append(
+                        "inner_temperature_mode='auto' (set 'fixed' or 'inherit_outer')"
+                    )
+                if cfg.inner_explorer_mode != "none" and (
+                    cfg.outer_critic_target == "entropy_augmented"
+                    or cfg.inner_sac_critic_target == "entropy_augmented"
+                ):
+                    conflicts.append(
+                        "entropy-augmented Q scaling requires "
+                        "inner_explorer_mode='none'"
+                    )
+            if conflicts:
+                raise ValueError(
+                    "sac_actor_loss_scale_mode='tdmpc2_percentile_range' requires "
+                    "fixed temperatures; entropy-augmented critics require ordinary "
+                    "SAC without explorers. Incompatible settings: "
+                    + "; ".join(conflicts)
+                    + ". Alternatively, set sac_actor_loss_scale_mode='none'."
+                )
 
         # Read-only aliases keep legacy integrations working for one release.
         # Canonical agent code must not use these for scheduling mixed updates.
@@ -3072,6 +3210,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_actor_q_min_all",
             "inner_actor_q_mean_all_minus_min_all",
             "inner_actor_entropy",
+            "inner_actor_scaled_entropy",
+            "inner_actor_entropy_bonus",
             "inner_actor_pre_tanh_abs_mean",
             "inner_actor_pre_tanh_abs_max",
             "inner_actor_pre_tanh_abs_ge_7p6_fraction",
@@ -3085,6 +3225,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_explorer_actor_grad_norm",
             "inner_explorer_actor_q_mean",
             "inner_explorer_actor_entropy",
+            "inner_explorer_actor_scaled_entropy",
+            "inner_explorer_actor_entropy_bonus",
             "inner_explorer_actor_pre_tanh_abs_mean",
             "inner_explorer_actor_pre_tanh_abs_max",
             "inner_explorer_actor_pre_tanh_abs_ge_7p6_fraction",

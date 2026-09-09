@@ -5,7 +5,7 @@ import torch
 
 import RL.tdmpc2_core.ambi_agent as ambi_agent_module
 from RL.tdmpc2_core.common import math as td_math
-from tests.test_ambi_inner_decoupling import _model
+from tests.test_ambi_inner_decoupling import _assert_tree_equal, _clone_tree, _model
 
 
 def _kl_model(schedule, **overrides):
@@ -14,6 +14,8 @@ def _kl_model(schedule, **overrides):
         "outer_behavior_policy_kl_min_valid_count": 1,
         "outer_behavior_policy_kl_ramp_updates": 4,
         "ent_coef": 0.5,
+        "outer_critic_target": "reward_only",
+        "inner_sac_critic_target": "reward_only",
     }
     params.update(overrides)
     return _model(**params)
@@ -665,7 +667,7 @@ def test_action_ce_state_roundtrips_and_rejects_reverse_kl_checkpoint(
     ("scale_mode", "expected_version"),
     [("none", 5), ("tdmpc2_percentile_range", 6)],
 )
-def test_reverse_kl_version_5_and_6_specs_remain_legacy_compatible(
+def test_reverse_kl_specs_record_q_only_scaling_without_changing_schema_version(
     scale_mode,
     expected_version,
 ):
@@ -679,9 +681,40 @@ def test_reverse_kl_version_5_and_6_specs_remain_legacy_compatible(
     assert "objective" not in spec
     assert spec["estimator"] == "analytic_diagonal_gaussian_jensen_component"
     assert spec["action_transform"] == "shared_tanh"
+    assert spec["actor_loss_scaling"] == (
+        "none" if scale_mode == "none" else "q_only"
+    )
 
 
-def test_behavior_kl_and_actor_scaling_share_one_q_tracker_and_scale_full_loss(
+@pytest.mark.parametrize("exact_resume", [False, True])
+def test_old_full_objective_behavior_spec_is_rejected_transactionally(exact_resume):
+    source = _kl_model(
+        "smooth", sac_actor_loss_scale_mode="tdmpc2_percentile_range"
+    ).agent
+    source.behavior_policy_kl_eligible_updates = 7
+    source.actor_loss_scale.fill_(4.0)
+    source.prepare_training_resume_boundary()
+    if exact_resume:
+        invalid = _clone_tree(source.training_state_dict())
+        outer = invalid["outer"]
+    else:
+        invalid = _clone_tree(source.checkpoint_state())
+        outer = invalid
+    # Isolate the behavior-spec check: the scale spec still matches q_only.
+    outer["behavior_policy_kl_spec"]["actor_loss_scaling"] = "full_objective"
+
+    target = _kl_model(
+        "smooth", sac_actor_loss_scale_mode="tdmpc2_percentile_range"
+    ).agent
+    target.actor_loss_scale.fill_(8.0)
+    pristine = _clone_tree(target.training_state_dict())
+    load = target.load_training_state_dict if exact_resume else target.load
+    with pytest.raises(ValueError, match="behavior-policy KL specification"):
+        load(invalid)
+    _assert_tree_equal(target.training_state_dict(), pristine)
+
+
+def test_behavior_kl_and_actor_scaling_share_tracker_and_leave_kl_unscaled(
     monkeypatch,
 ):
     agent = _kl_model(
@@ -704,12 +737,13 @@ def test_behavior_kl_and_actor_scaling_share_one_q_tracker_and_scale_full_loss(
     assert calls == 1
     assert metrics["actor_loss_scale"] == pytest.approx(4.0)
     assert metrics["behavior_policy_kl"] == pytest.approx(0.5)
-    assert metrics["behavior_policy_kl_weighted_loss"] == pytest.approx(0.125)
-    assert metrics["actor_loss"] == pytest.approx(0.125)
+    assert metrics["behavior_policy_kl_effective_coefficient"] == pytest.approx(1.0)
+    assert metrics["behavior_policy_kl_weighted_loss"] == pytest.approx(0.5)
+    assert metrics["actor_loss"] == pytest.approx(0.5)
     assert agent.checkpoint_state()["checkpoint_version"] == 6
 
 
-def test_action_ce_and_actor_scaling_share_tracker_and_scale_full_loss(monkeypatch):
+def test_action_ce_and_actor_scaling_share_tracker_and_leave_ce_unscaled(monkeypatch):
     agent = _kl_model(
         "quantile_gate",
         outer_behavior_policy_objective="action_space_cross_entropy",
@@ -732,10 +766,11 @@ def test_action_ce_and_actor_scaling_share_tracker_and_scale_full_loss(monkeypat
     assert calls == 1
     assert metrics["actor_loss_scale"] == pytest.approx(4.0)
     assert metrics["behavior_policy_action_ce"] == pytest.approx(expected_ce)
+    assert metrics["behavior_policy_action_ce_effective_coefficient"] == pytest.approx(1.0)
     assert metrics["behavior_policy_action_ce_weighted_loss"] == pytest.approx(
-        expected_ce / 4.0
+        expected_ce
     )
-    assert metrics["actor_loss"] == pytest.approx(expected_ce / 4.0)
+    assert metrics["actor_loss"] == pytest.approx(expected_ce)
     assert agent.checkpoint_state()["checkpoint_version"] == 6
 
 

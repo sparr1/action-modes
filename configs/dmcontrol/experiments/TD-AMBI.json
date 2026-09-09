@@ -1,0 +1,26 @@
+{
+  "study_type": "single_seed_exploratory_td_ambi",
+  "study_note": "TD-AMBI is a trainable AMBI preset using TD-MPC2 actor and critic loss formulas on the AMBI backbone. Both actors use the literal TD-MPC2 scaled entropy with fixed coefficient 1e-4, smooth tanh log-standard-deviation mapping over [-10, 2], the mean of two random critic heads, and Q-only percentile normalization. Both critics use reward-only targets with the minimum of two random heads and distributional cross-entropy weighted by 0.1. Outer losses retain TD-MPC2 temporal reductions with rho=0.5; inner learning retains AMBI transition minibatches without sequence-level rho weighting. Each action-local inner Q scale starts from the outer scale and then applies the running percentile-range EMA on every inner actor update. Inner target critics initialize from the outer target ensemble. This is separate from the evaluation-only TDAMBI wrapper. The Humanoid Walk base-v2 protocol is retained: state observations, seed 55, 14 million decisions, J=8, N=32, H=3, G=1, 768 imagined transitions and eight actor/critic update slots per action. Temperatures are fixed, so no temperature updates or entropy-target tuning are used. Outer and inner actor/critic learning rates are 3e-4 and target-network tau values are 0.01. Controller evaluation, paired controller evaluation, real-environment value evaluation, value-equivalence diagnostics/loss, imagined diagnostics, and periodic/final model saves remain disabled. This remains a single-seed exploratory run and supports no confidence, significance, or confirmatory claim.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 14000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "TD-AMBI"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": null,
+  "save_strat": "none",
+  "log_info": false,
+  "log_type": "summary"
+}

@@ -6,7 +6,6 @@ import pytest
 import torch
 
 from RL.AMBITDMPC2 import AMBITDMPC2
-from RL.tdmpc2_core.common import math as td_math
 
 
 def _params(horizon=1, **overrides):
@@ -154,7 +153,6 @@ def _metric(metrics, key):
 def test_value_equivalence_loss_is_exact_value_only_raw_mse(monkeypatch):
     model = _model(
         inner_sac_critic_target="reward_only",
-        temporal_loss_normalization="divide_horizon",
         value_equivalence_loss_coef=1.0,
         value_equivalence_loss_mc_samples=1,
     )
@@ -182,16 +180,16 @@ def test_value_equivalence_loss_is_exact_value_only_raw_mse(monkeypatch):
     assert float(raw_loss) == pytest.approx(2.5)
 
 
-@pytest.mark.parametrize("horizon", [1, 6])
+@pytest.mark.parametrize("horizon", [1, 2, 3, 4, 6])
+@pytest.mark.parametrize("rho", [0.0, 0.5, 1.0])
 def test_value_equivalence_loss_uses_told_temporal_reduction(
     monkeypatch,
     horizon,
+    rho,
 ):
     model = _model(
         horizon=horizon,
-        rho=0.5,
-        temporal_loss_normalization="reference_weighted_mean",
-        temporal_loss_reference_horizon=3,
+        rho=rho,
         inner_sac_critic_target="reward_only",
         value_equivalence_loss_coef=1.0,
         value_equivalence_loss_mc_samples=1,
@@ -203,14 +201,17 @@ def test_value_equivalence_loss_uses_told_temporal_reduction(
         agent,
         value=lambda z, action: z[..., :1],
     )
-    latent_states, next_z_targets = _loss_inputs(agent, horizon=horizon)
+    latent_states, next_z_targets = _loss_inputs(
+        agent, horizon=horizon, requires_grad=True
+    )
     residual = torch.arange(
         1,
         horizon + 1,
         dtype=latent_states.dtype,
         device=latent_states.device,
     )
-    latent_states[1:, :, 0] = residual[:, None]
+    with torch.no_grad():
+        latent_states[1:, :, 0] = residual[:, None]
 
     raw_loss, per_depth = agent._value_equivalence_loss(
         latent_states,
@@ -218,17 +219,19 @@ def test_value_equivalence_loss_uses_told_temporal_reduction(
         loss_update=11,
     )
     expected_per_depth = residual.square()
-    expected_raw = td_math.reduce_temporal_loss(
-        expected_per_depth,
-        agent.cfg.rho,
-        normalization=agent.cfg.temporal_loss_normalization,
-        reference_horizon=agent.cfg.temporal_loss_reference_horizon,
-        legacy_order="vector_sum_divide",
-        weights=agent._transition_temporal_weights,
-    )
+    expected_raw = sum(
+        rho**t * expected_per_depth[t] for t in range(horizon)
+    ) / horizon
 
     torch.testing.assert_close(per_depth, expected_per_depth)
     torch.testing.assert_close(raw_loss, expected_raw)
+    raw_loss.backward()
+    expected_gradient = torch.zeros_like(latent_states)
+    for t in range(horizon):
+        expected_gradient[t + 1, :, 0] = (
+            2 * residual[t] * rho**t / (horizon * latent_states.shape[1])
+        )
+    torch.testing.assert_close(latent_states.grad, expected_gradient)
 
 
 def test_value_equivalence_loss_averages_shared_mc_probes_before_square(
@@ -315,7 +318,6 @@ def test_value_equivalence_loss_uses_configured_soft_value_probe(
         ent_coef=2.0,
         inner_temperature_mode="inherit_outer",
         inner_sac_critic_target=critic_target,
-        temporal_loss_normalization="divide_horizon",
         value_equivalence_loss_coef=1.0,
         value_equivalence_loss_mc_samples=1,
     )
@@ -362,7 +364,6 @@ def test_value_equivalence_loss_uses_fresh_inner_alpha_modes(
         inner_temperature_initialization=initialization,
         inner_temperature=0.25,
         inner_sac_critic_target="entropy_augmented",
-        temporal_loss_normalization="divide_horizon",
         value_equivalence_loss_coef=1.0,
         value_equivalence_loss_mc_samples=1,
     )
@@ -387,6 +388,68 @@ def test_value_equivalence_loss_uses_fresh_inner_alpha_modes(
     expected_loss = (0.5 * expected_alpha) ** 2
     assert float(per_depth[0]) == pytest.approx(expected_loss)
     assert float(raw_loss) == pytest.approx(expected_loss)
+
+
+@pytest.mark.parametrize("mode", ["squashed", "tdmpc2_scaled"])
+@pytest.mark.parametrize("target", ["reward_only", "entropy_augmented"])
+@pytest.mark.parametrize("q_scale", [None, 3.5])
+def test_value_equivalence_entropy_matches_targets_and_preserves_latent_gradients(
+    monkeypatch, mode, target, q_scale,
+):
+    from tests.test_ambi_value_equivalence_diagnostics import _identity_reward_decoder
+
+    model = _model(
+        ent_coef=2.0, inner_actor_entropy_mode=mode, inner_sac_critic_target=target,
+        value_equivalence_loss_coef=1.0, value_equivalence_diagnostics=True,
+        value_equivalence_mc_samples=1,
+        sac_actor_loss_scale_mode="none" if q_scale is None else "tdmpc2_percentile_range",
+    )
+    try:
+        agent = model.agent
+        agent.discount = 0.5
+        if q_scale is not None:
+            agent.actor_loss_scale.fill_(q_scale)
+        requests = []
+
+        def policy(z, **kwargs):
+            requests.append((kwargs.get("detach_policy", False), kwargs.get("include_scaled_entropy", False)))
+            info = {"log_prob": z[..., :1]}
+            if kwargs.get("include_scaled_entropy"):
+                info["scaled_entropy"] = 3.0 * z[..., :1]
+            return z[..., :1] * 0.0, info
+
+        def critic(critic, z, action, reduction, pair_indices):
+            return z[..., :1] * 0.0
+
+        monkeypatch.setattr(agent.model, "pi", policy)
+        monkeypatch.setattr(agent, "_value_equivalence_q_with_input_grad", critic)
+        monkeypatch.setattr(agent, "_value_equivalence_q", critic)
+        _identity_reward_decoder(monkeypatch)
+        latent, real = _loss_inputs(agent)
+        latent[1, :, 0] = 2.0
+        real[..., 0] = 1.0
+        latent.requires_grad_()
+        real.requires_grad_()
+        loss, _ = agent._value_equivalence_loss(latent, real, loss_update=3)
+        entropy_slope = -1.0 if mode == "squashed" else 3.0
+        error = entropy_slope * (1.0 if q_scale is None else q_scale) if target == "entropy_augmented" else 0.0
+        torch.testing.assert_close(loss, torch.tensor(error**2))
+        loss.backward()
+        torch.testing.assert_close(latent.grad[1, :, 0], torch.full((2,), error**2))
+        assert real.grad is None
+        assert all(p.grad is None for p in agent.model.parameters())
+        assert agent.log_ent_coef is None
+
+        zeros = torch.zeros(1, 2, 1)
+        metrics = agent._value_equivalence_diagnostics(
+            latent, zeros, None, real, zeros, zeros, diagnostic_update=3,
+        )
+        assert float(metrics["ve_prior_target_bias"]) == pytest.approx(error)
+        assert float(metrics["ve_prior_target_rmse"]) == pytest.approx(abs(error))
+        selected = mode == "tdmpc2_scaled" and target == "entropy_augmented"
+        assert requests == [(True, selected), (False, selected)]
+    finally:
+        model.env.close()
 
 
 @pytest.mark.parametrize(

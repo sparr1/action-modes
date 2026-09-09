@@ -72,7 +72,7 @@ def _agent_stub(mode):
     return agent
 
 
-def test_legacy_exact_target_spec_migrates_only_when_explorer_is_disabled():
+def test_historical_entropy_upgrade_does_not_invent_explorer_provenance():
     legacy = {
         "outer_critic_target": "entropy_augmented",
         "inner_sac_critic_target": "entropy_augmented",
@@ -83,7 +83,23 @@ def test_legacy_exact_target_spec_migrates_only_when_explorer_is_disabled():
     assert disabled._normalize_saved_critic_target_spec(legacy) == (
         disabled._critic_target_spec()
     )
-    assert active._normalize_saved_critic_target_spec(legacy) == legacy
+    normalized = active._normalize_saved_critic_target_spec(legacy)
+    assert normalized == disabled._critic_target_spec()
+    assert "inner_population" not in normalized
+    assert normalized != active._critic_target_spec()
+    assert "entropy_semantics" not in legacy
+
+
+def test_historical_mixture_semantics_come_from_saved_population():
+    source = _agent_stub("shared_mixture")
+    saved = source._critic_target_spec()
+    saved.pop("entropy_semantics")
+    # A different configured population must not reinterpret the saved bonus.
+    normalized = _agent_stub("separate_critics")._normalize_saved_critic_target_spec(saved)
+    assert normalized["entropy_semantics"] == {
+        "outer": "squashed_action_entropy", "inner": "squashed_mixture_entropy",
+    }
+    assert normalized == source._critic_target_spec()
 
 
 def test_exact_population_spec_records_resolved_primary_and_target_row_doses():

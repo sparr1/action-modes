@@ -74,7 +74,11 @@ class SoftWorldModel(nn.Module):
             ]
         )
 
-        self.apply(init.weight_init)
+        # Upstream's TensorDict critics retain nn.Linear's constructor samples.
+        # Preserve those samples while initializing the other modules in order.
+        for name, module in self.named_children():
+            if name != "_Qs":
+                module.apply(init.weight_init)
         init.zero_([self._reward[-1].weight] + [q[-1].weight for q in self._Qs])
 
         self._log_std_min_value = float(cfg.log_std_min)
@@ -485,8 +489,9 @@ class SoftWorldModel(nn.Module):
         log_std_min=None,
         log_std_max=None,
         log_std_mapping=None,
+        include_scaled_entropy=False,
     ):
-        """Sample a tanh-squashed action and return its corrected log-probability."""
+        """Sample once, optionally also returning literal TD-MPC2 scaled entropy."""
         mean_raw, log_std, eps = self._policy_sample(
             z,
             task,
@@ -501,16 +506,44 @@ class SoftWorldModel(nn.Module):
             log_std_mapping=log_std_mapping,
         )
         log_prob = math.gaussian_logprob(eps, log_std)
+        gaussian_log_prob = log_prob
 
         pre_tanh_action = mean_raw + eps * log_std.exp()
         mean, action, log_prob = math.squash(mean_raw, pre_tanh_action, log_prob)
-        return action, {
+        info = {
             "mean": mean,
             "pre_tanh_mean": mean_raw,
             "pre_tanh_action": pre_tanh_action,
             "log_std": log_std,
             "log_prob": log_prob,
             "entropy": -log_prob,
+        }
+        if include_scaled_entropy:
+            info["scaled_entropy"] = math.tdmpc2_scaled_entropy(
+                gaussian_log_prob, action,
+            )
+        return action, info
+
+    def pi_tdmpc2(self, z, *, policy=None, generator=None, noise=None):
+        """Native TD-MPC2 actor information, without changing SAC's policy API.
+
+        In particular, ``scaled_entropy`` uses the native pre-squash Gaussian
+        log probability times action dimension and its original ratio. It is
+        not SAC's entropy and must not be replaced with ``-log_prob``.
+        """
+        mean_raw, log_std, eps = self._policy_sample(
+            z, policy=policy, generator=generator, noise=noise,
+        )
+        log_prob = math.gaussian_logprob(eps, log_std)
+        scaled_log_prob = log_prob * eps.shape[-1]
+        pre_tanh_action = mean_raw + eps * log_std.exp()
+        mean, action, log_prob = math.squash(mean_raw, pre_tanh_action, log_prob)
+        entropy_scale = scaled_log_prob / (log_prob + 1e-8)
+        return action, {
+            "mean": mean, "pre_tanh_mean": mean_raw,
+            "pre_tanh_action": pre_tanh_action, "log_std": log_std,
+            "log_prob": log_prob, "entropy": -log_prob,
+            "scaled_entropy": -log_prob * entropy_scale,
         }
 
     @property
@@ -578,6 +611,10 @@ class SoftWorldModel(nn.Module):
             detach=detach,
             qs=qs,
         )
+        if getattr(self.cfg, "inner_operator", None) == "tdambi":
+            # Native TD-MPC2 uses exp(abs(x)) - 1, whereas AMBI's backend
+            # uses expm1. Preserve native finite-precision values for TDAMBI.
+            return math.two_hot_inv(predictions, self.cfg)
         return self.q_backend.decode(predictions)
 
     def critic_loss(self, predictions, scalar_target, *, reduction="mean"):

@@ -51,6 +51,21 @@ def test_all_configs_are_valid_json_without_duplicate_keys():
         _load_json_strict(path)
 
 
+def test_maintained_tdmpc2_and_ambi_configs_use_the_selected_temporal_discount():
+    algorithms = {"AMBITDMPC2/AMBITDMPC2", "TDMPC2/TDMPC2Baseline"}
+    seen = set()
+    for path in sorted((ROOT / "configs").rglob("*.json")):
+        config = _load_json_strict(path)
+        if config.get("alg") not in algorithms:
+            continue
+        params = config["alg_params"]
+        assert params["rho"] == 0.5, path
+        assert "temporal_loss_normalization" not in params, path
+        assert "temporal_loss_reference_horizon" not in params, path
+        seen.add(config["alg"])
+    assert seen == algorithms
+
+
 def test_legacy_move_manifests_pin_their_historical_observation_slices():
     expected_task_info = {
         "velocity_coords": [15, 21],

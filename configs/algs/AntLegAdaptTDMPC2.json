@@ -17,7 +17,7 @@
         "num_pi_trajs": 24,
         "compile": false,
         "mpc": true,
-        "rho": 0.7,
+        "rho": 0.5,
         "wandb": true,
         "wandb_project": "ambi",
         "wandb_step_every": 1000,

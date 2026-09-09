@@ -1,0 +1,29 @@
+{
+  "study_type": "single_seed_exploratory_td_ambi_prior_objective_study",
+  "study_note": "4 prior-training configurations comparing TD-AMBI reward-only versus entropy-augmented critics and fixed-temperature Q-normalized versus learned-temperature unnormalized actors. Each configuration runs one Humanoid Walk state trial with seed 55 and 2 million decisions. Prior-only collection uses the stochastic outer policy with no inner work; retain all checkpoints every 25,000 decisions. Scaled-entropy targets are explicitly -441 wherever alpha is learned, with outer alpha initialized to 1e-4. For entropy-augmented critics, the bonus is alpha*S*H_scaled when Q scaling is enabled and alpha*H_scaled otherwise. Algorithm files specify the complete learner settings; no partial alg_params override is applied. This is a single-seed exploratory study. Each completed run produces 80 scheduled checkpoints.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 2000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "td_ambi_prior_reward_qscale",
+    "td_ambi_prior_entropy_qscale",
+    "td_ambi_prior_entropy_autotemp",
+    "td_ambi_prior_reward_autotemp"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

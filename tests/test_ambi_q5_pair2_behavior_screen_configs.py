@@ -126,8 +126,8 @@ def test_q5_pair2_base_freezes_critic_alpha_and_evaluation_contracts():
     assert params["ent_coef"] == "auto"
     assert params["inner_temperature_mode"] == "auto"
     assert params["rho"] == 0.5
-    assert params["temporal_loss_normalization"] == "reference_weighted_mean"
-    assert params["temporal_loss_reference_horizon"] == 3
+    assert "temporal_loss_normalization" not in params
+    assert "temporal_loss_reference_horizon" not in params
     assert params["eval_freq"] == 50_000
     assert params["eval_value"] is True
     assert params["eval_value_samples"] == 100

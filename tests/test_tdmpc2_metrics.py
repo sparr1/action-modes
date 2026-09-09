@@ -250,6 +250,214 @@ def test_tdmpc_update_and_final_plan_diagnostics(monkeypatch):
     _assert_finite_metrics(metrics)
 
 
+def test_tdmpc_explicit_policy_mean_ignores_mpc_without_planning(monkeypatch):
+    model = _make_model(TDMPC2Baseline)
+    agent = model.agent
+    agent.cfg.mpc = True
+
+    def forbidden_plan(*_args, **_kwargs):
+        raise AssertionError("the network-policy condition must not invoke MPPI")
+
+    monkeypatch.setattr(agent, "_plan_val", forbidden_plan, raising=False)
+    observation = torch.zeros(model.cfg.obs_shape["state"])
+
+    torch.manual_seed(701)
+    action = agent.act_policy_mean(observation)
+    torch.manual_seed(701)
+    latent = agent.model.encode(observation.unsqueeze(0), None)
+    _, info = agent.model.pi(latent, None)
+
+    torch.testing.assert_close(action, info["mean"][0].cpu(), rtol=0, atol=0)
+    assert agent.last_plan_metrics == {}
+
+
+@pytest.mark.parametrize("planning_horizon", [1, 3])
+def test_tdmpc_comparison_diagnostic_reuses_root_and_policy_prior(
+    monkeypatch, planning_horizon
+):
+    model = _make_model(
+        TDMPC2Baseline,
+        params=_tiny_params(
+            num_bins=0,
+            iterations=1,
+            num_samples=8,
+            num_elites=2,
+            num_pi_trajs=2,
+            outer_planning_horizon=planning_horizon,
+        ),
+    )
+    agent = model.agent
+    encoded_roots = []
+    policy_calls = []
+    diagnostic_calls = []
+    original_encode = agent.model.encode
+    original_pi = agent.model.pi
+    original_q = agent.model.Q
+
+    def tracked_encode(obs, task):
+        latent = original_encode(obs, task)
+        encoded_roots.append(latent.detach().clone())
+        return latent
+
+    def tracked_pi(z, task):
+        action, info = original_pi(z, task)
+        policy_calls.append(info["mean"].detach().clone())
+        return action, info
+
+    def tracked_q(z, action, task, return_type="min", target=False, detach=False):
+        if target and return_type == "all":
+            diagnostic_calls.append(
+                (z.detach().clone(), action.detach().clone(), task)
+            )
+            head_offsets = torch.arange(
+                agent.cfg.num_q, device=z.device, dtype=z.dtype
+            ).view(-1, 1, 1)
+            return action.sum(dim=-1, keepdim=True).unsqueeze(0) + head_offsets
+        return original_q(
+            z,
+            action,
+            task,
+            return_type=return_type,
+            target=target,
+            detach=detach,
+        )
+
+    monkeypatch.setattr(agent.model, "encode", tracked_encode)
+    monkeypatch.setattr(agent.model, "pi", tracked_pi)
+    monkeypatch.setattr(agent.model, "Q", tracked_q)
+
+    action = agent.act_mpc(
+        torch.zeros(model.cfg.obs_shape["state"]),
+        t0=True,
+        eval_mode=True,
+        collect_comparison_diagnostics=True,
+    )
+
+    assert len(encoded_roots) == 1
+    assert len(policy_calls) == planning_horizon + agent.cfg.iterations
+    assert len(diagnostic_calls) == 1
+    root_batch, compared_actions, task = diagnostic_calls[0]
+    assert task is None
+    torch.testing.assert_close(
+        root_batch,
+        encoded_roots[0].expand(2, -1),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(compared_actions[0].cpu(), action, rtol=0, atol=0)
+    torch.testing.assert_close(
+        compared_actions[1], policy_calls[0][0], rtol=0, atol=0
+    )
+    head_offsets = torch.arange(
+        agent.cfg.num_q,
+        device=compared_actions.device,
+        dtype=compared_actions.dtype,
+    ).view(-1, 1, 1)
+    expected_values = (
+        compared_actions.sum(dim=-1, keepdim=True).unsqueeze(0) + head_offsets
+    ).mean(dim=0)
+    expected_gain = expected_values[0].mean() - expected_values[1].mean()
+    assert agent.last_plan_metrics[
+        "inner_fixed_target_q_action_gain"
+    ] == pytest.approx(float(expected_gain))
+    assert agent.last_plan_metrics["planner_model_steps"] == pytest.approx(
+        agent.cfg.num_pi_trajs * (planning_horizon - 1)
+        + agent.cfg.iterations * agent.cfg.num_samples * planning_horizon
+    )
+    assert agent.last_plan_metrics["planner_diagnostic_seconds"] >= 0.0
+    assert agent.last_plan_metrics["planner_seconds"] >= agent.last_plan_metrics[
+        "planner_diagnostic_seconds"
+    ]
+
+
+def test_tdmpc_comparison_diagnostic_preserves_action_rng_and_model_state():
+    params = _tiny_params(
+        iterations=2,
+        num_samples=8,
+        num_elites=2,
+        num_pi_trajs=2,
+    )
+    ordinary = _make_model(TDMPC2Baseline, params=params)
+    diagnostic = _make_model(TDMPC2Baseline, params=params)
+    diagnostic.agent.model.load_state_dict(ordinary.agent.model.state_dict())
+    observation = torch.zeros(ordinary.cfg.obs_shape["state"])
+
+    torch.manual_seed(811)
+    ordinary_action = ordinary.agent.act_mpc(
+        observation,
+        t0=True,
+        eval_mode=True,
+        collect_comparison_diagnostics=False,
+    )
+    ordinary_rng = torch.random.get_rng_state().clone()
+
+    torch.manual_seed(811)
+    diagnostic_action = diagnostic.agent.act_mpc(
+        observation,
+        t0=True,
+        eval_mode=True,
+        collect_comparison_diagnostics=True,
+    )
+    diagnostic_rng = torch.random.get_rng_state().clone()
+
+    torch.testing.assert_close(ordinary_action, diagnostic_action, rtol=0, atol=0)
+    torch.testing.assert_close(
+        ordinary.agent._prev_mean, diagnostic.agent._prev_mean, rtol=0, atol=0
+    )
+    assert torch.equal(ordinary_rng, diagnostic_rng)
+    ordinary_metrics = {
+        key: value
+        for key, value in ordinary.agent.last_plan_metrics.items()
+        if key != "planner_seconds"
+    }
+    diagnostic_metrics = {
+        key: value
+        for key, value in diagnostic.agent.last_plan_metrics.items()
+        if key
+        not in {
+            "planner_seconds",
+            "planner_diagnostic_seconds",
+            "planner_model_steps",
+            "inner_fixed_target_q_action_gain",
+        }
+    }
+    assert diagnostic_metrics == ordinary_metrics
+    assert {
+        "inner_fixed_target_q_action_gain",
+        "planner_model_steps",
+        "planner_diagnostic_seconds",
+    }.isdisjoint(ordinary.agent.last_plan_metrics)
+    for key, value in ordinary.agent.model.state_dict().items():
+        torch.testing.assert_close(
+            value, diagnostic.agent.model.state_dict()[key], rtol=0, atol=0
+        )
+
+
+def test_tdmpc_comparison_diagnostic_requires_policy_prior_trajectories():
+    model = _make_model(
+        TDMPC2Baseline,
+        params=_tiny_params(num_pi_trajs=0, num_samples=8, num_elites=2),
+    )
+    agent = model.agent
+    agent._prev_mean.fill_(0.25)
+    agent.last_plan_metrics = {"sentinel": 3.0}
+    rng_before = torch.random.get_rng_state().clone()
+
+    with pytest.raises(ValueError, match="num_pi_trajs > 0"):
+        agent.act_mpc(
+            torch.zeros(model.cfg.obs_shape["state"]),
+            t0=True,
+            eval_mode=True,
+            collect_comparison_diagnostics=True,
+        )
+
+    assert torch.equal(torch.random.get_rng_state(), rng_before)
+    torch.testing.assert_close(
+        agent._prev_mean, torch.full_like(agent._prev_mean, 0.25), rtol=0, atol=0
+    )
+    assert agent.last_plan_metrics == {"sentinel": 3.0}
+
+
 def test_ambi_outer_and_inner_diagnostics_are_complete():
     model = _make_model(AMBITDMPC2)
     agent = model.agent

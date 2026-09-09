@@ -42,6 +42,25 @@ ways:
   requires `latent_dim == 16 * num_channels` (the model-size-5 default is 512);
 - current official vectorized-critic checkpoints are converted on load.
 
+Fresh critics always match the initialization in the official checkout at
+`8bbc14ebabdb32ea7ada5c801dc525d0dc73bafe`. Its TensorDict critic parameters
+retain the samples drawn by each `nn.Linear` constructor, so the ordinary
+`ModuleList` critics are excluded from the global truncated-normal initializer:
+
+- hidden linear weights and every linear bias, including the output bias,
+  retain their uniform samples in `[-1/sqrt(fan_in), 1/sqrt(fan_in)]`;
+- only the final linear layer's weights are zeroed;
+- LayerNorm weights remain one and biases remain zero.
+
+This contract applies to AMBI and the local TD-MPC2 baseline across
+ensemble sizes and scalar/distributional variants, with no configuration switch.
+Other model components retain their existing initialization and order. Target
+critics and inner critics copy their source weights, and checkpoint loading
+restores saved weights without reinitializing them. Checkpoint schemas and Q
+APIs are unchanged. Fresh runs differ from the earlier ModuleList initialization,
+which applied truncated-normal critic weights and zero biases; initial Q values
+are now determined by the sampled output biases and need not be zero.
+
 The maintained port deliberately replaces upstream TD-MPC2's epsilon-floored
 tanh log-Jacobian with the exact stable pre-tanh identity. This changes policy
 log-probabilities, entropy diagnostics, and their gradients, but not sampled
@@ -50,6 +69,9 @@ this boundary is therefore a new experimental lineage, even from a loadable
 older checkpoint. Actor diagnostics report mean and maximum absolute pre-tanh
 values, the fraction beyond the former floor's `7.600902` crossover, and the
 fraction of actions rounded exactly to either tanh bound.
+AMBI's optional `tdmpc2_scaled` actor entropy statistic separately reproduces
+the upstream floored Jacobian and ratio; it leaves these stable action
+log-probabilities and diagnostics intact.
 
 Replay keeps complete overlapping RGB frame stacks as `uint8`, matching
 upstream behavior. Random-shift augmentation remains active during acting and
@@ -71,6 +93,47 @@ size 5), inner SAC, and a learned action-local entropy temperature initialized
 from the current outer temperature. Scalar twin critics, LoRA, TD3, no inner
 improvement, and persistent inner scopes are explicit ablations. The MPPI inner
 operator is a compute-matched TD-MPC-style comparator, not AMBI's planner.
+
+Outer Adam defaults match TD-MPC2: `actor_lr=critic_lr=3e-4`,
+`actor_adam_eps=1e-5`, and `adam_eps=1e-8` for world-model and critic updates,
+with betas `(0.9, 0.999)`, zero weight decay, and AMSGrad disabled. Explicit
+`actor_adam_eps` values override the default; `null` inherits `adam_eps`.
+Inner optimizer settings are configured independently.
+
+### Temporal training weights
+
+AMBI and the local TD-MPC2 baseline use the upstream temporal reductions with
+`rho=0.5` by default and in maintained presets. For training horizon `H`, each
+per-time loss has already averaged its replay batch:
+
+```text
+consistency / reward / critic = sum(rho**t * loss[t], t=0..H-1) / H
+outer actor                 = sum(rho**t * loss[t], t=0..H)   / (H+1)
+```
+
+The actor includes the terminal latent. Critic training also averages all
+ensemble heads. AMBI's optional value-equivalence loss uses the transition
+reduction above. `rho` remains configurable; there is no reference horizon or
+rescaling to hold total weight constant as `H` changes. For example, at
+`rho=0.5`, transition weights sum to `1` at `H=1`, `7/12` at `H=3`, and
+`21/64` at `H=6`. Reductions preserve each caller's existing upstream-compatible
+floating-point operation order.
+
+Runtime metadata records `temporal_loss_normalization="divide_horizon"` and
+`rho`. Historical `temporal_loss_normalization` inputs (`"divide_horizon"` or
+`"reference_weighted_mean"`) and positive `temporal_loss_reference_horizon`
+inputs are accepted with a deprecation warning, then discarded. They cannot
+select the retired algorithm, and the resolved configuration contains no
+reference horizon. This keeps historical checkpoint sidecars loadable for
+evaluation without changing saved weights or their original metadata; the
+temporal change requires no checkpoint tensor-schema migration. Exact resumes
+across the change are rejected by the existing source/configuration identity
+checks. Intentional weight transfer starts a new lineage.
+
+AMBI's temperature and behavior-regularizer reductions retain their own
+normalization and use the configured `rho`. Inner SAC minibatch losses have no
+timestep weighting. Termination BCE keeps its unweighted upstream reduction.
+The optional Q-only percentile scaling described below is unchanged.
 
 ### Critic-only LoRA-RL
 
@@ -161,6 +224,51 @@ adapter method; their saved configuration is required to identify and reject an
 obsolete active LoRA run. Portable outer-model weights remain usable for a new
 study with an explicitly selected adaptation method.
 
+### TD-AMBI training preset
+
+[`configs/dmcontrol/algs/TD-AMBI.json`](../../configs/dmcontrol/algs/TD-AMBI.json)
+and its [experiment manifest](../../configs/dmcontrol/experiments/TD-AMBI.json)
+select TD-MPC2's actor and critic loss formulas for both learners on the AMBI
+training backbone. The outer sequence losses keep upstream `rho=0.5` and
+division by the horizon. The inner learner retains AMBI's individual imagined
+transition minibatches and their ordinary means, as an explicit design choice;
+it does not adopt upstream sequence batching or its terminal-depth actor term.
+
+Both actors minimize `-mean_pair(Q) / S - 1e-4 * H_scaled`. Both critics use
+`reward + discount * (1 - terminated) * min_pair(target_Q)` as their Bellman
+target, with distributional two-hot cross entropy averaged across five heads
+and coefficient `0.1`. The actor statistic is the literal upstream scaled
+entropy helper, both policies use the smooth tanh log-standard-deviation map
+over `[-10, 2]`, and neither learner creates a temperature optimizer. Actor
+and critic learning rates are `3e-4`, their Adam epsilons are `1e-5` and `1e-8`,
+gradient clipping is `20`, and target interpolation is `0.01` each update.
+
+The preset explicitly sets `inner_critic_loss_coef=0.1`,
+`inner_actor_adam_eps=1e-5`, `inner_actor_loss_scale_update="per_update"`, and
+`inner_critic_target_initialization="outer_target"`. At each real action the
+inner target starts from the outer target critic, and the inner scale starts
+from the current outer scale. Inner scale EMA updates then use the same actor
+samples and Q values as the loss, without extra sampling or outer-state mutation.
+The default settings remain coefficient `1`, actor epsilon inherited from
+`inner_adam_eps`, scale frozen for the action, and target copied from online Q.
+Nondefault coefficient/scale/target options currently require ordinary inner
+SAC without an explorer population; outer-target initialization additionally
+requires an action-local cloned critic.
+
+The Humanoid Walk preset retains base-v2's seed 55, 14-million-decision budget,
+J=8/N=32/H=3/G=1 collection schedule, minibatch/replay sizes, action-local
+learners, and disabled evaluation and model saves. It is a single-seed
+exploratory recipe. It uses `AMBITDMPC2/AMBITDMPC2` for training.
+
+```bash
+environments/dmcontrol/.venv/bin/python main.py \
+  --run configs/dmcontrol/experiments/TD-AMBI.json \
+  --alg-dir configs/dmcontrol/algs
+```
+
+This is a full training command; submit it through the scheduled-compute
+workflow when running an experiment.
+
 ### Optional adapted-prior writeback
 
 The reference behavior keeps the outer control priors immutable during action
@@ -235,9 +343,10 @@ independently for an ablation.
 Policy optimization and critic evaluation can be ablated independently.
 `outer_critic_target` and `inner_sac_critic_target` each accept
 `"entropy_augmented"` (the default, which bootstraps with
-`Q - alpha * log_pi`) or `"reward_only"` (which bootstraps with `Q`). The
+`Q + alpha * H_selected` without Q scaling, or `Q + alpha * S * H_selected`
+with Q scaling) or `"reward_only"` (which bootstraps with `Q`). The
 reward-only setting changes only the corresponding Bellman target; it does not
-otherwise change actor sampling, the `alpha * log_pi - Q` actor loss, or the
+otherwise change actor sampling, the selected actor entropy objective, or the
 configured temperature behavior. To mirror TD-MPC2's reward-return critic in
 both places, set both fields to `"reward_only"`. Ensemble selection remains a
 separate control: `min_all` and `mean_all` use every Q head, while the `*_pair`
@@ -290,9 +399,10 @@ The active choices are `"smooth"` (a readiness-paused smoothstep ramp to
 `outer_behavior_policy_kl_coef`), `"quantile_gate"` (coefficient active only
 while the just-updated P95-P5 Q-range EMA is strictly above its threshold), and
 `"dual"` (a separately optimized log coefficient targeting
-`outer_behavior_policy_kl_target`). If actor-loss scaling is enabled, the
-entire raw SAC-plus-regularizer objective is divided by the shared Q-range
-scale. The CE objective supports `"smooth"` and `"quantile_gate"` but rejects
+`outer_behavior_policy_kl_target`). If actor-loss scaling is enabled, only
+the SAC Q term is divided by the shared Q-range scale. Entropy and the
+behavior-policy regularizer retain their coefficients. The CE objective
+supports `"smooth"` and `"quantile_gate"` but rejects
 `"dual"`, because CE has no invariant zero-valued constraint target. Active
 modes require stochastic inner SAC execution. Replay and agent states move to
 versions 2 and 5/6 respectively only while this feature is active; exact
@@ -771,12 +881,196 @@ remain in eval mode in either setting.
 
 AMBI can optionally use TD-MPC2's running P95-P5 actor-value scale through
 `sac_actor_loss_scale_mode="tdmpc2_percentile_range"` (the default is
-`"none"`). Unlike TD-MPC2's fixed-entropy policy prior, AMBI divides the entire
-soft SAC actor objective by the detached scale, so Q and the learned entropy
-coefficient remain in consistent units. The outer learner updates the scale
-from real-replay actor values; each root-local SAC solve freezes one snapshot
-for the whole action. Rewards, Bellman targets, temperature losses, TD3, and
-MPPI are not normalized by this option.
+`"none"`). It applies the scale to Q only, matching TD-MPC2's placement:
+
+```text
+S <- (1 - tau_s) * S + tau_s * max(P95(Q[0]) - P5(Q[0]), 1)
+actor objective = -alpha * H_selected - Q / stop_gradient(S)
+```
+
+The scale starts at one. Each outer actor update estimates linearly
+interpolated percentiles across the replay batch at the first latent timestep,
+using the same decoded Q values and configured ensemble reduction as the actor.
+The updated scale is used immediately at every rollout depth.
+`sac_actor_loss_scale_tau` controls `tau_s` and defaults to `0.01`, matching
+upstream's default `tau`; set it to the comparator's `tau` when that value is
+overridden. The configured AMBI actor-Q reduction remains independent of
+scaling (upstream's actor uses `mean_pair`).
+
+By default, inner SAC applies the same Q-only division, with one snapshot of
+the outer scale frozen for the whole real action. Setting
+`inner_actor_loss_scale_update="per_update"` instead updates that local snapshot
+from each actor minibatch's selected Q values before using it, with the same
+percentiles, floor and `sac_actor_loss_scale_tau`. This requires ordinary inner
+SAC without an explorer population. The local updates never modify the outer
+scale, and each new real action starts from the current outer scale again.
+Entropy and outer/inner policy regularizers in the actor objective are
+unscaled, as are rewards and reward-only Bellman targets.
+TD3 and MPPI do not use this option. The diagnostics
+`actor_effective_ent_coef` and `inner_effective_alpha` report the unchanged
+entropy coefficient appearing in the optimized objective.
+
+Q scaling requires fixed temperatures: set a positive numeric `ent_coef` and
+use `inner_temperature_mode="fixed"` or `"inherit_outer"` for active inner SAC.
+Outer `auto`/`auto_<initial>` and inner `auto` remain rejected. Ordinary SAC
+without explorers also supports entropy-augmented critics with Q scaling:
+
+```text
+critic target = r + gamma * (1 - terminated) * (Q_target + alpha * stop_gradient(S) * H_selected)
+```
+
+The critic stores raw returns, so its entropy coefficient is `alpha * S`.
+Outer targets use the current outer scale before that update's actor EMA.
+Inner targets use the current private action-local scale before the paired
+actor update; after the actor advances it, the next critic update uses the
+new local value. A `per_action` scale remains frozen throughout the solve.
+Value-equivalence probes compare fresh inner solves using the inherited outer
+scale. Coefficient-unit provenance is added to checkpoint target metadata only
+for this combination; existing reward-only and unscaled identities are unchanged.
+An adaptive scale changes the effective regularized-return objective over time,
+and the critic and actor within a pair use their respective pre/post EMA snapshots.
+
+Entropy-augmented Q scaling is rejected for explorer populations. Unused inner
+SAC settings do not restrict non-SAC operators. Percentile tracking solely for
+the behavior regularizer's `quantile_gate` schedule remains compatible with
+adaptive temperatures and entropy-augmented critics when Q scaling is off.
+
+The historical `ambi_humanoid_walk_base_percentile_normalized` algorithm preset
+and experiment manifest retain their recorded scientific settings. They combine
+Q scaling with adaptive temperatures and entropy-augmented critics, so current
+configuration validation rejects them. To start a new experiment, explicitly
+select compatible settings and a new run identity; the historical preset is
+not a supported current training recipe.
+
+Earlier versions divided the entire SAC-plus-regularizer loss by the scale.
+The checkpoint specification now records `application="q_only"`; structured
+checkpoints carrying the old application are rejected before state mutation.
+For intentional weight transfer, load the raw model state into a fresh agent,
+which resets the running scale. The existing mode name and default `"none"`
+are retained; enabling normalization is still an explicit configuration choice.
+
+### Selectable actor and critic entropy
+
+`outer_actor_entropy_mode` and `inner_actor_entropy_mode` independently select
+`"squashed"` (the default) or `"tdmpc2_scaled"` for actor and temperature
+optimization and the corresponding entropy-augmented critic. The default uses
+the existing stable squashed-action entropy sample, `H_selected = -log_pi`.
+With Q scaling off, each learner's entropy-augmented Bellman target is:
+
+```text
+y = reward + discount * (1 - terminated) * (Q_target + alpha * H_selected_next)
+```
+
+The outer critic uses the outer mode and temperature. Inner SAC uses the inner
+mode; separate critics use their own policies and temperatures. Value-equivalence
+losses and diagnostics use the inner target statistic, preserving gradients
+through predicted latents for the loss. Critic targets themselves stop gradients.
+Reward-only targets have no entropy bonus. With Q scaling enabled, the supported
+fixed-temperature entropy-augmented case uses the `alpha * S` coefficient
+described above. Action-entropy metrics and the finite-horizon prior handoff
+retain their existing definitions.
+
+In scaled mode the critic estimates returns augmented by the selected surrogate
+statistic. The manuscript's standard maximum-entropy SAC equations describe
+the default `squashed` mode; scaled entropy is an explicit experimental variant.
+
+Scaled mode uses the same Gaussian sample and action, with no additional
+policy forward or random draw. For joint pre-tanh Gaussian log-probability
+`ell_G`, normalized action `a`, and action dimension `d`, it computes the
+literal [upstream implementation](https://github.com/nicklashansen/tdmpc2/blob/8bbc14ebabdb32ea7ada5c801dc525d0dc73bafe/tdmpc2/common/world_model.py):
+
+```text
+ell_TD = ell_G - sum(log(relu(1 - a**2) + 1e-6))
+H_scaled = -ell_TD * ((d * ell_G) / (ell_TD + 1e-8))
+actor objective = -Q / S - alpha * H_selected
+temperature objective = log_alpha * stop_gradient(H_selected - H_target)
+```
+
+Gradients flow through the entire scaled expression. The implementation does
+not cancel the ratio or detach its scale. The ordinary `log_prob` and
+`actor_entropy` diagnostics remain the actual stable squashed-action quantities.
+When scaled mode is active, `actor_scaled_entropy` reports the selected
+statistic and `actor_entropy_bonus` reports `alpha * H_selected`; inner and
+explorer metrics use their existing prefixes. Outer actor losses retain the
+`rho**t / (H+1)` temporal reduction, outer temperature updates retain normalized
+temporal weights, and inner updates use minibatch means. Policy regularizers
+remain independent and unscaled.
+
+Outer `ent_coef` and the existing inner temperature settings keep their current
+meanings, initialization, and numerical floors. Automatic tuning in scaled
+mode requires an explicit numeric `target_entropy` or `inner_target_entropy`
+for that learner: `"auto"` and `"inherit_outer"` are rejected as scaled tuning
+targets. A squashed inner learner may inherit its target only from a squashed
+outer learner; when outer entropy is scaled, set `inner_target_entropy="auto"`
+for the usual inner action-entropy target, or supply a numeric inner target.
+Unused targets do not impose these restrictions on fixed coefficients.
+Coefficient inheritance copies the coefficient without converting its units.
+`inner_temperature_grad_clip_norm=null` disables inner temperature-gradient
+clipping while retaining its norm diagnostic, matching the outer temperature
+optimizer. The default remains `20.0`; finite positive thresholds retain their
+existing behavior. Explicit scaled-entropy targets are in the selected statistic's
+units; for example, the TD-AMBI objective study uses `-441` for both learned
+outer and learned inner temperatures.
+
+Scaled inner entropy supports ordinary SAC, frozen-random and adaptive
+parameter-noise Gaussian explorers, and both actors in `separate_critics`.
+It is rejected for `shared_mixture` and non-SAC operators. Selecting scaled
+outer entropy does not change the inner selection.
+
+For the fixed-coefficient TD-MPC2 outer-actor comparison, use this configuration
+alongside matching network dimensions and initialization:
+
+```json
+{
+  "outer_actor_entropy_mode": "tdmpc2_scaled",
+  "ent_coef": 0.0001,
+  "outer_q_actor_reduction": "mean_pair",
+  "num_q": 5,
+  "q_pair_size": 2,
+  "log_std_mapping": "tdmpc2_tanh",
+  "log_std_min": -10,
+  "log_std_max": 2,
+  "sac_actor_loss_scale_mode": "tdmpc2_percentile_range",
+  "sac_actor_loss_scale_tau": 0.01,
+  "rho": 0.5,
+  "actor_lr": 0.0003,
+  "actor_adam_eps": 0.00001,
+  "grad_clip_norm": 20,
+  "outer_behavior_policy_kl_schedule": "none",
+  "outer_critic_target": "reward_only",
+  "inner_sac_critic_target": "reward_only",
+  "inner_temperature_mode": "inherit_outer"
+}
+```
+
+The inner actor retains its default squashed entropy statistic and inherits the
+fixed outer coefficient. Both critics use TD-MPC2's reward-only targets.
+The outer actor architecture and objective match TD-MPC2 given matching latent
+inputs, critic values, policy noise, sampled critic heads, normalization state,
+and optimizer state. Other AMBI training and inner-loop choices remain independent;
+this recipe does not make the full algorithms equivalent. Automatic tuning of scaled entropy is an
+AMBI extension; the fixed-coefficient recipe is the TD-MPC2 comparison. Existing
+experiment presets are unchanged.
+
+Checkpoint `critic_target_spec.entropy_semantics` and resolved run metadata
+`critic_entropy` record each critic's bonus as `none`, `squashed_action_entropy`,
+`squashed_mixture_entropy`, or `tdmpc2_scaled_entropy`. Historical checkpoints
+missing these fields used squashed entropy for entropy-augmented targets, even
+when their actors selected scaled entropy. Exact resumes reject a changed critic
+entropy statistic before mutating state; portable target metadata remains
+provenance for intentional weight transfer. Checkpoint entropy specifications
+also record actor modes and temperature-target semantics.
+Scientific run identity treats missing modes and explicit
+`"squashed"` defaults equivalently. Incompatible training resumes fail during
+preflight. Loading a structured outer checkpoint permits inner-objective
+changes for evaluation, while an exact training resume checks both objectives.
+Historical missing mode metadata means `"squashed"`. Explicit raw-model weight
+transfer remains available for starting a fresh learner with a new objective.
+Evaluation matrices still apply their explicit overrides: a matrix that sets
+`inner_target_entropy="inherit_outer"` must use `"auto"` or a numeric target
+for squashed inner SAC on scaled-outer weights. For a prior-only variant that
+sets `inner_operator="none"`, use `inner_actor_entropy_mode="squashed"` if the
+saved run selected scaled inner entropy. Existing matrices are not rewritten.
 
 Model saves are suitable for evaluation and weight transfer. They do not include
 replay, environment state, or all trainer counters, so they are not exact
@@ -942,16 +1236,20 @@ and combined aggregate CSV. The paper-facing quantities are `eval/mc_value`,
 
 ### Figure 2 paired-controller protocol
 
-The online paired-controller probe measures whether action-local inner
-optimization improves control in the real environment. For each evaluation
-episode it resets independent auxiliary environments with the same explicit
-seed, then compares deterministic outer-only control against deterministic
-execution after a fresh inner SAC solve at every visited state. The primary
-quantity is the episode-paired fresh-inner-minus-outer return; the fixed-target
-root-Q action gain collected along the fresh-inner trajectory is a
-model-predicted diagnostic, not a substitute for that real return difference.
-Positive predicted gain with a negative real return delta is evidence of
-critic/model optimism or compounded distribution shift.
+The online paired-controller probe compares an unoptimized network controller
+against an online optimized controller in the real environment. For each
+evaluation episode it resets independent auxiliary environments with the same
+explicit seed. In AMBI, `outer` is deterministic outer-policy control and
+`fresh_inner` performs a fresh inner SAC solve at every visited state. In the
+TD-MPC2 baseline, the same names mean deterministic network-policy control and
+eval-mode MPC/MPPI, respectively. Keeping the metric schema identical makes the
+two methods directly comparable without relabeling plots.
+
+The primary quantity is the episode-paired fresh-inner-minus-outer return. The
+fixed-target root-Q action gain collected along the optimized-controller
+trajectory is a model-predicted diagnostic, not a substitute for that real
+return difference. Positive predicted gain with a negative real return delta
+is evidence of critic/model optimism or compounded distribution shift.
 
 Enable the observational probe with:
 
@@ -959,19 +1257,18 @@ Enable the observational probe with:
 {
   "eval_inner_comparison": true,
   "eval_inner_comparison_episodes": 5,
-  "eval_inner_comparison_seed": 12345,
-  "inner_diagnostic_rollouts": 0
+  "eval_inner_comparison_seed": 12345
 }
 ```
 
-Zero diagnostic rollouts retains the fixed-target root-Q comparison without
-adding imagined diagnostic trajectories. The probe shares the frozen outer
-model read-only, disables inner writeback, and restores private inner and
-global RNG state; it does not touch the training environment or replay. Its
-numeric outputs merge into the ordinary evaluation event. Figure-facing
-uncertainty must be aggregated across the three independent training seeds;
-within-event episode dispersion and correlated per-state Q gains are only
-diagnostics.
+AMBI configurations must additionally pin `inner_diagnostic_rollouts=0`; this
+retains the fixed-target root-Q comparison without adding imagined diagnostic
+trajectories. The TD-MPC2 probe requires state observations, `mpc=true`, and at
+least one policy-prior trajectory. Both probes preserve learner and global RNG
+state, use auxiliary environments rather than the training environment, and
+merge their numeric outputs into the ordinary evaluation event. Figure-facing
+uncertainty must be aggregated across independent training seeds; within-event
+episode dispersion and correlated per-state Q gains are only diagnostics.
 
 The paired real-control curves are
 `eval/paired_outer_episode_reward` and
@@ -984,6 +1281,15 @@ population standard deviation, extrema, linear 5/25/50/75/95 percentiles, and
 positive fraction). Optimization-only model steps per action and control time
 with diagnostic time removed are logged separately from the observational
 diagnostic cost and total paired-evaluation wall time.
+
+For TD-MPC2, the root diagnostic is the all-head mean target-critic difference
+`Q_target(z, a_mpc) - Q_target(z, a_network)`. It adds one batched critic call
+per MPC-controlled root and no diagnostic model rollout. Reported planner model
+steps count policy-prior transitions plus every candidate transition across
+the effective MPPI iterations. Enabling five fixed-seed pairs alongside the
+ordinary ten MPC evaluation episodes adds approximately 50% more evaluation-time
+planner work plus five comparatively cheap network-policy episodes; training
+compute is unchanged.
 
 The three `ambi_anchor_kl_{smooth,quantile,dual}` Humanoid Walk manifests run
 this five-episode protocol at the existing 50,000-decision cadence alongside

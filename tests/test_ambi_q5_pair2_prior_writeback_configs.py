@@ -130,10 +130,8 @@ def test_writeback_cells_freeze_q_temperature_eval_and_lifecycle_contracts():
 
         assert params["rho"] == 0.5
         assert params["train_unroll_horizon"] == 3
-        assert params["temporal_loss_normalization"] == (
-            "reference_weighted_mean"
-        )
-        assert params["temporal_loss_reference_horizon"] == 3
+        assert "temporal_loss_normalization" not in params
+        assert "temporal_loss_reference_horizon" not in params
         assert params["ent_coef"] == "auto"
         assert params["inner_temperature_mode"] == "auto"
 

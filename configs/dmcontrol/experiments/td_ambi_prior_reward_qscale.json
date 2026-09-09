@@ -1,0 +1,26 @@
+{
+  "study_type": "single_seed_exploratory_td_ambi_objective_study",
+  "study_note": "Prior-only TD-AMBI reward/Q-scale family. The persistent outer actor uses literal TD-MPC2 scaled entropy with fixed coefficient 1e-4, Q-only percentile normalization, and mean-pair Q; the distributional critic uses reward-only min-pair targets with coefficient 0.1. Collection samples the stochastic outer policy after the standard random warmup, with mpc=false and inner_operator=none. Inner compute counts are zero and inactive inner-only settings are neutralized; these neutral values do not change outer learning. All step checkpoints and adjacent metadata are retained every 25,000 decisions, including learned outer Q-scale state. All variants retain Humanoid Walk state observations, seed 55, 2 million decisions, outer batch 256, UTD=1, H=3, rho=0.5, model-size 5, and the other TD-AMBI backbone settings. Controller evaluation, paired controller evaluation, real-environment value evaluation, value-equivalence diagnostics/loss, and imagined diagnostics are disabled. This is a single-seed exploratory comparison, not confirmatory evidence. Each completed run produces 80 scheduled checkpoints.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 2000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "td_ambi_prior_reward_qscale"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

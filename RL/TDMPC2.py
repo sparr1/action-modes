@@ -23,7 +23,6 @@ from RL.tdmpc2_core.agent import TDMPC2
 from RL.tdmpc2_core.common.buffer import Buffer
 from RL.tdmpc2_core.common.checkpoint import AsyncCheckpointWriter
 from RL.tdmpc2_core.common.device import resolve_device
-from RL.tdmpc2_core.common.math import TEMPORAL_LOSS_NORMALIZATIONS
 from utils.checkpointing import (
     CheckpointTracker,
     explicit_checkpoint_target,
@@ -47,7 +46,7 @@ _DEFAULTS = {
     "value_coef": 0.1,
     "termination_coef": 1.0,
     "consistency_coef": 20.0,
-    "rho": 0.7,
+    "rho": 0.5,
     "lr": 3e-4,
     "enc_lr_scale": 0.3,
     "grad_clip_norm": 20.0,
@@ -63,6 +62,9 @@ _DEFAULTS = {
     "eval_freq": None,
     "eval_episodes": 10,
     "eval_csv_path": None,
+    "eval_inner_comparison": False,
+    "eval_inner_comparison_episodes": 5,
+    "eval_inner_comparison_seed": 12345,
 
     # planning
     "mpc": True,
@@ -76,10 +78,6 @@ _DEFAULTS = {
     "min_std": 0.05,
     "max_std": 2.0,
     "temperature": 0.5,
-
-    # temporal weighting
-    "temporal_loss_normalization": "reference_weighted_mean",
-    "temporal_loss_reference_horizon": 3,
 
     # actor / critic
     "log_std_min": -10,
@@ -130,6 +128,34 @@ def _positive_int(value, key):
     return resolved
 
 
+def _strict_bool(value, key):
+    if not isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{key} must be a boolean.")
+    return bool(value)
+
+
+def _strict_positive_int(value, key):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, np.integer)
+    ):
+        raise ValueError(f"{key} must be a positive integer.")
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"{key} must be a positive integer.")
+    return value
+
+
+def _strict_nonnegative_int(value, key):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, np.integer)
+    ):
+        raise ValueError(f"{key} must be a non-negative integer.")
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"{key} must be a non-negative integer.")
+    return value
+
+
 def _normalize_horizon_params(params, *, resolve_defaults=True):
     """Resolve canonical horizons while retaining one-release legacy support."""
     params = copy.deepcopy(params)
@@ -153,6 +179,35 @@ def _normalize_horizon_params(params, *, resolve_defaults=True):
     for key in _EXPLICIT_HORIZON_FIELDS:
         if resolve_defaults or key in params:
             params[key] = _positive_int(params.get(key, 3), key)
+    return params
+
+
+def _normalize_temporal_params(params):
+    """Accept historical sidecars without retaining their retired loss rule."""
+    params = copy.deepcopy(params)
+    legacy_fields = []
+    if "temporal_loss_normalization" in params:
+        key = "temporal_loss_normalization"
+        value = str(params.pop(key)).lower()
+        if value not in {"divide_horizon", "reference_weighted_mean"}:
+            raise ValueError(
+                "temporal_loss_normalization must be one of "
+                "['divide_horizon', 'reference_weighted_mean']."
+            )
+        legacy_fields.append(key)
+    if "temporal_loss_reference_horizon" in params:
+        key = "temporal_loss_reference_horizon"
+        _positive_int(params.pop(key), key)
+        legacy_fields.append(key)
+    if legacy_fields:
+        warnings.warn(
+            f"Legacy temporal fields {legacy_fields} are deprecated and ignored; "
+            "training always uses TD-MPC2's divide_horizon rule with the actual "
+            "number of temporal terms. Weight transfer from older training "
+            "starts a new lineage; exact continuation is not supported.",
+            FutureWarning,
+            stacklevel=3,
+        )
     return params
 
 
@@ -534,8 +589,7 @@ class TDMPC2Baseline(Algorithm):
         )
         print(
             "Temporal loss normalization:",
-            f"{self.cfg.temporal_loss_normalization} ",
-            f"(reference_horizon={self.cfg.temporal_loss_reference_horizon})",
+            f"{self.cfg.temporal_loss_normalization} (rho={self.cfg.rho})",
         )
 
         self._set_seed(self.cfg.seed)
@@ -591,6 +645,7 @@ class TDMPC2Baseline(Algorithm):
             "TDMPC2_EVAL_CSV"
         )
         self._eval_csv_initialized = False
+        self._paired_controller_evaluator = None
 
         print("Architecture:", self.agent.model)
 
@@ -735,8 +790,36 @@ class TDMPC2Baseline(Algorithm):
         self._obs_torch_dtype = torch.float32
         return observation_type, (obs_dim,)
 
+    def _validate_paired_controller_config(self, cfg, observation_type):
+        """Validate controls specific to the TD-MPC2 baseline probe."""
+
+        if not cfg["eval_inner_comparison"]:
+            return
+        if cfg["eval_freq"] is None:
+            raise ValueError(
+                "eval_inner_comparison=true requires a configured eval_freq."
+            )
+        if observation_type != "state":
+            raise ValueError(
+                "eval_inner_comparison=true currently supports state "
+                "observations only."
+            )
+        if not isinstance(cfg["mpc"], (bool, np.bool_)) or not bool(
+            cfg["mpc"]
+        ):
+            raise ValueError("eval_inner_comparison=true requires mpc=true.")
+        try:
+            cfg["num_pi_trajs"] = _strict_positive_int(
+                cfg["num_pi_trajs"], "num_pi_trajs"
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "eval_inner_comparison=true requires num_pi_trajs>0 so "
+                "MPC has policy-prior trajectories."
+            ) from exc
+
     def _build_cfg(self, params):
-        params = _normalize_horizon_params(params)
+        params = _normalize_temporal_params(_normalize_horizon_params(params))
         cfg = copy.deepcopy(_DEFAULTS)
         cfg.update(copy.deepcopy(params))
 
@@ -814,6 +897,18 @@ class TDMPC2Baseline(Algorithm):
         cfg["eval_episodes"] = _positive_int(
             cfg.get("eval_episodes", 10), "eval_episodes"
         )
+        cfg["eval_inner_comparison"] = _strict_bool(
+            cfg["eval_inner_comparison"], "eval_inner_comparison"
+        )
+        cfg["eval_inner_comparison_episodes"] = _strict_positive_int(
+            cfg["eval_inner_comparison_episodes"],
+            "eval_inner_comparison_episodes",
+        )
+        cfg["eval_inner_comparison_seed"] = _strict_nonnegative_int(
+            cfg["eval_inner_comparison_seed"],
+            "eval_inner_comparison_seed",
+        )
+        self._validate_paired_controller_config(cfg, observation_type)
         eval_csv_path = cfg.get("eval_csv_path", None)
         if eval_csv_path is not None:
             if not isinstance(eval_csv_path, (str, os.PathLike)):
@@ -826,18 +921,8 @@ class TDMPC2Baseline(Algorithm):
         cfg["rho"] = float(cfg["rho"])
         if not math.isfinite(cfg["rho"]):
             raise ValueError("rho must be finite.")
-        cfg["temporal_loss_normalization"] = str(
-            cfg["temporal_loss_normalization"]
-        ).lower()
-        if cfg["temporal_loss_normalization"] not in TEMPORAL_LOSS_NORMALIZATIONS:
-            raise ValueError(
-                "temporal_loss_normalization must be one of "
-                f"{sorted(TEMPORAL_LOSS_NORMALIZATIONS)}."
-            )
-        cfg["temporal_loss_reference_horizon"] = _positive_int(
-            cfg["temporal_loss_reference_horizon"],
-            "temporal_loss_reference_horizon",
-        )
+        # Descriptive runtime metadata, not a selectable training algorithm.
+        cfg["temporal_loss_normalization"] = "divide_horizon"
         # Read-only compatibility alias for integrations that still size outer
         # training tensors through cfg.horizon. Core code must use the canonical
         # fields so planning can differ from recurrent training.
@@ -1820,12 +1905,49 @@ class TDMPC2Baseline(Algorithm):
     def _evaluation_payload_extras(self, step):
         """Return optional metrics to merge into this evaluation event.
 
-        Subclasses can run observational probes here without adding a second
-        evaluation scheduler or a second W&B event at the same environment
-        step. The base TD-MPC2 evaluator has no extra metrics.
+        Observational probes run here without adding a second evaluation
+        scheduler or a second W&B event at the same environment step.
         """
 
-        return {}
+        del step
+        if not bool(getattr(self.cfg, "eval_inner_comparison", False)):
+            return {}
+        if self._paired_controller_evaluator is None:
+            self._paired_controller_evaluator = (
+                self._make_paired_controller_evaluator()
+            )
+        extras = self._paired_controller_evaluator.evaluate()
+        if not isinstance(extras, Mapping):
+            raise TypeError(
+                "The paired-controller evaluator must return a mapping."
+            )
+        return dict(extras)
+
+    def _make_paired_controller_evaluator(self):
+        from RL.tdmpc2_core.paired_controller_evaluation import (
+            TDMPC2PairedControllerEvaluator,
+        )
+        from utils.core import build_env
+
+        return TDMPC2PairedControllerEvaluator(
+            agent=self.agent,
+            env_factory=lambda: build_env(
+                self.run_params,
+                self.experiment_params,
+                render_mode=None,
+            ),
+            observation_to_tensor=self._obs_to_tensor,
+            unscale_action=self._unscale_action,
+            episodes=int(self.cfg.eval_inner_comparison_episodes),
+            seed=int(self.cfg.eval_inner_comparison_seed),
+            device=self.agent.device,
+        )
+
+    def close(self):
+        evaluator = getattr(self, "_paired_controller_evaluator", None)
+        self._paired_controller_evaluator = None
+        if evaluator is not None:
+            evaluator.close()
 
     def _record_evaluation(self, step, reward, *, extras=None):
         reward = float(reward)

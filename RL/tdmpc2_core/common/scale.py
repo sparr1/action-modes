@@ -1,5 +1,37 @@
+from collections.abc import Mapping
+
 import torch
 from .device import resolve_device
+
+
+def preflight_scale_state(state):
+	"""Validate a saved native Q scale before mutating an agent or evaluator.
+
+	Portable and exact-training checkpoints share this payload. The learned
+	value is a float32 singleton, bounded below by the estimator's unit floor;
+	the percentile coordinates remain the native 5th and 95th percentiles.
+	"""
+	if not isinstance(state, Mapping) or set(state) != {"value", "percentiles"}:
+		raise ValueError("Checkpoint Q scale must contain exactly 'value' and 'percentiles'.")
+	value, percentiles = state["value"], state["percentiles"]
+	if (
+		not torch.is_tensor(value)
+		or value.shape != torch.Size([1])
+		or value.dtype != torch.float32
+	):
+		raise ValueError("Checkpoint Q scale value must be a float32 tensor with shape [1].")
+	if not bool(torch.isfinite(value).all()) or not bool((value >= 1.0).all()):
+		raise ValueError("Checkpoint Q scale value must be finite and at least 1.")
+	if (
+		not torch.is_tensor(percentiles)
+		or percentiles.shape != torch.Size([2])
+		or percentiles.dtype != torch.float32
+		or not torch.equal(
+			percentiles.detach().cpu(), torch.tensor([5.0, 95.0], dtype=torch.float32)
+		)
+	):
+		raise ValueError("Checkpoint Q scale percentiles must be float32 [5, 95] with shape [2].")
+	return state
 
 
 def linear_percentiles(x, percentiles):

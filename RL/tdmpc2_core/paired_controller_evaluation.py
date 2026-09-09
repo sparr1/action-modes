@@ -1,9 +1,9 @@
-"""Isolated paired outer-versus-fresh-inner controller evaluation.
+"""Isolated, seed-paired controller evaluation for AMBI and TD-MPC2.
 
-The evaluator runs deterministic outer-only and fresh-inner AMBI episodes in
-two independently constructed environments with paired reset seeds.  It owns a
-dedicated inner engine and temporarily installs that engine on the supplied
-agent, so evaluation cannot consume or mutate the live training engine.
+Both evaluators use independent auxiliary environments and the same reset-seed
+bank.  AMBI compares its outer policy with a dedicated fresh inner engine;
+TD-MPC2 compares its deterministic network mean with fixed-seed eval-mode MPPI.
+Neither probe consumes training-environment experience or live controller RNG.
 """
 
 from __future__ import annotations
@@ -512,4 +512,297 @@ class PairedControllerEvaluator:
             raise primary_error
 
 
-__all__ = ["PairedControllerEvaluator"]
+class TDMPC2PairedControllerEvaluator(PairedControllerEvaluator):
+    """Compare TD-MPC2's network mean with fixed-seed eval-mode MPPI.
+
+    This evaluator deliberately reuses the AMBI paired environment and metric
+    contract while replacing the controller-specific paths.  ``outer`` is the
+    deterministic network-policy mean and ``fresh_inner`` is a newly reset
+    MPPI controller at every episode.  The latter name is retained so baseline
+    and AMBI events can be plotted without metric translation.
+
+    The auxiliary environments are lazy and independent.  All planner state,
+    telemetry, module modes, and process-global RNG streams are restored even
+    when an auxiliary environment or controller raises.
+    """
+
+    def __init__(
+        self,
+        agent: Any,
+        env_factory: Callable[[], Any],
+        observation_to_tensor: Callable[[Any], torch.Tensor],
+        unscale_action: Callable[[np.ndarray], Any],
+        episodes: int,
+        seed: int,
+        device: torch.device | str,
+    ) -> None:
+        if not callable(env_factory):
+            raise TypeError("env_factory must be callable.")
+        if not callable(observation_to_tensor):
+            raise TypeError("observation_to_tensor must be callable.")
+        if not callable(unscale_action):
+            raise TypeError("unscale_action must be callable.")
+        if isinstance(episodes, bool) or not isinstance(episodes, int) or episodes <= 0:
+            raise ValueError("episodes must be a positive integer.")
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise ValueError("seed must be a non-negative integer.")
+        for attribute in (
+            "act_policy_mean",
+            "act_mpc",
+            "eval",
+            "modules",
+            "reset",
+        ):
+            if not callable(getattr(agent, attribute, None)):
+                raise TypeError(f"agent must provide callable {attribute}().")
+        for attribute in (
+            "_prev_mean",
+            "last_plan_metrics",
+            "_resume_boundary_prepared",
+        ):
+            if not hasattr(agent, attribute):
+                raise TypeError(f"agent must expose {attribute}.")
+        if not torch.is_tensor(agent._prev_mean):
+            raise TypeError("agent._prev_mean must be a torch.Tensor.")
+        if not isinstance(agent._resume_boundary_prepared, bool):
+            raise TypeError("agent._resume_boundary_prepared must be bool.")
+
+        self.agent = agent
+        self.env_factory = env_factory
+        self.observation_to_tensor = observation_to_tensor
+        self.unscale_action = unscale_action
+        self.episodes = int(episodes)
+        self.seed = int(seed)
+        self.device = torch.device(device)
+        if self.device.type not in {"cpu", "cuda"}:
+            raise NotImplementedError(
+                "TD-MPC2 paired controller evaluation supports CPU and CUDA "
+                "agents only."
+            )
+
+        self._outer_env: Any | None = None
+        self._inner_env: Any | None = None
+        self._closed = False
+        self._evaluating = False
+
+    def _environment_action(self, action: Any) -> Any:
+        if not torch.is_tensor(action):
+            raise TypeError("TD-MPC2 controllers must return torch.Tensor actions.")
+        if action.numel() == 0 or not bool(torch.isfinite(action).all()):
+            raise ValueError(
+                "TD-MPC2 controllers must return non-empty finite actions."
+            )
+        normalized = action.detach().cpu().numpy()
+        env_action = self.unscale_action(normalized)
+        try:
+            array = np.asarray(env_action, dtype=np.float64)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise TypeError("unscale_action must return a numeric action.") from exc
+        if array.size == 0 or not bool(np.isfinite(array).all()):
+            raise ValueError("unscale_action must return a non-empty finite action.")
+        return env_action
+
+    def _seed_mpc_episode(self, episode: int) -> None:
+        """Restart the fixed controller RNG substream for one MPPI episode."""
+
+        controller_seed = self._seed("fresh_inner_controller", episode)
+        random.seed(controller_seed)
+        np.random.seed(controller_seed & 0xFFFFFFFF)
+        torch.manual_seed(controller_seed)
+        if self.device.type == "cuda":
+            torch.cuda.manual_seed_all(controller_seed)
+
+    def _outer_episode(self, observation: Any) -> float:
+        env = self._environment("outer")
+        episode_reward = 0.0
+        while True:
+            action = self.agent.act_policy_mean(self._observation(observation))
+            observation, reward, done = self._transition(
+                env, self._environment_action(action)
+            )
+            episode_reward = _finite_float(
+                episode_reward + reward, "outer episode reward"
+            )
+            if done:
+                return episode_reward
+
+    def _fresh_inner_episode(
+        self,
+        episode: int,
+        observation: Any,
+        q_gains: list[float],
+        model_steps: list[float],
+        control_seconds: list[float],
+        diagnostic_seconds: list[float],
+    ) -> float:
+        env = self._environment("fresh_inner")
+        # ``reset`` clears MPPI warm-start state.  Force the evaluation-local
+        # boundary flag low first so a live resume marker cannot make that reset
+        # intentionally preserve the previous training episode's state.
+        self.agent._resume_boundary_prepared = False
+        self.agent.reset()
+        self._seed_mpc_episode(episode)
+
+        episode_reward = 0.0
+        first_action = True
+        while True:
+            action = self.agent.act_mpc(
+                self._observation(observation),
+                t0=first_action,
+                eval_mode=True,
+                collect_comparison_diagnostics=True,
+            )
+            first_action = False
+            metrics = self.agent.last_plan_metrics
+            if not isinstance(metrics, dict):
+                raise TypeError("agent.last_plan_metrics must be a dictionary.")
+            for key in (
+                _Q_GAIN_KEY,
+                "planner_model_steps",
+                "planner_seconds",
+                "planner_diagnostic_seconds",
+            ):
+                if key not in metrics:
+                    raise KeyError(
+                        "TD-MPC2 paired MPC evaluation requires diagnostic "
+                        f"metric {key!r}."
+                    )
+
+            q_gains.append(_finite_float(metrics[_Q_GAIN_KEY], _Q_GAIN_KEY))
+            model_steps.append(
+                _nonnegative_float(
+                    metrics["planner_model_steps"], "planner_model_steps"
+                )
+            )
+            action_seconds = _nonnegative_float(
+                metrics["planner_seconds"], "planner_seconds"
+            )
+            diagnostics = _nonnegative_float(
+                metrics["planner_diagnostic_seconds"],
+                "planner_diagnostic_seconds",
+            )
+            control_seconds.append(max(0.0, action_seconds - diagnostics))
+            diagnostic_seconds.append(diagnostics)
+
+            observation, reward, done = self._transition(
+                env, self._environment_action(action)
+            )
+            episode_reward = _finite_float(
+                episode_reward + reward, "fresh-inner episode reward"
+            )
+            if done:
+                return episode_reward
+
+    def evaluate(self) -> dict[str, float]:
+        """Run the fixed paired bank without changing TD-MPC2 training state."""
+
+        if self._closed:
+            raise RuntimeError("TDMPC2PairedControllerEvaluator is closed.")
+        if self._evaluating:
+            raise RuntimeError(
+                "TDMPC2PairedControllerEvaluator.evaluate() is not reentrant."
+            )
+
+        self._evaluating = True
+        started = time.perf_counter()
+        rng_state = _capture_global_rng()
+        module_modes = tuple(
+            (module, bool(module.training)) for module in self.agent.modules()
+        )
+        previous_mean = self.agent._prev_mean.detach().clone()
+        previous_metrics = self.agent.last_plan_metrics
+        boundary_prepared = self.agent._resume_boundary_prepared
+        try:
+            self.agent.eval()
+
+            outer_rewards: list[float] = []
+            inner_rewards: list[float] = []
+            q_gains: list[float] = []
+            model_steps: list[float] = []
+            control_seconds: list[float] = []
+            diagnostic_seconds: list[float] = []
+            for episode in range(self.episodes):
+                outer_observation, inner_observation = (
+                    self._paired_initial_observations(episode)
+                )
+                outer_rewards.append(self._outer_episode(outer_observation))
+                inner_rewards.append(
+                    self._fresh_inner_episode(
+                        episode,
+                        inner_observation,
+                        q_gains,
+                        model_steps,
+                        control_seconds,
+                        diagnostic_seconds,
+                    )
+                )
+
+            outer_mean, outer_std = _mean_std(
+                outer_rewards, "paired outer episode rewards"
+            )
+            inner_mean, inner_std = _mean_std(
+                inner_rewards, "paired fresh-inner episode rewards"
+            )
+            deltas = [
+                inner_reward - outer_reward
+                for outer_reward, inner_reward in zip(
+                    outer_rewards, inner_rewards
+                )
+            ]
+            delta_mean, delta_std = _mean_std(
+                deltas, "paired fresh-inner-minus-outer rewards"
+            )
+            action_count = len(q_gains)
+            if not (
+                action_count
+                == len(model_steps)
+                == len(control_seconds)
+                == len(diagnostic_seconds)
+            ):
+                raise RuntimeError("Paired MPC action diagnostics became misaligned.")
+
+            metrics = {
+                "eval/paired_outer_episode_reward": outer_mean,
+                "eval/paired_outer_episode_reward_std": outer_std,
+                "eval/paired_fresh_inner_episode_reward": inner_mean,
+                "eval/paired_fresh_inner_episode_reward_std": inner_std,
+                "eval/paired_fresh_inner_minus_outer": delta_mean,
+                "eval/paired_fresh_inner_minus_outer_std": delta_std,
+                "eval/paired_fresh_inner_win_fraction": float(
+                    np.mean(np.asarray(deltas, dtype=np.float64) > 0.0)
+                ),
+                "eval/paired_episodes": float(self.episodes),
+                "eval/paired_fresh_inner_model_steps_per_action": float(
+                    np.mean(np.asarray(model_steps, dtype=np.float64))
+                ),
+                "time/paired_fresh_inner_control_seconds_per_action": float(
+                    np.mean(np.asarray(control_seconds, dtype=np.float64))
+                ),
+                "time/paired_fresh_inner_diagnostic_seconds_per_action": float(
+                    np.mean(np.asarray(diagnostic_seconds, dtype=np.float64))
+                ),
+            }
+            metrics.update(self._q_gain_metrics(q_gains))
+            metrics["time/paired_inner_comparison_seconds"] = max(
+                0.0, time.perf_counter() - started
+            )
+            return {
+                key: _finite_float(value, f"paired controller metric {key}")
+                for key, value in metrics.items()
+            }
+        finally:
+            try:
+                with torch.no_grad():
+                    self.agent._prev_mean.copy_(previous_mean)
+                self.agent.last_plan_metrics = previous_metrics
+                self.agent._resume_boundary_prepared = boundary_prepared
+                for module, was_training in module_modes:
+                    module.training = was_training
+            finally:
+                try:
+                    _restore_global_rng(rng_state)
+                finally:
+                    self._evaluating = False
+
+
+__all__ = ["PairedControllerEvaluator", "TDMPC2PairedControllerEvaluator"]

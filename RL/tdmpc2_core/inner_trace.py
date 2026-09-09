@@ -15,6 +15,17 @@ from .common import math as td_math
 _DEFINITIONS = {
     "critic_loss": "Critic training loss on the pre-update sampled minibatch.",
     "critic_grad_norm": "Critic gradient norm before gradient clipping.",
+    "critic_value_loss": "Native TD-MPC2 head-averaged distributional cross entropy before value coefficient.",
+    "actor_q_scaled_mean": "Native TD-MPC2 actor mean-pair Q divided by the updated local Q scale.",
+    "actor_native_entropy": "Native TD-MPC2 negative squashed-policy log probability; not SAC temperature.",
+    "actor_native_scaled_entropy": "Native TD-MPC2 scaled entropy including its action-dimension and entropy-ratio expression.",
+    "actor_native_entropy_contribution": "Fixed native entropy coefficient times native scaled entropy in the actor objective.",
+    "actor_q_scale_before": "Local Q scale before the actor minibatch percentile-range EMA update.",
+    "actor_q_scale_after": "Local Q scale after the actor minibatch percentile-range EMA update; used by this actor loss.",
+    "actor_q_percentile_range": "Current actor minibatch P95 minus P5 of mean-pair Q, clamped to at least one.",
+    "tdambi_entropy_coef": "Fixed native TD-MPC2 entropy coefficient; not SAC alpha.",
+    "tdambi_calibration_scale": "Initial Q scale from frozen-prior actions and frozen online mean-pair Q on first-collection replay.",
+    "tdambi_calibration_samples": "Additional replay rows, policy evaluations and Q evaluations used once for local scale initialization.",
     "td_error_abs_mean": "Mean absolute decoded TD error on the pre-update minibatch.",
     "q_mean": "Mean decoded online inner Q on the pre-update critic minibatch.",
     "q_abs_mean": "Mean absolute decoded online inner Q on the critic minibatch.",
@@ -27,6 +38,23 @@ _DEFINITIONS = {
     "actor_q_min_all": "All-head minimum Q on the actor's sampled actions.",
     "actor_q_mean_all_minus_min_all": "All-head mean-minus-minimum Q on actor samples.",
     "actor_entropy": "Mean negative squashed-policy log probability on actor samples.",
+    "actor_scaled_entropy": (
+        "Mean selected TD-MPC2 scaled-entropy statistic on the actor sample, "
+        "including the literal action-dimension and entropy-ratio expression; "
+        "this is not squashed-action entropy."
+    ),
+    "actor_entropy_bonus": (
+        "Pre-update alpha times selected entropy, averaged over the actor "
+        "minibatch and subtracted from its objective; not divided by the Q scale."
+    ),
+    "explorer_actor_scaled_entropy": (
+        "Mean selected TD-MPC2 scaled-entropy statistic on the separate "
+        "explorer actor sample; this is not squashed-action entropy."
+    ),
+    "explorer_actor_entropy_bonus": (
+        "Pre-update explorer alpha times selected entropy, averaged over its "
+        "actor minibatch and subtracted from its objective; not divided by the Q scale."
+    ),
     "actor_pre_tanh_abs_mean": "Mean absolute pre-tanh value of sampled actor actions.",
     "actor_pre_tanh_abs_max": "Maximum absolute pre-tanh value of sampled actor actions.",
     "actor_pre_tanh_abs_ge_7p6_fraction": (
@@ -102,11 +130,15 @@ def metric_catalog(metric_names=()):
             phase, axis = "post_update_fixed_probe", "round_index"
         elif name.startswith("collection_"):
             phase, axis = "post_collection", "round_index"
+        elif name.startswith("tdambi_calibration_"):
+            phase, axis = "before_first_optimizer_update", "round_index"
+        elif name == "tdambi_entropy_coef":
+            phase, axis = "initial", "round_index"
         elif name == "alpha":
             phase, axis = "initial_or_post_update_probe", "round_index"
         elif name.startswith("temperature_") or name == "alpha_used":
             phase, axis = "pre_update_minibatch", "temperature_updates"
-        elif name.startswith("actor_") or name in {"outer_policy_kl", "outer_action_l2"}:
+        elif name.startswith(("actor_", "explorer_actor_")) or name in {"outer_policy_kl", "outer_action_l2"}:
             phase, axis = "pre_update_minibatch", "actor_updates"
         else:
             phase, axis = "pre_update_minibatch", "critic_updates"
@@ -116,7 +148,11 @@ def metric_catalog(metric_names=()):
             unit = "fraction"
         elif name.endswith(("_steps", "_transitions", "_count")):
             unit = "count"
-        elif "kl" in name or name == "actor_entropy":
+        elif name in {"actor_scaled_entropy", "explorer_actor_scaled_entropy"}:
+            unit = "scaled_entropy_statistic"
+        elif name in {"actor_entropy_bonus", "explorer_actor_entropy_bonus"}:
+            unit = "objective"
+        elif "kl" in name or name in {"actor_entropy", "explorer_actor_entropy"}:
             unit = "nats"
         elif "alpha" in name and "entropy_bonus" not in name and "soft_score" not in name:
             unit = "temperature"
@@ -245,13 +281,17 @@ class InnerActionTrace:
         )
         entropy_bonus -= discount * continuation * self._alpha * info["log_prob"]
         score = reward_sum + terminal_q
-        return {
+        result = {
             "discounted_reward": reward_sum.mean(),
             "discounted_terminal_q": terminal_q.mean(),
-            "fixed_alpha_entropy_bonus": entropy_bonus.mean(),
             "predicted_score": score.mean(),
-            "fixed_alpha_soft_score": (score + entropy_bonus).mean(),
         }
+        if cfg.inner_operator != "tdambi":
+            result.update(
+                fixed_alpha_entropy_bonus=entropy_bonus.mean(),
+                fixed_alpha_soft_score=(score + entropy_bonus).mean(),
+            )
+        return result
 
     @staticmethod
     def _policy_bounds(cfg):
@@ -302,6 +342,9 @@ class InnerActionTrace:
                 "alpha": engine.alpha.detach() if inner else self._alpha,
                 "probe_model_steps": model_steps,
             }
+            if cfg.inner_operator == "tdambi":
+                metrics.pop("fixed_evaluator_alpha")
+                metrics.pop("alpha")
             for name, value in scores.items():
                 metrics[f"{name}_outer"] = self._outer_probe[name]
                 metrics[f"{name}_inner"] = value

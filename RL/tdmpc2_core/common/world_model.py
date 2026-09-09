@@ -30,7 +30,11 @@ class WorldModel(nn.Module):
 		self._termination = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 1) if cfg.episodic else None
 		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
 		self._Qs = layers.Ensemble([layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)])
-		self.apply(init.weight_init)
+		# Upstream's TensorDict critics retain nn.Linear's constructor samples.
+		# Preserve those samples while initializing the other modules in order.
+		for name, module in self.named_children():
+			if name != "_Qs":
+				module.apply(init.weight_init)
 		init.zero_([self._reward[-1].weight] + [q[-1].weight for q in self._Qs])
 
 		self.register_buffer("log_std_min", torch.tensor(cfg.log_std_min))

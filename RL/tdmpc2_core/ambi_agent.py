@@ -9,6 +9,7 @@ from .common import math as td_math
 from .common.compile_regions import CompileRegion
 from .common.checkpoint import save_checkpoint
 from .common.device import resolve_device
+from .common.entropy import critic_entropy_spec, policy_entropy
 from .common.layers import api_model_conversion
 from .common.scale import percentile_range
 from .common.soft_world_model import SoftWorldModel
@@ -75,8 +76,6 @@ class AMBITDMPC2Agent(torch.nn.Module):
             td_math.temporal_loss_weights(
                 cfg.train_unroll_horizon,
                 cfg.rho,
-                normalization=cfg.temporal_loss_normalization,
-                reference_horizon=cfg.temporal_loss_reference_horizon,
                 device=self.device,
             ),
             persistent=False,
@@ -86,8 +85,6 @@ class AMBITDMPC2Agent(torch.nn.Module):
             td_math.temporal_loss_weights(
                 cfg.train_unroll_horizon,
                 cfg.rho,
-                normalization=cfg.temporal_loss_normalization,
-                reference_horizon=cfg.temporal_loss_reference_horizon,
                 include_terminal=True,
                 device=self.device,
             ),
@@ -189,6 +186,9 @@ class AMBITDMPC2Agent(torch.nn.Module):
             foreach=self.device.type == "cuda",
         )
 
+        self._actor_entropy_mode = str(
+            getattr(cfg, "outer_actor_entropy_mode", "squashed")
+        )
         self.target_entropy = self._target_entropy(
             getattr(cfg, "target_entropy", "auto")
         )
@@ -369,7 +369,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             return None
         return {
             "mode": _ACTOR_LOSS_SCALE_MODE,
-            "application": "full_sac_actor_objective",
+            "application": "q_only",
             "source": "decoded_outer_actor_q_depth0",
             "reduction": str(self.cfg.outer_q_actor_reduction),
             "percentiles": list(_ACTOR_LOSS_SCALE_PERCENTILES),
@@ -483,12 +483,12 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "dual_min": _BEHAVIOR_POLICY_KL_DUAL_MIN,
             "dual_max": float(self.cfg.outer_behavior_policy_kl_dual_max),
             "actor_loss_scaling": (
-                "full_objective" if self.actor_loss_scale_enabled else "none"
+                "q_only" if self.actor_loss_scale_enabled else "none"
             ),
         }
         if self._behavior_policy_objective == "reverse_kl":
-            # Preserve the exact version-5/6 reverse-KL specification so
-            # existing structured checkpoints remain loadable.
+            # The scaling application above distinguishes historical full-loss
+            # scaling from Q-only scaling without changing the state schema.
             return spec
         return {
             **spec,
@@ -728,6 +728,83 @@ class AMBITDMPC2Agent(torch.nn.Module):
             policy_spec["log_std_mapping"] = mapping.lower()
         return policy_spec
 
+    @staticmethod
+    def _entropy_target_semantics(mode):
+        return (
+            "tdmpc2_scaled_entropy"
+            if mode == "tdmpc2_scaled"
+            else "squashed_action_entropy"
+        )
+
+    def _inner_entropy_spec(self):
+        mode = str(getattr(self.cfg, "inner_actor_entropy_mode", "squashed"))
+        return {
+            "actor_entropy_mode": mode,
+            "target_entropy_semantics": self._entropy_target_semantics(mode),
+            "temperature_mode": str(self.cfg.inner_temperature_mode),
+            "target_entropy_setting": self.cfg.inner_target_entropy,
+            "target_entropy": float(
+                self.inner_engine._resolved_inner_target_entropy()
+            ),
+        }
+
+    def _entropy_spec(self):
+        return {
+            "mode": "auto" if self.log_ent_coef is not None else "fixed",
+            "target_entropy": float(self.target_entropy),
+            "actor_entropy_mode": self._actor_entropy_mode,
+            "target_entropy_semantics": self._entropy_target_semantics(
+                self._actor_entropy_mode
+            ),
+            "inner": self._inner_entropy_spec(),
+        }
+
+    def _preflight_entropy_spec(self, saved, *, exact=False):
+        """Validate objectives without restricting inner evaluation adaptation.
+
+        Historical payloads use action entropy. They did not record the inner
+        target, whose other settings remain protected by exact-run identity.
+        Raw model-only transfers do not call this objective preflight.
+        """
+        configured = self._entropy_spec()
+        if saved is None:
+            # Old portable saves could omit the entropy specification entirely.
+            saved = {
+                key: value
+                for key, value in configured.items()
+                if key not in {
+                    "actor_entropy_mode", "target_entropy_semantics", "inner"
+                }
+            }
+        if not isinstance(saved, dict):
+            raise ValueError("Checkpoint entropy specification must be a mapping.")
+        saved = dict(saved)
+        saved.setdefault("actor_entropy_mode", "squashed")
+        saved.setdefault(
+            "target_entropy_semantics",
+            self._entropy_target_semantics(saved["actor_entropy_mode"]),
+        )
+        saved_inner = saved.pop("inner", None)
+        configured_inner = configured.pop("inner")
+        if saved != configured:
+            raise ValueError(
+                "Checkpoint entropy specification does not match this agent: "
+                f"checkpoint={saved}, configured={configured}."
+            )
+        if exact:
+            if saved_inner is None:
+                saved_inner = {
+                    **configured_inner,
+                    "actor_entropy_mode": "squashed",
+                    "target_entropy_semantics": "squashed_action_entropy",
+                }
+            if saved_inner != configured_inner:
+                raise ValueError(
+                    "AMBI exact training-state inner entropy specification does "
+                    "not match this agent: "
+                    f"checkpoint={saved_inner}, configured={configured_inner}."
+                )
+
     def checkpoint_state(self):
         """Return the portable checkpoint structure over live outer state."""
         state = {
@@ -735,10 +812,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "observation_spec": self.observation_signature(),
             "critic_spec": self.model.critic_signature,
             "policy_spec": self._policy_spec(),
-            "entropy_spec": {
-                "mode": "auto" if self.log_ent_coef is not None else "fixed",
-                "target_entropy": float(self.target_entropy),
-            },
+            "entropy_spec": self._entropy_spec(),
             "critic_target_spec": self._critic_target_spec(),
             "model": self.model.state_dict(),
             "optim": self.optim.state_dict(),
@@ -764,9 +838,9 @@ class AMBITDMPC2Agent(torch.nn.Module):
         spec = {
             "outer_critic_target": str(self.cfg.outer_critic_target),
             "inner_sac_critic_target": str(self.cfg.inner_sac_critic_target),
+            "entropy_semantics": critic_entropy_spec(vars(self.cfg)),
         }
-        # Preserve the feature-off checkpoint contract byte-for-byte. Active
-        # populations add their complete resolved Bellman/execution identity;
+        # Active populations add their complete resolved Bellman/execution identity;
         # their absence itself denotes the legacy single-policy controller.
         if str(getattr(self.cfg, "inner_explorer_mode", "none")) != "none":
             spec["inner_population"] = self._inner_population_spec()
@@ -777,6 +851,19 @@ class AMBITDMPC2Agent(torch.nn.Module):
         }
         if getattr(self.cfg, "inner_update_timing", "round") != "round":
             options["update_timing"] = self.cfg.inner_update_timing
+        for key, default in (
+            ("inner_critic_loss_coef", 1.0),
+            ("inner_actor_loss_scale_update", "per_action"),
+            ("inner_critic_target_initialization", "online"),
+        ):
+            value = getattr(self.cfg, key, default)
+            if value != default:
+                options[key.removeprefix("inner_")] = value
+        actor_eps = getattr(self.cfg, "inner_actor_adam_eps", None)
+        if actor_eps is not None and actor_eps != self.cfg.inner_adam_eps:
+            options["actor_adam_eps"] = float(actor_eps)
+        if getattr(self.cfg, "inner_temperature_grad_clip_norm", 20.0) is None:
+            options["temperature_gradient_clipping"] = "none"
         if getattr(self.cfg, "inner_critic_adaptation", "clone") == "lora_rl":
             # Action-local adapters are absent at checkpoint boundaries, but
             # their learning protocol must still constrain exact continuation.
@@ -937,22 +1024,16 @@ class AMBITDMPC2Agent(torch.nn.Module):
         return spec
 
     def _normalize_saved_critic_target_spec(self, spec):
-        """Upgrade exact states written before inner populations existed.
-
-        Legacy states are valid only for the disabled population mode.  In
-        that case the new settings are inert, so canonicalize them to this
-        agent's resolved disabled specification.  Active modes deliberately
-        receive no migration and fail the ordinary exact-spec comparison.
-        """
-
+        """Missing historical Bellman semantics always mean action entropy."""
         if not isinstance(spec, dict):
             return spec
-        legacy_keys = {"outer_critic_target", "inner_sac_critic_target"}
-        if (
-            set(spec) == legacy_keys
-            and str(getattr(self.cfg, "inner_explorer_mode", "none")) == "none"
-        ):
-            return spec
+        spec = dict(spec)
+        if "entropy_semantics" not in spec:
+            historical = dict(spec)
+            population = spec.get("inner_population", {})
+            if isinstance(population, dict):
+                historical["inner_explorer_mode"] = population.get("mode", "none")
+            spec["entropy_semantics"] = critic_entropy_spec(historical, historical=True)
         return spec
 
     def training_state_dict(self):
@@ -1007,6 +1088,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 {"behavior_policy_kl_spec", "behavior_policy_kl_state"}
             )
         state = require_exact_keys(state, expected_keys, "AMBI outer training state")
+        self._preflight_entropy_spec(state["entropy_spec"], exact=True)
         expected_checkpoint_version = self._checkpoint_version()
         if state["checkpoint_version"] != expected_checkpoint_version:
             raise ValueError(
@@ -1249,16 +1331,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 f"checkpoint={saved_policy_spec}, configured={configured_policy_spec}."
             )
         saved_entropy_spec = state.get("entropy_spec") if isinstance(state, dict) else None
-        configured_entropy_spec = {
-            "mode": "auto" if self.log_ent_coef is not None else "fixed",
-            "target_entropy": float(self.target_entropy),
-        }
-        if saved_entropy_spec is not None and saved_entropy_spec != configured_entropy_spec:
-            raise ValueError(
-                "Checkpoint entropy specification does not match this agent: "
-                f"checkpoint={saved_entropy_spec}, configured={configured_entropy_spec}."
-            )
         if structured_checkpoint:
+            self._preflight_entropy_spec(saved_entropy_spec)
             has_log_alpha = "log_ent_coef" in state
             has_alpha_optimizer = "ent_coef_optim" in state
             if has_log_alpha != has_alpha_optimizer:
@@ -1678,7 +1752,11 @@ class AMBITDMPC2Agent(torch.nn.Module):
     @torch.no_grad()
     def _soft_td_target(self, next_z, reward, terminated):
         """Build the outer critic target; retain the historical helper name."""
-        next_action, next_info = self.model.pi(next_z)
+        entropy_augmented = self.cfg.outer_critic_target == "entropy_augmented"
+        scaled_entropy = entropy_augmented and self._actor_entropy_mode == "tdmpc2_scaled"
+        next_action, next_info = self.model.pi(
+            next_z, **({"include_scaled_entropy": True} if scaled_entropy else {})
+        )
         next_q = self.model.Q(
             next_z,
             next_action,
@@ -1686,8 +1764,15 @@ class AMBITDMPC2Agent(torch.nn.Module):
             reduction=self.cfg.outer_q_target_reduction,
         )
         bootstrap = next_q
-        if self.cfg.outer_critic_target == "entropy_augmented":
-            bootstrap = bootstrap - self.alpha.detach() * next_info["log_prob"]
+        if entropy_augmented:
+            coefficient = self.alpha.detach()
+            if self.actor_loss_scale_enabled:
+                # Q remains in raw return units. This is the current scale,
+                # before the subsequent actor update advances its estimator.
+                coefficient = coefficient * self.actor_loss_scale.detach()
+            bootstrap = bootstrap + coefficient * policy_entropy(
+                next_info, self._actor_entropy_mode
+            )
         return reward + self.discount * (1.0 - terminated) * bootstrap
 
     def _should_run_value_equivalence_diagnostics(self):
@@ -1696,6 +1781,15 @@ class AMBITDMPC2Agent(torch.nn.Module):
             return False
         cadence = int(getattr(self.cfg, "value_equivalence_every_updates", 1000))
         return (self.num_updates + 1) % cadence == 0
+
+    def _inner_critic_entropy_kwargs(self):
+        """Request the scaled statistic only when the inner Bellman target uses it."""
+        if (
+            self.cfg.inner_sac_critic_target == "entropy_augmented"
+            and self.cfg.inner_actor_entropy_mode == "tdmpc2_scaled"
+        ):
+            return {"include_scaled_entropy": True}
+        return {}
 
     def _initial_inner_diagnostic_alpha(self):
         """Return alpha at the beginning of a fresh inner SAC solve."""
@@ -1717,10 +1811,21 @@ class AMBITDMPC2Agent(torch.nn.Module):
             f"{initialization!r}"
         )
 
+    def _initial_inner_diagnostic_entropy_coefficient(self):
+        """Raw-return entropy coefficient inherited by a fresh inner solve."""
+        coefficient = self._initial_inner_diagnostic_alpha()
+        if self.actor_loss_scale_enabled:
+            coefficient = coefficient * self.actor_loss_scale.detach()
+        return coefficient
+
     def _value_equivalence_reference_critic(self):
         """Resolve the critic used by the fresh inner Bellman target."""
         source = str(self.cfg.inner_bootstrap_source)
-        if source == "outer_target":
+        if source == "outer_target" or (
+            source == "inner_target"
+            and getattr(self.cfg, "inner_critic_target_initialization", "online")
+            == "outer_target"
+        ):
             return self.model._target_Qs
         if source in {"inner_target", "outer_online"}:
             # A fresh action-local inner target is an eval-mode hard copy of
@@ -1811,7 +1916,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         ) % (2**63 - 1)
         generator.manual_seed(seed)
 
-        alpha = self._initial_inner_diagnostic_alpha()
+        alpha = self._initial_inner_diagnostic_entropy_coefficient()
         reduction = str(self.cfg.inner_q_target_reduction)
         mc_samples = int(self.cfg.value_equivalence_loss_mc_samples)
         sampled_values = []
@@ -1836,6 +1941,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
                     log_std_min=self.cfg.inner_log_std_min,
                     log_std_max=self.cfg.inner_log_std_max,
                     detach_policy=True,
+                    **self._inner_critic_entropy_kwargs(),
                 )
                 pair_indices = (
                     self.model.q_backend.sample_pair_indices(
@@ -1854,7 +1960,9 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 bootstrap_value = next_q
                 if self.cfg.inner_sac_critic_target == "entropy_augmented":
                     bootstrap_value = (
-                        bootstrap_value - alpha * next_info["log_prob"]
+                        bootstrap_value + alpha * policy_entropy(
+                            next_info, self.cfg.inner_actor_entropy_mode
+                        )
                     )
                 sampled_values.append(bootstrap_value)
         finally:
@@ -1874,10 +1982,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         loss = td_math.reduce_temporal_loss(
             per_depth_losses,
             self.cfg.rho,
-            normalization=self.cfg.temporal_loss_normalization,
-            reference_horizon=self.cfg.temporal_loss_reference_horizon,
             legacy_order="vector_sum_divide",
-            weights=self._transition_temporal_weights,
         )
         return loss, per_depth_losses
 
@@ -1952,7 +2057,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             dtype=paired_next_z.dtype,
             device=paired_next_z.device,
         )
-        alpha = self._initial_inner_diagnostic_alpha()
+        alpha = self._initial_inner_diagnostic_entropy_coefficient()
         reduction = str(self.cfg.inner_q_target_reduction)
         mc_samples = int(self.cfg.value_equivalence_mc_samples)
         try:
@@ -1975,6 +2080,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
                     log_std_mapping=self.cfg.inner_log_std_mapping,
                     log_std_min=self.cfg.inner_log_std_min,
                     log_std_max=self.cfg.inner_log_std_max,
+                    **self._inner_critic_entropy_kwargs(),
                 )
                 pair_indices = (
                     self.model.q_backend.sample_pair_indices(
@@ -1993,7 +2099,9 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 bootstrap_value = next_q
                 if self.cfg.inner_sac_critic_target == "entropy_augmented":
                     bootstrap_value = (
-                        bootstrap_value - alpha * next_info["log_prob"]
+                        bootstrap_value + alpha * policy_entropy(
+                            next_info, self.cfg.inner_actor_entropy_mode
+                        )
                     )
                 value_sum.add_(bootstrap_value)
         finally:
@@ -2357,7 +2465,11 @@ class AMBITDMPC2Agent(torch.nn.Module):
         behavior_log_std=None,
         behavior_policy_valid=None,
     ):
-        action, policy_info = self.model.pi(zs)
+        scaled_entropy_enabled = self._actor_entropy_mode == "tdmpc2_scaled"
+        if scaled_entropy_enabled:
+            action, policy_info = self.model.pi(zs, include_scaled_entropy=True)
+        else:
+            action, policy_info = self.model.pi(zs)
         actor_saturation_metrics = {}
         # Real SoftWorldModel policy samples always expose their pre-tanh action.
         # Keep the established lightweight policy-stub seam usable in tests and
@@ -2404,8 +2516,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
         alpha = self.alpha.detach()
         entropy_coefficient_loss = torch.zeros((), device=self.device)
         if self.ent_coef_optim is not None:
+            temperature_log_prob = (
+                -policy_info["scaled_entropy"]
+                if scaled_entropy_enabled
+                else policy_info["log_prob"]
+            )
             entropy_residual_per_time = (
-                policy_info["log_prob"] + self.target_entropy
+                temperature_log_prob + self.target_entropy
             ).detach().mean(dim=(1, 2))
             # Match the actor's relative depth mixture without making the
             # temperature step size depend on horizon-level loss scaling.
@@ -2522,41 +2639,32 @@ class AMBITDMPC2Agent(torch.nn.Module):
                     float(self.cfg.outer_behavior_policy_kl_coef)
                 )
 
-        actor_objective = alpha * policy_info["log_prob"] - q_policy
+        # TD-MPC2 normalizes the actor's Q term with the just-updated,
+        # detached depth-zero scale. Entropy and policy regularizers retain
+        # their coefficients in the optimized objective.
+        actor_q = (
+            q_policy / self._actor_loss_scale_value
+            if self.actor_loss_scale_enabled
+            else q_policy
+        )
+        if scaled_entropy_enabled:
+            actor_objective = -alpha * policy_info["scaled_entropy"] - actor_q
+        else:
+            actor_objective = alpha * policy_info["log_prob"] - actor_q
         actor_per_time = actor_objective.mean(dim=(1, 2))
         sac_actor_loss = td_math.reduce_temporal_loss(
             actor_per_time,
             self.cfg.rho,
-            normalization=self.cfg.temporal_loss_normalization,
-            reference_horizon=self.cfg.temporal_loss_reference_horizon,
             include_terminal=True,
             legacy_order="vector_mean",
-            weights=self._actor_temporal_weights,
         )
         if self.behavior_policy_kl_enabled:
             actor_loss = (
                 sac_actor_loss
                 + behavior_regularizer_coefficient * behavior_regularizer
             )
-            if self.actor_loss_scale_enabled:
-                actor_loss = actor_loss / self._actor_loss_scale_value.reshape(())
         else:
-            # Preserve the historical feature-disabled ordering, including
-            # scaling before temporal reduction.
-            if self.actor_loss_scale_enabled:
-                actor_objective = actor_objective / self._actor_loss_scale_value
-                actor_per_time = actor_objective.mean(dim=(1, 2))
-                actor_loss = td_math.reduce_temporal_loss(
-                    actor_per_time,
-                    self.cfg.rho,
-                    normalization=self.cfg.temporal_loss_normalization,
-                    reference_horizon=self.cfg.temporal_loss_reference_horizon,
-                    include_terminal=True,
-                    legacy_order="vector_mean",
-                    weights=self._actor_temporal_weights,
-                )
-            else:
-                actor_loss = sac_actor_loss
+            actor_loss = sac_actor_loss
 
         self.pi_optim.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -2581,6 +2689,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "ent_coef": alpha.detach(),
             "ent_coef_loss": entropy_coefficient_loss.detach(),
         }
+        if scaled_entropy_enabled:
+            metrics["actor_scaled_entropy"] = (
+                policy_info["scaled_entropy"].detach().mean()
+            )
+            metrics["actor_entropy_bonus"] = (
+                alpha * policy_info["scaled_entropy"].detach()
+            ).mean()
         if self.log_ent_coef is not None:
             metrics["ent_coef_floor_hit"] = (
                 self.log_ent_coef.detach().reshape(())
@@ -2588,19 +2703,14 @@ class AMBITDMPC2Agent(torch.nn.Module):
             ).to(dtype=torch.float32)
         if self.actor_loss_scale_enabled:
             metrics["actor_loss_scale"] = self._actor_loss_scale_value.detach()
-            metrics["actor_effective_ent_coef"] = (
-                alpha / self._actor_loss_scale_value
-            ).detach()
+            metrics["actor_effective_ent_coef"] = alpha.detach().expand_as(
+                self._actor_loss_scale_value
+            )
         if self.behavior_policy_kl_enabled:
             behavior_metric_prefix = (
                 "behavior_policy_kl"
                 if self._behavior_policy_objective == "reverse_kl"
                 else "behavior_policy_action_ce"
-            )
-            actor_scale = (
-                self._actor_loss_scale_value.reshape(())
-                if self.actor_loss_scale_enabled
-                else behavior_regularizer.new_ones(())
             )
             metrics.update(behavior_regularizer_metrics)
             metrics.update(
@@ -2609,12 +2719,11 @@ class AMBITDMPC2Agent(torch.nn.Module):
                         behavior_regularizer_coefficient.detach()
                     ),
                     f"{behavior_metric_prefix}_effective_coefficient": (
-                        behavior_regularizer_coefficient / actor_scale
+                        behavior_regularizer_coefficient
                     ).detach(),
                     f"{behavior_metric_prefix}_weighted_loss": (
                         behavior_regularizer_coefficient
                         * behavior_regularizer
-                        / actor_scale
                     ).detach(),
                 }
             )
@@ -2690,10 +2799,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         consistency_loss = td_math.reduce_temporal_loss(
             consistency_errors,
             self.cfg.rho,
-            normalization=self.cfg.temporal_loss_normalization,
-            reference_horizon=self.cfg.temporal_loss_reference_horizon,
             legacy_order="sequential",
-            weights=self._transition_temporal_weights,
         )
 
         rollout_states = latent_states[:-1]
@@ -2715,10 +2821,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         reward_loss = td_math.reduce_temporal_loss(
             reward_per_time,
             self.cfg.rho,
-            normalization=self.cfg.temporal_loss_normalization,
-            reference_horizon=self.cfg.temporal_loss_reference_horizon,
             legacy_order="vector_sum_divide",
-            weights=self._transition_temporal_weights,
         )
         critic_per_sample = self.model.critic_loss(
             q_predictions, td_targets, reduction="none"
@@ -2729,10 +2832,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         critic_loss = td_math.reduce_temporal_loss(
             critic_per_time,
             self.cfg.rho,
-            normalization=self.cfg.temporal_loss_normalization,
-            reference_horizon=self.cfg.temporal_loss_reference_horizon,
             legacy_order="vector_sum_divide",
-            weights=self._transition_temporal_weights,
         )
 
         if self.cfg.episodic:

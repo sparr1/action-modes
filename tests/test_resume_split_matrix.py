@@ -345,6 +345,13 @@ def _active_ambi_model(
             sac_actor_loss_scale_mode=(
                 "tdmpc2_percentile_range" if actor_loss_scaling else "none"
             ),
+            **({
+                "ent_coef": 0.5,
+                "inner_temperature_mode": "inherit_outer",
+                "inner_temperature_updates_per_action": 0,
+                "outer_critic_target": "reward_only",
+                "inner_sac_critic_target": "reward_only",
+            } if actor_loss_scaling else {}),
         )
     if actor_loss_scaling:
         # Keep S observably non-unit through this tiny run so the split test
