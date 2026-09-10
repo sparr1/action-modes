@@ -58,7 +58,7 @@ def test_smoke_invokes_one_checkpoint_and_optional_timing(tmp_path, measure):
         assert calls[-1]["matrix"] == str(ROOT / "configs/research/tdambi_humanoid_inner_benchmark.json")
 
 
-@pytest.mark.parametrize("rounds", [7, 10])
+@pytest.mark.parametrize("rounds", [1, 3, 7, 10])
 def test_smoke_uses_requested_rounds_preset(tmp_path, rounds):
     env = setup_launcher(tmp_path)
     env["TDAMBI_PRESET"] = f"update_timing/step_j{rounds}_c1_a1"

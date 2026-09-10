@@ -53,6 +53,26 @@
       "reference": "step_j5_c1_a1",
       "description": "Interleave native paired updates with each vectorized imagined rollout step.",
       "variants": {
+        "step_j1_c1_a1": {
+          "description": "One round; one paired update per vector step. H3 gives 3 updates each and 1,536 imagined transitions per decision; replay capacity matches the J7/J10 rounds sweep.",
+          "alg_params": {
+            "inner_rounds": 1,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 512,
+            "inner_updates_per_round": null,
+            "inner_replay_capacity": 32768
+          }
+        },
+        "step_j3_c1_a1": {
+          "description": "Three rounds; one paired update per vector step. H3 gives 9 updates each and 4,608 imagined transitions per decision; replay capacity matches the J7/J10 rounds sweep.",
+          "alg_params": {
+            "inner_rounds": 3,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 512,
+            "inner_updates_per_round": null,
+            "inner_replay_capacity": 32768
+          }
+        },
         "step_j5_c1_a1": {
           "description": "Five rounds; one paired critic/actor update after every 512 imagined transitions (one vector step). H3 gives 15 updates each per decision.",
           "alg_params": {

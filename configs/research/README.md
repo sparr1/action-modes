@@ -24,6 +24,15 @@ decision. This uses the shared step scheduler (`inner_steps_per_update=512`)
 and calibrates the native Q scale from the first collection before updating.
 The default round-end preset remains unchanged.
 
+Select `update_timing/step_j1_c1_a1` or `update_timing/step_j3_c1_a1` for the
+smaller-round comparison. These perform 3/9 paired actor, critic and target
+updates and collect 1,536/4,608 imagined transitions per decision, respectively.
+Both retain N512, horizon three, batch512, the same native learning settings
+and one paired update per vector step. Replay capacity is 32,768, matching the
+J7/J10 rounds sweep; all populated transitions are retained. These presets
+change only the number of rounds relative to J7/J10 and leave the default
+selection unchanged.
+
 Select `update_timing/step_j5_c2_a2` for two critic→actor→target updates after
 each vector step, using `inner_steps_per_update=256`. Collection still adds
 512 transitions at once. This gives 30 critic, actor, and target updates per

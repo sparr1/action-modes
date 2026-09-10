@@ -156,7 +156,7 @@ def test_tdambi_rejects_non_native_or_unsupported_controls(override):
 
 
 @pytest.mark.parametrize("pairs_per_step", [1, 2])
-@pytest.mark.parametrize("rounds", [5, 7, 10])
+@pytest.mark.parametrize("rounds", [1, 3, 5, 7, 10])
 def test_tdambi_step_configuration_uses_native_pairs_per_vector_step(pairs_per_step, rounds):
     updates = 3 * rounds * pairs_per_step
     instance = make_tdambi(inner_update_timing="step", inner_steps_per_update=512 // pairs_per_step,
@@ -227,7 +227,7 @@ def test_checkpoint_matrix_inherits_native_settings_and_expands_budgets_and_step
     variants.extend((f"update_timing/step_j5_c{pairs}_a{pairs}", 5, 15 * pairs,
                      "step", 512 // pairs) for pairs in (1, 2))
     variants.extend((f"update_timing/step_j{rounds}_c1_a1", rounds, 3 * rounds,
-                     "step", 512) for rounds in (7, 10))
+                     "step", 512) for rounds in (1, 3, 7, 10))
     for selector, rounds, updates, timing, interval in variants:
         resolved = resolve_preset(MATRIX, selector, checkpoint_context=context)
         assert resolved["algorithm_config"]["alg"] == "TDAMBI/TDAMBI"
@@ -247,7 +247,7 @@ def test_checkpoint_matrix_inherits_native_settings_and_expands_budgets_and_step
         assert cfg.inner_rollouts_per_round == 512
         assert cfg.inner_rollout_horizon == 3
         assert cfg.inner_batch_size == 512
-        assert cfg.inner_replay_capacity == (32768 if rounds in (7, 10) else 12288)
+        assert cfg.inner_replay_capacity == (32768 if rounds in (1, 3, 7, 10) else 12288)
         assert cfg.inner_replay_capacity >= rounds * 512 * 3
         assert cfg.inner_actor_updates_per_action == cfg.inner_critic_updates_per_action == updates
         assert cfg.inner_temperature_updates_per_action == 0

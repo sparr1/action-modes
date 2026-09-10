@@ -132,7 +132,7 @@ def test_production_selects_step_preset_without_changing_episode_protocol(tmp_pa
     assert env["TDAMBI_PRESET"] in report[report.index("--title") + 1]
 
 
-@pytest.mark.parametrize("rounds", [7, 10])
+@pytest.mark.parametrize("rounds", [1, 3, 7, 10])
 def test_oscar_production_reuses_protocol_with_rounds_preset(tmp_path, rounds):
     env = launcher_environment(tmp_path, 20)
     env["TDAMBI_PRESET"] = f"update_timing/step_j{rounds}_c1_a1"
