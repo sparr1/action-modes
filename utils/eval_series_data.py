@@ -266,6 +266,10 @@ def _tdambi_planner(config, algorithm, action_rule):
         "inner_q_actor_reduction", "inner_q_target_reduction", "q_pair_size",
     )
     settings = {key: copy.deepcopy(config[key]) for key in keys if key in config}
+    entropy_mode = config.get("tdambi_entropy_mode", "native_scaled")
+    _require(entropy_mode in {"native_scaled", "squashed"}, "Unknown TDAMBI entropy mode")
+    if entropy_mode == "squashed":
+        settings["tdambi_entropy_mode"] = entropy_mode
     step_timing = config.get("inner_update_timing", "round") == "step"
     if step_timing:
         # The interval is authoritative in step mode; the resolved per-round
@@ -289,6 +293,12 @@ def _tdambi_planner(config, algorithm, action_rule):
         "scale_update": "actor_minibatch_q_range_ema_before_q_only_scaling",
         "workspace": "fresh_actor_critic_target_optimizer_replay_scale_per_decision",
     }
+    if entropy_mode == "squashed":
+        semantics.update(
+            actor_objective="-(q/scale+eta*squashed_entropy)",
+            entropy_measure="joint_action_nats_stable_pre_tanh_jacobian",
+            temperature="fixed_squashed_entropy_coefficient_no_temperature_optimizer",
+        )
     return {"type": "tdambi", "backend": algorithm, "action_rule": action_rule,
             "settings": settings, "semantics": semantics}
 
@@ -493,9 +503,11 @@ def descriptive_label(identity, selector=None):
         budget = (f"step interval{settings.get('inner_steps_per_update')}"
                   if settings.get("inner_update_timing") == "step"
                   else f"G{settings.get('inner_updates_per_round')}")
+        entropy = (f" squashed entropy eta={settings.get('tdambi_entropy_coef'):g}"
+                   if settings.get("tdambi_entropy_mode") == "squashed" else "")
         return (f"{backbone} · TDAMBI {budget} "
                 f"J{settings.get('inner_rounds')} N{settings.get('inner_rollouts_per_round')} "
-                f"H{settings.get('inner_rollout_horizon')} B{settings.get('inner_batch_size')}")
+                f"H{settings.get('inner_rollout_horizon')} B{settings.get('inner_batch_size')}{entropy}")
     if planner["type"] == "mppi":
         horizon = settings.get("horizon", settings.get("planning_horizon", settings.get("inner_rollout_horizon")))
         title = (f"MPPI H{horizon} N{settings.get('num_samples', settings.get('inner_mppi_num_samples'))} "

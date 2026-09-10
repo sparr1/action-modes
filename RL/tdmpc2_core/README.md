@@ -99,6 +99,23 @@ critic remains in evaluation mode. Native Adam defaults, actor epsilon `1e-5`,
 critic epsilon `1e-8`, clipping and target interpolation are retained. No local
 temperature optimizer is created. The real action is the adapted `tanh(mean)`.
 
+The explicit evaluation ablation `tdambi_entropy_mode="squashed"` instead
+maximizes `Q / scale + tdambi_entropy_coef * (-log pi(a | z))` on the same
+reparameterized samples. Entropy is in **joint-action nats**, summed across
+coordinates, with the stable pre-tanh Jacobian correction. This keeps a mean
+gradient even when floating-point actions have rounded to a tanh bound. The
+coefficient is fixed, finite and nonnegative; only this mode permits overriding
+the saved native coefficient. The default `native_scaled` keeps the native
+objective and coefficient-inheritance checks. This is an actor-only ablation:
+critic targets remain reward-only, policy bounds and Q scaling are preserved,
+and neither outer learning nor writeback is enabled.
+
+Both entropy estimates remain logged. `actor_entropy_contribution` records the
+selected weighted bonus; `actor_native_entropy_contribution` is emitted only
+in native mode and `actor_squashed_entropy_contribution` only in squashed mode.
+Resolved configuration, curve identity, names and tags distinguish the mode
+and coefficient. Different objectives or coefficients cannot share a curve.
+
 Native weight checkpoints omit the running scale. Before the first optimizer
 update, TDAMBI samples a reproducible minibatch from its first imagined
 collection, evaluates frozen-prior actions with frozen online average-pair Q,

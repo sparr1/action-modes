@@ -234,7 +234,9 @@ def _planner_display_label(planner, *, compact=False):
             if value is not None and (not compact or value != 3e-4):
                 parts.append(prefix + number(value))
         entropy = settings.get("tdambi_entropy_coef")
-        if entropy is not None and (not compact or entropy != 1e-4):
+        if settings.get("tdambi_entropy_mode") == "squashed":
+            parts.append("squashed entropy eta=" + ("?" if entropy is None else number(entropy)))
+        elif entropy is not None and (not compact or entropy != 1e-4):
             parts.append(("eta" if compact else "fixed native entropy eta=") + number(entropy))
         scale_tau = settings.get("tdambi_scale_tau")
         if not compact:
@@ -287,7 +289,9 @@ def _evaluation_run_tags(registry):
     identity = registry["identity"]
     planner = identity["planner"]
     if planner.get("type") == "tdambi":
-        tags += ["tdambi", "native-tdmpc2", "fixed-native-entropy", "q-only-scale"]
+        squashed = planner.get("settings", {}).get("tdambi_entropy_mode") == "squashed"
+        tags += ["tdambi", "native-tdmpc2",
+                 "fixed-squashed-entropy" if squashed else "fixed-native-entropy", "q-only-scale"]
         if identity["backbone"] == "rwgao_b-brown-university/ambi/xq3zva9u":
             tags.append("prior-only-backbone")
         dose = planner.get("settings", {}).get("inner_updates_per_round")

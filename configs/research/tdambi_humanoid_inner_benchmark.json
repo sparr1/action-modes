@@ -112,6 +112,54 @@
           }
         }
       }
+    },
+    "entropy": {
+      "reference": "native_j5",
+      "description": "Frozen-checkpoint J5/C1 squashed actor-entropy coefficient sweep. Entropy is summed over action coordinates in nats; this is not SAC training or a soft-Q target.",
+      "variants": {
+        "native_j5": {
+          "description": "Native-entropy J5/C1 reference; identical to update_timing/step_j5_c1_a1.",
+          "alg_params": {
+            "inner_rounds": 5,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 512,
+            "inner_updates_per_round": null
+          }
+        },
+        "squashed_eta1e_5": {
+          "description": "J5/C1 actor-only entropy ablation: maximize joint tanh-corrected entropy with fixed coefficient 1e-05. Reward-only critic and native Q scaling are unchanged.",
+          "alg_params": {
+            "inner_rounds": 5,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 512,
+            "inner_updates_per_round": null,
+            "tdambi_entropy_mode": "squashed",
+            "tdambi_entropy_coef": 1e-05
+          }
+        },
+        "squashed_eta1e_4": {
+          "description": "J5/C1 actor-only entropy ablation: maximize joint tanh-corrected entropy with fixed coefficient 0.0001. Reward-only critic and native Q scaling are unchanged.",
+          "alg_params": {
+            "inner_rounds": 5,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 512,
+            "inner_updates_per_round": null,
+            "tdambi_entropy_mode": "squashed",
+            "tdambi_entropy_coef": 0.0001
+          }
+        },
+        "squashed_eta1e_3": {
+          "description": "J5/C1 actor-only entropy ablation: maximize joint tanh-corrected entropy with fixed coefficient 0.001. Reward-only critic and native Q scaling are unchanged.",
+          "alg_params": {
+            "inner_rounds": 5,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 512,
+            "inner_updates_per_round": null,
+            "tdambi_entropy_mode": "squashed",
+            "tdambi_entropy_coef": 0.001
+          }
+        }
+      }
     }
   }
 }

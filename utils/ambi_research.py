@@ -17,6 +17,7 @@ from pathlib import Path
 _NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _MAX_NUMPY_SEED = 2**32 - 1
 _CHECKPOINT_RUNTIME_PARAMS = {"device", "compile", "compile_strict", "wandb"}
+_TDAMBI_INNER_PARAMS = {"tdambi_entropy_mode", "tdambi_entropy_coef"}
 
 
 class PresetMatrixError(ValueError):
@@ -69,6 +70,7 @@ def _validate_checkpoint_overrides(alg_params, run_params, location):
         key for key in alg_params
         if not key.startswith(("inner_", "wandb_"))
         and key not in _CHECKPOINT_RUNTIME_PARAMS
+        and key not in _TDAMBI_INNER_PARAMS
     ]
     forbidden_run = sorted(set(run_params) - {"device"})
     if forbidden or forbidden_run:
@@ -288,6 +290,9 @@ def resolve_preset(matrix_path, selector, matrix=None, *, checkpoint_context=Non
         selected_operator = variant.get("alg_params", {}).get(
             "inner_operator", matrix.get("shared_alg_params", {}).get("inner_operator")
         )
+        overrides = {**matrix.get("shared_alg_params", {}), **variant.get("alg_params", {})}
+        if _TDAMBI_INNER_PARAMS.intersection(overrides) and selected_operator != "tdambi":
+            raise PresetMatrixError("TDAMBI entropy overrides require the TDAMBI controller.")
         if source_algorithm == "TDMPC2/TDMPC2Baseline" and selected_operator == "tdambi":
             from RL.TDAMBI import native_evaluation_params
             algorithm_config["alg_params"] = native_evaluation_params(algorithm_config["alg_params"])

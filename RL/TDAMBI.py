@@ -18,8 +18,8 @@ from RL.tdmpc2_core.ambi_agent import AMBITDMPC2Agent
 from RL.tdmpc2_core.common.layers import api_model_conversion
 
 
-# These are fixed native semantics, not additional SAC ablations. Only the
-# canonical collection/update budget and explicitly mapped learning rates vary.
+# Native semantics shared by the default and the explicit actor-entropy ablation.
+# Squashed entropy changes only the local actor bonus, never the critic target.
 _NATIVE_CONTRACT = {
     "mpc": False,
     "q_representation": "distributional",
@@ -94,6 +94,7 @@ def native_evaluation_params(params):
     result.setdefault("inner_log_std_min", float(native["log_std_min"]))
     result.setdefault("inner_log_std_max", float(native["log_std_max"]))
     result.setdefault("tdambi_entropy_coef", float(native["entropy_coef"]))
+    result.setdefault("tdambi_entropy_mode", "native_scaled")
     result.setdefault("tdambi_value_coef", float(native["value_coef"]))
     result.setdefault("tdambi_scale_tau", float(native["tau"]))
     result.setdefault("inner_rounds", 6)
@@ -202,12 +203,16 @@ class TDAMBI(AMBITDMPC2):
                 raise ValueError("TDAMBI must preserve the native distributional Q support.")
         if params.get("q_pair_size", 2) != 2:
             raise ValueError("TDAMBI uses native random two-head critic reductions.")
+        if params["tdambi_entropy_mode"] not in {"native_scaled", "squashed"}:
+            raise ValueError("TDAMBI tdambi_entropy_mode must be 'native_scaled' or 'squashed'.")
         for key in ("tdambi_entropy_coef", "tdambi_value_coef", "tdambi_scale_tau"):
             value = float(params[key])
             if not math.isfinite(value) or value < 0 or (key == "tdambi_scale_tau" and value > 1):
                 raise ValueError(f"{key} must be finite and nonnegative (scale tau at most one).")
         for key, native_key in (("tdambi_entropy_coef", "entropy_coef"),
                                 ("tdambi_value_coef", "value_coef"), ("tdambi_scale_tau", "tau")):
+            if key == "tdambi_entropy_coef" and params["tdambi_entropy_mode"] == "squashed":
+                continue  # Explicit evaluation ablation has its own fixed coefficient.
             if params[key] != params[native_key]:
                 raise ValueError(f"TDAMBI {key} must inherit native {native_key}.")
         # Reuse the existing canonical budget/lifecycle validation. The resolved

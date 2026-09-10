@@ -102,6 +102,7 @@ def _identity(config=None):
     ("tdambi_scale_tau", .1), ("inner_adam_eps", 1e-5), ("inner_actor_adam_eps", 1e-8),
     ("inner_critic_target_tau", .1), ("inner_actor_grad_clip_norm", 10),
     ("inner_replay_sampling", "without_replacement"), ("inner_log_std_min", -20),
+    ("tdambi_entropy_mode", "squashed"),
 ])
 def test_active_native_settings_identify_tdambi_curves(key, value):
     config = _config()
@@ -126,6 +127,32 @@ def test_scales_sac_temperature_and_unused_controls_do_not_split_tdambi():
 def test_prior_planner_still_ignores_native_inner_settings():
     config = {**_config(), "inner_operator": "none"}
     assert _identity(config) == {"type": "prior", "action_rule": "tanh_mean"}
+
+
+def test_squashed_mode_has_distinct_identity_labels_and_tags(tmp_path):
+    config = _config()
+    native = _identity(config)
+    config["tdambi_entropy_mode"] = "native_scaled"
+    assert _identity(config) == native  # Explicit default preserves existing planner identity.
+    config["tdambi_entropy_mode"] = "squashed"
+    squashed = _identity(config)
+    assert squashed != native
+    assert squashed["semantics"]["critic_target"] == native["semantics"]["critic_target"]
+    assert squashed["semantics"]["actor_objective"] == "-(q/scale+eta*squashed_entropy)"
+    identity = {"backbone": SOURCE, "planner": squashed, "protocol": storage.protocol_for(_resolved(), 12345, 500),
+                "science": {"algorithm": "TDAMBI/TDAMBI", "source_sha256": "test"}}
+    registry = {"run_id": "abcd1234", "attempt_label": "entropy", "identity": identity}
+    for label in (data.descriptive_label(identity), series.evaluation_run_name(registry),
+                  series.concise_curve_label(registry)):
+        assert "squashed entropy eta=0.0001" in label
+        assert "native entropy" not in label
+    assert "fixed-squashed-entropy" in series._evaluation_run_tags(registry)
+    assert "fixed-native-entropy" not in series._evaluation_run_tags(registry)
+    run = series.create_run(tmp_path / "registry", {"identity": identity, "label": data.descriptive_label(identity)},
+                            "entropy", "eval", "entity", "owner")
+    for planner in (native, _identity({**config, "tdambi_entropy_coef": 1e-3})):
+        with pytest.raises(series.SeriesError, match="Incompatible append"):
+            series.validate_identity(run, {**identity, "planner": planner})
 
 
 def test_tdambi_new_attempts_and_append_require_matching_behavior(tmp_path):
@@ -180,7 +207,8 @@ def test_tdambi_step_identity_and_legends_preserve_round_identity():
 
 
 @pytest.mark.parametrize("timing", ["round", "step"])
-def test_resolved_tdambi_preflight_matches_executed_configuration(native_reference, monkeypatch, timing):
+@pytest.mark.parametrize("entropy_mode", ["native_scaled", "squashed"])
+def test_resolved_tdambi_preflight_matches_executed_configuration(native_reference, monkeypatch, timing, entropy_mode):
     import gymnasium as gym
     from RL.TDAMBI import TDAMBI
 
@@ -193,6 +221,9 @@ def test_resolved_tdambi_preflight_matches_executed_configuration(native_referen
               "wandb": False, "inner_rounds": 1, "inner_rollouts_per_round": 4,
               "inner_rollout_horizon": 1, "inner_updates_per_round": 1,
               "inner_batch_size": 4, "inner_replay_capacity": 8, "inner_diagnostics_every": 1}
+    params["tdambi_entropy_mode"] = entropy_mode
+    if entropy_mode == "squashed":
+        params["tdambi_entropy_coef"] = 1e-3
     if timing == "step":
         params.update(inner_update_timing="step", inner_steps_per_update=4,
                       inner_updates_per_round=None)
@@ -211,7 +242,7 @@ def test_resolved_tdambi_preflight_matches_executed_configuration(native_referen
              "metadata": native_reference[1]}, resolved, storage.protocol_for(resolved, 12345, 2),
             [101, 102], {"commit": "b" * 40}, path=native_reference[0], env=env)
         assert actual["planner"] == expected
-        assert expected["settings"]["tdambi_entropy_coef"] == params.get("entropy_coef", 1e-4)
+        assert expected["settings"]["tdambi_entropy_coef"] == params.get("tdambi_entropy_coef", 1e-4)
         assert "inner_temperature" not in expected["settings"]
     finally:
         env.close()

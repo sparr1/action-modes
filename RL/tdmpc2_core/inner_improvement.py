@@ -4113,7 +4113,7 @@ class InnerImprovementEngine:
         }
 
     def _tdambi_actor_step(self, batch):
-        """Native fixed-entropy actor update after its same-batch critic step."""
+        """Fixed-entropy actor update after its same-batch reward-only critic step."""
         state, cfg = self.state, self.cfg
         z = batch["z"].detach()
         action, info = self.model.pi_tdmpc2(
@@ -4129,7 +4129,9 @@ class InnerImprovementEngine:
             robust_range = percentile_range(q.detach(), q.new_tensor([5.0, 95.0]))
             state.tdambi_scale.lerp_(robust_range, float(cfg.tdambi_scale_tau))
         scaled_q = q / state.tdambi_scale
-        entropy_contribution = float(cfg.tdambi_entropy_coef) * info["scaled_entropy"]
+        squashed_entropy = getattr(cfg, "tdambi_entropy_mode", "native_scaled") == "squashed"
+        entropy = info["entropy" if squashed_entropy else "scaled_entropy"]
+        entropy_contribution = float(cfg.tdambi_entropy_coef) * entropy
         actor_loss = -(scaled_q + entropy_contribution).mean()
         state.actor_optim.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -4153,7 +4155,9 @@ class InnerImprovementEngine:
             "actor_q_mean_all_minus_min_all": (mean_q - min_q).mean(),
             "actor_native_entropy": info["entropy"].detach().mean(),
             "actor_native_scaled_entropy": info["scaled_entropy"].detach().mean(),
-            "actor_native_entropy_contribution": entropy_contribution.detach().mean(),
+            "actor_entropy_contribution": entropy_contribution.detach().mean(),
+            ("actor_squashed_entropy_contribution" if squashed_entropy
+             else "actor_native_entropy_contribution"): entropy_contribution.detach().mean(),
             "actor_q_scale_before": before.reshape(()),
             "actor_q_scale_after": state.tdambi_scale.detach().clone().reshape(()),
             "actor_q_percentile_range": robust_range.reshape(()),
@@ -6383,6 +6387,9 @@ class InnerImprovementEngine:
                     and key != "inner_target_entropy"
                 }
                 metrics["inner_tdambi_entropy_coef"] = float(self.cfg.tdambi_entropy_coef)
+                metrics["inner_tdambi_squashed_entropy_enabled"] = float(
+                    getattr(self.cfg, "tdambi_entropy_mode", "native_scaled") == "squashed"
+                )
                 count = self.state.tdambi_calibration_samples
                 metrics["inner_tdambi_calibration_samples"] = float(count)
                 metrics["inner_tdambi_calibration_policy_evaluations"] = float(count)

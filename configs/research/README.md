@@ -55,6 +55,23 @@ launcher also accepts `TDAMBI_PRESET`, defaulting to the original round-end
 preset. Give different planner settings separate output roots and explicitly
 created curve registries.
 
+For the J5/C1 actor-entropy ablation, select `entropy/squashed_eta1e_5`,
+`entropy/squashed_eta1e_4`, or `entropy/squashed_eta1e_3`. These use the joint
+tanh-corrected entropy with fixed coefficients `1e-5`, `1e-4`, and `1e-3`;
+`entropy/native_j5` is exactly the existing `update_timing/step_j5_c1_a1`
+reference. The default preset is unchanged. All four retain J5/N512/H3/B512,
+replay capacity 12,288, 15 paired updates, native learning rates, reward-only
+critic targets and the same per-decision resets. No retraining is involved.
+The coefficient grid spans two orders of magnitude because native scaled
+entropy and joint squashed entropy have different scales; it does not claim
+to match their gradient strengths. Compare paired returns and saturation as
+well as entropy. The episode entropy diagnostics average samples over each
+controller's changing visited/imagined states, not a fixed observation bank.
+
+Each coefficient requires its own explicitly created curve. Existing native
+J5 results can be used for comparison after a default-behavior compatibility
+check; do not append the new implementation to an older scientific identity.
+
 The Hydra launcher accepts `TDAMBI_PRESET` and array indices 2–20 for the
 100k–1M checkpoint grid. It requests one GPU per checkpoint from the L40S/A6000 pool with no array
 throttle or fixed node, so pending checkpoints can use either node as slots

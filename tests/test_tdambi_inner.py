@@ -37,6 +37,7 @@ def _tdambi_model(**overrides):
     model = _tiny_model(**params)
     cfg = model.cfg
     cfg.inner_operator = "tdambi"
+    cfg.tdambi_entropy_mode = overrides.get("tdambi_entropy_mode", "native_scaled")
     cfg.tdambi_entropy_coef = 0.001
     cfg.tdambi_value_coef = 0.1
     cfg.tdambi_scale_tau = 0.03
@@ -120,8 +121,9 @@ def test_native_policy_information_and_saved_q_match_without_updates(action_dim)
 
 
 @pytest.mark.parametrize("dropout,num_q", [(0.0, 3), (0.25, 3), (0.25, 2)])
-def test_paired_update_matches_native_reference_and_optimizer_state(dropout, num_q):
-    holder = _tdambi_model(dropout=dropout, num_q=num_q)
+@pytest.mark.parametrize("entropy_mode", ["native_scaled", "squashed"])
+def test_paired_update_matches_native_reference_and_optimizer_state(dropout, num_q, entropy_mode):
+    holder = _tdambi_model(dropout=dropout, num_q=num_q, tdambi_entropy_mode=entropy_mode)
     engine = holder.agent.inner_engine
     cfg = holder.cfg
     try:
@@ -168,7 +170,8 @@ def test_paired_update_matches_native_reference_and_optimizer_state(dropout, num
                     action, info = native.pi(batch["z"], None)
                 qs = native.Q(batch["z"], action, None, return_type="avg", detach=True)
                 scale.update(qs)
-                actor_loss = -(scale(qs) + cfg.tdambi_entropy_coef * info["scaled_entropy"]).mean()
+                entropy_key = "entropy" if entropy_mode == "squashed" else "scaled_entropy"
+                actor_loss = -(scale(qs) + cfg.tdambi_entropy_coef * info[entropy_key]).mean()
                 actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(native._pi.parameters(), cfg.inner_actor_grad_clip_norm)
                 actor_optim.step()
@@ -198,6 +201,35 @@ def test_paired_update_matches_native_reference_and_optimizer_state(dropout, num
         holder.env.close()
 
 
+def test_squashed_actor_bonus_moves_fully_saturated_means_toward_interior():
+    holder = _tdambi_model(tdambi_entropy_mode="squashed", dropout=0.0)
+    try:
+        engine = holder.agent.inner_engine
+        dim = holder.cfg.action_dim
+        with torch.no_grad():
+            holder.agent.model._pi[-1].weight.zero_()
+            holder.agent.model._pi[-1].bias[:dim].fill_(100.)
+        with engine.rng.action_fork():
+            engine._prepare_workspace(t0=True)
+            root = holder.agent.model.encode(torch.zeros(1, 3)).detach()
+            engine._collect_round(root)
+            engine._calibrate_tdambi_scale()
+            batch = engine._sample_batch()
+            actor = engine.state.actor
+            before = actor[-1].bias[:dim].detach().clone()
+            with engine.rng.fork("gradient_policy"):
+                metrics = engine._tdambi_actor_step(batch)
+        assert metrics["actoraction_exact_saturation_fraction"] == 1
+        assert torch.isfinite(metrics["actor_loss"])
+        assert metrics["actor_native_entropy"] < -100 * dim
+        assert "actor_native_entropy_contribution" not in metrics
+        torch.testing.assert_close(metrics["actor_squashed_entropy_contribution"],
+                                   holder.cfg.tdambi_entropy_coef * metrics["actor_native_entropy"])
+        assert torch.all(actor[-1].bias[:dim] < before)
+    finally:
+        holder.env.close()
+
+
 def _snapshot(holder):
     engine = holder.agent.inner_engine
     return {
@@ -210,19 +242,20 @@ def _snapshot(holder):
 
 @pytest.mark.parametrize("probes", [False, True])
 @pytest.mark.parametrize("timing", ["round", "step"])
+@pytest.mark.parametrize("entropy_mode", ["native_scaled", "squashed"])
 @pytest.mark.parametrize("device", [
     "cpu", pytest.param("cuda", marks=pytest.mark.skipif(
         not torch.cuda.is_available(), reason="CUDA unavailable",
     )),
 ])
-def test_trace_non_interference_with_dropout_and_round_fidelity(probes, device, timing):
+def test_trace_non_interference_with_dropout_and_round_fidelity(probes, device, timing, entropy_mode):
     options = ({"inner_update_timing": "step", "inner_steps_per_update": 3,
                 "inner_updates_per_round": None, "inner_rounds": 5,
                 "inner_rollout_horizon": 3, "train_unroll_horizon": 3,
                 "inner_replay_capacity": 45}
                if timing == "step" else {})
-    ordinary = _tdambi_model(dropout=0.25, device=device, **options)
-    observed = _tdambi_model(dropout=0.25, device=device, **options)
+    ordinary = _tdambi_model(dropout=0.25, device=device, tdambi_entropy_mode=entropy_mode, **options)
+    observed = _tdambi_model(dropout=0.25, device=device, tdambi_entropy_mode=entropy_mode, **options)
     try:
         rng = torch.random.get_rng_state().clone()
         cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []

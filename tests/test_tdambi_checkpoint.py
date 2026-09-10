@@ -270,6 +270,59 @@ def test_tdambi_matrix_rejects_ambi_backbone_and_architecture_override(tmp_path)
         resolve_preset(MATRIX, "inner_budget/tdambi_3", matrix, checkpoint_context=context)
 
 
+@pytest.mark.parametrize("label,coefficient", [("1e_5", 1e-5), ("1e_4", 1e-4), ("1e_3", 1e-3)])
+def test_squashed_entropy_presets_change_only_local_actor_bonus(tmp_path, label, coefficient):
+    context = _native_context(tmp_path)
+    baseline = resolve_preset(MATRIX, "update_timing/step_j5_c1_a1", checkpoint_context=context)
+    reference = resolve_preset(MATRIX, "entropy/native_j5", checkpoint_context=context)
+    assert reference["algorithm_config"] == baseline["algorithm_config"]
+    selected = resolve_preset(MATRIX, f"entropy/squashed_eta{label}", checkpoint_context=context)
+    params = selected["algorithm_config"]["alg_params"]
+    before = baseline["algorithm_config"]["alg_params"]
+    assert {key for key in params if params[key] != before[key]} == {
+        "tdambi_entropy_mode", "tdambi_entropy_coef"}
+    holder = make_tdambi(**{**params, "inner_updates_per_round": None})
+    try:
+        cfg = holder.cfg
+        assert cfg.tdambi_entropy_mode == "squashed"
+        assert cfg.tdambi_entropy_coef == coefficient
+        assert cfg.entropy_coef == 0.0003  # Saved outer training setting is retained.
+        assert cfg.inner_actor_updates_per_action == cfg.inner_critic_updates_per_action == 15
+        assert cfg.inner_model_step_budget == 7680
+        assert cfg.inner_temperature_updates_per_action == 0
+        assert cfg.inner_sac_critic_target == "reward_only"
+    finally:
+        holder.env.close()
+
+
+@pytest.mark.parametrize("overrides", [
+    {"tdambi_entropy_mode": "unknown"},
+    {"tdambi_entropy_mode": "native_scaled", "tdambi_entropy_coef": 1e-3},
+    {"tdambi_entropy_mode": "squashed", "tdambi_entropy_coef": -1.},
+    {"tdambi_entropy_mode": "squashed", "tdambi_entropy_coef": float("nan")},
+    {"tdambi_entropy_mode": "squashed", "tdambi_entropy_coef": float("inf")},
+    {"tdambi_entropy_mode": "squashed", "tdambi_value_coef": 1.},
+])
+def test_entropy_ablation_rejects_invalid_or_unrelated_changes(overrides):
+    env = gym.make("Pendulum-v1", max_episode_steps=5)
+    instance = object.__new__(TDAMBI)
+    instance.env, instance.run_params = env, {"device": "cpu"}
+    try:
+        with pytest.raises(ValueError, match="TDAMBI|tdambi_"):
+            instance._build_cfg({**tiny_native_params(), **overrides})
+    finally:
+        env.close()
+
+
+def test_tdambi_entropy_overrides_are_rejected_for_sac(tmp_path):
+    context = _native_context(tmp_path)
+    context.trial_run_params["alg"] = "AMBITDMPC2/AMBITDMPC2"
+    matrix = load_preset_matrix(MATRIX)
+    matrix["shared_alg_params"]["inner_operator"] = "sac"
+    with pytest.raises(PresetMatrixError, match="entropy overrides require the TDAMBI"):
+        resolve_preset(MATRIX, "entropy/squashed_eta1e_4", matrix, checkpoint_context=context)
+
+
 def test_tdambi_evaluator_saves_frozen_bundle_and_native_provenance(tmp_path, monkeypatch):
     import gzip
     from evaluate_ambi_checkpoint import evaluate_matrix
