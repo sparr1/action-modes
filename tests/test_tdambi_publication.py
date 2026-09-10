@@ -206,6 +206,25 @@ def test_tdambi_step_identity_and_legends_preserve_round_identity():
     assert "step interval512" in data.descriptive_label(registry["identity"])
 
 
+@pytest.mark.parametrize("dose", [2, 5, 10])
+def test_outer_tail_integer_dose_labels_use_exact_decimal_intervals(dose):
+    config = _config()
+    config.update(inner_update_timing="step", inner_steps_per_update=512 / dose,
+                  inner_updates_per_round=None, inner_rounds=5, inner_finite_horizon=True,
+                  mppi_terminal_q_reduction="mean_pair")
+    selected = _identity(config)
+    registry = {"run_id": "abcd1234", "attempt_label": "outer-tail-dose",
+                "identity": {"planner": selected, "backbone": SOURCE,
+                             "science": {"algorithm": "TDAMBI/TDAMBI"}}}
+    assert series.concise_curve_label(registry) == (
+        f"TD-MPC2 · TDAMBI outer rollout tail C{dose}/A{dose} per step J5 · #abcd")
+    assert selected["semantics"]["target_initialization"] == "saved_outer_target"
+    assert selected["settings"]["inner_finite_horizon"]
+    config["inner_steps_per_update"] = 300
+    registry["identity"]["planner"] = _identity(config)
+    assert "step interval300" in series.concise_curve_label(registry)
+
+
 @pytest.mark.parametrize("rollouts", [256, 128, 64])
 def test_tdambi_rollout_curve_identity_and_label_retain_fixed_batch_and_update_dose(rollouts):
     config = _config()

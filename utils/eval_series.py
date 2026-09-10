@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from fractions import Fraction
 import fcntl
 import hashlib
 import json
@@ -219,8 +220,11 @@ def _planner_display_label(planner, *, compact=False):
         if settings.get("inner_update_timing") == "step":
             interval = settings.get("inner_steps_per_update")
             count = settings.get("inner_rollouts_per_round")
-            if isinstance(interval, (int, float)) and interval > 0 and isinstance(count, (int, float)) and count % interval == 0:
-                dose = number(count / interval)
+            ratio = (Fraction(str(count)) / Fraction(str(interval))
+                     if isinstance(interval, (int, float)) and interval > 0
+                     and isinstance(count, (int, float)) else None)
+            if ratio is not None and ratio.denominator == 1:
+                dose = str(ratio.numerator)
                 parts.append(f"C{dose}/A{dose} per step")
             else:
                 parts.append("step interval" + ("?" if interval is None else number(interval)))

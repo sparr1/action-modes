@@ -253,6 +253,54 @@
           }
         }
       }
+    },
+    "outer_tail_updates": {
+      "reference": "c2_a2",
+      "description": "Prior-initialized J5 inner actor and critic with frozen outer actor/online-Q bootstrap at H3; vary paired updates per vector step.",
+      "variants": {
+        "c2_a2": {
+          "description": "J5/N512/H3/B512 with prior actor and critic, saved outer target initialization, and outer rollout-tail bootstrap. 2 paired updates per vector step give 30 updates each and 7,680 imagined transitions per decision.",
+          "alg_params": {
+            "inner_actor_initialization": "prior",
+            "inner_critic_initialization": "prior",
+            "inner_critic_target_initialization": "outer_target",
+            "inner_finite_horizon": true,
+            "inner_rounds": 5,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 256.0,
+            "inner_updates_per_round": null,
+            "inner_replay_capacity": 12288
+          }
+        },
+        "c5_a5": {
+          "description": "J5/N512/H3/B512 with prior actor and critic, saved outer target initialization, and outer rollout-tail bootstrap. 5 paired updates per vector step give 75 updates each and 7,680 imagined transitions per decision.",
+          "alg_params": {
+            "inner_actor_initialization": "prior",
+            "inner_critic_initialization": "prior",
+            "inner_critic_target_initialization": "outer_target",
+            "inner_finite_horizon": true,
+            "inner_rounds": 5,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 102.4,
+            "inner_updates_per_round": null,
+            "inner_replay_capacity": 12288
+          }
+        },
+        "c10_a10": {
+          "description": "J5/N512/H3/B512 with prior actor and critic, saved outer target initialization, and outer rollout-tail bootstrap. 10 paired updates per vector step give 150 updates each and 7,680 imagined transitions per decision.",
+          "alg_params": {
+            "inner_actor_initialization": "prior",
+            "inner_critic_initialization": "prior",
+            "inner_critic_target_initialization": "outer_target",
+            "inner_finite_horizon": true,
+            "inner_rounds": 5,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 51.2,
+            "inner_updates_per_round": null,
+            "inner_replay_capacity": 12288
+          }
+        }
+      }
     }
   }
 }

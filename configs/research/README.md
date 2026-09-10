@@ -69,6 +69,18 @@ per-decision resets remain inherited. Use the same checkpoints and episode
 seeds, give each rollout count a separate curve, and reuse the native N512
 results and prior references.
 
+Select `outer_tail_updates/c2_a2`, `outer_tail_updates/c5_a5`, or
+`outer_tail_updates/c10_a10` for the J5 outer-bootstrap update-dose sweep.
+Both inner networks start from the saved prior, and the local target starts
+from the saved outer target. At collection depth H3, bootstrap with the frozen
+outer actor and online mean-pair Q; earlier depths use the adapting inner actor
+and local target critic. Keep N512, B512, replay capacity 12,288 and native
+entropy/Q scaling. Each decision collects 7,680 transitions and performs
+30/75/150 paired critic, actor and target updates, respectively. The transition
+intervals 256, 102.4 and 51.2 use exact rational scheduling, giving exactly
+2/5/10 updates after every vector step. Use separate curves with the same
+checkpoints and paired episode seeds as the original J5 C2/A2 evaluation.
+
 Select `random_outer_tail/j1`, `random_outer_tail/j5`, or
 `random_outer_tail/j10` for fresh **actor and critic** networks at every real
 decision. These keep N512/H3/B512 and one paired update per vector step,

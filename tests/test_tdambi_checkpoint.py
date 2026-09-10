@@ -260,6 +260,38 @@ def test_checkpoint_matrix_inherits_native_settings_and_expands_budgets_and_step
     assert context == before
 
 
+@pytest.mark.parametrize("dose", [2, 5, 10])
+def test_outer_tail_dose_presets_preserve_prior_initialization_and_exact_schedule(tmp_path, dose):
+    from RL.tdmpc2_core.common.inner_utils import updates_for_transitions
+
+    context = _native_context(tmp_path)
+    baseline = resolve_preset(MATRIX, "update_timing/step_j5_c2_a2", checkpoint_context=context)
+    selected = resolve_preset(MATRIX, f"outer_tail_updates/c{dose}_a{dose}", checkpoint_context=context)
+    params = selected["algorithm_config"]["alg_params"]
+    changed = {key for key in params if params[key] != baseline["algorithm_config"]["alg_params"].get(key)}
+    assert changed <= {"inner_actor_initialization", "inner_critic_initialization",
+                       "inner_critic_target_initialization", "inner_finite_horizon", "inner_steps_per_update"}
+    instance = object.__new__(TDAMBI)
+    instance.env = gym.make("Pendulum-v1", max_episode_steps=5)
+    instance.run_params = {"device": "cpu"}
+    try:
+        cfg = instance._build_cfg(params)
+    finally:
+        instance.env.close()
+    assert cfg.inner_actor_initialization == cfg.inner_critic_initialization == "prior"
+    assert cfg.inner_critic_target_initialization == "outer_target"
+    assert cfg.inner_finite_horizon and cfg.mppi_terminal_q_reduction == "mean_pair"
+    assert cfg.inner_rounds == 5 and cfg.inner_rollout_horizon == 3
+    assert cfg.inner_rollouts_per_round == cfg.inner_batch_size == 512
+    assert cfg.inner_replay_capacity == 12288 and cfg.inner_model_step_budget == 7680
+    assert cfg.inner_actor_updates_per_action == cfg.inner_critic_updates_per_action == 15 * dose
+    assert cfg.inner_temperature_updates_per_action == 0
+    assert cfg.inner_update_timing == "step"
+    for step in range(1, 16):
+        assert (updates_for_transitions(step * 512, cfg.inner_steps_per_update)
+                - updates_for_transitions((step - 1) * 512, cfg.inner_steps_per_update)) == dose
+
+
 @pytest.mark.parametrize("rollouts", [256, 128, 64])
 def test_rollout_presets_keep_full_batches_and_fifteen_interleaved_updates(tmp_path, monkeypatch, rollouts):
     from RL.tdmpc2_core.common.latent_buffer import LatentReplayBuffer
