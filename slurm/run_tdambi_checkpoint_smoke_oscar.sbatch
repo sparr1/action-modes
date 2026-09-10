@@ -33,7 +33,7 @@ export TORCHINDUCTOR_CACHE_DIR="${SLURM_TMPDIR:-/tmp}/tdambi-${SLURM_JOB_ID}"
 
 "$PYTHON_BIN" -c 'import torch; assert torch.cuda.is_available(), "CUDA unavailable in allocated GPU job"; torch.ones(1, device="cuda").sum().item(); print("Smoke GPU:", torch.cuda.get_device_name())'
 "$PYTHON_BIN" -m pytest -q tests/test_tdambi_inner.py tests/test_tdambi_checkpoint.py \
-    tests/test_tdambi_publication.py
+    tests/test_tdambi_publication.py tests/test_tdambi_random_tail.py
 "$PYTHON_BIN" evaluate_ambi_checkpoint.py \
     --matrix configs/research/tdambi_humanoid_inner_benchmark.json \
     --preset "$TDAMBI_PRESET" --checkpoint "$TDAMBI_CHECKPOINT" \

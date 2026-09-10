@@ -69,6 +69,31 @@ per-decision resets remain inherited. Use the same checkpoints and episode
 seeds, give each rollout count a separate curve, and reuse the native N512
 results and prior references.
 
+Select `random_outer_tail/j1`, `random_outer_tail/j5`, or
+`random_outer_tail/j10` for fresh **actor and critic** networks at every real
+decision. These keep N512/H3/B512 and one paired update per vector step,
+giving 3/15/30 actor, critic and target updates and 1,536/7,680/15,360 imagined
+transitions. All three retain the complete local replay in capacity 32,768.
+The local target starts from the new random critic. At collection depth H,
+the Bellman target instead uses a sampled frozen outer-policy action and
+frozen **online** outer Q averaged over a random head pair, matching the
+TD-MPC2 planning tail. Interior transitions keep the local actor/target-Q
+bootstrap. The collection boundary is not an environment termination.
+
+These explicit presets use `inner_actor_initialization="random"`,
+`inner_critic_initialization="random"`,
+`inner_critic_target_initialization="online"`, and `inner_finite_horizon=true`.
+Actor initialization follows TD-MPC2's truncated-normal rule; dense critics
+use Linear constructor initialization with zero final-layer weights and
+random output biases, with LayerNorm reset in both networks. Each decision
+draws fresh weights from a private seeded stream and resets optimizers,
+replay and Q scale. Native entropy, losses and first-collection Q-scale
+calibration retain the existing evaluation protocol. This evaluation branch
+ports the canonical dense initialization; it does not introduce critic LoRA
+or saved-scale behavior from newer training code. New curve identities and
+labels record both random networks and the outer rollout tail. Reuse paired
+prior references and create a separate attempt for each J value.
+
 For the J5/C1 actor-entropy ablation, select `entropy/squashed_eta1e_5`,
 `entropy/squashed_eta1e_4`, or `entropy/squashed_eta1e_3`. These use the joint
 tanh-corrected entropy with fixed coefficients `1e-5`, `1e-4`, and `1e-3`;

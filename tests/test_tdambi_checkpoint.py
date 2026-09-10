@@ -136,7 +136,8 @@ def test_tdambi_rejects_training_and_stochastic_execution(pair):
 
 
 @pytest.mark.parametrize("override", [
-    {"inner_finite_horizon": True}, {"inner_explorer_mode": "shared_mixture"},
+    {"inner_finite_horizon": True, "mppi_terminal_q_reduction": "min_pair"},
+    {"inner_explorer_mode": "shared_mixture"},
     {"inner_critic_dropout_enabled": False}, {"inner_actor_writeback_coef": 0.1},
     {"inner_actor_scope": "episode"}, {"inner_temperature_mode": "auto"},
     {"inner_actor_adaptation": "lora"}, {"inner_bootstrap_source": "outer_online"},

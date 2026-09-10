@@ -91,6 +91,28 @@ local target Q (minimum of two random heads) at a sampled local-policy action.
 Rollout cutoffs bootstrap and do not introduce synthetic terminal flags. There
 is no entropy bonus in that target.
 
+The explicit scratch ablation accepts independent
+`inner_actor_initialization="random"` and
+`inner_critic_initialization="random"`. Dense parameters are resampled at
+each real decision with the same initialization rules as the canonical AMBI
+implementation: the actor uses TD-MPC2 initialization, critics use Linear
+constructor initialization with zero output weights, and LayerNorm is reset.
+The private initialization stream advances even when allocations are reused.
+A random critic's independent local target copies that new critic; the
+default prior-initialized critic retains the saved outer target.
+
+With `inner_finite_horizon=true`, the final transition at collection depth H
+bootstraps from the frozen outer policy and **online** mean-pair outer Q,
+matching TD-MPC2's MPPI rollout tail. Interior transitions retain the local
+actor and local target critic. The finite collection boundary is distinct
+from environment termination, and there is no tail entropy bonus. The
+`random_outer_tail/j1`, `j5`, and `j10` research presets combine these options
+with dense updates, N512/H3/B512, and one paired update per vector step.
+Initialization and tail choices enter curve identity and display labels.
+The existing native loss, Q-scale calibration and prior defaults remain the
+same; this evaluation port does not enable random initialization for other
+operators or import newer training-scale or LoRA changes.
+
 Actor learning maximizes average-pair online Q divided by the running scale,
 plus the saved fixed coefficient times native `scaled_entropy`. This preserves
 the native policy standard-deviation mapping and this port's stable tanh

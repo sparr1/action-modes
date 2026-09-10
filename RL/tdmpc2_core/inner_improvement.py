@@ -7,6 +7,7 @@ the rest of the world model, and the entropy coefficient remain untouched.
 """
 
 from copy import deepcopy
+from contextlib import nullcontext
 from dataclasses import dataclass, field, fields as dataclass_fields
 import math
 import time
@@ -1343,9 +1344,42 @@ class InnerImprovementEngine:
                 elif isinstance(value, (int, float)):
                     parameter_state[key] = type(value)(0)
 
+    def _random_tdambi_component(self, component):
+        return self.cfg.inner_operator == "tdambi" and getattr(
+            self.cfg, f"inner_{component}_initialization", "prior"
+        ) == "random"
+
+    @staticmethod
+    @torch.no_grad()
+    def _reset_random_component(component, module):
+        """Dense initialization shared with the canonical scratch implementation."""
+        if component == "actor":
+            module.apply(td_init.weight_init)
+        elif component == "critic":
+            for layer in module.modules():
+                if isinstance(layer, torch.nn.Linear):
+                    layer.reset_parameters()
+            for head in module:
+                head[-1].weight.zero_()
+        else:
+            raise ValueError(f"Unknown inner component: {component!r}")
+        for layer in module.modules():
+            if isinstance(layer, torch.nn.LayerNorm):
+                layer.reset_parameters()
+
+    def _critic_target_base(self, critic):
+        if self.cfg.inner_operator == "tdambi" and not self._random_tdambi_component("critic"):
+            return self.model._target_Qs
+        return critic
+
     def _reset_action_component(self, component, module, outer):
         mode = str(getattr(self.cfg, f"inner_{component}_adaptation"))
-        if mode == "lora":
+        if self._random_tdambi_component(component):
+            if mode != "clone":
+                raise ValueError("This TDAMBI evaluation path supports dense scratch adaptation only.")
+            self._reset_random_component(component, module)
+            module.requires_grad_(True)
+        elif mode == "lora":
             rebase_lora_base_(module, outer)
             reset_lora_adapters_(module)
         else:
@@ -1385,8 +1419,8 @@ class InnerImprovementEngine:
                 copy_lora_adapters_(module, target)
             else:
                 target_base = (
-                    self.model._target_Qs
-                    if self.cfg.inner_operator == "tdambi" and component == "critic"
+                    self._critic_target_base(module)
+                    if component == "critic"
                     else module
                 )
                 target.load_state_dict(target_base.state_dict())
@@ -1400,6 +1434,8 @@ class InnerImprovementEngine:
             module.requires_grad_(False)
         elif mode == "clone":
             module = deepcopy(base).to(self.device)
+            if self._random_tdambi_component(component):
+                self._reset_random_component(component, module)
             module.requires_grad_(True)
         elif mode == "lora":
             scope = str(getattr(self.cfg, f"inner_{component}_scope"))
@@ -1681,9 +1717,7 @@ class InnerImprovementEngine:
             cfg.inner_bootstrap_source == "inner_target"
             and state.critic_target is None
         ):
-            target_base = (
-                self.model._target_Qs if cfg.inner_operator == "tdambi" else state.critic
-            )
+            target_base = self._critic_target_base(state.critic)
             state.critic_target = deepcopy(target_base).to(self.device).requires_grad_(False)
         if (
             state.critic_target is not None
@@ -1856,9 +1890,13 @@ class InnerImprovementEngine:
 
     def make_modules_for_compatibility(self):
         """Legacy test/debug hook returning freshly created inner modules."""
-        actor = self._adapt_module(self.model._pi, "actor")
-        critic = self._adapt_module(self.model._Qs, "critic")
-        target_base = self.model._target_Qs if self.cfg.inner_operator == "tdambi" else critic
+        context = self.rng.fork("initialization") if any(
+            self._random_tdambi_component(component) for component in ("actor", "critic")
+        ) else nullcontext()
+        with context:
+            actor = self._adapt_module(self.model._pi, "actor")
+            critic = self._adapt_module(self.model._Qs, "critic")
+        target_base = self._critic_target_base(critic)
         target = deepcopy(target_base).to(self.device).requires_grad_(False)
         actor_optim = self._new_optimizer(actor, "actor")
         critic_optim = self._new_optimizer(critic, "critic")
@@ -4077,11 +4115,14 @@ class InnerImprovementEngine:
             next_q = self.model.q_backend.reduce(
                 target_values, "min_pair", pair_indices=pair, trusted_pair_indices=True,
             )
-            # Imagined cutoff is not terminal: replay's terminated flag stays
-            # zero for this continuing-task controller, including final depth.
-            target_q = batch["reward"] + float(self.agent.discount) * (
-                1.0 - batch["terminated"]
-            ) * next_q
+            if getattr(cfg, "inner_finite_horizon", False):
+                # At H, hand off to the frozen outer actor and online mean-pair
+                # Q, as in TD-MPC2 planning. Interior rows retain local targets.
+                prior_q = self._prior_bootstrap(
+                    batch["next_z"], self._prior_noise(batch["next_z"]),
+                )
+                next_q = torch.where(batch["horizon_end"].bool(), prior_q, next_q)
+            target_q = self._sac_target(batch["reward"], batch["terminated"], next_q)
         predictions = self.model.q_predictions(z, action, qs=state.critic)
         # Preserve the native head-by-head soft CE calculation and averaging.
         value_loss = torch.stack([
@@ -4102,7 +4143,7 @@ class InnerImprovementEngine:
         count = int(z.shape[0])
         state.policy_evaluations += count
         state.q_evaluations += 2 * count
-        return {
+        metrics = {
             "critic_loss": critic_loss.detach(),
             "critic_value_loss": value_loss.detach(),
             "critic_grad_norm": grad_norm.detach(),
@@ -4111,6 +4152,9 @@ class InnerImprovementEngine:
             "q_target_clip_fraction": self._q_target_clip_fraction(target_q),
             "td_error_abs_mean": (values - target_q.unsqueeze(0)).abs().mean(),
         }
+        if getattr(cfg, "inner_finite_horizon", False):
+            metrics["critic_outer_tail_fraction"] = batch["horizon_end"].float().mean()
+        return metrics
 
     def _tdambi_actor_step(self, batch):
         """Fixed-entropy actor update after its same-batch reward-only critic step."""
@@ -6386,6 +6430,9 @@ class InnerImprovementEngine:
                     if "alpha" not in key and "soft_j" not in key
                     and key != "inner_target_entropy"
                 }
+                for component in ("actor", "critic"):
+                    if self._random_tdambi_component(component):
+                        metrics[f"inner_{component}_random_initialization"] = 1.0
                 metrics["inner_tdambi_entropy_coef"] = float(self.cfg.tdambi_entropy_coef)
                 metrics["inner_tdambi_squashed_entropy_enabled"] = float(
                     getattr(self.cfg, "tdambi_entropy_mode", "native_scaled") == "squashed"

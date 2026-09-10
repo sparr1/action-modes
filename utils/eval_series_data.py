@@ -266,6 +266,16 @@ def _tdambi_planner(config, algorithm, action_rule):
         "inner_q_actor_reduction", "inner_q_target_reduction", "q_pair_size",
     )
     settings = {key: copy.deepcopy(config[key]) for key in keys if key in config}
+    for component in ("actor", "critic"):
+        key = f"inner_{component}_initialization"
+        value = str(config.get(key, "prior")).lower()
+        _require(value in {"prior", "random"}, f"Unknown TDAMBI {component} initialization")
+        if value == "random":
+            settings[key] = value
+    finite_horizon = config.get("inner_finite_horizon", False)
+    if finite_horizon:
+        settings["inner_finite_horizon"] = True
+        settings["mppi_terminal_q_reduction"] = config["mppi_terminal_q_reduction"]
     entropy_mode = config.get("tdambi_entropy_mode", "native_scaled")
     _require(entropy_mode in {"native_scaled", "squashed"}, "Unknown TDAMBI entropy mode")
     if entropy_mode == "squashed":
@@ -293,6 +303,15 @@ def _tdambi_planner(config, algorithm, action_rule):
         "scale_update": "actor_minibatch_q_range_ema_before_q_only_scaling",
         "workspace": "fresh_actor_critic_target_optimizer_replay_scale_per_decision",
     }
+    if settings.get("inner_critic_initialization") == "random":
+        settings["inner_critic_target_initialization"] = "online"
+        semantics["target_initialization"] = "fresh_random_online_critic"
+    if finite_horizon:
+        semantics.update(
+            critic_target="reward_only_local_target_interior_outer_online_mean_pair_at_horizon",
+            bootstrap_action="adapted_actor_sample_interior_frozen_outer_actor_sample_at_horizon",
+            horizon_boundary="collection_depth_H_not_environment_termination",
+        )
     if entropy_mode == "squashed":
         semantics.update(
             actor_objective="-(q/scale+eta*squashed_entropy)",

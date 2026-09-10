@@ -205,6 +205,54 @@
           }
         }
       }
+    },
+    "random_outer_tail": {
+      "reference": "j5",
+      "description": "Dense scratch inner networks with the TD-MPC2 planning tail supplied by the frozen outer actor and online Q. Interior targets remain local.",
+      "variants": {
+        "j1": {
+          "description": "Fresh random actor and critic at every decision; J1/N512/H3/B512 with frozen outer actor and online mean-pair Q at the rollout tail, and 3 paired updates.",
+          "alg_params": {
+            "inner_actor_initialization": "random",
+            "inner_critic_initialization": "random",
+            "inner_critic_target_initialization": "online",
+            "inner_finite_horizon": true,
+            "inner_rounds": 1,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 512,
+            "inner_updates_per_round": null,
+            "inner_replay_capacity": 32768
+          }
+        },
+        "j5": {
+          "description": "Fresh random actor and critic at every decision; J5/N512/H3/B512 with frozen outer actor and online mean-pair Q at the rollout tail, and 15 paired updates.",
+          "alg_params": {
+            "inner_actor_initialization": "random",
+            "inner_critic_initialization": "random",
+            "inner_critic_target_initialization": "online",
+            "inner_finite_horizon": true,
+            "inner_rounds": 5,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 512,
+            "inner_updates_per_round": null,
+            "inner_replay_capacity": 32768
+          }
+        },
+        "j10": {
+          "description": "Fresh random actor and critic at every decision; J10/N512/H3/B512 with frozen outer actor and online mean-pair Q at the rollout tail, and 30 paired updates.",
+          "alg_params": {
+            "inner_actor_initialization": "random",
+            "inner_critic_initialization": "random",
+            "inner_critic_target_initialization": "online",
+            "inner_finite_horizon": true,
+            "inner_rounds": 10,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 512,
+            "inner_updates_per_round": null,
+            "inner_replay_capacity": 32768
+          }
+        }
+      }
     }
   }
 }

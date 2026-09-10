@@ -34,7 +34,6 @@ _NATIVE_CONTRACT = {
     "inner_q_actor_reduction": "mean_pair",
     "inner_sac_critic_target": "reward_only",
     "outer_critic_target": "reward_only",
-    "inner_finite_horizon": False,
     "inner_outer_replay_fraction": 0.0,
     "inner_explorer_mode": "none",
     "inner_behavior_action": "policy_sample",
@@ -86,6 +85,9 @@ def native_evaluation_params(params):
         result.setdefault(key, native[key])
     result.update({key: value for key, value in _NATIVE_CONTRACT.items()
                    if key not in result})
+    result.setdefault("inner_actor_initialization", "prior")
+    result.setdefault("inner_critic_initialization", "prior")
+    result.setdefault("inner_finite_horizon", False)
     result.setdefault("inner_actor_lr", float(native["lr"]))
     result.setdefault("inner_critic_lr", float(native["lr"]))
     result.setdefault("inner_critic_target_tau", float(native["tau"]))
@@ -178,6 +180,23 @@ class TDAMBI(AMBITDMPC2):
 
     def _build_cfg(self, params):
         params = native_evaluation_params(params)
+        for component in ("actor", "critic"):
+            key = f"inner_{component}_initialization"
+            params[key] = str(params[key]).lower()
+            if params[key] not in {"prior", "random"}:
+                raise ValueError(f"{key} must be 'prior' or 'random'.")
+        random_critic = params["inner_critic_initialization"] == "random"
+        target_initialization = str(params.get(
+            "inner_critic_target_initialization",
+            "online" if random_critic else "outer_target",
+        )).lower()
+        if target_initialization not in {"online", "outer_target"}:
+            raise ValueError("inner_critic_target_initialization must be 'online' or 'outer_target'.")
+        if random_critic and target_initialization != "online":
+            raise ValueError("A random TDAMBI critic requires inner_critic_target_initialization='online'.")
+        # Preserve historical prior+clone behavior, including its old 'online'
+        # spelling; a scratch target must instead copy the new local critic.
+        params["inner_critic_target_initialization"] = "online" if random_critic else "outer_target"
         for key, required in _NATIVE_CONTRACT.items():
             if params.get(key) != required:
                 raise ValueError(f"TDAMBI requires {key}={required!r}.")
@@ -225,6 +244,8 @@ class TDAMBI(AMBITDMPC2):
         if cfg.obs != "state":
             raise ValueError("TDAMBI currently supports single-task state observations only.")
         cfg.inner_operator = "tdambi"
+        if cfg.inner_finite_horizon and cfg.mppi_terminal_q_reduction != "mean_pair":
+            raise ValueError("TDAMBI outer rollout tails require native mean_pair online Q.")
         cfg.inner_temperature_updates_per_action = 0
         cfg.inner_primary_temperature_updates_per_round = 0
         cfg.inner_primary_optimizer_steps_per_action = (

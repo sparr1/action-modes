@@ -210,6 +210,12 @@ def _planner_display_label(planner, *, compact=False):
             if value is not None and (not compact or value != default):
                 parts.append(prefix + number(value))
     elif kind == "tdambi":
+        random_components = [name for name in ("actor", "critic")
+                             if settings.get(f"inner_{name}_initialization") == "random"]
+        if random_components:
+            parts.append("random " + "+".join(random_components))
+        if settings.get("inner_finite_horizon"):
+            parts.append("outer rollout tail")
         if settings.get("inner_update_timing") == "step":
             interval = settings.get("inner_steps_per_update")
             count = settings.get("inner_rollouts_per_round")
