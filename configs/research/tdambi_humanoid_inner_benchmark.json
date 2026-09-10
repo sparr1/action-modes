@@ -113,6 +113,51 @@
         }
       }
     },
+    "rollouts": {
+      "reference": "j5_n512",
+      "description": "Native J5/C1 rollout-count sweep with batch size 512 and one paired update after every vector step. Smaller rollout pools increase sample reuse while retaining 15 paired updates per decision.",
+      "variants": {
+        "j5_n512": {
+          "description": "Native J5/N512 reference; identical to update_timing/step_j5_c1_a1.",
+          "alg_params": {
+            "inner_rounds": 5,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 512,
+            "inner_updates_per_round": null
+          }
+        },
+        "j5_n256": {
+          "description": "J5/N256/H3/B512: 3,840 imagined transitions and 15 paired updates per decision; sample replay with replacement.",
+          "alg_params": {
+            "inner_rounds": 5,
+            "inner_rollouts_per_round": 256,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 256,
+            "inner_updates_per_round": null
+          }
+        },
+        "j5_n128": {
+          "description": "J5/N128/H3/B512: 1,920 imagined transitions and 15 paired updates per decision; sample replay with replacement.",
+          "alg_params": {
+            "inner_rounds": 5,
+            "inner_rollouts_per_round": 128,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 128,
+            "inner_updates_per_round": null
+          }
+        },
+        "j5_n64": {
+          "description": "J5/N64/H3/B512: 960 imagined transitions and 15 paired updates per decision; sample replay with replacement.",
+          "alg_params": {
+            "inner_rounds": 5,
+            "inner_rollouts_per_round": 64,
+            "inner_update_timing": "step",
+            "inner_steps_per_update": 64,
+            "inner_updates_per_round": null
+          }
+        }
+      }
+    },
     "entropy": {
       "reference": "native_j5",
       "description": "Frozen-checkpoint J5/C1 squashed actor-entropy coefficient sweep. Entropy is summed over action coordinates in nats; this is not SAC training or a soft-Q target.",

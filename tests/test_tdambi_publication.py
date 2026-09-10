@@ -206,6 +206,25 @@ def test_tdambi_step_identity_and_legends_preserve_round_identity():
     assert "step interval512" in data.descriptive_label(registry["identity"])
 
 
+@pytest.mark.parametrize("rollouts", [256, 128, 64])
+def test_tdambi_rollout_curve_identity_and_label_retain_fixed_batch_and_update_dose(rollouts):
+    config = _config()
+    config.update(inner_update_timing="step", inner_steps_per_update=512,
+                  inner_updates_per_round=None, inner_rounds=5)
+    native = _identity(config)
+    config.update(inner_rollouts_per_round=rollouts, inner_steps_per_update=rollouts)
+    selected = _identity(config)
+    assert selected != native
+    assert selected["semantics"] == native["semantics"]
+    assert {key for key in selected["settings"] if selected["settings"][key] != native["settings"][key]} == {
+        "inner_rollouts_per_round", "inner_steps_per_update"}
+    assert selected["settings"]["inner_batch_size"] == 512
+    registry = {"run_id": "abcd1234", "attempt_label": "rollout-test",
+                "identity": {"planner": selected, "backbone": SOURCE,
+                             "science": {"algorithm": "TDAMBI/TDAMBI"}}}
+    assert series.concise_curve_label(registry) == f"TD-MPC2 · TDAMBI C1/A1 per step J5 N{rollouts} · #abcd"
+
+
 @pytest.mark.parametrize("timing", ["round", "step"])
 @pytest.mark.parametrize("entropy_mode", ["native_scaled", "squashed"])
 def test_resolved_tdambi_preflight_matches_executed_configuration(native_reference, monkeypatch, timing, entropy_mode):

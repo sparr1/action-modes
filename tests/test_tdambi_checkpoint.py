@@ -259,6 +259,55 @@ def test_checkpoint_matrix_inherits_native_settings_and_expands_budgets_and_step
     assert context == before
 
 
+@pytest.mark.parametrize("rollouts", [256, 128, 64])
+def test_rollout_presets_keep_full_batches_and_fifteen_interleaved_updates(tmp_path, monkeypatch, rollouts):
+    from RL.tdmpc2_core.common.latent_buffer import LatentReplayBuffer
+
+    context = _native_context(tmp_path)
+    baseline = resolve_preset(MATRIX, "update_timing/step_j5_c1_a1", checkpoint_context=context)
+    reference = resolve_preset(MATRIX, "rollouts/j5_n512", checkpoint_context=context)
+    assert reference["algorithm_config"] == baseline["algorithm_config"]
+    selected = resolve_preset(MATRIX, f"rollouts/j5_n{rollouts}", checkpoint_context=context)
+    params = selected["algorithm_config"]["alg_params"]
+    before = baseline["algorithm_config"]["alg_params"]
+    assert {key for key in params if params[key] != before[key]} == {
+        "inner_rollouts_per_round", "inner_steps_per_update"}
+    sample = LatentReplayBuffer.sample
+    batches = []
+
+    def observe_sample(replay, *args, **kwargs):
+        batch = sample(replay, *args, **kwargs)
+        batches.append((replay.size, batch["z"].shape[0], kwargs["replacement"]))
+        return batch
+
+    monkeypatch.setattr(LatentReplayBuffer, "sample", observe_sample)
+    holder = make_tdambi(**{**params, "inner_updates_per_round": None})
+    try:
+        cfg = holder.cfg
+        assert cfg.inner_rounds == 5 and cfg.inner_rollout_horizon == 3
+        assert cfg.inner_batch_size == 512 and cfg.inner_replay_capacity == 12288
+        assert cfg.inner_steps_per_update == cfg.inner_rollouts_per_round == rollouts
+        assert cfg.tdambi_entropy_mode == "native_scaled"
+        assert cfg.tdambi_entropy_coef == cfg.entropy_coef == 0.0003
+        assert cfg.inner_actor_updates_per_action == cfg.inner_critic_updates_per_action == 15
+        assert cfg.inner_model_step_budget == 15 * rollouts
+        trace = InnerActionTrace()
+        holder.predict([0.2, -0.3, 0.7], collect_diagnostics=False, trace=trace)
+        metrics = holder.agent.last_inner_metrics
+        assert metrics["inner_actor_optimizer_steps"] == metrics["inner_critic_optimizer_steps"] == 15
+        assert metrics["inner_critic_target_updates"] == 15
+        assert metrics["inner_temperature_optimizer_steps"] == 0
+        assert metrics["inner_model_steps"] == metrics["inner_buffer_size"] == 15 * rollouts
+        assert batches == [(rollouts, 512, True)] + [
+            (rollouts * step, 512, True) for step in range(1, 16)]
+        assert [event["phase"] for event in trace.events] == (
+            ["initial", "collection", "calibration", "update"]
+            + ["collection", "update"] * 14)
+    finally:
+        holder.close()
+        holder.env.close()
+
+
 def test_tdambi_matrix_rejects_ambi_backbone_and_architecture_override(tmp_path):
     context = _native_context(tmp_path)
     context.trial_run_params["alg"] = "AMBITDMPC2/AMBITDMPC2"

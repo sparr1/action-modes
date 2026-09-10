@@ -55,6 +55,20 @@ launcher also accepts `TDAMBI_PRESET`, defaulting to the original round-end
 preset. Give different planner settings separate output roots and explicitly
 created curve registries.
 
+Select `rollouts/j5_n256`, `rollouts/j5_n128`, or `rollouts/j5_n64` to reduce
+rollouts per round while retaining J5, horizon three and **batch size 512**.
+`rollouts/j5_n512` is exactly the native `update_timing/step_j5_c1_a1`
+reference. The update interval equals the rollout count (256/128/64), so every
+vector step still triggers one critic→actor→target update: 15 updates each per
+real decision. Imagined transitions fall to 3,840/1,920/960 respectively.
+Replay capacity stays 12,288 and sampling uses replacement, including the
+first 512-sample calibration/update batches when fewer than 512 transitions
+exist. This changes data collection and sample reuse while holding the update
+count and batch size fixed. Native entropy, learning rates, Q scaling and
+per-decision resets remain inherited. Use the same checkpoints and episode
+seeds, give each rollout count a separate curve, and reuse the native N512
+results and prior references.
+
 For the J5/C1 actor-entropy ablation, select `entropy/squashed_eta1e_5`,
 `entropy/squashed_eta1e_4`, or `entropy/squashed_eta1e_3`. These use the joint
 tanh-corrected entropy with fixed coefficients `1e-5`, `1e-4`, and `1e-3`;
