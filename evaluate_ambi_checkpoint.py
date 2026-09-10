@@ -16,6 +16,7 @@ import json
 import math
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import gymnasium as gym
@@ -114,6 +115,21 @@ def build_parser():
         action="store_true",
         help="Record rather than fail on NaN/Inf model diagnostics.",
     )
+    parser.add_argument("--metadata", type=Path, help="Checkpoint sidecar override for checkpoint-based matrices.")
+    parser.add_argument("--bundle-dir", type=Path, help="Create a new portable benchmark bundle with full inner traces.")
+    parser.add_argument("--save-root-bank", type=Path, help="Save shared observations from a prior-only evaluation (requires --bundle-dir).")
+    parser.add_argument("--root-bank", type=Path, help="Evaluate the same saved observations with extra policy-quality probes.")
+    parser.add_argument("--bank-only", action="store_true", help="Run shared-observation solves without full episodes.")
+    parser.add_argument("--bank-repetitions", type=int, help="Solver repetitions per shared observation (matrix default: 3).")
+    parser.add_argument("--reference-bundle", type=Path, help="Completed prior-only bundle for matched episode return deltas.")
+    parser.add_argument("--eval-series-spec-dir", type=Path, help="Write New/Append identity templates from checkpoint settings without running evaluation.")
+    parser.add_argument("--checkpoint-inventory", type=Path, help="Verified checkpoint/source-run inventory for curve publication.")
+    parser.add_argument("--eval-run-dir", type=Path, help="Existing evaluation run directory for one selected planner.")
+    parser.add_argument("--eval-run-map", type=Path, help="JSON selector-to-run-directory map prepared before launching workers.")
+    parser.add_argument("--wandb", action="store_true", help="Queue results for CPU publication; requires explicit evaluation run selection.")
+    parser.add_argument("--wandb-project", default="ambi-inner-bench")
+    parser.add_argument("--wandb-entity", default="rwgao_b-brown-university")
+    parser.add_argument("--wandb-mode", choices=("online", "offline"), default="online")
     return parser
 
 
@@ -295,12 +311,16 @@ def _outer_state_digest(model):
         "world_optimizer": agent.optim.state_dict(),
         "actor_optimizer": agent.pi_optim.state_dict(),
         "outer_alpha": agent.alpha.detach(),
+        "log_ent_coef": getattr(agent, "log_ent_coef", None),
+        "fixed_ent_coef": getattr(agent, "fixed_ent_coef", None),
         "entropy_optimizer": (
             None if agent.ent_coef_optim is None else agent.ent_coef_optim.state_dict()
         ),
         "num_updates": int(agent.num_updates),
         "outer_version": int(getattr(agent, "outer_version", agent.num_updates)),
     }
+    if getattr(agent, "actor_loss_scale_enabled", False):
+        state["actor_loss_scale"] = agent._actor_loss_scale_state()
     digest = hashlib.sha256()
     _digest_update(digest, state)
     return digest.hexdigest()
@@ -533,6 +553,15 @@ def evaluate_preset(
     max_steps=None,
     device=None,
     allow_nonfinite_metrics=False,
+    bundle=None,
+    bundle_run=None,
+    root_bank=None,
+    bank_only=False,
+    bank_repetitions=3,
+    captured_roots=None,
+    root_decisions=(0, 100, 200, 300, 400),
+    probe_rollouts=8,
+    probe_horizon=3,
 ):
     """Evaluate one resolved preset and verify outer-state immutability."""
     checkpoint = Path(checkpoint).resolve()
@@ -557,18 +586,105 @@ def evaluate_preset(
     env = _make_env(resolved)
     model = None
     primary_error = None
+    pending_events = []
+    phase_id = "initialization"
+    active_episode = False
+    from utils.ambi_benchmark import capture_root, solver_seed
     try:
+        started = time.perf_counter()
         model, run_config = _initialize_frozen_model(
             resolved, env, checkpoint, controller_seed, device=device
         )
         digest_before = _outer_state_digest(model)
         updates_before = int(model.agent.num_updates)
+        controller = None
+        evaluation_controller = None
+        if resolved.get("evaluation_controller"):
+            from RL.tdmpc2_core.ambi_mppi import FrozenAMBIMPPIController
+            controller = FrozenAMBIMPPIController(model.agent,
+                resolved["evaluation_controller"].get("params"))
+            controller.reset(controller_seed)
+            evaluation_controller = {"type": "mppi", "settings": controller.settings,
+                                     "protocol": controller.protocol}
+        action_rule = controller.protocol["action_rule"] if controller else "tanh_mean"
         metric_values = {}
         nonfinite_metric_counts = {}
         episodes = []
+        bank_metric_values = {}
 
-        for seed in seeds:
+        if bundle is not None:
+            from RL.tdmpc2_core.inner_trace import InnerActionTrace
+            bundle_run["initialization_seconds"] = time.perf_counter() - started
+            bundle_run["resolved_config"] = _jsonable(vars(model.cfg))
+            if controller is not None:
+                bundle_run["action_rule"] = action_rule
+                bundle_run["evaluation_controller"] = evaluation_controller
+                bundle.manifest["protocol_semantics"] = {
+                    "action_rule": "prior_reference", "candidate_action_rule": "per_run"}
+            if root_bank is not None:
+                for root in root_bank["roots"]:
+                    if tuple(root["shape"]) != tuple(env.observation_space.shape):
+                        raise ValueError("Bank observation shape does not match checkpoint environment.")
+            # One unscored action pays lazy compilation before the measured
+            # solves. Reset RNG afterwards; warmup never enters return statistics.
+            warm_observation = (np.asarray(root_bank["roots"][0]["observation"], dtype=np.float32)
+                                if root_bank is not None else env.reset(seed=int(seeds[0]))[0])
+            started = time.perf_counter()
+            if controller is None:
+                model.predict(warm_observation, deterministic=True, episode_start=True)
+            else:
+                controller.act(warm_observation)
+            bundle_run["warmup_including_compile_seconds"] = time.perf_counter() - started
+
+        if root_bank is not None:
+            for root in root_bank["roots"]:
+                for repeat in range(bank_repetitions):
+                    root_seed = solver_seed(controller_seed, "root", root["root_id"], repeat)
+                    model.agent.inner_engine.reset_for_evaluation(root_seed, reuse_action_pool=True)
+                    trace = InnerActionTrace(probes=True,
+                        probe_seed=solver_seed(controller_seed, "probe", root["root_id"], repeat),
+                        probe_rollouts=probe_rollouts, probe_horizon=probe_horizon)
+                    phase_id = f"{root['root_id']}-repeat-{repeat}"
+                    started = time.perf_counter()
+                    model.predict(np.asarray(root["observation"], dtype=np.float32),
+                                  deterministic=True, episode_start=True, trace=trace)
+                    elapsed = time.perf_counter() - started
+                    pending_events = [{"root_id": root["root_id"], "repeat": repeat,
+                                       "decision_index": root["decision_index"], **event}
+                                      for event in trace.events]
+                    finite, nonfinite = _numeric_metrics(model.agent.last_inner_metrics)
+                    probes = [event["metrics"] for event in trace.events if event["phase"] == "probe"]
+                    diagnostic_seconds = sum(item.get("probe_seconds", 0.0) for item in probes)
+                    diagnostic_model_steps = sum(item.get("probe_model_steps", 0.0) for item in probes)
+                    bank_values = {**finite,
+                        **{f"final_probe/{key}": value for key, value in (probes[-1] if probes else {}).items()},
+                        "prediction_seconds": elapsed, "probe_seconds": diagnostic_seconds,
+                        "probe_model_steps": diagnostic_model_steps,
+                        "control_seconds": max(0.0, elapsed - diagnostic_seconds)}
+                    for key, value in bank_values.items():
+                        if math.isfinite(value):
+                            bank_metric_values.setdefault(key, []).append(value)
+                    root_result = {"root_id": root["root_id"], "repeat": repeat,
+                                   "solver_seed": root_seed, "root_bank_id": root_bank["id"],
+                                   "probe_seed": trace.probe_seed, "probe_rollouts": probe_rollouts,
+                                   "probe_horizon": probe_horizon, "prediction_seconds": elapsed,
+                                   "probe_seconds": diagnostic_seconds, "probe_model_steps": diagnostic_model_steps,
+                                   "control_seconds": max(0.0, elapsed - diagnostic_seconds),
+                                   "model_metrics": finite, "nonfinite_model_metrics": nonfinite}
+                    bundle_run["roots"].append(root_result)
+                    bundle.write_trace(bundle_run, phase_id, pending_events)
+                    pending_events = []
+                    for key in nonfinite:
+                        nonfinite_metric_counts[key] = nonfinite_metric_counts.get(key, 0) + 1
+
+        for seed in ([] if bank_only else seeds):
             seed = int(seed)
+            episode_seed = solver_seed(controller_seed, "episode", seed)
+            engine = getattr(model.agent, "inner_engine", None)
+            if controller is not None:
+                controller.reset(episode_seed)
+            if engine is not None:
+                engine.reset_for_evaluation(episode_seed, reuse_action_pool=bundle is not None)
             _seed_spaces(env, seed)
             observation, _ = env.reset(seed=seed)
             terminated = truncated = False
@@ -577,13 +693,30 @@ def evaluate_preset(
             episode_metric_values = {}
             episode_nonfinite_counts = {}
             truncated_by_evaluator = False
+            control_seconds = 0.0
+            phase_id = f"seed-{seed}"
+            active_episode = True
 
             while not (terminated or truncated):
-                action, _ = model.predict(
-                    observation,
-                    deterministic=True,
-                    episode_start=(episode_steps == 0),
-                )
+                if captured_roots is not None and episode_steps in root_decisions:
+                    captured_roots.append(capture_root(observation, seed, episode_steps, episode_return))
+                trace = InnerActionTrace() if bundle is not None else None
+                predict_options = {"trace": trace} if trace is not None else {}
+                started = time.perf_counter()
+                if controller is None:
+                    action, _ = model.predict(
+                        observation,
+                        deterministic=True,
+                        episode_start=(episode_steps == 0),
+                        **predict_options,
+                    )
+                else:
+                    action = model._unscale_action(controller.act(observation).numpy())
+                action_seconds = time.perf_counter() - started
+                control_seconds += action_seconds
+                if trace is not None:
+                    pending_events.extend({"episode_id": phase_id, "decision_index": episode_steps, **event}
+                                          for event in trace.events)
                 observation, reward, terminated, truncated, _ = env.step(action)
                 episode_return += float(reward)
                 episode_steps += 1
@@ -591,6 +724,19 @@ def evaluate_preset(
                 finite_metrics, nonfinite_metrics = _numeric_metrics(
                     getattr(model.agent, "last_inner_metrics", {})
                 )
+                if trace is not None:
+                    tail = trace.events[-1] if trace.events else {}
+                    pending_events.append({
+                        "episode_id": phase_id, "decision_index": episode_steps - 1,
+                        "event_index": len(trace.events), "phase": "decision",
+                        **{key: tail.get(key, 0) for key in
+                           ("round_index", "critic_updates", "actor_updates", "temperature_updates")},
+                        "metrics": {**{f"decision/{key}": value for key, value in finite_metrics.items()},
+                                    **{f"decision/{key}": None for key in nonfinite_metrics},
+                                    "decision/reward": float(reward),
+                                    "decision/control_seconds": action_seconds},
+                        "nonfinite": {f"decision/{key}": value for key, value in nonfinite_metrics.items()},
+                    })
                 for key, value in finite_metrics.items():
                     metric_values.setdefault(key, []).append(value)
                     episode_metric_values.setdefault(key, []).append(value)
@@ -613,11 +759,13 @@ def evaluate_preset(
             episodes.append(
                 {
                     "seed": seed,
+                    "solver_seed": episode_seed,
                     "return": episode_return,
                     "length": episode_steps,
                     "terminated": bool(terminated),
                     "truncated": bool(truncated),
                     "truncated_by_evaluator": truncated_by_evaluator,
+                    "control_seconds": control_seconds,
                     "model_metrics": {
                         key: float(np.mean(values))
                         for key, values in sorted(episode_metric_values.items())
@@ -627,6 +775,10 @@ def evaluate_preset(
                     ),
                 }
             )
+            if bundle is not None:
+                bundle.episode(bundle_run, episodes[-1], pending_events)
+                pending_events = []
+            active_episode = False
 
         digest_after = _outer_state_digest(model)
         updates_after = int(model.agent.num_updates)
@@ -635,10 +787,11 @@ def evaluate_preset(
                 f"Frozen evaluation invariant failed for {resolved['selector']}: "
                 "outer state changed during action selection."
             )
-        if nonfinite_metric_counts and not allow_nonfinite_metrics:
+        trace_nonfinite = bundle_run.get("nonfinite_trace_metrics", {}) if bundle_run is not None else {}
+        if (nonfinite_metric_counts or trace_nonfinite) and not allow_nonfinite_metrics:
             raise RuntimeError(
                 f"Non-finite model metrics for {resolved['selector']}: "
-                f"{dict(sorted(nonfinite_metric_counts.items()))}. Use "
+                f"{dict(sorted(nonfinite_metric_counts.items()))}; trace: {trace_nonfinite}. Use "
                 "--allow-nonfinite-metrics only for diagnostic collection."
             )
 
@@ -651,8 +804,11 @@ def evaluate_preset(
             "reference_variant": resolved["reference"],
             "description": resolved["description"],
             "critic_spec": copy.deepcopy(model.agent.model.critic_signature),
+            **({"evaluation_controller": evaluation_controller, "action_rule": action_rule}
+               if controller is not None else {}),
             "controller_seed": int(controller_seed),
             "environment_seeds": [int(seed) for seed in seeds],
+            "seed_scheme": "sha256-v1",
             "outer_updates_before": updates_before,
             "outer_updates_after": updates_after,
             "outer_state_unchanged": True,
@@ -662,14 +818,37 @@ def evaluate_preset(
             "episode_length": _summary(lengths),
             "episodes": episodes,
             "model_metrics": _aggregate_metrics(metric_values),
+            "bank_metrics": _aggregate_metrics(bank_metric_values),
+            "bank_solve_count": len(bundle_run["roots"]) if bundle_run is not None else 0,
             "model_metric_availability": sorted(metric_values),
             "nonfinite_model_metrics": dict(sorted(nonfinite_metric_counts.items())),
             "alg_params": run_config["alg_params"],
+            "nonfinite_trace_metrics": trace_nonfinite,
         }
     except BaseException as exc:
         primary_error = exc
         raise
     finally:
+        if primary_error is not None and bundle is not None and active_episode:
+            if not any(item["episode_id"] == phase_id for item in bundle_run["episodes"]):
+                bundle_run["episodes"].append({
+                    "episode_id": phase_id, "seed": seed, "solver_seed": episode_seed,
+                    "return": episode_return if math.isfinite(episode_return) else None,
+                    "length": episode_steps, "status": "failed",
+                    "terminated": bool(terminated), "truncated": bool(truncated),
+                    "capped": truncated_by_evaluator, "control_seconds": control_seconds,
+                    "inner_metrics_mean": {key: float(np.mean(values))
+                                           for key, values in episode_metric_values.items()},
+                })
+        if bundle is not None and pending_events:
+            try:
+                bundle.write_trace(bundle_run, f"{phase_id}-partial", pending_events)
+            except BaseException as exc:
+                if primary_error is None:
+                    primary_error = exc
+                    _close_resources(model, env, primary_error=exc)
+                    raise
+                add_cleanup_notes(primary_error, [exc])
         _close_resources(model, env, primary_error=primary_error)
 
 
@@ -684,12 +863,43 @@ def evaluate_matrix(
     max_steps=None,
     device=None,
     allow_nonfinite_metrics=False,
+    metadata_path=None,
+    bundle_dir=None,
+    save_root_bank=None,
+    root_bank_path=None,
+    bank_only=False,
+    bank_repetitions=None,
+    reference_bundle=None,
+    wandb_options=None,
+    eval_run_dir=None,
+    eval_run_map=None,
+    checkpoint_inventory=None,
+    source_run=None,
+    stage_results=True,
+    eval_series_spec_dir=None,
 ):
     """Evaluate selected presets from a matrix with paired seeds."""
+    evaluation_started = time.perf_counter()
     matrix_path = Path(matrix_path).resolve()
     matrix = load_preset_matrix(matrix_path)
     selectors = normalize_selectors(matrix, selectors, comparisons)
+    from utils.ambi_benchmark import resolve_eval_run_map
+    assigned_runs = resolve_eval_run_map(selectors, run_dir=eval_run_dir, run_map=eval_run_map, wandb=wandb_options)
+    if bank_only and assigned_runs:
+        raise ValueError("Observation-bank diagnostics remain in local bundles; evaluation curves require full episodes.")
     evaluation = matrix.get("evaluation", {})
+    if bank_repetitions is None:
+        bank_repetitions = evaluation.get("bank_repetitions", 3)
+    root_decisions = evaluation.get("bank_decisions", [0, 100, 200, 300, 400])
+    probe_rollouts = evaluation.get("diagnostic_rollouts", 8)
+    probe_horizon = evaluation.get("diagnostic_horizon", 3)
+    if (not isinstance(root_decisions, list) or not root_decisions
+            or any(isinstance(step, bool) or not isinstance(step, int) or step < 0 for step in root_decisions)
+            or len(set(root_decisions)) != len(root_decisions)):
+        raise ValueError("bank_decisions must be a nonempty list of distinct nonnegative integers.")
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 1
+           for value in (probe_rollouts, probe_horizon)):
+        raise ValueError("Bank diagnostic_rollouts and diagnostic_horizon must be positive integers.")
     seeds = list(evaluation.get("seeds", [])) if seeds is None else list(seeds)
     if not seeds:
         raise PresetMatrixError("No evaluation seeds were supplied by CLI or matrix.")
@@ -702,34 +912,162 @@ def evaluate_matrix(
     if max_steps is None:
         max_steps = evaluation.get("max_steps")
 
-    resolved_presets = [
-        resolve_preset(matrix_path, selector, matrix=matrix) for selector in selectors
-    ]
+    from utils.ambi_benchmark import (
+        BenchmarkBundle, atomic_json, load_bank, make_bank, protocol_for, reference_returns,
+    )
+    context = None
+    if matrix["base_alg_config"] == "checkpoint":
+        from utils.checkpoint_context import load_checkpoint_context
+        context = load_checkpoint_context(checkpoint, metadata_path=metadata_path)
+    elif metadata_path is not None:
+        raise ValueError("--metadata requires a checkpoint-based preset matrix.")
+    resolved_presets = [resolve_preset(matrix_path, selector, matrix=matrix, checkpoint_context=context)
+                        for selector in selectors]
     _validate_frozen_selection(matrix, resolved_presets)
+    if any(item.get("evaluation_controller") for item in resolved_presets) and (
+            save_root_bank or root_bank_path or bank_only):
+        raise ValueError("Evaluation-only MPPI supports full episodes; observation-bank probes are unsupported.")
+    if not isinstance(bank_repetitions, int) or isinstance(bank_repetitions, bool) or bank_repetitions < 1:
+        raise ValueError("bank_repetitions must be a positive integer.")
+    if (save_root_bank or root_bank_path or bank_only or reference_bundle or wandb_options or assigned_runs) and bundle_dir is None:
+        raise ValueError("Banks, references, and W&B require --bundle-dir.")
+    if bank_only and not root_bank_path:
+        raise ValueError("--bank-only requires --root-bank.")
+    if save_root_bank and (root_bank_path or bank_only):
+        raise ValueError("Capture a prior bank separately from evaluating a saved bank.")
+    if save_root_bank and (len(resolved_presets) != 1 or
+            resolved_presets[0]["algorithm_config"]["alg_params"].get("inner_operator") != "none"):
+        raise ValueError("Saving a bank requires exactly one prior-only preset.")
+    if save_root_bank and Path(save_root_bank).exists():
+        raise FileExistsError(f"Observation bank already exists: {save_root_bank}")
+    if bundle_dir is not None and Path(bundle_dir).exists():
+        raise FileExistsError(f"Benchmark bundle already exists: {bundle_dir}. Choose a new directory.")
+    if bundle_dir is not None:
+        # A selected prior supplies reference outcomes to subsequent runs and
+        # their artifacts. Never add an unselected baseline or SAC workload.
+        resolved_presets.sort(key=lambda item: (item["algorithm_config"]["alg_params"].get("inner_operator") != "none"
+                                             or bool(item.get("evaluation_controller"))))
+        for resolved in resolved_presets:
+            params = resolved["algorithm_config"]["alg_params"]
+            if _observation_architecture_key(resolved)[0] != "state":
+                raise ValueError("Benchmark bundles currently support state observations only.")
+            if params.get("inner_operator", "sac") not in {"none", "sac"}:
+                raise ValueError("Benchmark bundles currently support prior-only and SAC presets.")
+            scopes = [key for key in params if key.startswith("inner_") and key.endswith("_scope")
+                      and key != "inner_mppi_warm_start_scope"]
+            if any(params[key] != "action" for key in scopes):
+                raise ValueError("Benchmark presets require fresh action-local inner state.")
+            if any(params.get(key, 0) for key in ("inner_actor_writeback_coef", "inner_critic_writeback_coef")):
+                raise ValueError("Benchmark presets must disable prior writeback.")
+            if int(params.get("inner_diagnostic_rollouts", 0)) != 0:
+                raise ValueError("Use bank probes for extra imagined evaluations; set inner_diagnostic_rollouts=0.")
+    checkpoint_sha256 = _file_sha256(checkpoint)
+    protocols = [protocol_for(resolved, controller_seed, max_steps) for resolved in resolved_presets]
+    if bundle_dir is not None and any(protocol != protocols[0] for protocol in protocols):
+        raise ValueError("A benchmark bundle must use one common environment/action protocol.")
+    protocol = protocols[0]
+    root_bank = load_bank(root_bank_path, checkpoint_sha256, protocol) if root_bank_path else None
+    reference = reference_returns(reference_bundle, checkpoint_sha256, protocol) if reference_bundle else None
+    if reference is not None and not bank_only and any(int(seed) not in reference for seed in seeds):
+        raise ValueError("Prior reference is missing requested episode seeds.")
+    if root_bank is not None:
+        protocol["root_bank_id"] = root_bank["id"]
+    checkpoint_identity = {
+        "path": str(Path(checkpoint).resolve()), "sha256": checkpoint_sha256,
+        "source_run": source_run or matrix.get("source_run"),
+        "source_run_verified": False,
+        "metadata": None if context is None else context.metadata,
+    }
+    if eval_series_spec_dir is not None:
+        if assigned_runs:
+            raise ValueError("Prepare specifications separately from assigning an existing evaluation run.")
+        from utils.ambi_benchmark import write_eval_series_specs
+        return write_eval_series_specs(eval_series_spec_dir, checkpoint_identity, resolved_presets,
+                                       protocol, seeds, inventory_path=checkpoint_inventory,
+                                       source_run=source_run)
+    if assigned_runs:
+        from utils.ambi_benchmark import preflight_eval_runs
+        preflight_eval_runs(assigned_runs, checkpoint_identity, resolved_presets, protocol, seeds,
+                           result_path=Path(bundle_dir) / "manifest.json",
+                           inventory_path=checkpoint_inventory, source_run=source_run)
+    bundle = BenchmarkBundle(
+        bundle_dir, checkpoint=checkpoint_identity, protocol=protocol, reference=reference,
+        eval_run_map=assigned_runs if stage_results else {}, checkpoint_inventory=checkpoint_inventory,
+    ) if bundle_dir is not None else None
+    if bundle is not None:
+        bundle.started = evaluation_started
     results = []
-    for resolved in resolved_presets:
-        results.append(
-            evaluate_preset(
-                resolved,
-                checkpoint,
-                seeds,
-                controller_seed=controller_seed,
-                max_steps=max_steps,
-                device=device,
-                allow_nonfinite_metrics=allow_nonfinite_metrics,
-            )
-        )
+    captured_roots = [] if save_root_bank else None
+    primary_error = None
+    try:
+        if root_bank is not None:
+            atomic_json(bundle.path / "root_bank.json", root_bank)
+        if reference_bundle is not None:
+            reference_path = Path(reference_bundle)
+            if reference_path.is_dir():
+                reference_path /= "manifest.json"
+            bundle.manifest["reference"] = {"path": str(reference_path.resolve()),
+                                            "manifest_sha256": _file_sha256(reference_path)}
+        for resolved in resolved_presets:
+            kind = "bank" if bank_only else "both" if root_bank is not None else "episodes"
+            bundle_run = bundle.start_run(resolved, kind) if bundle is not None else None
+            try:
+                result = evaluate_preset(
+                    resolved, checkpoint, seeds,
+                    controller_seed=controller_seed, max_steps=max_steps, device=device,
+                    allow_nonfinite_metrics=allow_nonfinite_metrics,
+                    bundle=bundle, bundle_run=bundle_run, root_bank=root_bank,
+                    bank_only=bank_only, bank_repetitions=bank_repetitions,
+                    captured_roots=captured_roots, root_decisions=root_decisions,
+                    probe_rollouts=probe_rollouts, probe_horizon=probe_horizon,
+                )
+                results.append(result)
+                if (bundle is not None and resolved["algorithm_config"]["alg_params"].get("inner_operator") == "none"
+                        and not resolved.get("evaluation_controller")):
+                    bundle.reference = {episode["seed"]: episode["return"] for episode in result["episodes"]}
+                if save_root_bank:
+                    bank = make_bank(checkpoint_sha256, protocol, captured_roots, complete=True)
+                    atomic_json(save_root_bank, bank)
+                    if Path(save_root_bank).resolve() != (bundle.path / "root_bank.json").resolve():
+                        atomic_json(bundle.path / "root_bank.json", bank)
+                    bundle.manifest["protocol"]["root_bank_id"] = bank["id"]
+                if bundle is not None:
+                    bundle.finish_run(bundle_run, result=result)
+            except BaseException as exc:
+                if bundle is not None:
+                    try:
+                        bundle.finish_run(bundle_run, error=exc)
+                    except BaseException as cleanup:
+                        add_cleanup_notes(exc, [cleanup])
+                raise
+    except BaseException as exc:
+        primary_error = exc
+        if captured_roots and bundle is not None and not (bundle.path / "root_bank.json").exists():
+            try:
+                atomic_json(bundle.path / "root_bank.json",
+                            make_bank(checkpoint_sha256, protocol, captured_roots, complete=False))
+            except BaseException as cleanup:
+                add_cleanup_notes(exc, [cleanup])
+        raise
+    finally:
+        if bundle is not None:
+            try:
+                bundle.finish(error=primary_error)
+            except BaseException as exc:
+                if primary_error is None:
+                    raise
+                add_cleanup_notes(primary_error, [exc])
     _attach_paired_return_deltas(results)
     metric_sets = [set(result["model_metric_availability"]) for result in results]
     return {
         "schema_version": 1,
         "matrix": str(matrix_path),
         "checkpoint": str(Path(checkpoint).resolve()),
-        "checkpoint_sha256": _file_sha256(checkpoint),
+        "checkpoint_sha256": checkpoint_sha256,
         "matrix_sha256": _file_sha256(matrix_path),
         "frozen_outer_learning": True,
         "deterministic_execution": True,
-        "environment": copy.deepcopy(matrix["environment"]),
+        "environment": copy.deepcopy(resolved_presets[0]["environment"]),
         "common_model_metrics": sorted(set.intersection(*metric_sets)) if metric_sets else [],
         "available_model_metrics": sorted(set.union(*metric_sets)) if metric_sets else [],
         "results": results,
@@ -748,13 +1086,24 @@ def main(argv=None):
                 selectors if args.presets or args.comparisons else None,
             )
         if args.materialize_dir is not None:
+            context = None
+            if matrix["base_alg_config"] == "checkpoint":
+                if args.checkpoint is None:
+                    parser.error("Checkpoint-based materialization requires --checkpoint and its sidecar.")
+                from utils.checkpoint_context import load_checkpoint_context
+                context = load_checkpoint_context(args.checkpoint, metadata_path=args.metadata)
             written = materialize_presets(
                 args.matrix,
                 args.materialize_dir,
                 selectors=selectors,
+                checkpoint_context=context,
             )
             for path in written:
                 print(f"materialized {path}")
+            if matrix["base_alg_config"] == "checkpoint":
+                # --checkpoint supplies the base configuration here; it is not
+                # an implicit request to execute the materialized workloads.
+                return 0
         if args.checkpoint is None:
             if args.list_presets or args.materialize_dir is not None:
                 return 0
@@ -773,6 +1122,17 @@ def main(argv=None):
             max_steps=args.max_steps,
             device=args.device,
             allow_nonfinite_metrics=args.allow_nonfinite_metrics,
+            metadata_path=args.metadata,
+            bundle_dir=args.bundle_dir,
+            save_root_bank=args.save_root_bank,
+            root_bank_path=args.root_bank,
+            bank_only=args.bank_only,
+            bank_repetitions=args.bank_repetitions,
+            reference_bundle=args.reference_bundle,
+            eval_run_dir=args.eval_run_dir, eval_run_map=args.eval_run_map,
+            checkpoint_inventory=args.checkpoint_inventory, eval_series_spec_dir=args.eval_series_spec_dir,
+            wandb_options={"project": args.wandb_project, "entity": args.wandb_entity,
+                           "mode": args.wandb_mode} if args.wandb else None,
         )
         serialized = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
         if args.output is None:

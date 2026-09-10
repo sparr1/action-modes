@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "description": "Frozen no-inner Humanoid prior benchmark. Run the prior once to save shared observations, screen explicit SAC budgets on that bank, then evaluate promising budgets for full episodes.",
+  "base_alg_config": "checkpoint",
+  "source_run": "rwgao_b-brown-university/ambi/u13m14st",
+  "shared_alg_params": {
+    "inner_operator": "sac",
+    "inner_rounds": 8,
+    "inner_rollouts_per_round": 512,
+    "inner_rollout_horizon": 3,
+    "inner_updates_per_round": null,
+    "inner_iterations": null,
+    "inner_rollouts": null,
+    "inner_horizon": null,
+    "inner_updates_per_iteration": null,
+    "inner_model_step_budget": null,
+    "inner_critic_updates_per_action": null,
+    "inner_actor_updates_per_action": null,
+    "inner_temperature_updates_per_action": null,
+    "inner_batch_size": 512,
+    "inner_replay_capacity": 12288,
+    "inner_replay_sampling": "with_replacement",
+    "inner_diagnostic_rollouts": 0,
+    "inner_actor_adaptation": "clone",
+    "inner_critic_adaptation": "clone",
+    "inner_temperature_mode": "auto",
+    "inner_temperature_initialization": "inherit_outer",
+    "inner_target_entropy": "inherit_outer",
+    "inner_bootstrap_source": "inner_target",
+    "inner_behavior_action": "policy_sample",
+    "inner_execution_action": "mean",
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_actor_scope": "action",
+    "inner_critic_scope": "action",
+    "inner_temperature_scope": "action",
+    "inner_replay_scope": "action",
+    "inner_actor_optimizer_scope": "action",
+    "inner_critic_optimizer_scope": "action",
+    "inner_temperature_optimizer_scope": "action"
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "default_presets": [
+      "inner_budget/prior"
+    ],
+    "bank_decisions": [
+      0,
+      100,
+      200,
+      300,
+      400
+    ],
+    "bank_repetitions": 3,
+    "diagnostic_rollouts": 8,
+    "diagnostic_horizon": 3,
+    "wandb_project": "ambi-inner-bench"
+  },
+  "comparisons": {
+    "inner_budget": {
+      "description": "Paired frozen-checkpoint return and inner optimization diagnostics with fixed collection compute and a 3:1 critic/actor update ratio.",
+      "reference": "prior",
+      "variants": {
+        "prior": {
+          "description": "Execute the frozen prior's central action with no imagined work.",
+          "alg_params": {
+            "inner_operator": "none",
+            "inner_rounds": null,
+            "inner_rollouts_per_round": null,
+            "inner_critic_updates_per_round": null,
+            "inner_actor_updates_per_round": null,
+            "inner_temperature_mode": "inherit_outer"
+          }
+        },
+        "sac_1x": {
+          "description": "24 critic and 8 actor/temperature updates per decision: 3 critic and 1 actor update per round.",
+          "alg_params": {
+            "inner_critic_updates_per_round": 3,
+            "inner_actor_updates_per_round": 1
+          }
+        },
+        "sac_2x": {
+          "description": "48 critic and 16 actor/temperature updates per decision: 6 critic and 2 actor updates per round. Select explicitly.",
+          "alg_params": {
+            "inner_critic_updates_per_round": 6,
+            "inner_actor_updates_per_round": 2
+          }
+        },
+        "sac_4x": {
+          "description": "96 critic and 32 actor/temperature updates per decision: 12 critic and 4 actor updates per round. Select explicitly.",
+          "alg_params": {
+            "inner_critic_updates_per_round": 12,
+            "inner_actor_updates_per_round": 4
+          }
+        }
+      }
+    },
+    "named_run": {
+      "description": "Inner settings verified against rwgao_b-brown-university/ambi/09fdc28b8d304f2f8667d6d10799a792 (AMBITDMPC2-humanoid-walk-base-v2-d512-4-j6-seed55). Frozen evaluation executes the central action despite the training configuration using sampled actions.",
+      "reference": "prior",
+      "variants": {
+        "prior": {
+          "description": "Execute the frozen prior's central action with no imagined work.",
+          "alg_params": {
+            "inner_operator": "none",
+            "inner_rounds": null,
+            "inner_rollouts_per_round": null,
+            "inner_critic_updates_per_round": null,
+            "inner_actor_updates_per_round": null,
+            "inner_temperature_mode": "inherit_outer"
+          }
+        },
+        "d512_4_j6": {
+          "description": "Original J6/N512/H3/B512 joint-G3 inner SAC: 18 critic, actor, and temperature updates per decision. Finite-horizon handoff and real-replay mixing remain disabled, matching the source run.",
+          "alg_params": {
+            "inner_rollout_horizon": 3,
+            "inner_q_target_reduction": "min_pair",
+            "inner_q_actor_reduction": "min_pair",
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_operator": "sac",
+            "inner_rounds": 6,
+            "inner_rollouts_per_round": 512,
+            "inner_updates_per_round": 3,
+            "inner_batch_size": 512,
+            "inner_replay_capacity": 9216,
+            "inner_replay_sampling": "with_replacement",
+            "inner_diagnostic_rollouts": 0,
+            "inner_diagnostics_every": 1000,
+            "inner_actor_adaptation": "clone",
+            "inner_critic_adaptation": "clone",
+            "inner_temperature_mode": "auto",
+            "inner_temperature_initialization": "inherit_outer",
+            "inner_target_entropy": "inherit_outer",
+            "inner_bootstrap_source": "inner_target",
+            "inner_actor_lr": 5e-05,
+            "inner_critic_lr": 0.0001,
+            "inner_temperature_lr": 0.0003,
+            "inner_adam_eps": 1e-08,
+            "inner_critic_target_tau": 0.01,
+            "inner_critic_target_update_interval": 1,
+            "inner_behavior_action": "policy_sample",
+            "inner_execution_action": "policy_sample",
+            "inner_actor_scope": "action",
+            "inner_critic_scope": "action",
+            "inner_temperature_scope": "action",
+            "inner_replay_scope": "action",
+            "inner_actor_optimizer_scope": "action",
+            "inner_critic_optimizer_scope": "action",
+            "inner_temperature_optimizer_scope": "action",
+            "inner_critic_updates_per_round": null,
+            "inner_actor_updates_per_round": null,
+            "inner_finite_horizon": false,
+            "inner_steps_per_update": null,
+            "inner_outer_replay_fraction": 0.0
+          }
+        },
+        "d512_4_j6_outer_target": {
+          "description": "D512-4-J6 with only inner_bootstrap_source changed to outer_target: the frozen outer target critic supplies all SAC bootstraps; next actions still come from the adapting inner actor. J6/N512/H3/B512 joint-G3 and adaptive local temperature are unchanged.",
+          "alg_params": {
+            "inner_rollout_horizon": 3,
+            "inner_q_target_reduction": "min_pair",
+            "inner_q_actor_reduction": "min_pair",
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_operator": "sac",
+            "inner_rounds": 6,
+            "inner_rollouts_per_round": 512,
+            "inner_updates_per_round": 3,
+            "inner_batch_size": 512,
+            "inner_replay_capacity": 9216,
+            "inner_replay_sampling": "with_replacement",
+            "inner_diagnostic_rollouts": 0,
+            "inner_diagnostics_every": 1000,
+            "inner_actor_adaptation": "clone",
+            "inner_critic_adaptation": "clone",
+            "inner_temperature_mode": "auto",
+            "inner_temperature_initialization": "inherit_outer",
+            "inner_target_entropy": "inherit_outer",
+            "inner_bootstrap_source": "outer_target",
+            "inner_actor_lr": 5e-05,
+            "inner_critic_lr": 0.0001,
+            "inner_temperature_lr": 0.0003,
+            "inner_adam_eps": 1e-08,
+            "inner_critic_target_tau": 0.01,
+            "inner_critic_target_update_interval": 1,
+            "inner_behavior_action": "policy_sample",
+            "inner_execution_action": "policy_sample",
+            "inner_actor_scope": "action",
+            "inner_critic_scope": "action",
+            "inner_temperature_scope": "action",
+            "inner_replay_scope": "action",
+            "inner_actor_optimizer_scope": "action",
+            "inner_critic_optimizer_scope": "action",
+            "inner_temperature_optimizer_scope": "action",
+            "inner_critic_updates_per_round": null,
+            "inner_actor_updates_per_round": null,
+            "inner_finite_horizon": false,
+            "inner_steps_per_update": null,
+            "inner_outer_replay_fraction": 0.0
+          }
+        }
+      }
+    }
+  }
+}

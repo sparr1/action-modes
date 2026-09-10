@@ -1,5 +1,10 @@
 # Frozen-checkpoint AMBI research
 
+The four TD-AMBI prior banks have dedicated [MPPI and J5 C1/A1 evaluation
+matrices](TD-AMBI-PRIOR-EVAL.md), preserving each saved critic objective and
+checkpoint alpha/Q scale. They provide fixed-scalar and adaptive-scalar SAC
+comparisons, with paired prior references and explicit evaluation curves.
+
 The frozen evaluator supports finite-horizon inner SAC and transition-based
 update counts. It rejects `inner_outer_replay_fraction > 0` because these model
 snapshots do not include real replay. Test replay mixing through a populated

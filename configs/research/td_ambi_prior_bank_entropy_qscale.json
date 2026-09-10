@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "description": "TD-AMBI entropy_qscale frozen prior bank: every25k checkpoint through2M. Native MPPI, then J5 C1/A1 fixed and adaptive inner SAC.",
+  "base_alg_config": "checkpoint",
+  "source_run": "rwgao_b-brown-university/ambi/zdnoyhbt",
+  "shared_alg_params": {
+    "inner_operator": "none",
+    "inner_rounds": null,
+    "inner_rollouts_per_round": null,
+    "inner_rollout_horizon": 3,
+    "inner_updates_per_round": null,
+    "inner_iterations": null,
+    "inner_rollouts": null,
+    "inner_horizon": null,
+    "inner_updates_per_iteration": null,
+    "inner_model_step_budget": null,
+    "inner_critic_updates_per_action": null,
+    "inner_actor_updates_per_action": null,
+    "inner_temperature_updates_per_action": null,
+    "inner_critic_updates_per_round": null,
+    "inner_actor_updates_per_round": null,
+    "inner_temperature_updates_per_round": null,
+    "inner_steps_per_update": null,
+    "inner_update_timing": "round",
+    "inner_batch_size": 512,
+    "inner_replay_capacity": 7680,
+    "inner_replay_sampling": "with_replacement",
+    "inner_diagnostic_rollouts": 0,
+    "inner_actor_adaptation": "clone",
+    "inner_critic_adaptation": "clone",
+    "inner_temperature_mode": "inherit_outer",
+    "inner_temperature_initialization": "inherit_outer",
+    "inner_target_entropy": "inherit_outer",
+    "inner_bootstrap_source": "inner_target",
+    "inner_behavior_action": "policy_sample",
+    "inner_execution_action": "mean",
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_actor_loss_scale_update": "per_action",
+    "inner_critic_target_initialization": "online",
+    "inner_critic_loss_coef": 1.0,
+    "inner_actor_entropy_mode": "squashed",
+    "inner_explorer_mode": "none",
+    "inner_finite_horizon": false,
+    "inner_outer_replay_fraction": 0.0,
+    "inner_outer_policy_kl_coef": 0.0,
+    "inner_outer_action_l2_coef": 0.0,
+    "inner_actor_scope": "action",
+    "inner_critic_scope": "action",
+    "inner_temperature_scope": "action",
+    "inner_replay_scope": "action",
+    "inner_actor_optimizer_scope": "action",
+    "inner_critic_optimizer_scope": "action",
+    "inner_temperature_optimizer_scope": "action"
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "default_presets": [
+      "controller/prior",
+      "controller/mppi"
+    ],
+    "wandb_project": "ambi-inner-bench"
+  },
+  "comparisons": {
+    "controller": {
+      "reference": "prior",
+      "description": "Frozen prior versus native TD-MPC2 MPPI over raw model rewards and the checkpoint online-Q terminal tail.",
+      "variants": {
+        "prior": {
+          "description": "Frozen prior tanh mean with no imagination or optimizer updates.",
+          "alg_params": {}
+        },
+        "mppi": {
+          "description": "Native MPPI H3/N512/E64/pi24,6 configured and8 effective Humanoid iterations, episode warm start and online Q mean pair.",
+          "evaluation_controller": {
+            "type": "mppi",
+            "params": {
+              "horizon": 3,
+              "iterations": 6,
+              "num_samples": 512,
+              "num_elites": 64,
+              "num_pi_trajs": 24,
+              "min_std": 0.05,
+              "max_std": 2.0,
+              "temperature": 0.5
+            }
+          }
+        }
+      }
+    },
+    "inner": {
+      "reference": "fixed",
+      "description": "Paired J5/N512/H3/B512 SAC: one critic, actor and target update per vector step;15 updates per component per decision.",
+      "variants": {
+        "fixed": {
+          "description": "J5 C1/A1: initialize private actor, online critic and target critic from checkpoint; hold saved alpha and S fixed within each decision.",
+          "alg_params": {
+            "inner_operator": "sac",
+            "inner_rounds": 5,
+            "inner_rollouts_per_round": 512,
+            "inner_steps_per_update": 512,
+            "inner_update_timing": "step",
+            "inner_actor_entropy_mode": "tdmpc2_scaled",
+            "inner_log_std_mapping": "tdmpc2_tanh",
+            "inner_log_std_min": -10,
+            "inner_log_std_max": 2,
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_q_target_reduction": "min_pair",
+            "inner_q_actor_reduction": "mean_pair",
+            "inner_actor_lr": 0.0003,
+            "inner_critic_lr": 0.0003,
+            "inner_temperature_lr": 0.0003,
+            "inner_adam_eps": 1e-08,
+            "inner_actor_adam_eps": 1e-05,
+            "inner_actor_grad_clip_norm": 20.0,
+            "inner_critic_grad_clip_norm": 20.0,
+            "inner_critic_loss_coef": 0.1,
+            "inner_critic_dropout_enabled": true,
+            "inner_critic_target_initialization": "outer_target",
+            "inner_critic_target_tau": 0.01,
+            "inner_critic_target_update_interval": 1
+          }
+        },
+        "adaptive": {
+          "description": "J5 C1/A1: inherit the saved S and alpha each decision; adapt only private S per actor update (EMA0.01).",
+          "alg_params": {
+            "inner_operator": "sac",
+            "inner_rounds": 5,
+            "inner_rollouts_per_round": 512,
+            "inner_steps_per_update": 512,
+            "inner_update_timing": "step",
+            "inner_actor_entropy_mode": "tdmpc2_scaled",
+            "inner_log_std_mapping": "tdmpc2_tanh",
+            "inner_log_std_min": -10,
+            "inner_log_std_max": 2,
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_q_target_reduction": "min_pair",
+            "inner_q_actor_reduction": "mean_pair",
+            "inner_actor_lr": 0.0003,
+            "inner_critic_lr": 0.0003,
+            "inner_temperature_lr": 0.0003,
+            "inner_adam_eps": 1e-08,
+            "inner_actor_adam_eps": 1e-05,
+            "inner_actor_grad_clip_norm": 20.0,
+            "inner_critic_grad_clip_norm": 20.0,
+            "inner_critic_loss_coef": 0.1,
+            "inner_critic_dropout_enabled": true,
+            "inner_critic_target_initialization": "outer_target",
+            "inner_critic_target_tau": 0.01,
+            "inner_critic_target_update_interval": 1,
+            "inner_actor_loss_scale_update": "per_update"
+          }
+        }
+      }
+    }
+  }
+}
