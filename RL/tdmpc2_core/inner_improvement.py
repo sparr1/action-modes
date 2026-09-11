@@ -7,6 +7,7 @@ the rest of the world model, and the entropy coefficient remain untouched.
 """
 
 from copy import deepcopy
+from contextlib import nullcontext
 from dataclasses import dataclass, field, fields as dataclass_fields
 import math
 import time
@@ -31,6 +32,7 @@ from .common.lora import (
     dense_lora_rl_critic,
     lora_rl_parameter_groups,
     make_lora_rl_critic,
+    reset_lora_rl_adapters_,
     reset_lora_rl_critic_,
     trainable_parameters,
     update_lora_rl_target_,
@@ -412,7 +414,8 @@ class InnerImprovementEngine:
         a fresh root-local workspace and an episode-private RNG stream. The
         default discards allocations. Opt-in reuse retains only a single-policy,
         fully action-scoped allocation pool; ordinary workspace preparation
-        restores priors, target networks, optimizer moments, replay and alpha
+        applies configured initialization, resets target networks, optimizer
+        moments, replay and alpha
         before use. Keeping module identities also avoids recompiling Dynamo
         guards after every root. Other lifecycles still discard their pools.
         """
@@ -775,6 +778,16 @@ class InnerImprovementEngine:
             "weight_decay": float(self.cfg.inner_critic_lora_weight_decay),
         }
 
+    def _random_initialization_spec(self):
+        """Identify scratch solves while leaving historical payloads unchanged."""
+        spec = {
+            component: str(getattr(self.cfg, f"inner_{component}_initialization", "prior"))
+            for component in ("actor", "critic")
+        }
+        if getattr(self.cfg, "inner_actor_initial_std", None) is not None:
+            spec["actor_initial_std"] = float(self.cfg.inner_actor_initial_std)
+        return spec if "random" in spec.values() else None
+
     def training_state_dict(self):
         """Return persistent inner scientific state at an episode boundary."""
         self._require_resume_boundary()
@@ -785,8 +798,10 @@ class InnerImprovementEngine:
             # Version 2 records the active population identity; all R modules
             # are action-local and are therefore intentionally absent here.
             # Version 3 identifies the LoRA-RL solve even at an empty boundary.
+            # Version 4 records random initialization and optional LoRA-RL.
             "version": (
-                3 if self._lora_rl_spec() is not None
+                4 if self._random_initialization_spec() is not None
+                else 3 if self._lora_rl_spec() is not None
                 else 2 if self._explorer_active else 1
             ),
             "action_index": int(self.action_index),
@@ -835,6 +850,9 @@ class InnerImprovementEngine:
         lora_rl_spec = self._lora_rl_spec()
         if lora_rl_spec is not None:
             payload["lora_rl_spec"] = lora_rl_spec
+        initialization_spec = self._random_initialization_spec()
+        if initialization_spec is not None:
+            payload["initialization_spec"] = initialization_spec
         return payload
 
     def _load_module_candidate(
@@ -902,7 +920,13 @@ class InnerImprovementEngine:
                 "mppi_prev_mean",
         }
         lora_rl_spec = self._lora_rl_spec()
-        if version != 3 and lora_rl_spec is not None:
+        initialization_spec = self._random_initialization_spec()
+        if version != 4 and initialization_spec is not None:
+            raise ValueError(
+                "Random initialization is incompatible with prior-initialized "
+                "AMBI inner-engine state."
+            )
+        if version not in {3, 4} and lora_rl_spec is not None:
             raise ValueError(
                 "LoRA-RL exact resume is incompatible with legacy AMBI inner-engine state."
             )
@@ -926,12 +950,39 @@ class InnerImprovementEngine:
                     f"checkpoint={state.get('explorer_mode')!r}, "
                     f"configured={self._explorer_mode!r}."
                 )
+        elif version == 4:
+            if initialization_spec is None or self._explorer_active:
+                raise ValueError(
+                    "Random initialization inner-engine state is incompatible "
+                    "with the configured method."
+                )
+            expected_keys = common_keys | {"initialization_spec"}
+            saved_initialization = require_exact_keys(
+                state.get("initialization_spec"), set(initialization_spec),
+                "Inner initialization specification",
+            )
+            if any(
+                type(saved_initialization[key]) is not type(value)
+                or saved_initialization[key] != value
+                for key, value in initialization_spec.items()
+            ):
+                raise ValueError(
+                    "Inner initialization specification is incompatible: "
+                    f"checkpoint={saved_initialization!r}, configured={initialization_spec!r}."
+                )
+            if ("lora_rl_spec" in state) != (lora_rl_spec is not None):
+                raise ValueError("LoRA-RL inner-engine protocol specification is incompatible.")
+            if lora_rl_spec is not None:
+                expected_keys |= {"lora_rl_spec"}
         elif version == 3:
             expected_keys = common_keys | {"lora_rl_spec"}
             if lora_rl_spec is None or self._explorer_active:
                 raise ValueError(
                     "LoRA-RL inner-engine state is incompatible with the configured method."
                 )
+        else:
+            raise ValueError("Unsupported AMBI inner-engine training-state version.")
+        if version in {3, 4} and lora_rl_spec is not None:
             saved_spec = require_exact_keys(
                 state.get("lora_rl_spec"), set(lora_rl_spec), "LoRA-RL protocol specification"
             )
@@ -943,8 +994,6 @@ class InnerImprovementEngine:
                     "LoRA-RL inner-engine protocol specification is incompatible: "
                     f"checkpoint={saved_spec!r}, configured={lora_rl_spec!r}."
                 )
-        else:
-            raise ValueError("Unsupported AMBI inner-engine training-state version.")
         state = require_exact_keys(
             state,
             expected_keys,
@@ -952,7 +1001,7 @@ class InnerImprovementEngine:
         )
         if (
             state["schema"] != "ambi-inner-engine-training-state"
-            or state["version"] not in {1, 2, 3}
+            or state["version"] not in {1, 2, 3, 4}
         ):
             raise ValueError("Unsupported AMBI inner-engine training-state version.")
         action_index = self._validate_index(state["action_index"], "action_index")
@@ -1305,7 +1354,10 @@ class InnerImprovementEngine:
                 self._action_pool.log_alpha = state.log_alpha
                 self._action_pool.alpha_fixed = state.alpha_fixed
                 self._action_pool.temperature_optim = state.temperature_optim
-            else:
+            elif str(cfg.inner_temperature_scope) != "action":
+                # Repeated expiration can find an already pooled action-local
+                # alpha. Its optimizer still owns that same parameter; retain
+                # its allocations until workspace preparation resets moments.
                 self._action_pool.temperature_optim = None
             state.log_alpha = state.alpha_fixed = state.temperature_optim = None
             state.temperature_lifetime_steps = 0
@@ -1388,9 +1440,53 @@ class InnerImprovementEngine:
                 elif isinstance(value, (int, float)):
                     parameter_state[key] = type(value)(0)
 
+    @torch.no_grad()
+    def _reset_random_component(self, component, module):
+        """Reset dense parameters in construction order, including LoRA bases.
+
+        The critic retains Linear constructor initialization rather than the
+        actor's TD-MPC initializer. Traversal reaches wrapped Linear bases but
+        never samples adapter factors; those are reset after the entire base.
+        """
+        if component == "actor":
+            module.apply(td_init.weight_init)
+            initial_std = getattr(self.cfg, "inner_actor_initial_std", None)
+            if initial_std is not None:
+                # Keep the sampled mean network. A constant std head makes
+                # the requested pre-tanh exploration scale exact at all roots,
+                # while leaving its weights trainable after initialization.
+                head = module[-1]
+                action_dim = int(self.cfg.action_dim)
+                if not isinstance(head, torch.nn.Linear) or head.out_features != 2 * action_dim:
+                    raise ValueError("Explicit inner actor std requires a Gaussian Linear output head.")
+                raw_std = math.log(initial_std)
+                if self.cfg.inner_log_std_mapping == "tdmpc2_tanh":
+                    lower, upper = self.cfg.inner_log_std_min, self.cfg.inner_log_std_max
+                    raw_std = math.atanh(2.0 * (raw_std - lower) / (upper - lower) - 1.0)
+                head.weight[action_dim:].zero_()
+                head.bias[action_dim:].fill_(raw_std)
+        elif component == "critic":
+            for layer in module.modules():
+                if isinstance(layer, torch.nn.Linear):
+                    layer.reset_parameters()
+            for head in module:
+                head[-1].weight.zero_()
+        else:
+            raise ValueError(f"Unknown inner component: {component!r}")
+        for layer in module.modules():
+            if isinstance(layer, torch.nn.LayerNorm):
+                layer.reset_parameters()
+
     def _reset_action_component(self, component, module, outer):
         mode = str(getattr(self.cfg, f"inner_{component}_adaptation"))
-        if mode == "lora_rl":
+        initialization = getattr(self.cfg, f"inner_{component}_initialization", "prior")
+        if initialization == "random":
+            self._reset_random_component(component, module)
+            if mode == "lora_rl":
+                reset_lora_rl_adapters_(module)
+            else:
+                module.requires_grad_(mode != "frozen")
+        elif mode == "lora_rl":
             reset_lora_rl_critic_(module, outer)
         else:
             module.load_state_dict(outer.state_dict())
@@ -1438,13 +1534,16 @@ class InnerImprovementEngine:
 
     def _adapt_module(self, base, component):
         mode = str(getattr(self.cfg, f"inner_{component}_adaptation"))
-        if mode == "frozen":
+        random = getattr(self.cfg, f"inner_{component}_initialization", "prior") == "random"
+        if mode in {"frozen", "clone"}:
             module = deepcopy(base).to(self.device)
-            module.requires_grad_(False)
-        elif mode == "clone":
-            module = deepcopy(base).to(self.device)
-            module.requires_grad_(True)
+            if random:
+                self._reset_random_component(component, module)
+            module.requires_grad_(mode != "frozen")
         elif mode == "lora_rl" and component == "critic":
+            if random:
+                base = deepcopy(base).to(self.device)
+                self._reset_random_component(component, base)
             module = make_lora_rl_critic(
                 base,
                 rank=self.cfg.inner_critic_lora_rank,
@@ -1888,8 +1987,7 @@ class InnerImprovementEngine:
     @property
     def _initialize_critic_from_outer_target(self):
         return (
-            self.cfg.inner_operator == "tdambi"
-            or getattr(self.cfg, "inner_critic_target_initialization", "online")
+            getattr(self.cfg, "inner_critic_target_initialization", "online")
             == "outer_target"
         )
 
@@ -1903,8 +2001,13 @@ class InnerImprovementEngine:
 
     def make_modules_for_compatibility(self):
         """Legacy test/debug hook returning freshly created inner modules."""
-        actor = self._adapt_module(self.model._pi, "actor")
-        critic = self._adapt_module(self.model._Qs, "critic")
+        context = (
+            self.rng.fork("initialization")
+            if self._random_initialization_spec() is not None else nullcontext()
+        )
+        with context:
+            actor = self._adapt_module(self.model._pi, "actor")
+            critic = self._adapt_module(self.model._Qs, "critic")
         target = self._new_critic_target(critic)
         actor_optim = self._new_optimizer(actor, "actor")
         critic_optim = self._new_optimizer(critic, "critic")
@@ -5847,6 +5950,7 @@ class InnerImprovementEngine:
                 {"tdambi_entropy_coef": float(cfg.tdambi_entropy_coef)}
                 if cfg.inner_operator == "tdambi" else {"alpha": alpha_initial}
             ))
+            trace.capture_actor(self, state.actor)
             if trace.probes:
                 trace.probe(self, root_z, state.actor)
         explorer_alpha_initial = (
@@ -5973,8 +6077,10 @@ class InnerImprovementEngine:
                 )
                 transition_sources.append(rollout["transition_sources"])
 
-            if trace is not None and trace.probes:
-                trace.probe(self, root_z, state.actor)
+            if trace is not None:
+                trace.capture_actor(self, state.actor)
+                if trace.probes:
+                    trace.probe(self, root_z, state.actor)
 
         execution_start = self._timer_start()
         capture_behavior = bool(return_behavior_policy and not eval_mode)
@@ -6471,6 +6577,10 @@ class InnerImprovementEngine:
                 return_behavior_policy=return_behavior_policy,
                 apply_inner_writeback=apply_inner_writeback,
             )
+        except BaseException:
+            if trace is not None:
+                trace.abort()
+            raise
         finally:
             self._active_trace = None
 
@@ -6504,6 +6614,7 @@ class InnerImprovementEngine:
                         ({"tdambi_entropy_coef": float(self.cfg.tdambi_entropy_coef)}
                          if operator == "tdambi" else {"alpha": self.agent.alpha.detach()})
                     )
+                    self._active_trace.capture_actor(self, self.model._pi, inner=False)
                     if self._active_trace.probes:
                         self._active_trace.probe(
                             self, root_z, self.model._pi, inner=False

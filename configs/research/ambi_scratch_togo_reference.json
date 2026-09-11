@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "description": "Pinned reward/Q-scale 2M backbone: from-scratch inner SAC with a frozen outer horizon bootstrap and optional to-go calibration.",
+  "base_alg_config": "checkpoint",
+  "source_run": "rwgao_b-brown-university/ambi/mey3rxj8",
+  "shared_alg_params": {
+    "inner_operator": "sac",
+    "inner_rounds": 5,
+    "inner_rollouts_per_round": 512,
+    "inner_rollout_horizon": 3,
+    "inner_updates_per_round": null,
+    "inner_iterations": null,
+    "inner_rollouts": null,
+    "inner_horizon": null,
+    "inner_updates_per_iteration": null,
+    "inner_model_step_budget": null,
+    "inner_critic_updates_per_action": null,
+    "inner_actor_updates_per_action": null,
+    "inner_temperature_updates_per_action": null,
+    "inner_batch_size": 512,
+    "inner_replay_capacity": 7680,
+    "inner_replay_sampling": "with_replacement",
+    "inner_diagnostic_rollouts": 0,
+    "inner_actor_adaptation": "clone",
+    "inner_critic_adaptation": "clone",
+    "inner_temperature_mode": "fixed",
+    "inner_temperature_initialization": "fixed",
+    "inner_target_entropy": "inherit_outer",
+    "inner_bootstrap_source": "inner_target",
+    "inner_behavior_action": "policy_sample",
+    "inner_execution_action": "mean",
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_actor_scope": "action",
+    "inner_critic_scope": "action",
+    "inner_temperature_scope": "action",
+    "inner_replay_scope": "action",
+    "inner_actor_optimizer_scope": "action",
+    "inner_critic_optimizer_scope": "action",
+    "inner_temperature_optimizer_scope": "action",
+    "inner_actor_initialization": "random",
+    "inner_critic_initialization": "random",
+    "inner_critic_target_initialization": "online",
+    "inner_finite_horizon": true,
+    "inner_update_timing": "step",
+    "inner_steps_per_update": 512,
+    "inner_temperature": 0.0001,
+    "inner_actor_lr": 0.0003,
+    "inner_critic_lr": 0.0003,
+    "inner_sac_critic_target": "reward_only",
+    "inner_actor_entropy_mode": "tdmpc2_scaled",
+    "inner_actor_loss_scale_update": "per_action",
+    "inner_explorer_mode": "none",
+    "inner_outer_replay_fraction": 0.0,
+    "inner_critic_updates_per_round": null,
+    "inner_actor_updates_per_round": null
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "default_presets": [
+      "initialization/scratch"
+    ],
+    "bank_decisions": [
+      0,
+      100,
+      200,
+      300,
+      400
+    ],
+    "bank_repetitions": 3,
+    "diagnostic_rollouts": 8,
+    "diagnostic_horizon": 3,
+    "wandb_project": "ambi-inner-bench",
+    "togo_return_rollouts": 32
+  },
+  "comparisons": {
+    "initialization": {
+      "description": "Change only actor and critic initialization; preserve the horizon handoff and compute.",
+      "reference": "inherited",
+      "variants": {
+        "inherited": {
+          "description": "Matched learned actor/critic initialization with the same fixed outer H-step handoff.",
+          "alg_params": {
+            "inner_actor_initialization": "prior",
+            "inner_critic_initialization": "prior"
+          }
+        },
+        "scratch": {
+          "description": "Reference: random dense actor and critic, 15 paired updates per decision.",
+          "alg_params": {}
+        }
+      }
+    },
+    "update_dose": {
+      "description": "Hold J/N/H/B and initialization fixed; vary only paired update dose.",
+      "reference": "x1",
+      "variants": {
+        "x1": {
+          "description": "One paired update per vectorized step (15 actor/critic updates).",
+          "alg_params": {}
+        },
+        "x2": {
+          "description": "Two paired updates per vectorized step (30 actor/critic updates).",
+          "alg_params": {
+            "inner_steps_per_update": 256
+          }
+        },
+        "x4": {
+          "description": "Four paired updates per vectorized step (60 actor/critic updates).",
+          "alg_params": {
+            "inner_steps_per_update": 128
+          }
+        }
+      }
+    }
+  },
+  "checkpoint_contract": {
+    "sha256": "cafab725083b277fb510e79ab9d8aa0c5a9b7d20e81e6cd56d104bbbb2743497",
+    "step": 2000000,
+    "saved_q_scale": 17.54598045349121,
+    "alg_params": {
+      "outer_critic_target": "reward_only",
+      "sac_actor_loss_scale_mode": "tdmpc2_percentile_range",
+      "outer_actor_entropy_mode": "tdmpc2_scaled",
+      "ent_coef": 0.0001
+    }
+  },
+  "real_calibration": {
+    "decisions": [
+      0,
+      100,
+      200,
+      300,
+      400
+    ],
+    "solver_repetitions": 3,
+    "rollout_repetitions": 4,
+    "rounds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "tail_steps": 1000,
+    "bootstrap_resamples": 2000,
+    "reward_bound": 2.0
+  }
+}

@@ -161,7 +161,10 @@ _AMBI_DEFAULTS = {
     "inner_replay_capacity": None,
     "inner_replay_sampling": "with_replacement",
 
-    # Independently adaptable inner components.
+    # Initialization and trainability are independent for each inner component.
+    "inner_actor_initialization": "prior",
+    "inner_actor_initial_std": None,
+    "inner_critic_initialization": "prior",
     "inner_actor_adaptation": "clone",
     "inner_critic_adaptation": "clone",
     "inner_critic_dropout_enabled": True,
@@ -1797,6 +1800,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             )
 
         for key, modes in (
+            ("inner_actor_initialization", {"prior", "random"}),
+            ("inner_critic_initialization", {"prior", "random"}),
             ("inner_actor_adaptation", _ACTOR_ADAPTATION_MODES),
             ("inner_critic_adaptation", _CRITIC_ADAPTATION_MODES),
         ):
@@ -2082,6 +2087,22 @@ class AMBITDMPC2(TDMPC2Baseline):
         )
         if cfg.inner_log_std_min >= cfg.inner_log_std_max:
             raise ValueError("inner_log_std_min must be less than inner_log_std_max.")
+        if cfg.inner_actor_initial_std is not None:
+            cfg.inner_actor_initial_std = _finite_float(
+                cfg.inner_actor_initial_std, "inner_actor_initial_std"
+            )
+            if cfg.inner_actor_initialization != "random":
+                raise ValueError(
+                    "inner_actor_initial_std requires inner_actor_initialization='random'."
+                )
+            if cfg.inner_actor_initial_std <= 0 or not (
+                cfg.inner_log_std_min < math.log(cfg.inner_actor_initial_std)
+                < cfg.inner_log_std_max
+            ):
+                raise ValueError(
+                    "inner_actor_initial_std must be positive with its log strictly "
+                    "inside the inner log-standard-deviation bounds."
+                )
 
         scope_keys = (
             "inner_actor_scope",
@@ -2434,6 +2455,43 @@ class AMBITDMPC2(TDMPC2Baseline):
                 "inner_critic_target_initialization='outer_target' requires an "
                 "action-local cloned critic."
             )
+
+        random_initialization = any(
+            getattr(cfg, f"inner_{component}_initialization") == "random"
+            for component in ("actor", "critic")
+        )
+        if random_initialization:
+            if cfg.inner_operator != "sac" or cfg.inner_explorer_mode != "none":
+                raise ValueError(
+                    "Random inner initialization requires inner_operator='sac' "
+                    "and inner_explorer_mode='none'."
+                )
+            for key in scope_keys[:-1]:
+                if getattr(cfg, key) != "action":
+                    raise ValueError(
+                        "Random inner initialization requires fresh per-decision "
+                        f"state; {key} must be 'action'."
+                    )
+            if writeback_active:
+                raise ValueError(
+                    "Random inner initialization requires zero "
+                    "inner_actor_writeback_coef and inner_critic_writeback_coef."
+                )
+            if cfg.value_equivalence_diagnostics or cfg.value_equivalence_loss_coef > 0.0:
+                raise ValueError(
+                    "Random inner initialization requires "
+                    "value_equivalence_diagnostics=false and "
+                    "value_equivalence_loss_coef=0; those probes assume "
+                    "prior-initialized inner networks."
+                )
+            if (
+                cfg.inner_critic_initialization == "random"
+                and cfg.inner_critic_target_initialization == "outer_target"
+            ):
+                raise ValueError(
+                    "inner_critic_initialization='random' requires "
+                    "inner_critic_target_initialization='online'."
+                )
 
         for key in ("actor_lr", "critic_lr", "ent_coef_lr"):
             value = _finite_float(getattr(cfg, key), key)

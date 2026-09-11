@@ -34,6 +34,8 @@
           "description": "Outer-policy control with no imagined work.",
           "alg_params": {
             "inner_operator": "none",
+            "inner_actor_initialization": "prior",
+            "inner_critic_initialization": "prior",
             "inner_rounds": null,
             "inner_rollouts_per_round": null,
             "inner_rollout_horizon": null,
@@ -50,6 +52,8 @@
           "description": "Deterministic TD3 improvement with Gaussian imagined behavior exploration.",
           "alg_params": {
             "inner_operator": "td3",
+            "inner_actor_initialization": "prior",
+            "inner_critic_initialization": "prior",
             "inner_rounds": 4,
             "inner_rollouts_per_round": 64,
             "inner_rollout_horizon": 3,
@@ -64,6 +68,8 @@
           "description": "MPPI with 128 candidates, 8 elites, two iterations, and no policy-prior trajectories.",
           "alg_params": {
             "inner_operator": "mppi",
+            "inner_actor_initialization": "prior",
+            "inner_critic_initialization": "prior",
             "inner_rounds": null,
             "inner_rollouts_per_round": null,
             "inner_updates_per_round": null,

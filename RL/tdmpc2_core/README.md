@@ -52,10 +52,11 @@ retain the samples drawn by each `nn.Linear` constructor, so the ordinary
 - only the final linear layer's weights are zeroed;
 - LayerNorm weights remain one and biases remain zero.
 
-This contract applies to AMBI and the local TD-MPC2 baseline across
+This contract applies to AMBI, TDAMBI, and the local TD-MPC2 baseline across
 ensemble sizes and scalar/distributional variants, with no configuration switch.
 Other model components retain their existing initialization and order. Target
-critics and inner critics copy their source weights, and checkpoint loading
+critics and prior-initialized inner critics copy their source weights; random
+inner critics use the same fresh-critic rules. Checkpoint loading
 restores saved weights without reinitializing them. Checkpoint schemas and Q
 APIs are unchanged. Fresh runs differ from the earlier ModuleList initialization,
 which applied truncated-normal critic weights and zero biases; initial Q values
@@ -90,9 +91,10 @@ into a fresh root-local learner at every real decision, trains that learner on
 imagined TOLD transitions, and acts with the adapted actor. The reference model
 uses TD-MPC2's model-size-driven distributional ensemble (five Q heads at model
 size 5), inner SAC, and a learned action-local entropy temperature initialized
-from the current outer temperature. Scalar twin critics, LoRA, TD3, no inner
-improvement, and persistent inner scopes are explicit ablations. The MPPI inner
-operator is a compute-matched TD-MPC-style comparator, not AMBI's planner.
+from the current outer temperature. Scalar twin critics, random inner
+initialization, LoRA, TD3, no inner improvement, and persistent inner scopes are
+explicit ablations. The MPPI inner operator is a compute-matched TD-MPC-style
+comparator, not AMBI's planner.
 
 Outer Adam defaults match TD-MPC2: `actor_lr=critic_lr=3e-4`,
 `actor_adam_eps=1e-5`, and `adam_eps=1e-8` for world-model and critic updates,
@@ -135,15 +137,109 @@ normalization and use the configured `rho`. Inner SAC minibatch losses have no
 timestep weighting. Termination BCE keeps its unweighted upstream reduction.
 The optional Q-only percentile scaling described below is unchanged.
 
+### Inner-network initialization
+
+`inner_actor_initialization` and `inner_critic_initialization` independently
+accept `"prior"` (the default) or `"random"`. A prior-initialized component
+starts from its latest learned control prior. A random component receives fresh
+samples for every active inner solve, including when the engine reuses its parameter
+storage. The networks retain the configured architecture, device, and dtype.
+They do not reset the world model or the outer priors.
+
+Initialization controls starting weights; adaptation controls trainable
+parameters. In particular, the existing `"clone"` adaptation name means full
+dense training and also applies to a network initialized from scratch. To train
+both AMBI inner networks densely from scratch, add these algorithm parameters:
+
+```json
+{
+  "inner_operator": "sac",
+  "inner_actor_initialization": "random",
+  "inner_critic_initialization": "random",
+  "inner_critic_target_initialization": "online",
+  "inner_actor_adaptation": "clone",
+  "inner_critic_adaptation": "clone"
+}
+```
+
+Either initialization can instead be `"prior"` to isolate the actor or critic
+ablation. For a dense random actor and a random critic with LoRA updates, use:
+
+```json
+{
+  "inner_operator": "sac",
+  "inner_actor_initialization": "random",
+  "inner_critic_initialization": "random",
+  "inner_critic_target_initialization": "online",
+  "inner_actor_adaptation": "clone",
+  "inner_critic_adaptation": "lora_rl"
+}
+```
+
+Random actors follow AMBI's model-construction initializer: truncated-normal
+linear weights with standard deviation `0.02`, zero linear biases, and reset
+LayerNorm weights/biases of one/zero. Random critics follow the fresh-critic
+rules above: constructor-uniform linear weights and biases, zero final-layer
+weights, and reset LayerNorm. The critic's output biases remain random.
+Every active solve resets its targets, optimizer moments, and imagined replay.
+Seeded runs reproduce the initialization sequence; subsequent decisions draw
+new samples rather than restoring one fixed random network. Setting
+`inner_rounds=0` retains the existing outer-policy bypass and does not instantiate
+inner networks.
+
+Optional `inner_actor_initial_std` sets a random actor's initial **pre-tanh**
+Gaussian standard deviation exactly (for example `0.3`). The default `null`
+preserves the initializer above. The requested log standard deviation must lie
+strictly inside the resolved inner bounds. Initialization retains the random
+mean network, zeroes only the std output rows, and fills their biases using the
+inverse of `tdmpc2_tanh` or `direct_clamp`. Those rows remain trainable. Every
+action reset reapplies the scale without additional random draws or outer
+changes. The option requires `inner_actor_initialization="random"`, enters
+experiment and resume identity, and is preserved in immutable actor snapshots.
+With the default tanh mapping and bounds `[-10, 2]`, the unmodified near-zero
+std head instead starts near `exp(-4)`, approximately `0.018`.
+
+A random online critic initializes its independent local target from that same
+new critic. `inner_critic_target_initialization="outer_target"` is rejected
+when the critic initialization is random. LoRA targets use the merged effective
+weights and preserve the existing target-update rule. The initialization choice
+does not disable explicitly configured outer bootstrap sources, policy anchors,
+inherited entropy temperature, or Q scaling. These remain separate controls;
+random initialization alone does not remove all uses of learned priors.
+
+Random initialization is supported for single-policy inner SAC and the
+[native TDAMBI evaluator](#tdambi-native-inner-learning), with all seven actor,
+critic, temperature, replay, and corresponding optimizer scopes set to
+`"action"`. Dense adaptation uses `"clone"`; AMBI SAC also supports `"frozen"`
+components under the existing zero-update rules. Native TDAMBI retains paired
+updates with a `"clone"` actor and a `"clone"` or `"lora_rl"` critic. Critic
+`"lora_rl"` adaptation always requires a `"clone"` actor. Persistent scopes,
+explorer populations, other inner operators, nonzero prior writeback
+coefficients, a positive `value_equivalence_loss_coef`, and
+`value_equivalence_diagnostics=true` are rejected for this ablation. The
+value-equivalence features retain their fresh-prior interpretation.
+
+Omitting the initialization fields or setting both to `"prior"` preserves
+existing behavior and historical scientific identities. Random choices are
+included in configuration and experiment identities. AMBI exact inner-state
+training checkpoints for random initialization use version 4 to record and
+validate the initialization protocol before loading; an exact resume cannot
+change that protocol. Portable outer checkpoints remain loadable for a new
+scratch-initialized evaluation or study. Native TDAMBI remains an evaluation
+wrapper that loads frozen native model checkpoints and their saved scale.
+
 ### Critic-only LoRA-RL
 
 Set `inner_critic_adaptation="lora_rl"` and retain
 `inner_actor_adaptation="clone"` for the paper-inspired inner SAC variant.
+The native TDAMBI evaluator accepts the same critic adaptation while retaining
+its native TD-MPC2 actor and critic objectives.
 Dense actor/critic adaptation remains the reference default. The replacement
 is based on [LoRA-RL](https://arxiv.org/abs/2604.18978) and its released
 [implementation at commit `0395bb27b24016f6c680ca12c6d5e367f77db054`](https://github.com/paulzyzy/LoRA_RL/tree/0395bb27b24016f6c680ca12c6d5e367f77db054).
-It borrows critic update regularization while retaining AMBI's learned priors,
-architecture, actor loss, critic representation, target reduction, and budgets.
+It borrows critic update regularization while retaining AMBI's architecture,
+actor loss, critic representation, target reduction, and budgets. Initialization
+uses learned priors by default and supports the independent random options above.
 
 ```json
 {
@@ -156,9 +252,10 @@ architecture, actor loss, critic representation, target reduction, and budgets.
 }
 ```
 
-Each selected inner-critic matrix uses `W = W_outer + scale * B @ A`.
-`W_outer` is frozen during the solve; both adapter factors train. The output
-heads, biases, and LayerNorm parameters remain normally trainable in separate
+Each selected inner-critic matrix uses `W = W_base + scale * B @ A`.
+`W_base` is the copied prior weight or a fresh random weight, frozen during the
+solve; both adapter factors train. The output heads, biases, and LayerNorm
+parameters remain normally trainable in separate
 inner copies. There is no adapter dropout. The ordinary configured critic
 dropout still follows `inner_critic_dropout_enabled`. Actor updates remain
 dense, and gradients through the adapted critic reach actor actions without
@@ -196,12 +293,17 @@ does not implement this rule. The target follows the existing inner target
 cadence and tau. Frozen outer bootstrap choices retain their existing meaning.
 
 All actor, critic, replay, temperature, and optimizer scopes are action-local
-for this variant. Every decision restores the latest learned prior, initializes
+for this variant. Every active solve restores the latest learned prior or draws
+fresh random weights according to each initialization setting, initializes
 fresh A from a normal distribution with standard deviation `1/sqrt(rank)` and
 zero B, and resets target, optimizer, and replay state in reused storage.
-Zero B makes the initial adapted critic exactly reproduce its prior. This is
-an intentional departure from the paper's main random-base initialization,
-which would change a trained checkpoint's predictions at the start of a solve.
+Zero B makes the initial adapted critic exactly reproduce its selected dense
+base. Random initialization retains zero B and the existing trainable biases,
+LayerNorm, and value heads; it does not freeze the entire critic or the actor.
+In particular, keeping the zero-initialized critic value-head weight trainable
+allows learning to reach the hidden layers. This remains an intentional
+departure from the paper's random nonzero A/B initialization and specialized
+weight-normalization projection, which AMBI does not implement.
 The public SimbaV2 snapshot contains its launcher/configuration but lacks the
 `simbaV2` implementation imported by its agent factory; detailed target and
 trainable-parameter behavior is checked against BRC, not an unavailable SimbaV2
@@ -258,7 +360,8 @@ requires an action-local cloned critic.
 The Humanoid Walk preset retains base-v2's seed 55, 14-million-decision budget,
 J=8/N=32/H=3/G=1 collection schedule, minibatch/replay sizes, action-local
 learners, and disabled evaluation and model saves. It is a single-seed
-exploratory recipe. It uses `AMBITDMPC2/AMBITDMPC2` for training.
+exploratory recipe. It uses `AMBITDMPC2/AMBITDMPC2` for training; the separate
+`TDAMBI/TDAMBI` wrapper below remains for native frozen-checkpoint evaluation.
 
 ```bash
 environments/dmcontrol/.venv/bin/python main.py \
@@ -268,6 +371,108 @@ environments/dmcontrol/.venv/bin/python main.py \
 
 This is a full training command; submit it through the scheduled-compute
 workflow when running an experiment.
+
+### TDAMBI: native inner learning
+
+`RL/TDAMBI.py` adapts native TD-MPC2 checkpoints for frozen evaluation using the
+shared `InnerImprovementEngine`. By default, each active solve restores a local
+actor, online critic, and the checkpoint's **saved target critic**, clears
+optimizer moments and replay, and resets the local Q scale. Allocated storage
+can be reused. The actor and online critic independently support `"prior"` or
+`"random"` initialization; the actor trains densely and the critic supports
+`"clone"` or `"lora_rl"` adaptation. All outer parameters, including encoder,
+dynamics, reward, and saved control priors, remain immutable. Only single-task
+state observations are supported; the wrapper rejects training and SAC
+shared-observation probes.
+
+For example, add these planner settings to a native TDAMBI evaluation to train
+a fresh random actor and a critic with random frozen LoRA base matrices:
+
+```json
+{
+  "inner_actor_initialization": "random",
+  "inner_critic_initialization": "random",
+  "inner_critic_adaptation": "lora_rl"
+}
+```
+
+The wrapper selects the target initialization default from the critic settings:
+`"outer_target"` for a prior-initialized `"clone"` critic, and `"online"` for a
+random critic or any `"lora_rl"` critic. Historical `"online"` settings with a
+prior-initialized dense critic normalize to `"outer_target"`, preserving that
+controller's saved-target behavior and identity. Random or LoRA critics reject
+`"outer_target"`; their independent local targets start from the new online
+critic's effective weights. This applies on both initial allocation and reused
+storage. The source checkpoint must still contain its complete saved native
+target critic. Actor initialization does not change which target source is used.
+
+These settings change initialization and critic trainability while preserving
+native TD-MPC2 learning below. `TDAMBI/TDAMBI` remains the frozen native evaluator;
+the separately named `TD-AMBI.json` presets use `AMBITDMPC2/AMBITDMPC2` for
+training with AMBI's configurable SAC implementation.
+
+Imagined stochastic-policy transitions are detached and sampled as ordinary
+minibatches, without TD-MPC2's outer timestep batching or rho weighting. A
+paired update performs critic, actor, then target interpolation. Critic learning
+uses native distributional cross entropy averaged across heads, multiplied by
+the native value coefficient. Its target is predicted reward plus discounted
+local target Q (minimum of two random heads) at a sampled local-policy action.
+Rollout cutoffs bootstrap and do not introduce synthetic terminal flags. There
+is no entropy bonus in that target.
+
+Actor learning maximizes average-pair online Q divided by the running scale,
+plus the saved fixed coefficient times native `scaled_entropy`. This preserves
+the native policy standard-deviation mapping and this port's stable tanh
+calculations. Online critic dropout remains active during training; the target
+critic remains in evaluation mode. Dense updates retain native Adam defaults,
+actor epsilon `1e-5`, critic epsilon `1e-8`, clipping, and target interpolation.
+With LoRA, critic updates use the existing AdamW adapter groups: selected base
+weights freeze, adapters receive configured weight decay, and critic biases,
+normalization, and value heads remain trainable with zero weight decay. Its
+target averages merged effective weights. No local temperature optimizer is
+created. The real action is the adapted `tanh(mean)`.
+
+Native portable checkpoints now include `scale = {value, percentiles}` beside
+the model, including periodic asynchronous checkpoints. The value is captured
+at the same training step as the networks. Loaders validate its shape, dtype,
+finiteness, unit floor and fixed `[5, 95]` percentiles before mutating live state.
+Native exact-training checkpoints already included this state and keep their
+existing format. Loading an older model-only snapshot into the native learner
+resets its unavailable scale to one.
+
+TDAMBI's `tdambi_scale_initialization` selects one of three evaluation policies:
+
+- `checkpoint_or_calibrate` (default): copy the saved training scale into each
+  new inner solve when present; otherwise use the historical calibration below.
+- `checkpoint`: require saved scale state and fail clearly if it is missing.
+- `calibrate`: use historical local calibration even when a saved scale exists,
+  for a controlled initialization comparison.
+
+The saved reference scale stays frozen. Each solve owns its own copy and applies
+the native EMA on subsequent actor minibatches; the next real decision starts
+from the saved training value again. With checkpoint initialization, no
+calibration samples or calibration model calls are performed. Older snapshots
+cannot reconstruct a training scale that was never saved.
+
+Historical calibration samples a reproducible minibatch from the first imagined
+collection before the first optimizer update, evaluates frozen-prior actions
+with frozen online average-pair Q, and initializes `max(P95 - P5, 1)`. It has an
+isolated RNG stream and separate evaluation counts and timing. Random network
+initialization and LoRA preserve this explicit scale policy: saved-scale modes
+still use the checkpoint scale, and calibration still evaluates the frozen
+control priors rather than the random inner networks. Subsequent actor updates
+always update the local scale from the adapted online critic. Evaluation
+records the initialization policy and actual source; decision metrics include
+`inner_tdambi_scale_from_checkpoint`, `inner_tdambi_q_scale_initial`, and the
+existing final scale. Initialization policy is part of planner identity, while
+the learned numeric scale remains checkpoint-specific data.
+
+Detached raw traces include native entropy, its weighted contribution, raw and
+scaled Q, scale before/after, losses, gradients, target statistics and work
+counts. Losses are pre-optimizer measurements. No per-update synchronization,
+extra diagnostic forward, or publication is introduced by tracing. See the
+[frozen TDAMBI workflow](../../configs/research/README.md#tdambi-on-native-td-mpc2-checkpoints)
+for presets, matched native prior references, HTML reports and Oscar smoke use.
 
 ### Optional adapted-prior writeback
 
@@ -487,9 +692,8 @@ strictly positive integers. The monitor currently requires
 
 ### Value-equivalence training loss
 
-AMBI also includes an experimental, opt-in loss that trains TOLD to preserve
-the value component of the fresh-inner SAC Bellman operator. At recurrent depth
-`i`, it minimizes the raw squared residual
+AMBI can also train TOLD to preserve the value component of the fresh-inner SAC
+Bellman operator. At recurrent depth `i`, it minimizes the raw squared residual
 `(gamma * mean_k[V_k(z_model[i+1]) - V_k(z_real[i+1])]) ** 2`, reduced with
 TOLD's existing temporal weights. The replay action advances the recurrent
 model, while each successor branch samples its own state-conditioned fresh-inner
@@ -516,6 +720,13 @@ sampling is independent of `value_equivalence_mc_samples`, which controls only
 the observational live monitor.
 
 ### Finite-horizon inner SAC and real-replay mixing
+
+The opt-in [to-go calibration workflow](../../configs/research/TOGO_CALIBRATION.md)
+scores the current actor at initialization and completed rounds using H model
+steps plus the frozen outer online-Q tail. `InnerActionTrace` can also capture
+immutable actors for real H-step prefixes followed by continuing prior rollouts.
+Diagnostic randomness, timing, and work counts are separate from optimization;
+ordinary training and evaluation keep these diagnostics disabled by default.
 
 `inner_finite_horizon=true` makes `inner_rollout_horizon=H` a boundary for
 the inner solve. The final imagined transition, from depth `H-1` to `H`,
@@ -967,8 +1178,8 @@ losses and diagnostics use the inner target statistic, preserving gradients
 through predicted latents for the loss. Critic targets themselves stop gradients.
 Reward-only targets have no entropy bonus. With Q scaling enabled, the supported
 fixed-temperature entropy-augmented case uses the `alpha * S` coefficient
-described above. Action-entropy metrics and the finite-horizon prior handoff
-retain their existing definitions.
+described above. Action-entropy metrics, the finite-horizon prior handoff, and
+the native TDAMBI operator retain their existing definitions.
 
 In scaled mode the critic estimates returns augmented by the selected surrogate
 statistic. The manuscript's standard maximum-entropy SAC equations describe
@@ -1044,7 +1255,8 @@ alongside matching network dimensions and initialization:
 ```
 
 The inner actor retains its default squashed entropy statistic and inherits the
-fixed outer coefficient. Both critics use TD-MPC2's reward-only targets.
+fixed outer coefficient. Both critics use reward-only targets as required by
+Q scaling.
 The outer actor architecture and objective match TD-MPC2 given matching latent
 inputs, critic values, policy noise, sampled critic heads, normalization state,
 and optimizer state. Other AMBI training and inner-loop choices remain independent;
@@ -1286,10 +1498,11 @@ For TD-MPC2, the root diagnostic is the all-head mean target-critic difference
 `Q_target(z, a_mpc) - Q_target(z, a_network)`. It adds one batched critic call
 per MPC-controlled root and no diagnostic model rollout. Reported planner model
 steps count policy-prior transitions plus every candidate transition across
-the effective MPPI iterations. Enabling five fixed-seed pairs alongside the
-ordinary ten MPC evaluation episodes adds approximately 50% more evaluation-time
-planner work plus five comparatively cheap network-policy episodes; training
-compute is unchanged.
+the effective MPPI iterations. The maintained 14M Humanoid Walk state baseline
+enables five fixed-seed pairs at step zero and every 100,000 decisions. Because its existing
+evaluation already runs ten MPC episodes, the probe adds approximately 50%
+more evaluation-time planner work plus five comparatively cheap network-policy
+episodes; training compute is unchanged.
 
 The three `ambi_anchor_kl_{smooth,quantile,dual}` Humanoid Walk manifests run
 this five-episode protocol at the existing 50,000-decision cadence alongside

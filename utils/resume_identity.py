@@ -230,6 +230,9 @@ def scientific_trial_parameters(
                 # TD-AMBI's explicit loss/initialization changes remain part
                 # of the scientific configuration even though state is local.
                 for field, default in (
+                    ("inner_actor_initialization", "prior"),
+                    ("inner_actor_initial_std", None),
+                    ("inner_critic_initialization", "prior"),
                     ("inner_critic_loss_coef", 1.0),
                     ("inner_actor_loss_scale_update", "per_action"),
                     ("inner_critic_target_initialization", "online"),

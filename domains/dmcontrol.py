@@ -10,6 +10,9 @@ from __future__ import annotations
 from collections import deque
 import copy
 import importlib
+import importlib.metadata
+import hashlib
+import platform
 from typing import Any, Mapping
 
 import gymnasium as gym
@@ -21,6 +24,30 @@ _EPISODE_LENGTH = 500
 _FRAME_STACK = 3
 _IMAGE_SIZE = 64
 _RENDER_SIZE = 384
+
+
+def _generator_state(owner):
+    generator = owner.__dict__.get("_np_random")
+    return None if generator is None else copy.deepcopy(generator.bit_generator.state)
+
+
+def _restore_generator_state(owner, state):
+    if state is None:
+        owner._np_random = None
+        return
+    bit_generator = getattr(np.random, state["bit_generator"])()
+    bit_generator.state = copy.deepcopy(state)
+    owner._np_random = np.random.Generator(bit_generator)
+
+
+def _validate_generator_state(state):
+    if state is None:
+        return
+    bit_generator_class = getattr(np.random, state["bit_generator"], None)
+    if not isinstance(bit_generator_class, type) or not issubclass(bit_generator_class, np.random.BitGenerator):
+        raise ValueError("Unsupported NumPy bit generator in simulator snapshot.")
+    probe = bit_generator_class(0)
+    probe.state = copy.deepcopy(state)
 
 
 def _load_dmcontrol_dependencies():
@@ -116,6 +143,7 @@ class DMControlEnv(gym.Env):
         task: str,
         obs: str = "state",
         render_mode: str | None = None,
+        continuing_calibration: bool = False,
     ) -> None:
         super().__init__()
         if obs not in {"state", "rgb"}:
@@ -138,6 +166,9 @@ class DMControlEnv(gym.Env):
             )
 
         self.observation_type = obs
+        if continuing_calibration and (self.task_name != "humanoid-walk" or obs != "state"):
+            raise ValueError("Continuing calibration supports only Humanoid Walk state observations.")
+        self._continuing_calibration = bool(continuing_calibration)
         self.render_mode = render_mode
         self.action_repeat = _ACTION_REPEAT
         self.frame_stack = _FRAME_STACK if obs == "rgb" else None
@@ -194,6 +225,8 @@ class DMControlEnv(gym.Env):
             task_kwargs={"random": int(seed)},
             visualize_reward=False,
         )
+        if self._continuing_calibration:
+            env._step_limit = float("inf")
         return self._action_scale.Wrapper(env, minimum=-1.0, maximum=1.0)
 
     @staticmethod
@@ -354,6 +387,123 @@ class DMControlEnv(gym.Env):
             "observation_type": self.observation_type,
             "task_random_state": copy.deepcopy(task_random.get_state()),
         }
+
+    def enable_continuing_calibration(self) -> None:
+        """Disable the raw DMC clock in a dedicated diagnostic environment.
+
+        The caller must also disable its Gym TimeLimit. This deliberately does
+        not alter the ordinary environment's registered 500-decision horizon.
+        """
+        self._require_calibration_task()
+        raw = self._env._env
+        if raw._reset_next_step and raw._step_count < raw._step_limit:
+            raise ValueError("Cannot continue a reset-pending simulator root.")
+        if raw._step_count >= raw._step_limit:
+            raw._reset_next_step = False
+        raw._step_limit = float("inf")
+        self._continuing_calibration = True
+
+    def _require_calibration_task(self) -> None:
+        if self.task_name != "humanoid-walk" or self.observation_type != "state":
+            raise ValueError("Simulator calibration supports only Humanoid Walk state observations.")
+
+    def _calibration_runtime(self) -> dict[str, Any]:
+        import mujoco
+
+        physics = self._env.physics
+        return {
+            "dm_control": importlib.metadata.version("dm-control"),
+            "mujoco": mujoco.__version__,
+            "gymnasium": gym.__version__,
+            "numpy": np.__version__,
+            "python": platform.python_version(),
+            "platform": platform.system(),
+            "machine": platform.machine(),
+            "model_sha256": hashlib.sha256(physics.model.to_bytes()).hexdigest(),
+            "physics_class": f"{type(physics).__module__}.{type(physics).__qualname__}",
+            "legacy_step": bool(physics.legacy_step),
+            "action_repeat": self.action_repeat,
+            "control_timestep": self._effective_control_timestep,
+        }
+
+    def calibration_state(self) -> dict[str, Any]:
+        """Capture complete MuJoCo integration state, not a training resume.
+
+        The enclosing snapshot codec makes this mutable transport mapping
+        immutable and includes Gym wrapper bookkeeping. It is intentionally
+        limited to the pinned Humanoid task, whose task state outside Physics
+        consists only of its random generator and fixed construction options.
+        """
+        self._require_calibration_task()
+        import mujoco
+
+        raw = self._env._env
+        physics = self._env.physics
+        state_spec = mujoco.mjtState.mjSTATE_INTEGRATION
+        integration = np.empty(mujoco.mj_stateSize(physics.model.ptr, state_spec))
+        mujoco.mj_getState(physics.model.ptr, physics.data.ptr, integration, state_spec)
+        return {
+            "schema_version": 1,
+            "task": self.task_name,
+            "observation_type": self.observation_type,
+            "runtime": self._calibration_runtime(),
+            "integration": integration,
+            "observation": self._state_observation(raw.task.get_observation(physics)),
+            "task_random_state": copy.deepcopy(raw.task.random.get_state()),
+            "step_count": raw._step_count,
+            "reset_next_step": raw._reset_next_step,
+            "step_limit": None if np.isinf(raw._step_limit) else raw._step_limit,
+            "continuing_calibration": self._continuing_calibration,
+            "adapter_random_state": _generator_state(self),
+            "action_random_state": _generator_state(self.action_space),
+            "observation_random_state": _generator_state(self.observation_space),
+        }
+
+    def load_calibration_state(self, state: Mapping[str, Any]) -> np.ndarray:
+        """Restore an exact same-runtime root and return its state observation."""
+        self._require_calibration_task()
+        import mujoco
+
+        if (state.get("schema_version") != 1 or state.get("task") != self.task_name
+                or state.get("observation_type") != self.observation_type):
+            raise ValueError("Unsupported simulator calibration snapshot.")
+        if state.get("runtime") != self._calibration_runtime():
+            raise ValueError("Simulator snapshot runtime/model identity differs.")
+        physics = self._env.physics
+        state_spec = mujoco.mjtState.mjSTATE_INTEGRATION
+        integration = np.asarray(state["integration"], dtype=np.float64)
+        if (integration.shape != (mujoco.mj_stateSize(physics.model.ptr, state_spec),)
+                or not np.isfinite(integration).all()):
+            raise ValueError("Simulator integration state has an invalid shape or nonfinite values.")
+        observation = np.asarray(state["observation"])
+        if observation.shape != self.observation_space.shape or not np.isfinite(observation).all():
+            raise ValueError("Simulator snapshot observation has an invalid shape or nonfinite values.")
+        if (isinstance(state["step_count"], bool) or not isinstance(state["step_count"], int)
+                or state["step_count"] < 0):
+            raise ValueError("Simulator snapshot step count must be a nonnegative integer.")
+        if state["step_limit"] is not None and not (np.isfinite(state["step_limit"]) and state["step_limit"] > 0):
+            raise ValueError("Simulator snapshot step limit must be positive or continuing.")
+        task_random_probe = np.random.RandomState(0)
+        task_random_probe.set_state(copy.deepcopy(state["task_random_state"]))
+        for name in ("adapter_random_state", "action_random_state", "observation_random_state"):
+            _validate_generator_state(state[name])
+        raw = self._env._env
+        mujoco.mj_setState(physics.model.ptr, physics.data.ptr, integration, state_spec)
+        # Match dm_control's legacy step boundary. mj_forward would additionally
+        # overwrite acceleration-dependent fields and warm-start data.
+        mujoco.mj_step1(physics.model.ptr, physics.data.ptr)
+        raw.task.random.set_state(copy.deepcopy(state["task_random_state"]))
+        raw._step_count = int(state["step_count"])
+        raw._reset_next_step = bool(state["reset_next_step"])
+        raw._step_limit = float("inf") if state["step_limit"] is None else state["step_limit"]
+        self._continuing_calibration = bool(state["continuing_calibration"])
+        _restore_generator_state(self, state["adapter_random_state"])
+        _restore_generator_state(self.action_space, state["action_random_state"])
+        _restore_generator_state(self.observation_space, state["observation_random_state"])
+        observation = self._state_observation(raw.task.get_observation(physics))
+        if not np.array_equal(observation, state["observation"]):
+            raise RuntimeError("Simulator restoration did not reproduce its saved observation.")
+        return observation
 
     def load_training_resume_state(self, state: Mapping[str, Any]) -> None:
         """Restore reset RNG for the next state-observation episode."""

@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "base_alg_config": "checkpoint",
+  "shared_alg_params": {
+    "inner_operator": "tdambi",
+    "inner_rounds": 6,
+    "inner_rollouts_per_round": 512,
+    "inner_rollout_horizon": 3,
+    "inner_batch_size": 512,
+    "inner_replay_capacity": 12288,
+    "inner_diagnostic_rollouts": 0
+  },
+  "evaluation": {
+    "controller_seed": 12345,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "default_presets": [
+      "inner_budget/tdambi_3"
+    ]
+  },
+  "comparisons": {
+    "inner_budget": {
+      "reference": "tdambi_3",
+      "description": "Native TD-MPC2 actor\u2013critic updates on frozen-model imagined transitions; each update performs critic, actor, and local-target interpolation.",
+      "variants": {
+        "tdambi_3": {
+          "description": "TDAMBI: three paired critic/actor updates per round.",
+          "alg_params": {
+            "inner_updates_per_round": 3
+          }
+        },
+        "tdambi_6": {
+          "description": "TDAMBI: six paired critic/actor updates per round.",
+          "alg_params": {
+            "inner_updates_per_round": 6
+          }
+        },
+        "tdambi_12": {
+          "description": "TDAMBI: twelve paired critic/actor updates per round.",
+          "alg_params": {
+            "inner_updates_per_round": 12
+          }
+        }
+      }
+    },
+    "q_scale": {
+      "reference": "calibrate",
+      "description": "Compare saved training Q scale with first-collection calibration, holding the native TDAMBI update budget fixed.",
+      "variants": {
+        "checkpoint": {
+          "description": "Initialize every inner solve from the saved training Q scale; requires a checkpoint containing scale state.",
+          "alg_params": {
+            "inner_updates_per_round": 3,
+            "tdambi_scale_initialization": "checkpoint"
+          }
+        },
+        "calibrate": {
+          "description": "Ignore any saved training Q scale and calibrate from the first imagined replay batch.",
+          "alg_params": {
+            "inner_updates_per_round": 3,
+            "tdambi_scale_initialization": "calibrate"
+          }
+        }
+      }
+    }
+  }
+}
