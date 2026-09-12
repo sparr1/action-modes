@@ -1,5 +1,13 @@
 # Frozen-checkpoint AMBI research
 
+## Full-episode J1/J2/J4 compute scaling
+
+The `round_scaling_j{1,2,4}_h1_200k.json` matrices change only inner-round
+count on the frozen `mey3rxj8` 200k checkpoint, with20environment seeds and
+three controller-seed repetitions. They measure repeated mean-action
+control, retaining H1/N128/C32/A4 and fixedalpha0. See the
+[protocol and Oscar execution notes](ROUND_SCALING_OSCAR.md).
+
 ## Mean-prefix calibration with twenty seeds
 
 [`ambi_prior_mean_prefix_h1_20seeds.json`](ambi_prior_mean_prefix_h1_20seeds.json)
