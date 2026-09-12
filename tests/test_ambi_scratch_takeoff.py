@@ -21,6 +21,8 @@ from utils.resume_identity import scientific_trial_parameters
 ROOT = Path(__file__).resolve().parents[1]
 MATRIX = ROOT / "configs/research/ambi_scratch_takeoff_h1.json"
 ALPHA_ZERO_MATRIX = ROOT / "configs/research/ambi_scratch_takeoff_h1_alpha_zero.json"
+PRIOR_REFINEMENT_MATRIX = ROOT / "configs/research/ambi_prior_refinement_h1_200k.json"
+PRIOR_REFINEMENT_PARALLEL_MATRIX = ROOT / "configs/research/ambi_prior_refinement_h1_parallel.json"
 
 
 def _source_context():
@@ -141,6 +143,74 @@ def test_alpha_zero_matrix_changes_only_inner_temperature_and_presentation():
     assert planner_identity(base_params, {}, "AMBITDMPC2/AMBITDMPC2", "tanh_mean") != (
         planner_identity(zero_params, {}, "AMBITDMPC2/AMBITDMPC2", "tanh_mean")
     )
+
+
+def test_prior_refinement_changes_only_initialization_and_checkpoint_coverage(monkeypatch):
+    baseline = load_preset_matrix(ALPHA_ZERO_MATRIX)
+    matrix = load_preset_matrix(PRIOR_REFINEMENT_MATRIX)
+    scratch = resolve_preset(ALPHA_ZERO_MATRIX, "initialization/scratch", baseline,
+                             checkpoint_context=_source_context())
+    inherited = resolve_preset(PRIOR_REFINEMENT_MATRIX, "initialization/inherited", matrix,
+                               checkpoint_context=_source_context())
+    scratch_params = scratch["algorithm_config"]["alg_params"]
+    inherited_params = inherited["algorithm_config"]["alg_params"]
+    expected_changes = {
+        "inner_actor_initialization": "prior",
+        "inner_critic_initialization": "prior",
+        "inner_actor_initial_std": None,
+    }
+    # Preset resolution removes explicit nulls; clearing the scratch override
+    # must restore the algorithm's default rather than preserve the old value.
+    expected_params = {**scratch_params, **expected_changes}
+    expected_params.pop("inner_actor_initial_std")
+    assert inherited_params == expected_params
+    cfg = _build_cfg(**inherited_params)
+    assert cfg.inner_actor_initialization == cfg.inner_critic_initialization == "prior"
+    assert cfg.inner_actor_initial_std is None
+    assert cfg.inner_temperature == 0.0 and cfg.inner_temperature_mode == "fixed"
+    assert cfg.inner_model_step_budget == 512
+    assert (cfg.inner_critic_updates_per_action, cfg.inner_actor_updates_per_action) == (128, 16)
+    assert matrix["source_run"] == baseline["source_run"]
+    assert matrix["evaluation"] == {
+        **baseline["evaluation"], "default_presets": ["initialization/inherited"]}
+    assert matrix["real_calibration"] == baseline["real_calibration"]
+    pinned = next(item for item in baseline["checkpoint_contract"]["checkpoints"]
+                  if item["step"] == 200000)
+    assert matrix["checkpoint_contract"] == {
+        **baseline["checkpoint_contract"], "checkpoints": [pinned]}
+
+    prior = resolve_preset(PRIOR_REFINEMENT_MATRIX, "controller/prior", matrix,
+                           checkpoint_context=_source_context())
+    prior_cfg = _build_cfg(**prior["algorithm_config"]["alg_params"])
+    assert prior_cfg.inner_operator == "none" and prior_cfg.inner_model_step_budget == 0
+    assert prior_cfg.inner_actor_initial_std is None
+
+    context = SimpleNamespace(metadata={"checkpoint": {"step": 200000}})
+    monkeypatch.setattr("evaluate_ambi_checkpoint._file_sha256", lambda _: pinned["sha256"])
+    _validate_checkpoint_contract(matrix, "unused", context, [inherited])
+    context.metadata["checkpoint"]["step"] = 300000
+    with pytest.raises(ValueError, match="panel"):
+        _validate_checkpoint_contract(matrix, "unused", context, [inherited])
+
+
+def test_prior_refinement_parallel_changes_only_checkpoint_panel_and_description():
+    single = load_preset_matrix(PRIOR_REFINEMENT_MATRIX)
+    parallel = load_preset_matrix(PRIOR_REFINEMENT_PARALLEL_MATRIX)
+    baseline = load_preset_matrix(ALPHA_ZERO_MATRIX)
+    steps = [125000, 150000, 200000, 300000, 500000, 2000000]
+    pins = [pin for pin in baseline["checkpoint_contract"]["checkpoints"] if pin["step"] in steps]
+    assert [pin["step"] for pin in pins] == steps
+    assert parallel["checkpoint_contract"]["checkpoints"] == pins
+    restored = deepcopy(parallel)
+    restored["description"] = single["description"]
+    restored["checkpoint_contract"]["checkpoints"] = single["checkpoint_contract"]["checkpoints"]
+    assert restored == single
+    assert single["checkpoint_contract"]["checkpoints"] == [pin for pin in pins if pin["step"] == 200000]
+    single_resolved = resolve_preset(PRIOR_REFINEMENT_MATRIX, "initialization/inherited", single,
+                                    checkpoint_context=_source_context())
+    parallel_resolved = resolve_preset(PRIOR_REFINEMENT_PARALLEL_MATRIX, "initialization/inherited", parallel,
+                                      checkpoint_context=_source_context())
+    assert parallel_resolved["algorithm_config"]["alg_params"] == single_resolved["algorithm_config"]["alg_params"]
 
 
 @pytest.mark.parametrize("temperature", [0.0, 1e-4])

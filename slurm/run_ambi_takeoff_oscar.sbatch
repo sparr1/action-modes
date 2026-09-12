@@ -9,14 +9,14 @@
 #SBATCH --time=04:00:00
 #SBATCH --no-requeue
 
-# Submit a smoke first, then --array=0-13%<live-available-GPUs>. Tasks 0..6
-# evaluate full episodes; 7..13 run real calibration at the same checkpoints.
+# Select the matrix and its matching inventory. For K checkpoints, tasks
+# 0..K-1 evaluate episodes and K..2K-1 run real calibration. Smoke first.
 # Supply persistent --output/--error paths outside the source checkout.
 set -Eeuo pipefail
 umask 077
 cd "${SLURM_SUBMIT_DIR:?Submit from the repository root}"
 : "${EXPECTED_ACTION_MODES_SHA:?Supply the tested commit}"
-: "${AMBI_TAKEOFF_MANIFEST:?Supply the verified seven-checkpoint inventory}"
+: "${AMBI_TAKEOFF_MANIFEST:?Supply the verified selected-checkpoint inventory}"
 : "${AMBI_TAKEOFF_ROOT:?Supply the absolute campaign output root}"
 : "${AMBI_TAKEOFF_ATTEMPT:?Supply an explicit new attempt label}"
 [[ "$(git rev-parse HEAD)" == "$EXPECTED_ACTION_MODES_SHA" ]] || { echo "Unexpected commit" >&2; exit 1; }

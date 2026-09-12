@@ -9,8 +9,8 @@
 #SBATCH --no-requeue
 
 # Submit with --dependency=afterany:<compute-array> to drain complete diagnostic
-# bundles even when another checkpoint fails. Optional --array=0-13 publishes
-# independent bundles in parallel; successful publication receipts are reused.
+# bundles even when another checkpoint fails. Select the same matrix as the
+# workers; its 2K diagnostic cells can publish independently in an array.
 set -Eeuo pipefail
 umask 077
 cd "${SLURM_SUBMIT_DIR:?Submit from the repository root}"
@@ -21,6 +21,7 @@ cd "${SLURM_SUBMIT_DIR:?Submit from the repository root}"
 PYTHON_BIN="${AMBI_DMC_PYTHON:-/oscar/home/rgao48/action-modes/environments/dmcontrol/.venv/bin/python}"
 [[ -x "$PYTHON_BIN" ]] || { echo "Missing locked Python" >&2; exit 1; }
 arguments=(publish --output-root "$AMBI_TAKEOFF_ROOT")
+if [[ -n "${AMBI_TAKEOFF_MATRIX:-}" ]]; then arguments+=(--matrix "$AMBI_TAKEOFF_MATRIX"); fi
 if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then arguments+=(--task-index "$SLURM_ARRAY_TASK_ID"); fi
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONNOUSERSITE=1
 export WANDB_DIR="${SLURM_TMPDIR:-/tmp}/ambi-takeoff-wandb-${SLURM_JOB_ID}"

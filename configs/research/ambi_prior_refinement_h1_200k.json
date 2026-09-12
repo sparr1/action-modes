@@ -1,0 +1,207 @@
+{
+  "schema_version": 1,
+  "description": "Single-checkpoint prior-initialized SAC refinement reference: mey3rxj8 at 200k, H1/N128/J4/C32/A4, fixed inner alpha zero; paired gains from the actual inherited actor.",
+  "base_alg_config": "checkpoint",
+  "source_run": "rwgao_b-brown-university/ambi/mey3rxj8",
+  "shared_alg_params": {
+    "inner_operator": "sac",
+    "inner_rounds": 4,
+    "inner_rollouts_per_round": 128,
+    "inner_rollout_horizon": 1,
+    "inner_updates_per_round": null,
+    "inner_iterations": null,
+    "inner_rollouts": null,
+    "inner_horizon": null,
+    "inner_updates_per_iteration": null,
+    "inner_model_step_budget": null,
+    "inner_critic_updates_per_action": null,
+    "inner_actor_updates_per_action": null,
+    "inner_temperature_updates_per_action": null,
+    "inner_batch_size": 256,
+    "inner_replay_capacity": 2048,
+    "inner_replay_sampling": "with_replacement",
+    "inner_diagnostic_rollouts": 0,
+    "inner_actor_adaptation": "clone",
+    "inner_critic_adaptation": "clone",
+    "inner_temperature_mode": "fixed",
+    "inner_temperature_initialization": "fixed",
+    "inner_target_entropy": "inherit_outer",
+    "inner_bootstrap_source": "inner_target",
+    "inner_behavior_action": "policy_sample",
+    "inner_execution_action": "mean",
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_actor_scope": "action",
+    "inner_critic_scope": "action",
+    "inner_temperature_scope": "action",
+    "inner_replay_scope": "action",
+    "inner_actor_optimizer_scope": "action",
+    "inner_critic_optimizer_scope": "action",
+    "inner_temperature_optimizer_scope": "action",
+    "inner_actor_initialization": "prior",
+    "inner_critic_initialization": "prior",
+    "inner_critic_target_initialization": "online",
+    "inner_finite_horizon": true,
+    "inner_update_timing": "round",
+    "inner_steps_per_update": null,
+    "inner_temperature": 0.0,
+    "inner_actor_lr": 0.0003,
+    "inner_critic_lr": 0.0003,
+    "inner_sac_critic_target": "reward_only",
+    "inner_actor_entropy_mode": "tdmpc2_scaled",
+    "inner_actor_loss_scale_update": "per_action",
+    "inner_explorer_mode": "none",
+    "inner_outer_replay_fraction": 0.0,
+    "inner_critic_updates_per_round": 32,
+    "inner_actor_updates_per_round": 4,
+    "inner_actor_initial_std": null,
+    "inner_log_std_mapping": "tdmpc2_tanh",
+    "inner_log_std_min": -10,
+    "inner_log_std_max": 2,
+    "inner_q_actor_reduction": "mean_pair",
+    "inner_q_target_reduction": "min_pair",
+    "inner_critic_dropout_enabled": true,
+    "inner_actor_adam_eps": 1e-05,
+    "inner_adam_eps": 1e-08,
+    "inner_actor_grad_clip_norm": 20.0,
+    "inner_critic_grad_clip_norm": 20.0,
+    "inner_critic_loss_coef": 1.0,
+    "inner_critic_target_tau": 0.01,
+    "inner_critic_target_update_interval": 1,
+    "inner_outer_policy_kl_coef": 0.0,
+    "inner_outer_action_l2_coef": 0.0
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "default_presets": [
+      "initialization/inherited"
+    ],
+    "bank_decisions": [
+      0,
+      100,
+      200,
+      300,
+      400
+    ],
+    "bank_repetitions": 3,
+    "diagnostic_rollouts": 8,
+    "diagnostic_horizon": 1,
+    "wandb_project": "ambi-inner-bench",
+    "togo_return_rollouts": 32
+  },
+  "comparisons": {
+    "initialization": {
+      "description": "Fresh copies of the frozen prior actor and online critic at every decision. Measure adaptation relative to the actual inherited round-zero actor.",
+      "reference": "prior",
+      "variants": {
+        "inherited": {
+          "description": "Prior actor and online critic, inherited actor distribution, fresh optimizers/replay, then four rounds of 128 H1 samples, 32 critic updates and four actor updates; fixed inner alpha zero.",
+          "alg_params": {}
+        },
+        "prior": {
+          "description": "Frozen prior mean, no inner solve.",
+          "alg_params": {
+            "inner_operator": "none",
+            "inner_rounds": 0,
+            "inner_rollouts_per_round": 0,
+            "inner_updates_per_round": 0,
+            "inner_critic_updates_per_round": null,
+            "inner_actor_updates_per_round": null,
+            "inner_actor_initialization": "prior",
+            "inner_critic_initialization": "prior",
+            "inner_actor_initial_std": null,
+            "inner_temperature_mode": "inherit_outer",
+            "inner_temperature_initialization": "inherit_outer",
+            "inner_actor_entropy_mode": "squashed",
+            "inner_finite_horizon": false,
+            "inner_temperature": null
+          }
+        }
+      }
+    },
+    "controller": {
+      "description": "Prior-only ordinary episode reference; it is not an initial scratch actor.",
+      "reference": "prior",
+      "variants": {
+        "prior": {
+          "description": "Frozen prior mean, no inner solve.",
+          "alg_params": {
+            "inner_operator": "none",
+            "inner_rounds": 0,
+            "inner_rollouts_per_round": 0,
+            "inner_updates_per_round": 0,
+            "inner_critic_updates_per_round": null,
+            "inner_actor_updates_per_round": null,
+            "inner_actor_initialization": "prior",
+            "inner_critic_initialization": "prior",
+            "inner_actor_initial_std": null,
+            "inner_temperature_mode": "inherit_outer",
+            "inner_temperature_initialization": "inherit_outer",
+            "inner_actor_entropy_mode": "squashed",
+            "inner_finite_horizon": false,
+            "inner_temperature": null
+          }
+        }
+      }
+    }
+  },
+  "checkpoint_contract": {
+    "checkpoints": [
+      {
+        "sha256": "909e5c1d125aecc952e0544d802b4b946ae5089909c7a55885f272c32ed3e12f",
+        "step": 200000
+      }
+    ],
+    "alg_params": {
+      "obs": "state",
+      "model_size": 5,
+      "episodic": false,
+      "discount": 0.99,
+      "q_representation": "distributional",
+      "num_q": 5,
+      "q_num_bins": 101,
+      "q_vmin": -10,
+      "q_vmax": 10,
+      "q_pair_size": 2,
+      "dropout": 0.01,
+      "log_std_mapping": "tdmpc2_tanh",
+      "log_std_min": -10,
+      "log_std_max": 2,
+      "outer_critic_target": "reward_only",
+      "outer_q_target_reduction": "min_pair",
+      "outer_q_actor_reduction": "mean_pair",
+      "sac_actor_loss_scale_mode": "tdmpc2_percentile_range",
+      "outer_actor_entropy_mode": "tdmpc2_scaled",
+      "ent_coef": 0.0001
+    }
+  },
+  "real_calibration": {
+    "decisions": [
+      0,
+      100,
+      200,
+      300,
+      400
+    ],
+    "solver_repetitions": 3,
+    "rollout_repetitions": 4,
+    "rounds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "tail_steps": 1000,
+    "bootstrap_resamples": 2000,
+    "reward_bound": 2.0
+  }
+}

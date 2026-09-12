@@ -13,9 +13,9 @@ campaign = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(campaign)
 
 
-def inventory(tmp_path):
+def inventory(tmp_path, steps=campaign.STEPS):
     rows = []
-    for step in campaign.STEPS:
+    for step in steps:
         checkpoint = tmp_path / f"model_{step}"
         checkpoint.write_text(str(step))
         metadata = Path(str(checkpoint) + ".metadata.json")
@@ -88,7 +88,7 @@ def test_smoke_exercises_full_snapshot_batch_and_continuing_tail_without_publica
 def test_selected_matrix_reaches_episode_and_real_workers(tmp_path, monkeypatch, smoke, index):
     manifest = inventory(tmp_path)
     matrix = tmp_path / "selected-matrix.json"
-    matrix.write_text("{}")
+    matrix.write_text((ROOT / campaign.MATRIX).read_text())
     run_map = tmp_path / "run-map.json"
     run_map.write_text("{}")
     calls = []
@@ -191,3 +191,197 @@ def test_shell_launchers_parse_and_keep_submission_concurrency_explicit():
         text = path.read_text()
         assert "#SBATCH --array=" not in text
         assert "EXPECTED_ACTION_MODES_SHA" in text and "git status --porcelain" in text
+
+
+PRIOR_MATRIX = ROOT / "configs/research/ambi_prior_refinement_h1_200k.json"
+
+
+@pytest.mark.parametrize("smoke", [False, True])
+@pytest.mark.parametrize("index,mode", [(0, "episodes"), (1, "real")])
+def test_singleton_prior_matrix_limits_work_and_preserves_selector(tmp_path, monkeypatch, smoke, index, mode):
+    manifest = inventory(tmp_path, steps=(200000,))
+    run_map = tmp_path / "run-map.json"
+    run_map.write_text("{}")
+    calls = []
+    monkeypatch.setattr(campaign, "_run", lambda args, **kwargs: calls.append(list(map(str, args))))
+    campaign.run_worker(manifest, tmp_path / "results", "prior-attempt", index,
+                        matrix=PRIOR_MATRIX, smoke=smoke, eval_run_map=run_map)
+    evaluate = next(args for args in calls if args[0] in
+                    ("evaluate_ambi_checkpoint.py", "evaluate_ambi_calibration.py"))
+    assert argument(evaluate, "--checkpoint").endswith("model_200000")
+    assert argument(evaluate, "--preset") == "initialization/inherited"
+    if mode == "episodes":
+        assert argument(calls[-1], "--selector") == "initialization/inherited"
+        assert ("--max-steps" in evaluate) == smoke
+    else:
+        assert ("--solver-repetitions" in evaluate) == smoke
+    output = tmp_path / "results" / ("smoke" if smoke else "production") / "step_200000" / mode
+    receipt = json.loads((output / "worker-completion.json").read_text())
+    assert receipt["checkpoint_steps"] == [200000]
+    assert receipt["selector"] == "initialization/inherited"
+    assert receipt["matrix_sha256"] == campaign._hash(PRIOR_MATRIX)
+
+
+@pytest.mark.parametrize("index", [-1, 2, 3, 10, 13])
+def test_singleton_rejects_unrequested_worker_indices_before_compute(tmp_path, monkeypatch, index):
+    manifest = inventory(tmp_path, steps=(200000,))
+    calls = []
+    monkeypatch.setattr(campaign, "_run", lambda args, **kwargs: calls.append(args))
+    with pytest.raises(ValueError, match="Task index must be between 0 and 1"):
+        campaign.run_worker(manifest, tmp_path / "results", "prior-attempt", index,
+                            matrix=PRIOR_MATRIX, smoke=True)
+    assert not calls and not (tmp_path / "results").exists()
+
+
+def test_singleton_rejects_seven_checkpoint_inventory(tmp_path, monkeypatch):
+    manifest = inventory(tmp_path)
+    calls = []
+    monkeypatch.setattr(campaign, "_run", lambda args, **kwargs: calls.append(args))
+    with pytest.raises(ValueError, match="exactly the matrix-selected"):
+        campaign.run_worker(manifest, tmp_path / "results", "prior-attempt", 0,
+                            matrix=PRIOR_MATRIX, smoke=True)
+    assert not calls and not (tmp_path / "results").exists()
+
+
+def reusable_real_inventory(tmp_path):
+    manifest = inventory(tmp_path, steps=(200000,))
+    payload = json.loads(manifest.read_text())
+    bank = tmp_path / "roots.json"
+    bank.write_text("{}")
+    cache = tmp_path / "copied-reference-cache"
+    cache.mkdir()
+    payload["checkpoints"][0].update(real_root_bank=str(bank), real_root_bank_sha256=campaign._hash(bank),
+                                     real_reference_cache=str(cache))
+    manifest.write_text(json.dumps(payload))
+    return manifest, payload
+
+
+@pytest.mark.parametrize("smoke", [False, True])
+def test_real_reference_reuse_is_explicit_and_production_only(tmp_path, monkeypatch, smoke):
+    manifest, payload = reusable_real_inventory(tmp_path)
+    row = payload["checkpoints"][0]
+    calls = []
+    monkeypatch.setattr(campaign, "_run", lambda args, **kwargs: calls.append(list(map(str, args))))
+    campaign.run_worker(manifest, tmp_path / "results", "attempt", 1, matrix=PRIOR_MATRIX, smoke=smoke)
+    evaluate = calls[-1]
+    assert ("--save-root-bank" in evaluate) == smoke
+    assert ("--root-bank" in evaluate) != smoke
+    if not smoke:
+        assert argument(evaluate, "--root-bank") == row["real_root_bank"]
+        assert argument(evaluate, "--reference-cache") == row["real_reference_cache"]
+        receipt = json.loads((tmp_path / "results/production/step_200000/real/worker-completion.json").read_text())
+        assert receipt["real_root_bank_sha256"] == row["real_root_bank_sha256"]
+    else:
+        assert argument(evaluate, "--reference-cache") != row["real_reference_cache"]
+
+
+@pytest.mark.parametrize("failure", ["missing_hash", "changed_bank", "relative_bank", "missing_bank",
+                                     "missing_cache_key", "relative_cache", "missing_cache"])
+def test_real_reference_reuse_is_verified_before_compute(tmp_path, monkeypatch, failure):
+    manifest, payload = reusable_real_inventory(tmp_path)
+    row = payload["checkpoints"][0]
+    if failure == "missing_hash":
+        row.pop("real_root_bank_sha256")
+    elif failure == "changed_bank":
+        Path(row["real_root_bank"]).write_text('{"changed":true}')
+    elif failure == "relative_bank":
+        row["real_root_bank"] = "roots.json"
+    elif failure == "missing_bank":
+        row["real_root_bank"] = str(tmp_path / "missing.json")
+    elif failure == "missing_cache_key":
+        row.pop("real_reference_cache")
+    elif failure == "relative_cache":
+        row["real_reference_cache"] = "cache"
+    elif failure == "missing_cache":
+        row["real_reference_cache"] = str(tmp_path / "missing-cache")
+    manifest.write_text(json.dumps(payload))
+    calls = []
+    monkeypatch.setattr(campaign, "_run", lambda args, **kwargs: calls.append(args))
+    with pytest.raises(ValueError):
+        campaign.run_worker(manifest, tmp_path / "results", "attempt", 1, matrix=PRIOR_MATRIX)
+    assert not calls and not (tmp_path / "results").exists()
+
+
+@pytest.mark.parametrize("task_index,expected_modes", [(None, ["episodes", "real"]),
+                                                       (0, ["episodes"]), (1, ["real"])])
+def test_singleton_publisher_visits_only_selected_panel(tmp_path, monkeypatch, task_index, expected_modes):
+    # Even when old checkpoint bundles exist, they are not selected for upload.
+    for step in campaign.STEPS:
+        for mode in ("episodes", "real"):
+            output = tmp_path / "production" / f"step_{step}" / mode
+            bundle = output / ("model-series" if mode == "episodes" else "bundle")
+            bundle.mkdir(parents=True)
+            (bundle / "manifest.json").write_text('{"status":"complete"}')
+    calls = []
+    monkeypatch.setattr(campaign, "_run", lambda args, **kwargs: calls.append(list(map(str, args))))
+    assert campaign.publish_completed(tmp_path, entity="entity", project="project",
+                                      task_index=task_index, matrix=PRIOR_MATRIX) == 0
+    receipt = json.loads(next(tmp_path.glob("publication-summary-*.json")).read_text())
+    assert [row["mode"] for row in receipt["results"]] == expected_modes
+    assert all(row["step"] == 200000 for row in receipt["results"])
+    assert len(calls) == len(expected_modes)
+    assert all("step_200000" in argument(call, "--bundle") for call in calls)
+    assert receipt["selector"] == "initialization/inherited"
+
+
+def test_singleton_publisher_rejects_unrequested_index_before_publication(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(campaign, "_run", lambda args, **kwargs: calls.append(args))
+    with pytest.raises(ValueError, match="Task index must be between 0 and 1"):
+        campaign.publish_completed(tmp_path, entity="entity", project="project",
+                                   task_index=2, matrix=PRIOR_MATRIX)
+    assert not calls and not list(tmp_path.glob("publication-summary-*.json"))
+
+
+@pytest.mark.parametrize("source", ["default", "environment", "explicit"])
+def test_publisher_cli_matches_worker_matrix_selection(tmp_path, monkeypatch, source):
+    calls = []
+    monkeypatch.setattr(campaign, "publish_completed", lambda **kwargs: calls.append(kwargs) or 0)
+    monkeypatch.delenv("AMBI_TAKEOFF_MATRIX", raising=False)
+    args = ["publish", "--output-root", str(tmp_path)]
+    expected = Path(campaign.MATRIX)
+    if source in ("environment", "explicit"):
+        expected = tmp_path / "environment-matrix.json"
+        monkeypatch.setenv("AMBI_TAKEOFF_MATRIX", str(expected))
+    if source == "explicit":
+        expected = PRIOR_MATRIX
+        args += ["--matrix", str(expected)]
+    assert campaign.main(args) == 0
+    assert calls[0]["matrix"] == expected
+
+
+@pytest.mark.parametrize("failure", ["wrong_source", "missing_panel", "duplicate_step", "unknown_step",
+                                     "missing_hash", "invalid_hash", "no_default", "multiple_defaults",
+                                     "unknown_preset", "duplicate_json_key"])
+def test_invalid_matrix_fails_before_compute_or_publication(tmp_path, monkeypatch, failure):
+    config = json.loads(PRIOR_MATRIX.read_text())
+    panel = config["checkpoint_contract"]["checkpoints"]
+    if failure == "wrong_source":
+        config["source_run"] = "other"
+    elif failure == "missing_panel":
+        config["checkpoint_contract"].pop("checkpoints")
+    elif failure == "duplicate_step":
+        panel.append(dict(panel[0]))
+    elif failure == "unknown_step":
+        panel[0]["step"] = 250000
+    elif failure == "missing_hash":
+        panel[0].pop("sha256")
+    elif failure == "invalid_hash":
+        panel[0]["sha256"] = "z" * 64
+    elif failure == "no_default":
+        config["evaluation"]["default_presets"] = []
+    elif failure == "multiple_defaults":
+        config["evaluation"]["default_presets"] = ["initialization/inherited", "initialization/prior"]
+    elif failure == "unknown_preset":
+        config["evaluation"]["default_presets"] = ["initialization/missing"]
+    matrix = tmp_path / "matrix.json"
+    matrix.write_text(json.dumps(config) if failure != "duplicate_json_key" else
+                      '{"schema_version": 1, "schema_version": 1}')
+    calls = []
+    monkeypatch.setattr(campaign, "_run", lambda args, **kwargs: calls.append(args))
+    with pytest.raises(ValueError):
+        campaign.run_worker(tmp_path / "missing-inventory", tmp_path / "results", "attempt", 0,
+                            matrix=matrix)
+    with pytest.raises(ValueError):
+        campaign.publish_completed(tmp_path, entity="entity", project="project", matrix=matrix)
+    assert not calls and not (tmp_path / "results").exists()

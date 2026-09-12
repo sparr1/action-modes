@@ -1,5 +1,78 @@
 # Frozen-checkpoint AMBI research
 
+## Prior-initialized refinement at one checkpoint
+
+[`ambi_prior_refinement_h1_200k.json`](ambi_prior_refinement_h1_200k.json) is the
+fast iteration reference on the hash-pinned `mey3rxj8` **200k checkpoint only**.
+Its default `initialization/inherited` copies the checkpoint's actor and online
+critic at every decision. The actor keeps its learned mean and standard
+deviation; the scratch-only `inner_actor_initial_std` override is cleared.
+Optimizers and replay start fresh, and outer weights remain frozen.
+
+Relative to `ambi_scratch_takeoff_h1_alpha_zero.json`, the only algorithm changes
+are actor initialization, critic initialization, and clearing that standard-
+deviation override. H1/N128/J4/B256, C32 then A4 each round, alpha zero, the
+checkpoint's frozen saved Q scale, and all seeds, roots, repetitions and
+continuation lengths are retained. One checkpoint uses one seventh of the
+previous panel's total work; wall time does not scale by the same factor when
+checkpoint tasks run concurrently.
+
+Use the existing evaluators with an explicit single checkpoint and preset:
+
+```bash
+AMBI_REFINEMENT_MATRIX=configs/research/ambi_prior_refinement_h1_200k.json
+# Set these to the verified checkpoint and fresh output paths on the runtime.
+AMBI_REFINEMENT_CHECKPOINT=/absolute/path/to/verified-200000.pt
+AMBI_REFINEMENT_RESULTS=/absolute/path/to/fresh-refinement-results
+AMBI_REFINEMENT_PY=environments/dmcontrol/.venv/bin/python
+AMBI_REFINEMENT_ATTEMPT='<explicit-new-attempt>'
+"$AMBI_REFINEMENT_PY" evaluate_ambi_checkpoint.py \
+  --matrix "$AMBI_REFINEMENT_MATRIX" --preset initialization/inherited \
+  --checkpoint "$AMBI_REFINEMENT_CHECKPOINT" --device cuda \
+  --bundle-dir "$AMBI_REFINEMENT_RESULTS/episodes" \
+  --reference-bundle /absolute/path/to/verified-prior-episode-bundle
+"$AMBI_REFINEMENT_PY" evaluate_ambi_calibration.py run \
+  --matrix "$AMBI_REFINEMENT_MATRIX" --preset initialization/inherited \
+  --checkpoint "$AMBI_REFINEMENT_CHECKPOINT" --device cuda \
+  --bundle-dir "$AMBI_REFINEMENT_RESULTS/real" \
+  --attempt-label "$AMBI_REFINEMENT_ATTEMPT" \
+  --save-root-bank "$AMBI_REFINEMENT_RESULTS/root-bank.json" \
+  --reference-cache "$AMBI_REFINEMENT_RESULTS/prior-reference"
+```
+
+Run compute through the scheduler on Oscar after the usual tested-commit
+synchronization and CUDA smoke. The guarded `ambi_takeoff_campaign.py` launcher also accepts this matrix:
+set `AMBI_TAKEOFF_MATRIX` for both GPU workers and diagnostic publishers, and
+provide an inventory containing only its pinned 200k checkpoint. Array index 0
+is ordinary episode evaluation and index 1 is real calibration. Smoke and
+production each use `--array=0-1`, with fresh output directories and an explicit
+new publication attempt. The reference configuration itself does not submit
+or publish a run.
+
+Assess paired return changes from the actual initialization at actor-update
+counts 0/4/8/12/16, using the same roots and independent diagnostic noise.
+Round-zero inherited actions must match the frozen prior under paired noise.
+Ordinary episodes execute mean actions; existing shared-root calibration uses
+sampled actions. A mean-action shared-root diagnostic remains follow-up work:
+with alpha zero, sampled gains may arise from reduced variance without a
+better mean action. Preserve this distinction when interpreting results.
+The 125k and 300k checkpoints can later test transfer of a selected recipe;
+they are not included in this iteration's checkpoint contract. Success on 200k
+alone is exploratory evidence, not a claim across training stages.
+
+### Parallel checkpoint coverage
+
+[`ambi_prior_refinement_h1_parallel.json`](ambi_prior_refinement_h1_parallel.json)
+retains the same prior-initialized recipe and selects six checkpoints: 125k,
+150k, 200k, 300k, 500k and 2M. The 200k-only configuration remains the focused
+iteration reference. This panel uses twelve independent GPU tasks, so it fits
+in one wave when twelve GPUs and the required CPU/memory allowance are free.
+The 100k checkpoint is omitted because the prior remains near the return floor.
+Use the same matrix for workers and publishers; the inventory must list exactly
+these six checkpoints in order. Smoke indices `2,8` both select 200k. Production
+indices `0-5` evaluate episodes and `6-11` run real calibration. Set concurrency
+from live resources, rather than assuming this allowance always exists.
+
 ## Scratch inner SAC and to-go calibration
 
 [`ambi_scratch_takeoff_h1.json`](ambi_scratch_takeoff_h1.json) is the early-stage
