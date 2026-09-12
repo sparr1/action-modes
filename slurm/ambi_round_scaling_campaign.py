@@ -111,7 +111,7 @@ def metadata(campaign, execute=False):
     for cell in data["cells"]:
         directory = Path(data["output_root"]) / "specs" / cell["cell_id"]
         arguments = [*_common(data, cell, checkpoint), "--seeds", *cell["seeds"],
-                     "--eval-series-spec-dir", directory]
+                     "--eval-series-spec-dir", directory, "--bundle-dir", directory / "unused-bundle"]
         commands.append(dict(cell_id=cell["cell_id"], command=[sys.executable, *map(str, arguments)],
                              identity_spec=str(directory / "initialization__inherited.json")))
         if execute:

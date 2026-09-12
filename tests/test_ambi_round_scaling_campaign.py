@@ -116,7 +116,8 @@ def test_metadata_emits_full_panel_without_evaluation(campaign, monkeypatch):
     assert len(commands) == 9 and calls == []
     for item, cell in zip(commands, launch.load_campaign(campaign)["cells"]):
         command = item["command"]
-        assert "--eval-series-spec-dir" in command and "--bundle-dir" not in command
+        assert "--eval-series-spec-dir" in command and "--bundle-dir" in command
+        assert command[command.index("--bundle-dir") + 1].endswith("/unused-bundle")
         assert command[command.index("--controller-seed") + 1] == str(cell["controller_seed"])
         assert command[command.index("--seeds") + 1:command.index("--eval-series-spec-dir")] == list(map(str, launch.SEEDS))
 
