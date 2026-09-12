@@ -47,6 +47,13 @@ def calibration_options(matrix, cfg, **overrides):
                     model_probe_rollouts=32, benchmark_repetitions=0)
     for key, value in defaults.items():
         options.setdefault(key, value)
+    prefix_action_rule = options.get('prefix_action_rule', 'sampled')
+    if prefix_action_rule not in ('sampled', 'mean'):
+        raise ValueError('prefix_action_rule must be sampled or mean.')
+    # Omission and an explicit sampled override retain the existing protocol
+    # shape. Only the new mean-prefix diagnostic needs an identity extension.
+    if prefix_action_rule == 'sampled':
+        options.pop('prefix_action_rule', None)
     for key in ('solver_repetitions', 'rollout_repetitions', 'tail_steps', 'bootstrap_resamples', 'max_steps'):
         _positive(options[key], key)
     for key in ('model_probe_rollouts', 'benchmark_repetitions'):
@@ -183,11 +190,22 @@ def load_root_bank(path, checkpoint_sha256, protocol):
     return bank
 
 
-def paired_noise(controller_seed, root_id, *, horizon, tail_steps, rollouts, action_dim):
+def paired_noise(controller_seed, root_id, *, horizon, tail_steps, rollouts, action_dim,
+                 prefix_action_rule='sampled'):
+    """Pair policy draws, optionally executing tanh(mu) for only the prefix.
+
+    Draw the sampled prefix even in mean mode before replacing it with zeros.
+    Consequently a changed prefix rule never shifts the sampled prior tail,
+    and no learner or global RNG stream is involved.
+    """
+    if prefix_action_rule not in ('sampled', 'mean'):
+        raise ValueError('prefix_action_rule must be sampled or mean.')
     seed = solver_seed(controller_seed, 'real-calibration-noise', root_id)
     rng = np.random.default_rng(seed)
     prefix = rng.standard_normal((horizon, rollouts, action_dim)).astype(np.float32)
     tail = rng.standard_normal((tail_steps, rollouts, action_dim)).astype(np.float32)
+    if prefix_action_rule == 'mean':
+        prefix.fill(0)
     return prefix, tail, seed
 
 
@@ -365,7 +383,8 @@ def run_calibration(matrix_path, checkpoint, *, preset=None, bundle_dir, attempt
             snapshot = SimulatorSnapshot.from_dict(root['snapshot'])
             prefix_noise, tail_noise, noise_seed = paired_noise(controller_seed, root['root_id'],
                 horizon=horizon, tail_steps=options['tail_steps'], rollouts=options['rollout_repetitions'],
-                action_dim=model.cfg.action_dim)
+                action_dim=model.cfg.action_dim,
+                prefix_action_rule=options.get('prefix_action_rule', 'sampled'))
             pair_seed = solver_seed(controller_seed, 'real-calibration-q-pair', root['root_id'])
             indices = _pair_indices(model, pair_seed)
             prior = FrozenCallbacks(model, pair_indices=indices)
@@ -393,6 +412,8 @@ def run_calibration(matrix_path, checkpoint, *, preset=None, bundle_dir, attempt
                 outer_policy=dict(log_std_mapping=model.agent.model._log_std_mapping,
                     log_std_min=model.agent.model._log_std_min_value,
                     log_std_max=model.agent.model._log_std_max_value))
+            if options.get('prefix_action_rule') == 'mean':
+                reference_identity['prefix_action_rule'] = 'mean'
             reference, hit, reference_path = _cache_reference(cache, reference_identity,
                                                              lambda: measure(model.agent.model._pi, {}))
             if (len(reference['model_rows']) != options['rollout_repetitions']
@@ -464,10 +485,13 @@ def run_calibration(matrix_path, checkpoint, *, preset=None, bundle_dir, attempt
                 del trace
         if _outer_state_digest(model) != frozen_digest:
             raise RuntimeError('Calibration changed frozen outer weights or optimizer state.')
+        action_protocol = ({'action_rule': 'mean_prefix_sampled_tail', 'tail_action_rule': 'sampled'}
+                           if options.get('prefix_action_rule') == 'mean'
+                           else {'action_rule': 'sampled'})
         identity = dict(checkpoint=dict(sha256=checkpoint_hash, step=context.metadata['checkpoint']['step']),
             backbone=matrix.get('source_run'), setting=_jsonable(vars(model.cfg)), attempt=attempt_label,
             scope='common_prior_roots', code={'source_sha256': science}, protocol=dict(root_bank_id=bank['id'], root_protocol=protocol,
-                **options, horizon=horizon, discount=discount, action_rule='sampled',
+                **options, horizon=horizon, discount=discount, **action_protocol,
                 tail_actor='outer', tail_critic='outer_online', q_reduction=model.cfg.mppi_terminal_q_reduction,
                 q_pair_rule='private_fixed_per_root', tail_bootstrap=False, entropy_bonus=False,
                 actor_snapshot_rule='fixed_policy_for_H_real_steps_then_prior'))
@@ -543,6 +567,8 @@ def build_parser():
     run.add_argument('--device')
     run.add_argument('--seeds', nargs='+', type=int)
     run.add_argument('--controller-seed', type=int)
+    run.add_argument('--prefix-action-rule', choices=['sampled', 'mean'],
+                     help='Action rule for both actor and prior H-step prefixes; prior tails stay sampled.')
     coverage = run.add_mutually_exclusive_group()
     coverage.add_argument('--decisions', nargs='+', type=int)
     coverage.add_argument('--every-n', type=int)

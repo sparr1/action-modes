@@ -118,6 +118,15 @@ episode provenance is present; they are distinct from simulator-state banks.
 
 ## Separate continuing-simulator calibration
 
+The opt-in `--prefix-action-rule mean` (or matrix
+`real_calibration.prefix_action_rule="mean"`) executes `tanh(mu)` for the H
+prefix decisions of both the saved actor and its prior reference. All tail
+actions remain sampled, with unchanged tail noise and exact endpoint-Q
+handoff. Default `sampled` preserves the existing protocol. Mean-prefix
+references have a separate cache identity; sampled 32-rollout training probes
+are unchanged. The [twenty-seed experiment](MEAN_PREFIX_OSCAR.md) uses this
+diagnostic without changing inner optimization.
+
 ```bash
 "$AMBI_EVAL_PY" evaluate_ambi_calibration.py run \
   --matrix configs/research/ambi_scratch_togo_reference.json \

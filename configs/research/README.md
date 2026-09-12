@@ -1,5 +1,14 @@
 # Frozen-checkpoint AMBI research
 
+## Mean-prefix calibration with twenty seeds
+
+[`ambi_prior_mean_prefix_h1_20seeds.json`](ambi_prior_mean_prefix_h1_20seeds.json)
+keeps the prior-initialized H1/N128/J4/C32/A4 learner unchanged at 150k and
+200k, adds mean-action prefixes followed by sampled frozen-prior continuations,
+and expands paired episode coverage to seeds 101–120. See the
+[measurement and Oscar execution protocol](MEAN_PREFIX_OSCAR.md) for seed
+sharding, validation and complete-panel publication.
+
 ## Prior-initialized refinement at one checkpoint
 
 [`ambi_prior_refinement_h1_200k.json`](ambi_prior_refinement_h1_200k.json) is the

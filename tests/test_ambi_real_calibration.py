@@ -153,6 +153,75 @@ def test_analytic_discounting_exact_tail_action_and_batched_observation_encoding
     assert all(value >= 0 for value in result["timing"].values())
 
 
+@pytest.mark.parametrize('prefix_action_rule', ['sampled', 'mean'])
+def test_model_and_real_prefix_rule_keep_exact_sampled_outer_handoff(monkeypatch, prefix_action_rule):
+    """Both prefixes share the rule; only the first sampled tail action scores Q."""
+    from types import SimpleNamespace
+    import torch
+    import evaluate_ambi_calibration as calibration
+    from tests.test_ambi_togo_trace import _AnalyticModel
+
+    class Model(_AnalyticModel):
+        def encode(self, observations):
+            return observations
+
+        def pi(self, z, *, policy=None, noise, **bounds):
+            self.policy_calls.append((policy, noise.clone(), bounds))
+            return z + 2 + noise, {}
+
+        def reward_from_joint(self, joint):
+            return joint[:, 1:2]
+
+    world = Model()
+    cfg = SimpleNamespace(action_dim=1, episodic=False, mppi_terminal_q_reduction='mean_all')
+    engine = SimpleNamespace(model=world, cfg=cfg, agent=SimpleNamespace(discount=0.5))
+    model = SimpleNamespace(cfg=cfg, agent=SimpleNamespace(model=world, inner_engine=engine,
+                                                          device=torch.device('cpu')))
+    monkeypatch.setattr('RL.tdmpc2_core.inner_trace.td_math.two_hot_inv', lambda r, cfg: r)
+    prefix, tail, _ = calibration.paired_noise(55, 'analytic-root', horizon=2,
+        tail_steps=3, rollouts=2, action_dim=1, prefix_action_rule=prefix_action_rule)
+    policy = torch.nn.Linear(1, 1)
+    predicted = calibration._model_branches(model, np.array([0.0]), policy, {}, prefix, tail, None)
+    np.testing.assert_array_equal(world.policy_calls[-1][1].numpy(), tail[0])
+    assert world.policy_calls[-1][0] is None
+    for index in range(2):
+        assert world.policy_calls[index][0] is policy
+        np.testing.assert_array_equal(world.policy_calls[index][1].numpy(), prefix[index])
+    if prefix_action_rule == 'mean':
+        assert not np.any(prefix)
+    assert np.any(tail)
+
+    envs = [AnalyticEnv(), AnalyticEnv()]
+    prefix_calls, tail_calls, q_actions = [], [], []
+
+    def actor(observations, noise):
+        prefix_calls.append(noise.copy())
+        return observations + 2 + noise
+
+    def prior(observations, noise):
+        tail_calls.append(noise.copy())
+        return observations + 2 + noise
+
+    def q(observations, actions):
+        q_actions.append(actions.copy())
+        return 7 + actions[:, 0]
+
+    real = evaluate_real_branches(envs, _snapshot(), actor, prior, q, prefix, tail,
+                                 horizon=2, discount=0.5, original_remaining_steps=3)
+    np.testing.assert_array_equal(np.stack(prefix_calls), prefix)
+    np.testing.assert_array_equal(np.stack(tail_calls), tail)
+    for index, (prediction, row) in enumerate(zip(predicted, real['rows'])):
+        actions = np.array(envs[index].actions)[:, 0]
+        assert prediction['model_prefix_reward'] == pytest.approx(row['real_prefix_reward'])
+        assert prediction['model_return'] == pytest.approx(row['real_bootstrapped_return'])
+        if prefix_action_rule == 'mean':
+            np.testing.assert_array_equal(actions[:2], [2.0, 3.0])
+        assert actions[2] == 4 + tail[0, index, 0]
+        assert row['endpoint_action'] == q_actions[0][index].tolist() == envs[index].actions[2].tolist()
+        assert row['real_bootstrap'] == 0.25 * (7 + actions[2])
+        assert row['real_mc_return'] == sum(0.5 ** t * action for t, action in enumerate(actions))
+
+
 def test_termination_masks_bootstrap_and_retains_rollout_noise_indices():
     envs = [AnalyticEnv(terminal_at=1), AnalyticEnv(terminal_at=3), AnalyticEnv()]
     noise = np.arange(6, dtype=float).reshape(2, 3, 1) + 1

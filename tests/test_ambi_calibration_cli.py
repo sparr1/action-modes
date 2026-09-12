@@ -55,6 +55,56 @@ def test_configurable_coverage_and_round_selection():
         calibration.calibration_options(matrix,cfg,decisions=[500])
 
 
+def test_prefix_action_rule_config_cli_and_sampled_default_compatibility():
+    cfg = SimpleNamespace(inner_rounds=4)
+    default = calibration.calibration_options({}, cfg)
+    assert 'prefix_action_rule' not in default
+    assert calibration.calibration_options({}, cfg, prefix_action_rule='sampled') == default
+    matrix = {'real_calibration': {'prefix_action_rule': 'mean'}}
+    assert calibration.calibration_options(matrix, cfg)['prefix_action_rule'] == 'mean'
+    assert calibration.calibration_options(matrix, cfg, prefix_action_rule='sampled') == default
+    args = ['run', '--checkpoint', 'checkpoint.pt', '--bundle-dir', 'bundle', '--attempt-label', 'test']
+    assert calibration.build_parser().parse_args(args).prefix_action_rule is None
+    assert calibration.build_parser().parse_args(args + ['--prefix-action-rule', 'mean']).prefix_action_rule == 'mean'
+    for invalid in ('deterministic', '', None, True, ['mean']):
+        with pytest.raises(ValueError, match='prefix_action_rule'):
+            calibration.calibration_options({'real_calibration': {'prefix_action_rule': invalid}}, cfg)
+    with pytest.raises(SystemExit):
+        calibration.build_parser().parse_args(args + ['--prefix-action-rule', 'invalid'])
+
+
+def test_mean_prefix_noise_preserves_sampled_tail_seed_and_global_rng():
+    import random
+    import torch
+    from utils.ambi_benchmark import solver_seed
+
+    kwargs = dict(horizon=3, tail_steps=4, rollouts=2, action_dim=2)
+    global_torch = torch.random.get_rng_state().clone()
+    global_numpy = np.random.get_state()
+    global_python = random.getstate()
+    sampled = calibration.paired_noise(55, 'root', **kwargs)
+    mean = calibration.paired_noise(55, 'root', prefix_action_rule='mean', **kwargs)
+    explicit_sampled = calibration.paired_noise(55, 'root', prefix_action_rule='sampled', **kwargs)
+    # Reproduce the historical draw order rather than comparing two calls to
+    # the same implementation alone.
+    expected_seed = solver_seed(55, 'real-calibration-noise', 'root')
+    rng = np.random.default_rng(expected_seed)
+    expected_prefix = rng.standard_normal((3, 2, 2)).astype(np.float32)
+    expected_tail = rng.standard_normal((4, 2, 2)).astype(np.float32)
+    np.testing.assert_array_equal(sampled[0], expected_prefix)
+    np.testing.assert_array_equal(sampled[1], expected_tail)
+    np.testing.assert_array_equal(explicit_sampled[0], sampled[0])
+    np.testing.assert_array_equal(explicit_sampled[1], sampled[1])
+    np.testing.assert_array_equal(mean[0], np.zeros_like(expected_prefix))
+    np.testing.assert_array_equal(mean[1], expected_tail)
+    assert mean[2] == sampled[2] == expected_seed
+    torch.testing.assert_close(torch.random.get_rng_state(), global_torch, rtol=0, atol=0)
+    assert all(np.array_equal(a, b) for a, b in zip(np.random.get_state(), global_numpy))
+    assert random.getstate() == global_python
+    with pytest.raises(ValueError, match='prefix_action_rule'):
+        calibration.paired_noise(55, 'root', prefix_action_rule='invalid', **kwargs)
+
+
 def test_noise_and_reference_cache_are_paired_and_verified(tmp_path):
     kwargs = dict(horizon=3,tail_steps=4,rollouts=2,action_dim=1)
     first = calibration.paired_noise(55,'root',**kwargs)
@@ -110,13 +160,15 @@ def _humanoid_checkpoint(tmp_path):
 
 
 @pytest.mark.skipif(os.environ.get('AMBI_RUN_REAL_DMCONTROL_TESTS') != '1',reason='opt-in real DMControl runtime')
-def test_real_calibration_full_bundle_and_reference_reuse(tmp_path):
+@pytest.mark.parametrize('prefix_action_rule', ['sampled', 'mean'])
+def test_real_calibration_full_bundle_and_reference_reuse(tmp_path, prefix_action_rule):
     from utils.ambi_diagnostic_series import read_diagnostic_bundle, extract_diagnostic_html_data
     checkpoint,matrix = _humanoid_checkpoint(tmp_path)
     root_bank=tmp_path/'roots.json'
     cache=tmp_path/'reference-cache'
     first=calibration.run_calibration(matrix,checkpoint,bundle_dir=tmp_path/'scratch',attempt_label='smoke',
-        save_root_bank=root_bank,reference_cache=cache,benchmark_repetitions=2)
+        save_root_bank=root_bank,reference_cache=cache,benchmark_repetitions=2,
+        prefix_action_rule=prefix_action_rule)
     assert first['status']=='complete'
     assert len(first['rows'])==4*2*2*3
     assert [s['actor_updates'] for s in first['summaries']]==[0,2,4]
@@ -126,10 +178,26 @@ def test_real_calibration_full_bundle_and_reference_reuse(tmp_path):
     assert read_diagnostic_bundle(tmp_path/'scratch')==first
     assert extract_diagnostic_html_data((tmp_path/'scratch/report.html').read_text())==first
     second=calibration.run_calibration(matrix,checkpoint,preset='init/inherited',
-        bundle_dir=tmp_path/'inherited',attempt_label='smoke',root_bank=root_bank,reference_cache=cache)
+        bundle_dir=tmp_path/'inherited',attempt_label='smoke',root_bank=root_bank,reference_cache=cache,
+        prefix_action_rule=prefix_action_rule)
     assert second['timing']['prior_reference_cache_hits']==4
     assert second['timing']['branch_simulator_decisions']==4*2*3*2*6
     assert second['timing']['root_collection_seconds']==0
+    protocol = first['identity']['protocol']
+    if prefix_action_rule == 'mean':
+        assert protocol['action_rule'] == 'mean_prefix_sampled_tail'
+        assert protocol['prefix_action_rule'] == 'mean'
+        assert protocol['tail_action_rule'] == 'sampled'
+    else:
+        assert protocol['action_rule'] == 'sampled'
+        assert 'prefix_action_rule' not in protocol and 'tail_action_rule' not in protocol
+    for path in cache.glob('*.json'):
+        identity = read_json(path)['identity']
+        assert identity.get('prefix_action_rule', 'sampled') == prefix_action_rule
+    for row in second['rows']:
+        if row['round_index'] == 0:
+            for metric in ('model_gain_vs_prior', 'real_bootstrapped_gain_vs_prior', 'real_mc_gain_vs_prior'):
+                assert row['metrics'][metric] == 0.0
     for row in first['rows']:
         assert row['metrics']['model_return']==pytest.approx(row['metrics']['model_prefix_reward']+row['metrics']['model_bootstrap'])
         assert row['metrics']['real_mc_return']==pytest.approx(row['metrics']['real_prefix_reward']+row['metrics']['real_tail_contribution'])
@@ -144,6 +212,28 @@ def test_real_calibration_full_bundle_and_reference_reuse(tmp_path):
     corrupted.write_text(json.dumps(bad_bank))
     with pytest.raises(ValueError,match='observation differs'):
         calibration.load_root_bank(corrupted,bad_bank['checkpoint_sha256'],bad_bank['protocol'])
+
+
+@pytest.mark.skipif(os.environ.get('AMBI_RUN_REAL_DMCONTROL_TESTS') != '1',reason='opt-in real DMControl runtime')
+def test_mean_prefix_cannot_reuse_sampled_prior_reference(tmp_path):
+    checkpoint, matrix = _humanoid_checkpoint(tmp_path)
+    common = dict(preset='init/inherited', seeds=[101], decisions=[0], rounds=[0],
+                  solver_repetitions=1, rollout_repetitions=2, model_probe_rollouts=0,
+                  reference_cache=tmp_path/'cache', attempt_label='reference-rule')
+    sampled = calibration.run_calibration(matrix, checkpoint, bundle_dir=tmp_path/'sampled',
+        save_root_bank=tmp_path/'roots.json', **common)
+    mean = calibration.run_calibration(matrix, checkpoint, bundle_dir=tmp_path/'mean',
+        root_bank=tmp_path/'roots.json', prefix_action_rule='mean', **common)
+    assert sampled['timing']['prior_reference_cache_hits'] == mean['timing']['prior_reference_cache_hits'] == 0
+    assert len(list((tmp_path/'cache').glob('*.json'))) == 2
+    assert sampled['identity']['protocol']['root_bank_id'] == mean['identity']['protocol']['root_bank_id']
+    assert sampled['identity']['setting'] == mean['identity']['setting']
+    for left, right in zip(sampled['rows'], mean['rows']):
+        assert left['solver_seed'] == right['solver_seed']
+        assert left['policy_noise_seed'] == right['policy_noise_seed']
+        assert left['q_pair_seed'] == right['q_pair_seed']
+        assert left['actor_sha256'] == right['actor_sha256']
+        assert right['metrics']['real_mc_gain_vs_prior'] == 0
 
 
 def test_short_tail_cannot_claim_original_cutoff_returns():
