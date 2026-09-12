@@ -70,6 +70,17 @@ export AMBI_TAKEOFF_ATTEMPT=<explicit-new-attempt>
 export EVAL_RUN_MAP=/absolute/path/to/eval-run-map.json
 ```
 
+The default matrix remains `configs/research/ambi_scratch_takeoff_h1.json`.
+To launch a controlled variant, set `AMBI_TAKEOFF_MATRIX` to the selected
+versioned matrix for both smoke and production. The Python worker also accepts
+`--matrix`, which takes precedence over that environment variable. Relative
+matrix paths resolve from the repository root. The worker checks that the file
+exists before any compute and records its path in `worker-completion.json`;
+the evaluators retain their existing configuration and identity validation.
+This launcher still requires the same seven checkpoint panel, backbone, and
+`initialization/scratch` selector. Create and validate a new evaluation attempt
+using that same selected matrix; do not reuse another recipe's run map.
+
 Supply Slurm stdout/stderr paths outside the source checkout. The launcher has
 no implicit array or concurrency cap. First submit smoke indices `3,10`, which
 select the 200k checkpoint for ordinary episodes and real calibration:

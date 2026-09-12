@@ -20,6 +20,7 @@ from utils.resume_identity import scientific_trial_parameters
 
 ROOT = Path(__file__).resolve().parents[1]
 MATRIX = ROOT / "configs/research/ambi_scratch_takeoff_h1.json"
+ALPHA_ZERO_MATRIX = ROOT / "configs/research/ambi_scratch_takeoff_h1_alpha_zero.json"
 
 
 def _source_context():
@@ -115,12 +116,41 @@ def test_initial_std_exact_without_changing_mean_critic_rng_or_outer(mapping):
         explicit.env.close()
 
 
+def test_alpha_zero_matrix_changes_only_inner_temperature_and_presentation():
+    baseline = load_preset_matrix(MATRIX)
+    zero = load_preset_matrix(ALPHA_ZERO_MATRIX)
+    restored = deepcopy(zero)
+    restored["description"] = baseline["description"]
+    restored["comparisons"]["initialization"]["variants"]["scratch"]["description"] = (
+        baseline["comparisons"]["initialization"]["variants"]["scratch"]["description"]
+    )
+    restored["shared_alg_params"]["inner_temperature"] = 1e-4
+    assert restored == baseline
+    resolved = resolve_preset(ALPHA_ZERO_MATRIX, "initialization/scratch", zero,
+                              checkpoint_context=_source_context())
+    cfg = _build_cfg(**resolved["algorithm_config"]["alg_params"])
+    assert cfg.inner_temperature == 0.0
+    assert cfg.inner_temperature_mode == cfg.inner_temperature_initialization == "fixed"
+    assert cfg.inner_actor_entropy_mode == "tdmpc2_scaled"
+    assert cfg.ent_coef == 1e-4
+    base_resolved = resolve_preset(MATRIX, "initialization/scratch", baseline,
+                                   checkpoint_context=_source_context())
+    base_params = base_resolved["algorithm_config"]["alg_params"]
+    zero_params = resolved["algorithm_config"]["alg_params"]
+    assert {key for key in base_params if base_params[key] != zero_params[key]} == {"inner_temperature"}
+    assert planner_identity(base_params, {}, "AMBITDMPC2/AMBITDMPC2", "tanh_mean") != (
+        planner_identity(zero_params, {}, "AMBITDMPC2/AMBITDMPC2", "tanh_mean")
+    )
+
+
+@pytest.mark.parametrize("temperature", [0.0, 1e-4])
 @pytest.mark.parametrize("representation", ["scalar", "distributional"])
-def test_h1_takeoff_cadence_snapshot_and_probe_noninterference(representation):
+def test_h1_takeoff_cadence_snapshot_and_probe_noninterference(representation, temperature):
     matrix = load_preset_matrix(MATRIX)
     params = {k: v for k, v in matrix["shared_alg_params"].items() if v is not None}
     params.update(sac_actor_loss_scale_mode="tdmpc2_percentile_range",
                   ent_coef=1e-4, outer_critic_target="reward_only",
+                  inner_temperature=temperature,
                   q_representation=representation, num_q=2 if representation == "scalar" else 5)
     plain, traced = _tiny_component_model(**params), _tiny_component_model(**params)
     trace = InnerActionTrace(probes=True, probe_mode="outer_tail", probe_rollouts=32,

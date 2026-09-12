@@ -28,6 +28,7 @@ arguments=(worker --inventory "$AMBI_TAKEOFF_MANIFEST" --output-root "$AMBI_TAKE
     --attempt-label "$AMBI_TAKEOFF_ATTEMPT" --task-index "${SLURM_ARRAY_TASK_ID:?Supply a task index}")
 if [[ "${AMBI_TAKEOFF_SMOKE:-0}" == 1 ]]; then arguments+=(--smoke); fi
 if [[ -n "${EVAL_RUN_MAP:-}" ]]; then arguments+=(--eval-run-map "$EVAL_RUN_MAP"); fi
+if [[ -n "${AMBI_TAKEOFF_MATRIX:-}" ]]; then arguments+=(--matrix "$AMBI_TAKEOFF_MATRIX"); fi
 export MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-6}" TORCHINDUCTOR_COMPILE_THREADS=1
 export TORCHINDUCTOR_CACHE_DIR="${SLURM_TMPDIR:-/tmp}/ambi-takeoff-${SLURM_JOB_ID}"

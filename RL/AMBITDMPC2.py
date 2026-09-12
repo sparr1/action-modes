@@ -1858,8 +1858,13 @@ class AMBITDMPC2(TDMPC2Baseline):
         cfg.inner_temperature = _finite_float(
             cfg.inner_temperature, "inner_temperature"
         )
-        if cfg.inner_temperature <= 0.0:
-            raise ValueError("inner_temperature must be positive.")
+        if cfg.inner_temperature < 0.0 or (
+            cfg.inner_temperature == 0.0 and cfg.inner_temperature_mode != "fixed"
+        ):
+            raise ValueError(
+                "inner_temperature must be positive, or zero with "
+                "inner_temperature_mode='fixed'."
+            )
         if isinstance(cfg.inner_target_entropy, str):
             cfg.inner_target_entropy = cfg.inner_target_entropy.lower()
         if cfg.inner_target_entropy not in {"auto", "inherit_outer"}:

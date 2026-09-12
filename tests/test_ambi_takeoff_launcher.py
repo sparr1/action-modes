@@ -83,6 +83,56 @@ def test_smoke_exercises_full_snapshot_batch_and_continuing_tail_without_publica
     assert "--eval-run-map" not in evaluate
 
 
+@pytest.mark.parametrize("smoke", [False, True])
+@pytest.mark.parametrize("index", [3, 10])
+def test_selected_matrix_reaches_episode_and_real_workers(tmp_path, monkeypatch, smoke, index):
+    manifest = inventory(tmp_path)
+    matrix = tmp_path / "selected-matrix.json"
+    matrix.write_text("{}")
+    run_map = tmp_path / "run-map.json"
+    run_map.write_text("{}")
+    calls = []
+    monkeypatch.setattr(campaign, "_run", lambda args, **kwargs: calls.append(list(map(str, args))))
+    campaign.run_worker(manifest, tmp_path / "results", "matrix-attempt", index,
+                        smoke=smoke, eval_run_map=run_map, matrix=matrix)
+    evaluate = next(args for args in calls if args[0] in
+                    ("evaluate_ambi_checkpoint.py", "evaluate_ambi_calibration.py"))
+    assert argument(evaluate, "--matrix") == str(matrix)
+    mode, _ = campaign.task_cell(index)
+    output = tmp_path / "results" / ("smoke" if smoke else "production") / "step_200000" / mode
+    assert json.loads((output / "worker-completion.json").read_text())["matrix"] == str(matrix)
+
+
+@pytest.mark.parametrize("source", ["default", "environment", "explicit"])
+def test_worker_cli_selects_matrix_with_explicit_argument_precedence(tmp_path, monkeypatch, source):
+    calls = []
+    monkeypatch.setattr(campaign, "run_worker", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.delenv("AMBI_TAKEOFF_MATRIX", raising=False)
+    args = ["worker", "--inventory", str(tmp_path / "inventory.json"),
+            "--output-root", str(tmp_path / "results"), "--attempt-label", "new-attempt",
+            "--task-index", "3"]
+    expected = Path(campaign.MATRIX)
+    if source in ("environment", "explicit"):
+        expected = tmp_path / "environment-matrix.json"
+        monkeypatch.setenv("AMBI_TAKEOFF_MATRIX", str(expected))
+    if source == "explicit":
+        expected = tmp_path / "explicit-matrix.json"
+        args += ["--matrix", str(expected)]
+    assert campaign.main(args) == 0
+    assert calls[0]["matrix"] == expected
+
+
+def test_missing_matrix_is_rejected_before_compute_or_output_creation(tmp_path, monkeypatch):
+    manifest = inventory(tmp_path)
+    calls = []
+    monkeypatch.setattr(campaign, "_run", lambda args, **kwargs: calls.append(args))
+    with pytest.raises(ValueError, match="Research matrix must be an existing file"):
+        campaign.run_worker(manifest, tmp_path / "results", "new-attempt", 10,
+                            matrix=tmp_path / "missing-matrix.json")
+    assert not calls
+    assert not (tmp_path / "results").exists()
+
+
 @pytest.mark.parametrize("failure", ["checkpoint_hash", "sidecar_hash", "sidecar_step", "missing_reference", "reference_hash", "missing_reference_hash", "existing_output", "wrong_source", "wrong_panel"])
 def test_preflight_rejects_invalid_work_before_any_compute(tmp_path, monkeypatch, failure):
     path = inventory(tmp_path)

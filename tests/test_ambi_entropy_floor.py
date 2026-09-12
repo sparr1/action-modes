@@ -65,6 +65,72 @@ def test_learned_and_inherited_alpha_access_is_floored_but_fixed_is_unchanged():
     )
 
 
+@pytest.mark.parametrize("mode", ["auto", "inherit_outer"])
+def test_zero_configured_inner_temperature_requires_fixed_mode(mode):
+    from tests.test_ambi_root_local_sac import _build_cfg
+
+    with pytest.raises(ValueError, match="zero with inner_temperature_mode='fixed'"):
+        _build_cfg(inner_temperature=0.0, inner_temperature_mode=mode)
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), -float("inf"), True])
+def test_fixed_inner_temperature_rejects_invalid_values(value):
+    from tests.test_ambi_root_local_sac import _build_cfg
+
+    with pytest.raises(ValueError, match="inner_temperature"):
+        _build_cfg(inner_temperature=value, inner_temperature_mode="fixed")
+
+
+def test_zero_fixed_scratch_solve_preserves_initialization_rng_and_update_counts():
+    """A zero entropy coefficient changes gradients without changing the solve protocol."""
+    from copy import deepcopy
+    from pathlib import Path
+
+    from RL.tdmpc2_core.inner_trace import InnerActionTrace
+    from tests.test_ambi_root_local_sac import _tiny_component_model
+    from utils.ambi_research import load_preset_matrix
+
+    matrix = load_preset_matrix(
+        Path(__file__).resolve().parents[1] / "configs/research/ambi_scratch_takeoff_h1.json"
+    )
+    params = {key: value for key, value in matrix["shared_alg_params"].items() if value is not None}
+    params.update(sac_actor_loss_scale_mode="tdmpc2_percentile_range", ent_coef=1e-4,
+                  outer_critic_target="reward_only", q_representation="distributional", num_q=5)
+    baseline = _tiny_component_model(**params)
+    zero = _tiny_component_model(**{**params, "inner_temperature": 0.0})
+    before = deepcopy(zero.agent.model.state_dict())
+    traces = [InnerActionTrace(probes=True, probe_mode="outer_tail", probe_rollouts=32,
+                               probe_horizon=1, capture_actors=True) for _ in range(2)]
+    try:
+        for model, trace in zip((baseline, zero), traces):
+            action = model.agent.act(torch.zeros(3), t0=True, collect_diagnostics=False, trace=trace)
+            assert torch.isfinite(action).all()
+            assert [s.actor_updates for s in trace.actor_snapshots] == [0, 4, 8, 12, 16]
+            assert [s.critic_updates for s in trace.actor_snapshots] == [0, 32, 64, 96, 128]
+            assert all(math.isfinite(float(value)) for event in trace.events
+                       for value in event["metrics"].values() if isinstance(value, (int, float)))
+
+        # Same actual random initialization and same draws throughout the solve.
+        assert traces[0].actor_snapshots[0].sha256 == traces[1].actor_snapshots[0].sha256
+        _assert_tree_equal(baseline.agent.inner_engine.rng.training_state_dict(),
+                           zero.agent.inner_engine.rng.training_state_dict())
+        _assert_tree_equal(zero.agent.model.state_dict(), before)
+
+        updates = [event for event in traces[1].events if event["phase"] == "update"]
+        assert len(updates) == 144
+        assert all(event["metrics"]["alpha_used"] == 0.0 for event in updates)
+        actor_updates = [event for event in updates if event["updated_actor"]]
+        assert len(actor_updates) == 16
+        assert all(event["metrics"]["actor_entropy_bonus"] == 0.0 for event in actor_updates)
+        pool = zero.agent.inner_engine._action_pool
+        assert pool.alpha_fixed.item() == 0.0
+        assert pool.log_alpha is None and pool.temperature_optim is None
+        assert zero.cfg.inner_temperature_updates_per_action == 0
+    finally:
+        baseline.env.close()
+        zero.env.close()
+
+
 def test_learned_inner_initialization_floors_an_underflowed_outer_alpha():
     engine = _engine(mode="auto", outer_alpha=0.0)
 

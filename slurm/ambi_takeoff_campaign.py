@@ -64,12 +64,16 @@ def _run(arguments, *, env=None):
     subprocess.run(command, check=True, env=env)
 
 
-def run_worker(inventory_path, output_root, attempt_label, task_index, *, smoke=False, eval_run_map=None):
+def run_worker(inventory_path, output_root, attempt_label, task_index, *, smoke=False, eval_run_map=None,
+               matrix=MATRIX):
     if not attempt_label.strip():
         raise ValueError("Choose an explicit nonempty attempt label.")
     mode, checkpoint_index = task_cell(task_index)
     row = load_inventory(inventory_path)[checkpoint_index]
     checkpoint = verify_checkpoint(row)
+    matrix = Path(matrix)
+    if not matrix.is_file():
+        raise ValueError(f"Research matrix must be an existing file: {matrix}")
     output_root = Path(output_root)
     if not output_root.is_absolute():
         raise ValueError("Output root must be absolute.")
@@ -93,7 +97,7 @@ def run_worker(inventory_path, output_root, attempt_label, task_index, *, smoke=
               "tests/test_ambi_real_calibration.py", "tests/test_ambi_calibration_cli.py",
               "tests/test_ambi_inner_decoupling.py::test_cuda_act_preserves_all_global_rng_streams_and_outer_state"],
              env=environment)
-    common = ["--matrix", MATRIX, "--preset", SELECTOR, "--checkpoint", checkpoint, "--device", "cuda"]
+    common = ["--matrix", matrix, "--preset", SELECTOR, "--checkpoint", checkpoint, "--device", "cuda"]
     if mode == "episodes":
         arguments = ["evaluate_ambi_checkpoint.py", *common, "--bundle-dir", output / "bundle",
                      "--output", output / "results.json"]
@@ -119,6 +123,7 @@ def run_worker(inventory_path, output_root, attempt_label, task_index, *, smoke=
         _run(arguments)
     receipt = {"status": "complete", "step": row["step"], "mode": mode, "smoke": smoke,
                "attempt_label": attempt_label, "checkpoint_sha256": row["sha256"],
+               "matrix": str(matrix),
                "worker_elapsed_seconds": time.perf_counter() - started}
     (output / "worker-completion.json").write_text(json.dumps(receipt, indent=2) + "\n")
 
@@ -165,6 +170,7 @@ def main(argv=None):
     worker.add_argument("--task-index", type=int, required=True)
     worker.add_argument("--smoke", action="store_true")
     worker.add_argument("--eval-run-map", type=Path)
+    worker.add_argument("--matrix", type=Path, default=os.environ.get("AMBI_TAKEOFF_MATRIX", MATRIX))
     publisher = commands.add_parser("publish")
     publisher.add_argument("--output-root", type=Path, required=True)
     publisher.add_argument("--entity", default="rwgao_b-brown-university")
