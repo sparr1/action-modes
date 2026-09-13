@@ -2,12 +2,13 @@
 
 import math
 import time
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
 
 from .common import math as td_math
-from .common.compile_regions import CompileRegion
+from .common.compile_regions import CompileRegion, _preserve_host_rng_state
 from .common.checkpoint import save_checkpoint
 from .common.device import resolve_device
 from .common.entropy import critic_entropy_spec, policy_entropy
@@ -3123,19 +3124,25 @@ class AMBITDMPC2Agent(torch.nn.Module):
             raise NotImplementedError(
                 "AMBI-TD-MPC2 currently supports single-task training only."
             )
-        if (
-            bool(getattr(self.cfg, "compile", False))
-            and self.device.type == "cuda"
-            and hasattr(torch, "compiler")
-            and hasattr(torch.compiler, "cudagraph_mark_step_begin")
-        ):
-            torch.compiler.cudagraph_mark_step_begin()
-        return self._update(
-            obs,
-            action,
-            reward,
-            terminated,
-            behavior_pre_tanh_mean=behavior_pre_tanh_mean,
-            behavior_log_std=behavior_log_std,
-            behavior_policy_valid=behavior_policy_valid,
-        )
+        compiled = bool(getattr(self.cfg, "compile", False))
+        # Replay sampling above owns its scientific RNG draws. Within this
+        # tensor learner, host draws belong to lazy compiler/control work,
+        # including CUDA-graph setup and AOTAutograd's deferred backward.
+        # Preserve tensor RNG advancement for policy samples and dropout.
+        with _preserve_host_rng_state() if compiled else nullcontext():
+            if (
+                compiled
+                and self.device.type == "cuda"
+                and hasattr(torch, "compiler")
+                and hasattr(torch.compiler, "cudagraph_mark_step_begin")
+            ):
+                torch.compiler.cudagraph_mark_step_begin()
+            return self._update(
+                obs,
+                action,
+                reward,
+                terminated,
+                behavior_pre_tanh_mean=behavior_pre_tanh_mean,
+                behavior_log_std=behavior_log_std,
+                behavior_policy_valid=behavior_policy_valid,
+            )

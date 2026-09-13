@@ -184,6 +184,99 @@ def test_lazy_host_guard_finishes_before_eager_fallback(monkeypatch):
     assert (random.random(), np.random.random()) == expected_next
 
 
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("failure", [False, True])
+def test_compiled_update_isolates_lazy_backward_host_work_after_replay(
+    monkeypatch, compiled, failure
+):
+    from types import SimpleNamespace
+    from RL.tdmpc2_core.ambi_agent import AMBITDMPC2Agent
+
+    class LazyBackward(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value):
+            return value * 2.
+
+        @staticmethod
+        def backward(ctx, gradient):
+            random.random()
+            np.random.random()
+            actual_tensor_draw = torch.rand(())
+            if failure:
+                raise RuntimeError("lazy backward initialization failed")
+            return gradient * (2. + actual_tensor_draw)
+
+    class Replay:
+        calls = 0
+
+        def sample(self):
+            self.calls += 1
+            random.random()
+            np.random.random()
+            torch.rand(())
+            return None, None, None, None, None
+
+    markers = []
+
+    def mark_step():
+        markers.append(True)
+        random.random()
+        np.random.random()
+
+    monkeypatch.setattr(torch.compiler, "cudagraph_mark_step_begin", mark_step)
+    random.seed(1721)
+    np.random.seed(1822)
+    torch.manual_seed(1923)
+    python_initial = random.getstate()
+    numpy_initial = np.random.get_state()
+    torch_initial = torch.get_rng_state().clone()
+    Replay().sample()
+    python_after_replay = random.getstate()
+    numpy_after_replay = np.random.get_state()
+    expected_value = torch.ones((), requires_grad=True)
+    expected_loss = LazyBackward.apply(expected_value)
+    if failure:
+        with pytest.raises(RuntimeError, match="lazy backward initialization failed"):
+            expected_loss.backward()
+    else:
+        expected_loss.backward()
+    python_after = random.getstate()
+    numpy_after = np.random.get_state()
+    torch_after = torch.get_rng_state().clone()
+    random.setstate(python_initial)
+    np.random.set_state(numpy_initial)
+    torch.set_rng_state(torch_initial)
+
+    actual_value = torch.ones((), requires_grad=True)
+    actual_loss = LazyBackward.apply(actual_value)
+
+    def update(*_args, **_kwargs):
+        actual_loss.backward()
+        return "updated"
+
+    agent = SimpleNamespace(
+        cfg=SimpleNamespace(compile=compiled), device=SimpleNamespace(type="cuda"),
+        behavior_policy_kl_enabled=False, _update=update,
+    )
+    replay = Replay()
+    if failure:
+        with pytest.raises(RuntimeError, match="lazy backward initialization failed"):
+            AMBITDMPC2Agent.update(agent, replay)
+        assert actual_value.grad is expected_value.grad is None
+    else:
+        assert AMBITDMPC2Agent.update(agent, replay) == "updated"
+        torch.testing.assert_close(actual_value.grad, expected_value.grad, rtol=0, atol=0)
+    assert replay.calls == 1
+    assert len(markers) == int(compiled)
+    assert random.getstate() == (python_after_replay if compiled else python_after)
+    expected_numpy = numpy_after_replay if compiled else numpy_after
+    actual_numpy = np.random.get_state()
+    assert actual_numpy[0] == expected_numpy[0]
+    np.testing.assert_array_equal(actual_numpy[1], expected_numpy[1])
+    assert actual_numpy[2:] == expected_numpy[2:]
+    torch.testing.assert_close(torch.get_rng_state(), torch_after, rtol=0, atol=0)
+
+
 def test_non_strict_compile_failure_warns_once_and_stays_eager(monkeypatch):
     compile_calls = 0
 

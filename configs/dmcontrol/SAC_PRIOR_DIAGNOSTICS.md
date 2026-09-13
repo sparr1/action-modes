@@ -344,3 +344,7 @@ Compiled tensor-region calls preserve Python/NumPy global RNG state while
 retaining actual Torch/default/explicit-generator draws. The guard applies to
 lazy compilation and later guard-triggered recompilation; eager fallback keeps
 its existing full-RNG retry semantics. Maintained tests cover these boundaries.
+The compiled AMBI learner also isolates host RNG after replay sampling through
+CUDA-graph setup and deferred AOT backward work. This keeps scientific replay
+and tensor RNG draws while covering compiler initialization outside forward
+wrappers. The uncompiled learner path remains unchanged.
