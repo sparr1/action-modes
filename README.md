@@ -52,6 +52,12 @@ reward-only and entropy-augmented critics, Q scaling and learned temperatures,
 and fixed versus adaptive inner Q scales. Full runs use one paired actor/critic
 update per batched imagined step with six rounds and 512 branches.
 
+The [SAC prior parameterization study](configs/dmcontrol/SAC_PRIOR_DIAGNOSTICS.md)
+compares clipping and smooth log-std mappings with corrected action-entropy
+targets −21 and −10.5. Its four configurations run two seeds each and add
+outer-policy saturation, entropy, temperature and fixed-observation diagnostics
+to the prior-only checkpoint banks.
+
 The optional [critic-only LoRA-RL adapter](RL/tdmpc2_core/README.md#critic-only-lora-rl)
 uses `inner_critic_adaptation="lora_rl"` with a fully cloned actor. The default
 rank is 96, direct adapter scale is one, and AdamW adapter weight decay is

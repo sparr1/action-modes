@@ -239,6 +239,14 @@ _RUNTIME_CONFIG_FIELDS = (
     "eval_inner_comparison_episodes",
     "eval_inner_comparison_seed",
     "outer_policy_episode_probability",
+    "outer_policy_diagnostics",
+    "outer_policy_diagnostics_early_every",
+    "outer_policy_diagnostics_early_until",
+    "outer_policy_diagnostics_every",
+    "outer_policy_diagnostics_states",
+    "outer_policy_diagnostics_samples",
+    "outer_policy_diagnostics_seed",
+    "wandb_event_indexed",
     "train_unroll_horizon",
     "outer_planning_horizon",
     "inner_rollout_horizon",
@@ -640,6 +648,21 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
         metadata["evaluation"] = evaluation
     if collection:
         metadata["collection"] = collection
+    if resolved.get("outer_policy_diagnostics", False):
+        metadata["outer_policy_diagnostics"] = {
+            key: resolved[key]
+            for key in (
+                "outer_policy_diagnostics",
+                "outer_policy_diagnostics_early_every",
+                "outer_policy_diagnostics_early_until",
+                "outer_policy_diagnostics_every",
+                "outer_policy_diagnostics_states",
+                "outer_policy_diagnostics_samples",
+                "outer_policy_diagnostics_seed",
+                "wandb_event_indexed",
+            )
+            if key in resolved
+        }
     if actor_loss_scale:
         metadata["actor_loss_scale"] = actor_loss_scale
     if trial_run_params.get("alg") == "AMBITDMPC2/AMBITDMPC2":

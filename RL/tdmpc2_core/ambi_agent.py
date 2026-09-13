@@ -1,6 +1,7 @@
 """AMBI agent with TOLD priors and fresh per-root actor-critic adaptation."""
 
 import math
+import time
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +15,7 @@ from .common.layers import api_model_conversion
 from .common.scale import percentile_range
 from .common.soft_world_model import SoftWorldModel
 from .inner_improvement import InnerImprovementEngine, polyak_update
+from .outer_policy_diagnostics import diagnostics_due, policy_diagnostics
 from .common.training_state import (
     load_optimizer_state_preserving_hyperparameters,
     preflight_adam_state,
@@ -54,6 +56,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        self._outer_policy_diagnostics_packet = None
+        self._outer_policy_diagnostics_force = False
         self.device = resolve_device(getattr(cfg, "device", None))
         self.cfg.device = str(self.device)
         if self.device.type not in {"cpu", "cuda"}:
@@ -2458,6 +2462,12 @@ class AMBITDMPC2Agent(torch.nn.Module):
         torch._foreach_mul_(gradients, coefficient.to(gradients[0]))
         return total_norm
 
+    def drain_outer_policy_diagnostics(self):
+        """Consume the latest diagnostic packet, which is not checkpoint state."""
+        packet = self._outer_policy_diagnostics_packet
+        self._outer_policy_diagnostics_packet = None
+        return packet
+
     def _update_actor(
         self,
         zs,
@@ -2465,6 +2475,16 @@ class AMBITDMPC2Agent(torch.nn.Module):
         behavior_log_std=None,
         behavior_policy_valid=None,
     ):
+        diagnostic_requested = (
+            bool(getattr(self.cfg, "outer_policy_diagnostics", False))
+            and (
+                self._outer_policy_diagnostics_force
+                or diagnostics_due(self.cfg, self.num_updates + 1)
+            )
+        )
+        # A force request applies to one attempted update, including failures.
+        self._outer_policy_diagnostics_force = False
+        self._outer_policy_diagnostics_packet = None
         scaled_entropy_enabled = self._actor_entropy_mode == "tdmpc2_scaled"
         if scaled_entropy_enabled:
             action, policy_info = self.model.pi(zs, include_scaled_entropy=True)
@@ -2515,6 +2535,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         # next outer update.
         alpha = self.alpha.detach()
         entropy_coefficient_loss = torch.zeros((), device=self.device)
+        weighted_entropy_residual = None
         if self.ent_coef_optim is not None:
             temperature_log_prob = (
                 -policy_info["scaled_entropy"]
@@ -2772,6 +2793,48 @@ class AMBITDMPC2Agent(torch.nn.Module):
                         ),
                     }
                 )
+        if diagnostic_requested:
+            diagnostic_started = time.perf_counter()
+            packet = policy_diagnostics(
+                policy_info, action,
+                lower=self.cfg.log_std_min, upper=self.cfg.log_std_max,
+                rho=self.cfg.rho,
+            )
+            diagnostic_metrics = packet["metrics"]
+            selected_entropy = policy_entropy(policy_info, self._actor_entropy_mode).detach()
+            selected_per_depth = selected_entropy.mean(dim=(1, 2))
+            normalized_weights = self._actor_temporal_weights / self._actor_temporal_weights.sum()
+            selected_entropy_rho = (selected_per_depth * normalized_weights).sum()
+            diagnostic_metrics.update({
+                "alpha_before": alpha.detach().clone().reshape(()),
+                "alpha_after": self.alpha.detach().clone().reshape(()),
+                "target_entropy": action.new_tensor(self.target_entropy),
+                "temperature_entropy_rho_mean": selected_entropy_rho,
+                "entropy_shortfall": (
+                    weighted_entropy_residual.detach().clone()
+                    if weighted_entropy_residual is not None
+                    else action.new_tensor(self.target_entropy) - selected_entropy_rho
+                ),
+                "temperature_loss": entropy_coefficient_loss.detach().clone(),
+                "entropy_bonus_rho_mean": alpha.reshape(()) * selected_entropy_rho,
+                "entropy_actor_loss_contribution": -alpha.reshape(()) * (
+                    selected_per_depth * self._actor_temporal_weights
+                ).sum(),
+                **{key: torch.as_tensor(metrics[key]).detach().clone().reshape(()) for key in (
+                    "actor_loss", "actor_grad_norm", "actor_q_mean", "actor_q_mean_all",
+                    "actor_q_min_all", "actor_q_mean_all_minus_min_all",
+                )},
+            })
+            packet.update({
+                "actor_updates_before": int(self.num_updates),
+                "actor_updates_after": int(self.num_updates) + 1,
+                "policy_snapshot": "before_actor_update",
+                "latent_snapshot": "before_model_critic_update",
+                "actor_q_snapshot": "after_model_critic_update",
+                "diagnostic_collection_seconds": time.perf_counter() - diagnostic_started,
+                "diagnostic_collection_timing": "host_enqueue_without_device_synchronization",
+            })
+            self._outer_policy_diagnostics_packet = packet
         return metrics
 
     def _outer_update_kernel(
@@ -3020,6 +3083,23 @@ class AMBITDMPC2Agent(torch.nn.Module):
             )
         info.update(actor_info)
         info.update(value_equivalence_info)
+        if self._outer_policy_diagnostics_packet is not None:
+            diagnostic_started = time.perf_counter()
+            # Reuse the existing world/critic summaries. This adds no critic,
+            # model or policy evaluation and keeps normal update returns intact.
+            self._outer_policy_diagnostics_packet["metrics"].update({
+                key: info[key].detach().clone().reshape(()) for key in (
+                    "critic_loss", "reward_loss", "consistency_loss", "total_loss",
+                    "q_target_mean", "q_mean", "q_abs_mean", "td_error_abs_mean",
+                    "q_target_clip_fraction",
+                )
+            })
+            self._outer_policy_diagnostics_packet["metrics"]["world_critic_grad_norm"] = (
+                info["grad_norm"].detach().clone().reshape(())
+            )
+            self._outer_policy_diagnostics_packet["diagnostic_collection_seconds"] += (
+                time.perf_counter() - diagnostic_started
+            )
         return info
 
     def update(self, buffer):

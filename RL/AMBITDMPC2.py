@@ -101,6 +101,14 @@ _AMBI_DEFAULTS = {
     "tau": 0.005,
     "target_update_interval": 1,
     "compile_strict": False,
+    # Observational outer-policy telemetry; opt-in for the SAC prior study.
+    "outer_policy_diagnostics": False,
+    "outer_policy_diagnostics_early_every": 100,
+    "outer_policy_diagnostics_early_until": 10_000,
+    "outer_policy_diagnostics_every": 1_000,
+    "outer_policy_diagnostics_states": 32,
+    "outer_policy_diagnostics_samples": 32,
+    "outer_policy_diagnostics_seed": 12345,
 
     # Optional trajectory-level intervention used by value-calibration
     # experiments. Eligible training episodes draw once between the canonical
@@ -1360,6 +1368,29 @@ class AMBITDMPC2(TDMPC2Baseline):
                 inner_temperature_mode="inherit_outer",
             )
         cfg = super()._build_cfg(merged)
+        cfg.outer_policy_diagnostics = _strict_bool(
+            cfg.outer_policy_diagnostics, "outer_policy_diagnostics"
+        )
+        for key in (
+            "outer_policy_diagnostics_early_every", "outer_policy_diagnostics_every",
+            "outer_policy_diagnostics_states", "outer_policy_diagnostics_samples",
+        ):
+            value = _strict_nonnegative_int(getattr(cfg, key), key)
+            if value == 0:
+                raise ValueError(f"{key} must be positive.")
+            setattr(cfg, key, value)
+        for key in ("outer_policy_diagnostics_early_until", "outer_policy_diagnostics_seed"):
+            setattr(cfg, key, _strict_nonnegative_int(getattr(cfg, key), key))
+        if cfg.outer_policy_diagnostics and cfg.obs != "state":
+            raise ValueError("outer_policy_diagnostics currently requires state observations.")
+        if cfg.outer_policy_diagnostics and bool(getattr(cfg, "wandb", False)) and not bool(
+            getattr(cfg, "wandb_event_indexed", False)
+        ):
+            raise ValueError("outer_policy_diagnostics with W&B requires wandb_event_indexed=true.")
+        if cfg.outer_policy_diagnostics and (
+            cfg.inner_operator != "none" or bool(cfg.mpc)
+        ):
+            raise ValueError("outer_policy_diagnostics currently requires prior-only collection (inner_operator=none, mpc=false).")
         cfg.inner_schedule_mode = schedule_mode
         cfg.inner_component_update_schedule = component_update_schedule
         cfg.outer_policy_episode_probability = float(
@@ -2935,12 +2966,18 @@ class AMBITDMPC2(TDMPC2Baseline):
             raise RuntimeError(
                 "AMBI training state requires consumed behavior-policy metadata."
             )
-        return {
+        state = {
             "schema": "ambi-wrapper-training-state",
             "version": 2,
             "inner_steps_total": int(self._inner_steps_total),
             "inner_updates_total": int(self._inner_updates_total),
         }
+        if self.cfg.outer_policy_diagnostics:
+            recorder = self._outer_policy_recorder
+            state["outer_policy_diagnostics"] = (
+                recorder.state_dict() if recorder is not None else self._outer_policy_recorder_state
+            )
+        return state
 
     def _preflight_training_resume_algorithm_state(self, state):
         expected = {
@@ -2949,11 +2986,18 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_steps_total",
             "inner_updates_total",
         }
+        if self.cfg.outer_policy_diagnostics:
+            expected.add("outer_policy_diagnostics")
         if not isinstance(state, Mapping) or set(state) != expected:
             raise ValueError("AMBI wrapper training-state fields are invalid.")
         if state["schema"] != "ambi-wrapper-training-state" or state["version"] != 2:
             raise ValueError("Unsupported AMBI wrapper training-state version.")
         normalized = dict(state)
+        if self.cfg.outer_policy_diagnostics and state["outer_policy_diagnostics"] is not None:
+            from utils.outer_policy_diagnostics import OuterPolicyDiagnostics
+            normalized["outer_policy_diagnostics"] = OuterPolicyDiagnostics.validate_state(
+                state["outer_policy_diagnostics"], self.cfg
+            )
         for key in ("inner_steps_total", "inner_updates_total"):
             value = normalized[key]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -2964,6 +3008,8 @@ class AMBITDMPC2(TDMPC2Baseline):
         state = self._preflight_training_resume_algorithm_state(state)
         self._inner_steps_total = state["inner_steps_total"]
         self._inner_updates_total = state["inner_updates_total"]
+        if self.cfg.outer_policy_diagnostics:
+            self._outer_policy_recorder_state = state["outer_policy_diagnostics"]
         self._wandb_inner_seconds = 0.0
         self._wandb_inner_actions = 0
         self._wandb_inner_steps = 0

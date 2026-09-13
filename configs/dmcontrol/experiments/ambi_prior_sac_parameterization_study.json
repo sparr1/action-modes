@@ -1,0 +1,29 @@
+{
+  "study_type": "two_seed_exploratory_sac_prior_parameterization_study",
+  "study_note": "Four Humanoid Walk state backbone configurations compare native direct-clipped versus smooth tanh log-standard-deviation mappings with shared [-10, 2] bounds, crossed with corrected post-tanh entropy targets -21 and -10.5 joint nats. All use automatic alpha initialized at 1, no actor Q normalization, mean-pair actor Q, min-pair target Q, entropy-augmented critics, and stochastic prior-only collection without inner optimization or MPPI. Native random network initialization is preserved: matched seeds match raw weights, not initial action distributions across mappings. Each configuration runs seeds 55 and 56 for 2 million decisions with 80 scheduled checkpoints every 25,000 decisions. This is an exploratory two-seed screen, not confirmatory evidence. Algorithm files specify complete settings; the manifest does not override alg_params.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 2000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 2,
+  "configs": [
+    "ambi_prior_sac_clip_target21",
+    "ambi_prior_sac_clip_target10p5",
+    "ambi_prior_sac_smooth_target21",
+    "ambi_prior_sac_smooth_target10p5"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}
