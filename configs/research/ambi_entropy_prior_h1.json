@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "kind": "prior_entropy_intervention",
+  "description": "Entropy off, inherited prior recipe, and true squashed entropy with the checkpoint-matched Gaussian coefficient. Fit one inherited H1 critic on shared data, then freeze across paired actor arms.",
+  "episode_seeds": [
+    101,
+    102,
+    103,
+    104,
+    105,
+    106,
+    107,
+    108,
+    109,
+    110,
+    111,
+    112,
+    113,
+    114,
+    115,
+    116,
+    117,
+    118,
+    119,
+    120
+  ],
+  "decisions": [
+    0,
+    100,
+    200,
+    300,
+    400
+  ],
+  "actor_updates": [
+    0,
+    1,
+    4,
+    16
+  ],
+  "horizon": 1,
+  "max_steps": 500,
+  "rollouts": 128,
+  "batch_size": 256,
+  "critic_updates": 32,
+  "solver_repetitions": 3,
+  "rollout_repetitions": 4,
+  "tail_steps": 1000,
+  "model_probe_rollouts": 32,
+  "bootstrap_resamples": 2000,
+  "bootstrap_seed": 20260913,
+  "controller_seed": 55,
+  "prefix_action_rules": [
+    "sampled",
+    "mean"
+  ],
+  "checkpoints": [
+    {
+      "id": "mey3rxj8",
+      "source_run": "rwgao_b-brown-university/ambi/mey3rxj8",
+      "step": 200000,
+      "sha256": "909e5c1d125aecc952e0544d802b4b946ae5089909c7a55885f272c32ed3e12f",
+      "metadata_sha256": "1ba7b81893f8811a31f5d5416b71ab90a8cc40c106a518fd25759a128347504b",
+      "gaussian_control": false
+    },
+    {
+      "id": "jirflxz1",
+      "source_run": "rwgao_b-brown-university/ambi/jirflxz1",
+      "step": 500000,
+      "sha256": "e57fdce762a8683f64884833c64d66f3bd77c0d8cfb99fb12861d40363f81ed5",
+      "metadata_sha256": "5820c1c65bb35b13780d08da824b1b7f48effa2c57c83c1b86473a155bbd3a71",
+      "gaussian_control": false
+    },
+    {
+      "id": "u13m14st",
+      "source_run": "rwgao_b-brown-university/ambi/u13m14st",
+      "step": 500000,
+      "sha256": "a680d61efa7f685c1949d965bf9239f0e0fd4773e7c6cd5b434ae1f5e8a4aae7",
+      "metadata_sha256": "6b8a82851db99e8ec2b42f2d04a593c30262d9c35ac27c42dee3e340b5957bb1",
+      "gaussian_control": false
+    }
+  ]
+}
