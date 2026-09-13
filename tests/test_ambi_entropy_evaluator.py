@@ -202,7 +202,7 @@ def sealed_worker(tmp_path, study):
     source = study["checkpoints"][0]
     record = dict(complete=True, smoke=False, outer_state_unchanged=True,
                   study_sha256=canonical_hash(study), source=source, episode_seed=101,
-                  arm_names=ARMS, rows=1)
+                  arm_names=ARMS + (["gaussian_control"] if source.get("gaussian_control") else []), rows=1)
     rows = [dict(mc_complete=True, truncated=False, metrics={"real_mc_return": 3.})]
     atomic_json(directory / "results.json", record)
     for name in ("root-bank.json", "matrix.json", "checkpoint.metadata.json", "arms.json"):

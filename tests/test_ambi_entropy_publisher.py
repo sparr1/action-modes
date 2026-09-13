@@ -116,6 +116,8 @@ def sealed_worker(tmp_path, *, episode_seed=101, record_change=None, row_change=
     directory = tmp_path / "sealed"
     directory.mkdir()
     arms = ["off", "prior_recipe", "squashed_matched"]
+    if source.get("gaussian_control"):
+        arms.append("gaussian_control")
     rows = evaluator.expected_rows(study, source, [episode_seed], arms)
     for row in rows:
         row.update(mc_complete=True, truncated=False,
@@ -150,7 +152,7 @@ def test_validate_worker_preserves_sealed_source_and_raw_pairing(tmp_path):
     report = reporting.aggregate_entropy_rows(
         loaded, expected_rows=evaluator.expected_rows(study, source, [101], record["arm_names"]))
     assert report["coverage"]["complete"]
-    assert len(report["series"]) == 12
+    assert len(report["series"]) == len(record["arm_names"]) * len(study["actor_updates"]) * len(study["prefix_action_rules"])
 
 
 def test_worker_seal_rejects_modified_measurements_and_missing_required_file(tmp_path):
@@ -233,7 +235,9 @@ def test_final_publisher_validates_entire_panel_before_scientific_publication(tm
     evaluator.publish_campaign(campaign)
     assert len(published) == 1
     report, files = published[0]
-    assert report["status"] == "complete" and report["coverage"]["observed_rows"] == 24
+    arm_count = 3 + int(study["checkpoints"][0].get("gaussian_control", False))
+    count = len(study["episode_seeds"]) * len(study["actor_updates"]) * len(study["prefix_action_rules"]) * arm_count
+    assert report["status"] == "complete" and report["coverage"]["observed_rows"] == count
     assert all(point["metrics"]["real_mc_return"]["n_episodes"] == 2 for point in report["series"])
     assert run.finished == [{}] and len(run.artifacts) == 1
     assert len(run.artifacts[0].directories) == 2
