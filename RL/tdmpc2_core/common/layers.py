@@ -7,7 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.func import functional_call
 
-from .compile_regions import _capture_rng_state, _restore_rng_state
+from .compile_regions import (
+	_capture_rng_state, _preserve_host_rng_state, _restore_rng_state,
+)
 
 
 _DETACHED_PARAMETER_VIEWS = weakref.WeakKeyDictionary()
@@ -181,7 +183,8 @@ class Ensemble(nn.Module):
 			_restore_rng_state(construction_rng_snapshot)
 			object.__setattr__(self, "_compiled_forward", compiled)
 		try:
-			result = compiled(*args, **kwargs)
+			with _preserve_host_rng_state():
+				result = compiled(*args, **kwargs)
 		except Exception as exc:
 			if self._compile_strict:
 				raise
@@ -280,7 +283,8 @@ class Ensemble(nn.Module):
 			_restore_rng_state(construction_rng_snapshot)
 			object.__setattr__(self, "_compiled_detached_forward", compiled)
 		try:
-			result = compiled(*args, **kwargs)
+			with _preserve_host_rng_state():
+				result = compiled(*args, **kwargs)
 		except Exception as exc:
 			if self._compile_strict:
 				raise

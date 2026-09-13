@@ -86,6 +86,104 @@ def test_successful_compile_region_construction_preserves_all_rng(
     torch.testing.assert_close(actual[3], expected[3], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("kind", ["region", "ensemble", "detached_ensemble"])
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("failure_call", [None, 1, 2])
+def test_lazy_compiled_calls_preserve_host_rng_and_tensor_draws(
+    monkeypatch, kind, strict, failure_call
+):
+    """A cold backend/new guard must not change the learner's host streams."""
+    compiled_calls = 0
+
+    def eager(value, *, generator):
+        return value + torch.rand(()) + torch.rand((), generator=generator)
+
+    def fake_compile(function, **_kwargs):
+        def compiled(*args, **kwargs):
+            nonlocal compiled_calls
+            compiled_calls += 1
+            # Simulate backend initialization both cold and on a later guard.
+            random.random()
+            np.random.random()
+            result = function(*args, **kwargs)
+            if compiled_calls == failure_call:
+                raise RuntimeError("lazy host RNG failure")
+            return result
+        return compiled
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    if kind == "region":
+        call = CompileRegion("host-isolated region", eager, enabled=True, strict=strict)
+        reference = eager
+    else:
+        class RandomModule(torch.nn.Module):
+            def forward(self, value, *, generator):
+                return eager(value, generator=generator)
+
+        ensemble = Ensemble([RandomModule()])
+        ensemble.enable_compile(strict=strict)
+        detached = kind == "detached_ensemble"
+        call = ensemble.forward_detached if detached else ensemble.forward
+        reference = ensemble._forward_detached_eager if detached else ensemble._forward_eager
+
+    random.seed(717)
+    np.random.seed(818)
+    torch.manual_seed(919)
+    generator = torch.Generator().manual_seed(1020)
+    for invocation in (1, 2):
+        python_before = random.getstate()
+        numpy_before = np.random.get_state()
+        torch_before = torch.get_rng_state().clone()
+        generator_before = generator.get_state().clone()
+        expected = reference(torch.ones(1), generator=generator)
+        torch_after = torch.get_rng_state().clone()
+        generator_after = generator.get_state().clone()
+        torch.set_rng_state(torch_before)
+        generator.set_state(generator_before)
+
+        if invocation == failure_call and strict:
+            with pytest.raises(RuntimeError, match="lazy host RNG failure"):
+                call(torch.ones(1), generator=generator)
+        elif invocation == failure_call:
+            with pytest.warns(RuntimeWarning, match="lazy host RNG failure"):
+                actual = call(torch.ones(1), generator=generator)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        else:
+            actual = call(torch.ones(1), generator=generator)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert random.getstate() == python_before
+        numpy_after = np.random.get_state()
+        assert numpy_after[0] == numpy_before[0]
+        np.testing.assert_array_equal(numpy_after[1], numpy_before[1])
+        assert numpy_after[2:] == numpy_before[2:]
+        torch.testing.assert_close(torch.get_rng_state(), torch_after, rtol=0, atol=0)
+        torch.testing.assert_close(generator.get_state(), generator_after, rtol=0, atol=0)
+
+
+def test_lazy_host_guard_finishes_before_eager_fallback(monkeypatch):
+    def eager(value):
+        return value + random.random() + np.random.random()
+
+    def fake_compile(_function, **_kwargs):
+        def fail(_value):
+            random.random()
+            np.random.random()
+            raise RuntimeError("backend failure before eager host draw")
+        return fail
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    region = CompileRegion("fallback boundary", eager, enabled=True)
+    python_before = random.getstate()
+    numpy_before = np.random.get_state()
+    expected = eager(1.)
+    expected_next = (random.random(), np.random.random())
+    random.setstate(python_before)
+    np.random.set_state(numpy_before)
+    with pytest.warns(RuntimeWarning, match="backend failure before eager host draw"):
+        assert region(1.) == expected
+    assert (random.random(), np.random.random()) == expected_next
+
+
 def test_non_strict_compile_failure_warns_once_and_stays_eager(monkeypatch):
     compile_calls = 0
 

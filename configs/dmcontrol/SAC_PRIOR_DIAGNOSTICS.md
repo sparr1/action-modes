@@ -336,3 +336,11 @@ and production warmup settings, but calls only two direct fixture updates per
 mapping. Its 32-observation test bank is collected in 32 real decisions rather
 than executing production pretraining. It reports compilation fallback flags
 explicitly. This bounded validation is distinct from a full training run.
+
+The initial Linux/CUDA gate exposed a test fixture dtype mismatch (real actions
+are float64, ordinary replay stores float32), and a cold-compiler reproducibility
+issue in the shared compile wrappers. The fixture now mirrors replay casting.
+Compiled tensor-region calls preserve Python/NumPy global RNG state while
+retaining actual Torch/default/explicit-generator draws. The guard applies to
+lazy compilation and later guard-triggered recompilation; eager fallback keeps
+its existing full-RNG retry semantics. Maintained tests cover these boundaries.

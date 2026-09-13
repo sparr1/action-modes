@@ -30,6 +30,7 @@ export TORCHINDUCTOR_CACHE_DIR="$local_root/inductor" TRITON_CACHE_DIR="$local_r
 export TORCHINDUCTOR_COMPILE_THREADS=1 OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 echo "CUDA validation: commit=$AMBI_EXPECTED_COMMIT node=${SLURM_NODELIST:-unknown}"
 exec srun --kill-on-bad-exit=1 "$ambi_python" -m pytest -q -s -p no:cacheprovider \
+  tests/test_compile_regions.py \
   tests/test_ambi_prior_sac_hydra_launcher.py \
   tests/test_ambi_prior_sac_study_configs.py \
   tests/test_ambi_prior_sac_cuda_gate.py \

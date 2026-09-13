@@ -64,8 +64,10 @@ class _FixedRealReplay:
         observation_indices = np.arange(4)[:, None] + starts[None, :]
         transition_indices = np.arange(3)[:, None] + starts[None, :]
         self.batch = (
-            torch.as_tensor(np.asarray(observations)[observation_indices], device=device),
-            torch.as_tensor(np.asarray(actions)[transition_indices], device=device),
+            torch.as_tensor(np.asarray(observations, dtype=np.float32)[observation_indices], device=device),
+            # The raw DMControl action spec is float64. Ordinary training stages
+            # normalized actions as float32 before adding them to replay.
+            torch.as_tensor(np.asarray(actions, dtype=np.float32)[transition_indices], device=device),
             torch.as_tensor(np.asarray(rewards, dtype=np.float32)[transition_indices, None], device=device),
             torch.zeros(3, 256, 1, device=device),
             None,
@@ -79,7 +81,7 @@ class _FixedRealReplay:
 
 def test_gate_replay_repeats_complete_real_slices_without_extra_random_draws():
     observations = np.arange(33 * 67, dtype=np.float32).reshape(33, 67)
-    actions = np.arange(32 * 21, dtype=np.float32).reshape(32, 21)
+    actions = np.arange(32 * 21, dtype=np.float64).reshape(32, 21)
     rewards = np.arange(32, dtype=np.float32)
     before = _rng_state()
     replay = _FixedRealReplay(observations, actions, rewards, "cpu")
@@ -87,6 +89,7 @@ def test_gate_replay_repeats_complete_real_slices_without_extra_random_draws():
     _equal(_rng_state(), before)
     assert obs.shape == (4, 256, 67) and act.shape == (3, 256, 21)
     assert reward.shape == terminated.shape == (3, 256, 1)
+    assert obs.dtype == act.dtype == reward.dtype == terminated.dtype == torch.float32
     assert replay.draws == 1 and task is None
     for column in (0, 29, 30, 255):
         start = column % 30
