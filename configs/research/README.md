@@ -1,5 +1,12 @@
 # Frozen-checkpoint AMBI research
 
+## C64 with additional inner rounds
+
+The [C64 round-scaling follow-up](C64_ROUNDS.md) evaluates J2 with
+H1/N128/C64/A4/B256 and alpha zero fixed per round on `mey3rxj8` 200k. It reuses
+C64/J1 and C32/J1/J2 results, with one paired full-episode comparison.
+Increasing J scales data collection and both optimizers together.
+
 ## Named evaluation and critic-update sweep
 
 [Closed-loop refinement eval](CLOSED_LOOP_REFINEMENT_EVAL.md) names the full
