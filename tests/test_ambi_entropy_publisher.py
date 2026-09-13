@@ -1,9 +1,10 @@
 """Publisher/worker-seal regressions; no W&B connection or scheduler calls."""
-import copy
 import gzip
 import json
 from pathlib import Path
 import subprocess
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -43,10 +44,13 @@ class OfflineRun:
     id = "reserved-campaign-id"
 
     def __init__(self):
-        self.summary, self.finished = {}, []
+        self.summary, self.finished, self.artifacts = {}, [], []
 
     def finish(self, **kwargs):
         self.finished.append(kwargs)
+
+    def log_artifact(self, artifact):
+        self.artifacts.append(artifact)
 
 
 def test_publisher_updates_progress_twice_and_reports_incomplete_array(tmp_path, monkeypatch):
@@ -96,19 +100,33 @@ def test_resume_reuses_reserved_run_and_can_replace_old_failure_progress(tmp_pat
     assert "incomplete coverage" in read_json(tmp_path / "analysis/publication-failed.json")["error"]
 
 
-def sealed_worker(tmp_path, *, record_change=None, row_change=None):
+def test_resume_rejects_another_attempt_before_wandb_initialization(tmp_path, monkeypatch):
+    _, _, campaign = campaign_fixture(tmp_path)
+    atomic_json(tmp_path / "publication-started.json", {"run_id": "different", "campaign": str(campaign)})
+    def unexpected(**kwargs):
+        pytest.fail("A mismatched resume must not initialize W&B")
+    monkeypatch.setattr(reporting, "start_entropy_wandb", unexpected)
+    with pytest.raises(ValueError, match="different attempt"):
+        evaluator.publish_campaign(campaign)
+
+
+def sealed_worker(tmp_path, *, episode_seed=101, record_change=None, row_change=None):
     study = study_fixture()
     source = study["checkpoints"][0]
     directory = tmp_path / "sealed"
     directory.mkdir()
     arms = ["off", "prior_recipe", "squashed_matched"]
-    rows = evaluator.expected_rows(study, source, [101], arms)
+    rows = evaluator.expected_rows(study, source, [episode_seed], arms)
     for row in rows:
         row.update(mc_complete=True, truncated=False,
                    metrics={"real_mc_return": 10.0, "real_mc_gain_vs_prior": 0.0})
+    science = canonical_hash({"base": evaluator._science_identity(),
+                              "evaluator": evaluator._file_sha256(evaluator.__file__),
+                              "probe": evaluator._file_sha256(Path(evaluator.__file__).parent / "utils/ambi_entropy_probe.py")})
     record = {"schema_version": 1, "complete": True, "smoke": False,
               "outer_state_unchanged": True, "study_sha256": canonical_hash(study),
-              "source": source, "episode_seed": 101, "arm_names": arms, "rows": len(rows)}
+              "source": source, "episode_seed": episode_seed, "arm_names": arms,
+              "rows": len(rows), "science": science, "timing": {"optimization_seconds": 2.0}}
     if record_change:
         record_change(record)
     if row_change:
@@ -171,3 +189,56 @@ def test_worker_rejects_incomplete_or_truncated_calibration(tmp_path, change):
     directory, study, source, _ = sealed_worker(tmp_path, row_change=change)
     with pytest.raises(ValueError, match="Incomplete worker measurement rows"):
         evaluator.validate_worker(directory, study=study, source=source, episode_seed=101)
+
+
+class OfflineArtifact:
+    def __init__(self, name, **kwargs):
+        self.name, self.files, self.directories = name, [], []
+
+    def add_file(self, path, **kwargs):
+        self.files.append(path)
+
+    def add_dir(self, path, **kwargs):
+        self.directories.append((path, kwargs["name"]))
+
+
+@pytest.mark.parametrize("corruption", [None, "row_identity", "science"])
+def test_final_publisher_validates_entire_panel_before_scientific_publication(tmp_path, monkeypatch, corruption):
+    study, spec, campaign = campaign_fixture(tmp_path)
+    for task in spec["tasks"]:
+        row_change = None
+        record_change = None
+        if corruption == "row_identity" and task["episode_seed"] == 101:
+            row_change = lambda rows: rows[0].update(root_id="unexpected-root")
+        if corruption == "science":
+            record_change = lambda record: record.update(science="uniform-but-wrong")
+        directory, _, _, _ = sealed_worker(Path(task["output_dir"]), episode_seed=task["episode_seed"],
+                                            row_change=row_change, record_change=record_change)
+        atomic_json(directory / "status.json", {"status": "complete"})
+        task["output_dir"] = str(directory)
+    atomic_json(campaign, spec, overwrite=True)
+    run, published = OfflineRun(), []
+    monkeypatch.setattr(reporting, "start_entropy_wandb", lambda **kwargs: run)
+    monkeypatch.setattr(reporting, "publish_entropy_wandb", lambda run, report, files: published.append((report, files)))
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Artifact=OfflineArtifact))
+    def unexpected(*args, **kwargs):
+        pytest.fail("A complete declared panel does not need an additional scheduler query")
+    monkeypatch.setattr(subprocess, "check_output", unexpected)
+    if corruption is not None:
+        with pytest.raises(ValueError, match="Unexpected measurement|publishing checkout"):
+            evaluator.publish_campaign(campaign)
+        assert not published and not run.artifacts
+        assert run.finished == [{"exit_code": 1}]
+        return
+    evaluator.publish_campaign(campaign)
+    assert len(published) == 1
+    report, files = published[0]
+    assert report["status"] == "complete" and report["coverage"]["observed_rows"] == 24
+    assert all(point["metrics"]["real_mc_return"]["n_episodes"] == 2 for point in report["series"])
+    assert run.finished == [{}] and len(run.artifacts) == 1
+    assert len(run.artifacts[0].directories) == 2
+    assert run.summary["work/optimization_seconds"] == 4.0
+    completion = read_json(tmp_path / "analysis/publication-complete.json")
+    assert completion["run_id"] == spec["wandb_run_id"] and completion["workers"] == 2
+    assert completion["publication_seconds_including_upload_drain"] >= 0
+    assert all(Path(path).exists() for path in files.values())
