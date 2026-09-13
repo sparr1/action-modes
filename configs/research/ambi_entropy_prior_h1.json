@@ -60,7 +60,7 @@
       "step": 200000,
       "sha256": "909e5c1d125aecc952e0544d802b4b946ae5089909c7a55885f272c32ed3e12f",
       "metadata_sha256": "1ba7b81893f8811a31f5d5416b71ab90a8cc40c106a518fd25759a128347504b",
-      "gaussian_control": false
+      "gaussian_control": true
     },
     {
       "id": "jirflxz1",
