@@ -1,5 +1,14 @@
 # Frozen-checkpoint AMBI research
 
+## Named evaluation and critic-update sweep
+
+[Closed-loop refinement eval](CLOSED_LOOP_REFINEMENT_EVAL.md) names the full
+episode procedure with fresh prior-initialized adaptation at every decision.
+The [critic-update experiment](CRITIC_STEPS.md) varies C0/1/4/8/16/32/64 while
+holding J1/H1/N128/A4/B256 and alpha zero fixed on `mey3rxj8` 200k. It reuses the
+completed C32 reference and reports paired real returns and critic-training
+dynamics. Horizon is reserved for a separate comparison.
+
 ## Full-episode J1/J2/J4 compute scaling
 
 The `round_scaling_j{1,2,4}_h1_200k.json` matrices change only inner-round
