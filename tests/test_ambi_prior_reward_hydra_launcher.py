@@ -13,6 +13,14 @@ ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "slurm/run_ambi_prior_reward_study_hydra.sbatch"
 MANIFEST = "configs/dmcontrol/experiments/ambi_prior_reward_critic_study.json"
 SHA = "a" * 40
+CAPTURED_ENV_KEYS = (
+    "WANDB_MODE", "WANDB_DISABLE_CODE", "MUJOCO_GL",
+    "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED", "PYTHONNOUSERSITE",
+    "OMP_NUM_THREADS", "TORCHINDUCTOR_COMPILE_THREADS",
+    "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "XDG_CACHE_HOME",
+    "WANDB_DIR", "WANDB_CACHE_DIR", "WANDB_DATA_DIR", "WANDB_ARTIFACT_DIR",
+    "LAUNCHER_TEST_MULTILINE",
+)
 
 
 def _executable(path, text):
@@ -52,9 +60,14 @@ printf 'fake 100000000 0 %s 0%% /\\n' "$FAKE_FREE_KB"
     _executable(fake_bin / "srun", """#!/usr/bin/env bash
 set -eu
 printf '%s\\n' "$@" > "$FAKE_SRUN_ARGS"
-env > "$FAKE_RUN_ENV"
+# Record only fields checked by this fixture, never the caller's full environment.
+# NUL delimiters preserve multiline values (including exported module functions).
+: > "$FAKE_RUN_ENV"
+for key in CAPTURED_ENV_KEYS_PLACEHOLDER; do
+  printf '%s=%s\\0' "$key" "${!key-}" >> "$FAKE_RUN_ENV"
+done
 exit "${FAKE_SRUN_EXIT:-0}"
-""")
+""".replace("CAPTURED_ENV_KEYS_PLACEHOLDER", " ".join(CAPTURED_ENV_KEYS)))
     python = project / "environments/dmcontrol/.venv/bin/python"
     python.parent.mkdir(parents=True)
     _executable(python, """#!/usr/bin/env bash
@@ -102,6 +115,13 @@ def _after(arguments, option):
     return arguments[arguments.index(option) + 1]
 
 
+def _captured_env(path):
+    raw = Path(path).read_bytes()
+    assert raw.endswith(b"\0")
+    return dict(record.decode("utf-8").split("=", 1)
+                for record in raw[:-1].split(b"\0"))
+
+
 def test_hydra_launcher_scheduler_contract():
     source = LAUNCHER.read_text()
     for directive in (
@@ -146,7 +166,7 @@ def test_hydra_launcher_maps_one_seeded_cell_and_isolates_outputs(harness, task)
     python_calls = Path(env["FAKE_PYTHON_CALLS"]).read_text().splitlines()
     assert len(python_calls) == 2 and python_calls[0] == "-c"
     assert "torch.cuda.get_device_name()" in python_calls[1]
-    actual_env = dict(line.split("=", 1) for line in Path(env["FAKE_RUN_ENV"]).read_text().splitlines())
+    actual_env = _captured_env(env["FAKE_RUN_ENV"])
     for key, value in {
         "WANDB_MODE": "online", "WANDB_DISABLE_CODE": "true", "MUJOCO_GL": "egl",
         "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1", "PYTHONNOUSERSITE": "1",
@@ -258,3 +278,15 @@ def test_postlaunch_smoke_is_independent_and_requires_live_cuda():
     assert "WANDB_MODE=offline" in source
     syntax = subprocess.run(["/bin/bash", "-n", str(smoke)], capture_output=True, close_fds=False)
     assert syntax.returncode == 0, syntax.stderr
+
+
+def test_fake_srun_preserves_multiline_values_without_dumping_other_environment(harness):
+    value = "first=one\nsecond line without equals\nthird=two=three\r\n"
+    harness["env"]["LAUNCHER_TEST_MULTILINE"] = value
+    harness["env"]["UNRELATED_INHERITED_VALUE"] = "not captured"
+    result = _run(harness)
+    assert result.returncode == 0, result.stderr
+    actual_env = _captured_env(harness["env"]["FAKE_RUN_ENV"])
+    assert actual_env["LAUNCHER_TEST_MULTILINE"] == value
+    assert actual_env.keys() == set(CAPTURED_ENV_KEYS)
+    assert "UNRELATED_INHERITED_VALUE" not in actual_env
