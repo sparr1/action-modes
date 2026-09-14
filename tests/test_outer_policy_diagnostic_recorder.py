@@ -273,8 +273,16 @@ def test_resume_state_is_immutable_and_keeps_local_events_and_probe_identity(tmp
     assert not torch.any(restored.bank[0] == 88)
 
 
-def test_finish_artifact_contains_identical_final_manifest_trace_and_reference(tmp_path):
-    recorder = OuterPolicyDiagnostics(_cfg(), tmp_path)
+@pytest.mark.parametrize(("critic_target", "q_units"), [
+    (None, "decoded soft Q, not reward-only return"),
+    ("entropy_augmented", "decoded soft Q, not reward-only return"),
+    ("reward_only", "decoded predicted reward-only return, not measured return"),
+])
+def test_finish_artifact_contains_identical_final_manifest_trace_and_reference(
+    tmp_path, critic_target, q_units,
+):
+    overrides = {} if critic_target is None else {"outer_critic_target": critic_target}
+    recorder = OuterPolicyDiagnostics(_cfg(**overrides), tmp_path)
     agent = _agent()
     wandb = _Wandb()
     run = _initialize(wandb)
@@ -287,6 +295,8 @@ def test_finish_artifact_contains_identical_final_manifest_trace_and_reference(t
         assert (tmp_path / name).read_bytes() == content
     manifest = json.loads(artifact.files["manifest.json"])
     assert manifest["status"] == "complete"
+    assert manifest["q_units"] == q_units
+    assert manifest["config"].get("outer_critic_target") == critic_target
     assert hashlib.sha256(artifact.files["reference.json"]).hexdigest() == manifest["reference_sha256"]
     trace = [json.loads(line) for line in artifact.files["events.jsonl"].splitlines()]
     assert trace == recorder.rows

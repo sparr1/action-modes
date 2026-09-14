@@ -1,0 +1,31 @@
+{
+  "study_type": "single_seed_exploratory_reward_critic_prior_study",
+  "study_note": "Six reward-only-critic prior backbones, one seed (55). Four automatic-alpha cells match the SAC prior parameterization study at seed 55, changing only the active outer critic target to reward_only: clip/smooth log-std mappings on [-10, 2] crossed with joint post-tanh entropy targets -21 and -10.5, automatic alpha initialized at 1. Two additional cells use fixed actor alpha=0.0001, one per mapping; their retained target_entropy and ent_coef_lr are inactive. The fixed alpha matches the numerical TD-MPC2 coefficient but not its regularization strength because this study uses corrected post-tanh entropy and no Q normalization. Comparing fixed and automatic alpha includes their different initial temperatures and early training schedules. All cells retain mean-pair actor Q and min-pair target Q, native random initialization from scratch, stochastic prior collection, full diagnostics, 2 million decisions and 80 checkpoints every 25,000 decisions. Inner optimization and MPPI remain off; dormant inner settings do not define an approved inner-handoff recipe. Only the four automatic-alpha cells isolate critic entropy against existing SAC controls. The manifest does not override alg_params.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 2000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_prior_reward_clip_target21",
+    "ambi_prior_reward_clip_target10p5",
+    "ambi_prior_reward_smooth_target21",
+    "ambi_prior_reward_smooth_target10p5",
+    "ambi_prior_reward_clip_fixed0p0001",
+    "ambi_prior_reward_smooth_fixed0p0001"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

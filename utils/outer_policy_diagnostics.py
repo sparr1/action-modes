@@ -285,11 +285,18 @@ class OuterPolicyDiagnostics:
         provenance = dict(indices=self.indices, observations=bank, noise=self.noise.tolist())
         encoded = json.dumps(provenance, sort_keys=True).encode()
         (self.directory / "reference.json").write_bytes(encoded)
+        # The resolved critic target determines the meaning of decoded Q.
+        # Preserve the historical soft-Q label when older configs omit it.
+        q_units = (
+            "decoded predicted reward-only return, not measured return"
+            if getattr(self.cfg, "outer_critic_target", "entropy_augmented") == "reward_only"
+            else "decoded soft Q, not reward-only return"
+        )
         manifest = dict(schema="ambi-outer-policy-diagnostics", version=1, status=self.status,
                         row_count=len(self.rows), reference_sha256=hashlib.sha256(encoded).hexdigest(),
                         config=vars(self.cfg), timing=dict(self.timing),
                         initialization="native_random", histograms="24 equal-width log-std bins",
-                        entropy_units="joint nats", q_units="decoded soft Q, not reward-only return",
+                        entropy_units="joint nats", q_units=q_units,
                         timing_note="collection includes device transfer; publication measures enqueue calls")
         temp = self.directory / "manifest.json.tmp"
         temp.write_text(json.dumps(manifest, default=str, indent=2, allow_nan=False) + "\n")
