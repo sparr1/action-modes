@@ -1,5 +1,12 @@
 # Frozen-checkpoint AMBI research
 
+## Actor updates with fixed critic fitting
+
+The [actor-update experiment](ACTOR_STEPS.md) varies A1/A2/A4/A8 while
+holding J1/C32/H1/N128/B256 and alpha zero fixed on `mey3rxj8` 200k.
+It reuses the completed A4 reference and measures full-episode closed-loop
+returns alongside actor and critic training traces and model-return probes.
+
 ## Named evaluation and critic-update sweep
 
 [Closed-loop refinement eval](CLOSED_LOOP_REFINEMENT_EVAL.md) names the full
