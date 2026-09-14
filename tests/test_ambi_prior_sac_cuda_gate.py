@@ -38,7 +38,8 @@ def _scientific_state(agent):
     return {
         "weights": deepcopy(agent.state_dict()),
         "optimizers": {
-            key: deepcopy(getattr(agent, key).state_dict())
+            key: (None if getattr(agent, key) is None
+                  else deepcopy(getattr(agent, key).state_dict()))
             for key in ("optim", "pi_optim", "ent_coef_optim")
         },
         "gradients": [None if p.grad is None else p.grad.clone()
@@ -104,10 +105,18 @@ def test_gate_replay_repeats_complete_real_slices_without_extra_random_draws():
                     reason="set AMBI_RUN_REAL_DMCONTROL_TESTS=1 on an allocated GPU")
 @pytest.mark.parametrize("name,mapping,target", CASES)
 def test_humanoid_production_shape_cuda_gate(tmp_path, name, mapping, target):
+    _run_production_shape_cuda_gate(tmp_path, name, mapping, target)
+
+
+def _run_production_shape_cuda_gate(
+    tmp_path, name, mapping, target, *,
+    manifest_name="ambi_prior_sac_parameterization_study",
+    critic_target="entropy_augmented", expected_alpha=1.0,
+):
     pytest.importorskip("dm_control")
     import domains  # noqa: F401: register the actual adapter
 
-    manifest = json.loads((ROOT / "configs/dmcontrol/experiments/ambi_prior_sac_parameterization_study.json").read_text())
+    manifest = json.loads((ROOT / "configs/dmcontrol/experiments" / (manifest_name + ".json")).read_text())
     config = json.loads((ROOT / "configs/dmcontrol/algs" / (name + ".json")).read_text())
     run = {"name": name, **config, **manifest["overrides_alg"]}
     params = {**run["alg_params"], "wandb": False}
@@ -128,10 +137,12 @@ def test_humanoid_production_shape_cuda_gate(tmp_path, name, mapping, target):
         assert cfg.log_std_mapping == mapping and agent.target_entropy == target
         assert cfg.outer_q_actor_reduction == "mean_pair"
         assert cfg.outer_q_target_reduction == "min_pair"
-        assert cfg.outer_critic_target == "entropy_augmented"
+        assert cfg.outer_critic_target == critic_target
         assert cfg.outer_actor_entropy_mode == "squashed"
         assert cfg.sac_actor_loss_scale_mode == "none"
-        assert agent.alpha.item() == 1.
+        assert agent.alpha.item() == pytest.approx(expected_alpha)
+        fixed_alpha = not isinstance(cfg.ent_coef, str)
+        assert (agent.ent_coef_optim is None) == fixed_alpha
 
         fixture_cfg = deepcopy(cfg)
         fixture_cfg.seed_steps = 31
@@ -166,6 +177,9 @@ def test_humanoid_production_shape_cuda_gate(tmp_path, name, mapping, target):
                 agent._outer_policy_diagnostics_force = False
             torch.cuda.synchronize()
             assert agent.num_updates == replay.draws == completed
+            if fixed_alpha:
+                assert agent.alpha.item() == pytest.approx(expected_alpha)
+                assert agent.log_ent_coef is None and agent.ent_coef_optim is None
             assert all(torch.isfinite(torch.as_tensor(value)).all() for value in metrics.values())
             packet = agent.drain_outer_policy_diagnostics()
             assert packet is not None
@@ -204,7 +218,8 @@ def test_humanoid_production_shape_cuda_gate(tmp_path, name, mapping, target):
         }
         assert learner.buffer.total_transitions == 0
         report = {
-            "config": name, "device": torch.cuda.get_device_name(), "torch": torch.__version__,
+            "config": name, "critic_target": critic_target, "fixed_alpha": fixed_alpha,
+            "alpha": float(agent.alpha.item()), "device": torch.cuda.get_device_name(), "torch": torch.__version__,
             "real_decisions": 36, "optimizer_updates": 2, "replay_draws": replay.draws,
             "model_size": cfg.model_size, "batch_size": cfg.batch_size,
             "compile_requested": cfg.compile, "compile_strict": cfg.compile_strict,
