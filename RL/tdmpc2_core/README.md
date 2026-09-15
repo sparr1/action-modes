@@ -1296,3 +1296,170 @@ this five-episode protocol at the existing 50,000-decision cadence alongside
 Figure 1 value calibration. Their paired-controller settings are observational;
 after removing those settings and their W&B labels, the only learning-axis
 differences from the base are the declared replay behavior-policy-KL controls.
+
+## Split return and entropy critics
+
+`critic_value_mode="return_entropy"` enables a new experimental value
+representation. The default `"single"` preserves the existing architectures,
+regression arithmetic, and update ordering. Each split ensemble member keeps
+its own MLP trunk and emits two packed categorical heads, in the semantic
+order `return`, `entropy`. The two heads have separate softmaxes and losses.
+Sharing their trunk can cause capacity limits or competing representation
+gradients; it does not imply shared targets.
+
+Value semantics, numeric regression, and network layout are separate. Named
+`return` and `policy` projections compose decoded components. A future
+return-plus-soft-value variant can provide different component meanings and
+Bellman targets without changing the numeric codec. That future variant is
+not implemented, and equal tensor shapes do not make different component
+semantics checkpoint-compatible.
+
+### Mean-preserving regression
+
+The split mode uses symexp support points for both reward prediction and all
+critic components. Given evenly spaced symlog coordinates `b_i`, its raw
+support is `v_i = symexp(b_i)`. A target interpolates linearly between adjacent
+**raw** values, and predictions decode as `sum_i softmax(logits)_i * v_i`.
+Thus the encoded target reconstructs its raw value within support; mixtures
+reconstruct their arithmetic mean. This differs from legacy TD-MPC2's
+`symexp(sum_i p_i * b_i)` decoder and symlog-space target interpolation.
+
+Supports remain configurable, with 101 bins on `[-10,10]` by default. Targets
+outside the resulting raw support (approximately plus or minus 22,025) clip
+to the endpoints and are reported by clipping diagnostics. Mean preservation
+does not eliminate approximation or clipping error. Large raw support values
+can amplify actor derivatives through incorrect tail probabilities.
+
+The new critic's final weights and biases both start at zero. Hidden-layer
+initialization stays unchanged, and target/inner clones copy their sources.
+On the first backward pass, zero output weights can legitimately block critic
+gradients into the encoder and dynamics; those paths become active once the
+output weights learn.
+
+### Outer policy evaluation
+
+Write `h = -log pi(a|z)` for joint squashed-action entropy in normalized action
+coordinates. It is differential entropy and may be negative. The return head
+learns reward return under the outer prior. The entropy head learns all
+discounted future entropy starting at the **next** action, excluding current
+entropy. With a shared next-action sample and selected target member:
+
+```text
+y_R = reward + discount * (1 - terminated) * Q_R_next
+y_H = discount * (1 - terminated) * (h_next + Q_H_next)
+```
+
+Neither target multiplies its component by alpha or scale. Select one member
+of the sampled critic pair by minimum `Q_R + alpha * S * Q_H`, then gather
+both components from that same member. Taking independent component minima
+would produce a value pair that no ensemble member predicted.
+
+The actor minimizes `alpha * log_pi - Q_R / S - alpha * Q_H`. Both critic
+cross-entropies receive half of the existing total critic-loss coefficient;
+both train the encoder and recurrent dynamics through online rollout latents.
+Actor updates detach those latents and freeze critic parameters while keeping
+the derivative through action and both decoded values.
+
+Each outer critic–actor update freezes alpha and `S` at entry. Refreshed
+temperature/scale values apply on the next update. Scale statistics use the
+depth-zero return component from the actor's common-member reduction, with
+the existing percentile range, floor, and EMA. Moving return normalization
+requires fixed temperatures; automatic temperature tuning uses `S=1`.
+
+### Inner reward maximization and initialization
+
+The split variant supports ordinary action-local SAC and prior-only operation.
+For SAC, `inner_finite_horizon=true` is required and is the split default.
+`inner_entropy_enabled=false` is the default and removes entropy from both
+actor and critic targets and disables temperature optimization. Configured
+fixed/automatic temperature modes and temperature-update budgets are inactive
+when entropy is off; resolution sets mode `inherit_outer` and update budget
+zero. With entropy enabled, the existing fixed, inherited, and automatic
+temperature modes apply. No entropy decay schedule is provided.
+
+`inner_value_initialization="return"|"soft"` controls the starting value
+independently of `inner_critic_initialization="prior"` and critic adaptation.
+The copied components become a primary value `U` and residual `W`, with:
+
+```text
+C = U + c * W
+c = 0                                      # return initialization (default)
+c = frozen_outer_alpha * frozen_outer_scale # soft initialization
+```
+
+Initially `U=Q_R` and `W=Q_H`, so soft initialization preserves the exact
+decoded outer soft value without combining logits or fitting another head.
+`c` stays fixed throughout the solve. The residual is an initialization device;
+it is not trained as the inner policy's future entropy.
+
+At intermediate imagined transitions, select one target member by minimum
+`C` and use the inner policy's next action:
+
+```text
+y_U = reward + discount * (1 - terminated) * (U_next + beta_inner * h_next)
+y_W = discount * (1 - terminated) * W_next
+beta_inner = alpha_inner * S_inner # zero when inner entropy is off
+```
+
+At the imagined-rollout boundary, sample a frozen-prior action and evaluate
+the frozen **online outer return head**, selecting the minimum pair by return
+alone. Use that value in `y_U` and set `y_W=0`. The terminal action is not
+optimized. True termination suppresses continuation; time-limit truncation
+retains it. This tail measures rewards under the exploratory prior, rather
+than the reward-optimal tail.
+
+The composed targets satisfy the scalar Bellman identity
+`y_C = y_U + c * y_W`. When `c` is nonzero, the critic averages the two
+component cross-entropies. When `c=0`, it trains only `U` with the full existing
+inner critic coefficient. Separate categorical component losses are a different
+optimization problem from fitting a single categorical prediction of `C`.
+The inner actor minimizes `alpha_inner * log_pi - C / S_inner`.
+
+The inner world model and outer priors stay frozen. Inner scale is a private
+snapshot of the outer return estimator for the whole solve; automatic tuning
+uses one. Inner alpha updates take effect on the next update. No remaining
+horizon is added to critic inputs, so states appearing at different depths
+share a value approximation despite the finite-horizon boundary.
+
+### Supported configurations and checkpoints
+
+Split mode requires distributional critics, standard `squashed` entropy, and
+`min_pair` reductions for outer/inner actor, target, and terminal evaluations. It supports
+prior-initialized dense, critic-only LoRA, and frozen adaptation, with existing
+constraints on update budgets. Inner state and optimizer lifetimes must all be
+`action`; bootstrap source must be `inner_target`; target initialization must
+be `online`; scale updates must be `per_action`. Persistent rebase, prior writeback, random initialization,
+explorer populations, TD3, native TDAMBI, MPPI, and auxiliary value-equivalence
+training are outside this variant and rejected explicitly.
+
+The legacy `outer_critic_target` setting remains `entropy_augmented` for this
+mode, while named component semantics define its unweighted targets.
+`inner_sac_critic_target` resolves to `reward_only` or `entropy_augmented`
+according to the inner entropy switch; an explicit contradictory target is
+rejected. Legacy single-value mode does not accept the new nondefault inner
+entropy/initialization controls.
+
+Split checkpoints require metadata identifying ordered component roles,
+numeric encoding/decoding, packed layout, and reward regression. Old single-Q
+checkpoints cannot be silently reinterpreted as split weights. Incompatible or
+missing semantic metadata is rejected before live state is modified. Inner
+workspace serialization records the residual composition coefficient and role
+mapping. Portable model checkpoints and exact training resumes are supported.
+Exact resumes retain the existing boundary contract: action-local workspaces
+must be cleared before saving, so a partially completed inner solve cannot be
+resumed.
+
+Three algorithm examples are provided under `configs/dmcontrol/algs/`:
+
+| Algorithm basename | Inner entropy | Outer/inner temperature | Return normalization |
+|---|---|---|---|
+| `ambi_split_value_entropy_off` | Off | Fixed outer, inactive inner | Moving outer, frozen inner |
+| `ambi_split_value_entropy_fixed` | On | Fixed outer, inherited inner | Moving outer, frozen inner |
+| `ambi_split_value_entropy_auto` | On | Automatic outer and inner | Off (`S=1`) |
+
+They use return initialization, the existing base-v2 architecture, CPU,
+uncompiled execution, W&B disabled, and a 10,000-decision demonstration budget.
+They are configuration examples, not validated performance recipes or a
+controlled comparison. Select their basenames from an experiment manifest's
+`configs` list and use `--alg-dir configs/dmcontrol/algs`; the manifest supplies
+the DMControl task. Creating these files does not start any training.

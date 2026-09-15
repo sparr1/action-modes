@@ -406,13 +406,22 @@ def _critic_architecture_key(resolved):
     q_num_bins = params.get("q_num_bins")
     q_vmin = params.get("q_vmin")
     q_vmax = params.get("q_vmax")
-    return (
+    architecture = (
         representation,
         num_q,
         int(params.get("num_bins", 101) if q_num_bins is None else q_num_bins),
         float(params.get("vmin", -10) if q_vmin is None else q_vmin),
         float(params.get("vmax", 10) if q_vmax is None else q_vmax),
     )
+    value_mode = str(params.get("critic_value_mode", "single")).lower()
+    if value_mode != "single":
+        # Equal tensor dimensions do not imply equal value or reward semantics.
+        architecture += (
+            value_mode, "symexp_two_hot_mean_v1", "packed_component_bins_v1",
+            int(params.get("num_bins", 101)),
+            float(params.get("vmin", -10)), float(params.get("vmax", 10)),
+        )
+    return architecture
 
 
 def _observation_architecture_key(resolved):

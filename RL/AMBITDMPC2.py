@@ -18,6 +18,7 @@ from RL.TDMPC2 import TDMPC2Baseline, _normalize_horizon_params
 from RL.tdmpc2_core.ambi_agent import AMBITDMPC2Agent
 from RL.tdmpc2_core.common.inner_utils import updates_for_transitions
 from RL.tdmpc2_core.common.soft_world_model import normalize_log_std_mapping
+from RL.tdmpc2_core.common.value_semantics import ValueSpecification
 from utils.utils import setup_logs
 
 
@@ -54,6 +55,11 @@ _AMBI_DEFAULTS = {
     # entropy enters policy evaluation are independent controls.
     "mpc": False,
     "q_representation": "distributional",
+    "critic_value_mode": "single",
+    # Resolved by value mode: preserve legacy entropy, but default the split
+    # critic's inner learner to reward maximization.
+    "inner_entropy_enabled": None,
+    "inner_value_initialization": "return",
     "q_num_bins": None,
     "q_vmin": None,
     "q_vmax": None,
@@ -169,7 +175,10 @@ _AMBI_DEFAULTS = {
     "inner_replay_capacity": None,
     "inner_replay_sampling": "with_replacement",
 
-    # Independently adaptable inner components.
+    # Initialization and trainability are independent for each inner component.
+    "inner_actor_initialization": "prior",
+    "inner_actor_initial_std": None,
+    "inner_critic_initialization": "prior",
     "inner_actor_adaptation": "clone",
     "inner_critic_adaptation": "clone",
     "inner_critic_dropout_enabled": True,
@@ -1098,6 +1107,105 @@ def _normalize_legacy_params(params):
     return params, schedule_mode
 
 
+def _resolve_split_value_params(params):
+    """Resolve the opt-in value semantics before deriving update budgets."""
+
+    params = dict(params)
+    mode = _normalize_choice(
+        params.get("critic_value_mode", "single"),
+        "critic_value_mode", {"single", "return_entropy"},
+    )
+    params["critic_value_mode"] = mode
+    entropy = _strict_bool(
+        params.get("inner_entropy_enabled", mode == "single"),
+        "inner_entropy_enabled",
+    )
+    params["inner_entropy_enabled"] = entropy
+    params["inner_value_initialization"] = _normalize_choice(
+        params.get("inner_value_initialization", "return"),
+        "inner_value_initialization", {"return", "soft"},
+    )
+    if mode == "single":
+        if not entropy or params["inner_value_initialization"] != "return":
+            raise ValueError(
+                "inner_entropy_enabled=false and inner_value_initialization='soft' "
+                "require critic_value_mode='return_entropy'."
+            )
+        return params
+
+    operator = str(params.get("inner_operator", "sac")).lower()
+    params.setdefault("inner_finite_horizon", operator == "sac")
+    params.setdefault("inner_rebase_persistent", False)
+    params.setdefault("mppi_terminal_q_reduction", "min_pair")
+    expected_target = "entropy_augmented" if entropy else "reward_only"
+    if "inner_sac_critic_target" in params and str(
+        params["inner_sac_critic_target"]
+    ).lower() != expected_target:
+        raise ValueError(
+            f"inner_entropy_enabled={entropy} requires "
+            f"inner_sac_critic_target={expected_target!r} in split-value mode."
+        )
+    params["inner_sac_critic_target"] = expected_target
+    if not entropy:
+        if params.get("inner_temperature_mode") is not None:
+            _normalize_choice(
+                params["inner_temperature_mode"], "inner_temperature_mode",
+                {"inherit_outer", "fixed", "auto"},
+            )
+        # The entropy switch disables even an explicitly configured automatic
+        # temperature. Clear inactive legacy budget input before schedule
+        # detection so it cannot accidentally select the legacy scheduler.
+        params.pop("inner_temperature_updates_per_action", None)
+        params["inner_temperature_mode"] = "inherit_outer"
+    return params
+
+
+def _validate_split_value_config(cfg):
+    """Fail unsupported combinations before a split model is constructed."""
+
+    if cfg.critic_value_mode == "single":
+        return
+    requirements = {
+        "q_representation": "distributional",
+        "outer_actor_entropy_mode": "squashed",
+        "inner_actor_entropy_mode": "squashed",
+        "outer_critic_target": "entropy_augmented",
+        "inner_explorer_mode": "none",
+        "inner_actor_initialization": "prior",
+        "inner_critic_initialization": "prior",
+        "inner_bootstrap_source": "inner_target",
+        "inner_actor_loss_scale_update": "per_action",
+        "inner_critic_target_initialization": "online",
+        "inner_execution_policy_source": "primary",
+        "inner_rebase_persistent": False,
+        "inner_actor_writeback_coef": 0.0,
+        "inner_critic_writeback_coef": 0.0,
+        "value_equivalence_loss_coef": 0.0,
+        "mppi_terminal_q_reduction": "min_pair",
+    }
+    for key in (
+        "outer_q_target_reduction", "outer_q_actor_reduction",
+        "inner_q_target_reduction", "inner_q_actor_reduction",
+    ):
+        requirements[key] = "min_pair"
+    for component in (
+        "actor", "critic", "temperature", "replay",
+        "actor_optimizer", "critic_optimizer", "temperature_optimizer",
+    ):
+        requirements[f"inner_{component}_scope"] = "action"
+    for key, required in requirements.items():
+        if getattr(cfg, key) != required:
+            raise ValueError(
+                "critic_value_mode='return_entropy' requires "
+                f"{key}={required!r}; received {getattr(cfg, key)!r}."
+            )
+    if cfg.inner_operator not in {"none", "sac"}:
+        raise ValueError("Split-value critics support inner_operator='none' or 'sac'.")
+    if cfg.inner_operator == "sac" and not cfg.inner_finite_horizon:
+        raise ValueError("Split-value inner SAC requires inner_finite_horizon=true.")
+    cfg.critic_value_spec = ValueSpecification.from_config(cfg).signature()
+
+
 class AMBITDMPC2(TDMPC2Baseline):
     """TOLD learning with canonical cloned inner SAC and optional ablations."""
 
@@ -1223,6 +1331,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         # legacy inner-loop aliases. This rejects only combinations the caller
         # actually supplied while allowing an all-legacy configuration to make
         # its one-release migration cleanly.
+        params = _resolve_split_value_params(params)
         params = _normalize_horizon_params(params, resolve_defaults=False)
         params, schedule_mode = _normalize_legacy_params(params)
         component_update_schedule = bool(set(params) & _COMPONENT_SCHEDULE_KEYS)
@@ -1828,6 +1937,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             )
 
         for key, modes in (
+            ("inner_actor_initialization", {"prior", "random"}),
+            ("inner_critic_initialization", {"prior", "random"}),
             ("inner_actor_adaptation", _ACTOR_ADAPTATION_MODES),
             ("inner_critic_adaptation", _CRITIC_ADAPTATION_MODES),
         ):
@@ -2113,6 +2224,22 @@ class AMBITDMPC2(TDMPC2Baseline):
         )
         if cfg.inner_log_std_min >= cfg.inner_log_std_max:
             raise ValueError("inner_log_std_min must be less than inner_log_std_max.")
+        if cfg.inner_actor_initial_std is not None:
+            cfg.inner_actor_initial_std = _finite_float(
+                cfg.inner_actor_initial_std, "inner_actor_initial_std"
+            )
+            if cfg.inner_actor_initialization != "random":
+                raise ValueError(
+                    "inner_actor_initial_std requires inner_actor_initialization='random'."
+                )
+            if cfg.inner_actor_initial_std <= 0 or not (
+                cfg.inner_log_std_min < math.log(cfg.inner_actor_initial_std)
+                < cfg.inner_log_std_max
+            ):
+                raise ValueError(
+                    "inner_actor_initial_std must be positive with its log strictly "
+                    "inside the inner log-standard-deviation bounds."
+                )
 
         scope_keys = (
             "inner_actor_scope",
@@ -2466,6 +2593,43 @@ class AMBITDMPC2(TDMPC2Baseline):
                 "action-local cloned critic."
             )
 
+        random_initialization = any(
+            getattr(cfg, f"inner_{component}_initialization") == "random"
+            for component in ("actor", "critic")
+        )
+        if random_initialization:
+            if cfg.inner_operator != "sac" or cfg.inner_explorer_mode != "none":
+                raise ValueError(
+                    "Random inner initialization requires inner_operator='sac' "
+                    "and inner_explorer_mode='none'."
+                )
+            for key in scope_keys[:-1]:
+                if getattr(cfg, key) != "action":
+                    raise ValueError(
+                        "Random inner initialization requires fresh per-decision "
+                        f"state; {key} must be 'action'."
+                    )
+            if writeback_active:
+                raise ValueError(
+                    "Random inner initialization requires zero "
+                    "inner_actor_writeback_coef and inner_critic_writeback_coef."
+                )
+            if cfg.value_equivalence_diagnostics or cfg.value_equivalence_loss_coef > 0.0:
+                raise ValueError(
+                    "Random inner initialization requires "
+                    "value_equivalence_diagnostics=false and "
+                    "value_equivalence_loss_coef=0; those probes assume "
+                    "prior-initialized inner networks."
+                )
+            if (
+                cfg.inner_critic_initialization == "random"
+                and cfg.inner_critic_target_initialization == "outer_target"
+            ):
+                raise ValueError(
+                    "inner_critic_initialization='random' requires "
+                    "inner_critic_target_initialization='online'."
+                )
+
         for key in ("actor_lr", "critic_lr", "ent_coef_lr"):
             value = _finite_float(getattr(cfg, key), key)
             if value <= 0.0:
@@ -2560,6 +2724,8 @@ class AMBITDMPC2(TDMPC2Baseline):
                     + "; ".join(conflicts)
                     + ". Alternatively, set sac_actor_loss_scale_mode='none'."
                 )
+
+        _validate_split_value_config(cfg)
 
         # Read-only aliases keep legacy integrations working for one release.
         # Canonical agent code must not use these for scheduling mixed updates.
@@ -3238,6 +3404,17 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_q_target_mean",
             "inner_q_target_clip_fraction",
             "inner_td_error_abs_mean",
+            "inner_primary_critic_loss",
+            "inner_primary_q_mean",
+            "inner_primary_target_mean",
+            "inner_primary_target_clip_fraction",
+            "inner_initialization_residual_critic_loss",
+            "inner_initialization_residual_q_mean",
+            "inner_initialization_residual_target_mean",
+            "inner_initialization_residual_target_clip_fraction",
+            "inner_value_composition_coefficient",
+            "inner_alpha_used",
+            "inner_effective_entropy_coefficient",
         }
         explorer_critic_metrics = {
             "inner_explorer_critic_loss",
@@ -3249,6 +3426,9 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_explorer_critic_td_error_abs_mean",
         }
         actor_metrics = {
+            "inner_actor_alpha_used",
+            "inner_actor_effective_entropy_coefficient",
+            "inner_actor_value_composition_coefficient",
             "inner_actor_loss",
             "inner_actor_grad_norm",
             "inner_actor_q_mean",

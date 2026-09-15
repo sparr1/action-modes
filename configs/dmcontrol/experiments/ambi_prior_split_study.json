@@ -1,0 +1,28 @@
+{
+  "study_type": "single_seed_exploratory_split_value_prior_study",
+  "study_note": "Three return-plus-entropy split-critic prior backbones, one seed (55), with clipped actor log standard deviations on [-10, 2]. The first uses fixed alpha=0.0021 with adaptive return-only percentile scaling; the other two learn alpha from initial 0.005 with joint squashed-action entropy targets -10.5 and -21 and S=1. These compare alternative coefficient/normalization systems, not a one-axis temperature-target ablation across all three cells; only the two automatic-alpha cells differ by target. All cells use five independent critic trunks with ordered return and entropy categorical heads, shared-member min-pair reductions, and mean-preserving symexp reward/component regression. The total critic coefficient 0.2 averages two losses, giving each component coefficient 0.1. Models start from scratch with zero split output weights and biases. Retain stochastic prior collection, full outer-policy diagnostics, 2 million decisions and 80 checkpoints every 25,000 decisions. Inner optimization and MPPI remain off. The manifest does not override alg_params.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 2000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_prior_split_clip_fixed0p0021",
+    "ambi_prior_split_clip_target10p5",
+    "ambi_prior_split_clip_target21"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

@@ -199,6 +199,12 @@ def scientific_trial_parameters(
             # Preserve each default's scalar kind so omitted and explicit
             # defaults describe the same scientific lineage.
             for field, default in resolved_defaults.items():
+                if (
+                    projected.get("alg") == _AMBI_ALGORITHM
+                    and str(algorithm.get("critic_value_mode", "single")).lower() != "single"
+                    and field == "inner_finite_horizon"
+                ):
+                    default = str(algorithm.get("inner_operator", "sac")).lower() == "sac"
                 value = algorithm.get(field, default)
                 if isinstance(default, bool) and isinstance(
                     value, (bool, np.bool_)
@@ -229,7 +235,14 @@ def scientific_trial_parameters(
                 # Preserve historical identities for unchanged inner SAC.
                 # TD-AMBI's explicit loss/initialization changes remain part
                 # of the scientific configuration even though state is local.
+                split_values = str(algorithm.get("critic_value_mode", "single")).lower() != "single"
                 for field, default in (
+                    ("critic_value_mode", "single"),
+                    ("inner_entropy_enabled", not split_values),
+                    ("inner_value_initialization", "return"),
+                    ("inner_actor_initialization", "prior"),
+                    ("inner_actor_initial_std", None),
+                    ("inner_critic_initialization", "prior"),
                     ("inner_critic_loss_coef", 1.0),
                     ("inner_actor_loss_scale_update", "per_action"),
                     ("inner_critic_target_initialization", "online"),

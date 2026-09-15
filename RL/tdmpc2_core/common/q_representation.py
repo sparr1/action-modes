@@ -26,6 +26,93 @@ def _symexp(value):
     return torch.sign(value) * torch.expm1(torch.abs(value))
 
 
+class SymexpTwoHotCodec:
+    """Mean-preserving categorical regression over symexp-spaced raw support.
+
+    Leading axes may denote batches, times, ensembles, or value components. The
+    codec has no policy/value semantics and only interprets the final bin axis.
+    """
+
+    name = "symexp_two_hot_mean_v1"
+
+    def __init__(self, num_bins, vmin, vmax):
+        self.num_bins = int(num_bins)
+        self.vmin, self.vmax = float(vmin), float(vmax)
+        if self.num_bins < 2:
+            raise ValueError("Mean-preserving symexp regression requires at least 2 bins.")
+        if not (isfinite(self.vmin) and isfinite(self.vmax) and self.vmin < self.vmax):
+            raise ValueError("Symexp support bounds must be finite and increasing.")
+        self._support_cache = {}
+
+    def support(self, reference):
+        key = (reference.device, reference.dtype)
+        support = self._support_cache.get(key)
+        if support is None:
+            support = _symexp(torch.linspace(
+                self.vmin, self.vmax, self.num_bins,
+                device=reference.device, dtype=reference.dtype,
+            ))
+            self._support_cache[key] = support
+        return support
+
+    def _target(self, target):
+        if target.ndim == 0:
+            return target.reshape(1, 1)
+        if target.shape[-1] != 1:
+            raise ValueError("Regression targets require a trailing singleton dimension.")
+        return target
+
+    def bin_weights(self, target):
+        target = self._target(target)
+        support = self.support(target)
+        bounded = target.clamp(min=support[0], max=support[-1])
+        # Searching raw support avoids symlog roundoff choosing a neighbouring
+        # interval at an exact support point. Both interpolation and decoding
+        # therefore use the very same floating-point support values.
+        upper = torch.searchsorted(support, bounded.contiguous()).clamp(1, self.num_bins - 1)
+        lower = upper - 1
+        low_value, high_value = support[lower], support[upper]
+        high_weight = (bounded - low_value) / (high_value - low_value)
+        return lower, upper, 1.0 - high_weight, high_weight
+
+    def encode_target(self, target):
+        target = self._target(target)
+        lower, upper, low_weight, high_weight = self.bin_weights(target)
+        encoded = target.new_zeros(*target.shape[:-1], self.num_bins)
+        encoded.scatter_add_(-1, lower, low_weight)
+        encoded.scatter_add_(-1, upper, high_weight)
+        return encoded
+
+    def decode(self, predictions):
+        if predictions.shape[-1] != self.num_bins:
+            raise ValueError(f"Expected {self.num_bins} categorical logits.")
+        return (predictions.softmax(dim=-1) * self.support(predictions)).sum(-1, keepdim=True)
+
+    def loss(self, predictions, target, *, reduction="mean"):
+        if predictions.shape[-1] != self.num_bins:
+            raise ValueError(f"Expected {self.num_bins} categorical logits.")
+        lower, upper, low_weight, high_weight = self.bin_weights(target)
+        index_shape = predictions.shape[:-1] + (1,)
+        lower = torch.broadcast_to(lower, index_shape)
+        upper = torch.broadcast_to(upper, index_shape)
+        log_probabilities = F.log_softmax(predictions, dim=-1)
+        losses = -(
+            low_weight * log_probabilities.gather(-1, lower)
+            + high_weight * log_probabilities.gather(-1, upper)
+        )
+        if reduction == "none":
+            return losses
+        if reduction == "mean":
+            return losses.mean()
+        if reduction == "sum":
+            return losses.sum()
+        raise ValueError(f"Unknown regression loss reduction: {reduction!r}.")
+
+    def clipping_fraction(self, target):
+        support = self.support(target)
+        return ((target < support[0]) | (target > support[-1])).to(target.dtype).mean()
+
+
 @dataclass(frozen=True)
 class CriticSignature:
     """Architecture metadata needed to preflight critic checkpoints."""
@@ -63,6 +150,7 @@ class QRepresentation:
         num_bins=None,
         vmin=None,
         vmax=None,
+        codec="symlog",
     ):
         representation = str(representation).lower()
         if representation not in {"scalar", "distributional"}:
@@ -105,6 +193,14 @@ class QRepresentation:
         self.num_bins = num_bins
         self.vmin = vmin
         self.vmax = vmax
+        if codec not in {"symlog", "symexp_mean"}:
+            raise ValueError(f"Unknown categorical codec: {codec!r}.")
+        if codec == "symexp_mean" and representation != "distributional":
+            raise ValueError("Mean-preserving symexp regression requires distributional critics.")
+        self.codec = codec
+        self.value_codec = (
+            SymexpTwoHotCodec(num_bins, vmin, vmax) if codec == "symexp_mean" else None
+        )
         # QRepresentation intentionally is not an nn.Module, so this cache does
         # not add checkpoint entries. A model normally uses one device/dtype;
         # retaining the uncommon alternatives keeps device moves correct too.
@@ -127,6 +223,11 @@ class QRepresentation:
             num_bins=num_bins,
             vmin=vmin,
             vmax=vmax,
+            codec=(
+                "symexp_mean"
+                if str(getattr(cfg, "critic_value_mode", "single")).lower() != "single"
+                else "symlog"
+            ),
         )
 
     @property
@@ -161,6 +262,8 @@ class QRepresentation:
 
     def encode_target(self, scalar_target):
         """Encode scalar targets using the distributional symlog bins."""
+        if self.value_codec is not None:
+            return self.value_codec.encode_target(scalar_target)
         if self.representation == "scalar":
             return scalar_target
         if scalar_target.ndim == 0:
@@ -186,6 +289,8 @@ class QRepresentation:
 
     def _target_bin_weights(self, scalar_target):
         """Return the two occupied bins and their interpolation weights."""
+        if self.value_codec is not None:
+            return self.value_codec.bin_weights(scalar_target)
         symlog_target = _symlog(scalar_target).clamp(self.vmin, self.vmax)
         position = (symlog_target - self.vmin) / (self.vmax - self.vmin)
         position = position * (self.num_bins - 1)
@@ -212,6 +317,8 @@ class QRepresentation:
     def decode(self, predictions):
         """Decode every critic head to a scalar Q expectation."""
         self._validate_predictions(predictions)
+        if self.value_codec is not None:
+            return self.value_codec.decode(predictions)
         if self.representation == "scalar":
             return predictions
 
@@ -223,6 +330,8 @@ class QRepresentation:
     def loss(self, predictions, scalar_target, *, reduction="mean"):
         """Compute a per-head scalar or categorical critic loss."""
         self._validate_predictions(predictions)
+        if self.value_codec is not None:
+            return self.value_codec.loss(predictions, scalar_target, reduction=reduction)
         if scalar_target.ndim == 0:
             scalar_target = scalar_target.reshape(1, 1)
         elif scalar_target.shape[-1] != 1:

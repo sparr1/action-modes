@@ -13,7 +13,8 @@ import torch
 import torch.nn as nn
 
 from . import init, layers, math
-from .q_representation import QRepresentation
+from .q_representation import QRepresentation, SymexpTwoHotCodec
+from .value_semantics import ValueSpecification, reduce_components
 
 
 DEFAULT_LOG_STD_MAPPING = "direct_clamp"
@@ -43,7 +44,12 @@ class SoftWorldModel(nn.Module):
             raise NotImplementedError("AMBI-TD-MPC2 currently supports single-task training only.")
 
         self.cfg = cfg
+        self.value_spec = ValueSpecification.from_config(cfg)
         self.q_backend = QRepresentation.from_config(cfg)
+        self.reward_codec = (
+            SymexpTwoHotCodec(cfg.num_bins, cfg.vmin, cfg.vmax)
+            if self.value_spec.is_split else None
+        )
         self._encoder = layers.enc(cfg)
         self._dynamics = layers.mlp(
             cfg.latent_dim + cfg.action_dim,
@@ -67,7 +73,7 @@ class SoftWorldModel(nn.Module):
                 layers.mlp(
                     cfg.latent_dim + cfg.action_dim,
                     2 * [cfg.mlp_dim],
-                    self.q_backend.output_dim,
+                    self.q_backend.output_dim * self.value_spec.num_components,
                     dropout=cfg.dropout,
                 )
                 for _ in range(self.q_backend.num_q)
@@ -80,6 +86,10 @@ class SoftWorldModel(nn.Module):
             if name != "_Qs":
                 module.apply(init.weight_init)
         init.zero_([self._reward[-1].weight] + [q[-1].weight for q in self._Qs])
+        if self.value_spec.is_split:
+            # The raw expectation is sensitive to asymmetric probability mass
+            # in the tails. Start new split heads at a symmetric distribution.
+            init.zero_([self._reward[-1].bias] + [q[-1].bias for q in self._Qs])
 
         self._log_std_min_value = float(cfg.log_std_min)
         self._log_std_max_value = float(cfg.log_std_max)
@@ -201,6 +211,33 @@ class SoftWorldModel(nn.Module):
         if task is not None:
             raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
         return self.reward_from_joint(self.joint_input(z, a))
+
+    def encode_reward(self, target):
+        """Encode observed rewards with the model's declared numeric codec."""
+        if self.reward_codec is not None:
+            return self.reward_codec.encode_target(target)
+        return math.two_hot(target, self.cfg)
+
+    def decode_reward(self, predictions, *, support=None):
+        """Decode reward predictions, retaining exact legacy arithmetic."""
+        if self.reward_codec is not None:
+            return self.reward_codec.decode(predictions)
+        if support is None:
+            return math.two_hot_inv(predictions, self.cfg)
+        return math.two_hot_inv(predictions, self.cfg, support=support)
+
+    def reward_loss(self, predictions, target, *, reduction="none"):
+        """Regress rewards using the same support and mean convention as decode."""
+        if self.reward_codec is not None:
+            return self.reward_codec.loss(predictions, target, reduction=reduction)
+        losses = math.soft_ce(predictions, target, self.cfg)
+        if reduction == "none":
+            return losses
+        if reduction == "mean":
+            return losses.mean()
+        if reduction == "sum":
+            return losses.sum()
+        raise ValueError(f"Unknown reward loss reduction: {reduction!r}.")
 
     def termination(self, z, task=None, unnormalized=False):
         if task is not None:
@@ -549,7 +586,18 @@ class SoftWorldModel(nn.Module):
     @property
     def critic_signature(self):
         """Serializable critic architecture metadata for checkpoint preflight."""
-        return self.q_backend.signature.as_dict()
+        signature = self.q_backend.signature.as_dict()
+        if self.value_spec.is_split:
+            signature.update(self.value_spec.signature())
+            signature.update({
+                "q_value_codec": self.q_backend.value_codec.name,
+                "q_layout": "packed_component_bins_v1",
+                "reward_value_codec": self.reward_codec.name,
+                "reward_num_bins": self.reward_codec.num_bins,
+                "reward_vmin": self.reward_codec.vmin,
+                "reward_vmax": self.reward_codec.vmax,
+            })
+        return signature
 
     def q_predictions(
         self,
@@ -565,7 +613,8 @@ class SoftWorldModel(nn.Module):
 
         Scalar critics return values with shape ``[num_q, ..., 1]``;
         distributional critics return logits with shape
-        ``[num_q, ..., q_num_bins]``.
+        ``[num_q, ..., q_num_bins]``. Split critics insert a component axis
+        immediately before the bins: ``[num_q, ..., components, q_num_bins]``.
         """
         if task is not None:
             raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
@@ -599,6 +648,8 @@ class SoftWorldModel(nn.Module):
             out = self._Qs.forward_detached(q_input)
         else:
             out = self._Qs(q_input)
+        if self.value_spec.is_split:
+            out = out.reshape(*out.shape[:-1], self.value_spec.num_components, self.q_backend.output_dim)
         return out
 
     def q_values(self, z, a, task=None, *, target=False, detach=False, qs=None):
@@ -621,6 +672,22 @@ class SoftWorldModel(nn.Module):
         """Compute MSE or two-hot cross entropy against one scalar target."""
         return self.q_backend.loss(predictions, scalar_target, reduction=reduction)
 
+    def project_values(self, values, *, projection=None, beta=None, weights=None):
+        """Select or compose named decoded values before scalar operations."""
+        return self.value_spec.project(values, projection=projection, beta=beta, weights=weights)
+
+    def reduce_components(
+        self, values, reduction, *, projection=None, beta=None, weights=None,
+        pair_indices=None, generator=None, trusted_pair_indices=False,
+    ):
+        """Gather all components from one ensemble member chosen by projection."""
+        return reduce_components(
+            values, self.q_backend, self.value_spec, reduction,
+            projection=projection, beta=beta, weights=weights,
+            pair_indices=pair_indices, generator=generator,
+            trusted_pair_indices=trusted_pair_indices,
+        )
+
     def Q(
         self,
         z,
@@ -635,6 +702,9 @@ class SoftWorldModel(nn.Module):
         pair_indices=None,
         generator=None,
         trusted_pair_indices=False,
+        projection=None,
+        beta=None,
+        weights=None,
     ):
         """Evaluate critics and return decoded scalar Q-values.
 
@@ -653,6 +723,15 @@ class SoftWorldModel(nn.Module):
             detach=detach,
             qs=qs,
         )
+        if self.value_spec.is_split:
+            # Validate explicit scalar semantics even for mean/all reductions.
+            projected = self.project_values(values, projection=projection, beta=beta, weights=weights)
+            return self.q_backend.reduce(
+                projected, reduction, pair_indices=pair_indices,
+                generator=generator, trusted_pair_indices=trusted_pair_indices,
+            )
+        if projection is not None or beta is not None or weights is not None:
+            raise ValueError("Explicit component projections require a split critic.")
         return self.q_backend.reduce(
             values,
             reduction,
