@@ -87,7 +87,7 @@ if [[ "$mode" == smoke ]]; then
   mkdir "$AMBI_AUX_GATE_OUTPUT_ROOT" || fail "gate output exists; use a fresh campaign"
   export AMBI_RUN_AUX_RETURN_SAC_CUDA_GATE=1 WANDB_MODE=offline
   # The legacy regression suite deliberately tests the unchanged default recipe.
-  srun --unbuffered --kill-on-bad-exit=1 env AMBI_AUX_RECIPE=standard "$AMBI_PYTHON" -m pytest -q -s -p no:cacheprovider \
+  srun --unbuffered --kill-on-bad-exit=1 /usr/bin/env AMBI_AUX_RECIPE=standard "$AMBI_PYTHON" -m pytest -q -s -p no:cacheprovider \
     tests/test_ambi_aux_return_sac_campaign.py tests/test_aux_return_checkpoint.py \
     tests/test_ambi_aux_return_original_prior_campaign.py \
     tests/test_ambi_aux_return_original_prior_configs.py --basetemp="$local_root/pytest-regression"
