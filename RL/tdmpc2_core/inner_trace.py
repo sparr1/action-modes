@@ -49,14 +49,14 @@ class FrozenActorSnapshot:
 
 
 @torch.no_grad()
-def evaluate_frozen_outer_q(model, z, action, *, reduction, pair_indices=None):
+def evaluate_frozen_outer_q(model, z, action, *, reduction, pair_indices=None, critic=None):
     """Use the ordinary online-Q decoding/reduction without compiling a probe.
 
     Diagnostic batch sizes must not create, recompile, or disable the learner's
     cached ensemble kernel. Passing the eager callable through ``Q`` preserves
     its native/scalar/distributional decoding and explicit pair semantics.
     """
-    critic = model._Qs
+    critic = model._Qs if critic is None else critic
     modes = tuple((module, bool(module.training)) for module in critic.modules())
     try:
         critic.eval()
@@ -115,9 +115,16 @@ def evaluate_outer_tail(engine, root_z, policy, noise, *, pair_indices=None,
             if cfg.episodic:
                 alive &= model.termination(z) <= float(cfg.inner_termination_threshold)
             discount *= float(engine.agent.discount)
-        action, _ = model.pi(z, noise=noise[-1])
-        q = evaluate_frozen_outer_q(model, z, action,
-                                   reduction=reduction, pair_indices=pair_indices)
+        routed = getattr(cfg, "aux_return_mode", "off") != "off"
+        action, _ = model.pi(
+            z, noise=noise[-1],
+            **({"policy": engine._horizon_actor, **engine._horizon_actor_options}
+               if routed else {}),
+        )
+        q = evaluate_frozen_outer_q(
+            model, z, action, reduction=reduction, pair_indices=pair_indices,
+            **({"critic": engine._horizon_critic} if routed else {}),
+        )
         bootstrap = torch.where(alive, discount * q, 0.0)
         return {"reward": rewards, "bootstrap": bootstrap,
                 "total": rewards + bootstrap}
@@ -234,9 +241,9 @@ def metric_definitions():
         )
     components = {
         "discounted_reward": "Discounted predicted rewards over the probe horizon",
-        "discounted_terminal_q": "Discounted frozen outer target mean-all Q at the probe horizon",
+        "discounted_terminal_q": "Discounted frozen outer Q at the probe horizon, using the recorded controller sources and reduction",
         "fixed_alpha_entropy_bonus": (
-            "Discounted -outer-alpha*log(pi) over the horizon and terminal action"
+            "Discounted fixed-alpha entropy over the probe; split and auxiliary boundaries add no terminal entropy"
         ),
         "predicted_score": "Predicted reward sum plus terminal Q; Q may represent a soft return",
         "fixed_alpha_soft_score": "Predicted score plus the fixed-alpha entropy bonus",
@@ -364,6 +371,7 @@ class InnerActionTrace:
         self._togo_initial = None
         self._togo_pair_indices = None
         self._probe_timings = []
+        self.value_routing = None
 
     @torch.no_grad()
     def capture_actor(self, engine, policy, *, inner=True):
@@ -385,7 +393,8 @@ class InnerActionTrace:
             round_index=self.round_index, actor_updates=int(state.actor_steps),
             critic_updates=int(state.critic_steps),
             temperature_updates=int(state.temperature_steps), inner=inner,
-            bounds=tuple(self._policy_bounds(engine.cfg).items()) if inner else (),
+            bounds=tuple((self._policy_bounds(engine.cfg) if inner else
+                          getattr(engine, "_actor_options", {})).items()),
             payload=output.getvalue(),
         )
         self.actor_snapshots.append(snapshot)
@@ -394,10 +403,11 @@ class InnerActionTrace:
             "actor_snapshot_bytes": len(snapshot.payload),
         }, actor_sha256=snapshot.sha256, measurement="initial_or_post_update_snapshot")
 
-    def begin(self):
+    def begin(self, *, value_routing=None):
         if self._started:
             raise ValueError("An InnerActionTrace can record only one action.")
         self._started = True
+        self.value_routing = value_routing
 
     def abort(self):
         """Discard incomplete measurements and release device references on error."""
@@ -428,6 +438,7 @@ class InnerActionTrace:
             "temperature_updates": int(state.temperature_steps),
             "replay_size": int(state.replay.size) if state.replay is not None else 0,
             "metrics": values,
+            **({"value_routing": dict(self.value_routing)} if self.value_routing is not None else {}),
             **metadata,
         })
 
@@ -462,7 +473,7 @@ class InnerActionTrace:
         result = evaluate_outer_tail(
             engine, root_z, policy, self._noise,
             pair_indices=self._togo_pair_indices,
-            policy_bounds=self._policy_bounds(engine.cfg) if inner else None,
+            policy_bounds=self._policy_bounds(engine.cfg) if inner else getattr(engine, "_actor_options", None),
         )
         return result["reward"], result["bootstrap"], result["total"]
 
@@ -489,7 +500,7 @@ class InnerActionTrace:
                         or cfg.mppi_terminal_q_reduction.endswith("_pair")):
                     self._togo_pair_indices = model.q_backend.sample_pair_indices(
                         root_z.device, generator=generator)
-                self._outer_probe = self._togo_trajectory(engine, root_z, model._pi, inner=False)
+                self._outer_probe = self._togo_trajectory(engine, root_z, getattr(engine, "_actor_base", model._pi), inner=False)
                 model_steps *= 2
             rewards, tail, scores = self._togo_trajectory(engine, root_z, policy, inner=inner)
             if self._togo_initial is None:
@@ -529,7 +540,7 @@ class InnerActionTrace:
         entropy_bonus = torch.zeros_like(reward_sum)
         continuation = torch.ones_like(reward_sum)
         discount = 1.0
-        bounds = self._policy_bounds(cfg) if inner else {}
+        bounds = self._policy_bounds(cfg) if inner else getattr(engine, "_actor_options", {})
         for step in range(self.probe_horizon):
             action, info = model.pi(z, policy=policy, noise=self._noise[step], **bounds)
             joint = model.joint_input(z, action)
@@ -544,7 +555,17 @@ class InnerActionTrace:
                 alive = model.termination(z) <= float(cfg.inner_termination_threshold)
                 continuation *= alive.to(z.dtype)
             discount *= float(engine.agent.discount)
-        if getattr(cfg, "critic_value_mode", "single") == "return_entropy":
+        if getattr(cfg, "aux_return_mode", "off") != "off":
+            action, _ = model.pi(
+                z, policy=engine._horizon_actor, noise=self._noise[-1],
+                **engine._horizon_actor_options,
+            )
+            tail = evaluate_frozen_outer_q(
+                model, z, action, critic=engine._horizon_critic,
+                reduction=cfg.mppi_terminal_q_reduction,
+                pair_indices=self._togo_pair_indices,
+            )
+        elif getattr(cfg, "critic_value_mode", "single") == "return_entropy":
             action, _ = model.pi(z, noise=self._noise[-1])
             tail = model.Q(z, action, reduction="min_pair", projection="return",
                            pair_indices=self._togo_pair_indices, trusted_pair_indices=True)
@@ -552,7 +573,7 @@ class InnerActionTrace:
             action, info = model.pi(z, policy=policy, noise=self._noise[-1], **bounds)
             tail = model.Q(z, action, target=True, reduction="mean_all")
             entropy_bonus -= discount * continuation * self._alpha * info["log_prob"]
-        terminal_q = discount * continuation * tail
+        terminal_q = torch.where(continuation.bool(), discount * tail, 0.0) if getattr(cfg, "aux_return_mode", "off") != "off" else discount * continuation * tail
         score = reward_sum + terminal_q
         result = {
             "discounted_reward": reward_sum.mean(),
@@ -596,22 +617,34 @@ class InnerActionTrace:
                     (self.probe_horizon + 1, self.probe_rollouts, int(cfg.action_dim)),
                     device=root_z.device, dtype=root_z.dtype, generator=generator,
                 )
-                self._alpha = engine.agent.alpha.detach().clone()
+                self._alpha = getattr(engine, "_actor_owner", engine.agent).alpha.detach().clone()
                 if getattr(cfg, "critic_value_mode", "single") == "return_entropy":
                     if engine.agent.actor_loss_scale_enabled:
                         self._alpha = self._alpha * engine.agent.actor_loss_scale.detach()
                     self._togo_pair_indices = model.q_backend.sample_pair_indices(
                         root_z.device, generator=generator)
-                self._outer_stats = model.policy_stats(root_z, policy=model._pi)
+                routed = getattr(cfg, "aux_return_mode", "off") != "off"
+                if routed:
+                    if engine._critic_owner.actor_loss_scale_enabled:
+                        self._alpha = self._alpha * engine._critic_owner.actor_loss_scale.detach()
+                    if cfg.mppi_terminal_q_reduction.endswith("_pair"):
+                        self._togo_pair_indices = model.q_backend.sample_pair_indices(
+                            root_z.device, generator=generator)
+                self._outer_stats = model.policy_stats(
+                    root_z, policy=getattr(engine, "_actor_base", model._pi),
+                    **getattr(engine, "_actor_options", {}),
+                )
                 self._outer_q = model.Q(
-                    root_z, self._outer_stats["mean"], target=True, reduction="mean_all",
+                    root_z, self._outer_stats["mean"], reduction="mean_all",
+                    **({"qs": engine._horizon_critic} if routed else {"target": True}),
                     **({"projection": "return"} if getattr(cfg, "critic_value_mode", "single") == "return_entropy" else {}),
                 )
-                self._outer_probe = self._trajectory(engine, root_z, model._pi, inner=False)
+                self._outer_probe = self._trajectory(engine, root_z, getattr(engine, "_actor_base", model._pi), inner=False)
                 model_steps *= 2
-            bounds = self._policy_bounds(cfg) if inner else {}
+            bounds = self._policy_bounds(cfg) if inner else getattr(engine, "_actor_options", {})
             stats = model.policy_stats(root_z, policy=policy, **bounds)
-            q = model.Q(root_z, stats["mean"], target=True, reduction="mean_all",
+            q = model.Q(root_z, stats["mean"], reduction="mean_all",
+                        **({"qs": engine._horizon_critic} if getattr(cfg, "aux_return_mode", "off") != "off" else {"target": True}),
                         **({"projection": "return"} if getattr(cfg, "critic_value_mode", "single") == "return_entropy" else {}))
             scores = self._trajectory(engine, root_z, policy, inner=inner)
             metrics = {

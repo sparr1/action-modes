@@ -23,6 +23,7 @@ import numpy as np
 import torch
 
 from RL.tdmpc2_core import MODEL_SIZE
+from utils.aux_return_identity import auxiliary_return_architecture, auxiliary_return_routing
 from utils.cleanup import add_cleanup_notes, raise_cleanup_errors
 from utils.ambi_research import (
     PresetMatrixError,
@@ -301,6 +302,9 @@ def _outer_state_digest(model):
         "num_updates": int(agent.num_updates),
         "outer_version": int(getattr(agent, "outer_version", agent.num_updates)),
     }
+    auxiliary = getattr(agent, "aux_return", None)
+    if auxiliary is not None:
+        state["auxiliary_return"] = auxiliary.checkpoint_state()
     digest = hashlib.sha256()
     _digest_update(digest, state)
     return digest.hexdigest()
@@ -401,8 +405,10 @@ def _critic_architecture_key(resolved):
                     f"expected one of {list(MODEL_SIZE)}."
                 ) from exc
     num_q = int(num_q)
+    auxiliary_architecture = auxiliary_return_architecture(params)
     if representation == "scalar":
-        return representation, num_q, 1, None, None
+        architecture = (representation, num_q, 1, None, None)
+        return architecture + ((auxiliary_architecture,) if auxiliary_architecture else ())
     q_num_bins = params.get("q_num_bins")
     q_vmin = params.get("q_vmin")
     q_vmax = params.get("q_vmax")
@@ -421,7 +427,7 @@ def _critic_architecture_key(resolved):
             int(params.get("num_bins", 101)),
             float(params.get("vmin", -10)), float(params.get("vmax", 10)),
         )
-    return architecture
+    return architecture + ((auxiliary_architecture,) if auxiliary_architecture else ())
 
 
 def _observation_architecture_key(resolved):
@@ -660,6 +666,9 @@ def evaluate_preset(
             "reference_variant": resolved["reference"],
             "description": resolved["description"],
             "critic_spec": copy.deepcopy(model.agent.model.critic_signature),
+            **({"aux_return_spec": copy.deepcopy(model.agent.aux_return.specification()),
+                "value_routing": auxiliary_return_routing(vars(model.cfg))}
+               if getattr(model.agent, "aux_return", None) is not None else {}),
             "controller_seed": int(controller_seed),
             "environment_seeds": [int(seed) for seed in seeds],
             "outer_updates_before": updates_before,

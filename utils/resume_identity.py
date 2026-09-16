@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 
 from utils.lora_identity import normalize_lora_rl_identity
+from utils.aux_return_identity import normalize_aux_return_identity
 
 
 LINEAGE_IDENTITY_SCHEMA_VERSION = 1
@@ -201,7 +202,8 @@ def scientific_trial_parameters(
             for field, default in resolved_defaults.items():
                 if (
                     projected.get("alg") == _AMBI_ALGORITHM
-                    and str(algorithm.get("critic_value_mode", "single")).lower() != "single"
+                    and (str(algorithm.get("critic_value_mode", "single")).lower() != "single"
+                         or str(algorithm.get("aux_return_mode", "off")).lower() != "off")
                     and field == "inner_finite_horizon"
                 ):
                     default = str(algorithm.get("inner_operator", "sac")).lower() == "sac"
@@ -223,6 +225,7 @@ def scientific_trial_parameters(
                 algorithm[field] = value
             if projected.get("alg") == _AMBI_ALGORITHM:
                 algorithm = normalize_lora_rl_identity(algorithm)
+                algorithm = normalize_aux_return_identity(algorithm)
                 # Keep pre-interleaving lineage hashes unchanged: an omitted
                 # or explicit round default has no new scientific field.
                 timing = algorithm.get("inner_update_timing", "round")

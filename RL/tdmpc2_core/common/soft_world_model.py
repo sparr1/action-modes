@@ -102,6 +102,29 @@ class SoftWorldModel(nn.Module):
             torch.tensor(self._log_std_max_value - self._log_std_min_value),
         )
         self.init()
+        if str(getattr(cfg, "aux_return_mode", "off")) != "off":
+            # Auxiliary construction must not change the original learner's
+            # initialization samples or subsequent default RNG stream.
+            with torch.random.fork_rng(devices=[]):
+                # torch.manual_seed also seeds CUDA; these modules are created
+                # on CPU and must not alter any CUDA generator.
+                torch.random.default_generator.manual_seed(int(getattr(cfg, "seed", 0)) + 104729)
+                self._aux_return_Qs = layers.Ensemble([
+                    layers.mlp(
+                        cfg.latent_dim + cfg.action_dim,
+                        2 * [cfg.mlp_dim], self.q_backend.output_dim,
+                        dropout=cfg.dropout,
+                    ) for _ in range(self.q_backend.num_q)
+                ])
+                init.zero_([q[-1].weight for q in self._aux_return_Qs])
+                self._target_aux_return_Qs = deepcopy(self._aux_return_Qs)
+                self._target_aux_return_Qs.requires_grad_(False)
+                self._target_aux_return_Qs.train(False)
+                if cfg.aux_return_mode == "return_actor":
+                    self._return_pi = layers.mlp(
+                        cfg.latent_dim, 2 * [cfg.mlp_dim], 2 * cfg.action_dim,
+                    )
+                    self._return_pi.apply(init.weight_init)
 
     def init(self):
         """Create a frozen EMA target critic."""
@@ -166,6 +189,8 @@ class SoftWorldModel(nn.Module):
     def train(self, mode=True):
         super().train(mode)
         self._target_Qs.train(False)
+        if hasattr(self, "_target_aux_return_Qs"):
+            self._target_aux_return_Qs.train(False)
         return self
 
     @torch.no_grad()
@@ -179,6 +204,39 @@ class SoftWorldModel(nn.Module):
             torch._foreach_lerp_(target_parameters, online_parameters, tau)
         for target_buffer, buffer in zip(self._target_Qs.buffers(), self._Qs.buffers()):
             target_buffer.copy_(buffer)
+        if hasattr(self, "_aux_return_Qs"):
+            target_parameters = tuple(self._target_aux_return_Qs.parameters())
+            online_parameters = tuple(self._aux_return_Qs.parameters())
+            if tau == 1.0:
+                torch._foreach_copy_(target_parameters, online_parameters)
+            elif tau != 0.0:
+                torch._foreach_lerp_(target_parameters, online_parameters, tau)
+            for target_buffer, buffer in zip(
+                self._target_aux_return_Qs.buffers(), self._aux_return_Qs.buffers()
+            ):
+                target_buffer.copy_(buffer)
+
+    def aux_return_q_predictions(self, z, action, *, target=False, detach=False):
+        """Evaluate the independent, reward-only ensemble without split layout."""
+        if target and detach:
+            raise ValueError("target=True cannot be combined with detach=True.")
+        ensemble = self._target_aux_return_Qs if target else self._aux_return_Qs
+        joint = self.joint_input(z, action)
+        return ensemble.forward_detached(joint) if detach else ensemble(joint)
+
+    def aux_return_Q(
+        self, z, action, *, target=False, detach=False, reduction="min_pair",
+        pair_indices=None, generator=None, trusted_pair_indices=False,
+    ):
+        """Decode and reduce auxiliary reward returns in their own ensemble."""
+        predictions = self.aux_return_q_predictions(
+            z, action, target=target, detach=detach,
+        )
+        return self.q_backend.reduce(
+            self.q_backend.decode(predictions), reduction,
+            pair_indices=pair_indices, generator=generator,
+            trusted_pair_indices=trusted_pair_indices,
+        )
 
     def encode(self, obs, task=None):
         if task is not None:

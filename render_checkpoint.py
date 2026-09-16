@@ -23,6 +23,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 import domains  # noqa: F401  # Register project environments before build_env/gym.make.
+from utils.aux_return_identity import AUX_RETURN_SOURCE_DEFAULTS, auxiliary_return_routing
 from utils.cleanup import add_cleanup_notes, raise_cleanup_errors
 from utils.core import build_env, initialize_alg
 
@@ -96,6 +97,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Sample actions instead of using deterministic inference.",
     )
+    for key in AUX_RETURN_SOURCE_DEFAULTS:
+        choices = ("sac", "return_actor") if "actor" in key else ("sac", "aux_return")
+        parser.add_argument(
+            "--" + key.replace("_", "-"), choices=choices,
+            help="Override this AMBI source for rendering; requires matching learned checkpoint modules.",
+        )
     parser.add_argument(
         "--max-steps",
         type=int,
@@ -384,12 +391,20 @@ def _prepare_run_params(
     backend: str,
     device: str,
     controller_seed: int,
+    source_overrides: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     run_params = copy.deepcopy(context.trial_run_params)
     experiment_params = copy.deepcopy(context.experiment_params)
     alg_params = run_params.setdefault("alg_params", {})
     if not isinstance(alg_params, dict):
         raise RenderCheckpointError("alg_params must be an object.")
+    if source_overrides:
+        if backend != "ambi_tdmpc2":
+            raise RenderCheckpointError("Actor/critic source overrides require an AMBI checkpoint.")
+        unknown = set(source_overrides) - set(AUX_RETURN_SOURCE_DEFAULTS)
+        if unknown:
+            raise RenderCheckpointError(f"Unknown actor/critic source overrides: {sorted(unknown)}.")
+        alg_params.update(source_overrides)
 
     run_params["device"] = str(device)
     run_params["seed"] = int(controller_seed)
@@ -888,6 +903,7 @@ def _results_payload(
     deterministic: bool,
     max_steps: int | None,
     results: Sequence[EpisodeResult],
+    effective_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     returns = [float(result.episode_return) for result in results]
     lengths = [int(result.length) for result in results]
@@ -935,6 +951,12 @@ def _results_payload(
         payload["checkpoint_metadata"] = copy.deepcopy(
             context.metadata.get("checkpoint", {})
         )
+    routing = auxiliary_return_routing(
+        effective_config if effective_config is not None
+        else context.trial_run_params.get("alg_params", {})
+    )
+    if routing is not None:
+        payload["value_routing"] = routing
     return payload
 
 
@@ -997,6 +1019,10 @@ def render_checkpoint(
     metadata_path: Path | None = None,
     trial_settings: Path | None = None,
     experiment_settings: Path | None = None,
+    inner_actor_source: str | None = None,
+    inner_critic_source: str | None = None,
+    inner_horizon_actor_source: str | None = None,
+    inner_horizon_critic_source: str | None = None,
     overwrite: bool = False,
 ) -> list[EpisodeResult]:
     """Load one checkpoint and run complete deterministic or sampled rollouts."""
@@ -1024,6 +1050,12 @@ def render_checkpoint(
         backend=backend,
         device=device,
         controller_seed=first_seed,
+        source_overrides={key: value for key, value in {
+            "inner_actor_source": inner_actor_source,
+            "inner_critic_source": inner_critic_source,
+            "inner_horizon_actor_source": inner_horizon_actor_source,
+            "inner_horizon_critic_source": inner_horizon_critic_source,
+        }.items() if value is not None},
     )
     resolved_video_dir = (
         None if video_dir is None else Path(video_dir).expanduser().resolve()
@@ -1090,6 +1122,8 @@ def render_checkpoint(
                     deterministic=not stochastic,
                     max_steps=max_steps,
                     results=results,
+                    effective_config=(vars(model.cfg) if hasattr(model, "cfg")
+                                      else run_params.get("alg_params", {})),
                 ),
                 overwrite=overwrite,
             )
@@ -1124,6 +1158,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             metadata_path=args.metadata,
             trial_settings=args.trial_settings,
             experiment_settings=args.experiment_settings,
+            inner_actor_source=args.inner_actor_source,
+            inner_critic_source=args.inner_critic_source,
+            inner_horizon_actor_source=args.inner_horizon_actor_source,
+            inner_horizon_critic_source=args.inner_horizon_critic_source,
             overwrite=args.overwrite,
         )
     except RenderCheckpointError as exc:

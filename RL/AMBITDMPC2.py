@@ -19,6 +19,10 @@ from RL.tdmpc2_core.ambi_agent import AMBITDMPC2Agent
 from RL.tdmpc2_core.common.inner_utils import updates_for_transitions
 from RL.tdmpc2_core.common.soft_world_model import normalize_log_std_mapping
 from RL.tdmpc2_core.common.value_semantics import ValueSpecification
+from RL.tdmpc2_core.common.auxiliary_config import (
+    normalize_auxiliary_params, resolve_auxiliary_actor_config,
+    validate_auxiliary_config,
+)
 from utils.utils import setup_logs
 
 
@@ -56,6 +60,14 @@ _AMBI_DEFAULTS = {
     "mpc": False,
     "q_representation": "distributional",
     "critic_value_mode": "single",
+    "aux_return_mode": "off",
+    "aux_return_critic_coef": 0.1,
+    "aux_return_detach_representation": False,
+    "aux_return_critic_lr": None,
+    "inner_actor_source": "sac",
+    "inner_critic_source": "sac",
+    "inner_horizon_actor_source": "sac",
+    "inner_horizon_critic_source": "sac",
     # Resolved by value mode: preserve legacy entropy, but default the split
     # critic's inner learner to reward maximization.
     "inner_entropy_enabled": None,
@@ -1126,7 +1138,8 @@ def _resolve_split_value_params(params):
         "inner_value_initialization", {"return", "soft"},
     )
     if mode == "single":
-        if not entropy or params["inner_value_initialization"] != "return":
+        if ((not entropy and params.get("aux_return_mode", "off") == "off")
+                or params["inner_value_initialization"] != "return"):
             raise ValueError(
                 "inner_entropy_enabled=false and inner_value_initialization='soft' "
                 "require critic_value_mode='return_entropy'."
@@ -1331,6 +1344,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         # legacy inner-loop aliases. This rejects only combinations the caller
         # actually supplied while allowing an all-legacy configuration to make
         # its one-release migration cleanly.
+        params = normalize_auxiliary_params(params)
         params = _resolve_split_value_params(params)
         params = _normalize_horizon_params(params, resolve_defaults=False)
         params, schedule_mode = _normalize_legacy_params(params)
@@ -1477,6 +1491,14 @@ class AMBITDMPC2(TDMPC2Baseline):
                 inner_temperature_mode="inherit_outer",
             )
         cfg = super()._build_cfg(merged)
+        resolve_auxiliary_actor_config(cfg)
+        # Resolve policy inheritance before the existing inner validations.
+        if cfg.aux_return_mode != "off" and cfg.inner_actor_source == "return_actor":
+            for key in ("log_std_mapping", "log_std_min", "log_std_max"):
+                if getattr(cfg, f"inner_{key}") is None:
+                    setattr(cfg, f"inner_{key}", cfg.aux_return_actor_cfg[key])
+            if cfg.inner_operator == "sac" and "inner_actor_entropy_mode" not in params:
+                cfg.inner_actor_entropy_mode = cfg.aux_return_actor_cfg["outer_actor_entropy_mode"]
         cfg.outer_policy_diagnostics = _strict_bool(
             cfg.outer_policy_diagnostics, "outer_policy_diagnostics"
         )
@@ -2579,7 +2601,9 @@ class AMBITDMPC2(TDMPC2Baseline):
             )
         if (
             cfg.inner_actor_loss_scale_update == "per_update"
-            and cfg.sac_actor_loss_scale_mode != "tdmpc2_percentile_range"
+            and (cfg.aux_return_actor_cfg["sac_actor_loss_scale_mode"]
+                 if cfg.aux_return_mode != "off" and cfg.inner_critic_source == "aux_return"
+                 else cfg.sac_actor_loss_scale_mode) != "tdmpc2_percentile_range"
         ):
             raise ValueError(
                 "inner_actor_loss_scale_update='per_update' requires "
@@ -2682,14 +2706,29 @@ class AMBITDMPC2(TDMPC2Baseline):
                 cfg.inner_temperature_mode == "auto"
                 and cfg.inner_target_entropy in {"auto", "inherit_outer"}
             ):
-                raise ValueError(
-                    "inner_actor_entropy_mode='tdmpc2_scaled' with automatic "
-                    "temperature requires an explicit numeric inner_target_entropy."
+                selected_actor = (
+                    cfg.aux_return_actor_cfg
+                    if cfg.aux_return_mode != "off" and cfg.inner_actor_source == "return_actor"
+                    else vars(cfg)
                 )
+                numeric_inheritance = (
+                    cfg.aux_return_mode != "off"
+                    and cfg.inner_target_entropy == "inherit_outer"
+                    and selected_actor["outer_actor_entropy_mode"] == "tdmpc2_scaled"
+                    and selected_actor["target_entropy"] != "auto"
+                )
+                if not numeric_inheritance:
+                    raise ValueError(
+                        "inner_actor_entropy_mode='tdmpc2_scaled' with automatic "
+                        "temperature requires an explicit numeric inner_target_entropy "
+                        "or a numeric target inherited from the selected scaled-entropy actor."
+                    )
         elif (
             cfg.inner_temperature_mode == "auto"
             and cfg.inner_target_entropy == "inherit_outer"
-            and cfg.outer_actor_entropy_mode != cfg.inner_actor_entropy_mode
+            and (cfg.aux_return_actor_cfg["outer_actor_entropy_mode"]
+                 if cfg.aux_return_mode != "off" and cfg.inner_actor_source == "return_actor"
+                 else cfg.outer_actor_entropy_mode) != cfg.inner_actor_entropy_mode
         ):
             raise ValueError(
                 "Automatic inner temperature can inherit_outer target entropy only "
@@ -2703,7 +2742,9 @@ class AMBITDMPC2(TDMPC2Baseline):
                 conflicts.append(
                     f"ent_coef={cfg.ent_coef!r} (set a fixed numeric coefficient)"
                 )
-            if cfg.inner_operator == "sac":
+            if cfg.inner_operator == "sac" and not (
+                cfg.aux_return_mode != "off" and cfg.inner_critic_source == "aux_return"
+            ):
                 if cfg.inner_temperature_mode == "auto":
                     conflicts.append(
                         "inner_temperature_mode='auto' (set 'fixed' or 'inherit_outer')"
@@ -2726,6 +2767,7 @@ class AMBITDMPC2(TDMPC2Baseline):
                 )
 
         _validate_split_value_config(cfg)
+        validate_auxiliary_config(cfg)
 
         # Read-only aliases keep legacy integrations working for one release.
         # Canonical agent code must not use these for scheduling mixed updates.

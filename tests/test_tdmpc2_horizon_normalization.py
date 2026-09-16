@@ -187,6 +187,12 @@ class _TemporalLossModel(torch.nn.Module):
     def reward_from_joint(self, joint):
         return self.rewards
 
+    def reward_loss(self, predictions, targets, reduction):
+        assert reduction == "none"
+        # Match the model codec interface while retaining the independent
+        # middle-bin cross-entropy equation used by this temporal-loss probe.
+        return -predictions.log_softmax(-1)[..., 1:2]
+
     def Q(self, z, action, task=None, return_type=None):
         assert return_type == "all"
         return self.qs

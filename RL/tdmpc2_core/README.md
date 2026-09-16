@@ -1463,3 +1463,161 @@ They are configuration examples, not validated performance recipes or a
 controlled comparison. Select their basenames from an experiment manifest's
 `configs` list and use `--alg-dir configs/dmcontrol/algs`; the manifest supplies
 the DMControl task. Creating these files does not start any training.
+
+## Independent auxiliary return critic
+
+`aux_return_mode="sac"|"return_actor"` adds an independent online critic
+ensemble and its EMA target ensemble. Its architecture and numeric regression
+match the ordinary primary critic, but it has separate parameters and always
+learns reward-only targets. The original actor and critic keep their existing
+objectives. `aux_return_mode="off"` is the default and preserves the original
+networks, checkpoint format, optimizer layout, and random-number use.
+
+This variant requires `critic_value_mode="single"`. The existing
+`"return_entropy"` split-head implementation remains a separate supported
+variant; enabling both at once is rejected.
+
+### Learning targets and gradients
+
+```text
+aux_return_mode = sac          : next_action ~ SAC prior
+aux_return_mode = return_actor : next_action ~ separate return actor
+
+y_return = reward + discount * (1 - terminated)
+           * Q_return_target(next_z, next_action)
+```
+
+In `"sac"` mode, the auxiliary ensemble evaluates rewards under the SAC prior;
+no additional actor is constructed. In `"return_actor"` mode, a separate
+squashed-Gaussian actor trains against that ensemble. This estimates the rewards
+of the learned return actor, rather than a guaranteed optimal value.
+
+The auxiliary critic uses the same real-replay minibatch, rollout latents,
+temporal weighting, target-update cadence, and target EMA rate as the primary
+learner. Its loss is added to the shared world-model update with independent
+`aux_return_critic_coef=0.1`. The primary critic coefficient is unchanged.
+`aux_return_critic_lr=null` inherits `critic_lr`. By default the extra critic
+loss also trains the encoder and latent dynamics; set
+`aux_return_detach_representation=true` to restrict its gradients to its own
+critic parameters. Shared world-model gradients use the existing joint clipping
+and optimizer step. Actor updates detach the latents.
+
+The return actor reuses the SAC actor-update equations while owning its own
+optimizer, temperature, Q scale, behavior-regularizer state, and RNG stream.
+Its controls use the `aux_return_` prefix on the corresponding primary actor
+option, for example `aux_return_actor_lr`, `aux_return_log_std_min`,
+`aux_return_outer_q_actor_reduction`, `aux_return_outer_actor_entropy_mode`,
+`aux_return_ent_coef`, `aux_return_target_entropy`, and
+`aux_return_sac_actor_loss_scale_mode`. Omitted controls inherit the primary
+recipe's configured values, not its learned optimizer or scalar state.
+
+Set `aux_return_ent_coef=0` or `"off"` for reward maximization without an
+actor entropy bonus. Positive fixed coefficients and automatic temperature
+tuning are also supported, with the corresponding SAC normalization and entropy
+validation rules. With standard squashed-action entropy, the actor objective is
+`alpha_return * log_pi - Q_return / S_return`; `"tdmpc2_scaled"` selects the
+existing TD-MPC2 entropy surrogate. **Neither actor entropy option adds entropy
+to the auxiliary critic target.** Thus positive actor entropy regularizes the
+policy while the critic continues to measure reward return.
+
+### Inner initialization and horizon sources
+
+Each source defaults to `"sac"`; enabling the auxiliary learner alone does not
+change action selection.
+
+| Setting | Choices | Role |
+|---|---|---|
+| `inner_actor_source` | `sac`, `return_actor` | Actor copied into the inner learner |
+| `inner_critic_source` | `sac`, `aux_return` | Critic copied into the inner learner |
+| `inner_horizon_actor_source` | `sac`, `return_actor` | Frozen actor sampled at the imagined horizon |
+| `inner_horizon_critic_source` | `sac`, `aux_return` | Frozen online critic evaluated at that horizon |
+
+For inner SAC, the copied actor and critic adapt over the imagined horizon.
+Intermediate Bellman targets follow the current adapted actor and its inner
+target critic. The separately selected horizon actor and critic stay frozen.
+`inner_entropy_enabled=false` removes inner actor/target entropy and temperature
+updates. Actor bounds and inherited temperature follow the selected actor;
+inherited Q normalization follows the selected critic. Explicit inner overrides
+retain their existing meaning.
+
+For example, these additions to an otherwise complete canonical inner-SAC
+configuration retain the exploratory SAC actor initialization while using the
+return learner for the critic and continuation:
+
+```json
+{
+  "aux_return_mode": "return_actor",
+  "aux_return_ent_coef": 0.0,
+  "inner_actor_source": "sac",
+  "inner_critic_source": "aux_return",
+  "inner_horizon_actor_source": "return_actor",
+  "inner_horizon_critic_source": "aux_return"
+}
+```
+
+Matched horizon sources evaluate the selected critic's learned continuation
+policy. Mixing them is permitted and means one action from the selected horizon
+actor followed by the continuation policy learned by the selected critic. A
+primary entropy-augmented critic retains its soft-value semantics; selecting it
+does not remove its learned future entropy. Selecting a missing return actor or
+auxiliary critic fails validation.
+
+Supported operators are prior-only operation, canonical action-local
+finite-horizon SAC, and MPPI. SAC requires prior initialization and the normal
+inner-target bootstrap. Explorer populations, persistent inner state, prior
+writeback, TD3, native TDAMBI, and auxiliary value-equivalence training are
+rejected for this variant. The existing restrictions on each adaptation method
+still apply. Prior-only operation trains the selected auxiliary mode while
+executing `inner_actor_source` with that actor's distribution settings. Zero
+inner-update fallbacks use the same actor and the existing train/evaluation
+action rules.
+
+For MPPI, the improvement actor supplies policy-generated candidate trajectories
+and the horizon actor supplies the final action scored by the horizon critic.
+`inner_critic_source` is inactive: MPPI has no adaptable interior critic. These
+additions to a complete MPPI configuration use SAC proposals and a return-actor
+continuation, preserving the configured candidate budget and warm-start policy:
+
+```json
+{
+  "aux_return_mode": "return_actor",
+  "aux_return_ent_coef": 0.01,
+  "inner_operator": "mppi",
+  "inner_actor_source": "sac",
+  "inner_horizon_actor_source": "return_actor",
+  "inner_horizon_critic_source": "aux_return"
+}
+```
+
+### Checkpoints, evaluation, and rendering
+
+Train this variant jointly from scratch. Enabled checkpoints preserve the
+auxiliary networks, target networks, independent actor optimizer, scalar state,
+RNG state, and training semantics. Missing auxiliary weights or actor state are
+errors; existing checkpoints are not silently converted. Feature-off single and
+split checkpoints retain their existing contracts.
+
+Frozen checkpoint presets may vary the four `inner_*_source` selectors without
+changing the learned architecture. Auxiliary training settings remain pinned to
+the checkpoint. Exact resumes require the same training and controller
+semantics. Evaluation results include the selected sources, and frozen-state
+checks include the auxiliary optimizer/scalar/RNG state. Horizon to-go probes use
+the same selected terminal continuation as the inner learner. Value-equivalence
+diagnostics use the selected fresh inner actor/critic and replace probes at or
+beyond H with the selected frozen online horizon pair, without a separate
+terminal entropy term. Their replay probe depth can differ from H.
+
+`render_checkpoint.py` loads the saved sources and also accepts
+`--inner-actor-source`, `--inner-critic-source`,
+`--inner-horizon-actor-source`, and `--inner-horizon-critic-source` to compare
+controllers using the same checkpoint. For example:
+
+```bash
+python render_checkpoint.py /path/to/checkpoint.pt \
+  --results-json /path/to/new-results.json \
+  --inner-horizon-actor-source return_actor \
+  --inner-horizon-critic-source aux_return
+```
+
+The result records the effective source selections; these runtime overrides do
+not modify the checkpoint or its metadata sidecar.
