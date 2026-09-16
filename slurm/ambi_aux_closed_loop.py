@@ -90,9 +90,8 @@ def worker(args):
 
 def merge(args):
     from utils.ambi_seed_shards import merge_episode_bundles
-    from utils.ambi_diagnostic_series import write_diagnostic_bundle, publish_diagnostic_bundle
-    from utils.ambi_benchmark import stage_completed_bundle
-    from utils.eval_series import load_run, publish_run
+    from utils.ambi_diagnostic_series import write_diagnostic_bundle
+    from utils.eval_series import load_run
     from utils.eval_series_data import load_records
     from report_ambi_benchmark import load_bundles, render_html
     sources = [args.root / f'shards/seed-{seed}/bundle' for seed in SEEDS]
@@ -108,23 +107,43 @@ def merge(args):
     output = bundle.parent
     (output / 'comparison.html').write_text(render_html(load_bundles([bundle])))
     (output / 'results.json').write_text(json.dumps({'results': [r['result'] for r in manifest['runs']]}, indent=2) + '\n')
-    diagnostic_path = write_diagnostic_bundle(output / 'model-series', diagnostic)
+    write_diagnostic_bundle(output / 'model-series', diagnostic)
     receipt = dict(status='complete', checkpoint_step=625000, seeds=SEEDS,
                    metrics=record['metrics'], diagnostic_series_id=diagnostic['series_id'])
     (output / 'merge-completion.json').write_text(json.dumps(receipt, indent=2) + '\n')
     if args.publish:
-        staged = stage_completed_bundle(bundle, {SELECTOR: args.run_dir}, inventory_path=args.inventory)
-        assert staged[SELECTOR]['status'] == 'queued', staged
-        receipt['episode_publication'] = publish_run(args.run_dir, owner='oscar-rgao48')
-        receipt['diagnostic_publication'] = publish_diagnostic_bundle(
-            diagnostic_path, entity='rwgao_b-brown-university', mode='online')
-        (output / 'publication-completion.json').write_text(json.dumps(receipt, indent=2) + '\n')
+        publish(args)
+    else:
+        print(json.dumps(receipt, indent=2), flush=True)
+
+
+def publish(args):
+    """Publish an already complete panel; safe after a pre-publication failure."""
+    from utils.ambi_benchmark import stage_completed_bundle
+    from utils.ambi_diagnostic_series import read_diagnostic_bundle, publish_diagnostic_bundle
+    from utils.eval_series import publish_run
+    output = args.root / 'production'
+    receipt = json.loads((output / 'merge-completion.json').read_text())
+    assert receipt['status'] == 'complete' and receipt['checkpoint_step'] == 625000
+    assert receipt['seeds'] == SEEDS
+    diagnostic_path = output / 'model-series'
+    diagnostic = read_diagnostic_bundle(diagnostic_path)
+    assert diagnostic['series_id'] == receipt['diagnostic_series_id']
+    assert diagnostic['status'] == 'complete' and len(diagnostic['rows']) == 5000
+    # The staging receipt is JSON; the existing helper expects string paths.
+    staged = stage_completed_bundle(output / 'bundle', {SELECTOR: str(args.run_dir)},
+                                    inventory_path=args.inventory)
+    assert staged[SELECTOR]['status'] == 'queued', staged
+    receipt['episode_publication'] = publish_run(args.run_dir, owner='oscar-rgao48')
+    receipt['diagnostic_publication'] = publish_diagnostic_bundle(
+        diagnostic_path, entity='rwgao_b-brown-university', mode='online')
+    (output / 'publication-completion.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print(json.dumps(receipt, indent=2), flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['worker', 'merge'])
+    parser.add_argument('mode', choices=['worker', 'merge', 'publish'])
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--inventory', type=Path, required=True)
     parser.add_argument('--checkpoint', type=Path)
@@ -134,7 +153,7 @@ def main():
     parser.add_argument('--run-dir', type=Path)
     parser.add_argument('--publish', action='store_true')
     args = parser.parse_args()
-    (worker if args.mode == 'worker' else merge)(args)
+    {'worker': worker, 'merge': merge, 'publish': publish}[args.mode](args)
 
 
 if __name__ == '__main__':

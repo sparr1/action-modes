@@ -17,6 +17,11 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-2}" TORCHINDUCTOR_COMPILE_THREADS
 export WANDB_DIR="${AMBI_CAMPAIGN_ROOT:?}/wandb"
 mkdir -p "$WANDB_DIR"
 unset WANDB_RUN_ID WANDB_RESUME WANDB_NAME WANDB_RUN_GROUP WANDB_JOB_TYPE WANDB_TAGS
-exec "${AMBI_DMC_PYTHON:?}" slurm/ambi_aux_closed_loop.py merge \
+case "${1:-}" in
+  '') mode=merge ;;
+  --publish-only) mode=publish ;;
+  *) exit 2 ;;
+esac
+exec "${AMBI_DMC_PYTHON:?}" slurm/ambi_aux_closed_loop.py "$mode" \
   --root "$AMBI_CAMPAIGN_ROOT" --inventory "${CHECKPOINT_MANIFEST:?}" \
   --run-dir "${EVAL_RUN_DIR:?}" --publish

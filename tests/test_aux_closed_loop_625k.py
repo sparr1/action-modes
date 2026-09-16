@@ -98,3 +98,30 @@ def test_merge_rejects_missing_overlapping_seeds_and_corrupted_traces(panel, tmp
     with pytest.raises(ValueError, match='checksum'):
         merge_episode_bundles([duplicate, shards[1]], tmp_path / 'corrupt', expected_seeds=[101, 102])
     assert not (tmp_path / 'corrupt').exists()
+
+
+def test_publication_recovery_uses_saved_panel_and_json_paths(tmp_path, monkeypatch):
+    from argparse import Namespace
+    from slurm.ambi_aux_closed_loop import SEEDS, publish
+    import utils.ambi_benchmark as benchmark
+    import utils.ambi_diagnostic_series as diagnostics
+    import utils.eval_series as series
+    output = tmp_path / 'production'
+    output.mkdir()
+    receipt = dict(status='complete', checkpoint_step=625000, seeds=SEEDS,
+                   diagnostic_series_id='existing-diagnostic')
+    (output / 'merge-completion.json').write_text(json.dumps(receipt))
+    monkeypatch.setattr(diagnostics, 'read_diagnostic_bundle', lambda _: dict(
+        status='complete', series_id='existing-diagnostic', rows=[{}] * 5000))
+    calls = []
+    def stage(bundle, run_map, **kwargs):
+        # Exercise the failing JSON serialization of the real helper receipt.
+        json.dumps(run_map)
+        calls.append((bundle, run_map))
+        return {SELECTOR: dict(status='queued')}
+    monkeypatch.setattr(benchmark, 'stage_completed_bundle', stage)
+    monkeypatch.setattr(series, 'publish_run', lambda *a, **k: dict(status='complete'))
+    monkeypatch.setattr(diagnostics, 'publish_diagnostic_bundle', lambda *a, **k: dict(status='complete'))
+    publish(Namespace(root=tmp_path, run_dir=tmp_path / 'registry', inventory=tmp_path / 'inventory.json'))
+    assert calls == [(output / 'bundle', {SELECTOR: str(tmp_path / 'registry')})]
+    assert json.loads((output / 'publication-completion.json').read_text())['diagnostic_publication']['status'] == 'complete'
