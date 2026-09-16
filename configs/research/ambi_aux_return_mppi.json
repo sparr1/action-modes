@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "description": "Frozen auxiliary SAC backbone: paired MPPI soft-Q versus return-only-Q terminal bootstrap through 1M decisions. Same stochastic SAC proposal/tail actor, online mean-pair critic, raw rewards, no entropy correction, deterministic proposal-mean execution.",
+  "base_alg_config": "checkpoint",
+  "source_run": "rwgao_b-brown-university/ambi/aux6434715x3",
+  "shared_alg_params": {
+    "compile": false,
+    "wandb": false,
+    "inner_operator": "mppi",
+    "inner_rollout_horizon": 3,
+    "inner_model_step_budget": 12336,
+    "inner_mppi_iterations": 8,
+    "inner_mppi_num_elites": 64,
+    "inner_mppi_num_pi_trajs": 24,
+    "inner_mppi_temperature": 0.5,
+    "inner_mppi_min_std": 0.05,
+    "inner_mppi_max_std": 2.0,
+    "inner_mppi_warm_start_scope": "episode",
+    "inner_actor_source": "sac",
+    "inner_critic_source": "sac",
+    "inner_horizon_actor_source": "sac",
+    "inner_execution_action": "mean",
+    "inner_diagnostic_rollouts": 0,
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_rounds": null,
+    "inner_rollouts_per_round": null,
+    "inner_updates_per_round": null,
+    "inner_iterations": null,
+    "inner_rollouts": null,
+    "inner_horizon": null,
+    "inner_updates_per_iteration": null,
+    "inner_actor_updates_per_round": null,
+    "inner_critic_updates_per_round": null,
+    "inner_temperature_updates_per_round": null,
+    "outer_policy_diagnostics": false
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "default_presets": [
+      "bootstrap/soft_q",
+      "bootstrap/return_q"
+    ]
+  },
+  "comparisons": {
+    "bootstrap": {
+      "reference": "soft_q",
+      "variants": {
+        "soft_q": {
+          "description": "MPPI with frozen online SAC soft critic at terminal SAC action",
+          "alg_params": {
+            "inner_horizon_critic_source": "sac"
+          }
+        },
+        "return_q": {
+          "description": "MPPI with frozen online auxiliary reward-only critic at terminal SAC action",
+          "alg_params": {
+            "inner_horizon_critic_source": "aux_return"
+          }
+        }
+      }
+    }
+  }
+}
