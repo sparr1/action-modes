@@ -1,0 +1,141 @@
+"""Five independent episode workers followed by one complete-panel publisher.
+
+Workers never publish. All seeds, paired prior gains and both probe rounds must
+be present before the merger can stage a result or publish diagnostics.
+"""
+import argparse
+import json
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+MATRIX = ROOT / 'configs/research/ambi_aux_closed_loop_625k.json'
+SELECTOR = 'critic/soft_q'
+SEEDS = [101, 102, 103, 104, 105]
+ATTEMPT = 'aux625k-soft-init-soft-tail-j1-alpha0-20260916'
+
+
+def validate_bundle(path, seeds, max_steps, *, paired=True):
+    from utils.ambi_diagnostic_series import record_from_model_bundle
+    manifest = json.loads((Path(path) / 'manifest.json').read_text())
+    assert manifest['status'] == 'complete'
+    assert len(manifest['runs']) == 1
+    run, = manifest['runs']
+    result, cfg = run['result'], run['resolved_config']
+    assert run['selector'] == SELECTOR and run['status'] == 'complete'
+    assert result['outer_state_unchanged']
+    assert result['outer_updates_before'] == result['outer_updates_after']
+    assert not result['nonfinite_model_metrics'] and not result['nonfinite_trace_metrics']
+    assert result['environment_seeds'] == seeds and result['controller_seed'] == 55
+    assert cfg['inner_critic_source'] == cfg['inner_horizon_critic_source'] == 'sac'
+    assert cfg['inner_actor_source'] == cfg['inner_horizon_actor_source'] == 'sac'
+    assert cfg['inner_actor_initialization'] == cfg['inner_critic_initialization'] == 'prior'
+    assert cfg['inner_critic_target_initialization'] == 'online'
+    assert cfg['inner_finite_horizon'] and cfg['inner_sac_critic_target'] == 'reward_only'
+    assert not cfg['inner_entropy_enabled'] and cfg['inner_execution_action'] == 'mean'
+    assert cfg['inner_log_std_mapping'] == 'direct_clamp'
+    assert cfg['inner_batch_size'] == 256 and cfg['inner_rollout_horizon'] == 1
+    assert cfg['inner_rounds'] == 1 and cfg['inner_rollouts_per_round'] == 128
+    for key, value in [('inner_model_steps', 128), ('inner_actor_optimizer_steps', 4),
+                       ('inner_critic_optimizer_steps', 32), ('inner_temperature_optimizer_steps', 0),
+                       ('inner_alpha', 0), ('inner_compile_fallback', 0)]:
+        assert result['model_metrics'][key]['mean'] == value, key
+    probe = run['togo_return_probe']
+    assert probe['rollouts'] == 32 and probe['horizon'] == 1
+    assert probe['cadence'] == 'initial_and_after_each_round' and not probe['entropy_bonus']
+    assert probe['tail_q_reduction'] == 'mean_pair'
+    assert [e['seed'] for e in run['episodes']] == seeds
+    for episode in run['episodes']:
+        assert episode['length'] == max_steps
+        if paired:
+            assert not episode['truncated_by_evaluator']
+            assert 'paired_return_delta' in episode
+        points = episode['togo_round_summaries']
+        assert [(r['round_index'], r['actor_updates'], r['critic_updates']) for r in points] == [(0, 0, 0), (1, 4, 32)]
+        assert all(s['count'] == max_steps for r in points for s in r['metrics'].values())
+    diagnostics = record_from_model_bundle(path, SELECTOR, ATTEMPT, bootstrap_resamples=2000,
+                                          bootstrap_seed=20260912)
+    assert diagnostics['status'] == 'complete'
+    assert len(diagnostics['rows']) == len(seeds) * max_steps * 2
+    return manifest, diagnostics
+
+
+def worker(args):
+    import torch
+    from evaluate_ambi_checkpoint import evaluate_matrix
+    from utils.ambi_seed_shards import seal_episode_bundle
+    assert torch.cuda.is_available()
+    assert args.seed in SEEDS
+    directory = args.root / ('smoke' if args.smoke else f'shards/seed-{args.seed}')
+    directory.mkdir(parents=True, exist_ok=False)
+    result = evaluate_matrix(MATRIX, args.checkpoint, selectors=[SELECTOR], seeds=[args.seed],
+                             controller_seed=55, max_steps=20 if args.smoke else 500, device='cuda',
+                             bundle_dir=directory / 'bundle', checkpoint_inventory=args.inventory,
+                             reference_bundle=None if args.smoke else args.reference)
+    (directory / 'results.json').write_text(json.dumps(result, indent=2) + '\n')
+    manifest, _ = validate_bundle(directory / 'bundle', [args.seed], 20 if args.smoke else 500,
+                                  paired=not args.smoke)
+    cfg = manifest['runs'][0]['resolved_config']
+    assert cfg['compile'] and cfg['compile_strict']
+    assert result['results'][0]['resolved_device'].startswith('cuda')
+    assert manifest['checkpoint']['metadata']['checkpoint']['step'] == 625000
+    seal_episode_bundle(directory / 'bundle')
+    receipt = dict(status='complete', seed=args.seed, smoke=args.smoke,
+                   checkpoint_sha256=manifest['checkpoint']['sha256'], gpu=torch.cuda.get_device_name(0),
+                   episodes=manifest['runs'][0]['episodes'])
+    (directory / 'worker-completion.json').write_text(json.dumps(receipt, indent=2) + '\n')
+    print(json.dumps({k: v for k, v in receipt.items() if k != 'episodes'}), flush=True)
+
+
+def merge(args):
+    from utils.ambi_seed_shards import merge_episode_bundles
+    from utils.ambi_diagnostic_series import write_diagnostic_bundle, publish_diagnostic_bundle
+    from utils.ambi_benchmark import stage_completed_bundle
+    from utils.eval_series import load_run, publish_run
+    from utils.eval_series_data import load_records
+    from report_ambi_benchmark import load_bundles, render_html
+    sources = [args.root / f'shards/seed-{seed}/bundle' for seed in SEEDS]
+    for seed, source in zip(SEEDS, sources):
+        receipt = json.loads((source.parent / 'worker-completion.json').read_text())
+        assert receipt['status'] == 'complete' and receipt['seed'] == seed and not receipt['smoke']
+    bundle = merge_episode_bundles(sources, args.root / 'production/bundle', expected_seeds=SEEDS)
+    manifest, diagnostic = validate_bundle(bundle, SEEDS, 500)
+    record, = load_records(bundle, inventory_path=args.inventory)
+    assert record['checkpoint']['step'] == 625000
+    assert record['identity'] == load_run(args.run_dir)['identity']
+    assert record['metrics']['eval/paired_episodes'] == 5
+    output = bundle.parent
+    (output / 'comparison.html').write_text(render_html(load_bundles([bundle])))
+    (output / 'results.json').write_text(json.dumps({'results': [r['result'] for r in manifest['runs']]}, indent=2) + '\n')
+    diagnostic_path = write_diagnostic_bundle(output / 'model-series', diagnostic)
+    receipt = dict(status='complete', checkpoint_step=625000, seeds=SEEDS,
+                   metrics=record['metrics'], diagnostic_series_id=diagnostic['series_id'])
+    (output / 'merge-completion.json').write_text(json.dumps(receipt, indent=2) + '\n')
+    if args.publish:
+        staged = stage_completed_bundle(bundle, {SELECTOR: args.run_dir}, inventory_path=args.inventory)
+        assert staged[SELECTOR]['status'] == 'queued', staged
+        receipt['episode_publication'] = publish_run(args.run_dir, owner='oscar-rgao48')
+        receipt['diagnostic_publication'] = publish_diagnostic_bundle(
+            diagnostic_path, entity='rwgao_b-brown-university', mode='online')
+        (output / 'publication-completion.json').write_text(json.dumps(receipt, indent=2) + '\n')
+    print(json.dumps(receipt, indent=2), flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('mode', choices=['worker', 'merge'])
+    parser.add_argument('--root', type=Path, required=True)
+    parser.add_argument('--inventory', type=Path, required=True)
+    parser.add_argument('--checkpoint', type=Path)
+    parser.add_argument('--reference', type=Path)
+    parser.add_argument('--seed', type=int)
+    parser.add_argument('--smoke', action='store_true')
+    parser.add_argument('--run-dir', type=Path)
+    parser.add_argument('--publish', action='store_true')
+    args = parser.parse_args()
+    (worker if args.mode == 'worker' else merge)(args)
+
+
+if __name__ == '__main__':
+    main()
