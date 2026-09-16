@@ -14,13 +14,14 @@ import pytest
 import torch
 
 from RL.AMBITDMPC2 import AMBITDMPC2
+from slurm import ambi_aux_return_sac_campaign as campaign
 from tests.test_ambi_inner_decoupling import _assert_tree_equal
 from tests.test_ambi_prior_sac_cuda_gate import _FixedRealReplay
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_aux_return_sac_study.json"
-CASES = tuple(json.loads(MANIFEST.read_text())["configs"])
+MANIFEST = ROOT / campaign.MANIFEST
+CASES = campaign.CASES
 pytestmark = pytest.mark.skipif(
     os.environ.get("AMBI_RUN_AUX_RETURN_SAC_CUDA_GATE") != "1",
     reason="set AMBI_RUN_AUX_RETURN_SAC_CUDA_GATE=1 on an allocated CUDA GPU",
@@ -78,13 +79,15 @@ def test_production_shape_cold_cuda_updates_checkpoint_and_gradient_routing(tmp_
         assert (cfg.enc_dim, cfg.mlp_dim, cfg.latent_dim, cfg.num_q) == (256, 512, 512, 5)
         assert (cfg.train_unroll_horizon, cfg.batch_size, cfg.action_dim) == (3, 256, 21)
         assert tuple(cfg.obs_shape["state"]) == (67,)
-        assert cfg.seed_steps == cfg.pretrain_steps == 2500 and cfg.steps == 2_000_000
+        assert cfg.seed_steps == cfg.pretrain_steps == 2500 and cfg.steps == run["total_steps"]
         assert cfg.critic_coef == cfg.aux_return_critic_coef == .1
         assert cfg.actor_lr == cfg.critic_lr == cfg.aux_return_critic_lr == 3e-4
-        assert cfg.outer_q_actor_reduction == "mean_pair"
+        assert cfg.outer_q_actor_reduction == run["alg_params"]["outer_q_actor_reduction"]
         assert cfg.outer_q_target_reduction == agent.aux_return.cfg.outer_q_target_reduction == "min_pair"
+        assert cfg.log_std_mapping == "direct_clamp"
+        assert cfg.log_std_min == run["alg_params"]["log_std_min"] and cfg.log_std_max == 2
         assert agent.alpha.item() == 1. and agent.ent_coef_optim is not None
-        assert agent.target_entropy == (-10.5 if "target10p5" in name else -21.)
+        assert agent.target_entropy == run["alg_params"]["target_entropy"]
 
         # Keep all model/Q kernels cold until the first full production-shape update.
         observation, _ = env.reset(seed=55)

@@ -104,7 +104,7 @@ def test_wandb_names_and_configs_are_unique_and_seed_correct(monkeypatch):
     assert len({call["name"] for call in calls}) == 4
 
 
-def _receipt():
+def _receipt(campaign=campaign):
     binding = campaign.binding(SHA)
     cases = []
     for name in campaign.CASES:

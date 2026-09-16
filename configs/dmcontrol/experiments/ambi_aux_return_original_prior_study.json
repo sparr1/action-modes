@@ -1,0 +1,27 @@
+{
+  "study_type": "single_seed_exploratory_auxiliary_return_original_prior_study",
+  "study_note": "Two fresh Humanoid Walk state runs reproduce the active training settings of prior-only run u13m14st (source 253e89b3896ca3891844d797573b00ade338165d), except retaining current critic initialization and adding an independent reward-only critic that bootstraps the SAC actor. Both use actor/target min-pair, direct-clamp log standard deviations [-20, 2], squashed entropy, automatic temperature initially 1 with target -21, and no Q scaling. Auxiliary gradients into the encoder/dynamics are enabled or detached; both critic coefficients are 0.1. There is no return actor, inner optimization, or MPPI. Both use seed 55, 1.5 million decisions, 2500 warmup decisions and 2500 pretraining updates, and retain all 60 scheduled checkpoints each. Current strict compilation and observational diagnostics remain enabled. This is a single-seed exploratory comparison; complete recipes are versioned without alg_params overrides.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1500000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_aux_return_original_prior_shared",
+    "ambi_aux_return_original_prior_detached"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

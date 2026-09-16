@@ -14,6 +14,8 @@
 # Supply account/resources with sbatch after checking live allocation headroom.
 # First submit one AMBI_AUX_MODE=smoke job (recommend --time=02:00:00), then
 # AMBI_AUX_MODE=train --array=0-3 --dependency=afterok:<gate job> with its receipt.
+# AMBI_AUX_RECIPE=original_prior selects the two-cell historical-policy study
+# instead; submit its training with --array=0-1 and its own smoke receipt.
 # Create scheduler-log directories before submission; override --output/--error
 # when choosing another output root. Never submit the smoke as an array.
 set -Eeuo pipefail
@@ -33,13 +35,29 @@ fail() { printf 'Oscar auxiliary SAC campaign error: %s\n' "$*" >&2; exit 2; }
 [[ "$AMBI_AUX_CAMPAIGN" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "invalid campaign basename"
 mode="${AMBI_AUX_MODE:-train}"
 [[ "$mode" == smoke || "$mode" == train ]] || fail "mode must be smoke or train"
+recipe="${AMBI_AUX_RECIPE:-standard}"
+case "$recipe" in
+  standard)
+    manifest="configs/dmcontrol/experiments/ambi_aux_return_sac_study.json"
+    configs=(ambi_aux_return_sac_clip_target10p5_shared ambi_aux_return_sac_clip_target10p5_detached ambi_aux_return_sac_clip_target21_shared ambi_aux_return_sac_clip_target21_detached)
+    decisions=2000000
+    ;;
+  original_prior)
+    manifest="configs/dmcontrol/experiments/ambi_aux_return_original_prior_study.json"
+    configs=(ambi_aux_return_original_prior_shared ambi_aux_return_original_prior_detached)
+    decisions=1500000
+    ;;
+  *) fail "recipe must be standard or original_prior" ;;
+esac
+export AMBI_AUX_RECIPE="$recipe"
 if [[ "$mode" == smoke ]]; then
   [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]] || fail "submit the smoke as a single job"
 else
-  : "${SLURM_ARRAY_JOB_ID:?Train as a four-cell array.}"
-  : "${SLURM_ARRAY_TASK_ID:?Train as a four-cell array.}"
+  : "${SLURM_ARRAY_JOB_ID:?Train as a recipe array.}"
+  : "${SLURM_ARRAY_TASK_ID:?Train as a recipe array.}"
   : "${AMBI_AUX_GATE_RECEIPT:?Supply the successful GPU smoke receipt.}"
   [[ "$SLURM_ARRAY_TASK_ID" =~ ^[0-3]$ ]] || fail "array index must be 0..3"
+  (( SLURM_ARRAY_TASK_ID < ${#configs[@]} )) || fail "array index exceeds recipe cell count"
   [[ "$AMBI_AUX_GATE_RECEIPT" == /* && -f "$AMBI_AUX_GATE_RECEIPT" ]] || fail "receipt must exist at an absolute path"
 fi
 cd "$AMBI_PROJECT_DIR"
@@ -63,26 +81,28 @@ export XDG_CACHE_HOME="$local_root/cache"
 export WANDB_DISABLE_CODE=true WANDB_DIR="$local_root/wandb" WANDB_CACHE_DIR="$local_root/cache"
 export WANDB_DATA_DIR="$local_root/data" WANDB_ARTIFACT_DIR="$local_root/artifacts"
 export AMBI_AUX_CAMPAIGN EXPECTED_ACTION_MODES_SHA
-manifest="configs/dmcontrol/experiments/ambi_aux_return_sac_study.json"
 helper="slurm/ambi_aux_return_sac_campaign.py"
 if [[ "$mode" == smoke ]]; then
   export AMBI_AUX_GATE_OUTPUT_ROOT="$campaign_root/gate"
   mkdir "$AMBI_AUX_GATE_OUTPUT_ROOT" || fail "gate output exists; use a fresh campaign"
   export AMBI_RUN_AUX_RETURN_SAC_CUDA_GATE=1 WANDB_MODE=offline
-  srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m pytest -q -s -p no:cacheprovider \
+  # The legacy regression suite deliberately tests the unchanged default recipe.
+  srun --unbuffered --kill-on-bad-exit=1 env AMBI_AUX_RECIPE=standard "$AMBI_PYTHON" -m pytest -q -s -p no:cacheprovider \
     tests/test_ambi_aux_return_sac_campaign.py tests/test_aux_return_checkpoint.py \
-    tests/test_ambi_aux_return_sac_cuda_gate.py --basetemp="$local_root/pytest"
+    tests/test_ambi_aux_return_original_prior_campaign.py \
+    tests/test_ambi_aux_return_original_prior_configs.py --basetemp="$local_root/pytest-regression"
+  srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m pytest -q -s -p no:cacheprovider \
+    tests/test_ambi_aux_return_sac_cuda_gate.py --basetemp="$local_root/pytest-cuda"
   "$AMBI_PYTHON" "$helper" receipt --source-commit "$EXPECTED_ACTION_MODES_SHA" --gate-dir "$AMBI_AUX_GATE_OUTPUT_ROOT"
 else
-  configs=(ambi_aux_return_sac_clip_target10p5_shared ambi_aux_return_sac_clip_target10p5_detached ambi_aux_return_sac_clip_target21_shared ambi_aux_return_sac_clip_target21_detached)
   config="${configs[$SLURM_ARRAY_TASK_ID]}"
   run_root="$campaign_root/$config-seed55"
   mkdir "$run_root" || fail "run output exists; refusing a duplicate run"
   export WANDB_MODE=online WANDB_RESUME=never WANDB_RUN_ID="aux${SLURM_ARRAY_JOB_ID}x${SLURM_ARRAY_TASK_ID}"
   "$AMBI_PYTHON" "$helper" train-metadata --source-commit "$EXPECTED_ACTION_MODES_SHA" \
     --receipt "$AMBI_AUX_GATE_RECEIPT" --index "$SLURM_ARRAY_TASK_ID" --run-root "$run_root"
-  printf 'Job: %s_%s\nSource: %s\nConfig: %s; seed: 55; decisions: 2000000\nOutput: %s\n' \
-    "$SLURM_ARRAY_JOB_ID" "$SLURM_ARRAY_TASK_ID" "$EXPECTED_ACTION_MODES_SHA" "$config" "$run_root"
+  printf 'Job: %s_%s\nSource: %s\nConfig: %s; seed: 55; decisions: %s\nOutput: %s\n' \
+    "$SLURM_ARRAY_JOB_ID" "$SLURM_ARRAY_TASK_ID" "$EXPECTED_ACTION_MODES_SHA" "$config" "$decisions" "$run_root"
   exec srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" main.py \
     --run "$manifest" --alg-dir configs/dmcontrol/algs --log-dir "$run_root" \
     --alg-index "$SLURM_ARRAY_TASK_ID" --trial-index 0 --num-runs 1

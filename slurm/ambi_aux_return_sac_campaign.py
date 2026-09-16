@@ -1,4 +1,4 @@
-"""Fail-closed receipts and launch metadata for the four-cell auxiliary SAC study."""
+"""Fail-closed receipts and launch metadata for auxiliary SAC prior studies."""
 
 import argparse
 from copy import deepcopy
@@ -15,11 +15,18 @@ if not __debug__:
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MANIFEST = Path("configs/dmcontrol/experiments/ambi_aux_return_sac_study.json")
-CASES = tuple(
-    f"ambi_aux_return_sac_clip_target{target}_{gradient}"
-    for target in ("10p5", "21") for gradient in ("shared", "detached")
-)
+RECIPE = os.environ.get("AMBI_AUX_RECIPE", "standard")
+if RECIPE == "standard":
+    MANIFEST = Path("configs/dmcontrol/experiments/ambi_aux_return_sac_study.json")
+    CASES = tuple(
+        f"ambi_aux_return_sac_clip_target{target}_{gradient}"
+        for target in ("10p5", "21") for gradient in ("shared", "detached")
+    )
+elif RECIPE == "original_prior":
+    MANIFEST = Path("configs/dmcontrol/experiments/ambi_aux_return_original_prior_study.json")
+    CASES = tuple(f"ambi_aux_return_original_prior_{gradient}" for gradient in ("shared", "detached"))
+else:
+    raise ValueError(f"Unknown AMBI_AUX_RECIPE: {RECIPE!r}; expected standard or original_prior")
 FLAGS = {"aggregate", "outer_update", "sac_online", "sac_target", "aux_online", "aux_target"}
 
 
@@ -49,6 +56,22 @@ def binding(source_commit, root=ROOT):
         "config_sha256": {name: sha256(path) for name, path in files.items()},
         "environment_lock_sha256": sha256(root / "environments/dmcontrol/uv.lock"),
     }
+
+
+def checkpoint_counts(root=ROOT):
+    """Count the periodic bank using the same manifest/config precedence as main."""
+    manifest, files = recipes(root)
+    counts = {}
+    for name, path in files.items():
+        run = {**read_json(path), **manifest["overrides_alg"]}
+        steps = run["total_steps"]
+        cadence = run.get("checkpoint_every", manifest.get("checkpoint_every"))
+        retention = run.get("save_strat", manifest.get("save_strat"))
+        assert retention == "all", "campaign checkpoint bank must retain all periodic checkpoints"
+        assert type(steps) is int and steps > 0
+        assert type(cadence) is int and cadence > 0 and steps % cadence == 0
+        counts[name] = steps // cadence
+    return counts
 
 
 def validate_flags(status):
@@ -93,7 +116,7 @@ def validate_receipt(receipt, source_commit, root=ROOT):
     expected = binding(source_commit, root)
     assert receipt["schema"] == 1 and receipt["passed"] is True
     assert receipt["binding"] == expected, "receipt does not bind the current commit and all recipes"
-    assert len(receipt["cases"]) == 4 and tuple(case["config"] for case in receipt["cases"]) == CASES
+    assert len(receipt["cases"]) == len(CASES) and tuple(case["config"] for case in receipt["cases"]) == CASES
     for name, case in zip(CASES, receipt["cases"]):
         validate_case(case, name, expected)
     assert len({case["replay_sha256"] for case in receipt["cases"]}) == 1, "gate replay is not paired"
@@ -129,11 +152,14 @@ def collect_receipt(gate_dir, source_commit):
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     validate_receipt(receipt, source_commit)
-    receipt["estimated_checkpoint_bank_bytes"] = 80 * sum(case["checkpoint_size_bytes"] for case in receipt["cases"])
+    counts = checkpoint_counts()
+    receipt["estimated_checkpoint_bank_bytes"] = sum(
+        counts[case["config"]] * case["checkpoint_size_bytes"] for case in receipt["cases"]
+    )
     path = gate_dir / "receipt.json"
     write_new(path, receipt)
     print("AUX_RETURN_SAC_GATE_RECEIPT", path)
-    print("Estimated 320-checkpoint bank bytes:", receipt["estimated_checkpoint_bank_bytes"])
+    print(f"Estimated {sum(counts.values())}-checkpoint bank bytes:", receipt["estimated_checkpoint_bank_bytes"])
 
 
 def prepare_training(receipt_path, source_commit, index, run_root):
