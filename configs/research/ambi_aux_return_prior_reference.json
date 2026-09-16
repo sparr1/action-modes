@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "description": "Frozen SAC policy-mean reference for paired MPPI gains on the auxiliary target -21 detached backbone.",
+  "base_alg_config": "checkpoint",
+  "source_run": "rwgao_b-brown-university/ambi/aux6434715x3",
+  "shared_alg_params": {
+    "compile": false,
+    "wandb": false,
+    "inner_operator": "none",
+    "inner_rollout_horizon": 3,
+    "inner_model_step_budget": 0,
+    "inner_mppi_iterations": 0,
+    "inner_mppi_num_elites": 64,
+    "inner_mppi_num_pi_trajs": 24,
+    "inner_mppi_temperature": 0.5,
+    "inner_mppi_min_std": 0.05,
+    "inner_mppi_max_std": 2.0,
+    "inner_mppi_warm_start_scope": "episode",
+    "inner_actor_source": "sac",
+    "inner_critic_source": "sac",
+    "inner_horizon_actor_source": "sac",
+    "inner_execution_action": "mean",
+    "inner_diagnostic_rollouts": 0,
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_rounds": null,
+    "inner_rollouts_per_round": null,
+    "inner_updates_per_round": null,
+    "inner_iterations": null,
+    "inner_rollouts": null,
+    "inner_horizon": null,
+    "inner_updates_per_iteration": null,
+    "inner_actor_updates_per_round": null,
+    "inner_critic_updates_per_round": null,
+    "inner_temperature_updates_per_round": null,
+    "outer_policy_diagnostics": false,
+    "inner_horizon_critic_source": "sac"
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "default_presets": [
+      "reference/prior"
+    ]
+  },
+  "comparisons": {
+    "reference": {
+      "reference": "prior",
+      "variants": {
+        "prior": {
+          "description": "Frozen SAC prior tanh mean; no planning, no learning.",
+          "alg_params": {}
+        }
+      }
+    }
+  }
+}
