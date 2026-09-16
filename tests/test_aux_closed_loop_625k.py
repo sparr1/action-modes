@@ -1,34 +1,41 @@
 """Exercise real adaptation, independent probe RNG and immutable seed merging."""
 import copy
 import json
+import math
 from pathlib import Path
 
 import pytest
 
 from evaluate_ambi_checkpoint import evaluate_matrix
-from slurm.ambi_aux_closed_loop import MATRIX, SELECTOR, validate_bundle
+from slurm.ambi_aux_closed_loop import MATRIX, MATRICES, SELECTOR, checkpoint_alpha, validate_bundle
 from tests.test_ambi_root_local_sac import _tiny_model, _tiny_params
 from utils.ambi_diagnostic_series import diagnostic_history, record_from_model_bundle
 from utils.ambi_seed_shards import merge_episode_bundles, seal_episode_bundle
 from utils.eval_series_data import _metrics
 
 
-@pytest.fixture(scope='module')
-def panel(tmp_path_factory):
+@pytest.fixture(scope='module', params=['zero', 'inherit_outer'])
+def panel(tmp_path_factory, request):
+    import torch
     root = tmp_path_factory.mktemp('aux-closed-loop')
     options = dict(aux_return_mode='sac', log_std_mapping='direct_clamp',
                    sac_actor_loss_scale_mode='none', inner_operator='none',
-                   inner_rounds=0, inner_rollouts_per_round=0, inner_updates_per_round=0)
+                   inner_rounds=0, inner_rollouts_per_round=0, inner_updates_per_round=0,
+                   ent_coef='auto_0.2')
     model = _tiny_model(**options)
+    with torch.no_grad():
+        model.agent.log_ent_coef.fill_(math.log(.037))
     checkpoint = root / 'model_625000'
     model.agent.save(checkpoint)
     model.env.close()
+    assert checkpoint_alpha(checkpoint) == pytest.approx(.037)
+    expected_alpha = checkpoint_alpha(checkpoint) if request.param == 'inherit_outer' else 0.
     metadata = dict(schema_version=1, checkpoint=dict(kind='periodic', step=625000, episode=50, best_score=None, best_window=100),
                     trial_run_params=dict(alg='AMBITDMPC2/AMBITDMPC2', env='Pendulum-v1', seed=55,
                         device='cpu', total_steps=2000000, alg_params=_tiny_params(**options)),
                     experiment_params=dict(env_params=dict(max_episode_steps=3)))
     Path(str(checkpoint) + '.metadata.json').write_text(json.dumps(metadata))
-    matrix = json.loads(MATRIX.read_text())
+    matrix = json.loads(MATRICES[request.param].read_text())
     assert matrix['evaluation']['togo_return_rollouts'] == 32
     assert matrix['evaluation']['default_presets'] == [SELECTOR]
     matrix['shared_alg_params']['compile'] = False
@@ -51,15 +58,15 @@ def panel(tmp_path_factory):
         evaluate(shard, [seed])
         seal_episode_bundle(shard)
         shards.append(shard)
-    return root, shards
+    return root, shards, expected_alpha
 
 
 def test_probe_rng_and_parallel_seed_execution_preserve_actual_returns(panel):
-    root, shards = panel
-    serial, record = validate_bundle(root / 'serial', [101, 102], 3)
+    root, shards, alpha = panel
+    serial, record = validate_bundle(root / 'serial', [101, 102], 3, expected_alpha=alpha)
     plain = json.loads((root / 'without-probes/manifest.json').read_text())
     merged_path = merge_episode_bundles(shards, root / 'merged', expected_seeds=[101, 102])
-    merged, merged_record = validate_bundle(merged_path, [101, 102], 3)
+    merged, merged_record = validate_bundle(merged_path, [101, 102], 3, expected_alpha=alpha)
     for source in [plain, merged]:
         for expected, actual in zip(serial['runs'][0]['episodes'], source['runs'][0]['episodes']):
             for key in ['seed', 'solver_seed', 'return', 'length', 'paired_return_delta']:
@@ -84,7 +91,7 @@ def test_probe_rng_and_parallel_seed_execution_preserve_actual_returns(panel):
 
 
 def test_merge_rejects_missing_overlapping_seeds_and_corrupted_traces(panel, tmp_path):
-    _, shards = panel
+    _, shards, _ = panel
     for sources, seeds in [(shards[:1], [101, 102]), (shards, [101, 102, 103])]:
         with pytest.raises(ValueError, match='missing or unexpected seeds'):
             merge_episode_bundles(sources, tmp_path / 'missing', expected_seeds=seeds)
@@ -98,6 +105,16 @@ def test_merge_rejects_missing_overlapping_seeds_and_corrupted_traces(panel, tmp
     with pytest.raises(ValueError, match='checksum'):
         merge_episode_bundles([duplicate, shards[1]], tmp_path / 'corrupt', expected_seeds=[101, 102])
     assert not (tmp_path / 'corrupt').exists()
+
+
+def test_inherited_alpha_matrix_changes_only_entropy_enablement():
+    zero = json.loads(MATRIX.read_text())
+    inherited = json.loads(MATRICES['inherit_outer'].read_text())
+    assert inherited['evaluation'] == zero['evaluation']
+    for variant in zero['comparisons']['critic']['variants']:
+        assert inherited['comparisons']['critic']['variants'][variant]['alg_params'] == zero['comparisons']['critic']['variants'][variant]['alg_params']
+    expected = {**zero['shared_alg_params'], 'inner_entropy_enabled': True}
+    assert inherited['shared_alg_params'] == expected
 
 
 def test_publication_recovery_uses_saved_panel_and_json_paths(tmp_path, monkeypatch):

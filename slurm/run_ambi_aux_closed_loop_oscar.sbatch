@@ -18,7 +18,7 @@ export MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBU
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}" TORCHINDUCTOR_COMPILE_THREADS=1
 unset WANDB_RUN_ID WANDB_RESUME WANDB_NAME WANDB_RUN_GROUP WANDB_JOB_TYPE WANDB_TAGS
 python_bin="${AMBI_DMC_PYTHON:?}"
-common=(--root "${AMBI_CAMPAIGN_ROOT:?}" --inventory "${CHECKPOINT_MANIFEST:?}")
+common=(--root "${AMBI_CAMPAIGN_ROOT:?}" --inventory "${CHECKPOINT_MANIFEST:?}" --alpha-mode "${AMBI_ALPHA_MODE:-zero}")
 case "${1:-}" in
   --smoke) seed=101; extra=(--smoke) ;;
   '')
