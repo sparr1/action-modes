@@ -1,0 +1,29 @@
+{
+  "study_type": "single_seed_exploratory_auxiliary_return_sac_study",
+  "study_note": "Four fresh Humanoid Walk state runs cross automatic SAC entropy targets -10.5 and -21 with auxiliary-critic representation gradients attached or detached. The additional independent reward-only critic bootstraps from the SAC actor; no return actor exists. Collection uses the stochastic SAC prior without inner optimization or MPPI. Both critic losses have coefficient 0.1; actor Q is mean-pair and target Q is min-pair. All runs use seed 55, 2 million decisions, 2500 warmup decisions and 2500 pretraining updates, and retain all 80 scheduled checkpoints per run. This is a single-seed exploratory comparison, not confirmatory evidence. Full algorithm recipes are versioned without alg_params overrides.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 2000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_aux_return_sac_clip_target10p5_shared",
+    "ambi_aux_return_sac_clip_target10p5_detached",
+    "ambi_aux_return_sac_clip_target21_shared",
+    "ambi_aux_return_sac_clip_target21_detached"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}
