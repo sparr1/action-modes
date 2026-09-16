@@ -190,11 +190,21 @@ def _planner_display_label(planner, *, compact=False):
         for component in ("critic", "actor", "temperature"):
             dose = settings.get(f"inner_{component}_updates_per_round")
             total = settings.get(f"inner_{component}_updates_per_action")
+            if component == "temperature" and settings.get("inner_entropy_enabled") is False:
+                dose = 0
             if dose is None and isinstance(total, (int, float)) and rounds:
                 dose = total / rounds
             doses.append("?" if dose is None else number(dose))
         parts.append("/".join(prefix + dose for prefix, dose in zip("CAT", doses)))
-        if settings.get("inner_terminal_bootstrap") == "outer":
+        if kind == "sac" and settings.get("inner_finite_horizon"):
+            source = settings.get("inner_critic_source", "sac")
+            tail = settings.get("inner_horizon_critic_source", "sac")
+            if source == tail:
+                parts.append(("return-only Q" if source == "aux_return" else "SAC Q") + " init+tail")
+            else:
+                parts.append(("return Q" if source == "aux_return" else "SAC Q") + " init; " +
+                             ("return Q" if tail == "aux_return" else "SAC Q") + " tail")
+        elif settings.get("inner_terminal_bootstrap") == "outer":
             parts.append("outer-term" if compact else "outer terminal Q")
         else:
             bootstrap = settings.get("inner_bootstrap_source", "inner_target")
