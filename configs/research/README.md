@@ -122,6 +122,33 @@ unless `--overwrite` is supplied explicitly.
 When a comparison's reference preset is selected, it also reports seed-paired
 return deltas for every selected variant.
 
+An existing evaluation curve that omitted its prior reference can be backfilled
+without repeating planner episodes. Evaluate the frozen SAC policy mean on the
+same checkpoint files, environment seeds, controller seed, and full-episode
+protocol. For the auxiliary-return MPPI matrix, use
+`ambi_aux_return_prior_reference.json` and
+`slurm/run_ambi_aux_return_prior_oscar.sbatch`. Wait for the original curve's
+publisher to finish, then validate the complete reference grid:
+
+```bash
+python backfill_eval_series.py /path/to/authoritative/run \
+  --prior-bundles /path/to/prior/step_*/bundle \
+  --checkpoint-inventory /path/to/checkpoint-manifest.json \
+  --owner oscar-rgao48
+```
+
+Add `--publish --receipt /path/to/backfill-receipt.json` to append verified
+`eval/paired_gain_mean`, sample standard deviation, paired episode count, and
+prior return statistics to that same run. Gains are planner return minus prior
+return, matched by seed. The adapter verifies checkpoint hashes, backbone,
+scientific implementation, episode protocol, solver seeds, and frozen-state
+checks. Original return/runtime rows and checkpoint artifacts remain unchanged;
+supplemental rows share their checkpoint x coordinate and have separate
+`evaluation-reference` artifacts. Publication uses the existing exclusive-owner
+lock, immutable journal, and remote acknowledgement checks. Repeating the same
+backfill is idempotent; a different reference for an already paired point is
+rejected.
+
 Q representation is part of the checkpoint architecture. The reference
 checkpoint uses five distributional heads. It can compare checkpoint-compatible
 inner operators and controls, but it cannot be evaluated as a scalar twin model

@@ -8,6 +8,7 @@ import sys
 import pytest
 
 from utils import eval_series as series
+from utils.eval_series_paired import paired_measurements, prepare_paired_reference, stage_paired_reference
 
 
 def record(tmp_path, step=100_000, **changes):
@@ -117,6 +118,123 @@ class FakeWandb:
 
 def publish(registry, backend):
     return series.publish_run(registry["run_dir"], owner="oscar-owner", wandb_module=backend, acknowledgement_timeout=0)
+
+
+def paired_records(tmp_path):
+    target = record(tmp_path)
+    target["identity"]["protocol"] = {"environment_seeds": [101, 102], "max_steps": 500,
+                                      "controller_seed": 55, "action_rule": "mppi_proposal_mean"}
+    target["metrics"]["eval/frozen_state_unchanged"] = True
+    for episode in target["episodes"]:
+        episode.update(solver_seed=episode["seed"] + 10, length=500, truncated=True)
+    prior = deepcopy(target)
+    prior["record_id"] = "prior"
+    prior["identity"]["planner"] = {"type": "prior", "action_rule": "tanh_mean"}
+    prior["identity"]["protocol"]["action_rule"] = "tanh_mean"
+    prior["episodes"][0]["return"] = 0.5
+    prior["episodes"][1]["return"] = 1
+    prior["episodes"].reverse()
+    prior_path = tmp_path / "prior.json"
+    prior_path.write_text(json.dumps(prior["episodes"]))
+    prior["artifact_files"] = {"prior.json": str(prior_path)}
+    return target, prior
+
+
+def test_paired_backfill_preserves_history_artifacts_and_retries(tmp_path):
+    target, prior = paired_records(tmp_path)
+    registry = create(tmp_path, target)
+    run_dir = Path(registry["run_dir"])
+    series.stage_record(run_dir, target)
+    backend = FakeWandb()
+    publish(registry, backend)
+    remote = backend.runs[registry["run_id"]]
+    original_row = deepcopy(remote.rows[0])
+    original_entry = deepcopy(index(registry)["records"][target["record_id"]])
+    original_bytes = (run_dir / "records" / (target["record_id"] + ".json")).read_bytes()
+    prepared = prepare_paired_reference(run_dir, target["record_id"], prior)
+    assert len(index(registry)["records"]) == 1  # preflight has no writes
+    assert prepared["metrics"]["eval/paired_gain_mean"] == 1.25
+    assert prepared["metrics"]["eval/paired_gain_sample_std"] == pytest.approx(1.5 / 2 ** 0.5)
+    assert [e["paired_return_delta"] for e in prepared["episodes"]] == [0.5, 2]
+    assert "eval/return_mean" not in prepared["metrics"]
+    with pytest.raises(series.SeriesError, match="dedicated"):
+        series.stage_record(run_dir, prepared)
+    stage_paired_reference(run_dir, target["record_id"], prior)
+    publish(registry, backend)
+    assert len(remote.rows) == 2
+    assert remote.rows[0] == original_row
+    assert remote.rows[1][series.X_AXIS] == original_row[series.X_AXIS]
+    assert remote.rows[1]["eval/paired_gain_mean"] == 1.25
+    assert "eval/return_mean" not in remote.rows[1]
+    assert "runtime/control_seconds" not in remote.rows[1]
+    assert index(registry)["records"][target["record_id"]] == original_entry
+    assert (run_dir / "records" / (target["record_id"] + ".json")).read_bytes() == original_bytes
+    assert remote.artifacts[0][0].name.startswith("eval-")
+    assert remote.artifacts[1][0].name.startswith("paired-")
+    assert stage_paired_reference(run_dir, target["record_id"], prior)["status"] == "published"
+    assert series.stage_record(run_dir, target)["status"] == "published"
+    publish(registry, backend)
+    assert len(remote.rows) == 2
+    prior["episodes"][0]["return"] = 9
+    with pytest.raises(series.SeriesError, match="different paired reference"):
+        stage_paired_reference(run_dir, target["record_id"], prior)
+
+
+@pytest.mark.parametrize("change", ["backbone", "science", "checkpoint", "protocol", "actor",
+                                  "solver_seed", "seed", "missing_episode", "capped", "nonfinite", "frozen"])
+def test_paired_backfill_rejects_incompatible_reference(tmp_path, change):
+    target, prior = paired_records(tmp_path)
+    if change == "backbone":
+        prior["identity"]["backbone"] = "another/source/run"
+    elif change == "science":
+        prior["identity"]["science"] = {"source": "different"}
+    elif change == "checkpoint":
+        prior["checkpoint"]["sha256"] = "b" * 64
+    elif change == "protocol":
+        prior["identity"]["protocol"]["controller_seed"] = 56
+    elif change == "actor":
+        prior["identity"]["planner"]["settings"] = {"inner_actor_source": "aux_return"}
+    elif change == "solver_seed":
+        prior["episodes"][0]["solver_seed"] += 1
+    elif change == "seed":
+        prior["episodes"][0]["seed"] = 101
+    elif change == "missing_episode":
+        prior["episodes"].pop()
+    elif change == "capped":
+        prior["episodes"][0]["capped"] = True
+    elif change == "nonfinite":
+        prior["episodes"][0]["return"] = float("nan")
+    else:
+        prior["metrics"]["eval/frozen_state_unchanged"] = False
+    with pytest.raises(series.SeriesError):
+        paired_measurements(target, prior)
+
+
+def test_paired_backfill_requires_acknowledgement_and_unchanged_sources(tmp_path):
+    target, prior = paired_records(tmp_path)
+    registry = create(tmp_path, target)
+    series.stage_record(registry["run_dir"], target)
+    with pytest.raises(series.SeriesError, match="acknowledged"):
+        prepare_paired_reference(registry["run_dir"], target["record_id"], prior)
+    publish(registry, FakeWandb())
+    Path(target["source_result_path"]).write_text("changed original")
+    with pytest.raises(series.SeriesError, match="artifacts changed"):
+        prepare_paired_reference(registry["run_dir"], target["record_id"], prior)
+
+
+def test_paired_backfill_reconciles_interrupted_log_without_duplicate(tmp_path):
+    target, prior = paired_records(tmp_path)
+    registry = create(tmp_path, target)
+    series.stage_record(registry["run_dir"], target)
+    backend = FakeWandb()
+    publish(registry, backend)
+    stage_paired_reference(registry["run_dir"], target["record_id"], prior)
+    backend.fail_after_log = True
+    with pytest.raises(RuntimeError, match="after SDK"):
+        publish(registry, backend)
+    backend.fail_after_log = False
+    assert publish(registry, backend)["published"] == 2
+    assert len(backend.runs[registry["run_id"]].rows) == 2
 
 
 def test_new_attempt_always_allocates_distinct_id_before_results(tmp_path):

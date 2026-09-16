@@ -24,6 +24,7 @@ X_AXIS = "checkpoint/training_decisions"
 RECORD_KEY = "publication/record_id"
 HASH_KEY = "publication/record_sha256"
 VISIBLE_METRICS = ("eval/return_mean", "eval/paired_gain_mean", "runtime/control_seconds")
+PAIRED_REFERENCE_KIND = "paired-reference-supplement"
 
 
 class SeriesError(ValueError):
@@ -295,12 +296,16 @@ def stage_record(run_dir, record):
     run_dir = Path(run_dir).resolve()
     registry = load_run(run_dir)
     record = validate_record(record, registry["identity"])
+    if "record_kind" in record:
+        raise SeriesError("Supplemental records require their dedicated validated staging operation")
     file_hashes = {name: _file_digest(path) for name, path in record["artifact_files"].items()}
     fingerprint = _record_fingerprint(record, file_hashes)
     record_id = record["record_id"]
     with _lock(run_dir / ".records.lock"):
         index = _read(run_dir / "publication.json")
         for other_id, entry in index["records"].items():
+            if entry.get("record_kind") == PAIRED_REFERENCE_KIND:
+                continue
             if entry["checkpoint_step"] == record["checkpoint"]["step"]:
                 if other_id != record_id or entry["record_sha256"] != fingerprint:
                     raise SeriesError("Checkpoint already has a different accepted result; create a new run for a repeated evaluation")
@@ -490,7 +495,8 @@ class Publisher:
         if entry["status"] == "staged":
             for name in record["provenance"].get("legacy_artifacts", []):
                 self.run.use_artifact(name)
-            artifact = self.wandb.Artifact("eval-" + self.registry["run_id"] + "-" + str(entry["checkpoint_step"]), type="evaluation-checkpoint", metadata={"record_id": rid, "record_sha256": entry["record_sha256"], "checkpoint_sha256": entry["checkpoint_sha256"]})
+            paired = record.get("record_kind") == PAIRED_REFERENCE_KIND
+            artifact = self.wandb.Artifact(("paired-" if paired else "eval-") + self.registry["run_id"] + "-" + str(entry["checkpoint_step"]), type="evaluation-reference" if paired else "evaluation-checkpoint", metadata={"record_id": rid, "record_sha256": entry["record_sha256"], "checkpoint_sha256": entry["checkpoint_sha256"]})
             for name, path in record["artifact_files"].items():
                 artifact.add_file(path, name=name)
             artifact.add_file(str(self.run_dir / "records" / (rid + ".json")), name="evaluation-series-record.json")
