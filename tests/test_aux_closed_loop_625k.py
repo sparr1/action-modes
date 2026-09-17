@@ -15,15 +15,16 @@ from utils.eval_series_data import _metrics
 
 
 @pytest.fixture(scope='module', params=[
-    ('zero', 'soft_q', 1, 'c32_a4'), ('inherit_outer', 'soft_q', 1, 'c32_a4'),
-    ('auto', 'soft_q', 1, 'c32_a4'), ('auto', 'return_q', 1, 'c32_a4'),
-    ('zero', 'return_q', 1, 'c32_a4'), ('zero', 'soft_init_return_tail', 1, 'c32_a4'),
-    ('auto', 'soft_init_return_tail', 1, 'c32_a4'), ('auto', 'soft_q', 2, 'c32_a4'),
-    ('auto', 'soft_q', 2, 'c64_a4'), ('auto', 'soft_q', 2, 'c64_a8'),
+    ('zero', 'soft_q', 1, 'c32_a4', 1), ('inherit_outer', 'soft_q', 1, 'c32_a4', 1),
+    ('auto', 'soft_q', 1, 'c32_a4', 1), ('auto', 'return_q', 1, 'c32_a4', 1),
+    ('zero', 'return_q', 1, 'c32_a4', 1), ('zero', 'soft_init_return_tail', 1, 'c32_a4', 1),
+    ('auto', 'soft_init_return_tail', 1, 'c32_a4', 1), ('auto', 'soft_q', 2, 'c32_a4', 1),
+    ('auto', 'soft_q', 2, 'c64_a4', 1), ('auto', 'soft_q', 2, 'c64_a8', 1),
+    ('auto', 'soft_q', 1, 'c32_a4', 2),
 ])
 def panel(tmp_path_factory, request):
     import torch
-    alpha_mode, critic_mode, horizon, update_budget = request.param
+    alpha_mode, critic_mode, horizon, update_budget, rounds = request.param
     selector = f'critic/{critic_mode}'
     root = tmp_path_factory.mktemp('aux-closed-loop')
     options = dict(aux_return_mode='sac', log_std_mapping='direct_clamp',
@@ -43,7 +44,7 @@ def panel(tmp_path_factory, request):
                         device='cpu', total_steps=2000000, alg_params=_tiny_params(**options)),
                     experiment_params=dict(env_params=dict(max_episode_steps=3)))
     Path(str(checkpoint) + '.metadata.json').write_text(json.dumps(metadata))
-    matrix = json.loads(matrix_for(alpha_mode, horizon, update_budget).read_text())
+    matrix = json.loads(matrix_for(alpha_mode, horizon, update_budget, rounds).read_text())
     assert matrix['evaluation']['togo_return_rollouts'] == 32
     assert matrix['evaluation']['default_presets'] == [SELECTOR]
     matrix['shared_alg_params']['compile'] = False
@@ -66,16 +67,16 @@ def panel(tmp_path_factory, request):
         evaluate(shard, [seed])
         seal_episode_bundle(shard)
         shards.append(shard)
-    return root, shards, expected_alpha, alpha_mode, critic_mode, horizon, update_budget
+    return root, shards, expected_alpha, alpha_mode, critic_mode, horizon, update_budget, rounds
 
 
 def test_probe_rng_and_parallel_seed_execution_preserve_actual_returns(panel):
-    root, shards, alpha, alpha_mode, critic_mode, horizon, update_budget = panel
+    root, shards, alpha, alpha_mode, critic_mode, horizon, update_budget, rounds = panel
     selector = f'critic/{critic_mode}'
-    serial, record = validate_bundle(root / 'serial', [101, 102], 3, expected_alpha=alpha, alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=horizon, update_budget=update_budget)
+    serial, record = validate_bundle(root / 'serial', [101, 102], 3, expected_alpha=alpha, alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=horizon, update_budget=update_budget, rounds=rounds)
     plain = json.loads((root / 'without-probes/manifest.json').read_text())
     merged_path = merge_episode_bundles(shards, root / 'merged', expected_seeds=[101, 102])
-    merged, merged_record = validate_bundle(merged_path, [101, 102], 3, expected_alpha=alpha, alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=horizon, update_budget=update_budget)
+    merged, merged_record = validate_bundle(merged_path, [101, 102], 3, expected_alpha=alpha, alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=horizon, update_budget=update_budget, rounds=rounds)
     for source in [plain, merged]:
         for expected, actual in zip(serial['runs'][0]['episodes'], source['runs'][0]['episodes']):
             for key in ['seed', 'solver_seed', 'return', 'length', 'paired_return_delta']:
@@ -92,15 +93,15 @@ def test_probe_rng_and_parallel_seed_execution_preserve_actual_returns(panel):
     assert without_probe_time(merged_record['rows']) == without_probe_time(record['rows'])
     assert without_probe_time(merged_record['summaries']) == without_probe_time(record['summaries'])
     history = diagnostic_history(merged_record)
-    assert [r['diagnostic/actor_updates'] for r in history] == [0, UPDATE_BUDGETS[update_budget][1]]
-    assert [r['diagnostic/critic_updates'] for r in history] == [0, UPDATE_BUDGETS[update_budget][0]]
+    assert [r['diagnostic/actor_updates'] for r in history] == [j * UPDATE_BUDGETS[update_budget][1] for j in range(rounds + 1)]
+    assert [r['diagnostic/critic_updates'] for r in history] == [j * UPDATE_BUDGETS[update_budget][0] for j in range(rounds + 1)]
     metrics = _metrics(merged['runs'][0]['episodes'])
     assert metrics['eval/paired_episodes'] == 2
     assert 'eval/paired_gain_mean' in metrics
 
 
 def test_merge_rejects_missing_overlapping_seeds_and_corrupted_traces(panel, tmp_path):
-    _, shards, _, _, _, _, _ = panel
+    _, shards, _, _, _, _, _, _ = panel
     for sources, seeds in [(shards[:1], [101, 102]), (shards, [101, 102, 103])]:
         with pytest.raises(ValueError, match='missing or unexpected seeds'):
             merge_episode_bundles(sources, tmp_path / 'missing', expected_seeds=seeds)
@@ -139,7 +140,7 @@ def test_auto_alpha_matrix_only_unfreezes_temperature_with_explicit_learning_rat
 
 
 def test_auto_alpha_validation_rejects_no_updates_or_carried_alpha(panel, tmp_path):
-    root, _, alpha, alpha_mode, critic_mode, horizon, update_budget = panel
+    root, _, alpha, alpha_mode, critic_mode, horizon, update_budget, rounds = panel
     if alpha_mode != 'auto':
         return
     original = json.loads((root / 'serial/manifest.json').read_text())
@@ -150,12 +151,12 @@ def test_auto_alpha_validation_rejects_no_updates_or_carried_alpha(panel, tmp_pa
         metrics.update(mean=value, min=value, max=value)
         (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
         with pytest.raises(AssertionError):
-            validate_bundle(tmp_path, [101, 102], 3, expected_alpha=alpha, alpha_mode='auto', critic_mode=critic_mode, horizon=horizon, update_budget=update_budget)
+            validate_bundle(tmp_path, [101, 102], 3, expected_alpha=alpha, alpha_mode='auto', critic_mode=critic_mode, horizon=horizon, update_budget=update_budget, rounds=rounds)
 
 
 @pytest.mark.parametrize('critic_mode', ['soft_q', 'return_q', 'soft_init_return_tail'])
-@pytest.mark.parametrize('horizon,update_budget', [(1, 'c32_a4'), (2, 'c32_a4'), (2, 'c64_a4'), (2, 'c64_a8')])
-def test_publication_recovery_uses_saved_panel_and_json_paths(tmp_path, monkeypatch, critic_mode, horizon, update_budget):
+@pytest.mark.parametrize('horizon,update_budget,rounds', [(1, 'c32_a4', 1), (2, 'c32_a4', 1), (2, 'c64_a4', 1), (2, 'c64_a8', 1), (1, 'c32_a4', 2)])
+def test_publication_recovery_uses_saved_panel_and_json_paths(tmp_path, monkeypatch, critic_mode, horizon, update_budget, rounds):
     from argparse import Namespace
     from slurm.ambi_aux_closed_loop import SEEDS, publish
     import utils.ambi_benchmark as benchmark
@@ -170,9 +171,11 @@ def test_publication_recovery_uses_saved_panel_and_json_paths(tmp_path, monkeypa
         receipt['horizon'] = horizon
     if update_budget != 'c32_a4':
         receipt['update_budget'] = update_budget
+    if rounds != 1:
+        receipt['rounds'] = rounds
     (output / 'merge-completion.json').write_text(json.dumps(receipt))
     monkeypatch.setattr(diagnostics, 'read_diagnostic_bundle', lambda _: dict(
-        status='complete', series_id='existing-diagnostic', rows=[{}] * 5000))
+        status='complete', series_id='existing-diagnostic', rows=[{}] * (2500 * (rounds + 1))))
     calls = []
     def stage(bundle, run_map, **kwargs):
         # Exercise the failing JSON serialization of the real helper receipt.
@@ -182,22 +185,27 @@ def test_publication_recovery_uses_saved_panel_and_json_paths(tmp_path, monkeypa
     monkeypatch.setattr(benchmark, 'stage_completed_bundle', stage)
     monkeypatch.setattr(series, 'publish_run', lambda *a, **k: dict(status='complete'))
     monkeypatch.setattr(diagnostics, 'publish_diagnostic_bundle', lambda *a, **k: dict(status='complete'))
-    publish(Namespace(root=tmp_path, run_dir=tmp_path / 'registry', inventory=tmp_path / 'inventory.json', critic_mode=critic_mode, horizon=horizon, update_budget=update_budget))
+    publish(Namespace(root=tmp_path, run_dir=tmp_path / 'registry', inventory=tmp_path / 'inventory.json', critic_mode=critic_mode, horizon=horizon, update_budget=update_budget, rounds=rounds))
     assert calls == [(output / 'bundle', {selector: str(tmp_path / 'registry')})]
     with pytest.raises(AssertionError):
         publish(Namespace(root=tmp_path, run_dir=tmp_path / 'registry',
                           inventory=tmp_path / 'inventory.json', critic_mode=critic_mode,
-                          horizon=horizon, update_budget='c64_a8' if update_budget != 'c64_a8' else 'c64_a4'))
+                          horizon=horizon, update_budget='c64_a8' if update_budget != 'c64_a8' else 'c64_a4', rounds=rounds))
     assert len(calls) == 1
     with pytest.raises(AssertionError):
         publish(Namespace(root=tmp_path, run_dir=tmp_path / 'registry',
                           inventory=tmp_path / 'inventory.json', critic_mode=critic_mode,
-                          horizon=3 - horizon, update_budget=update_budget))
+                          horizon=horizon, update_budget=update_budget, rounds=3 - rounds))
+    assert len(calls) == 1
+    with pytest.raises(AssertionError):
+        publish(Namespace(root=tmp_path, run_dir=tmp_path / 'registry',
+                          inventory=tmp_path / 'inventory.json', critic_mode=critic_mode,
+                          horizon=3 - horizon, update_budget=update_budget, rounds=rounds))
     assert json.loads((output / 'publication-completion.json').read_text())['diagnostic_publication']['status'] == 'complete'
 
 
 def test_mixed_critic_validation_rejects_wrong_initialization_or_tail(panel, tmp_path):
-    root, _, alpha, alpha_mode, critic_mode, horizon, update_budget = panel
+    root, _, alpha, alpha_mode, critic_mode, horizon, update_budget, rounds = panel
     if critic_mode != 'soft_init_return_tail':
         return
     original = json.loads((root / 'serial/manifest.json').read_text())
@@ -211,7 +219,7 @@ def test_mixed_critic_validation_rejects_wrong_initialization_or_tail(panel, tmp
             (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
             with pytest.raises(AssertionError):
                 validate_bundle(tmp_path, [101, 102], 3, expected_alpha=alpha,
-                                alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=horizon, update_budget=update_budget)
+                                alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=horizon, update_budget=update_budget, rounds=rounds)
 
 
 def test_h2_matrix_changes_only_rollout_horizon():
@@ -225,7 +233,7 @@ def test_h2_matrix_changes_only_rollout_horizon():
 
 
 def test_h2_validation_rejects_h1_workload_or_probe(panel, tmp_path):
-    root, _, alpha, alpha_mode, critic_mode, horizon, update_budget = panel
+    root, _, alpha, alpha_mode, critic_mode, horizon, update_budget, rounds = panel
     if horizon != 2:
         return
     original = json.loads((root / 'serial/manifest.json').read_text())
@@ -241,7 +249,7 @@ def test_h2_validation_rejects_h1_workload_or_probe(panel, tmp_path):
         (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
         with pytest.raises(AssertionError):
             validate_bundle(tmp_path, [101, 102], 3, expected_alpha=alpha,
-                            alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=2, update_budget=update_budget)
+                            alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=2, update_budget=update_budget, rounds=rounds)
 
 
 @pytest.mark.parametrize('budget,critic,actor', [('c64_a4', 64, 4), ('c64_a8', 64, 8)])
@@ -260,7 +268,7 @@ def test_h2_update_matrices_change_only_update_counts(budget, critic, actor):
 
 
 def test_update_budget_validation_rejects_wrong_counts_and_cross_budget_labels(panel, tmp_path):
-    root, _, alpha, alpha_mode, critic_mode, horizon, update_budget = panel
+    root, _, alpha, alpha_mode, critic_mode, horizon, update_budget, rounds = panel
     if horizon != 2:
         return
     original = json.loads((root / 'serial/manifest.json').read_text())
@@ -268,7 +276,7 @@ def test_update_budget_validation_rejects_wrong_counts_and_cross_budget_labels(p
     with pytest.raises(AssertionError):
         validate_bundle(root / 'serial', [101, 102], 3, expected_alpha=alpha,
                         alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=2,
-                        update_budget=other)
+                        update_budget=other, rounds=rounds)
     for metric in ('inner_critic_optimizer_steps', 'inner_actor_optimizer_steps',
                    'inner_temperature_optimizer_steps'):
         manifest = copy.deepcopy(original)
@@ -277,4 +285,41 @@ def test_update_budget_validation_rejects_wrong_counts_and_cross_budget_labels(p
         with pytest.raises(AssertionError):
             validate_bundle(tmp_path, [101, 102], 3, expected_alpha=alpha,
                             alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=2,
-                            update_budget=update_budget)
+                            update_budget=update_budget, rounds=rounds)
+
+
+def test_j2_matrix_changes_only_round_count():
+    base = json.loads(matrix_for('auto').read_text())
+    j2 = json.loads(matrix_for('auto', rounds=2).read_text())
+    assert j2['shared_alg_params'] == {**base['shared_alg_params'], 'inner_rounds': 2}
+    for key in set(base) - {'description', 'shared_alg_params'}:
+        assert j2[key] == base[key]
+    for alpha, horizon, budget, rounds in [('zero', 1, 'c32_a4', 2),
+                                          ('auto', 2, 'c32_a4', 2),
+                                          ('auto', 1, 'c64_a4', 2),
+                                          ('auto', 1, 'c32_a4', 4)]:
+        with pytest.raises(ValueError, match='Additional rounds require'):
+            matrix_for(alpha, horizon, budget, rounds)
+
+
+def test_j2_validation_requires_both_rounds_and_cumulative_probe_axes(panel, tmp_path):
+    root, _, alpha, alpha_mode, critic_mode, horizon, update_budget, rounds = panel
+    if rounds != 2:
+        return
+    with pytest.raises(AssertionError):
+        validate_bundle(root / 'serial', [101, 102], 3, expected_alpha=alpha,
+                        alpha_mode=alpha_mode, rounds=1)
+    original = json.loads((root / 'serial/manifest.json').read_text())
+    for mutation in ('round_count', 'missing_probe', 'wrong_cumulative_updates'):
+        manifest = copy.deepcopy(original)
+        run = manifest['runs'][0]
+        if mutation == 'round_count':
+            run['resolved_config']['inner_rounds'] = 1
+        elif mutation == 'missing_probe':
+            run['episodes'][0]['togo_round_summaries'].pop()
+        else:
+            run['episodes'][0]['togo_round_summaries'][-1]['critic_updates'] = 32
+        (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
+        with pytest.raises(AssertionError):
+            validate_bundle(tmp_path, [101, 102], 3, expected_alpha=alpha,
+                            alpha_mode=alpha_mode, rounds=2)
