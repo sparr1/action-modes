@@ -124,6 +124,13 @@
             "inner_horizon_critic_source": "sac",
             "inner_updates_per_round": 0
           }
+        },
+        "soft_init_return_tail": {
+          "description": "Fresh frozen-SAC actor and soft-Q critic copies, return-only terminal bootstrap; reward-only inner fitting, fixed inherited outer alpha.",
+          "alg_params": {
+            "inner_critic_source": "sac",
+            "inner_horizon_critic_source": "aux_return"
+          }
         }
       }
     }

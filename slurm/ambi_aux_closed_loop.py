@@ -13,7 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 MATRIX = ROOT / 'configs/research/ambi_aux_closed_loop_625k.json'
 SELECTOR = 'critic/soft_q'
-CRITIC_SOURCES = {'soft_q': 'sac', 'return_q': 'aux_return'}
+CRITIC_ROUTES = {
+    'soft_q': ('sac', 'sac'),
+    'return_q': ('aux_return', 'aux_return'),
+    'soft_init_return_tail': ('sac', 'aux_return'),
+}
 SEEDS = [101, 102, 103, 104, 105]
 ATTEMPT = 'aux625k-soft-init-soft-tail-j1-alpha0-20260916'
 MATRICES = {'zero': MATRIX, 'inherit_outer': ROOT / 'configs/research/ambi_aux_closed_loop_625k_inherited_alpha.json'}
@@ -42,7 +46,7 @@ def validate_bundle(path, seeds, max_steps, *, paired=True, expected_alpha=0., a
         alpha_mode = 'inherit_outer' if expected_alpha > 0 else 'zero'
     assert alpha_mode in MATRICES
     selector = f'critic/{critic_mode}'
-    critic_source = CRITIC_SOURCES[critic_mode]
+    critic_source, horizon_critic_source = CRITIC_ROUTES[critic_mode]
     manifest = json.loads((Path(path) / 'manifest.json').read_text())
     assert manifest['status'] == 'complete'
     assert len(manifest['runs']) == 1
@@ -53,10 +57,12 @@ def validate_bundle(path, seeds, max_steps, *, paired=True, expected_alpha=0., a
     assert result['outer_updates_before'] == result['outer_updates_after']
     assert not result['nonfinite_model_metrics'] and not result['nonfinite_trace_metrics']
     assert result['environment_seeds'] == seeds and result['controller_seed'] == 55
-    assert cfg['inner_critic_source'] == cfg['inner_horizon_critic_source'] == critic_source
+    assert cfg['inner_critic_source'] == critic_source
+    assert cfg['inner_horizon_critic_source'] == horizon_critic_source
     assert cfg['inner_actor_source'] == cfg['inner_horizon_actor_source'] == 'sac'
     routing = result['value_routing']
-    assert routing['inner_critic_source'] == routing['inner_horizon_critic_source'] == critic_source
+    assert routing['inner_critic_source'] == critic_source
+    assert routing['inner_horizon_critic_source'] == horizon_critic_source
     assert routing['inner_actor_source'] == routing['inner_horizon_actor_source'] == 'sac'
     assert cfg['inner_actor_initialization'] == cfg['inner_critic_initialization'] == 'prior'
     assert cfg['inner_critic_target_initialization'] == 'online'
@@ -106,6 +112,8 @@ def validate_bundle(path, seeds, max_steps, *, paired=True, expected_alpha=0., a
     attempt = ATTEMPTS[alpha_mode]
     if critic_mode == 'return_q':
         attempt = attempt.replace('soft-init-soft-tail', 'return-init-return-tail')
+    elif critic_mode == 'soft_init_return_tail':
+        attempt = attempt.replace('soft-init-soft-tail', 'soft-init-return-tail').replace('20260916', '20260917')
     diagnostics = record_from_model_bundle(path, selector, attempt, bootstrap_resamples=2000,
                                           bootstrap_seed=20260912)
     assert diagnostics['status'] == 'complete'
@@ -228,7 +236,7 @@ def main():
     parser.add_argument('--run-dir', type=Path)
     parser.add_argument('--publish', action='store_true')
     parser.add_argument('--alpha-mode', choices=list(MATRICES), default='zero')
-    parser.add_argument('--critic-mode', choices=list(CRITIC_SOURCES), default='soft_q')
+    parser.add_argument('--critic-mode', choices=list(CRITIC_ROUTES), default='soft_q')
     args = parser.parse_args()
     {'worker': worker, 'merge': merge, 'publish': publish}[args.mode](args)
 

@@ -15,7 +15,9 @@ from utils.eval_series_data import _metrics
 
 
 @pytest.fixture(scope='module', params=[('zero', 'soft_q'), ('inherit_outer', 'soft_q'),
-                                      ('auto', 'soft_q'), ('auto', 'return_q')])
+                                      ('auto', 'soft_q'), ('auto', 'return_q'),
+                                      ('zero', 'return_q'), ('zero', 'soft_init_return_tail'),
+                                      ('auto', 'soft_init_return_tail')])
 def panel(tmp_path_factory, request):
     import torch
     alpha_mode, critic_mode = request.param
@@ -148,7 +150,7 @@ def test_auto_alpha_validation_rejects_no_updates_or_carried_alpha(panel, tmp_pa
             validate_bundle(tmp_path, [101, 102], 3, expected_alpha=alpha, alpha_mode='auto', critic_mode=critic_mode)
 
 
-@pytest.mark.parametrize('critic_mode', ['soft_q', 'return_q'])
+@pytest.mark.parametrize('critic_mode', ['soft_q', 'return_q', 'soft_init_return_tail'])
 def test_publication_recovery_uses_saved_panel_and_json_paths(tmp_path, monkeypatch, critic_mode):
     from argparse import Namespace
     from slurm.ambi_aux_closed_loop import SEEDS, publish
@@ -175,3 +177,21 @@ def test_publication_recovery_uses_saved_panel_and_json_paths(tmp_path, monkeypa
     publish(Namespace(root=tmp_path, run_dir=tmp_path / 'registry', inventory=tmp_path / 'inventory.json', critic_mode=critic_mode))
     assert calls == [(output / 'bundle', {selector: str(tmp_path / 'registry')})]
     assert json.loads((output / 'publication-completion.json').read_text())['diagnostic_publication']['status'] == 'complete'
+
+
+def test_mixed_critic_validation_rejects_wrong_initialization_or_tail(panel, tmp_path):
+    root, _, alpha, alpha_mode, critic_mode = panel
+    if critic_mode != 'soft_init_return_tail':
+        return
+    original = json.loads((root / 'serial/manifest.json').read_text())
+    for location in ('resolved_config', 'value_routing'):
+        for key, wrong in [('inner_critic_source', 'aux_return'),
+                           ('inner_horizon_critic_source', 'sac')]:
+            manifest = copy.deepcopy(original)
+            run = manifest['runs'][0]
+            target = run['resolved_config'] if location == 'resolved_config' else run['result']['value_routing']
+            target[key] = wrong
+            (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
+            with pytest.raises(AssertionError):
+                validate_bundle(tmp_path, [101, 102], 3, expected_alpha=alpha,
+                                alpha_mode=alpha_mode, critic_mode=critic_mode)
