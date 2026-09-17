@@ -25,6 +25,18 @@ ATTEMPTS = {'zero': ATTEMPT, 'inherit_outer': 'aux625k-soft-init-soft-tail-j1-in
 MATRICES['auto'] = ROOT / 'configs/research/ambi_aux_closed_loop_625k_auto_alpha.json'
 ATTEMPTS['auto'] = 'aux625k-soft-init-soft-tail-j1-auto-alpha-20260916'
 
+HORIZON_MATRICES = {
+    1: MATRICES,
+    2: {'auto': ROOT / 'configs/research/ambi_aux_closed_loop_625k_auto_alpha_h2.json'},
+}
+
+
+def matrix_for(alpha_mode, horizon=1):
+    try:
+        return HORIZON_MATRICES[horizon][alpha_mode]
+    except KeyError as exc:
+        raise ValueError(f'No tested matrix for alpha={alpha_mode}, horizon={horizon}') from exc
+
 
 def checkpoint_alpha(path):
     """Read the saved outer temperature without constructing a learner."""
@@ -40,11 +52,11 @@ def checkpoint_alpha(path):
 
 
 def validate_bundle(path, seeds, max_steps, *, paired=True, expected_alpha=0., alpha_mode=None,
-                    critic_mode='soft_q'):
+                    critic_mode='soft_q', horizon=1):
     from utils.ambi_diagnostic_series import record_from_model_bundle
     if alpha_mode is None:
         alpha_mode = 'inherit_outer' if expected_alpha > 0 else 'zero'
-    assert alpha_mode in MATRICES
+    matrix_for(alpha_mode, horizon)
     selector = f'critic/{critic_mode}'
     critic_source, horizon_critic_source = CRITIC_ROUTES[critic_mode]
     manifest = json.loads((Path(path) / 'manifest.json').read_text())
@@ -75,9 +87,9 @@ def validate_bundle(path, seeds, max_steps, *, paired=True, expected_alpha=0., a
         assert expected_alpha > 0 and cfg['inner_temperature_lr'] == 3e-4
     assert cfg['inner_execution_action'] == 'mean'
     assert cfg['inner_log_std_mapping'] == 'direct_clamp'
-    assert cfg['inner_batch_size'] == 256 and cfg['inner_rollout_horizon'] == 1
+    assert cfg['inner_batch_size'] == 256 and cfg['inner_rollout_horizon'] == horizon
     assert cfg['inner_rounds'] == 1 and cfg['inner_rollouts_per_round'] == 128
-    for key, value in [('inner_model_steps', 128), ('inner_actor_optimizer_steps', 4),
+    for key, value in [('inner_model_steps', 128 * horizon), ('inner_actor_optimizer_steps', 4),
                        ('inner_critic_optimizer_steps', 32),
                        ('inner_temperature_optimizer_steps', 4 if alpha_mode == 'auto' else 0),
                        ('inner_compile_fallback', 0)]:
@@ -97,7 +109,7 @@ def validate_bundle(path, seeds, max_steps, *, paired=True, expected_alpha=0., a
         for statistic in ('mean', 'min', 'max'):
             assert result['model_metrics']['inner_alpha'][statistic] == final[statistic]
     probe = run['togo_return_probe']
-    assert probe['rollouts'] == 32 and probe['horizon'] == 1
+    assert probe['rollouts'] == 32 and probe['horizon'] == horizon
     assert probe['cadence'] == 'initial_and_after_each_round' and not probe['entropy_bonus']
     assert probe['tail_q_reduction'] == 'mean_pair'
     assert [e['seed'] for e in run['episodes']] == seeds
@@ -114,6 +126,8 @@ def validate_bundle(path, seeds, max_steps, *, paired=True, expected_alpha=0., a
         attempt = attempt.replace('soft-init-soft-tail', 'return-init-return-tail')
     elif critic_mode == 'soft_init_return_tail':
         attempt = attempt.replace('soft-init-soft-tail', 'soft-init-return-tail').replace('20260916', '20260917')
+    if horizon != 1:
+        attempt = attempt.replace('-j1-', f'-j1-h{horizon}-').replace('20260916', '20260917')
     diagnostics = record_from_model_bundle(path, selector, attempt, bootstrap_resamples=2000,
                                           bootstrap_seed=20260912)
     assert diagnostics['status'] == 'complete'
@@ -134,21 +148,21 @@ def worker(args):
         assert expected_alpha > 0, 'Inherited-alpha condition requires a saved positive coefficient'
     directory = args.root / ('smoke' if args.smoke else f'shards/seed-{args.seed}')
     directory.mkdir(parents=True, exist_ok=False)
-    result = evaluate_matrix(MATRICES[args.alpha_mode], args.checkpoint, selectors=[selector], seeds=[args.seed],
+    result = evaluate_matrix(matrix_for(args.alpha_mode, args.horizon), args.checkpoint, selectors=[selector], seeds=[args.seed],
                              controller_seed=55, max_steps=20 if args.smoke else 500, device='cuda',
                              bundle_dir=directory / 'bundle', checkpoint_inventory=args.inventory,
                              reference_bundle=None if args.smoke else args.reference)
     (directory / 'results.json').write_text(json.dumps(result, indent=2) + '\n')
     manifest, _ = validate_bundle(directory / 'bundle', [args.seed], 20 if args.smoke else 500,
                                   paired=not args.smoke, expected_alpha=expected_alpha,
-                                  alpha_mode=args.alpha_mode, critic_mode=args.critic_mode)
+                                  alpha_mode=args.alpha_mode, critic_mode=args.critic_mode, horizon=args.horizon)
     cfg = manifest['runs'][0]['resolved_config']
     assert cfg['compile'] and cfg['compile_strict']
     assert result['results'][0]['resolved_device'].startswith('cuda')
     assert manifest['checkpoint']['metadata']['checkpoint']['step'] == 625000
     seal_episode_bundle(directory / 'bundle')
     receipt = dict(status='complete', seed=args.seed, smoke=args.smoke,
-                   alpha_mode=args.alpha_mode, critic_mode=args.critic_mode, selector=selector,
+                   alpha_mode=args.alpha_mode, critic_mode=args.critic_mode, horizon=args.horizon, selector=selector,
                    saved_outer_alpha=saved_alpha,
                    inner_alpha_initial=expected_alpha,
                    inner_alpha_final_mean=manifest['runs'][0]['result']['model_metrics']['inner_alpha_final']['mean'],
@@ -171,11 +185,12 @@ def merge(args):
         assert receipt['status'] == 'complete' and receipt['seed'] == seed and not receipt['smoke']
         assert receipt.get('alpha_mode', 'zero') == args.alpha_mode
         assert receipt.get('critic_mode', 'soft_q') == args.critic_mode
+        assert receipt.get('horizon', 1) == args.horizon
         alphas.append(receipt.get('inner_alpha_initial', receipt.get('inner_alpha', 0.)))
     assert len(set(alphas)) == 1
     bundle = merge_episode_bundles(sources, args.root / 'production/bundle', expected_seeds=SEEDS)
     manifest, diagnostic = validate_bundle(bundle, SEEDS, 500, expected_alpha=alphas[0],
-                                           alpha_mode=args.alpha_mode, critic_mode=args.critic_mode)
+                                           alpha_mode=args.alpha_mode, critic_mode=args.critic_mode, horizon=args.horizon)
     record, = load_records(bundle, inventory_path=args.inventory)
     assert record['checkpoint']['step'] == 625000
     assert record['identity'] == load_run(args.run_dir)['identity']
@@ -185,7 +200,7 @@ def merge(args):
     (output / 'results.json').write_text(json.dumps({'results': [r['result'] for r in manifest['runs']]}, indent=2) + '\n')
     write_diagnostic_bundle(output / 'model-series', diagnostic)
     receipt = dict(status='complete', checkpoint_step=625000, seeds=SEEDS,
-                   alpha_mode=args.alpha_mode, critic_mode=args.critic_mode,
+                   alpha_mode=args.alpha_mode, critic_mode=args.critic_mode, horizon=args.horizon,
                    selector=f'critic/{args.critic_mode}', inner_alpha_initial=alphas[0],
                    inner_alpha_final_mean=manifest['runs'][0]['result']['model_metrics']['inner_alpha_final']['mean'],
                    metrics=record['metrics'], diagnostic_series_id=diagnostic['series_id'])
@@ -209,6 +224,7 @@ def publish(args):
     selector = f'critic/{critic_mode}'
     assert receipt.get('critic_mode', 'soft_q') == critic_mode
     assert receipt.get('selector', SELECTOR) == selector
+    assert receipt.get('horizon', 1) == getattr(args, 'horizon', 1)
     diagnostic_path = output / 'model-series'
     diagnostic = read_diagnostic_bundle(diagnostic_path)
     assert diagnostic['series_id'] == receipt['diagnostic_series_id']
@@ -235,9 +251,11 @@ def main():
     parser.add_argument('--smoke', action='store_true')
     parser.add_argument('--run-dir', type=Path)
     parser.add_argument('--publish', action='store_true')
+    parser.add_argument('--horizon', type=int, choices=list(HORIZON_MATRICES), default=1)
     parser.add_argument('--alpha-mode', choices=list(MATRICES), default='zero')
     parser.add_argument('--critic-mode', choices=list(CRITIC_ROUTES), default='soft_q')
     args = parser.parse_args()
+    matrix_for(args.alpha_mode, args.horizon)
     {'worker': worker, 'merge': merge, 'publish': publish}[args.mode](args)
 
 

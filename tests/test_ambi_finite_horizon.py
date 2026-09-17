@@ -55,7 +55,7 @@ def test_horizon_hands_off_to_outer_priors_and_true_terminal_masks_both(
     assert all(p.grad is None for p in engine.model._Qs.parameters())
 
 
-@pytest.mark.parametrize('horizon', [1, 3])
+@pytest.mark.parametrize('horizon', [1, 2, 3])
 @pytest.mark.parametrize('mode', ['none', 'frozen_random', 'shared_mixture', 'separate_critics', 'adaptive_param_noise'])
 def test_all_collectors_label_only_last_depth(monkeypatch, horizon, mode):
     extra = {'inner_param_noise_actor_count': 1} if mode == 'adaptive_param_noise' else {}
