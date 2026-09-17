@@ -7,20 +7,23 @@ from pathlib import Path
 import pytest
 
 from evaluate_ambi_checkpoint import evaluate_matrix
-from slurm.ambi_aux_closed_loop import MATRIX, MATRICES, SELECTOR, checkpoint_alpha, matrix_for, validate_bundle
+from slurm.ambi_aux_closed_loop import MATRIX, MATRICES, SELECTOR, checkpoint_alpha, matrix_for, validate_bundle, UPDATE_BUDGETS
 from tests.test_ambi_root_local_sac import _tiny_model, _tiny_params
 from utils.ambi_diagnostic_series import diagnostic_history, record_from_model_bundle
 from utils.ambi_seed_shards import merge_episode_bundles, seal_episode_bundle
 from utils.eval_series_data import _metrics
 
 
-@pytest.fixture(scope='module', params=[('zero', 'soft_q', 1), ('inherit_outer', 'soft_q', 1),
-                                      ('auto', 'soft_q', 1), ('auto', 'return_q', 1),
-                                      ('zero', 'return_q', 1), ('zero', 'soft_init_return_tail', 1),
-                                      ('auto', 'soft_init_return_tail', 1), ('auto', 'soft_q', 2)])
+@pytest.fixture(scope='module', params=[
+    ('zero', 'soft_q', 1, 'c32_a4'), ('inherit_outer', 'soft_q', 1, 'c32_a4'),
+    ('auto', 'soft_q', 1, 'c32_a4'), ('auto', 'return_q', 1, 'c32_a4'),
+    ('zero', 'return_q', 1, 'c32_a4'), ('zero', 'soft_init_return_tail', 1, 'c32_a4'),
+    ('auto', 'soft_init_return_tail', 1, 'c32_a4'), ('auto', 'soft_q', 2, 'c32_a4'),
+    ('auto', 'soft_q', 2, 'c64_a4'), ('auto', 'soft_q', 2, 'c64_a8'),
+])
 def panel(tmp_path_factory, request):
     import torch
-    alpha_mode, critic_mode, horizon = request.param
+    alpha_mode, critic_mode, horizon, update_budget = request.param
     selector = f'critic/{critic_mode}'
     root = tmp_path_factory.mktemp('aux-closed-loop')
     options = dict(aux_return_mode='sac', log_std_mapping='direct_clamp',
@@ -40,7 +43,7 @@ def panel(tmp_path_factory, request):
                         device='cpu', total_steps=2000000, alg_params=_tiny_params(**options)),
                     experiment_params=dict(env_params=dict(max_episode_steps=3)))
     Path(str(checkpoint) + '.metadata.json').write_text(json.dumps(metadata))
-    matrix = json.loads(matrix_for(alpha_mode, horizon).read_text())
+    matrix = json.loads(matrix_for(alpha_mode, horizon, update_budget).read_text())
     assert matrix['evaluation']['togo_return_rollouts'] == 32
     assert matrix['evaluation']['default_presets'] == [SELECTOR]
     matrix['shared_alg_params']['compile'] = False
@@ -63,16 +66,16 @@ def panel(tmp_path_factory, request):
         evaluate(shard, [seed])
         seal_episode_bundle(shard)
         shards.append(shard)
-    return root, shards, expected_alpha, alpha_mode, critic_mode, horizon
+    return root, shards, expected_alpha, alpha_mode, critic_mode, horizon, update_budget
 
 
 def test_probe_rng_and_parallel_seed_execution_preserve_actual_returns(panel):
-    root, shards, alpha, alpha_mode, critic_mode, horizon = panel
+    root, shards, alpha, alpha_mode, critic_mode, horizon, update_budget = panel
     selector = f'critic/{critic_mode}'
-    serial, record = validate_bundle(root / 'serial', [101, 102], 3, expected_alpha=alpha, alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=horizon)
+    serial, record = validate_bundle(root / 'serial', [101, 102], 3, expected_alpha=alpha, alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=horizon, update_budget=update_budget)
     plain = json.loads((root / 'without-probes/manifest.json').read_text())
     merged_path = merge_episode_bundles(shards, root / 'merged', expected_seeds=[101, 102])
-    merged, merged_record = validate_bundle(merged_path, [101, 102], 3, expected_alpha=alpha, alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=horizon)
+    merged, merged_record = validate_bundle(merged_path, [101, 102], 3, expected_alpha=alpha, alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=horizon, update_budget=update_budget)
     for source in [plain, merged]:
         for expected, actual in zip(serial['runs'][0]['episodes'], source['runs'][0]['episodes']):
             for key in ['seed', 'solver_seed', 'return', 'length', 'paired_return_delta']:
@@ -89,15 +92,15 @@ def test_probe_rng_and_parallel_seed_execution_preserve_actual_returns(panel):
     assert without_probe_time(merged_record['rows']) == without_probe_time(record['rows'])
     assert without_probe_time(merged_record['summaries']) == without_probe_time(record['summaries'])
     history = diagnostic_history(merged_record)
-    assert [r['diagnostic/actor_updates'] for r in history] == [0, 4]
-    assert [r['diagnostic/critic_updates'] for r in history] == [0, 32]
+    assert [r['diagnostic/actor_updates'] for r in history] == [0, UPDATE_BUDGETS[update_budget][1]]
+    assert [r['diagnostic/critic_updates'] for r in history] == [0, UPDATE_BUDGETS[update_budget][0]]
     metrics = _metrics(merged['runs'][0]['episodes'])
     assert metrics['eval/paired_episodes'] == 2
     assert 'eval/paired_gain_mean' in metrics
 
 
 def test_merge_rejects_missing_overlapping_seeds_and_corrupted_traces(panel, tmp_path):
-    _, shards, _, _, _, _ = panel
+    _, shards, _, _, _, _, _ = panel
     for sources, seeds in [(shards[:1], [101, 102]), (shards, [101, 102, 103])]:
         with pytest.raises(ValueError, match='missing or unexpected seeds'):
             merge_episode_bundles(sources, tmp_path / 'missing', expected_seeds=seeds)
@@ -136,7 +139,7 @@ def test_auto_alpha_matrix_only_unfreezes_temperature_with_explicit_learning_rat
 
 
 def test_auto_alpha_validation_rejects_no_updates_or_carried_alpha(panel, tmp_path):
-    root, _, alpha, alpha_mode, critic_mode, horizon = panel
+    root, _, alpha, alpha_mode, critic_mode, horizon, update_budget = panel
     if alpha_mode != 'auto':
         return
     original = json.loads((root / 'serial/manifest.json').read_text())
@@ -147,12 +150,12 @@ def test_auto_alpha_validation_rejects_no_updates_or_carried_alpha(panel, tmp_pa
         metrics.update(mean=value, min=value, max=value)
         (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
         with pytest.raises(AssertionError):
-            validate_bundle(tmp_path, [101, 102], 3, expected_alpha=alpha, alpha_mode='auto', critic_mode=critic_mode, horizon=horizon)
+            validate_bundle(tmp_path, [101, 102], 3, expected_alpha=alpha, alpha_mode='auto', critic_mode=critic_mode, horizon=horizon, update_budget=update_budget)
 
 
 @pytest.mark.parametrize('critic_mode', ['soft_q', 'return_q', 'soft_init_return_tail'])
-@pytest.mark.parametrize('horizon', [1, 2])
-def test_publication_recovery_uses_saved_panel_and_json_paths(tmp_path, monkeypatch, critic_mode, horizon):
+@pytest.mark.parametrize('horizon,update_budget', [(1, 'c32_a4'), (2, 'c32_a4'), (2, 'c64_a4'), (2, 'c64_a8')])
+def test_publication_recovery_uses_saved_panel_and_json_paths(tmp_path, monkeypatch, critic_mode, horizon, update_budget):
     from argparse import Namespace
     from slurm.ambi_aux_closed_loop import SEEDS, publish
     import utils.ambi_benchmark as benchmark
@@ -165,6 +168,8 @@ def test_publication_recovery_uses_saved_panel_and_json_paths(tmp_path, monkeypa
                    diagnostic_series_id='existing-diagnostic', critic_mode=critic_mode, selector=selector)
     if horizon != 1:
         receipt['horizon'] = horizon
+    if update_budget != 'c32_a4':
+        receipt['update_budget'] = update_budget
     (output / 'merge-completion.json').write_text(json.dumps(receipt))
     monkeypatch.setattr(diagnostics, 'read_diagnostic_bundle', lambda _: dict(
         status='complete', series_id='existing-diagnostic', rows=[{}] * 5000))
@@ -177,17 +182,22 @@ def test_publication_recovery_uses_saved_panel_and_json_paths(tmp_path, monkeypa
     monkeypatch.setattr(benchmark, 'stage_completed_bundle', stage)
     monkeypatch.setattr(series, 'publish_run', lambda *a, **k: dict(status='complete'))
     monkeypatch.setattr(diagnostics, 'publish_diagnostic_bundle', lambda *a, **k: dict(status='complete'))
-    publish(Namespace(root=tmp_path, run_dir=tmp_path / 'registry', inventory=tmp_path / 'inventory.json', critic_mode=critic_mode, horizon=horizon))
+    publish(Namespace(root=tmp_path, run_dir=tmp_path / 'registry', inventory=tmp_path / 'inventory.json', critic_mode=critic_mode, horizon=horizon, update_budget=update_budget))
     assert calls == [(output / 'bundle', {selector: str(tmp_path / 'registry')})]
     with pytest.raises(AssertionError):
         publish(Namespace(root=tmp_path, run_dir=tmp_path / 'registry',
                           inventory=tmp_path / 'inventory.json', critic_mode=critic_mode,
-                          horizon=3 - horizon))
+                          horizon=horizon, update_budget='c64_a8' if update_budget != 'c64_a8' else 'c64_a4'))
+    assert len(calls) == 1
+    with pytest.raises(AssertionError):
+        publish(Namespace(root=tmp_path, run_dir=tmp_path / 'registry',
+                          inventory=tmp_path / 'inventory.json', critic_mode=critic_mode,
+                          horizon=3 - horizon, update_budget=update_budget))
     assert json.loads((output / 'publication-completion.json').read_text())['diagnostic_publication']['status'] == 'complete'
 
 
 def test_mixed_critic_validation_rejects_wrong_initialization_or_tail(panel, tmp_path):
-    root, _, alpha, alpha_mode, critic_mode, horizon = panel
+    root, _, alpha, alpha_mode, critic_mode, horizon, update_budget = panel
     if critic_mode != 'soft_init_return_tail':
         return
     original = json.loads((root / 'serial/manifest.json').read_text())
@@ -201,7 +211,7 @@ def test_mixed_critic_validation_rejects_wrong_initialization_or_tail(panel, tmp
             (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
             with pytest.raises(AssertionError):
                 validate_bundle(tmp_path, [101, 102], 3, expected_alpha=alpha,
-                                alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=horizon)
+                                alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=horizon, update_budget=update_budget)
 
 
 def test_h2_matrix_changes_only_rollout_horizon():
@@ -215,7 +225,7 @@ def test_h2_matrix_changes_only_rollout_horizon():
 
 
 def test_h2_validation_rejects_h1_workload_or_probe(panel, tmp_path):
-    root, _, alpha, alpha_mode, critic_mode, horizon = panel
+    root, _, alpha, alpha_mode, critic_mode, horizon, update_budget = panel
     if horizon != 2:
         return
     original = json.loads((root / 'serial/manifest.json').read_text())
@@ -231,4 +241,40 @@ def test_h2_validation_rejects_h1_workload_or_probe(panel, tmp_path):
         (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
         with pytest.raises(AssertionError):
             validate_bundle(tmp_path, [101, 102], 3, expected_alpha=alpha,
-                            alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=2)
+                            alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=2, update_budget=update_budget)
+
+
+@pytest.mark.parametrize('budget,critic,actor', [('c64_a4', 64, 4), ('c64_a8', 64, 8)])
+def test_h2_update_matrices_change_only_update_counts(budget, critic, actor):
+    base = json.loads(matrix_for('auto', 2).read_text())
+    updated = json.loads(matrix_for('auto', 2, budget).read_text())
+    assert updated['shared_alg_params'] == {
+        **base['shared_alg_params'], 'inner_critic_updates_per_round': critic,
+        'inner_actor_updates_per_round': actor,
+    }
+    for key in set(base) - {'description', 'shared_alg_params'}:
+        assert updated[key] == base[key]
+    for alpha, horizon in [('zero', 2), ('inherit_outer', 2), ('auto', 1)]:
+        with pytest.raises(ValueError, match='require H2'):
+            matrix_for(alpha, horizon, budget)
+
+
+def test_update_budget_validation_rejects_wrong_counts_and_cross_budget_labels(panel, tmp_path):
+    root, _, alpha, alpha_mode, critic_mode, horizon, update_budget = panel
+    if horizon != 2:
+        return
+    original = json.loads((root / 'serial/manifest.json').read_text())
+    other = 'c64_a4' if update_budget == 'c32_a4' else 'c32_a4'
+    with pytest.raises(AssertionError):
+        validate_bundle(root / 'serial', [101, 102], 3, expected_alpha=alpha,
+                        alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=2,
+                        update_budget=other)
+    for metric in ('inner_critic_optimizer_steps', 'inner_actor_optimizer_steps',
+                   'inner_temperature_optimizer_steps'):
+        manifest = copy.deepcopy(original)
+        manifest['runs'][0]['result']['model_metrics'][metric].update(mean=0, min=0, max=0)
+        (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
+        with pytest.raises(AssertionError):
+            validate_bundle(tmp_path, [101, 102], 3, expected_alpha=alpha,
+                            alpha_mode=alpha_mode, critic_mode=critic_mode, horizon=2,
+                            update_budget=update_budget)

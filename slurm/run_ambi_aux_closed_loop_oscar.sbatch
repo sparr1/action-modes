@@ -19,6 +19,7 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}" TORCHINDUCTOR_COMPILE_THREADS
 unset WANDB_RUN_ID WANDB_RESUME WANDB_NAME WANDB_RUN_GROUP WANDB_JOB_TYPE WANDB_TAGS
 python_bin="${AMBI_DMC_PYTHON:?}"
 common=(--root "${AMBI_CAMPAIGN_ROOT:?}" --inventory "${CHECKPOINT_MANIFEST:?}"
+        --update-budget "${AMBI_UPDATE_BUDGET:-c32_a4}"
         --horizon "${AMBI_HORIZON:-1}" --alpha-mode "${AMBI_ALPHA_MODE:-zero}" --critic-mode "${AMBI_CRITIC_MODE:-soft_q}")
 case "${1:-}" in
   --smoke) seed=101; extra=(--smoke) ;;

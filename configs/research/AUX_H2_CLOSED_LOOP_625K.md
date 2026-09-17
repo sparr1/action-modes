@@ -45,3 +45,32 @@ horizon, rejects H1/H2 mismatches, checks the realized transition/update counts,
 and requires unchanged full outer state and zero strict-compilation fallbacks.
 Create a new performance series and H2 diagnostic attempt; do not append H2
 results to the H1 planner identity.
+
+## Additional updates for H2 data
+
+Two explicit matrices extend the soft/soft automatic-alpha condition at the
+same checkpoint and paired seeds:
+
+| Matrix suffix after `auto_alpha_h2` | Update budget | Critic / actor / temperature updates |
+| --- | --- | --- |
+| `_c64_a4.json` | `c64_a4` | 64 / 4 / 4 |
+| `_c64_a8.json` | `c64_a8` | 64 / 8 / 8 |
+
+Set `AMBI_UPDATE_BUDGET` (or helper `--update-budget`) to select one. The
+default `c32_a4` preserves existing campaigns. Additional budgets require
+H2 and automatic alpha. Select `critic/soft_q` for the initial comparison.
+Only the critic and, for A8, actor counts change in these matrices; automatic
+temperature updates follow the actor count. J1, N128, B256, replay capacity
+2048, learning rates, target tau 0.01, and the inherited alpha remain fixed.
+More critic updates also perform more target-network updates at that fixed tau.
+
+With 256 collected transitions, C64/B256 restores the H1 C32/B256 ratio of
+critic updates to collected data. C64/A4 isolates extra critic fitting;
+C64/A8 also restores actor and temperature update ratios. Neither doubles
+collection or adds a second round. Compare both against the completed H2
+C32/A4 condition, reusing that result and the paired prior reference.
+
+Workers and publishers bind the update budget in their receipts, verify the
+actual C/A/T counts and probe axes, and reject mismatched budgets before
+publication. Each condition requires its own new performance series and
+diagnostic attempt. Keep all five seed shards of each condition together.

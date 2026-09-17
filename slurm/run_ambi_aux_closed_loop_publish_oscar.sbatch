@@ -26,4 +26,5 @@ exec "${AMBI_DMC_PYTHON:?}" slurm/ambi_aux_closed_loop.py "$mode" \
   --root "$AMBI_CAMPAIGN_ROOT" --inventory "${CHECKPOINT_MANIFEST:?}" \
   --horizon "${AMBI_HORIZON:-1}" --alpha-mode "${AMBI_ALPHA_MODE:-zero}" \
   --critic-mode "${AMBI_CRITIC_MODE:-soft_q}" \
+  --update-budget "${AMBI_UPDATE_BUDGET:-c32_a4}" \
   --run-dir "${EVAL_RUN_DIR:?}" --publish
