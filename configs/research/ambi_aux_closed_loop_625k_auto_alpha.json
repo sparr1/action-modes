@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "625k closed-loop refinement: soft-Q initialization and frozen soft-Q bootstrap, J1 with automatically tuned inner alpha initialized from the saved outer coefficient; five paired episodes and 32 model probes before and after refinement.",
+  "description": "625k closed-loop refinement: matched soft-Q or return-only-Q initialization and frozen bootstrap, J1 with automatically tuned inner alpha initialized from the saved outer coefficient; five paired episodes and 32 model probes before and after refinement.",
   "base_alg_config": "checkpoint",
   "source_run": "rwgao_b-brown-university/ambi/aux6434715x3",
   "shared_alg_params": {

@@ -25,4 +25,5 @@ esac
 exec "${AMBI_DMC_PYTHON:?}" slurm/ambi_aux_closed_loop.py "$mode" \
   --root "$AMBI_CAMPAIGN_ROOT" --inventory "${CHECKPOINT_MANIFEST:?}" \
   --alpha-mode "${AMBI_ALPHA_MODE:-zero}" \
+  --critic-mode "${AMBI_CRITIC_MODE:-soft_q}" \
   --run-dir "${EVAL_RUN_DIR:?}" --publish

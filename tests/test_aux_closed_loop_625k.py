@@ -14,9 +14,12 @@ from utils.ambi_seed_shards import merge_episode_bundles, seal_episode_bundle
 from utils.eval_series_data import _metrics
 
 
-@pytest.fixture(scope='module', params=['zero', 'inherit_outer', 'auto'])
+@pytest.fixture(scope='module', params=[('zero', 'soft_q'), ('inherit_outer', 'soft_q'),
+                                      ('auto', 'soft_q'), ('auto', 'return_q')])
 def panel(tmp_path_factory, request):
     import torch
+    alpha_mode, critic_mode = request.param
+    selector = f'critic/{critic_mode}'
     root = tmp_path_factory.mktemp('aux-closed-loop')
     options = dict(aux_return_mode='sac', log_std_mapping='direct_clamp',
                    sac_actor_loss_scale_mode='none', inner_operator='none',
@@ -29,13 +32,13 @@ def panel(tmp_path_factory, request):
     model.agent.save(checkpoint)
     model.env.close()
     assert checkpoint_alpha(checkpoint) == pytest.approx(.037)
-    expected_alpha = checkpoint_alpha(checkpoint) if request.param != 'zero' else 0.
+    expected_alpha = checkpoint_alpha(checkpoint) if alpha_mode != 'zero' else 0.
     metadata = dict(schema_version=1, checkpoint=dict(kind='periodic', step=625000, episode=50, best_score=None, best_window=100),
                     trial_run_params=dict(alg='AMBITDMPC2/AMBITDMPC2', env='Pendulum-v1', seed=55,
                         device='cpu', total_steps=2000000, alg_params=_tiny_params(**options)),
                     experiment_params=dict(env_params=dict(max_episode_steps=3)))
     Path(str(checkpoint) + '.metadata.json').write_text(json.dumps(metadata))
-    matrix = json.loads(MATRICES[request.param].read_text())
+    matrix = json.loads(MATRICES[alpha_mode].read_text())
     assert matrix['evaluation']['togo_return_rollouts'] == 32
     assert matrix['evaluation']['default_presets'] == [SELECTOR]
     matrix['shared_alg_params']['compile'] = False
@@ -48,7 +51,7 @@ def panel(tmp_path_factory, request):
     evaluate_matrix(prior_path, checkpoint, selectors=['critic/prior'], seeds=[101, 102], max_steps=3,
                     device='cpu', bundle_dir=root / 'prior')
     def evaluate(path, seeds, matrix_file=matrix_path):
-        return evaluate_matrix(matrix_file, checkpoint, selectors=[SELECTOR], seeds=seeds, max_steps=3,
+        return evaluate_matrix(matrix_file, checkpoint, selectors=[selector], seeds=seeds, max_steps=3,
                                device='cpu', bundle_dir=path, reference_bundle=root / 'prior')
     evaluate(root / 'serial', [101, 102])
     evaluate(root / 'without-probes', [101, 102], prior_path)
@@ -58,21 +61,22 @@ def panel(tmp_path_factory, request):
         evaluate(shard, [seed])
         seal_episode_bundle(shard)
         shards.append(shard)
-    return root, shards, expected_alpha, request.param
+    return root, shards, expected_alpha, alpha_mode, critic_mode
 
 
 def test_probe_rng_and_parallel_seed_execution_preserve_actual_returns(panel):
-    root, shards, alpha, alpha_mode = panel
-    serial, record = validate_bundle(root / 'serial', [101, 102], 3, expected_alpha=alpha, alpha_mode=alpha_mode)
+    root, shards, alpha, alpha_mode, critic_mode = panel
+    selector = f'critic/{critic_mode}'
+    serial, record = validate_bundle(root / 'serial', [101, 102], 3, expected_alpha=alpha, alpha_mode=alpha_mode, critic_mode=critic_mode)
     plain = json.loads((root / 'without-probes/manifest.json').read_text())
     merged_path = merge_episode_bundles(shards, root / 'merged', expected_seeds=[101, 102])
-    merged, merged_record = validate_bundle(merged_path, [101, 102], 3, expected_alpha=alpha, alpha_mode=alpha_mode)
+    merged, merged_record = validate_bundle(merged_path, [101, 102], 3, expected_alpha=alpha, alpha_mode=alpha_mode, critic_mode=critic_mode)
     for source in [plain, merged]:
         for expected, actual in zip(serial['runs'][0]['episodes'], source['runs'][0]['episodes']):
             for key in ['seed', 'solver_seed', 'return', 'length', 'paired_return_delta']:
                 assert actual[key] == expected[key], key
     raw_rows = [row for shard in shards for row in record_from_model_bundle(
-        shard, SELECTOR, 'source-check', bootstrap_resamples=1)['rows']]
+        shard, selector, 'source-check', bootstrap_resamples=1)['rows']]
     assert merged_record['rows'] == raw_rows
     # Independently executed serial/sharded runs have different wall timings.
     def without_probe_time(items):
@@ -91,7 +95,7 @@ def test_probe_rng_and_parallel_seed_execution_preserve_actual_returns(panel):
 
 
 def test_merge_rejects_missing_overlapping_seeds_and_corrupted_traces(panel, tmp_path):
-    _, shards, _, _ = panel
+    _, shards, _, _, _ = panel
     for sources, seeds in [(shards[:1], [101, 102]), (shards, [101, 102, 103])]:
         with pytest.raises(ValueError, match='missing or unexpected seeds'):
             merge_episode_bundles(sources, tmp_path / 'missing', expected_seeds=seeds)
@@ -130,7 +134,7 @@ def test_auto_alpha_matrix_only_unfreezes_temperature_with_explicit_learning_rat
 
 
 def test_auto_alpha_validation_rejects_no_updates_or_carried_alpha(panel, tmp_path):
-    root, _, alpha, alpha_mode = panel
+    root, _, alpha, alpha_mode, critic_mode = panel
     if alpha_mode != 'auto':
         return
     original = json.loads((root / 'serial/manifest.json').read_text())
@@ -141,19 +145,21 @@ def test_auto_alpha_validation_rejects_no_updates_or_carried_alpha(panel, tmp_pa
         metrics.update(mean=value, min=value, max=value)
         (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
         with pytest.raises(AssertionError):
-            validate_bundle(tmp_path, [101, 102], 3, expected_alpha=alpha, alpha_mode='auto')
+            validate_bundle(tmp_path, [101, 102], 3, expected_alpha=alpha, alpha_mode='auto', critic_mode=critic_mode)
 
 
-def test_publication_recovery_uses_saved_panel_and_json_paths(tmp_path, monkeypatch):
+@pytest.mark.parametrize('critic_mode', ['soft_q', 'return_q'])
+def test_publication_recovery_uses_saved_panel_and_json_paths(tmp_path, monkeypatch, critic_mode):
     from argparse import Namespace
     from slurm.ambi_aux_closed_loop import SEEDS, publish
     import utils.ambi_benchmark as benchmark
     import utils.ambi_diagnostic_series as diagnostics
     import utils.eval_series as series
+    selector = f'critic/{critic_mode}'
     output = tmp_path / 'production'
     output.mkdir()
     receipt = dict(status='complete', checkpoint_step=625000, seeds=SEEDS,
-                   diagnostic_series_id='existing-diagnostic')
+                   diagnostic_series_id='existing-diagnostic', critic_mode=critic_mode, selector=selector)
     (output / 'merge-completion.json').write_text(json.dumps(receipt))
     monkeypatch.setattr(diagnostics, 'read_diagnostic_bundle', lambda _: dict(
         status='complete', series_id='existing-diagnostic', rows=[{}] * 5000))
@@ -162,10 +168,10 @@ def test_publication_recovery_uses_saved_panel_and_json_paths(tmp_path, monkeypa
         # Exercise the failing JSON serialization of the real helper receipt.
         json.dumps(run_map)
         calls.append((bundle, run_map))
-        return {SELECTOR: dict(status='queued')}
+        return {selector: dict(status='queued')}
     monkeypatch.setattr(benchmark, 'stage_completed_bundle', stage)
     monkeypatch.setattr(series, 'publish_run', lambda *a, **k: dict(status='complete'))
     monkeypatch.setattr(diagnostics, 'publish_diagnostic_bundle', lambda *a, **k: dict(status='complete'))
-    publish(Namespace(root=tmp_path, run_dir=tmp_path / 'registry', inventory=tmp_path / 'inventory.json'))
-    assert calls == [(output / 'bundle', {SELECTOR: str(tmp_path / 'registry')})]
+    publish(Namespace(root=tmp_path, run_dir=tmp_path / 'registry', inventory=tmp_path / 'inventory.json', critic_mode=critic_mode))
+    assert calls == [(output / 'bundle', {selector: str(tmp_path / 'registry')})]
     assert json.loads((output / 'publication-completion.json').read_text())['diagnostic_publication']['status'] == 'complete'
