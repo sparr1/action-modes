@@ -3216,8 +3216,21 @@ class InnerImprovementEngine:
         )
 
     def _prior_bootstrap(self, next_z, noise):
-        """The MPPI tail: outer distribution, online Q, no extra entropy."""
+        """Frozen outer online Q, optionally completed to a soft state value."""
         with torch.no_grad():
+            if self.cfg.inner_terminal_entropy == "outer":
+                mode = self.cfg.outer_actor_entropy_mode
+                action, info = self.model.pi(
+                    next_z, noise=noise,
+                    **({"include_scaled_entropy": True} if mode == "tdmpc2_scaled" else {}),
+                )
+                value = self.model.Q(
+                    next_z, action, reduction=self.cfg.mppi_terminal_q_reduction,
+                )
+                coefficient = self.agent.alpha.detach()
+                if self.agent.actor_loss_scale_enabled:
+                    coefficient = coefficient * self.agent.actor_loss_scale.detach().reshape(())
+                return value + coefficient * policy_entropy(info, mode)
             if self._aux_return_active:
                 action, _ = self.model.pi(
                     next_z, policy=self._horizon_actor, noise=noise,
@@ -6856,7 +6869,7 @@ class InnerImprovementEngine:
                         "return_actor" if auxiliary_tail and self.cfg.aux_return_mode == "return_actor" else "sac"
                     ),
                     "horizon_critic_target": "reward_only" if auxiliary_tail else self.cfg.outer_critic_target,
-                    "terminal_entropy_bonus": False,
+                    "terminal_entropy_bonus": self.cfg.inner_terminal_entropy == "outer",
                 })
             else:
                 trace.begin()

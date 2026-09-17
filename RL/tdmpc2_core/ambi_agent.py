@@ -918,6 +918,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         if getattr(self.cfg, "inner_update_timing", "round") != "round":
             options["update_timing"] = self.cfg.inner_update_timing
         for key, default in (
+            ("inner_terminal_entropy", "none"),
             ("inner_critic_loss_coef", 1.0),
             ("inner_actor_loss_scale_update", "per_action"),
             ("inner_critic_target_initialization", "online"),

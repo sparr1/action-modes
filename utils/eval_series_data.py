@@ -357,6 +357,9 @@ def planner_identity(config, result, algorithm, action_rule):
     _require(operator in {"sac", "td3", "xqc", "mppi"}, "Unknown resolved inner operator")
     active = {key: value for key, value in normalize_aux_return_identity(config).items()
               if key.startswith("inner_")}
+    # Old Q-only boundaries and their explicit spelling remain one curve.
+    if active.get("inner_terminal_entropy", "none") == "none":
+        active.pop("inner_terminal_entropy", None)
     if operator == "mppi":
         # MPPI uses proposal and boundary actors plus a boundary critic; it
         # never allocates or adapts the selected interior critic.

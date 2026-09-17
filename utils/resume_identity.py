@@ -240,6 +240,7 @@ def scientific_trial_parameters(
                 # of the scientific configuration even though state is local.
                 split_values = str(algorithm.get("critic_value_mode", "single")).lower() != "single"
                 for field, default in (
+                    ("inner_terminal_entropy", "none"),
                     ("critic_value_mode", "single"),
                     ("inner_entropy_enabled", not split_values),
                     ("inner_value_initialization", "return"),

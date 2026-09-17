@@ -532,11 +532,26 @@ Interior rows retain the configured `inner_bootstrap_source`,
 AMBI's TD-MPC2 MPPI terminal score: it samples the stochastic outer policy with
 its outer log-standard-deviation settings and evaluates the outer **online**
 critic with `mppi_terminal_q_reduction` (default `"mean_pair"`). These priors
-remain fixed throughout the inner solve. No additional entropy term is added at
-the boundary. The outer critic retains whichever return semantics it was
+remain fixed throughout the inner solve. By default, no additional entropy
+term is added at the boundary (`inner_terminal_entropy="none"`), preserving
+historical experiments. The outer critic retains whichever return semantics it was
 trained with; set both `outer_critic_target` and `inner_sac_critic_target` to
 `"reward_only"` for the TD-MPC2 reward-return interpretation. An
 entropy-augmented outer critic still contributes its learned soft Q tail.
+
+For an entropy-consistent soft continuation, explicitly set
+`inner_terminal_entropy="outer"`. The boundary then uses
+`Q_outer(next_z, a_prior) - alpha_outer * log_pi_outer(a_prior | next_z)`.
+Soft Q already counts entropy after the sampled boundary action; this adds that
+action's entropy exactly once. It uses the frozen outer temperature, entropy
+statistic, and (when enabled) outer Q scale, independently of inner temperature
+adaptation, actor entropy, and critic initialization. This applies at H=1 too.
+The option requires finite-horizon inner SAC, a single entropy-augmented outer
+critic, and SAC horizon actor/critic sources. Return-only tails retain `"none"`.
+Interior targets remain controlled separately by `inner_sac_critic_target`.
+Resolved evaluation configurations, curve identities, and exact-resume target
+specifications distinguish the modes. Existing model-only outer-tail probes
+retain their Q-only scoring convention; they are not the corrected soft target.
 
 The horizon boundary is stored separately from true environment termination.
 A true termination suppresses every continuation, including a termination on

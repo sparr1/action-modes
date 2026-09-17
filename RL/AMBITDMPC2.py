@@ -68,6 +68,8 @@ _AMBI_DEFAULTS = {
     "inner_critic_source": "sac",
     "inner_horizon_actor_source": "sac",
     "inner_horizon_critic_source": "sac",
+    # Preserve historical Q-only tails; "outer" adds the outer policy entropy.
+    "inner_terminal_entropy": "none",
     # Resolved by value mode: preserve legacy entropy, but default the split
     # critic's inner learner to reward maximization.
     "inner_entropy_enabled": None,
@@ -2768,6 +2770,18 @@ class AMBITDMPC2(TDMPC2Baseline):
 
         _validate_split_value_config(cfg)
         validate_auxiliary_config(cfg)
+        cfg.inner_terminal_entropy = _normalize_choice(
+            cfg.inner_terminal_entropy, "inner_terminal_entropy", {"none", "outer"},
+        )
+        if cfg.inner_terminal_entropy == "outer":
+            requirements = {
+                "inner_operator": "sac", "inner_finite_horizon": True,
+                "critic_value_mode": "single", "outer_critic_target": "entropy_augmented",
+                "inner_horizon_actor_source": "sac", "inner_horizon_critic_source": "sac",
+            }
+            for key, value in requirements.items():
+                if getattr(cfg, key) != value:
+                    raise ValueError(f"inner_terminal_entropy='outer' requires {key}={value!r}.")
 
         # Read-only aliases keep legacy integrations working for one release.
         # Canonical agent code must not use these for scheduling mixed updates.
