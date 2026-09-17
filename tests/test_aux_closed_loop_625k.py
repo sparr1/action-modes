@@ -14,7 +14,7 @@ from utils.ambi_seed_shards import merge_episode_bundles, seal_episode_bundle
 from utils.eval_series_data import _metrics
 
 
-@pytest.fixture(scope='module', params=['zero', 'inherit_outer'])
+@pytest.fixture(scope='module', params=['zero', 'inherit_outer', 'auto'])
 def panel(tmp_path_factory, request):
     import torch
     root = tmp_path_factory.mktemp('aux-closed-loop')
@@ -29,7 +29,7 @@ def panel(tmp_path_factory, request):
     model.agent.save(checkpoint)
     model.env.close()
     assert checkpoint_alpha(checkpoint) == pytest.approx(.037)
-    expected_alpha = checkpoint_alpha(checkpoint) if request.param == 'inherit_outer' else 0.
+    expected_alpha = checkpoint_alpha(checkpoint) if request.param != 'zero' else 0.
     metadata = dict(schema_version=1, checkpoint=dict(kind='periodic', step=625000, episode=50, best_score=None, best_window=100),
                     trial_run_params=dict(alg='AMBITDMPC2/AMBITDMPC2', env='Pendulum-v1', seed=55,
                         device='cpu', total_steps=2000000, alg_params=_tiny_params(**options)),
@@ -58,15 +58,15 @@ def panel(tmp_path_factory, request):
         evaluate(shard, [seed])
         seal_episode_bundle(shard)
         shards.append(shard)
-    return root, shards, expected_alpha
+    return root, shards, expected_alpha, request.param
 
 
 def test_probe_rng_and_parallel_seed_execution_preserve_actual_returns(panel):
-    root, shards, alpha = panel
-    serial, record = validate_bundle(root / 'serial', [101, 102], 3, expected_alpha=alpha)
+    root, shards, alpha, alpha_mode = panel
+    serial, record = validate_bundle(root / 'serial', [101, 102], 3, expected_alpha=alpha, alpha_mode=alpha_mode)
     plain = json.loads((root / 'without-probes/manifest.json').read_text())
     merged_path = merge_episode_bundles(shards, root / 'merged', expected_seeds=[101, 102])
-    merged, merged_record = validate_bundle(merged_path, [101, 102], 3, expected_alpha=alpha)
+    merged, merged_record = validate_bundle(merged_path, [101, 102], 3, expected_alpha=alpha, alpha_mode=alpha_mode)
     for source in [plain, merged]:
         for expected, actual in zip(serial['runs'][0]['episodes'], source['runs'][0]['episodes']):
             for key in ['seed', 'solver_seed', 'return', 'length', 'paired_return_delta']:
@@ -91,7 +91,7 @@ def test_probe_rng_and_parallel_seed_execution_preserve_actual_returns(panel):
 
 
 def test_merge_rejects_missing_overlapping_seeds_and_corrupted_traces(panel, tmp_path):
-    _, shards, _ = panel
+    _, shards, _, _ = panel
     for sources, seeds in [(shards[:1], [101, 102]), (shards, [101, 102, 103])]:
         with pytest.raises(ValueError, match='missing or unexpected seeds'):
             merge_episode_bundles(sources, tmp_path / 'missing', expected_seeds=seeds)
@@ -115,6 +115,33 @@ def test_inherited_alpha_matrix_changes_only_entropy_enablement():
         assert inherited['comparisons']['critic']['variants'][variant]['alg_params'] == zero['comparisons']['critic']['variants'][variant]['alg_params']
     expected = {**zero['shared_alg_params'], 'inner_entropy_enabled': True}
     assert inherited['shared_alg_params'] == expected
+
+
+def test_auto_alpha_matrix_only_unfreezes_temperature_with_explicit_learning_rate():
+    inherited = json.loads(MATRICES['inherit_outer'].read_text())
+    auto = json.loads(MATRICES['auto'].read_text())
+    assert auto['evaluation'] == inherited['evaluation']
+    for variant in inherited['comparisons']['critic']['variants']:
+        assert auto['comparisons']['critic']['variants'][variant]['alg_params'] == inherited['comparisons']['critic']['variants'][variant]['alg_params']
+    assert auto['shared_alg_params'] == {
+        **inherited['shared_alg_params'], 'inner_temperature_mode': 'auto',
+        'inner_temperature_lr': 3e-4,
+    }
+
+
+def test_auto_alpha_validation_rejects_no_updates_or_carried_alpha(panel, tmp_path):
+    root, _, alpha, alpha_mode = panel
+    if alpha_mode != 'auto':
+        return
+    original = json.loads((root / 'serial/manifest.json').read_text())
+    for key, value in [('inner_alpha_initial', alpha * 1.01),
+                       ('inner_temperature_optimizer_steps', 0), ('inner_alpha_delta', 0)]:
+        manifest = copy.deepcopy(original)
+        metrics = manifest['runs'][0]['result']['model_metrics'][key]
+        metrics.update(mean=value, min=value, max=value)
+        (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
+        with pytest.raises(AssertionError):
+            validate_bundle(tmp_path, [101, 102], 3, expected_alpha=alpha, alpha_mode='auto')
 
 
 def test_publication_recovery_uses_saved_panel_and_json_paths(tmp_path, monkeypatch):

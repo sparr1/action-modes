@@ -17,6 +17,8 @@ SEEDS = [101, 102, 103, 104, 105]
 ATTEMPT = 'aux625k-soft-init-soft-tail-j1-alpha0-20260916'
 MATRICES = {'zero': MATRIX, 'inherit_outer': ROOT / 'configs/research/ambi_aux_closed_loop_625k_inherited_alpha.json'}
 ATTEMPTS = {'zero': ATTEMPT, 'inherit_outer': 'aux625k-soft-init-soft-tail-j1-inherited-alpha-20260916'}
+MATRICES['auto'] = ROOT / 'configs/research/ambi_aux_closed_loop_625k_auto_alpha.json'
+ATTEMPTS['auto'] = 'aux625k-soft-init-soft-tail-j1-auto-alpha-20260916'
 
 
 def checkpoint_alpha(path):
@@ -32,8 +34,11 @@ def checkpoint_alpha(path):
     return alpha
 
 
-def validate_bundle(path, seeds, max_steps, *, paired=True, expected_alpha=0.):
+def validate_bundle(path, seeds, max_steps, *, paired=True, expected_alpha=0., alpha_mode=None):
     from utils.ambi_diagnostic_series import record_from_model_bundle
+    if alpha_mode is None:
+        alpha_mode = 'inherit_outer' if expected_alpha > 0 else 'zero'
+    assert alpha_mode in MATRICES
     manifest = json.loads((Path(path) / 'manifest.json').read_text())
     assert manifest['status'] == 'complete'
     assert len(manifest['runs']) == 1
@@ -50,19 +55,34 @@ def validate_bundle(path, seeds, max_steps, *, paired=True, expected_alpha=0.):
     assert cfg['inner_critic_target_initialization'] == 'online'
     assert cfg['inner_finite_horizon'] and cfg['inner_sac_critic_target'] == 'reward_only'
     assert cfg['inner_entropy_enabled'] == (expected_alpha > 0)
-    assert cfg['inner_temperature_mode'] == cfg['inner_temperature_initialization'] == 'inherit_outer'
+    assert cfg['inner_temperature_mode'] == ('auto' if alpha_mode == 'auto' else 'inherit_outer')
+    assert cfg['inner_temperature_initialization'] == cfg['inner_target_entropy'] == 'inherit_outer'
+    assert cfg['inner_temperature_scope'] == cfg['inner_temperature_optimizer_scope'] == 'action'
+    if alpha_mode == 'auto':
+        assert expected_alpha > 0 and cfg['inner_temperature_lr'] == 3e-4
     assert cfg['inner_execution_action'] == 'mean'
     assert cfg['inner_log_std_mapping'] == 'direct_clamp'
     assert cfg['inner_batch_size'] == 256 and cfg['inner_rollout_horizon'] == 1
     assert cfg['inner_rounds'] == 1 and cfg['inner_rollouts_per_round'] == 128
     for key, value in [('inner_model_steps', 128), ('inner_actor_optimizer_steps', 4),
-                       ('inner_critic_optimizer_steps', 32), ('inner_temperature_optimizer_steps', 0),
+                       ('inner_critic_optimizer_steps', 32),
+                       ('inner_temperature_optimizer_steps', 4 if alpha_mode == 'auto' else 0),
                        ('inner_compile_fallback', 0)]:
-        assert result['model_metrics'][key]['mean'] == value, key
-    for key in ('inner_alpha', 'inner_alpha_initial'):
+        for statistic in ('mean', 'min', 'max'):
+            assert result['model_metrics'][key][statistic] == value, (key, statistic)
+    fixed_keys = ('inner_alpha_initial',) if alpha_mode == 'auto' else (
+        'inner_alpha', 'inner_alpha_initial', 'inner_alpha_final')
+    for key in fixed_keys:
         for statistic in ('mean', 'min', 'max'):
             assert math.isclose(result['model_metrics'][key][statistic], expected_alpha,
                                 rel_tol=1e-6, abs_tol=1e-10), (key, statistic)
+    if alpha_mode == 'auto':
+        final = result['model_metrics']['inner_alpha_final']
+        delta = result['model_metrics']['inner_alpha_delta']
+        assert final['min'] > 0
+        assert max(abs(delta['min']), abs(delta['max'])) > 1e-10, 'Alpha never changed'
+        for statistic in ('mean', 'min', 'max'):
+            assert result['model_metrics']['inner_alpha'][statistic] == final[statistic]
     probe = run['togo_return_probe']
     assert probe['rollouts'] == 32 and probe['horizon'] == 1
     assert probe['cadence'] == 'initial_and_after_each_round' and not probe['entropy_bonus']
@@ -76,7 +96,7 @@ def validate_bundle(path, seeds, max_steps, *, paired=True, expected_alpha=0.):
         points = episode['togo_round_summaries']
         assert [(r['round_index'], r['actor_updates'], r['critic_updates']) for r in points] == [(0, 0, 0), (1, 4, 32)]
         assert all(s['count'] == max_steps for r in points for s in r['metrics'].values())
-    attempt = ATTEMPTS['inherit_outer' if expected_alpha > 0 else 'zero']
+    attempt = ATTEMPTS[alpha_mode]
     diagnostics = record_from_model_bundle(path, SELECTOR, attempt, bootstrap_resamples=2000,
                                           bootstrap_seed=20260912)
     assert diagnostics['status'] == 'complete'
@@ -91,8 +111,8 @@ def worker(args):
     assert torch.cuda.is_available()
     assert args.seed in SEEDS
     saved_alpha = checkpoint_alpha(args.checkpoint)
-    expected_alpha = saved_alpha if args.alpha_mode == 'inherit_outer' else 0.
-    if args.alpha_mode == 'inherit_outer':
+    expected_alpha = saved_alpha if args.alpha_mode != 'zero' else 0.
+    if args.alpha_mode != 'zero':
         assert expected_alpha > 0, 'Inherited-alpha condition requires a saved positive coefficient'
     directory = args.root / ('smoke' if args.smoke else f'shards/seed-{args.seed}')
     directory.mkdir(parents=True, exist_ok=False)
@@ -102,14 +122,17 @@ def worker(args):
                              reference_bundle=None if args.smoke else args.reference)
     (directory / 'results.json').write_text(json.dumps(result, indent=2) + '\n')
     manifest, _ = validate_bundle(directory / 'bundle', [args.seed], 20 if args.smoke else 500,
-                                  paired=not args.smoke, expected_alpha=expected_alpha)
+                                  paired=not args.smoke, expected_alpha=expected_alpha,
+                                  alpha_mode=args.alpha_mode)
     cfg = manifest['runs'][0]['resolved_config']
     assert cfg['compile'] and cfg['compile_strict']
     assert result['results'][0]['resolved_device'].startswith('cuda')
     assert manifest['checkpoint']['metadata']['checkpoint']['step'] == 625000
     seal_episode_bundle(directory / 'bundle')
     receipt = dict(status='complete', seed=args.seed, smoke=args.smoke,
-                   alpha_mode=args.alpha_mode, saved_outer_alpha=saved_alpha, inner_alpha=expected_alpha,
+                   alpha_mode=args.alpha_mode, saved_outer_alpha=saved_alpha,
+                   inner_alpha_initial=expected_alpha,
+                   inner_alpha_final_mean=manifest['runs'][0]['result']['model_metrics']['inner_alpha_final']['mean'],
                    checkpoint_sha256=manifest['checkpoint']['sha256'], gpu=torch.cuda.get_device_name(0),
                    episodes=manifest['runs'][0]['episodes'])
     (directory / 'worker-completion.json').write_text(json.dumps(receipt, indent=2) + '\n')
@@ -128,10 +151,11 @@ def merge(args):
         receipt = json.loads((source.parent / 'worker-completion.json').read_text())
         assert receipt['status'] == 'complete' and receipt['seed'] == seed and not receipt['smoke']
         assert receipt.get('alpha_mode', 'zero') == args.alpha_mode
-        alphas.append(receipt.get('inner_alpha', 0.))
+        alphas.append(receipt.get('inner_alpha_initial', receipt.get('inner_alpha', 0.)))
     assert len(set(alphas)) == 1
     bundle = merge_episode_bundles(sources, args.root / 'production/bundle', expected_seeds=SEEDS)
-    manifest, diagnostic = validate_bundle(bundle, SEEDS, 500, expected_alpha=alphas[0])
+    manifest, diagnostic = validate_bundle(bundle, SEEDS, 500, expected_alpha=alphas[0],
+                                           alpha_mode=args.alpha_mode)
     record, = load_records(bundle, inventory_path=args.inventory)
     assert record['checkpoint']['step'] == 625000
     assert record['identity'] == load_run(args.run_dir)['identity']
@@ -141,7 +165,8 @@ def merge(args):
     (output / 'results.json').write_text(json.dumps({'results': [r['result'] for r in manifest['runs']]}, indent=2) + '\n')
     write_diagnostic_bundle(output / 'model-series', diagnostic)
     receipt = dict(status='complete', checkpoint_step=625000, seeds=SEEDS,
-                   alpha_mode=args.alpha_mode, inner_alpha=alphas[0],
+                   alpha_mode=args.alpha_mode, inner_alpha_initial=alphas[0],
+                   inner_alpha_final_mean=manifest['runs'][0]['result']['model_metrics']['inner_alpha_final']['mean'],
                    metrics=record['metrics'], diagnostic_series_id=diagnostic['series_id'])
     (output / 'merge-completion.json').write_text(json.dumps(receipt, indent=2) + '\n')
     if args.publish:
