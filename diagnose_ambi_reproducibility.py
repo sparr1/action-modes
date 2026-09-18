@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import platform
 import subprocess
+import shutil
 
 import numpy as np
 import torch
@@ -51,11 +52,16 @@ def fingerprints(value, prefix=''):
     return {prefix: digest(value)}
 
 
-def compiler_kernels():
+def compiler_kernels(output=None):
     """Record the actual selected Triton launch configurations, when present."""
     from torch._inductor.codecache import PyCodeCache
     result = []
     for key, module in PyCodeCache.cache.items():
+        if output is not None and getattr(module, '__file__', None):
+            output.mkdir(exist_ok=True)
+            destination = output / (key + '.py')
+            if not destination.exists():
+                shutil.copyfile(module.__file__, destination)
         for name, value in vars(module).items():
             if type(value).__name__ not in ('CachingAutotuner', 'DebugAutotuner'):
                 continue
@@ -144,6 +150,11 @@ def main():
                        environment={k: os.environ.get(k) for k in (
                            'CUBLAS_WORKSPACE_CONFIG', 'NVIDIA_TF32_OVERRIDE',
                            'TORCHINDUCTOR_CACHE_DIR', 'TRITON_CACHE_DIR', 'OMP_NUM_THREADS')})
+        import evaluate_ambi_checkpoint
+        runtime['evaluator_file'] = evaluate_ambi_checkpoint.__file__
+        runtime['imported_source_commit'] = subprocess.check_output(
+            ['git', '-C', str(Path(evaluate_ambi_checkpoint.__file__).parent), 'rev-parse', 'HEAD'],
+            text=True).strip()
         if torch.cuda.is_available():
             runtime['gpu'] = subprocess.check_output([
                 'nvidia-smi', '--query-gpu=name,uuid,driver_version',
@@ -215,7 +226,7 @@ def main():
             assert _outer_state_digest(model) == before
             case = dict(repeat=repeat, reset=reset, decisions=decisions, fingerprints=rec.events)
             report['cases'].append(case)
-            report['compiler_kernels'] = compiler_kernels()
+            report['compiler_kernels'] = compiler_kernels(args.output / 'generated')
             (args.output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
             print(f'Completed repeat={repeat} reset={reset}', flush=True)
     finally:

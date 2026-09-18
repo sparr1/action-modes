@@ -15,6 +15,25 @@ cd "${AMBI_PROJECT_DIR:?}"
 export MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONNOUSERSITE=1
 export OMP_NUM_THREADS=4 TORCHINDUCTOR_COMPILE_THREADS=1
 mkdir -p "${AMBI_DIAGNOSTIC_ROOT:?}"
+if [[ "${1:-}" == --source-and-cache ]]; then
+  for profile in historical current cold; do
+    run_root="$AMBI_PROJECT_DIR"
+    [[ "$profile" != historical ]] || run_root="${AMBI_HISTORICAL_SOURCE:?}"
+    (
+      cd "$run_root"
+      [[ -z "$(git status --porcelain)" ]]
+      if [[ "$profile" == cold ]]; then
+        export TORCHINDUCTOR_CACHE_DIR="$AMBI_DIAGNOSTIC_ROOT/cold-inductor"
+        export TRITON_CACHE_DIR="$AMBI_DIAGNOSTIC_ROOT/cold-triton"
+      fi
+      "${AMBI_DMC_PYTHON:?}" -c 'import runpy,sys; runpy.run_path(sys.argv.pop(1),run_name="__main__")' \
+        "$AMBI_PROJECT_DIR/diagnose_ambi_reproducibility.py" \
+        --bundle "${AMBI_DIAGNOSTIC_BUNDLE:?}" --reset-sequence 0 \
+        --output "$AMBI_DIAGNOSTIC_ROOT/$profile"
+    )
+  done
+  exit
+fi
 for profile in production compile-a compile-b deterministic eager; do
   extra=(--mode compile)
   [[ "$profile" != deterministic ]] || extra+=(--deterministic)
