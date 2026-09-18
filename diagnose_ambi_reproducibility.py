@@ -72,16 +72,18 @@ def compiler_kernels(output=None):
     return result
 
 
-def pin_kernel_configs(report_path, override=None):
-    """Diagnostic-only intervention: replay recorded launch choices exactly."""
-    import triton
-    from torch._inductor import config, triton_heuristics
+def selected_kernel_configs(report_path, override=None):
+    """Distinguish graph call sites that use the same generated source."""
     report = json.loads(report_path.read_text())
     selected = {}
     for kernel in report['compiler_kernels']:
+        # Raw cached modules also expose an unused generic ``triton_`` object.
+        # The graph's named bindings are the launchers actually called.
+        if kernel['name'] == 'triton_':
+            continue
         assert len(kernel['launchers']) == 1
         choice = kernel['launchers'][0]
-        key = kernel['source_sha256']
+        key = kernel['source_sha256'] + ':' + kernel['name']
         assert key not in selected or selected[key] == choice
         selected[key] = choice
     if override:
@@ -90,13 +92,22 @@ def pin_kernel_configs(report_path, override=None):
         assert len(keys) == 1
         selected[keys[0]] = dict(kwargs={'XBLOCK': int(xblock)},
                                  num_warps=int(warps), num_stages=1)
+    return selected
+
+
+def pin_kernel_configs(report_path, override=None):
+    """Diagnostic-only intervention: replay recorded launch choices exactly."""
+    import triton
+    from torch._inductor import config, triton_heuristics
+    selected = selected_kernel_configs(report_path, override)
     original = triton_heuristics.CachingAutotuner.__init__
     config.dynamic_scale_rblock = False
     config.coordinate_descent_tuning = False
 
     def initialize(self, *a, **kw):
         original(self, *a, **kw)
-        key = hashlib.sha256(str(self.fn.src).encode()).hexdigest()
+        key = (hashlib.sha256(str(self.fn.src).encode()).hexdigest() + ':'
+               + self.inductor_meta.get('kernel_name', ''))
         if key in selected:
             choice = selected[key]
             self.configs = [triton.Config(choice['kwargs'], num_warps=choice['num_warps'],
@@ -266,6 +277,11 @@ def main():
             case = dict(repeat=repeat, reset=reset, decisions=decisions, fingerprints=rec.events)
             report['cases'].append(case)
             report['compiler_kernels'] = compiler_kernels(args.output / 'generated')
+            if pinned:
+                for kernel in report['compiler_kernels']:
+                    key = kernel['source_sha256'] + ':' + kernel['name']
+                    if key in pinned:
+                        assert kernel['launchers'] == [pinned[key]], (key, kernel['launchers'], pinned[key])
             (args.output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
             print(f'Completed repeat={repeat} reset={reset}', flush=True)
     finally:
