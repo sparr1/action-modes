@@ -93,11 +93,12 @@ class LatentReplayBuffer:
             ids[: self.size] = self._sample_ids(indices)
         return ids
 
-    def clear(self):
+    def clear(self, *, preserve_sample_ids=False):
         """Discard all stored transitions without reallocating device storage."""
         self.pos = 0
         self.full = False
-        self.next_sample_id = 0
+        if not preserve_sample_ids:
+            self.next_sample_id = 0
 
     def _reshape_fields(self, z, action, reward, next_z, terminated, horizon_end=None):
         values = (

@@ -252,6 +252,7 @@ _AMBI_DEFAULTS = {
     "inner_critic_scope": "action",
     "inner_temperature_scope": "action",
     "inner_replay_scope": "action",
+    "inner_replay_reset_each_round": False,
     "inner_actor_optimizer_scope": "action",
     "inner_critic_optimizer_scope": "action",
     "inner_temperature_optimizer_scope": "action",
@@ -2280,22 +2281,41 @@ class AMBITDMPC2(TDMPC2Baseline):
             if value not in _LIFECYCLE_SCOPES:
                 raise ValueError(f"{key} must be one of {sorted(_LIFECYCLE_SCOPES)}.")
             setattr(cfg, key, value)
+        cfg.inner_replay_reset_each_round = _strict_bool(
+            cfg.inner_replay_reset_each_round, "inner_replay_reset_each_round"
+        )
+        if cfg.inner_replay_reset_each_round and (
+            cfg.inner_operator != "sac"
+            or cfg.inner_schedule_mode != "canonical"
+            or cfg.inner_replay_scope != "action"
+            or cfg.inner_update_timing != "round"
+            or cfg.inner_explorer_mode != "none"
+            or cfg.inner_outer_replay_fraction != 0
+        ):
+            raise ValueError(
+                "inner_replay_reset_each_round requires canonical SAC, action-local "
+                "replay, round update timing, no explorer and no outer replay mixing."
+            )
         if cfg.inner_critic_adaptation == "lora_rl":
             for key in scope_keys[:-1]:
                 if getattr(cfg, key) != "action":
                     raise ValueError(
                         f"lora_rl requires fresh per-decision state; {key} must be 'action'."
                     )
+        required_replay = (
+            cfg.inner_rollouts_per_round * cfg.inner_rollout_horizon
+            if cfg.inner_replay_reset_each_round else cfg.inner_model_step_budget
+        )
         if (
             cfg.inner_operator in {"sac", "td3"}
             and cfg.inner_replay_scope == "action"
-            and cfg.inner_replay_capacity < cfg.inner_model_step_budget
+            and cfg.inner_replay_capacity < required_replay
         ):
             raise ValueError(
-                "Action-local inner_replay_capacity must be at least the cumulative "
-                "nominal J*N*H transitions for one real action: "
+                "Action-local inner_replay_capacity must hold its nominal retained "
+                "transitions (N*H for round reset, otherwise J*N*H): "
                 f"capacity={cfg.inner_replay_capacity}, "
-                f"required={cfg.inner_model_step_budget}."
+                f"required={required_replay}."
             )
         for component in ("actor", "critic", "temperature"):
             parameter_scope = getattr(cfg, f"inner_{component}_scope")

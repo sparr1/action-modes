@@ -29,10 +29,14 @@ def test_complete_grid_and_objectives():
                                      'return_return_alpha_h3_j4','return_return_zero_h3_j4',
                                      'soft_soft_h2_j2','soft_return_h1_j1',
                                      'soft_soft_h3_j4_tau010','soft_return_h3_j4_tau010',
-                                     'soft_soft_h1_j1_tau010'])
+                                     'soft_soft_h1_j1_tau010',
+                                     'soft_soft_h3_j4_roundreplay','soft_return_h3_j4_roundreplay',
+                                     'soft_soft_h1_j1_roundreplay'])
 def panel(request,tmp_path_factory):
     root=tmp_path_factory.mktemp('hj')
-    matrix_path=(MATRIX.with_name('ambi_aux_polyak_sweep_625k.json')
+    matrix_path=(MATRIX.with_name('ambi_aux_round_replay_sweep_625k.json')
+                 if request.param.endswith('_roundreplay') else
+                 MATRIX.with_name('ambi_aux_polyak_sweep_625k.json')
                  if request.param.endswith('_tau010') else MATRIX)
     cell=next(c for c in cells(matrix_path) if c['name']==request.param)
     options=dict(aux_return_mode='sac',log_std_mapping='direct_clamp',sac_actor_loss_scale_mode='none',
@@ -68,7 +72,8 @@ def test_real_replay_and_complete_update_metrics(panel):
     assert all(r['metrics']['critic_loss']['count']==6 for r in critic)
     assert all(r['metrics']['actor_loss']['count']==6 for r in actor)
     assert all(r['metrics']['decision/reward']['count']==2 for r in summary['decision_curves'])
-    assert manifest['runs'][0]['result']['model_metrics']['inner_buffer_size']['mean']==128*cell['H']*cell['J']
+    assert manifest['runs'][0]['result']['model_metrics']['inner_buffer_size']['mean']==128*cell['H']*(
+        1 if cell['params'].get('inner_replay_reset_each_round',False) else cell['J'])
 
 
 def test_missing_update_or_wrong_replay_is_rejected(panel,tmp_path):

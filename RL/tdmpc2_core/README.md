@@ -1636,3 +1636,22 @@ python render_checkpoint.py /path/to/checkpoint.pt \
 
 The result records the effective source selections; these runtime overrides do
 not modify the checkpoint or its metadata sidecar.
+
+
+## Optional current-round inner replay
+
+Set `inner_replay_reset_each_round=true` to clear imagined replay before each
+inner collection round. The default is false, retaining all rounds within the
+configured replay lifetime. Actor, critic, targets, alpha and optimizer states
+are preserved across rounds; only available transitions expire. Diagnostic
+transition IDs remain unique within the real decision.
+
+This option requires canonical SAC, action-local replay, round update timing,
+no explorer population and no real-replay mixing. It works with early-stopping
+imagined rollouts. Replay capacity must hold at least N*H nominal transitions
+when enabled, versus J*N*H for ordinary action-local replay. The default capacity
+calculation is unchanged. Sampling and the number of updates are independent:
+current-round data can still be sampled repeatedly within the round.
+
+The625k evaluation ablation is documented in
+[`AUX_ROUND_REPLAY_SWEEP_625K.md`](../../configs/research/AUX_ROUND_REPLAY_SWEEP_625K.md).

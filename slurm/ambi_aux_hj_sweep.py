@@ -68,6 +68,8 @@ def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=
     assert cfg['inner_batch_size'] == 256 and cfg['inner_rollouts_per_round'] == 128
     assert cfg['inner_critic_updates_per_round'] == 32 and cfg['inner_actor_updates_per_round'] == 4
     assert cfg['inner_replay_capacity'] == 2048 and cfg['inner_replay_sampling'] == 'with_replacement'
+    round_only = cell['params'].get('inner_replay_reset_each_round', False)
+    assert cfg.get('inner_replay_reset_each_round', False) == round_only
     assert cfg['inner_bootstrap_source'] == 'inner_target' and cfg['inner_finite_horizon']
     for component in ('actor', 'critic', 'temperature', 'replay', 'actor_optimizer', 'critic_optimizer', 'temperature_optimizer'):
         assert cfg[f'inner_{component}_scope'] == 'action'
@@ -84,7 +86,7 @@ def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=
     assert not result['nonfinite_model_metrics'] and not result['nonfinite_trace_metrics']
     assert result['environment_seeds'] == seeds and result['controller_seed'] == 55
     j, h = cell['J'], cell['H']
-    expected = dict(inner_model_steps=128*h*j, inner_buffer_size=128*h*j,
+    expected = dict(inner_model_steps=128*h*j, inner_buffer_size=128*h*(1 if round_only else j),
                     inner_critic_optimizer_steps=32*j, inner_actor_optimizer_steps=4*j,
                     inner_temperature_optimizer_steps=4*j if cfg['inner_entropy_enabled'] else 0,
                     inner_compile_fallback=0)
@@ -110,24 +112,43 @@ def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=
     return manifest
 
 
-def polyak_baseline(spec, record):
-    """Require a complete paired baseline differing only in target tau."""
-    for key in ('backbone', 'protocol', 'science'):
+def matched_baseline(spec, record, *, setting, before, after, baseline_science=None):
+    """Require a complete paired baseline differing only in one named setting."""
+    for key in ('backbone', 'protocol'):
         assert spec['identity'][key] == record['identity'][key], key
+    assert record['identity']['science'] == (baseline_science or spec['identity']['science'])
     expected = deepcopy(record['identity']['planner'])
-    assert expected['settings']['inner_critic_target_tau'] == .01
-    expected['settings']['inner_critic_target_tau'] = .1
+    assert expected['settings'].get(setting, False) == before
+    expected['settings'][setting] = after
     assert spec['identity']['planner'] == expected
     assert record['checkpoint']['step'] == 625000
     assert record['checkpoint']['sha256'] == CHECKPOINT_SHA
     assert record['metrics']['eval/frozen_state_unchanged']
     assert sorted(e['seed'] for e in record['episodes']) == SEEDS
     assert all(e['length'] == 500 and not e['truncated_by_evaluator'] for e in record['episodes'])
-    return dict(tau=.01, record_id=record['record_id'],
+    return dict(record_id=record['record_id'],
                 episodes=[{k:e[k] for k in ('seed','solver_seed','return')} for e in record['episodes']])
 
 
+def polyak_baseline(spec, record):
+    return dict(matched_baseline(spec, record, setting='inner_critic_target_tau', before=.01, after=.1), tau=.01)
+
+
+def round_replay_baseline(spec, record, *, baseline_science=None):
+    result = matched_baseline(spec, record, setting='inner_replay_reset_each_round',
+                              before=False, after=True, baseline_science=baseline_science)
+    return dict(result, kind='round_replay', replay_reset_each_round=False,
+                source_comparison=dict(baseline=record['identity']['science'],
+                                       candidate=spec['identity']['science'],
+                                       change='Opt-in round replay reset; default-off parity tested.'))
+
+
+def comparison_prefix(baseline):
+    return 'comparison/all_round_replay' if baseline.get('kind') == 'round_replay' else 'comparison/tau001'
+
+
 def polyak_comparison(episodes, baseline):
+    """Paired episode differences, retaining the legacy public helper name."""
     import numpy as np
     old = {(e['seed'], e['solver_seed']):e['return'] for e in baseline['episodes']}
     new = {(e['seed'], e['solver_seed']):e['return'] for e in episodes}
@@ -138,13 +159,14 @@ def polyak_comparison(episodes, baseline):
     assert np.isfinite(delta).all()
     draws = np.random.default_rng(20260912).integers(0,5,size=(2000,5))
     low, high = np.percentile(delta[draws].mean(axis=1), [2.5,97.5])
+    prefix = comparison_prefix(baseline)
     return dict(rows=rows, bootstrap_seed=20260912, bootstrap_resamples=2000,
-                metrics={'comparison/tau001_gain_mean':float(delta.mean()),
-                         'comparison/tau001_gain_sample_std':float(delta.std(ddof=1)),
-                         'comparison/tau001_gain_ci95_low':float(low),
-                         'comparison/tau001_gain_ci95_high':float(high),
-                         'comparison/tau001_paired_episodes':5,
-                         'comparison/tau001_return_mean':float(np.mean(list(old.values())))})
+                metrics={prefix+'_gain_mean':float(delta.mean()),
+                         prefix+'_gain_sample_std':float(delta.std(ddof=1)),
+                         prefix+'_gain_ci95_low':float(low),
+                         prefix+'_gain_ci95_high':float(high),
+                         prefix+'_paired_episodes':5,
+                         prefix+'_return_mean':float(np.mean(list(old.values())))})
 
 
 def prepare(args):
@@ -188,9 +210,18 @@ def prepare(args):
         else:
             bundle, actual_selector = str(directory/'bundle'), cell['selector']
         if baseline_cells:
-            previous = baseline_cells[cell['name'].removesuffix('_tau010')]
+            round_replay = args.baseline_kind == 'round_replay'
+            previous = baseline_cells[cell['name'].removesuffix('_roundreplay' if round_replay else '_tau010')]
             record, = load_records(previous['bundle'], inventory_path=args.inventory)
-            cell['baseline'] = polyak_baseline(spec, record)
+            if round_replay:
+                from utils.eval_series_data import scientific_identity
+                # Explicit historical source pin: the new opt-in reset changes
+                # implementation identity. Never relax compatibility globally.
+                baseline_science = scientific_identity('AMBITDMPC2/AMBITDMPC2', None,
+                    '06d7077b32ec06d24e9467f6b8d38bb08133fd1f')
+                cell['baseline'] = round_replay_baseline(spec, record, baseline_science=baseline_science)
+            else:
+                cell['baseline'] = polyak_baseline(spec, record)
             cell['baseline'].update(performance_run_id=previous['performance_run_id'],
                                     bundle=previous['bundle'],
                                     manifest_sha256=digest(Path(previous['bundle'])/'manifest.json'))
@@ -282,7 +313,8 @@ def training_summary(bundle, cell, *, expected_steps=500):
                     assert e['replay_size'] == 0
                     counts[key]['initial'] += 1
                 if phase == 'collection':
-                    assert e['replay_size'] == e['round_index']*128*cell['H']
+                    retained = 1 if cell['params'].get('inner_replay_reset_each_round',False) else e['round_index']
+                    assert e['replay_size'] == retained*128*cell['H']
                     counts[key]['collection'] += 1
                 if phase == 'update':
                     for component in ('critic','actor','temperature'):
@@ -364,8 +396,10 @@ def publish_cell(args):
     summary = training_summary(bundle,cell)
     write(directory/'training-summary.json',summary)
     comparison = polyak_comparison(record['episodes'],cell['baseline']) if 'baseline' in cell else None
+    comparison_file = ('replay-comparison.json' if cell.get('baseline',{}).get('kind') == 'round_replay'
+                       else 'polyak-comparison.json')
     if comparison:
-        write(directory/'polyak-comparison.json', comparison)
+        write(directory/comparison_file, comparison)
     diagnostic = record_from_model_bundle(bundle,cell['actual_selector'],campaign['group']+'-'+cell['name'],
                                          bootstrap_resamples=2000,bootstrap_seed=20260912)
     assert diagnostic['status'] == 'complete' and len(diagnostic['rows']) == 2500*(cell['J']+1)
@@ -380,6 +414,8 @@ def publish_cell(args):
                                  setting=cell['name'],resolved_config=manifest['runs'][0]['resolved_config'],
                                  source_code=manifest['code'],reused=cell['reused'],
                                  inner_critic_target_tau=manifest['runs'][0]['resolved_config']['inner_critic_target_tau'],
+                                 inner_replay_capacity=manifest['runs'][0]['resolved_config']['inner_replay_capacity'],
+                                 inner_replay_reset_each_round=manifest['runs'][0]['resolved_config'].get('inner_replay_reset_each_round',False),
                                  baseline_performance_run_id=cell.get('baseline',{}).get('performance_run_id'),
                                  performance_run_id=cell['performance_run_id'],
                                  aggregation='Update curves average all decision roots; decision curves weight five seeds equally.',
@@ -408,7 +444,7 @@ def publish_cell(args):
                                   metadata=dict(manifest_sha256=receipt['manifest_sha256'],reused=cell['reused']))
         for name in ['manifest.json',*manifest['runs'][0]['trace_files']]: artifact.add_file(str(bundle/name),name='bundle/'+name)
         artifact.add_file(str(directory/'training-summary.json'),name='training-summary.json')
-        if comparison: artifact.add_file(str(directory/'polyak-comparison.json'),name='polyak-comparison.json')
+        if comparison: artifact.add_file(str(directory/comparison_file),name=comparison_file)
         for name in ('manifest.json','paired-rows.jsonl.gz','report.html'):
             artifact.add_file(str(directory/'model-series'/name),name='model-series/'+name)
         run.log_artifact(artifact)
@@ -457,7 +493,7 @@ def watch(args):
                          result.get('metrics',{}).get('eval/return_mean'),result.get('metrics',{}).get('eval/paired_gain_mean'),
                          f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["training_run_id"]}',
                          f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["performance_run_id"]}',
-                         result.get('metrics',{}).get('comparison/tau001_gain_mean')])
+                         result.get('metrics',{}).get(comparison_prefix(cell.get('baseline',{}))+'_gain_mean')])
         return rows
     terminal_since=None; previous=None
     try:
@@ -475,7 +511,7 @@ def watch(args):
                         attempted.add(index); futures[index]=pool.submit(launch,index)
                 rows=status_rows(); stamp=[r[3] for r in rows]
                 if stamp!=previous:
-                    table=wandb.Table(columns=['setting','H','J','status','reused','return','paired_gain','training_url','performance_url','paired_gain_vs_tau001'],data=rows)
+                    table=wandb.Table(columns=['setting','H','J','status','reused','return','paired_gain','training_url','performance_url','paired_gain_vs_baseline'],data=rows)
                     done=sum(r[3]=='published' for r in rows)
                     run.log({'campaign/published':done,'campaign/failed_publications':len(failures),'campaign/settings':table})
                     write(args.root/'progress.json',dict(published=done,total=total,rows=rows,failures=failures))
@@ -507,6 +543,7 @@ def main():
     p.add_argument('--group',default=GROUP)
     p.add_argument('--label',default='625k H/J sweep')
     p.add_argument('--baseline-campaign',type=Path)
+    p.add_argument('--baseline-kind',choices=['polyak','round_replay'],default='polyak')
     for name in ('checkpoint','inventory','reference','registry','reuse-alpha','reuse-zero'):
         p.add_argument('--'+name,type=Path)
     p.add_argument('--index',type=int)

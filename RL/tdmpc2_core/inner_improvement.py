@@ -6245,6 +6245,10 @@ class InnerImprovementEngine:
         collected_transition_count = 0
         interval_updates_requested = 0
         for round_index in range(int(cfg.inner_rounds)):
+            if getattr(cfg, "inner_replay_reset_each_round", False):
+                # Keep the learner/optimizers and diagnostic IDs across rounds;
+                # only the transitions available to the next updates expire.
+                state.replay.clear(preserve_sample_ids=True)
             if trace is not None:
                 trace.round_index = round_index + 1
             for rollout in self._collection_chunks(root_z):
