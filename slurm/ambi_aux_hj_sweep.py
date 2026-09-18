@@ -54,6 +54,10 @@ def cells(matrix=None):
     return result
 
 
+def actor_updates(cell):
+    return int(cell['params'].get('inner_actor_updates_per_round', 4))
+
+
 def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=CHECKPOINT_SHA):
     """Validate semantics, replay retention, exact work and trace coverage."""
     manifest = read(Path(path) / 'manifest.json')
@@ -66,7 +70,7 @@ def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=
     for key, value in cell['params'].items():
         assert cfg.get(key, 'none' if key == 'inner_terminal_entropy' else None) == value, (key, value)
     assert cfg['inner_batch_size'] == 256 and cfg['inner_rollouts_per_round'] == 128
-    assert cfg['inner_critic_updates_per_round'] == 32 and cfg['inner_actor_updates_per_round'] == 4
+    assert cfg['inner_critic_updates_per_round'] == 32 and cfg['inner_actor_updates_per_round'] == actor_updates(cell)
     assert cfg['inner_replay_capacity'] == 2048 and cfg['inner_replay_sampling'] == 'with_replacement'
     round_only = cell['params'].get('inner_replay_reset_each_round', False)
     assert cfg.get('inner_replay_reset_each_round', False) == round_only
@@ -87,8 +91,8 @@ def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=
     assert result['environment_seeds'] == seeds and result['controller_seed'] == 55
     j, h = cell['J'], cell['H']
     expected = dict(inner_model_steps=128*h*j, inner_buffer_size=128*h*(1 if round_only else j),
-                    inner_critic_optimizer_steps=32*j, inner_actor_optimizer_steps=4*j,
-                    inner_temperature_optimizer_steps=4*j if cfg['inner_entropy_enabled'] else 0,
+                    inner_critic_optimizer_steps=32*j, inner_actor_optimizer_steps=actor_updates(cell)*j,
+                    inner_temperature_optimizer_steps=actor_updates(cell)*j if cfg['inner_entropy_enabled'] else 0,
                     inner_compile_fallback=0)
     for key, value in expected.items():
         for statistic in ('mean', 'min', 'max'):
@@ -108,7 +112,7 @@ def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=
         if paired:
             assert not ep['truncated_by_evaluator'] and 'paired_return_delta' in ep
         assert [(p['round_index'], p['critic_updates'], p['actor_updates'])
-                for p in ep['togo_round_summaries']] == [(r, r*32, r*4) for r in range(j+1)]
+                for p in ep['togo_round_summaries']] == [(r, r*32, r*actor_updates(cell)) for r in range(j+1)]
     return manifest
 
 
@@ -144,6 +148,8 @@ def round_replay_baseline(spec, record, *, baseline_science=None):
 
 
 def comparison_prefix(baseline):
+    if baseline.get('kind') == 'actor_budget':
+        return 'comparison/a4'
     return 'comparison/all_round_replay' if baseline.get('kind') == 'round_replay' else 'comparison/tau001'
 
 
@@ -242,6 +248,10 @@ def prepare(args):
                     prior_source_science=prior['identity']['science'],
                     source_commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
                     overview_run_id=uuid.uuid4().hex, cells=panel)
+    execution = read(matrix).get('execution')
+    if execution:
+        from slurm.ambi_aux_actor_budget import prepare_campaign
+        prepare_campaign(campaign, root, execution)
     write(root/'campaign.json', campaign)
     print(json.dumps(dict(root=str(root), conditions=len(panel), reused=sum(c['reused'] for c in panel),
                          overview_run_id=campaign['overview_run_id'])), flush=True)
@@ -252,15 +262,23 @@ def worker(args):
     from evaluate_ambi_checkpoint import evaluate_matrix
     from utils.ambi_seed_shards import seal_episode_bundle
     campaign = read(args.root/'campaign.json')
+    from slurm.ambi_aux_actor_budget import configure_execution, runtime_receipt
+    configure_execution(campaign)
     assert torch.cuda.is_available()
     if args.smoke:
         # Both boundaries, both fitting rules and alpha-off, at the largest H/J.
-        chosen = [c for c in campaign['cells'] if c['H'] == 3 and c['J'] == 4]
+        chosen = ([c for c in campaign['cells'] if actor_updates(c) in (4,16)]
+                  if campaign.get('execution',{}).get('actor_budget_comparison') else
+                  [c for c in campaign['cells'] if c['H'] == max(x['H'] for x in campaign['cells'])
+                   and c['J'] == max(x['J'] for x in campaign['cells'])])
     else:
         chosen = [campaign['cells'][args.index]]
     for cell in chosen:
         assert args.smoke or not cell['reused']
-        directory = args.root/'smoke'/cell['name'] if args.smoke else Path(cell['directory'])
+        smoke_root = args.root/'smoke'
+        if getattr(args,'replica','default') != 'default':
+            smoke_root /= args.replica
+        directory = smoke_root/cell['name'] if args.smoke else Path(cell['directory'])
         directory.mkdir(parents=True, exist_ok=args.smoke is False)
         bundle = directory/'bundle'
         evaluate_matrix(campaign['matrix'], campaign['checkpoint'], selectors=[cell['selector']],
@@ -273,11 +291,14 @@ def worker(args):
         assert manifest['runs'][0]['resolved_config']['compile_strict']
         assert manifest['runs'][0]['result']['resolved_device'].startswith('cuda')
         training_summary(bundle, cell, expected_steps=3 if args.smoke else 500)
+        execution = runtime_receipt(campaign)
+        if execution:
+            write(bundle/'execution.json', execution)
         seal_episode_bundle(bundle)
         write(directory/'worker-completion.json',dict(status='complete', cell=cell['name'],
               manifest_sha256=digest(bundle/'manifest.json'), gpu=torch.cuda.get_device_name(0),
               trace_sha256={n:digest(bundle/n) for n in manifest['runs'][0]['trace_files']},
-              selector=cell['selector'], bundle=str(bundle), reused=False))
+              selector=cell['selector'], bundle=str(bundle), reused=False, execution=execution))
         print('COMPLETE '+cell['name'], flush=True)
 
 
@@ -340,8 +361,8 @@ def training_summary(bundle, cell, *, expected_steps=500):
     assert len(counts) == expected_n
     for count in counts.values():
         assert dict(count) == dict(initial=1, collection=cell['J'], critic=32*cell['J'],
-                                  actor=4*cell['J'],
-                                  **({'temperature':4*cell['J']} if cell['params']['inner_entropy_enabled'] else {}), decision=1), count
+                                  actor=actor_updates(cell)*cell['J'],
+                                  **({'temperature':actor_updates(cell)*cell['J']} if cell['params']['inner_entropy_enabled'] else {}), decision=1), count
     required = {'critic_loss','critic_grad_norm','td_error_abs_mean','q_target_mean','actor_loss',
                 'actor_grad_norm','actor_entropy','alpha_used'}
     assert required <= {k for d in curves.values() for k in d}, required
@@ -390,13 +411,17 @@ def publish_cell(args):
     record, = load_records(bundle,inventory_path=campaign['inventory'])
     assert record['identity'] == load_run(cell['run_dir'])['identity']
     assert record['metrics']['eval/paired_episodes'] == 5
+    if campaign.get('execution',{}).get('actor_budget_comparison'):
+        from slurm.ambi_aux_actor_budget import fresh_actor_baseline
+        cell['baseline'] = fresh_actor_baseline(campaign, cell, record)
+    comparison = polyak_comparison(record['episodes'],cell['baseline']) if 'baseline' in cell else None
     staged = stage_completed_bundle(bundle,{cell['actual_selector']:cell['run_dir']},inventory_path=campaign['inventory'])
     assert staged[cell['actual_selector']]['status'] == 'queued'
     performance = publish_performance(cell['run_dir'])
     summary = training_summary(bundle,cell)
     write(directory/'training-summary.json',summary)
-    comparison = polyak_comparison(record['episodes'],cell['baseline']) if 'baseline' in cell else None
     comparison_file = ('replay-comparison.json' if cell.get('baseline',{}).get('kind') == 'round_replay'
+                       else 'actor-budget-comparison.json' if cell.get('baseline',{}).get('kind') == 'actor_budget'
                        else 'polyak-comparison.json')
     if comparison:
         write(directory/comparison_file, comparison)
@@ -410,7 +435,8 @@ def publish_cell(args):
     run = wandb.init(entity=ENTITY,project=PROJECT,id=cell['training_run_id'],resume='never',
                      name='Inner training | '+cell['name']+' | 625k',group=campaign['group'],
                      job_type='inner-training-diagnostics',tags=['closed-loop','H-J-sweep',cell['name'].rsplit('_h',1)[0]],
-                     config=dict(H=cell['H'],J=cell['J'],N=128,B=256,C=32,A=4,checkpoint_step=625000,
+                     config=dict(H=cell['H'],J=cell['J'],N=128,B=256,C=32,A=actor_updates(cell),checkpoint_step=625000,
+                                 execution=receipt.get('execution'),
                                  setting=cell['name'],resolved_config=manifest['runs'][0]['resolved_config'],
                                  source_code=manifest['code'],reused=cell['reused'],
                                  inner_critic_target_tau=manifest['runs'][0]['resolved_config']['inner_critic_target_tau'],
@@ -444,6 +470,8 @@ def publish_cell(args):
                                   metadata=dict(manifest_sha256=receipt['manifest_sha256'],reused=cell['reused']))
         for name in ['manifest.json',*manifest['runs'][0]['trace_files']]: artifact.add_file(str(bundle/name),name='bundle/'+name)
         artifact.add_file(str(directory/'training-summary.json'),name='training-summary.json')
+        if (bundle/'execution.json').exists():
+            artifact.add_file(str(bundle/'execution.json'),name='execution.json')
         if comparison: artifact.add_file(str(directory/comparison_file),name=comparison_file)
         for name in ('manifest.json','paired-rows.jsonl.gz','report.html'):
             artifact.add_file(str(directory/'model-series'/name),name='model-series/'+name)
@@ -452,7 +480,7 @@ def publish_cell(args):
                             'status':'complete','reused':cell['reused'],
                             'diagnostic/paired_rows':len(diagnostic['rows']),
                             'training/decisions':2500,'training/critic_updates':2500*32*cell['J'],
-                            'training/actor_updates':2500*4*cell['J'],
+                            'training/actor_updates':2500*actor_updates(cell)*cell['J'],
                             'performance_url':f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["performance_run_id"]}'})
         run.finish()
     except BaseException:
@@ -474,7 +502,10 @@ def watch(args):
     run = wandb.init(entity=ENTITY,project=PROJECT,id=campaign['overview_run_id'],resume='never',
                      name=campaign.get('label','625k H/J sweep')+f' | {total} settings',
                      group=campaign['group'],job_type='campaign-overview',
-                     config=dict(H=[1,2,3],J=[1,2,4],N=128,B=256,C=32,A=4,seeds=SEEDS,
+                     config=dict(H=sorted({c['H'] for c in campaign['cells']}),
+                                 J=sorted({c['J'] for c in campaign['cells']}),N=128,B=256,C=32,
+                                 A=sorted({actor_updates(c) for c in campaign['cells']}),seeds=SEEDS,
+                                 execution=campaign.get('execution'),
                                  target_taus=sorted({c['params'].get('inner_critic_target_tau',.01) for c in campaign['cells']}),
                                  checkpoint_sha256=CHECKPOINT_SHA,source_commit=campaign['source_commit']),mode='online')
     attempted = set(); futures = {}; failures = {}
@@ -493,7 +524,7 @@ def watch(args):
                          result.get('metrics',{}).get('eval/return_mean'),result.get('metrics',{}).get('eval/paired_gain_mean'),
                          f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["training_run_id"]}',
                          f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["performance_run_id"]}',
-                         result.get('metrics',{}).get(comparison_prefix(cell.get('baseline',{}))+'_gain_mean')])
+                         result.get('metrics',{}).get(comparison_prefix({'kind':'actor_budget'} if campaign.get('execution',{}).get('actor_budget_comparison') else cell.get('baseline',{}))+'_gain_mean')])
         return rows
     terminal_since=None; previous=None
     try:
@@ -507,7 +538,9 @@ def watch(args):
                 for index,cell in enumerate(campaign['cells']):
                     if len(futures)>=2: break
                     d=Path(cell['directory'])
-                    if index not in attempted and (d/'worker-completion.json').exists() and not (d/'publication-completion.json').exists():
+                    baseline_ready = (not cell.get('actor_baseline_name') or
+                                      (args.root/cell['actor_baseline_name']/'worker-completion.json').exists())
+                    if index not in attempted and baseline_ready and (d/'worker-completion.json').exists() and not (d/'publication-completion.json').exists():
                         attempted.add(index); futures[index]=pool.submit(launch,index)
                 rows=status_rows(); stamp=[r[3] for r in rows]
                 if stamp!=previous:
@@ -548,6 +581,7 @@ def main():
         p.add_argument('--'+name,type=Path)
     p.add_argument('--index',type=int)
     p.add_argument('--smoke',action='store_true')
+    p.add_argument('--replica',default='default')
     args=p.parse_args()
     {'prepare':prepare,'worker':worker,'publish':publish_cell,'watch':watch}[args.mode](args)
 
