@@ -1,7 +1,8 @@
-"""Explicit 36-cell campaign; complete panels and streaming trace publication."""
+"""Configured H/J campaigns; complete panels and streaming trace publication."""
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import gzip
@@ -42,8 +43,8 @@ def digest(path):
     return h.hexdigest()
 
 
-def cells():
-    matrix = read(MATRIX)
+def cells(matrix=None):
+    matrix = read(matrix or MATRIX)
     result = []
     for selector in matrix['evaluation']['default_presets']:
         name = selector.split('/')[1]
@@ -76,7 +77,8 @@ def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=
     assert cfg['inner_critic_target_initialization'] == 'online'
     assert cfg['inner_temperature_initialization'] == cfg['inner_target_entropy'] == 'inherit_outer'
     assert cfg['inner_actor_lr'] == cfg['inner_critic_lr'] == 3e-4
-    assert cfg['inner_critic_target_tau'] == .01 and cfg['inner_critic_target_update_interval'] == 1
+    assert cfg['inner_critic_target_tau'] == cell['params'].get('inner_critic_target_tau', .01)
+    assert cfg['inner_critic_target_update_interval'] == 1
     assert cfg['inner_critic_dropout_enabled'] and cfg['inner_outer_replay_fraction'] == 0
     assert result['outer_state_unchanged'] and result['outer_updates_before'] == result['outer_updates_after']
     assert not result['nonfinite_model_metrics'] and not result['nonfinite_trace_metrics']
@@ -108,6 +110,43 @@ def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=
     return manifest
 
 
+def polyak_baseline(spec, record):
+    """Require a complete paired baseline differing only in target tau."""
+    for key in ('backbone', 'protocol', 'science'):
+        assert spec['identity'][key] == record['identity'][key], key
+    expected = deepcopy(record['identity']['planner'])
+    assert expected['settings']['inner_critic_target_tau'] == .01
+    expected['settings']['inner_critic_target_tau'] = .1
+    assert spec['identity']['planner'] == expected
+    assert record['checkpoint']['step'] == 625000
+    assert record['checkpoint']['sha256'] == CHECKPOINT_SHA
+    assert record['metrics']['eval/frozen_state_unchanged']
+    assert sorted(e['seed'] for e in record['episodes']) == SEEDS
+    assert all(e['length'] == 500 and not e['truncated_by_evaluator'] for e in record['episodes'])
+    return dict(tau=.01, record_id=record['record_id'],
+                episodes=[{k:e[k] for k in ('seed','solver_seed','return')} for e in record['episodes']])
+
+
+def polyak_comparison(episodes, baseline):
+    import numpy as np
+    old = {(e['seed'], e['solver_seed']):e['return'] for e in baseline['episodes']}
+    new = {(e['seed'], e['solver_seed']):e['return'] for e in episodes}
+    assert len(old) == len(new) == 5 and old.keys() == new.keys()
+    rows = [dict(seed=k[0], solver_seed=k[1], baseline_return=old[k],
+                 return_value=new[k], paired_gain=new[k]-old[k]) for k in sorted(old)]
+    delta = np.array([r['paired_gain'] for r in rows])
+    assert np.isfinite(delta).all()
+    draws = np.random.default_rng(20260912).integers(0,5,size=(2000,5))
+    low, high = np.percentile(delta[draws].mean(axis=1), [2.5,97.5])
+    return dict(rows=rows, bootstrap_seed=20260912, bootstrap_resamples=2000,
+                metrics={'comparison/tau001_gain_mean':float(delta.mean()),
+                         'comparison/tau001_gain_sample_std':float(delta.std(ddof=1)),
+                         'comparison/tau001_gain_ci95_low':float(low),
+                         'comparison/tau001_gain_ci95_high':float(high),
+                         'comparison/tau001_paired_episodes':5,
+                         'comparison/tau001_return_mean':float(np.mean(list(old.values())))})
+
+
 def prepare(args):
     from evaluate_ambi_checkpoint import evaluate_matrix
     from utils.eval_series import create_run
@@ -116,7 +155,8 @@ def prepare(args):
     root = args.root
     root.mkdir(parents=True, exist_ok=False)
     assert digest(args.checkpoint) == CHECKPOINT_SHA
-    evaluate_matrix(MATRIX, args.checkpoint, seeds=SEEDS, controller_seed=55, max_steps=500,
+    matrix, group = args.matrix, args.group
+    evaluate_matrix(matrix, args.checkpoint, seeds=SEEDS, controller_seed=55, max_steps=500,
                     bundle_dir=root/'unused', checkpoint_inventory=args.inventory,
                     reference_bundle=args.reference, eval_series_spec_dir=root/'specs')
     prior_manifest = read(args.reference/'manifest.json')
@@ -126,8 +166,10 @@ def prepare(args):
     assert prior['metrics']['eval/frozen_state_unchanged'] and [e['seed'] for e in prior['episodes']] == SEEDS
     assert all(e['length'] == 500 and not e['truncated_by_evaluator'] for e in prior['episodes'])
     reuse = {'return_return_alpha_h1_j1': args.reuse_alpha, 'return_return_zero_h1_j1': args.reuse_zero}
+    baseline_cells = ({c['name']:c for c in read(args.baseline_campaign/'campaign.json')['cells']}
+                      if args.baseline_campaign else {})
     panel = []
-    for cell in cells():
+    for cell in cells(matrix):
         directory = root/cell['name']
         directory.mkdir()
         spec = read(root/'specs'/f"{cell['selector'].replace('/', '__')}.json")
@@ -145,7 +187,14 @@ def prepare(args):
             bundle, actual_selector = str(source), manifest['runs'][0]['selector']
         else:
             bundle, actual_selector = str(directory/'bundle'), cell['selector']
-        registry = create_run(args.registry, spec, GROUP+'-'+cell['name']+('-reused' if source else ''),
+        if baseline_cells:
+            previous = baseline_cells[cell['name'].removesuffix('_tau010')]
+            record, = load_records(previous['bundle'], inventory_path=args.inventory)
+            cell['baseline'] = polyak_baseline(spec, record)
+            cell['baseline'].update(performance_run_id=previous['performance_run_id'],
+                                    bundle=previous['bundle'],
+                                    manifest_sha256=digest(Path(previous['bundle'])/'manifest.json'))
+        registry = create_run(args.registry, spec, group+'-'+cell['name']+('-reused' if source else ''),
                               PROJECT, ENTITY, 'oscar-rgao48')
         cell.update(bundle=bundle, actual_selector=actual_selector, reused=bool(source),
                     run_dir=registry['run_dir'], performance_run_id=registry['run_id'],
@@ -156,7 +205,7 @@ def prepare(args):
                   trace_sha256={n:digest(source/n) for n in manifest['runs'][0]['trace_files']},
                   bundle=bundle, selector=actual_selector))
         panel.append(cell)
-    campaign = dict(schema_version=1, group=GROUP, matrix=str(MATRIX), checkpoint=str(args.checkpoint),
+    campaign = dict(schema_version=1, group=group, label=args.label, matrix=str(matrix.resolve()), checkpoint=str(args.checkpoint),
                     checkpoint_sha256=CHECKPOINT_SHA, inventory=str(args.inventory), reference=str(args.reference),
                     prior_manifest_sha256=digest(args.reference/'manifest.json'),
                     prior_source_science=prior['identity']['science'],
@@ -183,7 +232,7 @@ def worker(args):
         directory = args.root/'smoke'/cell['name'] if args.smoke else Path(cell['directory'])
         directory.mkdir(parents=True, exist_ok=args.smoke is False)
         bundle = directory/'bundle'
-        evaluate_matrix(MATRIX, campaign['checkpoint'], selectors=[cell['selector']],
+        evaluate_matrix(campaign['matrix'], campaign['checkpoint'], selectors=[cell['selector']],
                         seeds=[101] if args.smoke else SEEDS, controller_seed=55,
                         max_steps=3 if args.smoke else 500, device='cuda', bundle_dir=bundle,
                         checkpoint_inventory=campaign['inventory'],
@@ -281,9 +330,21 @@ def training_summary(bundle, cell, *, expected_steps=500):
                 metric_catalog=manifest['metric_catalog'])
 
 
+def publish_performance(run_dir):
+    """Retry only through the publisher's identity/hash/SDK-slot reconciliation."""
+    from utils.eval_series import publish_run, PublicationUncertainError
+    for attempt in range(3):
+        try:
+            return publish_run(run_dir, owner='oscar-rgao48', acknowledgement_timeout=120)
+        except PublicationUncertainError:
+            if attempt == 2:
+                raise
+            time.sleep(15)
+
+
 def publish_cell(args):
     from utils.ambi_benchmark import stage_completed_bundle
-    from utils.eval_series import publish_run, load_run
+    from utils.eval_series import load_run
     from utils.eval_series_data import load_records
     from utils.ambi_diagnostic_series import record_from_model_bundle, write_diagnostic_bundle, diagnostic_history
     import wandb
@@ -299,10 +360,13 @@ def publish_cell(args):
     assert record['metrics']['eval/paired_episodes'] == 5
     staged = stage_completed_bundle(bundle,{cell['actual_selector']:cell['run_dir']},inventory_path=campaign['inventory'])
     assert staged[cell['actual_selector']]['status'] == 'queued'
-    performance = publish_run(cell['run_dir'],owner='oscar-rgao48')
+    performance = publish_performance(cell['run_dir'])
     summary = training_summary(bundle,cell)
     write(directory/'training-summary.json',summary)
-    diagnostic = record_from_model_bundle(bundle,cell['actual_selector'],GROUP+'-'+cell['name'],
+    comparison = polyak_comparison(record['episodes'],cell['baseline']) if 'baseline' in cell else None
+    if comparison:
+        write(directory/'polyak-comparison.json', comparison)
+    diagnostic = record_from_model_bundle(bundle,cell['actual_selector'],campaign['group']+'-'+cell['name'],
                                          bootstrap_resamples=2000,bootstrap_seed=20260912)
     assert diagnostic['status'] == 'complete' and len(diagnostic['rows']) == 2500*(cell['J']+1)
     write_diagnostic_bundle(directory/'model-series',diagnostic)
@@ -310,11 +374,13 @@ def publish_cell(args):
     if journal.exists(): raise RuntimeError('Training publication uncertain; inspect remote run before retry')
     write(journal,dict(status='uncertain',run_id=cell['training_run_id']))
     run = wandb.init(entity=ENTITY,project=PROJECT,id=cell['training_run_id'],resume='never',
-                     name='Inner training | '+cell['name']+' | 625k',group=GROUP,
+                     name='Inner training | '+cell['name']+' | 625k',group=campaign['group'],
                      job_type='inner-training-diagnostics',tags=['closed-loop','H-J-sweep',cell['name'].rsplit('_h',1)[0]],
                      config=dict(H=cell['H'],J=cell['J'],N=128,B=256,C=32,A=4,checkpoint_step=625000,
                                  setting=cell['name'],resolved_config=manifest['runs'][0]['resolved_config'],
                                  source_code=manifest['code'],reused=cell['reused'],
+                                 inner_critic_target_tau=manifest['runs'][0]['resolved_config']['inner_critic_target_tau'],
+                                 baseline_performance_run_id=cell.get('baseline',{}).get('performance_run_id'),
                                  performance_run_id=cell['performance_run_id'],
                                  aggregation='Update curves average all decision roots; decision curves weight five seeds equally.',
                                  probe_objective='Reward plus terminal Q; excludes explicit entropy.'),mode='online')
@@ -337,14 +403,17 @@ def publish_cell(args):
             run.log({'axis/decision':row['decision'],**per_seed[row['decision']],
                      **{f'episode/{k}/{s}':v for k,stats in row['metrics'].items() for s,v in stats.items()}})
         for row in diagnostic_history(diagnostic): run.log(row)
+        if comparison: run.log(comparison['metrics'])
         artifact = wandb.Artifact('inner-training-'+cell['training_run_id'],type='inner-training-traces',
                                   metadata=dict(manifest_sha256=receipt['manifest_sha256'],reused=cell['reused']))
         for name in ['manifest.json',*manifest['runs'][0]['trace_files']]: artifact.add_file(str(bundle/name),name='bundle/'+name)
         artifact.add_file(str(directory/'training-summary.json'),name='training-summary.json')
+        if comparison: artifact.add_file(str(directory/'polyak-comparison.json'),name='polyak-comparison.json')
         for name in ('manifest.json','paired-rows.jsonl.gz','report.html'):
             artifact.add_file(str(directory/'model-series'/name),name='model-series/'+name)
         run.log_artifact(artifact)
-        run.summary.update({**record['metrics'],'status':'complete','reused':cell['reused'],
+        run.summary.update({**record['metrics'],**(comparison['metrics'] if comparison else {}),
+                            'status':'complete','reused':cell['reused'],
                             'diagnostic/paired_rows':len(diagnostic['rows']),
                             'training/decisions':2500,'training/critic_updates':2500*32*cell['J'],
                             'training/actor_updates':2500*4*cell['J'],
@@ -354,19 +423,23 @@ def publish_cell(args):
         run.finish(exit_code=1); raise
     write(journal,dict(status='complete',run_id=cell['training_run_id']))
     write(directory/'publication-completion.json',dict(status='complete',cell=cell['name'],reused=cell['reused'],
-          performance=performance,training_run_id=cell['training_run_id'],metrics=record['metrics']))
+          performance=performance,training_run_id=cell['training_run_id'],
+          metrics={**record['metrics'],**(comparison['metrics'] if comparison else {})}))
 
 
 def watch(args):
     """One CPU owner, at most two independent complete-panel subprocesses."""
     import wandb
     campaign = read(args.root/'campaign.json')
+    total = len(campaign['cells'])
     marker = args.root/'watcher-started.json'
     if marker.exists(): raise RuntimeError('Watcher already started; inspect its state before recovery')
     write(marker,dict(pid=os.getpid(),started=time.time()))
     run = wandb.init(entity=ENTITY,project=PROJECT,id=campaign['overview_run_id'],resume='never',
-                     name='625k H/J sweep | 36 settings',group=GROUP,job_type='campaign-overview',
+                     name=campaign.get('label','625k H/J sweep')+f' | {total} settings',
+                     group=campaign['group'],job_type='campaign-overview',
                      config=dict(H=[1,2,3],J=[1,2,4],N=128,B=256,C=32,A=4,seeds=SEEDS,
+                                 target_taus=sorted({c['params'].get('inner_critic_target_tau',.01) for c in campaign['cells']}),
                                  checkpoint_sha256=CHECKPOINT_SHA,source_commit=campaign['source_commit']),mode='online')
     attempted = set(); futures = {}; failures = {}
     def launch(index):
@@ -383,7 +456,8 @@ def watch(args):
             rows.append([cell['name'],cell['H'],cell['J'],state,cell['reused'],
                          result.get('metrics',{}).get('eval/return_mean'),result.get('metrics',{}).get('eval/paired_gain_mean'),
                          f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["training_run_id"]}',
-                         f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["performance_run_id"]}'])
+                         f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["performance_run_id"]}',
+                         result.get('metrics',{}).get('comparison/tau001_gain_mean')])
         return rows
     terminal_since=None; previous=None
     try:
@@ -401,11 +475,11 @@ def watch(args):
                         attempted.add(index); futures[index]=pool.submit(launch,index)
                 rows=status_rows(); stamp=[r[3] for r in rows]
                 if stamp!=previous:
-                    table=wandb.Table(columns=['setting','H','J','status','reused','return','paired_gain','training_url','performance_url'],data=rows)
+                    table=wandb.Table(columns=['setting','H','J','status','reused','return','paired_gain','training_url','performance_url','paired_gain_vs_tau001'],data=rows)
                     done=sum(r[3]=='published' for r in rows)
                     run.log({'campaign/published':done,'campaign/failed_publications':len(failures),'campaign/settings':table})
-                    write(args.root/'progress.json',dict(published=done,total=36,rows=rows,failures=failures))
-                    print(f'Published {done}/36; publication failures {len(failures)}',flush=True)
+                    write(args.root/'progress.json',dict(published=done,total=total,rows=rows,failures=failures))
+                    print(f'Published {done}/{total}; publication failures {len(failures)}',flush=True)
                     previous=stamp
                 if all(r[3]=='published' for r in rows): break
                 submission=args.root/'submission.json'
@@ -429,6 +503,10 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('mode',choices=['prepare','worker','publish','watch'])
     p.add_argument('--root',type=Path,required=True)
+    p.add_argument('--matrix',type=Path,default=MATRIX)
+    p.add_argument('--group',default=GROUP)
+    p.add_argument('--label',default='625k H/J sweep')
+    p.add_argument('--baseline-campaign',type=Path)
     for name in ('checkpoint','inventory','reference','registry','reuse-alpha','reuse-zero'):
         p.add_argument('--'+name,type=Path)
     p.add_argument('--index',type=int)
