@@ -16,18 +16,25 @@ export MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBU
 export OMP_NUM_THREADS=4 TORCHINDUCTOR_COMPILE_THREADS=1
 mkdir -p "${AMBI_DIAGNOSTIC_ROOT:?}"
 if [[ "${1:-}" == --pin-kernels ]]; then
-  for profile in pinned-current pinned-cold critic-softmax-8 critic-softmax-32; do
+  read -r -a profiles <<< "${AMBI_KERNEL_PROFILES:-pinned-current pinned-cold critic-softmax-8 critic-softmax-32}"
+  for profile in "${profiles[@]}"; do
     reference="${AMBI_KERNEL_REFERENCE_ROOT:?}/current/report.json"
     extra=()
     [[ "$profile" != pinned-cold ]] || reference="$AMBI_KERNEL_REFERENCE_ROOT/cold/report.json"
     [[ "$profile" != critic-softmax-8 ]] || extra+=(--override-kernel bddca0b1e02f:8:8)
     [[ "$profile" != critic-softmax-32 ]] || extra+=(--override-kernel bddca0b1e02f:32:8)
+    [[ "$profile" != terminal-softmax-8 ]] || extra+=(--override-kernel 06755b84c373:8:8)
+    [[ "$profile" != terminal-softmax-32 ]] || extra+=(--override-kernel 06755b84c373:32:8)
+    config_args=(--kernel-configs "$reference")
+    if [[ "$profile" == deterministic-fresh-a || "$profile" == deterministic-fresh-b ]]; then
+      config_args=(--deterministic)
+    fi
     (
       export TORCHINDUCTOR_CACHE_DIR="$AMBI_DIAGNOSTIC_ROOT/$profile-inductor"
       export TRITON_CACHE_DIR="$AMBI_DIAGNOSTIC_ROOT/$profile-triton"
       "${AMBI_DMC_PYTHON:?}" diagnose_ambi_reproducibility.py \
         --bundle "${AMBI_DIAGNOSTIC_BUNDLE:?}" --reset-sequence 0 \
-        --kernel-configs "$reference" --output "$AMBI_DIAGNOSTIC_ROOT/$profile" "${extra[@]}"
+        "${config_args[@]}" --output "$AMBI_DIAGNOSTIC_ROOT/$profile" "${extra[@]}"
     )
   done
   exit
