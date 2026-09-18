@@ -4917,6 +4917,7 @@ class InnerImprovementEngine:
         actor_count,
         temperature_count,
         actor_loss_scale=None,
+        replay_indices=None,
     ):
         slots = max(critic_count, actor_count, temperature_count)
         if self.cfg.inner_operator == "tdambi":
@@ -4925,36 +4926,10 @@ class InnerImprovementEngine:
             if slots:
                 self._calibrate_tdambi_scale()
         metrics = []
-        replay_indices = None
-        if slots:
-            batch_size = int(self.cfg.inner_batch_size)
-            replay_generator = self.rng.generator("replay")
-            if self.cfg.inner_replay_sampling == "with_replacement":
-                replay_indices = torch.randint(
-                    self.state.replay.size,
-                    (slots, batch_size),
-                    device=self.device,
-                    generator=replay_generator,
-                )
-            else:
-                if batch_size > self.state.replay.size:
-                    raise ValueError(
-                        "Cannot sample latent replay without replacement: "
-                        f"batch_size={batch_size} exceeds replay "
-                        f"size={self.state.replay.size}."
-                    )
-                # Preserve the historical sequence of one randperm per update,
-                # but generate all update indices before entering hot kernels.
-                replay_indices = torch.stack(
-                    [
-                        torch.randperm(
-                            self.state.replay.size,
-                            device=self.device,
-                            generator=replay_generator,
-                        )[:batch_size]
-                        for _ in range(slots)
-                    ]
-                )
+        if replay_indices is None:
+            replay_indices = self._draw_update_indices(slots)
+        elif replay_indices.shape != (slots, int(self.cfg.inner_batch_size)):
+            raise ValueError("Pre-drawn replay indices must match update slots and batch size.")
         for slot in range(slots):
             do_critic = slot < critic_count
             do_actor = slot < actor_count
@@ -5016,6 +4991,28 @@ class InnerImprovementEngine:
             metrics.append(slot_metrics)
         return metrics
 
+    def _draw_update_indices(self, slots):
+        """Keep the historical shape and RNG sequence for each update phase."""
+        if not slots:
+            return None
+        batch_size = int(self.cfg.inner_batch_size)
+        replay_generator = self.rng.generator("replay")
+        if self.cfg.inner_replay_sampling == "with_replacement":
+            return torch.randint(
+                self.state.replay.size, (slots, batch_size), device=self.device,
+                generator=replay_generator,
+            )
+        if batch_size > self.state.replay.size:
+            raise ValueError(
+                "Cannot sample latent replay without replacement: "
+                f"batch_size={batch_size} exceeds replay size={self.state.replay.size}."
+            )
+        return torch.stack([
+            torch.randperm(self.state.replay.size, device=self.device,
+                           generator=replay_generator)[:batch_size]
+            for _ in range(slots)
+        ])
+
     def _run_component_update_counts(
         self,
         *,
@@ -5023,12 +5020,34 @@ class InnerImprovementEngine:
         actor_count,
         actor_loss_scale=None,
     ):
-        """Run canonical component counts in critic-first phases.
+        """Run canonical component counts in phased or interleaved order.
 
         Each component optimizer step samples its own batch. Automatic SAC
         temperature updates share the corresponding actor-phase batch and do
         not create additional update slots.
         """
+        if getattr(self.cfg, "inner_component_update_order", "critic_first") == "interleaved":
+            # Draw the critic sequence then actor sequence with exactly the
+            # same RNG call shapes as the phased schedule. Only their execution
+            # order changes; no minibatches are shared or additional draws made.
+            critic_indices = self._draw_update_indices(critic_count)
+            actor_indices = self._draw_update_indices(actor_count)
+            interval = critic_count // actor_count  # Validated at config resolution.
+            metrics = []
+            for actor_index in range(actor_count):
+                start = actor_index * interval
+                metrics.extend(self._run_update_counts(
+                    critic_count=interval, actor_count=0, temperature_count=0,
+                    actor_loss_scale=actor_loss_scale,
+                    replay_indices=critic_indices[start:start + interval],
+                ))
+                metrics.extend(self._run_update_counts(
+                    critic_count=0, actor_count=1,
+                    temperature_count=int(self.cfg.inner_temperature_mode == "auto"),
+                    actor_loss_scale=actor_loss_scale,
+                    replay_indices=actor_indices[actor_index:actor_index + 1],
+                ))
+            return metrics
         metrics = self._run_update_counts(
             critic_count=critic_count,
             actor_count=0,

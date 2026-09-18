@@ -32,10 +32,14 @@ def test_complete_grid_and_objectives():
                                      'soft_soft_h1_j1_tau010',
                                      'soft_soft_h3_j4_roundreplay','soft_return_h3_j4_roundreplay',
                                      'soft_soft_h1_j1_roundreplay',
-                                     'soft_soft_h3_j1_a16','soft_return_h2_j1_a8','soft_return_h3_j1_a4'])
+                                     'soft_soft_h3_j1_a16','soft_return_h2_j1_a8','soft_return_h3_j1_a4',
+                                     'soft_soft_h3_j1_a16_interleaved','soft_return_h2_j1_a8_interleaved',
+                                     'soft_soft_h2_j1_a4_interleaved'])
 def panel(request,tmp_path_factory):
     root=tmp_path_factory.mktemp('hj')
-    matrix_path=(MATRIX.with_name('ambi_aux_actor_budget_625k.json')
+    matrix_path=(MATRIX.with_name('ambi_aux_interleaved_625k.json')
+                 if request.param.endswith('_interleaved') else
+                 MATRIX.with_name('ambi_aux_actor_budget_625k.json')
                  if request.param.rsplit('_',1)[-1] in ('a4','a8','a16') else
                  MATRIX.with_name('ambi_aux_round_replay_sweep_625k.json')
                  if request.param.endswith('_roundreplay') else

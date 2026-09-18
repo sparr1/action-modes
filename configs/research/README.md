@@ -168,3 +168,7 @@ axes. Deterministic evaluation returns the policy mean, which collapses the
 execution-noise variants. Prior writeback is deliberately disabled outside
 training, so its variants would likewise collapse under a frozen outer
 checkpoint. Materialize and train those axes instead.
+
+The [625k matched-budget interleaving screen](AUX_INTERLEAVED_625K.md) compares
+actor/alpha updates spaced through the critic steps with the completed
+critic-first H2/H3, J1, C32, A4/A8/A16 screen.

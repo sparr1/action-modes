@@ -765,6 +765,23 @@ add no temperature step. The resolved runtime metadata records both per-round
 counts, their derived per-action critic, actor, and temperature totals, and the
 summed critic-plus-actor replay rows drawn. A component count may be zero.
 
+The default `inner_component_update_order="critic_first"` runs all critic
+steps, then all actor steps. For single-policy SAC, opt into `"interleaved"`
+to execute one actor/temperature step after each `C/A` critic steps. For
+example, C32/A4 runs `(8 critic, 1 actor/temperature)` four times. C32/A8
+uses intervals of four critic steps; C32/A16 uses intervals of two.
+Both counts must be positive and C must be an integer multiple of A.
+This option requires the canonical component schedule, round update timing,
+trainable actor/critic, no explorer and no outer-replay mixing.
+
+Collection still happens once at the start of the round. Critic and actor
+updates retain independent minibatches; their index sequences are drawn with
+the same call shapes and component ordering as the phased schedule, then
+executed in the selected order. Target critics still update after every
+eligible critic step. Later interior Bellman targets therefore use the updated
+inner policy and temperature; frozen outer horizon bootstraps remain frozen.
+The nondefault ordering is recorded in resolved configs and planner identity.
+
 This component schedule is mutually exclusive with the shared canonical
 `inner_updates_per_round` control and with the deprecated per-action total
 budget controls. Existing configurations that use a shared integer or

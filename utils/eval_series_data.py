@@ -381,6 +381,8 @@ def planner_identity(config, result, algorithm, action_rule):
         active.pop("inner_update_timing", None)
     if not active.get("inner_replay_reset_each_round", False):
         active.pop("inner_replay_reset_each_round", None)
+    if active.get("inner_component_update_order", "critic_first") == "critic_first":
+        active.pop("inner_component_update_order", None)
     if operator == "xqc":
         # Before the outer-terminal ablation existed, every XQC terminal
         # bootstrap used the inner learner. The new resolver makes that

@@ -153,9 +153,10 @@ _AMBI_DEFAULTS = {
     "inner_finite_horizon": False,
     "inner_outer_replay_fraction": 0.0,
     # Optional canonical component schedule. Both values must be specified;
-    # unlike the shared-G schedule, critic phases precede actor phases.
+    # unlike the shared-G schedule, each optimizer samples its own batch.
     "inner_critic_updates_per_round": None,
     "inner_actor_updates_per_round": None,
+    "inner_component_update_order": "critic_first",
 
     # Optional action-local random explorer. The prior weight always denotes
     # the primary/prior-initialized policy's share of imagined rollouts.
@@ -2281,6 +2282,33 @@ class AMBITDMPC2(TDMPC2Baseline):
             if value not in _LIFECYCLE_SCOPES:
                 raise ValueError(f"{key} must be one of {sorted(_LIFECYCLE_SCOPES)}.")
             setattr(cfg, key, value)
+        cfg.inner_component_update_order = _normalize_choice(
+            cfg.inner_component_update_order, "inner_component_update_order",
+            {"critic_first", "interleaved"},
+        )
+        if cfg.inner_component_update_order == "interleaved":
+            if (
+                cfg.inner_operator != "sac"
+                or cfg.inner_schedule_mode != "canonical"
+                or not cfg.inner_component_update_schedule
+                or cfg.inner_update_timing != "round"
+                or cfg.inner_explorer_mode != "none"
+                or cfg.inner_outer_replay_fraction != 0
+                or cfg.inner_critic_adaptation == "frozen"
+                or cfg.inner_actor_adaptation == "frozen"
+            ):
+                raise ValueError(
+                    "inner_component_update_order='interleaved' requires canonical "
+                    "component SAC, round timing, trainable actor/critic, no explorer "
+                    "and no outer replay mixing."
+                )
+            c, a = cfg.inner_critic_updates_per_round, cfg.inner_actor_updates_per_round
+            if not (isinstance(c, int) and isinstance(a, int)
+                    and c > 0 and a > 0 and c >= a and c % a == 0):
+                raise ValueError(
+                    "interleaved component updates require positive counts with "
+                    "critic updates an integer multiple of actor updates."
+                )
         cfg.inner_replay_reset_each_round = _strict_bool(
             cfg.inner_replay_reset_each_round, "inner_replay_reset_each_round"
         )

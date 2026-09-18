@@ -148,6 +148,8 @@ def round_replay_baseline(spec, record, *, baseline_science=None):
 
 
 def comparison_prefix(baseline):
+    if baseline.get('kind') == 'interleaved':
+        return 'comparison/phased'
     if baseline.get('kind') == 'actor_budget':
         return 'comparison/a4'
     return 'comparison/all_round_replay' if baseline.get('kind') == 'round_replay' else 'comparison/tau001'
@@ -217,9 +219,20 @@ def prepare(args):
             bundle, actual_selector = str(directory/'bundle'), cell['selector']
         if baseline_cells:
             round_replay = args.baseline_kind == 'round_replay'
-            previous = baseline_cells[cell['name'].removesuffix('_roundreplay' if round_replay else '_tau010')]
+            interleaved = args.baseline_kind == 'interleaved'
+            suffix = '_interleaved' if interleaved else '_roundreplay' if round_replay else '_tau010'
+            previous = baseline_cells[cell['name'].removesuffix(suffix)]
             record, = load_records(previous['bundle'], inventory_path=args.inventory)
-            if round_replay:
+            if interleaved:
+                from slurm.ambi_aux_interleaved import phased_baseline
+                cell['baseline'] = phased_baseline(spec, record)
+                old_receipt = read(Path(previous['directory'])/'worker-completion.json')
+                assert old_receipt['status'] == 'complete'
+                assert digest(Path(previous['bundle'])/'manifest.json') == old_receipt['manifest_sha256']
+                assert all(digest(Path(previous['bundle'])/n) == sha for n,sha in old_receipt['trace_sha256'].items())
+                validate(previous['bundle'], previous)
+                cell['baseline']['execution'] = old_receipt['execution']
+            elif round_replay:
                 from utils.eval_series_data import scientific_identity
                 # Explicit historical source pin: the new opt-in reset changes
                 # implementation identity. Never relax compatibility globally.
@@ -250,7 +263,11 @@ def prepare(args):
                     overview_run_id=uuid.uuid4().hex, cells=panel)
     execution = read(matrix).get('execution')
     if execution:
-        from slurm.ambi_aux_actor_budget import prepare_campaign
+        if execution.get('interleaved_comparison'):
+            from slurm.ambi_aux_interleaved import prepare_campaign
+            campaign['baseline_campaign'] = str(args.baseline_campaign)
+        else:
+            from slurm.ambi_aux_actor_budget import prepare_campaign
         prepare_campaign(campaign, root, execution)
     write(root/'campaign.json', campaign)
     print(json.dumps(dict(root=str(root), conditions=len(panel), reused=sum(c['reused'] for c in panel),
@@ -268,12 +285,18 @@ def worker(args):
     if args.smoke:
         # Both boundaries, both fitting rules and alpha-off, at the largest H/J.
         chosen = ([c for c in campaign['cells'] if actor_updates(c) in (4,16)]
-                  if campaign.get('execution',{}).get('actor_budget_comparison') else
+                  if any(campaign.get('execution',{}).get(k) for k in ('actor_budget_comparison','interleaved_comparison')) else
                   [c for c in campaign['cells'] if c['H'] == max(x['H'] for x in campaign['cells'])
                    and c['J'] == max(x['J'] for x in campaign['cells'])])
     else:
         chosen = [campaign['cells'][args.index]]
     for cell in chosen:
+        if getattr(args, 'phased_control', False):
+            assert args.smoke and campaign['execution']['interleaved_comparison']
+            cell = deepcopy(cell)
+            cell['name'] = cell['name'].removesuffix('_interleaved')
+            cell['selector'] = cell['selector'].removesuffix('_interleaved')
+            cell['params'].pop('inner_component_update_order')
         assert args.smoke or not cell['reused']
         smoke_root = args.root/'smoke'
         if getattr(args,'replica','default') != 'default':
@@ -341,6 +364,14 @@ def training_summary(bundle, cell, *, expected_steps=500):
                     for component in ('critic','actor','temperature'):
                         if e.get('updated_'+component):
                             counts[key][component] += 1
+                    if cell['params'].get('inner_component_update_order') == 'interleaved':
+                        # Validate the chronology, not just final optimizer totals.
+                        c, a = counts[key]['critic'], counts[key]['actor']
+                        interval = 32 // actor_updates(cell)
+                        assert bool(e.get('updated_critic')) != bool(e.get('updated_actor'))
+                        assert e['critic_updates'] == c and e['actor_updates'] == a
+                        assert c == a*interval if e.get('updated_actor') else a*interval < c <= (a+1)*interval
+                        assert bool(e.get('updated_temperature')) == bool(e.get('updated_actor'))
                     for metric,value in e['metrics'].items():
                         assert value is not None
                         if metric.startswith(('critic_', 'q_', 'td_error')):
@@ -414,6 +445,9 @@ def publish_cell(args):
     if campaign.get('execution',{}).get('actor_budget_comparison'):
         from slurm.ambi_aux_actor_budget import fresh_actor_baseline
         cell['baseline'] = fresh_actor_baseline(campaign, cell, record)
+    if campaign.get('execution',{}).get('interleaved_comparison'):
+        from slurm.ambi_aux_interleaved import validate_phased_comparison
+        validate_phased_comparison(campaign, cell, record, receipt)
     comparison = polyak_comparison(record['episodes'],cell['baseline']) if 'baseline' in cell else None
     staged = stage_completed_bundle(bundle,{cell['actual_selector']:cell['run_dir']},inventory_path=campaign['inventory'])
     assert staged[cell['actual_selector']]['status'] == 'queued'
@@ -421,6 +455,7 @@ def publish_cell(args):
     summary = training_summary(bundle,cell)
     write(directory/'training-summary.json',summary)
     comparison_file = ('replay-comparison.json' if cell.get('baseline',{}).get('kind') == 'round_replay'
+                       else 'interleaved-comparison.json' if cell.get('baseline',{}).get('kind') == 'interleaved'
                        else 'actor-budget-comparison.json' if cell.get('baseline',{}).get('kind') == 'actor_budget'
                        else 'polyak-comparison.json')
     if comparison:
@@ -576,12 +611,13 @@ def main():
     p.add_argument('--group',default=GROUP)
     p.add_argument('--label',default='625k H/J sweep')
     p.add_argument('--baseline-campaign',type=Path)
-    p.add_argument('--baseline-kind',choices=['polyak','round_replay'],default='polyak')
+    p.add_argument('--baseline-kind',choices=['polyak','round_replay','interleaved'],default='polyak')
     for name in ('checkpoint','inventory','reference','registry','reuse-alpha','reuse-zero'):
         p.add_argument('--'+name,type=Path)
     p.add_argument('--index',type=int)
     p.add_argument('--smoke',action='store_true')
     p.add_argument('--replica',default='default')
+    p.add_argument('--phased-control',action='store_true')
     args=p.parse_args()
     {'prepare':prepare,'worker':worker,'publish':publish_cell,'watch':watch}[args.mode](args)
 
