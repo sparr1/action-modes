@@ -72,6 +72,41 @@ def compiler_kernels(output=None):
     return result
 
 
+def pin_kernel_configs(report_path, override=None):
+    """Diagnostic-only intervention: replay recorded launch choices exactly."""
+    import triton
+    from torch._inductor import config, triton_heuristics
+    report = json.loads(report_path.read_text())
+    selected = {}
+    for kernel in report['compiler_kernels']:
+        assert len(kernel['launchers']) == 1
+        choice = kernel['launchers'][0]
+        key = kernel['source_sha256']
+        assert key not in selected or selected[key] == choice
+        selected[key] = choice
+    if override:
+        prefix, xblock, warps = override.split(':')
+        keys = [k for k in selected if k.startswith(prefix)]
+        assert len(keys) == 1
+        selected[keys[0]] = dict(kwargs={'XBLOCK': int(xblock)},
+                                 num_warps=int(warps), num_stages=1)
+    original = triton_heuristics.CachingAutotuner.__init__
+    config.dynamic_scale_rblock = False
+    config.coordinate_descent_tuning = False
+
+    def initialize(self, *a, **kw):
+        original(self, *a, **kw)
+        key = hashlib.sha256(str(self.fn.src).encode()).hexdigest()
+        if key in selected:
+            choice = selected[key]
+            self.configs = [triton.Config(choice['kwargs'], num_warps=choice['num_warps'],
+                                          num_stages=choice['num_stages'])]
+            # Do not write an intervention into a shared autotuning cache.
+            self.save_cache_hook = None
+    triton_heuristics.CachingAutotuner.__init__ = initialize
+    return selected
+
+
 class Recorder:
     def __init__(self, output):
         self.output = output
@@ -110,6 +145,8 @@ def main():
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--decisions', type=int, default=2)
     parser.add_argument('--reset-sequence', default='0,1,0')
+    parser.add_argument('--kernel-configs', type=Path)
+    parser.add_argument('--override-kernel', help='SHA prefix:XBLOCK:num_warps; diagnostic intervention only')
     parser.add_argument('--no-record', action='store_true',
                         help='Run untouched production methods; retain actions and traces only.')
     args = parser.parse_args()
@@ -117,6 +154,7 @@ def main():
     resets = [int(x) for x in args.reset_sequence.split(',')]
     assert all(x in (0, 1) for x in resets)
     args.output.mkdir(parents=True, exist_ok=False)
+    pinned = pin_kernel_configs(args.kernel_configs, args.override_kernel) if args.kernel_configs else None
     if args.deterministic:
         os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
         torch.use_deterministic_algorithms(True)
@@ -161,6 +199,7 @@ def main():
                 '--format=csv,noheader'], text=True).strip()
         report = dict(runtime=runtime, mode=args.mode, checkpoint_sha256=manifest['checkpoint']['sha256'],
                       manifest_code=manifest['code'], cases=[])
+        report['pinned_kernel_configs'] = pinned
         original_regions = engine._compile_regions.copy()
         original_collect = engine._collect_round
         original_sample = engine._sample_batch
