@@ -67,6 +67,7 @@ def test_historical_pairing_preserves_episode_seeds():
     old.update(record_id='original',metrics={'eval/frozen_state_unchanged':True},
         episodes=[dict(seed=s,solver_seed=55,length=500,truncated_by_evaluator=False,
                        **{'return':float(s)}) for s in range(101,106)])
+    new.pop('checkpoint')  # Preparation passes a specification, not a completed record.
     baseline = historical_baseline(new,old,8)
     episodes = [{**e,'return':e['return']+3} for e in reversed(old['episodes'])]
     assert polyak_comparison(episodes,baseline)['metrics']['comparison/j4_gain_mean']==3

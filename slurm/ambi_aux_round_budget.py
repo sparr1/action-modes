@@ -38,8 +38,8 @@ def historical_baseline(candidate, baseline, rounds):
     from utils.eval_series_data import scientific_identity
     old_science = scientific_identity('AMBITDMPC2/AMBITDMPC2', None, ORIGINAL_SOURCE)
     match_round_identity(candidate, baseline, rounds, baseline_science=old_science)
-    assert candidate['checkpoint']['sha256'] == baseline['checkpoint']['sha256'] == CHECKPOINT_SHA
-    assert candidate['checkpoint']['step'] == baseline['checkpoint']['step'] == 625000
+    assert baseline['checkpoint']['sha256'] == CHECKPOINT_SHA
+    assert baseline['checkpoint']['step'] == 625000
     assert baseline['metrics']['eval/frozen_state_unchanged']
     assert sorted(e['seed'] for e in baseline['episodes']) == SEEDS
     assert all(e['length'] == 500 and not e['truncated_by_evaluator'] for e in baseline['episodes'])
