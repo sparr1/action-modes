@@ -58,6 +58,10 @@ def actor_updates(cell):
     return int(cell['params'].get('inner_actor_updates_per_round', 4))
 
 
+def critic_updates(cell):
+    return int(cell['params'].get('inner_critic_updates_per_round', 32))
+
+
 def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=CHECKPOINT_SHA):
     """Validate semantics, replay retention, exact work and trace coverage."""
     manifest = read(Path(path) / 'manifest.json')
@@ -70,7 +74,7 @@ def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=
     for key, value in cell['params'].items():
         assert cfg.get(key, 'none' if key == 'inner_terminal_entropy' else None) == value, (key, value)
     assert cfg['inner_batch_size'] == 256 and cfg['inner_rollouts_per_round'] == 128
-    assert cfg['inner_critic_updates_per_round'] == 32 and cfg['inner_actor_updates_per_round'] == actor_updates(cell)
+    assert cfg['inner_critic_updates_per_round'] == critic_updates(cell) and cfg['inner_actor_updates_per_round'] == actor_updates(cell)
     assert cfg['inner_replay_capacity'] == cell['params'].get('inner_replay_capacity', 2048)
     assert cfg['inner_replay_sampling'] == 'with_replacement'
     round_only = cell['params'].get('inner_replay_reset_each_round', False)
@@ -92,7 +96,7 @@ def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=
     assert result['environment_seeds'] == seeds and result['controller_seed'] == 55
     j, h = cell['J'], cell['H']
     expected = dict(inner_model_steps=128*h*j, inner_buffer_size=128*h*(1 if round_only else j),
-                    inner_critic_optimizer_steps=32*j, inner_actor_optimizer_steps=actor_updates(cell)*j,
+                    inner_critic_optimizer_steps=critic_updates(cell)*j, inner_actor_optimizer_steps=actor_updates(cell)*j,
                     inner_temperature_optimizer_steps=actor_updates(cell)*j if cfg['inner_entropy_enabled'] else 0,
                     inner_compile_fallback=0)
     for key, value in expected.items():
@@ -113,7 +117,7 @@ def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=
         if paired:
             assert not ep['truncated_by_evaluator'] and 'paired_return_delta' in ep
         assert [(p['round_index'], p['critic_updates'], p['actor_updates'])
-                for p in ep['togo_round_summaries']] == [(r, r*32, r*actor_updates(cell)) for r in range(j+1)]
+                for p in ep['togo_round_summaries']] == [(r, r*critic_updates(cell), r*actor_updates(cell)) for r in range(j+1)]
     return manifest
 
 
@@ -149,6 +153,8 @@ def round_replay_baseline(spec, record, *, baseline_science=None):
 
 
 def comparison_prefix(baseline):
+    if baseline.get('kind') == 'critic_budget':
+        return 'comparison/c32'
     if baseline.get('kind') == 'round_budget':
         return 'comparison/j4'
     if baseline.get('kind') == 'interleaved':
@@ -201,6 +207,12 @@ def prepare(args):
     reuse = {'return_return_alpha_h1_j1': args.reuse_alpha, 'return_return_zero_h1_j1': args.reuse_zero}
     baseline_cells = ({c['name']:c for c in read(args.baseline_campaign/'campaign.json')['cells']}
                       if args.baseline_campaign else {})
+    if getattr(args, 'baseline_extension_campaign', None):
+        assert args.baseline_kind == 'critic_budget'
+        for cell in read(args.baseline_extension_campaign/'campaign.json')['cells']:
+            name = cell['name'].removesuffix('_jscale')
+            assert name not in baseline_cells
+            baseline_cells[name] = cell
     panel = []
     for cell in cells(matrix):
         directory = root/cell['name']
@@ -227,9 +239,15 @@ def prepare(args):
             baseline_name = cell['name'].removesuffix(suffix)
             if args.baseline_kind == 'round_budget':
                 baseline_name = cell['name'].removesuffix('_jscale').replace(f"_j{cell['J']}", '_j4')
+            elif args.baseline_kind == 'critic_budget':
+                baseline_name = cell['name'].rsplit('_c', 1)[0]
             previous = baseline_cells[baseline_name]
             record, = load_records(previous['bundle'], inventory_path=args.inventory)
-            if args.baseline_kind == 'round_budget':
+            if args.baseline_kind == 'critic_budget':
+                from slurm.ambi_aux_critic_budget import historical_critic_baseline
+                validate(previous['bundle'], previous)
+                cell['baseline'] = historical_critic_baseline(spec, record, critic_updates(cell))
+            elif args.baseline_kind == 'round_budget':
                 from slurm.ambi_aux_round_budget import historical_baseline
                 validate(previous['bundle'], previous)
                 cell['baseline'] = historical_baseline(spec, record, cell['J'])
@@ -285,6 +303,13 @@ def prepare(args):
         campaign['publisher_workers'] = 4
         campaign['baseline_campaign'] = str(args.baseline_campaign)
         campaign['extension_of_original_hj_table'] = True
+    if read(matrix).get('critic_budget_sweep'):
+        assert args.baseline_kind == 'critic_budget' and args.baseline_campaign
+        assert args.baseline_extension_campaign and not execution
+        campaign['publisher_workers'] = 4
+        campaign['baseline_campaign'] = str(args.baseline_campaign)
+        campaign['baseline_extension_campaign'] = str(args.baseline_extension_campaign)
+        campaign['critic_budget_sweep'] = True
     write(root/'campaign.json', campaign)
     print(json.dumps(dict(root=str(root), conditions=len(panel), reused=sum(c['reused'] for c in panel),
                          overview_run_id=campaign['overview_run_id'])), flush=True)
@@ -383,7 +408,7 @@ def training_summary(bundle, cell, *, expected_steps=500):
                     if cell['params'].get('inner_component_update_order') == 'interleaved':
                         # Validate the chronology, not just final optimizer totals.
                         c, a = counts[key]['critic'], counts[key]['actor']
-                        interval = 32 // actor_updates(cell)
+                        interval = critic_updates(cell) // actor_updates(cell)
                         assert bool(e.get('updated_critic')) != bool(e.get('updated_actor'))
                         assert e['critic_updates'] == c and e['actor_updates'] == a
                         assert c == a*interval if e.get('updated_actor') else a*interval < c <= (a+1)*interval
@@ -393,9 +418,9 @@ def training_summary(bundle, cell, *, expected_steps=500):
                         assert bool(e.get('updated_critic')) != bool(e.get('updated_actor'))
                         assert e['critic_updates'] == c and e['actor_updates'] == a
                         if e.get('updated_critic'):
-                            assert a == (r-1)*actor_updates(cell) and (r-1)*32 < c <= r*32
+                            assert a == (r-1)*actor_updates(cell) and (r-1)*critic_updates(cell) < c <= r*critic_updates(cell)
                         else:
-                            assert c == r*32 and (r-1)*actor_updates(cell) < a <= r*actor_updates(cell)
+                            assert c == r*critic_updates(cell) and (r-1)*actor_updates(cell) < a <= r*actor_updates(cell)
                         assert bool(e.get('updated_temperature')) == bool(e.get('updated_actor') and cell['params']['inner_entropy_enabled'])
                     for metric,value in e['metrics'].items():
                         assert value is not None
@@ -416,7 +441,7 @@ def training_summary(bundle, cell, *, expected_steps=500):
     expected_n = len(run['episodes'])*expected_steps
     assert len(counts) == expected_n
     for count in counts.values():
-        assert dict(count) == dict(initial=1, collection=cell['J'], critic=32*cell['J'],
+        assert dict(count) == dict(initial=1, collection=cell['J'], critic=critic_updates(cell)*cell['J'],
                                   actor=actor_updates(cell)*cell['J'],
                                   **({'temperature':actor_updates(cell)*cell['J']} if cell['params']['inner_entropy_enabled'] else {}), decision=1), count
     required = {'critic_loss','critic_grad_norm','td_error_abs_mean','q_target_mean','actor_loss',
@@ -480,6 +505,7 @@ def publish_cell(args):
     summary = training_summary(bundle,cell)
     write(directory/'training-summary.json',summary)
     comparison_file = ('replay-comparison.json' if cell.get('baseline',{}).get('kind') == 'round_replay'
+                       else 'critic-budget-comparison.json' if cell.get('baseline',{}).get('kind') == 'critic_budget'
                        else 'round-budget-comparison.json' if cell.get('baseline',{}).get('kind') == 'round_budget'
                        else 'interleaved-comparison.json' if cell.get('baseline',{}).get('kind') == 'interleaved'
                        else 'actor-budget-comparison.json' if cell.get('baseline',{}).get('kind') == 'actor_budget'
@@ -496,7 +522,7 @@ def publish_cell(args):
     run = wandb.init(entity=ENTITY,project=PROJECT,id=cell['training_run_id'],resume='never',
                      name='Inner training | '+cell['name']+' | 625k',group=campaign['group'],
                      job_type='inner-training-diagnostics',tags=['closed-loop','H-J-sweep',cell['name'].rsplit('_h',1)[0]],
-                     config=dict(H=cell['H'],J=cell['J'],N=128,B=256,C=32,A=actor_updates(cell),checkpoint_step=625000,
+                     config=dict(H=cell['H'],J=cell['J'],N=128,B=256,C=critic_updates(cell),A=actor_updates(cell),checkpoint_step=625000,
                                  execution=receipt.get('execution'),
                                  setting=cell['name'],resolved_config=manifest['runs'][0]['resolved_config'],
                                  source_code=manifest['code'],reused=cell['reused'],
@@ -540,7 +566,7 @@ def publish_cell(args):
         run.summary.update({**record['metrics'],**(comparison['metrics'] if comparison else {}),
                             'status':'complete','reused':cell['reused'],
                             'diagnostic/paired_rows':len(diagnostic['rows']),
-                            'training/decisions':2500,'training/critic_updates':2500*32*cell['J'],
+                            'training/decisions':2500,'training/critic_updates':2500*critic_updates(cell)*cell['J'],
                             'training/actor_updates':2500*actor_updates(cell)*cell['J'],
                             'performance_url':f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["performance_run_id"]}'})
         run.finish()
@@ -566,7 +592,8 @@ def watch(args):
                      name=campaign.get('label','625k H/J sweep')+f' | {total} settings',
                      group=campaign['group'],job_type='campaign-overview',
                      config=dict(H=sorted({c['H'] for c in campaign['cells']}),
-                                 J=sorted({c['J'] for c in campaign['cells']}),N=128,B=256,C=32,
+                                 J=sorted({c['J'] for c in campaign['cells']}),N=128,B=256,
+                                 C=sorted({critic_updates(c) for c in campaign['cells']}),
                                  A=sorted({actor_updates(c) for c in campaign['cells']}),seeds=SEEDS,
                                  execution=campaign.get('execution'),
                                  target_taus=sorted({c['params'].get('inner_critic_target_tau',.01) for c in campaign['cells']}),
@@ -641,7 +668,8 @@ def main():
     p.add_argument('--group',default=GROUP)
     p.add_argument('--label',default='625k H/J sweep')
     p.add_argument('--baseline-campaign',type=Path)
-    p.add_argument('--baseline-kind',choices=['polyak','round_replay','interleaved','round_budget'],default='polyak')
+    p.add_argument('--baseline-extension-campaign',type=Path)
+    p.add_argument('--baseline-kind',choices=['polyak','round_replay','interleaved','round_budget','critic_budget'],default='polyak')
     for name in ('checkpoint','inventory','reference','registry','reuse-alpha','reuse-zero'):
         p.add_argument('--'+name,type=Path)
     p.add_argument('--index',type=int)

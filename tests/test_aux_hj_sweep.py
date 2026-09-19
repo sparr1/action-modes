@@ -37,10 +37,13 @@ def test_complete_grid_and_objectives():
                                      'soft_soft_h2_j1_a4_interleaved',
                                      'soft_soft_h3_j8_jscale','soft_return_h3_j8_jscale',
                                      'soft_soft_h1_j6_jscale','soft_return_h2_j6_jscale',
-                                     'soft_return_h1_j8_jscale'])
+                                     'soft_return_h1_j8_jscale',
+                                     'soft_soft_h3_j8_c8','soft_soft_h2_j4_c16','soft_soft_h1_j2_c8'])
 def panel(request,tmp_path_factory):
     root=tmp_path_factory.mktemp('hj')
-    matrix_path=(MATRIX.with_name('ambi_aux_j68_625k.json')
+    matrix_path=(MATRIX.with_name('ambi_aux_soft_critic_budget_625k.json')
+                 if request.param.rsplit('_',1)[-1] in ('c8','c16') else
+                 MATRIX.with_name('ambi_aux_j68_625k.json')
                  if request.param.endswith('_jscale') else
                  MATRIX.with_name('ambi_aux_interleaved_625k.json')
                  if request.param.endswith('_interleaved') else
@@ -79,7 +82,7 @@ def test_real_replay_and_complete_update_metrics(panel):
     assert len(summary['decision_curves'])==3
     critic=[r for r in summary['update_curves'] if r['axis']=='critic_update']
     actor=[r for r in summary['update_curves'] if r['axis']=='actor_update']
-    assert [r['index'] for r in critic]==list(range(1,32*cell['J']+1))
+    assert [r['index'] for r in critic]==list(range(1,cell['params'].get('inner_critic_updates_per_round',32)*cell['J']+1))
     assert [r['index'] for r in actor]==list(range(1,cell['params'].get('inner_actor_updates_per_round',4)*cell['J']+1))
     assert all(r['metrics']['critic_loss']['count']==6 for r in critic)
     assert all(r['metrics']['actor_loss']['count']==6 for r in actor)
