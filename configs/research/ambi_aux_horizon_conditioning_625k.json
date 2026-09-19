@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Prepared eight-setting 625k soft/soft comparison: H3 J2/J4/J8 and H1 J4, horizon conditioning none/one_hot, per-horizon diagnostics in both arms. Full evaluations require an explicit launch.",
+  "description": "625k soft/soft horizon-conditioning sweep: H2/H3 x J1/J2/J4/J8 one_hot, plus two missing J1 unconditioned controls. Reuse six completed J2/J4/J8 C16 baselines. H1 deferred.",
   "base_alg_config": "checkpoint",
   "source_run": "rwgao_b-brown-university/ambi/aux6434715x3",
   "shared_alg_params": {
@@ -96,14 +96,16 @@
     "max_steps": 500,
     "togo_return_rollouts": 32,
     "default_presets": [
-      "sweep/soft_soft_h3_j2_c16_none",
-      "sweep/soft_soft_h3_j2_c16_one_hot",
-      "sweep/soft_soft_h3_j4_c16_none",
-      "sweep/soft_soft_h3_j4_c16_one_hot",
-      "sweep/soft_soft_h3_j8_c16_none",
       "sweep/soft_soft_h3_j8_c16_one_hot",
-      "sweep/soft_soft_h1_j4_c16_none",
-      "sweep/soft_soft_h1_j4_c16_one_hot"
+      "sweep/soft_soft_h2_j8_c16_one_hot",
+      "sweep/soft_soft_h3_j4_c16_one_hot",
+      "sweep/soft_soft_h2_j4_c16_one_hot",
+      "sweep/soft_soft_h3_j2_c16_one_hot",
+      "sweep/soft_soft_h2_j2_c16_one_hot",
+      "sweep/soft_soft_h3_j1_c16_one_hot",
+      "sweep/soft_soft_h2_j1_c16_one_hot",
+      "sweep/soft_soft_h3_j1_c16_none",
+      "sweep/soft_soft_h2_j1_c16_none"
     ]
   },
   "comparisons": {
@@ -272,8 +274,189 @@
             "inner_horizon_conditioning": "one_hot",
             "inner_horizon_diagnostics": true
           }
+        },
+        "soft_soft_h2_j2_c16_none": {
+          "description": "Soft/soft H2 J2 C16/A4; remaining-horizon conditioning none.",
+          "alg_params": {
+            "inner_critic_source": "sac",
+            "inner_horizon_critic_source": "sac",
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_terminal_entropy": "outer",
+            "inner_entropy_enabled": true,
+            "inner_temperature_mode": "auto",
+            "inner_rounds": 2,
+            "inner_rollout_horizon": 2,
+            "inner_replay_capacity": 3072,
+            "inner_component_update_order": "critic_first",
+            "inner_critic_updates_per_round": 16,
+            "inner_horizon_conditioning": "none",
+            "inner_horizon_diagnostics": true
+          }
+        },
+        "soft_soft_h2_j2_c16_one_hot": {
+          "description": "Soft/soft H2 J2 C16/A4; remaining-horizon conditioning one_hot.",
+          "alg_params": {
+            "inner_critic_source": "sac",
+            "inner_horizon_critic_source": "sac",
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_terminal_entropy": "outer",
+            "inner_entropy_enabled": true,
+            "inner_temperature_mode": "auto",
+            "inner_rounds": 2,
+            "inner_rollout_horizon": 2,
+            "inner_replay_capacity": 3072,
+            "inner_component_update_order": "critic_first",
+            "inner_critic_updates_per_round": 16,
+            "inner_horizon_conditioning": "one_hot",
+            "inner_horizon_diagnostics": true
+          }
+        },
+        "soft_soft_h2_j4_c16_none": {
+          "description": "Soft/soft H2 J4 C16/A4; remaining-horizon conditioning none.",
+          "alg_params": {
+            "inner_critic_source": "sac",
+            "inner_horizon_critic_source": "sac",
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_terminal_entropy": "outer",
+            "inner_entropy_enabled": true,
+            "inner_temperature_mode": "auto",
+            "inner_rounds": 4,
+            "inner_rollout_horizon": 2,
+            "inner_replay_capacity": 3072,
+            "inner_component_update_order": "critic_first",
+            "inner_critic_updates_per_round": 16,
+            "inner_horizon_conditioning": "none",
+            "inner_horizon_diagnostics": true
+          }
+        },
+        "soft_soft_h2_j4_c16_one_hot": {
+          "description": "Soft/soft H2 J4 C16/A4; remaining-horizon conditioning one_hot.",
+          "alg_params": {
+            "inner_critic_source": "sac",
+            "inner_horizon_critic_source": "sac",
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_terminal_entropy": "outer",
+            "inner_entropy_enabled": true,
+            "inner_temperature_mode": "auto",
+            "inner_rounds": 4,
+            "inner_rollout_horizon": 2,
+            "inner_replay_capacity": 3072,
+            "inner_component_update_order": "critic_first",
+            "inner_critic_updates_per_round": 16,
+            "inner_horizon_conditioning": "one_hot",
+            "inner_horizon_diagnostics": true
+          }
+        },
+        "soft_soft_h2_j8_c16_none": {
+          "description": "Soft/soft H2 J8 C16/A4; remaining-horizon conditioning none.",
+          "alg_params": {
+            "inner_critic_source": "sac",
+            "inner_horizon_critic_source": "sac",
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_terminal_entropy": "outer",
+            "inner_entropy_enabled": true,
+            "inner_temperature_mode": "auto",
+            "inner_rounds": 8,
+            "inner_rollout_horizon": 2,
+            "inner_replay_capacity": 3072,
+            "inner_component_update_order": "critic_first",
+            "inner_critic_updates_per_round": 16,
+            "inner_horizon_conditioning": "none",
+            "inner_horizon_diagnostics": true
+          }
+        },
+        "soft_soft_h2_j8_c16_one_hot": {
+          "description": "Soft/soft H2 J8 C16/A4; remaining-horizon conditioning one_hot.",
+          "alg_params": {
+            "inner_critic_source": "sac",
+            "inner_horizon_critic_source": "sac",
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_terminal_entropy": "outer",
+            "inner_entropy_enabled": true,
+            "inner_temperature_mode": "auto",
+            "inner_rounds": 8,
+            "inner_rollout_horizon": 2,
+            "inner_replay_capacity": 3072,
+            "inner_component_update_order": "critic_first",
+            "inner_critic_updates_per_round": 16,
+            "inner_horizon_conditioning": "one_hot",
+            "inner_horizon_diagnostics": true
+          }
+        },
+        "soft_soft_h2_j1_c16_none": {
+          "description": "Soft/soft H2 J1 C16/A4; remaining-horizon conditioning none.",
+          "alg_params": {
+            "inner_critic_source": "sac",
+            "inner_horizon_critic_source": "sac",
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_terminal_entropy": "outer",
+            "inner_entropy_enabled": true,
+            "inner_temperature_mode": "auto",
+            "inner_rounds": 1,
+            "inner_rollout_horizon": 2,
+            "inner_replay_capacity": 3072,
+            "inner_component_update_order": "critic_first",
+            "inner_critic_updates_per_round": 16,
+            "inner_horizon_conditioning": "none",
+            "inner_horizon_diagnostics": true
+          }
+        },
+        "soft_soft_h2_j1_c16_one_hot": {
+          "description": "Soft/soft H2 J1 C16/A4; remaining-horizon conditioning one_hot.",
+          "alg_params": {
+            "inner_critic_source": "sac",
+            "inner_horizon_critic_source": "sac",
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_terminal_entropy": "outer",
+            "inner_entropy_enabled": true,
+            "inner_temperature_mode": "auto",
+            "inner_rounds": 1,
+            "inner_rollout_horizon": 2,
+            "inner_replay_capacity": 3072,
+            "inner_component_update_order": "critic_first",
+            "inner_critic_updates_per_round": 16,
+            "inner_horizon_conditioning": "one_hot",
+            "inner_horizon_diagnostics": true
+          }
+        },
+        "soft_soft_h3_j1_c16_none": {
+          "description": "Soft/soft H3 J1 C16/A4; remaining-horizon conditioning none.",
+          "alg_params": {
+            "inner_critic_source": "sac",
+            "inner_horizon_critic_source": "sac",
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_terminal_entropy": "outer",
+            "inner_entropy_enabled": true,
+            "inner_temperature_mode": "auto",
+            "inner_rounds": 1,
+            "inner_rollout_horizon": 3,
+            "inner_replay_capacity": 3072,
+            "inner_component_update_order": "critic_first",
+            "inner_critic_updates_per_round": 16,
+            "inner_horizon_conditioning": "none",
+            "inner_horizon_diagnostics": true
+          }
+        },
+        "soft_soft_h3_j1_c16_one_hot": {
+          "description": "Soft/soft H3 J1 C16/A4; remaining-horizon conditioning one_hot.",
+          "alg_params": {
+            "inner_critic_source": "sac",
+            "inner_horizon_critic_source": "sac",
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_terminal_entropy": "outer",
+            "inner_entropy_enabled": true,
+            "inner_temperature_mode": "auto",
+            "inner_rounds": 1,
+            "inner_rollout_horizon": 3,
+            "inner_replay_capacity": 3072,
+            "inner_component_update_order": "critic_first",
+            "inner_critic_updates_per_round": 16,
+            "inner_horizon_conditioning": "one_hot",
+            "inner_horizon_diagnostics": true
+          }
         }
       }
     }
-  }
+  },
+  "horizon_conditioning_sweep": true
 }

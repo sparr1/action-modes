@@ -13,18 +13,32 @@ from tests.test_ambi_root_local_sac import _tiny_model, _tiny_params
 from tests.test_ambi_config_decoupling import _build_cfg
 
 
-def test_eight_settings_and_only_conditioning_differs_within_pairs():
+def test_eight_conditioned_settings_and_two_missing_j1_controls():
     matrix=json.loads(smoke.MATRIX.read_text())
     cells=sweep.cells(smoke.MATRIX)
-    assert len(cells)==8
-    assert {(c['H'],c['J']) for c in cells}=={(3,2),(3,4),(3,8),(1,4)}
-    for off,on in zip(cells[::2],cells[1::2]):
-        a=dict(off['params']);b=dict(on['params'])
+    historical=json.loads(smoke.MATRIX.with_name('ambi_aux_soft_critic_budget_625k.json').read_text())
+    variants=matrix['comparisons']['sweep']['variants']
+    assert len(cells)==10
+    conditioned=[c for c in cells if c['params']['inner_horizon_conditioning']=='one_hot']
+    assert len(conditioned)==8
+    assert {(c['H'],c['J']) for c in conditioned}=={(h,j) for h in (2,3) for j in (1,2,4,8)}
+    assert {(c['H'],c['J']) for c in cells if c not in conditioned}=={(2,1),(3,1)}
+    for key in ('controller_seed','seeds','max_steps','togo_return_rollouts'):
+        assert matrix['evaluation'][key]==historical['evaluation'][key]
+    for cell in conditioned:
+        a=dict(variants[cell['name'].replace('_one_hot','_none')]['alg_params'])
+        b=dict(cell['params'])
         assert a.pop('inner_horizon_conditioning')=='none'
         assert b.pop('inner_horizon_conditioning')=='one_hot'
         assert a==b and a['inner_horizon_diagnostics']
-    for cell in cells:
         params={**matrix['shared_alg_params'], **cell['params']}
+        old_name=cell['name'].removesuffix('_one_hot').replace('_j1_', '_j2_')
+        previous={**historical['shared_alg_params'],
+                  **historical['comparisons']['sweep']['variants'][old_name]['alg_params']}
+        previous['inner_rounds']=cell['J']
+        previous.setdefault('inner_replay_reset_each_round',False)
+        compared={k:v for k,v in params.items() if k not in ('inner_horizon_conditioning','inner_horizon_diagnostics')}
+        assert compared==previous
         cfg=_build_cfg(**{**{k:v for k,v in params.items() if v is not None},'aux_return_mode':'sac'})
         assert cfg.inner_critic_updates_per_round==16 and cfg.inner_actor_updates_per_round==4
         assert cfg.inner_actor_lr==cfg.inner_critic_lr==3e-4 and cfg.inner_critic_target_tau==.01

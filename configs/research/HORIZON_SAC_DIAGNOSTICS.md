@@ -1,15 +1,46 @@
 # Remaining-horizon SAC: conditioning and training diagnostics
 
-`ambi_aux_horizon_conditioning_625k.json` prepares eight soft/soft settings on
+`ambi_aux_horizon_conditioning_625k.json` prepares eight conditioned soft/soft settings and two new J1 controls on
 `rwgao_b-brown-university/ambi/aux6434715x3`, checkpoint 625,000 (seed 55).
 It does not submit jobs. The default selectors are:
 
 | H | J | Conditioning | Imagined rows per decision | Critic / actor updates |
 |---|---|---|---|---|
-| 3 | 2 | `none`, `one_hot` | 768 | 32 / 8 |
-| 3 | 4 | `none`, `one_hot` | 1,536 | 64 / 16 |
-| 3 | 8 | `none`, `one_hot` | 3,072 | 128 / 32 |
-| 1 | 4 | `none`, `one_hot` | 512 | 64 / 16 |
+| 2 | 1 | `none`, `one_hot` | 256 | 16 / 4 |
+| 2 | 2 | `one_hot` | 512 | 32 / 8 |
+| 2 | 4 | `one_hot` | 1,024 | 64 / 16 |
+| 2 | 8 | `one_hot` | 2,048 | 128 / 32 |
+| 3 | 1 | `none`, `one_hot` | 384 | 16 / 4 |
+| 3 | 2 | `one_hot` | 768 | 32 / 8 |
+| 3 | 4 | `one_hot` | 1,536 | 64 / 16 |
+| 3 | 8 | `one_hot` | 3,072 | 128 / 32 |
+
+Reuse the six completed unconditioned C16 settings from
+`ambi_aux_soft_critic_budget_625k.json` (source `fe87ae07`), matched by H and J.
+Their checkpoint, seeds, budgets, entropy settings and full-replay protocol
+match this comparison. Compare paired real returns and the existing aggregate
+training metrics/model probes. Historical traces do not contain the new
+per-horizon minibatch sums, so those curves cannot be recovered by republication.
+Before publication, validate the immutable baseline bundles and record their
+original source/run identities; do not append new conditioned results to them.
+
+This adds 50 full episodes: eight conditioned settings and the two missing
+J1/C16 unconditioned controls, with five seeds each. Existing J2/J4/J8 controls
+are reused; H1/J4 and other unconditioned variants remain explicit selectors for
+validation and are excluded from the production selection. H1 performance
+assessment is deferred.
+
+`slurm/launch_ambi_aux_horizon_oscar.sh` prepares explicit new curve identities,
+queues a three-case H2/J1 and H3/J8 smoke, then ten independent GPU workers gated
+on its success, plus one CPU publisher with four publication subprocesses.
+Longer J panels are first. The selected ten-way concurrency uses 40 GPU-worker
+CPUs/320 GiB, plus 8 CPUs/64 GiB for publication. Check live quota before use.
+The launcher reuses the existing frozen-prior reference. Comparison publication
+revalidates baseline identity and immutable manifest/trace hashes, and waits for
+the new J1 controls when needed. Training runs and the overview include
+`comparison/unconditioned_gain_*` with paired seed bootstrap intervals, in
+addition to the unchanged paired-prior improvement metrics. Historical controls
+retain their existing run identities; no historical results are republished.
 
 All arms enable `inner_horizon_diagnostics`. N128/B256, C16/A4, learning rates
 3e-4, tau .01, inherited adaptive alpha, critic-first updates and capacity 3072

@@ -153,6 +153,8 @@ def round_replay_baseline(spec, record, *, baseline_science=None):
 
 
 def comparison_prefix(baseline):
+    if baseline.get('kind') == 'horizon_conditioning':
+        return 'comparison/unconditioned'
     if baseline.get('kind') == 'critic_budget':
         return 'comparison/c32'
     if baseline.get('kind') == 'round_budget':
@@ -232,7 +234,7 @@ def prepare(args):
             bundle, actual_selector = str(source), manifest['runs'][0]['selector']
         else:
             bundle, actual_selector = str(directory/'bundle'), cell['selector']
-        if baseline_cells:
+        if baseline_cells and not read(matrix).get('horizon_conditioning_sweep'):
             round_replay = args.baseline_kind == 'round_replay'
             interleaved = args.baseline_kind == 'interleaved'
             suffix = '_interleaved' if interleaved else '_roundreplay' if round_replay else '_tau010'
@@ -310,6 +312,9 @@ def prepare(args):
         campaign['baseline_campaign'] = str(args.baseline_campaign)
         campaign['baseline_extension_campaign'] = str(args.baseline_extension_campaign)
         campaign['critic_budget_sweep'] = True
+    if read(matrix).get('horizon_conditioning_sweep'):
+        from slurm.ambi_aux_horizon_campaign import prepare_campaign
+        prepare_campaign(campaign, root, args.baseline_campaign)
     write(root/'campaign.json', campaign)
     print(json.dumps(dict(root=str(root), conditions=len(panel), reused=sum(c['reused'] for c in panel),
                          overview_run_id=campaign['overview_run_id'])), flush=True)
@@ -329,6 +334,8 @@ def worker(args):
                   if any(campaign.get('execution',{}).get(k) for k in ('actor_budget_comparison','interleaved_comparison')) else
                   [c for c in campaign['cells'] if c['H'] == max(x['H'] for x in campaign['cells'])
                    and c['J'] == max(x['J'] for x in campaign['cells'])])
+        if campaign.get('horizon_conditioning_sweep'):
+            chosen = [c for c in campaign['cells'] if (c['H'], c['J']) in ((2, 1), (3, 8))]
     else:
         chosen = [campaign['cells'][args.index]]
     for cell in chosen:
@@ -515,13 +522,17 @@ def publish_cell(args):
     if campaign.get('execution',{}).get('interleaved_comparison'):
         from slurm.ambi_aux_interleaved import validate_phased_comparison
         validate_phased_comparison(campaign, cell, record, receipt)
+    if campaign.get('horizon_conditioning_sweep') and cell['params']['inner_horizon_conditioning'] == 'one_hot':
+        from slurm.ambi_aux_horizon_campaign import publication_baseline
+        cell['baseline'] = publication_baseline(campaign, cell, record)
     comparison = polyak_comparison(record['episodes'],cell['baseline']) if 'baseline' in cell else None
     staged = stage_completed_bundle(bundle,{cell['actual_selector']:cell['run_dir']},inventory_path=campaign['inventory'])
     assert staged[cell['actual_selector']]['status'] == 'queued'
     performance = publish_performance(cell['run_dir'])
     summary = training_summary(bundle,cell)
     write(directory/'training-summary.json',summary)
-    comparison_file = ('replay-comparison.json' if cell.get('baseline',{}).get('kind') == 'round_replay'
+    comparison_file = ('horizon-conditioning-comparison.json' if cell.get('baseline',{}).get('kind') == 'horizon_conditioning'
+                       else 'replay-comparison.json' if cell.get('baseline',{}).get('kind') == 'round_replay'
                        else 'critic-budget-comparison.json' if cell.get('baseline',{}).get('kind') == 'critic_budget'
                        else 'round-budget-comparison.json' if cell.get('baseline',{}).get('kind') == 'round_budget'
                        else 'interleaved-comparison.json' if cell.get('baseline',{}).get('kind') == 'interleaved'
@@ -632,6 +643,7 @@ def watch(args):
                          f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["training_run_id"]}',
                          f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["performance_run_id"]}',
                          result.get('metrics',{}).get(comparison_prefix(
+                             {'kind':'horizon_conditioning'} if campaign.get('horizon_conditioning_sweep') else
                              {'kind':'actor_budget'} if campaign.get('execution',{}).get('actor_budget_comparison') else
                              cell.get('baseline',{}))+'_gain_mean')])
         return rows
@@ -649,6 +661,8 @@ def watch(args):
                     d=Path(cell['directory'])
                     baseline_ready = (not cell.get('actor_baseline_name') or
                                       (args.root/cell['actor_baseline_name']/'worker-completion.json').exists())
+                    baseline_ready = baseline_ready and (not cell.get('horizon_baseline_name') or
+                                      (args.root/cell['horizon_baseline_name']/'worker-completion.json').exists())
                     if index not in attempted and baseline_ready and (d/'worker-completion.json').exists() and not (d/'publication-completion.json').exists():
                         attempted.add(index); futures[index]=pool.submit(launch,index)
                 rows=status_rows(); stamp=[r[3] for r in rows]

@@ -184,8 +184,10 @@ and strict pairing to the corresponding historical C32 results.
 ## Horizon-conditioned SAC comparison
 
 [ambi_aux_horizon_conditioning_625k.json](ambi_aux_horizon_conditioning_625k.json)
-prepares eight soft/soft settings (H3 J2/J4/J8 and H1 J4, conditioning off/on)
-with C16/A4 and diagnostics in both arms. See
+prepares eight conditioned soft/soft settings (H2/H3 × J1/J2/J4/J8) and two
+missing unconditioned J1 controls
+with C16/A4 and per-horizon diagnostics. Reuse the completed unconditioned C16
+J2/J4/J8 baselines; H1 is deferred. See
 [HORIZON_SAC_DIAGNOSTICS.md](HORIZON_SAC_DIAGNOSTICS.md) for metric definitions,
 checkpoint compatibility and the separate three-decision Oscar smoke. Merely
 preparing this matrix does not launch full evaluations.
