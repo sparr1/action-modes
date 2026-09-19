@@ -67,6 +67,12 @@ uses metadata version 4; legacy unlabelled versions 1–3 remain unchanged.
 Appends/restores validate h in [1,H], integer values, and
 `horizon_end == (h == 1)`; restoration validates metadata before mutation.
 Trusted collectors skip host-side value checks on internally generated labels.
+Labelled samples make one device-local copy of the learner fields to preserve
+the original packed minibatch strides/offsets. Otherwise the extra label column
+can change compiled reduction schedules and accumulate floating-point drift in
+an unconditioned control, despite identical samples and RNG states.
+Diagnostic-only labels are attached outside the unconditioned compiled rollout,
+preserving that kernel's original output layout as well.
 Conditioned exact inner state uses version 7 and, for auxiliary backbones,
 includes and validates both conditioning and source metadata.
 

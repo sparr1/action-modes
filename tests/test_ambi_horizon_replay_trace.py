@@ -46,6 +46,20 @@ def test_horizon_rows_wrap_sample_and_restore_with_their_transitions(packed):
         assert (candidate.pos, candidate.full, candidate.next_sample_id) == (replay.pos, replay.full, replay.next_sample_id)
 
 
+def test_labels_preserve_learner_minibatch_strides_offsets_and_values():
+    labelled = _replay(capacity=6)
+    ordinary = LatentReplayBuffer(6, 1, 1, "cpu", store_horizon=True)
+    _append(labelled, [3, 2, 1, 3, 2, 1])
+    ordinary.add_batch(labelled.z, labelled.action, labelled.reward, labelled.next_z,
+                       labelled.terminated, horizon_end=labelled.horizon_end)
+    indices = torch.tensor([3, 1, 1, 5])
+    a, b = [buffer.sample(4, indices=indices) for buffer in (ordinary, labelled)]
+    for name in a:
+        torch.testing.assert_close(a[name], b[name], rtol=0, atol=0)
+        assert a[name].stride() == b[name].stride()
+        assert a[name].storage_offset() == b[name].storage_offset()
+
+
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("bad", [0, -1, 4, 1.5, float("nan"), float("inf")])
 def test_public_append_rejects_invalid_horizon_before_mutation(packed, bad):

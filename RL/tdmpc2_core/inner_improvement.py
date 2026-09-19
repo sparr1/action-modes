@@ -3086,7 +3086,8 @@ class InnerImprovementEngine:
                 noise=(policy_noise[step] if policy_noise.numel() else None),
                 std_scale=max(std_scale, 1e-12),
                 noise_std=cfg.inner_behavior_noise_std,
-                remaining_horizon=self._remaining_horizon(z, step),
+                remaining_horizon=(self._remaining_horizon(z, step)
+                                   if self._horizon_conditioning_horizon is not None else None),
             )
             joint = self.model.joint_input(z, action)
             reward_prediction = self.model.reward_from_joint(joint)
@@ -3099,7 +3100,7 @@ class InnerImprovementEngine:
             fields = (z, action, reward, next_z, terminated)
             if getattr(cfg, "inner_finite_horizon", False):
                 fields += (torch.full_like(terminated, float(step == horizon - 1)),)
-            if self._replay_horizon is not None:
+            if self._horizon_conditioning_horizon is not None:
                 fields += (self._remaining_horizon(z, step),)
             transitions.append(torch.cat(fields, dim=-1))
             reward_vector = reward.squeeze(-1)
@@ -3152,8 +3153,14 @@ class InnerImprovementEngine:
                 reward_support,
             )
 
+        packed = rollout[0]
+        if self._replay_horizon is not None and self._horizon_conditioning_horizon is None:
+            # Keep the unconditioned compiled rollout's output layout identical
+            # with diagnostics on/off; observational labels are attached eagerly.
+            labels = torch.arange(horizon, 0, -1, device=packed.device, dtype=packed.dtype)
+            packed = torch.cat((packed, labels.repeat_interleave(count).unsqueeze(1)), dim=-1)
         state.replay.add_packed(
-            rollout[0],
+            packed,
             **({"validate": False} if self._replay_horizon is not None else {}),
         )
         state.policy_evaluations += count * horizon

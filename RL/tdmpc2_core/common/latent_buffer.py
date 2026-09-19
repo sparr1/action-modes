@@ -349,10 +349,21 @@ class LatentReplayBuffer:
                 raise TypeError("Pre-generated latent replay indices must have dtype long.")
 
         packed = self._storage.index_select(0, indices)
+        # Observational labels must not change the tensor strides seen by the
+        # learner. In particular, Inductor may choose different reduction
+        # schedules for widened replay rows and introduce rounding drift even
+        # when the unconditioned networks never consume the labels. Preserve
+        # the historical packed minibatch layout with one device-local copy.
+        horizon_slice = self._field_slices.get("remaining_horizon")
+        learner_packed = (packed if horizon_slice is None
+                          else packed[:, :horizon_slice.start].contiguous())
         batch = {
-            name: packed[:, field_slice]
+            name: learner_packed[:, field_slice]
             for name, field_slice in self._field_slices.items()
+            if name != "remaining_horizon"
         }
+        if horizon_slice is not None:
+            batch["remaining_horizon"] = packed[:, horizon_slice]
         if self.source is not None:
             batch["source"] = self.source.index_select(0, indices)
         if include_ids:

@@ -172,6 +172,25 @@ def test_auxiliary_conditioned_checkpoint_and_resume_preflight():
         source.env.close(); restored.env.close()
 
 
+def test_unconditioned_dense_kernel_output_contract_is_independent_of_labels():
+    models = [_tiny_model(inner_finite_horizon=True, inner_rollout_horizon=3,
+                          inner_replay_capacity=24, inner_horizon_diagnostics=flag)
+              for flag in (False, True)]
+    try:
+        outputs=[]
+        for model in models:
+            engine=model.agent.inner_engine
+            with engine.rng.fork('initialization'): engine._prepare_workspace(t0=True)
+            engine.state.actor.eval(); engine.model.eval()
+            z=torch.zeros(1,model.cfg.latent_dim)
+            with torch.no_grad():
+                outputs.append(engine._dense_rollout_kernel(z,torch.zeros(3,2,model.cfg.action_dim),None))
+        _assert_tree_equal(outputs[0],outputs[1])
+        assert outputs[0][0].stride()==outputs[1][0].stride()
+    finally:
+        for model in models: model.env.close()
+
+
 @pytest.mark.parametrize("conditioning", ["none", "one_hot"])
 @pytest.mark.parametrize("source", ["inner_actor_source", "inner_critic_source", "inner_horizon_actor_source", "inner_horizon_critic_source"])
 def test_auxiliary_backbone_support_is_soft_sources_only(conditioning, source):
