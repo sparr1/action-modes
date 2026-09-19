@@ -626,6 +626,20 @@ def _initialize_frozen_model(resolved, env, checkpoint, controller_seed, device=
     return model, run_config
 
 
+def _validate_horizon_probe_selection(resolved_presets, *, root_bank_requested,
+                                      togo_return_rollouts):
+    """Reject legacy bank probes before creating environments or bundle output."""
+    if not root_bank_requested or togo_return_rollouts:
+        return
+    if any(str(item["algorithm_config"]["alg_params"].get(
+        "inner_horizon_conditioning", "none",
+    )).lower() == "one_hot" for item in resolved_presets):
+        raise ValueError(
+            "Horizon-conditioned actors do not support legacy bank probes; "
+            "set evaluation.togo_return_rollouts > 0 for outer-tail probes."
+        )
+
+
 def evaluate_preset(
     resolved,
     checkpoint,
@@ -670,6 +684,10 @@ def evaluate_preset(
         raise ValueError("togo_return_rollouts must be a nonnegative integer.")
     if togo_return_rollouts and bundle is None:
         raise ValueError("To-go return probes require a benchmark bundle.")
+    _validate_horizon_probe_selection(
+        [resolved], root_bank_requested=root_bank is not None,
+        togo_return_rollouts=togo_return_rollouts,
+    )
 
     env = _make_env(resolved)
     model = None
@@ -1054,6 +1072,10 @@ def evaluate_matrix(
                         for selector in selectors]
     _validate_frozen_selection(matrix, resolved_presets)
     _validate_checkpoint_contract(matrix, checkpoint, context, resolved_presets)
+    _validate_horizon_probe_selection(
+        resolved_presets, root_bank_requested=root_bank_path is not None,
+        togo_return_rollouts=togo_return_rollouts,
+    )
     if togo_return_rollouts and any(
         item["algorithm_config"].get("alg") != "AMBITDMPC2/AMBITDMPC2"
         or item["algorithm_config"]["alg_params"].get("inner_operator", "sac") not in {"sac", "none"}

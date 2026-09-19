@@ -1,5 +1,7 @@
 """Small device-resident replay buffer used by AMBI's per-state inner SAC."""
 
+from numbers import Integral
+
 import torch
 
 from .training_state import require_exact_keys
@@ -22,6 +24,7 @@ class LatentReplayBuffer:
         *,
         store_source=False,
         store_horizon=False,
+        remaining_horizon_max=None,
     ):
         self.capacity = max(1, int(capacity))
         self.device = torch.device(device)
@@ -33,6 +36,15 @@ class LatentReplayBuffer:
         if not isinstance(store_horizon, bool):
             raise TypeError("store_horizon must be bool.")
         self.store_horizon = store_horizon
+        if remaining_horizon_max is not None:
+            if (isinstance(remaining_horizon_max, bool)
+                    or not isinstance(remaining_horizon_max, Integral)
+                    or remaining_horizon_max < 1):
+                raise ValueError("remaining_horizon_max must be a positive integer or None.")
+            if not store_horizon:
+                raise ValueError("Horizon-labelled replay requires store_horizon=True.")
+            remaining_horizon_max = int(remaining_horizon_max)
+        self.remaining_horizon_max = remaining_horizon_max
         if self.latent_dim <= 0 or self.action_dim <= 0:
             raise ValueError("Latent and action dimensions must be positive.")
 
@@ -48,6 +60,8 @@ class LatentReplayBuffer:
         )
         if self.store_horizon:
             field_widths += (("horizon_end", 1),)
+        if self.remaining_horizon_max is not None:
+            field_widths += (("remaining_horizon", 1),)
         for name, width in field_widths:
             self._field_slices[name] = slice(offset, offset + width)
             offset += width
@@ -60,6 +74,10 @@ class LatentReplayBuffer:
         self.horizon_end = (
             self._storage[:, self._field_slices["horizon_end"]]
             if self.store_horizon else None
+        )
+        self.remaining_horizon = (
+            self._storage[:, self._field_slices["remaining_horizon"]]
+            if self.remaining_horizon_max is not None else None
         )
         self.source = (
             torch.empty(
@@ -100,7 +118,8 @@ class LatentReplayBuffer:
         if not preserve_sample_ids:
             self.next_sample_id = 0
 
-    def _reshape_fields(self, z, action, reward, next_z, terminated, horizon_end=None):
+    def _reshape_fields(self, z, action, reward, next_z, terminated, horizon_end=None,
+                        remaining_horizon=None):
         values = (
             z.detach().reshape(-1, self.latent_dim),
             action.detach().reshape(-1, self.action_dim),
@@ -114,6 +133,12 @@ class LatentReplayBuffer:
             values += (horizon_end.detach().reshape(-1, 1),)
         elif horizon_end is not None:
             raise ValueError("Latent replay horizon_end requires store_horizon=True.")
+        if self.remaining_horizon_max is not None:
+            if remaining_horizon is None:
+                raise ValueError("Horizon-labelled replay requires remaining_horizon.")
+            values += (remaining_horizon.detach().reshape(-1, 1),)
+        elif remaining_horizon is not None:
+            raise ValueError("Latent replay remaining_horizon requires remaining_horizon_max.")
         n = values[0].shape[0]
         if any(value.shape[0] != n for value in values[1:]):
             raise ValueError(
@@ -207,15 +232,20 @@ class LatentReplayBuffer:
         self.pos = (old_pos + original_n) % self.capacity
         self.full = self.full or (old_pos + original_n >= self.capacity)
 
-    def add_batch(self, z, action, reward, next_z, terminated, *, source=None, horizon_end=None):
-        """Append a flat batch of transitions in its existing row order."""
-        values, n = self._reshape_fields(z, action, reward, next_z, terminated, horizon_end)
+    def add_batch(self, z, action, reward, next_z, terminated, *, source=None,
+                  horizon_end=None, remaining_horizon=None, validate=True):
+        """Append transitions; internal collectors may skip generated horizon checks."""
+        values, n = self._reshape_fields(
+            z, action, reward, next_z, terminated, horizon_end, remaining_horizon,
+        )
         if n == 0:
             return
+        if validate and self.remaining_horizon_max is not None:
+            self._validate_remaining_horizon(values[-1], values[-2])
         source = self._reshape_source(source, n)
         self._append_packed(self._pack_fields(values, n), n, source)
 
-    def add_packed(self, packed, *, source=None):
+    def add_packed(self, packed, *, source=None, validate=True):
         """Append rows already laid out like the packed replay allocation."""
         if not torch.is_tensor(packed) or packed.ndim < 2:
             raise TypeError("Packed latent replay rows must be a tensor with rows.")
@@ -224,6 +254,11 @@ class LatentReplayBuffer:
                 "Packed latent replay width does not match the configured fields."
             )
         packed = packed.detach().reshape(-1, self._storage.shape[-1])
+        if validate and self.remaining_horizon_max is not None:
+            self._validate_remaining_horizon(
+                packed[:, self._field_slices["remaining_horizon"]],
+                packed[:, self._field_slices["horizon_end"]],
+            )
         if packed.device != self.device:
             packed = packed.to(self.device)
         if packed.dtype != self._storage.dtype:
@@ -233,14 +268,17 @@ class LatentReplayBuffer:
             source = self._reshape_source(source, n)
             self._append_packed(packed, n, source)
 
-    def add_round(self, z, action, reward, next_z, terminated, *, source=None, horizon_end=None):
+    def add_round(self, z, action, reward, next_z, terminated, *, source=None,
+                  horizon_end=None, remaining_horizon=None, validate=True):
         """Append a dense rollout round in horizon-major order.
 
         Inputs may have any common leading dimensions (normally ``H x N``).
         Flattening keeps the last dimension as the field width, so transitions
         are stored as ``h0/n0, h0/n1, ..., h1/n0, ...`` in one append.
         """
-        self.add_batch(z, action, reward, next_z, terminated, source=source, horizon_end=horizon_end)
+        self.add_batch(z, action, reward, next_z, terminated, source=source,
+                       horizon_end=horizon_end, remaining_horizon=remaining_horizon,
+                       validate=validate)
 
     def _draw_indices(self, batch_size, replacement, generator):
         if replacement:
@@ -342,13 +380,16 @@ class LatentReplayBuffer:
             state["source"] = self.source[:size].clone()
         if self.store_horizon:
             state["horizon_end"] = self.horizon_end[:size].clone()
+        if self.remaining_horizon_max is not None:
+            state["remaining_horizon_max"] = self.remaining_horizon_max
+            state["remaining_horizon"] = self.remaining_horizon[:size].clone()
         return state
 
     def training_state_dict(self):
         """Wrap the existing physical-ring state in a versioned contract."""
         state = {
             "schema": "ambi-latent-replay-training-state",
-            "version": 3 if self.store_horizon else (2 if self.store_source else 1),
+            "version": self._training_state_version,
             "latent_dim": self.latent_dim,
             "action_dim": self.action_dim,
             "state": self.state_dict(),
@@ -357,7 +398,15 @@ class LatentReplayBuffer:
             state["store_source"] = True
         if self.store_horizon:
             state["store_horizon"] = True
+        if self.remaining_horizon_max is not None:
+            state["remaining_horizon_max"] = self.remaining_horizon_max
         return state
+
+    @property
+    def _training_state_version(self):
+        if self.remaining_horizon_max is not None:
+            return 4
+        return 3 if self.store_horizon else (2 if self.store_source else 1)
 
     def _validate_ring_metadata(self, *, pos, full, next_sample_id, owner):
         if not isinstance(full, bool):
@@ -396,12 +445,14 @@ class LatentReplayBuffer:
             top_level_keys.add("store_source")
         if self.store_horizon:
             top_level_keys.add("store_horizon")
+        if self.remaining_horizon_max is not None:
+            top_level_keys.add("remaining_horizon_max")
         state = require_exact_keys(
             state,
             top_level_keys,
             "latent replay training state",
         )
-        expected_version = 3 if self.store_horizon else (2 if self.store_source else 1)
+        expected_version = self._training_state_version
         if (
             state["schema"] != "ambi-latent-replay-training-state"
             or state["version"] != expected_version
@@ -411,6 +462,7 @@ class LatentReplayBuffer:
             raise ValueError("Latent replay source-label configuration is incompatible.")
         if self.store_horizon and state["store_horizon"] is not True:
             raise ValueError("Latent replay horizon configuration is incompatible.")
+        self._validate_horizon_configuration(state)
         expected = {
             "latent_dim": self.latent_dim,
             "action_dim": self.action_dim,
@@ -442,11 +494,14 @@ class LatentReplayBuffer:
             physical_keys.add("source")
         if self.store_horizon:
             physical_keys.add("horizon_end")
+        if self.remaining_horizon_max is not None:
+            physical_keys.update(("remaining_horizon_max", "remaining_horizon"))
         state = require_exact_keys(
             state,
             physical_keys,
             "latent replay physical state",
         )
+        self._validate_horizon_configuration(state)
         capacity = state["capacity"]
         if (
             isinstance(capacity, bool)
@@ -464,6 +519,8 @@ class LatentReplayBuffer:
         }
         if self.store_horizon:
             widths["horizon_end"] = 1
+        if self.remaining_horizon_max is not None:
+            widths["remaining_horizon"] = 1
         values = []
         size = None
         for name, width in widths.items():
@@ -481,6 +538,8 @@ class LatentReplayBuffer:
             if name == "horizon_end":
                 self._validate_horizon_flags(value)
             values.append(value)
+        if self.remaining_horizon_max is not None:
+            self._validate_remaining_horizon(state["remaining_horizon"], state["horizon_end"])
         if not 0 <= size <= self.capacity:
             raise ValueError("Latent replay state has an invalid size.")
 
@@ -548,11 +607,34 @@ class LatentReplayBuffer:
         if not bool(((value == 0) | (value == 1)).all().item()):
             raise ValueError("Latent replay horizon_end flags must be 0 or 1.")
 
+    def _validate_horizon_configuration(self, state):
+        saved = state.get("remaining_horizon_max")
+        configured = self.remaining_horizon_max
+        if configured is None:
+            if "remaining_horizon_max" in state or "remaining_horizon" in state:
+                raise ValueError("Latent replay remaining-horizon metadata is incompatible.")
+        elif (isinstance(saved, bool) or not isinstance(saved, Integral)
+              or int(saved) != configured):
+            raise ValueError("Latent replay remaining_horizon_max is incompatible.")
+
+    def _validate_remaining_horizon(self, value, horizon_end):
+        # Public appends and restores validate data; trusted internal collectors
+        # pass validate=False to avoid synchronizing generated device tensors.
+        if value.dtype == torch.bool or value.is_complex():
+            raise ValueError("Latent replay remaining_horizon must contain integers in [1, H].")
+        valid = torch.isfinite(value) & (value >= 1) & (value <= self.remaining_horizon_max)
+        valid &= value == value.floor()
+        if not bool(valid.all().item()):
+            raise ValueError("Latent replay remaining_horizon must contain integers in [1, H].")
+        if not bool((horizon_end.to(value.device) == (value == 1)).all().item()):
+            raise ValueError("Latent replay horizon_end must equal (remaining_horizon == 1).")
+
     def load_state_dict(self, state):
         """Restore replay contents into this buffer, respecting its capacity."""
         if not state:
             self.clear()
             return
+        self._validate_horizon_configuration(state)
         if int(state.get("capacity", self.capacity)) != self.capacity:
             raise ValueError("Latent replay state capacity does not match this buffer.")
         size = int(state["z"].shape[0])
@@ -566,9 +648,12 @@ class LatentReplayBuffer:
             state["next_z"],
             state["terminated"],
             state.get("horizon_end"),
+            state.get("remaining_horizon"),
         )
         if self.store_horizon:
-            self._validate_horizon_flags(values[-1])
+            self._validate_horizon_flags(state["horizon_end"])
+        if self.remaining_horizon_max is not None:
+            self._validate_remaining_horizon(values[-1], values[-2])
         if packed_size != size:
             raise ValueError("Latent replay state fields have incompatible shapes.")
         full = state.get("full", size == self.capacity)

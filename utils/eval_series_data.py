@@ -357,6 +357,16 @@ def planner_identity(config, result, algorithm, action_rule):
     _require(operator in {"sac", "td3", "xqc", "mppi"}, "Unknown resolved inner operator")
     active = {key: value for key, value in normalize_aux_return_identity(config).items()
               if key.startswith("inner_")}
+    conditioning = config.get("inner_horizon_conditioning", "none")
+    if isinstance(conditioning, str):
+        conditioning = conditioning.lower()
+    if conditioning == "none":
+        active.pop("inner_horizon_conditioning", None)
+    else:
+        active["inner_horizon_conditioning"] = conditioning
+        active["horizon_conditioning_horizon"] = int(
+            config.get("inner_rollout_horizon", config.get("inner_horizon", 3))
+        )
     # Old Q-only boundaries and their explicit spelling remain one curve.
     if active.get("inner_terminal_entropy", "none") == "none":
         active.pop("inner_terminal_entropy", None)
@@ -388,7 +398,7 @@ def planner_identity(config, result, algorithm, action_rule):
         # bootstrap used the inner learner. The new resolver makes that
         # existing behavior explicit; absence is not a distinct planner.
         active.setdefault("inner_terminal_bootstrap", "inner")
-    ignored = {"inner_execution_action", "inner_execution_noise_std", "inner_execution_std_scale",
+    ignored = {"inner_horizon_diagnostics", "inner_execution_action", "inner_execution_noise_std", "inner_execution_std_scale",
                "inner_diagnostic_rollouts", "inner_diagnostics_every", "inner_horizon_ratio",
                "inner_nominal_critic_utd", "inner_nominal_transitions_per_round",
                "inner_nominal_updates_per_round", "inner_expected_update_slots",

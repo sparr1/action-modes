@@ -62,15 +62,17 @@ def test_outer_mode_requires_a_finite_horizon_soft_sac_tail(overrides):
         _build_cfg(**params)
 
 
+@pytest.mark.parametrize("conditioning", ["none", "one_hot"])
 @pytest.mark.parametrize("horizon", [1, 2])
 @pytest.mark.parametrize("mode", ["none", "outer"])
 @pytest.mark.parametrize("target_mode", ["reward_only", "entropy_augmented"])
 @pytest.mark.parametrize("auxiliary", [False, True])
 def test_boundary_adds_outer_entropy_once_and_masks_true_terminals(
-    monkeypatch, horizon, mode, target_mode, auxiliary,
+    monkeypatch, horizon, mode, target_mode, auxiliary, conditioning,
 ):
     with _prepared(
         inner_rollout_horizon=horizon, inner_terminal_entropy=mode,
+        inner_horizon_conditioning=conditioning, inner_horizon_diagnostics=True,
         inner_sac_critic_target=target_mode, aux_return_mode="sac" if auxiliary else "off",
     ) as (holder, engine):
         calls = []
@@ -92,13 +94,14 @@ def test_boundary_adds_outer_entropy_once_and_masks_true_terminals(
 
         monkeypatch.setattr(engine.model, "pi", policy)
         monkeypatch.setattr(engine.model, "Q", outer_q)
-        monkeypatch.setattr(engine, "_bootstrap_q", lambda z, *args: z.new_full((len(z), 1), 5.))
+        monkeypatch.setattr(engine, "_bootstrap_q", lambda z, *args, **kwargs: z.new_full((len(z), 1), 5.))
         z = torch.zeros(4, holder.cfg.latent_dim)
         boundary = torch.ones(4, 1) if horizon == 1 else torch.tensor([[0.], [1.], [0.], [1.]])
         output = engine._sac_critic_kernel(
             z, torch.zeros(4, 1), torch.full((4, 1), 3.), z,
             torch.tensor([[0.], [0.], [1.], [1.]]), torch.tensor(.9),
             torch.zeros(4, 1), None, boundary, torch.zeros(4, 1),
+            **engine._horizon_kwargs(torch.where(boundary.bool(), 1, horizon)),
         )
         interior = 5. + (.9 * 8. if target_mode == "entropy_augmented" else 0.)
         tail = 11. + (.2 * 2. if mode == "outer" else 0.)

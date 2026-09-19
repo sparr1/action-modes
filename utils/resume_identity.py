@@ -34,11 +34,10 @@ _DEPENDENCIES = (
     "mujoco",
 )
 
-# These are the only run-configuration fields currently consumed as output
-# destinations by the supported exact-resume learners. Keep this allowlist
+# Output destinations and observational flags do not change the learner. Keep this allowlist
 # explicit: paths to environments, pretrained models, or other scientific
 # inputs must remain fingerprinted.
-_OPERATIONAL_ALGORITHM_FIELDS = frozenset({"eval_csv_path"})
+_OPERATIONAL_ALGORITHM_FIELDS = frozenset({"eval_csv_path", "inner_horizon_diagnostics"})
 _AMBI_ALGORITHM = "AMBITDMPC2/AMBITDMPC2"
 _TDMPC2_ALGORITHM = "TDMPC2/TDMPC2Baseline"
 _AMBI_RESOLVED_IDENTITY_DEFAULTS = {
@@ -226,6 +225,17 @@ def scientific_trial_parameters(
             if projected.get("alg") == _AMBI_ALGORITHM:
                 algorithm = normalize_lora_rl_identity(algorithm)
                 algorithm = normalize_aux_return_identity(algorithm)
+                conditioning = algorithm.get("inner_horizon_conditioning", "none")
+                if isinstance(conditioning, str):
+                    conditioning = conditioning.lower()
+                if conditioning == "none":
+                    algorithm.pop("inner_horizon_conditioning", None)
+                    algorithm.pop("horizon_conditioning_horizon", None)
+                else:
+                    algorithm["inner_horizon_conditioning"] = conditioning
+                    algorithm["horizon_conditioning_horizon"] = int(
+                        algorithm.get("inner_rollout_horizon", algorithm.get("inner_horizon", 3))
+                    )
                 # Keep pre-interleaving lineage hashes unchanged: an omitted
                 # or explicit round default has no new scientific field.
                 timing = algorithm.get("inner_update_timing", "round")

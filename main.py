@@ -250,6 +250,9 @@ _RUNTIME_CONFIG_FIELDS = (
     "train_unroll_horizon",
     "outer_planning_horizon",
     "inner_rollout_horizon",
+    "inner_horizon_conditioning",
+    "inner_horizon_diagnostics",
+    "horizon_conditioning_horizon",
     "temporal_loss_normalization",
     "rho",
     "model_size",
@@ -587,6 +590,9 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
         "inner_explorer_temperature_updates_inherit_primary",
     )
     inner = {key: resolved[key] for key in inner_keys if key in resolved}
+    if resolved.get("inner_horizon_conditioning", "none") != "none":
+        inner["inner_horizon_conditioning"] = resolved["inner_horizon_conditioning"]
+        inner["horizon_conditioning_horizon"] = int(resolved["horizon_conditioning_horizon"])
     if {
         "inner_rounds",
         "inner_rollouts_per_round",

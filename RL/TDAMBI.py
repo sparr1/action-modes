@@ -207,6 +207,8 @@ class TDAMBI(AMBITDMPC2):
         super().__init__(name, env, custom_params, run_params, experiment_params)
 
     def _build_cfg(self, params):
+        if str(params.get("inner_horizon_conditioning", "none")).lower() != "none":
+            raise ValueError("Native TDAMBI requires inner_horizon_conditioning='none'.")
         if str(params.get("critic_value_mode", "single")).lower() != "single":
             raise ValueError("Native TDAMBI does not support split-value critics.")
         params = native_evaluation_params(params)

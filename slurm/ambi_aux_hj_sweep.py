@@ -380,6 +380,8 @@ class Moments:
 
 def training_summary(bundle, cell, *, expected_steps=500):
     """Stream all raw rows; retain every update position and per-seed decision."""
+    from utils.horizon_training_summary import HorizonTrainingSummary, seed_means
+    horizon_stats = HorizonTrainingSummary()
     manifest = read(Path(bundle)/'manifest.json')
     run, = manifest['runs']
     curves = defaultdict(lambda: defaultdict(Moments))
@@ -402,6 +404,7 @@ def training_summary(bundle, cell, *, expected_steps=500):
                     assert e['replay_size'] == retained*128*cell['H']
                     counts[key]['collection'] += 1
                 if phase == 'update':
+                    horizon_stats.add(e)
                     for component in ('critic','actor','temperature'):
                         if e.get('updated_'+component):
                             counts[key][component] += 1
@@ -423,6 +426,7 @@ def training_summary(bundle, cell, *, expected_steps=500):
                             assert c == r*critic_updates(cell) and (r-1)*actor_updates(cell) < a <= r*actor_updates(cell)
                         assert bool(e.get('updated_temperature')) == bool(e.get('updated_actor') and cell['params']['inner_entropy_enabled'])
                     for metric,value in e['metrics'].items():
+                        if metric.startswith(('critic_horizon_', 'actor_horizon_')): continue
                         assert value is not None
                         if metric.startswith(('critic_', 'q_', 'td_error')):
                             axis, index = 'critic_update', e['critic_updates']
@@ -448,20 +452,33 @@ def training_summary(bundle, cell, *, expected_steps=500):
                 'actor_grad_norm','actor_entropy','alpha_used'}
     assert required <= {k for d in curves.values() for k in d}, required
     packed = []
+    horizon_curves = horizon_stats.update_curves()
     for (axis,index),metrics in sorted(curves.items()):
-        packed.append(dict(axis=axis,index=index,metrics={k:v.summary() for k,v in metrics.items()}))
+        packed.append(dict(axis=axis,index=index,metrics={
+            **{k:v.summary() for k,v in metrics.items()},
+            **horizon_curves.get((axis,index), {}),
+        }))
     # Each seed/decision is retained; cross-seed summaries weight seeds equally.
     by_decision = defaultdict(lambda: defaultdict(Moments))
     per_seed = []
     for (ep,decision),metrics in sorted(decisions.items()):
         means = {k:v.total/v.n for k,v in metrics.items()}
+        means.update(seed_means(horizon_stats.decisions.get((ep,decision), {})))
         per_seed.append(dict(episode_id=ep,decision=decision,metrics=means))
         for k,v in means.items(): by_decision[decision][k].add(v)
+    horizon_decisions = horizon_stats.decision_curves()
+    from RL.tdmpc2_core.inner_trace import metric_catalog
+    catalog = dict(manifest["metric_catalog"])
+    if horizon_curves:
+        names = {name for metrics in horizon_curves.values() for name in metrics}
+        derived = metric_catalog(names)
+        catalog.update({name: derived[name] for name in names})
     return dict(update_curves=packed, per_seed_decisions=per_seed,
-                decision_curves=[dict(decision=i,metrics={k:v.summary() for k,v in ms.items()})
+                decision_curves=[dict(decision=i,metrics={**{k:v.summary() for k,v in ms.items()},
+                                                       **horizon_decisions.get(i, {})})
                                  for i,ms in sorted(by_decision.items())],
                 trace_rows_checked=sum(sum(v.values()) for v in counts.values()),
-                metric_catalog=manifest['metric_catalog'])
+                metric_catalog=catalog)
 
 
 def publish_performance(run_dir):
@@ -531,7 +548,7 @@ def publish_cell(args):
                                  inner_replay_reset_each_round=manifest['runs'][0]['resolved_config'].get('inner_replay_reset_each_round',False),
                                  baseline_performance_run_id=cell.get('baseline',{}).get('performance_run_id'),
                                  performance_run_id=cell['performance_run_id'],
-                                 aggregation='Update curves average all decision roots; decision curves weight five seeds equally.',
+                                 aggregation='Legacy update curves average decision roots; horizon curves pool samples within each seed then weight seeds equally. Zero-coverage means are omitted. Decision curves weight seeds equally.',
                                  probe_objective='Reward plus terminal Q; excludes explicit entropy.'),mode='online')
     try:
         for axis in ('critic_update','actor_update','decision'):

@@ -30,6 +30,8 @@ from .common.inner_utils import (
     trainable_parameter_count,
 )
 from .common.latent_buffer import LatentReplayBuffer
+from .common.horizon_conditioning import reset_horizon_module, widen_horizon_module
+from .horizon_diagnostics import horizon_sums
 from .common.scale import percentile_range
 from .common.lora import (
     dense_lora_rl_critic,
@@ -211,6 +213,33 @@ class InnerImprovementEngine:
                 "inner horizon prior value", self._prior_bootstrap,
                 enabled=enabled, strict=strict,
             )
+
+    @property
+    def _horizon_conditioning_horizon(self):
+        if getattr(self.cfg, "inner_horizon_conditioning", "none") == "one_hot":
+            return int(self.cfg.inner_rollout_horizon)
+        return None
+
+    @property
+    def _replay_horizon(self):
+        if getattr(self.cfg, "inner_horizon_diagnostics", False):
+            return int(self.cfg.inner_rollout_horizon)
+        return self._horizon_conditioning_horizon
+
+    def _remaining_horizon(self, z, step=0):
+        horizon = self._replay_horizon
+        if horizon is None:
+            return None
+        return torch.full(
+            (*z.shape[:-1], 1), horizon - step, device=z.device, dtype=torch.long,
+        )
+
+    def _horizon_kwargs(self, remaining_horizon):
+        if self._horizon_conditioning_horizon is None:
+            return {}
+        if remaining_horizon is None:
+            raise ValueError("Conditioned inner SAC requires remaining_horizon.")
+        return {"remaining_horizon": remaining_horizon.to(dtype=torch.long)}
 
     @property
     def _aux_return_active(self):
@@ -872,6 +901,12 @@ class InnerImprovementEngine:
             "composition": "primary + frozen_initial_coefficient * initialization_residual",
         }
 
+    def _horizon_conditioning_spec(self):
+        horizon = self._horizon_conditioning_horizon
+        if horizon is None:
+            return None
+        return {"mode": "one_hot", "horizon": horizon, "protocol_version": 1}
+
     def training_state_dict(self):
         """Return persistent inner scientific state at an episode boundary."""
         self._require_resume_boundary()
@@ -884,7 +919,8 @@ class InnerImprovementEngine:
             # Version 3 identifies the LoRA-RL solve even at an empty boundary.
             # Version 4 records random initialization and optional LoRA-RL.
             "version": (
-                6 if self._aux_return_active
+                7 if self._horizon_conditioning_horizon is not None
+                else 6 if self._aux_return_active
                 else 5 if self._split_values
                 else 4 if self._random_initialization_spec() is not None
                 else 3 if self._lora_rl_spec() is not None
@@ -947,6 +983,9 @@ class InnerImprovementEngine:
         initialization_spec = self._random_initialization_spec()
         if initialization_spec is not None:
             payload["initialization_spec"] = initialization_spec
+        horizon_spec = self._horizon_conditioning_spec()
+        if horizon_spec is not None:
+            payload["horizon_conditioning_spec"] = horizon_spec
         return payload
 
     def _load_module_candidate(
@@ -1015,7 +1054,10 @@ class InnerImprovementEngine:
         }
         lora_rl_spec = self._lora_rl_spec()
         initialization_spec = self._random_initialization_spec()
-        if self._aux_return_active and version != 6:
+        horizon_spec = self._horizon_conditioning_spec()
+        if horizon_spec is not None and version != 7:
+            raise ValueError("Horizon-conditioned inner state requires metadata version 7.")
+        if self._aux_return_active and version not in {6, 7}:
             raise ValueError("Auxiliary-return inner state requires source metadata version 6.")
         if version != 5 and self._split_values:
             raise ValueError("Split-value inner state requires semantic metadata version 5.")
@@ -1028,7 +1070,22 @@ class InnerImprovementEngine:
             raise ValueError(
                 "LoRA-RL exact resume is incompatible with legacy AMBI inner-engine state."
             )
-        if version == 6:
+        if version == 7:
+            if horizon_spec is None:
+                raise ValueError("Horizon-conditioned inner state requires one_hot conditioning.")
+            expected_keys = common_keys | {"horizon_conditioning_spec"}
+            if self._aux_return_active:
+                expected_keys.add("control_sources")
+                if state.get("control_sources") != source_metadata(self.cfg):
+                    raise ValueError("Inner control sources are incompatible.")
+            saved_spec = require_exact_keys(
+                state.get("horizon_conditioning_spec"), set(horizon_spec),
+                "Inner horizon-conditioning specification",
+            )
+            if any(type(saved_spec[key]) is not type(value) or saved_spec[key] != value
+                   for key, value in horizon_spec.items()):
+                raise ValueError("Inner horizon-conditioning specification is incompatible.")
+        elif version == 6:
             if not self._aux_return_active or self._split_values or self._explorer_active or initialization_spec is not None:
                 raise ValueError("Auxiliary-return inner state is incompatible with the configured method.")
             expected_keys = common_keys | {"control_sources"}
@@ -1121,7 +1178,7 @@ class InnerImprovementEngine:
         )
         if (
             state["schema"] != "ambi-inner-engine-training-state"
-            or state["version"] not in {1, 2, 3, 4, 5, 6}
+            or state["version"] not in {1, 2, 3, 4, 5, 6, 7}
         ):
             raise ValueError("Unsupported AMBI inner-engine training-state version.")
         action_index = self._validate_index(state["action_index"], "action_index")
@@ -1335,6 +1392,7 @@ class InnerImprovementEngine:
                 action_dim=self.cfg.action_dim,
                 device=self.device,
                 store_horizon=bool(getattr(self.cfg, "inner_finite_horizon", False)),
+                remaining_horizon_max=self._replay_horizon,
             )
             candidate.replay.load_training_state_dict(workspace["replay"])
 
@@ -1610,7 +1668,10 @@ class InnerImprovementEngine:
         elif mode == "lora_rl":
             reset_lora_rl_critic_(module, outer)
         else:
-            module.load_state_dict(outer.state_dict())
+            if self._horizon_conditioning_horizon is not None:
+                reset_horizon_module(module, outer)
+            else:
+                module.load_state_dict(outer.state_dict())
             module.requires_grad_(mode != "frozen")
 
     def _restore_action_component(self, component, outer):
@@ -1649,7 +1710,10 @@ class InnerImprovementEngine:
                     if component == "critic" and self._initialize_critic_from_outer_target
                     else module
                 )
-                target.load_state_dict(target_base.state_dict())
+                if self._horizon_conditioning_horizon is not None and target_base is not module:
+                    reset_horizon_module(target, target_base)
+                else:
+                    target.load_state_dict(target_base.state_dict())
             target.requires_grad_(False)
         return True
 
@@ -1660,6 +1724,8 @@ class InnerImprovementEngine:
             module = deepcopy(base).to(self.device)
             if random:
                 self._reset_random_component(component, module)
+            if self._horizon_conditioning_horizon is not None:
+                widen_horizon_module(module, self._horizon_conditioning_horizon)
             module.requires_grad_(mode != "frozen")
         elif mode == "lora_rl" and component == "critic":
             if random:
@@ -2073,6 +2139,7 @@ class InnerImprovementEngine:
                     device=self.device,
                     store_source=self._explorer_active,
                     store_horizon=bool(getattr(cfg, "inner_finite_horizon", False)),
+                    remaining_horizon_max=self._replay_horizon,
                 )
         elif outer_changed:
             # Latents are coordinates of the current encoder/dynamics and may
@@ -2129,7 +2196,10 @@ class InnerImprovementEngine:
         target_base = (
             self._critic_outer_target if self._initialize_critic_from_outer_target else critic
         )
-        return deepcopy(target_base).to(self.device).requires_grad_(False)
+        target = deepcopy(target_base).to(self.device)
+        if self._horizon_conditioning_horizon is not None and self._initialize_critic_from_outer_target:
+            widen_horizon_module(target, self._horizon_conditioning_horizon)
+        return target.requires_grad_(False)
 
     def make_modules_for_compatibility(self):
         """Legacy test/debug hook returning freshly created inner modules."""
@@ -2165,6 +2235,7 @@ class InnerImprovementEngine:
         noise_std=0.0,
         inner_bounds=True,
         return_info=False,
+        remaining_horizon=None,
     ):
         kwargs = {} if inner_bounds else self._actor_options
         if inner_bounds:
@@ -2173,6 +2244,8 @@ class InnerImprovementEngine:
                 "log_std_min": self.cfg.inner_log_std_min,
                 "log_std_max": self.cfg.inner_log_std_max,
             }
+        if getattr(policy, "horizon_conditioning_horizon", None) is not None:
+            kwargs.update(self._horizon_kwargs(remaining_horizon))
         if mode == "policy_sample":
             if hasattr(self.model, "pi_action") and not return_info:
                 return self.model.pi_action(
@@ -2779,7 +2852,7 @@ class InnerImprovementEngine:
             self._timer_stop("inner_rollout_seconds", start)
             yield rollout
 
-    def _rollout_step_kernel(self, z, policy_noise, reward_support):
+    def _rollout_step_kernel(self, z, policy_noise, reward_support, remaining_horizon=None):
         """One pure parallel model step; replay and optimization stay outside."""
         cfg = self.cfg
         std_scale = float(cfg.inner_behavior_std_scale)
@@ -2791,6 +2864,7 @@ class InnerImprovementEngine:
             noise=policy_noise if policy_noise.numel() else None,
             std_scale=max(std_scale, 1e-12),
             noise_std=cfg.inner_behavior_noise_std,
+            remaining_horizon=remaining_horizon,
         )
         joint = self.model.joint_input(z, action)
         reward_prediction = self.model.reward_from_joint(joint)
@@ -2849,7 +2923,11 @@ class InnerImprovementEngine:
                     self._rollout_step_kernel if cfg.episodic
                     else self._compile_regions["rollout"]
                 )
-                action, reward, next_z = kernel(active_z, noise, reward_support)
+                remaining_horizon = self._remaining_horizon(active_z, step)
+                action, reward, next_z = kernel(
+                    active_z, noise, reward_support,
+                    **self._horizon_kwargs(remaining_horizon),
+                )
                 done = (
                     (self.model.termination(next_z) > float(cfg.inner_termination_threshold)).float()
                     if cfg.episodic else reward.new_zeros(active_count, 1)
@@ -2858,6 +2936,8 @@ class InnerImprovementEngine:
                 active_z, action, reward, next_z, done,
                 **({"horizon_end": torch.full_like(done, float(step == horizon - 1))}
                    if getattr(cfg, "inner_finite_horizon", False) else {}),
+                **({"remaining_horizon": remaining_horizon, "validate": False}
+                   if remaining_horizon is not None else {}),
             )
             state.policy_evaluations += active_count
             rows = active if active is not None else slice(None)
@@ -2911,6 +2991,7 @@ class InnerImprovementEngine:
         self.model.eval()
         transition_fields = ([], [], [], [], [])
         horizon_flags = []
+        remaining_horizons = []
         transition_count = 0
         with self.rng.fork("collection") as generator:
             for step in range(horizon):
@@ -2930,6 +3011,7 @@ class InnerImprovementEngine:
                     generator=generator,
                     std_scale=max(std_scale, 1e-12),
                     noise_std=cfg.inner_behavior_noise_std,
+                    remaining_horizon=self._remaining_horizon(active_z, step),
                 )
                 state.policy_evaluations += int(active.numel())
                 joint = self.model.joint_input(active_z, action)
@@ -2947,6 +3029,8 @@ class InnerImprovementEngine:
                 transition_fields[4].append(terminated)
                 if getattr(cfg, "inner_finite_horizon", False):
                     horizon_flags.append(torch.full_like(terminated, float(step == horizon - 1)))
+                if self._replay_horizon is not None:
+                    remaining_horizons.append(self._remaining_horizon(active_z, step))
                 reward_vector = reward.squeeze(-1)
                 lengths[active] += 1
                 reward_sums[active] += reward_vector
@@ -2961,6 +3045,8 @@ class InnerImprovementEngine:
             state.replay.add_batch(
                 *(torch.cat(values, dim=0) for values in transition_fields),
                 **({"horizon_end": torch.cat(horizon_flags, dim=0)} if horizon_flags else {}),
+                **({"remaining_horizon": torch.cat(remaining_horizons, dim=0), "validate": False}
+                   if remaining_horizons else {}),
             )
 
         if cfg.inner_actor_adaptation != "frozen":
@@ -3000,6 +3086,7 @@ class InnerImprovementEngine:
                 noise=(policy_noise[step] if policy_noise.numel() else None),
                 std_scale=max(std_scale, 1e-12),
                 noise_std=cfg.inner_behavior_noise_std,
+                remaining_horizon=self._remaining_horizon(z, step),
             )
             joint = self.model.joint_input(z, action)
             reward_prediction = self.model.reward_from_joint(joint)
@@ -3012,6 +3099,8 @@ class InnerImprovementEngine:
             fields = (z, action, reward, next_z, terminated)
             if getattr(cfg, "inner_finite_horizon", False):
                 fields += (torch.full_like(terminated, float(step == horizon - 1)),)
+            if self._replay_horizon is not None:
+                fields += (self._remaining_horizon(z, step),)
             transitions.append(torch.cat(fields, dim=-1))
             reward_vector = reward.squeeze(-1)
             reward_sums = reward_sums + reward_vector
@@ -3063,7 +3152,10 @@ class InnerImprovementEngine:
                 reward_support,
             )
 
-        state.replay.add_packed(rollout[0])
+        state.replay.add_packed(
+            rollout[0],
+            **({"validate": False} if self._replay_horizon is not None else {}),
+        )
         state.policy_evaluations += count * horizon
         if cfg.inner_actor_adaptation != "frozen":
             state.actor.train()
@@ -3176,9 +3268,11 @@ class InnerImprovementEngine:
         *,
         pair_indices=None,
         trusted_pair_indices=False,
+        remaining_horizon=None,
     ):
         source = str(self.cfg.inner_bootstrap_source)
         kwargs = {"reduction": self.cfg.inner_q_target_reduction}
+        kwargs.update(self._horizon_kwargs(remaining_horizon))
         if source == "inner_target":
             kwargs["qs"] = self.state.critic_target
         elif source == "outer_target":
@@ -3267,6 +3361,7 @@ class InnerImprovementEngine:
         prior_noise=None,
         *,
         actor_loss_scale=None,
+        remaining_horizon=None,
     ):
         """Pure SAC critic loss region; the optimizer step stays eager."""
         if self._split_values:
@@ -3275,6 +3370,12 @@ class InnerImprovementEngine:
                 pair_indices, horizon_end, prior_noise, actor_loss_scale=actor_loss_scale,
             )
         state, cfg = self.state, self.cfg
+        current_horizon_kwargs = self._horizon_kwargs(remaining_horizon)
+        # Boundary rows use only the frozen prior. Keep their unused inner
+        # continuation index valid without introducing a learned h=0 slot.
+        next_horizon_kwargs = self._horizon_kwargs(
+            None if remaining_horizon is None else (remaining_horizon - 1).clamp_min(1)
+        )
         with torch.no_grad():
             next_action, next_info = self.model.pi(
                 next_z,
@@ -3284,15 +3385,17 @@ class InnerImprovementEngine:
                 log_std_min=cfg.inner_log_std_min,
                 log_std_max=cfg.inner_log_std_max,
                 **self.agent._inner_critic_entropy_kwargs(),
+                **next_horizon_kwargs,
             )
             if pair_indices is None:
-                next_q = self._bootstrap_q(next_z, next_action)
+                next_q = self._bootstrap_q(next_z, next_action, **next_horizon_kwargs)
             else:
                 next_q = self._bootstrap_q(
                     next_z,
                     next_action,
                     pair_indices=pair_indices,
                     trusted_pair_indices=True,
+                    **next_horizon_kwargs,
                 )
             bootstrap = next_q
             if cfg.inner_sac_critic_target == "entropy_augmented":
@@ -3312,7 +3415,9 @@ class InnerImprovementEngine:
                 bootstrap = torch.where(horizon_end.bool(), prior_value, bootstrap)
             target_q = self._sac_target(reward, terminated, bootstrap)
 
-        predictions = self.model.q_predictions(z, action, qs=state.critic)
+        predictions = self.model.q_predictions(
+            z, action, qs=state.critic, **current_horizon_kwargs,
+        )
         critic_loss = self.model.critic_loss(predictions, target_q)
         loss_coef = float(getattr(cfg, "inner_critic_loss_coef", 1.0))
         if loss_coef != 1.0:
@@ -3436,6 +3541,7 @@ class InnerImprovementEngine:
             pair_indices,
             *horizon_args,
             **scale_kwargs,
+            **self._horizon_kwargs(batch.get("remaining_horizon")),
         )
         critic_loss, values, target_q, clip_fraction = outputs[:4]
         state.policy_evaluations += batch_size
@@ -3462,6 +3568,12 @@ class InnerImprovementEngine:
         }
         if self._split_values:
             metrics.update(outputs[4])
+        if getattr(cfg, "inner_horizon_diagnostics", False):
+            metrics.update(horizon_sums(
+                "critic", batch["remaining_horizon"], cfg.inner_rollout_horizon,
+                td_error_abs=(values.detach() - target_q.detach().unsqueeze(0)).abs().mean(dim=0),
+                predicted_q=values.detach().mean(dim=0), target_q=target_q.detach(),
+            ))
         metrics.update(self._source_td_metrics(batch, values, target_q))
         return metrics
 
@@ -3855,6 +3967,7 @@ class InnerImprovementEngine:
         update_actor,
         *,
         q_scale=None,
+        remaining_horizon=None,
     ):
         """Pure SAC policy/loss region; optimizer mutation stays eager."""
         state, cfg = self.state, self.cfg
@@ -3869,6 +3982,7 @@ class InnerImprovementEngine:
             log_std_min=cfg.inner_log_std_min,
             log_std_max=cfg.inner_log_std_max,
             **({"include_scaled_entropy": True} if scaled_entropy_enabled else {}),
+            **self._horizon_kwargs(remaining_horizon),
         )
         # Keep the feature-off tuple contract unchanged. The optional statistic
         # remains connected for the actor objective and is detached only by the
@@ -3908,6 +4022,7 @@ class InnerImprovementEngine:
             detach=True,
             reduction="all",
             **({"weights": state.value_composition} if self._split_values else {}),
+            **self._horizon_kwargs(remaining_horizon),
         )
         q_pi = self.model.q_backend.reduce(
             q_pi_all,
@@ -3977,6 +4092,7 @@ class InnerImprovementEngine:
             (q_pi_mean_all - q_pi_min_all).mean(),
             *entropy_payload,
             *actor_sample,
+            *((actor_q.detach(),) if getattr(cfg, "inner_horizon_diagnostics", False) else ()),
             *scale_payload,
         )
 
@@ -3988,6 +4104,8 @@ class InnerImprovementEngine:
         policy_noise,
         pair_indices,
         update_actor,
+        *,
+        remaining_horizon=None,
     ):
         """SAC policy region with an explicit action-local Q scale."""
         return self._sac_actor_kernel(
@@ -3997,6 +4115,7 @@ class InnerImprovementEngine:
             pair_indices,
             update_actor,
             q_scale=actor_loss_scale,
+            **self._horizon_kwargs(remaining_horizon),
         )
 
     def _sac_policy_step(
@@ -4045,6 +4164,7 @@ class InnerImprovementEngine:
                     policy_noise,
                     pair_indices,
                     update_actor,
+                    **self._horizon_kwargs(batch.get("remaining_horizon")),
                 )
             else:
                 actor_outputs = self._compile_regions["actor"](
@@ -4054,6 +4174,7 @@ class InnerImprovementEngine:
                     policy_noise,
                     pair_indices,
                     update_actor,
+                    **self._horizon_kwargs(batch.get("remaining_horizon")),
                 )
             update_scale = (
                 scale_enabled
@@ -4063,6 +4184,9 @@ class InnerImprovementEngine:
             )
             if update_scale:
                 proposed_scale = actor_outputs[-1]
+                actor_outputs = actor_outputs[:-1]
+            if update_actor and getattr(cfg, "inner_horizon_diagnostics", False):
+                objective_q = actor_outputs[-1]
                 actor_outputs = actor_outputs[:-1]
             (
                 log_prob,
@@ -4131,6 +4255,11 @@ class InnerImprovementEngine:
                     ),
                     actor_entropy=entropy.detach().mean(),
                 )
+                if getattr(cfg, "inner_horizon_diagnostics", False):
+                    metrics.update(horizon_sums(
+                        "actor", batch["remaining_horizon"], cfg.inner_rollout_horizon,
+                        entropy=selected_entropy.detach(), objective_q=objective_q,
+                    ))
                 if self._collect_diagnostics and actor_sample:
                     metrics.update(
                         self._tanh_saturation_metrics(
@@ -5360,6 +5489,11 @@ class InnerImprovementEngine:
                     noise_std=self.cfg.inner_execution_noise_std,
                     inner_bounds=inner_bounds,
                     return_info=return_info,
+                    remaining_horizon=(
+                        self._remaining_horizon(root_z)
+                        if getattr(policy, "horizon_conditioning_horizon", None) is not None
+                        else None
+                    ),
                 )
         finally:
             for module, was_training in training_modes:
@@ -5729,6 +5863,7 @@ class InnerImprovementEngine:
                         log_std_mapping=self.cfg.inner_log_std_mapping,
                         log_std_min=self.cfg.inner_log_std_min,
                         log_std_max=self.cfg.inner_log_std_max,
+                        **self._horizon_kwargs(self._remaining_horizon(root_z)),
                     )
                 finally:
                     for module, was_training in policy_training_modes:
@@ -6883,6 +7018,11 @@ class InnerImprovementEngine:
                 raise ValueError(
                     "Fixed-noise trace probes require SAC or no inner optimization."
                 )
+            if trace.probes and self._horizon_conditioning_horizon is not None:
+                if trace.probe_mode != "outer_tail":
+                    raise ValueError("Horizon conditioning requires probe_mode='outer_tail'.")
+                if trace.probe_horizon != self._horizon_conditioning_horizon:
+                    raise ValueError("Conditioned probe horizon must match inner_rollout_horizon.")
             if self._aux_return_active:
                 auxiliary_tail = self.cfg.inner_horizon_critic_source == "aux_return"
                 trace.begin(value_routing={

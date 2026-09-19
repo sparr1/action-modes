@@ -917,6 +917,9 @@ class AMBITDMPC2Agent(torch.nn.Module):
         }
         if getattr(self.cfg, "inner_update_timing", "round") != "round":
             options["update_timing"] = self.cfg.inner_update_timing
+        if getattr(self.cfg, "inner_horizon_conditioning", "none") != "none":
+            options["horizon_conditioning"] = self.cfg.inner_horizon_conditioning
+            options["horizon_conditioning_horizon"] = int(self.cfg.inner_rollout_horizon)
         for key, default in (
             ("inner_terminal_entropy", "none"),
             ("inner_critic_loss_coef", 1.0),

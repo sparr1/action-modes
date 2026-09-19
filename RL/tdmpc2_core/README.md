@@ -1672,3 +1672,15 @@ current-round data can still be sampled repeatedly within the round.
 
 The625k evaluation ablation is documented in
 [`AUX_ROUND_REPLAY_SWEEP_625K.md`](../../configs/research/AUX_ROUND_REPLAY_SWEEP_625K.md).
+
+### Remaining-horizon inner SAC
+
+Optional `inner_horizon_conditioning="one_hot"` widens only private cloned inner
+actor/critic inputs with zero-initialized remaining-horizon columns. Frozen outer
+and auxiliary checkpoint networks retain their original shapes and state. The
+soft-source auxiliary-SAC backbone is supported; other source combinations remain
+rejected. `inner_horizon_diagnostics=false` independently enables detached
+training-minibatch counts/sums when set true, including for unconditioned controls.
+See [horizon SAC diagnostics](../../configs/research/HORIZON_SAC_DIAGNOSTICS.md)
+for target equations, replay metadata, metric units, aggregation and the prepared
+eight-setting comparison.

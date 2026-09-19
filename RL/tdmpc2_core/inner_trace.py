@@ -14,6 +14,7 @@ import time
 
 import torch
 
+from .horizon_diagnostics import horizon_metric_description
 from .common import math as td_math
 
 
@@ -33,6 +34,7 @@ class FrozenActorSnapshot:
     inner: bool
     bounds: tuple
     payload: bytes
+    horizon_conditioning_horizon: int | None = None
 
     @property
     def policy_bounds(self):
@@ -45,6 +47,8 @@ class FrozenActorSnapshot:
     def make_policy(self, device="cpu"):
         policy = torch.load(io.BytesIO(self.payload), map_location=device,
                             weights_only=False)
+        if getattr(policy, "horizon_conditioning_horizon", None) != self.horizon_conditioning_horizon:
+            raise ValueError("Frozen actor horizon-conditioning metadata is incompatible.")
         return policy.eval().requires_grad_(False)
 
 
@@ -87,6 +91,11 @@ def evaluate_outer_tail(engine, root_z, policy, noise, *, pair_indices=None,
         raise ValueError("noise action dimension does not match the checkpoint.")
     if root_z.ndim != 2 or root_z.shape[0] not in (1, noise.shape[1]):
         raise ValueError("root_z must contain one root or one root per rollout.")
+    conditioned_horizon = getattr(policy, "horizon_conditioning_horizon", None)
+    if conditioned_horizon is not None:
+        if (noise.shape[0] - 1 != conditioned_horizon
+                or getattr(cfg, "inner_rollout_horizon", conditioned_horizon) != conditioned_horizon):
+            raise ValueError("Conditioned actor probe horizon must match its horizon_conditioning_horizon.")
     reduction = ("min_pair" if getattr(cfg, "critic_value_mode", "single") == "return_entropy"
                  else cfg.mppi_terminal_q_reduction)
     backend = getattr(model, "q_backend", None)
@@ -103,8 +112,12 @@ def evaluate_outer_tail(engine, root_z, policy, noise, *, pair_indices=None,
         alive = torch.ones_like(rewards, dtype=torch.bool)
         discount = 1.0
         for step in range(noise.shape[0] - 1):
+            horizon_kwargs = ({"remaining_horizon": torch.full(
+                (z.shape[0], 1), conditioned_horizon - step,
+                dtype=torch.long, device=z.device,
+            )} if conditioned_horizon is not None else {})
             action, _ = model.pi(z, policy=policy, noise=noise[step],
-                                 **(policy_bounds or {}))
+                                 **(policy_bounds or {}), **horizon_kwargs)
             joint = model.joint_input(z, action)
             prediction = model.reward_from_joint(joint)
             # External analytic probe models retain the historical scalar seam.
@@ -293,7 +306,9 @@ def metric_catalog(metric_names=()):
             phase, axis = "pre_update_minibatch", "actor_updates"
         else:
             phase, axis = "pre_update_minibatch", "critic_updates"
-        if name.endswith("seconds"):
+        if name.startswith("actor_horizon_") and "entropy_" in name:
+            unit = "configured_entropy_statistic"
+        elif name.endswith("seconds"):
             unit = "seconds"
         elif name.endswith(("_fraction", "_rate")):
             unit = "fraction"
@@ -314,7 +329,8 @@ def metric_catalog(metric_names=()):
         elif "l2" in name:
             unit = "normalized_action"
         result[name] = {
-            "definition": definitions.get(name, f"Raw inner optimizer metric {name}."),
+            "definition": (horizon_metric_description(name)
+                           or definitions.get(name, f"Raw inner optimizer metric {name}.")),
             "unit": unit, "sampling_phase": phase, "preferred_axis": axis,
         }
     return result
@@ -396,12 +412,15 @@ class InnerActionTrace:
             bounds=tuple((self._policy_bounds(engine.cfg) if inner else
                           getattr(engine, "_actor_options", {})).items()),
             payload=output.getvalue(),
+            horizon_conditioning_horizon=getattr(policy, "horizon_conditioning_horizon", None),
         )
         self.actor_snapshots.append(snapshot)
+        metadata = ({"horizon_conditioning_horizon": snapshot.horizon_conditioning_horizon}
+                    if snapshot.horizon_conditioning_horizon is not None else {})
         self.record("actor_snapshot", state, {
             "actor_snapshot_seconds": time.perf_counter() - started,
             "actor_snapshot_bytes": len(snapshot.payload),
-        }, actor_sha256=snapshot.sha256, measurement="initial_or_post_update_snapshot")
+        }, actor_sha256=snapshot.sha256, measurement="initial_or_post_update_snapshot", **metadata)
 
     def begin(self, *, value_routing=None):
         if self._started:
@@ -598,6 +617,18 @@ class InnerActionTrace:
     @torch.no_grad()
     def probe(self, engine, root_z, policy, *, inner=True):
         """Evaluate with fixed explicit noise and dropout off; consume no learner RNG."""
+        conditioned_horizon = getattr(policy, "horizon_conditioning_horizon", None)
+        conditioning_active = (
+            conditioned_horizon is not None
+            or getattr(engine.cfg, "inner_horizon_conditioning", "none") != "none"
+        )
+        if conditioning_active:
+            if self.probe_mode != "outer_tail":
+                raise ValueError("Horizon-conditioned actors require probe_mode='outer_tail'; legacy probes are unsupported.")
+            expected_horizon = getattr(engine.cfg, "inner_rollout_horizon", conditioned_horizon)
+            if (self.probe_horizon != expected_horizon
+                    or conditioned_horizon is not None and self.probe_horizon != conditioned_horizon):
+                raise ValueError("Conditioned actor probe horizon must match inner_rollout_horizon.")
         if self.probe_mode == "outer_tail":
             return self._togo_probe(engine, root_z, policy, inner=inner)
         model, cfg = engine.model, engine.cfg

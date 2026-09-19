@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 
 from . import init, layers, math
+from .horizon_conditioning import pack_horizon_input
 from .q_representation import QRepresentation, SymexpTwoHotCodec
 from .value_semantics import ValueSpecification, reduce_components
 
@@ -319,6 +320,7 @@ class SoftWorldModel(nn.Module):
         log_std_min=None,
         log_std_max=None,
         log_std_mapping=None,
+        remaining_horizon=None,
     ):
         """Return policy parameters and one isolated standard-normal sample."""
         mean_raw, log_std = self._policy_parameters(
@@ -330,6 +332,7 @@ class SoftWorldModel(nn.Module):
             log_std_min=log_std_min,
             log_std_max=log_std_max,
             log_std_mapping=log_std_mapping,
+            remaining_horizon=remaining_horizon,
         )
         if noise is not None and generator is not None:
             raise ValueError("Specify either policy noise or a generator, not both.")
@@ -364,11 +367,13 @@ class SoftWorldModel(nn.Module):
         log_std_min=None,
         log_std_max=None,
         log_std_mapping=None,
+        remaining_horizon=None,
     ):
         """Return the policy's differentiable pre-tanh Gaussian parameters."""
         if task is not None:
             raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
         policy = self._pi if policy is None else policy
+        policy_input = pack_horizon_input(policy, z, remaining_horizon)
 
         std_scale = float(std_scale)
         if not 0.0 < std_scale < float("inf"):
@@ -377,9 +382,9 @@ class SoftWorldModel(nn.Module):
         # Detached policy probes are evaluated eagerly outside the compiled
         # TOLD kernel; the default path keeps existing compiled callers intact.
         policy_output = (
-            layers.detached_module_forward(policy, z)
+            layers.detached_module_forward(policy, policy_input)
             if detach_policy
-            else policy(z)
+            else policy(policy_input)
         )
         mean_raw, log_std = policy_output.chunk(2, dim=-1)
         lower_bound = (
@@ -425,6 +430,7 @@ class SoftWorldModel(nn.Module):
         log_std_min=None,
         log_std_max=None,
         log_std_mapping=None,
+        remaining_horizon=None,
     ):
         """Return differentiable squashed-Gaussian statistics without sampling."""
         mean_raw, log_std = self._policy_parameters(
@@ -436,6 +442,7 @@ class SoftWorldModel(nn.Module):
             log_std_min=log_std_min,
             log_std_max=log_std_max,
             log_std_mapping=log_std_mapping,
+            remaining_horizon=remaining_horizon,
         )
         return {
             "mean": torch.tanh(mean_raw),
@@ -553,6 +560,7 @@ class SoftWorldModel(nn.Module):
         log_std_min=None,
         log_std_max=None,
         log_std_mapping=None,
+        remaining_horizon=None,
     ):
         """Sample only an action, omitting policy statistics and log-probability."""
         mean_raw, log_std, eps = self._policy_sample(
@@ -567,6 +575,7 @@ class SoftWorldModel(nn.Module):
             log_std_min=log_std_min,
             log_std_max=log_std_max,
             log_std_mapping=log_std_mapping,
+            remaining_horizon=remaining_horizon,
         )
         return torch.tanh(mean_raw + eps * log_std.exp())
 
@@ -585,6 +594,7 @@ class SoftWorldModel(nn.Module):
         log_std_max=None,
         log_std_mapping=None,
         include_scaled_entropy=False,
+        remaining_horizon=None,
     ):
         """Sample once, optionally also returning literal TD-MPC2 scaled entropy."""
         mean_raw, log_std, eps = self._policy_sample(
@@ -599,6 +609,7 @@ class SoftWorldModel(nn.Module):
             log_std_min=log_std_min,
             log_std_max=log_std_max,
             log_std_mapping=log_std_mapping,
+            remaining_horizon=remaining_horizon,
         )
         log_prob = math.gaussian_logprob(eps, log_std)
         gaussian_log_prob = log_prob
@@ -619,7 +630,7 @@ class SoftWorldModel(nn.Module):
             )
         return action, info
 
-    def pi_tdmpc2(self, z, *, policy=None, generator=None, noise=None):
+    def pi_tdmpc2(self, z, *, policy=None, generator=None, noise=None, remaining_horizon=None):
         """Native TD-MPC2 actor information, without changing SAC's policy API.
 
         In particular, ``scaled_entropy`` uses the native pre-squash Gaussian
@@ -628,6 +639,7 @@ class SoftWorldModel(nn.Module):
         """
         mean_raw, log_std, eps = self._policy_sample(
             z, policy=policy, generator=generator, noise=noise,
+            remaining_horizon=remaining_horizon,
         )
         log_prob = math.gaussian_logprob(eps, log_std)
         scaled_log_prob = log_prob * eps.shape[-1]
@@ -666,6 +678,7 @@ class SoftWorldModel(nn.Module):
         target=False,
         detach=False,
         qs=None,
+        remaining_horizon=None,
     ):
         """Return raw predictions from every selected critic head.
 
@@ -685,6 +698,7 @@ class SoftWorldModel(nn.Module):
             target=target,
             detach=detach,
             qs=qs,
+            remaining_horizon=remaining_horizon,
         )
 
     def q_predictions_from_joint(
@@ -694,10 +708,13 @@ class SoftWorldModel(nn.Module):
         target=False,
         detach=False,
         qs=None,
+        remaining_horizon=None,
     ):
         """Run critics on an already packed latent/action tensor."""
         if target and (detach or qs is not None):
             raise ValueError("target=True cannot be combined with detach=True or an explicit critic.")
+        ensemble = qs if qs is not None else (self._target_Qs if target else self._Qs)
+        q_input = pack_horizon_input(ensemble, q_input, remaining_horizon)
         if qs is not None:
             out = qs.forward_detached(q_input) if detach else qs(q_input)
         elif target:
@@ -710,7 +727,7 @@ class SoftWorldModel(nn.Module):
             out = out.reshape(*out.shape[:-1], self.value_spec.num_components, self.q_backend.output_dim)
         return out
 
-    def q_values(self, z, a, task=None, *, target=False, detach=False, qs=None):
+    def q_values(self, z, a, task=None, *, target=False, detach=False, qs=None, remaining_horizon=None):
         """Return decoded scalar values from every selected critic head."""
         predictions = self.q_predictions(
             z,
@@ -719,6 +736,7 @@ class SoftWorldModel(nn.Module):
             target=target,
             detach=detach,
             qs=qs,
+            remaining_horizon=remaining_horizon,
         )
         if getattr(self.cfg, "inner_operator", None) == "tdambi":
             # Native TD-MPC2 uses exp(abs(x)) - 1, whereas AMBI's backend
@@ -763,6 +781,7 @@ class SoftWorldModel(nn.Module):
         projection=None,
         beta=None,
         weights=None,
+        remaining_horizon=None,
     ):
         """Evaluate critics and return decoded scalar Q-values.
 
@@ -780,6 +799,7 @@ class SoftWorldModel(nn.Module):
             target=target,
             detach=detach,
             qs=qs,
+            remaining_horizon=remaining_horizon,
         )
         if self.value_spec.is_split:
             # Validate explicit scalar semantics even for mean/all reductions.

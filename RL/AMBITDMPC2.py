@@ -151,6 +151,8 @@ _AMBI_DEFAULTS = {
     # rollout timesteps so the next imagined action uses the adapted actor.
     "inner_update_timing": "round",
     "inner_finite_horizon": False,
+    "inner_horizon_conditioning": "none",
+    "inner_horizon_diagnostics": False,
     "inner_outer_replay_fraction": 0.0,
     # Optional canonical component schedule. Both values must be specified;
     # unlike the shared-G schedule, each optimizer samples its own batch.
@@ -452,6 +454,56 @@ def _normalize_choice(value, key, choices):
     if value not in choices:
         raise ValueError(f"{key} must be one of {sorted(choices)}, got {value!r}.")
     return value
+
+
+def _validate_horizon_conditioning_config(cfg):
+    """Keep the opt-in time-aware learner within its supported SAC contract."""
+    conditioned = cfg.inner_horizon_conditioning != "none"
+    if not conditioned:
+        # This is derived metadata, not an independent architecture control.
+        vars(cfg).pop("horizon_conditioning_horizon", None)
+        if not cfg.inner_horizon_diagnostics:
+            return
+    feature = ("inner_horizon_conditioning='one_hot'" if conditioned
+               else "inner_horizon_diagnostics=True")
+    requirements = {
+        "inner_operator": "sac",
+        "inner_schedule_mode": "canonical",
+        "inner_finite_horizon": True,
+        "inner_actor_initialization": "prior",
+        "inner_critic_initialization": "prior",
+        "inner_actor_adaptation": "clone",
+        "inner_critic_adaptation": "clone",
+        "inner_bootstrap_source": "inner_target",
+        "inner_explorer_mode": "none",
+        "inner_execution_policy_source": "primary",
+        "critic_value_mode": "single",
+        "inner_outer_replay_fraction": 0.0,
+        "inner_actor_writeback_coef": 0.0,
+        "inner_critic_writeback_coef": 0.0,
+        "value_equivalence_diagnostics": False,
+        "value_equivalence_loss_coef": 0.0,
+        "inner_diagnostic_rollouts": 0,
+    }
+    for component in (
+        "actor", "critic", "temperature", "replay",
+        "actor_optimizer", "critic_optimizer", "temperature_optimizer",
+    ):
+        requirements[f"inner_{component}_scope"] = "action"
+    for key, expected in requirements.items():
+        if getattr(cfg, key) != expected:
+            raise ValueError(
+                f"{feature} requires "
+                f"{key}={expected!r}."
+            )
+    if cfg.aux_return_mode not in {"off", "sac"}:
+        raise ValueError(f"{feature} requires aux_return_mode='off' or 'sac'.")
+    for key in ("inner_actor_source", "inner_critic_source",
+                "inner_horizon_actor_source", "inner_horizon_critic_source"):
+        if getattr(cfg, key) != "sac":
+            raise ValueError(f"{feature} requires {key}='sac'.")
+    if conditioned:
+        cfg.horizon_conditioning_horizon = int(cfg.inner_rollout_horizon)
 
 
 def _integral_weighted_count(total, weight, *, total_key, weight_key):
@@ -1406,6 +1458,15 @@ class AMBITDMPC2(TDMPC2Baseline):
         if schedule_mode == "legacy" and requested_operator in {"sac", "td3"}:
             merged.update(_LEGACY_SCHEDULE_DEFAULTS)
         merged.update(params)
+        merged["inner_horizon_diagnostics"] = _strict_bool(
+            merged["inner_horizon_diagnostics"], "inner_horizon_diagnostics",
+        )
+        merged["inner_horizon_conditioning"] = _normalize_choice(
+            merged["inner_horizon_conditioning"],
+            "inner_horizon_conditioning", {"none", "one_hot"},
+        )
+        if merged["inner_horizon_conditioning"] != "none" and requested_operator != "sac":
+            raise ValueError("inner_horizon_conditioning='one_hot' requires inner_operator='sac'.")
         timing = merged["inner_update_timing"]
         if not isinstance(timing, str) or timing.lower() not in {"round", "step"}:
             raise ValueError("inner_update_timing must be 'round' or 'step'.")
@@ -2816,6 +2877,7 @@ class AMBITDMPC2(TDMPC2Baseline):
                     + ". Alternatively, set sac_actor_loss_scale_mode='none'."
                 )
 
+        _validate_horizon_conditioning_config(cfg)
         _validate_split_value_config(cfg)
         validate_auxiliary_config(cfg)
         cfg.inner_terminal_entropy = _normalize_choice(

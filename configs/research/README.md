@@ -180,3 +180,12 @@ results are reused, and replay capacity grows to retain all H3/J8 transitions.
 The [soft/soft critic-budget comparison](AUX_SOFT_CRITIC_BUDGET_625K.md) adds
 C8/C16 at H1/H2/H3 and J2/J4/J8, with fixed tau and learning rates, full replay,
 and strict pairing to the corresponding historical C32 results.
+
+## Horizon-conditioned SAC comparison
+
+[ambi_aux_horizon_conditioning_625k.json](ambi_aux_horizon_conditioning_625k.json)
+prepares eight soft/soft settings (H3 J2/J4/J8 and H1 J4, conditioning off/on)
+with C16/A4 and diagnostics in both arms. See
+[HORIZON_SAC_DIAGNOSTICS.md](HORIZON_SAC_DIAGNOSTICS.md) for metric definitions,
+checkpoint compatibility and the separate three-decision Oscar smoke. Merely
+preparing this matrix does not launch full evaluations.
