@@ -172,3 +172,7 @@ checkpoint. Materialize and train those axes instead.
 The [625k matched-budget interleaving screen](AUX_INTERLEAVED_625K.md) compares
 actor/alpha updates spaced through the critic steps with the completed
 critic-first H2/H3, J1, C32, A4/A8/A16 screen.
+
+The original 625k H/J table extends to J6/J8 for its two soft-inner arms in
+[`AUX_J68_625K.md`](AUX_J68_625K.md) and `ambi_aux_j68_625k.json`. Existing J4
+results are reused, and replay capacity grows to retain all H3/J8 transitions.

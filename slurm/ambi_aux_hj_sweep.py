@@ -71,7 +71,8 @@ def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=
         assert cfg.get(key, 'none' if key == 'inner_terminal_entropy' else None) == value, (key, value)
     assert cfg['inner_batch_size'] == 256 and cfg['inner_rollouts_per_round'] == 128
     assert cfg['inner_critic_updates_per_round'] == 32 and cfg['inner_actor_updates_per_round'] == actor_updates(cell)
-    assert cfg['inner_replay_capacity'] == 2048 and cfg['inner_replay_sampling'] == 'with_replacement'
+    assert cfg['inner_replay_capacity'] == cell['params'].get('inner_replay_capacity', 2048)
+    assert cfg['inner_replay_sampling'] == 'with_replacement'
     round_only = cell['params'].get('inner_replay_reset_each_round', False)
     assert cfg.get('inner_replay_reset_each_round', False) == round_only
     assert cfg['inner_bootstrap_source'] == 'inner_target' and cfg['inner_finite_horizon']
@@ -148,6 +149,8 @@ def round_replay_baseline(spec, record, *, baseline_science=None):
 
 
 def comparison_prefix(baseline):
+    if baseline.get('kind') == 'round_budget':
+        return 'comparison/j4'
     if baseline.get('kind') == 'interleaved':
         return 'comparison/phased'
     if baseline.get('kind') == 'actor_budget':
@@ -221,9 +224,16 @@ def prepare(args):
             round_replay = args.baseline_kind == 'round_replay'
             interleaved = args.baseline_kind == 'interleaved'
             suffix = '_interleaved' if interleaved else '_roundreplay' if round_replay else '_tau010'
-            previous = baseline_cells[cell['name'].removesuffix(suffix)]
+            baseline_name = cell['name'].removesuffix(suffix)
+            if args.baseline_kind == 'round_budget':
+                baseline_name = cell['name'].removesuffix('_jscale').replace(f"_j{cell['J']}", '_j4')
+            previous = baseline_cells[baseline_name]
             record, = load_records(previous['bundle'], inventory_path=args.inventory)
-            if interleaved:
+            if args.baseline_kind == 'round_budget':
+                from slurm.ambi_aux_round_budget import historical_baseline
+                validate(previous['bundle'], previous)
+                cell['baseline'] = historical_baseline(spec, record, cell['J'])
+            elif interleaved:
                 from slurm.ambi_aux_interleaved import phased_baseline
                 cell['baseline'] = phased_baseline(spec, record)
                 old_receipt = read(Path(previous['directory'])/'worker-completion.json')
@@ -269,6 +279,12 @@ def prepare(args):
         else:
             from slurm.ambi_aux_actor_budget import prepare_campaign
         prepare_campaign(campaign, root, execution)
+    if read(matrix).get('round_budget_sweep'):
+        assert args.baseline_kind == 'round_budget' and args.baseline_campaign
+        assert len(panel) == 12 and not execution
+        campaign['publisher_workers'] = 4
+        campaign['baseline_campaign'] = str(args.baseline_campaign)
+        campaign['extension_of_original_hj_table'] = True
     write(root/'campaign.json', campaign)
     print(json.dumps(dict(root=str(root), conditions=len(panel), reused=sum(c['reused'] for c in panel),
                          overview_run_id=campaign['overview_run_id'])), flush=True)
@@ -372,6 +388,15 @@ def training_summary(bundle, cell, *, expected_steps=500):
                         assert e['critic_updates'] == c and e['actor_updates'] == a
                         assert c == a*interval if e.get('updated_actor') else a*interval < c <= (a+1)*interval
                         assert bool(e.get('updated_temperature')) == bool(e.get('updated_actor'))
+                    elif cell['params'].get('inner_component_update_order') == 'critic_first':
+                        c, a, r = counts[key]['critic'], counts[key]['actor'], e['round_index']
+                        assert bool(e.get('updated_critic')) != bool(e.get('updated_actor'))
+                        assert e['critic_updates'] == c and e['actor_updates'] == a
+                        if e.get('updated_critic'):
+                            assert a == (r-1)*actor_updates(cell) and (r-1)*32 < c <= r*32
+                        else:
+                            assert c == r*32 and (r-1)*actor_updates(cell) < a <= r*actor_updates(cell)
+                        assert bool(e.get('updated_temperature')) == bool(e.get('updated_actor') and cell['params']['inner_entropy_enabled'])
                     for metric,value in e['metrics'].items():
                         assert value is not None
                         if metric.startswith(('critic_', 'q_', 'td_error')):
@@ -455,6 +480,7 @@ def publish_cell(args):
     summary = training_summary(bundle,cell)
     write(directory/'training-summary.json',summary)
     comparison_file = ('replay-comparison.json' if cell.get('baseline',{}).get('kind') == 'round_replay'
+                       else 'round-budget-comparison.json' if cell.get('baseline',{}).get('kind') == 'round_budget'
                        else 'interleaved-comparison.json' if cell.get('baseline',{}).get('kind') == 'interleaved'
                        else 'actor-budget-comparison.json' if cell.get('baseline',{}).get('kind') == 'actor_budget'
                        else 'polyak-comparison.json')
@@ -527,10 +553,12 @@ def publish_cell(args):
 
 
 def watch(args):
-    """One CPU owner, at most two independent complete-panel subprocesses."""
+    """One CPU owner with a bounded number of complete-panel subprocesses."""
     import wandb
     campaign = read(args.root/'campaign.json')
     total = len(campaign['cells'])
+    publishers = int(campaign.get('publisher_workers', 2))
+    assert 1 <= publishers <= 4
     marker = args.root/'watcher-started.json'
     if marker.exists(): raise RuntimeError('Watcher already started; inspect its state before recovery')
     write(marker,dict(pid=os.getpid(),started=time.time()))
@@ -559,11 +587,13 @@ def watch(args):
                          result.get('metrics',{}).get('eval/return_mean'),result.get('metrics',{}).get('eval/paired_gain_mean'),
                          f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["training_run_id"]}',
                          f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["performance_run_id"]}',
-                         result.get('metrics',{}).get(comparison_prefix({'kind':'actor_budget'} if campaign.get('execution',{}).get('actor_budget_comparison') else cell.get('baseline',{}))+'_gain_mean')])
+                         result.get('metrics',{}).get(comparison_prefix(
+                             {'kind':'actor_budget'} if campaign.get('execution',{}).get('actor_budget_comparison') else
+                             cell.get('baseline',{}))+'_gain_mean')])
         return rows
     terminal_since=None; previous=None
     try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with ThreadPoolExecutor(max_workers=publishers) as pool:
             while True:
                 for index,f in list(futures.items()):
                     if f.done():
@@ -571,7 +601,7 @@ def watch(args):
                         if rc: failures[index]=rc
                         del futures[index]
                 for index,cell in enumerate(campaign['cells']):
-                    if len(futures)>=2: break
+                    if len(futures)>=publishers: break
                     d=Path(cell['directory'])
                     baseline_ready = (not cell.get('actor_baseline_name') or
                                       (args.root/cell['actor_baseline_name']/'worker-completion.json').exists())
@@ -611,7 +641,7 @@ def main():
     p.add_argument('--group',default=GROUP)
     p.add_argument('--label',default='625k H/J sweep')
     p.add_argument('--baseline-campaign',type=Path)
-    p.add_argument('--baseline-kind',choices=['polyak','round_replay','interleaved'],default='polyak')
+    p.add_argument('--baseline-kind',choices=['polyak','round_replay','interleaved','round_budget'],default='polyak')
     for name in ('checkpoint','inventory','reference','registry','reuse-alpha','reuse-zero'):
         p.add_argument('--'+name,type=Path)
     p.add_argument('--index',type=int)
