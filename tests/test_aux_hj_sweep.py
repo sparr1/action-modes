@@ -38,10 +38,15 @@ def test_complete_grid_and_objectives():
                                      'soft_soft_h3_j8_jscale','soft_return_h3_j8_jscale',
                                      'soft_soft_h1_j6_jscale','soft_return_h2_j6_jscale',
                                      'soft_return_h1_j8_jscale',
-                                     'soft_soft_h3_j8_c8','soft_soft_h2_j4_c16','soft_soft_h1_j2_c8'])
+                                     'soft_soft_h3_j8_c8','soft_soft_h2_j4_c16','soft_soft_h1_j2_c8',
+                                     'soft_soft_h3_j8_c16_n32_b256','soft_soft_h3_j8_c16_n128_b64',
+                                     'soft_soft_h3_j8_c16_n32_b64','soft_soft_h1_j8_c16_n32_b256',
+                                     'soft_soft_h1_j8_c16_n128_b64','soft_soft_h1_j8_c16_n32_b64'])
 def panel(request,tmp_path_factory):
     root=tmp_path_factory.mktemp('hj')
-    matrix_path=(MATRIX.with_name('ambi_aux_soft_critic_budget_625k.json')
+    matrix_path=(MATRIX.with_name('ambi_aux_rollout_batch_625k.json')
+                 if request.param.endswith(('_b64','_b256')) else
+                 MATRIX.with_name('ambi_aux_soft_critic_budget_625k.json')
                  if request.param.rsplit('_',1)[-1] in ('c8','c16') else
                  MATRIX.with_name('ambi_aux_j68_625k.json')
                  if request.param.endswith('_jscale') else
@@ -87,7 +92,7 @@ def test_real_replay_and_complete_update_metrics(panel):
     assert all(r['metrics']['critic_loss']['count']==6 for r in critic)
     assert all(r['metrics']['actor_loss']['count']==6 for r in actor)
     assert all(r['metrics']['decision/reward']['count']==2 for r in summary['decision_curves'])
-    assert manifest['runs'][0]['result']['model_metrics']['inner_buffer_size']['mean']==128*cell['H']*(
+    assert manifest['runs'][0]['result']['model_metrics']['inner_buffer_size']['mean']==cell['params'].get('inner_rollouts_per_round',128)*cell['H']*(
         1 if cell['params'].get('inner_replay_reset_each_round',False) else cell['J'])
 
 

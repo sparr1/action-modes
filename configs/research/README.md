@@ -191,3 +191,10 @@ J2/J4/J8 baselines; H1 is deferred. See
 [HORIZON_SAC_DIAGNOSTICS.md](HORIZON_SAC_DIAGNOSTICS.md) for metric definitions,
 checkpoint compatibility and the separate three-decision Oscar smoke. Merely
 preparing this matrix does not launch full evaluations.
+
+### Soft/soft rollout and batch screen
+
+`ambi_aux_rollout_batch_625k.json` adds six H1/H3 J8/C16/A4 N/B panels and reuses
+the two completed N128/B256 references with their original W&B run IDs. See
+[AUX_ROLLOUT_BATCH_625K.md](AUX_ROLLOUT_BATCH_625K.md) for exact scope, pairing,
+work accounting and launch restrictions.
