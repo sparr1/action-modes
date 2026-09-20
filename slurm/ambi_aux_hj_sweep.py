@@ -95,7 +95,8 @@ def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=
     assert cfg['inner_actor_initialization'] == cfg['inner_critic_initialization'] == 'prior'
     assert cfg['inner_critic_target_initialization'] == 'online'
     assert cfg['inner_temperature_initialization'] == cfg['inner_target_entropy'] == 'inherit_outer'
-    assert cfg['inner_actor_lr'] == cfg['inner_critic_lr'] == 3e-4
+    assert cfg['inner_actor_lr'] == 3e-4
+    assert cfg['inner_critic_lr'] == cell['params'].get('inner_critic_lr', 3e-4)
     assert cfg['inner_critic_target_tau'] == cell['params'].get('inner_critic_target_tau', .01)
     assert cfg['inner_critic_target_update_interval'] == 1
     assert cfg['inner_critic_dropout_enabled'] and cfg['inner_outer_replay_fraction'] == 0
@@ -164,6 +165,8 @@ def round_replay_baseline(spec, record, *, baseline_science=None):
 
 
 def comparison_prefix(baseline):
+    if baseline.get('kind') == 'critic_lr':
+        return 'comparison/critic_lr_3e4'
     if baseline.get('kind') == 'step_timing':
         return 'comparison/round_timing'
     if baseline.get('kind') == 'rollout_batch':
@@ -204,6 +207,9 @@ def polyak_comparison(episodes, baseline):
 
 
 def prepare(args):
+    if read(args.matrix).get('critic_lr_sweep'):
+        from slurm.ambi_aux_critic_lr import prepare_campaign
+        return prepare_campaign(args)
     if read(args.matrix).get('step_timing_sweep'):
         from slurm.ambi_aux_step_timing import prepare_campaign
         return prepare_campaign(args)
@@ -357,8 +363,12 @@ def worker(args):
                    and c['J'] == max(x['J'] for x in campaign['cells'])])
         if campaign.get('horizon_conditioning_sweep'):
             chosen = [c for c in campaign['cells'] if (c['H'], c['J']) in ((2, 1), (3, 8))]
-        if campaign.get('rollout_batch_sweep') or campaign.get('step_timing_sweep'):
+        if any(campaign.get(k) for k in ('rollout_batch_sweep','step_timing_sweep','critic_lr_sweep')):
             chosen = [c for c in chosen if not c['reused']]
+        if args.index is not None:
+            assert campaign.get('critic_lr_sweep') and args.index in campaign['production_indices']
+            chosen = [campaign['cells'][args.index]]
+            assert not chosen[0]['reused']
     else:
         chosen = [campaign['cells'][args.index]]
     for cell in chosen:
@@ -571,13 +581,17 @@ def publish_cell(args):
     if campaign.get('step_timing_sweep'):
         from slurm.ambi_aux_step_timing import publication_baseline
         cell['baseline'] = publication_baseline(campaign, cell, record)
+    if campaign.get('critic_lr_sweep'):
+        from slurm.ambi_aux_critic_lr import publication_baseline
+        cell['baseline'] = publication_baseline(campaign, cell, record)
     comparison = polyak_comparison(record['episodes'],cell['baseline']) if 'baseline' in cell else None
     staged = stage_completed_bundle(bundle,{cell['actual_selector']:cell['run_dir']},inventory_path=campaign['inventory'])
     assert staged[cell['actual_selector']]['status'] == 'queued'
     performance = publish_performance(cell['run_dir'])
     summary = training_summary(bundle,cell)
     write(directory/'training-summary.json',summary)
-    comparison_file = ('step-timing-comparison.json' if cell.get('baseline',{}).get('kind') == 'step_timing'
+    comparison_file = ('critic-lr-comparison.json' if cell.get('baseline',{}).get('kind') == 'critic_lr'
+                       else 'step-timing-comparison.json' if cell.get('baseline',{}).get('kind') == 'step_timing'
                        else 'rollout-batch-comparison.json' if cell.get('baseline',{}).get('kind') == 'rollout_batch'
                        else 'horizon-conditioning-comparison.json' if cell.get('baseline',{}).get('kind') == 'horizon_conditioning'
                        else 'replay-comparison.json' if cell.get('baseline',{}).get('kind') == 'round_replay'
@@ -601,6 +615,8 @@ def publish_cell(args):
                      config=dict(H=cell['H'],J=cell['J'],N=rollouts(cell),B=batch_size(cell),C=critic_updates(cell),A=actor_updates(cell),checkpoint_step=625000,
                                  execution=receipt.get('execution'),
                                  setting=cell['name'],update_timing=cell['params'].get('inner_update_timing','round'),
+                                 actor_lr=manifest['runs'][0]['resolved_config']['inner_actor_lr'],
+                                 critic_lr=manifest['runs'][0]['resolved_config']['inner_critic_lr'],
                                   resolved_config=manifest['runs'][0]['resolved_config'],
                                  source_code=manifest['code'],reused=cell['reused'],
                                  inner_critic_target_tau=manifest['runs'][0]['resolved_config']['inner_critic_target_tau'],
@@ -676,6 +692,7 @@ def watch(args):
                                  A=sorted({actor_updates(c) for c in campaign['cells']}),seeds=SEEDS,
                                  execution=campaign.get('execution'),
                                  target_taus=sorted({c['params'].get('inner_critic_target_tau',.01) for c in campaign['cells']}),
+                                 critic_lrs=sorted({c['params'].get('inner_critic_lr',3e-4) for c in campaign['cells']}),
                                  checkpoint_sha256=CHECKPOINT_SHA,source_commit=campaign['source_commit']),mode='online')
     attempted = set(); futures = {}; failures = {}
     def launch(index):
@@ -694,6 +711,7 @@ def watch(args):
                          f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["training_run_id"]}',
                          f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["performance_run_id"]}',
                          result.get('metrics',{}).get(comparison_prefix(
+                             {'kind':'critic_lr'} if campaign.get('critic_lr_sweep') else
                              {'kind':'step_timing'} if campaign.get('step_timing_sweep') else
                              {'kind':'rollout_batch'} if campaign.get('rollout_batch_sweep') else
                              {'kind':'horizon_conditioning'} if campaign.get('horizon_conditioning_sweep') else

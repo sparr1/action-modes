@@ -181,6 +181,10 @@ The [soft/soft critic-budget comparison](AUX_SOFT_CRITIC_BUDGET_625K.md) adds
 C8/C16 at H1/H2/H3 and J2/J4/J8, with fixed tau and learning rates, full replay,
 and strict pairing to the corresponding historical C32 results.
 
+The [critic learning-rate screen](AUX_CRITIC_LR_625K.md) adds four H3/J8
+C8/C16 panels at critic LR0.0006/0.001. Actor LR stays0.0003; matching
+LR0.0003 controls and the prior are reused with their original W&B IDs.
+
 ## Horizon-conditioned SAC comparison
 
 [ambi_aux_horizon_conditioning_625k.json](ambi_aux_horizon_conditioning_625k.json)

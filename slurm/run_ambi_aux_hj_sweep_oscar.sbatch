@@ -21,6 +21,7 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}" TORCHINDUCTOR_COMPILE_THREADS
 unset WANDB_RUN_ID WANDB_RESUME WANDB_NAME WANDB_RUN_GROUP WANDB_JOB_TYPE WANDB_TAGS
 case "${1:-}" in
   --smoke) extra=(--smoke) ;;
+  --smoke-index) extra=(--smoke --index "${SLURM_ARRAY_TASK_ID:?}") ;;
   '') extra=(--index "${SLURM_ARRAY_TASK_ID:?}") ;;
   *) exit 2 ;;
 esac

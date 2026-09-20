@@ -42,10 +42,14 @@ def test_complete_grid_and_objectives():
                                      'soft_soft_h3_j8_c16_n32_b256','soft_soft_h3_j8_c16_n128_b64',
                                      'soft_soft_h3_j8_c16_n32_b64','soft_soft_h1_j8_c16_n32_b256',
                                      'soft_soft_h1_j8_c16_n128_b64','soft_soft_h1_j8_c16_n32_b64',
-                                     'soft_soft_h3_j8_c16_n32_b256_step','soft_soft_h3_j8_c16_n128_b256_step'])
+                                     'soft_soft_h3_j8_c16_n32_b256_step','soft_soft_h3_j8_c16_n128_b256_step',
+                                     'soft_soft_h3_j8_c8_lr6e4','soft_soft_h3_j8_c8_lr1e3',
+                                     'soft_soft_h3_j8_c16_lr6e4','soft_soft_h3_j8_c16_lr1e3'])
 def panel(request,tmp_path_factory):
     root=tmp_path_factory.mktemp('hj')
-    matrix_path=(MATRIX.with_name('ambi_aux_step_timing_625k.json')
+    matrix_path=(MATRIX.with_name('ambi_aux_critic_lr_625k.json')
+                 if request.param.endswith(('_lr6e4','_lr1e3')) else
+                 MATRIX.with_name('ambi_aux_step_timing_625k.json')
                  if request.param.endswith('_step') else
                  MATRIX.with_name('ambi_aux_rollout_batch_625k.json')
                  if request.param.endswith(('_b64','_b256')) else
@@ -119,6 +123,21 @@ def test_missing_update_or_wrong_replay_is_rejected(panel,tmp_path):
     with gzip.open(tmp_path/name,'wt') as f:
         f.write('\n'.join(json.dumps(r) for r in rows)+'\n')
     with pytest.raises(AssertionError): training_summary(tmp_path,cell,expected_steps=3)
+
+
+def test_wrong_learning_rate_is_rejected(panel,tmp_path):
+    root,cell,sha=panel
+    if 'inner_critic_lr' not in cell['params']:
+        return
+    manifest=json.loads((root/'bundle/manifest.json').read_text())
+    cfg=manifest['runs'][0]['resolved_config']
+    for key in ('inner_actor_lr','inner_critic_lr'):
+        expected=cfg[key]
+        cfg[key]=expected*2
+        (tmp_path/'manifest.json').write_text(json.dumps(manifest))
+        with pytest.raises(AssertionError):
+            validate(tmp_path,cell,seeds=[101,102],steps=3,checkpoint_sha=sha)
+        cfg[key]=expected
 
 
 def test_polyak_grid_changes_only_tau():

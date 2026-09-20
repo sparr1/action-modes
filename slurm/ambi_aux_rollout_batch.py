@@ -53,7 +53,8 @@ def reference_cell(previous, directory, manifest, record, receipt, *, kind='roll
     """Reference the existing bundle and W&B IDs; never allocate publication IDs."""
     from slurm.ambi_aux_hj_sweep import read, write, polyak_comparison
     cell = deepcopy(previous)
-    cell.update(name=previous['name']+('_n128_b256_reused' if kind=='rollout_batch' else '_round_reused'), directory=str(directory), reused=True)
+    suffix = {'rollout_batch':'_n128_b256_reused', 'critic_lr':'_lr3e4_reused'}.get(kind, '_round_reused')
+    cell.update(name=previous['name']+suffix, directory=str(directory), reused=True)
     cell.pop('baseline', None)
     publication = read(Path(previous['directory'])/'publication-completion.json')
     assert publication['status'] == 'complete' and publication['training_run_id'] == previous['training_run_id']
