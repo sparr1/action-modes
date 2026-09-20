@@ -41,10 +41,13 @@ def test_complete_grid_and_objectives():
                                      'soft_soft_h3_j8_c8','soft_soft_h2_j4_c16','soft_soft_h1_j2_c8',
                                      'soft_soft_h3_j8_c16_n32_b256','soft_soft_h3_j8_c16_n128_b64',
                                      'soft_soft_h3_j8_c16_n32_b64','soft_soft_h1_j8_c16_n32_b256',
-                                     'soft_soft_h1_j8_c16_n128_b64','soft_soft_h1_j8_c16_n32_b64'])
+                                     'soft_soft_h1_j8_c16_n128_b64','soft_soft_h1_j8_c16_n32_b64',
+                                     'soft_soft_h3_j8_c16_n32_b256_step','soft_soft_h3_j8_c16_n128_b256_step'])
 def panel(request,tmp_path_factory):
     root=tmp_path_factory.mktemp('hj')
-    matrix_path=(MATRIX.with_name('ambi_aux_rollout_batch_625k.json')
+    matrix_path=(MATRIX.with_name('ambi_aux_step_timing_625k.json')
+                 if request.param.endswith('_step') else
+                 MATRIX.with_name('ambi_aux_rollout_batch_625k.json')
                  if request.param.endswith(('_b64','_b256')) else
                  MATRIX.with_name('ambi_aux_soft_critic_budget_625k.json')
                  if request.param.rsplit('_',1)[-1] in ('c8','c16') else
@@ -166,3 +169,21 @@ def test_performance_retry_uses_reconciling_publisher(monkeypatch):
     monkeypatch.setattr(campaign.time,'sleep',lambda _:None)
     assert campaign.publish_performance('run')=={'published':1}
     assert len(calls)==2 and calls[0]==calls[1]
+
+
+def test_step_trace_rejects_updates_moved_before_their_collection(panel,tmp_path):
+    root,cell,_=panel
+    if cell['params'].get('inner_update_timing')!='step':
+        return
+    manifest=json.loads((root/'bundle/manifest.json').read_text())
+    (tmp_path/'manifest.json').write_text(json.dumps(manifest))
+    for name in manifest['runs'][0]['trace_files']:
+        target=tmp_path/name;target.parent.mkdir(parents=True,exist_ok=True)
+        target.write_bytes((root/'bundle'/name).read_bytes())
+    name=manifest['runs'][0]['trace_files'][0]
+    rows=[json.loads(line) for line in gzip.open(tmp_path/name,'rt')]
+    boundary=next(i for i,e in enumerate(rows) if e['phase']=='collection' and e['metrics'].get('collection_rollout_step')==2)
+    moved=next(i for i in range(boundary+1,len(rows)) if rows[i].get('updated_critic'))
+    rows.insert(boundary,rows.pop(moved))  # Same totals; sixth critic update arrives one depth early.
+    with gzip.open(tmp_path/name,'wt') as f:f.write('\n'.join(json.dumps(r) for r in rows)+'\n')
+    with pytest.raises(AssertionError):training_summary(tmp_path,cell,expected_steps=3)

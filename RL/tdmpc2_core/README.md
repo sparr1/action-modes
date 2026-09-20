@@ -724,11 +724,27 @@ per real decision, independently of replay capacity or lifetime. Horizon flags
 and optional real-replay critic mixing retain their existing target semantics.
 
 Step timing currently supports single-policy canonical SAC
-(`inner_explorer_mode="none"`) and requires the explicit transition interval.
+(`inner_explorer_mode="none"`) with an explicit transition interval or the
+component schedule below.
 The interval's existing restrictions on shared/component gradient counts and
 frozen actor/critic adaptation still apply. The default `"round"` path retains
 the existing schedules and explorer populations. This is an additional schedule
 ablation; the manuscript's grouped-rollout algorithm remains the default.
+
+Alternatively, explicit `inner_critic_updates_per_round` and
+`inner_actor_updates_per_round` can be combined with step timing, leaving
+`inner_steps_per_update=null`. This retains asymmetric per-round budgets and
+requires `inner_component_update_order="critic_first"`. After collecting depth
+d, each component with budget K runs `floor(K*d/H)-floor(K*(d-1)/H)` updates.
+For H3/C16/A4, the three doses are C5/A1, C5/A1 and C6/A2; temperature updates
+follow actor updates. Sampling uses all currently retained replay. Later
+imagined actions use the updated actor; no branch is restarted between depths.
+H1 reduces to ordinary round timing. The allocation restarts each round, and
+stopping all episodic branches early skips the doses for uncollected depths;
+resolved totals remain nominal full-horizon budgets. Without-replacement replay
+must already contain a full minibatch at the first depth with any update.
+The joint transition-interval schedule above remains unchanged and cannot be
+combined with explicit component counts.
 
 Non-episodic collection compiles one model timestep at a time, while the existing
 actor and critic kernels remain separately compiled. Episodic collection keeps

@@ -6445,6 +6445,16 @@ class InnerImprovementEngine:
                         else:
                             critic_count = int(cfg.inner_critic_updates_per_round)
                             actor_count = int(cfg.inner_actor_updates_per_round)
+                            if self._interleaves_updates and (critic_count or actor_count):
+                                # Keep each component's per-round budget. The
+                                # remainder is spent at later depths: H3/C16/A4
+                                # gives (5,1), (5,1), (6,2), independently each round.
+                                depth = int(rollout["rollout_step"])
+                                horizon = int(cfg.inner_rollout_horizon)
+                                critic_count = (critic_count * depth // horizon
+                                                - critic_count * (depth - 1) // horizon)
+                                actor_count = (actor_count * depth // horizon
+                                               - actor_count * (depth - 1) // horizon)
                             round_metrics = self._run_component_update_counts(
                                 critic_count=critic_count,
                                 actor_count=actor_count,

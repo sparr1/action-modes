@@ -198,3 +198,10 @@ preparing this matrix does not launch full evaluations.
 the two completed N128/B256 references with their original W&B run IDs. See
 [AUX_ROLLOUT_BATCH_625K.md](AUX_ROLLOUT_BATCH_625K.md) for exact scope, pairing,
 work accounting and launch restrictions.
+
+### Matched-budget stepwise updates
+
+[ambi_aux_step_timing_625k.json](ambi_aux_step_timing_625k.json) adds two H3/J8
+soft/soft evaluations at N32/N128, retaining C16/A4/B256 while distributing
+updates across imagined timesteps. Existing round-timing controls are reused
+with their original W&B IDs. See [AUX_STEP_TIMING_625K.md](AUX_STEP_TIMING_625K.md).

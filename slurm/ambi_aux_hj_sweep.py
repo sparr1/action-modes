@@ -104,7 +104,8 @@ def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=
     assert result['environment_seeds'] == seeds and result['controller_seed'] == 55
     j, h = cell['J'], cell['H']
     expected = dict(inner_model_steps=rollouts(cell)*h*j, inner_buffer_size=rollouts(cell)*h*(1 if round_only else j),
-                    inner_critic_optimizer_steps=critic_updates(cell)*j, inner_actor_optimizer_steps=actor_updates(cell)*j,
+                    inner_critic_optimizer_steps=critic_updates(cell)*j, inner_critic_target_updates=critic_updates(cell)*j,
+                    inner_actor_optimizer_steps=actor_updates(cell)*j,
                     inner_temperature_optimizer_steps=actor_updates(cell)*j if cfg['inner_entropy_enabled'] else 0,
                     inner_compile_fallback=0)
     if 'inner_rollouts_per_round' in cell['params'] and 'inner_batch_size' in cell['params']:
@@ -163,6 +164,8 @@ def round_replay_baseline(spec, record, *, baseline_science=None):
 
 
 def comparison_prefix(baseline):
+    if baseline.get('kind') == 'step_timing':
+        return 'comparison/round_timing'
     if baseline.get('kind') == 'rollout_batch':
         return 'comparison/n128_b256'
     if baseline.get('kind') == 'horizon_conditioning':
@@ -201,6 +204,9 @@ def polyak_comparison(episodes, baseline):
 
 
 def prepare(args):
+    if read(args.matrix).get('step_timing_sweep'):
+        from slurm.ambi_aux_step_timing import prepare_campaign
+        return prepare_campaign(args)
     if read(args.matrix).get('rollout_batch_sweep'):
         from slurm.ambi_aux_rollout_batch import prepare_campaign
         return prepare_campaign(args)
@@ -351,7 +357,7 @@ def worker(args):
                    and c['J'] == max(x['J'] for x in campaign['cells'])])
         if campaign.get('horizon_conditioning_sweep'):
             chosen = [c for c in campaign['cells'] if (c['H'], c['J']) in ((2, 1), (3, 8))]
-        if campaign.get('rollout_batch_sweep'):
+        if campaign.get('rollout_batch_sweep') or campaign.get('step_timing_sweep'):
             chosen = [c for c in chosen if not c['reused']]
     else:
         chosen = [campaign['cells'][args.index]]
@@ -411,6 +417,7 @@ def training_summary(bundle, cell, *, expected_steps=500):
     curves = defaultdict(lambda: defaultdict(Moments))
     decisions = defaultdict(lambda: defaultdict(Moments))
     counts = defaultdict(lambda: defaultdict(int))
+    step_timing = cell['params'].get('inner_update_timing', 'round') == 'step'
     for name in run['trace_files']:
         with gzip.open(Path(bundle)/name,'rt') as f:
             for line in f:
@@ -425,7 +432,17 @@ def training_summary(bundle, cell, *, expected_steps=500):
                     counts[key]['initial'] += 1
                 if phase == 'collection':
                     retained = 1 if cell['params'].get('inner_replay_reset_each_round',False) else e['round_index']
-                    assert e['replay_size'] == retained*rollouts(cell)*cell['H']
+                    if step_timing:
+                        depth = int(e['metrics']['collection_rollout_step'])
+                        assert 1 <= depth <= cell['H']
+                        assert counts[key]['collection'] == (e['round_index']-1)*cell['H'] + depth-1
+                        assert e['replay_size'] == ((retained-1)*cell['H']+depth)*rollouts(cell)
+                        assert e['metrics']['collection_transitions'] == rollouts(cell)
+                        for component, dose in [('critic',critic_updates(cell)),('actor',actor_updates(cell))]:
+                            expected_before = (e['round_index']-1)*dose + dose*(depth-1)//cell['H']
+                            assert counts[key].get(component,0) == expected_before
+                    else:
+                        assert e['replay_size'] == retained*rollouts(cell)*cell['H']
                     counts[key]['collection'] += 1
                 if phase == 'update':
                     horizon_stats.add(e)
@@ -444,10 +461,16 @@ def training_summary(bundle, cell, *, expected_steps=500):
                         c, a, r = counts[key]['critic'], counts[key]['actor'], e['round_index']
                         assert bool(e.get('updated_critic')) != bool(e.get('updated_actor'))
                         assert e['critic_updates'] == c and e['actor_updates'] == a
+                        depth = (counts[key]['collection']-1) % cell['H']+1 if step_timing else cell['H']
+                        previous_depth = depth-1 if step_timing else 0
+                        c0 = (r-1)*critic_updates(cell) + critic_updates(cell)*previous_depth//cell['H']
+                        c1 = (r-1)*critic_updates(cell) + critic_updates(cell)*depth//cell['H']
+                        a0 = (r-1)*actor_updates(cell) + actor_updates(cell)*previous_depth//cell['H']
+                        a1 = (r-1)*actor_updates(cell) + actor_updates(cell)*depth//cell['H']
                         if e.get('updated_critic'):
-                            assert a == (r-1)*actor_updates(cell) and (r-1)*critic_updates(cell) < c <= r*critic_updates(cell)
+                            assert a == a0 and c0 < c <= c1
                         else:
-                            assert c == r*critic_updates(cell) and (r-1)*actor_updates(cell) < a <= r*actor_updates(cell)
+                            assert c == c1 and a0 < a <= a1
                         assert bool(e.get('updated_temperature')) == bool(e.get('updated_actor') and cell['params']['inner_entropy_enabled'])
                     for metric,value in e['metrics'].items():
                         if metric.startswith(('critic_horizon_', 'actor_horizon_')): continue
@@ -469,7 +492,7 @@ def training_summary(bundle, cell, *, expected_steps=500):
     expected_n = len(run['episodes'])*expected_steps
     assert len(counts) == expected_n
     for count in counts.values():
-        assert dict(count) == dict(initial=1, collection=cell['J'], critic=critic_updates(cell)*cell['J'],
+        assert dict(count) == dict(initial=1, collection=cell['J']*(cell['H'] if step_timing else 1), critic=critic_updates(cell)*cell['J'],
                                   actor=actor_updates(cell)*cell['J'],
                                   **({'temperature':actor_updates(cell)*cell['J']} if cell['params']['inner_entropy_enabled'] else {}), decision=1), count
     required = {'critic_loss','critic_grad_norm','td_error_abs_mean','q_target_mean','actor_loss',
@@ -545,13 +568,17 @@ def publish_cell(args):
     if campaign.get('rollout_batch_sweep'):
         from slurm.ambi_aux_rollout_batch import publication_baseline
         cell['baseline'] = publication_baseline(campaign, cell, record)
+    if campaign.get('step_timing_sweep'):
+        from slurm.ambi_aux_step_timing import publication_baseline
+        cell['baseline'] = publication_baseline(campaign, cell, record)
     comparison = polyak_comparison(record['episodes'],cell['baseline']) if 'baseline' in cell else None
     staged = stage_completed_bundle(bundle,{cell['actual_selector']:cell['run_dir']},inventory_path=campaign['inventory'])
     assert staged[cell['actual_selector']]['status'] == 'queued'
     performance = publish_performance(cell['run_dir'])
     summary = training_summary(bundle,cell)
     write(directory/'training-summary.json',summary)
-    comparison_file = ('rollout-batch-comparison.json' if cell.get('baseline',{}).get('kind') == 'rollout_batch'
+    comparison_file = ('step-timing-comparison.json' if cell.get('baseline',{}).get('kind') == 'step_timing'
+                       else 'rollout-batch-comparison.json' if cell.get('baseline',{}).get('kind') == 'rollout_batch'
                        else 'horizon-conditioning-comparison.json' if cell.get('baseline',{}).get('kind') == 'horizon_conditioning'
                        else 'replay-comparison.json' if cell.get('baseline',{}).get('kind') == 'round_replay'
                        else 'critic-budget-comparison.json' if cell.get('baseline',{}).get('kind') == 'critic_budget'
@@ -573,7 +600,8 @@ def publish_cell(args):
                      job_type='inner-training-diagnostics',tags=['closed-loop','H-J-sweep',cell['name'].rsplit('_h',1)[0]],
                      config=dict(H=cell['H'],J=cell['J'],N=rollouts(cell),B=batch_size(cell),C=critic_updates(cell),A=actor_updates(cell),checkpoint_step=625000,
                                  execution=receipt.get('execution'),
-                                 setting=cell['name'],resolved_config=manifest['runs'][0]['resolved_config'],
+                                 setting=cell['name'],update_timing=cell['params'].get('inner_update_timing','round'),
+                                  resolved_config=manifest['runs'][0]['resolved_config'],
                                  source_code=manifest['code'],reused=cell['reused'],
                                  inner_critic_target_tau=manifest['runs'][0]['resolved_config']['inner_critic_target_tau'],
                                  inner_replay_capacity=manifest['runs'][0]['resolved_config']['inner_replay_capacity'],
@@ -666,6 +694,7 @@ def watch(args):
                          f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["training_run_id"]}',
                          f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["performance_run_id"]}',
                          result.get('metrics',{}).get(comparison_prefix(
+                             {'kind':'step_timing'} if campaign.get('step_timing_sweep') else
                              {'kind':'rollout_batch'} if campaign.get('rollout_batch_sweep') else
                              {'kind':'horizon_conditioning'} if campaign.get('horizon_conditioning_sweep') else
                              {'kind':'actor_budget'} if campaign.get('execution',{}).get('actor_budget_comparison') else

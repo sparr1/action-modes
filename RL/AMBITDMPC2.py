@@ -1475,11 +1475,11 @@ class AMBITDMPC2(TDMPC2Baseline):
             if (
                 requested_operator != "sac"
                 or schedule_mode != "canonical"
-                or merged["inner_steps_per_update"] is None
+                or (merged["inner_steps_per_update"] is None and not component_update_schedule)
             ):
                 raise ValueError(
                     "inner_update_timing='step' requires canonical inner SAC "
-                    "with an explicit inner_steps_per_update interval."
+                    "with an explicit inner_steps_per_update interval or component per-round counts."
                 )
             if str(merged["inner_explorer_mode"]).lower() != "none":
                 raise ValueError(
@@ -2006,11 +2006,16 @@ class AMBITDMPC2(TDMPC2Baseline):
             if cfg.inner_rounds > 0 else 0
         )
         if cfg.inner_update_timing == "step" and cfg.inner_rollouts_per_round > 0:
-            # Earliest vector step that earns an update, assuming no early
-            # termination. Use the same exact decimal interval as scheduling.
-            first_collection_size = cfg.inner_rollouts_per_round * math.ceil(
-                Fraction(str(cfg.inner_steps_per_update)) / cfg.inner_rollouts_per_round
-            )
+            if cfg.inner_component_update_schedule:
+                # floor(count * depth / H) first becomes positive here.
+                count = max(cfg.inner_critic_updates_per_round, cfg.inner_actor_updates_per_round)
+                depth = max(1, math.ceil(cfg.inner_rollout_horizon / count)) if count else cfg.inner_rollout_horizon
+                first_collection_size = cfg.inner_rollouts_per_round * depth
+            else:
+                # Use the same exact decimal interval as scheduling.
+                first_collection_size = cfg.inner_rollouts_per_round * math.ceil(
+                    Fraction(str(cfg.inner_steps_per_update)) / cfg.inner_rollouts_per_round
+                )
         if (
             cfg.inner_operator in {"sac", "td3"}
             and cfg.inner_replay_sampling == "without_replacement"
@@ -2347,6 +2352,9 @@ class AMBITDMPC2(TDMPC2Baseline):
             cfg.inner_component_update_order, "inner_component_update_order",
             {"critic_first", "interleaved"},
         )
+        if (cfg.inner_update_timing == "step" and cfg.inner_component_update_schedule
+                and cfg.inner_component_update_order != "critic_first"):
+            raise ValueError("Component step timing requires inner_component_update_order='critic_first'.")
         if cfg.inner_component_update_order == "interleaved":
             if (
                 cfg.inner_operator != "sac"

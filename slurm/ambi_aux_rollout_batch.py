@@ -49,15 +49,15 @@ def baseline_result(candidate, baseline, cell):
                 episodes=[{k:e[k] for k in ('seed','solver_seed','return')} for e in baseline['episodes']])
 
 
-def reference_cell(previous, directory, manifest, record, receipt):
+def reference_cell(previous, directory, manifest, record, receipt, *, kind='rollout_batch'):
     """Reference the existing bundle and W&B IDs; never allocate publication IDs."""
     from slurm.ambi_aux_hj_sweep import read, write, polyak_comparison
     cell = deepcopy(previous)
-    cell.update(name=previous['name']+'_n128_b256_reused', directory=str(directory), reused=True)
+    cell.update(name=previous['name']+('_n128_b256_reused' if kind=='rollout_batch' else '_round_reused'), directory=str(directory), reused=True)
     cell.pop('baseline', None)
     publication = read(Path(previous['directory'])/'publication-completion.json')
     assert publication['status'] == 'complete' and publication['training_run_id'] == previous['training_run_id']
-    baseline = dict(kind='rollout_batch', episodes=record['episodes'])
+    baseline = dict(kind=kind, episodes=record['episodes'])
     publication.update(cell=cell['name'], reused=True,
                        metrics={**record['metrics'], **polyak_comparison(record['episodes'], baseline)['metrics']})
     write(directory/'worker-completion.json', {**receipt, 'reused':True, 'bundle':previous['bundle']})
