@@ -1,5 +1,20 @@
 # Frozen-checkpoint AMBI research
 
+Opt-in [whole-round ERE](../../RL/tdmpc2_core/README.md#whole-round-ere-replay)
+changes inner SAC's replay sampling while keeping collection/update budgets
+fixed. Set `inner_replay_strategy="ere"`; final fraction defaults to 0.25 and
+minimum eligible rounds to one. Uniform replay remains the default, so existing
+presets and historical control identities are unchanged.
+
+`ambi_aux_ere_625k.json` evaluates soft/soft H1/H2/H3 at J8, C8/C16/C32,
+and ERE final fractions 0.5/0.25, with N128/B256/A4 and minimum one round.
+`slurm/ambi_aux_ere.py` verifies and reuses the nine matching published uniform
+controls from the critic-budget and J6/J8 campaigns; it schedules only the 18
+new settings. Paired full-episode gains versus uniform use
+`comparison/uniform_gain_*`, alongside the existing prior comparisons.
+Replay and horizon diagnostics are retained at every update. The separate CPU
+preparation job audits reference hashes before GPU smoke/production submission.
+
 The frozen evaluator supports finite-horizon inner SAC and transition-based
 update counts. It rejects `inner_outer_replay_fraction > 0` because these model
 snapshots do not include real replay. Test replay mixing through a populated

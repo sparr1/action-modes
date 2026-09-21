@@ -165,6 +165,8 @@ def round_replay_baseline(spec, record, *, baseline_science=None):
 
 
 def comparison_prefix(baseline):
+    if baseline.get('kind') == 'ere':
+        return 'comparison/uniform'
     if baseline.get('kind') == 'critic_lr':
         return 'comparison/critic_lr_3e4'
     if baseline.get('kind') == 'step_timing':
@@ -207,6 +209,9 @@ def polyak_comparison(episodes, baseline):
 
 
 def prepare(args):
+    if read(args.matrix).get('ere_sweep'):
+        from slurm.ambi_aux_ere import prepare_campaign
+        return prepare_campaign(args)
     if read(args.matrix).get('critic_lr_sweep'):
         from slurm.ambi_aux_critic_lr import prepare_campaign
         return prepare_campaign(args)
@@ -363,10 +368,10 @@ def worker(args):
                    and c['J'] == max(x['J'] for x in campaign['cells'])])
         if campaign.get('horizon_conditioning_sweep'):
             chosen = [c for c in campaign['cells'] if (c['H'], c['J']) in ((2, 1), (3, 8))]
-        if any(campaign.get(k) for k in ('rollout_batch_sweep','step_timing_sweep','critic_lr_sweep')):
+        if any(campaign.get(k) for k in ('rollout_batch_sweep','step_timing_sweep','critic_lr_sweep','ere_sweep')):
             chosen = [c for c in chosen if not c['reused']]
         if args.index is not None:
-            assert campaign.get('critic_lr_sweep') and args.index in campaign['production_indices']
+            assert (campaign.get('critic_lr_sweep') or campaign.get('ere_sweep')) and args.index in campaign['production_indices']
             chosen = [campaign['cells'][args.index]]
             assert not chosen[0]['reused']
     else:
@@ -455,6 +460,9 @@ def training_summary(bundle, cell, *, expected_steps=500):
                         assert e['replay_size'] == retained*rollouts(cell)*cell['H']
                     counts[key]['collection'] += 1
                 if phase == 'update':
+                    if cell['params'].get('inner_replay_strategy') == 'ere':
+                        from slurm.ambi_aux_ere import validate_update
+                        validate_update(e, cell)
                     horizon_stats.add(e)
                     for component in ('critic','actor','temperature'):
                         if e.get('updated_'+component):
@@ -495,6 +503,9 @@ def training_summary(bundle, cell, *, expected_steps=500):
                         curves[(axis,index)][metric].add(value)
                         decisions[(ep,decision)][metric].add(value)
                 elif phase == 'decision':
+                    if cell['params'].get('inner_replay_strategy') == 'ere':
+                        from slurm.ambi_aux_ere import validate_decision
+                        validate_decision(e, cell)
                     for metric,value in e['metrics'].items():
                         assert value is not None
                         decisions[(ep,decision)][metric].add(value)
@@ -550,6 +561,27 @@ def publish_performance(run_dir):
             time.sleep(15)
 
 
+def log_training_curves(run, summary):
+    """Publish every summarized metric, including optional replay diagnostics."""
+    for axis in ('critic_update', 'actor_update', 'decision'):
+        run.define_metric('axis/'+axis)
+        prefix = {'critic_update': 'critic', 'actor_update': 'actor', 'decision': 'episode'}[axis]
+        run.define_metric(prefix+'/*', step_metric='axis/'+axis)
+    run.define_metric('seed/*', step_metric='axis/decision')
+    run.define_metric('diagnostic/actor_updates')
+    run.define_metric('diagnostic/*', step_metric='diagnostic/actor_updates')
+    for row in summary['update_curves']:
+        prefix = 'critic' if row['axis']=='critic_update' else 'actor'
+        run.log({'axis/'+row['axis']: row['index'],
+                 **{f'{prefix}/{k}/{s}': v for k,stats in row['metrics'].items() for s,v in stats.items()}})
+    per_seed = defaultdict(dict)
+    for row in summary['per_seed_decisions']:
+        per_seed[row['decision']].update({f"seed/{row['episode_id']}/{k}": v for k,v in row['metrics'].items()})
+    for row in summary['decision_curves']:
+        run.log({'axis/decision': row['decision'], **per_seed[row['decision']],
+                 **{f'episode/{k}/{s}': v for k,stats in row['metrics'].items() for s,v in stats.items()}})
+
+
 def publish_cell(args):
     from utils.ambi_benchmark import stage_completed_bundle
     from utils.eval_series import load_run
@@ -584,13 +616,17 @@ def publish_cell(args):
     if campaign.get('critic_lr_sweep'):
         from slurm.ambi_aux_critic_lr import publication_baseline
         cell['baseline'] = publication_baseline(campaign, cell, record)
+    if campaign.get('ere_sweep'):
+        from slurm.ambi_aux_ere import publication_baseline
+        cell['baseline'] = publication_baseline(campaign, cell, record)
     comparison = polyak_comparison(record['episodes'],cell['baseline']) if 'baseline' in cell else None
     staged = stage_completed_bundle(bundle,{cell['actual_selector']:cell['run_dir']},inventory_path=campaign['inventory'])
     assert staged[cell['actual_selector']]['status'] == 'queued'
     performance = publish_performance(cell['run_dir'])
     summary = training_summary(bundle,cell)
     write(directory/'training-summary.json',summary)
-    comparison_file = ('critic-lr-comparison.json' if cell.get('baseline',{}).get('kind') == 'critic_lr'
+    comparison_file = ('ere-comparison.json' if cell.get('baseline',{}).get('kind') == 'ere'
+                       else 'critic-lr-comparison.json' if cell.get('baseline',{}).get('kind') == 'critic_lr'
                        else 'step-timing-comparison.json' if cell.get('baseline',{}).get('kind') == 'step_timing'
                        else 'rollout-batch-comparison.json' if cell.get('baseline',{}).get('kind') == 'rollout_batch'
                        else 'horizon-conditioning-comparison.json' if cell.get('baseline',{}).get('kind') == 'horizon_conditioning'
@@ -617,6 +653,8 @@ def publish_cell(args):
                                  setting=cell['name'],update_timing=cell['params'].get('inner_update_timing','round'),
                                  actor_lr=manifest['runs'][0]['resolved_config']['inner_actor_lr'],
                                  critic_lr=manifest['runs'][0]['resolved_config']['inner_critic_lr'],
+                                 replay_strategy=manifest['runs'][0]['resolved_config'].get('inner_replay_strategy','uniform'),
+                                 ere_final_fraction=manifest['runs'][0]['resolved_config'].get('inner_ere_final_fraction'),
                                   resolved_config=manifest['runs'][0]['resolved_config'],
                                  source_code=manifest['code'],reused=cell['reused'],
                                  inner_critic_target_tau=manifest['runs'][0]['resolved_config']['inner_critic_target_tau'],
@@ -627,23 +665,7 @@ def publish_cell(args):
                                  aggregation='Legacy update curves average decision roots; horizon curves pool samples within each seed then weight seeds equally. Zero-coverage means are omitted. Decision curves weight seeds equally.',
                                  probe_objective='Reward plus terminal Q; excludes explicit entropy.'),mode='online')
     try:
-        for axis in ('critic_update','actor_update','decision'):
-            run.define_metric('axis/'+axis)
-            prefix = {'critic_update':'critic','actor_update':'actor','decision':'episode'}[axis]
-            run.define_metric(prefix+'/*',step_metric='axis/'+axis)
-        run.define_metric('seed/*',step_metric='axis/decision')
-        run.define_metric('diagnostic/actor_updates')
-        run.define_metric('diagnostic/*',step_metric='diagnostic/actor_updates')
-        for row in summary['update_curves']:
-            prefix = 'critic' if row['axis']=='critic_update' else 'actor'
-            run.log({'axis/'+row['axis']:row['index'],
-                     **{f'{prefix}/{k}/{s}':v for k,stats in row['metrics'].items() for s,v in stats.items()}})
-        per_seed = defaultdict(dict)
-        for row in summary['per_seed_decisions']:
-            per_seed[row['decision']].update({f"seed/{row['episode_id']}/{k}":v for k,v in row['metrics'].items()})
-        for row in summary['decision_curves']:
-            run.log({'axis/decision':row['decision'],**per_seed[row['decision']],
-                     **{f'episode/{k}/{s}':v for k,stats in row['metrics'].items() for s,v in stats.items()}})
+        log_training_curves(run, summary)
         for row in diagnostic_history(diagnostic): run.log(row)
         if comparison: run.log(comparison['metrics'])
         artifact = wandb.Artifact('inner-training-'+cell['training_run_id'],type='inner-training-traces',
@@ -693,6 +715,9 @@ def watch(args):
                                  execution=campaign.get('execution'),
                                  target_taus=sorted({c['params'].get('inner_critic_target_tau',.01) for c in campaign['cells']}),
                                  critic_lrs=sorted({c['params'].get('inner_critic_lr',3e-4) for c in campaign['cells']}),
+                                 replay_strategies=sorted({c['params'].get('inner_replay_strategy','uniform') for c in campaign['cells']}),
+                                 ere_final_fractions=sorted({c['params']['inner_ere_final_fraction'] for c in campaign['cells']
+                                                            if c['params'].get('inner_replay_strategy') == 'ere'}),
                                  checkpoint_sha256=CHECKPOINT_SHA,source_commit=campaign['source_commit']),mode='online')
     attempted = set(); futures = {}; failures = {}
     def launch(index):
@@ -711,6 +736,7 @@ def watch(args):
                          f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["training_run_id"]}',
                          f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell["performance_run_id"]}',
                          result.get('metrics',{}).get(comparison_prefix(
+                             {'kind':'ere'} if campaign.get('ere_sweep') else
                              {'kind':'critic_lr'} if campaign.get('critic_lr_sweep') else
                              {'kind':'step_timing'} if campaign.get('step_timing_sweep') else
                              {'kind':'rollout_batch'} if campaign.get('rollout_batch_sweep') else

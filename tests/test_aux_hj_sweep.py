@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from evaluate_ambi_checkpoint import evaluate_matrix
-from slurm.ambi_aux_hj_sweep import MATRIX, cells, training_summary, validate, polyak_baseline, polyak_comparison, CHECKPOINT_SHA
+from slurm.ambi_aux_hj_sweep import MATRIX, cells, training_summary, log_training_curves, validate, polyak_baseline, polyak_comparison, CHECKPOINT_SHA
 from tests.test_ambi_root_local_sac import _tiny_model, _tiny_params
 
 
@@ -25,7 +25,7 @@ def test_complete_grid_and_objectives():
         assert p['inner_entropy_enabled'] == ('return_return_zero' not in c['name'])
 
 
-@pytest.fixture(scope='module',params=['soft_soft_h3_j4','soft_return_h3_j4',
+@pytest.fixture(scope='module',params=['soft_soft_h3_j4','soft_return_h3_j4','soft_soft_h3_j4_ere',
                                      'return_return_alpha_h3_j4','return_return_zero_h3_j4',
                                      'soft_soft_h2_j2','soft_return_h1_j1',
                                      'soft_soft_h3_j4_tau010','soft_return_h3_j4_tau010',
@@ -44,10 +44,14 @@ def test_complete_grid_and_objectives():
                                      'soft_soft_h1_j8_c16_n128_b64','soft_soft_h1_j8_c16_n32_b64',
                                      'soft_soft_h3_j8_c16_n32_b256_step','soft_soft_h3_j8_c16_n128_b256_step',
                                      'soft_soft_h3_j8_c8_lr6e4','soft_soft_h3_j8_c8_lr1e3',
-                                     'soft_soft_h3_j8_c16_lr6e4','soft_soft_h3_j8_c16_lr1e3'])
+                                     'soft_soft_h3_j8_c16_lr6e4','soft_soft_h3_j8_c16_lr1e3',
+                                     'soft_soft_h3_j8_c32_ere025','soft_soft_h2_j8_c16_ere050',
+                                     'soft_soft_h1_j8_c8_ere025'])
 def panel(request,tmp_path_factory):
     root=tmp_path_factory.mktemp('hj')
-    matrix_path=(MATRIX.with_name('ambi_aux_critic_lr_625k.json')
+    matrix_path=(MATRIX.with_name('ambi_aux_ere_625k.json')
+                 if request.param.endswith(('_ere025','_ere050')) else
+                 MATRIX.with_name('ambi_aux_critic_lr_625k.json')
                  if request.param.endswith(('_lr6e4','_lr1e3')) else
                  MATRIX.with_name('ambi_aux_step_timing_625k.json')
                  if request.param.endswith('_step') else
@@ -65,7 +69,9 @@ def panel(request,tmp_path_factory):
                  if request.param.endswith('_roundreplay') else
                  MATRIX.with_name('ambi_aux_polyak_sweep_625k.json')
                  if request.param.endswith('_tau010') else MATRIX)
-    cell=next(c for c in cells(matrix_path) if c['name']==request.param)
+    cell=next(c for c in cells(matrix_path) if c['name']==request.param.removesuffix('_ere'))
+    if request.param.endswith('_ere'):
+        cell['params']['inner_replay_strategy']='ere'
     options=dict(aux_return_mode='sac',log_std_mapping='direct_clamp',sac_actor_loss_scale_mode='none',
                  inner_operator='none',inner_rounds=0,inner_rollouts_per_round=0,inner_updates_per_round=0,
                  ent_coef='auto_0.2')
@@ -78,6 +84,7 @@ def panel(request,tmp_path_factory):
                   experiment_params=dict(env_params=dict(max_episode_steps=3)))
     Path(str(checkpoint)+'.metadata.json').write_text(json.dumps(metadata))
     matrix=json.loads(matrix_path.read_text());matrix['shared_alg_params']['compile']=False
+    matrix['comparisons']['sweep']['variants'][cell['name']]['alg_params']=cell['params']
     path=root/'matrix.json';path.write_text(json.dumps(matrix))
     evaluate_matrix(path,checkpoint,selectors=['sweep/prior'],seeds=[101,102],max_steps=3,
                     device='cpu',bundle_dir=root/'prior')
@@ -101,6 +108,32 @@ def test_real_replay_and_complete_update_metrics(panel):
     assert all(r['metrics']['decision/reward']['count']==2 for r in summary['decision_curves'])
     assert manifest['runs'][0]['result']['model_metrics']['inner_buffer_size']['mean']==cell['params'].get('inner_rollouts_per_round',128)*cell['H']*(
         1 if cell['params'].get('inner_replay_reset_each_round',False) else cell['J'])
+    if cell['params'].get('inner_replay_strategy')=='ere':
+        for component,curves in [('critic',critic),('actor',actor)]:
+            key=f'{component}_replay_window_rounds'
+            assert all(r['metrics'][key]['count']==6 for r in curves)
+            import math
+            fraction=cell['params'].get('inner_ere_final_fraction',.25)
+            window=math.ceil(cell['J']*fraction)
+            assert curves[-1]['metrics'][key]['mean']==window
+            name=f'decision/inner_{component}_replay_round_1_sample_count'
+            assert all(name in r['metrics'] for r in summary['per_seed_decisions'])
+            assert summary['metric_catalog'][name]['preferred_axis']=='decision_index'
+        class RecordingRun:
+            def __init__(self):
+                self.rows=[]
+                self.axes={}
+            def log(self,row): self.rows.append(row)
+            def define_metric(self,name,**kwargs): self.axes[name]=kwargs
+        run=RecordingRun()
+        log_training_curves(run,summary)
+        assert run.axes['critic/*']['step_metric']=='axis/critic_update'
+        assert run.axes['actor/*']['step_metric']=='axis/actor_update'
+        assert run.axes['episode/*']['step_metric']=='axis/decision'
+        assert any(row.get('critic/critic_replay_window_fraction/mean')==window/cell['J'] for row in run.rows)
+        assert any('actor/actor_replay_newest_round_fraction/mean' in row for row in run.rows)
+        assert any('episode/decision/inner_actor_replay_round_1_sample_count/mean' in row for row in run.rows)
+        assert any('seed/seed-101/decision/inner_critic_replay_round_1_sample_count' in row for row in run.rows)
 
 
 def test_missing_update_or_wrong_replay_is_rejected(panel,tmp_path):

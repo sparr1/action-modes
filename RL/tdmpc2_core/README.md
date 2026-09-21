@@ -515,6 +515,76 @@ so existing training and experiment configurations remain unchanged. Loss
 sampling is independent of `value_equivalence_mc_samples`, which controls only
 the observational live monitor.
 
+### Whole-round ERE replay
+
+Inner SAC supports opt-in Emphasizing Recent Experience (ERE):
+
+```json
+{
+  "inner_replay_strategy": "ere",
+  "inner_ere_final_fraction": 0.25,
+  "inner_ere_min_rounds": 1
+}
+```
+
+The default strategy is `"uniform"`. ERE is restricted to canonical SAC,
+action-local components, optimizers and replay, `inner_update_timing="round"`,
+no explorer, and no outer replay mixing. Existing capacity checks still retain
+all generated data within the action, or within the current round when
+`inner_replay_reset_each_round` is enabled. ERE never discards stored transitions.
+
+This is a whole-round adaptation of
+[Wang and Ross's ERE](https://arxiv.org/abs/1906.04009). A collection round
+contains all N parallel imagined trajectories, including every collected depth.
+Later rounds contain experience from more recently adapted policies. Shrinking
+by whole rounds avoids interpreting the horizon-major insertion order as a
+preference for deeper states. Sampling is uniform over transitions in eligible
+rounds; with early termination, rounds may contribute different row counts.
+
+After collecting round j, let R be the number of retained nonempty rounds.
+For update k = 0,...,K-1 within a complete optimizer phase, use the newest
+
+```text
+W = min(R, max(inner_ere_min_rounds, ceil(R * f ** (k / (K - 1)))))
+f = inner_ere_final_fraction
+```
+
+rounds. Zero updates draw nothing; one update uses all retained rounds. The
+first update always has access to all replay. The final fraction is finite and
+in (0,1]; a smaller value means stronger recency. The minimum is a positive
+integer capped by available rounds. For J8/H3/N128 with f=0.25 and minimum one,
+the final round's window starts at 3,072 transitions and ends at 768. Early
+rounds use their actual available data, not allocated buffer capacity.
+
+Separate component budgets sweep independently across C critic updates and A
+actor updates. Temperature shares the actor batch. Both critic-first and
+interleaved ordering retain these complete component counters; interleaved
+subgroups do not restart the schedule. Joint SAC slots retain one shared batch
+and one common schedule. No update counts, target-update clocks, learning rates,
+importance weights, or strength annealing change.
+
+`inner_replay_sampling` still selects with/without replacement. An eligible
+window too small for a without-replacement batch raises an error rather than
+widening the window. Actual collection boundaries support early termination.
+Per-round replay reset leaves one eligible round, making ERE uniform. Round
+metadata resets at each real decision and is not checkpoint tensor state.
+
+Disabled ERE retains historical RNG calls and scientific identities. An entire
+phase with full-buffer windows (including f=1) uses the same uniform RNG path.
+Active ERE parameters are recorded in evaluation and resume identities.
+
+When diagnostics or traces are enabled, `critic_replay_*` and `actor_replay_*`
+report eligible rounds/transitions/fractions, sampled round age (newest=0),
+newest-round fraction, and within-batch uniqueness. Per-decision
+`inner_{critic,actor}_replay_round_<j>_sample_count` counts all draws from each
+generation round, including repeats. Trace summaries and W&B retain these
+metrics; existing `inner_horizon_diagnostics` reports depth coverage. Reading
+these diagnostics consumes no training RNG or additional replay draws.
+The H/J sweep publisher uses `critic/critic_replay_*/mean` and
+`actor/actor_replay_*/mean` on the respective update axes, and
+`episode/decision/inner_{critic,actor}_replay_round_<j>_sample_count/mean`
+on the real-decision axis. Ordinary training logs use `train/inner_*`.
+
 ### Finite-horizon inner SAC and real-replay mixing
 
 `inner_finite_horizon=true` makes `inner_rollout_horizon=H` a boundary for

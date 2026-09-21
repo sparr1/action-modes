@@ -22,6 +22,7 @@ import subprocess
 
 from utils.lora_identity import publication_lora_identity
 from utils.aux_return_identity import normalize_aux_return_identity
+from utils.ere_identity import normalize_ere_identity
 
 
 def _require(condition, message):
@@ -355,7 +356,7 @@ def planner_identity(config, result, algorithm, action_rule):
     if operator == "tdambi":
         return _tdambi_planner(config, algorithm, action_rule)
     _require(operator in {"sac", "td3", "xqc", "mppi"}, "Unknown resolved inner operator")
-    active = {key: value for key, value in normalize_aux_return_identity(config).items()
+    active = {key: value for key, value in normalize_ere_identity(normalize_aux_return_identity(config)).items()
               if key.startswith("inner_")}
     conditioning = config.get("inner_horizon_conditioning", "none")
     if isinstance(conditioning, str):

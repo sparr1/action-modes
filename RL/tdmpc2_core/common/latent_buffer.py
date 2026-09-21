@@ -303,6 +303,34 @@ class LatentReplayBuffer:
             logical_offset = indices
         return logical_offset + oldest_id
 
+    def draw_recent_indices(self, batch_size, recent_size, *, replacement=True, generator=None):
+        """Draw physical indices from the newest ``recent_size`` live rows.
+
+        A full-buffer window takes the historical physical-index path, including
+        its exact RNG call shape. Smaller windows respect the ring write cursor.
+        This method does not discard rows or alter the packed learner layout.
+        """
+        if isinstance(recent_size, bool) or not isinstance(recent_size, int):
+            raise ValueError("recent_size must be a positive integer.")
+        if not 0 < recent_size <= self.size:
+            raise ValueError("recent_size must be within the live replay size.")
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise ValueError("Latent replay batch_size must be positive.")
+        if not replacement and batch_size > recent_size:
+            raise ValueError(
+                "Cannot sample latent replay without replacement: "
+                f"batch_size={batch_size} exceeds eligible replay size={recent_size}."
+            )
+        if recent_size == self.size:
+            return self._draw_indices(batch_size, replacement, generator)
+        offsets = (
+            torch.randint(recent_size, (batch_size,), device=self.device, generator=generator)
+            if replacement else
+            torch.randperm(recent_size, device=self.device, generator=generator)[:batch_size]
+        )
+        return (offsets + self.pos - recent_size).remainder(self.capacity)
+
     def sample(
         self,
         batch_size,
