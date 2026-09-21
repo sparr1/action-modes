@@ -12,6 +12,11 @@ PATH = MATRIX.with_name('ambi_aux_ere_actor_625k.json')
 
 
 def test_one_new_condition_matches_both_existing_controls():
+    from utils.ambi_research import load_preset_matrix
+    matrix = load_preset_matrix(PATH)
+    assert matrix['comparisons']['sweep']['reference'] == 'prior'
+    assert matrix['comparisons']['sweep']['variants']['prior']['alg_params']['inner_operator'] == 'none'
+    assert all('prior' not in selector for selector in matrix['evaluation']['default_presets'])
     cell, = cells(PATH)
     assert (cell['H'], cell['J'], cell['params']['inner_critic_updates_per_round']) == (3,8,16)
     assert cell['params']['inner_ere_actor'] is False

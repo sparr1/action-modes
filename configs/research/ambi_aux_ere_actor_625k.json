@@ -121,6 +121,24 @@
             "inner_ere_min_rounds": 1,
             "inner_ere_actor": false
           }
+        },
+        "prior": {
+          "description": "Frozen SAC policy mean, no adaptation.",
+          "alg_params": {
+            "inner_operator": "none",
+            "inner_rounds": 0,
+            "inner_rollouts_per_round": 0,
+            "inner_critic_updates_per_round": null,
+            "inner_actor_updates_per_round": null,
+            "inner_finite_horizon": false,
+            "inner_critic_source": "sac",
+            "inner_horizon_critic_source": "sac",
+            "inner_updates_per_round": 0,
+            "inner_terminal_entropy": "none",
+            "inner_entropy_enabled": false,
+            "inner_temperature_mode": "inherit_outer",
+            "inner_horizon_diagnostics": false
+          }
         }
       }
     }
