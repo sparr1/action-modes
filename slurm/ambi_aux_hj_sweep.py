@@ -703,7 +703,31 @@ def publish_cell(args):
           metrics={**record['metrics'],**(comparison['metrics'] if comparison else {})}))
 
 
+def active_gpu_jobs(job_ids):
+    """Return Slurm's job list, or None when scheduler state is unavailable."""
+    try:
+        result = subprocess.run(
+            ['squeue', '--noheader', '--jobs', ','.join(job_ids), '-o', '%i'],
+            text=True, capture_output=True, check=True, timeout=20,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        print(f'Scheduler query unavailable ({type(exc).__name__}); retrying without marking jobs finished.', flush=True)
+        return None
+    return result.stdout.strip()
+
+
 def watch(args):
+    """Keep one publication owner even when explicitly recovering a watcher."""
+    import fcntl
+    with (args.root/'watcher.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError('A campaign watcher already holds the publication lock.') from exc
+        return _watch(args)
+
+
+def _watch(args):
     """One CPU owner with a bounded number of complete-panel subprocesses."""
     import wandb
     campaign = read(args.root/'campaign.json')
@@ -711,9 +735,13 @@ def watch(args):
     publishers = int(campaign.get('publisher_workers', 2))
     assert 1 <= publishers <= 4
     marker = args.root/'watcher-started.json'
-    if marker.exists(): raise RuntimeError('Watcher already started; inspect its state before recovery')
-    write(marker,dict(pid=os.getpid(),started=time.time()))
-    run = wandb.init(entity=ENTITY,project=PROJECT,id=campaign['overview_run_id'],resume='never',
+    resume = getattr(args, 'resume_watch', False)
+    if marker.exists() != resume:
+        raise RuntimeError('Existing watcher marker requires explicit --resume-watch; recovery requires a marker.')
+    receipt = args.root/f'watcher-resumed-{time.time_ns()}.json' if resume else marker
+    write(receipt,dict(pid=os.getpid(),started=time.time(),source_commit=subprocess.check_output(
+        ['git', 'rev-parse', 'HEAD'], text=True).strip()))
+    run = wandb.init(entity=ENTITY,project=PROJECT,id=campaign['overview_run_id'],resume='must' if resume else 'never',
                      name=campaign.get('label','625k H/J sweep')+f' | {total} settings',
                      group=campaign['group'],job_type='campaign-overview',
                      config=dict(H=sorted({c['H'] for c in campaign['cells']}),
@@ -784,8 +812,10 @@ def watch(args):
                 submission=args.root/'submission.json'
                 if submission.exists():
                     job_ids=read(submission)['gpu_job_ids']
-                    active=subprocess.check_output(['squeue','--noheader','--jobs',','.join(job_ids),'-o','%i'],text=True).strip()
-                    if not active and not futures:
+                    active=active_gpu_jobs(job_ids)
+                    if active is None:
+                        terminal_since=None
+                    elif not active and not futures:
                         terminal_since=terminal_since or time.time()
                         if time.time()-terminal_since>90: break
                     else: terminal_since=None
@@ -814,6 +844,7 @@ def main():
     p.add_argument('--smoke',action='store_true')
     p.add_argument('--replica',default='default')
     p.add_argument('--phased-control',action='store_true')
+    p.add_argument('--resume-watch',action='store_true',help='Resume the existing W&B overview after verifying its previous watcher has stopped.')
     args=p.parse_args()
     {'prepare':prepare,'worker':worker,'publish':publish_cell,'watch':watch}[args.mode](args)
 

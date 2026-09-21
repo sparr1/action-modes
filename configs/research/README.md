@@ -22,6 +22,14 @@ uniform/uniform and ERE/ERE five-episode results; it does not rerun controls.
 both-component ERE condition. Actor/temperature replay windows remain full,
 while critic windows follow the existing whole-round schedule.
 
+The campaign watcher treats failed or timed-out Slurm queries as unknown state
+and retries; a scheduler outage is not evidence that GPU jobs have finished.
+After confirming a previous watcher has stopped, restart its CPU launcher with
+`--resume-watch` to resume the same W&B overview and preserve completed cell
+publications. A filesystem lock prevents concurrent recovery watchers. Existing
+publication journals still require inspection before retrying an uncertain cell
+publication; recovery does not bypass those guards or rerun GPU evaluation.
+
 The frozen evaluator supports finite-horizon inner SAC and transition-based
 update counts. It rejects `inner_outer_replay_fraction > 0` because these model
 snapshots do not include real replay. Test replay mixing through a populated
