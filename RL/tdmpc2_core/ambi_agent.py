@@ -921,6 +921,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
             options["replay_strategy"] = "ere"
             options["ere_final_fraction"] = float(self.cfg.inner_ere_final_fraction)
             options["ere_min_rounds"] = int(self.cfg.inner_ere_min_rounds)
+            if not self.cfg.inner_ere_actor:
+                options["ere_actor"] = False
         if getattr(self.cfg, "inner_horizon_conditioning", "none") != "none":
             options["horizon_conditioning"] = self.cfg.inner_horizon_conditioning
             options["horizon_conditioning_horizon"] = int(self.cfg.inner_rollout_horizon)

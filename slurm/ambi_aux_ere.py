@@ -15,7 +15,7 @@ def control_key(cell):
     return f"h{cell['H']}_c{critic_updates(cell)}"
 
 
-def match_identity(candidate, baseline, fraction, *, baseline_science=None):
+def match_identity(candidate, baseline, fraction, *, baseline_science=None, ere_actor=True):
     for key in ('backbone', 'protocol'):
         assert candidate['identity'][key] == baseline['identity'][key], key
     assert baseline['identity']['science'] == (baseline_science or candidate['identity']['science'])
@@ -39,6 +39,8 @@ def match_identity(candidate, baseline, fraction, *, baseline_science=None):
     assert s.get('inner_steps_per_update') is None
     assert s.get('inner_critic_source', 'sac') == s.get('inner_horizon_critic_source', 'sac') == 'sac'
     s.update(inner_replay_strategy='ere', inner_ere_final_fraction=fraction, inner_ere_min_rounds=1)
+    if not ere_actor:
+        s['inner_ere_actor'] = False
     assert candidate['identity']['planner'] == expected
 
 
@@ -47,6 +49,7 @@ def baseline_result(candidate, baseline, cell):
     from utils.eval_series_data import scientific_identity
     source = C32_SOURCE if critic_updates(cell) == 32 else REDUCED_SOURCE
     match_identity(candidate, baseline, cell['params']['inner_ere_final_fraction'],
+                   ere_actor=cell['params'].get('inner_ere_actor', True),
                    baseline_science=scientific_identity('AMBITDMPC2/AMBITDMPC2', None, source))
     assert baseline['checkpoint']['sha256'] == CHECKPOINT_SHA and baseline['checkpoint']['step'] == 625000
     assert baseline['metrics']['eval/frozen_state_unchanged']
@@ -128,6 +131,9 @@ def prepare_campaign(args):
 
 
 def publication_baseline(campaign, cell, record):
+    if campaign.get('ere_actor_ablation'):
+        from slurm.ambi_aux_ere_actor import publication_baseline as actor_baseline
+        return actor_baseline(campaign, cell, record)
     from slurm.ambi_aux_horizon_campaign import checked_control
     control = campaign['ere_controls'][control_key(cell)]
     baseline, receipt = checked_control(control, campaign['inventory'], traces=True)
@@ -151,6 +157,8 @@ def validate_update(event, cell):
         assert 0 <= k < slots
         w = round_windows(r, slots, cell['params'].get('inner_ere_final_fraction', .25),
                          cell['params'].get('inner_ere_min_rounds', 1))[k]
+        if component == 'actor' and not cell['params'].get('inner_ere_actor', True):
+            w = r
         metrics = event['metrics']
         prefix = component+'_replay_'
         assert metrics[prefix+'window_rounds'] == w

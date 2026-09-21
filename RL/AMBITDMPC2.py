@@ -194,6 +194,7 @@ _AMBI_DEFAULTS = {
     "inner_replay_strategy": "uniform",
     "inner_ere_final_fraction": 0.25,
     "inner_ere_min_rounds": 1,
+    "inner_ere_actor": True,
 
     # Initialization and trainability are independent for each inner component.
     "inner_actor_initialization": "prior",
@@ -2395,6 +2396,10 @@ class AMBITDMPC2(TDMPC2Baseline):
         cfg.inner_ere_min_rounds = _strict_positive_int(
             cfg.inner_ere_min_rounds, "inner_ere_min_rounds"
         )
+        cfg.inner_ere_actor = _strict_bool(cfg.inner_ere_actor, "inner_ere_actor")
+        if (cfg.inner_replay_strategy == "ere" and not cfg.inner_ere_actor
+                and not cfg.inner_component_update_schedule):
+            raise ValueError("inner_ere_actor=False requires separate component update budgets.")
         if cfg.inner_replay_strategy == "ere" and (
             cfg.inner_operator != "sac"
             or cfg.inner_schedule_mode != "canonical"

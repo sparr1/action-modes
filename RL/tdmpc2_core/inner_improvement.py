@@ -3216,13 +3216,14 @@ class InnerImprovementEngine:
     def _uses_ere(self):
         return getattr(self.cfg, "inner_replay_strategy", "uniform") == "ere"
 
-    def _ere_phase_windows(self, slots):
+    def _ere_phase_windows(self, slots, *, actor=False):
         """(Round count, transition count) for each slot of a complete phase."""
         if not self._uses_ere:
             return None
         rounds = self.state.replay_rounds
-        counts = round_windows(len(rounds), slots, self.cfg.inner_ere_final_fraction,
-                               self.cfg.inner_ere_min_rounds)
+        counts = ([len(rounds)] * slots if actor and not self.cfg.inner_ere_actor else
+                  round_windows(len(rounds), slots, self.cfg.inner_ere_final_fraction,
+                                self.cfg.inner_ere_min_rounds))
         windows = [(w, rounds[-1][2] - rounds[-w][1]) for w in counts]
         if any(size > self.state.replay.size for _, size in windows):
             raise RuntimeError("ERE round boundaries exceed retained action-local replay.")
@@ -5122,7 +5123,7 @@ class InnerImprovementEngine:
                 self._calibrate_tdambi_scale()
         metrics = []
         if replay_windows is None:
-            replay_windows = self._ere_phase_windows(slots)
+            replay_windows = self._ere_phase_windows(slots, actor=critic_count == 0)
         if replay_windows is not None and len(replay_windows) != slots:
             raise ValueError("ERE windows must match the complete update slot count.")
         if replay_indices is None:
@@ -5246,7 +5247,7 @@ class InnerImprovementEngine:
             # same RNG call shapes as the phased schedule. Only their execution
             # order changes; no minibatches are shared or additional draws made.
             critic_windows = self._ere_phase_windows(critic_count)
-            actor_windows = self._ere_phase_windows(actor_count)
+            actor_windows = self._ere_phase_windows(actor_count, actor=True)
             critic_indices = self._draw_update_indices(critic_count, replay_windows=critic_windows)
             actor_indices = self._draw_update_indices(actor_count, replay_windows=actor_windows)
             interval = critic_count // actor_count  # Validated at config resolution.

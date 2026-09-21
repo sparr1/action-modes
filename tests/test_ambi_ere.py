@@ -61,6 +61,7 @@ def test_formula_bounds_and_endpoints(rounds, updates, fraction, minimum):
 
 
 @pytest.mark.parametrize("key,value", [
+    ("inner_ere_actor", 0), ("inner_ere_actor", "false"),
     ("inner_replay_strategy", "recent"), ("inner_replay_strategy", None),
     ("inner_ere_final_fraction", 0), ("inner_ere_final_fraction", -1),
     ("inner_ere_final_fraction", 1.1), ("inner_ere_final_fraction", float("nan")),
@@ -176,8 +177,11 @@ def test_uniform_equivalence_and_action_lifecycle(models,component,replacement):
         torch.testing.assert_close(torch.random.get_rng_state(),global_rng,rtol=0,atol=0)
 
 
-def test_diagnostics_do_not_change_batches_or_rng(models):
-    plain=models(); traced=models(); diagnosed=models()
+@pytest.mark.parametrize('ere_actor', [True, False])
+def test_diagnostics_do_not_change_batches_or_rng(models, ere_actor):
+    plain=models(inner_ere_actor=ere_actor)
+    traced=models(inner_ere_actor=ere_actor)
+    diagnosed=models(inner_ere_actor=ere_actor)
     for _ in range(2):
         expected=plain.agent.act(torch.zeros(3),collect_diagnostics=False)
         for model,diagnostics,trace in [(traced,False,InnerActionTrace()),(diagnosed,True,None)]:
@@ -374,7 +378,8 @@ def test_exact_resume_keeps_ere_semantics_without_round_tensors(models):
 
 
 @pytest.mark.parametrize('order', ['critic_first','interleaved'])
-def test_strict_graphs_reused_as_windows_narrow(models,monkeypatch,order):
+@pytest.mark.parametrize('ere_actor', [True, False])
+def test_strict_graphs_reused_as_windows_narrow(models,monkeypatch,order,ere_actor):
     torch._dynamo.reset()
     graphs=[]
     real_compile=torch.compile
@@ -386,6 +391,7 @@ def test_strict_graphs_reused_as_windows_narrow(models,monkeypatch,order):
         return real_compile(function,backend=backend,**kwargs)
     monkeypatch.setattr(torch,'compile',compile_counted)
     model=models(compile=True,compile_strict=True,inner_finite_horizon=True,
+                 inner_ere_actor=ere_actor,
                  inner_component_update_order=order)
     try:
         model.agent.act(torch.zeros(3),collect_diagnostics=False,trace=InnerActionTrace())
@@ -419,3 +425,52 @@ def test_inductor_ere_solve_matches_eager(models):
         assert compiled.agent.last_inner_metrics['inner_compile_fallback']==0
     finally:
         torch._dynamo.reset()
+
+
+@pytest.mark.parametrize('order', ['critic_first', 'interleaved'])
+@pytest.mark.parametrize('sampling', ['with_replacement', 'without_replacement'])
+def test_critic_only_ere_actor_full_windows_and_budgets(models, monkeypatch, order, sampling):
+    model = models(inner_ere_actor=False, inner_component_update_order=order,
+                   inner_replay_sampling=sampling)
+    engine = model.agent.inner_engine
+    calls = []
+    original = torch.randint
+    def randint(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(torch, 'randint', randint)
+    for _ in range(2):
+        trace = InnerActionTrace()
+        model.agent.act(torch.zeros(3), collect_diagnostics=False, trace=trace)
+        for r in range(1, 4):
+            events = [e for e in trace.events if e['phase'] == 'update' and e['round_index'] == r]
+            for component, expected in [('critic', round_windows(r,4,.25,1)), ('actor', [r]*2)]:
+                selected = [e for e in events if e['updated_'+component]]
+                assert [e['metrics'][component+'_replay_window_rounds'] for e in selected] == expected
+                if component == 'actor':
+                    assert all(e['updated_temperature'] for e in selected)
+                    assert all(e['metrics']['actor_replay_window_fraction'] == 1 for e in selected)
+        metrics = model.agent.last_inner_metrics
+        assert metrics['inner_critic_optimizer_steps'] == 12
+        assert metrics['inner_actor_optimizer_steps'] == metrics['inner_temperature_optimizer_steps'] == 6
+        assert metrics['inner_replay_draws'] == 72
+        assert sum(metrics[f'inner_actor_replay_round_{r}_sample_count'] for r in range(1,4)) == 24
+    if sampling == 'with_replacement':
+        assert (12, (2,4)) in calls  # Historical full-phase matrix RNG draw.
+
+
+def test_critic_only_ere_identity_joint_rejection_and_uniform_endpoint(models):
+    with pytest.raises(ValueError, match='component'):
+        _build_cfg(inner_replay_strategy='ere', inner_ere_actor=False)
+    base = dict(alg='AMBITDMPC2/AMBITDMPC2', alg_params=dict(inner_replay_strategy='ere'))
+    both = deepcopy(base); both['alg_params']['inner_ere_actor'] = True
+    critic = deepcopy(base); critic['alg_params']['inner_ere_actor'] = False
+    assert scientific_trial_parameters(base) == scientific_trial_parameters(both)
+    assert scientific_trial_parameters(base) != scientific_trial_parameters(critic)
+    uniform = models(inner_replay_strategy='uniform', inner_ere_actor=False)
+    endpoint = models(inner_ere_final_fraction=1., inner_ere_actor=False)
+    torch.testing.assert_close(uniform.agent.act(torch.zeros(3),collect_diagnostics=False),
+                               endpoint.agent.act(torch.zeros(3),collect_diagnostics=False),rtol=0,atol=0)
+    _assert_tree_equal(_snapshot(uniform.agent), _snapshot(endpoint.agent))
+    active = models(inner_ere_actor=False)
+    assert active.agent._critic_target_spec()['inner_solve']['ere_actor'] is False

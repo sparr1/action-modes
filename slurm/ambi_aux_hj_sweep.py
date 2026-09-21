@@ -165,6 +165,8 @@ def round_replay_baseline(spec, record, *, baseline_science=None):
 
 
 def comparison_prefix(baseline):
+    if baseline.get('kind') == 'ere_both':
+        return 'comparison/ere_both'
     if baseline.get('kind') == 'ere':
         return 'comparison/uniform'
     if baseline.get('kind') == 'critic_lr':
@@ -209,6 +211,9 @@ def polyak_comparison(episodes, baseline):
 
 
 def prepare(args):
+    if read(args.matrix).get('ere_actor_ablation'):
+        from slurm.ambi_aux_ere_actor import prepare_campaign
+        return prepare_campaign(args)
     if read(args.matrix).get('ere_sweep'):
         from slurm.ambi_aux_ere import prepare_campaign
         return prepare_campaign(args)
@@ -620,6 +625,10 @@ def publish_cell(args):
         from slurm.ambi_aux_ere import publication_baseline
         cell['baseline'] = publication_baseline(campaign, cell, record)
     comparison = polyak_comparison(record['episodes'],cell['baseline']) if 'baseline' in cell else None
+    if campaign.get('ere_actor_ablation'):
+        secondary = polyak_comparison(record['episodes'], cell['baseline']['ere_both'])
+        comparison['ere_both'] = secondary
+        comparison['metrics'].update(secondary['metrics'])
     staged = stage_completed_bundle(bundle,{cell['actual_selector']:cell['run_dir']},inventory_path=campaign['inventory'])
     assert staged[cell['actual_selector']]['status'] == 'queued'
     performance = publish_performance(cell['run_dir'])
@@ -655,6 +664,7 @@ def publish_cell(args):
                                  critic_lr=manifest['runs'][0]['resolved_config']['inner_critic_lr'],
                                  replay_strategy=manifest['runs'][0]['resolved_config'].get('inner_replay_strategy','uniform'),
                                  ere_final_fraction=manifest['runs'][0]['resolved_config'].get('inner_ere_final_fraction'),
+                                 ere_actor=manifest['runs'][0]['resolved_config'].get('inner_ere_actor', True),
                                   resolved_config=manifest['runs'][0]['resolved_config'],
                                  source_code=manifest['code'],reused=cell['reused'],
                                  inner_critic_target_tau=manifest['runs'][0]['resolved_config']['inner_critic_target_tau'],

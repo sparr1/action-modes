@@ -15,6 +15,13 @@ new settings. Paired full-episode gains versus uniform use
 Replay and horizon diagnostics are retained at every update. The separate CPU
 preparation job audits reference hashes before GPU smoke/production submission.
 
+`ambi_aux_ere_actor_625k.json` adds only H3/J8/C16/A4 with critic ERE
+fraction 0.25 and `inner_ere_actor=false`. Its launcher reuses the matching
+uniform/uniform and ERE/ERE five-episode results; it does not rerun controls.
+`comparison/ere_both_gain_*` adds the paired comparison against the original
+both-component ERE condition. Actor/temperature replay windows remain full,
+while critic windows follow the existing whole-round schedule.
+
 The frozen evaluator supports finite-horizon inner SAC and transition-based
 update counts. It rejects `inner_outer_replay_fraction > 0` because these model
 snapshots do not include real replay. Test replay mixing through a populated

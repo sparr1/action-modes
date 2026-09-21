@@ -563,6 +563,14 @@ subgroups do not restart the schedule. Joint SAC slots retain one shared batch
 and one common schedule. No update counts, target-update clocks, learning rates,
 importance weights, or strength annealing change.
 
+For the critic-only ERE ablation, set `inner_ere_actor=false` (default true).
+This requires separate component budgets. The critic retains its ERE schedule;
+every actor/temperature batch samples uniformly from all retained rounds, using
+the existing full-buffer RNG path. Actor replay diagnostics still report the
+actual full window. Both critic-first and interleaved orders are supported;
+joint shared-minibatch updates reject this combination. Uniform replay ignores
+the flag, and existing uniform and both-component ERE identities are unchanged.
+
 `inner_replay_sampling` still selects with/without replacement. An eligible
 window too small for a without-replacement batch raises an error rather than
 widening the window. Actual collection boundaries support early termination.
