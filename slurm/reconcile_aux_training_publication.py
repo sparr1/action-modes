@@ -31,10 +31,15 @@ def missing_history(expected, actual):
     return expected[len(rows):]
 
 
+def saved_diagnostic_history(directory):
+    from utils.ambi_diagnostic_series import diagnostic_history, read_diagnostic_bundle
+    record = read_diagnostic_bundle(directory)
+    return record, diagnostic_history(record)
+
+
 def recover(root, index):
     import wandb
     from slurm.ambi_aux_hj_sweep import read, write, digest, log_training_curves, publish_performance, PROJECT, ENTITY
-    from utils.ambi_diagnostic_series import diagnostic_history
     from utils.eval_series_data import load_records
     campaign = read(root/'campaign.json'); cell = campaign['cells'][index]
     directory = Path(cell['directory']); bundle = Path(cell['bundle'])
@@ -47,14 +52,14 @@ def recover(root, index):
     record, = load_records(bundle, inventory_path=campaign['inventory'])
     assert record['metrics']['eval/frozen_state_unchanged'] and record['metrics']['eval/paired_episodes'] == 5
     summary = read(directory/'training-summary.json')
-    diagnostic = read(directory/'model-series/manifest.json')
+    diagnostic, diagnostic_rows = saved_diagnostic_history(directory/'model-series')
     comparison = read(directory/'ere-comparison.json')
     expected = []
     class Collector:
         def define_metric(self, *args, **kwargs): pass
         def log(self, row): expected.append(row)
     log_training_curves(Collector(), summary)
-    expected.extend(diagnostic_history(diagnostic))
+    expected.extend(diagnostic_rows)
     expected.append(comparison['metrics'])
     api = wandb.Api(timeout=60)
     remote = api.run(f'{ENTITY}/{PROJECT}/{cell["training_run_id"]}')

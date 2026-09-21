@@ -17,3 +17,13 @@ def test_only_missing_suffix_is_replayed():
 ])
 def test_uncertain_or_conflicting_history_is_not_overwritten(actual):
     with pytest.raises(AssertionError): missing_history([{'metric':1},{'metric':2}],actual)
+
+
+def test_recovery_reads_full_diagnostic_bundle_not_manifest_only(tmp_path):
+    from tests.test_ambi_diagnostic_series import record
+    from utils.ambi_diagnostic_series import write_diagnostic_bundle, diagnostic_history
+    from slurm.reconcile_aux_training_publication import saved_diagnostic_history
+    expected = record(bootstrap_resamples=10)
+    write_diagnostic_bundle(tmp_path/'model-series', expected)
+    loaded, rows = saved_diagnostic_history(tmp_path/'model-series')
+    assert loaded == expected and rows == diagnostic_history(expected)
