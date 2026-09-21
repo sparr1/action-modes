@@ -165,6 +165,8 @@ def round_replay_baseline(spec, record, *, baseline_science=None):
 
 
 def comparison_prefix(baseline):
+    if baseline.get('kind') == 'j_extension':
+        return 'comparison/j8'
     if baseline.get('kind') == 'ere_both':
         return 'comparison/ere_both'
     if baseline.get('kind') == 'ere':
@@ -247,9 +249,11 @@ def prepare(args):
     baseline_cells = ({c['name']:c for c in read(args.baseline_campaign/'campaign.json')['cells']}
                       if args.baseline_campaign else {})
     if getattr(args, 'baseline_extension_campaign', None):
-        assert args.baseline_kind == 'critic_budget'
+        assert args.baseline_kind in ('critic_budget', 'j_extension')
         for cell in read(args.baseline_extension_campaign/'campaign.json')['cells']:
             name = cell['name'].removesuffix('_jscale')
+            if args.baseline_kind == 'j_extension':
+                name += '_c32'
             assert name not in baseline_cells
             baseline_cells[name] = cell
     panel = []
@@ -280,9 +284,20 @@ def prepare(args):
                 baseline_name = cell['name'].removesuffix('_jscale').replace(f"_j{cell['J']}", '_j4')
             elif args.baseline_kind == 'critic_budget':
                 baseline_name = cell['name'].rsplit('_c', 1)[0]
+            elif args.baseline_kind == 'j_extension':
+                baseline_name = cell['name'].replace(f"_j{cell['J']}_", '_j8_')
             previous = baseline_cells[baseline_name]
             record, = load_records(previous['bundle'], inventory_path=args.inventory)
-            if args.baseline_kind == 'critic_budget':
+            if args.baseline_kind == 'j_extension':
+                from slurm.ambi_aux_j_extension import historical_j8_baseline
+                validate(previous['bundle'], previous)
+                old_receipt = read(Path(previous['directory'])/'worker-completion.json')
+                assert old_receipt['status'] == 'complete'
+                assert digest(Path(previous['bundle'])/'manifest.json') == old_receipt['manifest_sha256']
+                assert all(digest(Path(previous['bundle'])/n) == sha for n,sha in old_receipt['trace_sha256'].items())
+                cell['baseline'] = historical_j8_baseline(spec, record, cell['J'])
+                cell['baseline']['training_run_id'] = previous['training_run_id']
+            elif args.baseline_kind == 'critic_budget':
                 from slurm.ambi_aux_critic_budget import historical_critic_baseline
                 validate(previous['bundle'], previous)
                 cell['baseline'] = historical_critic_baseline(spec, record, critic_updates(cell))
@@ -342,6 +357,12 @@ def prepare(args):
         campaign['publisher_workers'] = 4
         campaign['baseline_campaign'] = str(args.baseline_campaign)
         campaign['extension_of_original_hj_table'] = True
+    if read(matrix).get('j_extension_sweep'):
+        assert args.baseline_kind == 'j_extension' and args.baseline_campaign and args.baseline_extension_campaign
+        assert len(panel) == 8 and not execution
+        campaign.update(j_extension_sweep=True, publisher_workers=4,
+                        baseline_campaign=str(args.baseline_campaign),
+                        baseline_extension_campaign=str(args.baseline_extension_campaign))
     if read(matrix).get('critic_budget_sweep'):
         assert args.baseline_kind == 'critic_budget' and args.baseline_campaign
         assert args.baseline_extension_campaign and not execution
@@ -641,6 +662,7 @@ def publish_cell(args):
                        else 'horizon-conditioning-comparison.json' if cell.get('baseline',{}).get('kind') == 'horizon_conditioning'
                        else 'replay-comparison.json' if cell.get('baseline',{}).get('kind') == 'round_replay'
                        else 'critic-budget-comparison.json' if cell.get('baseline',{}).get('kind') == 'critic_budget'
+                       else 'j8-comparison.json' if cell.get('baseline',{}).get('kind') == 'j_extension'
                        else 'round-budget-comparison.json' if cell.get('baseline',{}).get('kind') == 'round_budget'
                        else 'interleaved-comparison.json' if cell.get('baseline',{}).get('kind') == 'interleaved'
                        else 'actor-budget-comparison.json' if cell.get('baseline',{}).get('kind') == 'actor_budget'
@@ -837,7 +859,7 @@ def main():
     p.add_argument('--label',default='625k H/J sweep')
     p.add_argument('--baseline-campaign',type=Path)
     p.add_argument('--baseline-extension-campaign',type=Path)
-    p.add_argument('--baseline-kind',choices=['polyak','round_replay','interleaved','round_budget','critic_budget'],default='polyak')
+    p.add_argument('--baseline-kind',choices=['polyak','round_replay','interleaved','round_budget','critic_budget','j_extension'],default='polyak')
     for name in ('checkpoint','inventory','reference','registry','reuse-alpha','reuse-zero'):
         p.add_argument('--'+name,type=Path)
     p.add_argument('--index',type=int)
