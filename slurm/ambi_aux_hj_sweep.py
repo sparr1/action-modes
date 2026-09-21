@@ -359,10 +359,17 @@ def prepare(args):
         campaign['extension_of_original_hj_table'] = True
     if read(matrix).get('j_extension_sweep'):
         assert args.baseline_kind == 'j_extension' and args.baseline_campaign and args.baseline_extension_campaign
-        assert len(panel) == 8 and not execution
-        campaign.update(j_extension_sweep=True, publisher_workers=4,
+        assert not execution
+        expected = ({(h,10,16) for h in (1,2,3)} if read(matrix).get('seed_shards') else
+                    {(h,j,16) for h in (1,2,3) for j in (12,16)} | {(3,j,32) for j in (12,16)})
+        assert len(panel) == len(expected) and {(c['H'],c['J'],critic_updates(c)) for c in panel} == expected
+        campaign.update(j_extension_sweep=True, publisher_workers=min(4,len(panel)),
                         baseline_campaign=str(args.baseline_campaign),
                         baseline_extension_campaign=str(args.baseline_extension_campaign))
+        if read(matrix).get('seed_shards'):
+            from slurm.ambi_aux_seed_panels import seed_groups
+            campaign['seed_shards'] = read(matrix)['seed_shards']
+            seed_groups(campaign)
     if read(matrix).get('critic_budget_sweep'):
         assert args.baseline_kind == 'critic_budget' and args.baseline_campaign
         assert args.baseline_extension_campaign and not execution
@@ -403,6 +410,7 @@ def worker(args):
     else:
         chosen = [campaign['cells'][args.index]]
     for cell in chosen:
+        seeds = [101] if args.smoke else SEEDS
         if getattr(args, 'phased_control', False):
             assert args.smoke and campaign['execution']['interleaved_comparison']
             cell = deepcopy(cell)
@@ -414,14 +422,19 @@ def worker(args):
         if getattr(args,'replica','default') != 'default':
             smoke_root /= args.replica
         directory = smoke_root/cell['name'] if args.smoke else Path(cell['directory'])
+        shard_index = getattr(args, 'seed_shard_index', None)
+        if shard_index is not None:
+            from slurm.ambi_aux_seed_panels import shard_location
+            assert not args.smoke
+            directory, seeds = shard_location(campaign, cell, shard_index)
         directory.mkdir(parents=True, exist_ok=args.smoke is False)
         bundle = directory/'bundle'
         evaluate_matrix(campaign['matrix'], campaign['checkpoint'], selectors=[cell['selector']],
-                        seeds=[101] if args.smoke else SEEDS, controller_seed=55,
+                        seeds=seeds, controller_seed=55,
                         max_steps=3 if args.smoke else 500, device='cuda', bundle_dir=bundle,
                         checkpoint_inventory=campaign['inventory'],
                         reference_bundle=None if args.smoke else campaign['reference'])
-        manifest = validate(bundle, cell, seeds=[101] if args.smoke else SEEDS,
+        manifest = validate(bundle, cell, seeds=seeds,
                             steps=3 if args.smoke else 500, paired=not args.smoke)
         assert manifest['runs'][0]['resolved_config']['compile_strict']
         assert manifest['runs'][0]['result']['resolved_device'].startswith('cuda')
@@ -433,7 +446,8 @@ def worker(args):
         write(directory/'worker-completion.json',dict(status='complete', cell=cell['name'],
               manifest_sha256=digest(bundle/'manifest.json'), gpu=torch.cuda.get_device_name(0),
               trace_sha256={n:digest(bundle/n) for n in manifest['runs'][0]['trace_files']},
-              selector=cell['selector'], bundle=str(bundle), reused=False, execution=execution))
+              selector=cell['selector'], bundle=str(bundle), reused=False, execution=execution,
+              seeds=seeds, seed_shard_index=shard_index))
         print('COMPLETE '+cell['name'], flush=True)
 
 
@@ -852,7 +866,7 @@ def _watch(args):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('mode',choices=['prepare','worker','publish','watch'])
+    p.add_argument('mode',choices=['prepare','worker','merge','publish','watch'])
     p.add_argument('--root',type=Path,required=True)
     p.add_argument('--matrix',type=Path,default=MATRIX)
     p.add_argument('--group',default=GROUP)
@@ -863,12 +877,17 @@ def main():
     for name in ('checkpoint','inventory','reference','registry','reuse-alpha','reuse-zero'):
         p.add_argument('--'+name,type=Path)
     p.add_argument('--index',type=int)
+    p.add_argument('--seed-shard-index',type=int)
     p.add_argument('--smoke',action='store_true')
     p.add_argument('--replica',default='default')
     p.add_argument('--phased-control',action='store_true')
     p.add_argument('--resume-watch',action='store_true',help='Resume the existing W&B overview after verifying its previous watcher has stopped.')
     args=p.parse_args()
-    {'prepare':prepare,'worker':worker,'publish':publish_cell,'watch':watch}[args.mode](args)
+    if args.mode == 'merge':
+        from slurm.ambi_aux_seed_panels import merge
+        merge(args)
+    else:
+        {'prepare':prepare,'worker':worker,'publish':publish_cell,'watch':watch}[args.mode](args)
 
 
 if __name__=='__main__': main()

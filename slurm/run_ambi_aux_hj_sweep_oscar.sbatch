@@ -22,6 +22,7 @@ unset WANDB_RUN_ID WANDB_RESUME WANDB_NAME WANDB_RUN_GROUP WANDB_JOB_TYPE WANDB_
 case "${1:-}" in
   --smoke) extra=(--smoke) ;;
   --smoke-index) extra=(--smoke --index "${SLURM_ARRAY_TASK_ID:?}") ;;
+  --seed-shard) extra=(--index "$((${SLURM_ARRAY_TASK_ID:?} / ${AMBI_SEED_SHARD_COUNT:?}))" --seed-shard-index "$(($SLURM_ARRAY_TASK_ID % $AMBI_SEED_SHARD_COUNT))") ;;
   '') extra=(--index "${SLURM_ARRAY_TASK_ID:?}") ;;
   *) exit 2 ;;
 esac

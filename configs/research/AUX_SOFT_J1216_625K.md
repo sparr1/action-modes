@@ -35,3 +35,25 @@ log `comparison/j8_gain_*` against the matching H/C reference. Those probes
 omit explicit entropy and are not observed Monte Carlo returns. Primary scaling
 evidence comes from paired real full-episode returns; five evaluation seeds at
 one trained checkpoint remain exploratory. J24/J32 are outside this matrix.
+
+## J10 follow-up
+
+`ambi_aux_soft_j10_625k.json` adds only H1/H2/H3 at J10/C16, with all other
+settings above unchanged. Each decision uses 160 critic and 40 actor/temperature
+updates; H3 generates 3840 transitions, all retained in capacity6144. Reuse the
+same three C16/J8 references and the prior, with no baseline reevaluation.
+
+To reduce elapsed time, each setting partitions seeds into [101,102], [103,104],
+and [105]. Nine independent workers retain the existing seed-derived learner
+and probe RNG. `--seed-shard` maps array indices to cell and seed group;
+`AMBI_SEED_SHARD_COUNT=3`. Each group writes only below its setting's shard
+directory and seals immutable traces. The CPU `merge` mode uses the existing
+strict episode merger, checks complete nonoverlapping seed coverage and the
+full-panel evaluation identity, then releases the normal performance/training
+publisher. There is still one performance run and one training run per setting.
+No partial seed panel is published as a completed comparison.
+
+Set `AMBI_J_EXTENSION_MATRIX=configs/research/ambi_aux_soft_j10_625k.json` and
+the corresponding label on the existing preparation launcher. Depend each CPU
+merge on that setting's three GPU tasks. The watcher's job inventory must include
+the merge jobs so it remains alive while consolidation is running or queued.

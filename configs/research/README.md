@@ -3,6 +3,9 @@
 The [soft/soft J12/J16 extension](AUX_SOFT_J1216_625K.md) adds six C16
 H1/H2/H3 configurations and two H3/C32 controls, with uniform full replay.
 It reuses historical J8 and prior episodes and logs paired `comparison/j8_gain_*`.
+The J10/C16 follow-up uses `ambi_aux_soft_j10_625k.json` and partitions the five
+evaluation seeds into three workers per horizon, consolidating complete panels
+through the existing strict seed merger before publication.
 
 Opt-in [whole-round ERE](../../RL/tdmpc2_core/README.md#whole-round-ere-replay)
 changes inner SAC's replay sampling while keeping collection/update budgets

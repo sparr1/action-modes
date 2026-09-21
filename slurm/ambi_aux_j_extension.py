@@ -1,4 +1,4 @@
-"""Strict historical J8 pairing for the soft/soft J12/J16 extension."""
+"""Strict historical J8 pairing for soft/soft J10/J12/J16 extensions."""
 from copy import deepcopy
 
 SOURCES = {16: 'fe87ae07b2a7ed751cd6865a3f60b2eae88e6abb',
@@ -13,7 +13,8 @@ def match_j_identity(candidate, baseline, rounds, *, baseline_science=None):
     settings = expected['settings']
     h, c = settings['inner_rollout_horizon'], settings['inner_critic_updates_per_round']
     assert h in (1, 2, 3) and c in SOURCES and (c == 16 or h == 3)
-    assert settings['inner_rounds'] == 8 and rounds in (12, 16)
+    assert settings['inner_rounds'] == 8 and rounds in (10, 12, 16)
+    assert rounds != 10 or c == 16
     assert settings['inner_rollouts_per_round'] == 128 and settings['inner_actor_updates_per_round'] == 4
     assert settings['inner_replay_capacity'] == 3072
     assert settings.get('inner_replay_strategy', 'uniform') == 'uniform'
