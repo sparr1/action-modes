@@ -1,5 +1,9 @@
 # Frozen-checkpoint AMBI research
 
+The [575k closed-loop critic comparison](CLOSED_LOOP_CRITICS_575K.md) evaluates
+soft and return-only critics with C16/A4, H3 and J={1,2,4}, and publishes an
+explicit W&B comparison of full-episode returns, paired gains and diagnostics.
+
 The frozen evaluator supports finite-horizon inner SAC and transition-based
 update counts. It rejects `inner_outer_replay_fraction > 0` because these model
 snapshots do not include real replay. Test replay mixing through a populated

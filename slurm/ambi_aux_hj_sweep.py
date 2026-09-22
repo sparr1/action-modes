@@ -62,12 +62,13 @@ def critic_updates(cell):
     return int(cell['params'].get('inner_critic_updates_per_round', 32))
 
 
-def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=CHECKPOINT_SHA):
+def validate(path, cell, *, seeds=SEEDS, steps=500, paired=True, checkpoint_sha=CHECKPOINT_SHA,
+             checkpoint_step=625000):
     """Validate semantics, replay retention, exact work and trace coverage."""
     manifest = read(Path(path) / 'manifest.json')
     assert manifest['status'] == 'complete'
     assert manifest['checkpoint']['sha256'] == checkpoint_sha
-    assert manifest['checkpoint']['metadata']['checkpoint']['step'] == 625000
+    assert manifest['checkpoint']['metadata']['checkpoint']['step'] == checkpoint_step
     run, = manifest['runs']
     cfg, result = run['resolved_config'], run['result']
     assert run['status'] == 'complete'
@@ -488,7 +489,9 @@ def publish_cell(args):
     receipt = read(directory/'worker-completion.json')
     assert digest(bundle/'manifest.json') == receipt['manifest_sha256']
     assert all(digest(bundle/n) == sha for n,sha in receipt['trace_sha256'].items())
-    manifest = validate(bundle,cell)
+    checkpoint_step = campaign.get('checkpoint_step', 625000)
+    manifest = validate(bundle,cell, checkpoint_step=checkpoint_step,
+                        checkpoint_sha=campaign.get('checkpoint_sha256', CHECKPOINT_SHA))
     record, = load_records(bundle,inventory_path=campaign['inventory'])
     assert record['identity'] == load_run(cell['run_dir'])['identity']
     assert record['metrics']['eval/paired_episodes'] == 5
@@ -520,9 +523,15 @@ def publish_cell(args):
     if journal.exists(): raise RuntimeError('Training publication uncertain; inspect remote run before retry')
     write(journal,dict(status='uncertain',run_id=cell['training_run_id']))
     run = wandb.init(entity=ENTITY,project=PROJECT,id=cell['training_run_id'],resume='never',
-                     name='Inner training | '+cell['name']+' | 625k',group=campaign['group'],
+                     name='Inner training | '+cell['name']+f' | {checkpoint_step//1000}k',group=campaign['group'],
                      job_type='inner-training-diagnostics',tags=['closed-loop','H-J-sweep',cell['name'].rsplit('_h',1)[0]],
-                     config=dict(H=cell['H'],J=cell['J'],N=128,B=256,C=critic_updates(cell),A=actor_updates(cell),checkpoint_step=625000,
+                     config=dict(H=cell['H'],J=cell['J'],N=128,B=256,C=critic_updates(cell),A=actor_updates(cell),checkpoint_step=checkpoint_step,
+                                 checkpoint_sha256=campaign.get('checkpoint_sha256', CHECKPOINT_SHA),
+                                 campaign_group=campaign['group'],
+                                 source_run=campaign.get('source_run'),
+                                 critic_kind=cell.get('critic_kind'),
+                                 overview_url=(f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{campaign["overview_run_id"]}'
+                                               if campaign.get('overview_run_id') else None),
                                  execution=receipt.get('execution'),
                                  setting=cell['name'],resolved_config=manifest['runs'][0]['resolved_config'],
                                  source_code=manifest['code'],reused=cell['reused'],
