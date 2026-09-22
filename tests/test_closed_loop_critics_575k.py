@@ -35,27 +35,86 @@ def prior_fixture():
     return manifest, record
 
 
-def test_six_cells_keep_accepted_recipe_and_objectives():
-    panel = campaign.cells()
+def matrix_path(horizon):
+    return campaign.MATRIX if horizon == 3 else campaign.MATRIX.with_name('ambi_closed_loop_critics_h2_575k.json')
+
+
+@pytest.mark.parametrize('horizon', [2, 3])
+def test_six_cells_keep_accepted_recipe_and_objectives(horizon):
+    panel = campaign.cells(matrix_path(horizon))
     assert [(c['J'], c['critic_kind']) for c in panel] == [
         (j, arm) for j in (4, 2, 1) for arm in ('soft', 'return_only')]
     old = campaign.read(campaign.MATRIX.with_name('ambi_aux_hj_sweep_625k.json'))
     for cell in panel:
         arm = 'soft_soft' if cell['critic_kind'] == 'soft' else 'return_return_alpha'
         previous = {**old['shared_alg_params'],
-                    **old['comparisons']['sweep']['variants'][f'{arm}_h3_j{cell["J"]}']['alg_params']}
+                    **old['comparisons']['sweep']['variants'][f'{arm}_h{horizon}_j{cell["J"]}']['alg_params']}
         previous.update(inner_replay_capacity=3072, inner_critic_updates_per_round=16,
                         inner_actor_updates_per_round=4, inner_component_update_order='critic_first',
                         inner_replay_reset_each_round=False)
         assert cell['requested_alg_params'] == previous
         cfg = _build_cfg(**cell['params'], aux_return_mode='sac', log_std_mapping='direct_clamp',
                          target_entropy=-10.5, sac_actor_loss_scale_mode='none')
-        assert cfg.inner_model_step_budget == 128 * 3 * cell['J']
+        assert cfg.inner_model_step_budget == 128 * horizon * cell['J']
         assert cfg.inner_critic_updates_per_action == 16 * cell['J']
         assert cfg.inner_actor_updates_per_action == cfg.inner_temperature_updates_per_action == 4 * cell['J']
         assert cfg.inner_model_step_budget <= cfg.inner_replay_capacity
         assert cfg.inner_target_entropy == cfg.inner_temperature_initialization == 'inherit_outer'
         assert cfg.inner_actor_source == cfg.inner_horizon_actor_source == 'sac'
+
+
+def test_h2_changes_only_horizon_and_descriptive_names():
+    old = campaign.read(matrix_path(3))
+    new = campaign.read(matrix_path(2))
+    assert new['evaluation'] == {**old['evaluation'], 'default_presets': [
+        selector.replace('_h3_', '_h2_') for selector in old['evaluation']['default_presets']]}
+    assert new['shared_alg_params'] == {**old['shared_alg_params'], 'inner_rollout_horizon': 2}
+    assert new['source_run'] == old['source_run']
+    assert campaign.cells()[0]['H'] == 3  # Existing callers retain the H3 default.
+    for before, after in zip(campaign.cells(matrix_path(3)), campaign.cells(matrix_path(2))):
+        assert after['params'] == {**before['params'], 'inner_rollout_horizon': 2}
+        assert after['name'] == before['name'].replace('_h3_', '_h2_')
+
+
+def test_mixed_horizon_matrix_and_campaign_are_rejected(tmp_path):
+    matrix = campaign.read(matrix_path(2))
+    old_selector = matrix['evaluation']['default_presets'][-1]
+    new_selector = old_selector.replace('_h2_', '_h3_')
+    variants = matrix['comparisons']['sweep']['variants']
+    changed = variants.pop(old_selector.split('/')[1])
+    changed['alg_params']['inner_rollout_horizon'] = 3
+    variants[new_selector.split('/')[1]] = changed
+    matrix['evaluation']['default_presets'][-1] = new_selector
+    path = tmp_path / 'mixed.json'; path.write_text(json.dumps(matrix))
+    with pytest.raises(AssertionError, match='common horizon'):
+        campaign.cells(path)
+    panel = campaign.cells(matrix_path(2))
+    assert campaign.campaign_horizon({'cells': panel, 'H': 2}) == 2
+    with pytest.raises(AssertionError):
+        campaign.campaign_horizon({'cells': panel, 'H': 3})
+    panel[-1]['H'] = 3
+    with pytest.raises(AssertionError, match='common horizon'):
+        campaign.campaign_horizon({'cells': panel})
+
+
+@pytest.mark.parametrize('horizon', [2, 3])
+def test_probe_work_uses_selected_horizon_and_complete_coordinates(horizon):
+    cell = campaign.cells(matrix_path(horizon))[0]
+    rows = [dict(episode_id='seed-101', decision_index=decision, round_index=r,
+                 critic_updates=16*r, actor_updates=4*r,
+                 metrics=dict(probe_model_steps=32*horizon*(2 if r == 0 else 1),
+                              probe_q_evaluations=32*(2 if r == 0 else 1), togo_return_mean=1.0))
+            for decision in range(3) for r in range(cell['J'] + 1)]
+    campaign.validate_probe_rows({'togo_probe_rows': rows}, cell, seeds=[101], steps=3)
+    wrong = deepcopy(rows)
+    wrong[0]['metrics']['probe_model_steps'] = 32*(3 if horizon == 2 else 2)*2
+    with pytest.raises(AssertionError):
+        campaign.validate_probe_rows({'togo_probe_rows': wrong}, cell, seeds=[101], steps=3)
+    with pytest.raises(AssertionError):
+        campaign.validate_probe_rows({'togo_probe_rows': rows[:-1]}, cell, seeds=[101], steps=3)
+    wrong = deepcopy(rows); wrong[-1] = deepcopy(wrong[0])
+    with pytest.raises(AssertionError):
+        campaign.validate_probe_rows({'togo_probe_rows': wrong}, cell, seeds=[101], steps=3)
 
 
 def test_matching_prior_is_accepted():
@@ -79,7 +138,8 @@ def test_mismatched_prior_is_rejected(change):
         campaign.check_prior(manifest, record)
 
 
-def test_prepare_allocates_only_six_new_planners_and_reuses_prior(tmp_path, monkeypatch):
+@pytest.mark.parametrize('horizon', [2, 3])
+def test_prepare_allocates_only_six_new_planners_and_reuses_prior(tmp_path, monkeypatch, horizon):
     import evaluate_ambi_checkpoint
     import utils.eval_series
     import utils.eval_series_data
@@ -89,7 +149,7 @@ def test_prepare_allocates_only_six_new_planners_and_reuses_prior(tmp_path, monk
     checkpoint = tmp_path / 'checkpoint'; checkpoint.write_text('weight')
     args = SimpleNamespace(root=tmp_path / 'campaign', checkpoint=checkpoint,
                            reference=reference, inventory=tmp_path / 'inventory.json',
-                           registry=tmp_path / 'registry', matrix=campaign.MATRIX,
+                           registry=tmp_path / 'registry', matrix=matrix_path(horizon),
                            group='test-group', label='Test')
     real_digest = campaign.digest
     monkeypatch.setattr(campaign, 'digest', lambda path: campaign.CHECKPOINT_SHA
@@ -100,7 +160,7 @@ def test_prepare_allocates_only_six_new_planners_and_reuses_prior(tmp_path, monk
     def specifications(*a, **kwargs):
         evaluation_calls.append(kwargs)
         root = kwargs['eval_series_spec_dir']; root.mkdir()
-        for cell in campaign.cells():
+        for cell in campaign.cells(args.matrix):
             spec = dict(identity={**record['identity'], 'planner': {'type': 'sac', 'name': cell['name']}},
                         selector=cell['selector'])
             (root / (cell['selector'].replace('/', '__') + '.json')).write_text(json.dumps(spec))
@@ -114,6 +174,7 @@ def test_prepare_allocates_only_six_new_planners_and_reuses_prior(tmp_path, monk
     assert evaluation_calls[0]['reference_bundle'] == reference
     assert evaluation_calls[0]['eval_series_spec_dir'] == args.root / 'specs'
     assert result['source_run'] == campaign.SOURCE_RUN and result['checkpoint_step'] == 575000
+    assert result['H'] == horizon
     assert result['prior_manifest_sha256'] == real_digest(reference / 'manifest.json')
     assert result['prior_source_science'] == {'old': True}
     assert all(not cell['reused'] and cell['actual_selector'] == cell['selector'] for cell in result['cells'])
@@ -121,16 +182,18 @@ def test_prepare_allocates_only_six_new_planners_and_reuses_prior(tmp_path, monk
 
 
 @pytest.mark.parametrize('smoke,index', [(True, 0), (True, 1), (False, 0), (False, 5)])
-def test_worker_owns_one_complete_setting(tmp_path, monkeypatch, smoke, index):
+@pytest.mark.parametrize('horizon', [2, 3])
+def test_worker_owns_one_complete_setting(tmp_path, monkeypatch, smoke, index, horizon):
     import torch
     import evaluate_ambi_checkpoint
     import utils.ambi_seed_shards
-    panel = campaign.cells()
+    panel = campaign.cells(matrix_path(horizon))
     for cell in panel:
         cell['directory'] = str(tmp_path / cell['name'])
         cell['bundle'] = str(Path(cell['directory']) / 'bundle')
     settings = dict(source_commit='1' * 40, checkpoint_step=575000, checkpoint_sha256=campaign.CHECKPOINT_SHA,
-                    source_run=campaign.SOURCE_RUN, cells=panel, matrix=str(campaign.MATRIX),
+                    source_run=campaign.SOURCE_RUN, cells=panel, matrix=str(matrix_path(horizon)),
+                    H=horizon,
                     checkpoint='checkpoint', inventory='inventory', reference='existing-prior')
     (tmp_path / 'campaign.json').write_text(json.dumps(settings))
     monkeypatch.setattr(campaign, 'source_commit', lambda: '1' * 40)
@@ -154,6 +217,7 @@ def test_worker_owns_one_complete_setting(tmp_path, monkeypatch, smoke, index):
     assert calls[0]['max_steps'] == (3 if smoke else 500)
     assert calls[0]['reference_bundle'] == (None if smoke else 'existing-prior')
     assert receipt['status'] == 'complete' and receipt['checkpoint_step'] == 575000
+    assert receipt['H'] == horizon
     assert receipt['trace_sha256']['trace.jsonl.gz']
     assert (Path(receipt['bundle']).parent / 'validation.json').is_file()
     assert (Path(receipt['bundle']).parent / 'worker-completion.json').is_file()

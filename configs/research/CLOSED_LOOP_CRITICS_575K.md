@@ -50,3 +50,18 @@ GPU workers do not initialize W&B. Publication failure does not require rerunnin
 episodes; recover from the complete local bundles and inspect the publication
 journal before resuming an uncertain upload. All W&B staging and compiler caches
 use scratch through `slurm/run_ambi_closed_loop_critics_oscar.sbatch`.
+
+## H2 follow-up
+
+`ambi_closed_loop_critics_h2_575k.json` repeats the six conditions with H2.
+All other settings remain matched to H3, including the checkpoint, paired
+seeds, optimizer counts, replay capacity, and entropy settings. Each round now
+collects 256 imagined transitions instead of 384. This tests a shorter model
+rollout and earlier frozen-critic bootstrap while retaining C16/A4 per round.
+H2 and H3 have separate campaign and performance identities; completed H3 and
+prior episodes are reused for comparison.
+
+For preparation, select the matrix, group, and descriptive label through
+`EVAL_MATRIX_PATH`, `EVAL_CAMPAIGN_GROUP`, and `EVAL_CAMPAIGN_LABEL`. Unset values
+retain the original H3 defaults. GPU workers and the publisher derive H from
+the prepared campaign, including model-probe work counts and W&B metadata.

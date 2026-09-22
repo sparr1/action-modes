@@ -1,0 +1,219 @@
+{
+  "schema_version": 1,
+  "description": "575k target -10.5/shared closed-loop comparison of complete soft-Q and return-Q strategies; both retain inherited adaptive actor entropy. J1/J2/J4, H2/N128/B256/C16/A4, five paired full episodes and 32 model probes.",
+  "base_alg_config": "checkpoint",
+  "source_run": "rwgao_b-brown-university/ambi/aux6428346x0",
+  "shared_alg_params": {
+    "inner_operator": "sac",
+    "inner_rounds": 1,
+    "inner_rollouts_per_round": 128,
+    "inner_rollout_horizon": 2,
+    "inner_updates_per_round": null,
+    "inner_iterations": null,
+    "inner_rollouts": null,
+    "inner_horizon": null,
+    "inner_updates_per_iteration": null,
+    "inner_model_step_budget": null,
+    "inner_critic_updates_per_action": null,
+    "inner_actor_updates_per_action": null,
+    "inner_temperature_updates_per_action": null,
+    "inner_batch_size": 256,
+    "inner_replay_capacity": 3072,
+    "inner_replay_sampling": "with_replacement",
+    "inner_diagnostic_rollouts": 0,
+    "inner_actor_adaptation": "clone",
+    "inner_critic_adaptation": "clone",
+    "inner_temperature_mode": "auto",
+    "inner_temperature_initialization": "inherit_outer",
+    "inner_target_entropy": "inherit_outer",
+    "inner_bootstrap_source": "inner_target",
+    "inner_behavior_action": "policy_sample",
+    "inner_execution_action": "mean",
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_actor_scope": "action",
+    "inner_critic_scope": "action",
+    "inner_temperature_scope": "action",
+    "inner_replay_scope": "action",
+    "inner_actor_optimizer_scope": "action",
+    "inner_critic_optimizer_scope": "action",
+    "inner_temperature_optimizer_scope": "action",
+    "inner_actor_initialization": "prior",
+    "inner_critic_initialization": "prior",
+    "inner_critic_target_initialization": "online",
+    "inner_finite_horizon": true,
+    "inner_update_timing": "round",
+    "inner_steps_per_update": null,
+    "inner_temperature": null,
+    "inner_actor_lr": 0.0003,
+    "inner_critic_lr": 0.0003,
+    "inner_sac_critic_target": "reward_only",
+    "inner_actor_entropy_mode": "squashed",
+    "inner_actor_loss_scale_update": "per_action",
+    "inner_explorer_mode": "none",
+    "inner_outer_replay_fraction": 0.0,
+    "inner_critic_updates_per_round": 16,
+    "inner_actor_updates_per_round": 4,
+    "inner_actor_initial_std": null,
+    "inner_log_std_mapping": null,
+    "inner_log_std_min": -10,
+    "inner_log_std_max": 2,
+    "inner_q_actor_reduction": "mean_pair",
+    "inner_q_target_reduction": "min_pair",
+    "inner_critic_dropout_enabled": true,
+    "inner_actor_adam_eps": 1e-05,
+    "inner_adam_eps": 1e-08,
+    "inner_actor_grad_clip_norm": 20.0,
+    "inner_critic_grad_clip_norm": 20.0,
+    "inner_critic_loss_coef": 1.0,
+    "inner_critic_target_tau": 0.01,
+    "inner_critic_target_update_interval": 1,
+    "inner_outer_policy_kl_coef": 0.0,
+    "inner_outer_action_l2_coef": 0.0,
+    "compile": true,
+    "compile_strict": true,
+    "wandb": false,
+    "outer_policy_diagnostics": false,
+    "inner_actor_source": "sac",
+    "inner_horizon_actor_source": "sac",
+    "inner_entropy_enabled": true,
+    "inner_temperature_lr": 0.0003,
+    "inner_terminal_entropy": "none",
+    "inner_component_update_order": "critic_first",
+    "inner_replay_reset_each_round": false
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "togo_return_rollouts": 32,
+    "default_presets": [
+      "sweep/soft_soft_h2_j4_c16",
+      "sweep/return_return_alpha_h2_j4_c16",
+      "sweep/soft_soft_h2_j2_c16",
+      "sweep/return_return_alpha_h2_j2_c16",
+      "sweep/soft_soft_h2_j1_c16",
+      "sweep/return_return_alpha_h2_j1_c16"
+    ]
+  },
+  "comparisons": {
+    "sweep": {
+      "reference": "prior",
+      "variants": {
+        "prior": {
+          "description": "Frozen SAC policy mean, no adaptation.",
+          "alg_params": {
+            "inner_operator": "none",
+            "inner_rounds": 0,
+            "inner_rollouts_per_round": 0,
+            "inner_critic_updates_per_round": null,
+            "inner_actor_updates_per_round": null,
+            "inner_finite_horizon": false,
+            "inner_critic_source": "sac",
+            "inner_horizon_critic_source": "sac",
+            "inner_updates_per_round": 0,
+            "inner_terminal_entropy": "none",
+            "inner_entropy_enabled": false,
+            "inner_temperature_mode": "inherit_outer"
+          }
+        },
+        "soft_soft_h2_j4_c16": {
+          "description": "soft_soft: H2/J4, C16/A4, inherited adaptive actor entropy, target -10.5/shared at 575k.",
+          "alg_params": {
+            "inner_critic_source": "sac",
+            "inner_horizon_critic_source": "sac",
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_terminal_entropy": "outer",
+            "inner_entropy_enabled": true,
+            "inner_temperature_mode": "auto",
+            "inner_rollout_horizon": 2,
+            "inner_rounds": 4,
+            "inner_critic_updates_per_round": 16,
+            "inner_actor_updates_per_round": 4
+          }
+        },
+        "return_return_alpha_h2_j4_c16": {
+          "description": "return_return_alpha: H2/J4, C16/A4, inherited adaptive actor entropy, target -10.5/shared at 575k.",
+          "alg_params": {
+            "inner_critic_source": "aux_return",
+            "inner_horizon_critic_source": "aux_return",
+            "inner_sac_critic_target": "reward_only",
+            "inner_terminal_entropy": "none",
+            "inner_entropy_enabled": true,
+            "inner_temperature_mode": "auto",
+            "inner_rollout_horizon": 2,
+            "inner_rounds": 4,
+            "inner_critic_updates_per_round": 16,
+            "inner_actor_updates_per_round": 4
+          }
+        },
+        "soft_soft_h2_j2_c16": {
+          "description": "soft_soft: H2/J2, C16/A4, inherited adaptive actor entropy, target -10.5/shared at 575k.",
+          "alg_params": {
+            "inner_critic_source": "sac",
+            "inner_horizon_critic_source": "sac",
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_terminal_entropy": "outer",
+            "inner_entropy_enabled": true,
+            "inner_temperature_mode": "auto",
+            "inner_rollout_horizon": 2,
+            "inner_rounds": 2,
+            "inner_critic_updates_per_round": 16,
+            "inner_actor_updates_per_round": 4
+          }
+        },
+        "return_return_alpha_h2_j2_c16": {
+          "description": "return_return_alpha: H2/J2, C16/A4, inherited adaptive actor entropy, target -10.5/shared at 575k.",
+          "alg_params": {
+            "inner_critic_source": "aux_return",
+            "inner_horizon_critic_source": "aux_return",
+            "inner_sac_critic_target": "reward_only",
+            "inner_terminal_entropy": "none",
+            "inner_entropy_enabled": true,
+            "inner_temperature_mode": "auto",
+            "inner_rollout_horizon": 2,
+            "inner_rounds": 2,
+            "inner_critic_updates_per_round": 16,
+            "inner_actor_updates_per_round": 4
+          }
+        },
+        "soft_soft_h2_j1_c16": {
+          "description": "soft_soft: H2/J1, C16/A4, inherited adaptive actor entropy, target -10.5/shared at 575k.",
+          "alg_params": {
+            "inner_critic_source": "sac",
+            "inner_horizon_critic_source": "sac",
+            "inner_sac_critic_target": "entropy_augmented",
+            "inner_terminal_entropy": "outer",
+            "inner_entropy_enabled": true,
+            "inner_temperature_mode": "auto",
+            "inner_rollout_horizon": 2,
+            "inner_rounds": 1,
+            "inner_critic_updates_per_round": 16,
+            "inner_actor_updates_per_round": 4
+          }
+        },
+        "return_return_alpha_h2_j1_c16": {
+          "description": "return_return_alpha: H2/J1, C16/A4, inherited adaptive actor entropy, target -10.5/shared at 575k.",
+          "alg_params": {
+            "inner_critic_source": "aux_return",
+            "inner_horizon_critic_source": "aux_return",
+            "inner_sac_critic_target": "reward_only",
+            "inner_terminal_entropy": "none",
+            "inner_entropy_enabled": true,
+            "inner_temperature_mode": "auto",
+            "inner_rollout_horizon": 2,
+            "inner_rounds": 1,
+            "inner_critic_updates_per_round": 16,
+            "inner_actor_updates_per_round": 4
+          }
+        }
+      }
+    }
+  }
+}

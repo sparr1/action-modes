@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import getpass
 import math
 import os
 from pathlib import Path
@@ -25,6 +26,33 @@ from slurm.ambi_aux_hj_sweep import (ENTITY, PROJECT, SEEDS, actor_updates,
                                     validate, write)
 
 ARMS = {'soft': 'Soft critic', 'return_only': 'Return-only critic'}
+
+
+def campaign_horizon(campaign):
+    """A comparison holds the rollout horizon fixed across its six settings."""
+    values = {c['H'] for c in campaign['cells']}
+    if len(values) != 1:
+        raise ValueError('Expected one shared rollout horizon per critic comparison')
+    value, = values
+    if type(value) is not int or value < 1:
+        raise ValueError('Expected a positive integer rollout horizon')
+    return value
+
+
+def gpu_jobs_active(job_ids):
+    """Match the live user queue without requesting possibly expired job IDs.
+
+    Slurm may remove completed arrays from squeue while their CPU publication
+    is still draining. Querying those IDs directly then fails with "Invalid job
+    id specified". Query errors still propagate: they are not proof of exit.
+    """
+    requested = {str(job).split('_', 1)[0] for job in job_ids}
+    if not requested:
+        raise ValueError('Expected submitted GPU job IDs')
+    output = subprocess.check_output(
+        ['squeue', '--noheader', '--user', getpass.getuser(), '-o', '%i'], text=True)
+    live = {line.strip().split('_', 1)[0] for line in output.splitlines() if line.strip()}
+    return bool(requested & live)
 
 
 def moments(values):
@@ -175,6 +203,91 @@ def load_completed(campaign, cell):
     return manifest['runs'][0]['episodes']
 
 
+def completed_publications(campaign):
+    """Require all immutable worker outputs and completed publication receipts."""
+    completed = {}
+    for cell in campaign['cells']:
+        directory = Path(cell['directory'])
+        publication_path, training_path = (directory / 'publication-completion.json',
+                                           directory / 'training-publication.json')
+        if not publication_path.exists() or not training_path.exists():
+            raise ValueError(f'Missing completed publication receipts: {cell["name"]}')
+        publication, training = read(publication_path), read(training_path)
+        if (publication.get('status') != 'complete' or publication.get('cell') != cell['name']
+                or publication.get('training_run_id') != cell['training_run_id']
+                or training.get('status') != 'complete' or training.get('run_id') != cell['training_run_id']
+                or publication.get('performance', {}).get('run_id') != cell['performance_run_id']
+                or publication.get('performance', {}).get('published') != 1):
+            raise ValueError(f'Incomplete or mismatched publication: {cell["name"]}')
+        episodes = load_completed(campaign, cell)
+        bundle = Path(cell['bundle'])
+        manifest = read(bundle / 'manifest.json')
+        worker = read(directory / 'worker-completion.json')
+        traces = manifest['runs'][0]['trace_files']
+        if (set(worker['trace_sha256']) != set(traces)
+                or any(digest(bundle / name) != worker['trace_sha256'][name] for name in traces)):
+            raise ValueError(f'Published trace files changed: {cell["name"]}')
+        completed[cell['name']] = episodes
+    return completed
+
+
+def finalize(args):
+    """Repair only a stopped overview after every per-setting upload succeeded.
+
+    Native scientific rows, performance runs, diagnostic runs, and original
+    configurations remain untouched. An uncertain finalization is never blindly
+    repeated; inspect its journal and remote overview first.
+    """
+    campaign = read(args.root / 'campaign.json')
+    journal = args.root / 'overview-finalization.json'
+    if journal.exists():
+        if read(journal).get('status') == 'complete':
+            print('Overview finalization already complete', flush=True)
+            return
+        raise RuntimeError('Overview finalization uncertain; inspect its journal and remote run before retry')
+    completed = completed_publications(campaign)
+    prior_path = Path(campaign['reference']) / 'manifest.json'
+    if digest(prior_path) != campaign['prior_manifest_sha256']:
+        raise ValueError('Verified prior manifest changed')
+    prior, = [r for r in read(prior_path)['runs'] if r.get('episodes')
+              and r.get('config', {}).get('alg_params', {}).get('inner_operator') == 'none']
+    aggregate = aggregate_results(campaign, prior['episodes'], completed)
+    points = {p['setting']: p for p in aggregate['points']}
+    statuses = []
+    for cell in campaign['cells']:
+        point = points[cell['name']]
+        statuses.append(dict(setting=cell['name'], critic=cell['critic_kind'], J=cell['J'],
+                             status='published', failure=None,
+                             return_mean=point['return']['mean'], return_std=point['return']['std'],
+                             paired_gain_mean=point['paired_gain']['mean'], paired_gain_std=point['paired_gain']['std'],
+                             **{kind + '_url': f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{cell[kind + "_run_id"]}'
+                                for kind in ('performance', 'training')}))
+    import wandb
+    remote = wandb.Api(timeout=30).run(f'{ENTITY}/{PROJECT}/{campaign["overview_run_id"]}')
+    if remote.state not in {'finished', 'failed', 'crashed', 'killed'}:
+        raise ValueError('Overview must be stopped before finalization')
+    if (remote.config.get('campaign_group') != campaign['group']
+            or remote.config.get('checkpoint_sha256') != campaign['checkpoint_sha256']):
+        raise ValueError('Remote overview identity differs from prepared campaign')
+    reason = 'Completed all publications; repaired overview after expired Slurm job ID interrupted queue polling.'
+    receipt = dict(status='uncertain', overview_run_id=campaign['overview_run_id'],
+                   previous_remote_state=remote.state, reason=reason, started=time.time())
+    write(journal, receipt)
+    run = wandb.init(entity=ENTITY, project=PROJECT, id=campaign['overview_run_id'], resume='must', mode='online')
+    try:
+        run.log(overview_log(wandb, campaign, aggregate, statuses))
+        run.summary.update(dict(status='complete', failure=None, evaluated=len(statuses),
+                                published=len(statuses), failed_publications=0, recovery_reason=reason))
+        run.finish()
+    except BaseException:
+        run.finish(exit_code=1)
+        raise
+    write(args.root / 'progress.json', dict(rows=statuses, failures={}, evaluated=len(statuses)))
+    write(args.root / 'campaign-completion.json', dict(status='complete', rows=statuses, failures={}, recovery_reason=reason))
+    write(journal, dict(receipt, status='complete', finished=time.time()))
+    print(f'Finalized {len(statuses)} published settings without repeating scientific rows', flush=True)
+
+
 def watch(args):
     import wandb
     campaign = read(args.root / 'campaign.json')
@@ -197,7 +310,7 @@ def watch(args):
     config = {key: campaign.get(key) for key in ('checkpoint_step', 'checkpoint_sha256', 'source_run',
               'source_commit', 'initial_alpha', 'target_entropy', 'prior_manifest_sha256', 'prior_source_science')}
     config.update(campaign_group=campaign['group'], protocol='closed-loop-refinement-v1', protocol_variant='SAC auxiliary-critic comparison; adaptive actor entropy',
-                  J=sorted({c['J'] for c in campaign['cells']}), H=3, N=128, B=256, C=16, A=4,
+                  J=sorted({c['J'] for c in campaign['cells']}), H=campaign_horizon(campaign), N=128, B=256, C=16, A=4,
                   environment_seeds=SEEDS, controller_seed=55, max_decisions=500,
                   execution='Fresh adaptation at every real decision, then deterministic actor mean action',
                   prior_reference=str(campaign['reference']),
@@ -291,10 +404,9 @@ def watch(args):
                 if all(r['status'] == 'published' for r in statuses):
                     break
                 submission = args.root / 'submission.json'
-                if submission.exists():
-                    ids = [str(j) for j in read(submission)['gpu_job_ids']]
-                    active = subprocess.check_output(['squeue', '--noheader', '--jobs', ','.join(ids), '-o', '%i'], text=True).strip()
-                    if not active and not futures:
+                if submission.exists() and not futures:
+                    active = gpu_jobs_active(read(submission)['gpu_job_ids'])
+                    if not active:
                         terminal_since = terminal_since or time.time()
                         if time.time() - terminal_since > 90:
                             break
@@ -317,11 +429,11 @@ def watch(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['watch', 'publish'])
+    parser.add_argument('mode', choices=['watch', 'publish', 'finalize'])
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--index', type=int)
     args = parser.parse_args()
-    (watch if args.mode == 'watch' else publish_cell)(args)
+    {'watch': watch, 'publish': publish_cell, 'finalize': finalize}[args.mode](args)
 
 
 if __name__ == '__main__':

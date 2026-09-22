@@ -4,6 +4,7 @@ from copy import deepcopy
 import pytest
 
 from slurm.ambi_closed_loop_publish import (aggregate_results, chart_payloads,
+                                           campaign_horizon, gpu_jobs_active,
                                            numeric_rows, overview_log)
 
 
@@ -97,3 +98,89 @@ def test_log_contains_actual_episode_tables_and_only_real_publications(compariso
     assert len(output['comparison/prior_episodes']['data']) == 5
     assert len(output['comparison/critic_difference_episodes']['data']) == 15
     assert output['comparison/return_minus_soft_vs_J']['ys'] == [[3., 6., 12.]]
+
+
+@pytest.mark.parametrize('horizon', [2, 3])
+def test_overview_horizon_comes_from_the_campaign(horizon):
+    assert campaign_horizon({'cells': [{'H': horizon}, {'H': horizon}]}) == horizon
+
+
+def test_mixed_horizon_cannot_be_mislabeled_as_single_horizon():
+    with pytest.raises(ValueError, match='shared rollout horizon'):
+        campaign_horizon({'cells': [{'H': 2}, {'H': 3}]})
+
+
+@pytest.mark.parametrize('queue,expected', [
+    ('6596064_2\n', True), ('6596064_[0-5]\n6600000\n', True),
+    ('6600000\n', False), ('', False),
+])
+def test_expired_gpu_array_ids_are_matched_without_querying_them(monkeypatch, queue, expected):
+    from slurm import ambi_closed_loop_publish as publisher
+    calls = []
+    def check(command, **kwargs):
+        calls.append(command)
+        assert '--jobs' not in command and '6596064' not in command
+        return queue
+    monkeypatch.setattr(publisher.subprocess, 'check_output', check)
+    assert gpu_jobs_active(['6596064']) is expected
+    assert len(calls) == 1
+
+
+def test_queue_errors_are_not_treated_as_completed_jobs(monkeypatch):
+    import subprocess
+    from slurm import ambi_closed_loop_publish as publisher
+    def unavailable(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, args[0], stderr='Controller unavailable')
+    monkeypatch.setattr(publisher.subprocess, 'check_output', unavailable)
+    with pytest.raises(subprocess.CalledProcessError):
+        gpu_jobs_active(['6596064'])
+
+
+def test_finalize_requires_all_publications_before_any_wandb_mutation(tmp_path):
+    import json
+    from types import SimpleNamespace
+    from slurm.ambi_closed_loop_publish import finalize
+    campaign = {'cells': [{'name': 'missing', 'directory': str(tmp_path / 'missing')}]}
+    (tmp_path / 'campaign.json').write_text(json.dumps(campaign))
+    with pytest.raises(ValueError, match='Missing completed publication'):
+        finalize(SimpleNamespace(root=tmp_path))
+    assert not (tmp_path / 'overview-finalization.json').exists()
+
+
+def test_finalize_resumes_only_overview_without_relogging_scientific_rows(comparison, tmp_path, monkeypatch):
+    import json
+    import sys
+    from types import SimpleNamespace
+    from slurm import ambi_closed_loop_publish as publisher
+    campaign, prior, completed = comparison
+    for cell in campaign['cells']:
+        cell.update(training_run_id='training-'+cell['name'], performance_run_id='performance-'+cell['name'])
+    campaign.update(reference=str(tmp_path / 'prior'), prior_manifest_sha256='prior-hash',
+                    checkpoint_sha256='checkpoint-hash', group='group', overview_run_id='overview')
+    (tmp_path / 'campaign.json').write_text(json.dumps(campaign))
+    (tmp_path / 'prior').mkdir()
+    (tmp_path / 'prior' / 'manifest.json').write_text(json.dumps(
+        {'runs': [{'config': {'alg_params': {'inner_operator': 'none'}}, 'episodes': prior}]}))
+    monkeypatch.setattr(publisher, 'completed_publications', lambda campaign: completed)
+    monkeypatch.setattr(publisher, 'digest', lambda path: 'prior-hash')
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Finalization must not regenerate native scientific history')
+    monkeypatch.setattr(publisher, 'numeric_rows', forbidden)
+    remote = SimpleNamespace(state='failed', config={'campaign_group': 'group', 'checkpoint_sha256': 'checkpoint-hash'})
+    calls, history = [], []
+    run = SimpleNamespace(summary={}, log=history.append, finish=lambda **kwargs: None)
+    def init(**kwargs):
+        calls.append(kwargs)
+        return run
+    fake_wandb = SimpleNamespace(Api=lambda **kwargs: SimpleNamespace(run=lambda path: remote),
+                                 init=init, Table=lambda **kw: kw,
+                                 plot=SimpleNamespace(line_series=lambda **kw: kw))
+    monkeypatch.setitem(sys.modules, 'wandb', fake_wandb)
+    publisher.finalize(SimpleNamespace(root=tmp_path))
+    assert calls == [dict(entity=publisher.ENTITY, project=publisher.PROJECT, id='overview', resume='must', mode='online')]
+    assert len(history) == 1 and not any(k.startswith('closed_loop/') for k in history[0])
+    assert history[0]['campaign/published'] == 6
+    assert run.summary['status'] == 'complete' and run.summary['failure'] is None
+    assert json.loads((tmp_path / 'campaign-completion.json').read_text())['status'] == 'complete'
+    publisher.finalize(SimpleNamespace(root=tmp_path))
+    assert len(calls) == len(history) == 1

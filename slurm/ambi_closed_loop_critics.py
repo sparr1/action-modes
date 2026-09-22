@@ -53,7 +53,9 @@ def cells(matrix_path=MATRIX):
         params = {key: value for key, value in requested.items() if value is not None}
         kind = 'soft' if name.startswith('soft_soft_') else 'return_only'
         assert name.startswith(('soft_soft_', 'return_return_alpha_'))
-        assert params['inner_rollout_horizon'] == 3
+        horizon = params['inner_rollout_horizon']
+        assert horizon in (2, 3)
+        assert f'_h{horizon}_' in name
         assert params['inner_rounds'] in (1, 2, 4)
         assert params['inner_critic_updates_per_round'] == 16
         assert params['inner_actor_updates_per_round'] == 4
@@ -65,10 +67,21 @@ def cells(matrix_path=MATRIX):
         assert (params['inner_critic_source'], params['inner_sac_critic_target'], params['inner_terminal_entropy']) == expected
         assert params['inner_horizon_critic_source'] == expected[0]
         result.append(dict(name=name, selector=selector, params=params, requested_alg_params=requested,
-                           H=3, J=params['inner_rounds'], critic_kind=kind))
+                           H=horizon, J=params['inner_rounds'], critic_kind=kind))
     assert [(cell['J'], cell['critic_kind']) for cell in result] == [
         (j, arm) for j in (4, 2, 1) for arm in ('soft', 'return_only')]
+    assert len({cell['H'] for cell in result}) == 1, 'A campaign must use one common horizon.'
     return result
+
+
+def campaign_horizon(campaign):
+    """Accept historical H3 campaigns without an explicit top-level H."""
+    horizons = {cell['H'] for cell in campaign['cells']}
+    assert len(horizons) == 1, 'A campaign must use one common horizon.'
+    horizon, = horizons
+    assert horizon in (2, 3) and campaign.get('H', horizon) == horizon
+    assert all(cell['params']['inner_rollout_horizon'] == horizon for cell in campaign['cells'])
+    return horizon
 
 
 def check_prior(manifest, record):
@@ -140,7 +153,7 @@ def prepare(args):
                     prior_compatibility_note='Audited prior inference and evaluation protocol are unchanged; '
                         'the historical prior retains its original scientific identity.',
                     source_commit=commit, source_dir=str(ROOT), initial_alpha=INITIAL_ALPHA,
-                    target_entropy=-10.5, overview_run_id=uuid.uuid4().hex, cells=panel,
+                    target_entropy=-10.5, H=panel[0]['H'], overview_run_id=uuid.uuid4().hex, cells=panel,
                     publisher_workers=2)
     write(args.root / 'campaign.json', campaign)
     print(json.dumps(dict(root=str(args.root), conditions=len(panel), reused=0,
@@ -156,6 +169,7 @@ def validate_completed(bundle, cell, campaign, *, smoke=False):
                         checkpoint_step=campaign['checkpoint_step'])
     run, = manifest['runs']
     cfg, result = run['resolved_config'], run['result']
+    assert cfg['inner_rollout_horizon'] == cell['H'] == campaign_horizon(campaign)
     assert manifest['code']['commit'] == campaign['source_commit'] and manifest['code']['dirty'] is False
     assert manifest['checkpoint']['source_run'] == campaign['source_run']
     assert run['selector'] == cell['selector'] and result['selector'] == cell['selector']
@@ -198,6 +212,12 @@ def validate_completed(bundle, cell, campaign, *, smoke=False):
         assert len(summaries) == cell['J'] + 1
         for row in summaries:
             assert all(stats['count'] == steps for stats in row['metrics'].values())
+    validate_probe_rows(run, cell, seeds=seeds, steps=steps)
+    return manifest
+
+
+def validate_probe_rows(run, cell, *, seeds, steps):
+    """Probe work follows the selected horizon, including the initial prior probe."""
     expected_rows = {(f'seed-{seed}', decision, r) for seed in seeds
                      for decision in range(steps) for r in range(cell['J'] + 1)}
     rows = run['togo_probe_rows']
@@ -208,9 +228,8 @@ def validate_completed(bundle, cell, campaign, *, smoke=False):
         assert row['critic_updates'] == 16*r and row['actor_updates'] == 4*r
         assert all(isinstance(value, (int, float)) and math.isfinite(value) for value in metrics.values())
         factor = 2 if r == 0 else 1
-        assert metrics['probe_model_steps'] == 32*3*factor
+        assert metrics['probe_model_steps'] == 32*cell['H']*factor
         assert metrics['probe_q_evaluations'] == 32*factor
-    return manifest
 
 
 def worker(args):
@@ -221,6 +240,7 @@ def worker(args):
     assert source_commit() == campaign['source_commit']
     assert campaign['checkpoint_step'] == CHECKPOINT_STEP and campaign['checkpoint_sha256'] == CHECKPOINT_SHA
     assert campaign['source_run'] == SOURCE_RUN
+    horizon = campaign_horizon(campaign)
     if not 0 <= args.index < len(campaign['cells']):
         raise ValueError('Worker index is outside the prepared campaign.')
     cell = campaign['cells'][args.index]
@@ -240,7 +260,7 @@ def worker(args):
     seal_episode_bundle(bundle)
     receipt = dict(status='complete', cell=cell['name'], selector=cell['selector'],
                    bundle=str(bundle), reused=False, smoke=args.smoke,
-                   checkpoint_step=CHECKPOINT_STEP, checkpoint_sha256=CHECKPOINT_SHA,
+                   checkpoint_step=CHECKPOINT_STEP, checkpoint_sha256=CHECKPOINT_SHA, H=horizon,
                    manifest_sha256=digest(bundle / 'manifest.json'),
                    trace_sha256={name: digest(bundle / name) for name in manifest['runs'][0]['trace_files']},
                    trace_rows_checked=summary['trace_rows_checked'], gpu=torch.cuda.get_device_name(0))
