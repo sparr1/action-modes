@@ -101,3 +101,19 @@ Both extension smoke indices exercise J6, the largest budget in those matrices,
 for one seed and three decisions. Production evaluates five complete paired
 episodes per arm. Model probes retain the initial snapshot and all six round
 endpoints, with 32 rollouts each and work counts derived from the selected H.
+
+## J8 extension
+
+`ambi_closed_loop_critics_h1_j8_575k.json`,
+`ambi_closed_loop_critics_h2_j8_575k.json`, and
+`ambi_closed_loop_critics_h3_j8_575k.json` each add only the two J8 critic arms
+at the named horizon, with all other controls matched to J6. Existing matrices,
+defaults, and completed results are preserved; each new campaign reuses the
+same prior and allocates separate performance identities.
+
+J8 gives 128 critic updates and 32 actor/temperature updates per real decision.
+N128 yields 1024, 2048, and 3072 imagined transitions for H1, H2, and H3,
+respectively. H3 exactly fills the unchanged replay capacity of 3072; none of
+the eight rounds' transitions are evicted. Each smoke arm runs J8 for one seed
+and three decisions before production's five complete paired episodes. Probes
+retain the initial snapshot and all eight round endpoints.

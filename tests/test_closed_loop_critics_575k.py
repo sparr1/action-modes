@@ -35,9 +35,9 @@ def prior_fixture():
     return manifest, record
 
 
-def matrix_path(horizon, *, j6=False):
-    if j6:
-        return campaign.MATRIX.with_name(f'ambi_closed_loop_critics_h{horizon}_j6_575k.json')
+def matrix_path(horizon, *, rounds=None):
+    if rounds is not None:
+        return campaign.MATRIX.with_name(f'ambi_closed_loop_critics_h{horizon}_j{rounds}_575k.json')
     return campaign.MATRIX if horizon == 3 else campaign.MATRIX.with_name(f'ambi_closed_loop_critics_h{horizon}_575k.json')
 
 
@@ -66,35 +66,42 @@ def test_six_cells_keep_accepted_recipe_and_objectives(horizon):
 
 
 @pytest.mark.parametrize('horizon', [1, 2, 3])
-def test_j6_selects_only_two_new_arms_and_changes_only_rounds(horizon):
+@pytest.mark.parametrize('rounds', [6, 8])
+def test_extension_selects_only_two_new_arms_and_changes_only_rounds(horizon, rounds):
     old = campaign.cells(matrix_path(horizon))
-    new = campaign.cells(matrix_path(horizon, j6=True))
-    assert [(cell['J'], cell['critic_kind']) for cell in new] == [(6, 'soft'), (6, 'return_only')]
+    new = campaign.cells(matrix_path(horizon, rounds=rounds))
+    assert [(cell['J'], cell['critic_kind']) for cell in new] == [(rounds, 'soft'), (rounds, 'return_only')]
     assert not {cell['selector'] for cell in old}.intersection(cell['selector'] for cell in new)
     assert len(campaign.cells()) == 6
     for before, after in zip(old[:2], new):
-        assert after['requested_alg_params'] == {**before['requested_alg_params'], 'inner_rounds': 6}
+        assert after['requested_alg_params'] == {**before['requested_alg_params'], 'inner_rounds': rounds}
         cfg = _build_cfg(**after['params'], aux_return_mode='sac', log_std_mapping='direct_clamp',
                          target_entropy=-10.5, sac_actor_loss_scale_mode='none')
-        assert cfg.inner_model_step_budget == {1: 768, 2: 1536, 3: 2304}[horizon]
-        assert cfg.inner_model_step_budget < cfg.inner_replay_capacity == 3072
-        assert cfg.inner_critic_updates_per_action == 96
-        assert cfg.inner_actor_updates_per_action == cfg.inner_temperature_updates_per_action == 24
-    matrix = campaign.read(matrix_path(horizon, j6=True))
+        assert cfg.inner_model_step_budget == 128 * horizon * rounds
+        assert cfg.inner_model_step_budget <= cfg.inner_replay_capacity == 3072
+        assert (cfg.inner_model_step_budget == cfg.inner_replay_capacity) == (horizon == 3 and rounds == 8)
+        assert cfg.inner_critic_updates_per_action == 16 * rounds
+        assert cfg.inner_actor_updates_per_action == cfg.inner_temperature_updates_per_action == 4 * rounds
+    matrix = campaign.read(matrix_path(horizon, rounds=rounds))
     assert set(matrix['comparisons']['sweep']['variants']) == {'prior', *(cell['name'] for cell in new)}
     assert matrix['evaluation'] == {**campaign.read(matrix_path(horizon))['evaluation'],
                                     'default_presets': [cell['selector'] for cell in new]}
 
 
-@pytest.mark.parametrize('change', ['one_arm', 'duplicate', 'append_old', 'j4_only'])
-def test_unrequested_partial_or_mixed_round_grids_are_rejected(tmp_path, change):
-    matrix = campaign.read(matrix_path(3, j6=True))
+@pytest.mark.parametrize('rounds', [6, 8])
+@pytest.mark.parametrize('change', ['one_arm', 'duplicate', 'append_old', 'j4_only', 'mixed_extension'])
+def test_unrequested_partial_or_mixed_round_grids_are_rejected(tmp_path, change, rounds):
+    matrix = campaign.read(matrix_path(3, rounds=rounds))
     selectors = matrix['evaluation']['default_presets']
     old = campaign.read(matrix_path(3))
     if change == 'one_arm':
         selectors.pop()
     elif change == 'duplicate':
         selectors[1] = selectors[0]
+    elif change == 'mixed_extension':
+        other = campaign.read(matrix_path(3, rounds=8 if rounds == 6 else 6))
+        matrix['comparisons']['sweep']['variants'].update(other['comparisons']['sweep']['variants'])
+        selectors[1] = other['evaluation']['default_presets'][1]
     else:
         matrix['comparisons']['sweep']['variants'].update(old['comparisons']['sweep']['variants'])
         if change == 'append_old':
@@ -102,7 +109,7 @@ def test_unrequested_partial_or_mixed_round_grids_are_rejected(tmp_path, change)
         else:
             matrix['evaluation']['default_presets'] = old['evaluation']['default_presets'][:2]
     path = tmp_path / 'matrix.json'; path.write_text(json.dumps(matrix))
-    with pytest.raises(AssertionError, match='original screen or both J6'):
+    with pytest.raises(AssertionError, match='original screen or both J6/J8'):
         campaign.cells(path)
 
 
@@ -142,9 +149,9 @@ def test_mixed_horizon_matrix_and_campaign_are_rejected(tmp_path):
 
 
 @pytest.mark.parametrize('horizon', [1, 2, 3])
-@pytest.mark.parametrize('j6', [False, True])
-def test_probe_work_uses_selected_horizon_and_complete_coordinates(horizon, j6):
-    cell = campaign.cells(matrix_path(horizon, j6=j6))[0]
+@pytest.mark.parametrize('rounds', [None, 6, 8])
+def test_probe_work_uses_selected_horizon_and_complete_coordinates(horizon, rounds):
+    cell = campaign.cells(matrix_path(horizon, rounds=rounds))[0]
     rows = [dict(episode_id='seed-101', decision_index=decision, round_index=r,
                  critic_updates=16*r, actor_updates=4*r,
                  metrics=dict(probe_model_steps=32*horizon*(2 if r == 0 else 1),
@@ -184,8 +191,8 @@ def test_mismatched_prior_is_rejected(change):
 
 
 @pytest.mark.parametrize('horizon', [1, 2, 3])
-@pytest.mark.parametrize('j6', [False, True])
-def test_prepare_allocates_only_selected_new_planners_and_reuses_prior(tmp_path, monkeypatch, horizon, j6):
+@pytest.mark.parametrize('rounds', [None, 6, 8])
+def test_prepare_allocates_only_selected_new_planners_and_reuses_prior(tmp_path, monkeypatch, horizon, rounds):
     import evaluate_ambi_checkpoint
     import utils.eval_series
     import utils.eval_series_data
@@ -195,7 +202,7 @@ def test_prepare_allocates_only_selected_new_planners_and_reuses_prior(tmp_path,
     checkpoint = tmp_path / 'checkpoint'; checkpoint.write_text('weight')
     args = SimpleNamespace(root=tmp_path / 'campaign', checkpoint=checkpoint,
                            reference=reference, inventory=tmp_path / 'inventory.json',
-                           registry=tmp_path / 'registry', matrix=matrix_path(horizon, j6=j6),
+                           registry=tmp_path / 'registry', matrix=matrix_path(horizon, rounds=rounds),
                            group='test-group', label='Test')
     real_digest = campaign.digest
     monkeypatch.setattr(campaign, 'digest', lambda path: campaign.CHECKPOINT_SHA
@@ -216,7 +223,7 @@ def test_prepare_allocates_only_selected_new_planners_and_reuses_prior(tmp_path,
     monkeypatch.setattr(evaluate_ambi_checkpoint, 'evaluate_matrix', specifications)
     monkeypatch.setattr(utils.eval_series, 'create_run', new_run)
     result = campaign.prepare(args)
-    assert len(evaluation_calls) == 1 and len(registry_calls) == (2 if j6 else 6)
+    assert len(evaluation_calls) == 1 and len(registry_calls) == (6 if rounds is None else 2)
     assert evaluation_calls[0]['reference_bundle'] == reference
     assert evaluation_calls[0]['eval_series_spec_dir'] == args.root / 'specs'
     assert result['source_run'] == campaign.SOURCE_RUN and result['checkpoint_step'] == 575000
@@ -229,18 +236,18 @@ def test_prepare_allocates_only_selected_new_planners_and_reuses_prior(tmp_path,
 
 @pytest.mark.parametrize('smoke,index', [(True, 0), (True, 1), (False, 0), (False, 'last')])
 @pytest.mark.parametrize('horizon', [1, 2, 3])
-@pytest.mark.parametrize('j6', [False, True])
-def test_worker_owns_one_complete_setting(tmp_path, monkeypatch, smoke, index, horizon, j6):
+@pytest.mark.parametrize('rounds', [None, 6, 8])
+def test_worker_owns_one_complete_setting(tmp_path, monkeypatch, smoke, index, horizon, rounds):
     import torch
     import evaluate_ambi_checkpoint
     import utils.ambi_seed_shards
-    panel = campaign.cells(matrix_path(horizon, j6=j6))
+    panel = campaign.cells(matrix_path(horizon, rounds=rounds))
     index = len(panel) - 1 if index == 'last' else index
     for cell in panel:
         cell['directory'] = str(tmp_path / cell['name'])
         cell['bundle'] = str(Path(cell['directory']) / 'bundle')
     settings = dict(source_commit='1' * 40, checkpoint_step=575000, checkpoint_sha256=campaign.CHECKPOINT_SHA,
-                    source_run=campaign.SOURCE_RUN, cells=panel, matrix=str(matrix_path(horizon, j6=j6)),
+                    source_run=campaign.SOURCE_RUN, cells=panel, matrix=str(matrix_path(horizon, rounds=rounds)),
                     H=horizon,
                     checkpoint='checkpoint', inventory='inventory', reference='existing-prior')
     (tmp_path / 'campaign.json').write_text(json.dumps(settings))
