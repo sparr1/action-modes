@@ -80,3 +80,24 @@ initialization to include the paired frozen-prior probe.
 Select this matrix through `EVAL_MATRIX_PATH` and use a separate campaign group
 and label. Existing H2/H3 and prior results retain their original identities.
 The default matrix remains H3; adding H1 does not rerun an existing condition.
+
+## J6 extension
+
+`ambi_closed_loop_critics_h1_j6_575k.json`,
+`ambi_closed_loop_critics_h2_j6_575k.json`, and
+`ambi_closed_loop_critics_h3_j6_575k.json` each select only the two J6 critic arms
+at the named horizon. Existing J1/J2/J4 matrices and defaults are unchanged.
+Each extension uses a separate campaign and New performance identities while
+reusing the same prior episodes; it does not repeat a completed condition.
+
+J6 retains C16/A4 per round, giving 96 critic updates and 24 actor/temperature
+updates per real decision. N128 yields 768 imagined transitions at H1, 1536 at
+H2, and 2304 at H3. All fit within the unchanged replay capacity of 3072, so no
+imagined transitions are evicted. Actor/critic initialization, objectives,
+adaptive entropy, pairing, diagnostics, and full-episode execution remain the
+same as the corresponding earlier horizon screen.
+
+Both extension smoke indices exercise J6, the largest budget in those matrices,
+for one seed and three decisions. Production evaluates five complete paired
+episodes per arm. Model probes retain the initial snapshot and all six round
+endpoints, with 32 rollouts each and work counts derived from the selected H.

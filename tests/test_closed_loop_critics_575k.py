@@ -35,7 +35,9 @@ def prior_fixture():
     return manifest, record
 
 
-def matrix_path(horizon):
+def matrix_path(horizon, *, j6=False):
+    if j6:
+        return campaign.MATRIX.with_name(f'ambi_closed_loop_critics_h{horizon}_j6_575k.json')
     return campaign.MATRIX if horizon == 3 else campaign.MATRIX.with_name(f'ambi_closed_loop_critics_h{horizon}_575k.json')
 
 
@@ -61,6 +63,47 @@ def test_six_cells_keep_accepted_recipe_and_objectives(horizon):
         assert cfg.inner_model_step_budget <= cfg.inner_replay_capacity
         assert cfg.inner_target_entropy == cfg.inner_temperature_initialization == 'inherit_outer'
         assert cfg.inner_actor_source == cfg.inner_horizon_actor_source == 'sac'
+
+
+@pytest.mark.parametrize('horizon', [1, 2, 3])
+def test_j6_selects_only_two_new_arms_and_changes_only_rounds(horizon):
+    old = campaign.cells(matrix_path(horizon))
+    new = campaign.cells(matrix_path(horizon, j6=True))
+    assert [(cell['J'], cell['critic_kind']) for cell in new] == [(6, 'soft'), (6, 'return_only')]
+    assert not {cell['selector'] for cell in old}.intersection(cell['selector'] for cell in new)
+    assert len(campaign.cells()) == 6
+    for before, after in zip(old[:2], new):
+        assert after['requested_alg_params'] == {**before['requested_alg_params'], 'inner_rounds': 6}
+        cfg = _build_cfg(**after['params'], aux_return_mode='sac', log_std_mapping='direct_clamp',
+                         target_entropy=-10.5, sac_actor_loss_scale_mode='none')
+        assert cfg.inner_model_step_budget == {1: 768, 2: 1536, 3: 2304}[horizon]
+        assert cfg.inner_model_step_budget < cfg.inner_replay_capacity == 3072
+        assert cfg.inner_critic_updates_per_action == 96
+        assert cfg.inner_actor_updates_per_action == cfg.inner_temperature_updates_per_action == 24
+    matrix = campaign.read(matrix_path(horizon, j6=True))
+    assert set(matrix['comparisons']['sweep']['variants']) == {'prior', *(cell['name'] for cell in new)}
+    assert matrix['evaluation'] == {**campaign.read(matrix_path(horizon))['evaluation'],
+                                    'default_presets': [cell['selector'] for cell in new]}
+
+
+@pytest.mark.parametrize('change', ['one_arm', 'duplicate', 'append_old', 'j4_only'])
+def test_unrequested_partial_or_mixed_round_grids_are_rejected(tmp_path, change):
+    matrix = campaign.read(matrix_path(3, j6=True))
+    selectors = matrix['evaluation']['default_presets']
+    old = campaign.read(matrix_path(3))
+    if change == 'one_arm':
+        selectors.pop()
+    elif change == 'duplicate':
+        selectors[1] = selectors[0]
+    else:
+        matrix['comparisons']['sweep']['variants'].update(old['comparisons']['sweep']['variants'])
+        if change == 'append_old':
+            selectors.append(old['evaluation']['default_presets'][0])
+        else:
+            matrix['evaluation']['default_presets'] = old['evaluation']['default_presets'][:2]
+    path = tmp_path / 'matrix.json'; path.write_text(json.dumps(matrix))
+    with pytest.raises(AssertionError, match='original screen or both J6'):
+        campaign.cells(path)
 
 
 @pytest.mark.parametrize('horizon', [1, 2])
@@ -99,8 +142,9 @@ def test_mixed_horizon_matrix_and_campaign_are_rejected(tmp_path):
 
 
 @pytest.mark.parametrize('horizon', [1, 2, 3])
-def test_probe_work_uses_selected_horizon_and_complete_coordinates(horizon):
-    cell = campaign.cells(matrix_path(horizon))[0]
+@pytest.mark.parametrize('j6', [False, True])
+def test_probe_work_uses_selected_horizon_and_complete_coordinates(horizon, j6):
+    cell = campaign.cells(matrix_path(horizon, j6=j6))[0]
     rows = [dict(episode_id='seed-101', decision_index=decision, round_index=r,
                  critic_updates=16*r, actor_updates=4*r,
                  metrics=dict(probe_model_steps=32*horizon*(2 if r == 0 else 1),
@@ -140,7 +184,8 @@ def test_mismatched_prior_is_rejected(change):
 
 
 @pytest.mark.parametrize('horizon', [1, 2, 3])
-def test_prepare_allocates_only_six_new_planners_and_reuses_prior(tmp_path, monkeypatch, horizon):
+@pytest.mark.parametrize('j6', [False, True])
+def test_prepare_allocates_only_selected_new_planners_and_reuses_prior(tmp_path, monkeypatch, horizon, j6):
     import evaluate_ambi_checkpoint
     import utils.eval_series
     import utils.eval_series_data
@@ -150,7 +195,7 @@ def test_prepare_allocates_only_six_new_planners_and_reuses_prior(tmp_path, monk
     checkpoint = tmp_path / 'checkpoint'; checkpoint.write_text('weight')
     args = SimpleNamespace(root=tmp_path / 'campaign', checkpoint=checkpoint,
                            reference=reference, inventory=tmp_path / 'inventory.json',
-                           registry=tmp_path / 'registry', matrix=matrix_path(horizon),
+                           registry=tmp_path / 'registry', matrix=matrix_path(horizon, j6=j6),
                            group='test-group', label='Test')
     real_digest = campaign.digest
     monkeypatch.setattr(campaign, 'digest', lambda path: campaign.CHECKPOINT_SHA
@@ -171,7 +216,7 @@ def test_prepare_allocates_only_six_new_planners_and_reuses_prior(tmp_path, monk
     monkeypatch.setattr(evaluate_ambi_checkpoint, 'evaluate_matrix', specifications)
     monkeypatch.setattr(utils.eval_series, 'create_run', new_run)
     result = campaign.prepare(args)
-    assert len(evaluation_calls) == 1 and len(registry_calls) == 6
+    assert len(evaluation_calls) == 1 and len(registry_calls) == (2 if j6 else 6)
     assert evaluation_calls[0]['reference_bundle'] == reference
     assert evaluation_calls[0]['eval_series_spec_dir'] == args.root / 'specs'
     assert result['source_run'] == campaign.SOURCE_RUN and result['checkpoint_step'] == 575000
@@ -182,18 +227,20 @@ def test_prepare_allocates_only_six_new_planners_and_reuses_prior(tmp_path, monk
     assert not (args.root / 'unused').exists()  # Specifications do not construct an evaluator bundle.
 
 
-@pytest.mark.parametrize('smoke,index', [(True, 0), (True, 1), (False, 0), (False, 5)])
+@pytest.mark.parametrize('smoke,index', [(True, 0), (True, 1), (False, 0), (False, 'last')])
 @pytest.mark.parametrize('horizon', [1, 2, 3])
-def test_worker_owns_one_complete_setting(tmp_path, monkeypatch, smoke, index, horizon):
+@pytest.mark.parametrize('j6', [False, True])
+def test_worker_owns_one_complete_setting(tmp_path, monkeypatch, smoke, index, horizon, j6):
     import torch
     import evaluate_ambi_checkpoint
     import utils.ambi_seed_shards
-    panel = campaign.cells(matrix_path(horizon))
+    panel = campaign.cells(matrix_path(horizon, j6=j6))
+    index = len(panel) - 1 if index == 'last' else index
     for cell in panel:
         cell['directory'] = str(tmp_path / cell['name'])
         cell['bundle'] = str(Path(cell['directory']) / 'bundle')
     settings = dict(source_commit='1' * 40, checkpoint_step=575000, checkpoint_sha256=campaign.CHECKPOINT_SHA,
-                    source_run=campaign.SOURCE_RUN, cells=panel, matrix=str(matrix_path(horizon)),
+                    source_run=campaign.SOURCE_RUN, cells=panel, matrix=str(matrix_path(horizon, j6=j6)),
                     H=horizon,
                     checkpoint='checkpoint', inventory='inventory', reference='existing-prior')
     (tmp_path / 'campaign.json').write_text(json.dumps(settings))

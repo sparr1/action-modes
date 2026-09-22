@@ -56,7 +56,7 @@ def cells(matrix_path=MATRIX):
         horizon = params['inner_rollout_horizon']
         assert horizon in (1, 2, 3)
         assert f'_h{horizon}_' in name
-        assert params['inner_rounds'] in (1, 2, 4)
+        assert params['inner_rounds'] in (1, 2, 4, 6)
         assert params['inner_critic_updates_per_round'] == 16
         assert params['inner_actor_updates_per_round'] == 4
         assert params['inner_rollouts_per_round'] == 128 and params['inner_batch_size'] == 256
@@ -68,8 +68,10 @@ def cells(matrix_path=MATRIX):
         assert params['inner_horizon_critic_source'] == expected[0]
         result.append(dict(name=name, selector=selector, params=params, requested_alg_params=requested,
                            H=horizon, J=params['inner_rounds'], critic_kind=kind))
-    assert [(cell['J'], cell['critic_kind']) for cell in result] == [
-        (j, arm) for j in (4, 2, 1) for arm in ('soft', 'return_only')]
+    selected = [(cell['J'], cell['critic_kind']) for cell in result]
+    original = [(j, arm) for j in (4, 2, 1) for arm in ('soft', 'return_only')]
+    extension = [(6, arm) for arm in ('soft', 'return_only')]
+    assert selected in (original, extension), 'Expected the original screen or both J6 critic arms.'
     assert len({cell['H'] for cell in result}) == 1, 'A campaign must use one common horizon.'
     return result
 
@@ -245,7 +247,8 @@ def worker(args):
         raise ValueError('Worker index is outside the prepared campaign.')
     cell = campaign['cells'][args.index]
     if args.smoke:
-        assert cell['J'] == 4, 'Smoke must exercise the largest round budget of each critic arm.'
+        assert cell['J'] == max(c['J'] for c in campaign['cells']), (
+            'Smoke must exercise the largest round budget of each critic arm.')
     assert torch.cuda.is_available()
     directory = args.root / 'smoke' / cell['name'] if args.smoke else Path(cell['directory'])
     directory.mkdir(parents=True, exist_ok=not args.smoke)
