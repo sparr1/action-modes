@@ -309,8 +309,11 @@ def watch(args):
                         for kind in ('performance', 'training')} for c in campaign['cells']}
     config = {key: campaign.get(key) for key in ('checkpoint_step', 'checkpoint_sha256', 'source_run',
               'source_commit', 'initial_alpha', 'target_entropy', 'prior_manifest_sha256', 'prior_source_science')}
+    replay_capacity, = {c['params']['inner_replay_capacity'] for c in campaign['cells']}
     config.update(campaign_group=campaign['group'], protocol='closed-loop-refinement-v1', protocol_variant='SAC auxiliary-critic comparison; adaptive actor entropy',
                   J=sorted({c['J'] for c in campaign['cells']}), H=campaign_horizon(campaign), N=128, B=256, C=16, A=4,
+                  inner_replay_capacity=replay_capacity, inner_replay_scope='action',
+                  inner_replay_reset_each_round=False,
                   environment_seeds=SEEDS, controller_seed=55, max_decisions=500,
                   execution='Fresh adaptation at every real decision, then deterministic actor mean action',
                   prior_reference=str(campaign['reference']),

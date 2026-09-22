@@ -117,3 +117,24 @@ respectively. H3 exactly fills the unchanged replay capacity of 3072; none of
 the eight rounds' transitions are evicted. Each smoke arm runs J8 for one seed
 and three decisions before production's five complete paired episodes. Probes
 retain the initial snapshot and all eight round endpoints.
+
+## J10 extension
+
+`ambi_closed_loop_critics_h1_j10_575k.json`,
+`ambi_closed_loop_critics_h2_j10_575k.json`, and
+`ambi_closed_loop_critics_h3_j10_575k.json` each select only the two J10 critic
+arms at the named horizon. J10 gives 160 critic updates and 40 actor/temperature
+updates per real decision, with 1280, 2560, and 3840 imagined transitions at
+H1, H2, and H3. The ten rounds retain the same N128/B256/C16/A4 settings.
+
+All J10 matrices use replay capacity 3840, increasing the earlier capacity of
+3072 to preserve the established requirement that action-local replay retains
+every round. H3 exactly fills this capacity; H1/H2 have unused space. Keeping
+3072 would violate configuration validation at H3/J10, so no ring eviction or
+change to that validation is introduced. Existing matrices remain unchanged.
+
+Checkpoint, critic objectives, inherited adaptive entropy, seeds, diagnostics,
+and full-episode execution remain matched. Each campaign allocates two new
+performance identities and reuses the existing prior. Smoke checks exercise
+J10 for one seed and three decisions; production evaluates five complete paired
+episodes per arm with the initial probe and all ten round endpoints.

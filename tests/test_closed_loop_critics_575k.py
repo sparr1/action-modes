@@ -66,20 +66,22 @@ def test_six_cells_keep_accepted_recipe_and_objectives(horizon):
 
 
 @pytest.mark.parametrize('horizon', [1, 2, 3])
-@pytest.mark.parametrize('rounds', [6, 8])
-def test_extension_selects_only_two_new_arms_and_changes_only_rounds(horizon, rounds):
+@pytest.mark.parametrize('rounds', [6, 8, 10])
+def test_extension_selects_only_two_new_arms_with_retained_replay(horizon, rounds):
     old = campaign.cells(matrix_path(horizon))
     new = campaign.cells(matrix_path(horizon, rounds=rounds))
     assert [(cell['J'], cell['critic_kind']) for cell in new] == [(rounds, 'soft'), (rounds, 'return_only')]
     assert not {cell['selector'] for cell in old}.intersection(cell['selector'] for cell in new)
     assert len(campaign.cells()) == 6
+    capacity = 3840 if rounds == 10 else 3072
     for before, after in zip(old[:2], new):
-        assert after['requested_alg_params'] == {**before['requested_alg_params'], 'inner_rounds': rounds}
+        assert after['requested_alg_params'] == {**before['requested_alg_params'],
+                                                'inner_rounds': rounds, 'inner_replay_capacity': capacity}
         cfg = _build_cfg(**after['params'], aux_return_mode='sac', log_std_mapping='direct_clamp',
                          target_entropy=-10.5, sac_actor_loss_scale_mode='none')
         assert cfg.inner_model_step_budget == 128 * horizon * rounds
-        assert cfg.inner_model_step_budget <= cfg.inner_replay_capacity == 3072
-        assert (cfg.inner_model_step_budget == cfg.inner_replay_capacity) == (horizon == 3 and rounds == 8)
+        assert cfg.inner_model_step_budget <= cfg.inner_replay_capacity == capacity
+        assert (cfg.inner_model_step_budget == cfg.inner_replay_capacity) == (horizon == 3 and rounds in (8, 10))
         assert cfg.inner_critic_updates_per_action == 16 * rounds
         assert cfg.inner_actor_updates_per_action == cfg.inner_temperature_updates_per_action == 4 * rounds
     matrix = campaign.read(matrix_path(horizon, rounds=rounds))
@@ -88,7 +90,20 @@ def test_extension_selects_only_two_new_arms_and_changes_only_rounds(horizon, ro
                                     'default_presets': [cell['selector'] for cell in new]}
 
 
-@pytest.mark.parametrize('rounds', [6, 8])
+def test_h3_j10_rejects_capacity_that_would_discard_early_rounds(tmp_path):
+    cell = campaign.cells(matrix_path(3, rounds=10))[0]
+    with pytest.raises(ValueError, match='nominal retained transitions'):
+        _build_cfg(**{**cell['params'], 'inner_replay_capacity': 3072},
+                   aux_return_mode='sac', log_std_mapping='direct_clamp',
+                   target_entropy=-10.5, sac_actor_loss_scale_mode='none')
+    matrix = campaign.read(matrix_path(3, rounds=10))
+    matrix['shared_alg_params']['inner_replay_capacity'] = 3072
+    path = tmp_path / 'undersized.json'; path.write_text(json.dumps(matrix))
+    with pytest.raises(AssertionError, match='Replay capacity'):
+        campaign.cells(path)
+
+
+@pytest.mark.parametrize('rounds', [6, 8, 10])
 @pytest.mark.parametrize('change', ['one_arm', 'duplicate', 'append_old', 'j4_only', 'mixed_extension'])
 def test_unrequested_partial_or_mixed_round_grids_are_rejected(tmp_path, change, rounds):
     matrix = campaign.read(matrix_path(3, rounds=rounds))
@@ -109,7 +124,7 @@ def test_unrequested_partial_or_mixed_round_grids_are_rejected(tmp_path, change,
         else:
             matrix['evaluation']['default_presets'] = old['evaluation']['default_presets'][:2]
     path = tmp_path / 'matrix.json'; path.write_text(json.dumps(matrix))
-    with pytest.raises(AssertionError, match='original screen or both J6/J8'):
+    with pytest.raises(AssertionError, match='original screen or both J6/J8/J10'):
         campaign.cells(path)
 
 
@@ -149,7 +164,7 @@ def test_mixed_horizon_matrix_and_campaign_are_rejected(tmp_path):
 
 
 @pytest.mark.parametrize('horizon', [1, 2, 3])
-@pytest.mark.parametrize('rounds', [None, 6, 8])
+@pytest.mark.parametrize('rounds', [None, 6, 8, 10])
 def test_probe_work_uses_selected_horizon_and_complete_coordinates(horizon, rounds):
     cell = campaign.cells(matrix_path(horizon, rounds=rounds))[0]
     rows = [dict(episode_id='seed-101', decision_index=decision, round_index=r,
@@ -191,7 +206,7 @@ def test_mismatched_prior_is_rejected(change):
 
 
 @pytest.mark.parametrize('horizon', [1, 2, 3])
-@pytest.mark.parametrize('rounds', [None, 6, 8])
+@pytest.mark.parametrize('rounds', [None, 6, 8, 10])
 def test_prepare_allocates_only_selected_new_planners_and_reuses_prior(tmp_path, monkeypatch, horizon, rounds):
     import evaluate_ambi_checkpoint
     import utils.eval_series
@@ -236,7 +251,7 @@ def test_prepare_allocates_only_selected_new_planners_and_reuses_prior(tmp_path,
 
 @pytest.mark.parametrize('smoke,index', [(True, 0), (True, 1), (False, 0), (False, 'last')])
 @pytest.mark.parametrize('horizon', [1, 2, 3])
-@pytest.mark.parametrize('rounds', [None, 6, 8])
+@pytest.mark.parametrize('rounds', [None, 6, 8, 10])
 def test_worker_owns_one_complete_setting(tmp_path, monkeypatch, smoke, index, horizon, rounds):
     import torch
     import evaluate_ambi_checkpoint
