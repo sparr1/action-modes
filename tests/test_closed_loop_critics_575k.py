@@ -36,10 +36,10 @@ def prior_fixture():
 
 
 def matrix_path(horizon):
-    return campaign.MATRIX if horizon == 3 else campaign.MATRIX.with_name('ambi_closed_loop_critics_h2_575k.json')
+    return campaign.MATRIX if horizon == 3 else campaign.MATRIX.with_name(f'ambi_closed_loop_critics_h{horizon}_575k.json')
 
 
-@pytest.mark.parametrize('horizon', [2, 3])
+@pytest.mark.parametrize('horizon', [1, 2, 3])
 def test_six_cells_keep_accepted_recipe_and_objectives(horizon):
     panel = campaign.cells(matrix_path(horizon))
     assert [(c['J'], c['critic_kind']) for c in panel] == [
@@ -63,17 +63,18 @@ def test_six_cells_keep_accepted_recipe_and_objectives(horizon):
         assert cfg.inner_actor_source == cfg.inner_horizon_actor_source == 'sac'
 
 
-def test_h2_changes_only_horizon_and_descriptive_names():
+@pytest.mark.parametrize('horizon', [1, 2])
+def test_shorter_horizon_changes_only_horizon_and_descriptive_names(horizon):
     old = campaign.read(matrix_path(3))
-    new = campaign.read(matrix_path(2))
+    new = campaign.read(matrix_path(horizon))
     assert new['evaluation'] == {**old['evaluation'], 'default_presets': [
-        selector.replace('_h3_', '_h2_') for selector in old['evaluation']['default_presets']]}
-    assert new['shared_alg_params'] == {**old['shared_alg_params'], 'inner_rollout_horizon': 2}
+        selector.replace('_h3_', f'_h{horizon}_') for selector in old['evaluation']['default_presets']]}
+    assert new['shared_alg_params'] == {**old['shared_alg_params'], 'inner_rollout_horizon': horizon}
     assert new['source_run'] == old['source_run']
     assert campaign.cells()[0]['H'] == 3  # Existing callers retain the H3 default.
-    for before, after in zip(campaign.cells(matrix_path(3)), campaign.cells(matrix_path(2))):
-        assert after['params'] == {**before['params'], 'inner_rollout_horizon': 2}
-        assert after['name'] == before['name'].replace('_h3_', '_h2_')
+    for before, after in zip(campaign.cells(matrix_path(3)), campaign.cells(matrix_path(horizon))):
+        assert after['params'] == {**before['params'], 'inner_rollout_horizon': horizon}
+        assert after['name'] == before['name'].replace('_h3_', f'_h{horizon}_')
 
 
 def test_mixed_horizon_matrix_and_campaign_are_rejected(tmp_path):
@@ -97,7 +98,7 @@ def test_mixed_horizon_matrix_and_campaign_are_rejected(tmp_path):
         campaign.campaign_horizon({'cells': panel})
 
 
-@pytest.mark.parametrize('horizon', [2, 3])
+@pytest.mark.parametrize('horizon', [1, 2, 3])
 def test_probe_work_uses_selected_horizon_and_complete_coordinates(horizon):
     cell = campaign.cells(matrix_path(horizon))[0]
     rows = [dict(episode_id='seed-101', decision_index=decision, round_index=r,
@@ -138,7 +139,7 @@ def test_mismatched_prior_is_rejected(change):
         campaign.check_prior(manifest, record)
 
 
-@pytest.mark.parametrize('horizon', [2, 3])
+@pytest.mark.parametrize('horizon', [1, 2, 3])
 def test_prepare_allocates_only_six_new_planners_and_reuses_prior(tmp_path, monkeypatch, horizon):
     import evaluate_ambi_checkpoint
     import utils.eval_series
@@ -182,7 +183,7 @@ def test_prepare_allocates_only_six_new_planners_and_reuses_prior(tmp_path, monk
 
 
 @pytest.mark.parametrize('smoke,index', [(True, 0), (True, 1), (False, 0), (False, 5)])
-@pytest.mark.parametrize('horizon', [2, 3])
+@pytest.mark.parametrize('horizon', [1, 2, 3])
 def test_worker_owns_one_complete_setting(tmp_path, monkeypatch, smoke, index, horizon):
     import torch
     import evaluate_ambi_checkpoint

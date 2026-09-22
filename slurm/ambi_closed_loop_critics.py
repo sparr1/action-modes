@@ -54,7 +54,7 @@ def cells(matrix_path=MATRIX):
         kind = 'soft' if name.startswith('soft_soft_') else 'return_only'
         assert name.startswith(('soft_soft_', 'return_return_alpha_'))
         horizon = params['inner_rollout_horizon']
-        assert horizon in (2, 3)
+        assert horizon in (1, 2, 3)
         assert f'_h{horizon}_' in name
         assert params['inner_rounds'] in (1, 2, 4)
         assert params['inner_critic_updates_per_round'] == 16
@@ -79,7 +79,7 @@ def campaign_horizon(campaign):
     horizons = {cell['H'] for cell in campaign['cells']}
     assert len(horizons) == 1, 'A campaign must use one common horizon.'
     horizon, = horizons
-    assert horizon in (2, 3) and campaign.get('H', horizon) == horizon
+    assert horizon in (1, 2, 3) and campaign.get('H', horizon) == horizon
     assert all(cell['params']['inner_rollout_horizon'] == horizon for cell in campaign['cells'])
     return horizon
 

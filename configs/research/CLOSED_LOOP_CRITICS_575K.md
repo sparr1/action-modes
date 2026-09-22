@@ -65,3 +65,18 @@ For preparation, select the matrix, group, and descriptive label through
 `EVAL_MATRIX_PATH`, `EVAL_CAMPAIGN_GROUP`, and `EVAL_CAMPAIGN_LABEL`. Unset values
 retain the original H3 defaults. GPU workers and the publisher derive H from
 the prepared campaign, including model-probe work counts and W&B metadata.
+
+## H1 follow-up
+
+`ambi_closed_loop_critics_h1_575k.json` adds the same six conditions at H1.
+It keeps the H2/H3 checkpoint, critics, inherited adaptive actor entropy, paired
+seeds, N128/B256/C16/A4, replay capacity3072, and full-episode reset procedure.
+H1 collects128 imagined transitions per round, or128/256/512 per decision at
+J1/J2/J4. Sampling with replacement supports B256 even in the first round's
+128-transition replay. The frozen terminal critic is reached after one model
+step; each32-rollout model probe therefore uses32 transitions, with64 at
+initialization to include the paired frozen-prior probe.
+
+Select this matrix through `EVAL_MATRIX_PATH` and use a separate campaign group
+and label. Existing H2/H3 and prior results retain their original identities.
+The default matrix remains H3; adding H1 does not rerun an existing condition.
