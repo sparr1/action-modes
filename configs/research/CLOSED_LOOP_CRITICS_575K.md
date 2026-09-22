@@ -155,3 +155,20 @@ unchanged. Preparation creates two new performance identities per horizon and
 reuses the prior. Both smoke arms use J12 for one seed and three decisions;
 production retains five complete paired episodes, with the initial model probe
 and all twelve round endpoints.
+
+## J14 extension
+
+`ambi_closed_loop_critics_h1_j14_575k.json`,
+`ambi_closed_loop_critics_h2_j14_575k.json`, and
+`ambi_closed_loop_critics_h3_j14_575k.json` each select the two J14 critic arms
+at the named horizon. N128/B256/C16/A4 gives 224 critic updates and 56
+actor/temperature updates per real decision, collecting 1792, 3584, and 5376
+imagined transitions at H1, H2, and H3.
+
+Every J14 setting uses replay capacity 5376 to retain all fourteen rounds. H3
+fills it exactly; the previous capacity of 4608 would fail the retention guard
+at H3/J14. Earlier matrices and all other scientific controls remain unchanged.
+Each horizon receives two new performance identities and reuses the prior.
+Smoke checks use J14 for one seed and three decisions; production retains five
+complete paired episodes, with the initial probe and all fourteen round
+endpoints.

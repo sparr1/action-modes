@@ -56,7 +56,7 @@ def cells(matrix_path=MATRIX):
         horizon = params['inner_rollout_horizon']
         assert horizon in (1, 2, 3)
         assert f'_h{horizon}_' in name
-        assert params['inner_rounds'] in (1, 2, 4, 6, 8, 10, 12)
+        assert params['inner_rounds'] in (1, 2, 4, 6, 8, 10, 12, 14)
         assert params['inner_critic_updates_per_round'] == 16
         assert params['inner_actor_updates_per_round'] == 4
         assert params['inner_rollouts_per_round'] == 128 and params['inner_batch_size'] == 256
@@ -69,9 +69,9 @@ def cells(matrix_path=MATRIX):
                            H=horizon, J=params['inner_rounds'], critic_kind=kind))
     selected = [(cell['J'], cell['critic_kind']) for cell in result]
     original = [(j, arm) for j in (4, 2, 1) for arm in ('soft', 'return_only')]
-    extensions = [[(j, arm) for arm in ('soft', 'return_only')] for j in (6, 8, 10, 12)]
-    assert selected in [original, *extensions], 'Expected the original screen or both J6/J8/J10/J12 critic arms.'
-    assert all(cell['params']['inner_replay_capacity'] == {10: 3840, 12: 4608}.get(cell['J'], 3072)
+    extensions = [[(j, arm) for arm in ('soft', 'return_only')] for j in (6, 8, 10, 12, 14)]
+    assert selected in [original, *extensions], 'Expected the original screen or both J6/J8/J10/J12/J14 critic arms.'
+    assert all(cell['params']['inner_replay_capacity'] == {10: 3840, 12: 4608, 14: 5376}.get(cell['J'], 3072)
                for cell in result), 'Replay capacity must match the selected round budget.'
     assert len({cell['H'] for cell in result}) == 1, 'A campaign must use one common horizon.'
     return result
