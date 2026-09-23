@@ -84,6 +84,7 @@ def test_historical_comparison_allows_only_declared_changes(mode,estimator):
 def test_prepare_creates_only_requested_new_identities_and_exact_reward_references(tmp_path,monkeypatch,execution):
     import evaluate_ambi_checkpoint
     from utils import eval_series
+    from utils.eval_series_data import planner_identity
     panel=campaign.cells(campaign.BOTH_MATRIX if execution=='both' else campaign.MATRIX,execution=execution)
     pins=[];refs={}
     for h in (1,2,3):
@@ -97,7 +98,7 @@ def test_prepare_creates_only_requested_new_identities_and_exact_reward_referenc
                               seed_scheme='sha256-v1',environment={'id':'test'})
                 refs[campaign.reference_key(pin)]={**pin,'resolved_config':cfg,'episodes':episodes(),
                     'protocol':protocol,'identity':dict(backbone=campaign.SOURCE_RUN,protocol=protocol,
-                      planner=dict(type='inner_sac',action_rule=protocol['action_rule'],settings=deepcopy(cfg)))}
+                      planner=planner_identity(cfg,{},'AMBITDMPC2',protocol['action_rule']))}
     references=tmp_path/'refs.json';references.write_text(json.dumps({'references':pins}))
     monkeypatch.setattr(campaign,'source_commit',lambda:'tested')
     monkeypatch.setattr(campaign,'digest',lambda p:campaign.CHECKPOINT_SHA)
@@ -108,10 +109,13 @@ def test_prepare_creates_only_requested_new_identities_and_exact_reward_referenc
         for cell in panel:
             identity=deepcopy(refs[(cell['H'],cell['J'],'one_step','mean')]['identity'])
             rule=campaign.action_rule(cell['execution_mode'])
-            identity['protocol']['action_rule']=identity['planner']['action_rule']=rule
-            identity['planner']['settings'].update({campaign.EXECUTION_KEY:cell['execution_mode'],
+            identity['protocol']['action_rule']=rule
+            cfg={**refs[(cell['H'],cell['J'],'one_step','mean')]['resolved_config'],
+                campaign.EXECUTION_KEY:cell['execution_mode'],
                 **campaign.estimator_settings(cell['estimator'],cell['H']),
-                'inner_critic_source':'sac','inner_sac_critic_target':'entropy_augmented'})
+                'inner_critic_source':'sac','inner_sac_critic_target':'entropy_augmented'}
+            identity['planner']=planner_identity(cfg,{},'AMBITDMPC2',rule)
+            assert 'inner_critic_source' not in identity['planner']['settings']
             campaign.write(specs/(cell['selector'].replace('/','__')+'.json'),{'identity':identity})
     monkeypatch.setattr(evaluate_ambi_checkpoint,'evaluate_matrix',evaluate)
     created=[]
@@ -129,3 +133,21 @@ def test_prepare_creates_only_requested_new_identities_and_exact_reward_referenc
         assert (cell['reward_reference'] is None)==missing
         if not missing:
             assert campaign.reference_key(cell['reward_reference'])==(cell['H'],cell['J'],cell['estimator'],cell['execution_mode'])
+
+
+def test_real_planner_identity_omits_default_sac_source_but_keeps_return_terminal():
+    from utils.eval_series_data import planner_identity
+    cell=campaign.cells()[0]
+    mean=campaign.historical_cell(cell['H'],cell['J'])['params']
+    before=planner_identity(mean,{},'AMBITDMPC2','tanh_mean')
+    after=planner_identity(cell['params'],{},'AMBITDMPC2',campaign.ACTION_RULE)
+    assert before['settings']['inner_critic_source']=='aux_return'
+    assert 'inner_critic_source' not in after['settings']
+    assert after['settings']['inner_horizon_critic_source']=='aux_return'
+    campaign.matching_planner(after,before,cell)
+    changed=deepcopy(after)
+    changed['settings']['inner_critic_source']='aux_return'
+    with pytest.raises(AssertionError):campaign.matching_planner(changed,before,cell)
+    changed=deepcopy(after)
+    changed['settings'].pop('inner_horizon_critic_source')
+    with pytest.raises(AssertionError):campaign.matching_planner(changed,before,cell)

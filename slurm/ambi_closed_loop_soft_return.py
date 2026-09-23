@@ -93,6 +93,22 @@ def matching_protocol(actual, reference, *, execution='policy_sample', steps=500
     assert episode_protocol(actual) == episode_protocol({**reference, 'action_rule':rule, 'max_steps':steps})
 
 
+def matching_planner(actual, reference, cell):
+    """Compare canonical identities, including omission of the default SAC route."""
+    before, after = deepcopy(reference), deepcopy(actual)
+    assert before['settings']['inner_critic_source'] == 'aux_return'
+    before['action_rule'] = action_rule(cell['execution_mode'])
+    before['settings'] = normalized_config(before['settings'])
+    before['settings'].update({EXECUTION_KEY:cell['execution_mode'],
+        **estimator_settings(cell['estimator'],cell['H']),
+        'inner_sac_critic_target':'entropy_augmented'})
+    # planner_identity normalizes default source routes by omitting them.
+    # The resolved configuration is checked separately and must explicitly use SAC.
+    before['settings'].pop('inner_critic_source')
+    after['settings'] = normalized_config(after['settings'])
+    assert before == after
+
+
 def reference_key(reference):
     return reference['H'], reference['J'], reference['estimator'], reference['execution']
 
@@ -174,13 +190,7 @@ def prepare(args):
         reference = cell['mean_reference']['identity']
         assert spec['identity']['backbone'] == reference['backbone'] == SOURCE_RUN
         matching_protocol(spec['identity']['protocol'],reference['protocol'],execution=cell['execution_mode'])
-        before, after = deepcopy(reference['planner']), deepcopy(spec['identity']['planner'])
-        before['action_rule'] = action_rule(cell['execution_mode'])
-        before['settings'] = normalized_config(before['settings'])
-        before['settings'].update({EXECUTION_KEY:cell['execution_mode'],**estimator_settings(cell['estimator'],cell['H']),
-                                   'inner_critic_source':'sac','inner_sac_critic_target':'entropy_augmented'})
-        after['settings'] = normalized_config(after['settings'])
-        assert before == after
+        matching_planner(spec['identity']['planner'],reference['planner'],cell)
         registry = create_run(args.registry,spec,args.group+'-'+cell['name'],PROJECT,ENTITY,'oscar-rgao48')
         cell.update(directory=str(directory),bundle=str(directory/'bundle'),reused=False,
                     run_dir=registry['run_dir'],performance_run_id=registry['run_id'],training_run_id=uuid.uuid4().hex)
