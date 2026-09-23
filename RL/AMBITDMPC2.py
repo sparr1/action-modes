@@ -236,6 +236,7 @@ _AMBI_DEFAULTS = {
     "inner_execution_action": "policy_sample",
     "inner_execution_std_scale": 1.0,
     "inner_execution_noise_std": 0.0,
+    "inner_eval_execution_action": "mean",
     "inner_execution_policy_source": "primary",
     "inner_execution_handoff_samples": 8,
     "inner_log_std_mapping": None,
@@ -2105,6 +2106,11 @@ class AMBITDMPC2(TDMPC2Baseline):
                     f"{key} must be 'policy_sample', 'mean', or 'mean_plus_gaussian'."
                 )
             setattr(cfg, key, value)
+        cfg.inner_eval_execution_action = _normalize_choice(
+            cfg.inner_eval_execution_action,
+            "inner_eval_execution_action",
+            {"mean", "policy_sample"},
+        )
         for prefix in ("inner_behavior", "inner_execution"):
             mode = getattr(cfg, f"{prefix}_action")
             std_scale = getattr(cfg, f"{prefix}_std_scale")
@@ -2423,6 +2429,15 @@ class AMBITDMPC2(TDMPC2Baseline):
                 )
 
         _resolve_random_explorer_config(cfg)
+        if cfg.inner_eval_execution_action == "policy_sample" and (
+            cfg.inner_operator not in {"none", "sac"}
+            or cfg.inner_explorer_mode != "none"
+            or cfg.inner_execution_policy_source != "primary"
+        ):
+            raise ValueError(
+                "inner_eval_execution_action='policy_sample' requires single-policy "
+                "SAC or prior-only execution, with no explorer or policy handoff."
+            )
 
         cfg.inner_mppi_num_elites = int(cfg.inner_mppi_num_elites)
         cfg.inner_mppi_num_pi_trajs = int(cfg.inner_mppi_num_pi_trajs)
@@ -3138,6 +3153,10 @@ class AMBITDMPC2(TDMPC2Baseline):
         Training uses ``inner_diagnostics_every`` through ``_act_agent``;
         callers of the public prediction API keep the complete historical
         metric contract unless they explicitly opt out.
+
+        ``deterministic=True`` selects evaluation mode. Its final action is
+        the policy mean unless ``inner_eval_execution_action='policy_sample'``
+        explicitly requests sampled evaluation; outer writeback stays disabled.
         """
         t0 = self._predict_t0 if episode_start is None else bool(episode_start)
         if t0 and hasattr(self.agent, "reset"):

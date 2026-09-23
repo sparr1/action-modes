@@ -677,7 +677,7 @@ def evaluate_preset(
     pending_events = []
     phase_id = "initialization"
     active_episode = False
-    from utils.ambi_benchmark import capture_root, solver_seed
+    from utils.ambi_benchmark import capture_root, solver_seed, protocol_for
     try:
         started = time.perf_counter()
         model, run_config = _initialize_frozen_model(
@@ -928,6 +928,8 @@ def evaluate_preset(
             "controller_seed": int(controller_seed),
             "environment_seeds": [int(seed) for seed in seeds],
             "seed_scheme": "sha256-v1",
+            "action_rule": protocol_for(resolved, controller_seed, max_steps)["action_rule"],
+            "deterministic_execution": getattr(model.cfg, "inner_eval_execution_action", "mean") == "mean",
             "outer_updates_before": updates_before,
             "outer_updates_after": updates_after,
             "outer_state_unchanged": True,
@@ -1213,7 +1215,7 @@ def evaluate_matrix(
         "checkpoint_sha256": checkpoint_sha256,
         "matrix_sha256": _file_sha256(matrix_path),
         "frozen_outer_learning": True,
-        "deterministic_execution": True,
+        "deterministic_execution": all(item["action_rule"] != "squashed_gaussian_sample" for item in protocols),
         "environment": copy.deepcopy(resolved_presets[0]["environment"]),
         "common_model_metrics": sorted(set.intersection(*metric_sets)) if metric_sets else [],
         "available_model_metrics": sorted(set.union(*metric_sets)) if metric_sets else [],

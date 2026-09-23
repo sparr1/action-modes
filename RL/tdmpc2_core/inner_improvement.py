@@ -5341,8 +5341,13 @@ class InnerImprovementEngine:
         inner_bounds=True,
         return_info=False,
     ):
-        mode = "mean" if eval_mode else str(self.cfg.inner_execution_action)
-        std_scale = float(self.cfg.inner_execution_std_scale)
+        mode = (str(getattr(self.cfg, "inner_eval_execution_action", "mean"))
+                if eval_mode else str(self.cfg.inner_execution_action))
+        # Evaluation samples the actual final Gaussian; training exploration
+        # scaling and additive execution noise remain separate controls.
+        std_scale = 1.0 if eval_mode else float(self.cfg.inner_execution_std_scale)
+        noise_std = 0.0 if eval_mode else self.cfg.inner_execution_noise_std
+        sampled_eval = bool(eval_mode and mode == "policy_sample")
         if mode == "policy_sample" and std_scale == 0.0:
             mode = "mean"
         training_modes = tuple(
@@ -5357,10 +5362,18 @@ class InnerImprovementEngine:
                     mode=mode,
                     generator=generator,
                     std_scale=max(std_scale, 1e-12),
-                    noise_std=self.cfg.inner_execution_noise_std,
+                    noise_std=noise_std,
                     inner_bounds=inner_bounds,
-                    return_info=return_info,
+                    return_info=return_info or sampled_eval,
                 )
+            if eval_mode:
+                self._eval_execution_metrics = {
+                    "inner_eval_execution_sampled": float(sampled_eval),
+                    "inner_eval_execution_mean_action_l2": (
+                        (action - info["mean"]).norm(dim=-1).mean().detach()
+                        if sampled_eval else 0.0
+                    ),
+                }
         finally:
             for module, was_training in training_modes:
                 module.training = was_training
@@ -6867,6 +6880,15 @@ class InnerImprovementEngine:
         trace=None,
     ):
         """Run an action with an optional single-use observational recorder."""
+        if eval_mode and getattr(self.cfg, "inner_eval_execution_action", "mean") == "policy_sample" and (
+            self.cfg.inner_operator not in {"none", "sac"}
+            or self.cfg.inner_explorer_mode != "none"
+            or self.cfg.inner_execution_policy_source != "primary"
+        ):
+            raise ValueError(
+                "Sampled evaluation requires single-policy SAC or prior-only "
+                "execution, with no explorer or policy handoff."
+            )
         if trace is not None:
             from .inner_trace import InnerActionTrace
 
@@ -6922,6 +6944,7 @@ class InnerImprovementEngine:
         apply_inner_writeback=False,
     ):
         self._pending_timers = {}
+        self._eval_execution_metrics = {}
         start = self._timer_start()
         self.action_index += 1
         self._collect_diagnostics = bool(collect_diagnostics)
@@ -7020,6 +7043,7 @@ class InnerImprovementEngine:
             # Refresh after diagnostics/planning, since those calls may be the
             # first invocation that discovers an unsupported compiled critic.
             metrics.update(self._compile_fallback_metrics())
+            metrics.update(self._eval_execution_metrics)
 
             # Action-scoped tensors are explicitly released after producing
             # the action; episode/run scopes survive by configuration.

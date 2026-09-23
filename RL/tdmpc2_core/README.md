@@ -340,6 +340,27 @@ actor inherits these settings when `inner_log_std_mapping`,
 `inner_log_std_min`, and `inner_log_std_max` are `null`; each can be overridden
 independently for an ablation.
 
+Evaluation executes `tanh(mu)` by default. Set
+`inner_eval_execution_action="policy_sample"` to sample the final adapted SAC
+policy instead: `tanh(mu + exp(log_std) * epsilon)`, with fresh standard Gaussian
+noise from the isolated execution RNG. This option also supports a prior-only
+policy. It requires one policy with no explorer population or execution
+handoff; TD3 and MPPI do not support it. Evaluation mode remains enabled, outer
+state remains frozen, and normal inner adaptation still runs. Training's
+`inner_execution_action`, standard-deviation scaling, and additive execution
+noise are separate and do not alter these evaluation samples.
+The explicit option also applies to public `predict(..., deterministic=True)`
+calls, which select this evaluation path.
+
+The evaluator seeds the execution stream once per episode; it advances across
+real decisions independently of collection, optimization, and model probes.
+Action metrics record `inner_eval_execution_sampled` and
+`inner_eval_execution_mean_action_l2`, the normalized action's L2 distance from
+the same final policy's `tanh(mu)`. The sampled action and its mean come from one
+policy forward pass. Mean execution reports zero distance and does not draw
+execution noise. Record this changed action rule in evaluation protocols and
+planner identities when comparing sampled and mean execution.
+
 Policy optimization and critic evaluation can be ablated independently.
 `outer_critic_target` and `inner_sac_critic_target` each accept
 `"entropy_augmented"` (the default, which bootstraps with

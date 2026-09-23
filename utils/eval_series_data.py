@@ -357,6 +357,10 @@ def planner_identity(config, result, algorithm, action_rule):
     _require(operator in {"sac", "td3", "xqc", "mppi"}, "Unknown resolved inner operator")
     active = {key: value for key, value in normalize_aux_return_identity(config).items()
               if key.startswith("inner_")}
+    # Sampled evaluation uses the learned Gaussian at unit scale, independently
+    # of train-time execution controls. Omitted/default means are historical.
+    if active.get("inner_eval_execution_action", "mean") == "mean":
+        active.pop("inner_eval_execution_action", None)
     # Old Q-only boundaries and their explicit spelling remain one curve.
     if active.get("inner_terminal_entropy", "none") == "none":
         active.pop("inner_terminal_entropy", None)
@@ -556,7 +560,8 @@ def descriptive_label(identity, selector=None):
     if source.startswith("axqc-prior-"):
         source = source.removeprefix("axqc-prior-")
     planner = identity["planner"]
-    prefix = f"{family} {source} | "
+    execution_label = "sampled actions | " if planner.get("action_rule") == "squashed_gaussian_sample" else ""
+    prefix = f"{family} {source} | {execution_label}"
     if planner["type"] == "prior":
         return prefix + "Policy prior"
     settings = planner.get("settings", {})

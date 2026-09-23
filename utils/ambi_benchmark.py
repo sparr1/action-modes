@@ -41,12 +41,20 @@ def solver_seed(base, *identity):
 
 def protocol_for(resolved, controller_seed, max_steps):
     config = resolved["algorithm_config"]
+    execution = config.get("alg_params", {}).get("inner_eval_execution_action", "mean")
+    if execution not in {"mean", "policy_sample"}:
+        raise ValueError("Unknown frozen evaluation execution action.")
+    if execution == "policy_sample" and (
+        config.get("alg") != "AMBITDMPC2/AMBITDMPC2"
+        or config.get("alg_params", {}).get("inner_operator", "sac") not in {"sac", "none"}
+    ):
+        raise ValueError("Sampled frozen execution currently requires AMBI SAC or prior-only operation.")
     protocol = {
         "environment": copy.deepcopy(resolved["environment"]),
         "env_wrappers": copy.deepcopy(config.get("env_wrappers", [])),
         "env_wrapper": copy.deepcopy(config.get("env_wrapper")),
         "observation": config.get("alg_params", {}).get("obs", "state"),
-        "action_rule": "tanh_mean",
+        "action_rule": "squashed_gaussian_sample" if execution == "policy_sample" else "tanh_mean",
         "max_steps": max_steps,
         "controller_seed": int(controller_seed),
         "seed_scheme": SEED_SCHEME,

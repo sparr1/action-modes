@@ -117,7 +117,7 @@ python3 evaluate_ambi_checkpoint.py \
 
 Select individual presets with repeatable `--preset comparison/variant`, or an
 entire axis with repeatable `--comparison comparison`. The evaluator creates a
-fresh model for every preset, uses paired environment seeds, always returns the
+fresh model for every preset, uses paired environment seeds, by default returns the
 policy mean to the real environment, never calls the outer update, and hashes
 outer model/optimizer/temperature state before and after each run. Its output
 contains per-episode real returns and all finite model-predicted inner metrics.
@@ -125,6 +125,16 @@ Output is written atomically, and an existing `--output` path is preserved
 unless `--overwrite` is supplied explicitly.
 When a comparison's reference preset is selected, it also reports seed-paired
 return deltas for every selected variant.
+
+For stochastic execution, set `inner_eval_execution_action="policy_sample"`
+in a SAC or prior-only preset. Each real decision draws from the final actor's
+learned squashed Gaussian at unit standard-deviation scale, using the isolated
+execution RNG. Evaluation mode, fresh adaptation and outer-state freezing stay
+in force. The default `"mean"` preserves historical behavior. Training-time
+execution noise and standard-deviation scaling do not affect this override.
+Bundles and curve identities record `squashed_gaussian_sample`; they cannot
+reuse a mean prior as if it had the same action protocol. Historical mean
+outcomes require an explicitly labeled, seed-paired execution comparison.
 
 An existing evaluation curve that omitted its prior reference can be backfilled
 without repeating planner episodes. Evaluate the frozen SAC policy mean on the
