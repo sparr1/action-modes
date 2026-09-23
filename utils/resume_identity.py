@@ -226,6 +226,22 @@ def scientific_trial_parameters(
             if projected.get("alg") == _AMBI_ALGORITHM:
                 algorithm = normalize_lora_rl_identity(algorithm)
                 algorithm = normalize_aux_return_identity(algorithm)
+                estimator = algorithm.get("inner_sac_return_estimator", "one_step")
+                if isinstance(estimator, str):
+                    estimator = estimator.lower()
+                if estimator == "one_step":
+                    for field in ("inner_sac_return_estimator", "inner_retrace_lambda",
+                                  "inner_retrace_batch_trajectories"):
+                        algorithm.pop(field, None)
+                elif estimator == "retrace":
+                    algorithm["inner_sac_return_estimator"] = estimator
+                    algorithm["inner_retrace_lambda"] = float(algorithm.get("inner_retrace_lambda", 1.0))
+                    trajectories = algorithm.get("inner_retrace_batch_trajectories")
+                    if trajectories is None:
+                        horizon = int(algorithm.get("inner_rollout_horizon", 3))
+                        batch = int(algorithm.get("inner_batch_size", 128))
+                        trajectories = (batch + horizon - 1) // horizon
+                    algorithm["inner_retrace_batch_trajectories"] = int(trajectories)
                 # Keep pre-interleaving lineage hashes unchanged: an omitted
                 # or explicit round default has no new scientific field.
                 timing = algorithm.get("inner_update_timing", "round")

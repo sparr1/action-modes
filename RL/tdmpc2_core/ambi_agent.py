@@ -917,6 +917,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
         }
         if getattr(self.cfg, "inner_update_timing", "round") != "round":
             options["update_timing"] = self.cfg.inner_update_timing
+        if getattr(self.cfg, "inner_sac_return_estimator", "one_step") == "retrace":
+            options.update(
+                return_estimator="retrace",
+                retrace_lambda=float(self.cfg.inner_retrace_lambda),
+                retrace_batch_trajectories=int(self.cfg.inner_retrace_batch_trajectories),
+                retrace_protocol_version=1,
+            )
         for key, default in (
             ("inner_terminal_entropy", "none"),
             ("inner_critic_loss_coef", 1.0),

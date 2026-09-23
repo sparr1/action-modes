@@ -30,6 +30,8 @@ from .common.inner_utils import (
     trainable_parameter_count,
 )
 from .common.latent_buffer import LatentReplayBuffer
+from .common.latent_trajectory_buffer import LatentTrajectoryReplayBuffer
+from .inner_retrace import RetraceInnerMixin
 from .common.scale import percentile_range
 from .common.lora import (
     dense_lora_rl_critic,
@@ -91,7 +93,7 @@ class InnerWorkspace:
     value_composition: torch.Tensor | None = None
     value_roles: tuple[str, ...] | None = None
     temperature_optim: torch.optim.Optimizer | None = None
-    replay: LatentReplayBuffer | None = None
+    replay: LatentReplayBuffer | LatentTrajectoryReplayBuffer | None = None
     outer_version: int = -1
     critic_steps: int = 0
     critic_lifetime_steps: int = 0
@@ -143,7 +145,7 @@ class InnerWorkspace:
     explorer_transitions: int = 0
 
 
-class InnerImprovementEngine:
+class InnerImprovementEngine(RetraceInnerMixin):
     """Run none/SAC/TD3 inner improvement behind ``AMBI.agent.act``."""
 
     def __init__(self, agent):
@@ -171,6 +173,19 @@ class InnerImprovementEngine:
         extra = ("tdambi_calibration",) if self.cfg.inner_operator == "tdambi" else ()
         return InnerRNG(seed, self.device, extra_streams=extra)
 
+    def _new_replay(self):
+        """Use the same replay contract for allocation and checkpoint preflight."""
+        if self._retrace_enabled:
+            return self._new_trajectory_replay()
+        return LatentReplayBuffer(
+            capacity=self.cfg.inner_replay_capacity,
+            latent_dim=self.cfg.latent_dim,
+            action_dim=self.cfg.action_dim,
+            device=self.device,
+            store_source=self._explorer_active,
+            store_horizon=bool(getattr(self.cfg, "inner_finite_horizon", False)),
+        )
+
     def _initialize_compile_regions(self):
         enabled = bool(getattr(self.cfg, "compile", False))
         strict = bool(getattr(self.cfg, "compile_strict", False))
@@ -178,6 +193,8 @@ class InnerImprovementEngine:
         critic_kernel = (
             self._td3_critic_kernel if operator == "td3" else self._sac_critic_kernel
         )
+        if self._retrace_enabled:
+            critic_kernel = self._retrace_critic_kernel
         if operator == "td3":
             actor_kernel = self._td3_actor_kernel
         elif self._sac_actor_loss_scale_enabled:
@@ -189,7 +206,8 @@ class InnerImprovementEngine:
         self._compile_regions = {
             "rollout": CompileRegion(
                 ("inner rollout step" if self._interleaves_updates else "fixed-shape inner rollout"),
-                (self._rollout_step_kernel if self._interleaves_updates else self._dense_rollout_kernel),
+                (self._retrace_dense_rollout_kernel if self._retrace_enabled
+                 else self._rollout_step_kernel if self._interleaves_updates else self._dense_rollout_kernel),
                 enabled=enabled,
                 strict=strict,
             ),
@@ -884,7 +902,8 @@ class InnerImprovementEngine:
             # Version 3 identifies the LoRA-RL solve even at an empty boundary.
             # Version 4 records random initialization and optional LoRA-RL.
             "version": (
-                6 if self._aux_return_active
+                8 if self._retrace_enabled
+                else 6 if self._aux_return_active
                 else 5 if self._split_values
                 else 4 if self._random_initialization_spec() is not None
                 else 3 if self._lora_rl_spec() is not None
@@ -947,6 +966,8 @@ class InnerImprovementEngine:
         initialization_spec = self._random_initialization_spec()
         if initialization_spec is not None:
             payload["initialization_spec"] = initialization_spec
+        if self._retrace_enabled:
+            payload["retrace_spec"] = self._retrace_spec()
         return payload
 
     def _load_module_candidate(
@@ -1015,20 +1036,36 @@ class InnerImprovementEngine:
         }
         lora_rl_spec = self._lora_rl_spec()
         initialization_spec = self._random_initialization_spec()
-        if self._aux_return_active and version != 6:
+        if self._retrace_enabled != (version == 8):
+            raise ValueError("Retrace exact resume requires matching estimator metadata version 8.")
+        if self._aux_return_active and version not in {6, 8}:
             raise ValueError("Auxiliary-return inner state requires source metadata version 6.")
         if version != 5 and self._split_values:
             raise ValueError("Split-value inner state requires semantic metadata version 5.")
-        if version != 4 and initialization_spec is not None:
+        if version not in {4, 8} and initialization_spec is not None:
             raise ValueError(
                 "Random initialization is incompatible with prior-initialized "
                 "AMBI inner-engine state."
             )
-        if version not in {3, 4, 5, 6} and lora_rl_spec is not None:
+        if version not in {3, 4, 5, 6, 8} and lora_rl_spec is not None:
             raise ValueError(
                 "LoRA-RL exact resume is incompatible with legacy AMBI inner-engine state."
             )
-        if version == 6:
+        if version == 8:
+            specs = {"retrace_spec": self._retrace_spec()}
+            if self._aux_return_active:
+                specs["control_sources"] = source_metadata(self.cfg)
+            if initialization_spec is not None:
+                specs["initialization_spec"] = initialization_spec
+            if lora_rl_spec is not None:
+                specs["lora_rl_spec"] = lora_rl_spec
+            expected_keys = common_keys | set(specs)
+            for name, spec in specs.items():
+                saved_spec = require_exact_keys(state.get(name), set(spec), f"Inner {name}")
+                if any(type(saved_spec[key]) is not type(value) or saved_spec[key] != value
+                       for key, value in spec.items()):
+                    raise ValueError(f"Inner {name} is incompatible.")
+        elif version == 6:
             if not self._aux_return_active or self._split_values or self._explorer_active or initialization_spec is not None:
                 raise ValueError("Auxiliary-return inner state is incompatible with the configured method.")
             expected_keys = common_keys | {"control_sources"}
@@ -1121,7 +1158,7 @@ class InnerImprovementEngine:
         )
         if (
             state["schema"] != "ambi-inner-engine-training-state"
-            or state["version"] not in {1, 2, 3, 4, 5, 6}
+            or state["version"] not in {1, 2, 3, 4, 5, 6, 8}
         ):
             raise ValueError("Unsupported AMBI inner-engine training-state version.")
         action_index = self._validate_index(state["action_index"], "action_index")
@@ -1329,13 +1366,13 @@ class InnerImprovementEngine:
             )
 
         if workspace["replay"] is not None:
-            candidate.replay = LatentReplayBuffer(
+            candidate.replay = (self._new_trajectory_replay() if self._retrace_enabled else LatentReplayBuffer(
                 capacity=self.cfg.inner_replay_capacity,
                 latent_dim=self.cfg.latent_dim,
                 action_dim=self.cfg.action_dim,
                 device=self.device,
                 store_horizon=bool(getattr(self.cfg, "inner_finite_horizon", False)),
-            )
+            ))
             candidate.replay.load_training_state_dict(workspace["replay"])
 
         for field, value in normalized_counters.items():
@@ -2066,14 +2103,7 @@ class InnerImprovementEngine:
                 self._action_pool.replay = None
                 state.replay.clear()
             else:
-                state.replay = LatentReplayBuffer(
-                    capacity=cfg.inner_replay_capacity,
-                    latent_dim=cfg.latent_dim,
-                    action_dim=cfg.action_dim,
-                    device=self.device,
-                    store_source=self._explorer_active,
-                    store_horizon=bool(getattr(cfg, "inner_finite_horizon", False)),
-                )
+                state.replay = self._new_replay()
         elif outer_changed:
             # Latents are coordinates of the current encoder/dynamics and may
             # never survive a representation update.
@@ -2896,6 +2926,8 @@ class InnerImprovementEngine:
                 "transition_count": 0,
             }
 
+        if self._retrace_enabled:
+            return self._collect_retrace_round(root_z)
         if not cfg.episodic:
             return self._collect_dense_round(root_z, count=count, horizon=horizon)
 
@@ -4919,6 +4951,13 @@ class InnerImprovementEngine:
         actor_loss_scale=None,
         replay_indices=None,
     ):
+        if self._retrace_enabled:
+            if replay_indices is not None:
+                raise ValueError("Retrace requires whole-trajectory critic indices, not pre-drawn transition indices.")
+            return self._run_retrace_update_counts(
+                critic_count=critic_count, actor_count=actor_count,
+                temperature_count=temperature_count, actor_loss_scale=actor_loss_scale,
+            )
         slots = max(critic_count, actor_count, temperature_count)
         if self.cfg.inner_operator == "tdambi":
             if critic_count != actor_count or temperature_count:
@@ -6496,7 +6535,7 @@ class InnerImprovementEngine:
             inner_actor_target_updates=float(state.actor_target_steps),
             inner_policy_evaluations=float(state.policy_evaluations),
             inner_q_evaluations=float(state.q_evaluations),
-            inner_replay_draws=float(state.replay_draws),
+            inner_replay_draws=(state.replay_draws if self._retrace_enabled else float(state.replay_draws)),
             inner_buffer_size=float(state.replay.size),
             inner_buffer_capacity=float(state.replay.capacity),
             inner_buffer_fill_ratio=float(state.replay.size / state.replay.capacity),
@@ -6647,6 +6686,12 @@ class InnerImprovementEngine:
                 explorer_samples.float() / float(max(1, total_samples))
             )
         metrics.update(self._average_update_metrics(update_history))
+        if self._retrace_enabled:
+            for name in ("retrace_trajectory_draws", "retrace_critic_rows"):
+                metrics[f"inner_{name}"] = sum(item.get(name, 0.0) for item in update_history)
+            metrics["inner_retrace_replay_trajectories"] = state.replay.trajectory_count
+            metrics["inner_retrace_effective_capacity"] = state.replay.capacity
+            metrics["inner_retrace_requested_capacity"] = state.replay.requested_capacity
         metrics["inner_outer_replay_samples"] = sum(
             (item.get("outer_replay_samples", 0.0) for item in update_history), 0.0
         )

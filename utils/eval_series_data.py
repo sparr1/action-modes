@@ -214,7 +214,7 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
                  "RL/tdmpc2_core/xqc_mppi.py"]
     elif "AMBI" in algorithm:
         paths = ["RL/AMBITDMPC2.py", "RL/tdmpc2_core/ambi_agent.py",
-                 "RL/tdmpc2_core/inner_improvement.py",
+                 "RL/tdmpc2_core/inner_improvement.py", "RL/tdmpc2_core/inner_retrace.py",
                  "RL/tdmpc2_core/auxiliary_return.py", "RL/tdmpc2_core/mppi.py"]
     else:
         paths = ["RL/TDMPC2.py", "RL/tdmpc2_core/agent.py", "RL/tdmpc2_core/mppi.py"]
@@ -357,6 +357,22 @@ def planner_identity(config, result, algorithm, action_rule):
     _require(operator in {"sac", "td3", "xqc", "mppi"}, "Unknown resolved inner operator")
     active = {key: value for key, value in normalize_aux_return_identity(config).items()
               if key.startswith("inner_")}
+    estimator = config.get("inner_sac_return_estimator", "one_step")
+    if isinstance(estimator, str):
+        estimator = estimator.lower()
+    if estimator == "one_step":
+        for field in ("inner_sac_return_estimator", "inner_retrace_lambda",
+                      "inner_retrace_batch_trajectories"):
+            active.pop(field, None)
+    elif estimator == "retrace":
+        active["inner_sac_return_estimator"] = estimator
+        active["inner_retrace_lambda"] = float(config.get("inner_retrace_lambda", 1.0))
+        trajectories = config.get("inner_retrace_batch_trajectories")
+        if trajectories is None:
+            horizon = int(config.get("inner_rollout_horizon", 3))
+            batch = int(config.get("inner_batch_size", 128))
+            trajectories = (batch + horizon - 1) // horizon
+        active["inner_retrace_batch_trajectories"] = int(trajectories)
     # Sampled evaluation uses the learned Gaussian at unit scale, independently
     # of train-time execution controls. Omitted/default means are historical.
     if active.get("inner_eval_execution_action", "mean") == "mean":

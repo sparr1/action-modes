@@ -85,6 +85,11 @@ _AMBI_DEFAULTS = {
     "mppi_terminal_q_reduction": "mean_pair",
     "outer_critic_target": "entropy_augmented",
     "inner_sac_critic_target": "entropy_augmented",
+    "inner_sac_return_estimator": "one_step",
+    "inner_retrace_lambda": 1.0,
+    # Active Retrace defaults to ceil(inner_batch_size / rollout horizon).
+    # Actor/temperature minibatches retain their transition-count semantics.
+    "inner_retrace_batch_trajectories": None,
     # Actor, temperature, and entropy-augmented critic objectives share a statistic.
     "outer_actor_entropy_mode": "squashed",
     "inner_actor_entropy_mode": "squashed",
@@ -453,6 +458,65 @@ def _normalize_choice(value, key, choices):
     if value not in choices:
         raise ValueError(f"{key} must be one of {sorted(choices)}, got {value!r}.")
     return value
+
+
+def _validate_retrace_config(cfg):
+    """Bound trajectory Retrace to the supported fresh finite-horizon solve."""
+    if cfg.inner_sac_return_estimator != "retrace":
+        return
+    if getattr(cfg, "inner_horizon_conditioning", "none") != "none":
+        raise ValueError("Retrace in this evaluation branch requires inner_horizon_conditioning='none'.")
+    requirements = {
+        "inner_component_update_order": "critic_first",
+        "inner_replay_reset_each_round": False,
+        "inner_terminal_entropy": "none",
+        "inner_operator": "sac",
+        "inner_schedule_mode": "canonical",
+        "inner_finite_horizon": True,
+        "inner_bootstrap_source": "inner_target",
+        "inner_update_timing": "round",
+        "inner_explorer_mode": "none",
+        "inner_execution_policy_source": "primary",
+        "inner_behavior_action": "policy_sample",
+        "critic_value_mode": "single",
+        "inner_outer_replay_fraction": 0.0,
+        "inner_actor_writeback_coef": 0.0,
+        "inner_critic_writeback_coef": 0.0,
+    }
+    for component in (
+        "actor", "critic", "temperature", "replay",
+        "actor_optimizer", "critic_optimizer", "temperature_optimizer",
+    ):
+        requirements[f"inner_{component}_scope"] = "action"
+    for key, expected in requirements.items():
+        if getattr(cfg, key) != expected:
+            raise ValueError(
+                "inner_sac_return_estimator='retrace' requires "
+                f"{key}={expected!r}."
+            )
+    if cfg.inner_behavior_std_scale <= 0.0:
+        raise ValueError(
+            "inner_sac_return_estimator='retrace' requires a strictly positive "
+            "inner_behavior_std_scale for a continuous behavior density."
+        )
+    if (cfg.inner_replay_sampling == "without_replacement"
+            and cfg.inner_critic_updates_per_action > 0):
+        # Capacity remains measured in nominal transitions; storage owns whole
+        # H-step slots, including masked padding after an early termination.
+        slots = cfg.inner_replay_capacity // cfg.inner_rollout_horizon
+        batch = cfg.inner_retrace_batch_trajectories
+        if batch > slots:
+            raise ValueError(
+                "Without-replacement Retrace requires "
+                "inner_retrace_batch_trajectories <= "
+                "floor(inner_replay_capacity / inner_rollout_horizon)."
+            )
+        if cfg.inner_rounds > 0 and batch > cfg.inner_rollouts_per_round:
+            raise ValueError(
+                "Without-replacement Retrace cannot fill "
+                "inner_retrace_batch_trajectories before the first update; "
+                "reduce it or increase inner_rollouts_per_round."
+            )
 
 
 def _integral_weighted_count(total, weight, *, total_key, weight_key):
@@ -1407,6 +1471,24 @@ class AMBITDMPC2(TDMPC2Baseline):
         if schedule_mode == "legacy" and requested_operator in {"sac", "td3"}:
             merged.update(_LEGACY_SCHEDULE_DEFAULTS)
         merged.update(params)
+        merged["inner_sac_return_estimator"] = _normalize_choice(
+            merged["inner_sac_return_estimator"],
+            "inner_sac_return_estimator", {"one_step", "retrace"},
+        )
+        if (merged["inner_sac_return_estimator"] == "retrace"
+                and (requested_operator != "sac" or schedule_mode != "canonical")):
+            raise ValueError(
+                "inner_sac_return_estimator='retrace' requires the canonical "
+                "inner_operator='sac' schedule."
+            )
+        merged["inner_retrace_lambda"] = _strict_probability(
+            merged["inner_retrace_lambda"], "inner_retrace_lambda",
+        )
+        if merged["inner_retrace_batch_trajectories"] is not None:
+            merged["inner_retrace_batch_trajectories"] = _strict_positive_int(
+                merged["inner_retrace_batch_trajectories"],
+                "inner_retrace_batch_trajectories",
+            )
         timing = merged["inner_update_timing"]
         if not isinstance(timing, str) or timing.lower() not in {"round", "step"}:
             raise ValueError("inner_update_timing must be 'round' or 'step'.")
@@ -1903,6 +1985,12 @@ class AMBITDMPC2(TDMPC2Baseline):
                 raise ValueError(f"{key} must be positive, got {value}.")
             setattr(cfg, key, value)
 
+        if (cfg.inner_sac_return_estimator == "retrace"
+                and cfg.inner_retrace_batch_trajectories is None):
+            cfg.inner_retrace_batch_trajectories = (
+                cfg.inner_batch_size + cfg.inner_rollout_horizon - 1
+            ) // cfg.inner_rollout_horizon
+
         if cfg.inner_actor_target_update_interval is None:
             cfg.inner_actor_target_update_interval = (
                 cfg.inner_critic_target_update_interval
@@ -1914,10 +2002,19 @@ class AMBITDMPC2(TDMPC2Baseline):
             raise ValueError("inner_actor_target_update_interval must be positive.")
 
         if cfg.inner_replay_capacity is None:
-            cfg.inner_replay_capacity = max(1, cfg.inner_model_step_budget)
+            minimum_capacity = (
+                cfg.inner_rollout_horizon if cfg.inner_sac_return_estimator == "retrace" else 1
+            )
+            cfg.inner_replay_capacity = max(minimum_capacity, cfg.inner_model_step_budget)
         cfg.inner_replay_capacity = int(cfg.inner_replay_capacity)
         if cfg.inner_replay_capacity <= 0:
             raise ValueError("inner_replay_capacity must be positive.")
+        if (cfg.inner_sac_return_estimator == "retrace"
+                and cfg.inner_replay_capacity < cfg.inner_rollout_horizon):
+            raise ValueError(
+                "inner_sac_return_estimator='retrace' requires "
+                "inner_replay_capacity >= inner_rollout_horizon for one trajectory slot."
+            )
         cfg.inner_replay_sampling = str(cfg.inner_replay_sampling).lower()
         if cfg.inner_replay_sampling not in {"with_replacement", "without_replacement"}:
             raise ValueError(
@@ -1931,10 +2028,15 @@ class AMBITDMPC2(TDMPC2Baseline):
                 "inner_temperature_updates_per_action",
             )
         )
+        has_transition_updates = has_inner_updates and (
+            cfg.inner_sac_return_estimator != "retrace"
+            or cfg.inner_actor_updates_per_action > 0
+            or cfg.inner_temperature_updates_per_action > 0
+        )
         if (
             cfg.inner_operator in {"sac", "td3"}
             and cfg.inner_replay_sampling == "without_replacement"
-            and has_inner_updates
+            and has_transition_updates
             and cfg.inner_batch_size > cfg.inner_replay_capacity
         ):
             raise ValueError(
@@ -1954,7 +2056,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         if (
             cfg.inner_operator in {"sac", "td3"}
             and cfg.inner_replay_sampling == "without_replacement"
-            and has_inner_updates
+            and has_transition_updates
             and cfg.inner_rounds > 0
             and cfg.inner_batch_size > first_collection_size
         ):
@@ -2831,6 +2933,7 @@ class AMBITDMPC2(TDMPC2Baseline):
                     + ". Alternatively, set sac_actor_loss_scale_mode='none'."
                 )
 
+        _validate_retrace_config(cfg)
         _validate_split_value_config(cfg)
         validate_auxiliary_config(cfg)
         cfg.inner_terminal_entropy = _normalize_choice(
