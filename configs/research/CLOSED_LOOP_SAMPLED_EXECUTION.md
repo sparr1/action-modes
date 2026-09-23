@@ -14,8 +14,12 @@ The separate training-time `inner_execution_action` remains `mean` in this matri
 
 ## Selected comparison
 
-`ambi_closed_loop_sampled_h3_575k.json` selects exactly three new settings:
-H3, return-only critic, J1/J2/J4, C16/A4, N128 and B256. The 575,000-decision
+`ambi_closed_loop_sampled_h{1,2,3}_575k.json` provides one separate campaign for
+each rollout horizon. Each matrix selects exactly three settings: return-only
+critic, J1/J2/J4, C16/A4, N128 and B256. The H3 matrix remains the default;
+existing H3 runs continue under their original source and publication identities.
+Adding H1 and H2 requires six new settings, with their own overviews and workers.
+The 575,000-decision
 target -10.5/shared backbone checkpoint has SHA256
 `0c6955db7cb8555a67d7863344b70be68f4b3250814d131e647ee6f9ef01a042`.
 Actor entropy adapts from the inherited checkpoint alpha; return-Q fitting
@@ -25,8 +29,17 @@ match the completed historical mean-execution runs. Every episode has 500 real
 decisions. Thirty-two independent model probes accompany initialization and
 every completed round at every decision.
 
-Historical counterparts come from source
-`95dbae6769e976970e94a3987b070b31dbbd5b37`. Preparation checks their pinned
+Historical counterparts are selected at the same H and J. Their source commits,
+performance run IDs and manifest hashes are pinned separately by horizon in
+`slurm/ambi_closed_loop_sampled.py`:
+
+| Horizon | Historical mean source |
+|---|---|
+| H1 | `4f98943012ff3019fe0d556eef9654c481486fc6` |
+| H2 | `589ed0c0ba469245085af4db0ae740c692786695` |
+| H3 | `95dbae6769e976970e94a3987b070b31dbbd5b37` |
+
+Preparation checks their pinned
 manifest hashes, every trace hash, complete publication receipts, checkpoint,
 protocol, planner and seed identities. Sampled workers check all resolved
 settings against the counterpart, allowing only the new execution setting;
@@ -35,7 +48,7 @@ source changes are explicit: this comparison changes final execution only;
 the original source's identities are never rewritten.
 
 The primary paired outcome is **sampled return minus historical mean return at
-the same J, environment seed and controller seed**. It measures the effect of
+the same H, J, environment seed and controller seed**. It measures the effect of
 executing the adapted actor stochastically. It does not measure improvement over
 a sampled frozen prior. No new prior evaluations are included and no mean-prior
 reference is attached to a sampled bundle. The unselected matrix `prior` entry
@@ -49,12 +62,15 @@ sample standard deviation and exploratory percentile bootstrap intervals
 ## Preparation, execution and publication
 
 Use `slurm/ambi_closed_loop_sampled.py prepare` with `--root`, `--checkpoint`,
-`--inventory`, `--registry` and `--mean-reference-root`. The last path is the
-historical H3 campaign directory containing the three
-`return_return_alpha_h3_j{1,2,4}_c16/bundle` directories. Preparation creates
-three new immutable performance identities and a new comparison overview.
+`--inventory`, `--registry` and `--mean-reference-root`. Pass `--matrix` to select
+H1 or H2; omit it for the original H3 default. The reference path is the
+historical campaign for the selected horizon, containing its three
+`return_return_alpha_h{H}_j{1,2,4}_c16/bundle` directories. Preparation creates
+three new immutable performance identities and a new comparison overview per
+horizon. Default group names and labels follow the selected horizon. A mixed-H
+campaign or a mean counterpart from another horizon is rejected.
 
-One short J4 smoke checks three decisions, strict CUDA compilation, complete
+One short J4 smoke per new horizon checks three decisions, strict CUDA compilation, complete
 traces, finite metrics, unchanged outer state, and actual sampled execution.
 The measured sampled flag must be one throughout; average and maximum distance
 from the corresponding same-forward mean action must be positive. A zero minimum

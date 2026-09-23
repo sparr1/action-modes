@@ -17,7 +17,7 @@ from slurm.ambi_aux_hj_sweep import (ENTITY, PROJECT, SEEDS, actor_updates, crit
                                     digest, publish_performance, read, training_summary, write)
 from slurm.ambi_closed_loop_publish import gpu_jobs_active, indexed_episodes, moments
 from slurm.ambi_closed_loop_sampled import (ACTION_RULE, CHECKPOINT_SHA, validate_completed,
-                                           verify_mean_reference, verify_receipt)
+                                           campaign_horizon, verify_mean_reference, verify_receipt)
 
 def paired_comparison(sampled_episodes, mean_episodes):
     """Estimate the execution change at paired environment/controller seeds."""
@@ -48,6 +48,7 @@ def execution_proof(manifest):
 
 
 def aggregate_results(campaign, completed):
+    horizon = campaign_horizon(campaign)
     points, mean_points, rows, means = [], [], [], []
     names, rounds = set(), set()
     for cell in sorted(campaign['cells'], key=lambda c: c['J']):
@@ -70,7 +71,7 @@ def aggregate_results(campaign, completed):
             rows.extend(dict(J=j, setting=name, **r) for r in comparison['rows'])
     if set(completed) - names:
         raise ValueError('Unexpected completed sampled setting')
-    return dict(points=points, mean_points=mean_points, episodes=rows, means=means,
+    return dict(H=horizon, points=points, mean_points=mean_points, episodes=rows, means=means,
                 comparison='Sampled minus historical mean execution; no prior-relative interpretation.',
                 uncertainty='Five matched environment/controller seeds; exploratory bootstrap intervals.')
 
@@ -95,7 +96,7 @@ def chart_payloads(aggregate):
         xs=[[p['J'] for p in mean], [p['J'] for p in sampled]],
         ys=[[p['return_stats']['mean'] for p in mean], [p['return_stats']['mean'] for p in sampled]],
         keys=['Historical mean execution', 'Sampled execution'],
-        title='H3 return-only: full-episode return by execution mode', xname='Inner rounds J')}
+        title=f'H{aggregate["H"]} return-only: full-episode return by execution mode', xname='Inner rounds J')}
     if sampled:
         result['comparison/sample_minus_mean_vs_J'] = dict(
             xs=[p['J'] for p in sampled], ys=[[p['difference']['mean'] for p in sampled]],
@@ -255,6 +256,7 @@ def watch(args):
     """One CPU overview owner; every complete point is logged once by identity."""
     import wandb
     campaign = read(args.root / 'campaign.json')
+    horizon = campaign_horizon(campaign)
     for cell in campaign['cells']:
         verify_mean_reference(cell['mean_reference'], traces=True)
     aggregate_results(campaign, {})
@@ -272,7 +274,7 @@ def watch(args):
               'source_commit', 'initial_alpha', 'target_entropy', 'mean_source_commit')}
     config.update(campaign_group=campaign['group'], protocol='closed-loop-refinement-sampled-execution-v1',
                   protocol_variant='Final adapted squashed Gaussian sample; frozen evaluation API retained',
-                  J=[1, 2, 4], H=3, C=16, A=4, N=128, B=256, critic_kind='return_only',
+                  J=[1, 2, 4], H=horizon, C=16, A=4, N=128, B=256, critic_kind='return_only',
                   execution_mode='policy_sample', action_rule=ACTION_RULE, execution_std_scale=1.0,
                   inner_replay_capacity=3072, inner_replay_scope='action', inner_replay_reset_each_round=False,
                   environment_seeds=SEEDS, controller_seed=55, max_decisions=500,
@@ -283,7 +285,7 @@ def watch(args):
                   result_links=urls)
     run = wandb.init(entity=ENTITY, project=PROJECT, id=campaign['overview_run_id'], resume='never',
                      name=campaign['label'], group=campaign['group'], job_type='sampled-execution-comparison',
-                     tags=['closed-loop', 'sampled-vs-mean', 'return-only', 'H3'], config=config, mode='online')
+                     tags=['closed-loop', 'sampled-vs-mean', 'return-only', f'H{horizon}'], config=config, mode='online')
     run.define_metric('axis/inner_rounds')
     run.define_metric('sampled_execution/*', step_metric='axis/inner_rounds')
     run.define_metric('execution/*', step_metric='axis/inner_rounds')
