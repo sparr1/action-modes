@@ -64,6 +64,20 @@ def test_actual_resolved_settings_and_sample_std(bundle):
     assert record["metrics"]["work/model_steps"] == 23040000
 
 
+def test_retrace_value_sample_counts_reach_publication_identity_and_diagnostics(bundle):
+    path, payload = bundle
+    run = payload["runs"][0]
+    counts = {"inner_retrace_value_samples": 4, "inner_retrace_boundary_value_samples": 16}
+    run["resolved_config"].update(inner_sac_return_estimator="retrace", **counts)
+    for episode in run["episodes"]:
+        episode["model_metrics"].update(counts)
+    record, = data.load_records(dump(path, payload))
+    for key, value in counts.items():
+        assert record["identity"]["planner"]["settings"][key] == value
+        assert record["metrics"][f"diagnostics/{key}_mean"] == value
+    assert "Retrace V4/B16" in record["label"]
+
+
 def test_learned_values_and_cosmetics_do_not_split_planners(bundle):
     path, value = bundle
     first, = data.load_records(path)
@@ -258,6 +272,17 @@ def test_descriptive_label_identifies_backbone_and_planner(bundle):
     assert "prior" in record["label"]
     assert "SAC C6/A3/T3 inner Q" in record["label"]
     assert "100000" not in record["label"]
+
+
+@pytest.mark.parametrize("interior,boundary", [(1, 1), (4, 1), (1, 16), (4, 16)])
+def test_descriptive_label_identifies_retrace_value_sample_counts(bundle, interior, boundary):
+    path, _ = bundle
+    record, = data.load_records(path)
+    record["identity"]["planner"]["settings"].update(
+        inner_sac_return_estimator="retrace", inner_retrace_value_samples=interior,
+        inner_retrace_boundary_value_samples=boundary,
+    )
+    assert f"Retrace V{interior}/B{boundary}" in data.descriptive_label(record["identity"])
 
 
 def test_labels_distinguish_outer_terminal_from_every_transition_bootstrap(bundle):

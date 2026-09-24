@@ -362,7 +362,8 @@ def planner_identity(config, result, algorithm, action_rule):
         estimator = estimator.lower()
     if estimator == "one_step":
         for field in ("inner_sac_return_estimator", "inner_retrace_lambda",
-                      "inner_retrace_batch_trajectories"):
+                      "inner_retrace_batch_trajectories", "inner_retrace_value_samples",
+                      "inner_retrace_boundary_value_samples"):
             active.pop(field, None)
     elif estimator == "retrace":
         active["inner_sac_return_estimator"] = estimator
@@ -373,6 +374,12 @@ def planner_identity(config, result, algorithm, action_rule):
             batch = int(config.get("inner_batch_size", 128))
             trajectories = (batch + horizon - 1) // horizon
         active["inner_retrace_batch_trajectories"] = int(trajectories)
+        for field in ("inner_retrace_value_samples", "inner_retrace_boundary_value_samples"):
+            samples = int(config.get(field, 1))
+            if samples == 1:
+                active.pop(field, None)
+            else:
+                active[field] = samples
     # Sampled evaluation uses the learned Gaussian at unit scale, independently
     # of train-time execution controls. Omitted/default means are historical.
     if active.get("inner_eval_execution_action", "mean") == "mean":
@@ -613,6 +620,9 @@ def descriptive_label(identity, selector=None):
     else:
         bootstrap = "inner Q"
     title = f"{planner['type'].upper()} {'/'.join(budgets)} {bootstrap}"
+    if planner["type"] == "sac" and settings.get("inner_sac_return_estimator") == "retrace":
+        title += (f" Retrace V{settings.get('inner_retrace_value_samples', 1)}"
+                  f"/B{settings.get('inner_retrace_boundary_value_samples', 1)}")
     title += f" J{rounds}/N{settings.get('inner_rollouts_per_round')}/H{settings.get('inner_rollout_horizon')}"
     if settings.get("inner_steps_per_update") is not None:
         title += f" interval{settings['inner_steps_per_update']}"

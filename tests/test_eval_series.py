@@ -541,6 +541,21 @@ def test_curve_label_prioritizes_budgets_and_bootstrap():
     assert registry["attempt_label"] == "actor-sweep-20260905"
 
 
+@pytest.mark.parametrize("counts,label", [
+    ({}, "Retrace V1/B1"),
+    ({"inner_retrace_value_samples": 4}, "Retrace V4/B1"),
+    ({"inner_retrace_boundary_value_samples": 16}, "Retrace V1/B16"),
+    ({"inner_retrace_value_samples": 4, "inner_retrace_boundary_value_samples": 16},
+     "Retrace V4/B16"),
+])
+def test_retrace_curve_and_run_labels_show_both_value_sample_counts(counts, label):
+    registry = label_registry(inner_sac_return_estimator="retrace", **counts)
+    before = deepcopy(registry)
+    assert label in series.concise_curve_label(registry)
+    assert label in series.evaluation_run_name(registry)
+    assert registry == before
+
+
 def test_curve_label_aliases_and_cosmetic_names_do_not_change_semantics():
     registry = label_registry()
     original = series.concise_curve_label(registry)

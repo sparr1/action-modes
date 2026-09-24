@@ -18,6 +18,7 @@ SCOPES = (
     "actor", "critic", "temperature", "replay",
     "actor_optimizer", "critic_optimizer", "temperature_optimizer",
 )
+VALUE_SAMPLE_KEYS = ("inner_retrace_value_samples", "inner_retrace_boundary_value_samples")
 
 
 def _cfg(**options):
@@ -35,6 +36,40 @@ def test_retrace_defaults_leave_existing_one_step_configuration_unchanged():
     assert default.inner_sac_return_estimator == "one_step"
     assert default.inner_retrace_lambda == 1.0
     assert default.inner_retrace_batch_trajectories is None
+    assert default.inner_retrace_value_samples == 1
+    assert default.inner_retrace_boundary_value_samples == 1
+
+
+@pytest.mark.parametrize("interior,boundary", [(1, 1), (4, 1), (1, 16), (4, 16)])
+def test_retrace_value_sample_counts_resolve_independently(interior, boundary):
+    cfg = _cfg(inner_retrace_value_samples=interior,
+               inner_retrace_boundary_value_samples=boundary)
+    assert cfg.inner_retrace_value_samples == interior
+    assert cfg.inner_retrace_boundary_value_samples == boundary
+
+
+@pytest.mark.parametrize("key", VALUE_SAMPLE_KEYS)
+@pytest.mark.parametrize("value", [None, True, False, 0, -1, 2.0, "2"])
+def test_value_sample_count_requires_a_positive_integer(key, value):
+    with pytest.raises(ValueError, match=key):
+        _cfg(**{key: value})
+
+
+@pytest.mark.parametrize("key", VALUE_SAMPLE_KEYS)
+@pytest.mark.parametrize("operator", ["sac", "none", "mppi"])
+def test_multiple_value_samples_reject_inactive_retrace(key, operator):
+    with pytest.raises(ValueError, match=key):
+        _build_cfg(inner_operator=operator, **{key: 4})
+
+
+def test_retrace_value_sample_trace_catalog_describes_counts():
+    from RL.tdmpc2_core.inner_trace import metric_catalog
+
+    catalog = metric_catalog()
+    for name in ("retrace_value_samples", "retrace_boundary_value_samples"):
+        assert catalog[name]["unit"] == "count"
+        assert catalog[name]["preferred_axis"] == "critic_updates"
+        assert "action samples" in catalog[name]["definition"].lower()
 
 
 @pytest.mark.parametrize("horizon,batch,expected", [(1, 128, 128), (3, 128, 43), (3, 6, 2)])
@@ -227,6 +262,24 @@ def test_active_retrace_identity_resolves_defaults_and_tracks_scientific_changes
     assert identity({**params, "inner_sac_return_estimator": "one_step"}) != expected
 
 
+@pytest.mark.parametrize("identity", [_lineage, _planner])
+@pytest.mark.parametrize("estimator", ["one_step", "retrace"])
+def test_single_value_samples_preserve_historical_identity(identity, estimator):
+    params = {"inner_operator": "sac", "inner_sac_return_estimator": estimator,
+              "inner_finite_horizon": True, "inner_rollout_horizon": 3}
+    assert identity({**params, **dict.fromkeys(VALUE_SAMPLE_KEYS, 1)}) == identity(params)
+
+
+@pytest.mark.parametrize("identity", [_lineage, _planner])
+def test_each_active_value_sample_count_has_a_distinct_identity(identity):
+    params = {"inner_operator": "sac", "inner_sac_return_estimator": "retrace",
+              "inner_finite_horizon": True, "inner_rollout_horizon": 3}
+    variants = [identity({**params, **dict(zip(VALUE_SAMPLE_KEYS, counts))})
+                for counts in ((1, 1), (4, 1), (1, 4), (4, 16))]
+    for index, variant in enumerate(variants):
+        assert all(variant != previous for previous in variants[:index])
+
+
 @pytest.fixture
 def models():
     opened = []
@@ -252,10 +305,27 @@ def test_checkpoint_target_spec_records_only_active_retrace(models):
     assert active["retrace_protocol_version"] == 1
 
 
+def test_checkpoint_target_spec_records_only_nondefault_value_sample_counts(models):
+    default = models(inner_sac_return_estimator="retrace")._critic_target_spec()
+    explicit = models(inner_sac_return_estimator="retrace",
+                      **dict.fromkeys(VALUE_SAMPLE_KEYS, 1))._critic_target_spec()
+    assert explicit == default
+    assert "retrace_value_samples" not in default["inner_solve"]
+    assert "retrace_boundary_value_samples" not in default["inner_solve"]
+    interior = models(inner_sac_return_estimator="retrace",
+                      inner_retrace_value_samples=4)._critic_target_spec()["inner_solve"]
+    assert interior == {**default["inner_solve"], "retrace_value_samples": 4}
+    boundary = models(inner_sac_return_estimator="retrace",
+                      inner_retrace_boundary_value_samples=16)._critic_target_spec()["inner_solve"]
+    assert boundary == {**default["inner_solve"], "retrace_boundary_value_samples": 16}
+
+
 @pytest.mark.parametrize("change", [
     {"inner_sac_return_estimator": "one_step"},
     {"inner_retrace_lambda": 0.5},
     {"inner_retrace_batch_trajectories": 3},
+    {"inner_retrace_value_samples": 4},
+    {"inner_retrace_boundary_value_samples": 16},
 ])
 def test_exact_preflight_rejects_changed_estimator_semantics_before_mutation(models, change):
     source = models(inner_sac_return_estimator="retrace")
@@ -276,3 +346,21 @@ def test_portable_outer_weights_allow_a_new_inner_return_estimator(models, sourc
     target.load(deepcopy(source.checkpoint_state()))
     _assert_tree_equal(target.model.state_dict(), source.model.state_dict())
     assert target.cfg.inner_sac_return_estimator == ("one_step" if source_active else "retrace")
+
+
+@pytest.mark.parametrize("interior,boundary", [(4, 1), (1, 16), (4, 16)])
+def test_portable_outer_weights_allow_new_retrace_value_sample_counts(models, interior, boundary):
+    source = models(inner_sac_return_estimator="retrace")
+    target = models(inner_sac_return_estimator="retrace",
+                    inner_retrace_value_samples=interior,
+                    inner_retrace_boundary_value_samples=boundary)
+    with torch.no_grad():
+        for parameter in source.model.parameters():
+            parameter.add_(0.01)
+    source_state = deepcopy(source.checkpoint_state())
+    target.load(source_state)
+    _assert_tree_equal(target.model.state_dict(), source.model.state_dict())
+    _assert_tree_equal(source.checkpoint_state(), source_state)
+    assert target.cfg.inner_sac_return_estimator == "retrace"
+    assert target.cfg.inner_retrace_value_samples == interior
+    assert target.cfg.inner_retrace_boundary_value_samples == boundary

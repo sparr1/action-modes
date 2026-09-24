@@ -924,6 +924,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 retrace_batch_trajectories=int(self.cfg.inner_retrace_batch_trajectories),
                 retrace_protocol_version=1,
             )
+            for key in ("retrace_value_samples", "retrace_boundary_value_samples"):
+                value = int(getattr(self.cfg, "inner_" + key, 1))
+                if value != 1:
+                    options[key] = value
         for key, default in (
             ("inner_terminal_entropy", "none"),
             ("inner_critic_loss_coef", 1.0),

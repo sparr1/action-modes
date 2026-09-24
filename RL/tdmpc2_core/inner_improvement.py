@@ -171,6 +171,13 @@ class InnerImprovementEngine(RetraceInnerMixin):
     def _new_rng(self, seed):
         # Keep legacy stream identities and exact-resume schemas unchanged.
         extra = ("tdambi_calibration",) if self.cfg.inner_operator == "tdambi" else ()
+        if self._retrace_enabled and (
+            self.cfg.inner_retrace_value_samples > 1
+            or self.cfg.inner_retrace_boundary_value_samples > 1
+        ):
+            # Append both names so each estimator keeps its seed when the
+            # other sample count changes. Existing streams retain their indices.
+            extra += ("retrace_value_samples", "retrace_boundary_value_samples")
         return InnerRNG(seed, self.device, extra_streams=extra)
 
     def _new_replay(self):
@@ -1218,7 +1225,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
             )
         # Build the complete destination off to the side. Failures below do
         # not mutate the current engine or its RNG streams.
-        probe_rng = InnerRNG(self.cfg.seed, self.device)
+        probe_rng = self._new_rng(self.cfg.seed)
         with probe_rng.action_fork():
             with probe_rng.fork("initialization"):
                 candidate = InnerWorkspace()
@@ -1401,7 +1408,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 raise ValueError("Inner MPPI previous mean must be floating point.")
             previous_mean = previous_mean.detach().to(self.device).clone()
 
-        candidate_rng = InnerRNG(self.cfg.seed, self.device)
+        candidate_rng = self._new_rng(self.cfg.seed)
         candidate_rng.load_training_state_dict(state["rng"])
         return {
             "state": candidate,
@@ -6689,6 +6696,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
         if self._retrace_enabled:
             for name in ("retrace_trajectory_draws", "retrace_critic_rows"):
                 metrics[f"inner_{name}"] = sum(item.get(name, 0.0) for item in update_history)
+            metrics["inner_retrace_value_samples"] = self.cfg.inner_retrace_value_samples
+            metrics["inner_retrace_boundary_value_samples"] = self.cfg.inner_retrace_boundary_value_samples
             metrics["inner_retrace_replay_trajectories"] = state.replay.trajectory_count
             metrics["inner_retrace_effective_capacity"] = state.replay.capacity
             metrics["inner_retrace_requested_capacity"] = state.replay.requested_capacity

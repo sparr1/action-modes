@@ -152,6 +152,8 @@ _DEFINITIONS = {
     "q_abs_mean": "Mean absolute decoded online inner Q on the critic minibatch.",
     "q_target_mean": "Mean bootstrap target used for this critic update.",
     "q_target_clip_fraction": "Fraction of targets at or outside the distributional support edges.",
+    "retrace_value_samples": "Policy action samples averaged per interior successor state for the Retrace value expectation.",
+    "retrace_boundary_value_samples": "Frozen prior action samples averaged per horizon-boundary state for the Retrace value expectation.",
     "actor_loss": "Actor training objective evaluated before its optimizer step.",
     "actor_grad_norm": "Actor gradient norm before gradient clipping.",
     "actor_q_mean": "Q reduction used by the actor on its pre-update sampled actions.",
@@ -297,7 +299,8 @@ def metric_catalog(metric_names=()):
             unit = "seconds"
         elif name.endswith(("_fraction", "_rate")):
             unit = "fraction"
-        elif name.endswith(("_steps", "_transitions", "_count", "_evaluations", "_bytes")):
+        elif (name.endswith(("_steps", "_transitions", "_count", "_evaluations", "_bytes"))
+              or name in {"retrace_value_samples", "retrace_boundary_value_samples"}):
             unit = "count"
         elif name in {"actor_scaled_entropy", "explorer_actor_scaled_entropy"}:
             unit = "scaled_entropy_statistic"

@@ -231,7 +231,8 @@ def scientific_trial_parameters(
                     estimator = estimator.lower()
                 if estimator == "one_step":
                     for field in ("inner_sac_return_estimator", "inner_retrace_lambda",
-                                  "inner_retrace_batch_trajectories"):
+                                  "inner_retrace_batch_trajectories", "inner_retrace_value_samples",
+                                  "inner_retrace_boundary_value_samples"):
                         algorithm.pop(field, None)
                 elif estimator == "retrace":
                     algorithm["inner_sac_return_estimator"] = estimator
@@ -242,6 +243,12 @@ def scientific_trial_parameters(
                         batch = int(algorithm.get("inner_batch_size", 128))
                         trajectories = (batch + horizon - 1) // horizon
                     algorithm["inner_retrace_batch_trajectories"] = int(trajectories)
+                    for field in ("inner_retrace_value_samples", "inner_retrace_boundary_value_samples"):
+                        samples = int(algorithm.get(field, 1))
+                        if samples == 1:
+                            algorithm.pop(field, None)
+                        else:
+                            algorithm[field] = samples
                 # Keep pre-interleaving lineage hashes unchanged: an omitted
                 # or explicit round default has no new scientific field.
                 timing = algorithm.get("inner_update_timing", "round")

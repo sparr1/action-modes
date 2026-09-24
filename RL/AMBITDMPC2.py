@@ -90,6 +90,9 @@ _AMBI_DEFAULTS = {
     # Active Retrace defaults to ceil(inner_batch_size / rollout horizon).
     # Actor/temperature minibatches retain their transition-count semantics.
     "inner_retrace_batch_trajectories": None,
+    # Independent Monte Carlo action counts for interior and frozen-boundary V.
+    "inner_retrace_value_samples": 1,
+    "inner_retrace_boundary_value_samples": 1,
     # Actor, temperature, and entropy-augmented critic objectives share a statistic.
     "outer_actor_entropy_mode": "squashed",
     "inner_actor_entropy_mode": "squashed",
@@ -1489,6 +1492,10 @@ class AMBITDMPC2(TDMPC2Baseline):
                 merged["inner_retrace_batch_trajectories"],
                 "inner_retrace_batch_trajectories",
             )
+        for key in ("inner_retrace_value_samples", "inner_retrace_boundary_value_samples"):
+            merged[key] = _strict_positive_int(merged[key], key)
+            if merged[key] != 1 and merged["inner_sac_return_estimator"] != "retrace":
+                raise ValueError(f"{key} > 1 requires inner_sac_return_estimator='retrace'.")
         timing = merged["inner_update_timing"]
         if not isinstance(timing, str) or timing.lower() not in {"round", "step"}:
             raise ValueError("inner_update_timing must be 'round' or 'step'.")

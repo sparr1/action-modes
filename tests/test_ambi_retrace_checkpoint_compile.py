@@ -60,6 +60,7 @@ def test_zero_work_retrace_solve_allocates_valid_empty_replay_and_returns_finite
 
 @pytest.mark.parametrize("options", [
     {},
+    {"inner_retrace_value_samples": 4, "inner_retrace_boundary_value_samples": 3},
     {"inner_actor_initialization": "random", "inner_critic_initialization": "random",
      "inner_critic_adaptation": "lora_rl"},
     {"aux_return_mode": "return_actor", "inner_actor_source": "return_actor",
@@ -103,6 +104,8 @@ def test_active_schema8_roundtrip_reproduces_next_solve(models, options):
     {"inner_sac_return_estimator": "one_step"},
     {"inner_retrace_lambda": 0.5},
     {"inner_retrace_batch_trajectories": 3},
+    {"inner_retrace_value_samples": 4},
+    {"inner_retrace_boundary_value_samples": 3},
     {"inner_rollout_horizon": 1},
     {"inner_actor_initialization": "random"},
 ])
@@ -157,6 +160,10 @@ def test_portable_loading_between_estimators_leaves_outer_frozen_during_next_sol
 @pytest.mark.parametrize("options", [
     {"q_representation": "scalar"},
     {"q_representation": "distributional", "num_q": 3},
+    {"q_representation": "scalar", "inner_retrace_value_samples": 4,
+     "inner_retrace_boundary_value_samples": 3},
+    {"q_representation": "distributional", "num_q": 3,
+     "inner_retrace_value_samples": 4, "inner_retrace_boundary_value_samples": 3},
     {"q_representation": "scalar", "inner_actor_initialization": "random",
      "inner_critic_initialization": "random", "inner_critic_adaptation": "lora_rl"},
 ])
@@ -221,14 +228,18 @@ def _rollout_arguments(engine):
     return root, noise, td_math.categorical_support(root, cfg)
 
 
-@pytest.mark.parametrize("representation", ["scalar", "distributional"])
-def test_cpu_inductor_retrace_critic_targets_loss_and_gradients_match_eager(models, representation):
+@pytest.mark.parametrize("representation,samples,boundary_samples", [
+    ("scalar", 1, 1), ("distributional", 1, 1), ("distributional", 4, 3),
+])
+def test_cpu_inductor_retrace_critic_targets_loss_and_gradients_match_eager(models, representation, samples, boundary_samples):
     from torch._inductor import config as inductor_config
 
     torch._dynamo.reset()
     options = dict(q_representation=representation,
                    num_q=3 if representation == "distributional" else 2,
-                   mppi_terminal_q_reduction="mean_all")
+                   mppi_terminal_q_reduction="mean_all",
+                   inner_retrace_value_samples=samples,
+                   inner_retrace_boundary_value_samples=boundary_samples)
     agents = [models(**options) for _ in range(2)]
     for agent in agents:
         with torch.no_grad():
@@ -241,8 +252,14 @@ def test_cpu_inductor_retrace_critic_targets_loss_and_gradients_match_eager(mode
     eager, compiled = [_prepare(agent) for agent in agents]
     with torch.no_grad():
         batch = eager._retrace_dense_rollout_kernel(*_rollout_arguments(eager))
-    noise = torch.linspace(-0.9, 0.4, batch["action"].numel()).reshape_as(batch["action"])
-    prior_noise = noise[:, -1].clone()
+    noise_shape = (*batch["action"].shape[:2], samples, batch["action"].shape[-1])
+    noise = torch.linspace(-0.9, 0.4, batch["action"].numel() * samples).reshape(noise_shape)
+    prior_noise = torch.linspace(-0.5, 0.3, batch["action"].shape[0] * boundary_samples * batch["action"].shape[-1])
+    prior_noise = prior_noise.reshape(batch["action"].shape[0], boundary_samples, batch["action"].shape[-1])
+    if samples == 1:
+        noise = noise.squeeze(2)
+    if boundary_samples == 1:
+        prior_noise = prior_noise.squeeze(1)
     pair = torch.tensor([0, 2]) if representation == "distributional" else None
     alpha = torch.tensor(0.2, requires_grad=True)
     arguments = (batch, alpha, noise, prior_noise, pair)

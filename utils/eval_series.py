@@ -185,6 +185,10 @@ def _planner_display_label(planner, *, compact=False):
     number = lambda value: format(value, "g").replace("e-0", "e-").replace("e+0", "e+")
     parts = ["Prior only (no planning)" if kind == "prior" else str(kind).upper()]
     if kind in ("sac", "xqc"):
+        if kind == "sac" and settings.get("inner_sac_return_estimator") == "retrace":
+            interior = settings.get("inner_retrace_value_samples", 1)
+            boundary = settings.get("inner_retrace_boundary_value_samples", 1)
+            parts.append(f"Retrace V{number(interior)}/B{number(boundary)}")
         rounds = settings.get("inner_rounds")
         doses = []
         for component in ("critic", "actor", "temperature"):

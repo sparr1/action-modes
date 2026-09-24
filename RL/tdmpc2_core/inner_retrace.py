@@ -38,7 +38,7 @@ class RetraceInnerMixin:
     def _retrace_spec(self):
         if not self._retrace_enabled:
             return None
-        return {
+        spec = {
             "protocol_version": 1,
             "estimator": "retrace",
             "lambda": float(self.cfg.inner_retrace_lambda),
@@ -47,6 +47,12 @@ class RetraceInnerMixin:
             "loss_positions": "all_valid_suffixes",
             "boundary": "frozen_outer_no_extra_entropy",
         }
+        # Keep default-one checkpoints byte-for-byte compatible with version 1.
+        for name in ("value_samples", "boundary_value_samples"):
+            count = int(getattr(self.cfg, f"inner_retrace_{name}"))
+            if count != 1:
+                spec[name] = count
+        return spec
 
     def _new_trajectory_replay(self):
         return LatentTrajectoryReplayBuffer(
@@ -177,6 +183,8 @@ class RetraceInnerMixin:
                                *, actor_loss_scale=None):
         """One detached target snapshot; gradients update only the online critic."""
         cfg, state = self.cfg, self.state
+        value_samples = int(cfg.inner_retrace_value_samples)
+        boundary_samples = int(cfg.inner_retrace_boundary_value_samples)
         valid = batch["valid"].bool()
         batch_size, horizon = valid.shape[:2]
         flat_valid = valid.reshape(-1, 1)
@@ -190,14 +198,19 @@ class RetraceInnerMixin:
             continuing = valid & ~batch["terminated"].bool()
             next_z = torch.where(continuing, batch["next_z"], 0.0).reshape(-1, cfg.latent_dim)
             next_kwargs = self._horizon_kwargs(None if remaining is None else (remaining - 1).clamp_min(1))
+            # A single batched call shares the target-head pair across actions.
+            # Keep the K=1 path's shapes and operations unchanged.
+            value_z = next_z
+            if value_samples > 1:
+                value_z = next_z[:, None, :].expand(-1, value_samples, -1).reshape(-1, cfg.latent_dim)
             next_action, info = self.model.pi(
-                next_z, policy=state.actor, noise=policy_noise.reshape(-1, cfg.action_dim),
+                value_z, policy=state.actor, noise=policy_noise.reshape(-1, cfg.action_dim),
                 log_std_mapping=cfg.inner_log_std_mapping,
                 log_std_min=cfg.inner_log_std_min, log_std_max=cfg.inner_log_std_max,
                 **self.agent._inner_critic_entropy_kwargs(), **next_kwargs,
             )
             q_kwargs = {} if pair_indices is None else {"pair_indices": pair_indices, "trusted_pair_indices": True}
-            value = self._bootstrap_q(next_z, next_action, **q_kwargs, **next_kwargs)
+            value = self._bootstrap_q(value_z, next_action, **q_kwargs, **next_kwargs)
             if cfg.inner_sac_critic_target == "entropy_augmented":
                 coefficient = alpha
                 if self._sac_actor_loss_scale_enabled:
@@ -205,9 +218,20 @@ class RetraceInnerMixin:
                         raise RuntimeError("Scaled Retrace requires the action-local actor loss scale.")
                     coefficient = coefficient * actor_loss_scale.detach().reshape(())
                 value = value + coefficient * policy_entropy(info, cfg.inner_actor_entropy_mode)
-            value = value.reshape(batch_size, horizon, 1)
+            if value_samples > 1:
+                # Q is already decoded and head-reduced per action. In
+                # particular mean(min(Q1,Q2)) is not min(mean(Q1),mean(Q2)).
+                value = value.reshape(batch_size, horizon, value_samples, 1).mean(dim=2)
+            else:
+                value = value.reshape(batch_size, horizon, 1)
             # Only the actual H boundary uses the frozen outer continuation.
-            outer = self._prior_bootstrap(next_z.reshape(batch_size, horizon, -1)[:, -1], prior_noise)
+            boundary_z = next_z.reshape(batch_size, horizon, -1)[:, -1]
+            if boundary_samples > 1:
+                boundary_z = boundary_z[:, None, :].expand(-1, boundary_samples, -1).reshape(-1, cfg.latent_dim)
+                outer = self._prior_bootstrap(boundary_z, prior_noise.reshape(-1, cfg.action_dim))
+                outer = outer.reshape(batch_size, boundary_samples, 1).mean(dim=1)
+            else:
+                outer = self._prior_bootstrap(boundary_z, prior_noise)
             outer = outer[:, None, :].expand(-1, horizon, -1)
             value = torch.where(batch["horizon_end"].bool(), outer, value)
             value = torch.where(continuing, value, 0.0)
@@ -248,12 +272,30 @@ class RetraceInnerMixin:
                             dtype=batch["z"].dtype, generator=generator)
         prior_noise = self._prior_noise(batch["next_z"][:, -1])
         pair = self._sample_pair_indices(generator) if cfg.inner_q_target_reduction.endswith("_pair") else None
+        value_samples = int(cfg.inner_retrace_value_samples)
+        boundary_samples = int(cfg.inner_retrace_boundary_value_samples)
+        # Preserve the legacy sample and bootstrap stream, including pair
+        # selection. Extra draws cannot perturb the other estimator's samples.
+        if value_samples > 1:
+            extra = torch.randn(
+                (count, horizon, value_samples - 1, cfg.action_dim),
+                device=self.device, dtype=batch["z"].dtype,
+                generator=self.rng.generator("retrace_value_samples"),
+            )
+            noise = torch.cat((noise.unsqueeze(2), extra), dim=2)
+        if boundary_samples > 1:
+            extra = torch.randn(
+                (count, boundary_samples - 1, cfg.action_dim),
+                device=self.device, dtype=batch["z"].dtype,
+                generator=self.rng.generator("retrace_boundary_value_samples"),
+            )
+            prior_noise = torch.cat((prior_noise.unsqueeze(1), extra), dim=1)
         outputs = self._compile_regions["critic"](
             batch, alpha, noise, prior_noise, pair, actor_loss_scale=actor_loss_scale,
         )
         loss, values, targets, clip_fraction, c, lengths, corrections = outputs
-        state.policy_evaluations += 2 * count * horizon
-        state.q_evaluations += 3 * count * horizon
+        state.policy_evaluations += (value_samples + 1) * count * horizon + (boundary_samples - 1) * count
+        state.q_evaluations += (value_samples + 2) * count * horizon + (boundary_samples - 1) * count
         state.critic_optim.zero_grad(set_to_none=True)
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(state.critic_params, float(cfg.inner_critic_grad_clip_norm))
@@ -273,6 +315,8 @@ class RetraceInnerMixin:
             "td_error_abs_mean": _masked_mean((values - targets.unsqueeze(0)).abs(), flat_valid.unsqueeze(0)),
             "retrace_trajectory_draws": targets.new_tensor(count),
             "retrace_critic_rows": valid.sum().to(targets.dtype).detach(),
+            "retrace_value_samples": targets.new_tensor(value_samples),
+            "retrace_boundary_value_samples": targets.new_tensor(boundary_samples),
             "retrace_trace_coefficient_mean": _masked_mean(c[:, 1:], edges),
             "retrace_effective_trace_length": _masked_mean(lengths, valid),
             "retrace_correction_abs_mean": _masked_mean(corrections.abs(), valid),

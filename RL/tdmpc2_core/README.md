@@ -621,6 +621,48 @@ isolate the actor from this change. At `p=1`, the critic learns entirely from
 real data while the actor continues to improve on imagined states; finite
 horizon boundary rows then supply no direct critic loss.
 
+### Multiple-action value estimates for Retrace
+
+For `inner_sac_return_estimator="retrace"`, two independent positive integer
+controls set the Monte Carlo action count in the critic's value expectation:
+
+```json
+{
+  "inner_retrace_value_samples": 4,
+  "inner_retrace_boundary_value_samples": 16
+}
+```
+
+`inner_retrace_value_samples` averages sampled current-inner-policy values at
+each interior successor state. Reward-only targets average the decoded,
+ensemble-reduced Q values. Entropy-augmented targets average each sampled
+Q plus its configured entropy term, using the same detached temperature and
+optional Q scale for the whole critic update. The policy and critic sources,
+action distribution, and Q-head reduction retain their ordinary Retrace
+settings. The configured critic pair is shared across action samples.
+
+`inner_retrace_boundary_value_samples` independently averages frozen prior
+actions and frozen outer Q values at the actual horizon boundary. It retains
+the selected horizon actor/critic sources and terminal Q reduction, and adds
+no extra terminal entropy. This control also applies at H=1, where every
+nonterminated continuation is a boundary. True terminations suppress bootstrap.
+
+Both defaults are `1`; omitted and explicit-one settings preserve historical
+targets, random draws, and exact-resume compatibility. A count greater than one
+requires active Retrace. A frozen model checkpoint may be evaluated with new
+counts; exact training continuation requires matching counts. Extra samples
+only add policy/Q work at existing latent states: they do not add imagined
+transitions, actor updates, critic updates, or replay rows, and do not change
+the sampled behavior-action ratios or valid-suffix supervision.
+
+Resolved configurations and evaluation identities record the counts. Solve
+diagnostics expose `inner_retrace_value_samples` and
+`inner_retrace_boundary_value_samples`; update traces expose the corresponding
+names without the `inner_` prefix. Evaluation/W&B labels use `Retrace V4/B16`
+for the example above, where V is the interior count and B is the boundary
+count. `inner_policy_evaluations` and `inner_q_evaluations` include extra
+sampling work; model-transition counts retain their original meaning.
+
 ### Inner SAC updates per imagined transition
 
 `inner_steps_per_update` provides an alternative to a fixed number of updates
