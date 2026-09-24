@@ -49,3 +49,27 @@ and training traces plus an overview with a numeric J axis, matched-prior
 improvements, paired 95% bootstrap intervals, and all eight setting statuses.
 Intervals use 2,000 paired environment-seed resamples with seed 20260912;
 five episodes from one training seed remain exploratory evidence.
+
+## H1 and H2 extension
+
+`ambi_closed_loop_h1_j_sweep_650k.json` and
+`ambi_closed_loop_h2_j_sweep_650k.json` extend the same checkpoint and J grid to
+H1 and H2. Every one of their eight settings is new: the completed H3/J10
+episodes cannot be reused at another horizon. Each campaign therefore adds
+40 complete episodes, for 80 additional episodes across H1 and H2. The original
+H3 campaign and its publication identities remain independent.
+
+All remaining algorithm, seed, diagnostic and execution settings match their
+historical 575k horizon-specific recipes. Replay capacities intentionally stay
+at 3,072 through J8, 3,840 at J10, 4,608 at J12 and 5,376 at J14 for **all three
+horizons**, preserving those recipes rather than shrinking the buffer at H1/H2.
+The shorter horizons collect fewer imagined transitions per round but still
+perform C16/A4 updates.
+
+Preparation accepts `--horizon 1`, `--horizon 2` or `--horizon 3` and selects the
+corresponding matrix when `--matrix` is omitted. The launcher forwards
+`EVAL_HORIZON`; omitting it preserves the original H3 behavior. H1/H2 production
+indices are 0–7, gated on their own full-budget J14 three-decision smoke at
+index 7. Each campaign receives separate performance, training and overview
+identities, while its existing prior and fixed-budget MPPI references are
+reused unchanged.

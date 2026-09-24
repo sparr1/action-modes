@@ -14,21 +14,21 @@ def episodes(offset):
         truncated_by_evaluator=False, **{'return': float(offset + s - 100)}) for s in publication.SEEDS]
 
 
-def fixture_campaign():
+def fixture_campaign(horizon=3):
     prior = dict(episodes=episodes(350), checkpoint_step=650000, checkpoint_sha256='650k',
                  performance_run_id='prior', manifest_sha256='prior-manifest')
     cells = []
     for j in publication.ROUNDS:
-        cell = dict(name=f'j{j}', J=j, H=3, checkpoint_step=650000, training_decisions=650000,
-            checkpoint_sha256='650k', reused=j == 10, initial_alpha=.0042,
+        cell = dict(name=f'j{j}', J=j, H=horizon, checkpoint_step=650000, training_decisions=650000,
+            checkpoint_sha256='650k', reused=horizon == 3 and j == 10, initial_alpha=.0042,
             estimator='one_step', execution_mode='mean', alpha_mode='adaptive', critic_kind='return_only',
             performance_run_id=f'performance-j{j}', training_run_id=f'training-j{j}',
             prior_reference=deepcopy(prior), params={'inner_replay_capacity': max(3072, 384*j), 'inner_critic_updates_per_round': 16, 'inner_actor_updates_per_round': 4},
             directory=f'directory-j{j}', bundle=f'bundle-j{j}', run_dir=f'run-j{j}')
-        if j == 10:
+        if cell['reused']:
             cell['reuse_reference'] = dict(prior, episodes=episodes(344))
         cells.append(cell)
-    return dict(cells=cells, group='test-j-sweep', label='650k H3 J sweep', source_run='backbone',
+    return dict(H=horizon, cells=cells, group='test-j-sweep', label=f'650k H{horizon} J sweep', source_run='backbone',
         source_commit='tested', inventory='inventory.json', overview_run_id='overview', publisher_workers=3,
         mppi_references={kind: dict(prior, episodes=episodes(value), performance_run_id=kind)
                          for kind, value in [('soft', 428), ('return_only', 379)]})
@@ -151,14 +151,15 @@ def test_reused_j10_status_does_not_recheck_shared_curve_cumulative_counter(monk
     assert all(r['performance_url'] and r['training_url'] for r in rows)
 
 
-def test_real_sdk_disabled_mode_accepts_actual_plot_and_table_payload(tmp_path):
+@pytest.mark.parametrize('horizon', [1, 2, 3])
+def test_real_sdk_disabled_mode_accepts_actual_plot_and_table_payload(tmp_path, horizon):
     import wandb
-    campaign = fixture_campaign(); aggregate = publication.aggregate_results(campaign, {})
+    campaign = fixture_campaign(horizon); aggregate = publication.aggregate_results(campaign, {})
     statuses = [dict(point, status='reused' if point['reused'] else 'queued_or_running') for point in aggregate['points']]
     run = wandb.init(mode='disabled', dir=str(tmp_path))
     try:
         payload = publication.overview_log(wandb, aggregate, statuses)
-        assert payload['campaign/evaluated'] == 1 and payload['campaign/new_published'] == 0
+        assert payload['campaign/evaluated'] == int(horizon == 3) and payload['campaign/new_published'] == 0
         assert len(payload['comparison/points'].data) == 8
         assert len(payload['comparison/references'].data) == 3
         assert 'mppi_soft_return_mean' in payload['comparison/points'].columns
@@ -214,8 +215,10 @@ def test_generic_full_trace_publisher_uses_650k_j14_adapter_and_37500_probe_rows
     assert generic.read(tmp_path / 'publication-completion.json')['status'] == 'complete'
 
 
-def test_watcher_finishes_seven_new_publications_and_preserves_j10_identity(tmp_path, monkeypatch):
-    campaign = fixture_campaign(); values = completed(campaign)
+@pytest.mark.parametrize('horizon', [1, 2, 3])
+def test_watcher_finishes_all_new_publications_and_preserves_only_h3_j10(tmp_path, monkeypatch, horizon):
+    campaign = fixture_campaign(horizon); values = completed(campaign)
+    reused = int(horizon == 3)
     for cell in campaign['cells']:
         directory = tmp_path / cell['name']; directory.mkdir()
         cell.update(directory=str(directory), bundle=str(directory / 'bundle'))
@@ -234,7 +237,8 @@ def test_watcher_finishes_seven_new_publications_and_preserves_j10_identity(tmp_
     monkeypatch.setattr(publication, 'publication_complete', complete)
     def launch(command, **kwargs):
         index = int(command[-1]); cell = campaign['cells'][index]
-        assert not cell['reused'] and cell['J'] != 10
+        assert not cell['reused']
+        assert horizon != 3 or cell['J'] != 10
         published.add(cell['name'])
         return SimpleNamespace(returncode=0)
     monkeypatch.setattr(publication.subprocess, 'run', launch)
@@ -255,13 +259,69 @@ def test_watcher_finishes_seven_new_publications_and_preserves_j10_identity(tmp_
     monkeypatch.setattr(publication, 'overview_log', lambda wandb, aggregate, statuses: {'evaluated': aggregate['evaluated']})
     publication.watch(SimpleNamespace(root=tmp_path))
     final = publication.read(tmp_path / 'campaign-completion.json')
-    assert final['status'] == 'complete' and final['evaluated'] == 8 and final['published'] == 7
-    assert final['reused'] == 1 and 'j10' not in published
+    assert final['status'] == 'complete' and final['evaluated'] == 8 and final['published'] == 8 - reused
+    assert final['reused'] == reused and ('j10' not in published) == bool(reused)
     config = configs[0]['config']
-    assert config['protocol'] == 'closed-loop-h3-j-sweep-v1'
+    assert config['protocol'] == ('closed-loop-h3-j-sweep-v1' if horizon == 3 else 'closed-loop-hj-sweep-v1')
+    assert config['H'] == horizon
+    assert config['new_settings'] == 8 - reused and config['reused_settings'] == reused
     assert config['checkpoint_step'] == 650000 and config['J'] == publication.ROUNDS
     assert config['C'] == 16 and config['A'] == 4
     assert config['inner_replay_capacity_by_J'] == {str(j): max(3072, 384*j) for j in publication.ROUNDS}
-    assert run.summary['protocol_proof_by_setting']['j10'] == {'source': 'historical'}
+    assert run.summary['protocol_proof_by_setting']['j10'] == {'source': 'historical' if horizon == 3 else 'new'}
+    assert all(row['H'] == horizon for row in final['rows'])
     assert len([row for row in logs if 'j_sweep/return_mean' in row]) == 8
     assert len([row for row in logs if 'j_sweep/prior_return_mean' in row]) == 8
+
+
+@pytest.mark.parametrize('horizon', [1, 2])
+def test_new_horizon_starts_with_only_historical_baselines_and_all_eight_pending(horizon, monkeypatch):
+    campaign = fixture_campaign(horizon)
+    result = publication.aggregate_results(campaign, {})
+    assert result['H'] == horizon and result['evaluated'] == result['reused'] == result['new_evaluated'] == 0
+    assert len(result['points']) == 8 and result['episodes'] == []
+    assert all(point['H'] == horizon and point['return_mean'] is None and not point['reused'] for point in result['points'])
+    charts = publication.chart_payloads(result)
+    for chart in charts.values():
+        assert chart['xs'] == [publication.ROUNDS] * 3
+        assert len(chart['ys']) == len(chart['keys']) == 3
+        assert all('refinement' not in label for label in chart['keys'])
+    monkeypatch.setattr(publication, 'publication_complete', lambda cell: False)
+    statuses = publication.status_rows(campaign, result, {}, {}, {})
+    assert len(statuses) == 8 and all(row['status'] == 'queued_or_running' and row['H'] == horizon for row in statuses)
+    full = publication.aggregate_results(campaign, completed(campaign))
+    assert full['evaluated'] == full['new_evaluated'] == 8 and full['reused'] == 0
+    assert len(full['episodes']) == 40 and all(row['H'] == horizon for row in full['episodes'])
+    assert publication.chart_payloads(full)['comparison/return_vs_J']['keys'][0] == f'H{horizon} refinement'
+
+
+@pytest.mark.parametrize('horizon', [1, 2])
+def test_new_horizon_reference_check_never_loads_h3_j10(horizon, monkeypatch):
+    from slurm import ambi_closed_loop_j_sweep as source
+    campaign = fixture_campaign(horizon); calls = []
+    def prior(pin, inventory):
+        calls.append('prior'); return pin
+    def reused(pin, inventory):
+        raise AssertionError('H1/H2 cannot use H3/J10 as their measurement')
+    def mppi(pin, inventory, prior):
+        calls.append('mppi'); return campaign['mppi_references']
+    monkeypatch.setattr(source, 'load_prior', prior)
+    monkeypatch.setattr(source, 'load_reused', reused)
+    monkeypatch.setattr(source, 'load_mppi_references', mppi)
+    publication.verify_references(campaign)
+    assert calls == ['prior', 'mppi']
+
+
+@pytest.mark.parametrize('damage', ['mixed_horizons', 'unsupported_horizon', 'declared_horizon', 'h1_reuses_j10', 'h2_reuses_j10'])
+def test_horizon_scope_cannot_mix_methods_or_reuse_h3_results(damage):
+    campaign = fixture_campaign()
+    if damage == 'mixed_horizons': campaign['cells'][0]['H'] = 1
+    elif damage == 'unsupported_horizon':
+        campaign['H'] = 4
+        for cell in campaign['cells']: cell['H'] = 4
+    elif damage == 'declared_horizon': campaign['H'] = 2
+    else:
+        horizon = 1 if damage == 'h1_reuses_j10' else 2
+        campaign['H'] = horizon
+        for cell in campaign['cells']: cell['H'] = horizon
+    with pytest.raises(ValueError): publication.aggregate_results(campaign, {})

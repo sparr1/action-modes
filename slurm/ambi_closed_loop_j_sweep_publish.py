@@ -1,7 +1,8 @@
-"""Publish full-episode H3/J comparisons at the pinned 650k checkpoint.
+"""Publish full-episode fixed-horizon J comparisons at the pinned 650k checkpoint.
 
-Each new J owns a performance and training run. J10 and frozen prior/MPPI
-references retain their original identities and are never republished.
+Each new J owns a performance and training run. The historical H3/J10 and
+frozen prior/MPPI references retain their original identities and are never
+republished; H1 and H2 evaluate all eight round budgets.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from slurm.ambi_aux_hj_sweep import ENTITY, PROJECT, SEEDS, read, write
-from slurm.ambi_closed_loop_publish import gpu_jobs_active, indexed_episodes, moments
+from slurm.ambi_closed_loop_publish import campaign_horizon, gpu_jobs_active, indexed_episodes, moments
 from slurm.ambi_closed_loop_reward_retrace_publish import paired_comparison
 from slurm.ambi_closed_loop_sampled import verify_receipt
 from slurm.ambi_closed_loop_checkpoint_sweep_publish import publication_complete, protocol_proof
@@ -27,12 +28,12 @@ from slurm.ambi_closed_loop_checkpoint_sweep_publish import publication_complete
 ROUNDS = [1, 2, 4, 6, 8, 10, 12, 14]
 MPPI_FIELDS = [f'mppi_{kind}_{metric}' for kind in ('soft', 'return') for metric in
                ('return_mean', 'return_std', 'paired_gain_mean', 'paired_gain_ci95_low', 'paired_gain_ci95_high')]
-POINT_COLUMNS = ['setting', 'J', 'training_decisions', 'checkpoint_sha256', 'reused',
+POINT_COLUMNS = ['setting', 'H', 'J', 'training_decisions', 'checkpoint_sha256', 'reused',
     'performance_run_id', 'training_run_id', 'prior_performance_run_id', 'initial_alpha',
     'return_mean', 'return_std', 'return_episodes', 'prior_return_mean', 'prior_return_std',
     'paired_gain_mean', 'paired_gain_std', 'paired_gain_ci95_low', 'paired_gain_ci95_high',
     'paired_episodes', *MPPI_FIELDS]
-EPISODE_COLUMNS = ['setting', 'J', 'reused', 'seed', 'solver_seed', 'return', 'prior_return', 'paired_gain']
+EPISODE_COLUMNS = ['setting', 'H', 'J', 'reused', 'seed', 'solver_seed', 'return', 'prior_return', 'paired_gain']
 STATUS_COLUMNS = [*POINT_COLUMNS, 'status', 'performance_url', 'training_url', 'failure']
 REFERENCE_COLUMNS = ['kind', 'label', 'training_decisions', 'checkpoint_sha256', 'return_mean', 'return_std',
     'paired_gain_mean', 'paired_gain_ci95_low', 'paired_gain_ci95_high', 'performance_url', 'compute_budget_note']
@@ -44,10 +45,13 @@ def _url(run_id):
 
 def validate_scope(campaign):
     cells = campaign['cells']
+    horizon = campaign_horizon(campaign)
+    if horizon not in {1, 2, 3} or campaign.get('H', horizon) != horizon:
+        raise ValueError('Expected a single declared horizon H1, H2, or H3')
     if sorted(c['J'] for c in cells) != ROUNDS or len({c['name'] for c in cells}) != 8:
         raise ValueError('Expected exactly J1/2/4/6/8/10/12/14')
-    if [c['J'] for c in cells if c['reused']] != [10]:
-        raise ValueError('Only the pinned J10 evaluation may be reused')
+    if [c['J'] for c in cells if c['reused']] != ([10] if horizon == 3 else []):
+        raise ValueError('Only the pinned H3/J10 evaluation may be reused; H1/H2 are new')
     ids = [campaign['overview_run_id']] + [c[k] for c in cells for k in ('performance_run_id', 'training_run_id')]
     if len(set(ids)) != len(ids) or len({c['run_dir'] for c in cells}) != 8:
         raise ValueError('Each planner, training, and overview identity must be distinct')
@@ -57,7 +61,7 @@ def validate_scope(campaign):
     for cell in cells:
         if ((cell['H'], cell['checkpoint_step'], cell['training_decisions'], cell['estimator'],
                 cell['execution_mode'], cell['alpha_mode'], cell['critic_kind'])
-                != (3, 650000, 650000, 'one_step', 'mean', 'adaptive', 'return_only')):
+                != (horizon, 650000, 650000, 'one_step', 'mean', 'adaptive', 'return_only')):
             raise ValueError('Unexpected checkpoint or J-sweep method')
         params = cell['params']
         if (params['inner_critic_updates_per_round'], params['inner_actor_updates_per_round'], params['inner_replay_capacity']) != (16, 4, max(3072, 384*cell['J'])):
@@ -84,9 +88,9 @@ def verify_references(campaign):
     prior = campaign['cells'][0]['prior_reference']
     if indexed_episodes(load_prior(prior, campaign['inventory'])['episodes']) != indexed_episodes(prior['episodes']):
         raise ValueError('Prior changed after preparation')
-    cell, = [c for c in campaign['cells'] if c['reused']]
-    if indexed_episodes(load_reused(cell['reuse_reference'], campaign['inventory'])['episodes']) != indexed_episodes(cell['reuse_reference']['episodes']):
-        raise ValueError('Historical J10 result changed after preparation')
+    for cell in campaign['cells']:
+        if cell['reused'] and indexed_episodes(load_reused(cell['reuse_reference'], campaign['inventory'])['episodes']) != indexed_episodes(cell['reuse_reference']['episodes']):
+            raise ValueError('Historical H3/J10 result changed after preparation')
     # Enrichment reopens hash-pinned manifests and validates their source identity.
     from slurm.ambi_closed_loop_j_sweep import load_mppi_references
     references = campaign.get('mppi_references', {})
@@ -132,7 +136,7 @@ def aggregate_results(campaign, completed):
     points, rows = [], []
     for cell in sorted(cells, key=lambda c: c['J']):
         point = dict.fromkeys(POINT_COLUMNS)
-        point.update(setting=cell['name'], J=cell['J'], training_decisions=650000,
+        point.update(setting=cell['name'], H=cell['H'], J=cell['J'], training_decisions=650000,
             checkpoint_sha256=cell['checkpoint_sha256'], reused=cell['reused'],
             performance_run_id=cell['performance_run_id'], training_run_id=cell['training_run_id'],
             prior_performance_run_id=prior.get('performance_run_id'), initial_alpha=cell['initial_alpha'],
@@ -149,11 +153,12 @@ def aggregate_results(campaign, completed):
                 gain = episode['return'] - baseline['return']
                 if 'paired_return_delta' in episode and not math.isclose(episode['paired_return_delta'], gain, rel_tol=1e-10, abs_tol=1e-10):
                     raise ValueError('Stored gain differs from the matched prior')
-                rows.append(dict(setting=cell['name'], J=cell['J'], reused=cell['reused'], seed=key[0], solver_seed=key[1],
+                rows.append(dict(setting=cell['name'], H=cell['H'], J=cell['J'], reused=cell['reused'], seed=key[0], solver_seed=key[1],
                     **{'return': episode['return']}, prior_return=baseline['return'], paired_gain=gain))
         points.append(point)
-    return dict(points=points, episodes=rows, references=references, evaluated=len(completed) + 1,
-        new_evaluated=len(completed), reused=1, bootstrap_seed=20260912, bootstrap_resamples=2000,
+    reused = sum(c['reused'] for c in cells)
+    return dict(H=cells[0]['H'], points=points, episodes=rows, references=references, evaluated=len(completed) + reused,
+        new_evaluated=len(completed), reused=reused, bootstrap_seed=20260912, bootstrap_resamples=2000,
         comparison='Refined full-episode return minus matched frozen-prior return at checkpoint 650k.',
         uncertainty='Five paired environment seeds; 2,000 paired bootstrap resamples; exploratory 95% intervals.')
 
@@ -178,9 +183,10 @@ def chart_payloads(aggregate):
                            ('paired_gain', 'Paired improvement over the frozen prior at 650k')]:
         references = aggregate['references']
         payloads['comparison/' + metric + '_vs_J'] = dict(
-            xs=[[p['J'] for p in observed]] + [ROUNDS] * len(references),
-            ys=[[p[metric + '_mean'] for p in observed]] + [[r[metric + '_mean']] * len(ROUNDS) for r in references],
-            keys=['H3 refinement'] + [r['label'] for r in references], title=title, xname='Inner rounds J')
+            xs=([[p['J'] for p in observed]] if observed else []) + [ROUNDS] * len(references),
+            ys=([[p[metric + '_mean'] for p in observed]] if observed else []) + [[r[metric + '_mean']] * len(ROUNDS) for r in references],
+            keys=([f"H{aggregate['H']} refinement"] if observed else []) + [r['label'] for r in references],
+            title=title, xname='Inner rounds J')
     return payloads
 
 
@@ -191,7 +197,7 @@ def overview_log(wandb, aggregate, statuses):
             ('comparison/references', aggregate['references'], REFERENCE_COLUMNS), ('campaign/settings', statuses, STATUS_COLUMNS)]:
         payload[key] = wandb.Table(columns=columns, data=[[row.get(column) for column in columns] for row in rows])
     payload.update({'campaign/evaluated': aggregate['evaluated'], 'campaign/new_evaluated': aggregate['new_evaluated'],
-        'campaign/new_published': sum(row['status'] == 'published' for row in statuses), 'campaign/reused': 1})
+        'campaign/new_published': sum(row['status'] == 'published' for row in statuses), 'campaign/reused': aggregate['reused']})
     return payload
 
 
@@ -255,6 +261,9 @@ def watch(args):
     import wandb
     campaign = read(args.root / 'campaign.json')
     cells = validate_scope(campaign)
+    horizon, total = cells[0]['H'], len(cells)
+    reused = sum(c['reused'] for c in cells)
+    new = total - reused
     verify_references(campaign)
     proofs = {c['name']: protocol_proof(read(Path(c['bundle']) / 'manifest.json'), c) for c in cells if c['reused']}
     marker = args.root / 'watcher-started.json'
@@ -264,20 +273,20 @@ def watch(args):
     publishers = int(campaign.get('publisher_workers', 3))
     if not 1 <= publishers <= 3:
         raise ValueError('Expected one to three bounded publishers')
-    config = dict(protocol='closed-loop-h3-j-sweep-v1', campaign_group=campaign['group'], source_run=campaign['source_run'],
+    config = dict(protocol='closed-loop-h3-j-sweep-v1' if horizon == 3 else 'closed-loop-hj-sweep-v1', campaign_group=campaign['group'], source_run=campaign['source_run'],
         source_commit=campaign['source_commit'], checkpoint_step=650000, checkpoint_sha256=cells[0]['checkpoint_sha256'],
-        H=3, J=ROUNDS, C=16, A=4, N=128, B=256, execution_mode='mean', action_rule='tanh_mean',
+        H=horizon, J=ROUNDS, C=16, A=4, N=128, B=256, execution_mode='mean', action_rule='tanh_mean',
         estimator='one_step', critic_kind='return_only', alpha_mode='adaptive', inner_temperature_mode='auto',
         inner_temperature_initialization='inherit_outer', initial_alpha=cells[0]['initial_alpha'], target_entropy=-10.5,
         togo_return_rollouts=32, inner_replay_capacity_by_J={str(c['J']): c['params']['inner_replay_capacity'] for c in cells},
         inner_replay_scope='action', inner_replay_reset_each_round=False,
-        environment_seeds=SEEDS, controller_seed=55, max_decisions=500, total_settings=8, new_settings=7, reused_settings=1,
-        settings=[dict(setting=c['name'], J=c['J'], reused=c['reused'], replay_capacity=c['params']['inner_replay_capacity'],
+        environment_seeds=SEEDS, controller_seed=55, max_decisions=500, total_settings=total, new_settings=new, reused_settings=reused,
+        settings=[dict(setting=c['name'], H=c['H'], J=c['J'], reused=c['reused'], replay_capacity=c['params']['inner_replay_capacity'],
             performance_url=_url(c['performance_run_id']), training_url=_url(c['training_run_id'])) for c in cells],
         references=aggregate_results(campaign, {})['references'],
         uncertainty='Five paired environment seeds; 2,000 paired bootstrap resamples; exploratory 95% intervals.')
     run = wandb.init(entity=ENTITY, project=PROJECT, id=campaign['overview_run_id'], resume='never', name=campaign['label'],
-        group=campaign['group'], job_type='closed-loop-J-comparison', tags=['closed-loop', 'J-sweep', 'H3', '650k', 'return-only', 'mean'],
+        group=campaign['group'], job_type='closed-loop-J-comparison', tags=['closed-loop', 'J-sweep', f'H{horizon}', '650k', 'return-only', 'mean'],
         config=config, mode='online')
     run.define_metric('axis/inner_rounds')
     run.define_metric('j_sweep/*', step_metric='axis/inner_rounds')
@@ -301,12 +310,12 @@ def watch(args):
             run.log(overview_log(wandb, aggregate, statuses))
             published = sum(row['status'] == 'published' for row in statuses)
             progress = dict(rows=statuses, failures=failures, evaluated=aggregate['evaluated'],
-                            new_evaluated=len(completed), published=published, reused=1)
+                            new_evaluated=len(completed), published=published, reused=reused)
             run.summary.update(dict(status='running', evaluated=aggregate['evaluated'], new_evaluated=len(completed),
-                published=published, reused=1, total_settings=8, protocol_proof_by_setting=proofs))
+                published=published, reused=reused, total_settings=total, protocol_proof_by_setting=proofs))
             write(args.root / 'comparison-results.json', aggregate)
             write(args.root / 'progress.json', progress)
-            print(f"Evaluated {aggregate['evaluated']}/8 (J10 reused); newly published {published}/7", flush=True)
+            print(f"H{horizon}: evaluated {aggregate['evaluated']}/{total} ({reused} reused); newly published {published}/{new}", flush=True)
             previous = stamp
         return statuses
 
@@ -334,10 +343,10 @@ def watch(args):
                     else: terminal_since = None
                 time.sleep(15)
         statuses = update(terminal=True)
-        complete = len(completed) == 7 and all(row['status'] in {'published', 'reused'} for row in statuses)
+        complete = len(completed) == new and all(row['status'] in {'published', 'reused'} for row in statuses)
         status = 'complete' if complete else 'incomplete'
         write(args.root / 'campaign-completion.json', dict(status=status, rows=statuses, failures=failures,
-            evaluated=len(completed) + 1, new_evaluated=len(completed), reused=1,
+            evaluated=len(completed) + reused, new_evaluated=len(completed), reused=reused,
             published=sum(row['status'] == 'published' for row in statuses)))
         run.summary.update(dict(status=status, failed_publications=len(failures)))
         if not complete: raise RuntimeError('J sweep incomplete; inspect status table and publisher logs')

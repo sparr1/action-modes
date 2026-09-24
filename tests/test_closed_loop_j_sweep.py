@@ -41,7 +41,8 @@ def test_recipe_mutations_rejected(tmp_path,key,value):
     with pytest.raises(AssertionError): campaign.cells(path)
 
 
-def test_full_prepare_real_metadata_and_seven_independent_registries(tmp_path,monkeypatch):
+@pytest.mark.parametrize('horizon',[1,2,3])
+def test_full_prepare_real_metadata_and_independent_registries(tmp_path,monkeypatch,horizon):
     """Use actual evaluate_matrix specification generation; never build a learner."""
     import torch
     import evaluate_ambi_checkpoint as evaluator
@@ -95,20 +96,32 @@ def test_full_prepare_real_metadata_and_seven_independent_registries(tmp_path,mo
     campaign.write(references,dict(source_run=campaign.SOURCE_RUN,checkpoint_step=650000,
         prior_reference=prior,reused_evaluation=reuse))
     monkeypatch.setattr(campaign,'load_prior',lambda pin,inv:deepcopy(prior))
-    monkeypatch.setattr(campaign,'load_reused',lambda pin,inv:deepcopy(reuse))
-    args = SimpleNamespace(root=tmp_path/'campaign',matrix=campaign.MATRIX,inventory=inventory,
-        references=references,registry=tmp_path/'registry',group='regression',label='Regression')
+    monkeypatch.setattr(campaign,'load_reused',lambda pin,inv:deepcopy(reuse) if horizon==3
+                        else pytest.fail('H1/H2 must not load or reuse H3 refinement'))
+    args = SimpleNamespace(root=tmp_path/'campaign',matrix=campaign.matrix_for(horizon),inventory=inventory,
+        references=references,registry=tmp_path/'registry',group=None,label=None)
+    if horizon!=3:
+        args.horizon = horizon  # Omitting it retains the original H3 prepare API.
+        args.matrix = None  # The new CLI selects the matching matrix by horizon.
     result = campaign.prepare(args)
-    assert result['production_indices'] == [0,1,2,3,4,6,7] and result['smoke_indices'] == [7]
-    assert result['checkpoint_steps'] == [650000]*8 and len(list(args.registry.iterdir())) == 7
+    count = 7 if horizon==3 else 8
+    assert result['production_indices'] == ([0,1,2,3,4,6,7] if horizon==3 else list(range(8)))
+    assert result['smoke_indices'] == [7] and result['H'] == horizon
+    assert result['group'] == f'closed-loop-h{horizon}-j-sweep-650k-20260924'
+    assert result['checkpoint_steps'] == [650000]*8 and len(list(args.registry.iterdir())) == count
     new = [c for c in result['cells'] if not c['reused']]
-    assert len({c['performance_run_id'] for c in new}) == len({c['training_run_id'] for c in new}) == 7
-    assert result['cells'][5]['performance_run_id'] == reuse['performance_run_id']
-    assert result['cells'][5]['run_dir'] == reuse['run_dir']
+    assert len({c['performance_run_id'] for c in new}) == len({c['training_run_id'] for c in new}) == count
+    if horizon==3:
+        assert result['cells'][5]['performance_run_id'] == reuse['performance_run_id']
+        assert result['cells'][5]['run_dir'] == reuse['run_dir']
+    else:
+        assert all(c['performance_run_id']!=reuse['performance_run_id'] and 'reuse_reference' not in c for c in new)
     for cell in result['cells']:
         spec = campaign.read(Path(cell['directory'])/'specs'/(cell['selector'].replace('/','__')+'.json'))
         assert spec['identity']['planner']['type'] == 'sac' and spec['identity']['planner'] == cell['identity']['planner']
         assert cell['expected_config']['inner_rounds'] == cell['J']
+        assert cell['expected_config']['inner_rollout_horizon'] == horizon == cell['H']
+        assert cell['requested_alg_params'] == campaign.requested_params(cell['J'],horizon)
         assert cell['checkpoint_state_proof']['checkpoint_sha256'] == row['sha256']
         if not cell['reused']: assert load_run(cell['run_dir'])['identity'] == spec['identity']
         assert not (Path(cell['directory'])/'unused').exists()
@@ -140,6 +153,7 @@ def test_launcher_and_shared_worker_reject_reused_budget(tmp_path,monkeypatch):
     path = campaign.ROOT/'slurm/run_ambi_closed_loop_j_sweep_oscar.sbatch'
     subprocess.run(['bash','-n',str(path)],check=True)
     assert 'ambi_closed_loop_j_sweep_publish.py' in path.read_text()
+    assert 'EVAL_HORIZON' in path.read_text()
     campaign.write(tmp_path/'campaign.json',dict(source_commit='source',checkpoint_steps=[650000]*8,
         smoke_indices=[7],production_indices=[0,1,2,3,4,6,7],cells=campaign.cells()))
     monkeypatch.setattr(shared,'source_commit',lambda:'source')
@@ -186,3 +200,17 @@ def test_mppi_two_run_bundle_uses_real_record_normalization(tmp_path):
         changed_pin = {**pin,'manifest_sha256':campaign.digest(bundle/'manifest.json')}
         with pytest.raises((AssertionError,ValueError)):
             campaign.load_mppi_references(changed_pin,inventory,prior)
+
+
+@pytest.mark.parametrize('horizon',[1,2])
+def test_new_horizon_scope_preserves_exact_historical_capacity_and_has_no_reuse(horizon):
+    panel = campaign.cells(horizon=horizon)
+    assert [c['J'] for c in panel] == list(campaign.ROUNDS)
+    assert [c['params']['inner_replay_capacity'] for c in panel] == [3072]*5+[3840,4608,5376]
+    assert all(c['H']==horizon and not c['reused'] for c in panel)
+    with pytest.raises(AssertionError): campaign.cells(campaign.matrix_for(horizon),horizon=3)
+
+
+@pytest.mark.parametrize('horizon',[0,4,True])
+def test_unsupported_horizon_is_rejected(horizon):
+    with pytest.raises(AssertionError): campaign.cells(horizon=horizon)
