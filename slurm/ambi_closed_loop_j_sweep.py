@@ -15,7 +15,7 @@ from slurm.ambi_closed_loop_checkpoint_sweep import (
     check_episodes, checkpoint_state_proof, enrich_reference, load_prior, matching_config,
     resolve_config, validate_completed, verify_reference, worker,
 )
-from slurm.ambi_closed_loop_critics import SOURCE_RUN, source_commit
+from slurm.ambi_closed_loop_critics import SOURCE_RUN, source_commit, cells as historical_critic_cells
 from slurm.ambi_closed_loop_publish import indexed_episodes
 from slurm.ambi_closed_loop_reward_retrace import historical_cell
 from slurm.ambi_closed_loop_sampled import verify_receipt
@@ -29,24 +29,38 @@ CHECKPOINT_SHA = '021e7b4fb323f7181f7b25c0e0cf7c0f92e9097ecd60d9474284a47e50d660
 INITIAL_ALPHA = .0059470199048519135
 
 
-def matrix_for(horizon):
+def matrix_for(horizon, critic='return_only'):
     assert type(horizon) is int and horizon in (1,2,3)
-    return ROOT/f'configs/research/ambi_closed_loop_h{horizon}_j_sweep_650k.json'
+    assert critic in ('return_only','soft')
+    suffix = '_soft_soft' if critic == 'soft' else ''
+    return ROOT/f'configs/research/ambi_closed_loop_h{horizon}{suffix}_j_sweep_650k.json'
 
 
-def requested_params(rounds, horizon=3):
+def requested_params(rounds, horizon=3, critic='return_only'):
     assert type(horizon) is int and horizon in (1,2,3)
-    return {**historical_cell(horizon,rounds)['requested_alg_params'],
+    assert critic in ('return_only','soft')
+    if critic == 'return_only':
+        original = historical_cell(horizon,rounds)
+    else:
+        suffix = '' if horizon == 3 else f'_h{horizon}'
+        if rounds >= 6:
+            suffix = f'_h{horizon}_j{rounds}'
+        original = next(c for c in historical_critic_cells(
+            ROOT/f'configs/research/ambi_closed_loop_critics{suffix}_575k.json')
+            if c['critic_kind'] == 'soft' and c['J'] == rounds)
+    return {**original['requested_alg_params'],
             'inner_eval_execution_action':'mean', 'inner_sac_return_estimator':'one_step',
             'inner_retrace_lambda':1.0, 'inner_retrace_batch_trajectories':None}
 
 
-def cells(matrix_path=None, horizon=3):
+def cells(matrix_path=None, horizon=3, critic='return_only'):
     from utils.ambi_research import load_preset_matrix
-    matrix_path = matrix_path or matrix_for(horizon)
+    matrix_path = matrix_path or matrix_for(horizon,critic)
     assert type(horizon) is int and horizon in (1,2,3)
+    assert critic in ('return_only','soft')
     matrix = load_preset_matrix(matrix_path)
-    selectors = [f'sweep/return_return_alpha_h{horizon}_j{j}_c16' for j in ROUNDS]
+    prefix = 'soft_soft' if critic == 'soft' else 'return_return_alpha'
+    selectors = [f'sweep/{prefix}_h{horizon}_j{j}_c16' for j in ROUNDS]
     assert matrix['source_run'] == SOURCE_RUN and matrix['base_alg_config'] == 'checkpoint'
     assert matrix['checkpoint_steps'] == [CHECKPOINT_STEP]
     assert matrix['evaluation'] == dict(controller_seed=55,seeds=SEEDS,max_steps=500,
@@ -59,12 +73,13 @@ def cells(matrix_path=None, horizon=3):
     for j,selector in zip(ROUNDS,selectors):
         name = selector.split('/')[1]
         params = {**matrix['shared_alg_params'],**comparison['variants'][name]['alg_params']}
-        assert params == requested_params(j,horizon),name
+        assert params == requested_params(j,horizon,critic),name
         assert params['inner_replay_capacity'] == max(3072,384*j)
         panel.append(dict(name=name,checkpoint_step=CHECKPOINT_STEP,training_decisions=CHECKPOINT_STEP,
             selector=selector,actual_selector=selector,requested_alg_params=deepcopy(params),
-            params={k:v for k,v in params.items() if v is not None},H=horizon,J=j,critic_kind='return_only',
-            estimator='one_step',execution_mode='mean',alpha_mode='adaptive',reused=horizon==3 and j==10))
+            params={k:v for k,v in params.items() if v is not None},H=horizon,J=j,critic_kind=critic,
+            estimator='one_step',execution_mode='mean',alpha_mode='adaptive',
+            reused=critic=='return_only' and horizon==3 and j==10))
     return panel
 
 
@@ -148,16 +163,19 @@ def prepare(args):
     from utils.eval_series import create_run
     from utils.eval_series_data import planner_identity
     horizon = getattr(args,'horizon',3)
-    args.matrix = args.matrix or matrix_for(horizon)
-    args.group = args.group or f'closed-loop-h{horizon}-j-sweep-650k-20260924'
-    args.label = args.label or f'650k H{horizon} return critics | J sweep'
-    panel = cells(args.matrix,horizon); commit = source_commit(); pins = read(args.references)
+    critic = getattr(args,'critic','return_only')
+    args.matrix = args.matrix or matrix_for(horizon,critic)
+    suffix = '-soft-soft' if critic == 'soft' else ''
+    args.group = args.group or f'closed-loop-h{horizon}{suffix}-j-sweep-650k-20260924'
+    critic_label = 'soft/soft' if critic == 'soft' else 'return'
+    args.label = args.label or f'650k H{horizon} {critic_label} critics | J sweep'
+    panel = cells(args.matrix,horizon,critic); commit = source_commit(); pins = read(args.references)
     inventory = read(args.inventory)
     assert inventory['source_run'] == pins['source_run'] == SOURCE_RUN
     assert pins['checkpoint_step'] == CHECKPOINT_STEP
     row, = [r for r in inventory['checkpoints'] if r['step'] == CHECKPOINT_STEP]
     prior = load_prior(pins['prior_reference'],args.inventory)
-    reused = load_reused(pins['reused_evaluation'],args.inventory) if horizon == 3 else None
+    reused = load_reused(pins['reused_evaluation'],args.inventory) if any(c['reused'] for c in panel) else None
     assert row['sha256'] == prior['checkpoint_sha256'] == CHECKPOINT_SHA
     assert row['metadata_sha256'] == prior['metadata_sha256']
     assert digest(row['path']) == row['sha256'] and digest(row['metadata_path']) == row['metadata_sha256']
@@ -202,12 +220,12 @@ def prepare(args):
     campaign = dict(schema_version=1,group=args.group,label=args.label,matrix=str(args.matrix.resolve()),
         inventory=str(args.inventory.resolve()),source_commit=commit,source_dir=str(ROOT),source_run=SOURCE_RUN,
         checkpoint_step=CHECKPOINT_STEP,checkpoint_sha256=CHECKPOINT_SHA,checkpoint_steps=[CHECKPOINT_STEP]*len(panel),
-        target_entropy=-10.5,H=horizon,rounds=list(ROUNDS),cells=panel,mppi_references=mppi,
+        target_entropy=-10.5,H=horizon,critic_kind=critic,rounds=list(ROUNDS),cells=panel,mppi_references=mppi,
         production_indices=[i for i,c in enumerate(panel) if not c['reused']],smoke_indices=[7],
         publisher_workers=3,overview_run_id=uuid.uuid4().hex,
         prior_compatibility_note='Prior mean inference and full-episode pairing are unchanged; historical references retain original scientific identities.',
         reused_compatibility_note=('Exact H3/J10 planner and full-episode protocol reused at 650k; historical source, shared performance curve and training ID retained.'
-            if horizon == 3 else 'No refinement episodes are reused; prior and MPPI references retain their original identities.'))
+            if reused else 'No refinement episodes are reused; prior and MPPI references retain their original identities.'))
     write(args.root/'campaign.json',campaign)
     print(f'Prepared H{horizon}, 8 round budgets, {len(campaign["production_indices"])} new evaluations; overview {campaign["overview_run_id"]}',flush=True)
     return campaign
@@ -219,6 +237,7 @@ def main():
     for name in ('root','inventory','registry'):prep.add_argument('--'+name,type=Path,required=True)
     prep.add_argument('--references',type=Path,default=REFERENCES); prep.add_argument('--matrix',type=Path)
     prep.add_argument('--horizon',type=int,choices=(1,2,3),default=3)
+    prep.add_argument('--critic',choices=('return_only','soft'),default='return_only')
     prep.add_argument('--group'); prep.add_argument('--label')
     run = sub.add_parser('worker'); run.add_argument('--root',type=Path,required=True)
     run.add_argument('--index',type=int,required=True); run.add_argument('--smoke',action='store_true')

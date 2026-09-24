@@ -28,12 +28,12 @@ from slurm.ambi_closed_loop_checkpoint_sweep_publish import publication_complete
 ROUNDS = [1, 2, 4, 6, 8, 10, 12, 14]
 MPPI_FIELDS = [f'mppi_{kind}_{metric}' for kind in ('soft', 'return') for metric in
                ('return_mean', 'return_std', 'paired_gain_mean', 'paired_gain_ci95_low', 'paired_gain_ci95_high')]
-POINT_COLUMNS = ['setting', 'H', 'J', 'training_decisions', 'checkpoint_sha256', 'reused',
+POINT_COLUMNS = ['setting', 'H', 'J', 'critic_kind', 'critic_scheme', 'training_decisions', 'checkpoint_sha256', 'reused',
     'performance_run_id', 'training_run_id', 'prior_performance_run_id', 'initial_alpha',
     'return_mean', 'return_std', 'return_episodes', 'prior_return_mean', 'prior_return_std',
     'paired_gain_mean', 'paired_gain_std', 'paired_gain_ci95_low', 'paired_gain_ci95_high',
     'paired_episodes', *MPPI_FIELDS]
-EPISODE_COLUMNS = ['setting', 'H', 'J', 'reused', 'seed', 'solver_seed', 'return', 'prior_return', 'paired_gain']
+EPISODE_COLUMNS = ['setting', 'H', 'J', 'critic_kind', 'critic_scheme', 'reused', 'seed', 'solver_seed', 'return', 'prior_return', 'paired_gain']
 STATUS_COLUMNS = [*POINT_COLUMNS, 'status', 'performance_url', 'training_url', 'failure']
 REFERENCE_COLUMNS = ['kind', 'label', 'training_decisions', 'checkpoint_sha256', 'return_mean', 'return_std',
     'paired_gain_mean', 'paired_gain_ci95_low', 'paired_gain_ci95_high', 'performance_url', 'compute_budget_note']
@@ -43,15 +43,32 @@ def _url(run_id):
     return f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{run_id}' if run_id else None
 
 
+def campaign_critic(campaign):
+    kinds = {cell['critic_kind'] for cell in campaign['cells']}
+    if len(kinds) != 1 or not kinds <= {'return_only', 'soft'}:
+        raise ValueError('Expected one shared return-only or soft critic scheme')
+    kind, = kinds
+    if campaign.get('critic_kind', kind) != kind:
+        raise ValueError('Declared critic kind differs from the cells')
+    return kind
+
+
+def critic_scheme(kind):
+    return 'soft_soft' if kind == 'soft' else 'return_return'
+
+
 def validate_scope(campaign):
     cells = campaign['cells']
     horizon = campaign_horizon(campaign)
+    kind = campaign_critic(campaign)
+    if kind == 'soft' and horizon != 1:
+        raise ValueError('The new soft/soft campaign selects H1')
     if horizon not in {1, 2, 3} or campaign.get('H', horizon) != horizon:
         raise ValueError('Expected a single declared horizon H1, H2, or H3')
     if sorted(c['J'] for c in cells) != ROUNDS or len({c['name'] for c in cells}) != 8:
         raise ValueError('Expected exactly J1/2/4/6/8/10/12/14')
-    if [c['J'] for c in cells if c['reused']] != ([10] if horizon == 3 else []):
-        raise ValueError('Only the pinned H3/J10 evaluation may be reused; H1/H2 are new')
+    if [c['J'] for c in cells if c['reused']] != ([10] if horizon == 3 and kind == 'return_only' else []):
+        raise ValueError('Only the pinned return-only H3/J10 evaluation may be reused')
     ids = [campaign['overview_run_id']] + [c[k] for c in cells for k in ('performance_run_id', 'training_run_id')]
     if len(set(ids)) != len(ids) or len({c['run_dir'] for c in cells}) != 8:
         raise ValueError('Each planner, training, and overview identity must be distinct')
@@ -61,9 +78,15 @@ def validate_scope(campaign):
     for cell in cells:
         if ((cell['H'], cell['checkpoint_step'], cell['training_decisions'], cell['estimator'],
                 cell['execution_mode'], cell['alpha_mode'], cell['critic_kind'])
-                != (horizon, 650000, 650000, 'one_step', 'mean', 'adaptive', 'return_only')):
+                != (horizon, 650000, 650000, 'one_step', 'mean', 'adaptive', kind)):
             raise ValueError('Unexpected checkpoint or J-sweep method')
         params = cell['params']
+        expected = ('sac', 'sac', 'entropy_augmented', 'outer') if kind == 'soft' else ('aux_return', 'aux_return', 'reward_only', 'none')
+        if tuple(params[key] for key in ('inner_critic_source', 'inner_horizon_critic_source',
+                'inner_sac_critic_target', 'inner_terminal_entropy')) != expected:
+            raise ValueError('Critic sources, target, and terminal entropy must match the declared scheme')
+        if params['inner_actor_source'] != 'sac' or params['inner_horizon_actor_source'] != 'sac':
+            raise ValueError('Both actor sources must retain the SAC prior')
         if (params['inner_critic_updates_per_round'], params['inner_actor_updates_per_round'], params['inner_replay_capacity']) != (16, 4, max(3072, 384*cell['J'])):
             raise ValueError('J sweep requires C16/A4 and replay retaining all imagined transitions')
         if not math.isfinite(cell['initial_alpha']) or cell['initial_alpha'] <= 0:
@@ -111,6 +134,8 @@ def aggregate_results(campaign, completed):
     cells = validate_scope(campaign)
     if set(completed) - {c['name'] for c in cells if not c['reused']}:
         raise ValueError('Unexpected or republished historical result')
+    kind = campaign_critic(campaign)
+    scheme = critic_scheme(kind)
     prior = cells[0]['prior_reference']
     prior_stats = moments(e['return'] for e in prior['episodes'])
     references = [dict(kind='prior', label='Frozen prior (reused)', training_decisions=650000,
@@ -118,25 +143,25 @@ def aggregate_results(campaign, completed):
         paired_gain_mean=0., paired_gain_ci95_low=0., paired_gain_ci95_high=0.,
         performance_url=_url(prior.get('performance_run_id')), compute_budget_note='No planning.')]
     reference_fields = {}
-    for kind, reference in campaign.get('mppi_references', {}).items():
-        if kind not in {'soft', 'return_only'}:
+    for mppi_kind, reference in campaign.get('mppi_references', {}).items():
+        if mppi_kind not in {'soft', 'return_only'}:
             raise ValueError('Unexpected MPPI reference kind')
         stats = moments(e['return'] for e in reference['episodes'])
         paired = comparison_stats(reference['episodes'], prior['episodes'])
-        row = dict(kind=kind, label=f'MPPI {"soft" if kind == "soft" else "return-only"} critic (fixed historical budget)',
+        row = dict(kind=mppi_kind, label=f'MPPI {"soft" if mppi_kind == "soft" else "return-only"} critic (fixed historical budget)',
             training_decisions=650000, checkpoint_sha256=reference['checkpoint_sha256'],
             return_mean=stats['mean'], return_std=stats['std'],
             **{'paired_gain_' + key: paired[key] for key in ('mean', 'ci95_low', 'ci95_high')},
             performance_url=_url(reference.get('performance_run_id')),
             compute_budget_note='Fixed historical MPPI compute; J does not apply. Budgets differ from refinement.')
         references.append(row)
-        prefix = 'mppi_' + ('return' if kind == 'return_only' else kind) + '_'
+        prefix = 'mppi_' + ('return' if mppi_kind == 'return_only' else mppi_kind) + '_'
         reference_fields.update({prefix + key: row[key] for key in ('return_mean', 'return_std',
             'paired_gain_mean', 'paired_gain_ci95_low', 'paired_gain_ci95_high')})
     points, rows = [], []
     for cell in sorted(cells, key=lambda c: c['J']):
         point = dict.fromkeys(POINT_COLUMNS)
-        point.update(setting=cell['name'], H=cell['H'], J=cell['J'], training_decisions=650000,
+        point.update(setting=cell['name'], H=cell['H'], J=cell['J'], critic_kind=kind, critic_scheme=scheme, training_decisions=650000,
             checkpoint_sha256=cell['checkpoint_sha256'], reused=cell['reused'],
             performance_run_id=cell['performance_run_id'], training_run_id=cell['training_run_id'],
             prior_performance_run_id=prior.get('performance_run_id'), initial_alpha=cell['initial_alpha'],
@@ -153,11 +178,11 @@ def aggregate_results(campaign, completed):
                 gain = episode['return'] - baseline['return']
                 if 'paired_return_delta' in episode and not math.isclose(episode['paired_return_delta'], gain, rel_tol=1e-10, abs_tol=1e-10):
                     raise ValueError('Stored gain differs from the matched prior')
-                rows.append(dict(setting=cell['name'], H=cell['H'], J=cell['J'], reused=cell['reused'], seed=key[0], solver_seed=key[1],
+                rows.append(dict(setting=cell['name'], H=cell['H'], J=cell['J'], critic_kind=kind, critic_scheme=scheme, reused=cell['reused'], seed=key[0], solver_seed=key[1],
                     **{'return': episode['return']}, prior_return=baseline['return'], paired_gain=gain))
         points.append(point)
     reused = sum(c['reused'] for c in cells)
-    return dict(H=cells[0]['H'], points=points, episodes=rows, references=references, evaluated=len(completed) + reused,
+    return dict(H=cells[0]['H'], critic_kind=kind, critic_scheme=scheme, points=points, episodes=rows, references=references, evaluated=len(completed) + reused,
         new_evaluated=len(completed), reused=reused, bootstrap_seed=20260912, bootstrap_resamples=2000,
         comparison='Refined full-episode return minus matched frozen-prior return at checkpoint 650k.',
         uncertainty='Five paired environment seeds; 2,000 paired bootstrap resamples; exploratory 95% intervals.')
@@ -178,6 +203,7 @@ def numeric_rows(aggregate):
 
 def chart_payloads(aggregate):
     observed = [p for p in aggregate['points'] if p['return_mean'] is not None]
+    label = f"H{aggregate['H']} " + ('soft/soft refinement' if aggregate['critic_kind'] == 'soft' else 'refinement')
     payloads = {}
     for metric, title in [('return', 'Full-episode return at checkpoint 650k'),
                            ('paired_gain', 'Paired improvement over the frozen prior at 650k')]:
@@ -185,7 +211,7 @@ def chart_payloads(aggregate):
         payloads['comparison/' + metric + '_vs_J'] = dict(
             xs=([[p['J'] for p in observed]] if observed else []) + [ROUNDS] * len(references),
             ys=([[p[metric + '_mean'] for p in observed]] if observed else []) + [[r[metric + '_mean']] * len(ROUNDS) for r in references],
-            keys=([f"H{aggregate['H']} refinement"] if observed else []) + [r['label'] for r in references],
+            keys=([label] if observed else []) + [r['label'] for r in references],
             title=title, xname='Inner rounds J')
     return payloads
 
@@ -262,6 +288,7 @@ def watch(args):
     campaign = read(args.root / 'campaign.json')
     cells = validate_scope(campaign)
     horizon, total = cells[0]['H'], len(cells)
+    kind = campaign_critic(campaign)
     reused = sum(c['reused'] for c in cells)
     new = total - reused
     verify_references(campaign)
@@ -276,17 +303,22 @@ def watch(args):
     config = dict(protocol='closed-loop-h3-j-sweep-v1' if horizon == 3 else 'closed-loop-hj-sweep-v1', campaign_group=campaign['group'], source_run=campaign['source_run'],
         source_commit=campaign['source_commit'], checkpoint_step=650000, checkpoint_sha256=cells[0]['checkpoint_sha256'],
         H=horizon, J=ROUNDS, C=16, A=4, N=128, B=256, execution_mode='mean', action_rule='tanh_mean',
-        estimator='one_step', critic_kind='return_only', alpha_mode='adaptive', inner_temperature_mode='auto',
+        estimator='one_step', critic_kind=kind, critic_scheme=critic_scheme(kind),
+        inner_critic_source=cells[0]['params']['inner_critic_source'],
+        inner_horizon_critic_source=cells[0]['params']['inner_horizon_critic_source'],
+        inner_sac_critic_target=cells[0]['params']['inner_sac_critic_target'],
+        inner_terminal_entropy=cells[0]['params']['inner_terminal_entropy'],
+        performance_objective='Undiscounted raw environment reward; no entropy bonus or terminal bootstrap.', alpha_mode='adaptive', inner_temperature_mode='auto',
         inner_temperature_initialization='inherit_outer', initial_alpha=cells[0]['initial_alpha'], target_entropy=-10.5,
         togo_return_rollouts=32, inner_replay_capacity_by_J={str(c['J']): c['params']['inner_replay_capacity'] for c in cells},
         inner_replay_scope='action', inner_replay_reset_each_round=False,
         environment_seeds=SEEDS, controller_seed=55, max_decisions=500, total_settings=total, new_settings=new, reused_settings=reused,
-        settings=[dict(setting=c['name'], H=c['H'], J=c['J'], reused=c['reused'], replay_capacity=c['params']['inner_replay_capacity'],
+        settings=[dict(setting=c['name'], H=c['H'], J=c['J'], critic_kind=kind, critic_scheme=critic_scheme(kind), reused=c['reused'], replay_capacity=c['params']['inner_replay_capacity'],
             performance_url=_url(c['performance_run_id']), training_url=_url(c['training_run_id'])) for c in cells],
         references=aggregate_results(campaign, {})['references'],
         uncertainty='Five paired environment seeds; 2,000 paired bootstrap resamples; exploratory 95% intervals.')
     run = wandb.init(entity=ENTITY, project=PROJECT, id=campaign['overview_run_id'], resume='never', name=campaign['label'],
-        group=campaign['group'], job_type='closed-loop-J-comparison', tags=['closed-loop', 'J-sweep', f'H{horizon}', '650k', 'return-only', 'mean'],
+        group=campaign['group'], job_type='closed-loop-J-comparison', tags=['closed-loop', 'J-sweep', f'H{horizon}', '650k', 'soft-soft' if kind == 'soft' else 'return-only', 'mean'],
         config=config, mode='online')
     run.define_metric('axis/inner_rounds')
     run.define_metric('j_sweep/*', step_metric='axis/inner_rounds')

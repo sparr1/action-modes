@@ -41,8 +41,8 @@ def test_recipe_mutations_rejected(tmp_path,key,value):
     with pytest.raises(AssertionError): campaign.cells(path)
 
 
-@pytest.mark.parametrize('horizon',[1,2,3])
-def test_full_prepare_real_metadata_and_independent_registries(tmp_path,monkeypatch,horizon):
+@pytest.mark.parametrize('horizon,critic',[(1,'return_only'),(2,'return_only'),(3,'return_only'),(1,'soft')])
+def test_full_prepare_real_metadata_and_independent_registries(tmp_path,monkeypatch,horizon,critic):
     """Use actual evaluate_matrix specification generation; never build a learner."""
     import torch
     import evaluate_ambi_checkpoint as evaluator
@@ -96,22 +96,26 @@ def test_full_prepare_real_metadata_and_independent_registries(tmp_path,monkeypa
     campaign.write(references,dict(source_run=campaign.SOURCE_RUN,checkpoint_step=650000,
         prior_reference=prior,reused_evaluation=reuse))
     monkeypatch.setattr(campaign,'load_prior',lambda pin,inv:deepcopy(prior))
-    monkeypatch.setattr(campaign,'load_reused',lambda pin,inv:deepcopy(reuse) if horizon==3
-                        else pytest.fail('H1/H2 must not load or reuse H3 refinement'))
+    reusing = horizon==3 and critic=='return_only'
+    monkeypatch.setattr(campaign,'load_reused',lambda pin,inv:deepcopy(reuse) if reusing
+                        else pytest.fail('Only H3 return/return may load or reuse H3 refinement'))
     args = SimpleNamespace(root=tmp_path/'campaign',matrix=campaign.matrix_for(horizon),inventory=inventory,
         references=references,registry=tmp_path/'registry',group=None,label=None)
     if horizon!=3:
         args.horizon = horizon  # Omitting it retains the original H3 prepare API.
         args.matrix = None  # The new CLI selects the matching matrix by horizon.
+    if critic!='return_only':
+        args.critic = critic  # Omitting it retains every original return/return API.
     result = campaign.prepare(args)
-    count = 7 if horizon==3 else 8
-    assert result['production_indices'] == ([0,1,2,3,4,6,7] if horizon==3 else list(range(8)))
-    assert result['smoke_indices'] == [7] and result['H'] == horizon
-    assert result['group'] == f'closed-loop-h{horizon}-j-sweep-650k-20260924'
+    count = 7 if reusing else 8
+    assert result['production_indices'] == ([0,1,2,3,4,6,7] if reusing else list(range(8)))
+    assert result['smoke_indices'] == [7] and result['H'] == horizon and result['critic_kind'] == critic
+    suffix = '-soft-soft' if critic=='soft' else ''
+    assert result['group'] == f'closed-loop-h{horizon}{suffix}-j-sweep-650k-20260924'
     assert result['checkpoint_steps'] == [650000]*8 and len(list(args.registry.iterdir())) == count
     new = [c for c in result['cells'] if not c['reused']]
     assert len({c['performance_run_id'] for c in new}) == len({c['training_run_id'] for c in new}) == count
-    if horizon==3:
+    if reusing:
         assert result['cells'][5]['performance_run_id'] == reuse['performance_run_id']
         assert result['cells'][5]['run_dir'] == reuse['run_dir']
     else:
@@ -121,7 +125,12 @@ def test_full_prepare_real_metadata_and_independent_registries(tmp_path,monkeypa
         assert spec['identity']['planner']['type'] == 'sac' and spec['identity']['planner'] == cell['identity']['planner']
         assert cell['expected_config']['inner_rounds'] == cell['J']
         assert cell['expected_config']['inner_rollout_horizon'] == horizon == cell['H']
-        assert cell['requested_alg_params'] == campaign.requested_params(cell['J'],horizon)
+        assert cell['requested_alg_params'] == campaign.requested_params(cell['J'],horizon,critic)
+        expected_critic,expected_target,expected_terminal = (
+            ('sac','entropy_augmented','outer') if critic=='soft' else ('aux_return','reward_only','none'))
+        assert cell['expected_config']['inner_critic_source'] == cell['expected_config']['inner_horizon_critic_source'] == expected_critic
+        assert cell['expected_config']['inner_sac_critic_target'] == expected_target
+        assert cell['expected_config']['inner_terminal_entropy'] == expected_terminal
         assert cell['checkpoint_state_proof']['checkpoint_sha256'] == row['sha256']
         if not cell['reused']: assert load_run(cell['run_dir'])['identity'] == spec['identity']
         assert not (Path(cell['directory'])/'unused').exists()
@@ -154,6 +163,7 @@ def test_launcher_and_shared_worker_reject_reused_budget(tmp_path,monkeypatch):
     subprocess.run(['bash','-n',str(path)],check=True)
     assert 'ambi_closed_loop_j_sweep_publish.py' in path.read_text()
     assert 'EVAL_HORIZON' in path.read_text()
+    assert 'EVAL_CRITIC' in path.read_text()
     campaign.write(tmp_path/'campaign.json',dict(source_commit='source',checkpoint_steps=[650000]*8,
         smoke_indices=[7],production_indices=[0,1,2,3,4,6,7],cells=campaign.cells()))
     monkeypatch.setattr(shared,'source_commit',lambda:'source')
@@ -214,3 +224,33 @@ def test_new_horizon_scope_preserves_exact_historical_capacity_and_has_no_reuse(
 @pytest.mark.parametrize('horizon',[0,4,True])
 def test_unsupported_horizon_is_rejected(horizon):
     with pytest.raises(AssertionError): campaign.cells(horizon=horizon)
+
+
+def test_soft_soft_matches_historical_arm_with_only_four_critic_semantic_changes():
+    soft = campaign.cells(horizon=1,critic='soft')
+    returns = campaign.cells(horizon=1)
+    expected = dict(inner_critic_source=('aux_return','sac'),inner_horizon_critic_source=('aux_return','sac'),
+        inner_sac_critic_target=('reward_only','entropy_augmented'),inner_terminal_entropy=('none','outer'))
+    for before,after in zip(returns,soft):
+        a,b = before['requested_alg_params'],after['requested_alg_params']
+        assert {key:(a.get(key),b.get(key)) for key in a.keys()|b.keys() if a.get(key)!=b.get(key)} == expected
+        assert after['critic_kind']=='soft' and not after['reused']
+        assert after['name'] == f'soft_soft_h1_j{after["J"]}_c16'
+        assert after['params']['inner_temperature_mode']=='auto'
+        assert after['params']['inner_temperature_initialization']=='inherit_outer'
+        assert after['params']['inner_eval_execution_action']=='mean'
+
+
+@pytest.mark.parametrize('key,value',[('inner_critic_source','aux_return'),('inner_horizon_critic_source','aux_return'),
+    ('inner_sac_critic_target','reward_only'),('inner_terminal_entropy','none')])
+def test_soft_soft_rejects_hybrid_critic_configs(tmp_path,key,value):
+    matrix = campaign.read(campaign.matrix_for(1,'soft'))
+    matrix['comparisons']['sweep']['variants']['soft_soft_h1_j1_c16']['alg_params'][key] = value
+    path = tmp_path/'matrix.json'; campaign.write(path,matrix)
+    with pytest.raises(AssertionError): campaign.cells(path,horizon=1,critic='soft')
+
+
+def test_explicit_critic_selection_cannot_mislabel_another_matrix():
+    with pytest.raises(AssertionError): campaign.cells(campaign.matrix_for(1,'soft'),horizon=1)
+    with pytest.raises(AssertionError): campaign.cells(campaign.matrix_for(1),horizon=1,critic='soft')
+    with pytest.raises(AssertionError): campaign.cells(horizon=1,critic='soft_return')

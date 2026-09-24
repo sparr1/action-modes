@@ -38,6 +38,7 @@ case "$EVAL_MODE" in
       --registry /oscar/scratch/rgao48/ambi/evaluation-series/runs)
     if [[ -n "${EVAL_MATRIX_PATH:-}" ]]; then args+=(--matrix "$EVAL_MATRIX_PATH"); fi
     if [[ -n "${EVAL_HORIZON:-}" ]]; then args+=(--horizon "$EVAL_HORIZON"); fi
+    if [[ -n "${EVAL_CRITIC:-}" ]]; then args+=(--critic "$EVAL_CRITIC"); fi
     if [[ -n "${EVAL_CAMPAIGN_GROUP:-}" ]]; then args+=(--group "$EVAL_CAMPAIGN_GROUP"); fi
     if [[ -n "${EVAL_CAMPAIGN_LABEL:-}" ]]; then args+=(--label "$EVAL_CAMPAIGN_LABEL"); fi
     exec "$PYTHON_BIN" slurm/ambi_closed_loop_j_sweep.py "${args[@]}"

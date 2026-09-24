@@ -73,3 +73,29 @@ indices are 0–7, gated on their own full-budget J14 three-decision smoke at
 index 7. Each campaign receives separate performance, training and overview
 identities, while its existing prior and fixed-budget MPPI references are
 reused unchanged.
+
+## H1 soft/soft comparison
+
+`ambi_closed_loop_h1_soft_soft_j_sweep_650k.json` evaluates the complete
+J1/J2/J4/J6/J8/J10/J12/J14 grid with the coherent soft-critic strategy used in
+the historical 575k comparison. This changes exactly four settings from the
+H1 return/return matrix: `inner_critic_source="sac"`,
+`inner_horizon_critic_source="sac"`,
+`inner_sac_critic_target="entropy_augmented"`, and
+`inner_terminal_entropy="outer"`. The online SAC soft critic initializes the
+inner critic; inner targets include entropy, and the frozen soft terminal
+bootstrap includes the outer-policy entropy correction. The SAC actor retains
+its inherited adaptive alpha and mean-action execution.
+
+The selected 650k checkpoint, H1, N128/C16/A4/B256, replay capacities, five
+complete paired episodes per setting, and 32 model probes remain matched to
+the return/return sweep. All eight soft settings are new, totaling 40 episodes;
+return/return results are not substitutes. Existing prior and MPPI references
+remain reusable, and no historical refinement run is relabeled or republished.
+
+Pass `--horizon 1 --critic soft` to preparation, or set `EVAL_HORIZON=1` and
+`EVAL_CRITIC=soft` for the launcher. Omitting `--critic` retains `return_only`
+and all previous default matrix, group and reuse behavior. Preparation compares
+each requested soft recipe against its original 575k configuration and checks
+the actual evaluator specification before allocating eight new performance and
+training identities. Its J14 smoke gates all eight production settings.

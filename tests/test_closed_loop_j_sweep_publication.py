@@ -14,21 +14,26 @@ def episodes(offset):
         truncated_by_evaluator=False, **{'return': float(offset + s - 100)}) for s in publication.SEEDS]
 
 
-def fixture_campaign(horizon=3):
+def fixture_campaign(horizon=3, kind='return_only'):
     prior = dict(episodes=episodes(350), checkpoint_step=650000, checkpoint_sha256='650k',
                  performance_run_id='prior', manifest_sha256='prior-manifest')
     cells = []
     for j in publication.ROUNDS:
         cell = dict(name=f'j{j}', J=j, H=horizon, checkpoint_step=650000, training_decisions=650000,
-            checkpoint_sha256='650k', reused=horizon == 3 and j == 10, initial_alpha=.0042,
-            estimator='one_step', execution_mode='mean', alpha_mode='adaptive', critic_kind='return_only',
+            checkpoint_sha256='650k', reused=horizon == 3 and kind == 'return_only' and j == 10, initial_alpha=.0042,
+            estimator='one_step', execution_mode='mean', alpha_mode='adaptive', critic_kind=kind,
             performance_run_id=f'performance-j{j}', training_run_id=f'training-j{j}',
-            prior_reference=deepcopy(prior), params={'inner_replay_capacity': max(3072, 384*j), 'inner_critic_updates_per_round': 16, 'inner_actor_updates_per_round': 4},
+            prior_reference=deepcopy(prior), params={'inner_replay_capacity': max(3072, 384*j), 'inner_critic_updates_per_round': 16, 'inner_actor_updates_per_round': 4,
+                'inner_actor_source': 'sac', 'inner_horizon_actor_source': 'sac',
+                'inner_critic_source': 'sac' if kind == 'soft' else 'aux_return',
+                'inner_horizon_critic_source': 'sac' if kind == 'soft' else 'aux_return',
+                'inner_sac_critic_target': 'entropy_augmented' if kind == 'soft' else 'reward_only',
+                'inner_terminal_entropy': 'outer' if kind == 'soft' else 'none'},
             directory=f'directory-j{j}', bundle=f'bundle-j{j}', run_dir=f'run-j{j}')
         if cell['reused']:
             cell['reuse_reference'] = dict(prior, episodes=episodes(344))
         cells.append(cell)
-    return dict(H=horizon, cells=cells, group='test-j-sweep', label=f'650k H{horizon} J sweep', source_run='backbone',
+    return dict(H=horizon, critic_kind=kind, cells=cells, group='test-j-sweep', label=f'650k H{horizon} J sweep', source_run='backbone',
         source_commit='tested', inventory='inventory.json', overview_run_id='overview', publisher_workers=3,
         mppi_references={kind: dict(prior, episodes=episodes(value), performance_run_id=kind)
                          for kind, value in [('soft', 428), ('return_only', 379)]})
@@ -151,10 +156,10 @@ def test_reused_j10_status_does_not_recheck_shared_curve_cumulative_counter(monk
     assert all(r['performance_url'] and r['training_url'] for r in rows)
 
 
-@pytest.mark.parametrize('horizon', [1, 2, 3])
-def test_real_sdk_disabled_mode_accepts_actual_plot_and_table_payload(tmp_path, horizon):
+@pytest.mark.parametrize('horizon,kind', [(1, 'return_only'), (2, 'return_only'), (3, 'return_only'), (1, 'soft')])
+def test_real_sdk_disabled_mode_accepts_actual_plot_and_table_payload(tmp_path, horizon, kind):
     import wandb
-    campaign = fixture_campaign(horizon); aggregate = publication.aggregate_results(campaign, {})
+    campaign = fixture_campaign(horizon, kind); aggregate = publication.aggregate_results(campaign, {})
     statuses = [dict(point, status='reused' if point['reused'] else 'queued_or_running') for point in aggregate['points']]
     run = wandb.init(mode='disabled', dir=str(tmp_path))
     try:
@@ -169,10 +174,11 @@ def test_real_sdk_disabled_mode_accepts_actual_plot_and_table_payload(tmp_path, 
         run.finish()
 
 
-def test_generic_full_trace_publisher_uses_650k_j14_adapter_and_37500_probe_rows(tmp_path, monkeypatch):
+@pytest.mark.parametrize('kind', ['return_only', 'soft'])
+def test_generic_full_trace_publisher_uses_650k_j14_adapter_and_37500_probe_rows(tmp_path, monkeypatch, kind):
     from slurm import ambi_aux_hj_sweep as generic
     from utils import ambi_benchmark, ambi_diagnostic_series, eval_series, eval_series_data
-    campaign = fixture_campaign(); cell = campaign['cells'][-1]
+    campaign = fixture_campaign(1 if kind == 'soft' else 3, kind); cell = campaign['cells'][-1]
     cell.update(directory=str(tmp_path), bundle=str(tmp_path / 'bundle'), actual_selector='sweep/j14')
     bundle = tmp_path / 'bundle'; bundle.mkdir()
     cfg = dict(inner_critic_target_tau=.01, inner_replay_capacity=5376)
@@ -209,15 +215,16 @@ def test_generic_full_trace_publisher_uses_650k_j14_adapter_and_37500_probe_rows
     assert configs[0]['name'].endswith('650k')
     assert configs[0]['config']['checkpoint_step'] == 650000
     assert configs[0]['config']['J'] == 14 and configs[0]['config']['inner_replay_capacity'] == 5376
+    assert configs[0]['config']['critic_kind'] == kind
     assert run.summary['diagnostic/paired_rows'] == 37500
     assert run.summary['training/critic_updates'] == 2500 * 16 * 14
     assert run.summary['training/actor_updates'] == 2500 * 4 * 14
     assert generic.read(tmp_path / 'publication-completion.json')['status'] == 'complete'
 
 
-@pytest.mark.parametrize('horizon', [1, 2, 3])
-def test_watcher_finishes_all_new_publications_and_preserves_only_h3_j10(tmp_path, monkeypatch, horizon):
-    campaign = fixture_campaign(horizon); values = completed(campaign)
+@pytest.mark.parametrize('horizon,kind', [(1, 'return_only'), (2, 'return_only'), (3, 'return_only'), (1, 'soft')])
+def test_watcher_finishes_all_new_publications_and_preserves_only_h3_j10(tmp_path, monkeypatch, horizon, kind):
+    campaign = fixture_campaign(horizon, kind); values = completed(campaign)
     reused = int(horizon == 3)
     for cell in campaign['cells']:
         directory = tmp_path / cell['name']; directory.mkdir()
@@ -263,7 +270,12 @@ def test_watcher_finishes_all_new_publications_and_preserves_only_h3_j10(tmp_pat
     assert final['reused'] == reused and ('j10' not in published) == bool(reused)
     config = configs[0]['config']
     assert config['protocol'] == ('closed-loop-h3-j-sweep-v1' if horizon == 3 else 'closed-loop-hj-sweep-v1')
-    assert config['H'] == horizon
+    assert config['H'] == horizon and config['critic_kind'] == kind
+    assert config['critic_scheme'] == ('soft_soft' if kind == 'soft' else 'return_return')
+    assert config['inner_critic_source'] == ('sac' if kind == 'soft' else 'aux_return')
+    assert config['inner_horizon_critic_source'] == ('sac' if kind == 'soft' else 'aux_return')
+    assert config['inner_sac_critic_target'] == ('entropy_augmented' if kind == 'soft' else 'reward_only')
+    assert config['inner_terminal_entropy'] == ('outer' if kind == 'soft' else 'none')
     assert config['new_settings'] == 8 - reused and config['reused_settings'] == reused
     assert config['checkpoint_step'] == 650000 and config['J'] == publication.ROUNDS
     assert config['C'] == 16 and config['A'] == 4
@@ -324,4 +336,41 @@ def test_horizon_scope_cannot_mix_methods_or_reuse_h3_results(damage):
         horizon = 1 if damage == 'h1_reuses_j10' else 2
         campaign['H'] = horizon
         for cell in campaign['cells']: cell['H'] = horizon
+    with pytest.raises(ValueError): publication.aggregate_results(campaign, {})
+
+
+def test_soft_soft_curves_pair_raw_episode_returns_and_keep_reference_kinds_separate():
+    campaign = fixture_campaign(1, 'soft')
+    initial = publication.aggregate_results(campaign, {})
+    assert initial['critic_kind'] == 'soft' and initial['critic_scheme'] == 'soft_soft'
+    assert initial['evaluated'] == initial['reused'] == 0
+    assert all(p['critic_kind'] == 'soft' and p['critic_scheme'] == 'soft_soft' and p['return_mean'] is None for p in initial['points'])
+    full = publication.aggregate_results(campaign, completed(campaign))
+    assert full['evaluated'] == 8 and full['reused'] == 0
+    assert [r['kind'] for r in full['references']] == ['prior', 'soft', 'return_only']
+    assert all(p['critic_kind'] == 'soft' and p['critic_scheme'] == 'soft_soft' for p in full['points'])
+    assert all(r['critic_kind'] == 'soft' and r['critic_scheme'] == 'soft_soft' for r in full['episodes'])
+    for point in full['points']:
+        assert point['return_mean'] == 353 + point['J']
+        assert point['paired_gain_mean'] == point['paired_gain_ci95_low'] == point['paired_gain_ci95_high'] == point['J']
+    charts = publication.chart_payloads(full)
+    assert charts['comparison/return_vs_J']['keys'][0] == 'H1 soft/soft refinement'
+    assert charts['comparison/paired_gain_vs_J']['keys'][0] == 'H1 soft/soft refinement'
+
+
+@pytest.mark.parametrize('damage', ['mixed_kind', 'declared_kind', 'inner_return_critic', 'terminal_return_critic',
+    'reward_target', 'no_terminal_entropy', 'wrong_actor', 'reuse_j10', 'h3_soft'])
+def test_soft_scope_rejects_mislabeled_or_mixed_critic_semantics(damage):
+    campaign = fixture_campaign(1, 'soft'); cell = campaign['cells'][0]
+    if damage == 'mixed_kind': cell['critic_kind'] = 'return_only'
+    elif damage == 'declared_kind': campaign['critic_kind'] = 'return_only'
+    elif damage == 'inner_return_critic': cell['params']['inner_critic_source'] = 'aux_return'
+    elif damage == 'terminal_return_critic': cell['params']['inner_horizon_critic_source'] = 'aux_return'
+    elif damage == 'reward_target': cell['params']['inner_sac_critic_target'] = 'reward_only'
+    elif damage == 'no_terminal_entropy': cell['params']['inner_terminal_entropy'] = 'none'
+    elif damage == 'wrong_actor': cell['params']['inner_actor_source'] = 'aux_return'
+    elif damage == 'reuse_j10': campaign['cells'][5]['reused'] = True
+    else:
+        campaign['H'] = 3
+        for cell in campaign['cells']: cell['H'] = 3
     with pytest.raises(ValueError): publication.aggregate_results(campaign, {})
