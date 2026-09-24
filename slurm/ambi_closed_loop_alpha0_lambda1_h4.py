@@ -227,7 +227,7 @@ def prepare(args):
         spec = read(specs[cell['selector']])
         reference = cell['validation_reference']
         assert spec['identity']['backbone'] == reference['identity']['backbone'] == SOURCE_RUN
-        matching_protocol(spec['identity']['protocol'],reference['protocol'],execution=cell['execution_mode'])
+        matching_protocol(spec['identity']['protocol'],reference['identity']['protocol'],execution=cell['execution_mode'])
         matching_planner(spec['identity']['planner'],reference['resolved_config'],cell)
         registry = create_run(args.registry,spec,args.group+'-'+cell['name'],PROJECT,ENTITY,'oscar-rgao48')
         cell.update(directory=str(directory),bundle=str(directory/'bundle'),reused=False,

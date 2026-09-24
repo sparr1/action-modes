@@ -105,7 +105,7 @@ def test_prepare_creates_real_canonical_identities_with_exact_references(tmp_pat
         cfg={**resolved(h,j),**campaign.estimator_settings(e,h),campaign.EXECUTION_KEY:mode}
         pin=dict(H=h,J=j,estimator=e,execution=mode,performance_run_id=f'{h}-{j}-{e}-{mode}')
         refs[(h,j,e,mode)]={**pin,'resolved_config':cfg,'episodes':episodes(),'protocol':protocol(mode),
-            'identity':dict(backbone=campaign.SOURCE_RUN,protocol=protocol(mode),
+            'identity':dict(backbone=campaign.SOURCE_RUN,protocol={**protocol(mode),'environment_seeds':campaign.SEEDS,'mode':'episodes'},
                            planner=planner_identity(cfg,{},'AMBITDMPC2/AMBITDMPC2',campaign.action_rule(mode)))}
     references=tmp_path/'refs.json';references.write_text(json.dumps({'references':list(refs.values()),'prior_reference':{}}))
     monkeypatch.setattr(campaign,'source_commit',lambda:'tested')
@@ -120,7 +120,7 @@ def test_prepare_creates_real_canonical_identities_with_exact_references(tmp_pat
             if cell['selector'] not in kwargs['selectors']:
                 continue
             cfg=resolved(min(cell['H'],3),cell['J'],index)
-            identity=dict(backbone=campaign.SOURCE_RUN,protocol=protocol(cell['execution_mode']),
+            identity=dict(backbone=campaign.SOURCE_RUN,protocol={**protocol(cell['execution_mode']),'environment_seeds':campaign.SEEDS,'mode':'episodes'},
                 planner=planner_identity(cfg,{},'AMBITDMPC2/AMBITDMPC2',campaign.action_rule(cell['execution_mode'])))
             path=specs/(cell['selector'].replace('/','__')+'.json')
             campaign.write(path,{'identity':identity});paths[cell['selector']]=str(path)
@@ -224,10 +224,11 @@ def test_invalid_schema_reference_fails_in_cells_before_reference_loading(tmp_pa
 
 
 def test_real_metadata_preparation_writes_all_62_canonical_specs_without_a_prior_run(tmp_path,monkeypatch):
-    """Exercise the actual loader, selector resolution, protocol guard and spec writer."""
+    """Run full prepare with real resolution, protocol/spec checks and registrations."""
     import evaluate_ambi_checkpoint as evaluator
     from utils import ambi_benchmark
-    from utils.eval_series_data import resolved_checkpoint_config
+    from utils.eval_series import load_run
+    from utils.eval_series_data import identity_for_ambi_checkpoint, resolved_checkpoint_config
     checkpoint=tmp_path/'checkpoint.pt';checkpoint.write_bytes(b'metadata-only checkpoint fixture')
     base_params=dict(aux_return_mode='sac',aux_return_detach_representation=False,
                      target_entropy=-10.5,log_std_mapping='direct_clamp',
@@ -246,18 +247,47 @@ def test_real_metadata_preparation_writes_all_62_canonical_specs_without_a_prior
     monkeypatch.setattr(evaluator,'_make_env',lambda *a,**k:pytest.fail('metadata preparation constructed an environment'))
     monkeypatch.setattr(evaluator,'evaluate_preset',lambda *a,**k:pytest.fail('metadata preparation evaluated an episode'))
     panel=campaign.cells()
-    args=SimpleNamespace(root=tmp_path/'campaign',matrix=campaign.MATRIX,checkpoint=checkpoint,inventory=inventory)
-    specs=campaign.prepare_specs(args,panel)
+    checkpoint_info=dict(metadata=metadata,path=str(checkpoint),sha256=campaign.digest(checkpoint),source_run=campaign.SOURCE_RUN)
+    references={}
+    keys={(h,j,e,mode) for h in (1,2,3) for j in campaign.ROUNDS for e,mode in
+          [('one_step','mean'),('one_step','policy_sample'),('retrace','policy_sample')]}
+    keys|={(3,j,'one_step','mean') for j in (12,14)}
+    for h,j,estimator,mode in sorted(keys):
+        historical={'algorithm_config':{**trial,'alg_params':{
+            **base_params,**campaign.historical_cell(h,j)['params'],
+            **campaign.estimator_settings(estimator,h),campaign.EXECUTION_KEY:mode}},
+            'environment':{'id':'DMControl-v0','params':metadata['experiment_params']['env_params']}}
+        historical['algorithm_config']['alg_params']={k:v for k,v in historical['algorithm_config']['alg_params'].items() if v is not None}
+        manifest_protocol=ambi_benchmark.protocol_for(historical,55,500)
+        identity=identity_for_ambi_checkpoint(checkpoint_info,historical,manifest_protocol,campaign.SEEDS,
+            dict(commit=commit,dirty=False),path=checkpoint,inventory_path=inventory)
+        assert 'environment_seeds' not in manifest_protocol and identity['protocol']['environment_seeds']==campaign.SEEDS
+        references[(h,j,estimator,mode)]=dict(H=h,J=j,estimator=estimator,execution=mode,
+            performance_run_id=f'{h}-{j}-{estimator}-{mode}',episodes=episodes(),protocol=manifest_protocol,
+            resolved_config=resolved_checkpoint_config(checkpoint_info,historical),identity=identity)
+    references_path=tmp_path/'references.json'
+    references_path.write_text(json.dumps({'references':list(references.values()),'prior_reference':{}}))
+    monkeypatch.setattr(campaign,'source_commit',lambda:commit)
+    monkeypatch.setattr(campaign,'digest',lambda p:campaign.CHECKPOINT_SHA)
+    monkeypatch.setattr(campaign,'load_reference',lambda p,inv:deepcopy(references[campaign.reference_key(p)]))
+    monkeypatch.setattr(campaign,'load_prior',lambda p,inv:{'episodes':episodes()})
+    args=SimpleNamespace(root=tmp_path/'campaign',matrix=campaign.MATRIX,checkpoint=checkpoint,inventory=inventory,
+        references=references_path,registry=tmp_path/'registry',group='metadata-regression',label='Metadata regression')
+    prepared=campaign.prepare(args)
+    specs={cell['selector']:args.root/'specs'/cell['execution_mode']/(cell['selector'].replace('/','__')+'.json')
+           for cell in prepared['cells']}
     assert len(specs)==62 and 'sweep/prior' not in specs
+    assert len(list(args.registry.iterdir()))==62
+    assert len({cell['performance_run_id'] for cell in prepared['cells']})==62
     assert len(list((args.root/'specs'/'policy_sample').glob('*.json')))==36
     assert len(list((args.root/'specs'/'mean').glob('*.json')))==26
     assert not (args.root/'unused').exists()
-    checkpoint_info=dict(metadata=metadata)
-    for cell in panel:
+    for cell in prepared['cells']:
         spec=campaign.read(specs[cell['selector']]);identity=spec['identity']
-        reference=resolved_checkpoint_config(checkpoint_info,{'algorithm_config':{
-            **trial,'alg_params':{**base_params,**campaign.historical_cell(min(cell['H'],3),cell['J'])['params']}}})
-        campaign.matching_planner(identity['planner'],reference,cell)
+        assert load_run(cell['run_dir'])['identity']==identity
+        reference=references[(min(cell['H'],3),cell['J'],'one_step','mean')]
+        campaign.matching_planner(identity['planner'],reference['resolved_config'],cell)
+        campaign.matching_protocol(identity['protocol'],reference['identity']['protocol'],execution=cell['execution_mode'])
         assert spec['selector']==cell['selector'] and identity['backbone']==campaign.SOURCE_RUN
         assert identity['protocol']['action_rule']==campaign.action_rule(cell['execution_mode'])
         assert identity['planner']['type']=='sac'
