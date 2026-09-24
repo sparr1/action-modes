@@ -144,12 +144,12 @@ def checkpoint_state_proof(checkpoint, prior):
                 aux_return_actor_q_scale_mode='none')
 
 
-def resolve_config(matrix_path, checkpoint):
+def resolve_config(matrix_path, checkpoint, selector=SELECTOR):
     from utils.checkpoint_context import load_checkpoint_context
     from utils.ambi_research import load_preset_matrix, resolve_preset
     from utils.eval_series_data import resolved_checkpoint_config
     context = load_checkpoint_context(checkpoint)
-    resolved = resolve_preset(matrix_path,SELECTOR,matrix=load_preset_matrix(matrix_path),checkpoint_context=context)
+    resolved = resolve_preset(matrix_path,selector,matrix=load_preset_matrix(matrix_path),checkpoint_context=context)
     return resolved_checkpoint_config({'metadata':context.metadata},resolved)
 
 
@@ -279,7 +279,8 @@ def worker(args):
     campaign = read(args.root/'campaign.json'); assert source_commit() == campaign['source_commit']
     assert args.index in (campaign['smoke_indices'] if args.smoke else campaign['production_indices'])
     cell = campaign['cells'][args.index]
-    assert cell['checkpoint_step'] == STEPS[args.index] and not cell['reused'] and torch.cuda.is_available()
+    assert cell['checkpoint_step'] == campaign['checkpoint_steps'][args.index]
+    assert not cell['reused'] and torch.cuda.is_available()
     assert digest(cell['checkpoint']) == cell['checkpoint_sha256']
     assert digest(cell['checkpoint']+'.metadata.json') == cell['metadata_sha256']
     verify_reference(cell['prior_reference'],traces=True)
@@ -293,7 +294,7 @@ def worker(args):
     summary = training_summary(bundle,cell,expected_steps=3 if args.smoke else 500)
     seal_episode_bundle(bundle)
     receipt = dict(status='complete',cell=cell['name'],selector=cell['selector'],bundle=str(bundle),
-        reused=False,smoke=args.smoke,execution='mean',estimator='one_step',alpha_mode='adaptive',H=3,J=10,
+        reused=False,smoke=args.smoke,execution='mean',estimator='one_step',alpha_mode='adaptive',H=cell['H'],J=cell['J'],
         checkpoint_step=cell['checkpoint_step'],checkpoint_sha256=cell['checkpoint_sha256'],
         manifest_sha256=digest(bundle/'manifest.json'),
         trace_sha256={name:digest(bundle/name) for name in manifest['runs'][0]['trace_files']},

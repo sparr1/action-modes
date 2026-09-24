@@ -1,0 +1,74 @@
+{
+  "source_run": "rwgao_b-brown-university/ambi/aux6428346x0",
+  "checkpoint_step": 650000,
+  "prior_reference": {
+    "checkpoint_step": 650000,
+    "checkpoint_sha256": "021e7b4fb323f7181f7b25c0e0cf7c0f92e9097ecd60d9474284a47e50d6609e",
+    "metadata_sha256": "24e7cd83c7f6f9d0631dad6ddd26c0829aafa706f7414de418616c476eeb9584",
+    "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_650000/bundle",
+    "manifest_sha256": "0fe070c8e3ddf1afb8057cf080fbd132acafb41536d070b4a2bce372f7ef4358",
+    "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+    "initial_alpha": 0.0059470199048519135
+  },
+  "reused_evaluation": {
+    "checkpoint_step": 650000,
+    "checkpoint_sha256": "021e7b4fb323f7181f7b25c0e0cf7c0f92e9097ecd60d9474284a47e50d6609e",
+    "metadata_sha256": "24e7cd83c7f6f9d0631dad6ddd26c0829aafa706f7414de418616c476eeb9584",
+    "bundle": "/oscar/scratch/rgao48/ambi/closed-loop-h3-j10-checkpoints/20260924/campaign/step_650000/bundle",
+    "manifest_sha256": "3b6f83fe3e003b9cfd7f7249f5a72e988a29a129f9f96751ee0915a6cf1bd445",
+    "source_commit": "a16430ac7b67b6984530fcaf641feaa87d78b1ab",
+    "performance_run_id": "4aa700149cec4161886b916c4b135c07",
+    "training_run_id": "b4bfda4e5a2d497bb5fe7e6d74fadafc",
+    "run_dir": "/oscar/scratch/rgao48/ambi/evaluation-series/runs/4aa700149cec4161886b916c4b135c07",
+    "initial_alpha": 0.0059470199048519135,
+    "trace_sha256": {
+      "sweep__return_return_alpha_h3_j10_c16/seed-101.jsonl.gz": "7521d6966b1d1563c17e3f035d301d573df9d411e55fa2febc3317d695d18485",
+      "sweep__return_return_alpha_h3_j10_c16/seed-102.jsonl.gz": "1d7334adc3b4aa67f6c250ed62424667b085dfbe9937e998d0d97651bdc1ec17",
+      "sweep__return_return_alpha_h3_j10_c16/seed-103.jsonl.gz": "b50fbb24b37c7caa2e12c8b9295790df4ce7f6279d1ffc2e7513ef44ec833c9c",
+      "sweep__return_return_alpha_h3_j10_c16/seed-104.jsonl.gz": "f355bba93fcaae9b57598075af40d63314df980d0bbcbed8ebf693f2bf6a4a89",
+      "sweep__return_return_alpha_h3_j10_c16/seed-105.jsonl.gz": "1ac21661edb74e2c0511d56c3e4646ca85ee80fab793d04624dec0c26c927e87"
+    },
+    "record_id": "858af76eb11e324358b35bcbc862e31269f1577c7e081473270ae44385ab793f",
+    "publication_entry": {
+      "accepted_order": 6,
+      "artifact_sha256": {
+        "manifest.json": "3b6f83fe3e003b9cfd7f7249f5a72e988a29a129f9f96751ee0915a6cf1bd445",
+        "provenance/checkpoint-inventory-0.json": "b708e23b8369a24f012f3cba6e4f89eccf491e5f63e83778a263ec688cb45119",
+        "sweep__return_return_alpha_h3_j10_c16/seed-101.jsonl.gz": "7521d6966b1d1563c17e3f035d301d573df9d411e55fa2febc3317d695d18485",
+        "sweep__return_return_alpha_h3_j10_c16/seed-102.jsonl.gz": "1d7334adc3b4aa67f6c250ed62424667b085dfbe9937e998d0d97651bdc1ec17",
+        "sweep__return_return_alpha_h3_j10_c16/seed-103.jsonl.gz": "b50fbb24b37c7caa2e12c8b9295790df4ce7f6279d1ffc2e7513ef44ec833c9c",
+        "sweep__return_return_alpha_h3_j10_c16/seed-104.jsonl.gz": "f355bba93fcaae9b57598075af40d63314df980d0bbcbed8ebf693f2bf6a4a89",
+        "sweep__return_return_alpha_h3_j10_c16/seed-105.jsonl.gz": "1ac21661edb74e2c0511d56c3e4646ca85ee80fab793d04624dec0c26c927e87"
+      },
+      "checkpoint_sha256": "021e7b4fb323f7181f7b25c0e0cf7c0f92e9097ecd60d9474284a47e50d6609e",
+      "checkpoint_step": 650000,
+      "record_sha256": "22644d7a83fe2352a86c206958995a7fb13274f825cc96f1916763ff8e3fc01a",
+      "status": "published",
+      "wandb_step": 6
+    }
+  },
+  "mppi_reference": {
+    "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/mppi/step_650000/bundle",
+    "manifest_sha256": "b9e0c478c5b6792028b3173bf5f8adc90480ec0b73a350227c14235b8710f294",
+    "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+    "checkpoint_step": 650000,
+    "checkpoint_sha256": "021e7b4fb323f7181f7b25c0e0cf7c0f92e9097ecd60d9474284a47e50d6609e",
+    "protocol": {
+      "action_rule": "mppi_proposal_mean",
+      "controller_seed": 55,
+      "env_wrapper": null,
+      "env_wrappers": [],
+      "environment": {
+        "id": "DMControl-v0",
+        "params": {
+          "obs": "state",
+          "render_mode": null,
+          "task": "humanoid-walk"
+        }
+      },
+      "max_steps": 500,
+      "observation": "state",
+      "seed_scheme": "sha256-v1"
+    }
+  }
+}
