@@ -159,6 +159,24 @@
     "sweep": {
       "description": "Three explicitly labeled reward-critic comparisons.",
       "variants": {
+        "prior": {
+          "description": "Unselected schema reference only; never evaluated or registered by this campaign. Paired controls are the hash-pinned completed references.",
+          "alg_params": {
+            "inner_operator": "none",
+            "inner_rounds": 0,
+            "inner_rollouts_per_round": 0,
+            "inner_critic_updates_per_round": null,
+            "inner_actor_updates_per_round": null,
+            "inner_finite_horizon": false,
+            "inner_critic_source": "sac",
+            "inner_horizon_critic_source": "sac",
+            "inner_updates_per_round": 0,
+            "inner_terminal_entropy": "none",
+            "inner_entropy_enabled": false,
+            "inner_temperature_mode": "inherit_outer",
+            "inner_eval_execution_action": "mean"
+          }
+        },
         "alpha_zero_h1_j10_c16_one_step": {
           "description": "alpha_zero_h1_j10_c16_one_step",
           "alg_params": {
@@ -1027,7 +1045,8 @@
             "inner_retrace_batch_trajectories": null
           }
         }
-      }
+      },
+      "reference": "prior"
     }
   }
 }

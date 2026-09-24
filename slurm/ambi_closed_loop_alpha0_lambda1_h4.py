@@ -54,12 +54,16 @@ def cell_name(arm, h, estimator, j):
 
 
 def cells(matrix_path=MATRIX):
-    matrix = read(matrix_path)
+    from utils.ambi_research import load_preset_matrix
+    matrix = load_preset_matrix(matrix_path)
     assert matrix['source_run'] == SOURCE_RUN
     selectors = ['sweep/' + cell_name(*identity) for identity in identities()]
     assert matrix['evaluation'] == dict(controller_seed=55, seeds=SEEDS, max_steps=500,
                                        togo_return_rollouts=32, default_presets=selectors)
-    assert set(matrix['comparisons']['sweep']['variants']) == {s.split('/')[1] for s in selectors}
+    comparison = matrix['comparisons']['sweep']
+    assert comparison['reference'] == 'prior'
+    assert comparison['variants']['prior']['alg_params']['inner_operator'] == 'none'
+    assert set(comparison['variants']) == {'prior', *[s.split('/')[1] for s in selectors]}
     result = []
     for (arm, h, estimator, j), selector in zip(identities(), selectors):
         name = selector.split('/')[1]
@@ -122,7 +126,7 @@ def matching_config(actual, reference, cell):
 def matching_planner(actual, reference, cell):
     """Use the real canonicalizer: default/inactive fields must be omitted identically."""
     from utils.eval_series_data import planner_identity
-    expected = planner_identity(expected_config(reference,cell), {}, 'AMBITDMPC2',
+    expected = planner_identity(expected_config(reference,cell), {}, 'AMBITDMPC2/AMBITDMPC2',
                                 action_rule(cell['execution_mode']))
     assert actual == expected, (expected, actual)
 
@@ -174,8 +178,23 @@ def load_prior(pin, inventory):
             'trace_sha256':{name:digest(bundle/name) for name in manifest['runs'][0]['trace_files']}}
 
 
-def prepare(args):
+def prepare_specs(args, panel):
+    """Keep sampled and mean protocols in distinct metadata-only invocations."""
     from evaluate_ambi_checkpoint import evaluate_matrix
+    specs = {}
+    for mode in ('policy_sample','mean'):
+        selectors = [cell['selector'] for cell in panel if cell['execution_mode'] == mode]
+        result = evaluate_matrix(args.matrix,args.checkpoint,selectors=selectors,
+            seeds=SEEDS,controller_seed=55,max_steps=500,bundle_dir=args.root/'unused',
+            checkpoint_inventory=args.inventory,reference_bundle=None,
+            eval_series_spec_dir=args.root/'specs'/mode)
+        assert result['mode'] == 'evaluation_series_specifications' and set(result['specs']) == set(selectors)
+        specs.update(result['specs'])
+    assert set(specs) == {cell['selector'] for cell in panel}
+    return specs
+
+
+def prepare(args):
     from utils.eval_series import create_run
     from slurm.ambi_closed_loop_reward_retrace import matching_config as match_sampled_reference
     commit, panel = source_commit(), cells(args.matrix)
@@ -202,12 +221,10 @@ def prepare(args):
         cell['paired_reference'] = refs[key]
         assert indexed_episodes(cell['paired_reference']['episodes']).keys() == indexed_episodes(prior['episodes']).keys()
     args.root.mkdir(parents=True,exist_ok=False)
-    evaluate_matrix(args.matrix,args.checkpoint,seeds=SEEDS,controller_seed=55,max_steps=500,
-                    bundle_dir=args.root/'unused',checkpoint_inventory=args.inventory,
-                    reference_bundle=None,eval_series_spec_dir=args.root/'specs')
+    specs = prepare_specs(args,panel)
     for cell in panel:
         directory = args.root/cell['name']; directory.mkdir()
-        spec = read(args.root/'specs'/(cell['selector'].replace('/','__')+'.json'))
+        spec = read(specs[cell['selector']])
         reference = cell['validation_reference']
         assert spec['identity']['backbone'] == reference['identity']['backbone'] == SOURCE_RUN
         matching_protocol(spec['identity']['protocol'],reference['protocol'],execution=cell['execution_mode'])

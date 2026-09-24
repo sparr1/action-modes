@@ -2,6 +2,8 @@
 from copy import deepcopy
 from functools import lru_cache
 import json
+from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -46,7 +48,7 @@ def test_every_cell_resolves_exact_budgets_and_real_canonical_planner(index):
     cell=campaign.cells()[index];cfg=resolved(min(cell['H'],3),cell['J'],index)
     reference=resolved(min(cell['H'],3),cell['J'])
     campaign.matching_config(cfg,reference,cell)
-    planner=planner_identity(cfg,{},'AMBITDMPC2',campaign.action_rule(cell['execution_mode']))
+    planner=planner_identity(cfg,{},'AMBITDMPC2/AMBITDMPC2',campaign.action_rule(cell['execution_mode']))
     campaign.matching_planner(planner,reference,cell)
     assert cfg['inner_critic_source']==cfg['inner_horizon_critic_source']=='aux_return'
     assert cfg['inner_sac_critic_target']=='reward_only' and cfg['inner_terminal_entropy']=='none'
@@ -104,20 +106,25 @@ def test_prepare_creates_real_canonical_identities_with_exact_references(tmp_pat
         pin=dict(H=h,J=j,estimator=e,execution=mode,performance_run_id=f'{h}-{j}-{e}-{mode}')
         refs[(h,j,e,mode)]={**pin,'resolved_config':cfg,'episodes':episodes(),'protocol':protocol(mode),
             'identity':dict(backbone=campaign.SOURCE_RUN,protocol=protocol(mode),
-                           planner=planner_identity(cfg,{},'AMBITDMPC2',campaign.action_rule(mode)))}
+                           planner=planner_identity(cfg,{},'AMBITDMPC2/AMBITDMPC2',campaign.action_rule(mode)))}
     references=tmp_path/'refs.json';references.write_text(json.dumps({'references':list(refs.values()),'prior_reference':{}}))
     monkeypatch.setattr(campaign,'source_commit',lambda:'tested')
     monkeypatch.setattr(campaign,'digest',lambda p:campaign.CHECKPOINT_SHA)
     monkeypatch.setattr(campaign,'load_reference',lambda pin,inventory:deepcopy(refs[campaign.reference_key(pin)]))
     monkeypatch.setattr(campaign,'load_prior',lambda pin,inventory:{'episodes':episodes()})
     def evaluate(*args,**kwargs):
-        specs=kwargs['eval_series_spec_dir'];specs.mkdir()
+        specs=kwargs['eval_series_spec_dir'];specs.mkdir(parents=True)
         assert kwargs['reference_bundle'] is None and kwargs['seeds']==campaign.SEEDS
+        paths={}
         for index,cell in enumerate(panel):
+            if cell['selector'] not in kwargs['selectors']:
+                continue
             cfg=resolved(min(cell['H'],3),cell['J'],index)
             identity=dict(backbone=campaign.SOURCE_RUN,protocol=protocol(cell['execution_mode']),
-                planner=planner_identity(cfg,{},'AMBITDMPC2',campaign.action_rule(cell['execution_mode'])))
-            campaign.write(specs/(cell['selector'].replace('/','__')+'.json'),{'identity':identity})
+                planner=planner_identity(cfg,{},'AMBITDMPC2/AMBITDMPC2',campaign.action_rule(cell['execution_mode'])))
+            path=specs/(cell['selector'].replace('/','__')+'.json')
+            campaign.write(path,{'identity':identity});paths[cell['selector']]=str(path)
+        return dict(mode='evaluation_series_specifications',specs=paths)
     monkeypatch.setattr(evaluate_ambi_checkpoint,'evaluate_matrix',evaluate)
     created=[]
     def create(*args):
@@ -203,3 +210,54 @@ def test_versioned_reference_inventory_contains_exact_56_sources_and_prior():
     assert len(pins['references'])==len({campaign.reference_key(p) for p in pins['references']})==56
     assert all(p['critic_kind']=='return_only' and p['alpha_mode']=='adaptive' for p in pins['references'])
     assert pins['prior_reference']['bundle'] and len(pins['prior_reference']['manifest_sha256'])==64
+
+
+def test_invalid_schema_reference_fails_in_cells_before_reference_loading(tmp_path):
+    from utils.ambi_research import PresetMatrixError, load_preset_matrix
+    matrix=load_preset_matrix(campaign.MATRIX)
+    assert matrix['comparisons']['sweep']['reference']=='prior'
+    assert 'sweep/prior' not in matrix['evaluation']['default_presets']
+    matrix['comparisons']['sweep'].pop('reference')
+    path=tmp_path/'broken.json';path.write_text(json.dumps(matrix))
+    with pytest.raises(PresetMatrixError,match='reference must name'):
+        campaign.cells(path)
+
+
+def test_real_metadata_preparation_writes_all_62_canonical_specs_without_a_prior_run(tmp_path,monkeypatch):
+    """Exercise the actual loader, selector resolution, protocol guard and spec writer."""
+    import evaluate_ambi_checkpoint as evaluator
+    from utils import ambi_benchmark
+    from utils.eval_series_data import resolved_checkpoint_config
+    checkpoint=tmp_path/'checkpoint.pt';checkpoint.write_bytes(b'metadata-only checkpoint fixture')
+    base_params=dict(aux_return_mode='sac',aux_return_detach_representation=False,
+                     target_entropy=-10.5,log_std_mapping='direct_clamp',
+                     sac_actor_loss_scale_mode='none',train_unroll_horizon=3)
+    trial=dict(alg='AMBITDMPC2/AMBITDMPC2',env='DMControl-v0',seed=55,total_steps=1000000,
+               alg_params=base_params,resolved_runtime={'observation':dict(mode='state',shape=[67],action_dim=21,episode_length=500)})
+    metadata=dict(schema_version=1,trial_run_params=trial,
+        experiment_params={'env_params':{'task':'humanoid-walk','obs':'state'}},
+        checkpoint=dict(kind='periodic',step=575000,episode=1150,best_score=None,best_window=1))
+    Path(str(checkpoint)+'.metadata.json').write_text(json.dumps(metadata))
+    inventory=tmp_path/'inventory.json'
+    inventory.write_text(json.dumps(dict(source_run=campaign.SOURCE_RUN,
+        checkpoints=[dict(step=575000,sha256=campaign.digest(checkpoint))])))
+    commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=campaign.ROOT,text=True).strip()
+    monkeypatch.setattr(ambi_benchmark,'code_identity',lambda:dict(commit=commit,dirty=False))
+    monkeypatch.setattr(evaluator,'_make_env',lambda *a,**k:pytest.fail('metadata preparation constructed an environment'))
+    monkeypatch.setattr(evaluator,'evaluate_preset',lambda *a,**k:pytest.fail('metadata preparation evaluated an episode'))
+    panel=campaign.cells()
+    args=SimpleNamespace(root=tmp_path/'campaign',matrix=campaign.MATRIX,checkpoint=checkpoint,inventory=inventory)
+    specs=campaign.prepare_specs(args,panel)
+    assert len(specs)==62 and 'sweep/prior' not in specs
+    assert len(list((args.root/'specs'/'policy_sample').glob('*.json')))==36
+    assert len(list((args.root/'specs'/'mean').glob('*.json')))==26
+    assert not (args.root/'unused').exists()
+    checkpoint_info=dict(metadata=metadata)
+    for cell in panel:
+        spec=campaign.read(specs[cell['selector']]);identity=spec['identity']
+        reference=resolved_checkpoint_config(checkpoint_info,{'algorithm_config':{
+            **trial,'alg_params':{**base_params,**campaign.historical_cell(min(cell['H'],3),cell['J'])['params']}}})
+        campaign.matching_planner(identity['planner'],reference,cell)
+        assert spec['selector']==cell['selector'] and identity['backbone']==campaign.SOURCE_RUN
+        assert identity['protocol']['action_rule']==campaign.action_rule(cell['execution_mode'])
+        assert identity['planner']['type']=='sac'

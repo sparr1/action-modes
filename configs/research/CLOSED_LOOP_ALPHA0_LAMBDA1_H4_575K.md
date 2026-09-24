@@ -79,9 +79,11 @@ probe histories remain available.
 `slurm/ambi_closed_loop_alpha0_lambda1_h4.py prepare` accepts `--root`,
 `--checkpoint`, `--inventory`, `--registry`, and optional `--matrix`,
 `--references`, `--group`, `--label`. It verifies the completed references,
-generates evaluation-series specifications, checks canonical planner identities
+generates evaluation-series specifications separately under `specs/policy_sample`
+and `specs/mean`, checks canonical planner identities
 and creates exactly 62 new local publication registrations. Preparation does
-not evaluate episodes or publish W&B runs.
+not evaluate episodes or publish W&B runs. The matrix's unselected `prior`
+variant satisfies the preset schema only; it never creates a run or a result.
 
 `worker --root ROOT --index INDEX [--smoke]` owns one complete setting.
 Indices 0–9 are maximum-budget smoke representatives: six A paths at J10,
