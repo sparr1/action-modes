@@ -810,6 +810,68 @@ budget controls. Existing configurations that use a shared integer or
 number ordering. These controls do not change replay capacity, retention, or
 sampling semantics.
 
+### SAC updates on a cumulative critic-step clock
+
+Set `inner_actor_update_interval` to a positive integer P to opt into the
+frequency schedule discussed in
+[Speeding Up SAC with Massively Parallel Simulation](https://arthshukla.substack.com/p/speeding-up-sac-with-massively-parallel).
+The default `null` retains all existing schedules. This option changes update
+scheduling only; AMBI's critic, actor, entropy objectives, and temperature-loss
+sample remain unchanged.
+
+In this mode, shared `inner_updates_per_round=G` is the number of critic steps
+after collecting a complete rollout round. Each critic step samples one fresh
+minibatch. On completed critic steps divisible by P, update the actor and, when
+automatic temperature is enabled, alpha using that same minibatch. Finally,
+update the target critic when the completed critic-step count is divisible by
+`inner_critic_target_update_interval=T`. A coincident event therefore runs
+critic, actor, alpha, then target. The actor and target clocks continue across
+inner rounds and reset at the next real decision. Collection is still complete
+before learning begins; there are no updates between imagined rollout depths.
+
+| Critic / actor / target steps per round | G: critic steps | P: actor interval | T: target interval |
+|---|---|---|---|
+| 20 / 20 / 10 | 20 | 1 | 2 |
+| 20 / 4 / 10 | 20 | 5 | 2 |
+| 10 / 10 / 5 | 10 | 1 | 2 |
+
+For example:
+
+```json
+{
+  "inner_critic_updates_per_round": null,
+  "inner_actor_updates_per_round": null,
+  "inner_updates_per_round": 20,
+  "inner_actor_update_interval": 5,
+  "inner_critic_target_update_interval": 2
+}
+```
+
+When overriding a component C/A recipe, the two `null` entries clear its
+inherited component budgets and the explicit G replaces its inactive shared
+budget. Retain the selected N, H, B, alpha settings, and target Polyak
+coefficient; these scheduling overrides do not select new values for them.
+
+For J rounds, resolved per-action work is J*G critic steps, floor(J*G/P) actor
+steps, and the same number of alpha steps only for automatic temperature.
+There are J*G minibatch draws, so total replay rows drawn equal J*G*B. The
+number of actor steps need not be identical in every round: G3/P2/J3 executes
+1, 2, and 1 actor steps. A solve shorter than P critic steps has no actor or
+alpha updates. Target updates remain independent of actor updates and retain
+the configured Polyak coefficient.
+
+The initial implementation requires fixed positive integer G, P, and T;
+canonical single-policy one-step SAC; trainable actor and critic; action-local actor,
+critic, temperature, replay and optimizers; round timing; uniform replay; no
+explorer or outer-replay mixing; and the default `critic_first` component-order
+setting. Omit explicit component C/A budgets and deprecated total-budget keys
+(inactive `null` values are allowed). `inner_steps_per_update`, G=`"auto"`,
+Retrace, and ERE replay are not supported in this mode. The active actor interval is
+recorded in resolved configuration, evaluation planner identity, and strict
+resume identity; omitted and explicit `null` preserve historical identities.
+
+### Actor-only ablation
+
 For an actor-only inner-SAC ablation, set
 `inner_actor_adaptation="clone"`, `inner_critic_adaptation="frozen"`, and
 `inner_temperature_mode="inherit_outer"`. The canonical schedule then resolves

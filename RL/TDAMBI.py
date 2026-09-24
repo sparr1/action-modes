@@ -255,6 +255,7 @@ class TDAMBI(AMBITDMPC2):
             raise ValueError("TDAMBI currently supports single-task state observations only.")
         unsupported = [key for key in params if (
             key in {"inner_steps_per_update", "inner_critic_updates_per_round",
+                    "inner_actor_update_interval",
                     "inner_actor_updates_per_round", "inner_model_step_budget",
                     "inner_critic_updates_per_action", "inner_actor_updates_per_action",
                     "inner_temperature_updates_per_action", "inner_iterations",

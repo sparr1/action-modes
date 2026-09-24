@@ -162,6 +162,9 @@ _AMBI_DEFAULTS = {
     "inner_critic_updates_per_round": None,
     "inner_actor_updates_per_round": None,
     "inner_component_update_order": "critic_first",
+    # Opt-in cumulative critic-step clock for the canonical shared-G schedule.
+    # None preserves the historical joint and component update paths.
+    "inner_actor_update_interval": None,
 
     # Optional action-local random explorer. The prior weight always denotes
     # the primary/prior-initialized policy's share of imagined rollouts.
@@ -983,6 +986,32 @@ def _outer_policy_hash(seed, episode_start_step, namespace):
 def _normalize_legacy_params(params):
     """Normalize schedule aliases and identify canonical versus total scheduling."""
     params = copy.deepcopy(params)
+
+    if params.get("inner_actor_update_interval") is not None:
+        params["inner_actor_update_interval"] = _strict_positive_int(
+            params["inner_actor_update_interval"], "inner_actor_update_interval"
+        )
+        incompatible = (_V1_SCHEDULE_KEYS | _TOTAL_SCHEDULE_KEYS
+                        | _COMPONENT_SCHEDULE_KEYS | {"inner_steps_per_update"})
+        conflicts = sorted(key for key in incompatible if params.get(key) is not None)
+        if conflicts:
+            raise ValueError(
+                "inner_actor_update_interval requires canonical shared "
+                f"inner_updates_per_round without other update budgets: {conflicts}."
+            )
+        # Evaluation matrices commonly spell inactive schedule aliases as null.
+        for key in incompatible:
+            params.pop(key, None)
+        params["inner_updates_per_round"] = _strict_positive_int(
+            params.get("inner_updates_per_round", _AMBI_DEFAULTS["inner_updates_per_round"]),
+            "inner_updates_per_round with inner_actor_update_interval",
+        )
+        target_key = ("inner_target_update_interval" if "inner_target_update_interval" in params
+                      else "inner_critic_target_update_interval")
+        params[target_key] = _strict_positive_int(
+            params.get(target_key, _AMBI_DEFAULTS["inner_critic_target_update_interval"]),
+            target_key,
+        )
 
     # An old active LoRA configuration describes a different scientific
     # protocol. Never reinterpret it as the new critic regularizer.
@@ -1818,10 +1847,14 @@ class AMBITDMPC2(TDMPC2Baseline):
                         nominal_total if critic_enabled else 0
                     )
                     cfg.inner_actor_updates_per_action = (
-                        nominal_total if actor_enabled else 0
+                        (nominal_total if cfg.inner_actor_update_interval is None else
+                         nominal_total // cfg.inner_actor_update_interval)
+                        if actor_enabled else 0
                     )
                     cfg.inner_temperature_updates_per_action = (
-                        nominal_total if temperature_enabled else 0
+                        (nominal_total if cfg.inner_actor_update_interval is None else
+                         cfg.inner_actor_updates_per_action)
+                        if temperature_enabled else 0
                     )
 
                 cfg.inner_model_step_budget = (
@@ -2420,6 +2453,26 @@ class AMBITDMPC2(TDMPC2Baseline):
         cfg.inner_replay_reset_each_round = _strict_bool(
             cfg.inner_replay_reset_each_round, "inner_replay_reset_each_round"
         )
+        if cfg.inner_actor_update_interval is not None and (
+            cfg.inner_operator != "sac"
+            or cfg.inner_sac_return_estimator != "one_step"
+            or cfg.inner_schedule_mode != "canonical"
+            or cfg.inner_component_update_schedule
+            or cfg.inner_steps_per_update is not None
+            or cfg.inner_update_timing != "round"
+            or cfg.inner_component_update_order != "critic_first"
+            or getattr(cfg, "inner_replay_strategy", "uniform") != "uniform"
+            or cfg.inner_explorer_mode != "none"
+            or cfg.inner_outer_replay_fraction != 0
+            or cfg.inner_actor_adaptation == "frozen"
+            or cfg.inner_critic_adaptation == "frozen"
+            or any(getattr(cfg, key) != "action" for key in scope_keys[:-1])
+        ):
+            raise ValueError(
+                "inner_actor_update_interval requires canonical shared-budget, "
+                "action-local one-step SAC with trainable actor/critic, round timing, "
+                "uniform replay, critic_first ordering, no explorer and no outer replay mixing."
+            )
         if cfg.inner_replay_reset_each_round and (
             cfg.inner_operator != "sac"
             or cfg.inner_schedule_mode != "canonical"
@@ -2969,7 +3022,8 @@ class AMBITDMPC2(TDMPC2Baseline):
         cfg.inner_grad_clip_norm = max(
             cfg.inner_actor_grad_clip_norm, cfg.inner_critic_grad_clip_norm
         )
-        if cfg.inner_component_update_schedule or cfg.inner_steps_per_update is not None:
+        if (cfg.inner_component_update_schedule or cfg.inner_steps_per_update is not None
+                or cfg.inner_actor_update_interval is not None):
             # There is no truthful legacy single-G alias for a phased C/A
             # schedule. Keep it explicitly unset instead of reporting zero
             # updates for a solve that may perform nonzero component steps.

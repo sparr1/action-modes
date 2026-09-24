@@ -224,6 +224,10 @@ def scientific_trial_parameters(
                         value = 0.0
                 algorithm[field] = value
             if projected.get("alg") == _AMBI_ALGORITHM:
+                # Omitted and inactive frequency scheduling preserve historical
+                # lineage bytes; an active critic-step interval stays scientific.
+                if algorithm.get("inner_actor_update_interval") is None:
+                    algorithm.pop("inner_actor_update_interval", None)
                 algorithm = normalize_lora_rl_identity(algorithm)
                 algorithm = normalize_aux_return_identity(algorithm)
                 estimator = algorithm.get("inner_sac_return_estimator", "one_step")

@@ -4959,6 +4959,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 temperature_count=temperature_count, actor_loss_scale=actor_loss_scale,
             )
         slots = max(critic_count, actor_count, temperature_count)
+        actor_interval = getattr(self.cfg, "inner_actor_update_interval", None)
         if self.cfg.inner_operator == "tdambi":
             if critic_count != actor_count or temperature_count:
                 raise ValueError("TDAMBI requires paired critic/actor updates and no temperature updates.")
@@ -4973,6 +4974,18 @@ class InnerImprovementEngine(RetraceInnerMixin):
             do_critic = slot < critic_count
             do_actor = slot < actor_count
             do_temperature = slot < temperature_count and self._inner_entropy_enabled
+            if actor_interval is not None:
+                # The shared slot first completes one critic step. Schedule
+                # policy/alpha from that cumulative count, carrying the phase
+                # across collection rounds. Action-local critic initialization
+                # resets the clock at the next real decision. A delayed actor
+                # shares this slot's batch; it does not consume another draw.
+                policy_due = (
+                    do_critic
+                    and (self.state.critic_lifetime_steps + 1) % actor_interval == 0
+                )
+                do_actor = do_actor and policy_due
+                do_temperature = do_temperature and policy_due
             batch = self._sample_batch(
                 None if replay_indices is None else replay_indices[slot]
             )
