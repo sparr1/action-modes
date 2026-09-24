@@ -310,6 +310,11 @@ def watch(args):
     config = {key: campaign.get(key) for key in ('checkpoint_step', 'checkpoint_sha256', 'source_run',
               'source_commit', 'initial_alpha', 'target_entropy', 'prior_manifest_sha256', 'prior_source_science')}
     replay_capacity, = {c['params']['inner_replay_capacity'] for c in campaign['cells']}
+    selected_critics = {c['critic_kind'] for c in campaign['cells']}
+    critic_descriptions = {
+        'soft': 'SAC soft-Q initialization, entropy-augmented fitting, soft-Q terminal with entropy correction',
+        'return_only': 'Auxiliary return-Q initialization, reward-only fitting, return-Q terminal',
+    }
     config.update(campaign_group=campaign['group'], protocol='closed-loop-refinement-v1', protocol_variant='SAC auxiliary-critic comparison; adaptive actor entropy',
                   J=sorted({c['J'] for c in campaign['cells']}), H=campaign_horizon(campaign), N=128, B=256, C=16, A=4,
                   inner_replay_capacity=replay_capacity, inner_replay_scope='action',
@@ -317,14 +322,15 @@ def watch(args):
                   environment_seeds=SEEDS, controller_seed=55, max_decisions=500,
                   execution='Fresh adaptation at every real decision, then deterministic actor mean action',
                   prior_reference=str(campaign['reference']),
-                  critic_comparison={'soft': 'SAC soft-Q initialization, entropy-augmented fitting, soft-Q terminal with entropy correction',
-                                     'return_only': 'Auxiliary return-Q initialization, reward-only fitting, return-Q terminal'},
+                  critic_comparison={kind: text for kind, text in critic_descriptions.items() if kind in selected_critics},
                   uncertainty='Sample standard deviation across five paired episodes; exploratory screen',
                   result_links=urls)
     run = wandb.init(entity=ENTITY, project=PROJECT, id=campaign['overview_run_id'], resume='never',
                      name=campaign.get('label', 'Closed-loop critic comparison at 575k'),
                      group=campaign['group'], job_type='closed-loop-comparison',
-                     tags=['closed-loop', 'soft-vs-return-only', 'target10p5-shared'], config=config, mode='online')
+                     tags=['closed-loop', 'target10p5-shared',
+                           'return-only' if selected_critics == {'return_only'} else 'soft-vs-return-only'],
+                     config=config, mode='online')
     run.define_metric('axis/inner_rounds')
     run.define_metric('closed_loop/*', step_metric='axis/inner_rounds')
     run.summary.update(dict(status='running', result_type='Full-episode closed-loop environment returns',
