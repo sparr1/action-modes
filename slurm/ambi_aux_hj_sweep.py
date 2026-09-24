@@ -477,7 +477,7 @@ def publish_performance(run_dir):
             time.sleep(15)
 
 
-def publish_cell(args):
+def publish_cell(args, *, performance_publisher=None):
     from utils.ambi_benchmark import stage_completed_bundle
     from utils.eval_series import load_run
     from utils.eval_series_data import load_records
@@ -504,7 +504,7 @@ def publish_cell(args):
     comparison = polyak_comparison(record['episodes'],cell['baseline']) if 'baseline' in cell else None
     staged = stage_completed_bundle(bundle,{cell['actual_selector']:cell['run_dir']},inventory_path=campaign['inventory'])
     assert staged[cell['actual_selector']]['status'] == 'queued'
-    performance = publish_performance(cell['run_dir'])
+    performance = (performance_publisher or publish_performance)(cell['run_dir'])
     summary = training_summary(bundle,cell)
     write(directory/'training-summary.json',summary)
     comparison_file = ('replay-comparison.json' if cell.get('baseline',{}).get('kind') == 'round_replay'

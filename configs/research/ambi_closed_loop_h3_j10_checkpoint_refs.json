@@ -1,0 +1,271 @@
+{
+  "schema_version": 1,
+  "source_run": "rwgao_b-brown-university/ambi/aux6428346x0",
+  "checkpoint_steps": [
+    100000,
+    200000,
+    300000,
+    400000,
+    500000,
+    525000,
+    550000,
+    575000,
+    600000,
+    625000,
+    650000,
+    675000,
+    700000,
+    725000,
+    750000,
+    775000,
+    800000,
+    825000,
+    850000,
+    875000,
+    900000,
+    925000,
+    950000,
+    975000,
+    1000000
+  ],
+  "prior_references": [
+    {
+      "checkpoint_step": 100000,
+      "checkpoint_sha256": "7a43de8e25613326df7671ebb7eda6301bb2611fcc92d7be85983d4f247f8514",
+      "metadata_sha256": "8862a29a09021ec12c9ab0f17ade3ea92b0b06f395c73b3f8d99423138374529",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_100000/bundle",
+      "manifest_sha256": "00cb22bb1072c52a3bfde19515711cded5add046f2c1e3192332f8fb19c1823a",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.0017550134798511863
+    },
+    {
+      "checkpoint_step": 200000,
+      "checkpoint_sha256": "59e4d07ea2386d49cece5469e36bc4fd52f9e3dfd30a3444d8c2769ea22fd4fc",
+      "metadata_sha256": "9978b151ecb5c301afd8de59a146b94128764de0103f5100fd2c16e02061b802",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_200000/bundle",
+      "manifest_sha256": "70138723ad1fa6395cab9566b72a4c657d2063fec8ad978eea46083a6a7d4468",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.0025756859686225653
+    },
+    {
+      "checkpoint_step": 300000,
+      "checkpoint_sha256": "cce6c77956807a2daf2dc435a4f0b41cf3bfc68e1ceb86d8ec422f1143413e64",
+      "metadata_sha256": "7fca0f254ecf004993922d6c55a1cadfecf71244f792ec273d0236184ab13b95",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_300000/bundle",
+      "manifest_sha256": "0b2894d3208d02b1c0615d93be3133e21f95f251126c79170d6a6546da2394f9",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.0010360426967963576
+    },
+    {
+      "checkpoint_step": 400000,
+      "checkpoint_sha256": "801c7df60f859bde7b5793b62f963be15e28d2547d18a8aa5bbbf8ad2463561b",
+      "metadata_sha256": "9f38b3645d1209811ceda5be6fbfc210d82521df12caf18274d58e7def3375f9",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_400000/bundle",
+      "manifest_sha256": "12ec3905b8d8c85a9dfafac7563e10e5b7334db8f3404b883e2cf2e720c66d8e",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.0022350263316184282
+    },
+    {
+      "checkpoint_step": 500000,
+      "checkpoint_sha256": "cf5bb8044e6a42d7bbd9724fc716c476f0d06f96d05e954978dc4b00b695fe9e",
+      "metadata_sha256": "0f00b27de519ff592f478cb680cea3a84811f41d872d80710169379195d3ee97",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_500000/bundle",
+      "manifest_sha256": "4640362474eda5eba749d2ce0715528de6e1ad6d02172ef45210f3c6935b3439",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.0018822612473741174
+    },
+    {
+      "checkpoint_step": 525000,
+      "checkpoint_sha256": "f65993f621addf275798d9940cd84b7d4700bfc04832d75fa6db982d7ae35174",
+      "metadata_sha256": "88b12fcc87de67eb3175fb64f61f415f963f432f2788e0afc020932e82cc6d53",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_525000/bundle",
+      "manifest_sha256": "4850fb805aaf99a00b33170a19f07e762b308d1ad35ffc9ccd64ff070e074c70",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.0030113249085843563
+    },
+    {
+      "checkpoint_step": 550000,
+      "checkpoint_sha256": "b5b7271b8d734398031f80de4d2a326a005e8757d3d03a71cca110ac3d9b59bc",
+      "metadata_sha256": "0ca3163f737bab95fd1da58b0870f44d82bfdfd727188c578e10db3619c6ba2e",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_550000/bundle",
+      "manifest_sha256": "086e488fce7b892fed6a77d761201fe64f79bc98ca34ed2fa28aa157600b50e8",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.004150018561631441
+    },
+    {
+      "checkpoint_step": 575000,
+      "checkpoint_sha256": "0c6955db7cb8555a67d7863344b70be68f4b3250814d131e647ee6f9ef01a042",
+      "metadata_sha256": "8acc74b7ad4993050a5cc0d3c4c0860441fceb48f36a79540f5e1943e6b3e1d2",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_575000/bundle",
+      "manifest_sha256": "bcecdc4f8e3914d5567579ac98dc4a7ef8d13d5dd0ac507778d49fae35ea531f",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.004603903274983168
+    },
+    {
+      "checkpoint_step": 600000,
+      "checkpoint_sha256": "1a55a665051eedcb01ab417d83f185da6e6c66606d7b4878896b3d8d6fdc16f1",
+      "metadata_sha256": "90e3f6c9d8ac020135ff646d3fe721c7719de2c53822df61ea96e850325faaa1",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_600000/bundle",
+      "manifest_sha256": "78001f4c1e1be5db169d37ad8d7efbc9710ffdbab0c032d8f4e41b9b9065926c",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.004661236889660358
+    },
+    {
+      "checkpoint_step": 625000,
+      "checkpoint_sha256": "d9d644ce1a8a21714cf67e1d2db1d09cd0a11cac65fe25a9e298d9976f90505f",
+      "metadata_sha256": "b2c21c19f08872f41ea19c82249729fe4f083d52a11b99e2719b21d5742980d6",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_625000/bundle",
+      "manifest_sha256": "a34de0a941881b02306461083c9c64da8c3871ece854d814080fc7a0a6bb5452",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.005768151488155127
+    },
+    {
+      "checkpoint_step": 650000,
+      "checkpoint_sha256": "021e7b4fb323f7181f7b25c0e0cf7c0f92e9097ecd60d9474284a47e50d6609e",
+      "metadata_sha256": "24e7cd83c7f6f9d0631dad6ddd26c0829aafa706f7414de418616c476eeb9584",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_650000/bundle",
+      "manifest_sha256": "0fe070c8e3ddf1afb8057cf080fbd132acafb41536d070b4a2bce372f7ef4358",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.0059470199048519135
+    },
+    {
+      "checkpoint_step": 675000,
+      "checkpoint_sha256": "b50cc8b5f4ae8cbecc8ac0d0a8bd511820eb539d9fa8e377d403bca50f2c0181",
+      "metadata_sha256": "80f835f3679c66e462265a462685d48e21442e8b5002ff726d0993a215e047e7",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_675000/bundle",
+      "manifest_sha256": "7d2d4e11acddf4e214bf2931980a562a8137050d1eb48e9ecfbaa8547986cd27",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.007112768478691578
+    },
+    {
+      "checkpoint_step": 700000,
+      "checkpoint_sha256": "e2b9dc4a8e39ae10f5fbf838442e4dcf03c40919a03e0600569e9bfaa7d7d7e9",
+      "metadata_sha256": "b48065bffd6a294379bb33c673c301b1ec566c77ed32d1bd7482c6d4c1fe80d3",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_700000/bundle",
+      "manifest_sha256": "1b19fba594bc378bd23df06086878391b9ea3a41360019038d3d9bd607c0e448",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.0075722248293459415
+    },
+    {
+      "checkpoint_step": 725000,
+      "checkpoint_sha256": "958218f3adb1676b9a9ef78ea94701fe8653bc761a60087999cd49a8b2d153f1",
+      "metadata_sha256": "417dc907eb1e8f4aa572ce42ce9c8f1cf7f9a0d42b2a12a984a25c5b5dda7869",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_725000/bundle",
+      "manifest_sha256": "8d400d048eaff03ddd4ded148ea9e5398f026cc7c0b01ab50353cd80e33449b0",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.007644303608685732
+    },
+    {
+      "checkpoint_step": 750000,
+      "checkpoint_sha256": "dde96dbf7133532fa2f45823e4208d92cb2d9637f0ab34b4c77b1f197b91831e",
+      "metadata_sha256": "cc962e0e3f221ac9b25b42d5ac8407fe365bd0a44aa945a63592e28df79bf6ed",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_750000/bundle",
+      "manifest_sha256": "6aa708244bb5872fd493489935701d25785284f9888ea93b777c4889e6c3fed6",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.007977470755577087
+    },
+    {
+      "checkpoint_step": 775000,
+      "checkpoint_sha256": "6fd2fc9cb533566c1aab7ecbc67a9f6f3dca9d0ffef86078ce8938ba919444f6",
+      "metadata_sha256": "0103ea626274da287c5f5476587c351f05f51f339e792fc44497e3b52a486d6a",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_775000/bundle",
+      "manifest_sha256": "9c03cf279a3f75466c44d9d22c251743e49db5bee5096be3252fe6a1b2ee23aa",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.008844371885061264
+    },
+    {
+      "checkpoint_step": 800000,
+      "checkpoint_sha256": "62606f9d905be4798db89f916993355ff0c6edc994d2780636edbf876b1726a4",
+      "metadata_sha256": "dc1c98a9b6937b193c2d19821875323dd3cff5097c5f8caf426bbbe1f9842eab",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_800000/bundle",
+      "manifest_sha256": "6754c5c8fae547ac6ed9547c48affcfc7a7b4ef0c695acb9246a0e6dea1f99df",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.008937015198171139
+    },
+    {
+      "checkpoint_step": 825000,
+      "checkpoint_sha256": "3e0eb552a933c3f3a2fde37c3e7239d10d8134c5d816f8e0bc5c44dc9e290001",
+      "metadata_sha256": "289ac60193ba5c5c0d6f461248b435ae0357f617ab9838fb7469199fa15016e7",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_825000/bundle",
+      "manifest_sha256": "50895357636c0741adfc853748d24883e9ce1fecf2ae5847bbf0e02f2ed04eb7",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.009162362664937973
+    },
+    {
+      "checkpoint_step": 850000,
+      "checkpoint_sha256": "e5bacb9a52ca3ed49442ba6915d011337b8d7a01b909f497ad3d29916e6471de",
+      "metadata_sha256": "b225b09f6ee950992ab76d0f41adf901254f6049ef819e9b35161732db65fe70",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_850000/bundle",
+      "manifest_sha256": "ae63624c06c3bc6704526c069e68842d76b940732585df2d6a0a90b061f0f7cd",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.008954004384577274
+    },
+    {
+      "checkpoint_step": 875000,
+      "checkpoint_sha256": "7a8413ac5096fee0cbefd20a829c2ca605637200bed347a4245d48f0abdbfc08",
+      "metadata_sha256": "4af1f2838e10f2cd8a5ff8194e3de2f0ef448ae27fd9a2548232f345240a0acb",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_875000/bundle",
+      "manifest_sha256": "3dd21f6a51d8f0d706bc1c6cc31cc0e104655e27c7eef45a8a6ea8da210483ef",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.00913372915238142
+    },
+    {
+      "checkpoint_step": 900000,
+      "checkpoint_sha256": "00566fdb3d7a857dd16a081d3982ecee654ca832bcaae78c2c73173335eb17f3",
+      "metadata_sha256": "4da5da49f9141769863aa85591029c064111a52422cc62f491b8021d02d99e0e",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_900000/bundle",
+      "manifest_sha256": "a59863a913da53cf1a34dc4d74ab8117fa74a462d015aef6d29c1f3fa1e4325f",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.009735966101288795
+    },
+    {
+      "checkpoint_step": 925000,
+      "checkpoint_sha256": "75f3b05e32e6fe890df0826b6e73b59ee9b4c08ee54dc0273318d0483a97f99a",
+      "metadata_sha256": "a677663f306861ff0b288bd2faa89f19e3933dc44c94fc7dbf976a15f39b737d",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_925000/bundle",
+      "manifest_sha256": "a1a69fa84d65cf0c5584a607cafe92e8daddca30b3ad06b0ca0f493016bbe6aa",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.00959380716085434
+    },
+    {
+      "checkpoint_step": 950000,
+      "checkpoint_sha256": "52bed50ab7839c709f6fbc5f5388d434cd2d8455fc2c096f569397f2dbbafaa3",
+      "metadata_sha256": "520517bd260e6f4b001c8a69a256a8bb7483be64cada9f7d9724ff5a9f63be4c",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_950000/bundle",
+      "manifest_sha256": "0078bdfb4094be0572c6649aa0ab8e3f7156e38e5e1aacbe86fd087f180613dd",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.009282989427447319
+    },
+    {
+      "checkpoint_step": 975000,
+      "checkpoint_sha256": "63660b31933d725fbe9e2cb0439905b69119d24efe25610756c7ff06ce886b23",
+      "metadata_sha256": "7020faff33ebec6a31911e376a04bbb2e22091ee67e6c8d47d4100006df08e58",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_975000/bundle",
+      "manifest_sha256": "ae896b9fa3e36bd4e09c27fc2f52c330134376cef82c96d0d48dba6527fa6638",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.009926366619765759
+    },
+    {
+      "checkpoint_step": 1000000,
+      "checkpoint_sha256": "30840f74f290549aff6dad213d6b5b324a27107f3934ebe44c176d688732ffb5",
+      "metadata_sha256": "bb4146cf6ea9847dbcacdef8da2f437ee3d6687f72fcdbe4b00fd732ae048686",
+      "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_1000000/bundle",
+      "manifest_sha256": "f040aaffbfddec3ae77912c87184cb7b48df7aa3467f233ed831778bda9cc48c",
+      "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+      "initial_alpha": 0.009842105209827423
+    }
+  ],
+  "reused_evaluation": {
+    "H": 3,
+    "J": 10,
+    "execution": "mean",
+    "estimator": "one_step",
+    "bundle": "/oscar/scratch/rgao48/ambi/closed-loop-critics-j10-575k/20260922/h3/campaign/return_return_alpha_h3_j10_c16/bundle",
+    "source_commit": "5b3f3ced852e2d76de01e79a687c762170b8cad0",
+    "manifest_sha256": "59e75ddb2419b3ab7a20e9da3ad7e056e4c921e4166b0dd564678fcfbc672d89",
+    "performance_run_id": "6ed12e4bb02f4895bc6d0835294016e0",
+    "training_run_id": "b534c78ea43a4c688bafb840d59e0943",
+    "checkpoint_step": 575000,
+    "checkpoint_sha256": "0c6955db7cb8555a67d7863344b70be68f4b3250814d131e647ee6f9ef01a042"
+  }
+}
