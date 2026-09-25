@@ -18,6 +18,10 @@ comparisons.
 
 ### Critic-only LoRA-RL comparisons
 
+The [575k critic LoRA screen](CLOSED_LOOP_CRITIC_LORA_575K.md) evaluates ranks
+16 and 96 across H1/2/3 and J1/2/4/6/8/10 with C16/A4, uniform replay, and a
+dense actor. It reuses the matching dense-critic and frozen-prior episodes.
+
 The [LoRA-RL implementation contract](../../RL/tdmpc2_core/README.md#critic-only-lora-rl)
 keeps the actor dense and applies low-rank updates only to selected critic
 matrices. The initial reference is rank 96, direct scale one, and AdamW adapter

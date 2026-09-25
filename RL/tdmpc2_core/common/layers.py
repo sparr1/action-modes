@@ -200,28 +200,43 @@ class Ensemble(nn.Module):
 			and hasattr(torch.compiler, "is_compiling")
 			and torch.compiler.is_compiling()
 		)
+		if compiling:
+			# Import here because LoRA wrappers inherit the layer types in this
+			# module. The fixed types are resolved before their tensor graph.
+			from .lora import LoRARLLinear, LoRARLNormedLinear
 		outputs = []
 		for module in self.modules_list:
 			layers = module if isinstance(module, nn.Sequential) else (module,)
 			if compiling and len(args) == 1 and not kwargs and all(
-				type(layer) in (nn.Linear, NormedLinear) for layer in layers
+				type(layer) in (nn.Linear, NormedLinear, LoRARLLinear, LoRARLNormedLinear)
+				for layer in layers
 			):
 				# The locked PyTorch cannot trace functional_call. Express the
-				# standard critic MLP directly, retaining NormedLinear's exact
-				# linear -> dropout -> LayerNorm -> activation order. Eager and
-				# custom/LoRA modules retain the general stateless path below.
+				# supported critic MLP directly, retaining the factorized LoRA
+				# arithmetic and linear -> dropout -> LayerNorm -> activation
+				# order. Eager/custom modules retain the stateless path below.
 				x = args[0]
 				for layer in layers:
-					x = F.linear(x, layer.weight.detach(),
-						None if layer.bias is None else layer.bias.detach())
-					if isinstance(layer, NormedLinear):
-						if layer.dropout is not None:
-							x = layer.dropout(x)
-						ln = layer.ln
+					if isinstance(layer, LoRARLLinear):
+						base = layer.base
+						delta = F.linear(F.linear(x, layer.lora_A.detach()), layer.lora_B.detach())
+						x = F.linear(x, base.weight.detach(),
+							None if base.bias is None else base.bias.detach()) + layer.scaling * delta
+						# A plain LoRARLLinear wrapping NormedLinear intentionally
+						# has no normalization; only the normed wrapper applies it.
+						normed = base if isinstance(layer, LoRARLNormedLinear) else None
+					else:
+						x = F.linear(x, layer.weight.detach(),
+							None if layer.bias is None else layer.bias.detach())
+						normed = layer if isinstance(layer, NormedLinear) else None
+					if normed is not None:
+						if normed.dropout is not None:
+							x = normed.dropout(x)
+						ln = normed.ln
 						x = F.layer_norm(x, ln.normalized_shape,
 							None if ln.weight is None else ln.weight.detach(),
 							None if ln.bias is None else ln.bias.detach(), ln.eps)
-						x = layer.act(x)
+						x = normed.act(x)
 				outputs.append(x)
 				continue
 			# Weak-key cache lookups cannot be traced. During compilation,

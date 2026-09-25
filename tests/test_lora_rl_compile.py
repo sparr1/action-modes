@@ -6,8 +6,10 @@ import warnings
 import pytest
 import torch
 
-from RL.tdmpc2_core.common.lora import LoRARLLinear
-from tests.test_ambi_root_local_sac import _tiny_model
+from RL.tdmpc2_core.common.layers import Ensemble
+from RL.tdmpc2_core.common.lora import LoRARLLinear, make_lora_rl_critic
+from tests.test_lora_rl import _head
+from tests.test_ambi_root_local_sac import _tiny_component_model, _tiny_model
 
 
 @pytest.fixture(autouse=True)
@@ -17,11 +19,15 @@ def _reset_dynamo():
     torch._dynamo.reset()
 
 
-def _models(**options):
+def _models(*, strict=False, **options):
     options = {"inner_critic_adaptation": "lora_rl", "inner_critic_lora_rank": 4,
                "inner_updates_per_round": 1, **options}
-    return (_tiny_model(**options),
-            _tiny_model(**options, compile=True, compile_strict=False))
+    builder = _tiny_model
+    if "inner_critic_updates_per_round" in options:
+        options.pop("inner_updates_per_round")
+        builder = _tiny_component_model
+    return (builder(**options),
+            builder(**options, compile=True, compile_strict=strict))
 
 
 def _assert_state_equal(actual, expected):
@@ -44,7 +50,8 @@ def _assert_private_rng_equal(left, right):
 
 
 @pytest.mark.parametrize("dropout", [0.0, 0.2])
-def test_non_strict_graph_capture_matches_complete_lora_sac_solves(monkeypatch, dropout):
+@pytest.mark.parametrize("strict", [False, True])
+def test_graph_capture_matches_complete_lora_sac_solves(monkeypatch, dropout, strict):
     real_compile = torch.compile
     captured_regions = []
 
@@ -53,7 +60,7 @@ def test_non_strict_graph_capture_matches_complete_lora_sac_solves(monkeypatch, 
         return real_compile(function, backend="eager", **kwargs)
 
     monkeypatch.setattr(torch, "compile", eager_backend)
-    eager, compiled = _models(dropout=dropout)
+    eager, compiled = _models(dropout=dropout, strict=strict)
     try:
         eager_engine, compiled_engine = eager.agent.inner_engine, compiled.agent.inner_engine
         outer_state = deepcopy(eager.agent.model.state_dict())
@@ -140,29 +147,91 @@ def test_detached_lora_failure_warns_once_reports_fallback_and_restores_rng(monk
         compiled.env.close()
 
 
-def test_locked_runtime_strict_detached_lora_graph_fails_without_eager_fallback(monkeypatch):
+@pytest.mark.parametrize("placement", ["input_hidden", "hidden"])
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("normed", [False, True])
+def test_strict_detached_lora_graph_matches_stateless_values_gradients_and_rng(
+    monkeypatch, placement, training, normed,
+):
     real_compile = torch.compile
 
     def eager_backend(function, **kwargs):
         return real_compile(function, backend="eager", **kwargs)
 
     monkeypatch.setattr(torch, "compile", eager_backend)
-    model = _tiny_model(inner_critic_adaptation="lora_rl", inner_critic_lora_rank=4)
+    def head():
+        return (_head() if normed else torch.nn.Sequential(
+            torch.nn.Linear(5, 7), torch.nn.Linear(7, 6), torch.nn.Linear(6, 3)))
+
+    eager = make_lora_rl_critic(Ensemble([head(), head()]), rank=3,
+                                scale=0.75, placement=placement).train(training)
+    with torch.no_grad():
+        for layer in eager.modules():
+            if isinstance(layer, LoRARLLinear):
+                layer.lora_B.normal_(std=0.1)
+                layer.base.bias.add_(0.1)
+                if normed:
+                    layer.base.ln.weight.mul_(1.1)
+    compiled = deepcopy(eager).enable_compile(strict=True)
+    sample = torch.randn(4, 5)
+    rng = torch.random.get_rng_state().clone()
+    expected_input = sample.clone().requires_grad_(True)
+    expected = eager.forward_detached(expected_input)
+    expected.square().sum().backward()
+    expected_rng = torch.random.get_rng_state().clone()
+    torch.random.set_rng_state(rng)
+    actual_input = sample.clone().requires_grad_(True)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        actual = compiled.forward_detached(actual_input)
+        actual.square().sum().backward()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_input.grad, expected_input.grad, rtol=0, atol=0)
+    torch.testing.assert_close(torch.random.get_rng_state(), expected_rng, rtol=0, atol=0)
+    assert torch.count_nonzero(actual_input.grad)
+    assert all(parameter.grad is None for parameter in compiled.parameters())
+    assert not compiled.compile_failed
+    assert not any("Falling back to eager" in str(item.message) for item in caught)
+
+
+@pytest.mark.parametrize("horizon", [1, 3])
+def test_strict_auxiliary_return_lora_solves_preserve_dense_actor_and_reset(monkeypatch, horizon):
+    real_compile = torch.compile
+
+    def eager_backend(function, **kwargs):
+        assert kwargs.get("fullgraph") is True
+        return real_compile(function, backend="eager", **kwargs)
+
+    monkeypatch.setattr(torch, "compile", eager_backend)
+    eager, compiled = _models(
+        strict=True, aux_return_mode="sac", inner_actor_source="sac",
+        inner_critic_source="aux_return", inner_horizon_critic_source="aux_return",
+        inner_sac_critic_target="reward_only", inner_terminal_entropy="none",
+        inner_finite_horizon=True, inner_rounds=2, inner_rollouts_per_round=4,
+        inner_rollout_horizon=horizon, inner_replay_capacity=24,
+        inner_updates_per_round=None, inner_critic_updates_per_round=2,
+        inner_actor_updates_per_round=1, q_representation="distributional",
+        num_q=5, dropout=0.01, log_std_mapping="direct_clamp",
+    )
     try:
-        engine = model.agent.inner_engine
-        with engine.rng.fork("initialization"):
-            engine._prepare_workspace(t0=True)
-        critic = engine.state.critic
-        critic.enable_compile(strict=True)
-        value = torch.ones(4, model.cfg.latent_dim + model.cfg.action_dim, requires_grad=True)
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            # The locked PyTorch cannot fullgraph the custom critic's stateless
-            # functional_call path. A strict request must expose that error.
-            with pytest.raises(torch._dynamo.exc.Unsupported):
-                critic.forward_detached(value)
-        assert not critic.compile_failed
-        assert not any("Falling back to eager" in str(item.message) for item in caught)
-        assert engine._compile_fallback_metrics()["inner_compile_fallback"] == 0.0
+        outer_state = deepcopy(compiled.agent.model.state_dict())
+        for _ in range(2):
+            expected = eager.agent.act(torch.zeros(3), collect_diagnostics=False)
+            actual = compiled.agent.act(torch.zeros(3), collect_diagnostics=False)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            left, right = compiled.agent.inner_engine, eager.agent.inner_engine
+            for name in ("actor", "critic", "critic_target", "actor_optim", "critic_optim",
+                         "temperature_optim"):
+                _assert_state_equal(getattr(left._action_pool, name).state_dict(),
+                                    getattr(right._action_pool, name).state_dict())
+            _assert_private_rng_equal(left, right)
+            _assert_state_equal(compiled.agent.model.state_dict(), outer_state)
+            assert left._critic_base is compiled.agent.model._aux_return_Qs
+            assert left._horizon_critic is compiled.agent.model._aux_return_Qs
+            assert not any(isinstance(layer, LoRARLLinear) for layer in left._action_pool.actor.modules())
+            assert left.state.critic_steps == 4 and left.state.actor_steps == 2
+            assert all(parameter.grad is None for parameter in compiled.agent.model.parameters())
+            assert compiled.agent.last_inner_metrics["inner_compile_fallback"] == 0.0
     finally:
-        model.env.close()
+        eager.env.close()
+        compiled.env.close()

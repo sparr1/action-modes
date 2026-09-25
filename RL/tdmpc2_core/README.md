@@ -767,9 +767,11 @@ inner-solver ablations. Legacy disabled replay layouts remain unchanged.
 Horizon flags share packed replay storage; the compiled target uses fixed-size
 masks and never constructs variable-sized boundary batches. Real replay lookup
 metadata is cached until replay changes, and current/successor observations are
-encoded together. The ordinary cloned critic and actor kernels support strict
-graph capture (`compile_strict=true`), including the horizon tail. Custom/LoRA
-detached critics retain the existing general stateless path and may require
+encoded together. The ordinary cloned and LoRA-RL critic and actor kernels
+support strict graph capture (`compile_strict=true`), including the horizon
+tail. During graph capture, LoRA-RL evaluates its detached factorized weights
+directly, preserving action gradients and the usual dropout/LayerNorm order.
+Other custom detached critics retain the general stateless path and may require
 non-strict compilation on the locked PyTorch version. Compile failures remain
 visible through the existing fallback metrics. Benchmark compilation warm-up
 separately from steady-state actions.
