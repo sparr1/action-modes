@@ -26,10 +26,127 @@ from slurm.ambi_aux_hj_sweep import (ENTITY, PROJECT, SEEDS, actor_updates,
                                     validate, write)
 
 ARMS = {'soft': 'Soft critic', 'return_only': 'Return-only critic'}
+BUDGET_POINT_COLUMNS = ['setting', 'H', 'J', 'C', 'A', 'N', 'B', 'reused', 'status',
+    'return_mean', 'return_std', 'return_episodes', 'prior_return_mean', 'prior_return_std',
+    'paired_gain_mean', 'paired_gain_std', 'paired_gain_ci95_low', 'paired_gain_ci95_high',
+    'paired_episodes', 'performance_url', 'training_url']
+BUDGET_EPISODE_COLUMNS = ['setting', 'H', 'J', 'C', 'seed', 'solver_seed', 'return', 'prior_return', 'paired_gain']
+BUDGET_DIFFERENCE_COLUMNS = ['H', 'J', 'C', 'reference_C', 'mean', 'std', 'ci95_low', 'ci95_high', 'paired_episodes']
+
+
+def campaign_budget(campaign):
+    """Do not label changed optimizer work as the historical C16 budget."""
+    keys = {'N': 'inner_rollouts_per_round', 'B': 'inner_batch_size',
+            'C': 'inner_critic_updates_per_round', 'A': 'inner_actor_updates_per_round'}
+    result = {}
+    for label, key in keys.items():
+        values = {cell['params'][key] for cell in campaign['cells']}
+        if len(values) != 1:
+            raise ValueError('Expected one shared ' + label + ' budget')
+        result[label], = values
+    return result
+
+
+def load_comparison_references(campaign):
+    """Validate immutable C16 results before reusing them in a C32 comparison."""
+    from copy import deepcopy
+    from utils.ambi_benchmark import episode_protocol
+    references = campaign.get('comparison_references')
+    if references is None:
+        return {}
+    cells = campaign['cells']
+    if (len(cells) != len({cell['J'] for cell in cells})
+            or set(references) != {str(cell['J']) for cell in cells}
+            or any((cell['H'], cell['critic_kind'], critic_updates(cell)) != (3, 'return_only', 32)
+                   for cell in cells)):
+        raise ValueError('C32 comparison requires one matched C16 reference for every H3 return-only J')
+    prior_path = Path(campaign['reference']) / 'manifest.json'
+    if digest(prior_path) != campaign['prior_manifest_sha256']:
+        raise ValueError('Pinned prior changed before C16 comparison')
+    prior = read(prior_path)
+    prior_episodes = indexed_episodes(prior['runs'][0]['episodes'])
+    result = {}
+    for cell in cells:
+        pin = references[str(cell['J'])]
+        bundle = Path(pin['bundle'])
+        if digest(bundle / 'manifest.json') != pin['manifest_sha256']:
+            raise ValueError('Pinned C16 manifest changed')
+        if pin['critic_updates_per_round'] != 16:
+            raise ValueError('Expected historical C16 reference')
+        expected = deepcopy(cell)
+        expected['params']['inner_critic_updates_per_round'] = 16
+        manifest = validate(bundle, expected, checkpoint_step=campaign['checkpoint_step'],
+                            checkpoint_sha=campaign['checkpoint_sha256'])
+        run, = manifest['runs']
+        if (manifest['checkpoint']['source_run'] != campaign['source_run']
+                or manifest['code']['commit'] != pin['source_commit'] or manifest['code']['dirty']
+                or run['selector'] != pin['selector']
+                or manifest['code']['runtime'] != prior['code']['runtime']
+                or episode_protocol(manifest['protocol']) != episode_protocol(prior['protocol'])
+                or manifest['reference']['manifest_sha256'] != campaign['prior_manifest_sha256']):
+            raise ValueError('C16 source, selector, runtime, or paired prior differs from its pin')
+        episodes = indexed_episodes(run['episodes'])
+        if episodes.keys() != prior_episodes.keys():
+            raise ValueError('C16 and prior solver seeds differ')
+        for key, episode in episodes.items():
+            if not math.isclose(episode['paired_return_delta'],
+                                episode['return'] - prior_episodes[key]['return'], abs_tol=1e-9):
+                raise ValueError('C16 recorded prior gain differs from the paired returns')
+        result[cell['J']] = run['episodes']
+    return result
+
+
+def paired_statistics(episodes, baseline):
+    """Use the established five-seed paired bootstrap, with fixed resampling RNG."""
+    from slurm.ambi_closed_loop_reward_retrace_publish import paired_comparison
+    return {key.removeprefix('comparison/sample_minus_mean_'): value
+            for key, value in paired_comparison(episodes, baseline)['metrics'].items()}
+
+
+def budget_results(campaign, prior_episodes, completed, references):
+    prior = indexed_episodes(prior_episodes)
+    prior_stats = moments(e['return'] for e in prior.values())
+    points, rows, differences, difference_episodes = [], [], [], []
+    for cell in campaign['cells']:
+        j = cell['J']
+        pin = campaign['comparison_references'][str(j)]
+        baseline = references[j]
+        for c, episodes, reused, identity in ((16, baseline, True, pin),
+                (32, completed.get(cell['name']), False, cell)):
+            name = cell['name'].removesuffix('_c32') + f'_c{c}'
+            point = dict(setting=name, H=cell['H'], J=j, C=c, A=actor_updates(cell),
+                N=cell['params']['inner_rollouts_per_round'], B=cell['params']['inner_batch_size'],
+                reused=reused, status='reused' if reused else 'evaluated' if episodes else 'queued_or_running',
+                prior_return_mean=prior_stats['mean'], prior_return_std=prior_stats['std'],
+                **{kind + '_url': f'https://wandb.ai/{ENTITY}/{PROJECT}/runs/{identity[kind + "_run_id"]}'
+                   for kind in ('performance', 'training')})
+            if episodes is not None:
+                stats = moments(e['return'] for e in episodes)
+                gains = paired_statistics(episodes, prior_episodes)
+                point.update(**{'return_' + key: value for key, value in stats.items()},
+                    **{'paired_gain_' + key: value for key, value in gains.items() if key != 'paired_episodes'},
+                    paired_episodes=gains['paired_episodes'])
+                for key, ep in sorted(indexed_episodes(episodes).items()):
+                    rows.append(dict(setting=name, H=cell['H'], J=j, C=c, seed=key[0], solver_seed=key[1],
+                        **{'return': ep['return']}, prior_return=prior[key]['return'],
+                        paired_gain=ep['return']-prior[key]['return']))
+            points.append(point)
+        difference = dict(H=cell['H'], J=j, C=32, reference_C=16)
+        differences.append(difference)
+        if cell['name'] in completed:
+            episodes = completed[cell['name']]
+            difference.update(paired_statistics(episodes, baseline))
+            indexed = indexed_episodes(baseline)
+            for key, ep in sorted(indexed_episodes(episodes).items()):
+                difference_episodes.append(dict(H=cell['H'], J=j, seed=key[0], solver_seed=key[1],
+                    c32_return=ep['return'], c16_return=indexed[key]['return'],
+                    c32_minus_c16=ep['return']-indexed[key]['return']))
+    return dict(budget_points=points, budget_episodes=rows, budget_differences=differences,
+                budget_difference_episodes=difference_episodes)
 
 
 def campaign_horizon(campaign):
-    """A comparison holds the rollout horizon fixed across its six settings."""
+    """A comparison holds the rollout horizon fixed across its settings."""
     values = {c['H'] for c in campaign['cells']}
     if len(values) != 1:
         raise ValueError('Expected one shared rollout horizon per critic comparison')
@@ -77,7 +194,7 @@ def indexed_episodes(episodes, seeds=SEEDS):
     return result
 
 
-def aggregate_results(campaign, prior_episodes, completed):
+def aggregate_results(campaign, prior_episodes, completed, comparison_references=None):
     """Pure comparison payload used by both native history and plot tables."""
     prior = indexed_episodes(prior_episodes)
     cells = {c['name']: c for c in campaign['cells']}
@@ -113,11 +230,16 @@ def aggregate_results(campaign, prior_episodes, completed):
                       for key in sorted(prior)]
             direct.append({'J': j, 'difference': moments(e['return_minus_soft'] for e in paired),
                            'episodes': paired})
-    return {'prior': moments(e['return'] for e in prior.values()),
+    result = {'prior': moments(e['return'] for e in prior.values()),
             'prior_episodes': [prior[key] for key in sorted(prior)],
             'points': sorted(points, key=lambda p: (p['critic'], p['J'])),
             'episodes': sorted(rows, key=lambda p: (p['critic'], p['J'], p['seed'])),
             'direct': direct}
+    if campaign.get('comparison_references') is not None:
+        if comparison_references is None or set(comparison_references) != {cell['J'] for cell in cells.values()}:
+            raise ValueError('C32 comparison requires validated C16 episodes for every J')
+        result.update(budget_results(campaign, prior_episodes, completed, comparison_references))
+    return result
 
 
 def chart_payloads(campaign, aggregate):
@@ -146,6 +268,19 @@ def chart_payloads(campaign, aggregate):
             ys=[[p['difference']['mean'] for p in aggregate['direct']]],
             keys=['Return-only minus soft (paired)'],
             title='Critic effect: return-only minus soft', xname='Inner rounds J', yname='Paired return difference')
+    if 'budget_points' in aggregate:
+        for metric, title in (('return_mean', 'Closed-loop return: C32 versus C16'),
+                              ('paired_gain_mean', 'Paired improvement over frozen prior: C32 versus C16')):
+            series = [[p for p in aggregate['budget_points'] if p['C'] == c and metric in p] for c in (16, 32)]
+            result['comparison/critic_budget_' + metric + '_vs_J'] = dict(
+                xs=[[p['J'] for p in points] for points in series],
+                ys=[[p[metric] for p in points] for points in series],
+                keys=['C16 (reused)', 'C32'], title=title, xname='Inner rounds J', yname=title)
+        points = [p for p in aggregate['budget_differences'] if 'mean' in p]
+        if points:
+            result['comparison/c32_minus_c16_vs_J'] = dict(xs=[[p['J'] for p in points]],
+                ys=[[p['mean'] for p in points]], keys=['C32 minus C16 (paired)'],
+                title='Critic update effect: C32 minus C16', xname='Inner rounds J', yname='Paired return difference')
     return result
 
 
@@ -164,6 +299,17 @@ def numeric_rows(aggregate):
         rows.append(('paired_J' + str(p['J']), {'axis/inner_rounds': p['J'],
                      **{'closed_loop/return_minus_soft/' + stat: value
                         for stat, value in p['difference'].items()}}))
+    for point in aggregate.get('budget_points', []):
+        if point['reused']:
+            rows.append(('reference_C16_J' + str(point['J']), {'axis/inner_rounds': point['J'],
+                **{'closed_loop/c16_reference/' + key: point[key] for key in (
+                    'return_mean', 'return_std', 'paired_gain_mean', 'paired_gain_std',
+                    'paired_gain_ci95_low', 'paired_gain_ci95_high', 'paired_episodes')}}))
+    for point in aggregate.get('budget_differences', []):
+        if 'mean' in point:
+            rows.append(('paired_C32_C16_J' + str(point['J']), {'axis/inner_rounds': point['J'],
+                **{'closed_loop/c32_minus_c16/' + key: point[key] for key in (
+                    'mean', 'std', 'ci95_low', 'ci95_high', 'paired_episodes')}}))
     return rows
 
 
@@ -188,6 +334,15 @@ def overview_log(wandb, campaign, aggregate, statuses):
     result['campaign/evaluated'] = len(aggregate['points'])
     result['campaign/published'] = sum(r['status'] == 'published' for r in statuses)
     result['campaign/failed_publications'] = sum(r['status'] == 'publication_failed' for r in statuses)
+    if 'budget_points' in aggregate:
+        status_by_name = {row['setting']: row['status'] for row in statuses}
+        points = [{**point, 'status': 'reused' if point['reused'] else status_by_name[point['setting']]}
+                  for point in aggregate['budget_points']]
+        result['comparison/critic_budget_points'] = table(points, BUDGET_POINT_COLUMNS)
+        result['comparison/critic_budget_episodes'] = table(aggregate['budget_episodes'], BUDGET_EPISODE_COLUMNS)
+        result['comparison/c32_minus_c16'] = table(aggregate['budget_differences'], BUDGET_DIFFERENCE_COLUMNS)
+        result['comparison/c32_minus_c16_episodes'] = table(aggregate['budget_difference_episodes'],
+            ['H', 'J', 'seed', 'solver_seed', 'c32_return', 'c16_return', 'c32_minus_c16'])
     return result
 
 
@@ -251,7 +406,7 @@ def finalize(args):
         raise ValueError('Verified prior manifest changed')
     prior, = [r for r in read(prior_path)['runs'] if r.get('episodes')
               and r.get('config', {}).get('alg_params', {}).get('inner_operator') == 'none']
-    aggregate = aggregate_results(campaign, prior['episodes'], completed)
+    aggregate = aggregate_results(campaign, prior['episodes'], completed, load_comparison_references(campaign))
     points = {p['setting']: p for p in aggregate['points']}
     statuses = []
     for cell in campaign['cells']:
@@ -297,7 +452,8 @@ def watch(args):
     prior_runs = [r for r in read(prior_manifest)['runs'] if r.get('episodes')
                   and r.get('config', {}).get('alg_params', {}).get('inner_operator') == 'none']
     prior_run, = prior_runs
-    aggregate_results(campaign, prior_run['episodes'], {})
+    comparison_references = load_comparison_references(campaign)
+    aggregate_results(campaign, prior_run['episodes'], {}, comparison_references)
     marker = args.root / 'watcher-started.json'
     if marker.exists():
         raise RuntimeError('Overview already started; inspect its W&B history before recovery')
@@ -309,14 +465,16 @@ def watch(args):
                         for kind in ('performance', 'training')} for c in campaign['cells']}
     config = {key: campaign.get(key) for key in ('checkpoint_step', 'checkpoint_sha256', 'source_run',
               'source_commit', 'initial_alpha', 'target_entropy', 'prior_manifest_sha256', 'prior_source_science')}
-    replay_capacity, = {c['params']['inner_replay_capacity'] for c in campaign['cells']}
+    replay_capacities = {c['params']['inner_replay_capacity'] for c in campaign['cells']}
+    replay_capacity = (next(iter(replay_capacities)) if len(replay_capacities) == 1 else
+                       {str(c['J']): c['params']['inner_replay_capacity'] for c in campaign['cells']})
     selected_critics = {c['critic_kind'] for c in campaign['cells']}
     critic_descriptions = {
         'soft': 'SAC soft-Q initialization, entropy-augmented fitting, soft-Q terminal with entropy correction',
         'return_only': 'Auxiliary return-Q initialization, reward-only fitting, return-Q terminal',
     }
     config.update(campaign_group=campaign['group'], protocol='closed-loop-refinement-v1', protocol_variant='SAC auxiliary-critic comparison; adaptive actor entropy',
-                  J=sorted({c['J'] for c in campaign['cells']}), H=campaign_horizon(campaign), N=128, B=256, C=16, A=4,
+                  J=sorted({c['J'] for c in campaign['cells']}), H=campaign_horizon(campaign), **campaign_budget(campaign),
                   inner_replay_capacity=replay_capacity, inner_replay_scope='action',
                   inner_replay_reset_each_round=False,
                   environment_seeds=SEEDS, controller_seed=55, max_decisions=500,
@@ -325,6 +483,10 @@ def watch(args):
                   critic_comparison={kind: text for kind, text in critic_descriptions.items() if kind in selected_critics},
                   uncertainty='Sample standard deviation across five paired episodes; exploratory screen',
                   result_links=urls)
+    if comparison_references:
+        config.update(comparison_references=campaign['comparison_references'],
+            uncertainty='Paired 95% percentile bootstrap across five environment seeds; 2000 resamples, seed 20260912; exploratory.',
+            protocol_variant='C32 versus reused C16; matched return/return with adaptive actor entropy')
     run = wandb.init(entity=ENTITY, project=PROJECT, id=campaign['overview_run_id'], resume='never',
                      name=campaign.get('label', 'Closed-loop critic comparison at 575k'),
                      group=campaign['group'], job_type='closed-loop-comparison',
@@ -374,7 +536,7 @@ def watch(args):
 
     def update(terminal=False):
         nonlocal previous
-        aggregate = aggregate_results(campaign, prior_run['episodes'], completed)
+        aggregate = aggregate_results(campaign, prior_run['episodes'], completed, comparison_references)
         statuses = status_rows(aggregate, terminal)
         stamp = [(r['setting'], r['status']) for r in statuses]
         if stamp != previous:

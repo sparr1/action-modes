@@ -172,3 +172,35 @@ Each horizon receives two new performance identities and reuses the prior.
 Smoke checks use J14 for one seed and three decisions; production retains five
 complete paired episodes, with the initial probe and all fourteen round
 endpoints.
+
+## C32 critic-budget sweep
+
+`ambi_closed_loop_critics_h3_c32_j_sweep_575k.json` evaluates H3 return/return
+at J={1,2,4,6,8,10,12,14}, increasing critic updates per round from 16 to 32.
+Each setting otherwise matches its historical C16 counterpart exactly: A4,
+N128, B256, inherited adaptive temperature, critic-first updates, reward-only
+critic fitting and terminal bootstrap, and mean-action execution. Replay stays
+at 3072 through J8 and grows to 3840/4608/5376 for J10/J12/J14. The C32 sweep
+does not add horizons or soft-critic settings.
+
+Per real decision, the sweep performs 32J critic updates and 4J actor and
+temperature updates, with 384J imagined transitions. At J14 that is 448 critic
+updates, 56 actor/temperature updates, and 5376 retained transitions. The
+checkpoint, five full 500-decision episodes, environment seeds 101–105,
+controller seed 55, and 32 model probes at initialization and every round are
+unchanged. More critic updates also mean more target EMA updates at the same
+tau of 0.01; this experiment holds the recipe fixed while changing critic dose.
+
+The adjacent `ambi_closed_loop_critics_h3_c32_j_sweep_575k_refs.json` pins all
+eight completed C16 bundles and their original performance and diagnostic run
+identities. Preparation verifies each bundle's hash, scientific settings,
+checkpoint, source commit, episode protocol, seed pairing, and prior-reference
+identity before allocating the eight new C32 performance identities. Prior and
+C16 episodes are reused. The overview shows both return curves, paired gains
+over the prior, and the paired C32-minus-C16 difference with exploratory 95%
+bootstrap intervals at each J. Pending C32 results remain missing.
+
+Select the C32 matrix through `EVAL_MATRIX_PATH` and give it a separate group
+and label. Run the J14 cell (index 7) for one seed and three decisions as the
+smoke check, then one independent GPU worker per J for production. The CPU
+publisher uses three publication workers; GPU workers do not initialize W&B.

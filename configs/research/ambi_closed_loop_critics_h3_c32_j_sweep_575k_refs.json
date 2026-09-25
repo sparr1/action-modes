@@ -1,0 +1,74 @@
+{
+  "1": {
+    "bundle": "/oscar/scratch/rgao48/ambi/closed-loop-critics-575k/20260922/campaign/return_return_alpha_h3_j1_c16/bundle",
+    "manifest_sha256": "e763d7434ab1e0deec681c60ceaa9a1d59124a32713154c9231b5388f87a2b68",
+    "source_commit": "95dbae6769e976970e94a3987b070b31dbbd5b37",
+    "selector": "sweep/return_return_alpha_h3_j1_c16",
+    "performance_run_id": "29e3eb9b9601408892f19c7a8f122f6b",
+    "training_run_id": "4bf28a39334c45c6bce79386caf3adf8",
+    "critic_updates_per_round": 16
+  },
+  "2": {
+    "bundle": "/oscar/scratch/rgao48/ambi/closed-loop-critics-575k/20260922/campaign/return_return_alpha_h3_j2_c16/bundle",
+    "manifest_sha256": "3e910b892d4b5f0ab0db43b21c406b71b8d31cdf302c1ec83892903e872f4b21",
+    "source_commit": "95dbae6769e976970e94a3987b070b31dbbd5b37",
+    "selector": "sweep/return_return_alpha_h3_j2_c16",
+    "performance_run_id": "d901130bd24d449b9bd522f6c08075f7",
+    "training_run_id": "3a6685f0bbd54d6f9bf27bd8ae3511f1",
+    "critic_updates_per_round": 16
+  },
+  "4": {
+    "bundle": "/oscar/scratch/rgao48/ambi/closed-loop-critics-575k/20260922/campaign/return_return_alpha_h3_j4_c16/bundle",
+    "manifest_sha256": "f6c45d7176a446286b31416cb62ef47c8d59a80db5c131cd814d82d976eded3c",
+    "source_commit": "95dbae6769e976970e94a3987b070b31dbbd5b37",
+    "selector": "sweep/return_return_alpha_h3_j4_c16",
+    "performance_run_id": "19a3a76204164edfb6d2a479eac32f3d",
+    "training_run_id": "4d88d5d31187400a9034a443a51c1750",
+    "critic_updates_per_round": 16
+  },
+  "6": {
+    "bundle": "/oscar/scratch/rgao48/ambi/closed-loop-critics-j6-575k/20260922/h3/campaign/return_return_alpha_h3_j6_c16/bundle",
+    "manifest_sha256": "bbcd1684bda10aa0bed3d8e6104ece95c64ee12a0de5a9c342c82026b9c5e44c",
+    "source_commit": "8199fa4673d9479d4b4ed4ff8195a3d037c71b25",
+    "selector": "sweep/return_return_alpha_h3_j6_c16",
+    "performance_run_id": "f1ed8effc9824c049dcc9f541d30944f",
+    "training_run_id": "db245062220d46a49440582fd3412128",
+    "critic_updates_per_round": 16
+  },
+  "8": {
+    "bundle": "/oscar/scratch/rgao48/ambi/closed-loop-critics-j8-575k/20260922/h3/campaign/return_return_alpha_h3_j8_c16/bundle",
+    "manifest_sha256": "3ffe0be2f2735a98b6ed028e5e736f51d634296ed2cc55ad937602d5c62825f3",
+    "source_commit": "3a1a87fc2a12b670592cce43be485f870d76bf40",
+    "selector": "sweep/return_return_alpha_h3_j8_c16",
+    "performance_run_id": "3430aa0463354575880ae11152ed0d06",
+    "training_run_id": "13a4966eb67f460e88ecd7bcbfd0d1c2",
+    "critic_updates_per_round": 16
+  },
+  "10": {
+    "bundle": "/oscar/scratch/rgao48/ambi/closed-loop-critics-j10-575k/20260922/h3/campaign/return_return_alpha_h3_j10_c16/bundle",
+    "manifest_sha256": "59e75ddb2419b3ab7a20e9da3ad7e056e4c921e4166b0dd564678fcfbc672d89",
+    "source_commit": "5b3f3ced852e2d76de01e79a687c762170b8cad0",
+    "selector": "sweep/return_return_alpha_h3_j10_c16",
+    "performance_run_id": "6ed12e4bb02f4895bc6d0835294016e0",
+    "training_run_id": "b534c78ea43a4c688bafb840d59e0943",
+    "critic_updates_per_round": 16
+  },
+  "12": {
+    "bundle": "/oscar/scratch/rgao48/ambi/closed-loop-critics-j12-575k/20260922/h3/campaign/return_return_alpha_h3_j12_c16/bundle",
+    "manifest_sha256": "00bb0636192b80a430f9102afa367858279b053363c75aa8acb6f52d05ad6a6e",
+    "source_commit": "e2730c97186a08670a57c8f1f047cf7ed369382f",
+    "selector": "sweep/return_return_alpha_h3_j12_c16",
+    "performance_run_id": "0dd9bd017bf845669953301308454772",
+    "training_run_id": "26fb8b0ad8354e6e867c7d23a147d804",
+    "critic_updates_per_round": 16
+  },
+  "14": {
+    "bundle": "/oscar/scratch/rgao48/ambi/closed-loop-critics-j14-575k/20260922/h3/campaign/return_return_alpha_h3_j14_c16/bundle",
+    "manifest_sha256": "86811cd23122725db536a8a532f64debe2fabeb48f85cbee29ab924d1f4980b8",
+    "source_commit": "7109e1fa88ef3de997db8a98b73814a6c46d6148",
+    "selector": "sweep/return_return_alpha_h3_j14_c16",
+    "performance_run_id": "35375d89a2e04de18c9bd0df5018ecf9",
+    "training_run_id": "da1e7e0b83494aa58f238683be5ab0dc",
+    "critic_updates_per_round": 16
+  }
+}

@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from slurm.ambi_aux_hj_sweep import (
-    ENTITY, PROJECT, SEEDS, digest, read, training_summary, validate, write,
+    ENTITY, PROJECT, SEEDS, actor_updates, critic_updates, digest, read, training_summary, validate, write,
 )
 
 MATRIX = ROOT / 'configs/research/ambi_closed_loop_critics_575k.json'
@@ -58,7 +58,7 @@ def cells(matrix_path=MATRIX):
         assert horizon in (1, 2, 3, 4)
         assert f'_h{horizon}_' in name
         assert params['inner_rounds'] in ((16, 18) if horizon == 4 else (1, 2, 4, 6, 8, 10, 12, 14))
-        assert params['inner_critic_updates_per_round'] == 16
+        assert params['inner_critic_updates_per_round'] in (16, 32)
         assert params['inner_actor_updates_per_round'] == 4
         assert params['inner_rollouts_per_round'] == 128 and params['inner_batch_size'] == 256
         assert params['inner_entropy_enabled'] and params['inner_temperature_mode'] == 'auto'
@@ -72,7 +72,9 @@ def cells(matrix_path=MATRIX):
     selected = [(cell['J'], cell['critic_kind']) for cell in result]
     original = [(j, arm) for j in (4, 2, 1) for arm in ('soft', 'return_only')]
     extensions = [[(j, arm) for arm in ('soft', 'return_only')] for j in (6, 8, 10, 12, 14)]
-    if result[0]['H'] == 4:
+    if any(critic_updates(cell) != 16 for cell in result):
+        validate_critic_budget_extension(result)
+    elif result[0]['H'] == 4:
         assert selected in [[(16, 'return_only')], [(18, 'return_only')]], (
             'H4 extensions select exactly one return-only J16 or J18 setting.')
         params = result[0]['params']
@@ -89,6 +91,23 @@ def cells(matrix_path=MATRIX):
     return result
 
 
+def validate_critic_budget_extension(panel):
+    """The C32 follow-up changes only critic dose at every historical H3/J."""
+    assert [cell['J'] for cell in panel] == [1, 2, 4, 6, 8, 10, 12, 14], (
+        'The C32 follow-up owns the complete H3 return-only J1–J14 grid.')
+    for cell in panel:
+        rounds = cell['J']
+        name = f'return_return_alpha_h3_j{rounds}_c32'
+        assert (cell['name'], cell['selector'], cell['H'], cell['critic_kind']) == (
+            name, 'sweep/' + name, 3, 'return_only')
+        matrix = MATRIX if rounds <= 4 else MATRIX.with_name(f'ambi_closed_loop_critics_h3_j{rounds}_575k.json')
+        baseline, = [candidate for candidate in cells(matrix)
+                     if candidate['J'] == rounds and candidate['critic_kind'] == 'return_only']
+        expected = {**baseline['requested_alg_params'], 'inner_critic_updates_per_round': 32}
+        assert cell['requested_alg_params'] == expected, 'C32 must change only the critic update budget.'
+        assert cell['params'] == {key: value for key, value in expected.items() if value is not None}
+
+
 def campaign_horizon(campaign):
     """Accept historical H3 campaigns without an explicit top-level H."""
     horizons = {cell['H'] for cell in campaign['cells']}
@@ -96,6 +115,8 @@ def campaign_horizon(campaign):
     horizon, = horizons
     assert horizon in (1, 2, 3, 4) and campaign.get('H', horizon) == horizon
     assert all(cell['params']['inner_rollout_horizon'] == horizon for cell in campaign['cells'])
+    if any(critic_updates(cell) != 16 for cell in campaign['cells']):
+        validate_critic_budget_extension(campaign['cells'])
     if horizon == 4:
         assert len(campaign['cells']) == 1, 'H4 extensions own one setting per campaign.'
         cell, = campaign['cells']
@@ -147,6 +168,18 @@ def prepare(args):
     prior_manifest = read(args.reference / 'manifest.json')
     prior, = load_records(args.reference, inventory_path=args.inventory)
     check_prior(prior_manifest, prior)
+    comparison_file = read(args.matrix).get('comparison_references_file')
+    comparison_references = None
+    if any(critic_updates(cell) == 32 for cell in panel):
+        from slurm.ambi_closed_loop_publish import load_comparison_references
+        assert comparison_file, 'C32 requires pinned historical C16 references.'
+        comparison_references = read(args.matrix.parent / comparison_file)
+        load_comparison_references(dict(cells=panel, reference=str(args.reference),
+            prior_manifest_sha256=digest(args.reference / 'manifest.json'),
+            checkpoint_step=CHECKPOINT_STEP, checkpoint_sha256=CHECKPOINT_SHA,
+            source_run=SOURCE_RUN, comparison_references=comparison_references))
+    else:
+        assert comparison_file is None, 'C16 campaigns do not own the C32 comparison.'
     args.root.mkdir(parents=True, exist_ok=False)
     evaluate_matrix(args.matrix, args.checkpoint, seeds=SEEDS, controller_seed=55, max_steps=500,
                     bundle_dir=args.root / 'unused', checkpoint_inventory=args.inventory,
@@ -175,7 +208,9 @@ def prepare(args):
                         'the historical prior retains its original scientific identity.',
                     source_commit=commit, source_dir=str(ROOT), initial_alpha=INITIAL_ALPHA,
                     target_entropy=-10.5, H=panel[0]['H'], overview_run_id=uuid.uuid4().hex, cells=panel,
-                    publisher_workers=2)
+                    publisher_workers=3 if comparison_references else 2)
+    if comparison_references:
+        campaign['comparison_references'] = comparison_references
     write(args.root / 'campaign.json', campaign)
     print(json.dumps(dict(root=str(args.root), conditions=len(panel), reused=0,
                           overview_run_id=campaign['overview_run_id'])), flush=True)
@@ -246,7 +281,7 @@ def validate_probe_rows(run, cell, *, seeds, steps):
     assert {(r['episode_id'], r['decision_index'], r['round_index']) for r in rows} == expected_rows
     for row in rows:
         r, metrics = row['round_index'], row['metrics']
-        assert row['critic_updates'] == 16*r and row['actor_updates'] == 4*r
+        assert row['critic_updates'] == critic_updates(cell)*r and row['actor_updates'] == actor_updates(cell)*r
         assert all(isinstance(value, (int, float)) and math.isfinite(value) for value in metrics.values())
         factor = 2 if r == 0 else 1
         assert metrics['probe_model_steps'] == 32*cell['H']*factor
