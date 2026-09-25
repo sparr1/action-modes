@@ -92,15 +92,22 @@ def cells(matrix_path=MATRIX):
 
 
 def validate_critic_budget_extension(panel):
-    """The C32 follow-up changes only critic dose at every historical H3/J."""
+    """The C32 follow-up changes only critic dose at each historical H/J."""
     assert [cell['J'] for cell in panel] == [1, 2, 4, 6, 8, 10, 12, 14], (
-        'The C32 follow-up owns the complete H3 return-only J1–J14 grid.')
+        'The C32 follow-up owns the complete return-only J1–J14 grid.')
+    horizons = {cell['H'] for cell in panel}
+    assert len(horizons) == 1, 'A C32 campaign must use one common horizon.'
+    horizon, = horizons
+    assert horizon in (1, 2, 3), 'C32 is supported only at H1/H2/H3.'
     for cell in panel:
         rounds = cell['J']
-        name = f'return_return_alpha_h3_j{rounds}_c32'
+        name = f'return_return_alpha_h{horizon}_j{rounds}_c32'
         assert (cell['name'], cell['selector'], cell['H'], cell['critic_kind']) == (
-            name, 'sweep/' + name, 3, 'return_only')
-        matrix = MATRIX if rounds <= 4 else MATRIX.with_name(f'ambi_closed_loop_critics_h3_j{rounds}_575k.json')
+            name, 'sweep/' + name, horizon, 'return_only')
+        if rounds <= 4:
+            matrix = MATRIX if horizon == 3 else MATRIX.with_name(f'ambi_closed_loop_critics_h{horizon}_575k.json')
+        else:
+            matrix = MATRIX.with_name(f'ambi_closed_loop_critics_h{horizon}_j{rounds}_575k.json')
         baseline, = [candidate for candidate in cells(matrix)
                      if candidate['J'] == rounds and candidate['critic_kind'] == 'return_only']
         expected = {**baseline['requested_alg_params'], 'inner_critic_updates_per_round': 32}

@@ -204,3 +204,25 @@ Select the C32 matrix through `EVAL_MATRIX_PATH` and give it a separate group
 and label. Run the J14 cell (index 7) for one seed and three decisions as the
 smoke check, then one independent GPU worker per J for production. The CPU
 publisher uses three publication workers; GPU workers do not initialize W&B.
+
+### H1 and H2 C32 extension
+
+`ambi_closed_loop_critics_h1_c32_j_sweep_575k.json` and
+`ambi_closed_loop_critics_h2_c32_j_sweep_575k.json` add the same eight J values
+at H1 and H2. Each matrix selects only its own horizon and uses its adjacent
+`_refs.json` to pin the corresponding completed C16 results. The H3 manifest,
+reference pins, and existing campaign remain unchanged.
+
+Each new horizon preserves its historical C16 controls while changing only C
+from 16 to 32. This includes the shared replay capacities of 3072 through J8,
+3840 at J10, 4608 at J12, and 5376 at J14; unused capacity at shorter horizons
+does not change the collected data. Each real decision collects 128HJ
+transitions and performs 32J critic and 4J actor/temperature updates. H1/J14
+retains 1792 transitions and H2/J14 retains 3584, while both perform 448 critic
+and 56 actor/temperature updates.
+
+Prepare and launch H1 and H2 as separate campaigns with separate performance,
+diagnostic, and overview identities. Each uses its own J14 smoke at index 7,
+then eight five-episode evaluations. The two extensions add 16 settings and 80
+full episodes, reusing prior and C16 outcomes; they do not resubmit H3. Their
+overviews use the same paired C32-minus-C16 comparisons and confidence intervals.

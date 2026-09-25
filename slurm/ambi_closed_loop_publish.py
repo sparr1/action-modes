@@ -55,11 +55,13 @@ def load_comparison_references(campaign):
     if references is None:
         return {}
     cells = campaign['cells']
-    if (len(cells) != len({cell['J'] for cell in cells})
+    horizon = campaign_horizon(campaign)
+    if (horizon not in (1, 2, 3) or campaign.get('H', horizon) != horizon
+            or sorted(cell['J'] for cell in cells) != [1, 2, 4, 6, 8, 10, 12, 14]
             or set(references) != {str(cell['J']) for cell in cells}
-            or any((cell['H'], cell['critic_kind'], critic_updates(cell)) != (3, 'return_only', 32)
+            or any((cell['critic_kind'], critic_updates(cell)) != ('return_only', 32)
                    for cell in cells)):
-        raise ValueError('C32 comparison requires one matched C16 reference for every H3 return-only J')
+        raise ValueError('C32 comparison requires the full return-only J grid and matched C16 references at one H1/H2/H3 horizon')
     prior_path = Path(campaign['reference']) / 'manifest.json'
     if digest(prior_path) != campaign['prior_manifest_sha256']:
         raise ValueError('Pinned prior changed before C16 comparison')

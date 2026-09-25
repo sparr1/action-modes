@@ -19,25 +19,30 @@ MATRIX = campaign.MATRIX.with_name('ambi_closed_loop_critics_h3_c32_j_sweep_575k
 ROUNDS = [1, 2, 4, 6, 8, 10, 12, 14]
 
 
-def test_c32_sweep_changes_only_critic_update_count_at_each_historical_j():
+def c32_matrix(horizon):
+    return MATRIX.with_name(f'ambi_closed_loop_critics_h{horizon}_c32_j_sweep_575k.json')
+
+
+@pytest.mark.parametrize('horizon', [1, 2, 3])
+def test_c32_sweep_changes_only_critic_update_count_at_each_historical_j(horizon):
     from utils.ambi_research import load_preset_matrix
     from utils.eval_series_data import planner_identity
-    matrix = load_preset_matrix(MATRIX)
-    panel = campaign.cells(MATRIX)
+    matrix = load_preset_matrix(c32_matrix(horizon))
+    panel = campaign.cells(c32_matrix(horizon))
     assert [cell['J'] for cell in panel] == ROUNDS
     assert set(matrix['comparisons']['sweep']['variants']) == {'prior', *(c['name'] for c in panel)}
     assert matrix['evaluation'] == {**campaign.read(campaign.MATRIX)['evaluation'],
                                     'default_presets': [c['selector'] for c in panel]}
-    assert campaign.campaign_horizon({'cells': panel, 'H': 3}) == 3
+    assert campaign.campaign_horizon({'cells': panel, 'H': horizon}) == horizon
     for cell in panel:
         rounds = cell['J']
-        old = campaign.cells(matrix_path(3, rounds=None if rounds <= 4 else rounds))
+        old = campaign.cells(matrix_path(horizon, rounds=None if rounds <= 4 else rounds))
         baseline, = [c for c in old if c['J'] == rounds and c['critic_kind'] == 'return_only']
         assert cell['requested_alg_params'] == {**baseline['requested_alg_params'],
                                                'inner_critic_updates_per_round': 32}
         cfg = _build_cfg(**cell['params'], aux_return_mode='sac', log_std_mapping='direct_clamp',
                          target_entropy=-10.5, sac_actor_loss_scale_mode='none', train_unroll_horizon=3)
-        assert cfg.inner_model_step_budget == 384 * rounds
+        assert cfg.inner_model_step_budget == 128 * horizon * rounds
         assert cfg.inner_replay_capacity == max(3072, 384 * rounds)
         assert cfg.inner_critic_updates_per_action == 32 * rounds
         assert cfg.inner_actor_updates_per_action == cfg.inner_temperature_updates_per_action == 4 * rounds
@@ -48,8 +53,9 @@ def test_c32_sweep_changes_only_critic_update_count_at_each_historical_j():
 
 @pytest.mark.parametrize('change', ['partial', 'duplicate', 'mixed_c', 'soft', 'sampled', 'retrace',
                                    'alpha_zero', 'capacity', 'actor_updates', 'learning_rate'])
-def test_unrequested_scope_or_recipe_is_rejected(tmp_path, change):
-    matrix = campaign.read(MATRIX)
+@pytest.mark.parametrize('horizon', [1, 2, 3])
+def test_unrequested_scope_or_recipe_is_rejected(tmp_path, change, horizon):
+    matrix = campaign.read(c32_matrix(horizon))
     selectors = matrix['evaluation']['default_presets']
     variant = matrix['comparisons']['sweep']['variants'][selectors[-1].split('/')[1]]['alg_params']
     if change == 'partial': selectors.pop()
@@ -68,11 +74,12 @@ def test_unrequested_scope_or_recipe_is_rejected(tmp_path, change):
         campaign.cells(path)
 
 
-def test_probe_coordinates_require_c32_update_counts():
-    cell = campaign.cells(MATRIX)[-1]
+@pytest.mark.parametrize('horizon', [1, 2, 3])
+def test_probe_coordinates_require_c32_update_counts(horizon):
+    cell = campaign.cells(c32_matrix(horizon))[-1]
     rows = [dict(episode_id='seed-101', decision_index=decision, round_index=r,
                  critic_updates=32*r, actor_updates=4*r,
-                 metrics=dict(probe_model_steps=96*(2 if r == 0 else 1),
+                 metrics=dict(probe_model_steps=32*horizon*(2 if r == 0 else 1),
                               probe_q_evaluations=32*(2 if r == 0 else 1)))
             for decision in range(3) for r in range(15)]
     campaign.validate_probe_rows({'togo_probe_rows': rows}, cell, seeds=[101], steps=3)
@@ -81,7 +88,21 @@ def test_probe_coordinates_require_c32_update_counts():
         campaign.validate_probe_rows({'togo_probe_rows': wrong}, cell, seeds=[101], steps=3)
 
 
-def test_real_prepare_writes_eight_canonical_specs_and_distinct_registries(tmp_path, monkeypatch):
+def test_mixed_horizons_and_unrequested_h4_are_rejected():
+    panel = campaign.cells(c32_matrix(1))
+    panel[-1] = campaign.cells(c32_matrix(2))[-1]
+    with pytest.raises(AssertionError, match='common horizon'):
+        campaign.validate_critic_budget_extension(panel)
+    with pytest.raises(AssertionError, match='common horizon'):
+        campaign.campaign_horizon({'cells': panel, 'H': 1})
+    for cell in panel:
+        cell['H'] = 4
+    with pytest.raises(AssertionError, match='only at H1/H2/H3'):
+        campaign.validate_critic_budget_extension(panel)
+
+
+@pytest.mark.parametrize('horizon', [1, 2, 3])
+def test_real_prepare_writes_eight_canonical_specs_and_distinct_registries(tmp_path, monkeypatch, horizon):
     """Keep real configuration resolution and canonical identity/registry creation."""
     import evaluate_ambi_checkpoint as evaluator
     from slurm import ambi_closed_loop_publish as publisher
@@ -103,9 +124,10 @@ def test_real_prepare_writes_eight_canonical_specs_and_distinct_registries(tmp_p
     inventory = tmp_path / 'inventory.json'
     inventory.write_text(json.dumps(dict(source_run=campaign.SOURCE_RUN,
                                         checkpoints=[dict(step=575000, sha256=actual_sha)])))
-    matrix = load_preset_matrix(MATRIX)
+    matrix_file = c32_matrix(horizon)
+    matrix = load_preset_matrix(matrix_file)
     context = load_checkpoint_context(checkpoint)
-    prior_resolved = resolve_preset(MATRIX, 'sweep/prior', matrix=matrix, checkpoint_context=context)
+    prior_resolved = resolve_preset(matrix_file, 'sweep/prior', matrix=matrix, checkpoint_context=context)
     protocol = ambi_benchmark.protocol_for(prior_resolved, 55, 500)
     checkpoint_info = dict(metadata=metadata, path=str(checkpoint), sha256=actual_sha, source_run=campaign.SOURCE_RUN)
     monkeypatch.setattr(campaign, 'CHECKPOINT_SHA', actual_sha)
@@ -130,9 +152,9 @@ def test_real_prepare_writes_eight_canonical_specs_and_distinct_registries(tmp_p
         assert settings['checkpoint_sha256'] == actual_sha
         checked.append(settings)
     monkeypatch.setattr(publisher, 'load_comparison_references', check_references)
-    args = SimpleNamespace(root=tmp_path / 'campaign', matrix=MATRIX, checkpoint=checkpoint,
+    args = SimpleNamespace(root=tmp_path / 'campaign', matrix=matrix_file, checkpoint=checkpoint,
                            inventory=inventory, reference=reference, registry=tmp_path / 'registry',
-                           group='h3-c32', label='H3 C32')
+                           group=f'h{horizon}-c32', label=f'H{horizon} C32')
     with monkeypatch.context() as blocked:
         def reject_reference(settings):
             raise ValueError('Pinned C16 manifest changed')
@@ -154,12 +176,15 @@ def test_real_prepare_writes_eight_canonical_specs_and_distinct_registries(tmp_p
         assert any(run['identity'] == spec['identity'] for run in registered)
         assert spec['identity']['protocol'] == record['identity']['protocol']
         assert spec['identity']['planner']['settings']['inner_critic_updates_per_round'] == 32
+        assert spec['identity']['planner']['settings']['inner_rollout_horizon'] == horizon
+    assert prepared['H'] == horizon
     assert prepared['publisher_workers'] == 3
     assert not (args.root / 'unused').exists()
 
 
-def test_full_j14_c32_solve_keeps_actor_dose_and_executes_mean(monkeypatch):
-    cell = campaign.cells(MATRIX)[-1]
+@pytest.mark.parametrize('horizon', [1, 2, 3])
+def test_full_j14_c32_solve_keeps_actor_dose_and_executes_mean(monkeypatch, horizon):
+    cell = campaign.cells(c32_matrix(horizon))[-1]
     params = {**cell['params'], 'compile': False, 'compile_strict': False}
     holder = _tiny_component_model(**params, aux_return_mode='sac', train_unroll_horizon=3)
     try:
@@ -172,7 +197,7 @@ def test_full_j14_c32_solve_keeps_actor_dose_and_executes_mean(monkeypatch):
         torch.testing.assert_close(action, captured[-1]['mean'], rtol=0, atol=0)
         metrics = agent.last_inner_metrics
         assert engine._critic_base is engine._horizon_critic is engine.model._aux_return_Qs
-        assert metrics['inner_model_steps'] == metrics['inner_buffer_size'] == 5376
+        assert metrics['inner_model_steps'] == metrics['inner_buffer_size'] == 128 * horizon * 14
         assert metrics['inner_critic_optimizer_steps'] == 448
         assert metrics['inner_actor_optimizer_steps'] == metrics['inner_temperature_optimizer_steps'] == 56
         assert metrics['inner_alpha_initial'] > 0 and metrics['inner_alpha_final'] > 0

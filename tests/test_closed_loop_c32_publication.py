@@ -8,26 +8,27 @@ import pytest
 from slurm import ambi_closed_loop_publish as publication
 
 
-@pytest.fixture
-def budget_comparison():
+@pytest.fixture(params=[1, 2, 3])
+def budget_comparison(request):
+    horizon = request.param
     rounds = (1, 2, 4, 6, 8, 10, 12, 14)
     prior = [dict(seed=101+i, solver_seed=700+i, length=500,
                   truncated_by_evaluator=False, **{'return': float(100+i)}) for i in range(5)]
     cells, references, pins, completed = [], {}, {}, {}
     for j in rounds:
-        name = f'return_return_alpha_h3_j{j}_c32'
-        cells.append(dict(name=name, H=3, J=j, critic_kind='return_only',
+        name = f'return_return_alpha_h{horizon}_j{j}_c32'
+        cells.append(dict(name=name, H=horizon, J=j, critic_kind='return_only',
             params=dict(inner_critic_updates_per_round=32, inner_actor_updates_per_round=4,
-                        inner_rollouts_per_round=128, inner_batch_size=256),
+                        inner_rollouts_per_round=128, inner_batch_size=256, inner_rollout_horizon=horizon),
             performance_run_id=f'new-performance-{j}', training_run_id=f'new-training-{j}'))
         pins[str(j)] = dict(bundle=f'/reference/j{j}', manifest_sha256=f'manifest-{j}',
-            source_commit=f'commit-{j}', selector=f'critic_compare/return_return_alpha_h3_j{j}_c16',
+            source_commit=f'commit-{j}', selector=f'critic_compare/return_return_alpha_h{horizon}_j{j}_c16',
             critic_updates_per_round=16, performance_run_id=f'old-performance-{j}',
             training_run_id=f'old-training-{j}')
         references[j] = [{**ep, 'return': ep['return']+j, 'paired_return_delta': j} for ep in prior]
         completed[name] = [{**ep, 'return': ep['return']+j*2+i, 'paired_return_delta': j*2+i}
                            for i, ep in enumerate(prior)]
-    state = dict(cells=cells, comparison_references=pins, reference='/prior',
+    state = dict(cells=cells, H=horizon, comparison_references=pins, reference='/prior',
                  prior_manifest_sha256='prior-hash', checkpoint_step=575000,
                  checkpoint_sha256='checkpoint-hash', source_run='backbone')
     return state, prior, references, completed
@@ -84,7 +85,7 @@ def test_budget_overview_exposes_numeric_axes_confidence_intervals_and_actual_st
     points = [dict(zip(table['columns'], row)) for row in table['data']]
     assert len(points) == 16
     assert all(point['status'] == ('reused' if point['C'] == 16 else 'publishing') for point in points)
-    assert all(point['H'] == 3 and point['A'] == 4 and point['N'] == 128 and point['B'] == 256 for point in points)
+    assert all(point['H'] == campaign['H'] and point['A'] == 4 and point['N'] == 128 and point['B'] == 256 for point in points)
     assert len(payload['comparison/c32_minus_c16']['data']) == 8
     assert len(payload['comparison/critic_budget_episodes']['data']) == 80
     assert publication.campaign_budget(campaign) == dict(C=32, A=4, N=128, B=256)
@@ -110,7 +111,8 @@ def pinned_comparison(budget_comparison, monkeypatch):
     manifests = {j: dict(checkpoint={'source_run': 'backbone'},
         code=dict(commit=f'commit-{j}', dirty=False, runtime={'version': 'same'}),
         protocol=protocol, reference={'manifest_sha256': 'prior-hash'},
-        runs=[dict(selector=campaign['comparison_references'][str(j)]['selector'], episodes=eps)])
+        runs=[dict(selector=campaign['comparison_references'][str(j)]['selector'], episodes=eps,
+                   resolved_config={'inner_rollout_horizon': campaign['H']})])
         for j, eps in references.items()}
     prior_manifest = dict(code={'runtime': {'version': 'same'}}, protocol=protocol, runs=[{'episodes': prior}])
     def fake_digest(path):
@@ -124,6 +126,7 @@ def pinned_comparison(budget_comparison, monkeypatch):
         exact['params']['inner_critic_updates_per_round'] = 16
         assert expected == exact
         assert kwargs == dict(checkpoint_step=575000, checkpoint_sha='checkpoint-hash')
+        assert manifests[expected['J']]['runs'][0]['resolved_config']['inner_rollout_horizon'] == expected['params']['inner_rollout_horizon']
         validated.append(expected['J'])
         return manifests[expected['J']]
     monkeypatch.setattr(publication, 'digest', fake_digest)
@@ -153,4 +156,21 @@ def test_reference_loader_rejects_changed_provenance_before_publication(pinned_c
     if damage == 'gain': manifest['runs'][0]['episodes'][0]['paired_return_delta'] += 1
     if damage == 'missing': campaign['comparison_references'].pop('1')
     with pytest.raises(ValueError):
+        publication.load_comparison_references(campaign)
+
+
+@pytest.mark.parametrize('damage', ['mixed_horizon', 'unsupported_horizon', 'declared_horizon', 'partial_grid', 'reference_horizon'])
+def test_c32_reference_scope_cannot_cross_horizons_or_drop_rounds(pinned_comparison, damage):
+    campaign, manifests, _, _ = pinned_comparison
+    if damage == 'mixed_horizon': campaign['cells'][0]['H'] = 4
+    if damage == 'unsupported_horizon':
+        campaign['H'] = 4
+        for cell in campaign['cells']: cell['H'] = 4
+    if damage == 'declared_horizon': campaign['H'] = 4
+    if damage == 'partial_grid':
+        campaign['cells'].pop()
+        campaign['comparison_references'].pop('14')
+    if damage == 'reference_horizon':
+        manifests[1]['runs'][0]['resolved_config']['inner_rollout_horizon'] = 4
+    with pytest.raises((ValueError, AssertionError)):
         publication.load_comparison_references(campaign)
