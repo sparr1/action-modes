@@ -30,6 +30,7 @@ from .common.inner_utils import (
     trainable_parameter_count,
 )
 from .common.latent_buffer import LatentReplayBuffer
+from .common.ere import round_windows
 from .common.latent_trajectory_buffer import LatentTrajectoryReplayBuffer
 from .inner_retrace import RetraceInnerMixin
 from .common.scale import percentile_range
@@ -108,6 +109,9 @@ class InnerWorkspace:
     policy_evaluations: int = 0
     q_evaluations: int = 0
     sampled_ids: list[torch.Tensor] = field(default_factory=list)
+    # Action-local metadata, outside packed replay and serialized tensor state.
+    replay_rounds: list[tuple[int, int, int]] = field(default_factory=list)
+    replay_round_counts: dict[str, torch.Tensor] = field(default_factory=dict)
     actor_params: list[torch.nn.Parameter] = field(default_factory=list)
     critic_params: list[torch.nn.Parameter] = field(default_factory=list)
     actor_trainable_count: int = 0
@@ -664,6 +668,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
         for name in self._ACTION_TRANSIENT_COUNTER_FIELDS:
             setattr(self.state, name, 0)
         self.state.sampled_ids.clear()
+        self.state.replay_rounds.clear()
+        self.state.replay_round_counts.clear()
         self.state.sampled_sources.clear()
         self._collect_diagnostics = True
 
@@ -780,7 +786,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
             for name in self._ACTION_TRANSIENT_COUNTER_FIELDS
             if int(getattr(self.state, name)) != 0
         }
-        if live_action_counters or self.state.sampled_ids:
+        if (live_action_counters or self.state.sampled_ids
+                or self.state.replay_rounds or self.state.replay_round_counts):
             raise RuntimeError(
                 "AMBI action-local counters and sampled IDs must be cleared at "
                 "the exact resume boundary."
@@ -1536,6 +1543,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
             if str(cfg.inner_replay_scope) == "action" and state.replay is not None:
                 self._action_pool.replay = state.replay
             state.replay = None
+            state.replay_rounds.clear()
+            state.replay_round_counts.clear()
 
         # Active explorer configurations are validated as action-local.  Pool
         # the allocations, but reset every scientific value at the next root.
@@ -2115,6 +2124,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
         state.replay_draws = 0
         state.policy_evaluations = state.q_evaluations = 0
         state.sampled_ids.clear()
+        state.replay_rounds.clear()
+        state.replay_round_counts.clear()
         state.sampled_sources.clear()
         state.explorer_actor_steps = state.explorer_critic_steps = 0
         state.explorer_critic_target_steps = 0
@@ -3120,7 +3131,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
         try:
             batch = self.state.replay.sample(
                 self.cfg.inner_batch_size,
-                include_ids=self._collect_diagnostics,
+                include_ids=(self._collect_diagnostics or
+                             (self._uses_ere and self._active_trace is not None)),
                 **kwargs,
             )
         except TypeError:
@@ -3132,6 +3144,53 @@ class InnerImprovementEngine(RetraceInnerMixin):
         if "source" in batch:
             self.state.sampled_sources.append(batch["source"].detach())
         return batch
+
+    @property
+    def _uses_ere(self):
+        return getattr(self.cfg, "inner_replay_strategy", "uniform") == "ere"
+
+    def _ere_phase_windows(self, slots, *, actor=False):
+        """(Round count, transition count) for each slot of a complete phase."""
+        if not self._uses_ere:
+            return None
+        rounds = self.state.replay_rounds
+        counts = ([len(rounds)] * slots if actor and not self.cfg.inner_ere_actor else
+                  round_windows(len(rounds), slots, self.cfg.inner_ere_final_fraction,
+                                self.cfg.inner_ere_min_rounds))
+        windows = [(w, rounds[-1][2] - rounds[-w][1]) for w in counts]
+        if any(size > self.state.replay.size for _, size in windows):
+            raise RuntimeError("ERE round boundaries exceed retained action-local replay.")
+        return windows
+
+    def _ere_batch_metrics(self, batch, window, *, critic, actor):
+        """Observe realized draws without drawing randomness or modifying batches."""
+        if window is None or not (self._collect_diagnostics or self._active_trace is not None):
+            return {}
+        state = self.state
+        ids = batch["sample_ids"]
+        rounds = state.replay_rounds
+        ends = ids.new_tensor([end for _, _, end in rounds])
+        positions = torch.bucketize(ids, ends, right=True)
+        generations = ids.new_tensor([r for r, _, _ in rounds])[positions]
+        ages = (rounds[-1][0] - generations).float()
+        counts = torch.bincount(generations - 1, minlength=int(self.cfg.inner_rounds))
+        common = dict(
+            window_rounds=float(window[0]),
+            window_transitions=float(window[1]),
+            window_fraction=float(window[1]) / state.replay.size,
+            window_round_fraction=float(window[0]) / len(rounds),
+            round_age_mean=ages.mean(), round_age_min=ages.min(), round_age_max=ages.max(),
+            newest_round_fraction=(ages == 0).float().mean(),
+            batch_unique_fraction=float(ids.unique().numel()) / ids.numel(),
+        )
+        metrics = {}
+        for component, enabled in (("critic", critic), ("actor", actor)):
+            if enabled:
+                metrics.update({f"{component}_replay_{k}": v for k, v in common.items()})
+                if component not in state.replay_round_counts:
+                    state.replay_round_counts[component] = torch.zeros_like(counts)
+                state.replay_round_counts[component].add_(counts)
+        return metrics
 
     @torch.no_grad()
     def _mix_outer_critic_batch(self, batch):
@@ -4950,6 +5009,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         temperature_count,
         actor_loss_scale=None,
         replay_indices=None,
+        replay_windows=None,
     ):
         if self._retrace_enabled:
             if replay_indices is not None:
@@ -4965,8 +5025,12 @@ class InnerImprovementEngine(RetraceInnerMixin):
             if slots:
                 self._calibrate_tdambi_scale()
         metrics = []
+        if replay_windows is None:
+            replay_windows = self._ere_phase_windows(slots, actor=critic_count == 0)
+        if replay_windows is not None and len(replay_windows) != slots:
+            raise ValueError("ERE windows must match the complete update slot count.")
         if replay_indices is None:
-            replay_indices = self._draw_update_indices(slots)
+            replay_indices = self._draw_update_indices(slots, replay_windows=replay_windows)
         elif replay_indices.shape != (slots, int(self.cfg.inner_batch_size)):
             raise ValueError("Pre-drawn replay indices must match update slots and batch size.")
         for slot in range(slots):
@@ -4977,7 +5041,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 None if replay_indices is None else replay_indices[slot]
             )
             alpha = self.alpha.detach().clone() if self._split_values else self.alpha.detach()
-            slot_metrics = {}
+            slot_metrics = self._ere_batch_metrics(
+                batch, None if replay_windows is None else replay_windows[slot],
+                critic=do_critic, actor=do_actor,
+            )
             if self.cfg.inner_operator == "sac":
                 if do_critic:
                     critic_batch, mix_metrics = self._mix_outer_critic_batch(batch)
@@ -5030,12 +5097,25 @@ class InnerImprovementEngine(RetraceInnerMixin):
             metrics.append(slot_metrics)
         return metrics
 
-    def _draw_update_indices(self, slots):
+    def _draw_update_indices(self, slots, *, replay_windows=None):
         """Keep the historical shape and RNG sequence for each update phase."""
         if not slots:
             return None
         batch_size = int(self.cfg.inner_batch_size)
         replay_generator = self.rng.generator("replay")
+        if replay_windows is None:
+            replay_windows = self._ere_phase_windows(slots)
+        if replay_windows is not None and any(size != self.state.replay.size for _, size in replay_windows):
+            replacement = self.cfg.inner_replay_sampling == "with_replacement"
+            if not replacement and any(batch_size > size for _, size in replay_windows):
+                raise ValueError(
+                    "Cannot sample ERE without replacement: batch_size exceeds eligible replay size."
+                )
+            return torch.stack([
+                self.state.replay.draw_recent_indices(
+                    batch_size, size, replacement=replacement, generator=replay_generator,
+                ) for _, size in replay_windows
+            ])
         if self.cfg.inner_replay_sampling == "with_replacement":
             return torch.randint(
                 self.state.replay.size, (slots, batch_size), device=self.device,
@@ -5069,8 +5149,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
             # Draw the critic sequence then actor sequence with exactly the
             # same RNG call shapes as the phased schedule. Only their execution
             # order changes; no minibatches are shared or additional draws made.
-            critic_indices = self._draw_update_indices(critic_count)
-            actor_indices = self._draw_update_indices(actor_count)
+            critic_windows = self._ere_phase_windows(critic_count)
+            actor_windows = self._ere_phase_windows(actor_count, actor=True)
+            critic_indices = self._draw_update_indices(critic_count, replay_windows=critic_windows)
+            actor_indices = self._draw_update_indices(actor_count, replay_windows=actor_windows)
             interval = critic_count // actor_count  # Validated at config resolution.
             metrics = []
             for actor_index in range(actor_count):
@@ -5079,12 +5161,16 @@ class InnerImprovementEngine(RetraceInnerMixin):
                     critic_count=interval, actor_count=0, temperature_count=0,
                     actor_loss_scale=actor_loss_scale,
                     replay_indices=critic_indices[start:start + interval],
+                    replay_windows=(None if critic_windows is None else
+                                    critic_windows[start:start + interval]),
                 ))
                 metrics.extend(self._run_update_counts(
                     critic_count=0, actor_count=1,
                     temperature_count=int(self.cfg.inner_temperature_mode == "auto"),
                     actor_loss_scale=actor_loss_scale,
                     replay_indices=actor_indices[actor_index:actor_index + 1],
+                    replay_windows=(None if actor_windows is None else
+                                    actor_windows[actor_index:actor_index + 1]),
                 ))
             return metrics
         metrics = self._run_update_counts(
@@ -6320,9 +6406,15 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 # Keep the learner/optimizers and diagnostic IDs across rounds;
                 # only the transitions available to the next updates expire.
                 state.replay.clear(preserve_sample_ids=True)
+                state.replay_rounds.clear()
             if trace is not None:
                 trace.round_index = round_index + 1
             for rollout in self._collection_chunks(root_z):
+                if self._uses_ere and rollout["transition_count"]:
+                    end = state.replay.next_sample_id
+                    state.replay_rounds.append(
+                        (round_index + 1, end - int(rollout["transition_count"]), end)
+                    )
                 if trace is not None:
                     trace.record("collection", state, {
                         "collection_transitions": rollout["transition_count"],
@@ -6664,6 +6756,9 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 )
 
         metrics.update(self._parameter_noise_metrics())
+        for component, counts in state.replay_round_counts.items():
+            for index, count in enumerate(counts.unbind()):
+                metrics[f"inner_{component}_replay_round_{index + 1}_sample_count"] = count
         if actor_loss_scale is not None:
             metrics["inner_actor_loss_scale"] = actor_loss_scale.reshape(())
             metrics["inner_effective_alpha"] = alpha_final.mean()

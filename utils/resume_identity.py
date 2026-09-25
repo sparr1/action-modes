@@ -16,6 +16,7 @@ import numpy as np
 
 from utils.lora_identity import normalize_lora_rl_identity
 from utils.aux_return_identity import normalize_aux_return_identity
+from utils.ere_identity import normalize_ere_identity
 
 
 LINEAGE_IDENTITY_SCHEMA_VERSION = 1
@@ -226,6 +227,7 @@ def scientific_trial_parameters(
             if projected.get("alg") == _AMBI_ALGORITHM:
                 algorithm = normalize_lora_rl_identity(algorithm)
                 algorithm = normalize_aux_return_identity(algorithm)
+                algorithm = normalize_ere_identity(algorithm)
                 estimator = algorithm.get("inner_sac_return_estimator", "one_step")
                 if isinstance(estimator, str):
                     estimator = estimator.lower()

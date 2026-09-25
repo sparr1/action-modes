@@ -1,0 +1,274 @@
+{
+  "base_alg_config": "checkpoint",
+  "checkpoint_steps": [
+    575000
+  ],
+  "comparisons": {
+    "sweep": {
+      "reference": "prior",
+      "variants": {
+        "ere_f025_h1_j10_c16": {
+          "alg_params": {
+            "inner_replay_capacity": 3840,
+            "inner_rounds": 10
+          },
+          "description": "ERE f=.25 for actor and critic, H1/J10; inherited adaptive entropy, return critics and mean execution."
+        },
+        "ere_f025_h1_j1_c16": {
+          "alg_params": {},
+          "description": "ERE f=.25 for actor and critic, H1/J1; inherited adaptive entropy, return critics and mean execution."
+        },
+        "ere_f025_h1_j2_c16": {
+          "alg_params": {
+            "inner_rounds": 2
+          },
+          "description": "ERE f=.25 for actor and critic, H1/J2; inherited adaptive entropy, return critics and mean execution."
+        },
+        "ere_f025_h1_j4_c16": {
+          "alg_params": {
+            "inner_rounds": 4
+          },
+          "description": "ERE f=.25 for actor and critic, H1/J4; inherited adaptive entropy, return critics and mean execution."
+        },
+        "ere_f025_h1_j6_c16": {
+          "alg_params": {
+            "inner_rounds": 6
+          },
+          "description": "ERE f=.25 for actor and critic, H1/J6; inherited adaptive entropy, return critics and mean execution."
+        },
+        "ere_f025_h1_j8_c16": {
+          "alg_params": {
+            "inner_rounds": 8
+          },
+          "description": "ERE f=.25 for actor and critic, H1/J8; inherited adaptive entropy, return critics and mean execution."
+        },
+        "ere_f025_h2_j10_c16": {
+          "alg_params": {
+            "inner_replay_capacity": 3840,
+            "inner_rollout_horizon": 2,
+            "inner_rounds": 10
+          },
+          "description": "ERE f=.25 for actor and critic, H2/J10; inherited adaptive entropy, return critics and mean execution."
+        },
+        "ere_f025_h2_j1_c16": {
+          "alg_params": {
+            "inner_rollout_horizon": 2
+          },
+          "description": "ERE f=.25 for actor and critic, H2/J1; inherited adaptive entropy, return critics and mean execution."
+        },
+        "ere_f025_h2_j2_c16": {
+          "alg_params": {
+            "inner_rollout_horizon": 2,
+            "inner_rounds": 2
+          },
+          "description": "ERE f=.25 for actor and critic, H2/J2; inherited adaptive entropy, return critics and mean execution."
+        },
+        "ere_f025_h2_j4_c16": {
+          "alg_params": {
+            "inner_rollout_horizon": 2,
+            "inner_rounds": 4
+          },
+          "description": "ERE f=.25 for actor and critic, H2/J4; inherited adaptive entropy, return critics and mean execution."
+        },
+        "ere_f025_h2_j6_c16": {
+          "alg_params": {
+            "inner_rollout_horizon": 2,
+            "inner_rounds": 6
+          },
+          "description": "ERE f=.25 for actor and critic, H2/J6; inherited adaptive entropy, return critics and mean execution."
+        },
+        "ere_f025_h2_j8_c16": {
+          "alg_params": {
+            "inner_rollout_horizon": 2,
+            "inner_rounds": 8
+          },
+          "description": "ERE f=.25 for actor and critic, H2/J8; inherited adaptive entropy, return critics and mean execution."
+        },
+        "ere_f025_h3_j10_c16": {
+          "alg_params": {
+            "inner_replay_capacity": 3840,
+            "inner_rollout_horizon": 3,
+            "inner_rounds": 10
+          },
+          "description": "ERE f=.25 for actor and critic, H3/J10; inherited adaptive entropy, return critics and mean execution."
+        },
+        "ere_f025_h3_j1_c16": {
+          "alg_params": {
+            "inner_rollout_horizon": 3
+          },
+          "description": "ERE f=.25 for actor and critic, H3/J1; inherited adaptive entropy, return critics and mean execution."
+        },
+        "ere_f025_h3_j2_c16": {
+          "alg_params": {
+            "inner_rollout_horizon": 3,
+            "inner_rounds": 2
+          },
+          "description": "ERE f=.25 for actor and critic, H3/J2; inherited adaptive entropy, return critics and mean execution."
+        },
+        "ere_f025_h3_j4_c16": {
+          "alg_params": {
+            "inner_rollout_horizon": 3,
+            "inner_rounds": 4
+          },
+          "description": "ERE f=.25 for actor and critic, H3/J4; inherited adaptive entropy, return critics and mean execution."
+        },
+        "ere_f025_h3_j6_c16": {
+          "alg_params": {
+            "inner_rollout_horizon": 3,
+            "inner_rounds": 6
+          },
+          "description": "ERE f=.25 for actor and critic, H3/J6; inherited adaptive entropy, return critics and mean execution."
+        },
+        "ere_f025_h3_j8_c16": {
+          "alg_params": {
+            "inner_rollout_horizon": 3,
+            "inner_rounds": 8
+          },
+          "description": "ERE f=.25 for actor and critic, H3/J8; inherited adaptive entropy, return critics and mean execution."
+        },
+        "prior": {
+          "alg_params": {
+            "inner_actor_updates_per_round": null,
+            "inner_critic_source": "sac",
+            "inner_critic_updates_per_round": null,
+            "inner_entropy_enabled": false,
+            "inner_finite_horizon": false,
+            "inner_horizon_critic_source": "sac",
+            "inner_operator": "none",
+            "inner_replay_strategy": "uniform",
+            "inner_rollouts_per_round": 0,
+            "inner_rounds": 0,
+            "inner_temperature_mode": "inherit_outer",
+            "inner_terminal_entropy": "none",
+            "inner_updates_per_round": 0
+          },
+          "description": "Frozen SAC policy mean, no adaptation."
+        }
+      }
+    }
+  },
+  "description": "575k target -10.5/shared ERE f=.25 sweep. All H1/2/3 and J1/2/4/6/8/10; reuse equivalent J1 and all matched uniform/prior controls. Fresh full-episode adaptation, C16/A4/N128/B256, inherited adaptive alpha, one-step return critics, mean action.",
+  "evaluation": {
+    "controller_seed": 55,
+    "default_presets": [
+      "sweep/ere_f025_h1_j1_c16",
+      "sweep/ere_f025_h1_j2_c16",
+      "sweep/ere_f025_h1_j4_c16",
+      "sweep/ere_f025_h1_j6_c16",
+      "sweep/ere_f025_h1_j8_c16",
+      "sweep/ere_f025_h1_j10_c16",
+      "sweep/ere_f025_h2_j1_c16",
+      "sweep/ere_f025_h2_j2_c16",
+      "sweep/ere_f025_h2_j4_c16",
+      "sweep/ere_f025_h2_j6_c16",
+      "sweep/ere_f025_h2_j8_c16",
+      "sweep/ere_f025_h2_j10_c16",
+      "sweep/ere_f025_h3_j1_c16",
+      "sweep/ere_f025_h3_j2_c16",
+      "sweep/ere_f025_h3_j4_c16",
+      "sweep/ere_f025_h3_j6_c16",
+      "sweep/ere_f025_h3_j8_c16",
+      "sweep/ere_f025_h3_j10_c16"
+    ],
+    "max_steps": 500,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "togo_return_rollouts": 32
+  },
+  "schema_version": 1,
+  "shared_alg_params": {
+    "compile": true,
+    "compile_strict": true,
+    "inner_actor_adam_eps": 1e-05,
+    "inner_actor_adaptation": "clone",
+    "inner_actor_entropy_mode": "squashed",
+    "inner_actor_grad_clip_norm": 20.0,
+    "inner_actor_initial_std": null,
+    "inner_actor_initialization": "prior",
+    "inner_actor_loss_scale_update": "per_action",
+    "inner_actor_lr": 0.0003,
+    "inner_actor_optimizer_scope": "action",
+    "inner_actor_scope": "action",
+    "inner_actor_source": "sac",
+    "inner_actor_updates_per_action": null,
+    "inner_actor_updates_per_round": 4,
+    "inner_actor_writeback_coef": 0.0,
+    "inner_adam_eps": 1e-08,
+    "inner_batch_size": 256,
+    "inner_behavior_action": "policy_sample",
+    "inner_bootstrap_source": "inner_target",
+    "inner_component_update_order": "critic_first",
+    "inner_critic_adaptation": "clone",
+    "inner_critic_dropout_enabled": true,
+    "inner_critic_grad_clip_norm": 20.0,
+    "inner_critic_initialization": "prior",
+    "inner_critic_loss_coef": 1.0,
+    "inner_critic_lr": 0.0003,
+    "inner_critic_optimizer_scope": "action",
+    "inner_critic_scope": "action",
+    "inner_critic_source": "aux_return",
+    "inner_critic_target_initialization": "online",
+    "inner_critic_target_tau": 0.01,
+    "inner_critic_target_update_interval": 1,
+    "inner_critic_updates_per_action": null,
+    "inner_critic_updates_per_round": 16,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_diagnostic_rollouts": 0,
+    "inner_entropy_enabled": true,
+    "inner_ere_actor": true,
+    "inner_ere_final_fraction": 0.25,
+    "inner_ere_min_rounds": 1,
+    "inner_eval_execution_action": "mean",
+    "inner_execution_action": "mean",
+    "inner_explorer_mode": "none",
+    "inner_finite_horizon": true,
+    "inner_horizon": null,
+    "inner_horizon_actor_source": "sac",
+    "inner_horizon_critic_source": "aux_return",
+    "inner_iterations": null,
+    "inner_log_std_mapping": null,
+    "inner_log_std_max": 2,
+    "inner_log_std_min": -10,
+    "inner_model_step_budget": null,
+    "inner_operator": "sac",
+    "inner_outer_action_l2_coef": 0.0,
+    "inner_outer_policy_kl_coef": 0.0,
+    "inner_outer_replay_fraction": 0.0,
+    "inner_q_actor_reduction": "mean_pair",
+    "inner_q_target_reduction": "min_pair",
+    "inner_replay_capacity": 3072,
+    "inner_replay_reset_each_round": false,
+    "inner_replay_sampling": "with_replacement",
+    "inner_replay_scope": "action",
+    "inner_replay_strategy": "ere",
+    "inner_retrace_batch_trajectories": null,
+    "inner_retrace_lambda": 1.0,
+    "inner_rollout_horizon": 1,
+    "inner_rollouts": null,
+    "inner_rollouts_per_round": 128,
+    "inner_rounds": 1,
+    "inner_sac_critic_target": "reward_only",
+    "inner_sac_return_estimator": "one_step",
+    "inner_steps_per_update": null,
+    "inner_target_entropy": "inherit_outer",
+    "inner_temperature": null,
+    "inner_temperature_initialization": "inherit_outer",
+    "inner_temperature_lr": 0.0003,
+    "inner_temperature_mode": "auto",
+    "inner_temperature_optimizer_scope": "action",
+    "inner_temperature_scope": "action",
+    "inner_temperature_updates_per_action": null,
+    "inner_terminal_entropy": "none",
+    "inner_update_timing": "round",
+    "inner_updates_per_iteration": null,
+    "inner_updates_per_round": null,
+    "outer_policy_diagnostics": false,
+    "wandb": false
+  },
+  "source_run": "rwgao_b-brown-university/ambi/aux6428346x0"
+}

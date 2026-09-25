@@ -917,6 +917,12 @@ class AMBITDMPC2Agent(torch.nn.Module):
         }
         if getattr(self.cfg, "inner_update_timing", "round") != "round":
             options["update_timing"] = self.cfg.inner_update_timing
+        if getattr(self.cfg, "inner_replay_strategy", "uniform") == "ere":
+            options["replay_strategy"] = "ere"
+            options["ere_final_fraction"] = float(self.cfg.inner_ere_final_fraction)
+            options["ere_min_rounds"] = int(self.cfg.inner_ere_min_rounds)
+            if not self.cfg.inner_ere_actor:
+                options["ere_actor"] = False
         if getattr(self.cfg, "inner_sac_return_estimator", "one_step") == "retrace":
             options.update(
                 return_estimator="retrace",

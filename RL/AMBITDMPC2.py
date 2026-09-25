@@ -194,6 +194,10 @@ _AMBI_DEFAULTS = {
     "inner_batch_size": 128,
     "inner_replay_capacity": None,
     "inner_replay_sampling": "with_replacement",
+    "inner_replay_strategy": "uniform",
+    "inner_ere_final_fraction": 0.25,
+    "inner_ere_min_rounds": 1,
+    "inner_ere_actor": True,
 
     # Initialization and trainability are independent for each inner component.
     "inner_actor_initialization": "prior",
@@ -2420,6 +2424,34 @@ class AMBITDMPC2(TDMPC2Baseline):
         cfg.inner_replay_reset_each_round = _strict_bool(
             cfg.inner_replay_reset_each_round, "inner_replay_reset_each_round"
         )
+        cfg.inner_replay_strategy = _normalize_choice(
+            cfg.inner_replay_strategy, "inner_replay_strategy", {"uniform", "ere"}
+        )
+        cfg.inner_ere_final_fraction = _strict_probability(
+            cfg.inner_ere_final_fraction, "inner_ere_final_fraction"
+        )
+        if cfg.inner_ere_final_fraction == 0:
+            raise ValueError("inner_ere_final_fraction must be in (0, 1].")
+        cfg.inner_ere_min_rounds = _strict_positive_int(
+            cfg.inner_ere_min_rounds, "inner_ere_min_rounds"
+        )
+        cfg.inner_ere_actor = _strict_bool(cfg.inner_ere_actor, "inner_ere_actor")
+        if (cfg.inner_replay_strategy == "ere" and not cfg.inner_ere_actor
+                and not cfg.inner_component_update_schedule):
+            raise ValueError("inner_ere_actor=False requires separate component update budgets.")
+        if cfg.inner_replay_strategy == "ere" and (
+            cfg.inner_operator != "sac"
+            or cfg.inner_sac_return_estimator != "one_step"
+            or cfg.inner_schedule_mode != "canonical"
+            or any(getattr(cfg, key) != "action" for key in scope_keys[:-1])
+            or cfg.inner_update_timing != "round"
+            or cfg.inner_explorer_mode != "none"
+            or cfg.inner_outer_replay_fraction != 0
+        ):
+            raise ValueError(
+                "inner_replay_strategy='ere' requires canonical, action-local "
+                "one-step inner SAC with round timing, no explorer and no outer replay mixing."
+            )
         if cfg.inner_replay_reset_each_round and (
             cfg.inner_operator != "sac"
             or cfg.inner_schedule_mode != "canonical"
@@ -3804,6 +3836,21 @@ class AMBITDMPC2(TDMPC2Baseline):
             if key.startswith("inner_fixed_q_counterfactual_action_")
             and key.removeprefix("inner_fixed_q_counterfactual_action_").isdigit()
         )
+        for component, group in (("critic", critic_metrics), ("actor", actor_metrics)):
+            # Register base metrics only: add_stats below already handles their
+            # derived std/min/max summaries (including round_age_min/max).
+            group.update(
+                f"inner_{component}_replay_{suffix}"
+                for suffix in (
+                    "window_rounds", "window_transitions", "window_fraction",
+                    "window_round_fraction", "round_age_mean", "round_age_min",
+                    "round_age_max", "newest_round_fraction", "batch_unique_fraction",
+                )
+            )
+            for key in metrics:
+                if (key.startswith(f"inner_{component}_replay_round_")
+                        and key.endswith("_sample_count")):
+                    action_gauges.add(key)
 
         # Source-conditioned TD summaries have an exact sampled-row count.
         # Route them separately from ordinary per-optimizer diagnostics so a

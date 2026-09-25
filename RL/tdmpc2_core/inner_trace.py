@@ -227,6 +227,19 @@ _DEFINITIONS = {
 def metric_definitions():
     """Return portable descriptions; callers may retain unlisted raw metrics."""
     result = dict(_DEFINITIONS)
+    for component in ("critic", "actor"):
+        for suffix, description in {
+            "window_rounds": "Number of newest whole collection rounds eligible for this update.",
+            "window_transitions": "Number of transitions eligible for this update.",
+            "window_fraction": "Eligible transitions divided by live replay transitions.",
+            "window_round_fraction": "Eligible collection rounds divided by retained rounds.",
+            "round_age_mean": "Mean sampled round age; the newest collection round has age zero.",
+            "round_age_min": "Minimum sampled round age, in collection rounds.",
+            "round_age_max": "Maximum sampled round age, in collection rounds.",
+            "newest_round_fraction": "Fraction of sampled rows generated in the newest collection round.",
+            "batch_unique_fraction": "Unique transition IDs divided by minibatch size.",
+        }.items():
+            result[f"{component}_replay_{suffix}"] = description
     for component in ("reward", "bootstrap"):
         for reference in ("initial", "outer"):
             result[f"togo_{component}_{reference}_mean"] = (
@@ -272,7 +285,14 @@ def metric_catalog(metric_names=()):
     result = {}
     for name in sorted(set(definitions) | set(metric_names)):
         unit = "scalar"
-        if name.startswith("togo_"):
+        ere_round_count = (
+            name.startswith(("inner_critic_replay_round_", "inner_actor_replay_round_"))
+            and name.endswith("_sample_count")
+        )
+        if ere_round_count:
+            phase, axis = "post_decision", "decision_index"
+            definitions[name] = "Total sampled rows from this generation round during the real decision, including repeat draws."
+        elif name.startswith("togo_"):
             phase, axis = "post_update_togo_probe", "actor_updates"
             unit = "value"
         elif name in probe_names:
@@ -293,7 +313,9 @@ def metric_catalog(metric_names=()):
             phase, axis = "pre_update_minibatch", "actor_updates"
         else:
             phase, axis = "pre_update_minibatch", "critic_updates"
-        if name.endswith("seconds"):
+        if "_replay_round_age_" in name or name.endswith("_replay_window_rounds"):
+            unit = "collection_rounds"
+        elif name.endswith("seconds"):
             unit = "seconds"
         elif name.endswith(("_fraction", "_rate")):
             unit = "fraction"
