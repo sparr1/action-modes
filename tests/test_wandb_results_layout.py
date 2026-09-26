@@ -94,6 +94,59 @@ def test_install_reads_back_preserves_other_views_and_is_noop_on_repeat(tmp_path
     assert json.loads((tmp_path/'results-layout-receipt.json').read_text())==second
 
 
+def ui_normalized_spec():
+    """Omissions observed after the live W&B UI resaved the results workspace."""
+    spec = layout.patch_actor_transfer_spec(sample_spec())
+    overview, curves, tables = layout._bank(spec)['sections'][:3]
+    for section in (overview, curves, tables):
+        section.pop('type')
+        for panel in section['panels']:
+            panel.pop('layout')
+    overview['flowConfig'] = {'columnsPerPage':1}
+    curves.pop('flowConfig')
+    tables['flowConfig'] = {'columnsPerPage':2, 'rowsPerPage':1}
+    return spec
+
+
+def test_installed_accepts_observed_omitted_defaults_without_rewriting_view(tmp_path):
+    spec = ui_normalized_spec(); before = deepcopy(spec)
+    assert layout._installed(spec) and spec == before
+    service = Service(); service.views[0]['spec'] = json.dumps(spec)
+    before_views = deepcopy(service.views)
+    receipt = install(tmp_path, service)
+    assert receipt['status'] == 'verified' and receipt['changed'] is False
+    assert service.writes == 0 and service.views == before_views
+
+
+@pytest.mark.parametrize('corruption', [
+    'section_id', 'panel_id', 'panel_missing', 'panel_order', 'section_hidden', 'automatic_panels',
+    'panel_automatic', 'query', 'title', 'media_key', 'section_type', 'flow_value', 'flow_null',
+    'flow_extra', 'layout_value', 'layout_null', 'layout_partial',
+])
+def test_installed_normalization_still_rejects_changed_values_and_content(corruption):
+    spec = ui_normalized_spec()
+    overview, curves, tables = layout._bank(spec)['sections'][:3]
+    chart = curves['panels'][0]
+    if corruption == 'section_id': curves['__id__'] = 'wrong-section'
+    elif corruption == 'panel_id': chart['__id__'] = 'wrong-panel'
+    elif corruption == 'panel_missing': curves['panels'].pop()
+    elif corruption == 'panel_order': curves['panels'].reverse()
+    elif corruption == 'section_hidden': curves['isOpen'] = False
+    elif corruption == 'automatic_panels': curves['isPanelsAuto'] = True
+    elif corruption == 'panel_automatic': chart['isAuto'] = True
+    elif corruption == 'query': chart['config']['userQuery']['queryFields'][0]['fields'][0]['args'][0]['value'] = 'wrong_table'
+    elif corruption == 'title': chart['config']['stringSettings']['title'] = 'Stale results'
+    elif corruption == 'media_key': tables['panels'][0]['config']['mediaKeys'] = ['wrong_metric']
+    elif corruption == 'section_type': curves['type'] = 'grid'
+    elif corruption == 'flow_value': overview['flowConfig']['columnsPerPage'] = 99
+    elif corruption == 'flow_null': curves['flowConfig'] = None
+    elif corruption == 'flow_extra': overview['flowConfig']['unknown'] = True
+    elif corruption == 'layout_value': chart['layout'] = {'x':0, 'y':0, 'w':1, 'h':6}
+    elif corruption == 'layout_null': chart['layout'] = None
+    elif corruption == 'layout_partial': chart['layout'] = {'w':8, 'h':6}
+    assert not layout._installed(spec)
+
+
 def test_concurrent_edit_aborts_before_write(tmp_path):
     service=Service(concurrent=True)
     with pytest.raises(layout.ResultsLayoutError,match='changed during preparation'):install(tmp_path,service)

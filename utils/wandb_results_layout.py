@@ -164,7 +164,32 @@ def _without_owned(spec):
 
 
 def _installed(spec):
-    return [s for s in _bank(spec)['sections'] if s.get('__id__') in OWNED_SECTION_IDS] == actor_transfer_sections()
+    """Accept observed UI omission of layout defaults, never changed values/content.
+
+    W&B's UI drops section ``type``/flow defaults and whole panel ``layout``
+    mappings when resaving this flow workspace. Restore only absent defaults
+    in a copy for comparison; IDs, queries, configs, visibility, order, and any
+    explicitly saved layout values still have to match exactly.
+    """
+    actual = deepcopy([s for s in _bank(spec)['sections'] if s.get('__id__') in OWNED_SECTION_IDS])
+    expected = actor_transfer_sections()
+    if len(actual) != len(expected):
+        return False
+    for section, wanted in zip(actual, expected):
+        section.setdefault('type', wanted['type'])
+        flow = section.setdefault('flowConfig', {})
+        if not isinstance(flow, dict):
+            return False
+        for key, value in wanted['flowConfig'].items():
+            flow.setdefault(key, value)
+        panels = section.get('panels')
+        if not isinstance(panels, list) or len(panels) != len(wanted['panels']):
+            return False
+        for panel, wanted_panel in zip(panels, wanted['panels']):
+            if not isinstance(panel, dict):
+                return False
+            panel.setdefault('layout', wanted_panel['layout'])
+    return actual == expected
 
 
 def ensure_actor_transfer_results_layout(api, *, entity, project, receipt_dir,
