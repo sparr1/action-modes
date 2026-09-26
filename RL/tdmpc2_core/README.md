@@ -1659,6 +1659,35 @@ By default, `inner_first_action_rounds=None` uses `inner_rounds=J` at every
 decision, including the first. Actor retention does not require a different
 initial budget. The uniform-J transfer sweep uses this default.
 
+For frozen checkpoint evaluation, `inner_solve_interval=K` solves at real
+decisions `0,K,2K,...` and executes the resulting **feedback actor** at each
+fresh observation between solves. Its default is 1 and preserves ordinary
+per-decision control and all RNG streams. A held decision does not repeat the
+previous action or run an imagined open-loop sequence: it evaluates the fixed
+actor's mean at the newly encoded real observation. Setting K equal to H gives
+H real feedback actions per solve, with an ordinary partial final block when
+the episode length is not divisible by H.
+
+Intervals above 1 currently require state observations, evaluation mode,
+dense auxiliary one-step SAC, uniform positive J, canonical critic-first
+component updates, mean execution, no explorer/writeback, and action-scoped
+non-actor components. The actor may have action scope (reset at each solve)
+or episode scope (retain weights between solves). Critic, target, replay,
+temperature and optimizer states are fresh at each solve. Episode boundaries,
+evaluation resets and checkpoint loads discard the held policy and cadence
+clock. This evaluation cache is not a training-resume state.
+
+Held decisions skip collection, optimization and model/critic probes, and
+consume no learner or collection randomness. Their trace contains only the
+evaluator's decision event, with zero realized rounds, model steps, replay
+draws and optimizer steps; no previous solve's losses, values or temperature
+are relogged. Every decision reports `inner_solve_performed`,
+`inner_policy_held`, `inner_solve_interval`, zero-based `inner_solve_index`,
+`inner_episode_decision_index`, and `inner_action_age` (zero at a solve, then
+1 through K−1). Optimizer lifetime diagnostics therefore count **solves**,
+not held real decisions. Per-solve tracing retains the initialization,
+first-critic/first-actor and post-round observations described below.
+
 Optional `inner_first_action_rounds` gives the first decision of every episode
 a separately configured initialization dose. For example, set it to 10 and `inner_rounds=2`
 to use J10 once, then J2 thereafter. This option supports positive round counts,

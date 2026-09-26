@@ -109,10 +109,12 @@ def actor_transfer_sections():
         'Results panels display the summaries published by the selected run. '
         'The settings table distinguishes pending evaluations from completed results; '
         '**missing chart points are unavailable, never zero measurements.** '
-        'Cold resets the actor each decision; warm retains actor weights only. '
+        'Cold resets the actor at each solve; warm retains actor weights between solves. '
         'Each plotted value is a mean full-episode return across five environment seeds. '
-        'Read the selected run configuration for the first-decision budget: '
-        'the original study used first J10, while the corrected study uses J at every decision. '
+        'Read the selected run configuration for the solve cadence and first-solve budget: '
+        'the original study used first J10; the corrected study uses J at every decision; '
+        'hold-H solves every H decisions and uses '
+        'the fixed feedback actor on fresh observations between solves. '
         'The measurements table includes exact values even when only one point is available. '
         'Uncertainty is in the paired-effect table, not the line width or style.')
     overview = [_panel('explanation', 'Markdown Panel', {'value': intro}, width=24, height=4),
@@ -120,7 +122,7 @@ def actor_transfer_sections():
                                                     'mediaKeys': ['campaign/settings']}, width=24)]
     charts = [_chart(f'comparison/h{h}_return_vs_{axis}',
                      f'H{h}: full-episode return versus ' + ('J' if axis == 'rounds' else 'controller time'),
-                     'J (see run configuration)' if axis == 'rounds' else 'Controller seconds / decision')
+                     'J rounds / solve (see run configuration)' if axis == 'rounds' else 'Controller seconds / real decision')
               for axis in ('rounds', 'compute') for h in (1, 2, 3)]
     tables = [_panel('measurements', 'Media Browser', {'chartTitle': 'Episode returns and timing',
                  'mediaKeys': ['comparison/returns_and_compute']}, width=12),

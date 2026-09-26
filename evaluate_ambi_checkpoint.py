@@ -419,11 +419,18 @@ def _togo_round_summaries(rows):
 def _transfer_latency(samples):
     """Retain raw paired timings so population quantiles can be recomputed."""
     result = {"samples": samples}
-    for period, selected in (("first", samples[:1]), ("steady", samples[1:])):
+    groups = [("first", samples[:1]), ("steady", samples[1:])]
+    if all("solve_performed" in row and "policy_held" in row for row in samples):
+        groups.extend((
+            ("solve", [row for row in samples if row["solve_performed"]]),
+            ("held", [row for row in samples if row["policy_held"]]),
+        ))
+    for period, selected in groups:
         result[period] = {}
         for key in ("prediction_seconds", "control_seconds", "diagnostic_seconds"):
             values = [row[key] for row in selected]
             result[period][key] = {**_summary(values),
+                "total": float(sum(values)),
                 "median": float(np.median(values)) if values else None,
                 "p95": float(np.percentile(values, 95)) if values else None}
     return result
@@ -721,12 +728,16 @@ def evaluate_preset(
                     "control_seconds": "Prediction wall time minus measured probe durations; retains trace materialization and host overhead.",
                     "probe_clock": "CUDA stream events on GPU, wall clock on CPU.",
                     "compile": "One unscored initial solve before measured episodes; compilation warmup reported separately.",
+                    "decision_groups": "First/steady decision and solve/held feedback-action timings are separate; total controller time includes every decision.",
                 }
             if togo_return_rollouts:
                 bundle_run["togo_return_probe"] = {
                     "version": 2, "rollouts": togo_return_rollouts,
                     "horizon": int(model.cfg.inner_rollout_horizon),
                     "cadence": "initial_and_after_each_round",
+                    **({"solve_interval": int(model.cfg.inner_solve_interval),
+                        "held_decisions": "No solve or diagnostic probes; execute the cached feedback actor at the fresh observation."}
+                       if int(getattr(model.cfg, "inner_solve_interval", 1)) > 1 else {}),
                     "tail_actor": "outer", "tail_critic": "outer_online",
                     "tail_q_reduction": model.cfg.mppi_terminal_q_reduction,
                     "entropy_bonus": False, "policy_actions": "sampled",
@@ -842,7 +853,24 @@ def evaluate_preset(
                 prediction_seconds = action_seconds
                 probe_seconds = 0.0
                 togo_metrics = {}
-                if togo_return_rollouts:
+                inner_metrics = getattr(model.agent, "last_inner_metrics", {})
+                policy_held = bool(inner_metrics.get("inner_policy_held", False))
+                solve_performed = bool(inner_metrics.get("inner_solve_performed", not policy_held))
+                solve_interval = int(getattr(model.cfg, "inner_solve_interval", 1))
+                if solve_interval > 1:
+                    expected_solve = episode_steps % solve_interval == 0
+                    if solve_performed != expected_solve or policy_held == expected_solve:
+                        raise RuntimeError("Controller solve/hold flags disagree with the episode decision cadence.")
+                    if int(inner_metrics.get("inner_action_age", -1)) != episode_steps % solve_interval:
+                        raise RuntimeError("Held actor age disagrees with the episode decision cadence.")
+                if policy_held:
+                    if trace is not None and trace.events:
+                        raise RuntimeError("Held-policy decisions must not emit solve or probe events.")
+                    work = ("inner_rounds", "inner_model_steps", "inner_actor_optimizer_steps",
+                            "inner_critic_optimizer_steps", "inner_temperature_optimizer_steps")
+                    if any(inner_metrics.get(key) != 0 for key in work):
+                        raise RuntimeError("Held-policy decisions must report zero solve work.")
+                if togo_return_rollouts and not policy_held:
                     probes = [event["metrics"] for event in trace.events if event["phase"] == "probe"]
                     if not probes:
                         raise RuntimeError("Enabled to-go return probes produced no measurements.")
@@ -863,7 +891,11 @@ def evaluate_preset(
                 if actor_transfer_diagnostics:
                     latency_samples.append({"decision_index": episode_steps,
                         "prediction_seconds": prediction_seconds, "control_seconds": action_seconds,
-                        "diagnostic_seconds": probe_seconds})
+                        "diagnostic_seconds": probe_seconds,
+                        "solve_performed": solve_performed, "policy_held": policy_held,
+                        "solve_index": int(inner_metrics.get("inner_solve_index", episode_steps)),
+                        "action_age": int(inner_metrics.get("inner_action_age", 0)),
+                        "solve_interval": solve_interval})
                 if trace is not None:
                     pending_events.extend({"episode_id": phase_id, "decision_index": episode_steps, **event}
                                           for event in trace.events)
@@ -919,7 +951,14 @@ def evaluate_preset(
                     "truncated": bool(truncated),
                     "truncated_by_evaluator": truncated_by_evaluator,
                     "control_seconds": control_seconds,
-                    **({"transfer_latency": _transfer_latency(latency_samples)}
+                    **({"transfer_latency": _transfer_latency(latency_samples),
+                        "solve_count": sum(row["solve_performed"] for row in latency_samples),
+                        "held_decision_count": sum(row["policy_held"] for row in latency_samples),
+                        "solve_control_seconds": sum(row["control_seconds"] for row in latency_samples
+                                                     if row["solve_performed"]),
+                        "held_control_seconds": sum(row["control_seconds"] for row in latency_samples
+                                                    if row["policy_held"]),
+                        "control_seconds_per_decision": control_seconds / episode_steps}
                        if actor_transfer_diagnostics else {}),
                     **({"togo_probe_seconds": episode_probe_seconds,
                         "togo_probe_model_steps": episode_probe_model_steps,
@@ -1065,10 +1104,11 @@ def evaluate_matrix(
     study_protocol = matrix.get("study_protocol")
     if not isinstance(actor_transfer_diagnostics, bool):
         raise ValueError("evaluation.actor_transfer_diagnostics must be boolean.")
-    if actor_transfer_diagnostics and (study_protocol not in {"actor-transfer-v1", "actor-transfer-v2"}
+    if actor_transfer_diagnostics and (study_protocol not in {
+            "actor-transfer-v1", "actor-transfer-v2", "actor-transfer-hold-h-v1"}
             or not togo_return_rollouts or bundle_dir is None
             or save_root_bank or root_bank_path or bank_only):
-        raise ValueError("Actor-transfer diagnostics require actor-transfer-v1/v2 full episodes and bundled to-go probes.")
+        raise ValueError("Actor-transfer diagnostics require a named actor-transfer full-episode protocol and bundled to-go probes.")
     if (isinstance(togo_return_rollouts, bool) or not isinstance(togo_return_rollouts, int)
             or togo_return_rollouts < 0):
         raise ValueError("evaluation.togo_return_rollouts must be a nonnegative integer.")
@@ -1104,11 +1144,20 @@ def evaluate_matrix(
         raise ValueError("--metadata requires a checkpoint-based preset matrix.")
     resolved_presets = [resolve_preset(matrix_path, selector, matrix=matrix, checkpoint_context=context)
                         for selector in selectors]
-    if study_protocol == "actor-transfer-v2" and any(
+    if study_protocol in {"actor-transfer-v2", "actor-transfer-hold-h-v1"} and any(
         item["algorithm_config"]["alg_params"].get("inner_first_action_rounds") is not None
         for item in resolved_presets
     ):
-        raise ValueError("actor-transfer-v2 requires the selected J at every decision; inner_first_action_rounds must be None.")
+        raise ValueError(f"{study_protocol} requires the selected J at every decision that solves; inner_first_action_rounds must be None.")
+    for item in resolved_presets:
+        params = item["algorithm_config"]["alg_params"]
+        interval = params.get("inner_solve_interval", 1)
+        if interval != 1 and not (actor_transfer_diagnostics and study_protocol == "actor-transfer-hold-h-v1"):
+            raise ValueError("Held-policy evaluation requires the actor-transfer-hold-h-v1 protocol and transfer diagnostics.")
+        if (study_protocol == "actor-transfer-hold-h-v1"
+                and params.get("inner_operator", "sac") != "none"
+                and interval != params.get("inner_rollout_horizon", 3)):
+            raise ValueError("actor-transfer-hold-h-v1 requires inner_solve_interval to equal the imagined rollout horizon.")
     _validate_frozen_selection(matrix, resolved_presets)
     _validate_checkpoint_contract(matrix, checkpoint, context, resolved_presets)
     if togo_return_rollouts and any(

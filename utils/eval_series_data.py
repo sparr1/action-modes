@@ -357,6 +357,10 @@ def planner_identity(config, result, algorithm, action_rule):
     _require(operator in {"sac", "td3", "xqc", "mppi"}, "Unknown resolved inner operator")
     active = {key: value for key, value in normalize_aux_return_identity(config).items()
               if key.startswith("inner_")}
+    # Historical controllers solve at every real decision. Resolving that
+    # default explicitly must not split their identities or prior references.
+    if active.get("inner_solve_interval", 1) == 1:
+        active.pop("inner_solve_interval", None)
     estimator = config.get("inner_sac_return_estimator", "one_step")
     if isinstance(estimator, str):
         estimator = estimator.lower()
@@ -464,10 +468,16 @@ def planner_identity(config, result, algorithm, action_rule):
                        if key in config})
     if shared.get("sac_actor_loss_scale_mode") == "none":
         shared.pop("sac_actor_loss_scale_tau", None)
+    semantics = {}
+    if config.get("inner_first_action_rounds") is not None:
+        semantics.update(evaluation_protocol="actor-transfer-v1",
+                         first_action_rounds=config["inner_first_action_rounds"])
+    if config.get("inner_solve_interval", 1) > 1:
+        semantics.update(evaluation_protocol="actor-transfer-hold-h-v1",
+                         solve_interval=int(config["inner_solve_interval"]),
+                         held_action="cached_feedback_actor_at_current_observation")
     return {"type": operator, "backend": algorithm, "action_rule": action_rule,
-            **({"semantics": {"evaluation_protocol": "actor-transfer-v1",
-                              "first_action_rounds": config["inner_first_action_rounds"]}}
-               if config.get("inner_first_action_rounds") is not None else {}),
+            **({"semantics": semantics} if semantics else {}),
             "settings": {**shared, **active}}
 
 
@@ -688,18 +698,28 @@ def _metrics(episodes):
     if all(ep.get("evaluation_seconds") is not None for ep in episodes):
         metrics["runtime/evaluation_seconds"] = sum(ep["evaluation_seconds"] for ep in episodes)
     if all(ep.get("transfer_latency") is not None for ep in episodes):
-        for period in ("first", "steady"):
-            rows = [row for ep in episodes for row in ep["transfer_latency"]["samples"]
-                    if (row["decision_index"] == 0) == (period == "first")]
+        samples = [row for ep in episodes for row in ep["transfer_latency"]["samples"]]
+        # Older actor-transfer records predate hold support and every decision
+        # solved. The absent flags therefore have unambiguous legacy defaults.
+        groups = {
+            "first": [row for row in samples if row["decision_index"] == 0],
+            "steady": [row for row in samples if row["decision_index"] != 0],
+            "solve": [row for row in samples if row.get("solve_performed", True)],
+            "held": [row for row in samples if row.get("policy_held", False)],
+        }
+        for period, rows in groups.items():
             metrics[f"runtime/{period}_decisions"] = len(rows)
             for key in ("prediction_seconds", "control_seconds", "diagnostic_seconds"):
                 values = sorted(_number(row[key], key) for row in rows)
+                metrics[f"runtime/{period}_{key}_total"] = sum(values)
                 if values:
                     metrics[f"runtime/{period}_{key}_mean"] = statistics.mean(values)
                     metrics[f"runtime/{period}_{key}_median"] = statistics.median(values)
                     position = (len(values) - 1) * .95
                     lo, hi = math.floor(position), math.ceil(position)
                     metrics[f"runtime/{period}_{key}_p95"] = values[lo] + (values[hi] - values[lo]) * (position - lo)
+        metrics["work/solves"] = len(groups["solve"])
+        metrics["work/held_decisions"] = len(groups["held"])
     if all(ep.get("togo_probe_seconds") is not None for ep in episodes):
         metrics["runtime/togo_probe_seconds"] = sum(
             _number(ep["togo_probe_seconds"], "to-go probe seconds") for ep in episodes)

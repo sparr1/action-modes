@@ -148,6 +148,8 @@ _AMBI_DEFAULTS = {
     "inner_rounds": 4,
     # Optional episode-start solve dose; subsequent decisions use inner_rounds.
     "inner_first_action_rounds": None,
+    # Frozen evaluation: reuse the solved feedback actor between real solves.
+    "inner_solve_interval": 1,
     "inner_rollouts_per_round": 64,
     "inner_rollout_horizon": 3,
     "inner_updates_per_round": "auto",
@@ -2962,6 +2964,38 @@ class AMBITDMPC2(TDMPC2Baseline):
         _validate_retrace_config(cfg)
         _validate_split_value_config(cfg)
         validate_auxiliary_config(cfg)
+        cfg.inner_solve_interval = _strict_positive_int(
+            cfg.inner_solve_interval, "inner_solve_interval"
+        )
+        if cfg.inner_solve_interval > 1:
+            if (
+                cfg.obs != "state" or cfg.inner_operator != "sac"
+                or cfg.aux_return_mode == "off"
+                or cfg.inner_rounds <= 0
+                or cfg.inner_first_action_rounds is not None
+                or cfg.inner_schedule_mode != "canonical"
+                or not cfg.inner_component_update_schedule
+                or cfg.inner_component_update_order != "critic_first"
+                or cfg.inner_update_timing != "round"
+                or cfg.inner_actor_adaptation != "clone"
+                or cfg.inner_critic_adaptation != "clone"
+                or cfg.inner_actor_scope not in {"action", "episode"}
+                or cfg.inner_sac_return_estimator != "one_step"
+                or cfg.inner_eval_execution_action != "mean"
+                or cfg.inner_explorer_mode != "none"
+                or cfg.inner_execution_policy_source != "primary"
+                or cfg.inner_actor_writeback_coef != 0.0
+                or cfg.inner_critic_writeback_coef != 0.0
+                or any(getattr(cfg, f"inner_{component}_scope") != "action"
+                       for component in ("critic", "temperature", "replay", "actor_optimizer",
+                                         "critic_optimizer", "temperature_optimizer"))
+            ):
+                raise ValueError(
+                    "inner_solve_interval>1 requires state observations, active "
+                    "dense auxiliary one-step SAC, uniform canonical critic-first "
+                    "rounds, mean evaluation, actor scope action/episode, all other "
+                    "scopes action, and no explorer or prior writeback."
+                )
         cfg.inner_terminal_entropy = _normalize_choice(
             cfg.inner_terminal_entropy, "inner_terminal_entropy", {"none", "outer"},
         )

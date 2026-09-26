@@ -161,6 +161,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self.action_index = 0
         self.episode_index = 0
         self._mppi_prev_mean = None
+        self._reset_solve_cadence()
         self._collect_diagnostics = True
         self._active_trace = None
         self._pending_timers = {}
@@ -486,6 +487,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self.action_index = 0
         self.episode_index = 0
         self._mppi_prev_mean = None
+        self._reset_solve_cadence()
         self._pending_timers = {}
         self._parameter_noise_spec = None
         self._clear_parameter_noise_action_state()
@@ -543,6 +545,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self.action_index = 0
         self.episode_index = 0
         self._mppi_prev_mean = None
+        self._reset_solve_cadence()
         self._collect_diagnostics = True
         self._pending_timers = {}
         self._clear_parameter_noise_action_state()
@@ -596,9 +599,15 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self._pending_timers = {}
         return metrics
 
+    def _reset_solve_cadence(self):
+        """Discard the evaluation-only held actor and episode decision clock."""
+        self._held_actor = None
+        self._episode_decision_index = 0
+
     def reset_episode(self):
         """Clear action/episode state while preserving explicitly run-scoped state."""
         self.episode_index += 1
+        self._reset_solve_cadence()
         self._clear_expired(t0=True, include_action=True)
         if str(self.cfg.inner_mppi_warm_start_scope) != "run":
             self._mppi_prev_mean = None
@@ -1432,6 +1441,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self.action_index = candidate["action_index"]
         self.episode_index = candidate["episode_index"]
         self._mppi_prev_mean = candidate["mppi_prev_mean"]
+        self._reset_solve_cadence()
         self._collect_diagnostics = True
         self._pending_timers = {}
         self._parameter_noise_spec = None
@@ -6283,6 +6293,42 @@ class InnerImprovementEngine(RetraceInnerMixin):
             return action[0], metrics, [], behavior_policy
         return action[0], metrics, []
 
+    @torch.no_grad()
+    def _act_held(self, root_z, *, return_behavior_policy=False):
+        """Execute the last solved feedback actor at this fresh observed root.
+
+        This path has no workspace preparation, rollout, optimizer, or model
+        probe. The cached module can belong to the cold allocation pool or the
+        warm episode workspace; its weights remain fixed until the next solve.
+        """
+        if self._held_actor is None:
+            raise RuntimeError("A held action requires a preceding solve in this episode.")
+        execution_start = self._timer_start()
+        modes = tuple((module, bool(module.training)) for module in self._held_actor.modules())
+        try:
+            self._held_actor.eval()
+            # This opt-in path permits mean execution only, so no RNG fork or
+            # phase seed is needed, including the execution RNG stream.
+            action, _ = self._policy_action(
+                root_z, self._held_actor, mode="mean", generator=None,
+            )
+        finally:
+            for module, was_training in modes:
+                module.training = was_training
+        self._eval_execution_metrics = {
+            "inner_eval_execution_sampled": 0.0,
+            "inner_eval_execution_mean_action_l2": 0.0,
+        }
+        self._timer_stop("inner_execution_seconds", execution_start)
+        metrics = self._base_metrics(active=False)
+        # No temperature is being initialized/optimized on a held decision.
+        metrics = {key:value for key,value in metrics.items() if "alpha" not in key}
+        metrics.update(inner_model_steps_budget=0.0, inner_policy_evaluations=1.0,
+                       inner_actor_transferred=0.0, inner_first_action_rounds_applied=0.0)
+        if return_behavior_policy:
+            return action[0], metrics, [], None
+        return action[0], metrics, []
+
     def _act_rl(
         self,
         root_z,
@@ -6976,6 +7022,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
         trace=None,
     ):
         """Run an action with an optional single-use observational recorder."""
+        if int(getattr(self.cfg, "inner_solve_interval", 1)) > 1 and not eval_mode:
+            raise ValueError("inner_solve_interval>1 is supported only for frozen evaluation.")
         if eval_mode and getattr(self.cfg, "inner_eval_execution_action", "mean") == "policy_sample" and (
             self.cfg.inner_operator not in {"none", "sac"}
             or self.cfg.inner_explorer_mode != "none"
@@ -7056,6 +7104,12 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self._pending_timers = {}
         self._eval_execution_metrics = {}
         start = self._timer_start()
+        if t0:
+            self._reset_solve_cadence()
+        decision_index = self._episode_decision_index
+        solve_interval = int(getattr(self.cfg, "inner_solve_interval", 1))
+        action_age = decision_index % solve_interval
+        held = action_age > 0
         self.action_index += 1
         self._collect_diagnostics = bool(collect_diagnostics)
         with self.rng.action_fork():
@@ -7067,7 +7121,13 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 operator in {"sac", "td3", "tdambi"}
                 and int(self.cfg.inner_rounds) == 0
             )
-            if inactive:
+            if held:
+                result = self._act_held(root_z, return_behavior_policy=return_behavior_policy)
+                if return_behavior_policy:
+                    action, metrics, lengths, behavior_policy = result
+                else:
+                    action, metrics, lengths = result
+            elif inactive:
                 if self._active_trace is not None:
                     self._active_trace.record(
                         "initial", self.state,
@@ -7105,6 +7165,11 @@ class InnerImprovementEngine(RetraceInnerMixin):
                     action, metrics, lengths, behavior_policy = result
                 else:
                     action, metrics, lengths = result
+
+                if solve_interval > 1:
+                    # Keep the solved module, not a repeated open-loop action.
+                    # _clear_expired below may move this module into the pool.
+                    self._held_actor = self.state.actor
 
                 writeback_active = bool(
                     self.cfg.inner_actor_writeback_coef > 0.0
@@ -7154,10 +7219,19 @@ class InnerImprovementEngine(RetraceInnerMixin):
             # first invocation that discovers an unsupported compiled critic.
             metrics.update(self._compile_fallback_metrics())
             metrics.update(self._eval_execution_metrics)
+            metrics.update(
+                inner_solve_interval=float(solve_interval),
+                inner_solve_performed=float(not held and not inactive),
+                inner_policy_held=float(held),
+                inner_solve_index=float(decision_index // solve_interval if not inactive else -1),
+                inner_action_age=float(action_age),
+                inner_episode_decision_index=float(decision_index),
+            )
 
             # Action-scoped tensors are explicitly released after producing
             # the action; episode/run scopes survive by configuration.
             self._clear_expired(t0=False, include_action=True)
+        self._episode_decision_index += 1
         if return_behavior_policy:
             if operator != "sac":
                 behavior_policy = None

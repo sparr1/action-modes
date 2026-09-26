@@ -1,5 +1,9 @@
 # Frozen-checkpoint AMBI research
 
+The [H-decision actor-hold study](ACTOR_TRANSFER_HOLD_H_575K.md) solves at
+t=0,H,2H,… and evaluates the fixed adapted feedback actor on fresh observations
+between solves, across the same H/J cold-versus-warm panel.
+
 The [575k actor-only transfer study](ACTOR_TRANSFER_575K.md) compares cold and
 warm actor initialization across H1/2/3 and J1/2/4/6/8/10, using selected J at
 every decision, with per-phase transfer diagnostics and return-versus-compute reporting.

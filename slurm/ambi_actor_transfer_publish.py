@@ -15,7 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from slurm.ambi_actor_transfer_campaign import (
     CHECKPOINT_SHA, CHECKPOINT_STEP, ENTITY, HORIZONS, MODES, PROJECT,
-    PROTOCOL, ROUNDS, SEEDS, cells, digest, read, summarize_trace, validate_completed, write,
+    PROTOCOL, HOLD_PROTOCOL, ROUNDS, SEEDS, cells, digest, read, rounds_policy,
+    summarize_trace, validate_completed, validate_reused_source, write,
 )
 from slurm.ambi_aux_hj_sweep import publish_performance
 from slurm.ambi_closed_loop_checkpoint_sweep import load_prior
@@ -29,7 +30,8 @@ def url(run_id):
 
 def validate_scope(campaign):
     expected = cells(campaign['matrix'])
-    assert campaign['study_protocol'] == PROTOCOL
+    assert campaign['study_protocol'] in (PROTOCOL, HOLD_PROTOCOL)
+    assert campaign['study_protocol'] == read(campaign['matrix'])['study_protocol']
     assert campaign['checkpoint_step'] == CHECKPOINT_STEP and campaign['checkpoint_sha256'] == CHECKPOINT_SHA
     assert campaign['first_action_rounds'] is None
     assert len(campaign['cells']) == len(expected)
@@ -39,11 +41,15 @@ def validate_scope(campaign):
         assert actual.get('reused') in (False, True)
         if actual.get('reused'):
             from slurm.ambi_actor_transfer_campaign import _reuse_source
-            assert actual['J'] == 10, 'Only the six J10 cells may reuse the original study'
+            if campaign['study_protocol'] == HOLD_PROTOCOL:
+                assert actual['H'] == 1, 'Only the twelve H1 cells may reuse the uniform-J study'
+            else:
+                assert actual['J'] == 10, 'Only the six J10 cells may reuse the original study'
             _reuse_source(actual, campaign)  # Pin original config, identity, and artifact locations.
     reused = [c['name'] for c in campaign['cells'] if c.get('reused')]
     if reused:
-        assert set(reused) == {c['name'] for c in expected if c['J'] == 10}
+        assert set(reused) == {c['name'] for c in expected
+            if (c['H'] == 1 if campaign['study_protocol'] == HOLD_PROTOCOL else c['J'] == 10)}
         assert campaign['reused_cells'] == reused
     ids = [c['performance_run_id'] for c in campaign['cells']] + [campaign['overview_run_id']]
     assert len(set(ids)) == len(ids)
@@ -53,8 +59,7 @@ def validate_scope(campaign):
 def load_completed(campaign, cell):
     from utils.eval_series_data import load_records
     if cell.get('reused'):
-        from slurm.ambi_actor_transfer_campaign import validate_reused_j10_source
-        validate_reused_j10_source(campaign, cell)
+        validate_reused_source(campaign, cell)
     directory, bundle = Path(cell['directory']), Path(cell['bundle'])
     receipt = read(directory / 'worker-completion.json')
     assert receipt['cell'] == cell['name'] and receipt['status'] == 'complete' and not receipt['smoke']
@@ -108,6 +113,11 @@ def aggregate_results(campaign, completed):
                      reused=bool(cell.get('reused')), reuse_provenance=cell.get('reuse_provenance'),
                      return_mean=None, return_std=None, control_seconds=None, control_seconds_per_decision=None,
                      paired_gain_mean=None)
+        if campaign['study_protocol'] == HOLD_PROTOCOL:
+            point.update(solve_interval=cell['solve_interval'], solves_per_episode=cell['solves_per_episode'],
+                         held_decisions_per_episode=cell['held_decisions_per_episode'],
+                         nominal_critic_updates_per_episode=16*cell['J']*cell['solves_per_episode'],
+                         nominal_actor_updates_per_episode=4*cell['J']*cell['solves_per_episode'])
         if cell['name'] in completed:
             item = completed[cell['name']]; metrics = item['metrics']
             returns = moments(ep['return'] for ep in item['episodes'])
@@ -116,7 +126,7 @@ def aggregate_results(campaign, completed):
                          control_seconds_per_decision=metrics.get('runtime/control_seconds_per_decision'),
                          paired_gain_mean=metrics.get('eval/paired_gain_mean'))
             # Preserve new first/steady latency and diagnostic costs without renaming units.
-            point.update({key: value for key, value in metrics.items() if key.startswith('runtime/')})
+            point.update({key: value for key, value in metrics.items() if key.startswith(('runtime/', 'work/'))})
             for row in item['diagnostics']['stage_rows']:
                 diagnostic_rows.append(dict(setting=cell['name'], H=cell['H'], J=cell['J'],
                                             transfer_mode=cell['transfer_mode'], **row))
@@ -135,7 +145,7 @@ def aggregate_results(campaign, completed):
                     paired_episodes=metrics['comparison/sample_minus_mean_paired_episodes'],
                     episodes=[dict(seed=r['seed'], solver_seed=r['solver_seed'], cold_return=r['mean_return'],
                         warm_return=r['sampled_return'], warm_minus_cold=r['sample_minus_mean']) for r in comparison['rows']]))
-    return dict(study_protocol=campaign['study_protocol'], rounds_policy='J at every decision including the first',
+    return dict(study_protocol=campaign['study_protocol'], rounds_policy=rounds_policy(campaign),
         points=points, paired_comparisons=pairs, diagnostics=diagnostic_rows,
         completed=len(completed), total=len(panel), bootstrap_seed=20260912, bootstrap_resamples=2000,
         uncertainty='Five paired environment seeds on one trained backbone; exploratory unadjusted 95% episode-bootstrap intervals.')
@@ -145,7 +155,10 @@ def overview_payload(wandb, aggregate):
     point_columns = ['setting', 'H', 'J', 'transfer_mode', 'first_action_rounds', 'return_mean', 'return_std',
                      'control_seconds', 'control_seconds_per_decision', 'paired_gain_mean', 'performance_url',
                      'reused', 'reuse_provenance']
-    point_columns += sorted({k for p in aggregate['points'] for k in p if k.startswith('runtime/')})
+    if aggregate.get('study_protocol', PROTOCOL) == HOLD_PROTOCOL:
+        point_columns += ['solve_interval', 'solves_per_episode', 'held_decisions_per_episode',
+                          'nominal_critic_updates_per_episode', 'nominal_actor_updates_per_episode']
+    point_columns += sorted({k for p in aggregate['points'] for k in p if k.startswith(('runtime/', 'work/'))})
     pair_columns = ['H', 'J', 'warm_minus_cold_mean', 'warm_minus_cold_std', 'ci95_low', 'ci95_high', 'paired_episodes']
     diag_columns = ['setting', 'H', 'J', 'transfer_mode', 'phase', 'stage', 'round_index', 'decision_group',
                     'metric', 'mean', 'std', 'episodes']
@@ -168,17 +181,21 @@ def overview_payload(wandb, aggregate):
         series = [[p for p in aggregate['points'] if p['H'] == h and p['transfer_mode'] == mode
                    and p['return_mean'] is not None] for mode in MODES]
         if any(series):
+            hold_h = aggregate.get('study_protocol', PROTOCOL) == HOLD_PROTOCOL
             payload[f'comparison/h{h}_return_vs_rounds'] = wandb.plot.line_series(
                 xs=[[p['J'] for p in rows] for rows in series], ys=[[p['return_mean'] for p in rows] for rows in series],
                 keys=['Cold (reset actor)', 'Warm (retain actor)'],
-                title=f'H{h}: full-episode return versus rounds at every decision', xname='J rounds / decision')
+                title=(f'H{h}: full-episode return; solve every {h} decisions' if hold_h
+                       else f'H{h}: full-episode return versus rounds at every decision'),
+                xname='J rounds / solve' if hold_h else 'J rounds / decision')
             timed = [sorted((p for p in rows if p['control_seconds_per_decision'] is not None),
                             key=lambda p:p['control_seconds_per_decision']) for rows in series]
             payload[f'comparison/h{h}_return_vs_compute'] = wandb.plot.line_series(
                 xs=[[p['control_seconds_per_decision'] for p in rows] for rows in timed],
                 ys=[[p['return_mean'] for p in rows] for rows in timed],
                 keys=['Cold (reset actor)', 'Warm (retain actor)'],
-                title=f'H{h}: full-episode return versus measured controller time', xname='Controller seconds / decision')
+                title=f'H{h}: full-episode return versus measured controller time',
+                xname='Controller seconds / real decision (all 500)' if hold_h else 'Controller seconds / decision')
     return payload
 
 
@@ -220,11 +237,12 @@ def watch(args):
     run = wandb.init(entity=ENTITY, project=PROJECT, id=campaign['overview_run_id'], resume='never',
         name=campaign['label'], group=campaign['group'], job_type='actor-transfer-comparison',
         tags=['actor-transfer', '575k', 'mean', 'return-only'], mode='online',
-        config=dict(study_protocol=PROTOCOL, source_run=campaign['source_run'], source_commit=campaign['source_commit'],
+        config=dict(study_protocol=campaign['study_protocol'], source_run=campaign['source_run'], source_commit=campaign['source_commit'],
             checkpoint_step=CHECKPOINT_STEP, checkpoint_sha256=CHECKPOINT_SHA,
             campaign_group=campaign['group'],
             H=list(HORIZONS), J=list(ROUNDS), modes=list(MODES), first_action_rounds=None,
-            rounds_policy='J at every decision including the first',
+            rounds_policy=rounds_policy(campaign),
+            solve_cadence='H real decisions' if campaign['study_protocol'] == HOLD_PROTOCOL else 'one real decision',
             reused_settings=[c['name'] for c in panel if c.get('reused')],
             C=16, A=4, N=128, B=256, seeds=SEEDS, controller_seed=55, max_steps=500,
             prior_reference=campaign['prior_reference'], timing_note=campaign['timing_note']))
