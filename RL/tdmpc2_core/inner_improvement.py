@@ -501,7 +501,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
         training engine.  Each evaluation episode must nevertheless begin from
         a fresh root-local workspace and an episode-private RNG stream. The
         default discards allocations. Opt-in reuse retains only a single-policy,
-        fully action-scoped allocation pool; ordinary workspace preparation
+        action-scoped allocation pool (including the dense auxiliary actor-only
+        episode-transfer variant); ordinary workspace preparation
         applies configured initialization, resets target networks, optimizer
         moments, replay and alpha
         before use. Keeping module identities also avoids recompiling Dynamo
@@ -520,14 +521,21 @@ class InnerImprovementEngine(RetraceInnerMixin):
             reuse_action_pool
             and str(self.cfg.inner_operator) in {"sac", "td3", "tdambi"}
             and not self._explorer_active
+            and (str(self.cfg.inner_actor_scope) == "action" or (
+                self._aux_return_active and str(self.cfg.inner_actor_scope) == "episode"
+            ))
             and all(
                 str(getattr(self.cfg, f"inner_{component}_scope")) == "action"
                 for component in (
-                    "actor", "critic", "temperature", "replay",
+                    "critic", "temperature", "replay",
                     "actor_optimizer", "critic_optimizer", "temperature_optimizer",
                 )
             )
         )
+        if retain_pool and self._aux_return_active and self.cfg.inner_actor_scope == "episode":
+            # Pool the expired actor too. Its values are restored from the prior
+            # before use; only allocation identities survive the episode.
+            self._clear_expired(t0=True, include_action=True)
         self.state = InnerWorkspace()
         if not retain_pool:
             self._action_pool = InnerWorkspace()
@@ -1443,15 +1451,19 @@ class InnerImprovementEngine(RetraceInnerMixin):
     def _clear_expired(self, *, t0, include_action=True):
         state, cfg = self.state, self.cfg
         if self._scope_expires(cfg.inner_actor_scope, t0=t0, include_action=include_action):
-            if str(cfg.inner_actor_scope) == "action" and state.actor is not None:
-                self._action_pool.actor = state.actor
-                self._action_pool.actor_anchor = state.actor_anchor
-                self._action_pool.actor_target = state.actor_target
-                self._action_pool.actor_optim = state.actor_optim
-                self._action_pool.actor_params = state.actor_params
-                self._action_pool.actor_trainable_count = (
-                    state.actor_trainable_count
-                )
+            pool_actor = str(cfg.inner_actor_scope) == "action" or (
+                self._aux_return_active and str(cfg.inner_actor_scope) == "episode"
+            )
+            if pool_actor:
+                if state.actor is not None:
+                    self._action_pool.actor = state.actor
+                    self._action_pool.actor_anchor = state.actor_anchor
+                    self._action_pool.actor_target = state.actor_target
+                    # Between decisions the action Adam may already be pooled.
+                    if state.actor_optim is not None:
+                        self._action_pool.actor_optim = state.actor_optim
+                    self._action_pool.actor_params = state.actor_params
+                    self._action_pool.actor_trainable_count = state.actor_trainable_count
             elif str(cfg.inner_actor_scope) != "action":
                 # An optimizer may have a shorter lifetime than its owning
                 # module (for example, episode parameters with action Adam).
@@ -1913,7 +1925,9 @@ class InnerImprovementEngine(RetraceInnerMixin):
         critic_restored = False
         if actor_was_missing:
             actor_restored = (
-                str(cfg.inner_actor_scope) == "action"
+                (str(cfg.inner_actor_scope) == "action" or (
+                    self._aux_return_active and str(cfg.inner_actor_scope) == "episode"
+                ))
                 and self._restore_action_component("actor", self._actor_base)
             )
             if not actor_restored:
@@ -5058,6 +5072,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         critic_count,
         actor_count,
         actor_loss_scale=None,
+        root_z=None,
     ):
         """Run canonical component counts in phased or interleaved order.
 
@@ -5093,6 +5108,15 @@ class InnerImprovementEngine(RetraceInnerMixin):
             temperature_count=0,
             actor_loss_scale=actor_loss_scale,
         )
+        trace = self._active_trace
+        first_actor_block = bool(
+            trace is not None and trace.transfer_probes and actor_count > 0
+            and self.state.actor_steps == 0
+        )
+        if first_actor_block:
+            trace.transfer_probe(
+                self, root_z, self.state.actor, stage="before_first_actor_block"
+            )
         metrics.extend(
             self._run_update_counts(
                 critic_count=0,
@@ -5106,6 +5130,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 actor_loss_scale=actor_loss_scale,
             )
         )
+        if first_actor_block:
+            trace.transfer_probe(
+                self, root_z, self.state.actor, stage="after_first_actor_block"
+            )
         return metrics
 
     def _maybe_update_explorer_critic_target(self, *, critic_updated):
@@ -6265,6 +6293,11 @@ class InnerImprovementEngine(RetraceInnerMixin):
         return_behavior_policy=False,
     ):
         cfg, state = self.cfg, self.state
+        first_rounds = getattr(cfg, "inner_first_action_rounds", None)
+        rounds = int(first_rounds if t0 and first_rounds is not None else cfg.inner_rounds)
+        actor_transferred = bool(
+            state.actor is not None and cfg.inner_actor_scope == "episode" and not t0
+        )
         setup_start = self._timer_start()
         # LoRA adapter initialization uses ordinary PyTorch initializers; fork
         # it onto the private optimization stream so act() cannot advance the
@@ -6279,14 +6312,24 @@ class InnerImprovementEngine(RetraceInnerMixin):
             # each successful actor kernel's proposal only to this local copy.
             actor_loss_scale = self._critic_owner.actor_loss_scale.detach().clone()
         alpha_initial = self.alpha.detach().clone()
+        actor_lifetime_initial = state.actor_lifetime_steps
         trace = self._active_trace
         if trace is not None:
             trace.record("initial", state, (
                 {"tdambi_entropy_coef": float(cfg.tdambi_entropy_coef)}
                 if cfg.inner_operator == "tdambi" else {"alpha": alpha_initial}
             ))
+            if trace.transfer_probes:
+                trace.events[-1]["metrics"].update(
+                    inner_actor_transferred=float(actor_transferred),
+                    inner_actor_lifetime_updates_initial=float(actor_lifetime_initial),
+                    inner_rounds=float(rounds),
+                    **trace.optimizer_initial_metrics(state, self.device),
+                )
             trace.capture_actor(self, state.actor)
-            if trace.probes:
+            if trace.transfer_probes:
+                trace.transfer_probe(self, root_z, state.actor, stage="initial")
+            elif trace.probes:
                 trace.probe(self, root_z, state.actor)
         explorer_alpha_initial = (
             self.explorer_alpha.detach().clone()
@@ -6315,7 +6358,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         requested_update_slots = 0
         collected_transition_count = 0
         interval_updates_requested = 0
-        for round_index in range(int(cfg.inner_rounds)):
+        for round_index in range(rounds):
             if getattr(cfg, "inner_replay_reset_each_round", False):
                 # Keep the learner/optimizers and diagnostic IDs across rounds;
                 # only the transitions available to the next updates expire.
@@ -6359,6 +6402,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                                 critic_count=critic_count,
                                 actor_count=actor_count,
                                 actor_loss_scale=actor_loss_scale,
+                                root_z=root_z,
                             )
                             requested_update_slots += critic_count + actor_count
                     else:
@@ -6418,7 +6462,9 @@ class InnerImprovementEngine(RetraceInnerMixin):
 
             if trace is not None:
                 trace.capture_actor(self, state.actor)
-                if trace.probes:
+                if trace.transfer_probes:
+                    trace.transfer_probe(self, root_z, state.actor, stage="post_round")
+                elif trace.probes:
                     trace.probe(self, root_z, state.actor)
 
         execution_start = self._timer_start()
@@ -6483,7 +6529,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         rollout_count = int(length_values.numel())
         realized_model_steps = length_values.sum()
         nominal_model_steps = float(
-            cfg.inner_rounds
+            rounds
             * cfg.inner_rollouts_per_round
             * cfg.inner_rollout_horizon
         )
@@ -6496,11 +6542,16 @@ class InnerImprovementEngine(RetraceInnerMixin):
         )
         metrics = self._base_metrics(active=True)
         metrics.update(
-            inner_rounds=float(cfg.inner_rounds),
-            inner_iterations=float(cfg.inner_rounds),
+            inner_rounds=float(rounds),
+            inner_iterations=float(rounds),
+            inner_model_steps_budget=(nominal_model_steps if first_rounds is not None
+                                      else float(cfg.inner_model_step_budget)),
+            inner_first_action_rounds_applied=float(t0 and first_rounds is not None),
+            inner_actor_transferred=float(actor_transferred),
+            inner_actor_lifetime_updates_initial=float(actor_lifetime_initial),
             inner_rollouts=float(rollout_count),
             inner_requested_rollouts=float(
-                cfg.inner_rounds * cfg.inner_rollouts_per_round
+                rounds * cfg.inner_rollouts_per_round
             ),
             inner_rollout_count=float(rollout_count),
             inner_steps=realized_model_steps,
@@ -6511,8 +6562,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
             inner_update_slots=float(update_slots),
             inner_requested_update_slots=float(requested_update_slots),
             inner_updates_per_round_realized=(
-                float(update_slots) / float(cfg.inner_rounds)
-                if cfg.inner_rounds
+                float(update_slots) / float(rounds)
+                if rounds
                 else 0.0
             ),
             inner_critic_utd=(
@@ -6949,6 +7000,20 @@ class InnerImprovementEngine(RetraceInnerMixin):
             if trace.probes and operator == "td3":
                 raise ValueError(
                     "Fixed-noise trace probes require SAC or no inner optimization."
+                )
+            if trace.transfer_probes and (
+                operator != "sac" or not self._uses_component_update_schedule
+                or self.cfg.inner_component_update_order != "critic_first"
+                or self.cfg.inner_update_timing != "round"
+                or self.cfg.inner_actor_adaptation != "clone"
+                or self.cfg.inner_critic_adaptation != "clone"
+                or self.cfg.inner_sac_return_estimator != "one_step"
+                or self._explorer_active or self._split_values
+                or self.cfg.inner_rounds <= 0
+            ):
+                raise ValueError(
+                    "Transfer probes require active dense one-step, single-value "
+                    "SAC with canonical critic-first component updates each round."
                 )
             if self._aux_return_active:
                 auxiliary_tail = self.cfg.inner_horizon_critic_source == "aux_return"

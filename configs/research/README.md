@@ -1,5 +1,9 @@
 # Frozen-checkpoint AMBI research
 
+The [575k actor-only transfer study](ACTOR_TRANSFER_575K.md) compares cold and
+warm actor initialization across H1/2/3 and J1/2/4/6/8/10, with a common first
+J10 solve, per-phase transfer diagnostics, and return-versus-compute reporting.
+
 The [575k closed-loop critic comparison](CLOSED_LOOP_CRITICS_575K.md) evaluates
 soft and return-only critics with C16/A4, H3 and J={1,2,4}, and publishes an
 explicit W&B comparison of full-episode returns, paired gains and diagnostics.

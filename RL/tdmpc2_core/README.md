@@ -1616,8 +1616,9 @@ does not remove its learned future entropy. Selecting a missing return actor or
 auxiliary critic fails validation.
 
 Supported operators are prior-only operation, canonical action-local
-finite-horizon SAC, and MPPI. SAC requires prior initialization and the normal
-inner-target bootstrap. Explorer populations, persistent inner state, prior
+finite-horizon SAC, actor-only episode transfer below, and MPPI. SAC requires
+prior initialization and the normal inner-target bootstrap. Explorer populations,
+other persistent auxiliary inner state, prior
 writeback, TD3, native TDAMBI, and auxiliary value-equivalence training are
 rejected for this variant. The existing restrictions on each adaptation method
 still apply. Prior-only operation trains the selected auxiliary mode while
@@ -1641,6 +1642,58 @@ continuation, preserving the configured candidate budget and warm-start policy:
   "inner_horizon_critic_source": "aux_return"
 }
 ```
+
+### Auxiliary actor-only episode transfer
+
+For the auxiliary-return SAC route, `inner_actor_scope="episode"` explicitly
+retains the full dense adapted actor between real decisions. Every other scope
+must remain `"action"`, both actor and critic adaptation must be `"clone"`,
+and `inner_rebase_persistent=false`. The initial actor in each episode is the
+selected frozen prior. The critic and its target, replay, actor/critic Adam
+moments and counters, temperature and temperature optimizer restart at every
+decision. The terminal actor/critic and outer model remain frozen; there is no
+prior writeback. This is a separate controller from fresh-prior closed-loop
+refinement, not a change to its defaults.
+
+Optional `inner_first_action_rounds` gives the first decision of every episode
+a common initialization dose. For example, set it to 10 and `inner_rounds=2`
+to use J10 once, then J2 thereafter. This option supports positive round counts,
+canonical dense one-step SAC component updates, round timing and no explorer.
+It does not modify per-round C/A/N/H. Replay capacity must accommodate
+`max(inner_rounds, inner_first_action_rounds)*N*H`, unless round reset is active.
+Resolved per-action schedule fields describe the subsequent dose; action
+metrics report the actual rounds, model-step budget and realized optimizer
+counts. `inner_first_action_rounds_applied` identifies the first-decision dose.
+All arms in a matched comparison should use the same first-decision dose.
+
+Actor-only transfer can initially disagree with the reset prior-continuation
+critic. It retains the configured critic-first update schedule; there is no
+implicit catch-up phase or changed target interpolation. The optional
+`InnerActionTrace(transfer_probes=True, probes=True, probe_mode="outer_tail", ...)`
+observes this mismatch at initialization, immediately before and after the first
+actor-update block, and after each completed round. Transfer probes require
+canonical dense one-step SAC with critic-first component updates.
+
+Root events have `phase="transfer_probe"` and an explicit `stage`. They report
+Gaussian KL to the prior, tanh-mean action displacement, pre-tanh standard
+deviation, alpha, and all decoded heads of the inner online critic, inner target
+critic, and frozen horizon critic at both actor and prior mean actions. They
+also report all-head mean, all-head minimum, exact expected minimum over the
+unordered two-head pairs, and actor-minus-prior value differences. These are
+diagnostic predictions, not real-environment value calibration. The paired
+outer-tail rollout probe uses the same stage and fixed private noise/pair
+throughout the solve, with initial-actor and frozen-prior references.
+
+The initial event records inherited actor lifetime updates, the transfer flag,
+actual rounds, replay size, and maximum Adam step counters. `inner_actor_transferred`
+is zero for cold solves and episode starts. Probe operations use eager all-head
+critics, disable/restore dropout modes and consume no learner RNG. Their
+`probe_seconds` and evaluation counts are separate diagnostic overhead; the
+controller's inclusive wall time still includes them. First-block probes also
+fall inside the inclusive update timer, so overhead must be removed consistently
+when reporting learner-only time. Evaluation allocation reuse preserves tensor
+identities across episode resets to avoid needless compiler guards; all
+scientific values still reset, including the carried actor.
 
 ### Checkpoints, evaluation, and rendering
 

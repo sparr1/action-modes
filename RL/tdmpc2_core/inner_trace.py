@@ -221,12 +221,31 @@ _DEFINITIONS = {
     "togo_return_outer_mean": "To-go return of the frozen outer actor over all H steps and the outer tail, with paired probe noise.",
     "togo_return_gain_vs_initial": "Current minus initial to-go return at the identical root with paired probe noise.",
     "togo_return_gain_vs_outer": "Current minus frozen outer-policy to-go return at the identical root with paired probe noise.",
+    "inner_actor_transferred": "One when this decision starts from the preceding decision's episode-scoped actor; zero at episode initialization or for cold solves.",
+    "inner_actor_lifetime_updates_initial": "Actor optimizer updates accumulated before this decision; optimizer moments are independently action-local.",
+    "transfer_policy_kl_vs_prior": "Root analytic Gaussian KL(current actor || frozen prior), with the common tanh transform and no sampling.",
+    "transfer_mean_action_delta_l2": "Root tanh-mean action L2 displacement from the frozen prior.",
+    "transfer_actor_std_mean": "Mean pre-tanh standard deviation across the current actor's root action coordinates.",
+    "transfer_prior_std_mean": "Mean pre-tanh standard deviation across the frozen prior's root action coordinates.",
+    "transfer_actor_log_std_mean": "Mean pre-tanh log standard deviation of the current actor at the root.",
+    "transfer_actor_alpha": "Current action-local SAC temperature at the transfer probe boundary.",
 }
 
 
 def metric_definitions():
     """Return portable descriptions; callers may retain unlisted raw metrics."""
     result = dict(_DEFINITIONS)
+    for component in ("actor", "critic", "temperature"):
+        result[f"{component}_optimizer_steps_initial"] = (
+            f"Maximum Adam step counter in the {component} optimizer after decision initialization; zero is required for fresh action-local optimization."
+        )
+    for critic in ("inner", "target", "frozen"):
+        for action in ("actor", "prior", "advantage"):
+            for reduction in ("mean_all", "expected_min_pair", "min_all"):
+                result[f"transfer_root_q_{critic}_{action}_{reduction}"] = (
+                    f"Root {critic} critic decoded {reduction} at the {action} mean action "
+                    "(advantage means actor minus prior); expected_min_pair averages every unordered pair without sampling."
+                )
     for component in ("reward", "bootstrap"):
         for reference in ("initial", "outer"):
             result[f"togo_{component}_{reference}_mean"] = (
@@ -272,7 +291,11 @@ def metric_catalog(metric_names=()):
     result = {}
     for name in sorted(set(definitions) | set(metric_names)):
         unit = "scalar"
-        if name.startswith("togo_"):
+        if name.startswith("transfer_"):
+            phase, axis = "transfer_boundary_root_probe", "actor_updates"
+        elif name.endswith("optimizer_steps_initial"):
+            phase, axis = "initial", "round_index"
+        elif name.startswith("togo_"):
             phase, axis = "post_update_togo_probe", "actor_updates"
             unit = "value"
         elif name in probe_names:
@@ -314,7 +337,11 @@ def metric_catalog(metric_names=()):
         elif "l2" in name:
             unit = "normalized_action"
         result[name] = {
-            "definition": definitions.get(name, f"Raw inner optimizer metric {name}."),
+            "definition": definitions.get(name, (
+                "Individual decoded critic-head value at the root and the named deterministic actor/prior mean action."
+                if name.startswith("transfer_root_q_") and "_head_" in name
+                else f"Raw inner optimizer metric {name}."
+            )),
             "unit": unit, "sampling_phase": phase, "preferred_axis": axis,
         }
     return result
@@ -328,11 +355,16 @@ class InnerActionTrace:
     """
 
     def __init__(self, *, probes=False, probe_seed=0, probe_rollouts=8, probe_horizon=3,
-                 probe_mode="legacy", capture_actors=False, actor_rounds=None):
+                 probe_mode="legacy", capture_actors=False, actor_rounds=None,
+                 transfer_probes=False):
         if not isinstance(probes, bool):
             raise TypeError("probes must be bool.")
         if not isinstance(capture_actors, bool):
             raise TypeError("capture_actors must be bool.")
+        if not isinstance(transfer_probes, bool):
+            raise TypeError("transfer_probes must be bool.")
+        if transfer_probes and probes and probe_mode != "outer_tail":
+            raise ValueError("transfer_probes with rollouts requires probe_mode='outer_tail'.")
         if actor_rounds is not None:
             actor_rounds = tuple(actor_rounds)
             if any(isinstance(r, bool) or not isinstance(r, Integral) or r < 0
@@ -352,6 +384,7 @@ class InnerActionTrace:
         if int(probe_seed) >= 2**63:
             raise ValueError("probe_seed must be smaller than 2**63.")
         self.probes = probes
+        self.transfer_probes = transfer_probes
         self.probe_seed = int(probe_seed)
         self.probe_rollouts = int(probe_rollouts)
         self.probe_horizon = int(probe_horizon)
@@ -372,6 +405,100 @@ class InnerActionTrace:
         self._togo_pair_indices = None
         self._probe_timings = []
         self.value_routing = None
+
+    @staticmethod
+    def optimizer_initial_metrics(state, device):
+        """Read reset counters without forcing a device-to-host synchronization."""
+        result = {}
+        for component in ("actor", "critic", "temperature"):
+            optimizer = getattr(state, f"{component}_optim")
+            counters = [] if optimizer is None else [
+                torch.as_tensor(value["step"], device=device).detach().clone().reshape(())
+                for value in optimizer.state.values() if "step" in value
+            ]
+            result[f"{component}_optimizer_steps_initial"] = (
+                torch.stack(counters).max() if counters else 0.0
+            )
+        return result
+
+    @torch.no_grad()
+    def transfer_probe(self, engine, root_z, policy, *, stage):
+        """Root values plus optional common-noise returns at an explicit boundary.
+
+        All-head eager critics avoid modifying compiled-kernel caches. Policies
+        are queried without sampling, and rollout probes own their RNG, leaving
+        the solve's random streams and learning state unchanged.
+        """
+        if stage not in {"initial", "before_first_actor_block",
+                         "after_first_actor_block", "post_round"}:
+            raise ValueError(f"Unknown transfer probe stage: {stage!r}.")
+        if root_z is None:
+            raise ValueError("Transfer probes require the current encoded root.")
+        model, state = engine.model, engine.state
+        critics = {"inner": state.critic, "target": state.critic_target,
+                   "frozen": engine._horizon_critic}
+        modes = {module: bool(module.training)
+                 for root in (model, policy, *critics.values())
+                 if root is not None for module in root.modules()}
+        started = engine._timer_start()
+        event = None
+        try:
+            for module in modes:
+                module.training = False
+            prior = model.policy_stats(root_z, policy=engine._actor_base,
+                                       **engine._actor_options)
+            current = model.policy_stats(root_z, policy=policy,
+                                         **self._policy_bounds(engine.cfg))
+            metrics = {
+                "transfer_policy_kl_vs_prior": engine._gaussian_kl(current, prior).mean(),
+                "transfer_mean_action_delta_l2": torch.linalg.vector_norm(
+                    current["mean"] - prior["mean"], dim=-1).mean(),
+                "transfer_actor_std_mean": current["log_std"].exp().mean(),
+                "transfer_prior_std_mean": prior["log_std"].exp().mean(),
+                "transfer_actor_log_std_mean": current["log_std"].mean(),
+                "transfer_actor_alpha": engine.alpha.detach().clone(),
+                "probe_model_steps": 0,
+                "probe_reward_evaluations": 0,
+                "probe_policy_evaluations": 2 * root_z.shape[0],
+                "probe_q_evaluations": 0,
+            }
+            for critic_name, critic in critics.items():
+                if critic is None:
+                    continue
+                actions = torch.cat((current["mean"], prior["mean"]), dim=0)
+                values = evaluate_frozen_outer_q(
+                    model, root_z.repeat(2, 1), actions, critic=critic, reduction="all"
+                )
+                metrics["probe_q_evaluations"] += actions.shape[0]
+                pairs = torch.triu_indices(values.shape[0], values.shape[0],
+                                           offset=1, device=values.device)
+                reduced = {
+                    "mean_all": values.mean(0),
+                    "min_all": values.amin(0),
+                    "expected_min_pair": torch.minimum(
+                        values[pairs[0]], values[pairs[1]]).mean(0),
+                }
+                for reduction, predictions in reduced.items():
+                    actor_q, prior_q = predictions.chunk(2, dim=0)
+                    prefix = f"transfer_root_q_{critic_name}"
+                    metrics[f"{prefix}_actor_{reduction}"] = actor_q.mean()
+                    metrics[f"{prefix}_prior_{reduction}"] = prior_q.mean()
+                    metrics[f"{prefix}_advantage_{reduction}"] = (actor_q - prior_q).mean()
+                for head, predictions in enumerate(values):
+                    actor_q, prior_q = predictions.chunk(2, dim=0)
+                    metrics[f"transfer_root_q_{critic_name}_actor_head_{head}"] = actor_q.mean()
+                    metrics[f"transfer_root_q_{critic_name}_prior_head_{head}"] = prior_q.mean()
+            self.record("transfer_probe", state, metrics, stage=stage,
+                        measurement="transfer_boundary_root_probe")
+            event = self.events[-1]
+        finally:
+            for module, was_training in modes.items():
+                module.training = was_training
+            if event is not None:
+                self._probe_timings.append((event, started, engine._timer_start()))
+        if self.probes:
+            self.probe(engine, root_z, policy)
+            self.events[-1]["stage"] = stage
 
     @torch.no_grad()
     def capture_actor(self, engine, policy, *, inner=True):

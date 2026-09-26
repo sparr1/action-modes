@@ -146,6 +146,8 @@ _AMBI_DEFAULTS = {
     # were actually generated in that round.
     "inner_operator": "sac",
     "inner_rounds": 4,
+    # Optional episode-start solve dose; subsequent decisions use inner_rounds.
+    "inner_first_action_rounds": None,
     "inner_rollouts_per_round": 64,
     "inner_rollout_horizon": 3,
     "inner_updates_per_round": "auto",
@@ -2001,11 +2003,35 @@ class AMBITDMPC2(TDMPC2Baseline):
         if cfg.inner_actor_target_update_interval <= 0:
             raise ValueError("inner_actor_target_update_interval must be positive.")
 
+        if cfg.inner_first_action_rounds is not None:
+            cfg.inner_first_action_rounds = _strict_nonnegative_int(
+                cfg.inner_first_action_rounds, "inner_first_action_rounds"
+            )
+            if (
+                cfg.inner_first_action_rounds <= 0 or cfg.inner_rounds <= 0
+                or cfg.inner_operator != "sac"
+                or cfg.inner_schedule_mode != "canonical"
+                or not cfg.inner_component_update_schedule
+                or cfg.inner_update_timing != "round"
+                or cfg.inner_explorer_mode != "none"
+                or cfg.inner_actor_adaptation != "clone"
+                or cfg.inner_critic_adaptation != "clone"
+                or cfg.inner_sac_return_estimator != "one_step"
+            ):
+                raise ValueError(
+                    "inner_first_action_rounds requires positive first/subsequent "
+                    "round counts and canonical dense one-step SAC component "
+                    "updates with round timing and no explorer."
+                )
+        maximum_model_budget = max(
+            cfg.inner_model_step_budget,
+            (cfg.inner_first_action_rounds or 0) * nominal_transitions_per_round,
+        )
         if cfg.inner_replay_capacity is None:
             minimum_capacity = (
                 cfg.inner_rollout_horizon if cfg.inner_sac_return_estimator == "retrace" else 1
             )
-            cfg.inner_replay_capacity = max(minimum_capacity, cfg.inner_model_step_budget)
+            cfg.inner_replay_capacity = max(minimum_capacity, maximum_model_budget)
         cfg.inner_replay_capacity = int(cfg.inner_replay_capacity)
         if cfg.inner_replay_capacity <= 0:
             raise ValueError("inner_replay_capacity must be positive.")
@@ -2440,7 +2466,7 @@ class AMBITDMPC2(TDMPC2Baseline):
                     )
         required_replay = (
             cfg.inner_rollouts_per_round * cfg.inner_rollout_horizon
-            if cfg.inner_replay_reset_each_round else cfg.inner_model_step_budget
+            if cfg.inner_replay_reset_each_round else maximum_model_budget
         )
         if (
             cfg.inner_operator in {"sac", "td3"}

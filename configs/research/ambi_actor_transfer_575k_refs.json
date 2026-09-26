@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "source_run": "rwgao_b-brown-university/ambi/aux6428346x0",
+  "checkpoint_step": 575000,
+  "checkpoint_sha256": "0c6955db7cb8555a67d7863344b70be68f4b3250814d131e647ee6f9ef01a042",
+  "prior_reference": {
+    "checkpoint_step": 575000,
+    "checkpoint_sha256": "0c6955db7cb8555a67d7863344b70be68f4b3250814d131e647ee6f9ef01a042",
+    "metadata_sha256": "8acc74b7ad4993050a5cc0d3c4c0860441fceb48f36a79540f5e1943e6b3e1d2",
+    "bundle": "/oscar/scratch/rgao48/ambi/aux-return-mppi/20260921-other-backbones/target10p5_shared/production/prior/step_575000/bundle",
+    "manifest_sha256": "bcecdc4f8e3914d5567579ac98dc4a7ef8d13d5dd0ac507778d49fae35ea531f",
+    "source_commit": "0830be2d694b7eea21436b305eb416fcf049b001",
+    "initial_alpha": 0.004603903274983168
+  }
+}

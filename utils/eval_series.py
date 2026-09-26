@@ -186,6 +186,9 @@ def _planner_display_label(planner, *, compact=False):
     parts = ["Prior only (no planning)" if kind == "prior" else str(kind).upper()]
     if kind in ("sac", "xqc"):
         rounds = settings.get("inner_rounds")
+        if settings.get("inner_first_action_rounds") is not None:
+            parts.append("actor-warm" if settings.get("inner_actor_scope") == "episode" else "cold")
+            parts.append("firstJ" + number(settings["inner_first_action_rounds"]))
         doses = []
         for component in ("critic", "actor", "temperature"):
             dose = settings.get(f"inner_{component}_updates_per_round")

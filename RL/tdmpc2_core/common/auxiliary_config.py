@@ -173,7 +173,17 @@ def validate_auxiliary_config(cfg):
         "inner_execution_policy_source": "primary", "inner_actor_writeback_coef": 0.,
         "inner_critic_writeback_coef": 0., "value_equivalence_loss_coef": 0.,
     }
-    for component in ("actor", "critic", "temperature", "replay", "actor_optimizer", "critic_optimizer", "temperature_optimizer"):
+    actor_transfer = cfg.inner_actor_scope == "episode"
+    if actor_transfer:
+        if (cfg.inner_operator != "sac" or cfg.inner_actor_adaptation != "clone"
+                or cfg.inner_critic_adaptation != "clone"
+                or cfg.inner_rebase_persistent):
+            raise ValueError(
+                "Auxiliary actor-only episode transfer requires dense SAC actor/critic "
+                "clones and inner_rebase_persistent=false."
+            )
+    requirements["inner_actor_scope"] = "episode" if actor_transfer else "action"
+    for component in ("critic", "temperature", "replay", "actor_optimizer", "critic_optimizer", "temperature_optimizer"):
         requirements[f"inner_{component}_scope"] = "action"
     for key, value in requirements.items():
         if getattr(cfg, key) != value:

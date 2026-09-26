@@ -398,6 +398,7 @@ def _togo_rows(trace, *, episode_id, root_id, decision_index, repeat=0):
              "decision_index": int(decision_index), "solver_repeat": repeat,
              "rollout_repeat": 0,
              **{key: event[key] for key in ("round_index", "actor_updates", "critic_updates")},
+             **({"stage": event["stage"]} if "stage" in event else {}),
              "metrics": dict(event["metrics"])}
             for event in trace.events if event["phase"] == "probe"]
 
@@ -405,13 +406,27 @@ def _togo_rows(trace, *, episode_id, root_id, decision_index, repeat=0):
 def _togo_round_summaries(rows):
     grouped = {}
     for row in rows:
-        key = (row["round_index"], row["actor_updates"], row["critic_updates"])
+        key = (row["round_index"], row["actor_updates"], row["critic_updates"], row.get("stage", ""))
         metrics = grouped.setdefault(key, {})
         for name, value in row["metrics"].items():
             if value is not None and math.isfinite(value):
                 metrics.setdefault(name, []).append(value)
     return [{"round_index": key[0], "actor_updates": key[1], "critic_updates": key[2],
+             **({"stage": key[3]} if key[3] else {}),
              "metrics": _aggregate_metrics(metrics)} for key, metrics in sorted(grouped.items())]
+
+
+def _transfer_latency(samples):
+    """Retain raw paired timings so population quantiles can be recomputed."""
+    result = {"samples": samples}
+    for period, selected in (("first", samples[:1]), ("steady", samples[1:])):
+        result[period] = {}
+        for key in ("prediction_seconds", "control_seconds", "diagnostic_seconds"):
+            values = [row[key] for row in selected]
+            result[period][key] = {**_summary(values),
+                "median": float(np.median(values)) if values else None,
+                "p95": float(np.percentile(values, 95)) if values else None}
+    return result
 
 
 def _validate_checkpoint_contract(matrix, checkpoint, context, resolved_presets):
@@ -645,6 +660,7 @@ def evaluate_preset(
     probe_rollouts=8,
     probe_horizon=3,
     togo_return_rollouts=0,
+    actor_transfer_diagnostics=False,
 ):
     """Evaluate one resolved preset and verify outer-state immutability."""
     checkpoint = Path(checkpoint).resolve()
@@ -670,6 +686,8 @@ def evaluate_preset(
         raise ValueError("togo_return_rollouts must be a nonnegative integer.")
     if togo_return_rollouts and bundle is None:
         raise ValueError("To-go return probes require a benchmark bundle.")
+    if actor_transfer_diagnostics and (not togo_return_rollouts or bundle is None or root_bank is not None or bank_only):
+        raise ValueError("Actor-transfer diagnostics require full episodes with bundled to-go probes.")
 
     env = _make_env(resolved)
     model = None
@@ -696,6 +714,14 @@ def evaluate_preset(
             from RL.tdmpc2_core.inner_trace import InnerActionTrace
             bundle_run["initialization_seconds"] = time.perf_counter() - started
             bundle_run["resolved_config"] = _jsonable(vars(model.cfg))
+            if actor_transfer_diagnostics:
+                bundle_run["study_protocol"] = "actor-transfer-v1"
+                bundle_run["transfer_timing"] = {
+                    "prediction_seconds": "Wall time of model.predict, including trace collection and probes.",
+                    "control_seconds": "Prediction wall time minus measured probe durations; retains trace materialization and host overhead.",
+                    "probe_clock": "CUDA stream events on GPU, wall clock on CPU.",
+                    "compile": "One unscored initial solve before measured episodes; compilation warmup reported separately.",
+                }
             if togo_return_rollouts:
                 bundle_run["togo_return_probe"] = {
                     "version": 2, "rollouts": togo_return_rollouts,
@@ -788,6 +814,7 @@ def evaluate_preset(
             episode_probe_seconds = 0.0
             episode_probe_model_steps = 0
             episode_togo_rows = []
+            latency_samples = []
             phase_id = f"seed-{seed}"
             active_episode = True
 
@@ -796,6 +823,7 @@ def evaluate_preset(
                     captured_roots.append(capture_root(observation, seed, episode_steps, episode_return))
                 trace = (InnerActionTrace(
                     probes=True, probe_mode="outer_tail",
+                    transfer_probes=actor_transfer_diagnostics,
                     probe_rollouts=togo_return_rollouts,
                     probe_horizon=int(model.cfg.inner_rollout_horizon),
                     probe_seed=solver_seed(controller_seed, "togo_probe", seed, episode_steps),
@@ -811,6 +839,8 @@ def evaluate_preset(
                     **predict_options,
                 )
                 action_seconds = time.perf_counter() - started
+                prediction_seconds = action_seconds
+                probe_seconds = 0.0
                 togo_metrics = {}
                 if togo_return_rollouts:
                     probes = [event["metrics"] for event in trace.events if event["phase"] == "probe"]
@@ -820,14 +850,20 @@ def evaluate_preset(
                         root_id=f"{phase_id}-decision-{episode_steps}", decision_index=episode_steps)
                     togo_rows.extend(round_rows)
                     episode_togo_rows.extend(round_rows)
-                    probe_seconds = sum(item["probe_seconds"] for item in probes)
-                    probe_steps = sum(item["probe_model_steps"] for item in probes)
+                    diagnostic_probes = [event["metrics"] for event in trace.events
+                                         if event["phase"] in {"probe", "transfer_probe"}]
+                    probe_seconds = sum(item.get("probe_seconds", 0.0) for item in diagnostic_probes)
+                    probe_steps = sum(item.get("probe_model_steps", 0) for item in diagnostic_probes)
                     episode_probe_seconds += probe_seconds
                     episode_probe_model_steps += int(probe_steps)
                     action_seconds = max(0.0, action_seconds - probe_seconds)
                     togo_metrics = {f"inner_{key}": value for key, value in probes[-1].items()
                                     if key.startswith("togo_")}
                 control_seconds += action_seconds
+                if actor_transfer_diagnostics:
+                    latency_samples.append({"decision_index": episode_steps,
+                        "prediction_seconds": prediction_seconds, "control_seconds": action_seconds,
+                        "diagnostic_seconds": probe_seconds})
                 if trace is not None:
                     pending_events.extend({"episode_id": phase_id, "decision_index": episode_steps, **event}
                                           for event in trace.events)
@@ -848,6 +884,9 @@ def evaluate_preset(
                         "metrics": {**{f"decision/{key}": value for key, value in finite_metrics.items()},
                                     **{f"decision/{key}": None for key in nonfinite_metrics},
                                     "decision/reward": float(reward),
+                                    **({"decision/prediction_seconds": prediction_seconds,
+                                        "decision/diagnostic_seconds": probe_seconds}
+                                       if actor_transfer_diagnostics else {}),
                                     "decision/control_seconds": action_seconds},
                         "nonfinite": {f"decision/{key}": value for key, value in nonfinite_metrics.items()},
                     })
@@ -880,6 +919,8 @@ def evaluate_preset(
                     "truncated": bool(truncated),
                     "truncated_by_evaluator": truncated_by_evaluator,
                     "control_seconds": control_seconds,
+                    **({"transfer_latency": _transfer_latency(latency_samples)}
+                       if actor_transfer_diagnostics else {}),
                     **({"togo_probe_seconds": episode_probe_seconds,
                         "togo_probe_model_steps": episode_probe_model_steps,
                         "togo_round_summaries": _togo_round_summaries(episode_togo_rows)}
@@ -934,6 +975,7 @@ def evaluate_preset(
             "outer_updates_after": updates_after,
             "outer_state_unchanged": True,
             "resolved_config": _jsonable(vars(model.cfg)),
+            **({"study_protocol": "actor-transfer-v1"} if actor_transfer_diagnostics else {}),
             **({"togo_return_probe": bundle_run["togo_return_probe"],
                 "togo_round_summaries": _togo_round_summaries(togo_rows)}
                if togo_return_rollouts else {}),
@@ -1019,6 +1061,13 @@ def evaluate_matrix(
     probe_rollouts = evaluation.get("diagnostic_rollouts", 8)
     probe_horizon = evaluation.get("diagnostic_horizon", 3)
     togo_return_rollouts = evaluation.get("togo_return_rollouts", 0)
+    actor_transfer_diagnostics = evaluation.get("actor_transfer_diagnostics", False)
+    if not isinstance(actor_transfer_diagnostics, bool):
+        raise ValueError("evaluation.actor_transfer_diagnostics must be boolean.")
+    if actor_transfer_diagnostics and (matrix.get("study_protocol") != "actor-transfer-v1"
+            or not togo_return_rollouts or bundle_dir is None
+            or save_root_bank or root_bank_path or bank_only):
+        raise ValueError("Actor-transfer diagnostics require actor-transfer-v1 full episodes and bundled to-go probes.")
     if (isinstance(togo_return_rollouts, bool) or not isinstance(togo_return_rollouts, int)
             or togo_return_rollouts < 0):
         raise ValueError("evaluation.togo_return_rollouts must be a nonnegative integer.")
@@ -1097,7 +1146,9 @@ def evaluate_matrix(
                 raise ValueError("Benchmark bundles currently support prior-only, SAC, TDAMBI, and MPPI presets.")
             scopes = [key for key in params if key.startswith("inner_") and key.endswith("_scope")
                       and key != "inner_mppi_warm_start_scope"]
-            if any(params[key] != "action" for key in scopes):
+            if any(params[key] != "action" and not (
+                    actor_transfer_diagnostics and key == "inner_actor_scope" and params[key] == "episode")
+                   for key in scopes):
                 raise ValueError("Benchmark presets require fresh action-local inner state.")
             if any(params.get(key, 0) for key in ("inner_actor_writeback_coef", "inner_critic_writeback_coef")):
                 raise ValueError("Benchmark presets must disable prior writeback.")
@@ -1170,6 +1221,7 @@ def evaluate_matrix(
                     captured_roots=captured_roots, root_decisions=root_decisions,
                     probe_rollouts=probe_rollouts, probe_horizon=probe_horizon,
                     togo_return_rollouts=togo_return_rollouts,
+                    actor_transfer_diagnostics=actor_transfer_diagnostics,
                 )
                 results.append(result)
                 if bundle is not None and resolved["algorithm_config"]["alg_params"].get("inner_operator") == "none":

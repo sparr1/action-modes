@@ -465,6 +465,9 @@ def planner_identity(config, result, algorithm, action_rule):
     if shared.get("sac_actor_loss_scale_mode") == "none":
         shared.pop("sac_actor_loss_scale_tau", None)
     return {"type": operator, "backend": algorithm, "action_rule": action_rule,
+            **({"semantics": {"evaluation_protocol": "actor-transfer-v1",
+                              "first_action_rounds": config["inner_first_action_rounds"]}}
+               if config.get("inner_first_action_rounds") is not None else {}),
             "settings": {**shared, **active}}
 
 
@@ -614,6 +617,9 @@ def descriptive_label(identity, selector=None):
         bootstrap = "inner Q"
     title = f"{planner['type'].upper()} {'/'.join(budgets)} {bootstrap}"
     title += f" J{rounds}/N{settings.get('inner_rollouts_per_round')}/H{settings.get('inner_rollout_horizon')}"
+    if settings.get("inner_first_action_rounds") is not None:
+        title += " actor-warm" if settings.get("inner_actor_scope") == "episode" else " cold"
+        title += f" firstJ{settings['inner_first_action_rounds']}"
     if settings.get("inner_steps_per_update") is not None:
         title += f" interval{settings['inner_steps_per_update']}"
     if settings.get("inner_actor_lr") is not None:
@@ -681,6 +687,19 @@ def _metrics(episodes):
                                                            metrics["work/environment_decisions"])
     if all(ep.get("evaluation_seconds") is not None for ep in episodes):
         metrics["runtime/evaluation_seconds"] = sum(ep["evaluation_seconds"] for ep in episodes)
+    if all(ep.get("transfer_latency") is not None for ep in episodes):
+        for period in ("first", "steady"):
+            rows = [row for ep in episodes for row in ep["transfer_latency"]["samples"]
+                    if (row["decision_index"] == 0) == (period == "first")]
+            metrics[f"runtime/{period}_decisions"] = len(rows)
+            for key in ("prediction_seconds", "control_seconds", "diagnostic_seconds"):
+                values = sorted(_number(row[key], key) for row in rows)
+                if values:
+                    metrics[f"runtime/{period}_{key}_mean"] = statistics.mean(values)
+                    metrics[f"runtime/{period}_{key}_median"] = statistics.median(values)
+                    position = (len(values) - 1) * .95
+                    lo, hi = math.floor(position), math.ceil(position)
+                    metrics[f"runtime/{period}_{key}_p95"] = values[lo] + (values[hi] - values[lo]) * (position - lo)
     if all(ep.get("togo_probe_seconds") is not None for ep in episodes):
         metrics["runtime/togo_probe_seconds"] = sum(
             _number(ep["togo_probe_seconds"], "to-go probe seconds") for ep in episodes)
