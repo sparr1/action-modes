@@ -108,13 +108,19 @@ def actor_transfer_sections():
     intro = ('### Evaluation results\n\n'
         'Results panels display the summaries published by the selected run. '
         'The settings table distinguishes pending evaluations from completed results; '
-        '**missing chart points are unavailable, never zero measurements.**')
+        '**missing chart points are unavailable, never zero measurements.** '
+        'Cold resets the actor each decision; warm retains actor weights only. '
+        'Each plotted value is a mean full-episode return across five environment seeds. '
+        'Read the selected run configuration for the first-decision budget: '
+        'the original study used first J10, while the corrected study uses J at every decision. '
+        'The measurements table includes exact values even when only one point is available. '
+        'Uncertainty is in the paired-effect table, not the line width or style.')
     overview = [_panel('explanation', 'Markdown Panel', {'value': intro}, width=24, height=4),
                 _panel('progress', 'Media Browser', {'chartTitle': 'Evaluation settings and publication progress',
                                                     'mediaKeys': ['campaign/settings']}, width=24)]
     charts = [_chart(f'comparison/h{h}_return_vs_{axis}',
-                     f'H{h}: full-episode return versus ' + ('subsequent J' if axis == 'rounds' else 'controller time'),
-                     'Subsequent J (first J10)' if axis == 'rounds' else 'Controller seconds / decision')
+                     f'H{h}: full-episode return versus ' + ('J' if axis == 'rounds' else 'controller time'),
+                     'J (see run configuration)' if axis == 'rounds' else 'Controller seconds / decision')
               for axis in ('rounds', 'compute') for h in (1, 2, 3)]
     tables = [_panel('measurements', 'Media Browser', {'chartTitle': 'Episode returns and timing',
                  'mediaKeys': ['comparison/returns_and_compute']}, width=12),

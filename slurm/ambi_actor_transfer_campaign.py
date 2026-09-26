@@ -1,7 +1,7 @@
 """Actor-only warm starts with matched cold controls at the frozen 575k checkpoint.
 
 GPU workers only evaluate/seal artifacts. CPU publication owns W&B and preserves
-immutable prior references. Every episode starts with J10; later solves use J.
+immutable prior references. Every solve, including the first, uses the selected J.
 """
 from __future__ import annotations
 
@@ -32,12 +32,12 @@ from slurm.ambi_closed_loop_reward_retrace_publish import paired_comparison
 
 MATRIX = ROOT / 'configs/research/ambi_actor_transfer_575k.json'
 REFERENCES = ROOT / 'configs/research/ambi_actor_transfer_575k_refs.json'
-GROUP = 'actor-transfer-575k-20260925'
-PROTOCOL = 'actor-transfer-v1'
+GROUP = 'actor-transfer-v2-575k-20260925'
+PROTOCOL = 'actor-transfer-v2'
 HORIZONS = (1, 2, 3)
 ROUNDS = (1, 2, 4, 6, 8, 10)
 MODES = ('cold', 'actor_warm')
-FIRST_ROUNDS = 10
+FIRST_ROUNDS = None
 OTHER_SCOPES = ('critic', 'temperature', 'replay', 'actor_optimizer', 'critic_optimizer', 'temperature_optimizer')
 
 
@@ -46,7 +46,7 @@ def requested_params(horizon, rounds, mode):
     return {**historical_cell(horizon, rounds)['requested_alg_params'],
             'inner_first_action_rounds': FIRST_ROUNDS,
             'inner_actor_scope': 'episode' if mode == 'actor_warm' else 'action',
-            'inner_replay_capacity': max(3072, 128*horizon*max(rounds, FIRST_ROUNDS)),
+            'inner_replay_capacity': max(3072, 128*horizon*rounds),
             'inner_eval_execution_action': 'mean', 'inner_sac_return_estimator': 'one_step',
             'inner_retrace_lambda': 1., 'inner_retrace_batch_trajectories': None}
 
@@ -82,13 +82,115 @@ def cells(matrix_path=MATRIX):
 
 
 def effective_rounds(cell, decision):
-    return FIRST_ROUNDS if decision == 0 else cell['J']
+    return cell['J']
 
 
 def check_config(actual, expected):
     a, b = deepcopy(actual), deepcopy(expected)
     a.pop('device', None); b.pop('device', None)
     assert a == b, {k: (b.get(k), a.get(k)) for k in a.keys() | b.keys() if a.get(k) != b.get(k)}
+
+
+def check_j10_equivalence(cell, source):
+    """The explicit first J10 override is redundant only for J10 cells."""
+    assert cell['J'] == source['J'] == 10, 'Only J10 can reuse the first-J10 protocol'
+    for key in ('H', 'name', 'selector', 'transfer_mode', 'checkpoint_step'):
+        assert cell[key] == source[key], key
+    assert not source.get('reused'), 'Reuse must point directly to an original evaluation'
+    for field in ('requested_alg_params', 'expected_config'):
+        wanted, original = deepcopy(cell[field]), deepcopy(source[field])
+        assert wanted.pop('inner_first_action_rounds', None) is None
+        assert original.pop('inner_first_action_rounds') == 10
+        check_config(original, wanted)
+    for key in ('checkpoint_sha256', 'metadata_sha256', 'initial_alpha'):
+        assert cell[key] == source[key], key
+    wanted, original = deepcopy(cell['identity']), deepcopy(source['identity'])
+    assert original['planner']['settings'].pop('inner_first_action_rounds') == 10
+    assert original['planner'].pop('semantics') == dict(evaluation_protocol='actor-transfer-v1', first_action_rounds=10)
+    assert wanted == original, 'Scientific identity differs beyond the redundant first override'
+
+
+def _reuse_source(cell, campaign):
+    from utils.eval_series_data import scientific_identity
+    proof = cell['reuse_provenance']
+    path = Path(proof['campaign_path'])
+    assert digest(path) == proof['campaign_sha256'], 'Reuse source campaign changed'
+    source_campaign = read(path)
+    assert source_campaign['study_protocol'] == proof['study_protocol'] == 'actor-transfer-v1'
+    assert source_campaign['source_commit'] == proof['source_commit']
+    assert source_campaign['group'] == proof['group']
+    assert source_campaign['first_action_rounds'] == 10
+    current_science = scientific_identity('AMBITDMPC2/AMBITDMPC2', 'sac', campaign['source_commit'])
+    assert proof['implementation_fingerprint'] == current_science == cell['identity']['science']
+    for key in ('checkpoint_step', 'checkpoint_sha256', 'source_run'):
+        assert source_campaign[key] == campaign[key], key
+    assert source_campaign['prior_reference']['manifest_sha256'] == campaign['prior_reference']['manifest_sha256']
+    source, = [row for row in source_campaign['cells'] if row['name'] == cell['name']]
+    corrected = {**cell, 'identity': cell['corrected_identity']}
+    check_j10_equivalence(corrected, source)
+    assert cell['source_expected_config'] == source['expected_config']
+    for key in ('directory', 'bundle', 'run_dir', 'performance_run_id', 'identity', 'checkpoint',
+                'checkpoint_sha256', 'metadata_sha256', 'initial_alpha'):
+        assert cell[key] == source[key], key
+    return source_campaign, source
+
+
+def validate_reused_j10_source(campaign, cell):
+    """Read-only audit of complete original science, immutable publication and hashes."""
+    from utils.eval_series import load_run
+    from utils.eval_series_data import load_records
+    assert cell.get('reused') and cell['J'] == 10
+    _reuse_source(cell, campaign)
+    directory, bundle = Path(cell['directory']), Path(cell['bundle'])
+    receipt = read(directory / 'worker-completion.json')
+    assert receipt['status'] == 'complete' and not receipt['smoke']
+    assert receipt['study_protocol'] == 'actor-transfer-v1' and receipt['J'] == receipt['first_action_rounds'] == 10
+    assert receipt['cell'] == cell['name'] and receipt['transfer_mode'] == cell['transfer_mode']
+    assert receipt['H'] == cell['H'] and 'L40S' in receipt['gpu']
+    assert receipt['checkpoint_sha256'] == CHECKPOINT_SHA and receipt['checkpoint_step'] == CHECKPOINT_STEP
+    assert receipt['manifest_sha256'] == digest(bundle / 'manifest.json')
+    assert receipt['diagnostics_sha256'] == digest(directory / 'transfer-diagnostics.json')
+    manifest = validate_completed(bundle, cell, campaign)
+    assert set(receipt['trace_sha256']) == set(manifest['runs'][0]['trace_files'])
+    assert all(digest(bundle / name) == sha for name, sha in receipt['trace_sha256'].items())
+    summary = summarize_trace(bundle, cell, seeds=SEEDS, steps=500)
+    assert summary == read(directory / 'transfer-diagnostics.json'), 'Reused diagnostics disagree with raw full-episode traces'
+    assert receipt['trace_rows_checked'] == summary['trace_rows_checked']
+    record, = load_records(bundle, inventory_path=campaign['inventory'])
+    assert record['identity'] == cell['identity'] == load_run(cell['run_dir'])['identity']
+    assert not record['provenance']['missing_artifact_files']
+    publication = read(directory / 'publication-completion.json')
+    assert publication['status'] == 'complete' and publication['cell'] == cell['name']
+    assert publication['performance']['run_id'] == cell['performance_run_id']
+    return manifest
+
+
+def reuse_j10_cells(panel, source_path, campaign):
+    """Pin all six completed J10 cells before allocating any new publication IDs."""
+    path = Path(source_path).resolve()
+    if path.is_dir(): path = path / 'campaign.json'
+    source_campaign = read(path)
+    assert source_campaign['study_protocol'] == 'actor-transfer-v1'
+    assert source_campaign['group'] != campaign['group']
+    original = {cell['name']: cell for cell in source_campaign['cells']}
+    assert len(original) == len(source_campaign['cells'])
+    reused = []
+    for cell in panel:
+        if cell['J'] != 10: continue
+        source = original[cell['name']]
+        check_j10_equivalence(cell, source)
+        corrected_identity = deepcopy(cell['identity'])
+        cell.update({key: deepcopy(source[key]) for key in ('directory', 'bundle', 'run_dir', 'performance_run_id',
+            'identity', 'checkpoint', 'checkpoint_sha256', 'metadata_sha256', 'initial_alpha')})
+        cell.update(reused=True, source_expected_config=deepcopy(source['expected_config']), corrected_identity=corrected_identity,
+            reuse_provenance=dict(campaign_path=str(path), campaign_sha256=digest(path),
+                study_protocol=source_campaign['study_protocol'], group=source_campaign['group'],
+                source_commit=source_campaign['source_commit'], implementation_fingerprint=corrected_identity['science'],
+                reason='J10 at every decision in both protocols; only redundant first-override configuration differs'))
+        validate_reused_j10_source(campaign, cell)
+        reused.append(cell['name'])
+    assert len(reused) == 6
+    return reused
 
 
 def prepare(args):
@@ -126,8 +228,13 @@ def prepare(args):
         cell.update(directory=str(directory), bundle=str(directory / 'bundle'), checkpoint=row['path'],
             checkpoint_sha256=row['sha256'], metadata_sha256=row['metadata_sha256'],
             initial_alpha=proof['initial_alpha'], expected_config=config, identity=spec['identity'])
-    # Resolve and validate the entire grid before allocating publication IDs.
+    reuse_context = dict(group=args.group, source_commit=commit, checkpoint_step=CHECKPOINT_STEP,
+        checkpoint_sha256=CHECKPOINT_SHA, source_run=SOURCE_RUN, prior_reference=prior,
+        inventory=str(args.inventory.resolve()))
+    reused = reuse_j10_cells(panel, args.reuse_j10_from, reuse_context) if args.reuse_j10_from else []
+    # Resolve and validate the entire grid and references before allocating publication IDs.
     for cell in panel:
+        if cell['reused']: continue
         registry = create_run(args.registry, specifications[cell['selector']], args.group + '-' + cell['name'],
                               PROJECT, ENTITY, 'oscar-rgao48')
         cell.update(run_dir=registry['run_dir'], performance_run_id=registry['run_id'])
@@ -137,17 +244,19 @@ def prepare(args):
         checkpoint_step=CHECKPOINT_STEP, checkpoint_sha256=CHECKPOINT_SHA, checkpoint_state_proof=proof,
         initial_alpha=proof['initial_alpha'], target_entropy=-10.5, H=list(HORIZONS), J=list(ROUNDS),
         first_action_rounds=FIRST_ROUNDS, modes=list(MODES), cells=panel, prior_reference=prior,
-        production_indices=list(range(len(panel))), smoke_indices=[0, 1, 16, 17, 34, 35],
+        production_indices=[i for i, cell in enumerate(panel) if not cell['reused']],
+        smoke_indices=[0, 1, 16, 17, 32, 33], reused_cells=reused,
         publisher_workers=3, overview_run_id=uuid.uuid4().hex,
-        prior_compatibility_note='Only immutable prior-mean episodes are reused. All cold and warm solves are new, with a shared first-decision J10 budget.',
+        prior_compatibility_note='Immutable prior-mean episodes are reused; explicitly validated J10 cells may retain their original performance identities. Every decision uses the selected J.',
         timing_note='Identical L40S hardware. Controller timing is prediction wall time minus measured CUDA probe durations; it retains host trace overhead and is not untraced latency. Report first/steady latency, probe duration, and instrumented prediction time separately.')
     write(args.root / 'campaign.json', campaign)
-    print(f'Prepared {len(panel)} new settings; overview {campaign["overview_run_id"]}', flush=True)
+    print(f'Prepared {len(panel)-len(reused)} new settings and {len(reused)} reused J10 settings; overview {campaign["overview_run_id"]}', flush=True)
     return campaign
 
 
 def summarize_trace(bundle, cell, *, seeds=SEEDS, steps=500):
-    """Validate actual variable-budget work and keep compact per-stage diagnostics."""
+    """Validate actual uniform-budget work and keep compact per-stage diagnostics."""
+    assert not cell.get('reused') or cell['J'] == 10
     manifest = read(Path(bundle) / 'manifest.json'); run, = manifest['runs']
     counts = defaultdict(Counter)
     # Aggregate decisions within each seed first, then weight seeds equally.
@@ -169,7 +278,7 @@ def summarize_trace(bundle, cell, *, seeds=SEEDS, steps=500):
                     assert event['replay_size'] == 0
                     assert values['inner_rounds'] == budget
                     assert values['inner_actor_transferred'] == float(cell['transfer_mode'] == 'actor_warm' and decision > 0)
-                    lifetime = 4*(FIRST_ROUNDS+(decision-1)*cell['J']) if cell['transfer_mode'] == 'actor_warm' and decision > 0 else 0
+                    lifetime = 4*decision*cell['J'] if cell['transfer_mode'] == 'actor_warm' and decision > 0 else 0
                     assert values['inner_actor_lifetime_updates_initial'] == lifetime
                     assert math.isclose(values['alpha'], cell.get('initial_alpha', INITIAL_ALPHA), rel_tol=1e-6)
                     for component in ('actor', 'critic', 'temperature'):
@@ -197,7 +306,7 @@ def summarize_trace(bundle, cell, *, seeds=SEEDS, steps=500):
                     # Engine flags establish the live lifecycle and dose, not just configuration.
                     lookup = {k.removeprefix('decision/'): v for k, v in values.items()}
                     assert lookup['inner_rounds'] == budget
-                    assert lookup['inner_first_action_rounds_applied'] == float(decision == 0)
+                    assert lookup['inner_first_action_rounds_applied'] == float(bool(cell.get('reused')) and decision == 0)
                     assert lookup['inner_actor_transferred'] == float(cell['transfer_mode'] == 'actor_warm' and decision > 0)
                     assert lookup['inner_critic_optimizer_steps'] == 16*budget
                     assert lookup['inner_actor_optimizer_steps'] == lookup['inner_temperature_optimizer_steps'] == 4*budget
@@ -217,12 +326,16 @@ def summarize_trace(bundle, cell, *, seeds=SEEDS, steps=500):
     stage_rows = [dict(phase=k[0], stage=k[1], round_index=k[2], decision_group=k[3], metric=k[4],
                        **moments(values)) for k, values in sorted(grouped.items())]
     return dict(trace_rows_checked=trace_rows, decisions=len(expected), stage_rows=stage_rows,
-                decision_rows=decision_rows, total_rounds=len(seeds)*(FIRST_ROUNDS+(steps-1)*cell['J']),
+                decision_rows=decision_rows, total_rounds=len(seeds)*steps*cell['J'],
                 aggregation='Average roots within each episode, then weight paired environment seeds equally; first decision separated from steady decisions.')
 
 
 def validate_completed(bundle, cell, campaign, *, smoke=False):
     from utils.ambi_benchmark import episode_protocol, solver_seed
+    if cell.get('reused'):
+        assert not smoke
+        source_campaign, source = _reuse_source(cell, campaign)
+        return validate_completed(bundle, source, source_campaign)
     seeds, steps = ([101, 102], 3) if smoke else (SEEDS, 500)
     manifest = read(Path(bundle) / 'manifest.json')
     assert manifest['status'] == 'complete' and manifest['code']['dirty'] is False
@@ -309,8 +422,10 @@ def main():
     for name in ('root', 'inventory', 'registry'): prep.add_argument('--' + name, type=Path, required=True)
     prep.add_argument('--references', type=Path, default=REFERENCES)
     prep.add_argument('--matrix', type=Path, default=MATRIX)
+    prep.add_argument('--reuse-j10-from', type=Path,
+        help='Original actor-transfer-v1 campaign directory; all six J10 cells must be complete and published')
     prep.add_argument('--group', default=GROUP)
-    prep.add_argument('--label', default='575k actor-only transfer | H1/2/3 J1/2/4/6/8/10 | first J10')
+    prep.add_argument('--label', default='575k actor-only transfer v2 | H1/2/3 J1/2/4/6/8/10 at every decision')
     run = sub.add_parser('worker'); run.add_argument('--root', type=Path, required=True)
     run.add_argument('--index', type=int, required=True); run.add_argument('--smoke', action='store_true')
     args = parser.parse_args(); {'prepare': prepare, 'worker': worker}[args.command](args)

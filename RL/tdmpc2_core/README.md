@@ -1655,8 +1655,12 @@ decision. The terminal actor/critic and outer model remain frozen; there is no
 prior writeback. This is a separate controller from fresh-prior closed-loop
 refinement, not a change to its defaults.
 
+By default, `inner_first_action_rounds=None` uses `inner_rounds=J` at every
+decision, including the first. Actor retention does not require a different
+initial budget. The uniform-J transfer sweep uses this default.
+
 Optional `inner_first_action_rounds` gives the first decision of every episode
-a common initialization dose. For example, set it to 10 and `inner_rounds=2`
+a separately configured initialization dose. For example, set it to 10 and `inner_rounds=2`
 to use J10 once, then J2 thereafter. This option supports positive round counts,
 canonical dense one-step SAC component updates, round timing and no explorer.
 It does not modify per-round C/A/N/H. Replay capacity must accommodate

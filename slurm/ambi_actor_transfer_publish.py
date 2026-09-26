@@ -14,7 +14,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from slurm.ambi_actor_transfer_campaign import (
-    CHECKPOINT_SHA, CHECKPOINT_STEP, ENTITY, FIRST_ROUNDS, HORIZONS, MODES, PROJECT,
+    CHECKPOINT_SHA, CHECKPOINT_STEP, ENTITY, HORIZONS, MODES, PROJECT,
     PROTOCOL, ROUNDS, SEEDS, cells, digest, read, summarize_trace, validate_completed, write,
 )
 from slurm.ambi_aux_hj_sweep import publish_performance
@@ -31,10 +31,20 @@ def validate_scope(campaign):
     expected = cells(campaign['matrix'])
     assert campaign['study_protocol'] == PROTOCOL
     assert campaign['checkpoint_step'] == CHECKPOINT_STEP and campaign['checkpoint_sha256'] == CHECKPOINT_SHA
-    assert campaign['first_action_rounds'] == FIRST_ROUNDS
+    assert campaign['first_action_rounds'] is None
     assert len(campaign['cells']) == len(expected)
     for actual, wanted in zip(campaign['cells'], expected):
-        for key, value in wanted.items(): assert actual[key] == value, key
+        for key, value in wanted.items():
+            if key != 'reused': assert actual[key] == value, key
+        assert actual.get('reused') in (False, True)
+        if actual.get('reused'):
+            from slurm.ambi_actor_transfer_campaign import _reuse_source
+            assert actual['J'] == 10, 'Only the six J10 cells may reuse the original study'
+            _reuse_source(actual, campaign)  # Pin original config, identity, and artifact locations.
+    reused = [c['name'] for c in campaign['cells'] if c.get('reused')]
+    if reused:
+        assert set(reused) == {c['name'] for c in expected if c['J'] == 10}
+        assert campaign['reused_cells'] == reused
     ids = [c['performance_run_id'] for c in campaign['cells']] + [campaign['overview_run_id']]
     assert len(set(ids)) == len(ids)
     return campaign['cells']
@@ -42,6 +52,9 @@ def validate_scope(campaign):
 
 def load_completed(campaign, cell):
     from utils.eval_series_data import load_records
+    if cell.get('reused'):
+        from slurm.ambi_actor_transfer_campaign import validate_reused_j10_source
+        validate_reused_j10_source(campaign, cell)
     directory, bundle = Path(cell['directory']), Path(cell['bundle'])
     receipt = read(directory / 'worker-completion.json')
     assert receipt['cell'] == cell['name'] and receipt['status'] == 'complete' and not receipt['smoke']
@@ -52,6 +65,10 @@ def load_completed(campaign, cell):
     record, = load_records(bundle, inventory_path=campaign['inventory'])
     assert record['identity'] == cell['identity']
     assert not record['provenance']['missing_artifact_files']
+    if cell.get('reused'):
+        publication = read(directory / 'publication-completion.json')
+        assert publication['status'] == 'complete'
+        assert publication['performance']['run_id'] == cell['performance_run_id']
     return dict(episodes=manifest['runs'][0]['episodes'], metrics=record['metrics'],
                 diagnostics=read(directory / 'transfer-diagnostics.json'))
 
@@ -68,6 +85,8 @@ def publish_cell(args):
         receipt = read(receipt_path)
         assert receipt['status'] == 'complete' and receipt['performance']['run_id'] == cell['performance_run_id']
         return receipt
+    if cell.get('reused'):
+        raise RuntimeError('A reused result must retain its completed original publication; never republish it.')
     staged = stage_completed_bundle(cell['bundle'], {cell['selector']: cell['run_dir']},
                                      inventory_path=campaign['inventory'])
     assert staged[cell['selector']]['status'] == 'queued'
@@ -85,7 +104,8 @@ def aggregate_results(campaign, completed):
     points, pairs, diagnostic_rows = [], [], []
     for cell in panel:
         point = dict(setting=cell['name'], H=cell['H'], J=cell['J'], transfer_mode=cell['transfer_mode'],
-                     first_action_rounds=FIRST_ROUNDS, performance_url=url(cell['performance_run_id']),
+                     first_action_rounds=cell['J'], performance_url=url(cell['performance_run_id']),
+                     reused=bool(cell.get('reused')), reuse_provenance=cell.get('reuse_provenance'),
                      return_mean=None, return_std=None, control_seconds=None, control_seconds_per_decision=None,
                      paired_gain_mean=None)
         if cell['name'] in completed:
@@ -115,14 +135,16 @@ def aggregate_results(campaign, completed):
                     paired_episodes=metrics['comparison/sample_minus_mean_paired_episodes'],
                     episodes=[dict(seed=r['seed'], solver_seed=r['solver_seed'], cold_return=r['mean_return'],
                         warm_return=r['sampled_return'], warm_minus_cold=r['sample_minus_mean']) for r in comparison['rows']]))
-    return dict(points=points, paired_comparisons=pairs, diagnostics=diagnostic_rows,
+    return dict(study_protocol=campaign['study_protocol'], rounds_policy='J at every decision including the first',
+        points=points, paired_comparisons=pairs, diagnostics=diagnostic_rows,
         completed=len(completed), total=len(panel), bootstrap_seed=20260912, bootstrap_resamples=2000,
         uncertainty='Five paired environment seeds on one trained backbone; exploratory unadjusted 95% episode-bootstrap intervals.')
 
 
 def overview_payload(wandb, aggregate):
     point_columns = ['setting', 'H', 'J', 'transfer_mode', 'first_action_rounds', 'return_mean', 'return_std',
-                     'control_seconds', 'control_seconds_per_decision', 'paired_gain_mean', 'performance_url']
+                     'control_seconds', 'control_seconds_per_decision', 'paired_gain_mean', 'performance_url',
+                     'reused', 'reuse_provenance']
     point_columns += sorted({k for p in aggregate['points'] for k in p if k.startswith('runtime/')})
     pair_columns = ['H', 'J', 'warm_minus_cold_mean', 'warm_minus_cold_std', 'ci95_low', 'ci95_high', 'paired_episodes']
     diag_columns = ['setting', 'H', 'J', 'transfer_mode', 'phase', 'stage', 'round_index', 'decision_group',
@@ -148,12 +170,15 @@ def overview_payload(wandb, aggregate):
         if any(series):
             payload[f'comparison/h{h}_return_vs_rounds'] = wandb.plot.line_series(
                 xs=[[p['J'] for p in rows] for rows in series], ys=[[p['return_mean'] for p in rows] for rows in series],
-                keys=list(MODES), title=f'H{h}: episode return versus subsequent solve rounds (first J10)', xname='Subsequent J')
-            timed = [[p for p in rows if p['control_seconds_per_decision'] is not None] for rows in series]
+                keys=['Cold (reset actor)', 'Warm (retain actor)'],
+                title=f'H{h}: full-episode return versus rounds at every decision', xname='J rounds / decision')
+            timed = [sorted((p for p in rows if p['control_seconds_per_decision'] is not None),
+                            key=lambda p:p['control_seconds_per_decision']) for rows in series]
             payload[f'comparison/h{h}_return_vs_compute'] = wandb.plot.line_series(
                 xs=[[p['control_seconds_per_decision'] for p in rows] for rows in timed],
-                ys=[[p['return_mean'] for p in rows] for rows in timed], keys=list(MODES),
-                title=f'H{h}: episode return versus controller time including first solve', xname='Controller seconds / decision')
+                ys=[[p['return_mean'] for p in rows] for rows in timed],
+                keys=['Cold (reset actor)', 'Warm (retain actor)'],
+                title=f'H{h}: full-episode return versus measured controller time', xname='Controller seconds / decision')
     return payload
 
 
@@ -198,7 +223,9 @@ def watch(args):
         config=dict(study_protocol=PROTOCOL, source_run=campaign['source_run'], source_commit=campaign['source_commit'],
             checkpoint_step=CHECKPOINT_STEP, checkpoint_sha256=CHECKPOINT_SHA,
             campaign_group=campaign['group'],
-            H=list(HORIZONS), J=list(ROUNDS), modes=list(MODES), first_action_rounds=FIRST_ROUNDS,
+            H=list(HORIZONS), J=list(ROUNDS), modes=list(MODES), first_action_rounds=None,
+            rounds_policy='J at every decision including the first',
+            reused_settings=[c['name'] for c in panel if c.get('reused')],
             C=16, A=4, N=128, B=256, seeds=SEEDS, controller_seed=55, max_steps=500,
             prior_reference=campaign['prior_reference'], timing_note=campaign['timing_note']))
     layout_receipt = install_results_layout(wandb, run, campaign, args.root)
@@ -221,9 +248,13 @@ def watch(args):
                     if cell['name'] not in completed and (directory / 'worker-completion.json').exists():
                         completed[cell['name']] = load_completed(campaign, cell)
                     if (cell['name'] in completed and index not in attempted and len(futures) < campaign['publisher_workers']
+                            and not cell.get('reused')
                             and not (directory / 'publication-completion.json').exists()):
                         attempted.add(index); futures[index] = pool.submit(launch, index)
-                states = [dict(setting=c['name'], state=('published' if (Path(c['directory']) / 'publication-completion.json').exists()
+                states = [dict(setting=c['name'], reused=bool(c.get('reused')),
+                    performance_url=url(c['performance_run_id']),
+                    state=(('reused' if c.get('reused') else 'published')
+                    if (Path(c['directory']) / 'publication-completion.json').exists() and c['name'] in completed
                     else 'publication_failed' if i in failures else 'publishing' if i in futures
                     else 'evaluated' if c['name'] in completed else 'queued_or_running')) for i, c in enumerate(panel)]
                 stamp = [r['state'] for r in states]
@@ -234,11 +265,11 @@ def watch(args):
                     if len(completed) != previous_completed:
                         run.log(overview_payload(wandb, aggregate))
                         previous_completed = len(completed)
-                    run.log({'campaign/settings': wandb.Table(columns=['setting', 'state'],
-                        data=[[r['setting'], r['state']] for r in states])})
+                    run.log({'campaign/settings': wandb.Table(columns=['setting', 'state', 'reused', 'performance_url'],
+                        data=[[r[k] for k in ('setting', 'state', 'reused', 'performance_url')] for r in states])})
                     previous = stamp
-                    print(f'Evaluated {len(completed)}/{len(panel)}; published {stamp.count("published")}; failures {len(failures)}', flush=True)
-                if all(s == 'published' for s in stamp): break
+                    print(f'Evaluated {len(completed)}/{len(panel)}; published {stamp.count("published")}; reused {stamp.count("reused")}; failures {len(failures)}', flush=True)
+                if all(s in {'published', 'reused'} for s in stamp): break
                 submission = args.root / 'submission.json'
                 if submission.exists() and not gpu_jobs_active(read(submission)['gpu_job_ids']) and not futures:
                     terminal_since = terminal_since or time.time()

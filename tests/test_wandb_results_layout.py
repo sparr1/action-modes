@@ -69,12 +69,16 @@ def test_visible_panel_schema_and_exact_publisher_keys():
     for panel in charts:
         cfg=panel['config'];assert cfg['panelDefId']=='wandb/lineseries/v0'
         assert cfg['fieldSettings']=={'step':'step','lineKey':'lineKey','lineVal':'lineVal'}
+        assert 'first J10' not in cfg['stringSettings']['xname']
+        assert 'subsequent' not in cfg['stringSettings']['title']
         actual.append(cfg['userQuery']['queryFields'][0]['fields'][0]['args'][0]['value'])
     assert actual==[key+'_table' for key in layout.CHART_KEYS]
     assert {p['config']['mediaKeys'][0] for p in panels if p['viewType']=='Media Browser'}==set(layout.TABLE_KEYS)
     assert len({p['__id__'] for p in panels})==len(panels)
     intro=next(p['config']['value'] for p in panels if p['viewType']=='Markdown Panel')
     assert 'pending' in intro and 'completed' in intro and '575k' not in intro
+    assert 'corrected study uses J at every decision' in intro
+    assert 'original study used first J10' in intro
 
 
 def test_install_reads_back_preserves_other_views_and_is_noop_on_repeat(tmp_path):
@@ -156,3 +160,122 @@ def test_publisher_results_url_selects_exact_overview_in_verified_personal_layou
     assert receipt['url']==run.summary['results_layout/url']==expected
     assert receipt['workspace_url']==run.summary['results_layout/workspace_url']==workspace_url
     assert json.loads((tmp_path/'results-layout'/'campaign-results-layout.json').read_text())==receipt
+
+
+def test_uniform_overview_preserves_reused_identity_and_pending_nulls(monkeypatch):
+    from slurm import ambi_actor_transfer_publish as publication
+    panel = [dict(name='cold_h1_j10_c16', H=1, J=10, transfer_mode='cold',
+                  performance_run_id='original-id', reused=True,
+                  reuse_provenance={'source_protocol':'actor-transfer-v1'}),
+             dict(name='actor_warm_h1_j1_c16', H=1, J=1, transfer_mode='actor_warm',
+                  performance_run_id='new-id')]
+    monkeypatch.setattr(publication, 'validate_scope', lambda campaign: panel)
+    result = publication.aggregate_results({'study_protocol':'uniform-J'}, {
+        panel[0]['name']:dict(episodes=[{'return':v} for v in (10,20,30,40,50)],
+            metrics={'runtime/control_seconds':125., 'runtime/control_seconds_per_decision':.05},
+            diagnostics={'stage_rows':[]})})
+    inherited, pending = result['points']
+    assert inherited['return_mean'] == 30 and inherited['first_action_rounds'] == 10
+    assert inherited['performance_url'].endswith('/runs/original-id')
+    assert inherited['reuse_provenance']['source_protocol'] == 'actor-transfer-v1'
+    assert inherited['reused'] is True
+    assert pending['first_action_rounds'] == 1 and pending['return_mean'] is None
+    assert pending['reused'] is False and result['paired_comparisons'] == []
+    assert result['rounds_policy'] == 'J at every decision including the first'
+
+
+def test_uniform_scope_accepts_only_pinned_six_j10_reuses(tmp_path, monkeypatch):
+    from slurm import ambi_actor_transfer_campaign as campaign
+    from slurm import ambi_actor_transfer_publish as publication
+    from utils import eval_series_data
+    science = {'version':1, 'source_fingerprint':'same-controller-source'}
+    monkeypatch.setattr(eval_series_data, 'scientific_identity', lambda *args:science)
+    panel = campaign.cells()
+    for index, cell in enumerate(panel):
+        cell.update(expected_config=deepcopy(cell['requested_alg_params']),
+            performance_run_id=f'new-{index}',
+            identity={'science':science, 'planner':{'settings':deepcopy(cell['params'])}, 'controller_seed':55},
+            directory=f'/original/{cell["name"]}', bundle=f'/original/{cell["name"]}/bundle',
+            run_dir=f'/registry/{cell["name"]}', checkpoint='/checkpoints/575000.pt',
+            checkpoint_sha256=campaign.CHECKPOINT_SHA, metadata_sha256='metadata-hash', initial_alpha=.01)
+    source = dict(matrix=str(campaign.MATRIX), study_protocol='actor-transfer-v1',
+        group='original-group', source_commit='original-commit', source_run=campaign.SOURCE_RUN,
+        checkpoint_step=campaign.CHECKPOINT_STEP, checkpoint_sha256=campaign.CHECKPOINT_SHA,
+        first_action_rounds=10, prior_reference={'manifest_sha256':'prior-hash'}, cells=deepcopy(panel))
+    for cell in source['cells']:
+        cell['first_action_rounds'] = 10
+        cell['requested_alg_params']['inner_first_action_rounds'] = 10
+        cell['expected_config']['inner_first_action_rounds'] = 10
+        cell['performance_run_id'] = 'original-' + cell['name']
+        cell['identity']['planner']['settings']['inner_first_action_rounds'] = 10
+        cell['identity']['planner']['semantics'] = dict(evaluation_protocol='actor-transfer-v1', first_action_rounds=10)
+    path = tmp_path/'original-campaign.json'
+    path.write_text(json.dumps(source))
+    reused = []
+    for cell, original in zip(panel, source['cells']):
+        if cell['J'] != 10: continue
+        cell.update(reused=True, corrected_identity=deepcopy(cell['identity']), performance_run_id=original['performance_run_id'],
+            identity=deepcopy(original['identity']), source_expected_config=deepcopy(original['expected_config']),
+            reuse_provenance=dict(campaign_path=str(path), campaign_sha256=campaign.digest(path),
+                study_protocol='actor-transfer-v1', group=source['group'], source_commit=source['source_commit'],
+                implementation_fingerprint=science))
+        reused.append(cell['name'])
+    corrected = {**source, 'study_protocol':campaign.PROTOCOL, 'group':'corrected-group',
+        'source_commit':'corrected-commit', 'first_action_rounds':None, 'cells':panel,
+        'overview_run_id':'corrected-overview', 'reused_cells':reused}
+    assert len(publication.validate_scope(corrected)) == 36 and len(reused) == 6
+    point = next(c for c in panel if c['reused'])
+    assert point['expected_config']['inner_first_action_rounds'] is None
+    assert point['identity']['planner']['settings']['inner_first_action_rounds'] == 10
+    for key, value in [('identity', point['corrected_identity']), ('performance_run_id', 'duplicate-new-run'),
+                       ('source_expected_config', point['expected_config'])]:
+        corrupt = deepcopy(corrected)
+        next(c for c in corrupt['cells'] if c['reused'])[key] = value
+        with pytest.raises(AssertionError): publication.validate_scope(corrupt)
+    corrupt = deepcopy(corrected)
+    corrupt['cells'][0].update(reused=True, reuse_provenance=deepcopy(point['reuse_provenance']))
+    with pytest.raises(AssertionError, match='Only the six J10'):
+        publication.validate_scope(corrupt)
+    path.write_text(path.read_text() + '\n')
+    with pytest.raises(AssertionError, match='Reuse source campaign changed'):
+        publication.validate_scope(corrected)
+
+
+def test_uniform_overview_chart_labels_and_compute_order():
+    from slurm.ambi_actor_transfer_publish import overview_payload
+    fake = SimpleNamespace(Table=lambda **kw:kw, plot=SimpleNamespace(line_series=lambda **kw:kw))
+    points = [dict(H=1, J=j, transfer_mode='cold', return_mean=ret,
+                   control_seconds_per_decision=seconds, first_action_rounds=j,
+                   reused=(j==10), performance_url='original' if j==10 else 'new')
+              for j,ret,seconds in ((1,20.,.2),(10,30.,.1))]
+    aggregate = dict(points=points, paired_comparisons=[], diagnostics=[], completed=2, total=36)
+    payload = overview_payload(fake, aggregate)
+    rounds = payload['comparison/h1_return_vs_rounds']
+    assert rounds['xname'] == 'J rounds / decision'
+    assert 'every decision' in rounds['title'] and 'first J10' not in rounds['title']
+    assert rounds['keys'] == ['Cold (reset actor)', 'Warm (retain actor)']
+    compute = payload['comparison/h1_return_vs_compute']
+    assert compute['xs'][0] == [.1,.2] and compute['ys'][0] == [30.,20.]
+    assert 'reused' in payload['comparison/returns_and_compute']['columns']
+    assert 'comparison/h2_return_vs_rounds' not in payload
+
+
+def test_reused_completed_publication_never_stages_or_uploads(tmp_path, monkeypatch):
+    from slurm import ambi_actor_transfer_publish as publication
+    from utils import ambi_benchmark, eval_series
+    cell = dict(name='cold_h1_j10_c16', reused=True, directory=str(tmp_path/'old-cell'),
+                run_dir='original-registry', identity={'original':True}, performance_run_id='original')
+    campaign = {'cells':[cell]}
+    (tmp_path/'campaign.json').write_text(json.dumps(campaign))
+    directory = tmp_path/'old-cell';directory.mkdir()
+    receipt = {'status':'complete','performance':{'run_id':'original'}}
+    (directory/'publication-completion.json').write_text(json.dumps(receipt))
+    monkeypatch.setattr(publication,'validate_scope',lambda campaign:[cell])
+    monkeypatch.setattr(publication,'load_completed',lambda *args:{'metrics':{}})
+    monkeypatch.setattr(eval_series,'load_run',lambda directory:{'identity':cell['identity']})
+    monkeypatch.setattr(ambi_benchmark,'stage_completed_bundle',lambda *args,**kwargs:pytest.fail('Restaged reused data'))
+    monkeypatch.setattr(publication,'publish_performance',lambda *args:pytest.fail('Republished reused data'))
+    assert publication.publish_cell(SimpleNamespace(root=tmp_path,index=0)) == receipt
+    (directory/'publication-completion.json').unlink()
+    with pytest.raises(RuntimeError,match='never republish'):
+        publication.publish_cell(SimpleNamespace(root=tmp_path,index=0))
