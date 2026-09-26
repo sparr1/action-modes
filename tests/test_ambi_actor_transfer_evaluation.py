@@ -97,3 +97,75 @@ def test_togo_stage_boundaries_do_not_merge():
                  stage=stage, metrics={"value": value})
             for stage, value in (("initial", 1), ("before_first_actor_block", 5))]
     assert len(evaluator._togo_round_summaries(rows)) == 2
+
+
+def uniform_transfer_matrix(path):
+    matrix=json.loads(path.read_text())
+    matrix['study_protocol']='actor-transfer-v2'
+    matrix['shared_alg_params']={'inner_first_action_rounds':None}
+    path.write_text(json.dumps(matrix))
+    return matrix
+
+
+def test_uniform_j_v2_actual_matrix_specification_preflight(transfer_matrix,tmp_path,monkeypatch):
+    from utils import ambi_benchmark as storage
+    from utils import eval_series_data as data
+    checkpoint,path=transfer_matrix
+    uniform_transfer_matrix(path)
+    resolved=[]
+    def identity(checkpoint,resolution,*args,**kwargs):
+        params=resolution['algorithm_config']['alg_params']
+        resolved.append(params)
+        return {'backbone':'entity/train/prior','planner':planner_identity(params,{},'AMBITDMPC2/AMBITDMPC2','tanh_mean'),
+                'protocol':{'max_steps':3,'seeds':[101,102]},'science':{'evaluator':'fixture'}}
+    monkeypatch.setattr(data,'identity_for_ambi_checkpoint',identity)
+    monkeypatch.setattr(storage,'code_identity',lambda:{'commit':'fixture','dirty':False})
+    monkeypatch.setattr(evaluator,'_make_env',lambda *a:pytest.fail('specification preflight created an environment'))
+    result=evaluator.evaluate_matrix(path,checkpoint,selectors=['transfer/cold','transfer/warm'],
+        bundle_dir=tmp_path/'unused',eval_series_spec_dir=tmp_path/'specs')
+    assert result['mode']=='evaluation_series_specifications'
+    assert set(result['specs'])=={'transfer/cold','transfer/warm'}
+    assert len(resolved)==2 and all(p.get('inner_first_action_rounds') is None for p in resolved)
+    assert {p['inner_actor_scope'] for p in resolved}=={'action','episode'}
+    assert not (tmp_path/'unused').exists()
+
+
+def test_uniform_j_v2_full_episode_budget_and_durable_protocol_metadata(transfer_matrix,tmp_path):
+    checkpoint,path=transfer_matrix
+    uniform_transfer_matrix(path)
+    bundle=tmp_path/'uniform'
+    result=evaluator.evaluate_matrix(path,checkpoint,seeds=[101,102],bundle_dir=bundle)['results'][0]
+    assert result['study_protocol']=='actor-transfer-v2' and result['outer_state_unchanged']
+    manifest=json.loads((bundle/'manifest.json').read_text())
+    run,=manifest['runs']
+    assert run['study_protocol']==run['result']['study_protocol']=='actor-transfer-v2'
+    decisions=[row['metrics'] for row in events(bundle) if row['phase']=='decision']
+    assert [row['decision/inner_rounds'] for row in decisions]==[1]*6
+    assert [row['decision/inner_first_action_rounds_applied'] for row in decisions]==[0]*6
+    assert [row['decision/inner_actor_transferred'] for row in decisions]==[0,1,1]*2
+    assert _metrics(result['episodes'])['work/critic_updates']==12
+    assert _metrics(result['episodes'])['work/actor_updates']==6
+
+
+def test_uniform_j_v2_rejects_inherited_first_override_before_model_creation(transfer_matrix,tmp_path,monkeypatch):
+    checkpoint,path=transfer_matrix
+    matrix=json.loads(path.read_text());matrix['study_protocol']='actor-transfer-v2'
+    path.write_text(json.dumps(matrix))
+    monkeypatch.setattr(evaluator,'_make_env',lambda *a:pytest.fail('invalid v2 created an environment'))
+    with pytest.raises(ValueError,match='selected J at every decision'):
+        evaluator.evaluate_matrix(path,checkpoint,bundle_dir=tmp_path/'invalid',eval_series_spec_dir=tmp_path/'specs')
+    assert not (tmp_path/'specs').exists()
+
+
+def test_failed_uniform_j_v2_keeps_correct_bundle_protocol(transfer_matrix,tmp_path,monkeypatch):
+    checkpoint,path=transfer_matrix
+    uniform_transfer_matrix(path)
+    def fail(*args,**kwargs):
+        kwargs['bundle_run']['study_protocol']='actor-transfer-v1'
+        raise RuntimeError('simulated model failure')
+    monkeypatch.setattr(evaluator,'evaluate_preset',fail)
+    bundle=tmp_path/'failed'
+    with pytest.raises(RuntimeError,match='simulated model failure'):
+        evaluator.evaluate_matrix(path,checkpoint,bundle_dir=bundle)
+    manifest=json.loads((bundle/'manifest.json').read_text())
+    assert manifest['status']=='failed' and manifest['runs'][0]['study_protocol']=='actor-transfer-v2'

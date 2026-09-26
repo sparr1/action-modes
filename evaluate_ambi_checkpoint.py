@@ -1062,12 +1062,13 @@ def evaluate_matrix(
     probe_horizon = evaluation.get("diagnostic_horizon", 3)
     togo_return_rollouts = evaluation.get("togo_return_rollouts", 0)
     actor_transfer_diagnostics = evaluation.get("actor_transfer_diagnostics", False)
+    study_protocol = matrix.get("study_protocol")
     if not isinstance(actor_transfer_diagnostics, bool):
         raise ValueError("evaluation.actor_transfer_diagnostics must be boolean.")
-    if actor_transfer_diagnostics and (matrix.get("study_protocol") != "actor-transfer-v1"
+    if actor_transfer_diagnostics and (study_protocol not in {"actor-transfer-v1", "actor-transfer-v2"}
             or not togo_return_rollouts or bundle_dir is None
             or save_root_bank or root_bank_path or bank_only):
-        raise ValueError("Actor-transfer diagnostics require actor-transfer-v1 full episodes and bundled to-go probes.")
+        raise ValueError("Actor-transfer diagnostics require actor-transfer-v1/v2 full episodes and bundled to-go probes.")
     if (isinstance(togo_return_rollouts, bool) or not isinstance(togo_return_rollouts, int)
             or togo_return_rollouts < 0):
         raise ValueError("evaluation.togo_return_rollouts must be a nonnegative integer.")
@@ -1103,6 +1104,11 @@ def evaluate_matrix(
         raise ValueError("--metadata requires a checkpoint-based preset matrix.")
     resolved_presets = [resolve_preset(matrix_path, selector, matrix=matrix, checkpoint_context=context)
                         for selector in selectors]
+    if study_protocol == "actor-transfer-v2" and any(
+        item["algorithm_config"]["alg_params"].get("inner_first_action_rounds") is not None
+        for item in resolved_presets
+    ):
+        raise ValueError("actor-transfer-v2 requires the selected J at every decision; inner_first_action_rounds must be None.")
     _validate_frozen_selection(matrix, resolved_presets)
     _validate_checkpoint_contract(matrix, checkpoint, context, resolved_presets)
     if togo_return_rollouts and any(
@@ -1223,6 +1229,11 @@ def evaluate_matrix(
                     togo_return_rollouts=togo_return_rollouts,
                     actor_transfer_diagnostics=actor_transfer_diagnostics,
                 )
+                if actor_transfer_diagnostics:
+                    # The matrix owns this descriptive study version. Keep the
+                    # shared numerical evaluator unchanged for J10 equivalence.
+                    result["study_protocol"] = study_protocol
+                    bundle_run["study_protocol"] = study_protocol
                 results.append(result)
                 if bundle is not None and resolved["algorithm_config"]["alg_params"].get("inner_operator") == "none":
                     bundle.reference = {episode["seed"]: episode["return"] for episode in result["episodes"]}
@@ -1236,6 +1247,8 @@ def evaluate_matrix(
                     bundle.finish_run(bundle_run, result=result)
             except BaseException as exc:
                 if bundle is not None:
+                    if actor_transfer_diagnostics:
+                        bundle_run["study_protocol"] = study_protocol
                     try:
                         bundle.finish_run(bundle_run, error=exc)
                     except BaseException as cleanup:
