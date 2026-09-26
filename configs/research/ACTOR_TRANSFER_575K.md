@@ -90,6 +90,35 @@ cover cold and warm H1/J1, H2/J4, and H3/J10, each with two seeds and
 three decisions to test first J10, subsequent J, transfer, and episode reset. Production indices cover all 36 cells.
 GPU workers never initialize W&B. One CPU watcher bounds publication concurrency
 and drains finished workers; `submission.json` supplies its `gpu_job_ids` list.
+
+The CPU watcher also installs explicit Results panels in the authenticated
+user's existing personal **project workspace** through
+`utils/wandb_results_layout.py`. A native UI edit verified that the current
+single-run page reads this project's `project-view`; the similarly named
+legacy viewer-owned `run-view` does not control these panels. Logging metrics,
+setting `hidden=False`, or logging `wandb.plot` objects alone is insufficient
+when panels are absent. Future campaign publishers must install and verify the
+results layout as part of publication, and verify browser rendering before
+reporting visibility.
+
+The helper preserves unrelated sections, settings, associations, and all other
+project workspaces; only its stable owned section IDs are inserted or updated.
+The explicit personal view defaults to `nw-nwuserrwgao_b-w` and can be selected
+with `WANDB_RESULTS_VIEW_NAME`. No personal username is guessed from a team
+entity. The scope is this project's workspace and run pages. The delivered URL
+selects the exact overview run; generic workspace filters can exclude that run.
+Close the workspace browser tab during an external layout update, then open a
+fresh tab: an already-open UI can autosave stale state over the API patch.
+
+Before/proposed/after snapshots and verification receipts are retained under
+`results-layout/`. Readback verifies the saved schema, not browser rendering.
+A layout failure is logged explicitly in the watcher and run summary; it does
+not discard results, interrupt computation, or trigger checkpoint reevaluation.
+Stable IDs make retries idempotent, including recovery from an uncertain
+response. The helper reads fresh state immediately before mutation, but W&B
+view updates in this helper do not perform an atomic compare-and-swap. A
+concurrent edit in the final read/write gap can still be overwritten without
+readback detecting it.
 Use live Oscar allocation/QOS headroom to choose array concurrency. Do not reuse
 an arbitrary historical throttle.
 

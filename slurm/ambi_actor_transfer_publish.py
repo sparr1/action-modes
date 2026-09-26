@@ -157,6 +157,33 @@ def overview_payload(wandb, aggregate):
     return payload
 
 
+
+def install_results_layout(wandb, run, campaign, root):
+    """A presentation failure must not interrupt publication of completed science."""
+    from utils.wandb_results_layout import DEFAULT_VIEW_NAME, ensure_actor_transfer_results_layout
+    try:
+        receipt = ensure_actor_transfer_results_layout(wandb.Api(timeout=30), entity=ENTITY,
+            project=PROJECT, receipt_dir=Path(root) / 'results-layout',
+            view_name=os.environ.get('WANDB_RESULTS_VIEW_NAME', DEFAULT_VIEW_NAME),
+            run_id=campaign['overview_run_id'])
+        run.summary.update({'results_layout/status': receipt['status'],
+            'results_layout/url': receipt['url'], 'results_layout/workspace_url': receipt['workspace_url'],
+            'results_layout/schema_verified': True})
+        write(Path(root) / 'results-layout' / 'campaign-results-layout.json', receipt)
+        print('Results layout schema verified (browser check required): ' + receipt['url'], flush=True)
+        return receipt
+    except Exception as exc:
+        receipt = dict(status='failed', error_type=type(exc).__name__, schema_verified=False,
+            message='Results panels could not be verified. Evaluation and metric publication continue; inspect results-layout receipts.')
+        write(Path(root) / 'results-layout-failure.json', receipt)
+        try:
+            run.summary.update({'results_layout/status': 'failed', 'results_layout/schema_verified': False,
+                                'results_layout/error_type': type(exc).__name__})
+        except Exception:
+            pass  # Local receipt and the explicit watcher message remain available.
+        print('RESULTS LAYOUT FAILED: ' + receipt['message'] + ' (' + type(exc).__name__ + ')', flush=True)
+        return receipt
+
 def watch(args):
     import wandb
     campaign = read(args.root / 'campaign.json'); panel = validate_scope(campaign)
@@ -170,9 +197,11 @@ def watch(args):
         tags=['actor-transfer', '575k', 'mean', 'return-only'], mode='online',
         config=dict(study_protocol=PROTOCOL, source_run=campaign['source_run'], source_commit=campaign['source_commit'],
             checkpoint_step=CHECKPOINT_STEP, checkpoint_sha256=CHECKPOINT_SHA,
+            campaign_group=campaign['group'],
             H=list(HORIZONS), J=list(ROUNDS), modes=list(MODES), first_action_rounds=FIRST_ROUNDS,
             C=16, A=4, N=128, B=256, seeds=SEEDS, controller_seed=55, max_steps=500,
             prior_reference=campaign['prior_reference'], timing_note=campaign['timing_note']))
+    layout_receipt = install_results_layout(wandb, run, campaign, args.root)
     attempted, completed, futures, failures = set(), {}, {}, {}
     previous, terminal_since, previous_completed = None, None, -1
     def launch(index):
@@ -228,7 +257,8 @@ def watch(args):
         run.summary.update(dict(status='complete' if complete else 'incomplete', completed_settings=len(completed), total_settings=len(panel)))
         run.finish(exit_code=0 if complete else 1)
         write(args.root / 'publication-summary.json', dict(status='complete' if complete else 'incomplete',
-            overview_url=url(campaign['overview_run_id']), completed=len(completed), total=len(panel), failures=failures))
+            overview_url=url(campaign['overview_run_id']), results_layout=layout_receipt,
+            completed=len(completed), total=len(panel), failures=failures))
         if not complete: raise RuntimeError('Campaign incomplete; inspect GPU and publication receipts')
     except BaseException:
         run.finish(exit_code=1); raise
