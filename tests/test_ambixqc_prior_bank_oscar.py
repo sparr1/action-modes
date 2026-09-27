@@ -55,10 +55,10 @@ def test_source_protocol_guard_rejects_changed_scientific_inputs(monkeypatch, ke
         helper.prepare_inputs("smoke", "test")
 
 
-def _checkpoint(root, step):
+def _checkpoint(root, step, *, version=2):
     path = root / f"prior-{step}.pt"
     state = {
-        "checkpoint_version": 2, "semantic_signature": {"collection_operator": "none"},
+        "checkpoint_version": version, "semantic_signature": {"collection_operator": "none"},
         "inner": {"action_index": 0}, "reward_normalizer": {"count": float(step)},
         "num_updates": max(0, step - 1), "module": {"weights": torch.ones(2)},
     }
@@ -71,9 +71,10 @@ def _checkpoint(root, step):
     return path, state
 
 
-def test_smoke_checkpoint_bank_requires_three_finite_metadata_pairs(tmp_path):
+@pytest.mark.parametrize("version", [2, 3, 4, 5])
+def test_smoke_checkpoint_bank_requires_three_finite_metadata_pairs(tmp_path, version):
     for step in (1000, 2000, 3000):
-        _checkpoint(tmp_path, step)
+        _checkpoint(tmp_path, step, version=version)
     records = helper.validate_checkpoint_bank(tmp_path, total_steps=3000, cadence=1000)
     assert [record["step"] for record in records] == [1000, 2000, 3000]
     assert all(len(record["sha256"]) == 64 and record["bytes"] > 0 for record in records)

@@ -600,6 +600,7 @@ class TDMPC2Baseline(Algorithm):
         self._predict_t0 = True
         self._checkpointing = None
         self._checkpoint_writer = AsyncCheckpointWriter()
+        self._replay_archive = None
         self._global_step = 0
         self._episode_idx = 0
         self._episode_return = 0.0
@@ -1443,9 +1444,28 @@ class TDMPC2Baseline(Algorithm):
             if self.alg_logger is not None and hasattr(self.alg_logger, "flush"):
                 self.alg_logger.flush()
             os.makedirs(save_path, exist_ok=True)
+            checkpoint_path = os.path.join(
+                save_path, f"{name_prefix}_{self._global_step}"
+            )
+            if getattr(self, "_replay_archive", None) is not None:
+                # Legacy tuple callers also need portable replay metadata.
+                target = explicit_checkpoint_target(
+                    checkpoint_path,
+                    step=self._global_step,
+                    episode=self._episode_idx,
+                    trial_run_params=getattr(self, "run_params", {}),
+                    experiment_params=getattr(self, "experiment_params", {}),
+                    kind="periodic",
+                )
+                self._checkpoint_writer.enqueue_many(
+                    self.agent.checkpoint_state(),
+                    self._checkpoint_targets_with_replay((target,)),
+                    signature=self._checkpoint_signature(),
+                )
+                return
             self._checkpoint_writer.enqueue(
                 self.agent.checkpoint_state(),
-                os.path.join(save_path, f"{name_prefix}_{self._global_step}"),
+                checkpoint_path,
                 signature=self._checkpoint_signature(),
             )
             return
@@ -1457,7 +1477,7 @@ class TDMPC2Baseline(Algorithm):
             self.alg_logger.flush()
         self._checkpoint_writer.enqueue_many(
             self.agent.checkpoint_state(),
-            targets,
+            self._checkpoint_targets_with_replay(targets),
             signature=self._checkpoint_signature(),
         )
 
@@ -1471,7 +1491,7 @@ class TDMPC2Baseline(Algorithm):
             self.alg_logger.flush()
         return self._checkpoint_writer.save_many(
             self.agent.checkpoint_state(),
-            targets,
+            self._checkpoint_targets_with_replay(targets),
             signature=self._checkpoint_signature(),
         )
 
@@ -2034,6 +2054,14 @@ class TDMPC2Baseline(Algorithm):
                         "Set alg_params.episodic=true or disable true terminations in the env."
                     )
                 self.buffer.add(self._episode_staging[:episode_rows])
+                if getattr(self, "_replay_archive", None) is not None:
+                    # The archive owns its copies before this CPU staging area
+                    # is reused. Only episodes actually inserted in replay enter
+                    # a checkpoint's reference distribution.
+                    self._replay_archive.append_episode(
+                        self._episode_staging[:episode_rows],
+                        episode_id=self.buffer.num_eps - 1,
+                    )
 
             if self._global_step > self.cfg.seed_steps and self.buffer.num_eps > 0:
                 num_updates = (
@@ -2329,6 +2357,10 @@ class TDMPC2Baseline(Algorithm):
                 self._checkpoint_writer.shutdown()
             except BaseException as exc:
                 cleanup_errors.append(exc)
+            try:
+                self.close_replay_archive()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
             if cleanup_errors:
                 if primary_error is not None:
                     add_cleanup_notes(
@@ -2372,9 +2404,29 @@ class TDMPC2Baseline(Algorithm):
             )
         return self._checkpoint_writer.save_many(
             self.agent.checkpoint_state(),
-            (target,),
+            self._checkpoint_targets_with_replay((target,)),
             signature=self._checkpoint_signature(),
         )[0]
+
+    def _checkpoint_targets_with_replay(self, targets):
+        """Publish completed replay data before a checkpoint can reference it."""
+        archive = getattr(self, "_replay_archive", None)
+        if archive is None:
+            return targets
+        # A preceding asynchronous publication may still own the same alias.
+        # Finish it before capturing the next immutable manifest/reference.
+        self._checkpoint_writer.flush()
+        for target in targets:
+            target.metadata["replay"] = archive.checkpoint_reference(
+                target.path, step=int(self._global_step)
+            )
+        return targets
+
+    def close_replay_archive(self):
+        """Finish optional replay writes; later model saves may still snapshot it."""
+        archive = getattr(self, "_replay_archive", None)
+        if archive is not None:
+            archive.close()
 
     def _checkpoint_signature(self):
         """Version the exact outer state represented by native checkpoints."""

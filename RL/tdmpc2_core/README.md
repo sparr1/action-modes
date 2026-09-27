@@ -85,12 +85,47 @@ The XQC controller semantics reuse the PyTorch port of official XQC commit
 `9a6832bb742ef01bbe9f1e06153a9338e612dae5`; TOLD remains derived from the
 TD-MPC2 source identified above.
 
+The optional `aux_return_mode="xqc"` adds reward-only policy evaluation under
+the main persistent XQC actor. It owns twin online/target categorical critics
+and a critic optimizer, with the main critic's architecture, support, BN
+semantics, projected weights, discount, real reward scale, and learning-rate
+schedule. It creates no auxiliary actor or entropy optimizer. The default
+`aux_return_detach_representation=true` detaches recurrent latent inputs from
+this loss; `false` allows its `aux_return_critic_coef` (default 0.1, positive)
+loss contribution to train the shared representation. `aux_return_mode="off"`
+is the compatibility default and adds no auxiliary training work.
+The auxiliary optimizer receives unscaled CE gradients directly; the
+coefficient weights only the auxiliary contribution to the representation.
+
+`inner_critic_source` independently chooses the online `"xqc"` or
+`"aux_return"` critic copied into the fresh inner online and target critics.
+The inner actor and temperature always come from the main learner. The
+resolved `inner_critic_target` defaults to `"entropy_augmented"` for XQC
+initialization and `"reward_only"` for auxiliary initialization; either may be
+explicitly selected. `inner_horizon_critic_source` independently chooses the
+frozen outer critic for `inner_terminal_bootstrap="outer"`. Both sources
+default to `"xqc"`; any auxiliary selection requires an auxiliary-enabled
+backbone and `inner_reward_normalization="frozen_real_scale"`, even if dormant.
+Auxiliary frozen horizon continuations always omit entropy. A reward-only
+inner target with a main soft-Q tail still includes the tail's learned future
+entropy; a soft inner target with an auxiliary tail includes entropy within
+the adapting imagined prefix only. These are explicit mixed-objective
+ablations, not implicit conversions between soft values and reward returns.
+
+Version-5 checkpoints include the auxiliary learner when enabled and record
+all three inner selections. Versions 1–4 migrate to auxiliary-off,
+XQC/XQC sources, and an entropy-augmented inner target. Strict loading retains
+outer training semantics; frozen evaluation may override the inner choices
+only when the required auxiliary weights already exist. MPPI always retains
+its main-XQC soft tail.
+
 The optional `inner_terminal_bootstrap="outer"` ablation changes the Bellman
 target only for a nonterminated transition at the imagined horizon boundary.
 It samples the frozen persistent actor using the existing bootstrap noise,
 queries the frozen online twin critics with running BatchNorm statistics,
 selects the lower-expectation categorical distribution, and applies the same
-XQC projection and current inner-temperature entropy weighting. Earlier
+XQC projection and, for the default soft target/main critic, current
+inner-temperature entropy weighting. Earlier
 transitions retain the adapting inner actor and target critics. The original
 joined current/next batches used by inner critic BatchNorm remain intact;
 replacing their next actions would unintentionally change other rows too.
@@ -199,6 +234,11 @@ from real-replay actor values; each root-local SAC solve freezes one snapshot
 for the whole action. Rewards, Bellman targets, temperature losses, TD3, and
 MPPI are not normalized by this option.
 
-Model saves are suitable for evaluation and weight transfer. They do not include
-replay, environment state, or all trainer counters, so they are not exact
-mid-run resume checkpoints.
+Model saves are suitable for evaluation and weight transfer. State-observation
+AMBI-XQC runs can additionally set the top-level `save_replay_buffer: true`
+checkpoint option to retain completed real experience in a separate incremental
+archive. Each model sidecar references its checkpoint-matched resident replay;
+`utils.replay_archive.load_checkpoint_replay` loads raw reference sequences for
+later experiments. This option leaves training, BatchNorm, and evaluation
+behavior unchanged. Portable model saves still omit environment state and the
+complete trainer state, so this archive does not enable exact training resume.

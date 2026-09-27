@@ -9,6 +9,7 @@ at every real decision.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 import warnings
 
 import numpy as np
@@ -49,6 +50,12 @@ _AMBIXQC_DEFAULTS = {
     "xqc_optimizer_backend": "auto",
     "xqc_reward_normalization": True,
 
+    # Optional policy-evaluation critic; the persistent XQC actor remains the
+    # only outer policy. Its optimizer and LR schedule follow the main critic.
+    "aux_return_mode": "off",
+    "aux_return_detach_representation": True,
+    "aux_return_critic_coef": 0.1,
+
     # Canonical action-local AMBI compute budget.  The local schedule counter
     # starts at zero on every real decision; actor and temperature optimizers
     # therefore run at local slots 0, 3, 6, ... by default.
@@ -62,6 +69,9 @@ _AMBIXQC_DEFAULTS = {
     "inner_replay_capacity": None,
     "inner_replay_sampling": "with_replacement",
     "inner_terminal_bootstrap": "inner",
+    "inner_critic_source": "xqc",
+    "inner_horizon_critic_source": "xqc",
+    "inner_critic_target": None,
     # Existing experiments retain the real-stream scale snapshot. Heavy
     # inner-data screens can opt into fresh action-local imagined-return
     # moments without contaminating the persistent real-data normalizer.
@@ -83,12 +93,18 @@ _PUBLIC_INNER_KEYS = {
     "inner_replay_capacity",
     "inner_replay_sampling",
     "inner_terminal_bootstrap",
+    "inner_critic_source",
+    "inner_horizon_critic_source",
+    "inner_critic_target",
     "inner_reward_normalization",
     "inner_actor_lr",
     "inner_critic_lr",
     "inner_diagnostics_every",
 }
 _PUBLIC_XQC_KEYS = {key for key in _AMBIXQC_DEFAULTS if key.startswith("xqc_")}
+_PUBLIC_AUX_RETURN_KEYS = {
+    key for key in _AMBIXQC_DEFAULTS if key.startswith("aux_return_")
+}
 
 
 # These settings describe other algorithms or make faithful XQC behavior
@@ -138,6 +154,9 @@ _INCOMPATIBLE_EXPLICIT_KEYS = {
     "sac_actor_loss_scale_mode",
     "sac_actor_loss_scale_tau",
     "critic_coef",
+    "critic_value_mode",
+    "actor_source",
+    "outer_actor_source",
     "log_std_mapping",
     "log_std_min",
     "log_std_max",
@@ -272,6 +291,7 @@ class AMBIXQC(AMBITDMPC2):
                 for key in params
                 if (key.startswith("inner_") and key not in _PUBLIC_INNER_KEYS)
                 or (key.startswith("xqc_") and key not in _PUBLIC_XQC_KEYS)
+                or (key.startswith("aux_return_") and key not in _PUBLIC_AUX_RETURN_KEYS)
                 or "lora" in key.lower()
             )
         )
@@ -279,7 +299,9 @@ class AMBIXQC(AMBITDMPC2):
         if incompatible:
             raise ValueError(
                 "AMBIXQC has fixed XQC/action-local semantics and does not accept "
-                f"these AMBI or standalone-XQC options: {incompatible}."
+                f"these AMBI or standalone-XQC options: {incompatible}. "
+                "Use aux_return_mode='xqc' for the optional return critic; "
+                "actors always inherit the main XQC policy."
             )
         if "mpc" in params and params["mpc"] is not False:
             raise ValueError("AMBIXQC does not use MPPI; mpc must be false.")
@@ -324,6 +346,36 @@ class AMBIXQC(AMBITDMPC2):
             "dtype": str(self.env.action_space.dtype),
         }
         cfg.value_coef = _finite_float(cfg.value_coef, "value_coef", positive=True)
+        if not isinstance(cfg.aux_return_mode, str) or cfg.aux_return_mode.lower() not in {
+            "off", "xqc"
+        }:
+            raise ValueError("aux_return_mode must be 'off' or 'xqc'.")
+        cfg.aux_return_mode = cfg.aux_return_mode.lower()
+        if not isinstance(cfg.aux_return_detach_representation, (bool, np.bool_)):
+            raise ValueError("aux_return_detach_representation must be a boolean.")
+        cfg.aux_return_detach_representation = bool(cfg.aux_return_detach_representation)
+        cfg.aux_return_critic_coef = _finite_float(
+            cfg.aux_return_critic_coef, "aux_return_critic_coef", positive=True
+        )
+        for key in ("inner_critic_source", "inner_horizon_critic_source"):
+            value = getattr(cfg, key)
+            if not isinstance(value, str) or value.lower() not in {"xqc", "aux_return"}:
+                raise ValueError(f"{key} must be 'xqc' or 'aux_return'.")
+            setattr(cfg, key, value.lower())
+        if cfg.inner_critic_target is None:
+            cfg.inner_critic_target = (
+                "reward_only" if cfg.inner_critic_source == "aux_return"
+                else "entropy_augmented"
+            )
+        if (
+            not isinstance(cfg.inner_critic_target, str)
+            or cfg.inner_critic_target.lower() not in {"entropy_augmented", "reward_only"}
+        ):
+            raise ValueError(
+                "inner_critic_target must be 'entropy_augmented', 'reward_only', "
+                "or null to use the initialization-source default."
+            )
+        cfg.inner_critic_target = cfg.inner_critic_target.lower()
 
         cfg.xqc_actor_net_arch = _architecture(
             cfg.xqc_actor_net_arch, "xqc_actor_net_arch"
@@ -455,6 +507,16 @@ class AMBIXQC(AMBITDMPC2):
                 "inner_reward_normalization must be 'frozen_real_scale' or "
                 "'action_local_imagined'."
             )
+        if "aux_return" in (cfg.inner_critic_source, cfg.inner_horizon_critic_source):
+            if cfg.aux_return_mode != "xqc":
+                raise ValueError(
+                    "An aux_return inner critic source requires aux_return_mode='xqc'."
+                )
+            if cfg.inner_reward_normalization != "frozen_real_scale":
+                raise ValueError(
+                    "An aux_return inner critic source requires "
+                    "inner_reward_normalization='frozen_real_scale'."
+                )
         cfg.inner_actor_lr = _finite_float(
             cfg.inner_actor_lr, "inner_actor_lr", positive=True
         )
@@ -535,6 +597,26 @@ class AMBIXQC(AMBITDMPC2):
 
     def _make_agent(self, cfg):
         return AMBIXQCAgent(cfg)
+
+    def enable_replay_archive(self, save_path, name_prefix):
+        """Preserve completed real episodes beside portable model checkpoints."""
+        from utils.replay_archive import ReplayArchiveWriter
+
+        if self.cfg.obs != "state":
+            raise NotImplementedError(
+                "AMBI-XQC replay preservation supports state observations only."
+            )
+        if self._global_step != 0 or self.buffer.num_eps != 0:
+            raise RuntimeError("Replay preservation must be enabled before collection.")
+        if self._replay_archive is not None:
+            raise RuntimeError("Replay preservation is already enabled for this learner.")
+        self._replay_archive = ReplayArchiveWriter(
+            Path(save_path) / f"{name_prefix}.replay",
+            capacity=int(self.buffer.capacity),
+            observation_shape=tuple(self.cfg.obs_shape["state"]),
+            action_dim=int(self.cfg.action_dim),
+        )
+        return self._replay_archive
 
     def load(self, path, *, frozen_evaluation=False):
         """Load a checkpoint, optionally selecting a frozen evaluation controller."""

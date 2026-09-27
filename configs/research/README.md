@@ -42,6 +42,89 @@ Checkpoint return, paired improvement and runtime use
 the portable artifact and existing HTML report.
 
 
+## AMBI-XQC auxiliary return critic evaluation
+
+A backbone trained with `alg_params.aux_return_mode="xqc"` saves a separate
+reward-only XQC critic in its version-5 checkpoint. Its outer actor is still
+the main XQC policy. Existing version-1–4 checkpoints have no auxiliary critic
+and remain valid for the established XQC/MPPI evaluations.
+
+Checkpoint-based matrix variants can independently override
+`inner_critic_source` and `inner_horizon_critic_source` to `"xqc"` or
+`"aux_return"`, and `inner_critic_target` to `"entropy_augmented"` or
+`"reward_only"`. Initialization copies the selected online critic into both
+the inner online and target critics. The horizon choice is used only with
+`inner_terminal_bootstrap="outer"`; it does not choose the inner actor, which
+always inherits the main policy. Any auxiliary selection requires the saved
+auxiliary learner and `inner_reward_normalization="frozen_real_scale"`, even
+for a currently inactive inner controller or horizon override.
+
+When a preset changes initialization source without explicitly specifying a
+target, resolution recomputes its default: XQC initialization uses the soft
+target, and auxiliary initialization uses the reward-only target. Otherwise
+the saved target is retained. An explicit null target requests this same
+source-dependent default. Changing only the horizon source does not silently
+change the adapting critic's target. Outer auxiliary training options cannot
+be changed through a frozen-evaluation matrix.
+
+For a reward-only inner solve with a frozen auxiliary horizon continuation,
+use this variant's `alg_params` on an auxiliary-enabled checkpoint:
+
+```json
+{
+  "inner_operator": "xqc",
+  "inner_critic_source": "aux_return",
+  "inner_horizon_critic_source": "aux_return",
+  "inner_critic_target": "reward_only",
+  "inner_terminal_bootstrap": "outer",
+  "inner_reward_normalization": "frozen_real_scale"
+}
+```
+
+Auxiliary horizon continuations omit entropy even for an entropy-augmented
+inner target. Conversely, a reward-only target with a frozen main XQC tail
+still contains the tail's learned future entropy. Treat these mixed choices
+as explicit ablations. Resolved configurations, checkpoint provenance, and
+planner labels distinguish initialization, horizon, and target choices;
+frozen-state checks include the saved auxiliary learner. MPPI keeps its
+existing main-XQC soft-value tail. Existing matrices and campaign defaults
+are unchanged.
+
+## AMBI-XQC 1M backbone replay comparison
+
+The three `ambixqc_humanoid_walk_backbone_replay_1m_<arm>.json` presets have
+matching algorithm files under `configs/dmcontrol/algs/` and single-run
+manifests under `configs/dmcontrol/experiments/`:
+
+| Arm | Auxiliary mode | Detach representation |
+| --- | --- | --- |
+| `baseline` | `off` | `true` (inactive) |
+| `aux_shared` | `xqc` | `false` |
+| `aux_detached` | `xqc` | `true` |
+
+All three train Humanoid Walk state backbones at seed 55 for one million
+agent decisions. They preserve the earlier 1.5M prior bank's model-size-5
+TOLD/XQC architecture, 2,500-step random warmup and pretraining, and remaining
+outer learning settings, with the learning-rate schedule spanning the new 1M
+budget. Training uses eager execution, `inner_operator="none"`, no online
+evaluation, and stochastic persistent-policy actions after warmup. Auxiliary
+critics use coefficient 0.1 and the main critic's optimizer/LR schedule;
+only representation detachment differs between the two auxiliary arms.
+
+Each manifest enables top-level `save_replay_buffer=true` and retains all 40
+checkpoints at 25,000-decision intervals. Completed replay episodes are stored
+once in immutable chunks, and each checkpoint references its resident replay
+snapshot. Preserve the replay directory alongside the checkpoint/metadata
+pairs when transferring results. Replay preservation does not enable exact
+trainer resume. Dormant inner defaults remain J2/N32/H3/G4, frozen real reward
+scale, main-XQC initialization/horizon sources, and entropy-augmented targets;
+later auxiliary inner evaluation requires explicit overrides.
+
+The three runs share W&B group `ambixqc-humanoid-walk-backbone-replay-1m`, with
+distinct arm names/tags. This is a paired-seed exploratory comparison, not
+multi-seed confirmation. The pre-existing 1.5M checkpoint bank and research
+evaluation matrices are unchanged.
+
 ## AMBI-XQC inner J6 checkpoint campaign
 
 `ambixqc_humanoid_inner_j6_benchmark.json` evaluates native inner XQC with

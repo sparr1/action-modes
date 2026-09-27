@@ -10,6 +10,7 @@ it never reads live model or optimizer storage.
 from __future__ import annotations
 
 import copy
+import hashlib
 import os
 import shutil
 import tempfile
@@ -216,10 +217,38 @@ class AsyncCheckpointWriter:
                 path, metadata = publication
             else:
                 path, metadata = publication, None
+            if metadata is not None and "replay" in metadata:
+                replay = metadata["replay"]
+                if not isinstance(replay, dict):
+                    raise ValueError("Checkpoint replay reference must be a mapping.")
+                if replay.get("step") != metadata.get("checkpoint", {}).get("step"):
+                    raise ValueError("Checkpoint and replay reference steps do not match.")
             normalized.append((os.fspath(path), copy.deepcopy(metadata)))
         if not normalized:
             raise ValueError("At least one checkpoint publication target is required.")
         return tuple(normalized)
+
+    @staticmethod
+    def _checkpoint_sha256(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    @classmethod
+    def _publish_metadata(cls, publications):
+        # Bind replay to the serialized model bytes, including when an explicit
+        # final save reuses a previous snapshot. Ordinary saves incur no hash I/O.
+        digest = None
+        if any(metadata is not None and "replay" in metadata
+               for _, metadata in publications):
+            digest = cls._checkpoint_sha256(publications[0][0])
+        for path, metadata in publications:
+            if metadata is not None:
+                if "replay" in metadata:
+                    metadata["replay"]["checkpoint_sha256"] = digest
+                write_metadata_atomic(path, metadata)
 
     @staticmethod
     def _write_many(snapshot, publications):
@@ -243,9 +272,7 @@ class AsyncCheckpointWriter:
                 paths.append(_atomic_clone(first, path))
             fsync_checkpoint_files(path for path, _ in publications)
             fsync_checkpoint_directories(path for path, _ in publications)
-            for path, metadata in publications:
-                if metadata is not None:
-                    write_metadata_atomic(path, metadata)
+            AsyncCheckpointWriter._publish_metadata(publications)
             return tuple(paths)
         finally:
             try:
@@ -317,9 +344,10 @@ class AsyncCheckpointWriter:
                     _atomic_clone(self._last_path, target)
             fsync_checkpoint_files(targets)
             fsync_checkpoint_directories(targets)
-            for target, (_, metadata) in zip(targets, normalized):
-                if metadata is not None:
-                    write_metadata_atomic(target, metadata)
+            self._publish_metadata(tuple(
+                (target, metadata)
+                for target, (_, metadata) in zip(targets, normalized)
+            ))
             self._last_path = targets[0]
             return targets
 

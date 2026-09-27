@@ -75,6 +75,7 @@ class CheckpointConfig:
     every: int | None
     strategies: tuple[str, ...]
     best_window: int
+    save_replay_buffer: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -105,6 +106,16 @@ def resolve_checkpoint_config(
     every = resolved("checkpoint_every", None)
     strategies = normalize_save_strat(resolved("save_strat", None))
     best_window = resolved("checkpoint_best_window", 100)
+    save_replay_buffer = resolved("save_replay_buffer", False)
+    for source in (trial, experiment):
+        nested = source.get("alg_params")
+        if isinstance(nested, Mapping) and "save_replay_buffer" in nested:
+            raise ValueError(
+                "save_replay_buffer belongs at the top level beside checkpoint_every, "
+                "not in alg_params."
+            )
+    if not isinstance(save_replay_buffer, bool):
+        raise ValueError("save_replay_buffer must be a boolean.")
 
     if every is not None:
         if isinstance(every, bool):
@@ -127,7 +138,22 @@ def resolve_checkpoint_config(
     if not math.isfinite(numeric_window) or best_window <= 0 or numeric_window != best_window:
         raise ValueError("checkpoint_best_window must be a positive integer.")
 
-    return CheckpointConfig(every=every, strategies=strategies, best_window=best_window)
+    config = CheckpointConfig(
+        every=every,
+        strategies=strategies,
+        best_window=best_window,
+        save_replay_buffer=save_replay_buffer,
+    )
+    if (
+        save_replay_buffer
+        and not config.enabled
+        and experiment.get("save_trials", "first") not in ("first", "all", "best")
+    ):
+        raise ValueError(
+            "save_replay_buffer requires periodic checkpointing or a final "
+            "model-saving policy (save_trials='first', 'all', or 'best')."
+        )
+    return config
 
 
 @dataclass(frozen=True)

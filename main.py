@@ -85,6 +85,27 @@ def _learn_resets_env_with_seed(alg_path):
     return alg_path in _SEEDED_LEARN_RESET_ALGORITHMS
 
 
+def _validate_replay_archive_config(
+    run_params, experiment_params, checkpoint_config, *, resume_requested
+):
+    """Reject unsupported replay exports before creating environments/artifacts."""
+    if not checkpoint_config.save_replay_buffer:
+        return
+    if resume_requested:
+        raise ValueError(
+            "save_replay_buffer cannot be combined with exact resume mode. "
+            "It preserves evaluation replay alongside portable model checkpoints."
+        )
+    if run_params.get("alg") not in {"AMBIXQC/AMBIXQC", "AMBIXQC/AMBIXQCBaseline"}:
+        raise ValueError(
+            "save_replay_buffer currently supports only AMBIXQC/AMBIXQC."
+        )
+    algorithm_obs = (run_params.get("alg_params") or {}).get("obs", "state")
+    environment_obs = (experiment_params.get("env_params") or {}).get("obs", "state")
+    if any(str(mode).lower() != "state" for mode in (algorithm_obs, environment_obs)):
+        raise ValueError("save_replay_buffer supports state observations only.")
+
+
 def _remove_saved_checkpoint(checkpoint_path):
     """Remove superseded cross-trial artifacts and their matching sidecars."""
 
@@ -264,6 +285,9 @@ _RUNTIME_CONFIG_FIELDS = (
     "inner_replay_capacity",
     "inner_replay_sampling",
     "inner_reward_normalization",
+    "inner_critic_source",
+    "inner_horizon_critic_source",
+    "inner_critic_target",
     "inner_replay_scope",
     "inner_critic_dropout_enabled",
     "inner_model_step_budget",
@@ -289,6 +313,9 @@ _RUNTIME_CONFIG_FIELDS = (
     "xqc_reward_normalization",
     "xqc_lr_transition_steps",
     "xqc_official_commit",
+    "aux_return_mode",
+    "aux_return_detach_representation",
+    "aux_return_critic_coef",
 )
 
 
@@ -469,6 +496,9 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
         "inner_replay_capacity",
         "inner_replay_sampling",
         "inner_reward_normalization",
+        "inner_critic_source",
+        "inner_horizon_critic_source",
+        "inner_critic_target",
         "inner_replay_scope",
         "inner_critic_dropout_enabled",
         "inner_model_step_budget",
@@ -536,6 +566,12 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
     }
     if xqc:
         metadata["xqc"] = xqc
+        metadata["aux_return"] = {
+            key: resolved[key] for key in (
+                "aux_return_mode", "aux_return_detach_representation",
+                "aux_return_critic_coef",
+            ) if key in resolved
+        }
     if actor_loss_scale:
         metadata["actor_loss_scale"] = actor_loss_scale
     return _json_safe_metadata(metadata)
@@ -902,6 +938,13 @@ def main():
     checkpointing_requested = any(config.enabled for config in checkpoint_configs)
 
     resume_requested = args["resume_mode"] is not None or args["lineage_dir"] is not None
+    for run_params, checkpoint_config in zip(runtime_params, checkpoint_configs):
+        _validate_replay_archive_config(
+            run_params,
+            experiment_params,
+            checkpoint_config,
+            resume_requested=resume_requested,
+        )
     if resume_requested:
         if args["resume_mode"] is None or args["lineage_dir"] is None:
             raise ValueError(
@@ -1043,6 +1086,10 @@ def main():
                     json.dumps(trial_run_params["resolved_runtime"], sort_keys=True),
                 )
 
+                if checkpoint_config.save_replay_buffer:
+                    model.enable_replay_archive(
+                        model_save_dir, name_prefix=f'model:{alg_config}_{t}'
+                    )
                 if checkpoint_config.enabled:
                     if not supports_composable_checkpointing(model):
                         raise ValueError(
@@ -1066,6 +1113,12 @@ def main():
                     if writer is not None:
                         try:
                             writer.shutdown()
+                        except BaseException as cleanup_error:
+                            cleanup_errors.append(cleanup_error)
+                    close_archive = getattr(model, "close_replay_archive", None)
+                    if callable(close_archive):
+                        try:
+                            close_archive()
                         except BaseException as cleanup_error:
                             cleanup_errors.append(cleanup_error)
                     close_model = getattr(model, "close", None)
@@ -1150,6 +1203,12 @@ def main():
                 if writer is not None:
                     try:
                         writer.shutdown()
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
+                close_archive = getattr(model, "close_replay_archive", None)
+                if callable(close_archive):
+                    try:
+                        close_archive()
                     except BaseException as exc:
                         cleanup_errors.append(exc)
                 close_model = getattr(model, "close", None)

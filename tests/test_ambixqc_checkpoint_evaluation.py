@@ -13,7 +13,7 @@ from RL.AMBIXQC import AMBIXQC
 
 
 @pytest.fixture
-def checkpoint_case(tmp_path):
+def checkpoint_case(tmp_path, request):
     params = {
         "device": "cpu", "model_size": None, "enc_dim": 16, "mlp_dim": 16,
         "latent_dim": 8, "num_enc_layers": 2, "simnorm_dim": 4,
@@ -28,6 +28,7 @@ def checkpoint_case(tmp_path):
         "inner_updates_per_round": 4, "inner_batch_size": 2,
         "inner_replay_capacity": 4, "inner_diagnostics_every": 1,
     }
+    params.update(getattr(request, "param", {}))
     run = {"alg": "AMBIXQC/AMBIXQC", "env": "Pendulum-v1", "seed": 3,
            "total_steps": 10, "device": "cpu", "alg_params": params}
     environment = {"env_params": {"max_episode_steps": 3}}
@@ -94,7 +95,7 @@ def test_paired_controllers_frozen_bundle_and_actual_delayed_counts(checkpoint_c
         assert result["environment_seeds"] == [101, 102]
         assert result["paired_return_delta_vs_reference"]["count"] == 2
         assert result["saved_algorithm_config"]["alg_params"]["inner_operator"] == "none"
-        assert result["checkpoint_evaluation_provenance"]["checkpoint_version"] == 4
+        assert result["checkpoint_evaluation_provenance"]["checkpoint_version"] == 5
     manifest = json.loads((bundle / "manifest.json").read_text())
     assert manifest["status"] == "complete"
     for run in manifest["runs"]:
@@ -106,6 +107,34 @@ def test_paired_controllers_frozen_bundle_and_actual_delayed_counts(checkpoint_c
                    == expected for event in events)
         assert all("decision/reward" in event["metrics"] and
                    event["metrics"]["decision/control_seconds"] >= 0 for event in events)
+
+
+@pytest.mark.parametrize("checkpoint_case", [{"aux_return_mode": "xqc"}], indirect=True)
+def test_auxiliary_checkpoint_evaluates_independent_routes_with_frozen_bundle(checkpoint_case, tmp_path):
+    matrix_path, checkpoint = checkpoint_case
+    matrix = json.loads(matrix_path.read_text())
+    variants = matrix["comparisons"]["controller"]["variants"]
+    for name, source in (("auxiliary", "aux_return"), ("mixed", "xqc")):
+        variants[name] = {"alg_params": {
+            "inner_operator": "xqc", "inner_terminal_bootstrap": "outer",
+            "inner_critic_source": source, "inner_horizon_critic_source": "aux_return",
+        }}
+    matrix_path.write_text(json.dumps(matrix))
+    payload = evaluator.evaluate_matrix(
+        matrix_path, checkpoint, selectors=["controller/auxiliary", "controller/mixed"],
+        bundle_dir=tmp_path / "auxiliary_bundle",
+    )
+    assert len(payload["results"]) == 2
+    signatures = [result["checkpoint_evaluation_provenance"]["evaluated_semantic_signature"]
+                  for result in payload["results"]]
+    assert {signature["inner_critic_source"] for signature in signatures} == {"xqc", "aux_return"}
+    for result, signature in zip(payload["results"], signatures):
+        assert result["outer_state_unchanged"]
+        assert signature["aux_return"]["mode"] == "xqc"
+        assert signature["inner_horizon_critic_source"] == "aux_return"
+        assert signature["inner_critic_target"] == (
+            "reward_only" if signature["inner_critic_source"] == "aux_return" else "entropy_augmented"
+        )
 
 
 def test_episode_seeds_are_order_independent_and_warmup_is_unscored(checkpoint_case, tmp_path):

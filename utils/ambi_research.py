@@ -26,6 +26,7 @@ _XQC_CHECKPOINT_INNER_PARAMS = {
     "inner_terminal_bootstrap",
     "inner_update_timing",
     "inner_policy_delay",
+    "inner_critic_source", "inner_horizon_critic_source", "inner_critic_target",
 }
 _MPPI_PARAMETERS = {
     "horizon", "iterations", "num_samples", "num_elites", "num_pi_trajs",
@@ -360,8 +361,36 @@ def resolve_preset(matrix_path, selector, matrix=None, *, checkpoint_context=Non
     alg_params = _require_mapping(
         algorithm_config.get("alg_params"), f"{base_path}.alg_params"
     )
+    previous_critic_source = str(alg_params.get("inner_critic_source", "xqc")).lower()
     _apply_alg_overrides(alg_params, matrix.get("shared_alg_params", {}))
     _apply_alg_overrides(alg_params, variant.get("alg_params", {}))
+    if algorithm_config.get("alg") == "AMBIXQC/AMBIXQC":
+        authored = {**matrix.get("shared_alg_params", {}), **variant.get("alg_params", {})}
+        for key in ("inner_critic_source", "inner_horizon_critic_source"):
+            if key in alg_params:
+                value = alg_params[key]
+                if not isinstance(value, str) or value.lower() not in {"xqc", "aux_return"}:
+                    raise PresetMatrixError(f"{key} must be 'xqc' or 'aux_return'.")
+                alg_params[key] = value.lower()
+        critic_source = alg_params.get("inner_critic_source", "xqc")
+        if critic_source != previous_critic_source and "inner_critic_target" not in authored:
+            # A saved resolved target belongs to its initialization source.
+            # Changing that source alone requests the new source's default.
+            alg_params["inner_critic_target"] = (
+                "reward_only" if critic_source == "aux_return" else "entropy_augmented"
+            )
+        if "aux_return" in (
+            critic_source, alg_params.get("inner_horizon_critic_source", "xqc")
+        ):
+            if str(alg_params.get("aux_return_mode", "off")).lower() != "xqc":
+                raise PresetMatrixError(
+                    "An aux_return critic source requires a checkpoint trained with "
+                    "aux_return_mode='xqc'; auxiliary critics cannot be created during evaluation."
+                )
+            if str(alg_params.get("inner_reward_normalization", "frozen_real_scale")).lower() != "frozen_real_scale":
+                raise PresetMatrixError(
+                    "An aux_return critic source requires inner_reward_normalization='frozen_real_scale'."
+                )
     algorithm_config.update(copy.deepcopy(variant.get("run_params", {})))
     evaluation_controller = copy.deepcopy(variant.get("evaluation_controller"))
     if evaluation_controller is not None:

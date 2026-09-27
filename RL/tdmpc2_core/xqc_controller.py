@@ -16,6 +16,8 @@ from typing import Any
 import torch
 from torch import nn
 
+from .common.training_state import preflight_module_state
+
 from RL.xqc_core import (
     XQCActor,
     XQCTwinCritic,
@@ -321,19 +323,34 @@ class LatentXQCController(nn.Module):
         }
 
     @torch.no_grad()
-    def reset_prior_from_(self, source: "LatentXQCController"):
+    def reset_prior_from_(self, source: "LatentXQCController", *, critic_source=None):
         if not isinstance(source, LatentXQCController):
             raise TypeError("source must be a LatentXQCController.")
         if self.critic_signature != source.critic_signature:
             raise ValueError("Cannot copy incompatible latent XQC controllers.")
+        selected_critic = source.critic if critic_source is None else critic_source
+        if critic_source is not None:
+            self._validate_critic_source(selected_critic)
         self.actor.load_state_dict(source.actor.state_dict())
-        self.critic.load_state_dict(source.critic.state_dict())
+        self.critic.load_state_dict(selected_critic.state_dict())
         # A fresh inner target starts from the copied online critic, including
         # its BN buffers.  Subsequent target EMA updates parameters only.
-        self.critic_target.load_state_dict(source.critic.state_dict())
+        self.critic_target.load_state_dict(selected_critic.state_dict())
         self.log_temperature.copy_(source.log_temperature)
         self._refresh_cached_tensors()
         return self
+
+    def _validate_critic_source(self, critic):
+        if not isinstance(critic, XQCTwinCritic):
+            raise TypeError("Selected XQC critic must be an XQCTwinCritic.")
+        preflight_module_state(self.critic, critic.state_dict(), "Selected XQC critic")
+        # Equal tensor shapes are insufficient: a changed C51 support changes
+        # the units represented by every output atom.
+        equal_support = torch.eq(critic.support, self.critic.support).all()
+        if equal_support.device.type == "cuda":
+            torch._assert_async(equal_support, "Selected XQC critic support is incompatible.")
+        elif not bool(equal_support):
+            raise ValueError("Selected XQC critic support is incompatible.")
 
     def critic_objective(
         self,
@@ -343,7 +360,19 @@ class LatentXQCController(nn.Module):
         reward_scale: float | torch.Tensor = 1.0,
         outer_terminal_mask: torch.Tensor | None = None,
         outer_controller: "LatentXQCController | None" = None,
+        critic_target_kind: str = "entropy_augmented",
+        outer_critic: XQCTwinCritic | None = None,
+        outer_critic_is_return: bool = False,
     ) -> LatentXQCCriticObjective:
+        if critic_target_kind not in {"entropy_augmented", "reward_only"}:
+            raise ValueError("critic_target_kind must be 'entropy_augmented' or 'reward_only'.")
+        if type(outer_critic_is_return) is not bool:
+            raise ValueError("outer_critic_is_return must be a boolean.")
+        if outer_critic is not None or outer_critic_is_return:
+            if outer_controller is None or outer_terminal_mask is None:
+                raise ValueError("An outer critic selection requires a row mask and controller.")
+        if outer_critic is not None:
+            self._validate_critic_source(outer_critic)
         flat = batch.flattened(self.latent_dim, self.action_dim)
         leading = batch.leading_shape
         count = flat["latents"].shape[0]
@@ -405,13 +434,21 @@ class LatentXQCController(nn.Module):
                 outer_actions, outer_log_prob = outer_controller.actor.sample(
                     flat["next_latents"], bn_mode="running", noise=next_noise
                 )
-                outer_log_q = outer_controller.critic.log_probs(
+                selected_outer_critic = (
+                    outer_controller.critic if outer_critic is None else outer_critic
+                )
+                outer_log_q = selected_outer_critic.log_probs(
                     flat["next_latents"], outer_actions, bn_mode="running"
                 )
                 outer_selected, outer_values, outer_head = select_lower_distribution(
-                    outer_log_q, outer_controller.critic.support
+                    outer_log_q, selected_outer_critic.support
                 )
+                if outer_critic_is_return:
+                    outer_log_prob = torch.zeros_like(outer_log_prob)
             terminal_args = (mask, outer_log_prob, outer_selected, outer_values, outer_head)
+        target_alpha = self.temperature.detach()
+        if critic_target_kind == "reward_only":
+            target_alpha = torch.zeros_like(target_alpha)
         outputs = critic_loss(
             flat["latents"],
             flat["actions"],
@@ -421,7 +458,7 @@ class LatentXQCController(nn.Module):
             flat["discount"],
             next_noise,
             scale.reshape(()),
-            self.temperature.detach(),
+            target_alpha,
             *terminal_args,
         )
         (
@@ -672,7 +709,7 @@ class LatentXQCController(nn.Module):
             ),
         )
 
-    def clone_for_inner(self, *, actor_lr, critic_lr, transition_steps=1):
+    def clone_for_inner(self, *, actor_lr, critic_lr, transition_steps=1, critic_source=None):
         clone = LatentXQCController(
             self.latent_dim, self.action_dim, copy.deepcopy(self.config)
         ).to(next(self.parameters()).device)
@@ -680,7 +717,7 @@ class LatentXQCController(nn.Module):
             enabled=self._compile_requested,
             strict=self._compile_strict,
         )
-        clone.reset_prior_from_(self)
+        clone.reset_prior_from_(self, critic_source=critic_source)
         return clone.make_workspace(
             actor_lr=actor_lr,
             critic_lr=critic_lr,
@@ -739,8 +776,8 @@ class LatentXQCWorkspace:
         self.actor_optimizer_steps = 0
         self.temperature_optimizer_steps = 0
 
-    def reset_from_(self, source: LatentXQCController):
-        self.controller.reset_prior_from_(source)
+    def reset_from_(self, source: LatentXQCController, *, critic_source=None):
+        self.controller.reset_prior_from_(source, critic_source=critic_source)
         for optimizer in (
             self.actor_optimizer,
             self.critic_optimizer,
@@ -838,6 +875,9 @@ class LatentXQCWorkspace:
         reward_scale=1.0,
         outer_terminal_mask: torch.Tensor | None = None,
         outer_controller: LatentXQCController | None = None,
+        critic_target_kind: str = "entropy_augmented",
+        outer_critic: XQCTwinCritic | None = None,
+        outer_critic_is_return: bool = False,
     ) -> dict[str, Any]:
         terminal_kwargs = {}
         if outer_terminal_mask is not None or outer_controller is not None:
@@ -845,6 +885,12 @@ class LatentXQCWorkspace:
                 "outer_terminal_mask": outer_terminal_mask,
                 "outer_controller": outer_controller,
             }
+        if critic_target_kind != "entropy_augmented":
+            terminal_kwargs["critic_target_kind"] = critic_target_kind
+        if outer_critic is not None or outer_critic_is_return:
+            terminal_kwargs.update(
+                outer_critic=outer_critic, outer_critic_is_return=outer_critic_is_return
+            )
         objective = self.controller.critic_objective(
             batch, next_noise=next_noise, reward_scale=reward_scale, **terminal_kwargs
         )

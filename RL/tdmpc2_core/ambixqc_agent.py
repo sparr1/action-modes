@@ -22,6 +22,7 @@ from .common.training_state import (
 )
 from .common.xqc_world_model import XQCTOLDWorldModel
 from .inner_xqc import InnerXQCEngine
+from .xqc_auxiliary_return import XQCAuxiliaryReturnLearner
 from .xqc_controller import (
     LatentXQCBatch,
     LatentXQCConfig,
@@ -39,7 +40,7 @@ from RL.xqc_core import (
 class AMBIXQCAgent(nn.Module):
     """Persistent TOLD model and XQC priors with fresh inner XQC per action."""
 
-    _CHECKPOINT_VERSION = 4
+    _CHECKPOINT_VERSION = 5
 
     def __init__(self, cfg):
         super().__init__()
@@ -139,6 +140,11 @@ class AMBIXQCAgent(nn.Module):
         self._outer_generator = torch.Generator(device=generator_device)
         self._outer_generator.manual_seed(int(cfg.seed) + 9_973_199)
 
+        self.aux_return = (
+            XQCAuxiliaryReturnLearner(self.xqc_controller, cfg, self.device)
+            if getattr(cfg, "aux_return_mode", "off") == "xqc" else None
+        )
+
         self.num_updates = 0
         self.outer_version = 0
         self.last_inner_metrics = {}
@@ -224,7 +230,7 @@ class AMBIXQCAgent(nn.Module):
                 return type(value)(snapshot(item) for item in value)
             return copy.deepcopy(value)
 
-        return snapshot({
+        state = {
             "module": self.state_dict(),
             "buffers": dict(self.named_buffers()),
             "world_optimizer": self.world_optimizer.state_dict(),
@@ -236,7 +242,10 @@ class AMBIXQCAgent(nn.Module):
             "training_modes": {
                 name: module.training for name, module in self.named_modules()
             },
-        })
+        }
+        if self.aux_return is not None:
+            state["aux_return"] = self.aux_return.training_state_dict()
+        return snapshot(state)
 
     def prepare_training_resume_boundary(self):
         if not self._resume_boundary_prepared:
@@ -415,6 +424,35 @@ class AMBIXQCAgent(nn.Module):
             + float(self.cfg.termination_coef) * termination_loss
             + float(self.cfg.value_coef) * critic_loss
         )
+        primary_loss = total_loss
+        auxiliary = {}
+        if self.aux_return is not None:
+            auxiliary_states = (
+                rollout_states.detach()
+                if self.cfg.aux_return_detach_representation else rollout_states
+            )
+            auxiliary_objective = self.aux_return.critic_objective(
+                LatentXQCBatch(
+                    latents=auxiliary_states,
+                    actions=action,
+                    rewards=reward,
+                    next_latents=next_z_targets,
+                    bootstrap_mask=1.0 - terminated,
+                    discount=self.discount,
+                ),
+                actor=self.xqc_controller.actor,
+                reward_scale=self.reward_normalizer.scale,
+            )
+            auxiliary_loss = td_math.reduce_temporal_loss(
+                auxiliary_objective.per_sample_loss.mean(dim=1),
+                self.cfg.rho,
+                normalization=self.cfg.temporal_loss_normalization,
+                reference_horizon=self.cfg.temporal_loss_reference_horizon,
+                legacy_order="vector_sum_divide",
+                weights=self._transition_temporal_weights,
+            )
+            total_loss = total_loss + float(self.cfg.aux_return_critic_coef) * auxiliary_loss
+            auxiliary = {"aux_return_critic": auxiliary_objective, "aux_return_loss": auxiliary_loss}
         return {
             "latent_states": latent_states,
             "consistency_per_time": consistency_per_time,
@@ -424,8 +462,10 @@ class AMBIXQCAgent(nn.Module):
             "critic": critic_objective,
             "critic_loss": critic_loss,
             "termination_prediction": termination_prediction,
+            **auxiliary,
             "termination_loss": termination_loss,
             "total_loss": total_loss,
+            "primary_loss": primary_loss,
         }
 
     def _update_actor_and_temperature(self, latent_states):
@@ -481,7 +521,23 @@ class AMBIXQCAgent(nn.Module):
         )
         self.world_optimizer.zero_grad(set_to_none=True)
         self.xqc_workspace.zero_critic_grad()
-        losses["total_loss"].backward()
+        if self.aux_return is not None:
+            self.aux_return.zero_grad()
+            if self.cfg.aux_return_detach_representation:
+                losses["primary_loss"].backward()
+                losses["aux_return_loss"].backward()
+            else:
+                # Route the unscaled CE directly into the auxiliary optimizer.
+                # Multiplying then dividing can amplify cancellation error in
+                # near-zero BN gradients through Adam's small denominator.
+                losses["aux_return_loss"].backward(
+                    inputs=tuple(self.aux_return.critic.parameters()), retain_graph=True,
+                )
+                losses["total_loss"].backward(
+                    inputs=tuple(self._world_params) + tuple(self.xqc_controller.critic.parameters()),
+                )
+        else:
+            losses["total_loss"].backward()
 
         # TOLD's value coefficient controls how strongly value learning shapes
         # the representation.  XQC's own critic Adam still receives the
@@ -507,6 +563,7 @@ class AMBIXQCAgent(nn.Module):
         ).norm(2)
         self.world_optimizer.step()
         critic_lr, target_updated = self.xqc_workspace.step_critic()
+        auxiliary_info = self.aux_return.step() if self.aux_return is not None else {}
         actor_info = self._update_actor_and_temperature(losses["latent_states"])
 
         self.num_updates += 1
@@ -514,6 +571,8 @@ class AMBIXQCAgent(nn.Module):
         self.inner_engine.mark_outer_update(self.outer_version)
         if self.xqc_workspace.update_step != self.num_updates:
             raise RuntimeError("Outer XQC and TOLD update counters diverged.")
+        if self.aux_return is not None and self.aux_return.update_step != self.num_updates:
+            raise RuntimeError("Auxiliary XQC and TOLD update counters diverged.")
         self.model.eval()
 
         reward_values = td_math.two_hot_inv(
@@ -569,6 +628,20 @@ class AMBIXQCAgent(nn.Module):
                 )
             )
         info.update(actor_info)
+        if self.aux_return is not None:
+            auxiliary = losses["aux_return_critic"]
+            values = auxiliary.current_values.detach()
+            info.update({
+                "aux_return_critic_loss": losses["aux_return_loss"].detach(),
+                "aux_return_q_mean": values.mean(),
+                "aux_return_q_target_mean": auxiliary.target_values.detach().mean(),
+                "aux_return_q_head_disagreement": (values[0] - values[1]).abs().mean(),
+                "aux_return_q_target_clip_fraction": auxiliary.clip_fraction.detach().clone(),
+                **auxiliary_info,
+            })
+            fallback = bool(self.aux_return.compile_status["fallback"])
+            info["compile_aux_return_fallback"] = float(fallback)
+            info["compile_fallback"] = float(bool(info["compile_fallback"]) or fallback)
         return info
 
     def update(self, buffer):
@@ -594,6 +667,17 @@ class AMBIXQCAgent(nn.Module):
             "inner_terminal_bootstrap": str(getattr(self.cfg, "inner_terminal_bootstrap", "inner")),
             "inner_update_timing": str(getattr(self.cfg, "inner_update_timing", "round")),
             "inner_policy_delay": int(getattr(self.cfg, "inner_policy_delay", self.cfg.xqc_policy_delay)),
+            "inner_critic_source": str(getattr(self.cfg, "inner_critic_source", "xqc")),
+            "inner_horizon_critic_source": str(getattr(self.cfg, "inner_horizon_critic_source", "xqc")),
+            "inner_critic_target": str(getattr(self.cfg, "inner_critic_target", "entropy_augmented")),
+            "aux_return": (
+                {"mode": "off"} if self.aux_return is None else {
+                    "mode": "xqc",
+                    "target": "reward_only",
+                    "detach_representation": bool(self.cfg.aux_return_detach_representation),
+                    "critic_coef": float(self.cfg.aux_return_critic_coef),
+                }
+            ),
             "official_xqc_commit": str(self.cfg.xqc_official_commit),
             "observation": self.observation_signature(),
             "action_dim": int(self.cfg.action_dim),
@@ -668,7 +752,7 @@ class AMBIXQCAgent(nn.Module):
         }
 
     def checkpoint_state(self):
-        return {
+        state = {
             "checkpoint_version": self._CHECKPOINT_VERSION,
             "semantic_signature": self.semantic_signature(),
             "module": self.state_dict(),
@@ -680,6 +764,9 @@ class AMBIXQCAgent(nn.Module):
             "outer_version": int(self.outer_version),
             "inner": self.inner_engine.training_state_dict(),
         }
+        if self.aux_return is not None:
+            state["aux_return"] = self.aux_return.training_state_dict()
+        return state
 
     def save(self, fp):
         return save_checkpoint(self.checkpoint_state(), fp)
@@ -717,8 +804,15 @@ class AMBIXQCAgent(nn.Module):
     def _preflight_semantic_signature(self, state, *, frozen_evaluation):
         expected = self.semantic_signature()
         saved = copy.deepcopy(state["semantic_signature"])
+        if not isinstance(saved, dict):
+            raise ValueError("AMBI-XQC checkpoint semantics must be a mapping.")
         version = state["checkpoint_version"]
         legacy_defaults = {}
+        if version <= 4:
+            legacy_defaults.update(
+                aux_return={"mode": "off"}, inner_critic_source="xqc",
+                inner_horizon_critic_source="xqc", inner_critic_target="entropy_augmented",
+            )
         if version <= 3:
             legacy_defaults["inner_update_timing"] = "round"
             legacy_defaults["inner_policy_delay"] = saved.get("policy_delay")
@@ -738,6 +832,41 @@ class AMBIXQCAgent(nn.Module):
             saved["action_contract"] = None
             expected["action_contract"] = None
         require_exact_keys(saved, expected, "AMBI-XQC checkpoint semantics")
+        auxiliary = saved["aux_return"]
+        if (not isinstance(auxiliary, dict) or not isinstance(auxiliary.get("mode"), str)
+                or auxiliary["mode"] not in {"off", "xqc"}):
+            raise ValueError("AMBI-XQC checkpoint auxiliary return mode is invalid.")
+        if auxiliary["mode"] == "off":
+            require_exact_keys(auxiliary, {"mode"}, "AMBI-XQC auxiliary return semantics")
+        else:
+            require_exact_keys(
+                auxiliary, {"mode", "target", "detach_representation", "critic_coef"},
+                "AMBI-XQC auxiliary return semantics",
+            )
+            coefficient = auxiliary["critic_coef"]
+            if (
+                auxiliary["target"] != "reward_only"
+                or not isinstance(auxiliary["detach_representation"], bool)
+                or isinstance(coefficient, bool)
+                or not isinstance(coefficient, (int, float))
+                or not math.isfinite(coefficient) or coefficient <= 0
+            ):
+                raise ValueError("AMBI-XQC checkpoint auxiliary return semantics are invalid.")
+        for key in ("inner_critic_source", "inner_horizon_critic_source"):
+            if not isinstance(saved[key], str) or saved[key] not in {"xqc", "aux_return"}:
+                raise ValueError(f"AMBI-XQC checkpoint {key} is invalid.")
+        if (not isinstance(saved["inner_critic_target"], str)
+                or saved["inner_critic_target"] not in {"entropy_augmented", "reward_only"}):
+            raise ValueError("AMBI-XQC checkpoint inner critic target is invalid.")
+        uses_auxiliary = any(
+            saved[key] == "aux_return"
+            for key in ("inner_critic_source", "inner_horizon_critic_source")
+        )
+        if uses_auxiliary and (
+            auxiliary["mode"] != "xqc"
+            or saved["reward_normalization"] != "real_discounted_return_only"
+        ):
+            raise ValueError("AMBI-XQC auxiliary inner critics require saved auxiliary state and frozen reward scale.")
         if saved["collection_operator"] not in {"none", "xqc"}:
             raise ValueError("AMBI-XQC checkpoint collection operator is invalid.")
         if (not isinstance(saved["inner_terminal_bootstrap"], str)
@@ -791,6 +920,7 @@ class AMBIXQCAgent(nn.Module):
             for key in (
                 "collection_operator", "inner_schedule", "reward_normalization",
                 "inner_terminal_bootstrap", "inner_update_timing", "inner_policy_delay",
+                "inner_critic_source", "inner_horizon_critic_source", "inner_critic_target",
             ):
                 saved_comparison[key] = expected[key]
         if saved_comparison != expected:
@@ -837,11 +967,15 @@ class AMBIXQCAgent(nn.Module):
             "outer_version",
             "inner",
         }
+        if self.aux_return is not None:
+            if not isinstance(state, Mapping) or "aux_return" not in state:
+                raise ValueError("Checkpoint lacks a trained auxiliary return critic.")
+            expected.add("aux_return")
         state = require_exact_keys(state, expected, "AMBI-XQC checkpoint")
         if (
             isinstance(state["checkpoint_version"], bool)
             or not isinstance(state["checkpoint_version"], int)
-            or state["checkpoint_version"] not in {1, 2, 3, self._CHECKPOINT_VERSION}
+            or state["checkpoint_version"] not in {1, 2, 3, 4, self._CHECKPOINT_VERSION}
         ):
             raise ValueError("Unsupported AMBI-XQC checkpoint version.")
         saved_signature = self._preflight_semantic_signature(
@@ -889,6 +1023,17 @@ class AMBIXQCAgent(nn.Module):
                 "AMBI-XQC delayed actor/temperature counters are inconsistent."
             )
         preflight_module_state(self, state["module"], "AMBI-XQC module")
+        critic_owners = ("xqc_controller", "aux_return") if self.aux_return is not None else ("xqc_controller",)
+        for owner in critic_owners:
+            for network in ("critic", "critic_target"):
+                name = f"{owner}.{network}.support"
+                support = state["module"][name].detach().cpu()
+                expected_support = torch.linspace(
+                    self.cfg.xqc_vmin, self.cfg.xqc_vmax, self.cfg.xqc_num_atoms,
+                    dtype=support.dtype,
+                )
+                if not torch.equal(support, expected_support):
+                    raise ValueError(f"AMBI-XQC checkpoint {name} is incompatible with its categorical support.")
         preflight_optimizer_state(
             self.world_optimizer,
             state["world_optimizer"],
@@ -977,7 +1122,13 @@ class AMBIXQCAgent(nn.Module):
                 inner_payload["rng"][key] = local_rng[key]
             generator_state = self._outer_generator.get_state()
         inner = self.inner_engine._preflight_training_state_dict(inner_payload)
-        return state, workspace, generator_state, inner, saved_signature, cross_device
+        auxiliary = None
+        if self.aux_return is not None:
+            auxiliary = self.aux_return.preflight_training_state(
+                state["aux_return"], expected_updates=state["num_updates"],
+                frozen_evaluation=frozen_evaluation,
+            )
+        return state, workspace, generator_state, inner, saved_signature, cross_device, auxiliary
 
     def load(self, fp, *, frozen_evaluation=False):
         if not isinstance(frozen_evaluation, bool):
@@ -988,7 +1139,7 @@ class AMBIXQCAgent(nn.Module):
             else torch.load(fp, map_location=self.device, weights_only=False)
         )
         (
-            state, workspace, generator_state, inner, saved_signature, cross_device
+            state, workspace, generator_state, inner, saved_signature, cross_device, auxiliary
         ) = self._preflight_checkpoint(
             state, frozen_evaluation=frozen_evaluation,
         )
@@ -1014,6 +1165,8 @@ class AMBIXQCAgent(nn.Module):
             workspace["temperature_optimizer_steps"]
         )
         self.xqc_workspace.restore_learning_rate_phase_()
+        if self.aux_return is not None:
+            self.aux_return.load_training_state(auxiliary, frozen_evaluation=frozen_evaluation)
         self.reward_normalizer.load_state_dict(state["reward_normalizer"])
         self._outer_generator.set_state(generator_state.to("cpu"))
         self.num_updates = int(state["num_updates"])

@@ -55,6 +55,51 @@ def test_checkpoint_config_uses_per_algorithm_values_before_experiment():
     assert legacy.enabled
 
 
+def test_replay_archive_setting_defaults_and_algorithm_precedence():
+    assert not resolve_checkpoint_config({}, {}).save_replay_buffer
+    assert resolve_checkpoint_config({}, {"save_replay_buffer": True}).save_replay_buffer
+    assert not resolve_checkpoint_config(
+        {"save_replay_buffer": False}, {"save_replay_buffer": True}
+    ).save_replay_buffer
+    assert resolve_checkpoint_config(
+        {"save_replay_buffer": True}, {"save_replay_buffer": False}
+    ).save_replay_buffer
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true", "false", [], {}])
+def test_replay_archive_setting_requires_strict_boolean(value):
+    with pytest.raises(ValueError, match="save_replay_buffer must be a boolean"):
+        resolve_checkpoint_config({"save_replay_buffer": value}, {})
+    with pytest.raises(ValueError, match="save_replay_buffer must be a boolean"):
+        resolve_checkpoint_config({}, {"save_replay_buffer": value})
+
+
+def test_replay_archive_setting_rejects_nested_algorithm_placement():
+    with pytest.raises(ValueError, match="not in alg_params"):
+        resolve_checkpoint_config({"alg_params": {"save_replay_buffer": True}}, {})
+
+
+@pytest.mark.parametrize("strategies", ["all", "none"])
+def test_replay_archive_requires_a_model_save_policy(strategies):
+    with pytest.raises(ValueError, match="requires periodic checkpointing"):
+        resolve_checkpoint_config(
+            {"save_replay_buffer": True, "checkpoint_every": None, "save_strat": strategies},
+            {"save_trials": "none"},
+        )
+    with pytest.raises(ValueError, match="requires periodic checkpointing"):
+        resolve_checkpoint_config(
+            {"save_replay_buffer": True, "checkpoint_every": 5, "save_strat": "none"},
+            {"save_trials": None},
+        )
+    assert resolve_checkpoint_config(
+        {"save_replay_buffer": True, "checkpoint_every": 5}, {"save_trials": "none"}
+    ).save_replay_buffer
+    for strategy in ("first", "all", "best"):
+        assert resolve_checkpoint_config(
+            {"save_replay_buffer": True, "save_strat": "none"}, {"save_trials": strategy}
+        ).save_replay_buffer
+
+
 @pytest.mark.parametrize("key", ["checkpoint_every", "checkpoint_best_window"])
 def test_checkpoint_config_rejects_non_positive_or_fractional_numbers(key):
     values = {"checkpoint_every": 10, "checkpoint_best_window": 10}

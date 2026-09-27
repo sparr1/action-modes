@@ -328,10 +328,28 @@ def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None,
         timing = params.get("inner_update_timing", "round")
         parts.append(f"{timing} updates")
         tags.append(f"update-timing:{timing}")
+        target = params.get("inner_critic_target") or (
+            "reward_only" if params.get("inner_critic_source") == "aux_return"
+            else "entropy_augmented"
+        )
         if params.get("inner_terminal_bootstrap", "inner") == "outer":
             parts.append("outer terminal bootstrap")
+            auxiliary_tail = params.get("inner_horizon_critic_source", "xqc") == "aux_return"
             tags.extend(("terminal-bootstrap:outer", "terminal-policy:frozen-outer",
-                         "terminal-q:online-outer", "terminal-alpha:inner"))
+                         "terminal-q:online-aux-return" if auxiliary_tail else "terminal-q:online-outer",
+                         "terminal-alpha:none" if auxiliary_tail or target == "reward_only"
+                         else "terminal-alpha:inner"))
+        for key, tag, description in (
+            ("inner_critic_source", "critic-init", "auxiliary return init"),
+            ("inner_horizon_critic_source", "horizon-critic", "auxiliary return horizon"),
+        ):
+            value = params.get(key, "xqc")
+            tags.append(f"{tag}:{value}")
+            if value == "aux_return":
+                parts.append(description)
+        tags.append(f"critic-target:{target}")
+        if target == "reward_only":
+            parts.append("reward-only target")
     else:
         schedule = []
         legacy = (not any(params.get(key) is not None for key in (

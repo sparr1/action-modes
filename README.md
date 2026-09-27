@@ -67,7 +67,9 @@ of the XQC actor loss.
 
 AMBI-XQC supports portable model checkpoints for evaluation and weight
 transfer. It is not allowlisted for exact trainer resume because that stronger
-contract also requires replay and environment state. Eager execution remains
+contract also requires complete trainer, RNG, and environment state. Optional
+replay archives for later evaluation are described under training checkpoints.
+Eager execution remains
 the canonical one-million-decision screen. CUDA runs may enable five
 fixed-shape regions with `compile=true`: the persistent and action-local XQC
 actor and critic losses plus the dense, fixed-horizon non-episodic inner
@@ -75,6 +77,48 @@ rollout. `compile_strict=true` makes any graph or runtime fallback fatal. The
 outer recurrent TOLD computation, optimizer mutations, action-local lifecycle
 orchestration, and episodic rollout path remain eager. A compile request is
 inactive on CPU rather than silently changing the device contract.
+
+### Optional AMBI-XQC return critic
+
+`alg_params.aux_return_mode="xqc"` trains a separate twin categorical critic to
+evaluate reward-only discounted returns under the current persistent XQC
+policy. The default `"off"` retains existing behavior. This auxiliary learner
+has no actor or temperature optimizer: it uses the main policy's sampled next
+actions, raw replay rewards divided by the same current real reward scale,
+and no entropy term in its Bellman target. Its architecture, support, optimizer
+settings, and learning-rate schedule follow the main XQC critic.
+
+`aux_return_detach_representation=true` (default) prevents its loss from
+updating the shared encoder/dynamics. Set it to `false` to let the auxiliary
+loss also train those representations; `aux_return_critic_coef=0.1` is the
+default positive representation-loss coefficient. The auxiliary optimizer
+always receives the unscaled critic loss, including when representation
+gradients are enabled. Separate auxiliary actor/LR settings and
+native AMBI `critic_value_mode` controls are rejected.
+
+The following inner choices are independent:
+
+| Setting | Values and meaning |
+| --- | --- |
+| `inner_critic_source` | `"xqc"` (default) or `"aux_return"`: initialize the fresh inner critic from this online outer critic; initialize its target from that same copy. |
+| `inner_horizon_critic_source` | `"xqc"` (default) or `"aux_return"`: select the frozen outer critic used at the imagined horizon when `inner_terminal_bootstrap="outer"`. |
+| `inner_critic_target` | `"entropy_augmented"` or `"reward_only"`: choose the adapting inner critic's Bellman target. Omitted/null defaults to entropy-augmented for XQC initialization and reward-only for auxiliary initialization. |
+
+The inner actor and temperature always inherit the main XQC policy and
+temperature. Any auxiliary source requires a backbone trained with
+`aux_return_mode="xqc"` and `inner_reward_normalization="frozen_real_scale"`,
+including currently dormant settings. Auxiliary horizon continuations omit
+entropy regardless of the adapting critic's target setting. Mixed choices are
+intentional ablations: a reward-only update bootstrapping from a pretrained
+soft XQC tail still includes that tail's learned future entropy; changing the
+immediate target term does not convert it into a pure return estimate. Likewise,
+entropy-augmented inner updates with an auxiliary horizon continuation retain
+entropy inside the imagined prefix but omit it from the frozen tail.
+
+Frozen evaluation presets may select these inner choices but cannot enable
+or retrain a missing auxiliary critic. MPPI continues to use the main online
+XQC soft-value tail. No shipped training or evaluation preset enables the
+auxiliary critic automatically.
 
 ### AMBI-XQC prior-only checkpoint evaluation
 
@@ -109,9 +153,12 @@ with `AMBIXQC_MODE=production`. Production uses one L40S, six CPUs, 48 GB RAM,
 and a 72-hour limit. Each job creates a fresh result directory; production
 publishes to W&B project `ambi` with its source SHA and job ID in the run name.
 
-New XQC checkpoints use version 4 to record the collection operator,
+New XQC checkpoints use version 5 to record the auxiliary return critic and
+the independent inner critic sources/target, alongside the collection operator,
 `inner_terminal_bootstrap`, `inner_update_timing`, and effective
-`inner_policy_delay`. Version-1 through version-3 checkpoints remain readable:
+`inner_policy_delay`. Version-1 through version-4 checkpoints remain readable
+as auxiliary-off models with XQC initialization/horizon sources and an
+entropy-augmented inner target:
 missing timing means `round`, missing inner delay inherits the saved outer
 policy delay, missing terminal setting means `inner`, and version 1 also
 defaults to inner-XQC collection. Ordinary loading retains strict semantic checks; the
@@ -435,6 +482,70 @@ for `latest`; `none` must be used alone. If `save_strat` is omitted, a positive
 `save_trials` remains a separate policy for final models across trials.
 Checkpoint files are model snapshots and do not universally contain replay or
 environment state for full training resume.
+
+### Optional AMBI-XQC replay archives
+
+For state-observation AMBI-XQC training, add `save_replay_buffer: true` beside
+`checkpoint_every`, outside `alg_params`:
+
+```json
+{
+  "checkpoint_every": 25000,
+  "save_strat": ["all"],
+  "save_replay_buffer": true
+}
+```
+
+The default is `false`; existing presets do not change. The algorithm's
+top-level value takes precedence over the experiment value, including an
+explicit `false`. The setting requires periodic checkpointing or a final
+`save_trials` policy (`first`, `all`, or `best`). It is supported only by
+`AMBIXQC/AMBIXQC` (including its `AMBIXQCBaseline` alias) with state observations,
+and cannot be combined with exact resume mode.
+
+Completed episodes are archived immediately after insertion into training
+replay, retaining raw observations and rewards, normalized actions, termination
+flags, and episode boundaries. Unfinished staged episodes are excluded because
+they have not entered replay. Immutable chunks store experience once across
+checkpoints; each checkpoint's manifest selects the rows still resident at
+that boundary, including partially evicted episodes. Chunks flush at 65,536
+rows or a checkpoint boundary. Owned CPU copies and bounded background writing
+avoid changing the live replay, training RNG, reward normalization, or BN state.
+
+The checkpoint's adjacent `.metadata.json` sidecar links to its immutable
+manifest and binds the archive to that model snapshot with hashes. Keep the
+checkpoint, sidecar, and its `model:<config>_<trial>.replay/` directory together
+when copying results. Relative references remain usable after relocation;
+when the archive is stored elsewhere, pass the actual `archive-<uuid>` child
+directory as `archive_root`. Shared chunks and historical manifests remain
+available even when `best` or `latest` aliases are replaced.
+
+```python
+from utils.replay_archive import load_checkpoint_replay
+
+replay = load_checkpoint_replay("/results/models/model:Config_0_25000")
+obs, actions, rewards, terminated, task = replay.sample_sequences(
+    batch_size=64, horizon=3, seed=123
+)
+```
+
+The reader provides chronological episode fragments and samples uniformly
+over valid sequence starts, without crossing episode boundaries or using
+evicted rows. Batch size and horizon are chosen at load/use time independently
+of training; sampling uses a private seeded RNG. Results use the existing
+`Buffer.sample()` CPU layout (`obs` has `horizon + 1` timesteps, the other
+tensors have `horizon`, and `task` is `None`). Raw fragment access preserves
+initial-row NaN sentinels used by the replay format. Missing or corrupt data,
+checkpoint mismatches, and requests for sequences unavailable in empty or
+short replay fail explicitly.
+
+For Humanoid Walk's 67 observation and 21 action dimensions, one million
+uncompressed rows occupy about 370 MB before serialization overhead; 1.5
+million rows occupy about 550 MB. The archive retains all completed training
+experience once, so its total storage follows experience collected, rather
+than just current replay capacity. This feature supplies data for future
+evaluation experiments; it does not change evaluation losses or BatchNorm
+behavior and does not provide exact trainer resume.
 
 The compact AMBI branch-count and imagination-horizon suite lives under
 `configs/ambi/`. Each of its five algorithm files has one matching runnable

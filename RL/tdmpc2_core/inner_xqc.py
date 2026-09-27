@@ -103,6 +103,9 @@ class InnerXQCState:
     outer_terminal_flags: torch.Tensor | None = None
     outer_terminal_boundary_rows: torch.Tensor | float = 0.0
     outer_terminal_bootstrap_rows: torch.Tensor | float = 0.0
+    critic_source: str = "xqc"
+    horizon_critic_source: str = "xqc"
+    critic_target_kind: str = "entropy_augmented"
 
 
 class InnerXQCEngine:
@@ -427,8 +430,25 @@ class InnerXQCEngine:
             )
         return count
 
+    def _critic_from_source(self, source):
+        """Select critic weights without changing the persistent actor or alpha."""
+        if source == "xqc":
+            return self.outer_controller.critic
+        if source != "aux_return":
+            raise ValueError(f"Unsupported AMBI-XQC critic source {source!r}.")
+        auxiliary = getattr(self.agent, "aux_return", None)
+        if auxiliary is None:
+            raise ValueError("An auxiliary return critic is required for aux_return.")
+        return auxiliary.critic
+
     def _prepare_action(self):
         cfg = self.cfg
+        critic_source = getattr(cfg, "inner_critic_source", "xqc")
+        horizon_critic_source = getattr(cfg, "inner_horizon_critic_source", "xqc")
+        critic_target_kind = getattr(cfg, "inner_critic_target", "entropy_augmented")
+        critic_kwargs = {}
+        if critic_source != "xqc":
+            critic_kwargs["critic_source"] = self._critic_from_source(critic_source)
         if self._workspace_pool is None:
             workspace = self.outer_controller.clone_for_inner(
                 actor_lr=float(cfg.inner_actor_lr),
@@ -438,11 +458,12 @@ class InnerXQCEngine:
                 transition_steps=int(
                     cfg.inner_rounds * cfg.inner_updates_per_round
                 ),
+                **critic_kwargs,
             )
         else:
             workspace = self._workspace_pool
             self._workspace_pool = None
-            workspace.reset_from_(self.outer_controller)
+            workspace.reset_from_(self.outer_controller, **critic_kwargs)
 
         # The outer learner retains its original delay. An evaluation override
         # belongs only to this disposable controller, including reused pools.
@@ -497,6 +518,9 @@ class InnerXQCEngine:
             reward_return_seed=self._real_return_accumulator(),
             reward_normalizer=reward_normalizer,
             reward_normalizer_count_initial=reward_normalizer_count_initial,
+            critic_source=critic_source,
+            horizon_critic_source=horizon_critic_source,
+            critic_target_kind=critic_target_kind,
         )
         if self._uses_outer_terminal_bootstrap:
             # Sample IDs are action-local append offsets because capacity must
@@ -962,6 +986,17 @@ class InnerXQCEngine:
                 "outer_terminal_mask": mask,
                 "outer_controller": self.outer_controller,
             }
+            if self.state.horizon_critic_source != "xqc":
+                terminal_kwargs.update(
+                    outer_critic=self._critic_from_source(
+                        self.state.horizon_critic_source
+                    ),
+                    # The auxiliary head estimates rewards alone. Subtracting
+                    # entropy from that tail would change the represented value.
+                    outer_critic_is_return=True,
+                )
+        if self.state.critic_target_kind != "entropy_augmented":
+            terminal_kwargs["critic_target_kind"] = self.state.critic_target_kind
         return self.state.workspace.update(
             batch,
             next_noise=next_noise,
@@ -1158,6 +1193,23 @@ class InnerXQCEngine:
             reward_scale_final = self.state.reward_scale
 
             metrics = self._base_metrics()
+            if (
+                self.state.critic_source != "xqc"
+                or self.state.horizon_critic_source != "xqc"
+                or self.state.critic_target_kind != "entropy_augmented"
+            ):
+                metrics.update(
+                    inner_critic_source_aux_return=float(
+                        self.state.critic_source == "aux_return"
+                    ),
+                    inner_horizon_critic_source_aux_return=float(
+                        self._uses_outer_terminal_bootstrap
+                        and self.state.horizon_critic_source == "aux_return"
+                    ),
+                    inner_critic_target_reward_only=float(
+                        self.state.critic_target_kind == "reward_only"
+                    ),
+                )
             metrics.update(
                 inner_rounds=float(self.cfg.inner_rounds),
                 inner_iterations=float(self.cfg.inner_rounds),

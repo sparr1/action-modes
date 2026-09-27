@@ -203,6 +203,12 @@ def _planner_display_label(planner, *, compact=False):
         if kind == "xqc":
             step_timing = settings.get("inner_update_timing", "round") == "step"
             parts.append(("step" if step_timing else "round") + ("" if compact else " updates"))
+            if settings.get("inner_critic_source") == "aux_return":
+                parts.append("aux init" if compact else "auxiliary return critic init")
+            if settings.get("inner_horizon_critic_source") == "aux_return":
+                parts.append("aux tail" if compact else "auxiliary return horizon critic")
+            if settings.get("inner_critic_target") == "reward_only":
+                parts.append("reward-only target")
         if settings.get("inner_component_update_schedule"):
             parts.append("split")
         rate = settings.get("inner_actor_lr")

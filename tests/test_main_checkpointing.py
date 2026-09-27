@@ -57,6 +57,8 @@ def _write_configs(
     algorithm_checkpoint="missing",
     save_strat=("best", "latest"),
     save_trials="none",
+    algorithm_overrides=None,
+    experiment_overrides=None,
 ):
     alg_dir = tmp_path / "algs"
     alg_dir.mkdir()
@@ -69,6 +71,7 @@ def _write_configs(
     }
     if algorithm_checkpoint != "missing":
         algorithm["checkpoint_every"] = algorithm_checkpoint
+    algorithm.update(algorithm_overrides or {})
     (alg_dir / "Config.json").write_text(json.dumps(algorithm), encoding="utf-8")
 
     experiment = {
@@ -80,12 +83,13 @@ def _write_configs(
         "save_strat": list(save_strat),
         "checkpoint_best_window": 7,
     }
+    experiment.update(experiment_overrides or {})
     experiment_path = tmp_path / "Experiment.json"
     experiment_path.write_text(json.dumps(experiment), encoding="utf-8")
     return experiment_path, alg_dir
 
 
-def _run(monkeypatch, tmp_path, model, **config_kwargs):
+def _run(monkeypatch, tmp_path, model, *, extra_args=(), **config_kwargs):
     experiment_path, alg_dir = _write_configs(tmp_path, **config_kwargs)
     output_dir = tmp_path / "output"
     env = _Env()
@@ -107,6 +111,7 @@ def _run(monkeypatch, tmp_path, model, **config_kwargs):
             str(alg_dir),
             "--log-dir",
             str(output_dir),
+            *extra_args,
         ],
     )
     training_main.main()
@@ -272,4 +277,105 @@ def test_save_trials_all_remains_active_when_logs_are_disabled(monkeypatch, tmp_
     expected_dir = output_dir / "Experiment_STAMP" / "models"
     assert model.checkpoint_calls == []
     assert model.save_calls == [(str(expected_dir) + "/", "model:Config_0")]
+    assert env.closed
+
+
+class _ReplayModel(_Model):
+    def __init__(self, *, failure=None):
+        super().__init__()
+        self.archive_calls = []
+        self.archive_closed = False
+        self.failure = failure
+
+    def enable_replay_archive(self, path, *, name_prefix):
+        self.archive_calls.append((path, name_prefix))
+
+    def close_replay_archive(self):
+        self.archive_closed = True
+
+    def set_checkpointing(self, **kwargs):
+        if self.failure == "setup":
+            raise RuntimeError("checkpoint setup failed")
+        super().set_checkpointing(**kwargs)
+
+    def learn(self, **kwargs):
+        assert self.archive_calls
+        if self.failure == "learn":
+            raise RuntimeError("training failed")
+        return super().learn(**kwargs)
+
+
+@pytest.mark.parametrize("periodic", [True, False])
+@pytest.mark.parametrize("algorithm", ["AMBIXQC/AMBIXQC", "AMBIXQC/AMBIXQCBaseline"])
+def test_replay_archive_enabled_before_training_for_periodic_and_final_saves(
+    monkeypatch, tmp_path, periodic, algorithm
+):
+    model = _ReplayModel()
+    env, output_dir = _run(
+        monkeypatch,
+        tmp_path,
+        model,
+        experiment_checkpoint=5 if periodic else None,
+        save_trials="none" if periodic else "all",
+        algorithm_overrides={"alg": algorithm, "save_replay_buffer": True},
+    )
+    expected_dir = output_dir / "Experiment_STAMP" / "models"
+    assert model.archive_calls == [(str(expected_dir) + "/", "model:Config_0")]
+    assert bool(model.checkpoint_calls) == periodic
+    assert bool(model.save_calls) != periodic
+    assert model.archive_closed
+    assert env.closed
+
+
+@pytest.mark.parametrize("failure", ["setup", "learn"])
+def test_replay_archive_closed_after_initialization_or_training_failure(
+    monkeypatch, tmp_path, failure
+):
+    model = _ReplayModel(failure=failure)
+    with pytest.raises(RuntimeError, match="failed"):
+        _run(
+            monkeypatch,
+            tmp_path,
+            model,
+            algorithm_overrides={"alg": "AMBIXQC/AMBIXQC", "save_replay_buffer": True},
+        )
+    assert model.archive_closed
+
+
+@pytest.mark.parametrize(
+    "algorithm_overrides,experiment_overrides,extra_args,error",
+    [
+        ({}, {}, (), "only AMBIXQC/AMBIXQC"),
+        ({"alg": "AMBIXQC/AMBIXQC", "alg_params": {"obs": "rgb"}}, {}, (), "state observations"),
+        ({"alg": "AMBIXQC/AMBIXQC"}, {"env_params": {"obs": "rgb"}}, (), "state observations"),
+        ({"alg": "AMBIXQC/AMBIXQC"}, {}, ("--resume-mode", "new", "--lineage-dir", "unused"), "exact resume"),
+    ],
+)
+def test_replay_archive_unsupported_settings_fail_before_artifact_creation(
+    monkeypatch, tmp_path, algorithm_overrides, experiment_overrides, extra_args, error
+):
+    model = _Model()
+    with pytest.raises(ValueError, match=error):
+        _run(
+            monkeypatch,
+            tmp_path,
+            model,
+            algorithm_overrides={**algorithm_overrides, "save_replay_buffer": True},
+            experiment_overrides=experiment_overrides,
+            extra_args=extra_args,
+        )
+    assert not model.learn_calls
+    assert not (tmp_path / "output").exists()
+
+
+def test_replay_archive_disabled_does_not_require_algorithm_support(monkeypatch, tmp_path):
+    model = _Model()
+    env, _ = _run(
+        monkeypatch,
+        tmp_path,
+        model,
+        algorithm_overrides={"save_replay_buffer": False},
+        experiment_overrides={"save_replay_buffer": True},
+    )
+    assert model.learn_calls
     assert env.closed

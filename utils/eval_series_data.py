@@ -274,6 +274,15 @@ def planner_identity(config, result, algorithm, action_rule):
             active.pop("inner_update_timing", None)
         if active.get("inner_policy_delay") in (None, config.get("xqc_policy_delay", 3)):
             active.pop("inner_policy_delay", None)
+        # Explicit defaults added with auxiliary critics preserve the identities
+        # of existing soft-XQC planners and their prior-reference bundles.
+        for key, default in (
+            ("inner_critic_source", "xqc"),
+            ("inner_horizon_critic_source", "xqc"),
+            ("inner_critic_target", "entropy_augmented"),
+        ):
+            if active.get(key, default) == default:
+                active.pop(key, None)
     ignored = {"inner_execution_action", "inner_execution_noise_std", "inner_execution_std_scale",
                "inner_diagnostic_rollouts", "inner_diagnostics_every", "inner_horizon_ratio",
                "inner_nominal_critic_utd", "inner_nominal_transitions_per_round",
@@ -468,6 +477,13 @@ def descriptive_label(identity, selector=None):
     else:
         bootstrap = "inner Q"
     title = f"{planner['type'].upper()} {'/'.join(budgets)} {bootstrap}"
+    if planner["type"] == "xqc":
+        if settings.get("inner_critic_source") == "aux_return":
+            title += " | aux return init"
+        if settings.get("inner_horizon_critic_source") == "aux_return":
+            title += " | aux return horizon"
+        if settings.get("inner_critic_target") == "reward_only":
+            title += " | reward-only target"
     title += f" J{rounds}/N{settings.get('inner_rollouts_per_round')}/H{settings.get('inner_rollout_horizon')}"
     if settings.get("inner_steps_per_update") is not None:
         title += f" interval{settings['inner_steps_per_update']}"

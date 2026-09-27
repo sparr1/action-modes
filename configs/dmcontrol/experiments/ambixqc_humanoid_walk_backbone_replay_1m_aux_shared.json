@@ -1,0 +1,25 @@
+{
+  "study_type": "ambixqc_single_seed_exploratory_backbone_aux_return_comparison",
+  "study_note": "Auxiliary return critic with shared representation gradients. One of three paired-seed exploratory Humanoid Walk state backbones (seed 55, one million agent decisions). Persistent XQC policy collection follows the unchanged random warmup; no inner adaptation or online evaluation runs during training. Full architecture, eager TOLD/XQC training, and all main policy routes are shared. Retain all 40 portable checkpoint/metadata pairs every 25,000 decisions and archive completed raw replay experience once with checkpoint-matched manifests. Auxiliary critics, when enabled, use coefficient 0.1 and differ only in representation detachment. This is not confirmatory evidence or exact trainer resume.",
+  "overrides_alg": {
+    "env": "DMControl-v0"
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambixqc_humanoid_walk_backbone_replay_1m_aux_shared"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": [
+    "all"
+  ],
+  "save_replay_buffer": true,
+  "log_info": false,
+  "log_type": "summary"
+}
