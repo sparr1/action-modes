@@ -125,6 +125,26 @@ distinct arm names/tags. This is a paired-seed exploratory comparison, not
 multi-seed confirmation. The pre-existing 1.5M checkpoint bank and research
 evaluation matrices are unchanged.
 
+Use `slurm/run_ambixqc_backbone_replay_oscar.sbatch` from the clean pushed
+commit, with the existing `EXPECTED_ACTION_MODES_SHA`,
+`AMBIXQC_ACTION_MODES_DIR`, `AMBIXQC_PYTHON`, and `AMBIXQC_RESULTS_ROOT`
+environment variables. Set `AMBIXQC_MODE=smoke` and `AMBIXQC_ARM=all` for one
+GPU job that tests all three arms sequentially. Each arm trains 4,000 decisions
+with four replay-preserving checkpoints and the full production architecture.
+The smoke measures a synchronized 900-decision window after pretraining; its
+shortened learning-rate schedule makes it a correctness/timing canary, not a
+matched prefix of the 1M learning trajectory.
+
+After the smoke job's `PASS` marker and `smoke-gate.json` are present, set
+`AMBIXQC_MODE=production`, `AMBIXQC_SMOKE_GATE` to that gate's absolute path,
+and `AMBIXQC_ARM` to one of the three arm IDs per independent job. Production
+preflight checks the exact source commit, versioned configuration hashes, and
+unchanged validation artifacts for all three smoke arms. Each job creates its
+own output directory and W&B run; scheduler time/resource requests should be
+chosen from the measured timings and current Oscar availability. Keep the
+smoke gate and its referenced validation files available through production
+startup.
+
 ## AMBI-XQC inner J6 checkpoint campaign
 
 `ambixqc_humanoid_inner_j6_benchmark.json` evaluates native inner XQC with
