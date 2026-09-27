@@ -148,22 +148,30 @@ def _bank(spec):
     return bank
 
 
-def patch_actor_transfer_spec(spec):
-    """Replace only our stable section IDs; preserve every unrelated field."""
+def patch_results_spec(spec, sections):
+    """Replace only the supplied stable section IDs, preserving unrelated fields."""
+    owned_ids = {section['__id__'] for section in sections}
+    if len(owned_ids) != len(sections) or not owned_ids:
+        raise ResultsLayoutError('Expected distinct, nonempty owned section IDs.')
     proposed = deepcopy(spec)
     bank = _bank(proposed)
-    remaining = [section for section in bank['sections'] if section.get('__id__') not in OWNED_SECTION_IDS]
-    bank['sections'] = actor_transfer_sections() + remaining
+    remaining = [section for section in bank['sections'] if section.get('__id__') not in owned_ids]
+    bank['sections'] = deepcopy(sections) + remaining
     return proposed
 
 
-def _without_owned(spec):
+def patch_actor_transfer_spec(spec):
+    """Replace only our stable section IDs; preserve every unrelated field."""
+    return patch_results_spec(spec, actor_transfer_sections())
+
+
+def _without_owned(spec, owned_ids=OWNED_SECTION_IDS):
     result = deepcopy(spec); bank = _bank(result)
-    bank['sections'] = [s for s in bank['sections'] if s.get('__id__') not in OWNED_SECTION_IDS]
+    bank['sections'] = [s for s in bank['sections'] if s.get('__id__') not in owned_ids]
     return result
 
 
-def _installed(spec):
+def _installed(spec, sections=None):
     """Accept observed UI omission of layout defaults, never changed values/content.
 
     W&B's UI drops section ``type``/flow defaults and whole panel ``layout``
@@ -171,8 +179,9 @@ def _installed(spec):
     in a copy for comparison; IDs, queries, configs, visibility, order, and any
     explicitly saved layout values still have to match exactly.
     """
-    actual = deepcopy([s for s in _bank(spec)['sections'] if s.get('__id__') in OWNED_SECTION_IDS])
-    expected = actor_transfer_sections()
+    expected = actor_transfer_sections() if sections is None else sections
+    owned_ids = {section['__id__'] for section in expected}
+    actual = deepcopy([s for s in _bank(spec)['sections'] if s.get('__id__') in owned_ids])
     if len(actual) != len(expected):
         return False
     for section, wanted in zip(actual, expected):
@@ -194,6 +203,13 @@ def _installed(spec):
 
 def ensure_actor_transfer_results_layout(api, *, entity, project, receipt_dir,
                                          view_name=DEFAULT_VIEW_NAME, run_id=None):
+    return ensure_results_layout(api, entity=entity, project=project, receipt_dir=receipt_dir,
+        view_name=view_name, run_id=run_id, layout_version=LAYOUT_VERSION,
+        sections=actor_transfer_sections(), chart_keys=CHART_KEYS, table_keys=TABLE_KEYS)
+
+
+def ensure_results_layout(api, *, entity, project, receipt_dir, layout_version, sections,
+                          chart_keys=(), table_keys=(), view_name=DEFAULT_VIEW_NAME, run_id=None):
     """Idempotently patch and verify the project's personal workspace, with receipts.
 
     Two fresh reads detect changes before mutation. This helper does not perform
@@ -204,21 +220,22 @@ def ensure_actor_transfer_results_layout(api, *, entity, project, receipt_dir,
     """
     root = Path(receipt_dir); root.mkdir(parents=True, exist_ok=True)
     views = _views(api, entity, project); view = _selected(views, view_name)
-    before = _spec(view); proposed = patch_actor_transfer_spec(before)
+    owned_ids = tuple(section['__id__'] for section in sections)
+    before = _spec(view); proposed = patch_results_spec(before, sections)
     fingerprint = _hash(proposed)
-    assert _without_owned(before) == _without_owned(proposed)
+    assert _without_owned(before, owned_ids) == _without_owned(proposed, owned_ids)
     workspace_url = f'https://wandb.ai/{entity}/{project}/workspace?nw={view_name[3:-2]}'
     url = f'https://wandb.ai/{entity}/{project}/runs/{run_id}?nw={view_name[3:-2]}' if run_id else None
-    receipt = dict(schema_version=1, layout_version=LAYOUT_VERSION, entity=entity, project=project,
+    receipt = dict(schema_version=1, layout_version=layout_version, entity=entity, project=project,
         view_id=view['id'], view_name=view_name, view_type='project-view',
         layout_scope='selected personal project workspace and its run pages',
-        url=url, workspace_url=workspace_url, run_id=run_id, owned_section_ids=list(OWNED_SECTION_IDS),
-        expected_chart_keys=list(CHART_KEYS), expected_table_keys=list(TABLE_KEYS),
+        url=url, workspace_url=workspace_url, run_id=run_id, owned_section_ids=list(owned_ids),
+        expected_chart_keys=list(chart_keys), expected_table_keys=list(table_keys),
         before_sha256=_hash(before), proposed_sha256=fingerprint,
         verification='saved workspace schema read back; browser rendering must be checked separately')
     _write(root / ('before-' + _hash(before)[:16] + '.json'), views)
     _write(root / ('proposed-' + fingerprint[:16] + '.json'), proposed)
-    if _installed(before):
+    if _installed(before, sections):
         receipt.update(status='verified', changed=False, after_sha256=_hash(before))
         _write(root / 'results-layout-receipt.json', receipt)
         return receipt
