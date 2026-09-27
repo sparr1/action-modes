@@ -334,7 +334,7 @@ def capture_episode(*, checkpoint, matrix_path, selector, seed, output,
 @torch.no_grad()
 def snapshot_mean_action(model, observation, snapshot):
     policy = snapshot.make_policy(model.agent.device)
-    obs = model._obs_to_tensor(observation).unsqueeze(0)
+    obs = model._obs_to_tensor(observation).to(model.agent.device).unsqueeze(0)
     z = model.agent.model.encode(obs)
     action, _ = model.agent.model.pi(z, policy=policy, deterministic=True,
                                       **snapshot.policy_bounds)

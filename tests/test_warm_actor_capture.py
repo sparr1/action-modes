@@ -2,6 +2,7 @@
 
 import copy
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -15,6 +16,19 @@ from tests.test_ambi_root_local_sac import _model_from_params
 from tests.test_aux_actor_transfer import _params
 from utils import warm_actor_capture as capture
 from utils.ambi_real_calibration import SimulatorSnapshot
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA first-action placement regression")
+def test_snapshot_first_action_moves_observation_to_policy_device():
+    encoder = torch.nn.Linear(3, 2).cuda()
+    world = SimpleNamespace(encode=encoder,
+        pi=lambda z, **kwargs: (z[:, :1].tanh(), {}))
+    wrapped = SimpleNamespace(agent=SimpleNamespace(device=torch.device("cuda"), model=world),
+        _obs_to_tensor=lambda obs: torch.as_tensor(obs, dtype=torch.float32),
+        _unscale_action=lambda action: action)
+    snapshot = SimpleNamespace(make_policy=lambda device: torch.nn.Identity().to(device), policy_bounds={})
+    result = capture.snapshot_mean_action(wrapped, np.zeros(3, dtype=np.float32), snapshot)
+    assert result.shape == (1,) and np.isfinite(result).all()
 
 
 def _model():
