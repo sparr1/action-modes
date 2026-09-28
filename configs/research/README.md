@@ -418,9 +418,22 @@ reward-only critic. No critic, actor, temperature, BatchNorm statistic, optimize
 real reward normalizer, or outer RNG is updated. Decision records report actual
 model work and zero optimizer steps, alongside returns and control time.
 
+For a checkpoint trained with the auxiliary reward-only critic, set
+`evaluation_controller.params.terminal_value_source="aux_return"` to use its
+online twin mean for the MPPI terminal value. This requires saved, trained
+auxiliary critics and supports both shared and detached representation training.
+The main XQC actor still supplies policy trajectories and sampled terminal
+actions; predicted prefix rewards remain raw, and the auxiliary tail uses the
+same frozen real reward scale. Its protocol records
+`online_aux_return_twin_mean` and
+`learned_reward_only_q_tail_under_main_xqc_policy`, distinguishing it from the
+default soft-Q tail. Omitted or explicit `"xqc"` preserves the existing planner
+settings identity and behavior. Each value source must use a separate evaluation
+curve, while compatible paired prior episode bundles can be reused.
+
 Planner settings live in a variant's `evaluation_controller` object, separate
-from training `alg_params`. Only the eight documented planner settings are
-accepted. MPPI presets cannot be materialized into training configurations.
+from training `alg_params`. Only the eight documented search settings and the
+terminal-value selector above are accepted. MPPI presets cannot be materialized into training configurations.
 Use the existing XQC matrix below for an explicitly requested inner-XQC
 comparison.
 

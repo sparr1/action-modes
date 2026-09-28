@@ -88,6 +88,8 @@ def test_humanoid_defaults_keep_authored_and_effective_iterations_distinct():
     {"num_samples": 2, "num_elites": 3}, {"num_pi_trajs": 513},
     {"temperature": float("nan")}, {"min_std": 4}, {"max_std": 0},
     {"effective_iterations": 8}, {"q_reduction": "min_all"},
+    {"terminal_value_source": "target"}, {"terminal_value_source": None},
+    {"terminal_value_source": []}, {"terminal_value_source": True},
 ])
 def test_settings_reject_invalid_or_unsupported_semantics(settings):
     with pytest.raises(ValueError):
@@ -105,6 +107,35 @@ def frozen_model():
 
 
 SMALL = {"horizon": 2, "num_samples": 8, "num_elites": 3, "num_pi_trajs": 2, "iterations": 2}
+
+
+@pytest.fixture(params=[False, True], ids=["shared", "detached"])
+def frozen_auxiliary_model(request):
+    model = _tiny_model(
+        inner_operator="none", aux_return_mode="xqc",
+        aux_return_detach_representation=request.param,
+    )
+    try:
+        model.agent.observe_reward(2.0, False, False)
+        model.agent._update(*_batch(model.agent))
+        model.load(deepcopy(model.agent.checkpoint_state()), frozen_evaluation=True)
+        yield model
+    finally:
+        model.env.close()
+
+
+def test_explicit_default_preserves_existing_settings_protocol_actions_and_rng(frozen_model):
+    agent = frozen_model.agent
+    default = FrozenXQCMPPIController(agent, SMALL)
+    explicit = FrozenXQCMPPIController(agent, {**SMALL, "terminal_value_source": "xqc"})
+    assert default.settings == explicit.settings
+    assert "terminal_value_source" not in explicit.settings
+    assert default.protocol == explicit.protocol
+    observation, _ = frozen_model.env.reset(seed=17)
+    for _ in range(3):
+        torch.testing.assert_close(default.act(observation), explicit.act(observation), rtol=0, atol=0)
+        torch.testing.assert_close(default.previous_mean, explicit.previous_mean, rtol=0, atol=0)
+        assert torch.equal(default.generator.get_state(), explicit.generator.get_state())
 
 
 def test_adapter_preserves_all_outer_state_and_resets_episode_warmstarts(frozen_model):
@@ -141,6 +172,71 @@ def test_adapter_preserves_all_outer_state_and_resets_episode_warmstarts(frozen_
         assert metrics[key] == 0
     assert agent.inner_engine._workspace_pool is None
     assert all(torch.isfinite(torch.as_tensor(value)) for value in metrics.values())
+
+
+@pytest.mark.parametrize("source", ["xqc", "aux_return"])
+def test_auxiliary_backbone_preserves_complete_outer_state_and_episode_rng(frozen_auxiliary_model, source):
+    agent = frozen_auxiliary_model.agent
+    planner = FrozenXQCMPPIController(agent, {**SMALL, "terminal_value_source": source})
+    before = agent.frozen_outer_state()
+    global_rng = torch.get_rng_state().clone()
+    observation, _ = frozen_auxiliary_model.env.reset(seed=17)
+
+    def episode(seed):
+        planner.reset(seed)
+        assert planner.previous_mean is None
+        return torch.stack([planner.act(observation) for _ in range(3)])
+
+    first = episode(101)
+    episode(202)
+    repeated = episode(101)
+    torch.testing.assert_close(first, repeated, rtol=0, atol=0)
+    assert _tree_equal(before, agent.frozen_outer_state())
+    assert torch.equal(global_rng, torch.get_rng_state())
+    assert agent.inner_engine._workspace_pool is None
+    assert agent.last_inner_metrics["inner_critic_optimizer_steps"] == 0
+    assert agent.last_inner_metrics["inner_reward_scale_delta"] == 0
+
+
+def test_auxiliary_terminal_reads_only_online_return_twins_and_keeps_main_actor(frozen_auxiliary_model, monkeypatch):
+    agent = frozen_auxiliary_model.agent
+    planner = FrozenXQCMPPIController(agent, {**SMALL, "terminal_value_source": "aux_return"})
+    assert planner.settings["terminal_value_source"] == "aux_return"
+    assert planner.controller is agent.xqc_controller
+    assert planner.terminal_critic is agent.aux_return.critic
+    calls = []
+
+    def values(z, action, *, bn_mode):
+        calls.append((z.clone(), action.clone(), bn_mode))
+        return torch.stack((z.new_full((z.shape[0],), 2), z.new_full((z.shape[0],), 4)))
+
+    def wrong_critic(*args, **kwargs):
+        pytest.fail("Auxiliary MPPI must not read either soft-Q critic or the auxiliary target")
+
+    monkeypatch.setattr(agent.aux_return.critic, "values", values)
+    monkeypatch.setattr(agent.aux_return.critic_target, "values", wrong_critic)
+    monkeypatch.setattr(agent.xqc_controller.critic, "values", wrong_critic)
+    monkeypatch.setattr(agent.xqc_controller.critic_target, "values", wrong_critic)
+    policy_calls = []
+    main_sample = agent.xqc_controller.sample_action
+
+    def sample(z, **kwargs):
+        policy_calls.append(z.shape[0])
+        return main_sample(z, **kwargs)
+
+    monkeypatch.setattr(agent.xqc_controller, "sample_action", sample)
+    z, action = torch.zeros(5, agent.cfg.latent_dim), torch.zeros(5, agent.cfg.action_dim)
+    result = planner._terminal_q(z, action, reduction="mean_all", generator=planner.generator)
+    torch.testing.assert_close(result, torch.full((5, 1), 3 * planner.reward_scale))
+    assert calls[0][2] == "running"
+    observation, _ = frozen_auxiliary_model.env.reset(seed=17)
+    planner.act(observation)
+    # H policy trajectory calls and one terminal policy call per iteration.
+    assert policy_calls == [2, 2, 8, 8]
+    assert all(call[2] == "running" for call in calls)
+    assert planner.protocol["terminal_value_source"] == "online_aux_return_twin_mean"
+    assert planner.protocol["terminal_value_units"] == "normalized_aux_return_q_times_frozen_real_reward_scale"
+    assert planner.protocol["terminal_value_semantics"] == "learned_reward_only_q_tail_under_main_xqc_policy"
 
 
 def test_terminal_q_uses_running_online_twin_mean_and_frozen_scale(frozen_model, monkeypatch):
@@ -183,6 +279,37 @@ def test_planner_combines_raw_model_rewards_with_scaled_soft_q_tail(frozen_model
     assert agent.last_inner_metrics["planner_value_mean"] == pytest.approx(expected, rel=1e-6)
 
 
+def test_planner_combines_raw_model_rewards_with_scaled_return_only_tail(frozen_auxiliary_model, monkeypatch):
+    agent = frozen_auxiliary_model.agent
+    planner = FrozenXQCMPPIController(agent, {**SMALL, "terminal_value_source": "aux_return"})
+
+    def reward_logits(joint):
+        logits = joint.new_full((joint.shape[0], agent.cfg.num_bins), -100)
+        logits[:, -2] = 100
+        return logits
+
+    monkeypatch.setattr(agent.model, "reward_from_joint", reward_logits)
+    monkeypatch.setattr(agent.aux_return.critic, "values", lambda z, a, *, bn_mode:
+                        torch.stack((z.new_full((z.shape[0],), 2), z.new_full((z.shape[0],), 4))))
+    raw_reward = float(td_math.two_hot_inv(reward_logits(torch.zeros(1, 1)), agent.cfg).item())
+    observation, _ = frozen_auxiliary_model.env.reset(seed=13)
+    planner.act(observation)
+    expected = raw_reward * (1 + agent.discount) + agent.discount ** 2 * 3 * planner.reward_scale
+    assert agent.last_inner_metrics["planner_value_mean"] == pytest.approx(expected, rel=1e-6)
+
+
+def test_auxiliary_selection_rejects_missing_and_untrained_checkpoint(frozen_model):
+    with pytest.raises(ValueError, match="trained auxiliary return critic checkpoint"):
+        FrozenXQCMPPIController(frozen_model.agent, {"terminal_value_source": "aux_return"})
+    model = _tiny_model(inner_operator="none", aux_return_mode="xqc")
+    try:
+        model.load(deepcopy(model.agent.checkpoint_state()), frozen_evaluation=True)
+        with pytest.raises(ValueError, match="trained auxiliary return critic checkpoint"):
+            FrozenXQCMPPIController(model.agent, {"terminal_value_source": "aux_return"})
+    finally:
+        model.env.close()
+
+
 def test_adapter_rejects_training_agent_and_invalid_reward_scale(monkeypatch):
     model = _tiny_model(inner_operator="none")
     try:
@@ -197,16 +324,21 @@ def test_adapter_rejects_training_agent_and_invalid_reward_scale(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA hardware is unavailable")
-def test_cuda_adapter_preserves_outer_and_global_rng_and_repeats_seeded_episodes():
+@pytest.mark.parametrize("auxiliary_detach", [None, False, True], ids=["soft", "aux_shared", "aux_detached"])
+def test_cuda_adapter_preserves_outer_and_global_rng_and_repeats_seeded_episodes(auxiliary_detach):
     model = _tiny_model(
-        device="cuda", inner_operator="none", xqc_optimizer_backend="auto"
+        device="cuda", inner_operator="none", xqc_optimizer_backend="auto",
+        aux_return_mode="off" if auxiliary_detach is None else "xqc",
+        aux_return_detach_representation=auxiliary_detach is not False,
     )
     try:
         agent = model.agent
         agent.observe_reward(2.0, False, False)
         agent._update(*(tensor.to(agent.device) for tensor in _batch(agent)))
         model.load(deepcopy(agent.checkpoint_state()), frozen_evaluation=True)
-        planner = FrozenXQCMPPIController(agent, SMALL)
+        planner = FrozenXQCMPPIController(agent, {
+            **SMALL, "terminal_value_source": "xqc" if auxiliary_detach is None else "aux_return",
+        })
         assert planner.generator.device.type == "cuda"
         observation, _ = model.env.reset(seed=17)
         outer_before = agent.frozen_outer_state()

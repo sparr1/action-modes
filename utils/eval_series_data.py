@@ -409,9 +409,10 @@ def identity_for_ambi_checkpoint(checkpoint, resolved, protocol, seeds, code, *,
         description = FrozenXQCMPPIController.__new__(FrozenXQCMPPIController)
         description.reward_scale = 1.0  # Only the initialization rule enters identity.
         description.discount = agent._get_discount(config["episode_length"])
+        settings = resolve_mppi_settings(configured.get("params"), action_dim=config["action_dim"])
+        description.terminal_value_source = settings.get("terminal_value_source", "xqc")
         evaluation_controller = {"type": "mppi", "protocol": description.protocol,
-                                 "settings": resolve_mppi_settings(configured.get("params"),
-                                                                   action_dim=config["action_dim"])}
+                                 "settings": settings}
         action_rule = description.protocol["action_rule"]
     result = {"evaluation_controller": evaluation_controller} if evaluation_controller else {}
     action = action_rule or protocol["action_rule"]
@@ -457,7 +458,10 @@ def descriptive_label(identity, selector=None):
                  f"pi{settings.get('num_pi_trajs', settings.get('inner_mppi_num_pi_trajs'))} "
                  f"J{settings.get('effective_iterations', settings.get('inner_mppi_iterations'))}")
         if planner.get("backend") == "tdmpc2_mppi_over_frozen_xqc":
-            title += " | online XQC Q × frozen scale"
+            source = planner.get("semantics", {}).get("terminal_value_source")
+            title += (" | online auxiliary return Q × frozen scale"
+                      if source == "online_aux_return_twin_mean"
+                      else " | online XQC Q × frozen scale")
         elif planner.get("backend") == "native_tdmpc2":
             title += " | online TD-MPC2 Q"
         return prefix + title

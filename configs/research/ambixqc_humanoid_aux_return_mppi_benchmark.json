@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "description": "Frozen MPPI using either the main XQC soft critic or the trained auxiliary reward-return critic; same main actor, world model, reward scale and MPPI budget. Reuse matching completed prior bundles when evaluating the return critic alone.",
+  "base_alg_config": "checkpoint",
+  "evaluation": {
+    "controller_seed": 12345,
+    "seeds": [101, 102, 103, 104, 105],
+    "max_steps": 500,
+    "default_presets": ["bootstrap/mppi_return"],
+    "wandb_project": "ambi-inner-bench"
+  },
+  "comparisons": {
+    "bootstrap": {
+      "reference": "prior",
+      "variants": {
+        "prior": {
+          "description": "Frozen main actor mean; may be reused from a compatible completed reference bundle.",
+          "alg_params": {"inner_operator": "none"}
+        },
+        "mppi_soft": {
+          "description": "Usual MPPI with the online main XQC soft-Q twin mean.",
+          "evaluation_controller": {"type": "mppi", "params": {}}
+        },
+        "mppi_return": {
+          "description": "Same MPPI using the online auxiliary reward-only twin critic, scaled by the checkpoint's frozen real reward scale. The main XQC actor supplies all policy proposals and terminal actions.",
+          "evaluation_controller": {
+            "type": "mppi",
+            "params": {"terminal_value_source": "aux_return"}
+          }
+        }
+      }
+    }
+  }
+}

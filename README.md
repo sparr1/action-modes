@@ -116,9 +116,12 @@ entropy-augmented inner updates with an auxiliary horizon continuation retain
 entropy inside the imagined prefix but omit it from the frozen tail.
 
 Frozen evaluation presets may select these inner choices but cannot enable
-or retrain a missing auxiliary critic. MPPI continues to use the main online
-XQC soft-value tail. No shipped training or evaluation preset enables the
-auxiliary critic automatically.
+or retrain a missing auxiliary critic. MPPI defaults to the main online XQC
+soft-value tail. Set the evaluation controller parameter
+`terminal_value_source="aux_return"` to use a checkpoint's trained auxiliary
+return critic with the same main actor and frozen reward scale. The matrix
+`configs/research/ambixqc_humanoid_aux_return_mppi_benchmark.json` supplies this
+comparison; it cannot enable or initialize a missing auxiliary critic.
 
 ### AMBI-XQC prior-only checkpoint evaluation
 

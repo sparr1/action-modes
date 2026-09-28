@@ -67,7 +67,8 @@ def validate_evaluation_controller(config, controller):
     if not isinstance(settings, dict) or not isinstance(protocol, dict):
         raise ValueError("MPPI requires resolved settings and controller protocol.")
     for key, value in config.get("evaluation_controller", {}).get("params", {}).items():
-        if settings.get(key) != value:
+        actual = settings.get(key, "xqc") if key == "terminal_value_source" else settings.get(key)
+        if actual != value:
             raise ValueError(f"Recorded MPPI setting {key!r} conflicts with the authored configuration.")
     for key in ("horizon", "iterations", "effective_iterations", "num_samples", "num_elites"):
         if isinstance(settings.get(key), bool) or not isinstance(settings.get(key), int) or settings[key] <= 0:
@@ -86,9 +87,20 @@ def validate_evaluation_controller(config, controller):
         raise ValueError("MPPI minimum standard deviation exceeds its maximum.")
     if protocol.get("action_rule") != MPPI_ACTION_RULE:
         raise ValueError("MPPI controller action rule must describe weighted-elite execution.")
-    if protocol.get("terminal_value_source") != "online_xqc_twin_mean":
-        raise ValueError("MPPI terminal value source must use the online XQC twin mean.")
-    if protocol.get("terminal_value_units") != "normalized_xqc_soft_q_times_frozen_real_reward_scale":
+    source = settings.get("terminal_value_source", "xqc")
+    authored = config.get("evaluation_controller", {}).get("params", {}).get("terminal_value_source", "xqc")
+    if not isinstance(source, str) or source not in {"xqc", "aux_return"} or source != authored:
+        raise ValueError("Recorded MPPI terminal value source conflicts with its configuration.")
+    auxiliary = source == "aux_return"
+    expected_source = "online_aux_return_twin_mean" if auxiliary else "online_xqc_twin_mean"
+    expected_units = ("normalized_aux_return_q_times_frozen_real_reward_scale" if auxiliary
+                      else "normalized_xqc_soft_q_times_frozen_real_reward_scale")
+    if protocol.get("terminal_value_source") != expected_source:
+        raise ValueError("MPPI terminal value source must use the selected online twin mean.")
+    if auxiliary and (config.get("alg_params", {}).get("aux_return_mode") != "xqc"
+                      or protocol.get("terminal_value_semantics") != "learned_reward_only_q_tail_under_main_xqc_policy"):
+        raise ValueError("Auxiliary MPPI requires a saved return critic and reward-only value semantics.")
+    if protocol.get("terminal_value_units") != expected_units:
         raise ValueError("MPPI terminal value units must describe the frozen reward-scale conversion.")
     scale = protocol.get("reward_scale")
     if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0:
@@ -305,11 +317,14 @@ def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None,
             tags.append(f"J:{settings['effective_iterations']}")
         elif "iterations" in settings:
             schedule.append(f"configured iterations {settings['iterations']}")
+        auxiliary = settings.get("terminal_value_source", "xqc") == "aux_return"
+        tail = "online-aux-return-twin-mean" if auxiliary else "online-xqc-twin-mean"
         tags.extend(("algorithm:ambixqc", "schedule:mppi-search", "C:0", "A:0", "T:0",
-                     "terminal-q:online-xqc-twin-mean", "reward-scale:frozen-real"))
+                     f"terminal-q:{tail}", "reward-scale:frozen-real"))
         if "iterations" in settings:
             tags.append(f"configured-iterations:{settings['iterations']}")
-        parts.extend((" ".join(["MPPI", *schedule]), "weighted elite", "online Q × frozen scale"))
+        parts.extend((" ".join(["MPPI", *schedule]), "weighted elite",
+                      "online auxiliary return Q × frozen scale" if auxiliary else "online Q × frozen scale"))
     elif _is_xqc(config):
         schedule = []
         for symbol, key in (("J", "inner_rounds"), ("N", "inner_rollouts_per_round"),

@@ -1,10 +1,11 @@
 """Evaluation-only TD-MPC2 MPPI over a frozen AMBI-XQC checkpoint.
 
 The population defaults and action selection follow official TD-MPC2 commit
-8bbc14ebabdb32ea7ada5c801dc525d0dc73bafe. The terminal value is deliberately an
-XQC bootstrap approximation: its learned soft-Q tail is multiplied by the
-frozen real reward scale and averaged over both online critics. It remains a
-soft-Q tail; no entropy correction makes it a raw-reward value function.
+8bbc14ebabdb32ea7ada5c801dc525d0dc73bafe. The default terminal value uses the
+learned XQC soft-Q tail. An explicitly selected auxiliary return critic supplies
+a reward-only tail when present in the trained checkpoint. Both average the
+selected online twins and multiply by the frozen real reward scale. The main
+XQC actor supplies policy trajectories and terminal actions in either case.
 """
 
 from __future__ import annotations
@@ -37,6 +38,9 @@ def resolve_mppi_settings(settings, *, action_dim):
     if settings is not None and not isinstance(settings, Mapping):
         raise TypeError("MPPI settings must be a mapping.")
     settings = dict(settings or {})
+    terminal_value_source = settings.pop("terminal_value_source", "xqc")
+    if not isinstance(terminal_value_source, str) or terminal_value_source not in {"xqc", "aux_return"}:
+        raise ValueError("MPPI terminal_value_source must be 'xqc' or 'aux_return'.")
     unknown = set(settings) - set(TD_MPC2_MPPI_DEFAULTS)
     if unknown:
         raise ValueError(f"Unsupported XQC MPPI settings: {sorted(unknown)}")
@@ -61,6 +65,10 @@ def resolve_mppi_settings(settings, *, action_dim):
     # Preserve the official large-action-space heuristic, including overrides
     # to the authored base iteration count. Humanoid has 21 actions: 6 + 2.
     resolved["effective_iterations"] = resolved["iterations"] + 2 * int(action_dim >= 20)
+    # Keep existing soft-Q planner identities unchanged, including an explicitly
+    # selected default. Only the new reward-only route adds a settings key.
+    if terminal_value_source != "xqc":
+        resolved["terminal_value_source"] = terminal_value_source
     return resolved
 
 
@@ -77,6 +85,13 @@ class FrozenXQCMPPIController:
         self.controller = agent.xqc_controller
         self.device = torch.device(agent.device)
         self._settings = resolve_mppi_settings(settings, action_dim=agent.cfg.action_dim)
+        self.terminal_value_source = self._settings.get("terminal_value_source", "xqc")
+        self.terminal_critic = self.controller.critic
+        if self.terminal_value_source == "aux_return":
+            auxiliary = getattr(agent, "aux_return", None)
+            if auxiliary is None or auxiliary.update_step <= 0:
+                raise ValueError("MPPI aux_return requires a trained auxiliary return critic checkpoint.")
+            self.terminal_critic = auxiliary.critic
         self.reward_scale = float(agent.reward_normalizer.scale)
         if not math.isfinite(self.reward_scale) or self.reward_scale <= 0:
             raise ValueError("XQC MPPI requires a positive finite frozen real reward scale.")
@@ -100,12 +115,19 @@ class FrozenXQCMPPIController:
 
     @property
     def protocol(self):
+        auxiliary = self.terminal_value_source == "aux_return"
         return {
             "algorithm": "tdmpc2_mppi_over_frozen_xqc",
             "action_rule": "weighted_elite_gumbel_no_execution_noise",
-            "terminal_value_source": "online_xqc_twin_mean",
-            "terminal_value_units": "normalized_xqc_soft_q_times_frozen_real_reward_scale",
-            "terminal_value_semantics": "learned_soft_q_tail_without_entropy_correction",
+            "terminal_value_source": "online_aux_return_twin_mean" if auxiliary else "online_xqc_twin_mean",
+            "terminal_value_units": (
+                "normalized_aux_return_q_times_frozen_real_reward_scale" if auxiliary
+                else "normalized_xqc_soft_q_times_frozen_real_reward_scale"
+            ),
+            "terminal_value_semantics": (
+                "learned_reward_only_q_tail_under_main_xqc_policy" if auxiliary
+                else "learned_soft_q_tail_without_entropy_correction"
+            ),
             "reward_units": "raw_environment_reward",
             "reward_scale": self.reward_scale,
             "discount": self.discount,
@@ -155,7 +177,7 @@ class FrozenXQCMPPIController:
         if reduction != "mean_all":
             raise ValueError("Frozen XQC MPPI uses the mean of both online critics.")
         self._q_evaluations += int(z.shape[0])
-        normalized_values = self.controller.critic.values(z, action, bn_mode="running")
+        normalized_values = self.terminal_critic.values(z, action, bn_mode="running")
         return normalized_values.mean(dim=0).unsqueeze(-1) * self.reward_scale
 
     @torch.no_grad()
@@ -174,6 +196,7 @@ class FrozenXQCMPPIController:
             root_z = self.model.encode(observation.unsqueeze(0))
             settings = dict(self._settings)
             settings["iterations"] = settings.pop("effective_iterations")
+            settings.pop("terminal_value_source", None)
             result = mppi_plan(
                 root_z, callbacks=self.callbacks, **settings,
                 discount=self.discount, q_reduction="mean_all",

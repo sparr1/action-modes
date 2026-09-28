@@ -30,7 +30,7 @@ _XQC_CHECKPOINT_INNER_PARAMS = {
 }
 _MPPI_PARAMETERS = {
     "horizon", "iterations", "num_samples", "num_elites", "num_pi_trajs",
-    "min_std", "max_std", "temperature",
+    "min_std", "max_std", "temperature", "terminal_value_source",
 }
 
 
@@ -106,6 +106,9 @@ def _validate_evaluation_controller(value, location):
     defaults = {"horizon": 3, "iterations": 6, "num_samples": 512, "num_elites": 64,
                 "num_pi_trajs": 24, "min_std": 0.05, "max_std": 2.0, "temperature": 0.5}
     settings = {**defaults, **params}
+    terminal_source = settings.get("terminal_value_source", "xqc")
+    if not isinstance(terminal_source, str) or terminal_source not in {"xqc", "aux_return"}:
+        raise PresetMatrixError(f"{location}.terminal_value_source must be 'xqc' or 'aux_return'.")
     for key in ("horizon", "iterations", "num_samples", "num_elites", "num_pi_trajs"):
         number = settings[key]
         if isinstance(number, bool) or not isinstance(number, int) or number < (0 if key == "num_pi_trajs" else 1):
@@ -396,6 +399,9 @@ def resolve_preset(matrix_path, selector, matrix=None, *, checkpoint_context=Non
     if evaluation_controller is not None:
         if algorithm_config.get("alg") != "AMBIXQC/AMBIXQC":
             raise PresetMatrixError("The evaluation-only MPPI controller requires an AMBI-XQC checkpoint.")
+        if (evaluation_controller.get("params", {}).get("terminal_value_source", "xqc") == "aux_return"
+                and alg_params.get("aux_return_mode", "off") != "xqc"):
+            raise PresetMatrixError("Return-critic MPPI requires a checkpoint with aux_return_mode='xqc'.")
         # The saved model is loaded as a frozen XQC prior. Planner settings
         # belong to evaluation metadata and never enter the training algorithm.
         authored = {**matrix.get("shared_alg_params", {}), **variant.get("alg_params", {})}

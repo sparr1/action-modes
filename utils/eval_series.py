@@ -219,6 +219,8 @@ def _planner_display_label(planner, *, compact=False):
             if value is not None and (not compact or value != default):
                 parts.append(prefix + number(value))
     elif kind == "mppi":
+        if planner.get("semantics", {}).get("terminal_value_source") == "online_aux_return_twin_mean":
+            parts.append("return Q" if compact else "auxiliary return Q")
         for value, prefix in ((settings.get("planning_horizon", settings.get("horizon")), "H"),
                               (settings.get("num_samples"), "N"),
                               (settings.get("num_elites"), "E"),
@@ -229,7 +231,10 @@ def _planner_display_label(planner, *, compact=False):
         if not compact:
             backend = planner.get("backend")
             if backend == "tdmpc2_mppi_over_frozen_xqc":
-                parts.append("online XQC Q × frozen scale")
+                source = planner.get("semantics", {}).get("terminal_value_source")
+                parts.append("online auxiliary return Q × frozen scale"
+                             if source == "online_aux_return_twin_mean"
+                             else "online XQC Q × frozen scale")
             elif backend == "native_tdmpc2":
                 parts.append("online TD-MPC2 Q")
     return " ".join(parts)
