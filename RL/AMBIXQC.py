@@ -22,11 +22,12 @@ from RL.xqc_core import OFFICIAL_XQC_COMMIT
 
 
 _AMBIXQC_DEFAULTS = {
-    # TOLD remains a one-update-per-interaction recurrent learner.  XQC's
-    # controller slot is part of that update; UTD=2 must not double BPTT.
+    # TOLD remains a one-update-per-interaction recurrent learner. Additional
+    # XQC slots train on fresh replay with detached recurrent latents.
     "mpc": False,
     "discount": 0.99,
     "utd": 1,
+    "xqc_utd": 1,
     "compile": False,
     "compile_strict": False,
     "inner_operator": "xqc",
@@ -307,8 +308,8 @@ class AMBIXQC(AMBITDMPC2):
             raise ValueError("AMBIXQC does not use MPPI; mpc must be false.")
         if "utd" in params and _positive_int(params["utd"], "utd") != 1:
             raise ValueError(
-                "AMBIXQC requires utd=1 so controller updates do not duplicate "
-                "TOLD's recurrent BPTT update."
+                "AMBIXQC requires utd=1 for TOLD's recurrent BPTT update. "
+                "Use xqc_utd to request additional XQC-only updates."
             )
         for key in ("compile", "compile_strict"):
             if key in params and not isinstance(params[key], (bool, np.bool_)):
@@ -328,6 +329,7 @@ class AMBIXQC(AMBITDMPC2):
         cfg.discount_max = cfg.discount
         cfg.mpc = False
         cfg.utd = 1
+        cfg.xqc_utd = _positive_int(cfg.xqc_utd, "xqc_utd")
         cfg.compile = bool(cfg.compile)
         cfg.compile_strict = bool(cfg.compile_strict)
         if not isinstance(cfg.inner_operator, str) or cfg.inner_operator.lower() not in {
@@ -442,8 +444,8 @@ class AMBIXQC(AMBITDMPC2):
         cfg.reward_normalization = True
         cfg.xqc_official_commit = OFFICIAL_XQC_COMMIT
         # The outer schedule advances once per accepted controller optimizer
-        # slot and spans the run's intended TOLD update budget.
-        cfg.xqc_lr_transition_steps = int(cfg.steps)
+        # slot and spans the run's intended controller update budget.
+        cfg.xqc_lr_transition_steps = int(cfg.steps) * cfg.xqc_utd
 
         cfg.inner_rounds = _positive_int(cfg.inner_rounds, "inner_rounds")
         cfg.inner_rollouts_per_round = _positive_int(

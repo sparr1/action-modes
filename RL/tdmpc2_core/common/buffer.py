@@ -1,4 +1,5 @@
 from collections import deque
+from numbers import Integral
 
 import torch
 from tensordict.tensordict import TensorDict
@@ -7,6 +8,19 @@ from torchrl.data.replay_buffers import ReplayBuffer, LazyTensorStorage
 from torchrl.data.replay_buffers.samplers import SliceSampler
 
 from .training_state import require_exact_keys
+
+
+def resolve_replay_capacity(buffer_size, steps, replay_capacity=None):
+	"""Resolve row capacity while preserving the historical budget cap by default."""
+	if replay_capacity is None:
+		return min(buffer_size, steps)
+	if (
+		isinstance(replay_capacity, bool)
+		or not isinstance(replay_capacity, Integral)
+		or replay_capacity <= 0
+	):
+		raise ValueError("replay_capacity must be a positive integer row count or null.")
+	return int(replay_capacity)
 
 
 class Buffer():
@@ -19,7 +33,11 @@ class Buffer():
 		self.cfg = cfg
 		self._device = resolve_device(getattr(cfg, 'device', None))
 		self.cfg.device = str(self._device)
-		self._capacity = min(cfg.buffer_size, getattr(cfg, 'steps', cfg.buffer_size))
+		self._capacity = resolve_replay_capacity(
+			cfg.buffer_size,
+			getattr(cfg, 'steps', cfg.buffer_size),
+			getattr(cfg, 'replay_capacity', None),
+		)
 		self._sampler = self._make_sampler()
 		self._batch_size = cfg.batch_size * (cfg.train_unroll_horizon+1)
 		self._num_eps = 0

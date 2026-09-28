@@ -22,10 +22,11 @@ def _primary_state(agent):
 
 
 @pytest.mark.parametrize("operator", ["none", "xqc"])
-def test_detached_auxiliary_preserves_seeded_primary_training(wrappers, operator):
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_detached_auxiliary_preserves_seeded_primary_training(wrappers, operator, ratio):
     outcomes = []
     for mode in ("off", "xqc"):
-        model = wrappers(inner_operator=operator, aux_return_mode=mode)
+        model = wrappers(inner_operator=operator, aux_return_mode=mode, xqc_utd=ratio)
         # Gym otherwise creates OS-seeded streams lazily before learn() applies
         # the configured seed, so initialize those streams for this comparison.
         model.env.reset(seed=3)
@@ -40,7 +41,7 @@ def test_detached_auxiliary_preserves_seeded_primary_training(wrappers, operator
             "replay_accounting": model.buffer._accounting_state(),
         })
         if mode == "xqc":
-            assert model.agent.aux_return.update_step == model.agent.num_updates > 0
+            assert model.agent.aux_return.update_step == model.agent.num_updates * ratio > 0
             assert model.agent.aux_return.critic is not model.agent.xqc_controller.critic
             assert not any("actor" in key or "temperature" in key
                            for key in model.agent.aux_return.state_dict())

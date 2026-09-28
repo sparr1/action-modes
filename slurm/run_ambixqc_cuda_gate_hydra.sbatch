@@ -244,7 +244,7 @@ if (
     set(state) != expected_fields
     or isinstance(checkpoint_version, bool)
     or not isinstance(checkpoint_version, int)
-    or checkpoint_version not in {1, 2}
+    or checkpoint_version not in {1, 2, 3, 4, 5, 6}
 ):
     raise SystemExit(f"unexpected AMBI-XQC checkpoint schema: {set(state)}")
 signature = state["semantic_signature"]

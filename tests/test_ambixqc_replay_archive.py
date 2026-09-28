@@ -14,7 +14,7 @@ from RL.AMBIXQC import AMBIXQC
 from utils.replay_archive import ReplayArchiveError, load_checkpoint_replay
 
 
-def _model(*, total_steps=13, inner_operator="xqc"):
+def _model(*, total_steps=13, inner_operator="xqc", xqc_utd=1):
     return AMBIXQC(
         "AMBIXQC",
         gym.make("Pendulum-v1", max_episode_steps=5),
@@ -25,7 +25,7 @@ def _model(*, total_steps=13, inner_operator="xqc"):
             "num_bins": 5, "vmin": -5, "vmax": 5,
             "batch_size": 2, "train_unroll_horizon": 2,
             "buffer_size": 9, "seed_steps": 4, "pretrain_steps": 1,
-            "utd": 1, "compile": False, "episodic": False,
+            "utd": 1, "xqc_utd": xqc_utd, "compile": False, "episodic": False,
             "discount": 0.99, "wandb": False,
             "xqc_actor_net_arch": [8, 8], "xqc_critic_net_arch": [8, 8],
             "xqc_num_atoms": 11, "xqc_vmin": -2, "xqc_vmax": 2,
@@ -91,11 +91,12 @@ def _rng_state(model):
 
 
 @pytest.mark.parametrize("inner_operator", ["none", "xqc"])
-def test_archive_matches_checkpoint_replay_without_changing_training(tmp_path, inner_operator):
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_archive_matches_checkpoint_replay_without_changing_training(tmp_path, inner_operator, ratio):
     results = []
     for enabled in (False, True):
         directory = tmp_path / str(enabled)
-        model = _model(inner_operator=inner_operator)
+        model = _model(inner_operator=inner_operator, xqc_utd=ratio)
         model.set_checkpointing(
             2, directory, "model", save_strat=("all", "best", "latest")
         )

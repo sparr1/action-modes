@@ -40,7 +40,7 @@ from RL.xqc_core import (
 class AMBIXQCAgent(nn.Module):
     """Persistent TOLD model and XQC priors with fresh inner XQC per action."""
 
-    _CHECKPOINT_VERSION = 5
+    _CHECKPOINT_VERSION = 6
 
     def __init__(self, cfg):
         super().__init__()
@@ -330,6 +330,16 @@ class AMBIXQCAgent(nn.Module):
             generator=self._outer_generator,
         )
 
+    def _reduce_critic_loss(self, objective):
+        return td_math.reduce_temporal_loss(
+            objective.per_sample_loss.mean(dim=1),
+            self.cfg.rho,
+            normalization=self.cfg.temporal_loss_normalization,
+            reference_horizon=self.cfg.temporal_loss_reference_horizon,
+            legacy_order="vector_sum_divide",
+            weights=self._transition_temporal_weights,
+        )
+
     def _recurrent_world_and_value_losses(
         self, obs, action, reward, terminated, next_z_targets
     ):
@@ -384,15 +394,7 @@ class AMBIXQCAgent(nn.Module):
             next_noise=self._noise(action.shape[:-1], action.dtype),
             reward_scale=self.reward_normalizer.scale,
         )
-        critic_per_time = critic_objective.per_sample_loss.mean(dim=1)
-        critic_loss = td_math.reduce_temporal_loss(
-            critic_per_time,
-            self.cfg.rho,
-            normalization=self.cfg.temporal_loss_normalization,
-            reference_horizon=self.cfg.temporal_loss_reference_horizon,
-            legacy_order="vector_sum_divide",
-            weights=self._transition_temporal_weights,
-        )
+        critic_loss = self._reduce_critic_loss(critic_objective)
 
         termination_prediction = (
             self.model.termination(latent_states[1:], unnormalized=True)
@@ -443,14 +445,7 @@ class AMBIXQCAgent(nn.Module):
                 actor=self.xqc_controller.actor,
                 reward_scale=self.reward_normalizer.scale,
             )
-            auxiliary_loss = td_math.reduce_temporal_loss(
-                auxiliary_objective.per_sample_loss.mean(dim=1),
-                self.cfg.rho,
-                normalization=self.cfg.temporal_loss_normalization,
-                reference_horizon=self.cfg.temporal_loss_reference_horizon,
-                legacy_order="vector_sum_divide",
-                weights=self._transition_temporal_weights,
-            )
+            auxiliary_loss = self._reduce_critic_loss(auxiliary_objective)
             total_loss = total_loss + float(self.cfg.aux_return_critic_coef) * auxiliary_loss
             auxiliary = {"aux_return_critic": auxiliary_objective, "aux_return_loss": auxiliary_loss}
         return {
@@ -509,9 +504,119 @@ class AMBIXQCAgent(nn.Module):
             ],
         }
 
-    def _update(self, obs, action, reward, terminated):
+    def _xqc_only_losses(self, obs, action, reward, terminated):
+        """Recompute replay latents without training any part of TOLD.
+
+        Keep the joint update's recurrent input distribution, temporal weights,
+        and terminal actor latent. Directly encoding every current observation
+        or using the flat controller workspace loss would change that objective.
+        """
+        with torch.no_grad():
+            next_z_targets = self.model.encode(obs[1:])
+            z = self.model.encode(obs[0])
+            latent_states = [z]
+            for recorded_action in action.unbind(0):
+                z = self.model.next(z, recorded_action)
+                latent_states.append(z)
+            latent_states = torch.stack(latent_states, dim=0)
+        batch = LatentXQCBatch(
+            latents=latent_states[:-1], actions=action, rewards=reward,
+            next_latents=next_z_targets, bootstrap_mask=1.0 - terminated,
+            discount=self.discount,
+        )
+        objective = self.xqc_controller.critic_objective(
+            batch,
+            next_noise=self._noise(action.shape[:-1], action.dtype),
+            reward_scale=self.reward_normalizer.scale,
+        )
+        losses = {
+            "latent_states": latent_states, "critic": objective,
+            "critic_loss": self._reduce_critic_loss(objective),
+        }
+        if self.aux_return is not None:
+            # Extra slots detach even in shared-representation mode. Auxiliary
+            # representation gradients belong only to the one joint update.
+            auxiliary = self.aux_return.critic_objective(
+                batch, actor=self.xqc_controller.actor,
+                reward_scale=self.reward_normalizer.scale,
+            )
+            losses.update(
+                aux_return_critic=auxiliary,
+                aux_return_loss=self._reduce_critic_loss(auxiliary),
+            )
+        return losses
+
+    def _controller_update_metrics(
+        self, losses, critic_grad_norm, critic_lr, target_updated,
+        auxiliary_info, actor_info,
+    ):
+        critic = losses["critic"]
+        q_values = critic.current_values.detach()
+        info = {
+            "critic_loss": losses["critic_loss"].detach(),
+            "critic_grad_norm": critic_grad_norm.detach(),
+            "q_target_mean": critic.target_values.detach().mean(),
+            "q_mean": q_values.mean(),
+            "q_abs_mean": q_values.abs().mean(),
+            "q_head_disagreement": (q_values[0] - q_values[1]).abs().mean(),
+            "q_target_clip_fraction": critic.clip_fraction.detach().clone(),
+            "critic_learning_rate": float(critic_lr),
+            "target_updated": float(target_updated),
+            "compile_fallback": float(self.xqc_controller.compile_status["fallback"]),
+            **actor_info,
+        }
+        for depth in range(int(self.cfg.train_unroll_horizon)):
+            values_at_depth = q_values[:, depth]
+            info[f"q_error_depth_{depth + 1}"] = (
+                values_at_depth - critic.target_values[depth].detach()
+            ).abs().mean()
+            info[f"q_head_disagreement_depth_{depth + 1}"] = (
+                values_at_depth[0] - values_at_depth[1]
+            ).abs().mean()
+        if self.aux_return is not None:
+            auxiliary = losses["aux_return_critic"]
+            values = auxiliary.current_values.detach()
+            info.update({
+                "aux_return_critic_loss": losses["aux_return_loss"].detach(),
+                "aux_return_q_mean": values.mean(),
+                "aux_return_q_target_mean": auxiliary.target_values.detach().mean(),
+                "aux_return_q_head_disagreement": (values[0] - values[1]).abs().mean(),
+                "aux_return_q_target_clip_fraction": auxiliary.clip_fraction.detach().clone(),
+                **auxiliary_info,
+            })
+            fallback = bool(self.aux_return.compile_status["fallback"])
+            info["compile_aux_return_fallback"] = float(fallback)
+            info["compile_fallback"] = float(bool(info["compile_fallback"]) or fallback)
+        return info
+
+    def _update_xqc_only(self, obs, action, reward, terminated):
         if self._frozen_evaluation:
             raise RuntimeError("A frozen-evaluation AMBI-XQC agent cannot update.")
+        losses = self._xqc_only_losses(obs, action, reward, terminated)
+        self.xqc_workspace.zero_critic_grad()
+        losses["critic_loss"].backward()
+        if self.aux_return is not None:
+            self.aux_return.zero_grad()
+            losses["aux_return_loss"].backward()
+        critic_grad_norm = torch.stack([
+            parameter.grad.detach().norm(2)
+            for parameter in self.xqc_controller.critic.parameters()
+            if parameter.grad is not None
+        ]).norm(2)
+        critic_lr, target_updated = self.xqc_workspace.step_critic()
+        auxiliary_info = self.aux_return.step() if self.aux_return is not None else {}
+        # This forward also owns actor BN updates on optimizer-skipped slots.
+        actor_info = self._update_actor_and_temperature(losses["latent_states"])
+        return self._controller_update_metrics(
+            losses, critic_grad_norm, critic_lr, target_updated,
+            auxiliary_info, actor_info,
+        )
+
+    def _update(self, obs, action, reward, terminated, *, extra_batch_sampler=None):
+        if self._frozen_evaluation:
+            raise RuntimeError("A frozen-evaluation AMBI-XQC agent cannot update.")
+        if self.cfg.xqc_utd > 1 and not callable(extra_batch_sampler):
+            raise ValueError("xqc_utd > 1 requires a fresh replay batch sampler; use update(buffer).")
         with torch.no_grad():
             next_z_targets = self.model.encode(obs[1:])
 
@@ -566,44 +671,22 @@ class AMBIXQCAgent(nn.Module):
         auxiliary_info = self.aux_return.step() if self.aux_return is not None else {}
         actor_info = self._update_actor_and_temperature(losses["latent_states"])
 
-        self.num_updates += 1
-        self.outer_version += 1
-        self.inner_engine.mark_outer_update(self.outer_version)
-        if self.xqc_workspace.update_step != self.num_updates:
-            raise RuntimeError("Outer XQC and TOLD update counters diverged.")
-        if self.aux_return is not None and self.aux_return.update_step != self.num_updates:
-            raise RuntimeError("Auxiliary XQC and TOLD update counters diverged.")
         self.model.eval()
 
         reward_values = td_math.two_hot_inv(
             losses["reward_predictions"].detach(), self.cfg
         )
-        critic = losses["critic"]
-        q_values = critic.current_values.detach()
         info = {
             "consistency_loss": losses["consistency_loss"].detach(),
             "reward_loss": losses["reward_loss"].detach(),
-            "critic_loss": losses["critic_loss"].detach(),
             "termination_loss": losses["termination_loss"].detach(),
             "total_loss": losses["total_loss"].detach(),
             "grad_norm": torch.as_tensor(world_grad_norm).detach(),
-            "critic_grad_norm": critic_grad_norm.detach(),
-            "q_target_mean": critic.target_values.detach().mean(),
-            "q_mean": q_values.mean(),
-            "q_abs_mean": q_values.abs().mean(),
-            "q_head_disagreement": (q_values[0] - q_values[1]).abs().mean(),
-            "q_target_clip_fraction": critic.clip_fraction.detach().clone(),
             "reward_pred_mean": reward_values.mean(),
             "reward_target_mean": reward.detach().mean(),
             "reward_abs_mean": reward.detach().abs().mean(),
             "reward_scale": torch.tensor(
                 self.reward_normalizer.scale, device=self.device
-            ),
-            "critic_learning_rate": float(critic_lr),
-            "target_updated": float(target_updated),
-            "num_updates": float(self.num_updates),
-            "compile_fallback": float(
-                self.xqc_controller.compile_status["fallback"]
             ),
         }
         for depth in range(int(self.cfg.train_unroll_horizon)):
@@ -613,13 +696,6 @@ class AMBIXQCAgent(nn.Module):
             info[f"reward_error_depth_{depth + 1}"] = (
                 reward_values[depth] - reward[depth]
             ).abs().mean()
-            values_at_depth = q_values[:, depth]
-            info[f"q_error_depth_{depth + 1}"] = (
-                values_at_depth - critic.target_values[depth].detach()
-            ).abs().mean()
-            info[f"q_head_disagreement_depth_{depth + 1}"] = (
-                values_at_depth[0] - values_at_depth[1]
-            ).abs().mean()
         if bool(self.cfg.episodic):
             info.update(
                 td_math.termination_statistics(
@@ -627,30 +703,47 @@ class AMBIXQCAgent(nn.Module):
                     terminated[-1].detach(),
                 )
             )
-        info.update(actor_info)
-        if self.aux_return is not None:
-            auxiliary = losses["aux_return_critic"]
-            values = auxiliary.current_values.detach()
-            info.update({
-                "aux_return_critic_loss": losses["aux_return_loss"].detach(),
-                "aux_return_q_mean": values.mean(),
-                "aux_return_q_target_mean": auxiliary.target_values.detach().mean(),
-                "aux_return_q_head_disagreement": (values[0] - values[1]).abs().mean(),
-                "aux_return_q_target_clip_fraction": auxiliary.clip_fraction.detach().clone(),
-                **auxiliary_info,
-            })
-            fallback = bool(self.aux_return.compile_status["fallback"])
-            info["compile_aux_return_fallback"] = float(fallback)
-            info["compile_fallback"] = float(bool(info["compile_fallback"]) or fallback)
+        info.update(self._controller_update_metrics(
+            losses, critic_grad_norm, critic_lr, target_updated,
+            auxiliary_info, actor_info,
+        ))
+        # Keep only detached metrics while extra slots construct fresh graphs.
+        del losses
+        for _ in range(self.cfg.xqc_utd - 1):
+            info.update(self._update_xqc_only(*extra_batch_sampler()))
+
+        self.num_updates += 1  # World-model clock, also used by the trainer.
+        self.outer_version += 1
+        self.inner_engine.mark_outer_update(self.outer_version)
+        if self.xqc_workspace.update_step != self.num_updates * self.cfg.xqc_utd:
+            raise RuntimeError("Outer XQC counters do not match the configured update ratio.")
+        if (self.aux_return is not None
+                and self.aux_return.update_step != self.xqc_workspace.update_step):
+            raise RuntimeError("Auxiliary and primary XQC update counters diverged.")
+        info.update(
+            num_updates=float(self.num_updates),
+            world_model_num_updates=float(self.num_updates),
+            xqc_num_updates=float(self.xqc_workspace.update_step),
+            xqc_actor_num_updates=float(self.xqc_workspace.actor_optimizer_steps),
+            xqc_temperature_num_updates=float(self.xqc_workspace.temperature_optimizer_steps),
+            xqc_updates_per_world_update=float(self.cfg.xqc_utd),
+        )
         return info
+
+    @staticmethod
+    def _sample_replay_batch(buffer):
+        obs, action, reward, terminated, task = buffer.sample()
+        if task is not None:
+            raise NotImplementedError("AMBI-XQC supports single-task training only.")
+        return obs, action, reward, terminated
 
     def update(self, buffer):
         if self._frozen_evaluation:
             raise RuntimeError("A frozen-evaluation AMBI-XQC agent cannot update.")
-        obs, action, reward, terminated, task = buffer.sample()
-        if task is not None:
-            raise NotImplementedError("AMBI-XQC supports single-task training only.")
-        return self._update(obs, action, reward, terminated)
+        return self._update(
+            *self._sample_replay_batch(buffer),
+            extra_batch_sampler=lambda: self._sample_replay_batch(buffer),
+        )
 
     def observation_signature(self):
         mode = str(self.cfg.obs)
@@ -724,6 +817,7 @@ class AMBIXQCAgent(nn.Module):
             "init_temperature": float(self.cfg.xqc_init_temperature),
             "actor_lr": float(self.cfg.xqc_actor_lr),
             "critic_lr": float(self.cfg.xqc_critic_lr),
+            "xqc_utd": int(self.cfg.xqc_utd),
             "lr_end": float(self.cfg.xqc_lr_end),
             "lr_transition_steps": int(self.cfg.xqc_lr_transition_steps),
             "adam_eps": float(self.cfg.xqc_adam_eps),
@@ -808,6 +902,8 @@ class AMBIXQCAgent(nn.Module):
             raise ValueError("AMBI-XQC checkpoint semantics must be a mapping.")
         version = state["checkpoint_version"]
         legacy_defaults = {}
+        if version <= 5:
+            legacy_defaults["xqc_utd"] = 1
         if version <= 4:
             legacy_defaults.update(
                 aux_return={"mode": "off"}, inner_critic_source="xqc",
@@ -832,6 +928,13 @@ class AMBIXQCAgent(nn.Module):
             saved["action_contract"] = None
             expected["action_contract"] = None
         require_exact_keys(saved, expected, "AMBI-XQC checkpoint semantics")
+        if type(saved["xqc_utd"]) is not int or saved["xqc_utd"] <= 0:
+            raise ValueError("AMBI-XQC checkpoint xqc_utd must be a positive integer.")
+        if saved["xqc_utd"] != expected["xqc_utd"]:
+            raise ValueError(
+                "AMBI-XQC checkpoint semantics require matching xqc_utd: "
+                f"checkpoint uses {saved['xqc_utd']}, agent uses {expected['xqc_utd']}."
+            )
         auxiliary = saved["aux_return"]
         if (not isinstance(auxiliary, dict) or not isinstance(auxiliary.get("mode"), str)
                 or auxiliary["mode"] not in {"off", "xqc"}):
@@ -975,7 +1078,7 @@ class AMBIXQCAgent(nn.Module):
         if (
             isinstance(state["checkpoint_version"], bool)
             or not isinstance(state["checkpoint_version"], int)
-            or state["checkpoint_version"] not in {1, 2, 3, 4, self._CHECKPOINT_VERSION}
+            or state["checkpoint_version"] not in {1, 2, 3, 4, 5, self._CHECKPOINT_VERSION}
         ):
             raise ValueError("Unsupported AMBI-XQC checkpoint version.")
         saved_signature = self._preflight_semantic_signature(
@@ -1008,8 +1111,8 @@ class AMBIXQCAgent(nn.Module):
             value = workspace[key]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"AMBI-XQC workspace {key} is invalid.")
-        if workspace["update_step"] != state["num_updates"]:
-            raise ValueError("AMBI-XQC workspace and outer counters differ.")
+        if workspace["update_step"] != state["num_updates"] * saved_signature["xqc_utd"]:
+            raise ValueError("AMBI-XQC workspace and outer counters do not match xqc_utd.")
         expected_delayed_steps = (
             0
             if workspace["update_step"] == 0
@@ -1125,7 +1228,7 @@ class AMBIXQCAgent(nn.Module):
         auxiliary = None
         if self.aux_return is not None:
             auxiliary = self.aux_return.preflight_training_state(
-                state["aux_return"], expected_updates=state["num_updates"],
+                state["aux_return"], expected_updates=workspace["update_step"],
                 frozen_evaluation=frozen_evaluation,
             )
         return state, workspace, generator_state, inner, saved_signature, cross_device, auxiliary

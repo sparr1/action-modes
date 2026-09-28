@@ -1,0 +1,25 @@
+{
+  "study_type": "ambixqc_single_seed_exploratory_backbone_aux_return_utd_comparison",
+  "study_note": "aux_detached, XQC UTD 1. One of six paired-seed exploratory Humanoid Walk state backbones (seed 55, 500,000 decisions / 1,000,000 raw environment steps). Retains the established 1M-decision backbone recipe except decision budget, XQC update ratio, explicit 1M-row replay capacity, and identity. Persistent stochastic XQC collection; no inner adaptation or online evaluation. TOLD updates once; additional XQC slots use fresh replay and detached recurrent latents. Shared auxiliary representation gradients enter only in the joint update. Retain all 20 portable checkpoints every 25,000 decisions plus checkpoint-matched raw replay archives. This is not confirmatory evidence or exact trainer resume.",
+  "overrides_alg": {
+    "env": "DMControl-v0"
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambixqc_humanoid_walk_backbone_replay_500k_aux_detached_utd1"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": [
+    "all"
+  ],
+  "save_replay_buffer": true,
+  "log_info": false,
+  "log_type": "summary"
+}

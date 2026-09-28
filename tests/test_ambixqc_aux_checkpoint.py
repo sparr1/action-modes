@@ -25,7 +25,7 @@ def test_auxiliary_checkpoint_round_trip_and_identical_next_update(wrappers, tmp
     source.agent._update(*_batch(source.agent))
     checkpoint = source.save(tmp_path, "auxiliary")
     saved = deepcopy(source.agent.checkpoint_state())
-    assert saved["checkpoint_version"] == 5
+    assert saved["checkpoint_version"] == 6
     assert saved["aux_return"]["update_step"] == 1
     assert saved["semantic_signature"]["aux_return"]["target"] == "reward_only"
     restored = wrappers(**_settings()).load(checkpoint)
@@ -121,14 +121,15 @@ def test_missing_auxiliary_cannot_be_restored_as_random_weights(wrappers, frozen
         wrappers().load(auxiliary, frozen_evaluation=frozen)
 
 
-def test_auxiliary_checkpoint_retains_matching_replay_archive(wrappers, tmp_path):
-    source = wrappers(aux_return_mode="xqc", inner_operator="none")
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_auxiliary_checkpoint_retains_matching_replay_archive(wrappers, tmp_path, ratio):
+    source = wrappers(aux_return_mode="xqc", inner_operator="none", xqc_utd=ratio)
     source.enable_replay_archive(tmp_path, "auxiliary")
     source.set_checkpointing(5, tmp_path, "auxiliary", save_strat=("all", "latest"))
     try:
         source.learn(total_timesteps=10)
         checkpoint = source.save(tmp_path, "auxiliary_final")
-        restored = wrappers(aux_return_mode="xqc", inner_operator="none").load(checkpoint)
+        restored = wrappers(aux_return_mode="xqc", inner_operator="none", xqc_utd=ratio).load(checkpoint)
         # Final saves may reuse the last periodic model bytes; compare the
         # serialized snapshot rather than post-episode lifecycle counters.
         _assert_equal(torch.load(checkpoint, weights_only=False), restored.agent.checkpoint_state())

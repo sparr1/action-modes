@@ -108,9 +108,11 @@ def test_gate_validates_final_checkpoint_semantics_and_numerics():
 @pytest.mark.parametrize(
     "version, collection_operator, accepted",
     [(1, None, True), (2, "xqc", True), (2, None, False),
-     (2, "none", False), (3, "xqc", False), (True, "xqc", False)],
+     (2, "none", False), (3, "xqc", True), (4, "xqc", True),
+     (5, "xqc", True), (6, "xqc", True), (7, "xqc", False),
+     (True, "xqc", False)],
 )
-def test_gate_accepts_v1_and_v2_inner_xqc_checkpoints(
+def test_gate_accepts_supported_inner_xqc_checkpoints(
     monkeypatch, version, collection_operator, accepted
 ):
     # Execute the launcher's actual schema/semantic gate without a GPU job.

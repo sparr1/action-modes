@@ -45,7 +45,7 @@ the portable artifact and existing HTML report.
 ## AMBI-XQC auxiliary return critic evaluation
 
 A backbone trained with `alg_params.aux_return_mode="xqc"` saves a separate
-reward-only XQC critic in its version-5 checkpoint. Its outer actor is still
+reward-only XQC critic in its version-5 or later checkpoint. Its outer actor is still
 the main XQC policy. Existing version-1–4 checkpoints have no auxiliary critic
 and remain valid for the established XQC/MPPI evaluations.
 
@@ -655,3 +655,89 @@ python3 evaluate_ambi_checkpoint.py --checkpoint scalar.pt \
 The evaluator rejects a mixed-architecture selection before running either
 side. It also rejects `execution_noise`, because deterministic evaluation must
 return the policy mean and would collapse those training-only variants.
+
+## AMBI-XQC 500k backbone update-ratio comparison on Hydra
+
+The six `ambixqc_humanoid_walk_backbone_replay_500k_<arm>_utd<ratio>.json`
+algorithm/experiment pairs train Humanoid Walk state at seed 55 for 500,000
+agent decisions (1,000,000 raw environment steps). Each of `baseline`,
+`aux_shared`, and `aux_detached` runs with `xqc_utd=1` and `xqc_utd=2`.
+They inherit the preceding 1M backbone recipe, including full architecture,
+eager execution, prior-only stochastic collection, 2,500 warmup/pretrain steps,
+no inner adaptation, and no online evaluation. The intended differences are
+the training budget, XQC update ratio, explicit replay capacity, and identity.
+
+`utd=1` retains one joint TOLD/XQC update. At ratio 2, a second XQC update uses
+a fresh replay sample and recomputed detached recurrent latents; the auxiliary
+critic follows the same ratio. Shared auxiliary representation gradients enter
+only during the joint update. The XQC LR schedule spans 500k updates at ratio
+1 and 1M at ratio 2; delayed actor/temperature optimizers retain their own
+accepted-step clocks. `replay_capacity=1000000` keeps capacity independent of
+the decision budget, avoiding the small final eviction that a 500k-row cap
+would introduce. Each complete 500-decision episode occupies 501 replay rows,
+so each completed production run archives 501,000 rows.
+
+All six manifests enable `save_replay_buffer=true` and retain all 20 portable
+checkpoint/metadata pairs every 25,000 decisions. Replay chunks contain raw
+rewards and are shared across checkpoint manifests, not copied twenty times.
+Copy each checkpoint with its sidecar and the whole referenced replay archive.
+This remains a paired-seed exploratory comparison and is not exact resume.
+The W&B group is `ambixqc-humanoid-walk-backbone-replay-500k-utd`; per-job names
+and IDs identify the auxiliary arm, ratio, source SHA, and scheduler job.
+
+The Hydra launcher pins both smoke and production allocations to **gpu2501**,
+checks the runtime hostname, and requires one L40S GPU per cell. Defaults are
+six CPUs, 48 GiB RAM, and a 24-hour limit. Start from a clean checkout of the
+exact pushed commit and reuse the existing locked DMControl Python; no runtime
+installation or source copying occurs in the launcher. Results must live in
+an existing directory outside the checkout. Export these absolute paths and
+submit all six independent smoke cells concurrently when capacity permits:
+
+```bash
+export EXPECTED_ACTION_MODES_SHA=$(git rev-parse HEAD)
+export AMBIXQC_ACTION_MODES_DIR=/absolute/clean/action-modes-checkout
+export AMBIXQC_PYTHON=/absolute/existing/environments/dmcontrol/.venv/bin/python
+export AMBIXQC_RESULTS_ROOT=/absolute/durable/new-campaign
+export AMBIXQC_MODE=smoke
+sbatch --array=0-5%6 --time=02:00:00 \
+  --output="$AMBIXQC_RESULTS_ROOT/slurm/smoke-%A_%a.out" \
+  --error="$AMBIXQC_RESULTS_ROOT/slurm/smoke-%A_%a.err" \
+  slurm/run_ambixqc_backbone_replay_500k_hydra.sbatch
+```
+
+Create the campaign and `slurm` directories before submission. Array indices
+0–5 select baseline/shared/detached at ratio 1, then baseline/shared/detached at
+ratio 2. Each smoke trains 4,000 decisions at full architecture with the same
+1M-row capacity, writes four replay-preserving checkpoints, verifies final raw
+replay equivalence and optimizer counts, and checks frozen checkpoint loading.
+Task 0 also runs focused regression tests with an explicit CUDA requirement.
+The shortened LR schedule makes smoke a correctness/timing canary, not a
+prefix of the production learning trajectory. Timing uses a synchronized
+900-decision window after pretraining and excludes checkpoint boundaries.
+
+After every smoke job has its `PASS` marker, the following lightweight command
+validates the six unique cell results and writes `smoke-gate.json`. Production
+requires this exact-commit gate, matching configuration hashes, and unchanged
+validation artifacts. Keep the gate and referenced files through startup.
+
+```bash
+"$AMBIXQC_PYTHON" tests/benchmarks/ambixqc_backbone_replay_500k_campaign.py \
+  --mode summarize --output "$AMBIXQC_RESULTS_ROOT"
+export AMBIXQC_SMOKE_GATE="$AMBIXQC_RESULTS_ROOT/smoke-gate.json"
+export AMBIXQC_MODE=production
+sbatch --array=0-5%6 \
+  --output="$AMBIXQC_RESULTS_ROOT/slurm/production-%A_%a.out" \
+  --error="$AMBIXQC_RESULTS_ROOT/slurm/production-%A_%a.err" \
+  slurm/run_ambixqc_backbone_replay_500k_hydra.sbatch
+```
+
+Before production submission, compare filesystem **and account quota**
+headroom with the gate's `required_campaign_free_bytes` across all six cells.
+The estimate uses the largest measured full checkpoint per cell, twenty
+checkpoints, one replay archive, a 50% safety margin, and 2 GiB per-cell reserve.
+The launcher checks an initial filesystem floor (`AMBIXQC_MIN_FREE_GIB`, default
+8) and the measured per-cell requirement. These independent checks do not
+reserve disk space or account for simultaneous unrelated writers. Retain
+additional quota headroom when other campaigns share storage. Node-local
+scratch owns W&B caches; durable results own checkpoints, sidecars, replay,
+validation, and job logs. Result directories are unique and never overwritten.

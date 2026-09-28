@@ -85,6 +85,27 @@ The XQC controller semantics reuse the PyTorch port of official XQC commit
 `9a6832bb742ef01bbe9f1e06153a9338e612dae5`; TOLD remains derived from the
 TD-MPC2 source identified above.
 
+`alg_params.xqc_utd` (positive integer, default 1) controls persistent XQC
+updates independently of TOLD's required `utd=1`. The first slot is the joint
+recurrent world/value update. Each remaining slot samples a fresh sequence
+batch, recomputes the recurrent latent rollout under `no_grad` using the
+updated world model, and trains only the controller. It preserves recurrent
+temporal weighting, H+1 actor latents, online BN updates, parameter-only target
+updates, and actor/temperature delay measured in critic slots. Extra slots do
+not run the world optimizer or observe rewards. Initial pretraining uses the
+same ratio. Both primary and auxiliary critics receive all slots; shared
+auxiliary representation gradients apply only in the joint slot.
+
+`num_updates` and `outer_version` count completed world-model updates;
+`xqc_workspace.update_step` and auxiliary `update_step` count critic slots and
+must equal `num_updates * xqc_utd`. Actor/temperature counters count their
+accepted steps. All XQC schedules span `cfg.steps * xqc_utd`, with each
+optimizer retaining its own clock. Inner budgets and learning rates are
+independent. Training metrics retain joint world losses and the last slot's
+controller metrics, plus explicit cumulative world/critic/actor/temperature
+counts. Extra slots reuse the same eager/compiled loss primitives as the joint
+update, including strict fallback handling.
+
 The optional `aux_return_mode="xqc"` adds reward-only policy evaluation under
 the main persistent XQC actor. It owns twin online/target categorical critics
 and a critic optimizer, with the main critic's architecture, support, BN
@@ -112,8 +133,11 @@ entropy; a soft inner target with an auxiliary tail includes entropy within
 the adapting imagined prefix only. These are explicit mixed-objective
 ablations, not implicit conversions between soft values and reward returns.
 
-Version-5 checkpoints include the auxiliary learner when enabled and record
-all three inner selections. Versions 1–4 migrate to auxiliary-off,
+Version-6 checkpoints record `xqc_utd` and validate independent optimizer
+clocks. Versions 1–5 imply a ratio of 1. Ratio changes are rejected before
+loading state, including for frozen evaluation. Version-5 checkpoints introduced
+the auxiliary learner when enabled and all three inner selections.
+Versions 1–4 migrate to auxiliary-off,
 XQC/XQC sources, and an entropy-augmented inner target. Strict loading retains
 outer training semantics; frozen evaluation may override the inner choices
 only when the required auxiliary weights already exist. MPPI always retains
@@ -233,6 +257,22 @@ coefficient remain in consistent units. The outer learner updates the scale
 from real-replay actor values; each root-local SAC solve freezes one snapshot
 for the whole action. Rewards, Bellman targets, temperature losses, TD3, and
 MPPI are not normalized by this option.
+
+Real replay normally holds `min(buffer_size, total_steps)` rows. Set
+`alg_params.replay_capacity` to a positive integer to use that exact row capacity
+independently of both the decision budget and `buffer_size`; omitted or `null`
+preserves the existing cap. For example, `"replay_capacity": 1000000` retains
+the same one-million-row capacity in a 500,000-decision run as in the existing
+one-million-decision runs. Each completed episode also occupies one initial
+observation row, so row capacity is not a count of environment transitions.
+This setting applies to TD-MPC2 and its AMBI wrappers and does not change replay
+sampling, placement heuristics, or exact-resume opt-in. Memory estimates, replay
+metrics, resume validation, and saved replay manifests use the resolved capacity.
+Allocation still reserves that full capacity when the first episode enters
+replay; incremental disk archives store only collected completed episodes and
+retain their history independently of ring eviction. RGB's memory warning uses
+the explicit capacity too (one million RGB rows require about 36.9 GB just for
+observations).
 
 Model saves are suitable for evaluation and weight transfer. State-observation
 AMBI-XQC runs can additionally set the top-level `save_replay_buffer: true`

@@ -21,7 +21,7 @@ except ImportError:  # tensordict<newer API compatibility
 from RL.alg import Algorithm, validate_timestep_budget
 from RL.tdmpc2_core import MODEL_SIZE
 from RL.tdmpc2_core.agent import TDMPC2
-from RL.tdmpc2_core.common.buffer import Buffer
+from RL.tdmpc2_core.common.buffer import Buffer, resolve_replay_capacity
 from RL.tdmpc2_core.common.checkpoint import AsyncCheckpointWriter
 from RL.tdmpc2_core.common.device import resolve_device
 from RL.tdmpc2_core.common.math import TEMPORAL_LOSS_NORMALIZATIONS
@@ -57,6 +57,7 @@ _DEFAULTS = {
     "discount_min": 0.95,
     "discount_max": 0.995,
     "buffer_size": 1_000_000,
+    "replay_capacity": None,
     "utd": 1,
     "pretrain_steps": None,
 
@@ -811,6 +812,11 @@ class TDMPC2Baseline(Algorithm):
 
         cfg["seed"] = int(self.run_params.get("seed", cfg.get("seed", 1)))
         cfg["steps"] = int(float(self.run_params.get("total_steps", cfg.get("steps", 1_000_000))))
+        replay_rows = resolve_replay_capacity(
+            cfg["buffer_size"], cfg["steps"], cfg["replay_capacity"]
+        )
+        if cfg["replay_capacity"] is not None:
+            cfg["replay_capacity"] = replay_rows
 
         observation_type, observation_shape = self._resolve_observation_space(
             params
@@ -916,7 +922,6 @@ class TDMPC2Baseline(Algorithm):
         cfg["obs_shape"] = {observation_type: observation_shape}
         cfg["obs_dtype"] = self._obs_np_dtype.name
         if observation_type == "rgb":
-            replay_rows = min(int(cfg["buffer_size"]), int(cfg["steps"]))
             replay_observation_bytes = (
                 replay_rows
                 * int(np.prod(observation_shape))
@@ -927,7 +932,8 @@ class TDMPC2Baseline(Algorithm):
                     "RGB replay observations alone are projected to require "
                     f"{replay_observation_bytes / 1e9:.1f} GB for "
                     f"{replay_rows:,} uint8 rows. Replay capacity is unchanged; "
-                    "set buffer_size explicitly if this footprint is not intended.",
+                    "lower replay_capacity (or buffer_size when replay_capacity "
+                    "is null) if this footprint is not intended.",
                     UserWarning,
                     stacklevel=3,
                 )

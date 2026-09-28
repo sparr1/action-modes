@@ -43,12 +43,14 @@ def test_step_timing_compile_request_is_explicitly_unsupported(wrappers):
         wrappers(inner_update_timing="step", inner_updates_per_round=2, compile=True)
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6])
 def test_legacy_round_checkpoints_support_explicit_step_evaluation(wrappers, version):
     source = wrappers(inner_operator="none", inner_updates_per_round=2)
     source.agent._update(*_batch(source.agent))
     saved = deepcopy(source.agent.checkpoint_state())
     saved["checkpoint_version"] = version
+    if version < 6:
+        saved["semantic_signature"].pop("xqc_utd")
     if version < 5:
         for key in ("aux_return", "inner_critic_source", "inner_horizon_critic_source", "inner_critic_target"):
             saved["semantic_signature"].pop(key)
@@ -81,7 +83,7 @@ def test_step_checkpoint_round_trip_and_reverse_frozen_override(wrappers, delay)
                       inner_terminal_bootstrap="outer", inner_policy_delay=delay)
     source.agent._update(*_batch(source.agent))
     saved = deepcopy(source.agent.checkpoint_state())
-    assert saved["checkpoint_version"] == 5
+    assert saved["checkpoint_version"] == 6
     assert saved["semantic_signature"]["inner_update_timing"] == "step"
     restored = wrappers(inner_update_timing="step", inner_updates_per_round=2,
                         inner_terminal_bootstrap="outer", inner_policy_delay=delay).load(saved)

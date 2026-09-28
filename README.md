@@ -60,6 +60,37 @@ and fixed `5e-5` actor/critic learning rates. Temperature always uses the actor
 learning rate. These are initial method defaults, not a frozen benchmark
 protocol; every experiment must record its resolved settings.
 
+AMBI-XQC can train its persistent controller more often than TOLD. Set these
+fields inside `alg_params` to use two XQC critic updates per world-model update:
+
+```json
+{
+  "utd": 1,
+  "xqc_utd": 2
+}
+```
+
+`xqc_utd` is a positive integer, defaulting to `1`; existing presets keep that
+default. Each training iteration first performs the existing joint recurrent
+TOLD/XQC update. Additional XQC updates each sample a fresh replay batch and
+recompute recurrent latents with the updated, frozen world model. They retain
+the temporal loss weights and actor's terminal latent. Actor/temperature delay
+and target-update intervals count XQC critic updates, so delay 3 means one
+actor/temperature optimizer step every three critic slots. This ratio also
+applies during the initial `pretrain_steps` world-model updates. Real reward
+normalization still advances only when collecting a real transition.
+
+The outer XQC linear learning-rate schedule spans `total_steps * xqc_utd`.
+Each optimizer advances it using its own accepted-step count, preserving XQC's
+slower actor/temperature decay under delayed updates. TOLD's learning rate is
+unchanged. For example, 500,000 decisions with `xqc_utd=2` gives a 1,000,000-step
+XQC schedule. This changes the controller update budget; it does not make the
+AMBI world-model architecture or training protocol identical to standalone XQC.
+Logs expose `world_model_num_updates`, `xqc_num_updates`,
+`xqc_actor_num_updates`, and `xqc_temperature_num_updates`. World-model losses
+describe the joint update; controller losses, learning rates, and acceptance
+flags describe the last XQC slot of that iteration.
+
 AMBI-XQC uses the same sparse W&B key as inner SAC for final-policy drift:
 `train/inner_final_outer_policy_kl` reports the closed-form root-state
 `KL(final adapted actor || outer prior)` and is observational rather than part
@@ -95,6 +126,11 @@ default positive representation-loss coefficient. The auxiliary optimizer
 always receives the unscaled critic loss, including when representation
 gradients are enabled. Separate auxiliary actor/LR settings and
 native AMBI `critic_value_mode` controls are rejected.
+The auxiliary critic follows `xqc_utd` too. With a shared representation,
+auxiliary representation gradients enter only during the one joint update;
+all additional XQC updates use detached latents. Changing `xqc_utd` can still
+change later TOLD learning through the controller's value targets and collected
+experience, even though TOLD's optimizer runs only once per training iteration.
 
 The following inner choices are independent:
 
@@ -153,8 +189,11 @@ with `AMBIXQC_MODE=production`. Production uses one L40S, six CPUs, 48 GB RAM,
 and a 72-hour limit. Each job creates a fresh result directory; production
 publishes to W&B project `ambi` with its source SHA and job ID in the run name.
 
-New XQC checkpoints use version 5 to record the auxiliary return critic and
-the independent inner critic sources/target, alongside the collection operator,
+New AMBI-XQC checkpoints use version 6 to record `xqc_utd` and validate the
+separate world-model and controller update counts. Versions 1–5 load with
+`xqc_utd=1`; loading requires the saved ratio even for frozen evaluation.
+Version 5 introduced the auxiliary return critic and
+independent inner critic sources/target, alongside the collection operator,
 `inner_terminal_bootstrap`, `inner_update_timing`, and effective
 `inner_policy_delay`. Version-1 through version-4 checkpoints remain readable
 as auxiliary-off models with XQC initialization/horizon sources and an
