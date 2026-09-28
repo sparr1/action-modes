@@ -371,14 +371,56 @@ def test_cuda_ratio_compiled_updates_match_eager(wrappers):
     compiled = wrappers(
         device="cuda", xqc_utd=2, aux_return_mode="xqc", compile=True, compile_strict=True,
     ).agent
+    _assert_equal(eager.state_dict(), compiled.state_dict())
     eager_replay, compiled_replay = _Replay(eager), _Replay(compiled)
     for _ in range(2):
         eager.update(eager_replay)
         compiled.update(compiled_replay)
     for key, value in eager.state_dict().items():
-        torch.testing.assert_close(value, compiled.state_dict()[key], rtol=3e-4, atol=3e-5)
-    assert compiled.xqc_workspace.update_step == 4
-    assert compiled.aux_return.update_step == 4
+        # As in the existing four-slot compile tests, Adam amplifies reduction
+        # noise in near-zero BN-affine bias gradients. Keep the tighter bound
+        # for every other parameter and buffer, including running statistics.
+        atol, rtol = (1e-3, 1e-3) if "batch_norm.bias" in key else (3e-5, 3e-4)
+        torch.testing.assert_close(
+            value, compiled.state_dict()[key], rtol=rtol, atol=atol,
+            msg=lambda message, name=key: f"{name}: {message}",
+        )
+    _assert_equal(eager_replay.batches, compiled_replay.batches)
+    _assert_equal(eager_replay.generator.get_state(), compiled_replay.generator.get_state())
+    _assert_equal(eager._outer_generator.get_state(), compiled._outer_generator.get_state())
+    _assert_equal(eager.aux_return._generator.get_state(), compiled.aux_return._generator.get_state())
+    for agent in (eager, compiled):
+        assert agent.num_updates == agent.outer_version == 2
+        assert agent.xqc_workspace.update_step == agent.aux_return.update_step == 4
+        assert agent.xqc_workspace.actor_optimizer_steps == 2
+        assert agent.xqc_workspace.temperature_optimizer_steps == 2
+
+    observations = torch.randn(
+        16, eager.cfg.obs_shape["state"][0],
+        generator=torch.Generator().manual_seed(97),
+    ).to(eager.device)
+    probes = []
+    for agent in (eager, compiled):
+        before = deepcopy(dict(agent.named_buffers()))
+        with torch.no_grad():
+            latents = agent.model.encode(observations)
+            actions, _ = agent.xqc_controller.sample_action(latents, deterministic=True)
+            probe = {"latents": latents, "actions": actions}
+            for name, critic in (("soft", agent.xqc_controller.critic),
+                                 ("return", agent.aux_return.critic)):
+                log_probs = critic.log_probs(latents, actions, bn_mode="running")
+                probe[f"{name}_probabilities"] = log_probs.exp()
+                probe[f"{name}_values"] = critic.values_from_log_probs(log_probs)
+        _assert_equal(dict(agent.named_buffers()), before)
+        probes.append(probe)
+    for name, value in probes[0].items():
+        # Check held-out behavior as well as parameter drift, using the existing
+        # multi-slot compile tolerance for policy/Q-derived outputs.
+        atol, rtol = (3e-5, 3e-4) if name == "latents" else (2e-4, 1e-3)
+        torch.testing.assert_close(
+            value, probes[1][name], atol=atol, rtol=rtol,
+            msg=lambda message, name=name: f"held-out {name}: {message}",
+        )
     assert compiled.xqc_controller.compile_status["critic_compiled"]
     assert compiled.xqc_controller.compile_status["actor_compiled"]
     assert compiled.aux_return.compile_status["critic_compiled"]
