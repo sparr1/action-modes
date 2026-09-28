@@ -42,6 +42,46 @@ Checkpoint return, paired improvement and runtime use
 the portable artifact and existing HTML report.
 
 
+## AMBI-XQC inner actor BatchNorm evaluation
+
+Checkpoint-based XQC presets may set `inner_actor_bn_mode` to `"batch_update"`
+(the existing default) or `"running"`. Batch-update mode uses each actor-loss
+batch's statistics and updates the disposable inner actor's running buffers.
+Running mode uses the inherited running statistics without changing their mean
+or variance during the inner solve. Actor weights and BatchNorm
+affine parameters still learn, and temperature updates retain their existing
+schedule. Online/target critic BatchNorm and the outer learner remain unchanged.
+
+For example, add `"inner_actor_bn_mode": "running"` beside
+`"inner_operator": "xqc"` in a matrix variant's `alg_params`. This is an inner
+evaluation choice, so it can be applied to an existing frozen backbone without
+retraining. Version-6 checkpoints save the mode; older checkpoints load with
+`"batch_update"`. Metadata-only specifications and completed episode bundles
+use the same planner identity. An absent mode and explicit `"batch_update"`
+preserve the same planner settings; `"running"` has a distinct identity and
+actor-BatchNorm label, preventing accidental append to a batch-update curve.
+A matrix value of `null` removes an inherited setting and restores
+`"batch_update"`; a direct algorithm configuration must use a valid mode string.
+
+The exploratory `ambixqc_humanoid_h1_actor_bn_screen.json` matrix uses H1,
+J1/2/4/8, N256/G3/B256, policy delay 3, and actor/critic learning rates `5e-5`.
+It compares matched auxiliary return/return and main soft/soft critic choices,
+with `inner_actor_bn_mode="running"` and inherited adaptive temperature. The
+return/return cells require an auxiliary-enabled checkpoint. These eight cells
+are an exploratory screen, not a tuned or confirmatory protocol.
+
+`slurm/run_ambixqc_actor_bn_smoke_oscar.sbatch` validates this screen before a
+full experiment. From the clean synchronized checkout, set
+`EXPECTED_ACTION_MODES_SHA` and an absolute scratch `RESULT_ROOT`; the default
+`PYTHON_BIN` uses Oscar's locked runtime. Submit `AMBIXQC_SMOKE_MODE=tests` first
+to run the CUDA correctness checks. For `AMBIXQC_SMOKE_MODE=episodes`, also set
+`CHECKPOINT_MANIFEST` to two hash-pinned 500k checkpoint rows in
+`aux_shared`, `aux_detached` order, then submit an array `0-7` after the test job
+succeeds. The eight smoke cells cover both backbones with return/return and
+soft/soft at J1 and J8, one seed and three decisions each; they validate finite
+diagnostics, update counts, and frozen outer state. The smoke disables W&B
+publication and is not a full-episode performance result.
+
 ## AMBI-XQC auxiliary return critic evaluation
 
 A backbone trained with `alg_params.aux_return_mode="xqc"` saves a separate
@@ -160,7 +200,8 @@ This identifies the budget reference, separately from the evaluated checkpoint.
 Each real decision collects 3,072 imagined branches and 9,216 model
 transitions. Eighteen XQC update slots produce **18 critic, six actor, and six
 temperature optimizer steps** with the checkpoint's policy delay of three.
-Actor objectives and BatchNorm training forwards still run in every slot.
+Actor objectives and, with the default `inner_actor_bn_mode="batch_update"`,
+BatchNorm training forwards still run in every slot.
 Each decision copies the persistent actor, online critic, and temperature into
 a fresh inner learner with empty optimizer state and replay. The inner target
 starts from the copied online critic. Tensor allocations may be reused. Both real controllers

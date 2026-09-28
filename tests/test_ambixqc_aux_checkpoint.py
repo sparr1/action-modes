@@ -25,7 +25,7 @@ def test_auxiliary_checkpoint_round_trip_and_identical_next_update(wrappers, tmp
     source.agent._update(*_batch(source.agent))
     checkpoint = source.save(tmp_path, "auxiliary")
     saved = deepcopy(source.agent.checkpoint_state())
-    assert saved["checkpoint_version"] == 5
+    assert saved["checkpoint_version"] == 6
     assert saved["aux_return"]["update_step"] == 1
     assert saved["semantic_signature"]["aux_return"]["target"] == "reward_only"
     restored = wrappers(**_settings()).load(checkpoint)

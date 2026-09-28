@@ -203,6 +203,8 @@ def _planner_display_label(planner, *, compact=False):
         if kind == "xqc":
             step_timing = settings.get("inner_update_timing", "round") == "step"
             parts.append(("step" if step_timing else "round") + ("" if compact else " updates"))
+            if settings.get("inner_actor_bn_mode") == "running":
+                parts.append("actor BN running" if compact else "actor BatchNorm running statistics")
             if settings.get("inner_critic_source") == "aux_return":
                 parts.append("aux init" if compact else "auxiliary return critic init")
             if settings.get("inner_horizon_critic_source") == "aux_return":

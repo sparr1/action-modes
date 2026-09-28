@@ -289,6 +289,35 @@ def test_xqc_policy_delay_alone_is_a_distinct_planner():
     assert changed != original and changed["settings"]["xqc_policy_delay"] == 3
 
 
+def test_xqc_actor_bn_default_preserves_identity_and_running_rejects_append(bundle):
+    from utils.eval_series import SeriesError, validate_record
+    path, value = bundle
+    run = value["runs"][0]
+    run["config"]["alg"] = "AMBIXQC/AMBIXQC"
+    run["resolved_config"]["inner_operator"] = "xqc"
+    old, = data.load_records(dump(path, value))
+    run["resolved_config"]["inner_actor_bn_mode"] = "batch_update"
+    default, = data.load_records(dump(path, value))
+    assert old["identity"] == default["identity"]
+    assert "inner_actor_bn_mode" not in default["identity"]["planner"]["settings"]
+    run["resolved_config"]["inner_actor_bn_mode"] = "running"
+    running, = data.load_records(dump(path, value))
+    assert running["identity"]["planner"]["settings"]["inner_actor_bn_mode"] == "running"
+    assert "actor BN running statistics" in data.descriptive_label(running["identity"])
+    with pytest.raises(SeriesError, match="Incompatible append: planner"):
+        validate_record(running, old["identity"])
+
+
+def test_actor_bn_mode_is_inactive_for_prior_and_mppi():
+    prior = {"inner_operator": "none"}
+    assert data.planner_identity(prior, {}, "AMBIXQC/AMBIXQC", "tanh_mean") == data.planner_identity(
+        {**prior, "inner_actor_bn_mode": "running"}, {}, "AMBIXQC/AMBIXQC", "tanh_mean")
+    result = {"evaluation_controller": {"type": "mppi", "settings": {},
+                                       "protocol": {"algorithm": "fixture"}}}
+    assert data.planner_identity(prior, result, "AMBIXQC/AMBIXQC", "mppi") == data.planner_identity(
+        {**prior, "inner_actor_bn_mode": "running"}, result, "AMBIXQC/AMBIXQC", "mppi")
+
+
 def test_missing_and_nonfinite_diagnostics_remain_distinct(bundle):
     path, value = bundle
     value["runs"][0]["episodes"][0]["model_metrics"]["nan_metric"] = float("nan")

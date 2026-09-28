@@ -92,7 +92,7 @@ def test_prior_training_keeps_outer_learning_warmup_and_checkpoint_metadata(
         assert getattr(model.cfg, key) == 0
     path = model.save(tmp_path, "prior.pt")
     checkpoint = torch.load(path, weights_only=False)
-    assert checkpoint["checkpoint_version"] == 5
+    assert checkpoint["checkpoint_version"] == 6
     assert checkpoint["semantic_signature"]["collection_operator"] == "none"
     metadata = json.loads((tmp_path / "prior.pt.metadata.json").read_text())
     assert metadata["checkpoint"]["step"] == 10
@@ -189,6 +189,7 @@ def test_v1_checkpoints_mean_xqc_and_keep_strict_loading(wrappers):
     legacy["semantic_signature"].pop("inner_terminal_bootstrap")
     legacy["semantic_signature"].pop("inner_update_timing")
     legacy["semantic_signature"].pop("inner_policy_delay")
+    legacy["semantic_signature"].pop("inner_actor_bn_mode")
     same = wrappers().load(legacy)
     assert _tree_equal(source.agent.frozen_outer_state(), same.agent.frozen_outer_state())
     prior = wrappers(inner_operator="none")

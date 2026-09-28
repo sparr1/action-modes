@@ -49,6 +49,11 @@ def _positive_int(value, name):
     return int(value)
 
 
+def _validate_actor_bn_mode(mode):
+    if not isinstance(mode, str) or mode not in {"batch_update", "running"}:
+        raise ValueError("actor_bn_mode must be 'batch_update' or 'running'.")
+
+
 @dataclass(frozen=True)
 class LatentXQCConfig:
     actor_net_arch: tuple[int, ...] = (256, 256, 256, 256)
@@ -595,7 +600,9 @@ class LatentXQCController(nn.Module):
         *,
         actor_noise: torch.Tensor,
         alpha: torch.Tensor | None = None,
+        actor_bn_mode: str = "batch_update",
     ) -> LatentXQCActorObjective:
+        _validate_actor_bn_mode(actor_bn_mode)
         if latents.shape[-1] != self.latent_dim:
             raise ValueError("Actor latents have the wrong feature width.")
         leading = tuple(latents.shape[:-1])
@@ -618,7 +625,10 @@ class LatentXQCController(nn.Module):
                 if self._actor_loss_region is None
                 else self._actor_loss_region
             )
-            outputs = actor_loss(flat_latents, actor_noise, alpha)
+            # The compile wrapper accepts positional arguments. Keeping the
+            # mode explicit also lets Dynamo specialize without mutable mode
+            # state that could survive an inner-workspace reset.
+            outputs = actor_loss(flat_latents, actor_noise, alpha, actor_bn_mode)
         finally:
             for parameter, requires_grad in zip(
                 self.critic.parameters(), critic_requires_grad
@@ -639,11 +649,12 @@ class LatentXQCController(nn.Module):
         latents: torch.Tensor,
         actor_noise: torch.Tensor,
         alpha: torch.Tensor,
+        actor_bn_mode: str = "batch_update",
     ):
         """Fixed-shape actor math with critic parameter freezing handled eager."""
 
         actions, log_prob = self.actor.sample(
-            latents, bn_mode="batch_update", noise=actor_noise
+            latents, bn_mode=actor_bn_mode, noise=actor_noise
         )
         log_q = self.critic.log_probs(latents, actions, bn_mode="running")
         q_values = self.critic.values_from_log_probs(log_q)
@@ -878,7 +889,11 @@ class LatentXQCWorkspace:
         critic_target_kind: str = "entropy_augmented",
         outer_critic: XQCTwinCritic | None = None,
         outer_critic_is_return: bool = False,
+        actor_bn_mode: str = "batch_update",
     ) -> dict[str, Any]:
+        # Reject invalid actor settings before the critic forward mutates BN
+        # buffers or its optimizer advances.
+        _validate_actor_bn_mode(actor_bn_mode)
         terminal_kwargs = {}
         if outer_terminal_mask is not None or outer_controller is not None:
             terminal_kwargs = {
@@ -900,7 +915,7 @@ class LatentXQCWorkspace:
         critic_lr, target_updated = self.step_critic()
 
         actor = self.controller.actor_objective(
-            batch.latents.detach(), actor_noise=actor_noise
+            batch.latents.detach(), actor_noise=actor_noise, actor_bn_mode=actor_bn_mode
         )
         step_info = self.step_actor_and_temperature(
             actor.loss, actor.entropy.mean()

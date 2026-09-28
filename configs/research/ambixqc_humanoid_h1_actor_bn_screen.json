@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "description": "Exploratory H1 inner-XQC screen with frozen inherited actor BatchNorm statistics and adaptive alpha. J1/2/4/8, matched return/return and soft/soft critics, N256/G3/B256/delay3/LR5e-5. Requires an auxiliary-enabled checkpoint for return/return; this is not a tuned or confirmatory protocol.",
+  "base_alg_config": "checkpoint",
+  "shared_alg_params": {
+    "inner_rollout_horizon": 1,
+    "inner_rollouts_per_round": 256,
+    "inner_updates_per_round": 3,
+    "inner_batch_size": 256,
+    "inner_replay_capacity": 2048,
+    "inner_replay_sampling": "with_replacement",
+    "inner_update_timing": "round",
+    "inner_policy_delay": 3,
+    "inner_actor_lr": 5e-05,
+    "inner_critic_lr": 5e-05,
+    "inner_terminal_bootstrap": "outer",
+    "inner_reward_normalization": "frozen_real_scale",
+    "inner_diagnostics_every": 1,
+    "inner_actor_bn_mode": "running"
+  },
+  "evaluation": {
+    "controller_seed": 12345,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "default_presets": [
+      "controller/return_return_j1",
+      "controller/soft_soft_j1",
+      "controller/return_return_j2",
+      "controller/soft_soft_j2",
+      "controller/return_return_j4",
+      "controller/soft_soft_j4",
+      "controller/return_return_j8",
+      "controller/soft_soft_j8"
+    ],
+    "wandb_project": "ambi-inner-bench"
+  },
+  "comparisons": {
+    "controller": {
+      "description": "Matched critic sources with identical adaptive main actor and inner work budget.",
+      "reference": "prior",
+      "variants": {
+        "prior": {
+          "description": "Frozen main XQC actor mean; reuse matching completed prior episodes.",
+          "alg_params": {
+            "inner_operator": "none"
+          }
+        },
+        "return_return_j1": {
+          "description": "H1 J1; return_return critic initialization and frozen outer horizon; inherited adaptive actor alpha. N256/G3/B256/delay3, actor and critic LR5e-5. Actor BatchNorm uses frozen inherited running statistics; affine parameters and alpha adapt.",
+          "alg_params": {
+            "inner_operator": "xqc",
+            "inner_rounds": 1,
+            "inner_critic_source": "aux_return",
+            "inner_horizon_critic_source": "aux_return",
+            "inner_critic_target": "reward_only"
+          }
+        },
+        "soft_soft_j1": {
+          "description": "H1 J1; soft_soft critic initialization and frozen outer horizon; inherited adaptive actor alpha. N256/G3/B256/delay3, actor and critic LR5e-5. Actor BatchNorm uses frozen inherited running statistics; affine parameters and alpha adapt.",
+          "alg_params": {
+            "inner_operator": "xqc",
+            "inner_rounds": 1,
+            "inner_critic_source": "xqc",
+            "inner_horizon_critic_source": "xqc",
+            "inner_critic_target": "entropy_augmented"
+          }
+        },
+        "return_return_j2": {
+          "description": "H1 J2; return_return critic initialization and frozen outer horizon; inherited adaptive actor alpha. N256/G3/B256/delay3, actor and critic LR5e-5. Actor BatchNorm uses frozen inherited running statistics; affine parameters and alpha adapt.",
+          "alg_params": {
+            "inner_operator": "xqc",
+            "inner_rounds": 2,
+            "inner_critic_source": "aux_return",
+            "inner_horizon_critic_source": "aux_return",
+            "inner_critic_target": "reward_only"
+          }
+        },
+        "soft_soft_j2": {
+          "description": "H1 J2; soft_soft critic initialization and frozen outer horizon; inherited adaptive actor alpha. N256/G3/B256/delay3, actor and critic LR5e-5. Actor BatchNorm uses frozen inherited running statistics; affine parameters and alpha adapt.",
+          "alg_params": {
+            "inner_operator": "xqc",
+            "inner_rounds": 2,
+            "inner_critic_source": "xqc",
+            "inner_horizon_critic_source": "xqc",
+            "inner_critic_target": "entropy_augmented"
+          }
+        },
+        "return_return_j4": {
+          "description": "H1 J4; return_return critic initialization and frozen outer horizon; inherited adaptive actor alpha. N256/G3/B256/delay3, actor and critic LR5e-5. Actor BatchNorm uses frozen inherited running statistics; affine parameters and alpha adapt.",
+          "alg_params": {
+            "inner_operator": "xqc",
+            "inner_rounds": 4,
+            "inner_critic_source": "aux_return",
+            "inner_horizon_critic_source": "aux_return",
+            "inner_critic_target": "reward_only"
+          }
+        },
+        "soft_soft_j4": {
+          "description": "H1 J4; soft_soft critic initialization and frozen outer horizon; inherited adaptive actor alpha. N256/G3/B256/delay3, actor and critic LR5e-5. Actor BatchNorm uses frozen inherited running statistics; affine parameters and alpha adapt.",
+          "alg_params": {
+            "inner_operator": "xqc",
+            "inner_rounds": 4,
+            "inner_critic_source": "xqc",
+            "inner_horizon_critic_source": "xqc",
+            "inner_critic_target": "entropy_augmented"
+          }
+        },
+        "return_return_j8": {
+          "description": "H1 J8; return_return critic initialization and frozen outer horizon; inherited adaptive actor alpha. N256/G3/B256/delay3, actor and critic LR5e-5. Actor BatchNorm uses frozen inherited running statistics; affine parameters and alpha adapt.",
+          "alg_params": {
+            "inner_operator": "xqc",
+            "inner_rounds": 8,
+            "inner_critic_source": "aux_return",
+            "inner_horizon_critic_source": "aux_return",
+            "inner_critic_target": "reward_only"
+          }
+        },
+        "soft_soft_j8": {
+          "description": "H1 J8; soft_soft critic initialization and frozen outer horizon; inherited adaptive actor alpha. N256/G3/B256/delay3, actor and critic LR5e-5. Actor BatchNorm uses frozen inherited running statistics; affine parameters and alpha adapt.",
+          "alg_params": {
+            "inner_operator": "xqc",
+            "inner_rounds": 8,
+            "inner_critic_source": "xqc",
+            "inner_horizon_critic_source": "xqc",
+            "inner_critic_target": "entropy_augmented"
+          }
+        }
+      }
+    }
+  }
+}

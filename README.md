@@ -156,7 +156,8 @@ with `AMBIXQC_MODE=production`. Production uses one L40S, six CPUs, 48 GB RAM,
 and a 72-hour limit. Each job creates a fresh result directory; production
 publishes to W&B project `ambi` with its source SHA and job ID in the run name.
 
-New XQC checkpoints use version 5 to record the auxiliary return critic and
+New XQC checkpoints use version 6 to record `inner_actor_bn_mode`, in addition
+to the version-5 auxiliary return critic and
 the independent inner critic sources/target, alongside the collection operator,
 `inner_terminal_bootstrap`, `inner_update_timing`, and effective
 `inner_policy_delay`. Version-1 through version-4 checkpoints remain readable
@@ -168,6 +169,13 @@ defaults to inner-XQC collection. Ordinary loading retains strict semantic check
 evaluator's explicit frozen load permits only supported inner/controller changes
 and records the saved and evaluated settings. Existing checkpoint banks do not
 need rewriting.
+
+The optional `inner_actor_bn_mode="running"` freezes the inherited inner actor's
+BatchNorm running statistics while its weights, affine parameters, and
+temperature continue learning. Critic BatchNorm behavior is unchanged.
+`"batch_update"` preserves the existing behavior and is the migration default
+for checkpoints through version 5. Frozen checkpoint matrices can select either
+mode; see the [inner actor BatchNorm evaluation workflow](configs/research/README.md#ambi-xqc-inner-actor-batchnorm-evaluation).
 
 The [J6 checkpoint campaign](configs/research/README.md#ambi-xqc-inner-j6-checkpoint-campaign)
 uses native inner XQC with the rollout and update-slot budgets from

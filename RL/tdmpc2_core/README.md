@@ -77,10 +77,20 @@ return, resets branches to that seed every collection round, and updates the
 local scale from every realized imagined transition before that round's XQC
 updates. Raw replay rewards remain unchanged, the local moments are discarded
 after the action, and imagined statistics never write back to the outer
-normalizer. SimNorm itself has no running state. Inner online actor and critic
-BatchNorm statistics already adapt on their respective training batches;
+normalizer. SimNorm itself has no running state. By default, inner online actor and critic
+BatchNorm statistics adapt on their respective training batches;
 target-critic buffers keep official XQC's `batch_no_update` rule, while rollout
 and execution consume the adapted running statistics without mutating them.
+`inner_actor_bn_mode="batch_update"` preserves this default actor update rule.
+The opt-in `"running"` mode uses the inherited actor BatchNorm running statistics
+and freezes its running mean and variance throughout the inner
+solve. Actor weights, including BatchNorm affine scale/bias, and temperature
+remain trainable on their scheduled updates. This does not freeze the actor or
+change critic BatchNorm, target-critic updates, rollout, or action-execution rules.
+Version-6 checkpoints record this inner choice; versions 1–5 load with
+`"batch_update"`. Frozen evaluation can explicitly override the mode while
+preserving the outer checkpoint state. Presets and evaluation identities omit
+the explicit default when comparing planners; `"running"` is a distinct planner.
 The XQC controller semantics reuse the PyTorch port of official XQC commit
 `9a6832bb742ef01bbe9f1e06153a9338e612dae5`; TOLD remains derived from the
 TD-MPC2 source identified above.

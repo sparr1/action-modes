@@ -65,6 +65,7 @@ _AMBIXQC_DEFAULTS = {
     "inner_updates_per_round": 4,
     "inner_update_timing": "round",
     "inner_policy_delay": None,
+    "inner_actor_bn_mode": "batch_update",
     "inner_batch_size": 64,
     "inner_replay_capacity": None,
     "inner_replay_sampling": "with_replacement",
@@ -89,6 +90,7 @@ _PUBLIC_INNER_KEYS = {
     "inner_updates_per_round",
     "inner_update_timing",
     "inner_policy_delay",
+    "inner_actor_bn_mode",
     "inner_batch_size",
     "inner_replay_capacity",
     "inner_replay_sampling",
@@ -472,6 +474,10 @@ class AMBIXQC(AMBITDMPC2):
             cfg.xqc_policy_delay if cfg.inner_policy_delay is None
             else _positive_int(cfg.inner_policy_delay, "inner_policy_delay")
         )
+        if (not isinstance(cfg.inner_actor_bn_mode, str)
+                or cfg.inner_actor_bn_mode.lower() not in {"batch_update", "running"}):
+            raise ValueError("inner_actor_bn_mode must be 'batch_update' or 'running'.")
+        cfg.inner_actor_bn_mode = cfg.inner_actor_bn_mode.lower()
         cfg.inner_batch_size = _positive_int(cfg.inner_batch_size, "inner_batch_size")
         cfg.inner_model_step_budget = (
             cfg.inner_rounds

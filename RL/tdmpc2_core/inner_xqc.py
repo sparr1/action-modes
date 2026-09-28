@@ -997,6 +997,9 @@ class InnerXQCEngine:
                 )
         if self.state.critic_target_kind != "entropy_augmented":
             terminal_kwargs["critic_target_kind"] = self.state.critic_target_kind
+        actor_bn_mode = getattr(self.cfg, "inner_actor_bn_mode", "batch_update")
+        if actor_bn_mode != "batch_update":
+            terminal_kwargs["actor_bn_mode"] = actor_bn_mode
         return self.state.workspace.update(
             batch,
             next_noise=next_noise,
