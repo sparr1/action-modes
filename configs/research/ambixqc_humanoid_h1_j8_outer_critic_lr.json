@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "description": "Exploratory H1 J8 follow-up to the low-actor-LR screen: raise only the inner critic LR from 5e-5 to 0.00016500054, the saved current (last-applied) main and auxiliary critic optimizer LR in both aux_shared/aux_detached 500k checkpoints. Actor and tied adaptive-temperature LR remain 6.25e-6. Matched return/return and soft/soft critics, N256/G3/B256/delay3, frozen inherited actor BatchNorm statistics and frozen real reward scale. The critic rate is fixed throughout each inner solve; it is not the outer initial LR or next scheduled LR. All other J8 settings are unchanged; this is not a tuned or confirmatory protocol.",
+  "base_alg_config": "checkpoint",
+  "shared_alg_params": {
+    "inner_rollout_horizon": 1,
+    "inner_rollouts_per_round": 256,
+    "inner_updates_per_round": 3,
+    "inner_batch_size": 256,
+    "inner_replay_capacity": 2048,
+    "inner_replay_sampling": "with_replacement",
+    "inner_update_timing": "round",
+    "inner_policy_delay": 3,
+    "inner_actor_lr": 6.25e-06,
+    "inner_critic_lr": 0.00016500054,
+    "inner_terminal_bootstrap": "outer",
+    "inner_reward_normalization": "frozen_real_scale",
+    "inner_diagnostics_every": 1,
+    "inner_actor_bn_mode": "running"
+  },
+  "evaluation": {
+    "controller_seed": 12345,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "default_presets": [
+      "controller/return_return_j8",
+      "controller/soft_soft_j8"
+    ],
+    "wandb_project": "ambi-inner-bench"
+  },
+  "comparisons": {
+    "controller": {
+      "description": "J8 matched critic routes with actor and tied temperature LR 6.25e-6; critic LR 0.00016500054 matches the saved 500k outer critic optimizer rate.",
+      "reference": "prior",
+      "variants": {
+        "prior": {
+          "description": "Frozen main XQC actor mean; reuse matching completed prior episodes.",
+          "alg_params": {
+            "inner_operator": "none"
+          }
+        },
+        "return_return_j8": {
+          "description": "H1 J8; return_return critic initialization and frozen outer horizon; inherited adaptive actor alpha. N256/G3/B256/delay3, actor and tied temperature LR 6.25e-6; critic LR 0.00016500054 (saved 500k outer critic optimizer rate). Actor BatchNorm uses frozen inherited running statistics; affine parameters and alpha adapt.",
+          "alg_params": {
+            "inner_operator": "xqc",
+            "inner_rounds": 8,
+            "inner_critic_source": "aux_return",
+            "inner_horizon_critic_source": "aux_return",
+            "inner_critic_target": "reward_only"
+          }
+        },
+        "soft_soft_j8": {
+          "description": "H1 J8; soft_soft critic initialization and frozen outer horizon; inherited adaptive actor alpha. N256/G3/B256/delay3, actor and tied temperature LR 6.25e-6; critic LR 0.00016500054 (saved 500k outer critic optimizer rate). Actor BatchNorm uses frozen inherited running statistics; affine parameters and alpha adapt.",
+          "alg_params": {
+            "inner_operator": "xqc",
+            "inner_rounds": 8,
+            "inner_critic_source": "xqc",
+            "inner_horizon_critic_source": "xqc",
+            "inner_critic_target": "entropy_augmented"
+          }
+        }
+      }
+    }
+  }
+}

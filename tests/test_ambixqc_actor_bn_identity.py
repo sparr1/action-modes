@@ -143,3 +143,47 @@ def test_j8_low_actor_lr_changes_only_actor_and_tied_temperature_rates(checkpoin
                 for config in configs]
     assert planners[0] != planners[1]
     assert planners[1]["settings"]["inner_temperature_lr"] == 6.25e-6
+
+
+@pytest.mark.parametrize("checkpoint_case", [{"aux_return_mode": "xqc"}], indirect=True)
+@pytest.mark.parametrize("route", ["return_return", "soft_soft"])
+def test_j8_outer_critic_lr_changes_only_critic_rate(checkpoint_case, route):
+    from utils.ambi_research import load_preset_matrix, normalize_selectors
+
+    root = Path(__file__).resolve().parents[1] / "configs/research"
+    original_path = root / "ambixqc_humanoid_h1_j8_low_actor_lr.json"
+    followup_path = root / "ambixqc_humanoid_h1_j8_outer_critic_lr.json"
+    original = load_preset_matrix(original_path)
+    followup = load_preset_matrix(followup_path)
+    assert normalize_selectors(followup) == normalize_selectors(original) == [
+        "controller/return_return_j8", "controller/soft_soft_j8",
+    ]
+    assert followup["evaluation"] == original["evaluation"]
+    _, checkpoint = checkpoint_case
+    context = load_checkpoint_context(checkpoint)
+    selector = f"controller/{route}_j8"
+    resolved = [resolve_preset(path, selector, checkpoint_context=context)
+                for path in (original_path, followup_path)]
+    before, after = [item["algorithm_config"]["alg_params"] for item in resolved]
+    assert {key for key in set(before) | set(after)
+            if before.get(key) != after.get(key)} == {"inner_critic_lr"}
+    env = gym.make("Pendulum-v1", max_episode_steps=3)
+    try:
+        configs = [data.resolved_checkpoint_config(
+            {"metadata": context.metadata}, item, env=env,
+        ) for item in resolved]
+    finally:
+        env.close()
+    before, after = configs
+    assert {key for key in set(before) | set(after)
+            if before.get(key) != after.get(key)} == {"inner_critic_lr"}
+    assert before["inner_critic_lr"] == 5e-5
+    assert after["inner_critic_lr"] == 0.00016500054
+    assert after["inner_actor_lr"] == after["inner_temperature_lr"] == 6.25e-6
+    assert (after["inner_model_step_budget"], after["inner_critic_updates_per_action"],
+            after["inner_actor_updates_per_action"], after["inner_temperature_updates_per_action"]) == (2048, 24, 8, 8)
+    planners = [data.planner_identity(config, {}, "AMBIXQC/AMBIXQC", "tanh_mean")
+                for config in configs]
+    assert planners[0] != planners[1]
+    planners[1]["settings"]["inner_critic_lr"] = planners[0]["settings"]["inner_critic_lr"]
+    assert planners[1] == planners[0]

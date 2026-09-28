@@ -82,6 +82,18 @@ protocol when comparing with the original J8 and J1 results. Reuse completed
 prior references and create new evaluation identities for the changed learning
 rate. This remains an exploratory follow-up.
 
+The next follow-up `ambixqc_humanoid_h1_j8_outer_critic_lr.json` changes only
+`inner_critic_lr` to `0.00016500054`, retaining actor and tied temperature LR
+`6.25e-6` and every other low-actor-LR setting. This is the saved current
+(last-applied) rate in both the main and auxiliary critic optimizer parameter
+groups of the shared and detached 500k checkpoints, verified directly from
+their hash-checked checkpoint payloads. Both have 499999 critic updates;
+their next scheduled outer rate would be `0.00016500027`. The inner rate stays
+constant during each solve: it does not inherit the outer optimizer or resume
+its schedule. This matrix pins the 500k rate rather than computing it for an
+arbitrary checkpoint. Reuse the same paired prior references and create new
+evaluation identities; this remains a single-axis exploratory comparison.
+
 `slurm/run_ambixqc_actor_bn_smoke_oscar.sbatch` validates this screen before a
 full experiment. From the clean synchronized checkout, set
 `EXPECTED_ACTION_MODES_SHA` and an absolute scratch `RESULT_ROOT`; the default
