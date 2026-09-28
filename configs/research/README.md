@@ -70,6 +70,18 @@ with `inner_actor_bn_mode="running"` and inherited adaptive temperature. The
 return/return cells require an auxiliary-enabled checkpoint. These eight cells
 are an exploratory screen, not a tuned or confirmatory protocol.
 
+The follow-up `ambixqc_humanoid_h1_j8_low_actor_lr.json` selects only
+`controller/return_return_j8` and `controller/soft_soft_j8`. It lowers
+`inner_actor_lr` from `5e-5` to `6.25e-6` while retaining critic LR `5e-5` and
+all other J8 settings. XQC ties the adaptive-temperature learning rate to the
+actor learning rate, so both decrease eightfold; this is not an actor-only
+learning-rate intervention. Each decision still collects 2048 imagined
+transitions and performs 24 critic, 8 actor, and 8 temperature optimizer steps.
+Use the same checkpoint, five paired seeds, controller seed, and full-episode
+protocol when comparing with the original J8 and J1 results. Reuse completed
+prior references and create new evaluation identities for the changed learning
+rate. This remains an exploratory follow-up.
+
 `slurm/run_ambixqc_actor_bn_smoke_oscar.sbatch` validates this screen before a
 full experiment. From the clean synchronized checkout, set
 `EXPECTED_ACTION_MODES_SHA` and an absolute scratch `RESULT_ROOT`; the default
