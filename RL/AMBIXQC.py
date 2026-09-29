@@ -67,6 +67,7 @@ _AMBIXQC_DEFAULTS = {
     "inner_update_timing": "round",
     "inner_policy_delay": None,
     "inner_actor_bn_mode": "batch_update",
+    "inner_critic_bn_mode": "batch_update",
     "inner_batch_size": 64,
     "inner_replay_capacity": None,
     "inner_replay_sampling": "with_replacement",
@@ -80,6 +81,7 @@ _AMBIXQC_DEFAULTS = {
     "inner_reward_normalization": "frozen_real_scale",
     "inner_actor_lr": 5e-5,
     "inner_critic_lr": 5e-5,
+    "inner_temperature_lr": None,
     "inner_diagnostics_every": 1000,
 }
 
@@ -92,6 +94,7 @@ _PUBLIC_INNER_KEYS = {
     "inner_update_timing",
     "inner_policy_delay",
     "inner_actor_bn_mode",
+    "inner_critic_bn_mode",
     "inner_batch_size",
     "inner_replay_capacity",
     "inner_replay_sampling",
@@ -102,6 +105,7 @@ _PUBLIC_INNER_KEYS = {
     "inner_reward_normalization",
     "inner_actor_lr",
     "inner_critic_lr",
+    "inner_temperature_lr",
     "inner_diagnostics_every",
 }
 _PUBLIC_XQC_KEYS = {key for key in _AMBIXQC_DEFAULTS if key.startswith("xqc_")}
@@ -171,7 +175,6 @@ _INCOMPATIBLE_EXPLICIT_KEYS = {
     "inner_temperature_mode",
     "inner_temperature_initialization",
     "inner_temperature",
-    "inner_temperature_lr",
     "inner_target_entropy",
     "inner_bootstrap_source",
     "inner_actor_scope",
@@ -480,6 +483,12 @@ class AMBIXQC(AMBITDMPC2):
                 or cfg.inner_actor_bn_mode.lower() not in {"batch_update", "running"}):
             raise ValueError("inner_actor_bn_mode must be 'batch_update' or 'running'.")
         cfg.inner_actor_bn_mode = cfg.inner_actor_bn_mode.lower()
+        if (not isinstance(cfg.inner_critic_bn_mode, str)
+                or cfg.inner_critic_bn_mode.lower() not in {"batch_update", "batch_no_update", "running"}):
+            raise ValueError(
+                "inner_critic_bn_mode must be 'batch_update', 'batch_no_update', or 'running'."
+            )
+        cfg.inner_critic_bn_mode = cfg.inner_critic_bn_mode.lower()
         cfg.inner_batch_size = _positive_int(cfg.inner_batch_size, "inner_batch_size")
         cfg.inner_model_step_budget = (
             cfg.inner_rounds
@@ -531,6 +540,11 @@ class AMBIXQC(AMBITDMPC2):
         cfg.inner_critic_lr = _finite_float(
             cfg.inner_critic_lr, "inner_critic_lr", positive=True
         )
+        cfg.inner_temperature_lr = (
+            cfg.inner_actor_lr if cfg.inner_temperature_lr is None else _finite_float(
+                cfg.inner_temperature_lr, "inner_temperature_lr", positive=True
+            )
+        )
         cfg.inner_diagnostics_every = _positive_int(
             cfg.inner_diagnostics_every, "inner_diagnostics_every"
         )
@@ -553,7 +567,6 @@ class AMBIXQC(AMBITDMPC2):
         cfg.inner_rebase_persistent = False
         cfg.inner_behavior_action = "policy_sample"
         cfg.inner_execution_action = "policy_sample"
-        cfg.inner_temperature_lr = cfg.inner_actor_lr
         cfg.inner_critic_target_tau = cfg.xqc_tau
         cfg.inner_critic_target_update_interval = cfg.xqc_target_update_interval
         cfg.inner_critic_dropout_enabled = False

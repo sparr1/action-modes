@@ -114,11 +114,11 @@ def resolve_run_map(path, index, mode):
 
 
 def validate_bundle(bundle_path, index, *, seeds, max_steps, reference_bundle=None,
-                    source_sha=None):
+                    source_sha=None, expected_selector=None, expected_config=None):
     path = Path(bundle_path)
     saved = banks.read_json(path / "manifest.json")
-    selector = selector_for(index)
-    cfg_expected = expected_settings(index)
+    selector = selector_for(index) if expected_selector is None else expected_selector
+    cfg_expected = expected_settings(index) if expected_config is None else expected_config
     j = cfg_expected["inner_rounds"]
     if (saved.get("status") != "complete" or saved.get("code", {}).get("dirty") is not False
             or (source_sha is not None and saved["code"].get("commit") != source_sha)
@@ -142,6 +142,9 @@ def validate_bundle(bundle_path, index, *, seeds, max_steps, reference_bundle=No
     evaluated = provenance.get("evaluated_semantic_signature", {})
     if evaluated.get("inner_actor_bn_mode") != "running":
         raise ValueError("Frozen-evaluation provenance does not record running actor BN.")
+    if ("inner_critic_bn_mode" in cfg_expected
+            and evaluated.get("inner_critic_bn_mode", "batch_update") != cfg_expected["inner_critic_bn_mode"]):
+        raise ValueError("Frozen-evaluation provenance records a different critic BN mode.")
     if [e["seed"] for e in run["episodes"]] != list(seeds):
         raise ValueError("Episode seeds differ.")
     from utils.ambi_benchmark import reference_returns
@@ -183,7 +186,7 @@ def validate_bundle(bundle_path, index, *, seeds, max_steps, reference_bundle=No
                 # for the unchanged xqc/xqc/entropy_augmented route. Config
                 # and frozen-evaluation provenance were checked above; only
                 # these known default metrics may be absent, never work/scale.
-                expected_route = float(index % 2 == 0)
+                expected_route = float(cfg_expected["inner_critic_source"] == "aux_return")
                 if any(metrics.get(key, 0.0 if not expected_route else None) != expected_route
                        for key in routing):
                     raise ValueError("Trace critic routing differs.")

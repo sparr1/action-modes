@@ -54,6 +54,11 @@ def _validate_actor_bn_mode(mode):
         raise ValueError("actor_bn_mode must be 'batch_update' or 'running'.")
 
 
+def _validate_critic_bn_mode(mode):
+    if not isinstance(mode, str) or mode not in {"batch_update", "batch_no_update", "running"}:
+        raise ValueError("critic_bn_mode must be 'batch_update', 'batch_no_update', or 'running'.")
+
+
 @dataclass(frozen=True)
 class LatentXQCConfig:
     actor_net_arch: tuple[int, ...] = (256, 256, 256, 256)
@@ -368,7 +373,10 @@ class LatentXQCController(nn.Module):
         critic_target_kind: str = "entropy_augmented",
         outer_critic: XQCTwinCritic | None = None,
         outer_critic_is_return: bool = False,
+        critic_bn_mode: str = "batch_update",
     ) -> LatentXQCCriticObjective:
+        # Validate before any training forward can mutate local BN buffers.
+        _validate_critic_bn_mode(critic_bn_mode)
         if critic_target_kind not in {"entropy_augmented", "reward_only"}:
             raise ValueError("critic_target_kind must be 'entropy_augmented' or 'reward_only'.")
         if type(outer_critic_is_return) is not bool:
@@ -464,6 +472,7 @@ class LatentXQCController(nn.Module):
             next_noise,
             scale.reshape(()),
             target_alpha,
+            critic_bn_mode,
             *terminal_args,
         )
         (
@@ -502,6 +511,7 @@ class LatentXQCController(nn.Module):
         next_noise: torch.Tensor,
         reward_scale: torch.Tensor,
         alpha: torch.Tensor,
+        critic_bn_mode: str = "batch_update",
         outer_terminal_mask: torch.Tensor | None = None,
         outer_next_log_prob: torch.Tensor | None = None,
         outer_target_log_probs: torch.Tensor | None = None,
@@ -575,7 +585,7 @@ class LatentXQCController(nn.Module):
         )
         joined_actions = torch.cat((actions, next_actions), dim=0)
         joined_log_probs = self.critic.log_probs(
-            joined_latents, joined_actions, bn_mode="batch_update"
+            joined_latents, joined_actions, bn_mode=critic_bn_mode
         )
         current_log_probs = joined_log_probs[:, :count]
         per_head = -(
@@ -705,6 +715,8 @@ class LatentXQCController(nn.Module):
         critic_lr_end=None,
         transition_steps=1,
         optimizer_backend=None,
+        temperature_lr=None,
+        temperature_lr_end=None,
     ):
         return LatentXQCWorkspace(
             self,
@@ -713,6 +725,8 @@ class LatentXQCController(nn.Module):
             actor_lr_end=actor_lr if actor_lr_end is None else actor_lr_end,
             critic_lr_end=critic_lr if critic_lr_end is None else critic_lr_end,
             transition_steps=transition_steps,
+            temperature_lr=temperature_lr,
+            temperature_lr_end=temperature_lr_end,
             optimizer_backend=(
                 self.config.optimizer_backend
                 if optimizer_backend is None
@@ -720,7 +734,8 @@ class LatentXQCController(nn.Module):
             ),
         )
 
-    def clone_for_inner(self, *, actor_lr, critic_lr, transition_steps=1, critic_source=None):
+    def clone_for_inner(self, *, actor_lr, critic_lr, transition_steps=1, critic_source=None,
+                        temperature_lr=None):
         clone = LatentXQCController(
             self.latent_dim, self.action_dim, copy.deepcopy(self.config)
         ).to(next(self.parameters()).device)
@@ -735,6 +750,8 @@ class LatentXQCController(nn.Module):
             actor_lr_end=actor_lr,
             critic_lr_end=critic_lr,
             transition_steps=transition_steps,
+            temperature_lr=temperature_lr,
+            temperature_lr_end=temperature_lr,
         )
 
 
@@ -751,12 +768,22 @@ class LatentXQCWorkspace:
         critic_lr_end,
         transition_steps,
         optimizer_backend,
+        temperature_lr=None,
+        temperature_lr_end=None,
     ):
         self.controller = controller
         self.actor_lr = _positive_float(actor_lr, "actor_lr")
         self.critic_lr = _positive_float(critic_lr, "critic_lr")
         self.actor_lr_end = _positive_float(actor_lr_end, "actor_lr_end")
         self.critic_lr_end = _positive_float(critic_lr_end, "critic_lr_end")
+        self.temperature_lr = _positive_float(
+            actor_lr if temperature_lr is None else temperature_lr, "temperature_lr"
+        )
+        self.temperature_lr_end = _positive_float(
+            (actor_lr_end if temperature_lr is None else temperature_lr)
+            if temperature_lr_end is None else temperature_lr_end,
+            "temperature_lr_end",
+        )
         self.transition_steps = _positive_int(transition_steps, "transition_steps")
         device = next(controller.parameters()).device
         execution = _optimizer_execution_kwargs(device, str(optimizer_backend).lower())
@@ -778,7 +805,7 @@ class LatentXQCWorkspace:
         )
         self.temperature_optimizer = torch.optim.Adam(
             [controller.log_temperature],
-            lr=self.actor_lr,
+            lr=self.temperature_lr,
             betas=(0.9, 0.999),
             eps=controller.config.adam_eps,
             **execution,
@@ -857,8 +884,8 @@ class LatentXQCWorkspace:
             [self.controller.log_temperature]
         )
         temperature_lr = linear_learning_rate(
-            self.actor_lr,
-            self.actor_lr_end,
+            self.temperature_lr,
+            self.temperature_lr_end,
             self.temperature_optimizer_steps,
             self.transition_steps,
         )
@@ -890,10 +917,12 @@ class LatentXQCWorkspace:
         outer_critic: XQCTwinCritic | None = None,
         outer_critic_is_return: bool = False,
         actor_bn_mode: str = "batch_update",
+        critic_bn_mode: str = "batch_update",
     ) -> dict[str, Any]:
-        # Reject invalid actor settings before the critic forward mutates BN
+        # Reject invalid BN settings before the critic forward mutates BN
         # buffers or its optimizer advances.
         _validate_actor_bn_mode(actor_bn_mode)
+        _validate_critic_bn_mode(critic_bn_mode)
         terminal_kwargs = {}
         if outer_terminal_mask is not None or outer_controller is not None:
             terminal_kwargs = {
@@ -907,7 +936,8 @@ class LatentXQCWorkspace:
                 outer_critic=outer_critic, outer_critic_is_return=outer_critic_is_return
             )
         objective = self.controller.critic_objective(
-            batch, next_noise=next_noise, reward_scale=reward_scale, **terminal_kwargs
+            batch, next_noise=next_noise, reward_scale=reward_scale,
+            critic_bn_mode=critic_bn_mode, **terminal_kwargs
         )
         self.zero_critic_grad()
         objective.loss.backward()
@@ -978,8 +1008,8 @@ class LatentXQCWorkspace:
         _set_optimizer_lr(
             self.temperature_optimizer,
             linear_learning_rate(
-                self.actor_lr,
-                self.actor_lr_end,
+                self.temperature_lr,
+                self.temperature_lr_end,
                 temperature_index,
                 self.transition_steps,
             ),

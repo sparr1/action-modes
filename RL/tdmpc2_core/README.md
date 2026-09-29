@@ -83,11 +83,20 @@ The opt-in `inner_actor_bn_mode="running"` freezes the inner actor's inherited
 running statistics during actor updates while retaining gradients through its
 weights and BN affine parameters. This is useful for H1 adaptation, whose
 current-state batch repeats one root latent. Alpha remains inherited and
-adaptive, with its learning rate tied to `inner_actor_lr`. The default
+adaptive. Its learning rate defaults to `inner_actor_lr`; the optional positive
+`inner_temperature_lr` sets a separate constant action-local rate while keeping
+the same delayed update clock. The default
 `batch_update` behavior, including actor BN updates on optimizer-skipped slots,
 is unchanged. This option never changes persistent outer actor training.
-Critic training still uses joined replay/policy batch statistics;
-target-critic buffers keep official XQC's `batch_no_update` rule, while actor
+The inner critic defaults to `inner_critic_bn_mode="batch_update"`: joined
+replay/policy batch statistics are used and committed to running buffers.
+`"batch_no_update"` uses the identical joined batch moments without committing
+them; `"running"` uses the inherited running moments for the fitting forward
+pass. Both alternatives retain gradients through critic weights and BN affine
+parameters, and neither updates the running buffers. Every real action still
+starts from the selected outer online critic's weights and buffers, including
+when a workspace is reused. These options affect only the disposable inner
+critic. Target-critic buffers keep official XQC's `batch_no_update` rule, while actor
 critic queries, rollout, and execution use running statistics.
 
 Checkpoint version 7 records this actor BN mode alongside independent XQC UTD.
@@ -95,8 +104,14 @@ Versions 1–5 default to `batch_update` and UTD1. Historical UTD-v6 checkpoints
 contain `xqc_utd` but no actor BN mode; historical actor-BN-v6 checkpoints contain
 the mode but no `xqc_utd`. The loader accepts only an unambiguous version-6
 schema, supplying the missing historical default. Frozen evaluation can
-explicitly override the inner actor BN mode and records both saved and executed
-semantics. It cannot override outer UTD. Replay sidecars and frozen MPPI remain
+explicitly override the inner actor/critic BN modes and temperature learning
+rate and records both saved and executed semantics. Nondefault inner critic BN
+and independent temperature rates are optional version-7 signature extensions;
+their absence means `batch_update` and the saved inner actor learning rate.
+Default checkpoint payloads retain the existing signature, and older readers
+reject the nondefault extensions instead of silently ignoring them. Strict
+training loads require matching resolved settings. Frozen evaluation cannot
+override outer UTD. Replay sidecars and frozen MPPI remain
 compatible, and loading never rewrites their checkpoint payloads.
 The XQC controller semantics reuse the PyTorch port of official XQC commit
 `9a6832bb742ef01bbe9f1e06153a9338e612dae5`; TOLD remains derived from the

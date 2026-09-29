@@ -449,6 +449,10 @@ class InnerXQCEngine:
         critic_kwargs = {}
         if critic_source != "xqc":
             critic_kwargs["critic_source"] = self._critic_from_source(critic_source)
+        clone_kwargs = dict(critic_kwargs)
+        temperature_lr = float(getattr(cfg, "inner_temperature_lr", cfg.inner_actor_lr))
+        if temperature_lr != float(cfg.inner_actor_lr):
+            clone_kwargs["temperature_lr"] = temperature_lr
         if self._workspace_pool is None:
             workspace = self.outer_controller.clone_for_inner(
                 actor_lr=float(cfg.inner_actor_lr),
@@ -458,12 +462,17 @@ class InnerXQCEngine:
                 transition_steps=int(
                     cfg.inner_rounds * cfg.inner_updates_per_round
                 ),
-                **critic_kwargs,
+                **clone_kwargs,
             )
         else:
             workspace = self._workspace_pool
             self._workspace_pool = None
             workspace.reset_from_(self.outer_controller, **critic_kwargs)
+        # Rates are action-local too. Refresh them on a reused allocation so
+        # an explicit evaluation override cannot leave a stale temperature LR.
+        workspace.temperature_lr = temperature_lr
+        workspace.temperature_lr_end = temperature_lr
+        workspace.restore_learning_rate_phase_()
 
         # The outer learner retains its original delay. An evaluation override
         # belongs only to this disposable controller, including reused pools.
@@ -1000,6 +1009,9 @@ class InnerXQCEngine:
         actor_bn_mode = getattr(self.cfg, "inner_actor_bn_mode", "batch_update")
         if actor_bn_mode != "batch_update":
             terminal_kwargs["actor_bn_mode"] = actor_bn_mode
+        critic_bn_mode = getattr(self.cfg, "inner_critic_bn_mode", "batch_update")
+        if critic_bn_mode != "batch_update":
+            terminal_kwargs["critic_bn_mode"] = critic_bn_mode
         return self.state.workspace.update(
             batch,
             next_noise=next_noise,

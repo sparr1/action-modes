@@ -27,6 +27,7 @@ _XQC_CHECKPOINT_INNER_PARAMS = {
     "inner_update_timing",
     "inner_policy_delay",
     "inner_actor_bn_mode",
+    "inner_critic_bn_mode", "inner_temperature_lr",
     "inner_critic_source", "inner_horizon_critic_source", "inner_critic_target",
 }
 _MPPI_PARAMETERS = {
@@ -89,6 +90,10 @@ def _validate_checkpoint_overrides(alg_params, run_params, location):
             raise PresetMatrixError(
                 f"{location}.inner_actor_bn_mode must be 'batch_update', 'running', or null to reset."
             )
+    if "inner_critic_bn_mode" in alg_params:
+        mode = alg_params["inner_critic_bn_mode"]
+        if mode is not None and (not isinstance(mode, str) or mode not in {"batch_update", "batch_no_update", "running"}):
+            raise PresetMatrixError(f"{location}.inner_critic_bn_mode must be batch_update, batch_no_update, running, or null to reset.")
     forbidden = [
         key for key in alg_params
         if not key.startswith(("inner_", "wandb_"))

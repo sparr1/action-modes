@@ -92,6 +92,11 @@ class _FakeWorkspace:
         self.actor_optimizer_steps = 0
         self.temperature_optimizer_steps = 0
 
+    def restore_learning_rate_phase_(self):
+        # This oracle has no optimizer, but the action-preparation contract
+        # refreshes its constant temperature rate alongside real workspaces.
+        assert self.temperature_lr == self.temperature_lr_end == 5e-5
+
     def update(
         self,
         batch,

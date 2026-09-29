@@ -754,7 +754,18 @@ class AMBIXQCAgent(nn.Module):
         }
 
     def semantic_signature(self):
+        # Optional v7 extensions preserve the established default payload.
+        # Older readers reject nondefault fields rather than silently changing
+        # the learner; new readers resolve an absent field to its old behavior.
+        inner_extensions = {}
+        critic_bn_mode = str(getattr(self.cfg, "inner_critic_bn_mode", "batch_update"))
+        if critic_bn_mode != "batch_update":
+            inner_extensions["inner_critic_bn_mode"] = critic_bn_mode
+        temperature_lr = float(getattr(self.cfg, "inner_temperature_lr", self.cfg.inner_actor_lr))
+        if temperature_lr != float(self.cfg.inner_actor_lr):
+            inner_extensions["inner_temperature_lr"] = temperature_lr
         return {
+            **inner_extensions,
             "algorithm": "AMBIXQC",
             "collection_operator": str(self.cfg.inner_operator),
             "inner_terminal_bootstrap": str(getattr(self.cfg, "inner_terminal_bootstrap", "inner")),
@@ -902,6 +913,26 @@ class AMBIXQCAgent(nn.Module):
         if not isinstance(saved, dict):
             raise ValueError("AMBI-XQC checkpoint semantics must be a mapping.")
         version = state["checkpoint_version"]
+        extension_keys = {"inner_critic_bn_mode", "inner_temperature_lr"}
+        if version < 7 and extension_keys.intersection(saved):
+            raise ValueError("AMBI-XQC inner critic BN and temperature LR extensions require v7.")
+        if not isinstance(saved.get("inner_schedule"), dict):
+            raise ValueError("AMBI-XQC checkpoint inner schedule must be a mapping.")
+        saved_critic_bn = saved.pop("inner_critic_bn_mode", "batch_update")
+        expected_critic_bn = expected.pop("inner_critic_bn_mode", "batch_update")
+        saved_temperature_lr = saved.pop("inner_temperature_lr", saved["inner_schedule"].get("actor_lr"))
+        expected_temperature_lr = expected.pop("inner_temperature_lr", expected["inner_schedule"]["actor_lr"])
+        if (not isinstance(saved_critic_bn, str)
+                or saved_critic_bn not in {"batch_update", "batch_no_update", "running"}):
+            raise ValueError("AMBI-XQC checkpoint inner_critic_bn_mode is invalid.")
+        if (isinstance(saved_temperature_lr, bool)
+                or not isinstance(saved_temperature_lr, (float, int))
+                or not math.isfinite(saved_temperature_lr) or saved_temperature_lr <= 0):
+            raise ValueError("AMBI-XQC checkpoint inner_temperature_lr is invalid.")
+        if not frozen_evaluation and (
+            saved_critic_bn != expected_critic_bn or saved_temperature_lr != expected_temperature_lr
+        ):
+            raise ValueError("AMBI-XQC checkpoint inner critic BN or temperature LR semantics differ.")
         legacy_defaults = {}
         if version <= 5:
             legacy_defaults["xqc_utd"] = 1
@@ -1050,7 +1081,8 @@ class AMBIXQCAgent(nn.Module):
                 saved_comparison[key] = expected[key]
         if saved_comparison != expected:
             raise ValueError("AMBI-XQC checkpoint semantics do not match this agent.")
-        return saved
+        return {**saved, "inner_critic_bn_mode": saved_critic_bn,
+                "inner_temperature_lr": saved_temperature_lr}
 
     @staticmethod
     def _validate_serialized_generator(value, name, device_type):
@@ -1301,10 +1333,13 @@ class AMBIXQCAgent(nn.Module):
         self.last_inner_rollout_lengths = []
         self._resume_boundary_prepared = False
         self._frozen_evaluation = frozen_evaluation
+        evaluated_signature = self.semantic_signature()
+        evaluated_signature.setdefault("inner_critic_bn_mode", "batch_update")
+        evaluated_signature.setdefault("inner_temperature_lr", float(self.cfg.inner_actor_lr))
         self._checkpoint_evaluation_provenance = {
             "checkpoint_version": state["checkpoint_version"],
             "saved_semantic_signature": saved_signature,
-            "evaluated_semantic_signature": self.semantic_signature(),
+            "evaluated_semantic_signature": evaluated_signature,
             "frozen_evaluation": frozen_evaluation,
             "cross_device_rng_reset": cross_device,
         }

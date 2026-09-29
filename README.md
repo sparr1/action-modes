@@ -56,8 +56,8 @@ The resolved AMBI-XQC defaults use the released four-layer XQC actor
 (`256` units per layer), twin four-layer critics (`512` units per layer), 101
 atoms on `[-5, 5]`, `alpha=0.01`, policy delay 3, and `tau=0.005`. The fresh
 inner solve defaults to `J=2`, `N=32`, `H=3`, and `G=4`, with a 64-row batch
-and fixed `5e-5` actor/critic learning rates. Temperature always uses the actor
-learning rate. These are initial method defaults, not a frozen benchmark
+and fixed `5e-5` actor/critic learning rates. Temperature defaults to the actor
+learning rate; `inner_temperature_lr` can override it independently. These are initial method defaults, not a frozen benchmark
 protocol; every experiment must record its resolved settings.
 
 AMBI-XQC can train its persistent controller more often than TOLD. Set these
@@ -170,8 +170,9 @@ episodes for each inner budget.
 
 See [the checkpoint evaluation workflow](configs/research/README.md#ambi-xqc-episode-comparison)
 for training, evaluation, and portable HTML report commands. This workflow
-records episode returns and per-decision diagnostics; shared-observation probes
-and per-update optimizer traces are not supported for XQC.
+records episode returns and per-decision diagnostics. The separate
+[BN mechanism study](configs/research/AMBIXQC_BN_STUDY.md) supports fixed-root
+XQC diagnostics and a staged full-episode normalization/budget comparison.
 
 The [prior-versus-MPPI workflow](configs/research/README.md#ambi-xqc-prior-versus-mppi)
 uses TD-MPC2's Humanoid search defaults on the frozen XQC model. It compares
@@ -215,7 +216,7 @@ need rewriting.
 For inner adaptation, `inner_actor_bn_mode="running"` keeps the copied actor's
 BatchNorm running statistics fixed during gradient updates. Its weights and BN
 affine parameters still learn; inherited alpha still adapts at
-`inner_actor_lr`. This avoids estimating actor batch statistics from repeated
+`inner_temperature_lr` (defaulting to `inner_actor_lr`). This avoids estimating actor batch statistics from repeated
 root states in an H1 solve. The default `batch_update` preserves historical XQC
 behavior. Critic joined-batch training, target BN, outer training, and frozen
 MPPI are unchanged. The setting is an explicit frozen-evaluation override and
