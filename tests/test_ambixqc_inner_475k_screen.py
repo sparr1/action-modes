@@ -81,6 +81,13 @@ def make_bundle(path, index=0, *, seeds=(101, 102), steps=3):
                                      "decision/inner_critic_source_aux_return": float(index % 2 == 0),
                                      "decision/inner_horizon_critic_source_aux_return": float(index % 2 == 0),
                                      "decision/inner_critic_target_reward_only": float(index % 2 == 0)}}
+                # The real producer omits all routing metrics for pure soft
+                # XQC rather than emitting three redundant zero values.
+                if index % 2:
+                    for key in ("decision/inner_critic_source_aux_return",
+                                "decision/inner_horizon_critic_source_aux_return",
+                                "decision/inner_critic_target_reward_only"):
+                        event["metrics"].pop(key)
                 stream.write(json.dumps(event) + "\n")
     result = {"action_rule": "tanh_mean", "outer_state_unchanged": True,
               "outer_updates_before": 9, "outer_updates_after": 9,
@@ -138,6 +145,24 @@ def test_trace_rejects_incomplete_or_invalid_decisions(tmp_path, problem):
         for row in rows: stream.write(json.dumps(row)+"\n")
     with pytest.raises(ValueError):
         campaign.validate_bundle(path, 0, seeds=[101, 102], max_steps=3)
+
+
+@pytest.mark.parametrize("index,problem", [(0, "missing_return"), (1, "wrong_soft"),
+                                         (1, "missing_scale"), (3, "missing_work")])
+def test_only_omitted_soft_routing_metrics_default_to_zero(tmp_path, index, problem):
+    path = tmp_path / "bundle"
+    make_bundle(path, index)
+    trace = path / "seed-101.jsonl.gz"
+    with gzip.open(trace, "rt") as stream: rows = [json.loads(line) for line in stream]
+    metrics = rows[0]["metrics"]
+    if problem == "missing_return": metrics.pop("decision/inner_critic_source_aux_return")
+    elif problem == "wrong_soft": metrics["decision/inner_critic_source_aux_return"] = 1
+    elif problem == "missing_scale": metrics.pop("decision/inner_reward_scale_delta")
+    else: metrics.pop("decision/inner_model_steps")
+    with gzip.open(trace, "wt") as stream:
+        for row in rows: stream.write(json.dumps(row)+"\n")
+    with pytest.raises(ValueError):
+        campaign.validate_bundle(path, index, seeds=[101, 102], max_steps=3)
 
 
 def prior_reference(tmp_path, inventory):

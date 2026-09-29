@@ -173,12 +173,20 @@ def validate_bundle(bundle_path, index, *, seeds, max_steps, reference_bundle=No
                 required = {"decision/inner_model_steps": 256*j,
                             "decision/inner_reward_scale_delta": 0,
                             "decision/inner_reward_normalizer_imagined_updates": 0,
-                            "decision/inner_diagnostics_sampled": 1,
-                            "decision/inner_critic_source_aux_return": float(index % 2 == 0),
-                            "decision/inner_horizon_critic_source_aux_return": float(index % 2 == 0),
-                            "decision/inner_critic_target_reward_only": float(index % 2 == 0)}
+                            "decision/inner_diagnostics_sampled": 1}
                 if any(metrics.get(key) != value for key, value in required.items()):
-                    raise ValueError("Trace work, frozen scale, sampling or critic routing differs.")
+                    raise ValueError("Trace work, frozen scale or sampling differs.")
+                routing = ("decision/inner_critic_source_aux_return",
+                           "decision/inner_horizon_critic_source_aux_return",
+                           "decision/inner_critic_target_reward_only")
+                # InnerXQCEngine intentionally omits these three diagnostics
+                # for the unchanged xqc/xqc/entropy_augmented route. Config
+                # and frozen-evaluation provenance were checked above; only
+                # these known default metrics may be absent, never work/scale.
+                expected_route = float(index % 2 == 0)
+                if any(metrics.get(key, 0.0 if not expected_route else None) != expected_route
+                       for key in routing):
+                    raise ValueError("Trace critic routing differs.")
                 if not all(isinstance(value, (int, float)) and math.isfinite(value) for value in metrics.values()):
                     raise ValueError("Trace contains nonfinite metrics.")
     if seen != {(f"seed-{seed}", decision) for seed in seeds for decision in range(max_steps)}:
