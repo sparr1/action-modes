@@ -131,6 +131,28 @@ GPU workers disable W&B, validate their completed bundles, then stage them for
 the existing single-owner CPU publisher. Publisher receipt acknowledgement and
 native panel verification remain part of campaign orchestration.
 
+### Continue after a completed Stage 2 launch
+
+`continue_ambixqc_bn_study.py` launches only the three new Stage 3 conditions.
+Run it with `slurm/continue_ambixqc_bn_study_oscar.sbatch` on a CPU allocation,
+using a separate extension result directory. It verifies the completed parent,
+all four publication acknowledgements and the original six GPU smoke checks.
+The existing J1 / actor-LR5e-5 winner is reused without another evaluation.
+
+The continuation records two commits: its own tooling commit and the original
+experiment commit. It imports the evaluator, controller, GPU launcher and
+publication helpers from the original clean experiment checkout, preserving
+the source identity of the paired study. The parent completion, plans, results
+and publication records remain unchanged. The working named dashboard uses
+the alphanumeric token `xqcbn290926`; the continuation verifies its exact
+extension panel specification before submitting GPU jobs.
+
+The required arguments are `--execution-root`, `--source-sha`, `--tooling-sha`,
+`--parent-root`, `--result-root`, `--workspace-spec` and `--progress-run-id`.
+The parent evidence supplies checkpoint, prior-reference and smoke paths.
+`--gpu-type` defaults to `nvidia_rtx_a5000`. This is an explicitly authorized
+extension, not an automatic consequence of completing Stage 2.
+
 ## Oscar launcher and production gate
 
 `slurm/run_ambixqc_bn_study_oscar.sbatch` takes the existing exact-source,
