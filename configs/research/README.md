@@ -741,3 +741,122 @@ reserve disk space or account for simultaneous unrelated writers. Retain
 additional quota headroom when other campaigns share storage. Node-local
 scratch owns W&B caches; durable results own checkpoints, sidecars, replay,
 validation, and job logs. Result directories are unique and never overwritten.
+
+## MPPI on the six 500k AMBI-XQC backbones
+
+`run_ambixqc_backbone_mppi_evaluation.py` evaluates every retained checkpoint
+from the completed six-cell 500k training campaign: 25k through 500k decisions,
+20 checkpoints per cell and 120 checkpoints total. Each checkpoint receives
+five paired prior-mean and native MPPI episodes, environment seeds 101–105,
+controller seed 12345, and 500 decisions per episode. This is 1,200 full
+episodes. It is a new evaluation attempt, distinct from the historical 1.5M
+prior-only bank; the historical driver and its fixed inventory remain intact.
+
+The planner inherits `ambixqc_humanoid_mppi_benchmark.json`: H3, 512 candidates,
+64 elites, 24 policy trajectories, standard deviation 0.05–2, temperature 0.5,
+and eight effective Humanoid iterations (six configured). It executes the
+native weighted stochastic elite action, while the prior executes `tanh(mu)`.
+MPPI scores raw model rewards and the frozen primary online twin-critic mean,
+converted using the saved real reward scale. Auxiliary return critics remain
+frozen and are not selected for MPPI's terminal value. Evaluation never adapts
+a policy, changes BatchNorm or reward statistics, or samples the saved replay.
+Each MPPI decision performs 12,336 model transitions and zero optimizer steps.
+
+Create the immutable inventory from the completed training root. Its cell order
+is baseline/shared/detached at UTD1, then baseline/shared/detached at UTD2;
+within each cell, the checkpoint steps ascend. Row indices 0–119 therefore
+identify one checkpoint each. The inventory pins checkpoint and sidecar hashes,
+all six original training validations, the training source commit, and the
+source-run identities. Paths inside the training root are relative. When
+copying to another cluster, retain the checkpoint/sidecar/replay tree and
+training validation/PASS files, verify all copied file hashes, and use
+`--checkpoint-root` or `AMBIXQC_CHECKPOINT_ROOT` to select the copied root. The
+unchanged inventory and original files remain useful on both clusters.
+
+```bash
+"$AMBIXQC_PYTHON" run_ambixqc_backbone_mppi_evaluation.py \
+  --build-inventory --training-root /absolute/completed-training-root \
+  --output /absolute/new-evaluation/checkpoint-manifest.json
+```
+
+The Oscar and Hydra launchers are
+`slurm/run_ambixqc_backbone_mppi_eval_oscar.sbatch` and
+`slurm/run_ambixqc_backbone_mppi_eval_hydra.sbatch`. Each task requests one L40S,
+six CPUs, 32 GiB RAM and 30 minutes. Hydra additionally pins `gpu2501` and
+checks its runtime hostname. Submit from an exact, clean, pushed checkout;
+reuse the locked nested DMControl environment. The launcher canonicalizes the
+Python directory while preserving its virtual-environment executable, including
+Hydra's `/home` alias. It creates node-local caches, checks the runtime lock and
+CUDA device, and keeps durable results outside the source tree.
+
+Export `EXPECTED_ACTION_MODES_SHA`, `AMBIXQC_ACTION_MODES_DIR`,
+`AMBIXQC_PYTHON`, `AMBIXQC_RESULTS_ROOT`, and `AMBIXQC_CHECKPOINT_MANIFEST` as
+absolute paths where applicable. Create the result root and its `slurm/`
+directory before submission. First set `AMBIXQC_MODE=smoke` and submit
+`--array=0,39,40,79,80,119`, choosing concurrent allocations from live GPU,
+account, CPU and memory availability. These six indices cover all cells,
+including early and final checkpoints at both update ratios. Every smoke runs
+two seeds and three real decisions with the full MPPI budget. Index 0 also
+runs the focused GPU regression tests; no smoke publishes to W&B.
+
+```bash
+export AMBIXQC_MODE=smoke
+sbatch --array=0,39,40,79,80,119 \
+  --output="$AMBIXQC_RESULTS_ROOT/slurm/smoke-%A_%a.out" \
+  --error="$AMBIXQC_RESULTS_ROOT/slurm/smoke-%A_%a.err" \
+  slurm/run_ambixqc_backbone_mppi_eval_oscar.sbatch
+
+# After all six allocated tasks finish successfully:
+"$AMBIXQC_PYTHON" tests/benchmarks/ambixqc_backbone_mppi_smoke_gate.py create \
+  --smoke-root "$AMBIXQC_RESULTS_ROOT/smoke" \
+  --manifest "$AMBIXQC_CHECKPOINT_MANIFEST" \
+  --source-sha "$EXPECTED_ACTION_MODES_SHA" \
+  --output "$AMBIXQC_RESULTS_ROOT/smoke-gate.json"
+```
+
+The gate certifies these **six actual smoke checkpoints**, not all 120. It
+checks both completion markers, exact evaluation source, inventory and matrix,
+frozen-state checks, paired diagnostic traces, and index 0's regression result.
+It hashes the preserved smoke artifacts and refuses duplicate or incomplete
+smokes and replacement of an existing gate. Production revalidates the gate
+and its referenced files before allocating a model. Each production worker
+still validates its own checkpoint and metadata before evaluation.
+
+Prepare twelve explicit evaluation-series assignments, one prior and one MPPI
+curve for each training cell. Generate each cell's two prospective identities
+with the driver, e.g. `--manifest ... --index 0 --eval-series-spec-dir ...` for
+the first cell (indices 20,40,60,80,100 select the others). Use the existing
+`eval_series.py create` or deliberate `append` workflow, with the Oscar
+publication owner. `EVAL_RUN_MAP` must identify a JSON object with this schema
+and entries for all six cells, using twelve distinct absolute run directories:
+
+```json
+{
+  "schema": "ambixqc-backbone-mppi-run-map-v1",
+  "cells": {
+    "baseline_utd1": {
+      "controller/prior": "/absolute/registry/prior-run-directory",
+      "controller/mppi": "/absolute/registry/mppi-run-directory"
+    }
+  }
+}
+```
+
+The example shows one cell; the other five are required. Once assignments and
+the smoke gate are ready, set `AMBIXQC_MODE=production` and
+`AMBIXQC_SMOKE_GATE="$AMBIXQC_RESULTS_ROOT/smoke-gate.json"`, then submit the
+selected indices in 0–119. Select an explicit concurrency limit from current
+capacity, accounting for other campaigns. Each checkpoint task runs both
+controllers together, preserving paired seeds and result ownership. Do not
+submit the same checkpoint on both clusters.
+
+Outputs live under
+`RESULTS_ROOT/{smoke,production}/jobARRAY-taskINDEX/CELL/step_N/`, including
+`bundle/`, `paired.json`, `validation.json`, `comparison.html`, and `PASS`.
+Existing output directories are never overwritten. Both launchers disable W&B
+inside GPU workers: completed production bundles are queued into the selected
+evaluation-series directories. Only the authoritative Oscar CPU publisher
+writes the twelve curves to W&B. If compute runs on Hydra, transfer its
+completed bundles and staging records to that owner before publication; do
+not concurrently resume those W&B IDs from Hydra. Preserve completed bundles
+when upload fails and recover through the publisher without reevaluating.
