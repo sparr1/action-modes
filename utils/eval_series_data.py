@@ -407,6 +407,7 @@ def identity_for_ambi_checkpoint(checkpoint, resolved, protocol, seeds, code, *,
         agent = AMBIXQCAgent.__new__(AMBIXQCAgent)
         agent.cfg = SimpleNamespace(**config)
         description = FrozenXQCMPPIController.__new__(FrozenXQCMPPIController)
+        description.terminal_critic_source = configured.get("terminal_critic_source", "xqc")
         description.reward_scale = 1.0  # Only the initialization rule enters identity.
         description.discount = agent._get_discount(config["episode_length"])
         evaluation_controller = {"type": "mppi", "protocol": description.protocol,
@@ -457,7 +458,8 @@ def descriptive_label(identity, selector=None):
                  f"pi{settings.get('num_pi_trajs', settings.get('inner_mppi_num_pi_trajs'))} "
                  f"J{settings.get('effective_iterations', settings.get('inner_mppi_iterations'))}")
         if planner.get("backend") == "tdmpc2_mppi_over_frozen_xqc":
-            title += " | online XQC Q × frozen scale"
+            auxiliary = planner.get("semantics", {}).get("terminal_value_source") == "online_aux_return_twin_mean"
+            title += " | return-only Q × frozen scale" if auxiliary else " | online XQC Q × frozen scale"
         elif planner.get("backend") == "native_tdmpc2":
             title += " | online TD-MPC2 Q"
         return prefix + title

@@ -59,13 +59,15 @@ def select_checkpoint(manifest_path, index):
     return row
 
 
-def validate_bundle(bundle_path, *, seeds, max_steps):
+def validate_bundle(bundle_path, *, seeds, max_steps, mppi_selector="controller/mppi",
+                    reference_bundle=None, terminal_value_source=None):
     manifest = json.loads((Path(bundle_path) / "manifest.json").read_text())
     if manifest["status"] != "complete":
         raise ValueError("Evaluation bundle did not complete.")
     runs = {run["selector"]: run for run in manifest["runs"]}
-    if set(runs) != {"controller/prior", "controller/mppi"}:
-        raise ValueError("Expected exactly the paired prior and MPPI controllers.")
+    expected = {mppi_selector} if reference_bundle is not None else {"controller/prior", mppi_selector}
+    if len(runs) != len(manifest["runs"]) or set(runs) != expected:
+        raise ValueError("Expected exactly the selected MPPI and optional paired prior controllers.")
     counts = {}
     for selector, run in runs.items():
         if run["status"] != "complete" or not run["result"]["outer_state_unchanged"]:
@@ -75,7 +77,11 @@ def validate_bundle(bundle_path, *, seeds, max_steps):
             raise ValueError("Episode seeds differ from the requested protocol.")
         if any(episode["length"] != max_steps for episode in episodes):
             raise ValueError("Humanoid evaluation did not finish the requested episode lengths.")
-        expected_steps = 12_336 if selector == "controller/mppi" else 0
+        expected_steps = 12_336 if selector == mppi_selector else 0
+        if selector == mppi_selector and terminal_value_source is not None:
+            protocol = run.get("evaluation_controller", {}).get("protocol", {})
+            if protocol.get("terminal_value_source") != terminal_value_source:
+                raise ValueError("MPPI bundle used the wrong terminal critic.")
         decisions = 0
         for relative in run["trace_files"]:
             with gzip.open(Path(bundle_path) / relative, "rt") as stream:
@@ -89,15 +95,19 @@ def validate_bundle(bundle_path, *, seeds, max_steps):
                     metrics = event["metrics"]
                     if metrics["decision/inner_model_steps"] != expected_steps:
                         raise ValueError("Planner model-step count differs from Humanoid defaults.")
-                    if selector == "controller/mppi" and metrics["decision/inner_mppi_iterations"] != 8:
+                    if selector == mppi_selector and metrics["decision/inner_mppi_iterations"] != 8:
                         raise ValueError("Expected eight effective Humanoid MPPI iterations.")
                     decisions += 1
         if decisions != len(seeds) * max_steps:
             raise ValueError("Per-decision diagnostics are missing or duplicated.")
         counts[selector] = decisions
-    prior_returns = {episode["seed"]: episode["return"]
-                     for episode in runs["controller/prior"]["episodes"]}
-    for episode in runs["controller/mppi"]["episodes"]:
+    if reference_bundle is None:
+        prior_returns = {episode["seed"]: episode["return"]
+                         for episode in runs["controller/prior"]["episodes"]}
+    else:
+        from utils.ambi_benchmark import reference_returns
+        prior_returns = reference_returns(reference_bundle, manifest["checkpoint"]["sha256"], manifest["protocol"])
+    for episode in runs[mppi_selector]["episodes"]:
         if abs(episode["paired_return_delta"] - (episode["return"] - prior_returns[episode["seed"]])) > 1e-9:
             raise ValueError("Paired return delta does not match the reference episode.")
     return {"outer_state_unchanged": True, "decision_counts": counts,

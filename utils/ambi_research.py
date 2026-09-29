@@ -97,8 +97,10 @@ def _validate_checkpoint_overrides(alg_params, run_params, location):
 def _validate_evaluation_controller(value, location):
     """Validate the separate evaluation-only controller before allocating a model."""
     value = _require_mapping(value, location)
-    if set(value) - {"type", "params"} or value.get("type") != "mppi":
-        raise PresetMatrixError(f"{location} supports only type='mppi' and a params object.")
+    if set(value) - {"type", "params", "terminal_critic_source"} or value.get("type") != "mppi":
+        raise PresetMatrixError(f"{location} supports type='mppi', params and terminal_critic_source.")
+    if value.get("terminal_critic_source", "xqc") not in ("xqc", "aux_return"):
+        raise PresetMatrixError(f"{location}.terminal_critic_source must be 'xqc' or 'aux_return'.")
     params = _require_mapping(value.get("params", {}), f"{location}.params")
     unknown = set(params) - _MPPI_PARAMETERS
     if unknown:
@@ -396,6 +398,11 @@ def resolve_preset(matrix_path, selector, matrix=None, *, checkpoint_context=Non
     if evaluation_controller is not None:
         if algorithm_config.get("alg") != "AMBIXQC/AMBIXQC":
             raise PresetMatrixError("The evaluation-only MPPI controller requires an AMBI-XQC checkpoint.")
+        if (evaluation_controller.get("terminal_critic_source", "xqc") == "aux_return"
+                and str(alg_params.get("aux_return_mode", "off")).lower() != "xqc"):
+            raise PresetMatrixError(
+                "Return-only MPPI requires a checkpoint trained with aux_return_mode='xqc'; "
+                "an auxiliary critic cannot be created during evaluation.")
         # The saved model is loaded as a frozen XQC prior. Planner settings
         # belong to evaluation metadata and never enter the training algorithm.
         authored = {**matrix.get("shared_alg_params", {}), **variant.get("alg_params", {})}

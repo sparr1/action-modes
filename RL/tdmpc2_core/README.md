@@ -140,8 +140,9 @@ the auxiliary learner when enabled and all three inner selections.
 Versions 1–4 migrate to auxiliary-off,
 XQC/XQC sources, and an entropy-augmented inner target. Strict loading retains
 outer training semantics; frozen evaluation may override the inner choices
-only when the required auxiliary weights already exist. MPPI always retains
-its main-XQC soft tail.
+only when the required auxiliary weights already exist. Evaluation-only MPPI
+defaults to its main-XQC soft tail and can explicitly select the saved
+auxiliary return critic through `evaluation_controller.terminal_critic_source`.
 
 The optional `inner_terminal_bootstrap="outer"` ablation changes the Bellman
 target only for a nonterminated transition at the imagined horizon boundary.
@@ -175,9 +176,12 @@ semantics while explicit frozen evaluation permits these supported inner changes
 `xqc_mppi.py` attaches an evaluation-only MPPI controller to a frozen AMBI-XQC
 checkpoint. It uses running BatchNorm statistics and its own episode-seeded
 RNG, retains a shifted plan mean within an episode, and performs no optimizer
-or normalizer updates. Terminal scoring averages the online XQC critics and
-multiplies by the frozen real reward scale before adding raw predicted rewards;
-the resulting tail still includes the learned soft-Q objective. The optional
+or normalizer updates. Terminal scoring averages the selected online twin
+critics and multiplies by the frozen real reward scale before adding raw
+predicted rewards. The default `terminal_critic_source="xqc"` retains the
+learned soft-Q objective; `"aux_return"` estimates reward return under the
+persistent XQC actor. Both policy proposals and terminal actions always use
+that actor. Neither route adds an explicit entropy term. The optional
 `action_selection="tdmpc2"` helper mode reproduces native weighted elite action
 selection, while existing helper callers retain their previous defaults.
 

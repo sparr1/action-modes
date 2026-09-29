@@ -632,7 +632,9 @@ def evaluate_preset(
         if _controller_type(resolved) == "mppi":
             from RL.tdmpc2_core.xqc_mppi import FrozenXQCMPPIController
             configured = resolved.get("evaluation_controller") or run_config["evaluation_controller"]
-            controller = FrozenXQCMPPIController(model.agent, settings=configured.get("params", {}))
+            controller = FrozenXQCMPPIController(
+                model.agent, settings=configured.get("params", {}),
+                terminal_critic_source=configured.get("terminal_critic_source", "xqc"))
             controller.reset(controller_seed)
             evaluation_controller = {"type": "mppi", "settings": _jsonable(controller.settings),
                                      "protocol": _jsonable(controller.protocol)}

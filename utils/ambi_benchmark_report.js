@@ -214,7 +214,7 @@
       const mode = $("mode").value, semantic = data.metric_catalog[$("metric").value] || {};
       const visibleRuns = chosen().length ? chosen() : data.runs;
       const xqcUnits = visibleRuns.some(run => (run.config || {}).alg === "AMBIXQC/AMBIXQC")
-        ? " XQC network values use normalized reward units; environment returns use raw rewards. MPPI scores convert the frozen soft-Q tail to raw reward units." : "";
+        ? " XQC network values use normalized reward units; environment returns use raw rewards. MPPI converts the selected frozen critic tail to raw reward units; the controller protocol identifies soft versus reward-only values." : "";
       text("diagnostic-description", capabilities(visibleRuns).optimizer
         ? "Frozen-checkpoint outcomes and recorded optimizer events inside each decision."
         : "Frozen-checkpoint outcomes and one aggregate measurement per real decision." + xqcUnits);

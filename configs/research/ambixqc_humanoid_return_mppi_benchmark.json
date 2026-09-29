@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "description": "Frozen MPPI with the auxiliary reward-return critic under the persistent XQC actor. Reuse the paired prior episodes from the soft-tail campaign.",
+  "base_alg_config": "checkpoint",
+  "evaluation": {
+    "controller_seed": 12345,
+    "seeds": [101, 102, 103, 104, 105],
+    "max_steps": 500,
+    "default_presets": ["controller/mppi_return"],
+    "wandb_project": "ambi-inner-bench"
+  },
+  "comparisons": {
+    "controller": {
+      "reference": "prior",
+      "variants": {
+        "prior": {
+          "description": "Frozen persistent actor mean, for short smoke pairing only.",
+          "alg_params": {"inner_operator": "none"}
+        },
+        "mppi_return": {
+          "description": "Native MPPI with the online auxiliary twin mean times the frozen real reward scale. Main XQC actor proposals and terminal actions, no explicit entropy term.",
+          "evaluation_controller": {
+            "type": "mppi",
+            "terminal_critic_source": "aux_return",
+            "params": {
+              "horizon": 3,
+              "iterations": 6,
+              "num_samples": 512,
+              "num_elites": 64,
+              "num_pi_trajs": 24,
+              "min_std": 0.05,
+              "max_std": 2.0,
+              "temperature": 0.5
+            }
+          }
+        }
+      }
+    }
+  }
+}

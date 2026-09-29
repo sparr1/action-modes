@@ -86,10 +86,19 @@ def validate_evaluation_controller(config, controller):
         raise ValueError("MPPI minimum standard deviation exceeds its maximum.")
     if protocol.get("action_rule") != MPPI_ACTION_RULE:
         raise ValueError("MPPI controller action rule must describe weighted-elite execution.")
-    if protocol.get("terminal_value_source") != "online_xqc_twin_mean":
-        raise ValueError("MPPI terminal value source must use the online XQC twin mean.")
-    if protocol.get("terminal_value_units") != "normalized_xqc_soft_q_times_frozen_real_reward_scale":
+    source = config.get("evaluation_controller", {}).get("terminal_critic_source", "xqc")
+    if source not in ("xqc", "aux_return"):
+        raise ValueError("Invalid MPPI terminal critic source.")
+    auxiliary = source == "aux_return"
+    expected_source = "online_aux_return_twin_mean" if auxiliary else "online_xqc_twin_mean"
+    expected_units = ("normalized_reward_return_q_times_frozen_real_reward_scale" if auxiliary
+                      else "normalized_xqc_soft_q_times_frozen_real_reward_scale")
+    if protocol.get("terminal_value_source") != expected_source:
+        raise ValueError("MPPI terminal value source conflicts with the selected online twin critic.")
+    if protocol.get("terminal_value_units") != expected_units:
         raise ValueError("MPPI terminal value units must describe the frozen reward-scale conversion.")
+    if auxiliary and protocol.get("terminal_value_semantics") != "learned_reward_return_under_persistent_xqc_actor":
+        raise ValueError("Return-only MPPI must record reward-return terminal semantics.")
     scale = protocol.get("reward_scale")
     if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0:
         raise ValueError("MPPI controller requires a finite positive frozen reward scale.")
@@ -117,8 +126,9 @@ def decision_metric_catalog(names, *, xqc=False):
         elif key.startswith(("planner_value_", "planner_elite_value_")):
             unit = "raw_return_score"
             definition = ("MPPI final-iteration score statistic: raw predicted rewards plus discounted "
-                          "online mean XQC soft-Q tail times the frozen real reward scale; "
-                          f"no entropy correction. Statistic: {key}." if xqc else
+                          "the selected online twin-Q mean times the frozen real reward scale; "
+                          "the controller protocol records soft versus reward-return semantics, "
+                          f"without an explicit entropy correction. Statistic: {key}." if xqc else
                           f"MPPI final-iteration predicted score statistic: {key}.")
         elif key.startswith("planner_std_") or key == "planner_action_l2":
             unit = "normalized_action"
@@ -305,11 +315,14 @@ def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None,
             tags.append(f"J:{settings['effective_iterations']}")
         elif "iterations" in settings:
             schedule.append(f"configured iterations {settings['iterations']}")
+        auxiliary = config["evaluation_controller"].get("terminal_critic_source", "xqc") == "aux_return"
         tags.extend(("algorithm:ambixqc", "schedule:mppi-search", "C:0", "A:0", "T:0",
-                     "terminal-q:online-xqc-twin-mean", "reward-scale:frozen-real"))
+                     "terminal-q:online-aux-return-twin-mean" if auxiliary else "terminal-q:online-xqc-twin-mean",
+                     "reward-scale:frozen-real"))
         if "iterations" in settings:
             tags.append(f"configured-iterations:{settings['iterations']}")
-        parts.extend((" ".join(["MPPI", *schedule]), "weighted elite", "online Q × frozen scale"))
+        parts.extend((" ".join(["MPPI", *schedule]), "weighted elite",
+                      "return-only Q × frozen scale" if auxiliary else "online Q × frozen scale"))
     elif _is_xqc(config):
         schedule = []
         for symbol, key in (("J", "inner_rounds"), ("N", "inner_rollouts_per_round"),

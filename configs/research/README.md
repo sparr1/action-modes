@@ -86,9 +86,10 @@ inner target. Conversely, a reward-only target with a frozen main XQC tail
 still contains the tail's learned future entropy. Treat these mixed choices
 as explicit ablations. Resolved configurations, checkpoint provenance, and
 planner labels distinguish initialization, horizon, and target choices;
-frozen-state checks include the saved auxiliary learner. MPPI keeps its
-existing main-XQC soft-value tail. Existing matrices and campaign defaults
-are unchanged.
+frozen-state checks include the saved auxiliary learner. MPPI defaults to its
+existing main-XQC soft-value tail; the separate `terminal_critic_source`
+evaluation setting below selects the saved auxiliary critic. Existing matrices
+and campaign defaults are unchanged.
 
 ## AMBI-XQC 1M backbone replay comparison
 
@@ -419,8 +420,10 @@ real reward normalizer, or outer RNG is updated. Decision records report actual
 model work and zero optimizer steps, alongside returns and control time.
 
 Planner settings live in a variant's `evaluation_controller` object, separate
-from training `alg_params`. Only the eight documented planner settings are
-accepted. MPPI presets cannot be materialized into training configurations.
+from training `alg_params`. Its `params` accepts the eight documented search
+settings. Alongside `params`, `terminal_critic_source="xqc"` (default) or
+`"aux_return"` selects the online twin critic. MPPI presets cannot be
+materialized into training configurations.
 Use the existing XQC matrix below for an explicitly requested inner-XQC
 comparison.
 
@@ -860,3 +863,47 @@ writes the twelve curves to W&B. If compute runs on Hydra, transfer its
 completed bundles and staging records to that owner before publication; do
 not concurrently resume those W&B IDs from Hydra. Preserve completed bundles
 when upload fails and recover through the publisher without reevaluating.
+
+### Return-only MPPI on the four auxiliary backbones
+
+`ambixqc_humanoid_return_mppi_benchmark.json` keeps the same H3/N512/E64/pi24,
+8 effective iterations, std 0.05–2, temperature 0.5, episode seeds 101–105,
+controller seed 12345 and 500-decision protocol. Its default selector is
+`controller/mppi_return`. Only `evaluation_controller.terminal_critic_source`
+changes to `aux_return`. The two baseline banks lack an auxiliary critic and
+are excluded. No training, inner adaptation, replay loading or normalization
+updates occur.
+
+The score is the raw predicted reward prefix plus the discounted auxiliary
+online twin mean multiplied by the checkpoint's frozen real reward scale.
+Proposals and terminal actions still come from the persistent XQC actor;
+there is no extra actor and no entropy subtraction. Auxiliary and primary BN
+buffers remain frozen, queried with running statistics. Source, units and
+reward-only semantics enter the evaluation identity so soft and return-only
+results cannot share a curve assignment accidentally.
+
+`run_ambixqc_return_mppi_evaluation.py` maps indices 0–79 onto the existing
+immutable six-bank inventory rows 20–59 and 80–119. The order is shared UTD1,
+detached UTD1, shared UTD2, detached UTD2, each at 25k through 500k. Production
+runs only the return-only controller and reuses the completed prior bundles.
+The reference index has schema `ambixqc-return-mppi-prior-references-v1`, pins
+`checkpoint_manifest_sha256`, and contains ordered `references` with `cell`,
+`step`, `checkpoint_sha256`, `bundle_path` and `manifest_sha256`. Checkpoint,
+reference hash and pairing protocol are validated before scoring.
+
+Use metadata-only `--eval-series-spec-dir` once per cell, create four explicit
+New curve registries, and pass an `--eval-run-map` with schema
+`ambixqc-return-mppi-run-map-v1`. Each of its four `cells` maps
+`controller/mppi_return` to its own absolute registry directory. Existing
+soft/prior registries and results are left intact.
+
+The Oscar launcher is `slurm/run_ambixqc_return_mppi_eval_oscar.sbatch`. It
+uses the same exact-SHA, clean-checkout and locked-runtime guards as the paired
+campaign. In smoke mode, submit indices `0,39,40,79`; index 0 also executes GPU
+regression tests. Each smoke scores two three-decision prior/return-MPPI
+pairs. Production requires `AMBIXQC_SMOKE_ROOT`, `AMBIXQC_REFERENCE_INDEX`
+and `EVAL_RUN_MAP`; the launcher rechecks all four smoke results before work.
+Submit production indices `0-79` with concurrency selected from current account
+and cluster capacity. One CPU publisher owns each new curve; extend the
+existing comparison view to include and label these four curves before
+presenting its URL. GPU workers do not initialize W&B.
