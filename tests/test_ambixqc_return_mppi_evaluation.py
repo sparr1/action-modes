@@ -132,7 +132,7 @@ def test_return_matrix_changes_only_terminal_critic():
 def test_launcher_requires_verified_references_and_completed_smokes():
     path = campaign.ROOT / "slurm/run_ambixqc_return_mppi_eval_oscar.sbatch"
     text = path.read_text()
-    for expected in ("--array=0", "#SBATCH --gres=gpu:l40s:1", "#SBATCH --cpus-per-task=6",
+    for expected in ("--array=0", "#SBATCH --gres=gpu:nvidia_rtx_a5000:1", "#SBATCH --cpus-per-task=6",
                      "SLURM_ARRAY_TASK_ID < 80", "0|39|40|79", "--reference-index",
                      "--verify-smoke-root", "LOCK_SHA", "--untracked-files=all",
                      "test_xqc_return_mppi.py", "WANDB_MODE=disabled", "--color=no"):

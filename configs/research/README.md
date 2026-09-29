@@ -898,6 +898,9 @@ New curve registries, and pass an `--eval-run-map` with schema
 soft/prior registries and results are left intact.
 
 The Oscar launcher is `slurm/run_ambixqc_return_mppi_eval_oscar.sbatch`. It
+requests one RTX A5000 to avoid the occupied L40S queue; GPU model and runtime
+are recorded. Compare returns with the existing L40S results, but do not treat
+the runtime curves as a comparison on identical hardware. It
 uses the same exact-SHA, clean-checkout and locked-runtime guards as the paired
 campaign. In smoke mode, submit indices `0,39,40,79`; index 0 also executes GPU
 regression tests. Each smoke scores two three-decision prior/return-MPPI

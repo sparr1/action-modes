@@ -2,7 +2,7 @@
 #SBATCH --job-name=axqc-return-mppi
 #SBATCH --partition=gpu
 #SBATCH --qos=pri-gpu+
-#SBATCH --gres=gpu:l40s:1
+#SBATCH --gres=gpu:nvidia_rtx_a5000:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=6
@@ -105,7 +105,7 @@ from pathlib import Path
 assert sys.version_info[:2] == (3, 10)
 assert torch.__version__.split("+")[0] == "2.3.1"
 assert torch.cuda.is_available() and torch.cuda.device_count() == 1
-assert "L40S" in torch.cuda.get_device_name(0)
+assert "RTX A5000" in torch.cuda.get_device_name(0)
 assert Path(sys.prefix).resolve() == Path(sys.argv[1]).resolve() / ".venv"
 assert torch.ones(1, device="cuda").sum().item() == 1
 print(json.dumps({"python": sys.version, "torch": torch.__version__, "gpu": torch.cuda.get_device_name(0)}))
