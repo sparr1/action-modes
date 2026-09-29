@@ -251,7 +251,7 @@ def test_ratio_checkpoint_round_trip_continues_identically(wrappers, tmp_path, m
         source.agent.update(source_replay)
     checkpoint = source.save(tmp_path, "ratio")
     saved = deepcopy(source.agent.checkpoint_state())
-    assert saved["checkpoint_version"] == 6
+    assert saved["checkpoint_version"] == 7
     assert saved["semantic_signature"]["xqc_utd"] == 3
     restored = wrappers(xqc_utd=3, aux_return_mode=mode).load(checkpoint)
     _assert_equal(saved, restored.agent.checkpoint_state())
@@ -270,6 +270,7 @@ def test_version_five_implies_ratio_one_including_auxiliary(wrappers, mode):
     saved = deepcopy(source.agent.checkpoint_state())
     saved["checkpoint_version"] = 5
     saved["semantic_signature"].pop("xqc_utd")
+    saved["semantic_signature"].pop("inner_actor_bn_mode")
     restored = wrappers(aux_return_mode=mode).load(saved)
     _assert_equal(source.agent.checkpoint_state(), restored.agent.checkpoint_state())
     with pytest.raises(ValueError, match="semantics"):

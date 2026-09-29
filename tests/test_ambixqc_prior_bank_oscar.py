@@ -71,7 +71,7 @@ def _checkpoint(root, step, *, version=2):
     return path, state
 
 
-@pytest.mark.parametrize("version", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("version", [2, 3, 4, 5, 6, 7])
 def test_smoke_checkpoint_bank_requires_three_finite_metadata_pairs(tmp_path, version):
     for step in (1000, 2000, 3000):
         _checkpoint(tmp_path, step, version=version)

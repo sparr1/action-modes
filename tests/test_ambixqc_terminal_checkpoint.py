@@ -14,12 +14,14 @@ def test_terminal_selection_rejects_ambiguous_values(wrappers, selection):
         wrappers(inner_terminal_bootstrap=selection)
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6])
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7])
 def test_legacy_and_current_checkpoints_load_with_terminal_outer_evaluation(wrappers, version):
     source = wrappers()
     source.agent._update(*_batch(source.agent))
     saved = deepcopy(source.agent.checkpoint_state())
     saved["checkpoint_version"] = version
+    if version < 7:
+        saved["semantic_signature"].pop("inner_actor_bn_mode")
     if version < 6:
         saved["semantic_signature"].pop("xqc_utd")
     if version < 5:
@@ -51,7 +53,7 @@ def test_legacy_and_current_checkpoints_load_with_terminal_outer_evaluation(wrap
 def test_terminal_outer_checkpoint_round_trip_and_reverse_override(wrappers):
     source = wrappers(inner_terminal_bootstrap="outer")
     saved = deepcopy(source.agent.checkpoint_state())
-    assert saved["checkpoint_version"] == 6
+    assert saved["checkpoint_version"] == 7
     assert saved["semantic_signature"]["inner_terminal_bootstrap"] == "outer"
     target = wrappers(inner_terminal_bootstrap="outer").load(saved)
     assert _tree_equal(source.agent.frozen_outer_state(), target.agent.frozen_outer_state())

@@ -341,6 +341,10 @@ def benchmark_run_labels(checkpoint, protocol, config, kind, *, selector=None,
         timing = params.get("inner_update_timing", "round")
         parts.append(f"{timing} updates")
         tags.append(f"update-timing:{timing}")
+        actor_bn_mode = params.get("inner_actor_bn_mode", "batch_update")
+        tags.append(f"actor-bn:{actor_bn_mode}")
+        if actor_bn_mode == "running":
+            parts.append("actor BatchNorm running statistics")
         target = params.get("inner_critic_target") or (
             "reward_only" if params.get("inner_critic_source") == "aux_return"
             else "entropy_augmented"

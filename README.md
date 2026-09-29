@@ -191,9 +191,14 @@ with `AMBIXQC_MODE=production`. Production uses one L40S, six CPUs, 48 GB RAM,
 and a 72-hour limit. Each job creates a fresh result directory; production
 publishes to W&B project `ambi` with its source SHA and job ID in the run name.
 
-New AMBI-XQC checkpoints use version 6 to record `xqc_utd` and validate the
-separate world-model and controller update counts. Versions 1–5 load with
-`xqc_utd=1`; loading requires the saved ratio even for frozen evaluation.
+New AMBI-XQC checkpoints use version 7 to record both `xqc_utd` and
+`inner_actor_bn_mode`, validating separate world-model and controller update
+counts. Two historical version-6 schemas are supported: the UTD schema includes
+`xqc_utd` and defaults actor BN to `batch_update`; the actor-BN schema includes
+`inner_actor_bn_mode` and defaults `xqc_utd=1`. Their semantic fields identify
+the schema explicitly; ambiguous or incomplete schemas fail before loading.
+Versions 1–5 use both historical defaults. Loading always requires the saved
+UTD ratio, including frozen evaluation.
 Version 5 introduced the auxiliary return critic and
 independent inner critic sources/target, alongside the collection operator,
 `inner_terminal_bootstrap`, `inner_update_timing`, and effective
@@ -206,6 +211,15 @@ defaults to inner-XQC collection. Ordinary loading retains strict semantic check
 evaluator's explicit frozen load permits only supported inner/controller changes
 and records the saved and evaluated settings. Existing checkpoint banks do not
 need rewriting.
+
+For inner adaptation, `inner_actor_bn_mode="running"` keeps the copied actor's
+BatchNorm running statistics fixed during gradient updates. Its weights and BN
+affine parameters still learn; inherited alpha still adapts at
+`inner_actor_lr`. This avoids estimating actor batch statistics from repeated
+root states in an H1 solve. The default `batch_update` preserves historical XQC
+behavior. Critic joined-batch training, target BN, outer training, and frozen
+MPPI are unchanged. The setting is an explicit frozen-evaluation override and
+forms part of the inner planner's recorded identity.
 
 The [J6 checkpoint campaign](configs/research/README.md#ambi-xqc-inner-j6-checkpoint-campaign)
 uses native inner XQC with the rollout and update-slot budgets from

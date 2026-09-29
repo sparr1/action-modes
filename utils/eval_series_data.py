@@ -277,6 +277,7 @@ def planner_identity(config, result, algorithm, action_rule):
         # Explicit defaults added with auxiliary critics preserve the identities
         # of existing soft-XQC planners and their prior-reference bundles.
         for key, default in (
+            ("inner_actor_bn_mode", "batch_update"),
             ("inner_critic_source", "xqc"),
             ("inner_horizon_critic_source", "xqc"),
             ("inner_critic_target", "entropy_augmented"),
@@ -480,6 +481,8 @@ def descriptive_label(identity, selector=None):
         bootstrap = "inner Q"
     title = f"{planner['type'].upper()} {'/'.join(budgets)} {bootstrap}"
     if planner["type"] == "xqc":
+        if settings.get("inner_actor_bn_mode") == "running":
+            title += " | actor BN running statistics"
         if settings.get("inner_critic_source") == "aux_return":
             title += " | aux return init"
         if settings.get("inner_horizon_critic_source") == "aux_return":

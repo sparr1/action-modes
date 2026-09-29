@@ -77,10 +77,27 @@ return, resets branches to that seed every collection round, and updates the
 local scale from every realized imagined transition before that round's XQC
 updates. Raw replay rewards remain unchanged, the local moments are discarded
 after the action, and imagined statistics never write back to the outer
-normalizer. SimNorm itself has no running state. Inner online actor and critic
-BatchNorm statistics already adapt on their respective training batches;
-target-critic buffers keep official XQC's `batch_no_update` rule, while rollout
-and execution consume the adapted running statistics without mutating them.
+normalizer. SimNorm itself has no running state. By default, inner online actor
+and critic BatchNorm statistics adapt on their respective training batches.
+The opt-in `inner_actor_bn_mode="running"` freezes the inner actor's inherited
+running statistics during actor updates while retaining gradients through its
+weights and BN affine parameters. This is useful for H1 adaptation, whose
+current-state batch repeats one root latent. Alpha remains inherited and
+adaptive, with its learning rate tied to `inner_actor_lr`. The default
+`batch_update` behavior, including actor BN updates on optimizer-skipped slots,
+is unchanged. This option never changes persistent outer actor training.
+Critic training still uses joined replay/policy batch statistics;
+target-critic buffers keep official XQC's `batch_no_update` rule, while actor
+critic queries, rollout, and execution use running statistics.
+
+Checkpoint version 7 records this actor BN mode alongside independent XQC UTD.
+Versions 1–5 default to `batch_update` and UTD1. Historical UTD-v6 checkpoints
+contain `xqc_utd` but no actor BN mode; historical actor-BN-v6 checkpoints contain
+the mode but no `xqc_utd`. The loader accepts only an unambiguous version-6
+schema, supplying the missing historical default. Frozen evaluation can
+explicitly override the inner actor BN mode and records both saved and executed
+semantics. It cannot override outer UTD. Replay sidecars and frozen MPPI remain
+compatible, and loading never rewrites their checkpoint payloads.
 The XQC controller semantics reuse the PyTorch port of official XQC commit
 `9a6832bb742ef01bbe9f1e06153a9338e612dae5`; TOLD remains derived from the
 TD-MPC2 source identified above.

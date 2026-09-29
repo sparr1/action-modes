@@ -469,6 +469,17 @@ def test_xqc_step_curve_label_distinguishes_matched_optimizer_dose():
     assert "step updates" in series.evaluation_run_name(registry)
 
 
+def test_xqc_actor_bn_label_distinguishes_running_without_changing_default():
+    registry = label_registry()
+    registry["identity"]["planner"]["type"] = "xqc"
+    previous = series.concise_curve_label(registry)
+    registry["identity"]["planner"]["settings"]["inner_actor_bn_mode"] = "batch_update"
+    assert series.concise_curve_label(registry) == previous
+    registry["identity"]["planner"]["settings"]["inner_actor_bn_mode"] = "running"
+    assert "actor BN running" in series.concise_curve_label(registry)
+    assert "actor BatchNorm running statistics" in series.evaluation_run_name(registry)
+
+
 def test_prior_label_excludes_inactive_settings_and_mppi_shows_changed_budget():
     registry = label_registry()
     registry["identity"]["planner"]["type"] = "prior"

@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "description": "Exploratory four-cell H1 AMBI-XQC screen on the shared auxiliary UTD2 475k checkpoint. J1/J4 have approximately equal summed actor and tied-temperature learning rates. This is not the SAC closed-loop-refinement-v1 protocol.",
+  "base_alg_config": "checkpoint",
+  "shared_alg_params": {
+    "inner_rollout_horizon": 1,
+    "inner_rollouts_per_round": 256,
+    "inner_updates_per_round": 3,
+    "inner_batch_size": 256,
+    "inner_replay_capacity": 1024,
+    "inner_replay_sampling": "with_replacement",
+    "inner_update_timing": "round",
+    "inner_policy_delay": 3,
+    "inner_critic_lr": 5e-05,
+    "inner_terminal_bootstrap": "outer",
+    "inner_reward_normalization": "frozen_real_scale",
+    "inner_diagnostics_every": 1,
+    "inner_actor_bn_mode": "running",
+    "compile": false,
+    "compile_strict": false
+  },
+  "evaluation": {
+    "controller_seed": 12345,
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "max_steps": 500,
+    "default_presets": [
+      "controller/return_return_j1",
+      "controller/soft_soft_j1",
+      "controller/return_return_j4",
+      "controller/soft_soft_j4"
+    ],
+    "wandb_project": "ambi-inner-bench"
+  },
+  "comparisons": {
+    "controller": {
+      "description": "Both pure critic routes at J1 and J4, controlling the sum of actor learning rates.",
+      "reference": "prior",
+      "variants": {
+        "prior": {
+          "description": "Reference only: reuse the completed matching actor-mean episodes; never scheduled by this campaign.",
+          "alg_params": {
+            "inner_operator": "none"
+          }
+        },
+        "return_return_j1": {
+          "description": "H1 J1; return_return; inherited actor running BN and temperature; actor/temperature LR 5e-05; critic LR5e-5. Fresh adaptation at every real decision.",
+          "alg_params": {
+            "inner_operator": "xqc",
+            "inner_rounds": 1,
+            "inner_actor_lr": 5e-05,
+            "inner_critic_source": "aux_return",
+            "inner_horizon_critic_source": "aux_return",
+            "inner_critic_target": "reward_only"
+          }
+        },
+        "soft_soft_j1": {
+          "description": "H1 J1; soft_soft; inherited actor running BN and temperature; actor/temperature LR 5e-05; critic LR5e-5. Fresh adaptation at every real decision.",
+          "alg_params": {
+            "inner_operator": "xqc",
+            "inner_rounds": 1,
+            "inner_actor_lr": 5e-05,
+            "inner_critic_source": "xqc",
+            "inner_horizon_critic_source": "xqc",
+            "inner_critic_target": "entropy_augmented"
+          }
+        },
+        "return_return_j4": {
+          "description": "H1 J4; return_return; inherited actor running BN and temperature; actor/temperature LR 1.25e-05; critic LR5e-5. Fresh adaptation at every real decision.",
+          "alg_params": {
+            "inner_operator": "xqc",
+            "inner_rounds": 4,
+            "inner_actor_lr": 1.25e-05,
+            "inner_critic_source": "aux_return",
+            "inner_horizon_critic_source": "aux_return",
+            "inner_critic_target": "reward_only"
+          }
+        },
+        "soft_soft_j4": {
+          "description": "H1 J4; soft_soft; inherited actor running BN and temperature; actor/temperature LR 1.25e-05; critic LR5e-5. Fresh adaptation at every real decision.",
+          "alg_params": {
+            "inner_operator": "xqc",
+            "inner_rounds": 4,
+            "inner_actor_lr": 1.25e-05,
+            "inner_critic_source": "xqc",
+            "inner_horizon_critic_source": "xqc",
+            "inner_critic_target": "entropy_augmented"
+          }
+        }
+      }
+    }
+  }
+}

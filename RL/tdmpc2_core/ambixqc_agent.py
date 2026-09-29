@@ -40,7 +40,7 @@ from RL.xqc_core import (
 class AMBIXQCAgent(nn.Module):
     """Persistent TOLD model and XQC priors with fresh inner XQC per action."""
 
-    _CHECKPOINT_VERSION = 6
+    _CHECKPOINT_VERSION = 7
 
     def __init__(self, cfg):
         super().__init__()
@@ -760,6 +760,7 @@ class AMBIXQCAgent(nn.Module):
             "inner_terminal_bootstrap": str(getattr(self.cfg, "inner_terminal_bootstrap", "inner")),
             "inner_update_timing": str(getattr(self.cfg, "inner_update_timing", "round")),
             "inner_policy_delay": int(getattr(self.cfg, "inner_policy_delay", self.cfg.xqc_policy_delay)),
+            "inner_actor_bn_mode": str(getattr(self.cfg, "inner_actor_bn_mode", "batch_update")),
             "inner_critic_source": str(getattr(self.cfg, "inner_critic_source", "xqc")),
             "inner_horizon_critic_source": str(getattr(self.cfg, "inner_horizon_critic_source", "xqc")),
             "inner_critic_target": str(getattr(self.cfg, "inner_critic_target", "entropy_augmented")),
@@ -904,6 +905,23 @@ class AMBIXQCAgent(nn.Module):
         legacy_defaults = {}
         if version <= 5:
             legacy_defaults["xqc_utd"] = 1
+            legacy_defaults["inner_actor_bn_mode"] = "batch_update"
+        elif version == 6:
+            # Two historical branches independently emitted v6: controller
+            # UTD added xqc_utd, while actor-BN control added inner_actor_bn_mode.
+            # Each schema has exactly one discriminator. Never infer defaults
+            # from an incomplete v7 state or an ambiguous relabeled v6 state.
+            has_utd = "xqc_utd" in saved
+            has_actor_bn = "inner_actor_bn_mode" in saved
+            if has_utd == has_actor_bn:
+                raise ValueError(
+                    "AMBI-XQC v6 checkpoint semantics must identify exactly one "
+                    "historical schema: xqc_utd or inner_actor_bn_mode."
+                )
+            if has_utd:
+                legacy_defaults["inner_actor_bn_mode"] = "batch_update"
+            else:
+                legacy_defaults["xqc_utd"] = 1
         if version <= 4:
             legacy_defaults.update(
                 aux_return={"mode": "off"}, inner_critic_source="xqc",
@@ -980,6 +998,9 @@ class AMBIXQCAgent(nn.Module):
             raise ValueError("AMBI-XQC checkpoint inner update timing is invalid.")
         if type(saved["inner_policy_delay"]) is not int or saved["inner_policy_delay"] <= 0:
             raise ValueError("AMBI-XQC checkpoint inner policy delay is invalid.")
+        if (not isinstance(saved["inner_actor_bn_mode"], str)
+                or saved["inner_actor_bn_mode"] not in {"batch_update", "running"}):
+            raise ValueError("AMBI-XQC checkpoint inner_actor_bn_mode is invalid.")
         saved_comparison = copy.deepcopy(saved)
         if frozen_evaluation:
             schedule = require_exact_keys(
@@ -1023,6 +1044,7 @@ class AMBIXQCAgent(nn.Module):
             for key in (
                 "collection_operator", "inner_schedule", "reward_normalization",
                 "inner_terminal_bootstrap", "inner_update_timing", "inner_policy_delay",
+                "inner_actor_bn_mode",
                 "inner_critic_source", "inner_horizon_critic_source", "inner_critic_target",
             ):
                 saved_comparison[key] = expected[key]
@@ -1078,7 +1100,7 @@ class AMBIXQCAgent(nn.Module):
         if (
             isinstance(state["checkpoint_version"], bool)
             or not isinstance(state["checkpoint_version"], int)
-            or state["checkpoint_version"] not in {1, 2, 3, 4, 5, self._CHECKPOINT_VERSION}
+            or state["checkpoint_version"] not in {1, 2, 3, 4, 5, 6, self._CHECKPOINT_VERSION}
         ):
             raise ValueError("Unsupported AMBI-XQC checkpoint version.")
         saved_signature = self._preflight_semantic_signature(
