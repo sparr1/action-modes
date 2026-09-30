@@ -328,10 +328,24 @@ def label_curve(api, registry, cell, publication):
     # Stock science identities already include critic LR, but stock display names
     # do not. Apply metadata after each Publisher session, which resets labels.
     label = f"475k shared UTD2 · return/running · J4 · critic LR {cell['critic_lr']:g} · actor/temp 5e-5"
+    # Api.run caches the pre-publication object. Run.update also writes its
+    # summary, so even an innocuous label refresh can erase completed results.
+    # Fetch current config and issue a metadata-only mutation: never write summary.
+    api.flush()
     run = api.run(f"{publication.ENTITY}/{publication.PROJECT}/{registry['run_id']}")
-    run.name = label
     run.config["curve_label"] = label
-    run.update()
+    query = '''mutation LabelCriticRateRun($id:String!,$display_name:String!,$config:JSONString!){
+        upsertBucket(input:{id:$id,displayName:$display_name,config:$config}){
+            bucket{id displayName}}}'''
+    variables = {"id": run.storage_id, "display_name": label, "config": run.json_config}
+    service = getattr(api, "__dict__", {}).get("_service_api")
+    if service is not None and hasattr(service, "execute_graphql"):
+        response = service.execute_graphql(query, variables=variables)
+    else:
+        from wandb_gql import gql
+        response = api.client.execute(gql(query), variable_values=variables)
+    if response.get("upsertBucket", {}).get("bucket") != {"id": run.storage_id, "displayName": label}:
+        raise RuntimeError("Critic-rate display label was not acknowledged")
 
 
 def publish_finished(args, plan, state, coordinator, study, publication, api, *, timeout=12600):

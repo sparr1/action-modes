@@ -72,6 +72,71 @@ def test_matrix_contains_only_two_new_conditions_and_honest_rate_descriptions():
     assert matrix["comparisons"]["controller"]["reference"] == "prior"
 
 
+def test_label_refresh_preserves_published_summary_and_current_config(tmp_path, monkeypatch):
+    """Exercise the real SDK Run.update side effect against an in-memory backend."""
+    from wandb.apis.public import Run
+
+    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
+    pending = {"study/status": "pending", "study/expected_episodes": 5}
+    remote = {"id": "storage-id", "name": "run-id", "displayName": "old label",
+              "state": "finished", "tags": [], "description": "", "notes": "", "group": "",
+              "config": json.dumps({"campaign_id": {"value": publication.CAMPAIGN}}),
+              "summaryMetrics": json.dumps(pending), "systemMetrics": "{}"}
+    summary_writes = []
+    metadata_writes = []
+
+    class Client:
+        late_summary = None
+
+        def execute(self, query, variable_values=None, **kwargs):
+            values = variable_values or {}
+            if "summaryMetrics" in values:
+                summary_writes.append(values)
+                remote["summaryMetrics"] = values["summaryMetrics"]
+            elif "config" in values:
+                # Publication may advance even after a fresh metadata read.
+                if self.late_summary is not None:
+                    remote["summaryMetrics"] = json.dumps(self.late_summary)
+                metadata_writes.append(values)
+                remote["config"] = values["config"]
+                remote["displayName"] = values["display_name"]
+            else:
+                return {"project": {"run": deepcopy(remote)}}
+            return {"upsertBucket": {"bucket": {"id": remote["id"], "displayName": remote["displayName"]}}}
+
+    class Api:
+        client = Client()
+
+        def __init__(self):
+            self.runs = {}
+
+        def run(self, path):
+            if path not in self.runs:
+                self.runs[path] = Run(self.client, *path.split("/"), attrs=deepcopy(remote))
+            return self.runs[path]
+
+        def flush(self):
+            self.runs.clear()
+
+    api = Api()
+    registry = {"run_id": "run-id"}
+    cell = followup.conditions(study)[0]
+    followup.label_curve(api, registry, cell, publication)
+    published = {"study/status": "complete", "study/expected_episodes": 5,
+                 "eval/return_mean": 612.5, "publication/record_id": "accepted-record",
+                 "eval/paired_gain_mean": 60.5}
+    remote["summaryMetrics"] = json.dumps(published)
+    remote["config"] = json.dumps({"campaign_id": {"value": publication.CAMPAIGN},
+                                   "publication_added": {"value": "preserve me"}})
+    api.client.late_summary = {**published, "publication/late_ack": True}
+    followup.label_curve(api, registry, cell, publication)
+    assert summary_writes == []
+    assert json.loads(remote["summaryMetrics"]) == api.client.late_summary
+    assert json.loads(remote["config"])["publication_added"]["value"] == "preserve me"
+    assert "critic LR 0.0001" in remote["displayName"]
+    assert len(metadata_writes) == 2
+
+
 def test_condition_copies_cannot_change_each_other_or_baseline():
     original = followup.conditions(study)
     mutated = followup.conditions(study)

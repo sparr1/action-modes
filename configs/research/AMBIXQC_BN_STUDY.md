@@ -198,3 +198,42 @@ capacity. Source travels through Git, and the clean committed source and locked
 runtime are checked before and after each task. Outputs and private caches are
 never reused. Compile settings remain checkpoint-derived; the driver neither
 enables fallback nor overrides strict compilation.
+
+## Rounds × updates per round extension
+
+`run_ambixqc_update_sweep.py` evaluates J in {1, 2, 4, 6} crossed with
+`inner_updates_per_round` G in {3, 6, 9}. Actor delay stays 3; all actor,
+critic and temperature learning rates remain 5e-5. The checkpoint, return-only
+initialization and outer tail, running actor/critic BN, frozen real reward scale,
+H1/N256/B256 and full-episode protocol above are unchanged. This tests additional
+optimization before the next collection round, separately from increasing J.
+The XQC ordering accepts actor/temperature updates at slots 0, 3, 6, …; it does
+not introduce a critic-only warmup block.
+
+The J1/G3 and J4/G3 completed conditions are reused, with their episode,
+checkpoint, source and publication evidence verified. The default grid therefore
+adds ten conditions and fifty episodes. `--rounds` accepts a nonempty subset of
+1, 2, 4, 6; reuse and submission counts follow that explicit selection. Each new
+cell has its own immutable plan entry, registry, output directory and GPU task.
+It must pass a short exact-configuration smoke before its five full episodes.
+Each validated condition is published independently, without waiting for the
+slowest cell. Metadata-only label updates preserve completed summaries.
+
+Per real decision, model transitions equal 256J, critic updates JG, and actor and
+temperature updates JG/3. Replay capacity is max(1024, 256J), retaining every
+collected transition: original XQC outer-terminal provenance does not support
+eviction within an inner solve. Only J6 needs capacity 1536; J1/J2/J4 retain 1024.
+Thus each G comparison holds the collection budget and capacity fixed. Changing
+G can still change the actual transitions collected by later adapted actors.
+
+Execution stays pinned to the original clean `10852a8` scientific checkout;
+new orchestration and publication tooling runs from a separate verified Git
+checkout. The locked DMControl runtime and compiled loss policy remain intact.
+Oscar workers use one GPU, six CPUs, 32GiB, and a six-hour limit. The launch
+uses `--gpu-type prefer_l40s`: Slurm first tries L40S and falls back to A5000
+when the preferred resources are unavailable. Each worker records its actual
+GPU model; wall-clock comparisons must account for mixed hardware. The eight-hour
+CPU coordinator uses an explicit `--max-concurrent` selected from live quota and
+availability, scheduling larger JG cells first. The default ten-cell launch can
+use ten concurrent GPUs. No backbone training or archived-replay mixing is
+introduced.
