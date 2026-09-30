@@ -153,6 +153,31 @@ The parent evidence supplies checkpoint, prior-reference and smoke paths.
 `--gpu-type` defaults to `nvidia_rtx_a5000`. This is an explicitly authorized
 extension, not an automatic consequence of completing Stage 2.
 
+### Critic learning rate follow-up
+
+`run_ambixqc_critic_lr_study.py` extends the completed Stage 3 study with two
+critic-only learning-rate changes: `1e-4` and `2e-4`. It reuses the completed
+J4 / actor-LR5e-5 / critic-LR5e-5 return-only, running-BN result as the baseline.
+J4/H1/N256/B256/G3, delay 3, replay capacity 1024, actor and temperature rates
+5e-5, frozen real reward scale, and action-local resets remain fixed. The same
+five paired seeds 101–105 each run 500 decisions, adding ten full episodes.
+
+The operator and GPU wrapper live in a separately pinned tooling checkout.
+Evaluation, scientific identities, validation and publication use the original
+clean experiment checkout. Both source identities and the completed baseline
+artifacts are recorded. A short smoke for each new rate precedes production;
+the baseline and prior episodes are reused. Each completed condition is
+validated and published individually, with cumulative progress advancing from
+seven conditions / 35 episodes to nine / 45. This is exploratory tuning;
+fresh-seed confirmation is a separate experiment.
+
+Use `slurm/orchestrate_ambixqc_critic_lr_study_oscar.sbatch` for the CPU
+coordinator and `slurm/run_ambixqc_critic_lr_study_oscar.sbatch` for the two
+GPU workers. The coordinator takes `--execution-root`, `--source-sha`,
+`--tooling-sha`, `--parent-root` (the completed Stage 3 directory),
+`--result-root`, `--workspace-spec`, `--progress-run-id`, and
+`--worker-launcher`, with optional `--gpu-type`.
+
 ## Oscar launcher and production gate
 
 `slurm/run_ambixqc_bn_study_oscar.sbatch` takes the existing exact-source,
