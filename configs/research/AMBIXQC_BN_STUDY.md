@@ -237,3 +237,30 @@ CPU coordinator uses an explicit `--max-concurrent` selected from live quota and
 availability, scheduling larger JG cells first. The default ten-cell launch can
 use ten concurrent GPUs. No backbone training or archived-replay mixing is
 introduced.
+
+
+## J8 and G12 extension
+
+`run_ambixqc_update_extension.py` extends a completed rounds/update-dose sweep
+to J in {1, 2, 4, 6, 8} and G in {3, 6, 9, 12}. It runs exactly eight new
+conditions: G12 at J1/J2/J4/J6 and J8 at G3/G6/G9/G12. Each receives the same
+five paired full episodes. The twelve existing grid results are reused only
+after validating their completed parent plans, worker bundles and publication
+receipts. No existing condition is allocated or evaluated again.
+
+All scientific settings above remain fixed, including the original `10852a8`
+evaluator and checkpoint. Replay follows max(1024, 256J), so J8 retains 2048
+rows. J8/G12 performs 96 critic and 32 actor/temperature updates per real
+decision, with 2048 imagined transitions. Stage 6 adds 40 episodes; the J/G
+grid totals 20 conditions / 100 episodes and the whole BN/LR campaign totals
+27 conditions / 135 episodes.
+
+Submit the extension coordinator with `--completed-sweep-root` pointing to the
+completed Stage 5 result directory and a separate `--result-root`. Use
+`slurm/orchestrate_ambixqc_update_extension_oscar.sbatch` with
+`slurm/run_ambixqc_update_extension_oscar.sbatch`. Workers retain the six-hour
+limit and exact-configuration CUDA smoke gates. Choose `--max-concurrent` from
+live combined quota; eight workers use 48 CPUs and eight GPUs.
+`--gpu-type prefer_l40s` preserves the L40S preference with A5000 fallback.
+The live J-axis comparison reads published summaries directly and includes
+four curves, one for each G, at J1/J2/J4/J6/J8.

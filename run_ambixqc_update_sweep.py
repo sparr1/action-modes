@@ -306,7 +306,7 @@ def worker_root(plan, index, job):
     if (type(index) is not int or not 0 <= index < len(plan["conditions"])
             or not re.fullmatch(r"\d+", str(job))):
         raise ValueError("Require an index in the submitted update-dose array")
-    return Path(plan["result_root"]) / "stage5" / f"job{job}-task{index}"
+    return Path(plan["result_root"]) / plan.get("stage", "stage5") / f"job{job}-task{index}"
 
 
 def evaluate_cell(plan, index, root, study, *, smoke):
@@ -333,14 +333,19 @@ def evaluate_cell(plan, index, root, study, *, smoke):
     (root / "PASS").write_text("PASS\n")
 
 
-def worker(args, coordinator, study, publication, provenance):
-    plan = load_plan(args.plan, study, args.source_sha, args.tooling_sha)
+def parent_arguments(plan):
+    return SimpleNamespace(parent_root=Path(plan["parent_root"]),
+        previous_stage_root=Path(plan["previous_stage_root"]), rounds=plan["rounds"],
+        source_sha=plan["source_sha"], progress_run_id=plan["progress_run_id"])
+
+
+def worker(args, coordinator, study, publication, provenance, *, policy=None):
+    policy = policy or sys.modules[__name__]
+    plan = policy.load_plan(args.plan, study, args.source_sha, args.tooling_sha)
     if provenance != {"tooling": plan["tooling"], "execution": plan["execution"]}:
         raise ValueError("Worker checkouts differ from the allocated plan")
-    parent_args = SimpleNamespace(parent_root=Path(plan["parent_root"]),
-        previous_stage_root=Path(plan["previous_stage_root"]), rounds=plan["rounds"],
-        source_sha=args.source_sha, progress_run_id=plan["progress_run_id"])
-    evidence, reused = parent_evidence(parent_args, study, publication)
+    parent_args = policy.parent_arguments(plan)
+    evidence, reused = policy.parent_evidence(parent_args, study, publication)
     if (evidence != plan["parent"] or reused != plan["reused"]
             or plan["inputs"] != {key: study.bind(getattr(parent_args, key)) for key in ("manifest", "reference_index")}
             or plan["smoke_root"] != str(parent_args.smoke_root)
@@ -364,12 +369,12 @@ def worker(args, coordinator, study, publication, provenance):
             "gpu": torch.cuda.get_device_name(0), "cuda_device_count": 1})
         study.immutable_json(root / "provenance.json", {"plan": study.bind(args.plan), "index": args.index,
             "job": job, **provenance})
-        evaluate_cell(plan, args.index, root / "smoke", study, smoke=True)
+        policy.evaluate_cell(plan, args.index, root / "smoke", study, smoke=True)
         # Each evaluation reconstructs and reseeds its controller. Release cyclic
         # model/workspace allocations from the smoke before constructing the full run.
         gc.collect()
         torch.cuda.empty_cache()
-        evaluate_cell(plan, args.index, root / "full", study, smoke=False)
+        policy.evaluate_cell(plan, args.index, root / "full", study, smoke=False)
         continuation.require_checkout(TOOLING_ROOT, args.tooling_sha)
         coordinator.require_source(args.source_sha)
         (root / "PASS").write_text("PASS\n")
@@ -387,7 +392,7 @@ def validate_worker(plan, index, job, study):
     if not runtime.get("gpu") or not runtime.get("torch", "").startswith("2.3.1") or runtime.get("cuda_device_count") != 1:
         raise ValueError("Missing allocated CUDA runtime evidence")
     provenance = study.read(root / "provenance.json")
-    if provenance != {"plan": study.bind(Path(plan["result_root"]) / "stage5-plan.json"), "index": index,
+    if provenance != {"plan": study.bind(Path(plan["result_root"]) / (plan.get("stage", "stage5") + "-plan.json")), "index": index,
                       "job": str(job), "tooling": plan["tooling"], "execution": plan["execution"]}:
         raise ValueError("Worker provenance differs from the exact submitted plan")
     for phase in ("smoke", "full"):
@@ -404,9 +409,11 @@ def validate_worker(plan, index, job, study):
             "bundle_manifest": study.bind(root / "full/bundle/manifest.json")}
 
 
-def submit(args, plan_path, state, coordinator, study):
+def submit(args, plan_path, state, coordinator, study, *, policy=None):
+    policy = policy or sys.modules[__name__]
     coordinator.require_source(args.source_sha)
-    plan = load_plan(plan_path, study, args.source_sha, args.tooling_sha)
+    plan = policy.load_plan(plan_path, study, args.source_sha, args.tooling_sha)
+    stage = plan.get("stage", "stage5")
     count = len(plan["conditions"])
     if type(args.max_concurrent) is not int or args.max_concurrent < 1:
         raise ValueError("max-concurrent must be a positive integer selected from live cluster capacity")
@@ -431,14 +438,14 @@ def submit(args, plan_path, state, coordinator, study):
     command = ["sbatch", "--parsable", "--job-name=" + state["submission_intent"]["job_name"],
                f"--array=0-{count-1}%{min(count,args.max_concurrent)}", "--export=ALL",
                *gpu_options, "--cpus-per-task=6", "--mem=32G", "--time=06:00:00",
-               "--output=" + str(args.result_root / "slurm/stage5-%A_%a.out"),
-               "--error=" + str(args.result_root / "slurm/stage5-%A_%a.err"), str(args.worker_launcher)]
+               "--output=" + str(args.result_root / "slurm" / (stage + "-%A_%a.out")),
+               "--error=" + str(args.result_root / "slurm" / (stage + "-%A_%a.err")), str(args.worker_launcher)]
     job = subprocess.check_output(command, env=env, text=True, timeout=60).strip().split(";")[0]
     if not job.isdigit():
         raise RuntimeError("Unrecognized sbatch receipt; inspect the persisted intent before retrying")
     state["job"] = job
     coordinator.atomic_json(state_path, state, overwrite=True)
-    print(json.dumps({"stage": "stage5", "submitted_job": job, "conditions": count,
+    print(json.dumps({"stage": stage, "submitted_job": job, "conditions": count,
                       "max_concurrent": min(count,args.max_concurrent)}), flush=True)
     return job
 
@@ -463,7 +470,8 @@ def label_curve(api, registry, cell, publication):
         raise RuntimeError("Update-dose display label was not acknowledged")
 
 
-def publish_finished(args, plan, state, coordinator, study, publication, api, *, timeout=25200):
+def publish_finished(args, plan, state, coordinator, study, publication, api, *, timeout=25200, policy=None):
+    policy = policy or sys.modules[__name__]
     start = time.monotonic()
     pending = set(range(len(plan["conditions"])))
     observed = {index: set() for index in pending}
@@ -476,16 +484,17 @@ def publish_finished(args, plan, state, coordinator, study, publication, api, *,
             pending.remove(index)
             try:
                 coordinator.wait_jobs([job])
-                entries[index] = validate_worker(plan, index, state["job"], study)
+                entries[index] = policy.validate_worker(plan, index, state["job"], study)
                 cell = plan["conditions"][index]
                 registry = study.read(plan["runs"][cell["selector"]]["path"])
                 receipt = publication.publish_curve(registry["run_dir"], cell["selector"], study.CHECKPOINT_SHA,
                                                     source_sha=args.source_sha)
-                label_curve(api, registry, cell, publication)
+                policy.label_curve(api, registry, cell, publication)
                 state["published"][cell["selector"]] = receipt
                 coordinator.atomic_json(args.result_root / "coordinator-state.json", state, overwrite=True)
-                publication.update_progress(api, args.progress_run_id, conditions_completed=9 + len(state["published"]),
-                                            episodes_completed=45 + 5 * len(state["published"]))
+                publication.update_progress(api, args.progress_run_id,
+                    conditions_completed=plan.get("baseline_conditions", 9) + len(state["published"]),
+                    episodes_completed=plan.get("baseline_episodes", 45) + 5 * len(state["published"]))
             except Exception as error:
                 failures[str(index)] = {"type": type(error).__name__, "message": str(error)}
                 state["failures"] = failures
