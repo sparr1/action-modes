@@ -437,7 +437,7 @@ def submit(args, plan_path, state, coordinator, study, *, policy=None):
                    if args.gpu_type == "prefer_l40s" else ["--gres=gpu:" + args.gpu_type + ":1"])
     command = ["sbatch", "--parsable", "--job-name=" + state["submission_intent"]["job_name"],
                f"--array=0-{count-1}%{min(count,args.max_concurrent)}", "--export=ALL",
-               *gpu_options, "--cpus-per-task=6", "--mem=32G", "--time=06:00:00",
+               *gpu_options, "--cpus-per-task=6", "--mem=32G", "--time=" + getattr(policy, "WORKER_TIME", "06:00:00"),
                "--output=" + str(args.result_root / "slurm" / (stage + "-%A_%a.out")),
                "--error=" + str(args.result_root / "slurm" / (stage + "-%A_%a.err")), str(args.worker_launcher)]
     job = subprocess.check_output(command, env=env, text=True, timeout=60).strip().split(";")[0]

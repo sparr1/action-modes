@@ -264,3 +264,29 @@ live combined quota; eight workers use 48 CPUs and eight GPUs.
 `--gpu-type prefer_l40s` preserves the L40S preference with A5000 fallback.
 The live J-axis comparison reads published summaries directly and includes
 four curves, one for each G, at J1/J2/J4/J6/J8.
+
+### Single actor learning-rate follow-up
+
+The actor-rate comparison changes only `inner_actor_lr` from `5e-5` to
+`1e-4` at J2/G6. Reuse the completed J2/G6 baseline from the Stage 5 sweep;
+run exactly one new condition with five full paired episodes. Critic and
+temperature learning rates remain `5e-5`, including the explicit temperature
+rate override. The frozen 475k shared-representation UTD2 checkpoint,
+original `10852a8` scientific execution, H1/N256/B256, replay1024, return-only
+initialization and outer tail, running BN, frozen reward scale, seeds101–105,
+controller seed12345, and 500-decision episodes remain unchanged.
+
+`run_ambixqc_actor_lr_study.py` validates the completed parent and baseline
+publication, runs an exact-condition CUDA smoke, then evaluates and publishes
+only the new cell. Each decision performs512 model transitions,12 critic,
+4 actor and4 temperature updates. Its `stage7` outputs are separate from prior
+campaigns, and campaign publication advances from27conditions/135episodes to
+28conditions/140episodes. Use the corresponding actor-LR worker and coordinator
+Slurm wrappers, with90minutes for the GPU task and3hours for the CPU coordinator.
+
+The new curve uses `actor_lr_study_id=ambixqc-actor-lr-20261001` and explicitly
+labels the distinct learning rates. It must not receive `update_sweep_id`,
+which would mix the changed actor rate into the existing fixed-rate J/G curves.
+Evaluate paired environment return first; increased predicted Q or policy KL
+alone is not evidence of improvement. This remains an exploratory comparison
+on one backbone and reused tuning seeds.

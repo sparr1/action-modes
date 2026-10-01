@@ -21,6 +21,9 @@ continuation = sweep.continuation
 TOOLING_ROOT = Path(__file__).resolve().parent
 SOURCE_SHA = sweep.SOURCE_SHA
 SCHEMA = "ambixqc-update-extension-v1"
+STAGE = "stage6"
+BASELINE_CONDITIONS = 19
+BASELINE_EPISODES = 95
 ROUNDS = (1, 2, 4, 6, 8)
 UPDATES = (3, 6, 9, 12)
 REUSED = {(j, g) for j in sweep.ROUNDS for g in sweep.UPDATES}
@@ -132,14 +135,16 @@ def parent_evidence(args, study, publication):
     return evidence, reused
 
 
-def prepare_plan(args, study, publication, provenance):
-    evidence, reused = parent_evidence(args, study, publication)
+def prepare_plan(args, study, publication, provenance, *, policy=None):
+    policy = policy or sys.modules[__name__]
+    stage = policy.STAGE
+    evidence, reused = policy.parent_evidence(args, study, publication)
     study.verify_smokes(args.smoke_root, args.manifest, args.source_sha)
     row = study.screen.select_checkpoint(args.manifest, checkpoint_root=args.checkpoint_root)
     reference = study.screen.select_reference(args.reference_index, row, args.manifest)
-    cells, _ = split_conditions(study)
-    matrix_path = args.result_root / "stage6.matrix.json"
-    study.immutable_json(matrix_path, matrix_for(study, cells))
+    cells, _ = policy.split_conditions(study)
+    matrix_path = args.result_root / (stage + ".matrix.json")
+    study.immutable_json(matrix_path, policy.matrix_for(study, cells))
     from evaluate_ambi_checkpoint import evaluate_matrix
     runs = {}
     for index, cell in enumerate(cells):
@@ -151,46 +156,49 @@ def prepare_plan(args, study, publication, provenance):
                 raise ValueError("Each extension cell must resolve exactly one scientific identity")
             spec = study.read(prepared["specs"][cell["selector"]])
         study.immutable_json(args.result_root / "specs" / f"{index}.json", spec)
-        registry = publication.allocate_curve(args.result_root, spec, "stage6", cell["selector"])
+        registry = publication.allocate_curve(args.result_root, spec, stage, cell["selector"])
         runs[cell["selector"]] = study.bind(Path(registry["run_dir"]) / "run.json")
-    plan = {"schema": SCHEMA, "stage": "stage6", "source_sha": args.source_sha, **provenance,
+    plan = {"schema": policy.SCHEMA, "stage": stage, "source_sha": args.source_sha, **provenance,
         "campaign": publication.CAMPAIGN, "checkpoint_sha256": study.CHECKPOINT_SHA, "checkpoint_step": 475000,
-        "rounds": list(ROUNDS), "updates": list(UPDATES), "conditions": cells, "reused": reused, "parent": evidence,
+        "rounds": list(policy.ROUNDS), "updates": list(policy.UPDATES), "conditions": cells, "reused": reused, "parent": evidence,
         "completed_sweep_root": str(args.completed_sweep_root), "progress_run_id": args.progress_run_id,
         "result_root": str(args.result_root), "matrix": study.bind(matrix_path), "runs": runs,
         "inputs": {key: study.bind(getattr(args, key)) for key in ("manifest", "reference_index")},
         "checkpoint_root": str(args.checkpoint_root) if args.checkpoint_root else None,
         "reference_bundle": str(reference), "smoke_root": str(args.smoke_root),
         "environment_seeds": study.SEEDS, "controller_seed": 12345, "max_steps": 500,
-        "smoke_seeds": [101, 102], "smoke_max_steps": 3, "baseline_conditions": 19, "baseline_episodes": 95}
+        "smoke_seeds": [101, 102], "smoke_max_steps": 3,
+        "baseline_conditions": policy.BASELINE_CONDITIONS, "baseline_episodes": policy.BASELINE_EPISODES}
     plan["plan_sha256"] = study.digest(plan)
-    path = args.result_root / "stage6-plan.json"
+    path = args.result_root / (stage + "-plan.json")
     study.immutable_json(path, plan)
     return path, plan
 
 
-def load_plan(path, study, source_sha, tooling_sha):
+def load_plan(path, study, source_sha, tooling_sha, *, policy=None):
+    policy = policy or sys.modules[__name__]
     plan = study.read(path)
-    cells, reused = split_conditions(study)
+    cells, reused = policy.split_conditions(study)
     signed = {k: v for k, v in plan.items() if k != "plan_sha256"}
-    if (plan.get("schema") != SCHEMA or plan.get("stage") != "stage6"
+    if (plan.get("schema") != policy.SCHEMA or plan.get("stage") != policy.STAGE
             or plan.get("campaign") != "ambixqc-bn-study-20260929" or plan.get("plan_sha256") != study.digest(signed)
             or source_sha != SOURCE_SHA or plan.get("source_sha") != source_sha
             or plan.get("tooling", {}).get("commit") != tooling_sha
             or plan.get("execution", {}).get("commit") != source_sha
             or plan.get("checkpoint_sha256") != study.CHECKPOINT_SHA or plan.get("checkpoint_step") != 475000
-            or plan.get("rounds") != list(ROUNDS) or plan.get("updates") != list(UPDATES)
+            or plan.get("rounds") != list(policy.ROUNDS) or plan.get("updates") != list(policy.UPDATES)
             or plan.get("conditions") != cells or [item.get("condition") for item in plan.get("reused", [])] != reused
             or plan.get("environment_seeds") != study.SEEDS or plan.get("controller_seed") != 12345
             or plan.get("max_steps") != 500 or plan.get("smoke_seeds") != [101, 102] or plan.get("smoke_max_steps") != 3
-            or plan.get("baseline_conditions") != 19 or plan.get("baseline_episodes") != 95):
+            or plan.get("baseline_conditions") != policy.BASELINE_CONDITIONS
+            or plan.get("baseline_episodes") != policy.BASELINE_EPISODES):
         raise ValueError("Extension plan changed source, controlled settings, reuse or protocol")
     critic.bindings_unchanged(plan, study)
-    if study.read(plan["matrix"]["path"]) != matrix_for(study, cells):
+    if study.read(plan["matrix"]["path"]) != policy.matrix_for(study, cells):
         raise ValueError("Extension matrix differs from its plan")
     if (set(plan["runs"]) != {cell["selector"] for cell in cells}
             or len({binding["path"] for binding in plan["runs"].values()}) != len(cells)):
-        raise ValueError("Only the eight new cells may have distinct allocated registries")
+        raise ValueError("Only the planned new cells may have distinct allocated registries")
     for item in plan["reused"]:
         old = item["result"]["condition"]
         if old["settings"] != item["condition"]["settings"] or old["selector"] != item["condition"]["selector"]:
@@ -211,9 +219,11 @@ def publish_finished(args, plan, state, coordinator, study, publication, api, *,
                                   timeout=timeout, policy=sys.modules[__name__])
 
 
-def coordinate(args, coordinator, study, publication, provenance, *, api):
+def coordinate(args, coordinator, study, publication, provenance, *, api, policy=None):
+    policy = policy or sys.modules[__name__]
+    stage = policy.STAGE
     workspace = continuation.verify_workspace(api, args.workspace_spec, publication)
-    expected = {"schema": SCHEMA, "source_sha": args.source_sha, **provenance,
+    expected = {"schema": policy.SCHEMA, "source_sha": args.source_sha, **provenance,
         "completed_sweep_root": str(args.completed_sweep_root), "max_concurrent": args.max_concurrent,
         "workspace_spec": study.bind(args.workspace_spec), "progress_run_id": args.progress_run_id,
         "gpu_type": args.gpu_type, "worker_launcher": study.bind(args.worker_launcher)}
@@ -222,34 +232,36 @@ def coordinate(args, coordinator, study, publication, provenance, *, api):
     if any(state.get(key) != value for key, value in expected.items()):
         raise ValueError("Extension state belongs to different source, scope or publication inputs")
     coordinator.atomic_json(state_path, state, overwrite=True)
-    plan_path, plan = prepare_plan(args, study, publication, provenance)
-    load_plan(plan_path, study, args.source_sha, args.tooling_sha)
+    plan_path, plan = policy.prepare_plan(args, study, publication, provenance)
+    policy.load_plan(plan_path, study, args.source_sha, args.tooling_sha)
     state["plan"] = study.bind(plan_path)
     for cell in plan["conditions"]:
-        label_curve(api, study.read(plan["runs"][cell["selector"]]["path"]), cell, publication)
+        policy.label_curve(api, study.read(plan["runs"][cell["selector"]]["path"]), cell, publication)
     total_conditions = plan["baseline_conditions"] + len(plan["conditions"])
     total_episodes = plan["baseline_episodes"] + 5 * len(plan["conditions"])
-    publication.update_progress(api, args.progress_run_id, phase="stage6", conditions_expected=total_conditions,
+    publication.update_progress(api, args.progress_run_id, phase=stage, conditions_expected=total_conditions,
         episodes_expected=total_episodes, conditions_completed=plan["baseline_conditions"] + len(state["published"]),
         episodes_completed=plan["baseline_episodes"] + 5 * len(state["published"]))
-    submit(args, plan_path, state, coordinator, study)
-    entries = publish_finished(args, plan, state, coordinator, study, publication, api)
-    study.immutable_json(args.result_root / "stage6-results.json", {"schema": SCHEMA, "stage": "stage6",
+    policy.submit(args, plan_path, state, coordinator, study)
+    entries = policy.publish_finished(args, plan, state, coordinator, study, publication, api)
+    result_path = args.result_root / (stage + "-results.json")
+    study.immutable_json(result_path, {"schema": policy.SCHEMA, "stage": stage,
         "plan": study.bind(plan_path), "source_sha": args.source_sha, "reused": plan["reused"], "entries": entries})
     critic.bindings_unchanged(plan, study)
     continuation.require_checkout(TOOLING_ROOT, args.tooling_sha)
     coordinator.require_source(args.source_sha)
-    state["stage6_complete"] = True
-    state["stage6_results"] = study.bind(args.result_root / "stage6-results.json")
+    state[stage + "_complete"] = True
+    state[stage + "_results"] = study.bind(result_path)
     coordinator.atomic_json(state_path, state, overwrite=True)
     study.immutable_json(args.result_root / "COMPLETE.json", {**state, "workspace": workspace})
-    publication.update_progress(api, args.progress_run_id, phase="complete", stage6_complete=1,
+    publication.update_progress(api, args.progress_run_id, phase="complete", **{stage + "_complete": 1},
                                 conditions_completed=total_conditions, episodes_completed=total_episodes)
     (args.result_root / "FAILED.json").unlink(missing_ok=True)
     return state
 
 
-def run(args):
+def run(args, *, policy=None):
+    policy = policy or sys.modules[__name__]
     if not os.environ.get("SLURM_JOB_ID") or args.source_sha != SOURCE_SHA:
         raise ValueError("Use a scheduler allocation and original10852a8 experiment source")
     args.execution_root = args.execution_root.resolve()
@@ -259,7 +271,7 @@ def run(args):
     coordinator, study, publication = continuation.execution_modules(args.execution_root)
     if args.command == "worker":
         args.plan = args.plan.resolve(strict=True)
-        return worker(args, coordinator, study, publication, provenance)
+        return policy.worker(args, coordinator, study, publication, provenance)
     if type(args.max_concurrent) is not int or args.max_concurrent < 1:
         raise ValueError("max-concurrent must be positive")
     for key in ("completed_sweep_root", "result_root", "workspace_spec", "worker_launcher"):
@@ -276,19 +288,20 @@ def run(args):
         api = None
         try:
             api = wandb.Api(timeout=60)
-            return coordinate(args, coordinator, study, publication, provenance, api=api)
+            return policy.coordinate(args, coordinator, study, publication, provenance, api=api)
         except Exception as error:
             coordinator.atomic_json(args.result_root / "FAILED.json", {"type": type(error).__name__,
                                     "message": str(error), **provenance}, overwrite=True)
             try:
-                publication.update_progress(api, args.progress_run_id, phase="stage6_failed", failure_type=type(error).__name__)
+                publication.update_progress(api, args.progress_run_id, phase=policy.STAGE + "_failed", failure_type=type(error).__name__)
             except Exception:
                 pass
             raise
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(argv=None, *, policy=None):
+    policy = policy or sys.modules[__name__]
+    parser = argparse.ArgumentParser(description=policy.__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     for command in ("coordinate", "worker"):
         sub = commands.add_parser(command)
@@ -305,7 +318,7 @@ def main(argv=None):
         else:
             sub.add_argument("--plan", type=Path, required=True)
             sub.add_argument("--index", type=int, required=True)
-    print(json.dumps(run(parser.parse_args(argv)), indent=2, allow_nan=False))
+    print(json.dumps(policy.run(parser.parse_args(argv)), indent=2, allow_nan=False))
 
 
 if __name__ == "__main__":
