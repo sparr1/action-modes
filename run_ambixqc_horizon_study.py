@@ -73,7 +73,15 @@ def validate_bundle(plan, index, root, study, smoke):
     cell = plan["conditions"][index]
     if cell != conditions(study)[0]:
         raise ValueError("Horizon validation requires the exact H2 intervention")
+    return validate_h2_boundaries(plan, index, root, study, result)
+
+
+def validate_h2_boundaries(plan, index, root, study, result):
+    """Add H2 boundary checks after shared source, replay and trace validation."""
+    cell = plan["conditions"][index]
     cfg = cell["settings"]
+    if cfg["inner_rollout_horizon"] != 2:
+        raise ValueError("H2 boundary validation requires horizon two")
     counts = expected_counts(cell)
     rollouts = cfg["inner_rounds"] * cfg["inner_rollouts_per_round"]
     required = {

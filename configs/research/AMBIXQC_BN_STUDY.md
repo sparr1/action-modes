@@ -336,3 +336,48 @@ campaign from 28 conditions / 140 episodes to 29 conditions / 145 episodes. A se
 H1/H2 comparison shows pending status and publishes the new result only after
 all five episodes and validation succeed. This remains an exploratory test on
 one backbone and reused tuning seeds.
+
+
+### H2 sweep over collection rounds
+
+`run_ambixqc_horizon_j_sweep.py` extends H2 to J in {1, 2, 4, 6, 8}, holding
+G6, N256, B256 and all three learning rates at 5e-5. It evaluates only J1,
+J4, J6 and J8. The exact completed H2/J2 run
+`4b2d4437ffd84ca49093e303f794a11b` is reused after checking the completed Stage 8
+plan, worker bundles, checkpoint, original source, and publication receipts.
+Each new condition has five paired 500-decision episodes, seeds 101–105 and
+controller seed 12345, with fresh inner adaptation at every decision.
+
+Replay capacity is max(1024, 512J): 1024, 1024, 2048, 3072 and 4096 rows for
+J1, J2, J4, J6 and J8 respectively. This retains all imagined transitions and
+preserves the outer-boundary flags without eviction. Each decision produces
+512J model transitions, performs 6J critic and 2J actor/temperature updates,
+and draws 1536J replay rows. Thus total draws per collected row stay at three,
+although older rounds receive more sampling opportunities than newer rounds.
+Increasing J grows both collection and adaptation; it is not a fixed-compute
+comparison. More target updates also reduce the inner target's initial weight,
+so H2's recursive bootstrap can respond differently from H1's frozen tail.
+
+The learner, two-depth target semantics, target BN policy, frozen reward scale,
+475k shared-representation UTD2 checkpoint and original scientific source
+10852a8 remain unchanged. H2's first-depth transitions use the inner target;
+only horizon-boundary transitions use the frozen outer auxiliary return critic.
+All completed H1/G6 points may be shown alongside H2 as an existing control
+curve without another evaluation.
+
+For this driver, `--completed-sweep-root` identifies the completed Stage 8
+H2 result directory. Use a separate result root and the
+`run_ambixqc_horizon_j_sweep_oscar.sbatch` and
+`orchestrate_ambixqc_horizon_j_sweep_oscar.sbatch` wrappers. Each cell passes an
+exact-configuration CUDA smoke before its full episodes. Workers have four-hour
+limits and the CPU coordinator six hours. Set concurrency from live resources;
+four simultaneous workers require four GPUs, 24 CPUs and 128 GiB, with L40S
+preferred and A5000 fallback. Larger J runs are submitted first.
+
+Stage 9 adds 20 episodes and advances campaign totals from 29 conditions /
+145 episodes to 33 / 165. Its new runs use
+`horizon_j_study_id=ambixqc-h2-j-20261001` and are excluded from the older
+fixed-H1 J/G, actor-LR, and single-J H1/H2 comparisons. A dedicated J-axis view
+queries completed H1/H2 results directly and shows pending episode counts.
+Missing returns remain missing; publication requires each full five-episode
+bundle to pass the work, boundary, frozen-state and finite-metric checks.
