@@ -51,7 +51,8 @@ def test_comparison_binds_both_sources_and_ignores_only_timing(canary):
     report = campaign.compare_default_canary(plan, root, study)
     assert [call[0]["source_sha"] for call in calls] == [plan["source_sha"], campaign.PARENT_SOURCE_SHA]
     assert report["action_comparison"] is False
-    assert report["decisions"] == 1 and report["numeric_comparisons"] == 5
+    assert report["decisions"] == report["matched_root_decisions"] == 1
+    assert report["numeric_comparisons"] == 4
     assert report["max_absolute_difference"] == 0
     for key in ("old_manifest", "new_manifest"):
         study.check_binding(report[key])
@@ -79,6 +80,32 @@ def test_small_float_roundoff_allowed_with_reported_magnitude(canary):
     change_trace(traces, lambda row: row["metrics"].update({"decision/inner_critic_loss": 5.400001}))
     report = campaign.compare_default_canary(plan, root, study)
     assert report["max_absolute_difference"] == pytest.approx(1e-6)
+
+
+@pytest.mark.parametrize("change_count", [False, True])
+def test_later_closed_loop_drift_is_recorded_but_counters_remain_exact(canary, change_count):
+    plan, root, traces, _ = canary
+    old = root.parent / "old/smoke/bundle"
+    for directory in (old, traces):
+        path = directory / "trace.jsonl.gz"
+        with gzip.open(path, "rt") as stream:
+            row = json.loads(stream.readline())
+        later = deepcopy(row)
+        later.update(decision_index=1, event_index=1)
+        if directory == traces:
+            later["metrics"]["decision/inner_critic_loss"] += 0.001
+            if change_count:
+                later["metrics"]["decision/inner_reward_normalizer_count_final"] += 1
+        with gzip.open(path, "wt") as stream:
+            stream.write(json.dumps(row) + "\n" + json.dumps(later) + "\n")
+    if change_count:
+        with pytest.raises(ValueError):
+            campaign.compare_default_canary(plan, root, study)
+    else:
+        report = campaign.compare_default_canary(plan, root, study)
+        assert report["decisions"] == 2 and report["matched_root_decisions"] == 1
+        assert report["closed_loop_differences"][0]["key"] == "decision/inner_critic_loss"
+        assert report["closed_loop_differences"][0]["absolute_difference"] == pytest.approx(.001)
 
 
 @pytest.mark.parametrize("problem", ["counter", "metric", "episode", "rows"])

@@ -444,12 +444,20 @@ Stage 10 parent, including both publication receipts. The checkpoint-matched
 historical prior reference remains valid and is reused without rewriting it.
 
 Before the new full run, the worker evaluates the exact historical default
-recipe for two seeds and three decisions. It compares recorded rewards and
-scientific scalars with the archived Stage 8 smoke: discrete counts and frozen
-reward statistics must match exactly; other scalars use `rtol=1e-5` and
-`atol=1e-6`. Timing is excluded. Historical traces contain no actions, so this
-is a scalar compatibility check, supplemented by engine-level reset and
-default-behavior tests. A separate exact-condition CUDA smoke then gates the
+recipe for two seeds and three decisions. It compares first-decision rewards
+and scientific scalars with the archived Stage 8 smoke at the same initial
+environment states, using `rtol=1e-5` and `atol=1e-6`. Discrete counts and frozen
+reward statistics must match exactly at every decision. Later continuous
+scalar and episode-return differences are recorded, rather than treated as
+matched-state comparisons. Timing is excluded. The original CUDA protocol does
+not enable deterministic algorithms: a same-GPU old/old/new diagnostic found
+the unchanged original code's three-step returns differed by `7.43e-5`, while
+all first-decision comparisons passed the original tolerance. The optional
+`diagnose_ambixqc_target_bn_parity.py` reproduces this check without publishing.
+Historical traces contain no actions, so this is a scalar compatibility check,
+supplemented by engine-level reset and default-behavior tests. Compilation
+settings are inherited from the baseline (this checkpoint uses eager execution).
+A separate exact-condition CUDA smoke then gates the
 new five paired 500-decision episodes (seeds 101–105, controller seed 12345).
 The new numeric trace field `inner_critic_target_bn_running` must be zero in
 the default canary and one in the experimental smoke and full evaluation.
