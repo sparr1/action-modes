@@ -124,17 +124,26 @@ def test_h2_inner_target_parameters_matter_but_its_running_buffers_and_alpha_do_
 
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA hardware is unavailable"))])
-def test_frozen_h2_j2_g6_actual_budget_masks_bn_and_fresh_action_resets(
-    device, tmp_path, monkeypatch, deterministic_xqc_numerics,
+@pytest.mark.parametrize("updates_per_round,policy_delay,accepted_slots", [
+    (6, 3, (0, 3, 6, 9)),
+    (12, 6, (0, 6, 12, 18)),
+    (12, 3, (0, 3, 6, 9, 12, 15, 18, 21)),
+])
+def test_frozen_h2_j2_actual_budget_masks_bn_and_fresh_action_resets(
+    device, updates_per_round, policy_delay, accepted_slots,
+    tmp_path, monkeypatch, deterministic_xqc_numerics,
 ):
     # Real learner/model/optimizers, with the production N/B/J/G budget. Only
     # network widths, action dimension and training minibatch are kept tiny.
     common = dict(device=device, train_unroll_horizon=3, xqc_utd=2,
                   aux_return_mode="xqc", aux_return_detach_representation=False)
+    critic_steps = 2 * updates_per_round
+    actor_steps = len(accepted_slots)
+    replay_draws = 256 * critic_steps
     source = _wrapper(inner_operator="none", **common)
     target = _wrapper(**common, inner_rounds=2, inner_rollout_horizon=2,
-        inner_rollouts_per_round=256, inner_batch_size=256, inner_updates_per_round=6,
-        inner_replay_capacity=1024, inner_policy_delay=3, inner_update_timing="round",
+        inner_rollouts_per_round=256, inner_batch_size=256, inner_updates_per_round=updates_per_round,
+        inner_replay_capacity=1024, inner_policy_delay=policy_delay, inner_update_timing="round",
         inner_critic_source="aux_return", inner_horizon_critic_source="aux_return",
         inner_critic_target="reward_only", inner_terminal_bootstrap="outer",
         inner_actor_bn_mode="running", inner_critic_bn_mode="running",
@@ -148,6 +157,9 @@ def test_frozen_h2_j2_g6_actual_budget_masks_bn_and_fresh_action_resets(
         source.agent.save(str(checkpoint))
         target.load(str(checkpoint), frozen_evaluation=True)
         agent, engine = target.agent, target.agent.inner_engine
+        provenance = agent.checkpoint_evaluation_provenance
+        assert provenance["saved_semantic_signature"]["inner_policy_delay"] == 3
+        assert provenance["evaluated_semantic_signature"]["inner_policy_delay"] == policy_delay
         frozen = agent.frozen_outer_state()
         observation, _ = target.env.reset(seed=101)
         global_rng = torch.get_rng_state().clone(), random.getstate(), np.random.get_state()
@@ -160,6 +172,8 @@ def test_frozen_h2_j2_g6_actual_budget_masks_bn_and_fresh_action_resets(
             prepare()
             state, workspace = engine.state, engine.state.workspace
             local = workspace.controller
+            assert local.config.policy_delay == policy_delay
+            assert agent.xqc_controller.config.policy_delay == 3
             assert workspace.update_step == workspace.actor_optimizer_steps == workspace.temperature_optimizer_steps == 0
             assert state.replay.size == state.replay.next_sample_id == 0
             assert not state.outer_terminal_flags.any() and state.reward_normalizer is None
@@ -217,21 +231,23 @@ def test_frozen_h2_j2_g6_actual_budget_masks_bn_and_fresh_action_resets(
                 rounds.clear(); sampled_masks.clear(); steps.clear(); target_modes.clear()
                 actions.append(target.predict(observation, deterministic=True)[0])
                 metrics = agent.last_inner_metrics
-                assert rounds == [(0, 0), (512, 6)]
-                assert steps == [component for slot in range(12)
-                                 for component in (("critic", "actor", "temperature") if slot % 3 == 0 else ("critic",))]
+                assert rounds == [(0, 0), (512, updates_per_round)]
+                assert steps == [component for slot in range(critic_steps)
+                                 for component in (("critic", "actor", "temperature")
+                                     if slot in accepted_slots else ("critic",))]
                 expected = {"inner_model_steps": 1024, "inner_buffer_size": 1024,
                     "inner_buffer_capacity": 1024, "inner_rollout_count": 512, "inner_rollout_len_mean": 2,
-                    "inner_replay_draws": 3072, "inner_critic_optimizer_steps": 12,
-                    "inner_actor_optimizer_steps": 4, "inner_temperature_optimizer_steps": 4,
-                    "inner_target_updates": 12, "inner_outer_terminal_boundary_rows": 512,
+                    "inner_replay_draws": replay_draws, "inner_critic_optimizer_steps": critic_steps,
+                    "inner_actor_optimizer_steps": actor_steps, "inner_temperature_optimizer_steps": actor_steps,
+                    "inner_policy_delay": policy_delay,
+                    "inner_target_updates": critic_steps, "inner_outer_terminal_boundary_rows": 512,
                     "inner_reward_scale_delta": 0, "inner_reward_normalizer_imagined_updates": 0,
                     "inner_critic_source_aux_return": 1, "inner_horizon_critic_source_aux_return": 1,
                     "inner_critic_target_reward_only": 1, "inner_compile_fallback": 0}
                 assert all(metrics[key] == value for key, value in expected.items())
-                assert target_modes == ["batch_no_update"]*12
+                assert target_modes == ["batch_no_update"]*critic_steps
                 assert metrics["inner_outer_terminal_bootstrap_rows"] == sum(int(mask.sum()) for mask in sampled_masks)
-                assert 0 < metrics["inner_outer_terminal_bootstrap_rows"] < 3072
+                assert 0 < metrics["inner_outer_terminal_bootstrap_rows"] < replay_draws
                 assert all(torch.isfinite(torch.as_tensor(value)).all() for value in metrics.values())
                 local = engine._workspace_pool.controller
                 assert _tree_equal(_buffers(local.actor), _buffers(agent.xqc_controller.actor))

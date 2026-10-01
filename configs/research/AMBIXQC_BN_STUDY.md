@@ -381,3 +381,45 @@ fixed-H1 J/G, actor-LR, and single-J H1/H2 comparisons. A dedicated J-axis view
 queries completed H1/H2 results directly and shows pending episode counts.
 Missing returns remain missing; publication requires each full five-episode
 bundle to pass the work, boundary, frozen-state and finite-metric checks.
+
+### H2 critic and policy update comparison
+
+`run_ambixqc_h2_update_study.py` adds two conditions at H2/J2/N256/B256,
+holding replay capacity at 1024 and all learning rates at `5e-5`:
+
+| Condition | G per round | Policy delay | Critic steps per decision | Actor/temperature steps |
+| --- | ---: | ---: | ---: | ---: |
+| Reused H2/J2 control | 6 | 3 | 12 | 4 each |
+| More critic updates | 12 | 6 | 24 | 4 each |
+| More critic and policy updates | 12 | 3 | 24 | 8 each |
+
+XQC updates actor and temperature at slots 0, delay, 2 × delay, and so on;
+there is no initial critic-only warmup. The delay-6 condition preserves the
+number of actor/temperature updates while changing their spacing among critic
+updates. Later collection rounds may consequently sample different imagined
+actions and transitions. Both new conditions still generate 1024 transitions
+per decision and sample 6144 replay rows across their 24 critic updates. Exactly
+512 stored rows are final-depth boundaries; their number among sampled rows is
+random. Earlier-depth targets continue using the inner learner, while boundary
+targets use the frozen persistent actor and outer auxiliary return critic.
+
+Pass `--completed-sweep-root` pointing to the completed Stage 9 H2/J sweep.
+The driver verifies its exact `543f5c9` tooling revision, all four worker results
+and publication receipts, and the inherited Stage 8 J2 result. Only that exact
+J2/G6 baseline is reused; no prior condition is allocated or evaluated again.
+Use the matching `run_ambixqc_h2_update_study_oscar.sbatch` and
+`orchestrate_ambixqc_h2_update_study_oscar.sbatch` wrappers. Each independent GPU
+worker has a two-hour limit, six CPUs and 32 GiB; the CPU coordinator has four
+hours and publishes each validated condition independently. Select GPU type
+and concurrency explicitly from live availability, with at most two useful
+workers for this comparison.
+
+Scientific execution remains pinned to `10852a8` and the same 475k shared UTD2
+backbone. Return-only initialization/tail, running actor/critic BN, frozen real
+reward scale, seeds 101–105, controller seed 12345 and full 500-decision episodes
+remain fixed. An exact-condition two-seed CUDA smoke gates each full run.
+Stage 10 adds ten episodes, advancing the campaign from 33 conditions / 165
+episodes to 35 / 175. New curves use
+`h2_update_study_id=ambixqc-h2-updates-20261001` and explicit G/delay labels;
+they are excluded from earlier J/G, actor-rate, horizon and H2/J panels. The
+comparison remains exploratory on one backbone and reused tuning seeds.
