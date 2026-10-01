@@ -279,6 +279,7 @@ def planner_identity(config, result, algorithm, action_rule):
         for key, default in (
             ("inner_actor_bn_mode", "batch_update"),
             ("inner_critic_bn_mode", "batch_update"),
+            ("inner_critic_target_bn_mode", "batch_no_update"),
             ("inner_critic_source", "xqc"),
             ("inner_horizon_critic_source", "xqc"),
             ("inner_critic_target", "entropy_augmented"),
@@ -486,6 +487,8 @@ def descriptive_label(identity, selector=None):
             title += " | actor BN running statistics"
         if settings.get("inner_critic_bn_mode", "batch_update") != "batch_update":
             title += " | critic BN " + settings["inner_critic_bn_mode"]
+        if settings.get("inner_critic_target_bn_mode") == "running":
+            title += " | target critic BN running statistics"
         if settings.get("inner_critic_source") == "aux_return":
             title += " | aux return init"
         if settings.get("inner_horizon_critic_source") == "aux_return":

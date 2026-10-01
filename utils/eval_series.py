@@ -207,6 +207,8 @@ def _planner_display_label(planner, *, compact=False):
                 parts.append("actor BN running" if compact else "actor BatchNorm running statistics")
             if settings.get("inner_critic_bn_mode", "batch_update") != "batch_update":
                 parts.append("critic BN " + settings["inner_critic_bn_mode"])
+            if settings.get("inner_critic_target_bn_mode") == "running":
+                parts.append("target critic BN running")
             if settings.get("inner_critic_source") == "aux_return":
                 parts.append("aux init" if compact else "auxiliary return critic init")
             if settings.get("inner_horizon_critic_source") == "aux_return":

@@ -222,6 +222,18 @@ behavior. Critic joined-batch training, target BN, outer training, and frozen
 MPPI are unchanged. The setting is an explicit frozen-evaluation override and
 forms part of the inner planner's recorded identity.
 
+The independent `inner_critic_target_bn_mode` defaults to `"batch_no_update"`.
+Setting it to `"running"` uses the copied inner target critic's inherited BN
+moments instead of joined replay/policy batch moments. Both modes leave target
+buffers fixed and retain parameter-only target updates. This affects inner
+bootstrap rows; the frozen outer horizon tail remains unchanged. In particular,
+H1 with outer terminal bootstrapping has no affected target rows, while H2 can
+change earlier-depth targets. Persistent backbone and auxiliary critic training
+are unchanged. The option is an explicit frozen-evaluation override and a
+nondefault v7 checkpoint/planner semantic extension: missing means historical
+`batch_no_update`, and old readers reject the new nondefault field. Each adapted
+action records `inner_critic_target_bn_running` as 0 or 1.
+
 The [J6 checkpoint campaign](configs/research/README.md#ambi-xqc-inner-j6-checkpoint-campaign)
 uses native inner XQC with the rollout and update-slot budgets from
 `AMBITDMPC2-humanoid-walk-base-v2-d512-4-j6-seed55`: J6/N512/H3/G3, batch 512,

@@ -1012,6 +1012,11 @@ class InnerXQCEngine:
         critic_bn_mode = getattr(self.cfg, "inner_critic_bn_mode", "batch_update")
         if critic_bn_mode != "batch_update":
             terminal_kwargs["critic_bn_mode"] = critic_bn_mode
+        critic_target_bn_mode = getattr(
+            self.cfg, "inner_critic_target_bn_mode", "batch_no_update"
+        )
+        if critic_target_bn_mode != "batch_no_update":
+            terminal_kwargs["critic_target_bn_mode"] = critic_target_bn_mode
         return self.state.workspace.update(
             batch,
             next_noise=next_noise,
@@ -1248,6 +1253,9 @@ class InnerXQCEngine:
                 inner_actor_optimizer_steps=float(actor_steps),
                 inner_temperature_optimizer_steps=float(temperature_steps),
                 inner_policy_delay=float(workspace.controller.config.policy_delay),
+                inner_critic_target_bn_running=float(
+                    getattr(self.cfg, "inner_critic_target_bn_mode", "batch_no_update") == "running"
+                ),
                 inner_critic_utd=(
                     torch.as_tensor(float(update_slots), device=self.device)
                     / utd_denominator

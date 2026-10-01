@@ -96,18 +96,35 @@ pass. Both alternatives retain gradients through critic weights and BN affine
 parameters, and neither updates the running buffers. Every real action still
 starts from the selected outer online critic's weights and buffers, including
 when a workspace is reused. These options affect only the disposable inner
-critic. Target-critic buffers keep official XQC's `batch_no_update` rule, while actor
-critic queries, rollout, and execution use running statistics.
+critic. The independent target option `inner_critic_target_bn_mode` defaults to
+`"batch_no_update"`, preserving official XQC's joined current/next batch moments
+without buffer updates. The opt-in `"running"` evaluates the inner target with
+its inherited running moments. Neither mode updates target BN buffers; target
+Polyak updates still change parameters only. Fresh inner online and target
+critics both copy the selected outer online critic's buffers at each real
+action, including workspace reuse. Actor critic queries, rollout, execution,
+and frozen outer-tail queries always retain their running-statistics behavior.
+
+The target option changes only disposable inner Bellman targets. For outer
+terminal bootstrapping, it affects earlier imagined transitions (H2 and above),
+while final-depth transitions still use the frozen persistent actor and selected
+outer online critic. With H1 all bootstrap rows use that outer tail, so this
+option does not change the loss or its gradients. The inner target forward is
+still evaluated, with no buffer mutation in either mode. Backbone training,
+auxiliary training, reward normalization, and RNG streams are unchanged. The
+numeric diagnostic `inner_critic_target_bn_running` records the selected inner
+target mode for each adapted action (0 for batch statistics, 1 for running).
 
 Checkpoint version 7 records this actor BN mode alongside independent XQC UTD.
 Versions 1–5 default to `batch_update` and UTD1. Historical UTD-v6 checkpoints
 contain `xqc_utd` but no actor BN mode; historical actor-BN-v6 checkpoints contain
 the mode but no `xqc_utd`. The loader accepts only an unambiguous version-6
 schema, supplying the missing historical default. Frozen evaluation can
-explicitly override the inner actor/critic BN modes and temperature learning
-rate and records both saved and executed semantics. Nondefault inner critic BN
-and independent temperature rates are optional version-7 signature extensions;
-their absence means `batch_update` and the saved inner actor learning rate.
+explicitly override the inner actor/online-critic/target-critic BN modes and
+temperature learning rate and records both saved and executed semantics.
+Nondefault inner online/target critic BN and independent temperature rates are
+optional version-7 signature extensions; their absence means `batch_update`,
+`batch_no_update`, and the saved inner actor learning rate, respectively.
 Default checkpoint payloads retain the existing signature, and older readers
 reject the nondefault extensions instead of silently ignoring them. Strict
 training loads require matching resolved settings. Frozen evaluation cannot

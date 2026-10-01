@@ -27,7 +27,7 @@ _XQC_CHECKPOINT_INNER_PARAMS = {
     "inner_update_timing",
     "inner_policy_delay",
     "inner_actor_bn_mode",
-    "inner_critic_bn_mode", "inner_temperature_lr",
+    "inner_critic_bn_mode", "inner_critic_target_bn_mode", "inner_temperature_lr",
     "inner_critic_source", "inner_horizon_critic_source", "inner_critic_target",
 }
 _MPPI_PARAMETERS = {
@@ -94,6 +94,12 @@ def _validate_checkpoint_overrides(alg_params, run_params, location):
         mode = alg_params["inner_critic_bn_mode"]
         if mode is not None and (not isinstance(mode, str) or mode not in {"batch_update", "batch_no_update", "running"}):
             raise PresetMatrixError(f"{location}.inner_critic_bn_mode must be batch_update, batch_no_update, running, or null to reset.")
+    if "inner_critic_target_bn_mode" in alg_params:
+        mode = alg_params["inner_critic_target_bn_mode"]
+        if mode is not None and (not isinstance(mode, str) or mode not in {"batch_no_update", "running"}):
+            raise PresetMatrixError(
+                f"{location}.inner_critic_target_bn_mode must be batch_no_update, running, or null to reset."
+            )
     forbidden = [
         key for key in alg_params
         if not key.startswith(("inner_", "wandb_"))
@@ -387,6 +393,11 @@ def resolve_preset(matrix_path, selector, matrix=None, *, checkpoint_context=Non
             raise PresetMatrixError("Resolved inner_actor_bn_mode must be 'batch_update' or 'running'.")
         if "inner_actor_bn_mode" in alg_params:
             alg_params["inner_actor_bn_mode"] = actor_bn_mode.lower()
+        target_bn_mode = alg_params.get("inner_critic_target_bn_mode", "batch_no_update")
+        if not isinstance(target_bn_mode, str) or target_bn_mode.lower() not in {"batch_no_update", "running"}:
+            raise PresetMatrixError("Resolved inner_critic_target_bn_mode must be 'batch_no_update' or 'running'.")
+        if "inner_critic_target_bn_mode" in alg_params:
+            alg_params["inner_critic_target_bn_mode"] = target_bn_mode.lower()
         for key in ("inner_critic_source", "inner_horizon_critic_source"):
             if key in alg_params:
                 value = alg_params[key]

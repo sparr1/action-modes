@@ -59,6 +59,11 @@ def _validate_critic_bn_mode(mode):
         raise ValueError("critic_bn_mode must be 'batch_update', 'batch_no_update', or 'running'.")
 
 
+def _validate_critic_target_bn_mode(mode):
+    if not isinstance(mode, str) or mode not in {"batch_no_update", "running"}:
+        raise ValueError("critic_target_bn_mode must be 'batch_no_update' or 'running'.")
+
+
 @dataclass(frozen=True)
 class LatentXQCConfig:
     actor_net_arch: tuple[int, ...] = (256, 256, 256, 256)
@@ -374,9 +379,11 @@ class LatentXQCController(nn.Module):
         outer_critic: XQCTwinCritic | None = None,
         outer_critic_is_return: bool = False,
         critic_bn_mode: str = "batch_update",
+        critic_target_bn_mode: str = "batch_no_update",
     ) -> LatentXQCCriticObjective:
         # Validate before any training forward can mutate local BN buffers.
         _validate_critic_bn_mode(critic_bn_mode)
+        _validate_critic_target_bn_mode(critic_target_bn_mode)
         if critic_target_kind not in {"entropy_augmented", "reward_only"}:
             raise ValueError("critic_target_kind must be 'entropy_augmented' or 'reward_only'.")
         if type(outer_critic_is_return) is not bool:
@@ -462,6 +469,11 @@ class LatentXQCController(nn.Module):
         target_alpha = self.temperature.detach()
         if critic_target_kind == "reward_only":
             target_alpha = torch.zeros_like(target_alpha)
+        # Keep the historical default call shape, including compiled regions.
+        if critic_target_bn_mode != "batch_no_update":
+            # The shared mutable compile region accepts positional arguments.
+            # Fill the optional tail operands only for this explicit ablation.
+            terminal_args = (terminal_args or (None,) * 5) + (critic_target_bn_mode,)
         outputs = critic_loss(
             flat["latents"],
             flat["actions"],
@@ -517,6 +529,7 @@ class LatentXQCController(nn.Module):
         outer_target_log_probs: torch.Tensor | None = None,
         outer_target_values: torch.Tensor | None = None,
         outer_target_head: torch.Tensor | None = None,
+        critic_target_bn_mode: str = "batch_no_update",
     ):
         """Fixed-shape critic math; validation and state updates stay eager."""
 
@@ -530,7 +543,7 @@ class LatentXQCController(nn.Module):
             )
             target_actions = torch.cat((actions, next_actions), dim=0)
             target_joined = self.critic_target.log_probs(
-                target_latents, target_actions, bn_mode="batch_no_update"
+                target_latents, target_actions, bn_mode=critic_target_bn_mode
             )
             target_next = target_joined[:, count:]
             selected, target_values, target_head = select_lower_distribution(
@@ -918,11 +931,13 @@ class LatentXQCWorkspace:
         outer_critic_is_return: bool = False,
         actor_bn_mode: str = "batch_update",
         critic_bn_mode: str = "batch_update",
+        critic_target_bn_mode: str = "batch_no_update",
     ) -> dict[str, Any]:
         # Reject invalid BN settings before the critic forward mutates BN
         # buffers or its optimizer advances.
         _validate_actor_bn_mode(actor_bn_mode)
         _validate_critic_bn_mode(critic_bn_mode)
+        _validate_critic_target_bn_mode(critic_target_bn_mode)
         terminal_kwargs = {}
         if outer_terminal_mask is not None or outer_controller is not None:
             terminal_kwargs = {
@@ -935,6 +950,8 @@ class LatentXQCWorkspace:
             terminal_kwargs.update(
                 outer_critic=outer_critic, outer_critic_is_return=outer_critic_is_return
             )
+        if critic_target_bn_mode != "batch_no_update":
+            terminal_kwargs["critic_target_bn_mode"] = critic_target_bn_mode
         objective = self.controller.critic_objective(
             batch, next_noise=next_noise, reward_scale=reward_scale,
             critic_bn_mode=critic_bn_mode, **terminal_kwargs

@@ -122,15 +122,43 @@ def test_h2_inner_target_parameters_matter_but_its_running_buffers_and_alpha_do_
     assert _tree_equal(target_buffers, _buffers(inner.critic_target))
 
 
+def test_h1_all_outer_targets_ignore_inner_target_bn_for_loss_and_gradient():
+    inner, outer, auxiliary, batch, kwargs = _mixed_case()
+    # H1 sends every live transition to the frozen outer tail. The inner
+    # target branch is still evaluated, but must not affect the selected loss.
+    batch.bootstrap_mask = torch.ones_like(batch.bootstrap_mask)
+    kwargs["outer_terminal_mask"] = torch.ones_like(kwargs["outer_terminal_mask"])
+    before = deepcopy((inner.state_dict(), outer.state_dict(), auxiliary.state_dict()))
+    rng = torch.get_rng_state().clone()
+    objectives, gradients = [], []
+    for mode in ("batch_no_update", "running"):
+        inner.zero_grad(set_to_none=True)
+        objective = inner.critic_objective(batch, critic_target_bn_mode=mode, **kwargs)
+        objective.loss.backward()
+        objectives.append(objective)
+        gradients.append([parameter.grad.clone() for parameter in inner.critic.parameters()])
+    for field in ("loss", "target_probabilities", "target_values", "target_head",
+                  "current_log_probs", "clip_fraction"):
+        torch.testing.assert_close(getattr(objectives[0], field), getattr(objectives[1], field),
+                                   rtol=0, atol=0)
+    for left, right in zip(*gradients):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    assert all(parameter.grad is None for module in (inner.actor, inner.critic_target, outer, auxiliary)
+               for parameter in module.parameters())
+    assert _tree_equal(before, (inner.state_dict(), outer.state_dict(), auxiliary.state_dict()))
+    assert torch.equal(rng, torch.get_rng_state())
+
+
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA hardware is unavailable"))])
-@pytest.mark.parametrize("updates_per_round,policy_delay,accepted_slots", [
-    (6, 3, (0, 3, 6, 9)),
-    (12, 6, (0, 6, 12, 18)),
-    (12, 3, (0, 3, 6, 9, 12, 15, 18, 21)),
+@pytest.mark.parametrize("updates_per_round,policy_delay,accepted_slots,target_bn_mode", [
+    (6, 3, (0, 3, 6, 9), "batch_no_update"),
+    (12, 6, (0, 6, 12, 18), "batch_no_update"),
+    (12, 3, (0, 3, 6, 9, 12, 15, 18, 21), "batch_no_update"),
+    (6, 3, (0, 3, 6, 9), "running"),
 ])
 def test_frozen_h2_j2_actual_budget_masks_bn_and_fresh_action_resets(
-    device, updates_per_round, policy_delay, accepted_slots,
+    device, updates_per_round, policy_delay, accepted_slots, target_bn_mode,
     tmp_path, monkeypatch, deterministic_xqc_numerics,
 ):
     # Real learner/model/optimizers, with the production N/B/J/G budget. Only
@@ -147,6 +175,7 @@ def test_frozen_h2_j2_actual_budget_masks_bn_and_fresh_action_resets(
         inner_critic_source="aux_return", inner_horizon_critic_source="aux_return",
         inner_critic_target="reward_only", inner_terminal_bootstrap="outer",
         inner_actor_bn_mode="running", inner_critic_bn_mode="running",
+        inner_critic_target_bn_mode=target_bn_mode,
         inner_actor_lr=5e-5, inner_critic_lr=5e-5, inner_temperature_lr=5e-5,
         inner_reward_normalization="frozen_real_scale", inner_diagnostics_every=1)
     try:
@@ -160,6 +189,8 @@ def test_frozen_h2_j2_actual_budget_masks_bn_and_fresh_action_resets(
         provenance = agent.checkpoint_evaluation_provenance
         assert provenance["saved_semantic_signature"]["inner_policy_delay"] == 3
         assert provenance["evaluated_semantic_signature"]["inner_policy_delay"] == policy_delay
+        assert provenance["saved_semantic_signature"].get("inner_critic_target_bn_mode", "batch_no_update") == "batch_no_update"
+        assert provenance["evaluated_semantic_signature"].get("inner_critic_target_bn_mode", "batch_no_update") == target_bn_mode
         frozen = agent.frozen_outer_state()
         observation, _ = target.env.reset(seed=101)
         global_rng = torch.get_rng_state().clone(), random.getstate(), np.random.get_state()
@@ -240,12 +271,13 @@ def test_frozen_h2_j2_actual_budget_masks_bn_and_fresh_action_resets(
                     "inner_replay_draws": replay_draws, "inner_critic_optimizer_steps": critic_steps,
                     "inner_actor_optimizer_steps": actor_steps, "inner_temperature_optimizer_steps": actor_steps,
                     "inner_policy_delay": policy_delay,
+                    "inner_critic_target_bn_running": float(target_bn_mode == "running"),
                     "inner_target_updates": critic_steps, "inner_outer_terminal_boundary_rows": 512,
                     "inner_reward_scale_delta": 0, "inner_reward_normalizer_imagined_updates": 0,
                     "inner_critic_source_aux_return": 1, "inner_horizon_critic_source_aux_return": 1,
                     "inner_critic_target_reward_only": 1, "inner_compile_fallback": 0}
                 assert all(metrics[key] == value for key, value in expected.items())
-                assert target_modes == ["batch_no_update"]*critic_steps
+                assert target_modes == [target_bn_mode]*critic_steps
                 assert metrics["inner_outer_terminal_bootstrap_rows"] == sum(int(mask.sum()) for mask in sampled_masks)
                 assert 0 < metrics["inner_outer_terminal_bootstrap_rows"] < replay_draws
                 assert all(torch.isfinite(torch.as_tensor(value)).all() for value in metrics.values())
