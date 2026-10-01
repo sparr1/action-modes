@@ -309,7 +309,8 @@ def worker_root(plan, index, job):
     return Path(plan["result_root"]) / plan.get("stage", "stage5") / f"job{job}-task{index}"
 
 
-def evaluate_cell(plan, index, root, study, *, smoke):
+def evaluate_cell(plan, index, root, study, *, smoke, policy=None):
+    policy = policy or sys.modules[__name__]
     from evaluate_ambi_checkpoint import evaluate_matrix
     from utils.ambi_benchmark import stage_completed_bundle
     cell = plan["conditions"][index]
@@ -325,7 +326,7 @@ def evaluate_cell(plan, index, root, study, *, smoke):
     if payload["checkpoint_sha256"] != study.CHECKPOINT_SHA:
         raise ValueError("Update-dose worker evaluated a different checkpoint")
     study.immutable_json(root / "results.json", payload)
-    study.immutable_json(root / "validation.json", validate_bundle(plan, index, root, study, smoke))
+    study.immutable_json(root / "validation.json", policy.validate_bundle(plan, index, root, study, smoke))
     if not smoke:
         staged = stage_completed_bundle(root / "bundle", assigned, source_run=row["source_run"], inventory_path=manifest)
         if set(staged) != {cell["selector"]} or staged[cell["selector"]]["status"] != "queued":
@@ -384,7 +385,8 @@ def worker(args, coordinator, study, publication, provenance, *, policy=None):
     return {"output": str(root), "index": args.index}
 
 
-def validate_worker(plan, index, job, study):
+def validate_worker(plan, index, job, study, *, policy=None):
+    policy = policy or sys.modules[__name__]
     root = worker_root(plan, index, job)
     if (root / "FAILED").exists() or not (root / "PASS").is_file() or (root / "PASS").read_text().strip() != "PASS":
         raise ValueError("Submitted update-dose GPU task did not finish successfully")
@@ -399,7 +401,7 @@ def validate_worker(plan, index, job, study):
         directory = root / phase
         if not (directory / "PASS").is_file() or (directory / "PASS").read_text().strip() != "PASS":
             raise ValueError("Missing smoke or full evaluation completion")
-        if study.read(directory / "validation.json") != validate_bundle(plan, index, directory, study, phase == "smoke"):
+        if study.read(directory / "validation.json") != policy.validate_bundle(plan, index, directory, study, phase == "smoke"):
             raise ValueError("Worker bundle changed after validation")
     episodes = study.read(root / "full/bundle/manifest.json")["runs"][0]["episodes"]
     return {"index": index, "condition": plan["conditions"][index], "output_path": str(root),

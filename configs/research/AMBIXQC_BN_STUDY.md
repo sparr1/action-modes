@@ -290,3 +290,49 @@ which would mix the changed actor rate into the existing fixed-rate J/G curves.
 Evaluate paired environment return first; increased predicted Q or policy KL
 alone is not evidence of improvement. This remains an exploratory comparison
 on one backbone and reused tuning seeds.
+
+
+### H2 at the fixed J2/G6 update budget
+
+`run_ambixqc_horizon_study.py` changes only `inner_rollout_horizon` from 1 to 2
+relative to the completed Stage 5 J2/G6 baseline
+`1a763d57173e4efdb3d228d123232e2f`. Actor, critic and temperature learning
+rates are all 5e-5. It reuses the five H1 episodes and evaluates one new H2
+condition on the same seeds 101–105, controller seed12345, and 500-decision
+protocol. All checkpoint, critic routing, reward normalization, online BN,
+source and compilation settings remain fixed. Scientific execution is still
+pinned to 10852a8; no learner changes are introduced.
+
+H2 uses one-step TD updates. Root transitions bootstrap from the current inner
+actor and inner target critic at the first predicted next state. Second-step
+transitions bootstrap from the frozen outer actor and auxiliary return critic.
+Both targets remain reward-only. The inherited inner target critic uses joined
+batch statistics without updating BN buffers, even though the online critic
+uses running statistics. H1 replaced every selected target with the running-BN
+outer tail; H2 makes this inner-target BN policy and parameter-only Polyak
+updates relevant. This first H2 comparison deliberately preserves that policy.
+
+Each round collects all 256 two-step rollouts before its six update slots.
+Two rounds produce 1024 replay rows, exactly the existing capacity, with no
+eviction. Each real decision still performs 12 critic, 4 actor and 4 temperature
+updates and 3,072 replay draws. Half the stored rows mark the outer horizon;
+uniform sampling does not require exactly half of each minibatch to be boundary
+rows. Actor updates now use a mixture of root and depth-one states. Average
+replay draws per imagined row fall from 6 to 3. Deeper model error, the new target
+path and the state mixture must be considered when interpreting returns or
+pooled diagnostics; this does not isolate only the effect of extra rewards.
+
+The driver verifies H2 rollout lengths, buffer size, boundary counts, sampled
+boundary counts, update counts, compilation and frozen-state checks in the smoke and full
+bundles. A two-seed, three-decision exact-configuration CUDA smoke gates the
+five full episodes. Use `--completed-sweep-root` for the completed Stage 5 parent,
+a new result root, and the corresponding horizon-study worker/coordinator
+Slurm wrappers. The GPU task retains a 90-minute limit and the coordinator 3 hours.
+L40S is preferred, with A5000 fallback; actual hardware is recorded.
+
+The new run receives `horizon_study_id=ambixqc-horizon-20261001`, excluded from
+both the fixed-H1 J/G curves and the actor-LR comparison. Stage 8 increases the
+campaign from 28 conditions / 140 episodes to 29 conditions / 145 episodes. A separate
+H1/H2 comparison shows pending status and publishes the new result only after
+all five episodes and validation succeed. This remains an exploratory test on
+one backbone and reused tuning seeds.
