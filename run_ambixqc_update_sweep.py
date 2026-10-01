@@ -352,7 +352,7 @@ def worker(args, coordinator, study, publication, provenance, *, policy=None):
             or plan["smoke_root"] != str(parent_args.smoke_root)
             or plan["checkpoint_root"] != (str(parent_args.checkpoint_root) if parent_args.checkpoint_root else None)):
         raise ValueError("Worker parent, inputs or reused baselines differ")
-    study.verify_smokes(parent_args.smoke_root, parent_args.manifest, args.source_sha)
+    study.verify_smokes(parent_args.smoke_root, parent_args.manifest, getattr(policy, "PARENT_SOURCE_SHA", args.source_sha))
     row = study.screen.select_checkpoint(parent_args.manifest, checkpoint_root=parent_args.checkpoint_root)
     if str(study.screen.select_reference(parent_args.reference_index, row, parent_args.manifest)) != plan["reference_bundle"]:
         raise ValueError("Worker paired reference differs")
@@ -370,6 +370,8 @@ def worker(args, coordinator, study, publication, provenance, *, policy=None):
             "gpu": torch.cuda.get_device_name(0), "cuda_device_count": 1})
         study.immutable_json(root / "provenance.json", {"plan": study.bind(args.plan), "index": args.index,
             "job": job, **provenance})
+        if hasattr(policy, "before_smoke"):
+            policy.before_smoke(plan, args.index, root, study)
         policy.evaluate_cell(plan, args.index, root / "smoke", study, smoke=True)
         # Each evaluation reconstructs and reseeds its controller. Release cyclic
         # model/workspace allocations from the smoke before constructing the full run.

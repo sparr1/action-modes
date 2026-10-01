@@ -423,3 +423,41 @@ episodes to 35 / 175. New curves use
 `h2_update_study_id=ambixqc-h2-updates-20261001` and explicit G/delay labels;
 they are excluded from earlier J/G, actor-rate, horizon and H2/J panels. The
 comparison remains exploratory on one backbone and reused tuning seeds.
+
+### H2 target-critic BatchNorm ablation
+
+`run_ambixqc_target_bn_study.py` adds one H2/J2/G6/delay3 condition using
+`inner_critic_target_bn_mode=running`. It reuses the completed Stage 8 control
+`4b2d4437ffd84ca49093e303f794a11b`, whose missing setting means the historical
+`batch_no_update` policy. All learning rates remain `5e-5`, with N256, B256,
+replay capacity 1024, reward-only auxiliary initialization and outer tail, and
+frozen real reward scale. Each real decision still collects 1024 rows and
+performs 12 critic and four actor/temperature updates. Actor and online-critic
+BN use running statistics in both conditions. Only the inner target critic's
+non-boundary bootstrap changes; frozen outer-tail queries remain unchanged.
+
+Unlike the earlier tooling-only extensions, this intervention uses a new
+scientific execution commit. Historical manifests, planner identities and
+publication receipts remain bound to their original source. The driver pins
+the new execution SHA separately from its tooling SHA and checks the completed
+Stage 10 parent, including both publication receipts. The checkpoint-matched
+historical prior reference remains valid and is reused without rewriting it.
+
+Before the new full run, the worker evaluates the exact historical default
+recipe for two seeds and three decisions. It compares recorded rewards and
+scientific scalars with the archived Stage 8 smoke: discrete counts and frozen
+reward statistics must match exactly; other scalars use `rtol=1e-5` and
+`atol=1e-6`. Timing is excluded. Historical traces contain no actions, so this
+is a scalar compatibility check, supplemented by engine-level reset and
+default-behavior tests. A separate exact-condition CUDA smoke then gates the
+new five paired 500-decision episodes (seeds 101–105, controller seed 12345).
+The new numeric trace field `inner_critic_target_bn_running` must be zero in
+the default canary and one in the experimental smoke and full evaluation.
+
+Use the target-BN worker/coordinator Slurm wrappers with the completed Stage 10
+root and one L40S worker (six CPUs, 32 GiB, two hours). The CPU coordinator has
+a four-hour limit. The new run uses `target_bn_study_id=ambixqc-h2-target-bn-20261001`
+and its own comparison view; the historical baseline receives only that
+display-group tag, preserving its planner and results. Stage 11 advances the
+campaign from 35 conditions / 175 episodes to 36 / 180. It remains exploratory
+on one backbone and reused tuning seeds.

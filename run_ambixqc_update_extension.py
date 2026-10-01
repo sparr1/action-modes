@@ -139,7 +139,7 @@ def prepare_plan(args, study, publication, provenance, *, policy=None):
     policy = policy or sys.modules[__name__]
     stage = policy.STAGE
     evidence, reused = policy.parent_evidence(args, study, publication)
-    study.verify_smokes(args.smoke_root, args.manifest, args.source_sha)
+    study.verify_smokes(args.smoke_root, args.manifest, getattr(policy, "PARENT_SOURCE_SHA", args.source_sha))
     row = study.screen.select_checkpoint(args.manifest, checkpoint_root=args.checkpoint_root)
     reference = study.screen.select_reference(args.reference_index, row, args.manifest)
     cells, _ = policy.split_conditions(study)
@@ -182,7 +182,7 @@ def load_plan(path, study, source_sha, tooling_sha, *, policy=None):
     signed = {k: v for k, v in plan.items() if k != "plan_sha256"}
     if (plan.get("schema") != policy.SCHEMA or plan.get("stage") != policy.STAGE
             or plan.get("campaign") != "ambixqc-bn-study-20260929" or plan.get("plan_sha256") != study.digest(signed)
-            or source_sha != SOURCE_SHA or plan.get("source_sha") != source_sha
+            or source_sha != getattr(policy, "SOURCE_SHA", SOURCE_SHA) or plan.get("source_sha") != source_sha
             or plan.get("tooling", {}).get("commit") != tooling_sha
             or plan.get("execution", {}).get("commit") != source_sha
             or plan.get("checkpoint_sha256") != study.CHECKPOINT_SHA or plan.get("checkpoint_step") != 475000
@@ -262,8 +262,8 @@ def coordinate(args, coordinator, study, publication, provenance, *, api, policy
 
 def run(args, *, policy=None):
     policy = policy or sys.modules[__name__]
-    if not os.environ.get("SLURM_JOB_ID") or args.source_sha != SOURCE_SHA:
-        raise ValueError("Use a scheduler allocation and original10852a8 experiment source")
+    if not os.environ.get("SLURM_JOB_ID") or args.source_sha != getattr(policy, "SOURCE_SHA", SOURCE_SHA):
+        raise ValueError("Use a scheduler allocation and the policy-pinned experiment source")
     args.execution_root = args.execution_root.resolve()
     provenance = {"tooling": continuation.require_checkout(TOOLING_ROOT, args.tooling_sha),
                   "execution": continuation.require_checkout(args.execution_root, args.source_sha)}
