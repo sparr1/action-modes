@@ -163,6 +163,17 @@ def resolve_auxiliary_actor_config(cfg):
 
 
 def validate_auxiliary_config(cfg):
+    if getattr(cfg, "inner_critic_transfer_head", "retain") == "random" and (
+        cfg.aux_return_mode == "off"
+        or cfg.inner_operator != "sac"
+        or cfg.inner_actor_scope != "action"
+        or cfg.inner_critic_scope != "episode"
+    ):
+        raise ValueError(
+            "inner_critic_transfer_head='random' requires auxiliary SAC "
+            "critic-only episode transfer (inner_actor_scope='action', "
+            "inner_critic_scope='episode')."
+        )
     if cfg.aux_return_mode == "off":
         return
     if cfg.inner_operator == "sac" and cfg.inner_schedule_mode != "canonical":

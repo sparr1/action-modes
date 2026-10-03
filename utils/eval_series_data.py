@@ -188,6 +188,18 @@ class _WithoutControlTiming(ast.NodeTransformer):
         return self.generic_visit(node)
 
 
+def _scientific_evaluator_nodes(tree, selected):
+    """Include protocol gates in new revisions without rekeying old source."""
+    protocol_names = {"_ACTOR_TRANSFER_PROTOCOLS", "_CRITIC_TRANSFER_PROTOCOLS",
+                      "_CRITIC_HIDDEN_TRANSFER_PROTOCOLS", "_HOLD_TRANSFER_PROTOCOLS"}
+    def assigned_names(node):
+        return {target.id for target in getattr(node, "targets", []) if isinstance(target, ast.Name)}
+    hidden_protocol_revision = any("_CRITIC_HIDDEN_TRANSFER_PROTOCOLS" in assigned_names(node)
+                                   for node in tree.body)
+    return [node for node in tree.body if getattr(node, "name", None) in selected
+            or (hidden_protocol_revision and assigned_names(node) & protocol_names)]
+
+
 @lru_cache(maxsize=128)
 def scientific_identity(algorithm, controller, commit, dirty=False, source_sha256=None):
     """Conservative scientific-source identity, excluding publisher/report code.
@@ -227,7 +239,8 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
                  "_capture_global_rng", "_restore_global_rng", "_predicted_action_gain",
                  "evaluate_tdmpc2_mppi_checkpoint"}
                 if evaluator.startswith("evaluate_tdmpc2") else
-                {"_make_env", "_seed_spaces", "_initialize_frozen_model", "evaluate_preset"})
+                {"_make_env", "_seed_spaces", "_initialize_frozen_model", "evaluate_preset",
+                 "_validate_critic_transfer_head_protocol"})
     try:
         entries = _git_output(root, "ls-tree", "-rz", commit, "--", *paths)
         names = sorted(entry.split(b"\t", 1)[1].decode() for entry in entries.split(b"\0") if entry)
@@ -243,7 +256,8 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
                 tree = ast.parse(content)
                 if name == evaluator or name in helper_selections:
                     names_selected = selected if name == evaluator else helper_selections[name]
-                    tree.body = [node for node in tree.body if getattr(node, "name", None) in names_selected]
+                    tree.body = (_scientific_evaluator_nodes(tree, names_selected) if name == evaluator else
+                                 [node for node in tree.body if getattr(node, "name", None) in names_selected])
                     _require(any(getattr(n, "name", None) in names_selected for n in tree.body),
                              "Scientific evaluator functions missing")
                 if name == evaluator:
@@ -361,6 +375,10 @@ def planner_identity(config, result, algorithm, action_rule):
     # default explicitly must not split their identities or prior references.
     if active.get("inner_solve_interval", 1) == 1:
         active.pop("inner_solve_interval", None)
+    # The new resolved default must not split historical full-critic, actor,
+    # or fresh identities. Only the opt-in new-head lifecycle changes identity.
+    if active.get("inner_critic_transfer_head", "retain") == "retain":
+        active.pop("inner_critic_transfer_head", None)
     estimator = config.get("inner_sac_return_estimator", "one_step")
     if isinstance(estimator, str):
         estimator = estimator.lower()
@@ -491,6 +509,18 @@ def planner_identity(config, result, algorithm, action_rule):
             replay_temperature_optimizers="reset_each_solve",
             episode_boundary="reset_all_scientific_inner_state",
         )
+        if config.get("inner_critic_transfer_head", "retain") == "random":
+            semantics.update(
+                evaluation_protocol=("critic-hidden-transfer-hold-h-v1"
+                                     if config.get("inner_solve_interval", 1) > 1 else "critic-hidden-transfer-v1"),
+                transfer_component="online_inner_critic_hidden_layers",
+                critic_initialization="checkpoint_hidden_layers_at_episode_start_then_previous_solve_hidden_layers",
+                critic_head_initialization="xavier_uniform_zero_bias_each_solve",
+                critic_head_reset_at_first_solve=True,
+                critic_head_extent="final_linear_weight_and_bias_of_each_ensemble_member",
+                critic_hidden_normalization="retained_and_trainable",
+                target_initialization="starting_online_critic_after_head_reset_each_solve",
+            )
     return {"type": operator, "backend": algorithm, "action_rule": action_rule,
             **({"semantics": semantics} if semantics else {}),
             "settings": {**shared, **active}}
@@ -642,10 +672,13 @@ def descriptive_label(identity, selector=None):
         bootstrap = "inner Q"
     title = f"{planner['type'].upper()} {'/'.join(budgets)} {bootstrap}"
     title += f" J{rounds}/N{settings.get('inner_rollouts_per_round')}/H{settings.get('inner_rollout_horizon')}"
-    if planner.get("semantics", {}).get("transfer_component") == "online_inner_critic":
+    transfer_component = planner.get("semantics", {}).get("transfer_component")
+    if transfer_component in {"online_inner_critic", "online_inner_critic_hidden_layers"}:
         critic = "return" if settings.get("inner_critic_source", "sac") == "aux_return" else "soft"
         tail = "return" if settings.get("inner_horizon_critic_source", "sac") == "aux_return" else "soft"
-        title += f" critic-only transfer ({critic}/{tail})"
+        transfer = ("critic hidden transfer + fresh head" if transfer_component == "online_inner_critic_hidden_layers"
+                    else "critic-only transfer")
+        title += f" {transfer} ({critic}/{tail})"
         if settings.get("inner_solve_interval", 1) > 1:
             title += f" hold{settings['inner_solve_interval']}"
     if settings.get("inner_first_action_rounds") is not None:

@@ -35,6 +35,21 @@ PRIOR_MATRIX = ROOT / 'configs/research/ambi_transfer_prior_reference_575k.json'
 MATRICES = [ROOT / 'configs/research' / name for name in (
     'ambi_critic_transfer_sweep_575k.json', 'ambi_critic_transfer_hold_h_sweep_575k.json',
     'ambi_actor_transfer_sweep_575k.json', 'ambi_actor_transfer_hold_h_sweep_575k.json')]
+HIDDEN_MATRICES = [ROOT / 'configs/research' / name for name in (
+    'ambi_critic_hidden_transfer_sweep_575k.json', 'ambi_critic_hidden_transfer_hold_h_sweep_575k.json')]
+CAMPAIGN_MODES = ('full', 'critic-hidden')
+HIDDEN_TRANSFER_METADATA = {
+    'transfer_mode': 'critic_hidden_only',
+    'actor_initialization': 'checkpoint_prior_each_solve',
+    'critic_initialization': 'checkpoint_hidden_layers_at_episode_start_then_previous_solve_hidden_layers',
+    'critic_head_initialization': 'xavier_uniform_zero_bias_each_solve',
+    'critic_head_reset_at_first_solve': True,
+    'critic_head_extent': 'final_linear_weight_and_bias_of_each_ensemble_member',
+    'critic_hidden_normalization': 'retained_and_trainable',
+    'target_initialization': 'starting_online_critic_after_head_reset_each_solve',
+    'replay_temperature_optimizers': 'reset_each_solve',
+    'episode_boundary': 'reset_all_scientific_inner_state',
+}
 
 
 def require(condition, message):
@@ -73,8 +88,11 @@ def source_commit():
     return subprocess.check_output(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], text=True).strip()
 
 
-def cells(matrix_paths=MATRICES):
+def cells(matrix_paths=None, *, campaign_mode='full'):
     from utils.ambi_research import load_preset_matrix
+    require(campaign_mode in CAMPAIGN_MODES, 'Unknown campaign mode.')
+    hidden = campaign_mode == 'critic-hidden'
+    matrix_paths = matrix_paths or (HIDDEN_MATRICES if hidden else MATRICES)
     panel = []
     for path in matrix_paths:
         path = Path(path).resolve()
@@ -91,11 +109,14 @@ def cells(matrix_paths=MATRICES):
             group, variant = selector.split('/')
             params = {**matrix['shared_alg_params'],
                       **matrix['comparisons'][group]['variants'][variant]['alg_params']}
-            mode = ('actor_only' if params['inner_actor_scope'] == 'episode' else
+            head = params.get('inner_critic_transfer_head', 'retain')
+            require(head == ('random' if hidden else 'retain'), 'Incorrect critic output-head transfer setting.')
+            mode = ('critic_hidden' if hidden else 'actor_only' if params['inner_actor_scope'] == 'episode' else
                     'critic_only' if params['inner_critic_scope'] == 'episode' else 'fresh')
             require((params['inner_actor_scope'], params['inner_critic_scope']) == {
                 'fresh': ('action', 'action'), 'actor_only': ('episode', 'action'),
-                'critic_only': ('action', 'episode')}[mode], 'Only one component may persist.')
+                'critic_only': ('action', 'episode'), 'critic_hidden': ('action', 'episode')}[mode],
+                'Only one component may persist.')
             source = params['inner_critic_source']
             require(source in ('sac', 'aux_return'), 'Unknown critic source.')
             kind = 'soft' if source == 'sac' else 'return'
@@ -122,15 +143,27 @@ def cells(matrix_paths=MATRICES):
             require(rounds in (1, 8) and interval in (1, 3), 'Sweep must use J1/J8 and cadence1/3.')
             protocol = ('actor-transfer-hold-h-v1' if interval == 3 else 'actor-transfer-v2') if mode == 'actor_only' else (
                 'critic-transfer-hold-h-v1' if interval == 3 else 'critic-transfer-v1')
+            if hidden:
+                protocol = 'critic-hidden-transfer-hold-h-v1' if interval == 3 else 'critic-hidden-transfer-v1'
             require(matrix['study_protocol'] == protocol, 'Incorrect transfer protocol.')
             panel.append(dict(name=f'{kind}_{mode}_h3_j{rounds}_i{interval}', selector=selector,
                               matrix=str(path), matrix_sha256=digest(path), study_protocol=protocol,
                               critic_kind=kind, transfer_mode=mode, H=3, J=rounds, solve_interval=interval,
                               requested_alg_params=params))
     keys = [(c['critic_kind'], c['transfer_mode'], c['J'], c['solve_interval']) for c in panel]
-    expected_keys = set(itertools.product(('soft', 'return'), ('fresh', 'actor_only', 'critic_only'), (1, 8), (1, 3)))
-    require(len(keys) == 24 and set(keys) == expected_keys, 'Sweep must contain exactly 24 distinct settings.')
-    order = {'fresh': 0, 'actor_only': 1, 'critic_only': 2}
+    expected_keys = set(itertools.product(('soft', 'return'),
+        ('critic_hidden',) if hidden else ('fresh', 'actor_only', 'critic_only'), (1, 8), (1, 3)))
+    require(len(keys) == len(expected_keys) and set(keys) == expected_keys,
+            f'Sweep must contain exactly {len(expected_keys)} distinct settings.')
+    if hidden:
+        controls = {(c['critic_kind'], c['J'], c['solve_interval']): c
+                    for c in cells() if c['transfer_mode'] == 'critic_only'}
+        for cell in panel:
+            control = controls[cell['critic_kind'], cell['J'], cell['solve_interval']]
+            expected = {**control['requested_alg_params'], 'inner_critic_transfer_head': 'random'}
+            require(cell['requested_alg_params'] == expected,
+                    'Hidden-transfer setting differs from the matched full-critic setting beyond the head reset.')
+    order = {'fresh': 0, 'actor_only': 1, 'critic_only': 2, 'critic_hidden': 3}
     # Largest nominal workloads first; Slurm controls live concurrency.
     return sorted(panel, key=lambda c: (-c['J'] * math.ceil(STEPS/c['solve_interval']),
                                         c['critic_kind'], order[c['transfer_mode']]))
@@ -144,11 +177,25 @@ def matching_config(actual, expected):
         if actual.get(key) != expected.get(key)}))
 
 
+def plan(args):
+    panel = cells(args.matrix, campaign_mode=args.campaign_mode)
+    hidden = args.campaign_mode == 'critic-hidden'
+    result = dict(campaign_mode=args.campaign_mode, new_settings=len(panel),
+                  new_prior_references=0 if hidden else 1,
+                  new_episodes=(len(panel) + (0 if hidden else 1)) * len(SEEDS),
+                  seeds=SEEDS, controller_seed=55, max_steps=STEPS,
+                  cells=panel, smoke_seeds=SMOKE_SEEDS, smoke_steps=SMOKE_STEPS,
+                  transfer_metadata=HIDDEN_TRANSFER_METADATA if hidden else None)
+    print(json.dumps(result, indent=2)); return result
+
+
 def prepare(args):
     from slurm.ambi_closed_loop_checkpoint_sweep import resolve_config
     from utils.eval_series_data import planner_identity, scientific_identity
     commit = source_commit()
-    panel = cells(args.matrix or MATRICES)
+    campaign_mode = getattr(args, 'campaign_mode', 'full')
+    hidden = campaign_mode == 'critic-hidden'
+    panel = cells(args.matrix, campaign_mode=campaign_mode)
     inventory = read(args.inventory)
     require(inventory['source_run'] == SOURCE_RUN, 'Wrong checkpoint inventory source.')
     rows = [row for row in inventory['checkpoints'] if row['step'] == CHECKPOINT_STEP]
@@ -173,35 +220,42 @@ def prepare(args):
         require(config['target_entropy'] == -10.5, 'Checkpoint entropy target changed.')
         cell.update(index=index, expected_config=config,
                     planner_identity=planner_identity(config, {}, 'AMBITDMPC2/AMBITDMPC2', 'tanh_mean'))
-    smoke_indices = [cell['index'] for cell in panel if cell['J'] == 8]
-    from utils.ambi_research import load_preset_matrix
-    prior_matrix = Path(args.prior_matrix).resolve()
-    prior = load_preset_matrix(prior_matrix)
-    require(prior['source_run'] == SOURCE_RUN and prior['checkpoint_contract'] == {
-        'step': CHECKPOINT_STEP, 'sha256': CHECKPOINT_SHA}, 'Prior checkpoint pin changed.')
-    require(prior['evaluation']['default_presets'] == ['reference/prior'] and
-            prior['evaluation']['seeds'] == SEEDS and prior['evaluation']['max_steps'] == STEPS and
-            prior['evaluation']['controller_seed'] == 55, 'Prior reference protocol changed.')
-    prior_config = resolve_config(prior_matrix, checkpoint, 'reference/prior')
-    require(prior_config['inner_operator'] == 'none' and prior_config['inner_eval_execution_action'] == 'mean',
-            'Prior reference must execute the frozen prior mean.')
-    panel.append(dict(index=24, name='prior_reference', selector='reference/prior',
-        matrix=str(prior_matrix), matrix_sha256=digest(prior_matrix), transfer_mode='prior',
-        J=0, H=3, solve_interval=1, expected_config=prior_config,
-        planner_identity=planner_identity(prior_config, {}, 'AMBITDMPC2/AMBITDMPC2', 'tanh_mean')))
-    campaign = dict(schema_version=1, kind='ambi-warm-start-sweep-v1', source_commit=commit,
+    # New output heads can be undertrained at J1; smoke every new setting.
+    smoke_indices = [cell['index'] for cell in panel if hidden or cell['J'] == 8]
+    if not hidden:
+        from utils.ambi_research import load_preset_matrix
+        prior_matrix = Path(args.prior_matrix).resolve()
+        prior = load_preset_matrix(prior_matrix)
+        require(prior['source_run'] == SOURCE_RUN and prior['checkpoint_contract'] == {
+            'step': CHECKPOINT_STEP, 'sha256': CHECKPOINT_SHA}, 'Prior checkpoint pin changed.')
+        require(prior['evaluation']['default_presets'] == ['reference/prior'] and
+                prior['evaluation']['seeds'] == SEEDS and prior['evaluation']['max_steps'] == STEPS and
+                prior['evaluation']['controller_seed'] == 55, 'Prior reference protocol changed.')
+        prior_config = resolve_config(prior_matrix, checkpoint, 'reference/prior')
+        require(prior_config['inner_operator'] == 'none' and prior_config['inner_eval_execution_action'] == 'mean',
+                'Prior reference must execute the frozen prior mean.')
+        panel.append(dict(index=24, name='prior_reference', selector='reference/prior',
+            matrix=str(prior_matrix), matrix_sha256=digest(prior_matrix), transfer_mode='prior',
+            J=0, H=3, solve_interval=1, expected_config=prior_config,
+            planner_identity=planner_identity(prior_config, {}, 'AMBITDMPC2/AMBITDMPC2', 'tanh_mean')))
+    campaign = dict(schema_version=2 if hidden else 1,
+                    kind='ambi-critic-hidden-transfer-sweep-v1' if hidden else 'ambi-warm-start-sweep-v1',
+                    source_commit=commit,
                     source_run=SOURCE_RUN, checkpoint=str(checkpoint), checkpoint_step=CHECKPOINT_STEP,
                     checkpoint_sha256=CHECKPOINT_SHA, metadata_sha256=digest(metadata),
                     inventory=str(Path(args.inventory).resolve()), inventory_sha256=digest(args.inventory),
                     source_dir=str(ROOT), initial_alpha=initial_alpha, cells=panel,
                     seeds=SEEDS, controller_seed=55, max_steps=STEPS,
                     smoke_indices=smoke_indices, smoke_seeds=SMOKE_SEEDS, smoke_steps=SMOKE_STEPS,
-                    cuda_gate_index=smoke_indices[0], production_indices=list(range(25)),
+                    cuda_gate_index=smoke_indices[0], production_indices=list(range(len(panel))),
                     science=scientific_identity('AMBITDMPC2/AMBITDMPC2', 'sac', commit),
                     publication='local_bundles_only_no_online_publication')
+    if hidden:
+        campaign.update(campaign_mode=campaign_mode, transfer_metadata=HIDDEN_TRANSFER_METADATA,
+                        comparison_policy='separate_historical_references_no_automatic_identity_reuse')
     root = Path(args.root).resolve(); root.mkdir(parents=True, exist_ok=False)
     write_new(root / 'campaign.json', campaign)
-    print(json.dumps(dict(root=str(root), settings=24, prior_references=1, smoke_indices=smoke_indices,
+    print(json.dumps(dict(root=str(root), settings=8 if hidden else 24, prior_references=0 if hidden else 1, smoke_indices=smoke_indices,
                           production_indices=campaign['production_indices'], source_commit=commit)))
     return campaign
 
@@ -245,11 +299,13 @@ def validate_trace(bundle, cell, *, seeds, steps, initial_alpha=INITIAL_ALPHA):
                     metrics = {k.removeprefix('decision/'): v for k, v in values.items()}
                     require(metrics['inner_actor_transferred'] == (solved and decision > 0 and cell['transfer_mode'] == 'actor_only'),
                             'Actor transfer flag mismatch.')
-                    if cell['transfer_mode'] == 'critic_only':
+                    if cell['transfer_mode'] in ('critic_only', 'critic_hidden'):
                         require(metrics['inner_critic_transferred'] == (solved and decision > 0), 'Critic transfer flag mismatch.')
                         require(metrics['inner_critic_target_reinitialized'] == solved, 'Critic target reset flag mismatch.')
                         require(metrics['inner_critic_updates_initial'] == (
                             16 * rounds * (decision // interval) if solved else 0), 'Critic cumulative count mismatch.')
+                    if cell['transfer_mode'] == 'critic_hidden':
+                        require(metrics['inner_critic_head_reinitialized'] == solved, 'Critic head reset flag mismatch.')
                     if phase == 'decision':
                         dose = rounds if solved else 0
                         expected = dict(inner_rounds=dose, inner_first_action_rounds_applied=0,
@@ -298,6 +354,10 @@ def validate_completed(bundle, cell, campaign, *, smoke=False):
     require(run['selector'] == result['selector'] == cell['selector'], 'Wrong evaluated selector.')
     if cell['transfer_mode'] != 'prior':
         require(run['study_protocol'] == result['study_protocol'] == cell['study_protocol'], 'Wrong evaluated protocol.')
+    if cell['transfer_mode'] == 'critic_hidden':
+        require(campaign.get('transfer_metadata') == HIDDEN_TRANSFER_METADATA, 'Campaign hidden-transfer metadata changed.')
+        require(run.get('transfer') == result.get('transfer') == HIDDEN_TRANSFER_METADATA,
+                'Hidden-transfer lifecycle metadata changed.')
     matching_config(run['resolved_config'], cell['expected_config'])
     matching_config(result['resolved_config'], cell['expected_config'])
     require(planner_identity(run['resolved_config'], result, 'AMBITDMPC2/AMBITDMPC2', 'tanh_mean') ==
@@ -342,12 +402,58 @@ def receipt(root, campaign, index, *, smoke=False, verify=False):
     return result
 
 
+def hidden_cuda_reports(log, output, commit):
+    """Seal the four explicit hidden-head gate reports emitted by pytest."""
+    marker = 'CRITIC_HIDDEN_TRANSFER_CUDA_GATE_REPORT '
+    records = [json.loads(line.split(marker, 1)[1]) for line in Path(log).read_text().splitlines()
+               if marker in line]
+    keys = [(record['critic'], record['solve_interval']) for record in records]
+    require(len(keys) == 4 and set(keys) == set(itertools.product(('soft', 'return'), (1, 3))),
+            'Hidden CUDA gate did not emit exactly four distinct successful cases.')
+    reports = []
+    for record in records:
+        require(record['passed'] and record['inner_critic_transfer_head'] == 'random' and
+                record['weight_initializer'] == 'xavier_uniform' and record['bias_initializer'] == 'zeros' and
+                record['reset_timing'] == 'every_solve_including_first', 'Hidden CUDA head lifecycle changed.')
+        for name in ('deterministic_numerical_parity', 'compiled_stochastic_lifecycle'):
+            check = record[name]
+            require(check['passed'] and check['compile_strict'] and not check['compile_fallback'] and
+                    check['source_commit'] == commit and check['allocation_reuse'] and
+                    check['exact_lifecycle_boundaries'] and check['optimizer_references_and_reset'],
+                    'Hidden CUDA compilation/lifecycle report failed.')
+        record.update(source_commit=commit, compile_strict=True, compile_fallback=False)
+        path = Path(output) / f"critic-hidden-{record['critic']}-interval{record['solve_interval']}.json"
+        write_new(path, record); reports.append(path)
+    return reports
+
+
+def validate_hidden_campaign(campaign):
+    """Reconstruct the complete setting panel before executing a new-mode worker."""
+    if campaign.get('campaign_mode') != 'critic-hidden':
+        require(campaign.get('kind') != 'ambi-critic-hidden-transfer-sweep-v1', 'Hidden campaign mode missing.')
+        return
+    require(campaign['schema_version'] == 2 and campaign['kind'] == 'ambi-critic-hidden-transfer-sweep-v1',
+            'Hidden campaign schema changed.')
+    require(campaign['transfer_metadata'] == HIDDEN_TRANSFER_METADATA, 'Hidden campaign lifecycle changed.')
+    for key, expected in dict(seeds=SEEDS, controller_seed=55, max_steps=STEPS,
+                              smoke_seeds=SMOKE_SEEDS, smoke_steps=SMOKE_STEPS,
+                              smoke_indices=list(range(8)), production_indices=list(range(8)),
+                              cuda_gate_index=0).items():
+        require(campaign[key] == expected, f'Hidden campaign {key} changed.')
+    expected_cells = cells(campaign_mode='critic-hidden')
+    require(len(campaign['cells']) == 8, 'Hidden campaign must own only eight new settings.')
+    for index, (actual, expected) in enumerate(zip(campaign['cells'], expected_cells)):
+        require(actual['index'] == index and all(actual[key] == value for key, value in expected.items()),
+                'Hidden campaign setting identity changed.')
+
+
 def worker(args):
     import torch
     from evaluate_ambi_checkpoint import evaluate_matrix
     from utils.ambi_seed_shards import seal_episode_bundle
     root = Path(args.root).resolve(); campaign = read(root / 'campaign.json')
     require(source_commit() == campaign['source_commit'], 'Worker source commit mismatch.')
+    validate_hidden_campaign(campaign)
     require(args.index in (campaign['smoke_indices'] if args.smoke else campaign['production_indices']), 'Invalid worker index.')
     cell = campaign['cells'][args.index]
     require(digest(cell['matrix']) == cell['matrix_sha256'], 'Worker matrix changed.')
@@ -376,12 +482,18 @@ def worker(args):
             environment = {**os.environ, 'AMBI_RUN_CRITIC_TRANSFER_CUDA_GATE': '1',
                 'AMBI_CRITIC_TRANSFER_GATE_OUTPUT_ROOT': str(gate_directory),
                 'EXPECTED_ACTION_MODES_SHA': campaign['source_commit']}
+            hidden = campaign.get('campaign_mode') == 'critic-hidden'
+            if hidden:
+                environment['AMBI_RUN_CRITIC_HIDDEN_TRANSFER_CUDA_GATE'] = '1'
             with (directory / 'cuda-lifecycle-gate.log').open('x') as output:
                 subprocess.run([sys.executable, '-m', 'pytest', '-q', '-s',
+                    'tests/test_critic_hidden_transfer_cuda_gate.py' if hidden else
                     'tests/test_ambi_critic_transfer_cuda_gate.py'], env=environment,
                     stdout=output, stderr=subprocess.STDOUT, check=True, close_fds=False)
-            reports = [gate_directory / f'critic-{kind}-interval{interval}.json'
-                       for kind in ('soft', 'return') for interval in (1, 3)]
+            reports = (hidden_cuda_reports(directory / 'cuda-lifecycle-gate.log', gate_directory,
+                                          campaign['source_commit']) if hidden else
+                       [gate_directory / f'critic-{kind}-interval{interval}.json'
+                        for kind in ('soft', 'return') for interval in (1, 3)])
             for report in reports:
                 value = read(report)
                 require(value['passed'] and value['compile_strict'] and not value['compile_fallback'] and
@@ -457,10 +569,14 @@ def status(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
+    dry = commands.add_parser('plan')
+    dry.add_argument('--campaign-mode', choices=CAMPAIGN_MODES, default='full')
+    dry.add_argument('--matrix', type=Path, action='append')
     prep = commands.add_parser('prepare')
     prep.add_argument('--root', type=Path, required=True)
     prep.add_argument('--inventory', type=Path, required=True)
     prep.add_argument('--matrix', type=Path, action='append')
+    prep.add_argument('--campaign-mode', choices=CAMPAIGN_MODES, default='full')
     prep.add_argument('--prior-matrix', type=Path, default=PRIOR_MATRIX)
     run = commands.add_parser('worker')
     run.add_argument('--root', type=Path, required=True)
@@ -470,7 +586,7 @@ def main():
     inspect.add_argument('--root', type=Path, required=True)
     inspect.add_argument('--verify', action='store_true')
     args = parser.parse_args()
-    {'prepare': prepare, 'worker': worker, 'status': status}[args.command](args)
+    {'plan': plan, 'prepare': prepare, 'worker': worker, 'status': status}[args.command](args)
 
 
 if __name__ == '__main__':

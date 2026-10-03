@@ -1,5 +1,14 @@
 # Frozen-checkpoint AMBI research
 
+The [575k critic hidden-layer transfer examples](CRITIC_HIDDEN_TRANSFER_575K.md)
+retain trainable critic hidden layers and normalization while creating a fresh
+Xavier-uniform, zero-bias output head at every solve, including the first.
+Separate protocols cover soft/soft and return/return critics with every-decision
+or hold-H execution; existing full-critic examples remain unchanged.
+The [matched hidden-layer sweep](CRITIC_HIDDEN_TRANSFER_SWEEP_575K.md) adds
+eight J1/J8 conditions and an Oscar smoke/production gate without rerunning
+the historical controls.
+
 The [H3 transfer sweep](TRANSFER_SWEEP_575K.md) crosses J1/J8, fresh/actor-only/
 critic-only initialization, soft/soft versus return/return critics, and
 every-decision/hold-H cadences. Its four matrices select 24 unique conditions

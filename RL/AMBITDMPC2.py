@@ -203,6 +203,9 @@ _AMBI_DEFAULTS = {
     "inner_actor_initialization": "prior",
     "inner_actor_initial_std": None,
     "inner_critic_initialization": "prior",
+    # Auxiliary critic-only transfer can retain learned hidden layers while
+    # drawing a fresh output head at every solve, including episode starts.
+    "inner_critic_transfer_head": "retain",
     "inner_actor_adaptation": "clone",
     "inner_critic_adaptation": "clone",
     "inner_critic_dropout_enabled": True,
@@ -2096,6 +2099,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         for key, modes in (
             ("inner_actor_initialization", {"prior", "random"}),
             ("inner_critic_initialization", {"prior", "random"}),
+            ("inner_critic_transfer_head", {"retain", "random"}),
             ("inner_actor_adaptation", _ACTOR_ADAPTATION_MODES),
             ("inner_critic_adaptation", _CRITIC_ADAPTATION_MODES),
         ):

@@ -42,10 +42,12 @@ def synthetic_trace(cell, *, steps=7, seeds=(101, 102)):
                 inner_solve_performed=int(solved), inner_policy_held=int(not solved),
                 inner_solve_index=d//cell['solve_interval'], inner_action_age=d%cell['solve_interval'],
                 inner_episode_decision_index=d, inner_solve_interval=cell['solve_interval'])
-            if cell['transfer_mode'] == 'critic_only':
+            if cell['transfer_mode'] in ('critic_only', 'critic_hidden'):
                 metrics.update(inner_critic_transferred=int(solved and d > 0),
                     inner_critic_target_reinitialized=int(solved),
                     inner_critic_updates_initial=16*cell['J']*(d//cell['solve_interval']) if solved else 0)
+            if cell['transfer_mode'] == 'critic_hidden':
+                metrics['inner_critic_head_reinitialized'] = int(solved)
             common = dict(episode_id=f'seed-{seed}', decision_index=d, nonfinite={})
             if solved:
                 initial = dict(metrics, alpha=campaign.INITIAL_ALPHA,
@@ -73,7 +75,7 @@ def trace_bundle(tmp_path, rows):
     return bundle
 
 
-@pytest.mark.parametrize('mode', ['fresh', 'actor_only', 'critic_only'])
+@pytest.mark.parametrize('mode', ['fresh', 'actor_only', 'critic_only', 'critic_hidden'])
 @pytest.mark.parametrize('interval', [1, 3])
 @pytest.mark.parametrize('rounds', [1, 8])
 def test_trace_checks_work_and_episode_counters(tmp_path, mode, interval, rounds):
@@ -97,7 +99,8 @@ def test_trace_rejects_misreported_critic_lifecycle(tmp_path, metric):
         campaign.validate_trace(bundle, cell, seeds=[101, 102], steps=7)
 
 
-def test_prepare_pins_25_jobs_and_refuses_existing_root(tmp_path, monkeypatch):
+@pytest.mark.parametrize('mode', ['full', 'critic-hidden'])
+def test_prepare_pins_jobs_and_refuses_existing_root(tmp_path, monkeypatch, mode):
     import torch
     from slurm import ambi_closed_loop_checkpoint_sweep as helpers
     from utils import eval_series_data as identities
@@ -121,14 +124,25 @@ def test_prepare_pins_25_jobs_and_refuses_existing_root(tmp_path, monkeypatch):
     monkeypatch.setattr(helpers, 'resolve_config', config)
     monkeypatch.setattr(identities, 'scientific_identity', lambda *a: {'fixture': True})
     args = SimpleNamespace(root=tmp_path/'campaign', inventory=inventory, matrix=None,
-                           prior_matrix=campaign.PRIOR_MATRIX)
+                           prior_matrix=campaign.PRIOR_MATRIX, campaign_mode=mode)
     value = campaign.prepare(args)
-    assert len(value['cells']) == 25
-    assert value['production_indices'] == list(range(25))
-    assert value['smoke_indices'] == list(range(12))
+    hidden = mode == 'critic-hidden'
+    assert len(value['cells']) == (8 if hidden else 25)
+    assert value['production_indices'] == list(range(8 if hidden else 25))
+    assert value['smoke_indices'] == list(range(8 if hidden else 12))
     assert value['cuda_gate_index'] == 0
-    assert value['cells'][24]['transfer_mode'] == 'prior'
-    assert value['cells'][24]['selector'] == 'reference/prior'
+    if hidden:
+        assert value['schema_version'] == 2
+        assert value['kind'] == 'ambi-critic-hidden-transfer-sweep-v1'
+        campaign.validate_hidden_campaign(value)
+        wrong = deepcopy(value)
+        wrong['cells'][0]['requested_alg_params']['inner_critic_transfer_head'] = 'retain'
+        with pytest.raises(ValueError, match='setting identity'):
+            campaign.validate_hidden_campaign(wrong)
+    else:
+        assert value['schema_version'] == 1
+        assert value['cells'][24]['transfer_mode'] == 'prior'
+        assert value['cells'][24]['selector'] == 'reference/prior'
     with pytest.raises(FileExistsError):
         campaign.prepare(args)
 
@@ -151,14 +165,15 @@ def test_receipt_rejects_modified_smoke_gate_output(tmp_path):
         campaign.receipt(root, value, 0, smoke=True, verify=True)
 
 
-@pytest.mark.parametrize('mode', ['fresh', 'actor_only', 'critic_only', 'prior'])
+@pytest.mark.parametrize('mode', ['fresh', 'actor_only', 'critic_only', 'critic_hidden', 'prior'])
 def test_actual_evaluator_bundle_matches_campaign_validation(tmp_path, monkeypatch, mode):
     prior = mode == 'prior'
     import evaluate_ambi_checkpoint as evaluator
     from tests.test_ambi_root_local_sac import _tiny_component_model, _tiny_params
     from utils import eval_series_data as identities
     options = dict(aux_return_mode='sac', inner_actor_scope='episode' if mode == 'actor_only' else 'action',
-        inner_critic_scope='episode' if mode == 'critic_only' else 'action',
+        inner_critic_scope='episode' if mode in ('critic_only', 'critic_hidden') else 'action',
+        inner_critic_transfer_head='random' if mode == 'critic_hidden' else 'retain',
         inner_critic_source='aux_return', inner_horizon_critic_source='aux_return',
         inner_sac_critic_target='reward_only', inner_rebase_persistent=False,
         inner_rounds=1, inner_first_action_rounds=None, inner_rollouts_per_round=128,
@@ -187,6 +202,8 @@ def test_actual_evaluator_bundle_matches_campaign_validation(tmp_path, monkeypat
         comparisons={'test': {'reference': 'arm', 'variants': {'arm': {'alg_params': {}}}}})
     if not prior:
         matrix['study_protocol'] = 'actor-transfer-hold-h-v1' if mode == 'actor_only' else 'critic-transfer-hold-h-v1'
+    if mode == 'critic_hidden':
+        matrix['study_protocol'] = 'critic-hidden-transfer-hold-h-v1'
     path=tmp_path/'matrix.json'; path.write_text(json.dumps(matrix)); bundle=tmp_path/'bundle'
     evaluator.evaluate_matrix(path, checkpoint, bundle_dir=bundle)
     manifest=campaign.read(bundle/'manifest.json'); run=manifest['runs'][0]
@@ -197,6 +214,8 @@ def test_actual_evaluator_bundle_matches_campaign_validation(tmp_path, monkeypat
     (bundle/'manifest.json').write_text(json.dumps(manifest))
     monkeypatch.setattr(identities,'scientific_identity',lambda *a: {'fixture':True})
     record=dict(source_commit='a'*40, checkpoint=str(checkpoint), metadata_sha256=campaign.digest(sidecar), science={'fixture':True})
+    if mode == 'critic_hidden':
+        record['transfer_metadata'] = campaign.HIDDEN_TRANSFER_METADATA
     cell=dict(selector='test/arm', expected_config=run['resolved_config'], transfer_mode=mode,
         J=0 if prior else 1, H=3, solve_interval=1 if prior else 3,
         study_protocol=matrix.get('study_protocol'),

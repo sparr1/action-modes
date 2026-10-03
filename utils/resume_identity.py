@@ -263,6 +263,7 @@ def scientific_trial_parameters(
                     ("inner_actor_initialization", "prior"),
                     ("inner_actor_initial_std", None),
                     ("inner_critic_initialization", "prior"),
+                    ("inner_critic_transfer_head", "retain"),
                     ("inner_critic_loss_coef", 1.0),
                     ("inner_actor_loss_scale_update", "per_action"),
                     ("inner_critic_target_initialization", "online"),

@@ -1,5 +1,10 @@
 # Critic-only transfer at 575k
 
+The opt-in [hidden-layer transfer variant](CRITIC_HIDDEN_TRANSFER_575K.md)
+retains critic hidden layers while randomly resetting its output head at each
+solve. It uses separate protocols and matrices; these full-critic examples
+continue to retain the complete critic.
+
 The separate [H3 transfer sweep](TRANSFER_SWEEP_575K.md) extends these examples
 to J1/J8 and actor-only controls using 24 distinct default configurations.
 The eight examples and their defaults below remain unchanged.

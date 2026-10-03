@@ -43,8 +43,46 @@ DEFAULT_MATRIX = (
 )
 _MAX_NUMPY_SEED = 2**32 - 1
 _ACTOR_TRANSFER_PROTOCOLS = {"actor-transfer-v1", "actor-transfer-v2", "actor-transfer-hold-h-v1"}
-_CRITIC_TRANSFER_PROTOCOLS = {"critic-transfer-v1", "critic-transfer-hold-h-v1"}
-_HOLD_TRANSFER_PROTOCOLS = {"actor-transfer-hold-h-v1", "critic-transfer-hold-h-v1"}
+_CRITIC_HIDDEN_TRANSFER_PROTOCOLS = {"critic-hidden-transfer-v1", "critic-hidden-transfer-hold-h-v1"}
+_CRITIC_TRANSFER_PROTOCOLS = {"critic-transfer-v1", "critic-transfer-hold-h-v1"} | _CRITIC_HIDDEN_TRANSFER_PROTOCOLS
+_HOLD_TRANSFER_PROTOCOLS = {"actor-transfer-hold-h-v1", "critic-transfer-hold-h-v1",
+                            "critic-hidden-transfer-hold-h-v1"}
+
+
+def _validate_critic_transfer_head_protocol(params, study_protocol):
+    """Never publish new-head solves under a historical transfer protocol."""
+    head = params.get("inner_critic_transfer_head", "retain")
+    if study_protocol in _CRITIC_HIDDEN_TRANSFER_PROTOCOLS:
+        if head != "random" or params.get("inner_critic_scope", "action") != "episode":
+            raise ValueError(f"{study_protocol} requires inner_critic_transfer_head='random' and an episode-scoped critic.")
+        if params.get("inner_first_action_rounds") is not None:
+            raise ValueError(f"{study_protocol} requires the selected J at every solve; inner_first_action_rounds must be None.")
+        interval = params.get("inner_solve_interval", 1)
+        if study_protocol in _HOLD_TRANSFER_PROTOCOLS:
+            if interval != params.get("inner_rollout_horizon", 3):
+                raise ValueError(f"{study_protocol} requires inner_solve_interval to equal the imagined rollout horizon.")
+        elif interval != 1:
+            raise ValueError(f"{study_protocol} requires inner_solve_interval=1.")
+        if params.get("aux_return_mode", "off") == "off":
+            raise ValueError(f"{study_protocol} requires auxiliary SAC.")
+        requirements = {
+            "inner_operator": ("sac", "sac"),
+            "inner_actor_adaptation": ("clone", "clone"),
+            "inner_critic_adaptation": ("clone", "clone"),
+            "inner_actor_initialization": ("prior", "prior"),
+            "inner_critic_initialization": ("prior", "prior"),
+            "inner_critic_target_initialization": ("online", "online"),
+            "inner_rebase_persistent": (False, True),
+            "inner_actor_writeback_coef": (0, 0),
+            "inner_critic_writeback_coef": (0, 0),
+            **{f"inner_{component}_scope": ("action", "action") for component in (
+                "actor", "temperature", "replay", "actor_optimizer", "critic_optimizer", "temperature_optimizer")},
+        }
+        for key, (required, default) in requirements.items():
+            if params.get(key, default) != required:
+                raise ValueError(f"{study_protocol} requires {key}={required!r}.")
+    elif head != "retain":
+        raise ValueError("New-head critic evaluation requires a critic-hidden-transfer protocol.")
 
 
 def build_parser():
@@ -687,8 +725,15 @@ def evaluate_preset(
         critic_warm = (params.get("aux_return_mode", "off") != "off"
                        and params.get("inner_critic_scope", "action") == "episode"
                        and params.get("inner_actor_scope", "action") == "action")
-        study_protocol = ("critic-transfer-hold-h-v1" if params.get("inner_solve_interval", 1) > 1
-                          else "critic-transfer-v1") if critic_warm else "actor-transfer-v1"
+        if critic_warm:
+            prefix = ("critic-hidden-transfer" if params.get("inner_critic_transfer_head", "retain") == "random"
+                      else "critic-transfer")
+            study_protocol = prefix + ("-hold-h-v1" if params.get("inner_solve_interval", 1) > 1 else "-v1")
+        else:
+            study_protocol = "actor-transfer-v1"
+    _validate_critic_transfer_head_protocol(params, study_protocol)
+    if study_protocol in _CRITIC_HIDDEN_TRANSFER_PROTOCOLS and not transfer_diagnostics:
+        raise ValueError("Critic-hidden-transfer protocols require transfer diagnostics and bundled to-go probes.")
     checkpoint = Path(checkpoint).resolve()
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint}")
@@ -747,6 +792,16 @@ def evaluate_preset(
                 "replay_temperature_optimizers": "reset_each_solve",
                 "episode_boundary": "reset_all_scientific_inner_state",
             }
+            if study_protocol in _CRITIC_HIDDEN_TRANSFER_PROTOCOLS:
+                transfer_metadata.update(
+                    transfer_mode="critic_hidden_only",
+                    critic_initialization="checkpoint_hidden_layers_at_episode_start_then_previous_solve_hidden_layers",
+                    critic_head_initialization="xavier_uniform_zero_bias_each_solve",
+                    critic_head_reset_at_first_solve=True,
+                    critic_head_extent="final_linear_weight_and_bias_of_each_ensemble_member",
+                    critic_hidden_normalization="retained_and_trainable",
+                    target_initialization="starting_online_critic_after_head_reset_each_solve",
+                )
 
         if bundle is not None:
             from RL.tdmpc2_core.inner_trace import InnerActionTrace
@@ -1190,6 +1245,7 @@ def evaluate_matrix(
         raise ValueError(f"{study_protocol} requires the selected J at every decision that solves; inner_first_action_rounds must be None.")
     for item in resolved_presets:
         params = item["algorithm_config"]["alg_params"]
+        _validate_critic_transfer_head_protocol(params, study_protocol)
         interval = params.get("inner_solve_interval", 1)
         if interval != 1 and not (transfer_diagnostics and study_protocol in _HOLD_TRANSFER_PROTOCOLS):
             raise ValueError("Held-policy evaluation requires a named hold-H transfer protocol and transfer diagnostics.")

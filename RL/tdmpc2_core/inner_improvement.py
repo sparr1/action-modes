@@ -246,6 +246,12 @@ class InnerImprovementEngine(RetraceInnerMixin):
         )
 
     @property
+    def _random_critic_transfer_head(self):
+        return self._aux_critic_transfer and (
+            getattr(self.cfg, "inner_critic_transfer_head", "retain") == "random"
+        )
+
+    @property
     def _actor_source(self):
         return getattr(self.cfg, "inner_actor_source", "sac")
 
@@ -908,6 +914,18 @@ class InnerImprovementEngine(RetraceInnerMixin):
             spec["actor_initial_std"] = float(self.cfg.inner_actor_initial_std)
         return spec if "random" in spec.values() else None
 
+    def _critic_transfer_head_spec(self):
+        """Opt-in resume identity; retain mode keeps historical payloads exact."""
+        if not self._random_critic_transfer_head:
+            return None
+        return {
+            "mode": "random",
+            "protocol_version": 1,
+            "weight_initializer": "xavier_uniform",
+            "bias_initializer": "zeros",
+            "reset_timing": "every_solve_including_first",
+        }
+
     def _split_value_spec(self):
         if not self._split_values:
             return None
@@ -982,6 +1000,9 @@ class InnerImprovementEngine(RetraceInnerMixin):
         }
         if self._aux_return_active:
             payload["control_sources"] = source_metadata(self.cfg)
+        critic_head_spec = self._critic_transfer_head_spec()
+        if critic_head_spec is not None:
+            payload["critic_transfer_head_spec"] = critic_head_spec
         if self._split_values:
             payload["split_value_spec"] = self._split_value_spec()
             payload["workspace"].update(
@@ -1066,6 +1087,17 @@ class InnerImprovementEngine(RetraceInnerMixin):
         }
         lora_rl_spec = self._lora_rl_spec()
         initialization_spec = self._random_initialization_spec()
+        critic_head_spec = self._critic_transfer_head_spec()
+        if ("critic_transfer_head_spec" in state) != (critic_head_spec is not None):
+            raise ValueError("Critic transfer head initialization is incompatible.")
+        if critic_head_spec is not None:
+            saved_spec = require_exact_keys(
+                state["critic_transfer_head_spec"], set(critic_head_spec),
+                "Critic transfer head specification",
+            )
+            if any(type(saved_spec[key]) is not type(value) or saved_spec[key] != value
+                   for key, value in critic_head_spec.items()):
+                raise ValueError("Critic transfer head initialization is incompatible.")
         if self._retrace_enabled != (version == 8):
             raise ValueError("Retrace exact resume requires matching estimator metadata version 8.")
         if self._aux_return_active and version not in {6, 8}:
@@ -1181,6 +1213,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
                     "LoRA-RL inner-engine protocol specification is incompatible: "
                     f"checkpoint={saved_spec!r}, configured={lora_rl_spec!r}."
                 )
+        if critic_head_spec is not None:
+            expected_keys |= {"critic_transfer_head_spec"}
         state = require_exact_keys(
             state,
             expected_keys,
@@ -1671,6 +1705,24 @@ class InnerImprovementEngine(RetraceInnerMixin):
             if isinstance(layer, torch.nn.LayerNorm):
                 layer.reset_parameters()
 
+    @torch.no_grad()
+    def _reset_critic_transfer_heads(self, critic):
+        """Fresh Glorot-uniform output kernels and zero biases, in place.
+
+        This matches the paper's fresh Keras Dense head initialization, not
+        AMBI's full random-critic initializer (which zeroes output weights).
+        Hidden and normalization layers, parameter identities, and optimizer
+        references are preserved. The caller owns the private initialization
+        RNG fork; no head is constructed or reset on a held decision.
+        """
+        heads = [member[-1] for member in critic]
+        if not heads or any(not isinstance(head, torch.nn.Linear) for head in heads):
+            raise ValueError("Critic head transfer requires dense Linear output heads.")
+        for head in heads:
+            torch.nn.init.xavier_uniform_(head.weight)
+            if head.bias is not None:
+                torch.nn.init.zeros_(head.bias)
+
     def _reset_action_component(self, component, module, outer):
         mode = str(getattr(self.cfg, f"inner_{component}_adaptation"))
         initialization = getattr(self.cfg, f"inner_{component}_initialization", "prior")
@@ -1997,6 +2049,11 @@ class InnerImprovementEngine(RetraceInnerMixin):
             if not critic_was_missing:
                 self._refresh_persistent_component("critic", self._critic_base)
 
+        if self._random_critic_transfer_head:
+            # Episode starts restore the full selected checkpoint first;
+            # later solves retain the learned body. Both receive fresh heads.
+            self._reset_critic_transfer_heads(state.critic)
+
         if (
             cfg.inner_bootstrap_source == "inner_target"
             and state.critic_target is None
@@ -2208,11 +2265,14 @@ class InnerImprovementEngine(RetraceInnerMixin):
         """Legacy test/debug hook returning freshly created inner modules."""
         context = (
             self.rng.fork("initialization")
-            if self._random_initialization_spec() is not None else nullcontext()
+            if (self._random_initialization_spec() is not None
+                or self._random_critic_transfer_head) else nullcontext()
         )
         with context:
             actor = self._adapt_module(self._actor_base, "actor")
             critic = self._adapt_module(self._critic_base, "critic")
+            if self._random_critic_transfer_head:
+                self._reset_critic_transfer_heads(critic)
         target = self._new_critic_target(critic)
         actor_optim = self._new_optimizer(actor, "actor")
         critic_optim = self._new_optimizer(critic, "critic")
@@ -6350,6 +6410,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
                            inner_critic_target_reinitialized=0.0,
                            inner_critic_updates_initial=0.0,
                            inner_critic_lifetime_updates=float(self.state.critic_lifetime_steps))
+        if self._random_critic_transfer_head:
+            metrics["inner_critic_head_reinitialized"] = 0.0
         if return_behavior_policy:
             return action[0], metrics, [], None
         return action[0], metrics, []
@@ -6390,6 +6452,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
             "inner_critic_target_reinitialized": 1.0,
             "inner_critic_updates_initial": float(state.critic_lifetime_steps),
         } if self._aux_critic_transfer else {})
+        if self._random_critic_transfer_head:
+            critic_transfer_metrics["inner_critic_head_reinitialized"] = 1.0
         trace = self._active_trace
         if trace is not None:
             trace.record("initial", state, (

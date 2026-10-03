@@ -33,7 +33,8 @@ export MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0
 case "$EVAL_MODE" in
   prepare)
     exec "$PYTHON_BIN" slurm/ambi_transfer_sweep_campaign.py prepare \
-      --root "$CAMPAIGN_ROOT" --inventory "${CHECKPOINT_INVENTORY:?}"
+      --root "$CAMPAIGN_ROOT" --inventory "${CHECKPOINT_INVENTORY:?}" \
+      --campaign-mode "${CAMPAIGN_MODE:-full}"
     ;;
   worker)
     args=(worker --root "$CAMPAIGN_ROOT" --index "${SLURM_ARRAY_TASK_ID:?}")

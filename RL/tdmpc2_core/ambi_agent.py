@@ -932,6 +932,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             ("inner_actor_initialization", "prior"),
             ("inner_actor_initial_std", None),
             ("inner_critic_initialization", "prior"),
+            ("inner_critic_transfer_head", "retain"),
         ):
             value = getattr(self.cfg, key, default)
             if value != default:
