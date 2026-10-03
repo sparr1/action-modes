@@ -236,6 +236,16 @@ class InnerImprovementEngine(RetraceInnerMixin):
         return getattr(self.cfg, "aux_return_mode", "off") != "off"
 
     @property
+    def _aux_critic_transfer(self):
+        """The validated auxiliary-SAC exception to generic critic persistence."""
+        return (
+            self._aux_return_active
+            and self.cfg.inner_operator == "sac"
+            and self.cfg.inner_actor_scope == "action"
+            and self.cfg.inner_critic_scope == "episode"
+        )
+
+    @property
     def _actor_source(self):
         return getattr(self.cfg, "inner_actor_source", "sac")
 
@@ -503,8 +513,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
         training engine.  Each evaluation episode must nevertheless begin from
         a fresh root-local workspace and an episode-private RNG stream. The
         default discards allocations. Opt-in reuse retains only a single-policy,
-        action-scoped allocation pool (including the dense auxiliary actor-only
-        episode-transfer variant); ordinary workspace preparation
+        action-scoped allocation pool (including dense auxiliary actor-only or
+        critic-only episode transfer); ordinary workspace preparation
         applies configured initialization, resets target networks, optimizer
         moments, replay and alpha
         before use. Keeping module identities also avoids recompiling Dynamo
@@ -526,16 +536,19 @@ class InnerImprovementEngine(RetraceInnerMixin):
             and (str(self.cfg.inner_actor_scope) == "action" or (
                 self._aux_return_active and str(self.cfg.inner_actor_scope) == "episode"
             ))
+            and (str(self.cfg.inner_critic_scope) == "action" or self._aux_critic_transfer)
             and all(
                 str(getattr(self.cfg, f"inner_{component}_scope")) == "action"
                 for component in (
-                    "critic", "temperature", "replay",
+                    "temperature", "replay",
                     "actor_optimizer", "critic_optimizer", "temperature_optimizer",
                 )
             )
         )
-        if retain_pool and self._aux_return_active and self.cfg.inner_actor_scope == "episode":
-            # Pool the expired actor too. Its values are restored from the prior
+        if retain_pool and (self._aux_critic_transfer or (
+            self._aux_return_active and self.cfg.inner_actor_scope == "episode"
+        )):
+            # Pool the expired episode component. Its values are restored from the prior
             # before use; only allocation identities survive the episode.
             self._clear_expired(t0=True, include_action=True)
         self.state = InnerWorkspace()
@@ -1497,15 +1510,16 @@ class InnerImprovementEngine(RetraceInnerMixin):
             state.actor_optim = None
 
         if self._scope_expires(cfg.inner_critic_scope, t0=t0, include_action=include_action):
-            if str(cfg.inner_critic_scope) == "action" and state.critic is not None:
-                self._action_pool.critic = state.critic
-                self._action_pool.critic_anchor = state.critic_anchor
-                self._action_pool.critic_target = state.critic_target
-                self._action_pool.critic_optim = state.critic_optim
-                self._action_pool.critic_params = state.critic_params
-                self._action_pool.critic_trainable_count = (
-                    state.critic_trainable_count
-                )
+            if str(cfg.inner_critic_scope) == "action" or self._aux_critic_transfer:
+                if state.critic is not None:
+                    self._action_pool.critic = state.critic
+                    self._action_pool.critic_anchor = state.critic_anchor
+                    self._action_pool.critic_target = state.critic_target
+                    # An action optimizer may already be pooled at episode end.
+                    if state.critic_optim is not None:
+                        self._action_pool.critic_optim = state.critic_optim
+                    self._action_pool.critic_params = state.critic_params
+                    self._action_pool.critic_trainable_count = state.critic_trainable_count
             elif str(cfg.inner_critic_scope) != "action":
                 self._action_pool.critic_optim = None
             state.critic = state.critic_anchor = state.critic_target = None
@@ -1956,12 +1970,12 @@ class InnerImprovementEngine(RetraceInnerMixin):
             state.actor_lifetime_steps = 0
         if critic_was_missing:
             critic_restored = (
-                str(cfg.inner_critic_scope) == "action"
+                (str(cfg.inner_critic_scope) == "action" or self._aux_critic_transfer)
                 and self._restore_action_component("critic", self._critic_base)
             )
             if not critic_restored:
                 state.critic = self._adapt_module(self._critic_base, "critic")
-            if str(cfg.inner_critic_scope) == "action":
+            if str(cfg.inner_critic_scope) == "action" or self._aux_critic_transfer:
                 state.critic_anchor = None
             elif not critic_restored or state.critic_anchor is None:
                 state.critic_anchor = (
@@ -1988,6 +2002,11 @@ class InnerImprovementEngine(RetraceInnerMixin):
             and state.critic_target is None
         ):
             state.critic_target = self._new_critic_target(state.critic)
+        if self._aux_critic_transfer:
+            # Carry only online weights. The target starts every solve at the
+            # online critic, while preserving allocations and compile guards.
+            state.critic_target.load_state_dict(state.critic.state_dict())
+            state.critic_target.requires_grad_(False)
         if (
             state.critic_target is not None
             and bool(getattr(cfg, "compile", False))
@@ -4916,10 +4935,11 @@ class InnerImprovementEngine(RetraceInnerMixin):
 
     def _maybe_update_targets(self, *, critic_updated, actor_updated):
         state, cfg = self.state, self.cfg
+        critic_clock = state.critic_steps if self._aux_critic_transfer else state.critic_lifetime_steps
         if (
             critic_updated
-            and state.critic_lifetime_steps > 0
-            and state.critic_lifetime_steps
+            and critic_clock > 0
+            and critic_clock
             % int(cfg.inner_critic_target_update_interval)
             == 0
             and cfg.inner_bootstrap_source == "inner_target"
@@ -6325,6 +6345,11 @@ class InnerImprovementEngine(RetraceInnerMixin):
         metrics = {key:value for key,value in metrics.items() if "alpha" not in key}
         metrics.update(inner_model_steps_budget=0.0, inner_policy_evaluations=1.0,
                        inner_actor_transferred=0.0, inner_first_action_rounds_applied=0.0)
+        if self._aux_critic_transfer:
+            metrics.update(inner_critic_transferred=0.0,
+                           inner_critic_target_reinitialized=0.0,
+                           inner_critic_updates_initial=0.0,
+                           inner_critic_lifetime_updates=float(self.state.critic_lifetime_steps))
         if return_behavior_policy:
             return action[0], metrics, [], None
         return action[0], metrics, []
@@ -6344,6 +6369,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         actor_transferred = bool(
             state.actor is not None and cfg.inner_actor_scope == "episode" and not t0
         )
+        critic_transferred = bool(self._aux_critic_transfer and state.critic is not None and not t0)
         setup_start = self._timer_start()
         # LoRA adapter initialization uses ordinary PyTorch initializers; fork
         # it onto the private optimization stream so act() cannot advance the
@@ -6359,12 +6385,18 @@ class InnerImprovementEngine(RetraceInnerMixin):
             actor_loss_scale = self._critic_owner.actor_loss_scale.detach().clone()
         alpha_initial = self.alpha.detach().clone()
         actor_lifetime_initial = state.actor_lifetime_steps
+        critic_transfer_metrics = ({
+            "inner_critic_transferred": float(critic_transferred),
+            "inner_critic_target_reinitialized": 1.0,
+            "inner_critic_updates_initial": float(state.critic_lifetime_steps),
+        } if self._aux_critic_transfer else {})
         trace = self._active_trace
         if trace is not None:
             trace.record("initial", state, (
                 {"tdambi_entropy_coef": float(cfg.tdambi_entropy_coef)}
                 if cfg.inner_operator == "tdambi" else {"alpha": alpha_initial}
             ))
+            trace.events[-1]["metrics"].update(critic_transfer_metrics)
             if trace.transfer_probes:
                 trace.events[-1]["metrics"].update(
                     inner_actor_transferred=float(actor_transferred),
@@ -6730,6 +6762,9 @@ class InnerImprovementEngine(RetraceInnerMixin):
             ),
         )
         metrics.update(selector_metrics)
+        if self._aux_critic_transfer:
+            metrics.update(critic_transfer_metrics)
+            metrics["inner_critic_lifetime_updates"] = float(state.critic_lifetime_steps)
         if self._explorer_active:
             replay_sources = state.replay.source[: state.replay.size].float()
             explorer_replay_fraction = (

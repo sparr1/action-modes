@@ -174,16 +174,23 @@ def validate_auxiliary_config(cfg):
         "inner_critic_writeback_coef": 0., "value_equivalence_loss_coef": 0.,
     }
     actor_transfer = cfg.inner_actor_scope == "episode"
-    if actor_transfer:
+    critic_transfer = cfg.inner_critic_scope == "episode"
+    if actor_transfer and critic_transfer:
+        raise ValueError("Auxiliary episode transfer requires only one episode scope: actor or critic.")
+    if actor_transfer or critic_transfer:
         if (cfg.inner_operator != "sac" or cfg.inner_actor_adaptation != "clone"
                 or cfg.inner_critic_adaptation != "clone"
                 or cfg.inner_rebase_persistent):
+            component = "actor" if actor_transfer else "critic"
             raise ValueError(
-                "Auxiliary actor-only episode transfer requires dense SAC actor/critic "
+                f"Auxiliary {component}-only episode transfer requires dense SAC actor/critic "
                 "clones and inner_rebase_persistent=false."
             )
     requirements["inner_actor_scope"] = "episode" if actor_transfer else "action"
-    for component in ("critic", "temperature", "replay", "actor_optimizer", "critic_optimizer", "temperature_optimizer"):
+    requirements["inner_critic_scope"] = "episode" if critic_transfer else "action"
+    if critic_transfer:
+        requirements["inner_critic_target_initialization"] = "online"
+    for component in ("temperature", "replay", "actor_optimizer", "critic_optimizer", "temperature_optimizer"):
         requirements[f"inner_{component}_scope"] = "action"
     for key, value in requirements.items():
         if getattr(cfg, key) != value:

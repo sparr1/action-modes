@@ -42,6 +42,9 @@ DEFAULT_MATRIX = (
     / "ambi_inner_decoupling.json"
 )
 _MAX_NUMPY_SEED = 2**32 - 1
+_ACTOR_TRANSFER_PROTOCOLS = {"actor-transfer-v1", "actor-transfer-v2", "actor-transfer-hold-h-v1"}
+_CRITIC_TRANSFER_PROTOCOLS = {"critic-transfer-v1", "critic-transfer-hold-h-v1"}
+_HOLD_TRANSFER_PROTOCOLS = {"actor-transfer-hold-h-v1", "critic-transfer-hold-h-v1"}
 
 
 def build_parser():
@@ -668,8 +671,24 @@ def evaluate_preset(
     probe_horizon=3,
     togo_return_rollouts=0,
     actor_transfer_diagnostics=False,
+    transfer_diagnostics=False,
+    study_protocol=None,
 ):
     """Evaluate one resolved preset and verify outer-state immutability."""
+    for name, enabled in (("actor_transfer_diagnostics", actor_transfer_diagnostics),
+                          ("transfer_diagnostics", transfer_diagnostics)):
+        if not isinstance(enabled, bool):
+            raise ValueError(f"{name} must be boolean.")
+    transfer_diagnostics = transfer_diagnostics or actor_transfer_diagnostics
+    # Matrix calls carry their study label. Infer a truthful label for direct
+    # critic-only calls while retaining the historical actor default.
+    params = resolved.get("algorithm_config", {}).get("alg_params", {})
+    if study_protocol is None:
+        critic_warm = (params.get("aux_return_mode", "off") != "off"
+                       and params.get("inner_critic_scope", "action") == "episode"
+                       and params.get("inner_actor_scope", "action") == "action")
+        study_protocol = ("critic-transfer-hold-h-v1" if params.get("inner_solve_interval", 1) > 1
+                          else "critic-transfer-v1") if critic_warm else "actor-transfer-v1"
     checkpoint = Path(checkpoint).resolve()
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint}")
@@ -693,8 +712,8 @@ def evaluate_preset(
         raise ValueError("togo_return_rollouts must be a nonnegative integer.")
     if togo_return_rollouts and bundle is None:
         raise ValueError("To-go return probes require a benchmark bundle.")
-    if actor_transfer_diagnostics and (not togo_return_rollouts or bundle is None or root_bank is not None or bank_only):
-        raise ValueError("Actor-transfer diagnostics require full episodes with bundled to-go probes.")
+    if transfer_diagnostics and (not togo_return_rollouts or bundle is None or root_bank is not None or bank_only):
+        raise ValueError("Transfer diagnostics require full episodes with bundled to-go probes.")
 
     env = _make_env(resolved)
     model = None
@@ -716,13 +735,27 @@ def evaluate_preset(
         episodes = []
         bank_metric_values = {}
         togo_rows = []
+        transfer_metadata = {}
+        if study_protocol in _CRITIC_TRANSFER_PROTOCOLS:
+            critic_warm = model.cfg.inner_critic_scope == "episode"
+            transfer_metadata = {
+                "transfer_mode": "critic_only" if critic_warm else "fresh",
+                "actor_initialization": "checkpoint_prior_each_solve",
+                "critic_initialization": ("previous_solve_online_with_checkpoint_at_episode_start"
+                                          if critic_warm else "checkpoint_prior_each_solve"),
+                "target_initialization": "starting_online_critic_each_solve",
+                "replay_temperature_optimizers": "reset_each_solve",
+                "episode_boundary": "reset_all_scientific_inner_state",
+            }
 
         if bundle is not None:
             from RL.tdmpc2_core.inner_trace import InnerActionTrace
             bundle_run["initialization_seconds"] = time.perf_counter() - started
             bundle_run["resolved_config"] = _jsonable(vars(model.cfg))
-            if actor_transfer_diagnostics:
-                bundle_run["study_protocol"] = "actor-transfer-v1"
+            if transfer_metadata:
+                bundle_run["transfer"] = transfer_metadata
+            if transfer_diagnostics:
+                bundle_run["study_protocol"] = study_protocol
                 bundle_run["transfer_timing"] = {
                     "prediction_seconds": "Wall time of model.predict, including trace collection and probes.",
                     "control_seconds": "Prediction wall time minus measured probe durations; retains trace materialization and host overhead.",
@@ -834,7 +867,7 @@ def evaluate_preset(
                     captured_roots.append(capture_root(observation, seed, episode_steps, episode_return))
                 trace = (InnerActionTrace(
                     probes=True, probe_mode="outer_tail",
-                    transfer_probes=actor_transfer_diagnostics,
+                    transfer_probes=transfer_diagnostics,
                     probe_rollouts=togo_return_rollouts,
                     probe_horizon=int(model.cfg.inner_rollout_horizon),
                     probe_seed=solver_seed(controller_seed, "togo_probe", seed, episode_steps),
@@ -888,7 +921,7 @@ def evaluate_preset(
                     togo_metrics = {f"inner_{key}": value for key, value in probes[-1].items()
                                     if key.startswith("togo_")}
                 control_seconds += action_seconds
-                if actor_transfer_diagnostics:
+                if transfer_diagnostics:
                     latency_samples.append({"decision_index": episode_steps,
                         "prediction_seconds": prediction_seconds, "control_seconds": action_seconds,
                         "diagnostic_seconds": probe_seconds,
@@ -918,7 +951,7 @@ def evaluate_preset(
                                     "decision/reward": float(reward),
                                     **({"decision/prediction_seconds": prediction_seconds,
                                         "decision/diagnostic_seconds": probe_seconds}
-                                       if actor_transfer_diagnostics else {}),
+                                       if transfer_diagnostics else {}),
                                     "decision/control_seconds": action_seconds},
                         "nonfinite": {f"decision/{key}": value for key, value in nonfinite_metrics.items()},
                     })
@@ -959,7 +992,7 @@ def evaluate_preset(
                         "held_control_seconds": sum(row["control_seconds"] for row in latency_samples
                                                     if row["policy_held"]),
                         "control_seconds_per_decision": control_seconds / episode_steps}
-                       if actor_transfer_diagnostics else {}),
+                       if transfer_diagnostics else {}),
                     **({"togo_probe_seconds": episode_probe_seconds,
                         "togo_probe_model_steps": episode_probe_model_steps,
                         "togo_round_summaries": _togo_round_summaries(episode_togo_rows)}
@@ -1014,7 +1047,8 @@ def evaluate_preset(
             "outer_updates_after": updates_after,
             "outer_state_unchanged": True,
             "resolved_config": _jsonable(vars(model.cfg)),
-            **({"study_protocol": "actor-transfer-v1"} if actor_transfer_diagnostics else {}),
+            **({"study_protocol": study_protocol} if transfer_diagnostics else {}),
+            **({"transfer": transfer_metadata} if transfer_metadata else {}),
             **({"togo_return_probe": bundle_run["togo_return_probe"],
                 "togo_round_summaries": _togo_round_summaries(togo_rows)}
                if togo_return_rollouts else {}),
@@ -1101,14 +1135,19 @@ def evaluate_matrix(
     probe_horizon = evaluation.get("diagnostic_horizon", 3)
     togo_return_rollouts = evaluation.get("togo_return_rollouts", 0)
     actor_transfer_diagnostics = evaluation.get("actor_transfer_diagnostics", False)
+    transfer_diagnostics = evaluation.get("transfer_diagnostics", False)
     study_protocol = matrix.get("study_protocol")
-    if not isinstance(actor_transfer_diagnostics, bool):
-        raise ValueError("evaluation.actor_transfer_diagnostics must be boolean.")
-    if actor_transfer_diagnostics and (study_protocol not in {
-            "actor-transfer-v1", "actor-transfer-v2", "actor-transfer-hold-h-v1"}
+    for name, enabled in (("actor_transfer_diagnostics", actor_transfer_diagnostics),
+                          ("transfer_diagnostics", transfer_diagnostics)):
+        if not isinstance(enabled, bool):
+            raise ValueError(f"evaluation.{name} must be boolean.")
+    transfer_diagnostics = transfer_diagnostics or actor_transfer_diagnostics
+    if transfer_diagnostics and (study_protocol not in _ACTOR_TRANSFER_PROTOCOLS | _CRITIC_TRANSFER_PROTOCOLS
             or not togo_return_rollouts or bundle_dir is None
             or save_root_bank or root_bank_path or bank_only):
-        raise ValueError("Actor-transfer diagnostics require a named actor-transfer full-episode protocol and bundled to-go probes.")
+        raise ValueError("Transfer diagnostics require a named transfer full-episode protocol and bundled to-go probes.")
+    if study_protocol in _CRITIC_TRANSFER_PROTOCOLS and not transfer_diagnostics:
+        raise ValueError("Critic-transfer protocols require transfer diagnostics and bundled to-go probes.")
     if (isinstance(togo_return_rollouts, bool) or not isinstance(togo_return_rollouts, int)
             or togo_return_rollouts < 0):
         raise ValueError("evaluation.togo_return_rollouts must be a nonnegative integer.")
@@ -1144,7 +1183,7 @@ def evaluate_matrix(
         raise ValueError("--metadata requires a checkpoint-based preset matrix.")
     resolved_presets = [resolve_preset(matrix_path, selector, matrix=matrix, checkpoint_context=context)
                         for selector in selectors]
-    if study_protocol in {"actor-transfer-v2", "actor-transfer-hold-h-v1"} and any(
+    if study_protocol in {"actor-transfer-v2", "actor-transfer-hold-h-v1"} | _CRITIC_TRANSFER_PROTOCOLS and any(
         item["algorithm_config"]["alg_params"].get("inner_first_action_rounds") is not None
         for item in resolved_presets
     ):
@@ -1152,12 +1191,29 @@ def evaluate_matrix(
     for item in resolved_presets:
         params = item["algorithm_config"]["alg_params"]
         interval = params.get("inner_solve_interval", 1)
-        if interval != 1 and not (actor_transfer_diagnostics and study_protocol == "actor-transfer-hold-h-v1"):
-            raise ValueError("Held-policy evaluation requires the actor-transfer-hold-h-v1 protocol and transfer diagnostics.")
-        if (study_protocol == "actor-transfer-hold-h-v1"
+        if interval != 1 and not (transfer_diagnostics and study_protocol in _HOLD_TRANSFER_PROTOCOLS):
+            raise ValueError("Held-policy evaluation requires a named hold-H transfer protocol and transfer diagnostics.")
+        if (study_protocol in _HOLD_TRANSFER_PROTOCOLS
                 and params.get("inner_operator", "sac") != "none"
                 and interval != params.get("inner_rollout_horizon", 3)):
-            raise ValueError("actor-transfer-hold-h-v1 requires inner_solve_interval to equal the imagined rollout horizon.")
+            raise ValueError(f"{study_protocol} requires inner_solve_interval to equal the imagined rollout horizon.")
+        if study_protocol in _CRITIC_TRANSFER_PROTOCOLS:
+            if (params.get("inner_operator", "sac") != "sac"
+                    or params.get("aux_return_mode", "off") == "off"
+                    or params.get("inner_actor_scope", "action") != "action"
+                    or params.get("inner_critic_scope", "action") not in {"action", "episode"}):
+                raise ValueError("Critic-transfer protocols require auxiliary SAC with fresh actors and fresh or episode-scoped critics.")
+            requirements = {
+                "inner_actor_adaptation": ("clone", "clone"),
+                "inner_critic_adaptation": ("clone", "clone"),
+                "inner_actor_initialization": ("prior", "prior"),
+                "inner_critic_initialization": ("prior", "prior"),
+                "inner_critic_target_initialization": ("online", "online"),
+                "inner_rebase_persistent": (False, True),
+            }
+            for key, (required, default) in requirements.items():
+                if params.get(key, default) != required:
+                    raise ValueError(f"{study_protocol} requires {key}={required!r}.")
     _validate_frozen_selection(matrix, resolved_presets)
     _validate_checkpoint_contract(matrix, checkpoint, context, resolved_presets)
     if togo_return_rollouts and any(
@@ -1201,8 +1257,10 @@ def evaluate_matrix(
                 raise ValueError("Benchmark bundles currently support prior-only, SAC, TDAMBI, and MPPI presets.")
             scopes = [key for key in params if key.startswith("inner_") and key.endswith("_scope")
                       and key != "inner_mppi_warm_start_scope"]
+            allowed_scope = ("inner_critic_scope" if study_protocol in _CRITIC_TRANSFER_PROTOCOLS
+                             else "inner_actor_scope")
             if any(params[key] != "action" and not (
-                    actor_transfer_diagnostics and key == "inner_actor_scope" and params[key] == "episode")
+                    transfer_diagnostics and key == allowed_scope and params[key] == "episode")
                    for key in scopes):
                 raise ValueError("Benchmark presets require fresh action-local inner state.")
             if any(params.get(key, 0) for key in ("inner_actor_writeback_coef", "inner_critic_writeback_coef")):
@@ -1277,8 +1335,9 @@ def evaluate_matrix(
                     probe_rollouts=probe_rollouts, probe_horizon=probe_horizon,
                     togo_return_rollouts=togo_return_rollouts,
                     actor_transfer_diagnostics=actor_transfer_diagnostics,
+                    transfer_diagnostics=transfer_diagnostics, study_protocol=study_protocol,
                 )
-                if actor_transfer_diagnostics:
+                if transfer_diagnostics:
                     # The matrix owns this descriptive study version. Keep the
                     # shared numerical evaluator unchanged for J10 equivalence.
                     result["study_protocol"] = study_protocol
@@ -1296,7 +1355,7 @@ def evaluate_matrix(
                     bundle.finish_run(bundle_run, result=result)
             except BaseException as exc:
                 if bundle is not None:
-                    if actor_transfer_diagnostics:
+                    if transfer_diagnostics:
                         bundle_run["study_protocol"] = study_protocol
                     try:
                         bundle.finish_run(bundle_run, error=exc)

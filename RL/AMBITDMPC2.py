@@ -2980,6 +2980,8 @@ class AMBITDMPC2(TDMPC2Baseline):
                 or cfg.inner_actor_adaptation != "clone"
                 or cfg.inner_critic_adaptation != "clone"
                 or cfg.inner_actor_scope not in {"action", "episode"}
+                or cfg.inner_critic_scope not in {"action", "episode"}
+                or (cfg.inner_actor_scope == "episode" and cfg.inner_critic_scope == "episode")
                 or cfg.inner_sac_return_estimator != "one_step"
                 or cfg.inner_eval_execution_action != "mean"
                 or cfg.inner_explorer_mode != "none"
@@ -2987,14 +2989,14 @@ class AMBITDMPC2(TDMPC2Baseline):
                 or cfg.inner_actor_writeback_coef != 0.0
                 or cfg.inner_critic_writeback_coef != 0.0
                 or any(getattr(cfg, f"inner_{component}_scope") != "action"
-                       for component in ("critic", "temperature", "replay", "actor_optimizer",
+                       for component in ("temperature", "replay", "actor_optimizer",
                                          "critic_optimizer", "temperature_optimizer"))
             ):
                 raise ValueError(
                     "inner_solve_interval>1 requires state observations, active "
                     "dense auxiliary one-step SAC, uniform canonical critic-first "
-                    "rounds, mean evaluation, actor scope action/episode, all other "
-                    "scopes action, and no explorer or prior writeback."
+                    "rounds, mean evaluation, action scopes or actor-only/critic-only "
+                    "episode transfer, and no explorer or prior writeback."
                 )
         cfg.inner_terminal_entropy = _normalize_choice(
             cfg.inner_terminal_entropy, "inner_terminal_entropy", {"none", "outer"},

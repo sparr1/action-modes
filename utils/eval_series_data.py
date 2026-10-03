@@ -476,6 +476,21 @@ def planner_identity(config, result, algorithm, action_rule):
         semantics.update(evaluation_protocol="actor-transfer-hold-h-v1",
                          solve_interval=int(config["inner_solve_interval"]),
                          held_action="cached_feedback_actor_at_current_observation")
+    # Only the newly supported auxiliary critic-only lifecycle receives these
+    # semantics. Keep historical fresh, actor-only, and generic persistence
+    # identities byte-for-byte compatible with their existing structure.
+    if (operator == "sac" and config.get("aux_return_mode", "off") != "off"
+            and config.get("inner_actor_scope", "action") == "action"
+            and config.get("inner_critic_scope", "action") == "episode"):
+        semantics.update(
+            evaluation_protocol=("critic-transfer-hold-h-v1"
+                                 if config.get("inner_solve_interval", 1) > 1 else "critic-transfer-v1"),
+            transfer_component="online_inner_critic",
+            actor_initialization="checkpoint_prior_each_solve",
+            target_initialization="starting_online_critic_each_solve",
+            replay_temperature_optimizers="reset_each_solve",
+            episode_boundary="reset_all_scientific_inner_state",
+        )
     return {"type": operator, "backend": algorithm, "action_rule": action_rule,
             **({"semantics": semantics} if semantics else {}),
             "settings": {**shared, **active}}
@@ -627,6 +642,12 @@ def descriptive_label(identity, selector=None):
         bootstrap = "inner Q"
     title = f"{planner['type'].upper()} {'/'.join(budgets)} {bootstrap}"
     title += f" J{rounds}/N{settings.get('inner_rollouts_per_round')}/H{settings.get('inner_rollout_horizon')}"
+    if planner.get("semantics", {}).get("transfer_component") == "online_inner_critic":
+        critic = "return" if settings.get("inner_critic_source", "sac") == "aux_return" else "soft"
+        tail = "return" if settings.get("inner_horizon_critic_source", "sac") == "aux_return" else "soft"
+        title += f" critic-only transfer ({critic}/{tail})"
+        if settings.get("inner_solve_interval", 1) > 1:
+            title += f" hold{settings['inner_solve_interval']}"
     if settings.get("inner_first_action_rounds") is not None:
         title += " actor-warm" if settings.get("inner_actor_scope") == "episode" else " cold"
         title += f" firstJ{settings['inner_first_action_rounds']}"

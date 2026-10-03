@@ -1,5 +1,18 @@
 # Frozen-checkpoint AMBI research
 
+The [H3 transfer sweep](TRANSFER_SWEEP_575K.md) crosses J1/J8, fresh/actor-only/
+critic-only initialization, soft/soft versus return/return critics, and
+every-decision/hold-H cadences. Its four matrices select 24 unique conditions
+by default, evaluating each shared fresh reference once. A fifth matrix adds
+the same-checkpoint frozen-prior mean reference on the five paired seeds.
+
+The [575k critic-only transfer examples](CRITIC_TRANSFER_575K.md) compare fresh
+and carried online critics for both soft/soft and return/return objectives,
+with every-decision and hold-H solve cadences. The actor resets at each solve;
+the target is freshly copied from the retained online critic. Each matrix
+defaults to only the return-only carried-critic example and uses the generic
+frozen evaluator with local output bundles.
+
 The [H-decision actor-hold study](ACTOR_TRANSFER_HOLD_H_575K.md) solves at
 t=0,H,2H,… and evaluates the fixed adapted feedback actor on fresh observations
 between solves, across the same H/J cold-versus-warm panel.

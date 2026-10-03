@@ -1616,7 +1616,7 @@ does not remove its learned future entropy. Selecting a missing return actor or
 auxiliary critic fails validation.
 
 Supported operators are prior-only operation, canonical action-local
-finite-horizon SAC, actor-only episode transfer below, and MPPI. SAC requires
+finite-horizon SAC, actor-only or critic-only episode transfer below, and MPPI. SAC requires
 prior initialization and the normal inner-target bootstrap. Explorer populations,
 other persistent auxiliary inner state, prior
 writeback, TD3, native TDAMBI, and auxiliary value-equivalence training are
@@ -1670,10 +1670,11 @@ the episode length is not divisible by H.
 
 Intervals above 1 currently require state observations, evaluation mode,
 dense auxiliary one-step SAC, uniform positive J, canonical critic-first
-component updates, mean execution, no explorer/writeback, and action-scoped
-non-actor components. The actor may have action scope (reset at each solve)
-or episode scope (retain weights between solves). Critic, target, replay,
-temperature and optimizer states are fresh at each solve. Episode boundaries,
+component updates, mean execution and no explorer/writeback. In the actor-only
+protocol, the actor may have action scope (reset at each solve) or episode scope
+(retain weights between solves); every other component has action scope.
+The separate critic-only protocol below instead retains only the online critic.
+Replay, temperature and optimizer states are fresh at each solve. Episode boundaries,
 evaluation resets and checkpoint loads discard the held policy and cadence
 clock. This evaluation cache is not a training-resume state.
 
@@ -1727,6 +1728,40 @@ fall inside the inclusive update timer, so overhead must be removed consistently
 when reporting learner-only time. Evaluation allocation reuse preserves tensor
 identities across episode resets to avoid needless compiler guards; all
 scientific values still reset, including the carried actor.
+
+### Auxiliary critic-only episode transfer
+
+For a dense auxiliary SAC ablation, `inner_actor_scope="action"` with
+`inner_critic_scope="episode"` retains the adapted online critic between
+solves while starting the actor from its selected frozen prior every time.
+The first solve of each episode initializes the online critic from the selected
+checkpoint critic. `inner_critic_target_initialization="online"` is required:
+the target critic is freshly copied from the retained online critic at each
+solve, then updated normally within that solve. The previous lagged target
+does not carry over.
+
+Both adaptation modes must be `"clone"`, `inner_rebase_persistent=false`, and
+all other component scopes must be `"action"`. Replay, temperature and all
+optimizers reset at every solve. Only the critic's diagnostic cumulative update
+count persists within an episode; per-solve counters and the target-update
+cadence restart at zero. Joint actor-and-critic persistence is rejected
+for the auxiliary route. The outer model and horizon actor/critic stay frozen;
+retaining an inner critic never writes it into the terminal prior. Episode
+boundaries, evaluation resets and checkpoint loads discard transferred values
+and any cached feedback actor. Reusing evaluation allocations can preserve
+tensor identities for compilation while resetting all expired scientific
+values and counters.
+
+Critic-only transfer also supports the evaluation solve interval described
+above. During held decisions, the last adapted actor supplies feedback mean
+actions without learning. At the next solve its weights reset, while the online
+critic is retained. Uniform J and all other held-policy restrictions remain in
+force. The eight [575k examples](../../configs/research/CRITIC_TRANSFER_575K.md)
+cover fresh/critic-only initialization, soft/soft and return/return objectives,
+and every-decision/hold-H cadences through the frozen evaluator. They enable
+`evaluation.transfer_diagnostics` and record the same per-stage critic and
+actor probes as the actor-transfer route. These probes observe value estimates;
+they do not establish real-return accuracy.
 
 ### Checkpoints, evaluation, and rendering
 
