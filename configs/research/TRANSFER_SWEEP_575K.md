@@ -101,7 +101,16 @@ calibrated full-episode values. The study does not train the outer model or
 replace its terminal critic.
 
 GPU smoke checks use short episodes and separate output directories; they are
-not substituted for full results. Resume only complete, identity-verified
+not substituted for full results. The CUDA fixture gate separately checks
+eager/compiled numerical parity with critic dropout disabled and exact
+reproducibility between two compiled controllers with critic dropout enabled.
+Eager CUDA and Inductor may generate different dropout masks from the same seed,
+so stochastic eager/compiled weight equality is not a valid parity criterion.
+Both fixture paths check critic carry-over, target and optimizer resets,
+allocation reuse, held decisions, episode boundaries and checkpoint loads.
+These fixture choices do not change the production dropout configuration.
+
+Resume only complete, identity-verified
 results or previously submitted work for the same campaign, preserving outputs
 and avoiding duplicate evaluations. The historical actor-transfer launchers and
 publishers remain unchanged. New campaign outputs use their own directories;

@@ -1,9 +1,11 @@
 """Opt-in CUDA lifecycle gate, complementary to real-checkpoint campaign smokes.
 
-The fixture uses five distributional Q heads, both selected critic semantics,
-H3/J1/C2/A2 and two seven-decision episodes. It checks exact solve boundaries
-on CUDA while comparing eager and strict Inductor execution. Production model
-shapes, the 575K weights, and J1/J8 campaign cells are checked by campaign smokes.
+Each case separately checks deterministic eager/Inductor numerical parity and
+the original dropout-enabled lifecycle with two strict-compiled replicas.
+Inductor's CUDA dropout need not draw the same masks as eager CUDA from an
+identical seed; a direct dropout probe records that distinction. Both fixtures
+use five distributional Q heads, H3/J1/C2/A2 and two seven-decision episodes.
+Production shapes, 575K weights and J1/J8 cells remain campaign smoke checks.
 """
 
 import gc
@@ -65,34 +67,97 @@ def _instrument_boundaries(model):
     return observed
 
 
-def _assert_close_modules(left, right):
+def _assert_close_modules(left, right, *, context, exact=False):
+    """Check every named parameter, reporting where a numerical drift occurs."""
+    drift = {}
     for name in ("actor", "critic", "critic_target"):
         a = getattr(left.state, name) or getattr(left._action_pool, name)
         b = getattr(right.state, name) or getattr(right._action_pool, name)
-        for parameter_a, parameter_b in zip(a.parameters(), b.parameters()):
-            torch.testing.assert_close(parameter_a, parameter_b, atol=2e-5, rtol=2e-4)
+        reference, actual = dict(a.named_parameters()), dict(b.named_parameters())
+        assert reference.keys() == actual.keys()
+        maximum = 0.
+        maximum_parameter = None
+        for parameter_name, parameter_a in reference.items():
+            parameter_b = actual[parameter_name]
+            difference = (parameter_a - parameter_b).abs().max().item()
+            if difference > maximum:
+                maximum, maximum_parameter = difference, parameter_name
+            torch.testing.assert_close(
+                parameter_b, parameter_a,
+                atol=0 if exact else 2e-5, rtol=0 if exact else 2e-4,
+                msg=lambda message, component=name, parameter=parameter_name:
+                    f"{context}: {component}.{parameter}\n{message}",
+            )
+        drift[name] = {"max_absolute_difference": maximum, "parameter": maximum_parameter}
+    return drift
 
 
-def _run_fixture_gate(critic, interval, *, device="cuda", compile_enabled=True):
+def _dropout_rng_probe(device):
+    """Observe cross-backend masks and require same-backend seeded replay."""
+    device = torch.device(device)
+    devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+    before = _global_rng(device)
+    probability = .01
+    values = torch.ones(2048, device=device)
+
+    def dropout(x):
+        return torch.nn.functional.dropout(x, p=probability, training=True)
+
+    with torch.random.fork_rng(devices=devices), torch.no_grad():
+        compiled = torch.compile(dropout, fullgraph=True, dynamic=False)
+        compiled(values)  # Pay lazy compilation before the paired draws.
+
+        def draw(function):
+            torch.random.default_generator.manual_seed(173)
+            if device.type == "cuda":
+                torch.cuda.manual_seed(173)
+            result = function(values)
+            return result, _global_rng(device)
+
+        eager, eager_rng = draw(dropout)
+        first, first_rng = draw(compiled)
+        repeat, repeat_rng = draw(compiled)
+        torch.testing.assert_close(first, repeat, rtol=0, atol=0)
+        _assert_tree_equal(first_rng, repeat_rng)
+    _assert_tree_equal(_global_rng(device), before)
+    return {
+        "probability": probability, "elements": values.numel(),
+        "same_seed_eager_compiled_masks_equal": bool(torch.equal(eager == 0, first == 0)),
+        "differing_mask_elements": int(torch.count_nonzero((eager == 0) != (first == 0)).item()),
+        "same_seed_eager_compiled_post_rng_equal": all(torch.equal(eager_rng[k], first_rng[k]) for k in eager_rng),
+        "compiled_same_seed_replay_exact": True,
+        "global_rng_preserved": True,
+    }
+
+
+def _run_fixture_gate(critic, interval, *, device="cuda", compile_enabled=True,
+                      reference_compile=False, inner_critic_dropout_enabled=False):
     started = time.perf_counter()
     params = critic_params(
         critic, device=device, inner_rollout_horizon=3, inner_solve_interval=interval,
         train_unroll_horizon=3, q_representation="distributional", num_q=5,
         dropout=.01, inner_critic_target_update_interval=3,
+        inner_critic_dropout_enabled=inner_critic_dropout_enabled,
     )
-    eager = compiled = None
+    exact = reference_compile == compile_enabled
+    comparison = "compiled_stochastic_reproducibility" if reference_compile else "eager_compiled_deterministic_parity"
+    require_coupled_dropout = inner_critic_dropout_enabled and not exact
+    if require_coupled_dropout:
+        raise ValueError("Cross-backend numerical parity must disable inner dropout; seeded masks are backend-specific.")
+    reference = compiled = None
     try:
-        eager = _model_from_params(params)
+        reference = _model_from_params(dict(params, compile=reference_compile, compile_strict=True))
         compiled = _model_from_params(dict(params, compile=compile_enabled, compile_strict=True))
-        assert eager.agent.device.type == compiled.agent.device.type == torch.device(device).type
-        checkpoint = _clone_tree(eager.agent.checkpoint_state())
+        assert reference.agent.device.type == compiled.agent.device.type == torch.device(device).type
+        checkpoint = _clone_tree(reference.agent.checkpoint_state())
         compiled.agent.load(checkpoint)
-        models = (eager, compiled)
+        models = (reference, compiled)
         observers = [_instrument_boundaries(model) for model in models]
         outer = [_clone_tree(model.agent.checkpoint_state()) for model in models]
         solve_count = 0
         max_action_difference = 0.
-        global_rng = _global_rng(eager.agent.device)
+        module_drift = {}
+        global_rng = _global_rng(reference.agent.device)
         for seed in (101, 102):
             for model in models:
                 model.agent.inner_engine.reset_for_evaluation(seed, reuse_action_pool=True)
@@ -149,10 +214,17 @@ def _run_fixture_gate(critic, interval, *, device="cuda", compile_enabled=True):
                                 parameter.add_(3.)
                     _assert_tree_equal(model.agent.checkpoint_state(), frozen)
                     _assert_tree_equal(_global_rng(engine.device), global_rng)
-                torch.testing.assert_close(actions[0], actions[1], atol=2e-5, rtol=2e-4)
+                context = f"{comparison}, critic={critic}, interval={interval}, seed={seed}, decision={decision}"
+                torch.testing.assert_close(actions[1], actions[0], atol=0 if exact else 2e-5,
+                                           rtol=0 if exact else 2e-4,
+                                           msg=lambda message: f"{context}: executed action\n{message}")
                 max_action_difference = max(max_action_difference, (actions[0] - actions[1]).abs().max().item())
-                _assert_close_modules(eager.agent.inner_engine, compiled.agent.inner_engine)
-                _assert_tree_equal(eager.agent.inner_engine.rng.training_state_dict(),
+                drift = _assert_close_modules(reference.agent.inner_engine, compiled.agent.inner_engine,
+                                              context=context, exact=exact)
+                for component, values in drift.items():
+                    if component not in module_drift or values["max_absolute_difference"] > module_drift[component]["max_absolute_difference"]:
+                        module_drift[component] = {**values, "seed": seed, "decision": decision}
+                _assert_tree_equal(reference.agent.inner_engine.rng.training_state_dict(),
                                    compiled.agent.inner_engine.rng.training_state_dict())
                 solve_count += not held
         for model, observer in zip(models, observers):
@@ -165,10 +237,14 @@ def _run_fixture_gate(critic, interval, *, device="cuda", compile_enabled=True):
             assert model.agent.last_inner_metrics["inner_critic_updates_initial"] == 0
             assert model.agent.last_inner_metrics["inner_compile_fallback"] == 0
             _assert_tree_equal(model.agent.checkpoint_state(), checkpoint)
-        if eager.agent.device.type == "cuda":
-            torch.cuda.synchronize(eager.agent.device)
+        if reference.agent.device.type == "cuda":
+            torch.cuda.synchronize(reference.agent.device)
         return {
             "passed": True, "fixture": "tiny-five-head-distributional-critic-transfer",
+            "comparison": comparison, "reference_compile": reference_compile,
+            "inner_critic_dropout_enabled": inner_critic_dropout_enabled,
+            "module_dropout_probability": .01,
+            "comparison_atol": 0 if exact else 2e-5, "comparison_rtol": 0 if exact else 2e-4,
             "production_checkpoint_tested": False, "critic": critic, "solve_interval": interval,
             "H": 3, "J": 1, "C": 2, "A": 2, "seeds": [101, 102], "decisions_per_episode": 7,
             "solves_per_controller": solve_count, "checkpoint_load_followup_solves_per_controller": 1,
@@ -177,17 +253,19 @@ def _run_fixture_gate(critic, interval, *, device="cuda", compile_enabled=True):
             "target_clock_restarted": True, "optimizer_references_and_reset": True,
             "allocation_reuse": True, "held_state_and_rng_unchanged": True,
             "outer_state_unchanged": True, "checkpoint_load_clears_transfer": True,
-            "eager_compiled_action_max_absolute_difference": max_action_difference,
-            "device": (torch.cuda.get_device_name(eager.agent.device)
-                       if eager.agent.device.type == "cuda" else "cpu"),
+            "paired_action_max_absolute_difference": max_action_difference,
+            "paired_module_maximum_drift": module_drift,
+            "private_rng_states_equal": True,
+            "device": (torch.cuda.get_device_name(reference.agent.device)
+                       if reference.agent.device.type == "cuda" else "cpu"),
             "torch": torch.__version__, "elapsed_seconds": time.perf_counter() - started,
             "source_commit": os.environ.get("EXPECTED_ACTION_MODES_SHA"),
         }
     finally:
-        for model in (eager, compiled):
+        for model in (reference, compiled):
             if model is not None:
                 model.close()
-        del eager, compiled
+        del reference, compiled
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -201,7 +279,20 @@ def test_cuda_critic_transfer_lifecycle_and_strict_compile_parity(critic, interv
     assert torch.cuda.is_available(), "Requested critic-transfer CUDA gate requires a GPU."
     output = Path(os.environ["AMBI_CRITIC_TRANSFER_GATE_OUTPUT_ROOT"])
     assert output.is_dir(), "Create a fresh CUDA gate output directory before running."
-    result = _run_fixture_gate(critic, interval)
+    rng_probe = _dropout_rng_probe("cuda")
+    print("CRITIC_TRANSFER_DROPOUT_RNG_PROBE " + json.dumps(rng_probe, sort_keys=True), flush=True)
+    deterministic = _run_fixture_gate(critic, interval, inner_critic_dropout_enabled=False)
+    stochastic = _run_fixture_gate(critic, interval, reference_compile=True,
+                                   inner_critic_dropout_enabled=True)
+    result = {
+        "passed": True, "compile_strict": True, "compile_fallback": False,
+        "source_commit": os.environ.get("EXPECTED_ACTION_MODES_SHA"),
+        "production_checkpoint_tested": False, "critic": critic, "solve_interval": interval,
+        "dropout_rng_probe": rng_probe,
+        "deterministic_numerical_parity": deterministic,
+        "default_dropout_compiled_lifecycle": stochastic,
+        "rng_expectation": "Private explicit/phase seed streams agree; each controller preserves global RNG. Implicit dropout masks are compared only within the same backend.",
+    }
     with (output / f"critic-{critic}-interval{interval}.json").open("x") as stream:
         json.dump(result, stream, indent=2, allow_nan=False)
         stream.write("\n")
