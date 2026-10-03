@@ -116,3 +116,26 @@ and avoiding duplicate evaluations. The historical actor-transfer launchers and
 publishers remain unchanged. New campaign outputs use their own directories;
 the generic evaluator writes bundles and JSON without automatically publishing
 W&B results.
+
+## W&B publication
+
+Attach `slurm/run_ambi_transfer_sweep_publish_oscar.sbatch` as a separate CPU
+job to publish a running or completed campaign. Submit from a clean publisher
+checkout with `CAMPAIGN_ROOT`, a sibling `PUBLICATION_ROOT`,
+`EXPECTED_PUBLISHER_SHA` and `GPU_JOB_IDS`. Keep the evaluation checkout at its
+original revision: pending GPU workers verify that revision before starting.
+
+The publisher creates an overview in `rwgao_b-brown-university/ambi` with all
+25 conditions visible immediately, then updates completed five-seed returns,
+control time, per-seed outcomes and paired gains over matching fresh settings
+and the prior. Pending measurements remain null. Each complete condition also
+gets an immutable evaluation-series run. Publication state and run IDs live
+outside the campaign; the publisher never modifies sealed evaluation bundles
+or the campaign manifest. Restarting the same publisher revision and publication
+directory resumes the existing runs and journals.
+
+`utils/wandb_transfer_sweep_layout.py` installs and verifies dedicated progress,
+comparison and episode panels while preserving the existing personal workspace.
+Layout errors are surfaced explicitly. Verify the resulting authenticated
+browser page before delivering its URL; logging tables alone does not ensure
+that a manual W&B workspace displays them.
