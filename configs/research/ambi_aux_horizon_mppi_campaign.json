@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "description": "Shared target -10.5 auxiliary-return SAC backbones: independently vary training unroll and frozen MPPI planning horizon.",
+  "training_horizons": [1, 3, 5, 7],
+  "planning_horizons": [1, 3, 5, 7],
+  "terminal_critic_sources": ["sac", "aux_return"],
+  "actor_source": "sac",
+  "mppi_template": "configs/research/ambi_aux_return_mppi.json",
+  "prior_template": "configs/research/ambi_aux_return_prior_reference.json",
+  "mppi": {
+    "iterations": 8,
+    "candidates": 512,
+    "elites": 64,
+    "policy_trajectories": 24,
+    "temperature": 0.5,
+    "min_std": 0.05,
+    "max_std": 2.0,
+    "warm_start_scope": "episode",
+    "execution": "proposal_mean",
+    "reward": "raw_model_reward",
+    "terminal_q": "online_mean_pair",
+    "explicit_entropy_correction": false
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "environment_seeds": [101, 102, 103, 104, 105],
+    "max_steps": 500,
+    "frozen_outer_state": true
+  },
+  "checkpoint_selection": "An explicit common grid is required in the launch inventory; no default checkpoint range.",
+  "publication": "One new curve per training backbone and MPPI horizon/critic arm, plus four prior curves; reused completed records must pass exact scientific identity validation."
+}
