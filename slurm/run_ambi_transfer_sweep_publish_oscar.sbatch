@@ -26,6 +26,12 @@ mkdir -p "$TMPDIR" "$WANDB_DIR" "$WANDB_CACHE_DIR" "$WANDB_DATA_DIR" "$XDG_CACHE
 unset WANDB_RUN_ID WANDB_NAME WANDB_GROUP WANDB_RESUME WANDB_SERVICE _WANDB_SERVICE
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONNOUSERSITE=1 OMP_NUM_THREADS=1
 args=(--root "$CAMPAIGN_ROOT" --publication-root "$PUBLICATION_ROOT")
+if [[ -n "${REFERENCE_ROOT:-}${REFERENCE_PUBLICATION_ROOT:-}${REFERENCE_AUDIT:-}" ]]; then
+  : "${REFERENCE_ROOT:?Hidden comparison requires reference campaign}"
+  : "${REFERENCE_PUBLICATION_ROOT:?Hidden comparison requires original publisher state}"
+  : "${REFERENCE_AUDIT:?Hidden comparison requires pinned reference audit}"
+  args+=(--reference-root "$REFERENCE_ROOT" --reference-publication-root "$REFERENCE_PUBLICATION_ROOT" --reference-audit "$REFERENCE_AUDIT")
+fi
 read -r -a jobs <<< "$GPU_JOB_IDS"
 for job in "${jobs[@]}"; do args+=(--gpu-job-id "$job"); done
 exec "$PYTHON_BIN" slurm/ambi_transfer_sweep_publish.py "${args[@]}"

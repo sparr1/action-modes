@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -27,6 +28,8 @@ from utils.ambi_benchmark import atomic_json
 ENTITY = 'rwgao_b-brown-university'
 PROJECT = 'ambi'
 MODES = ('fresh', 'actor_only', 'critic_only')
+HIDDEN_MODES = (*MODES, 'critic_hidden')
+HISTORICAL_COMMIT = '7694cfca76875735b421de13ee6a5d829518d4ff'
 TABLE_COLUMNS = {
     'settings': ['index', 'setting', 'critic', 'transfer', 'J', 'solve_interval', 'state',
                  'completed_episodes', 'expected_episodes', 'performance_url', 'error'],
@@ -71,11 +74,13 @@ def publisher_commit():
     return subprocess.check_output(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], text=True).strip()
 
 
-def publication_state(campaign_root, publication_root, campaign, commit):
+def publication_state(campaign_root, publication_root, campaign, commit, *, reference_binding=None):
     path = Path(publication_root) / 'publication.json'
     binding = dict(campaign_root=str(Path(campaign_root).resolve()),
         campaign_sha256=digest(Path(campaign_root) / 'campaign.json'),
         evaluation_commit=campaign['source_commit'], publisher_commit=commit)
+    if reference_binding is not None:
+        binding['comparison_reference'] = reference_binding
     if path.exists():
         state = read(path)
         require(all(state.get(k) == v for k, v in binding.items()),
@@ -195,43 +200,138 @@ def aggregate(campaign, progress, completed):
                     if reference in completed and reference != name:
                         effect = paired_effect(data, completed[reference]['episodes'], name, reference, comparison)
                         pairs.append(effect); row['paired_' + comparison + '_mean'] = effect['gain_mean']
+            if cell['transfer_mode'] == 'critic_hidden':
+                for mode, comparison in (('critic_only', 'vs_full_critic'), ('actor_only', 'vs_actor')):
+                    reference = f"{cell['critic_kind']}_{mode}_h3_j{cell['J']}_i{cell['solve_interval']}"
+                    if reference in completed:
+                        effect = paired_effect(data, completed[reference]['episodes'], name, reference, comparison)
+                        pairs.append(effect); row['paired_' + comparison + '_mean'] = effect['gain_mean']
+        if 'origin' in status:
+            row.update({key: status[key] for key in ('origin', 'evaluation_commit')})
         results.append(row)
     return dict(settings=progress, results=results, paired_effects=pairs, episodes=episodes,
         completed=len(completed), total=len(campaign['cells']),
         published=sum(row['state'] == 'published' for row in progress))
 
 
-def overview_payload(wandb, snapshot):
-    payload = {f'transfer_sweep/{name}': wandb.Table(columns=columns,
+def overview_payload(wandb, snapshot, *, hidden_comparison=False):
+    namespace = 'critic_hidden_sweep' if hidden_comparison else 'transfer_sweep'
+    table_columns = {name: list(columns) for name, columns in TABLE_COLUMNS.items()}
+    if hidden_comparison:
+        for name in ('settings', 'results'):
+            table_columns[name] += ['origin', 'evaluation_commit']
+        table_columns['results'] += ['paired_vs_full_critic_mean', 'paired_vs_actor_mean']
+    payload = {f'{namespace}/{name}': wandb.Table(columns=columns,
         data=[[row.get(k) for k in columns] for row in snapshot[name]])
-        for name, columns in TABLE_COLUMNS.items()}
+        for name, columns in table_columns.items()}
     payload.update({'campaign/completed': snapshot['completed'], 'campaign/total': snapshot['total'],
                     'campaign/published': snapshot['published']})
     for critic in ('soft', 'return'):
         for interval in (1, 3):
             groups = [[row for row in snapshot['results'] if row['critic'] == critic and
                        row['solve_interval'] == interval and row['transfer'] == mode and row['return_mean'] is not None]
-                      for mode in MODES]
+                      for mode in (HIDDEN_MODES if hidden_comparison else MODES)]
             for axis, field in (('j', 'J'), ('compute', 'controller_seconds_per_decision')):
                 series = [sorted(group, key=lambda r:r[field]) for group in groups]
                 # Register the chart even while empty; explicit panels show pending context.
-                payload[f'transfer_sweep/{critic}_i{interval}_return_vs_{axis}'] = wandb.plot.line_series(
+                payload[f'{namespace}/{critic}_i{interval}_return_vs_{axis}'] = wandb.plot.line_series(
                     xs=[[row[field] for row in group] for group in series],
                     ys=[[row['return_mean'] for row in group] for group in series],
-                    keys=['Fresh', 'Actor-only transfer', 'Critic-only transfer'],
+                    keys=(['Fresh (historical)', 'Actor-only (historical)', 'Full critic (historical)',
+                           'Hidden layers / random head (new)'] if hidden_comparison else
+                          ['Fresh', 'Actor-only transfer', 'Critic-only transfer']),
                     title=f'{critic} critic, solve every {interval} decision(s): return versus {axis}',
                     xname='J rounds per solve' if axis == 'j' else 'Controller seconds per real decision')
     return payload
 
 
-def install_layout(wandb, run, publication_root):
+def install_layout(wandb, run, publication_root, *, hidden_comparison=False):
     from utils.wandb_transfer_sweep_layout import DEFAULT_VIEW_NAME, ensure_transfer_sweep_results_layout
     receipt = ensure_transfer_sweep_results_layout(wandb.Api(timeout=30), entity=ENTITY, project=PROJECT,
         receipt_dir=Path(publication_root)/'results-layout',
-        view_name=os.environ.get('WANDB_RESULTS_VIEW_NAME', DEFAULT_VIEW_NAME), run_id=run.id)
+        view_name=os.environ.get('WANDB_RESULTS_VIEW_NAME', DEFAULT_VIEW_NAME), run_id=run.id,
+        **({'hidden_comparison': True} if hidden_comparison else {}))
     run.summary.update({'results_layout/status': receipt['status'], 'results_layout/url': receipt['url'],
                         'results_layout/workspace_url': receipt['workspace_url'], 'results_layout/schema_verified': True})
     return receipt
+
+
+def load_references(args, campaign):
+    """Read historical bundles under their own identities; never publish/rekey them."""
+    from utils.eval_series import load_run
+    root = Path(args.reference_root).resolve()
+    publication = Path(args.reference_publication_root).resolve()
+    audit_path = Path(args.reference_audit).resolve()
+    reference = read(root / 'campaign.json')
+    audit = read(audit_path)
+    require(audit.get('scope') == 'comparison_only_no_identity_reuse', 'Reference audit scope differs.')
+    require(reference['source_commit'] == audit.get('reference_commit') == HISTORICAL_COMMIT,
+            'Reference must be the explicitly audited historical evaluation revision.')
+    require(digest(root / 'campaign.json') == audit.get('reference_campaign_sha256'),
+            'Reference audit campaign fingerprint differs.')
+    require(audit.get('cpu_default_path_proof', {}).get('status') == 'passed',
+            'Reference audit default-path proof has not passed.')
+    require(audit.get('new_source_commit') == campaign['source_commit'],
+            'Reference audit candidate commit differs from the new campaign.')
+    candidate_hashes = audit.get('candidate_source_sha256', {})
+    require(isinstance(candidate_hashes, dict) and 'RL/tdmpc2_core/inner_improvement.py' in candidate_hashes,
+            'Reference audit lacks candidate scientific source fingerprints.')
+    for path, expected in candidate_hashes.items():
+        require(not Path(path).is_absolute() and '..' not in Path(path).parts,
+                'Reference audit source path escapes repository.')
+        source = subprocess.check_output(['git', '-C', str(ROOT), 'show', f"{campaign['source_commit']}:{path}"])
+        require(hashlib.sha256(source).hexdigest() == expected, f'Audited candidate source changed: {path}.')
+    require(len(reference['cells']) == 25 and reference['cells'][24]['transfer_mode'] == 'prior',
+            'Expected the complete original 25-cell campaign.')
+    for key in ('source_run', 'checkpoint_sha256', 'metadata_sha256', 'checkpoint_step',
+                'seeds', 'controller_seed', 'max_steps'):
+        require(reference[key] == campaign[key], f'Reference comparison {key} differs.')
+    published = read(publication / 'publication.json')
+    require(published['campaign_root'] == str(root) and
+            published['campaign_sha256'] == digest(root / 'campaign.json') and
+            published['evaluation_commit'] == reference['source_commit'], 'Reference publisher binding differs.')
+    complete = {}
+    for cell in reference['cells']:
+        name = cell['name']
+        value = load_completed(root, reference, cell)
+        entry = published['cells'].get(name, {})
+        require(entry.get('status') == 'published' and entry.get('record_id') == value['record']['record_id'],
+                f'Reference {name} is not published under its original record identity.')
+        registry_path = Path(entry['run_dir']).resolve()
+        require(registry_path.is_relative_to(publication), 'Reference registry escapes publication root.')
+        registry = load_run(registry_path)
+        require(registry['identity'] == value['record']['identity'] and registry['run_id'] == entry['run_id'],
+                'Reference immutable registry identity differs.')
+        journal = read(registry_path / 'publication.json')
+        require(journal['records'].get(entry['record_id'], {}).get('status') == 'published',
+                'Reference registry lacks publication acknowledgement.')
+        complete[name] = value
+    binding = dict(campaign_root=str(root), campaign_sha256=digest(root / 'campaign.json'),
+        publication_root=str(publication), publication_sha256=digest(publication / 'publication.json'),
+        evaluation_commit=reference['source_commit'], science=reference['science'],
+        audit_path=str(audit_path), audit_sha256=digest(audit_path), audit=audit,
+        policy='comparison_only_no_identity_reuse', overview_url=url(published['overview_run_id']))
+    return dict(campaign=reference, completed=complete, state=published, binding=binding)
+
+
+def comparison_snapshot(campaign_root, campaign, state, completed, failures, *, jobs_active=True, references=None):
+    progress = progress_rows(campaign_root, campaign, state, completed, failures, jobs_active=jobs_active)
+    if references is None:
+        return aggregate(campaign, progress, completed)
+    for row in progress:
+        row.update(origin='new_evaluation', evaluation_commit=campaign['source_commit'])
+    historical = progress_rows(references['binding']['campaign_root'], references['campaign'],
+        references['state'], references['completed'], {}, jobs_active=False)
+    for index, row in enumerate(historical, start=len(progress)):
+        row['index'] = index
+        row.update(origin='historical_reference', evaluation_commit=references['campaign']['source_commit'])
+    all_cells = campaign['cells'] + references['campaign']['cells']
+    require(len({cell['name'] for cell in all_cells}) == len(all_cells), 'Reference and candidate names overlap.')
+    snapshot = aggregate({'cells': all_cells}, progress + historical, {**completed, **references['completed']})
+    snapshot.update(new_completed=len(completed), new_total=len(campaign['cells']),
+        new_published=sum(row['state'] == 'published' for row in progress),
+        historical_completed=len(references['completed']), reference_provenance=references['binding'])
+    return snapshot
 
 
 def watch(args):
@@ -239,26 +339,47 @@ def watch(args):
     campaign_root, output = Path(args.root).resolve(), Path(args.publication_root).resolve()
     require(not output.is_relative_to(campaign_root), 'Publication directory must be separate from the immutable campaign.')
     campaign = read(campaign_root/'campaign.json')
-    require(len(campaign['cells']) == 25 and campaign['cells'][24]['transfer_mode'] == 'prior', 'Expected 24 settings plus prior.')
+    hidden = campaign.get('campaign_mode') == 'critic-hidden'
+    if hidden:
+        require(len(campaign['cells']) == 8 and all(c['transfer_mode'] == 'critic_hidden' for c in campaign['cells']),
+                'Expected eight hidden-transfer settings.')
+        require(all(getattr(args, key, None) for key in ('reference_root', 'reference_publication_root', 'reference_audit')),
+                'Hidden comparison requires explicit reference campaign, publication and audit.')
+        require(not output.is_relative_to(Path(args.reference_root).resolve()) and
+                not output.is_relative_to(Path(args.reference_publication_root).resolve()),
+                'New publisher state must be separate from historical references.')
+        references = load_references(args, campaign)
+    else:
+        require(not any(getattr(args, key, None) for key in ('reference_root', 'reference_publication_root', 'reference_audit')),
+                'Historical references are supported only for the explicit hidden comparison.')
+        require(len(campaign['cells']) == 25 and campaign['cells'][24]['transfer_mode'] == 'prior', 'Expected 24 settings plus prior.')
+        references = None
+    total = len(campaign['cells']) + (len(references['campaign']['cells']) if references else 0)
+    new_total = len(campaign['cells'])
     with publisher_lock(output):
-        state = publication_state(campaign_root, output, campaign, publisher_commit())
+        state = publication_state(campaign_root, output, campaign, publisher_commit(),
+            **({'reference_binding': references['binding']} if references else {}))
         run = wandb.init(entity=ENTITY, project=PROJECT, id=state['overview_run_id'], resume='allow',
-            name='575K warm starts | fresh vs actor-only vs critic-only | H3 J1/J8',
+            name=('575K hidden critic transfer | random head vs full critic and fresh | H3 J1/J8' if hidden else
+                  '575K warm starts | fresh vs actor-only vs critic-only | H3 J1/J8'),
             group='transfer-sweep-575k-' + state['overview_run_id'][:8], job_type='transfer-sweep-overview',
-            tags=['575k', 'warm-start', 'critic-transfer', 'soft-and-return'], mode='online',
+            tags=['575k', 'warm-start', 'critic-transfer', 'soft-and-return'] +
+                 (['hidden-critic-transfer', 'historical-comparison'] if hidden else []), mode='online',
             config=dict(evaluation_commit=campaign['source_commit'], publisher_commit=state['publisher_commit'],
                 checkpoint_sha256=campaign['checkpoint_sha256'], checkpoint_step=campaign['checkpoint_step'],
                 source_run=campaign['source_run'], campaign_sha256=state['campaign_sha256'],
-                H=3, J=[1, 8], solve_intervals=[1, 3], modes=list(MODES), critic_kinds=['soft', 'return'],
-                seeds=SEEDS, controller_seed=55, max_steps=500, C=16, A=4, N=128, B=256))
+                H=3, J=[1, 8], solve_intervals=[1, 3], modes=list(HIDDEN_MODES if hidden else MODES), critic_kinds=['soft', 'return'],
+                seeds=SEEDS, controller_seed=55, max_steps=500, C=16, A=4, N=128, B=256,
+                **({'comparison_reference': references['binding'], 'new_settings': new_total,
+                    'historical_settings': len(references['campaign']['cells'])} if references else {})))
         completed, failures, attempts = {}, {}, {}
         previous, terminal_since, layout = None, None, None
         try:
-            # Publish all rows before any expensive result validation/artifact upload.
-            initial = aggregate(campaign, progress_rows(campaign_root, campaign, state, {}, {}), {})
-            run.log(overview_payload(wandb, initial))
-            run.summary.update({'status': 'running', 'completed_settings': 0, 'total_settings': 25})
-            layout = install_layout(wandb, run, output)
+            # Historical evidence is already verified; show every row before new result uploads.
+            initial = comparison_snapshot(campaign_root, campaign, state, {}, {}, references=references)
+            run.log(overview_payload(wandb, initial, hidden_comparison=hidden))
+            run.summary.update({'status': 'running', 'completed_settings': initial['completed'], 'total_settings': total})
+            layout = install_layout(wandb, run, output, **({'hidden_comparison': True} if hidden else {}))
             print('LIVE OVERVIEW ' + layout['url'], flush=True)
             while True:
                 active = gpu_jobs_active(args.gpu_job_id)
@@ -266,16 +387,16 @@ def watch(args):
                     name = cell['name']; directory = campaign_root/'settings'/name
                     if name not in completed and (directory/'worker-completion.json').is_file():
                         completed[name] = load_completed(campaign_root, campaign, cell)
-                progress = progress_rows(campaign_root, campaign, state, completed, failures, jobs_active=active)
-                snapshot = aggregate(campaign, progress, completed)
+                snapshot = comparison_snapshot(campaign_root, campaign, state, completed, failures,
+                    jobs_active=active, references=references)
                 stamp = json.dumps(snapshot, sort_keys=True)
                 if stamp != previous:
                     _write(output/'snapshot.json', snapshot)
-                    run.log(overview_payload(wandb, snapshot))
-                    run.summary.update({'completed_settings': len(completed), 'published_settings': snapshot['published'],
-                                        'total_settings': 25, 'status': 'running' if active else 'publishing'})
+                    run.log(overview_payload(wandb, snapshot, hidden_comparison=hidden))
+                    run.summary.update({'completed_settings': snapshot['completed'], 'published_settings': snapshot['published'],
+                                        'total_settings': total, 'new_completed_settings': len(completed), 'status': 'running' if active else 'publishing'})
                     previous = stamp
-                    print(f'Evaluated {len(completed)}/25; published {snapshot["published"]}/25', flush=True)
+                    print(f'Evaluated {snapshot["completed"]}/{total}; published {snapshot["published"]}/{total}', flush=True)
                 # One per loop bounds CPU and publication overhead; journals make retries safe.
                 pending = [cell for cell in campaign['cells'] if cell['name'] in completed and
                     state['cells'].get(cell['name'], {}).get('status') != 'published' and attempts.get(cell['name'], 0) < 3]
@@ -288,7 +409,7 @@ def watch(args):
                         _write(output/'publication-errors.json', failures)
                         print('PUBLICATION RETRY ' + name + ': ' + failures[name], flush=True)
                     continue
-                if len(completed) == 25 and snapshot['published'] == 25:
+                if len(completed) == new_total and snapshot['published'] == total:
                     break
                 if args.once:
                     break
@@ -299,9 +420,11 @@ def watch(args):
                 else:
                     terminal_since = None
                 time.sleep(args.poll_seconds)
-            complete = len(completed) == 25 and all(state['cells'].get(c['name'], {}).get('status') == 'published' for c in campaign['cells'])
+            complete = len(completed) == new_total and all(state['cells'].get(c['name'], {}).get('status') == 'published' for c in campaign['cells'])
             status = 'complete' if complete else 'running' if args.once and active else 'incomplete'
-            run.summary.update({'status': status, 'completed_settings': len(completed), 'total_settings': 25})
+            run.summary.update({'status': status, 'completed_settings': len(completed) +
+                                (len(references['completed']) if references else 0), 'total_settings': total,
+                                'new_completed_settings': len(completed)})
             _write(output/'publisher-status.json', dict(status=status, overview_url=layout['url'],
                 overview_run_id=run.id, completed=len(completed), failures=failures, results_layout=layout))
             run.finish(exit_code=0 if complete or args.once else 1)
@@ -321,6 +444,9 @@ def main():
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--publication-root', type=Path, required=True)
     parser.add_argument('--gpu-job-id', action='append', required=True)
+    parser.add_argument('--reference-root', type=Path)
+    parser.add_argument('--reference-publication-root', type=Path)
+    parser.add_argument('--reference-audit', type=Path)
     parser.add_argument('--poll-seconds', type=float, default=30)
     parser.add_argument('--terminal-grace', type=float, default=120)
     parser.add_argument('--once', action='store_true')

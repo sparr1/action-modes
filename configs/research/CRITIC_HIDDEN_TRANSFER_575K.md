@@ -145,3 +145,33 @@ AMBI_RUN_CRITIC_HIDDEN_TRANSFER_CUDA_GATE=1 \
 Its four cases cover both critic types and solve intervals 1 and 3, checking
 deterministic parity and compiled dropout. A smoke evaluation using the actual
 575k checkpoint also remains required before production experiments.
+
+## Comparing with the completed full-critic sweep
+
+The eight-setting [H3 J1/J8 campaign](CRITIC_HIDDEN_TRANSFER_SWEEP_575K.md)
+can publish alongside the original 25 completed fresh, actor-only, full-critic
+and prior settings without rerunning or republishing those references.
+`slurm/ambi_transfer_sweep_publish.py` requires `--reference-root`,
+`--reference-publication-root` and `--reference-audit` for this explicit mode.
+The matching CPU sbatch launcher accepts `REFERENCE_ROOT`,
+`REFERENCE_PUBLICATION_ROOT` and `REFERENCE_AUDIT` alongside its ordinary
+campaign, publication and GPU-job bindings.
+
+The audit records the reviewed source and executed default-path equivalence
+proof. Its complete fingerprint is bound to the new publisher. Historical
+bundles are verified against their original campaign receipts, original
+scientific/planner identities and acknowledged immutable publication records.
+The publisher fails on missing or inconsistent evidence; it does not substitute
+a summary table or declare old and new scientific identities interchangeable.
+Historical bundles, registries, W&B runs and campaign manifests remain unchanged.
+Only the eight new settings receive new evaluation-series records.
+
+The new overview starts with 33 rows: eight pending evaluations and 25 explicit
+historical references. The tables expose each row's origin and evaluation
+commit. Eight return-versus-J/compute plots show fresh, actor-only, full-critic
+and hidden-layer/random-head arms. Paired gains use the matching critic, J,
+cadence and environment/controller seeds; new results compare against full
+critic, fresh, actor-only and prior references. Partial episodes show progress
+only, and pending returns remain null. Dedicated `critic_hidden_sweep/*` panels
+are installed and read back without replacing the original transfer panels.
+The authenticated browser must still be checked before delivering its URL.
