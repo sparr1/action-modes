@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "protocol": "inner-sac-transfer-discovery-v1",
+  "description": "Exploratory within-episode transfer discovery; 14 mechanisms across H1/2/3 and J1/2/4/6/8/10, three development seeds. Frozen 575k return/return checkpoint; no claim of confirmatory selection or equal compute across H/J.",
+  "base_matrix": "ambi_critic_transfer_575k.json",
+  "base_preset": "return_return/fresh",
+  "checkpoint_contract": {"step": 575000, "sha256": "0c6955db7cb8555a67d7863344b70be68f4b3250814d131e647ee6f9ef01a042"},
+  "horizons": [1, 2, 3],
+  "rounds": [1, 2, 4, 6, 8, 10],
+  "seeds": [101, 102, 103],
+  "controller_seed": 55,
+  "max_steps": 500,
+  "critic_updates": 16,
+  "actor_updates": 4,
+  "rollouts": 128,
+  "batch_size": 256,
+  "arms": {
+    "rho_a0_c0": {"actor_rho": 0.0, "critic_rho": 0.0, "description": "Fresh pretrained actor and critic at every decision."},
+    "rho_a0_c05": {"actor_rho": 0.0, "critic_rho": 0.5, "description": "Fresh actor; critic halfway between frozen prior and previous final critic."},
+    "rho_a0_c1": {"actor_rho": 0.0, "critic_rho": 1.0, "description": "Fresh actor; full previous online critic."},
+    "rho_a05_c0": {"actor_rho": 0.5, "critic_rho": 0.0, "description": "Half actor transfer; fresh critic."},
+    "rho_a05_c05": {"actor_rho": 0.5, "critic_rho": 0.5, "description": "Half actor and half critic transfer toward frozen priors."},
+    "rho_a05_c1": {"actor_rho": 0.5, "critic_rho": 1.0, "description": "Half actor transfer; full critic transfer."},
+    "rho_a1_c0": {"actor_rho": 1.0, "critic_rho": 0.0, "description": "Full actor transfer; fresh critic."},
+    "rho_a1_c05": {"actor_rho": 1.0, "critic_rho": 0.5, "description": "Full actor transfer; half critic transfer."},
+    "rho_a1_c1": {"actor_rho": 1.0, "critic_rho": 1.0, "description": "Full actor and online critic transfer, fresh target from online and fresh Adam/replay/temperature."},
+    "behavior_only": {"actor_rho": 0.0, "critic_rho": 0.0, "collection": "previous_actor", "description": "Fresh learner actor and critic; fixed previous final actor collects imagined transitions. First decision uses ordinary fresh collection."},
+    "fresh_replay25": {"actor_rho": 0.0, "critic_rho": 0.0, "replay_fraction": 0.25, "description": "Fresh networks; 25% replay minibatch rows from the preceding solve, 75% from current solve."},
+    "joint_replay25": {"actor_rho": 1.0, "critic_rho": 1.0, "replay_fraction": 0.25, "description": "Joint weight transfer and 25% preceding-solve replay; fresh Adam/temperature and target copied from online."},
+    "full_state_replay25": {"actor_rho": 1.0, "critic_rho": 1.0, "replay_fraction": 0.25, "full_state": true, "description": "Joint networks plus target critic, Adam, temperature and lifetime state; 25% preceding-solve replay. Outer world model remains frozen."},
+    "joint_prior_anchors": {"actor_rho": 1.0, "critic_rho": 1.0, "actor_prior_kl_coef": 0.1, "critic_prior_l2_coef": 0.1, "description": "Joint weights with actor KL(current||frozen prior) coefficient 0.1 and critic normalized per-tensor prior MSE coefficient 0.1; denominator mean(prior tensor squared)+1e-6."}
+  }
+}

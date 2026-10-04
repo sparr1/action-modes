@@ -7,7 +7,7 @@ the rest of the world model, and the entropy coefficient remain untouched.
 """
 
 from copy import deepcopy
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, fields as dataclass_fields, replace
 import math
 import time
@@ -164,10 +164,264 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self._reset_solve_cadence()
         self._collect_diagnostics = True
         self._active_trace = None
+        self._diagnostic_initialization = None
+        self._diagnostic_collection_actor = None
+        self._diagnostic_collection_pool = None
+        self._diagnostic_previous_replay = None
+        self._diagnostic_replay_fraction = 0.
+        self._diagnostic_actor_prior_kl_coef = 0.
+        self._diagnostic_critic_prior_l2_coef = 0.
+        self._diagnostic_allow_compile = False
+        self._diagnostic_last_metadata = None
+        self._diagnostic_last_actor_loss_scale = None
+        self._diagnostic_replay_counts = [0, 0]
         self._pending_timers = {}
         self._parameter_noise_spec = None
         self._clear_parameter_noise_action_state()
         self._initialize_compile_regions()
+
+    def _validate_transfer_diagnostic(self, *, eval_mode, apply_inner_writeback=False,
+                                      allow_compile=False):
+        """Keep counterfactual branches separate from production persistence."""
+        cfg = self.cfg
+        scopes = ("actor", "critic", "temperature", "replay", "actor_optimizer",
+                  "critic_optimizer", "temperature_optimizer")
+        if not eval_mode or apply_inner_writeback:
+            raise ValueError("Transfer diagnostics require frozen evaluation without writeback.")
+        if any(getattr(cfg, f"inner_{name}_scope") != "action" for name in scopes):
+            raise ValueError("Transfer diagnostics require action-local networks, replay and optimizers.")
+        if (cfg.inner_operator != "sac" or not self._uses_component_update_schedule
+                or cfg.inner_component_update_order != "critic_first"
+                or cfg.inner_update_timing != "round"
+                or cfg.inner_actor_adaptation != "clone"
+                or cfg.inner_critic_adaptation != "clone"
+                or cfg.inner_sac_return_estimator != "one_step"
+                or self._explorer_active or self._split_values
+                or cfg.inner_rounds <= 0 or cfg.inner_rollout_horizon <= 0
+                or int(getattr(cfg, "inner_solve_interval", 1)) != 1
+                or (bool(getattr(cfg, "compile", False)) and not allow_compile)
+                or float(getattr(cfg, "inner_actor_writeback_coef", 0)) != 0
+                or float(getattr(cfg, "inner_critic_writeback_coef", 0)) != 0):
+            raise ValueError(
+                "Transfer diagnostics require eager dense one-step single-value SAC, "
+                "positive horizon/rounds, critic-first round updates, and no held policy or writeback."
+            )
+
+    @contextmanager
+    def diagnostic_initialization(self, *, actor=None, critic=None, target=None,
+                                  collection_actor=None, replay=None, replay_fraction=.25,
+                                  learner_state=None, actor_prior_kl_coef=0.,
+                                  critic_prior_l2_coef=0., allow_compile=False):
+        """Temporarily install weight-only counterfactual initialization.
+
+        Donors are modules or state dictionaries, defensively copied at entry.
+        Omitted donors retain normal fresh-prior initialization. ``target='online'``
+        resets the target to the selected online critic; an explicit target donor
+        instead permits an independent target crossing. ``collection_actor='prior'``
+        or a donor fixes rollout behavior while updates use the learner actor.
+        ``replay`` is an opaque previous-solve export: a fixed fraction of each
+        actor/critic minibatch comes from that buffer, with fresh targets. Full
+        ``learner_state`` additionally restores target weights, Adam, temperature,
+        lifetime counters and the actor Q scale. Only previous-solve transitions
+        are retained; mixed batches are never appended to the current buffer.
+        Prior anchors apply during updates, independently of initial blending.
+        This evaluation-only facility never changes production scope configuration.
+        """
+        if self._diagnostic_initialization is not None or self._active_trace is not None:
+            raise RuntimeError("Diagnostic initialization is not reentrant.")
+        if not isinstance(allow_compile, bool):
+            raise TypeError("allow_compile must be bool.")
+        self._validate_transfer_diagnostic(eval_mode=True, allow_compile=allow_compile)
+        for name, value in (("replay_fraction", replay_fraction),
+                            ("actor_prior_kl_coef", actor_prior_kl_coef),
+                            ("critic_prior_l2_coef", critic_prior_l2_coef)):
+            if isinstance(value, bool) or not math.isfinite(float(value)) or value < 0:
+                raise ValueError(f"{name} must be finite and nonnegative.")
+        if replay_fraction > 1:
+            raise ValueError("replay_fraction must be at most one.")
+        if learner_state is not None and any(value is not None for value in (actor, critic, target, replay)):
+            raise ValueError("Full learner_state is exclusive with individual weight/replay donors.")
+        if (replay is not None or learner_state is not None) and float(
+            getattr(self.cfg, "inner_outer_replay_fraction", 0.)
+        ):
+            raise ValueError("Previous-solve replay cannot also mix outer replay.")
+
+        def donor(value, *, token=None):
+            if value is None:
+                return None
+            if isinstance(value, str):
+                if value != token:
+                    raise ValueError(f"Invalid diagnostic donor token: {value!r}.")
+                return value
+            if isinstance(value, torch.nn.Module):
+                value = value.state_dict()
+            return deepcopy(require_mapping(value, "diagnostic donor"))
+
+        payload = {"actor": donor(actor), "critic": donor(critic),
+                   "critic_target": donor(target, token="online"),
+                   "collection_actor": donor(collection_actor, token="prior"),
+                   "replay": deepcopy(replay), "learner_state": deepcopy(learner_state)}
+        self._diagnostic_initialization = payload
+        self._diagnostic_allow_compile = allow_compile
+        self._diagnostic_actor_prior_kl_coef = float(actor_prior_kl_coef)
+        self._diagnostic_critic_prior_l2_coef = float(critic_prior_l2_coef)
+        self._diagnostic_replay_fraction = float(replay_fraction)
+        try:
+            yield self
+        finally:
+            self._diagnostic_initialization = None
+            self._diagnostic_collection_actor = None
+            self._diagnostic_previous_replay = None
+            self._diagnostic_replay_fraction = 0.
+            self._diagnostic_actor_prior_kl_coef = 0.
+            self._diagnostic_critic_prior_l2_coef = 0.
+            self._diagnostic_allow_compile = False
+
+    def _diagnostic_contract(self):
+        names = ("latent_dim", "action_dim", "inner_rollout_horizon", "inner_finite_horizon",
+                 "inner_sac_critic_target", "inner_temperature_mode", "inner_entropy_enabled",
+                 "inner_actor_loss_scale_update", "inner_log_std_mapping", "inner_log_std_min",
+                 "inner_log_std_max", "inner_horizon_actor_source", "inner_horizon_critic_source")
+        return {name: getattr(self.cfg, name, None) for name in names}
+
+    @torch.no_grad()
+    def export_diagnostic_state(self, *, include_optimizers=False, include_replay=False):
+        """Export independent device tensors after a successful diagnostic solve.
+
+        No module serialization, CPU transfer, or Adam copy occurs unless
+        requested. The caller owns episode lifetime and must discard the export
+        on reset. This private evaluation payload is not a training checkpoint.
+        """
+        if self._diagnostic_last_metadata is None:
+            raise RuntimeError("Export requires a completed diagnostic solve.")
+        def current(name):
+            value = getattr(self.state, name)
+            return getattr(self._action_pool, name) if value is None else value
+        def tensor(value):
+            return None if value is None else value.detach().clone()
+        payload = {
+            "schema": "inner-transfer-campaign-state-v1", "contract": self._diagnostic_contract(),
+            "modules": {name: deepcopy(current(name).state_dict())
+                        for name in ("actor", "critic", "critic_target")},
+            "temperature": {name: tensor(current(name)) for name in ("log_alpha", "alpha_fixed")},
+            "lifetimes": dict(self._diagnostic_last_metadata),
+            "actor_loss_scale": tensor(self._diagnostic_last_actor_loss_scale),
+            "optimizers": None, "replay": None,
+        }
+        if include_optimizers:
+            payload["optimizers"] = {
+                name: None if current(name + "_optim") is None else deepcopy(current(name + "_optim").state_dict())
+                for name in ("actor", "critic", "temperature")
+            }
+        if include_replay:
+            payload["replay"] = {"contract": self._diagnostic_contract(),
+                                 "buffer": current("replay").training_state_dict()}
+        return payload
+
+    def _preflight_diagnostic_full_state(self, incoming):
+        incoming = require_exact_keys(incoming, {"schema", "contract", "modules", "temperature",
+            "lifetimes", "actor_loss_scale", "optimizers", "replay"}, "campaign learner state")
+        if incoming["schema"] != "inner-transfer-campaign-state-v1" or incoming["contract"] != self._diagnostic_contract():
+            raise ValueError("Full learner state has an incompatible campaign contract.")
+        require_exact_keys(incoming["modules"], {"actor", "critic", "critic_target"}, "campaign modules")
+        require_exact_keys(incoming["temperature"], {"log_alpha", "alpha_fixed"}, "campaign temperature")
+        require_exact_keys(incoming["optimizers"], {"actor", "critic", "temperature"}, "campaign optimizers")
+        require_exact_keys(incoming["lifetimes"], {"actor", "critic", "temperature"}, "campaign lifetimes")
+        for component in ("actor", "critic", "temperature"):
+            steps = incoming["lifetimes"][component]
+            if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
+                raise ValueError("Campaign lifetime counters must be nonnegative integers.")
+            optimizer, saved = getattr(self.state, component + "_optim"), incoming["optimizers"][component]
+            if (optimizer is None) != (saved is None):
+                raise ValueError(f"Campaign {component} optimizer presence differs.")
+            if optimizer is not None:
+                preflight_adam_state(optimizer, saved, f"campaign {component}", expected_steps=steps)
+        for name in ("log_alpha", "alpha_fixed"):
+            value, saved = getattr(self.state, name), incoming["temperature"][name]
+            if (value is None) != (saved is None):
+                raise ValueError(f"Campaign {name} presence differs.")
+            if value is not None:
+                require_tensor(saved, f"campaign {name}", shape=value.shape, dtype=value.dtype)
+                if not torch.isfinite(saved).all():
+                    raise ValueError(f"Nonfinite campaign {name}.")
+        scale = incoming["actor_loss_scale"]
+        if (scale is not None) != bool(self._sac_actor_loss_scale_enabled):
+            raise ValueError("Campaign Q scale presence differs.")
+        if scale is not None and (not torch.is_tensor(scale) or scale.numel() != 1
+                                  or not torch.isfinite(scale).all() or not (scale > 0).all()):
+            raise ValueError("Campaign Q scale must be a positive finite scalar.")
+        return incoming
+
+    @torch.no_grad()
+    def _apply_diagnostic_initialization(self):
+        payload = self._diagnostic_initialization
+        if payload is None:
+            return
+        donors = {key: payload[key] for key in ("actor", "critic", "critic_target")}
+        full_state = payload["learner_state"]
+        if full_state is not None:
+            self._preflight_diagnostic_full_state(full_state)
+            donors = dict(full_state["modules"])
+        previous = payload["replay"] if full_state is None else full_state["replay"]
+        replay_candidate = None
+        if previous is not None:
+            require_exact_keys(previous, {"contract", "buffer"}, "campaign replay")
+            if previous["contract"] != self._diagnostic_contract():
+                raise ValueError("Previous replay has an incompatible horizon/objective contract.")
+            replay_candidate = self._new_replay()
+            replay_candidate.load_training_state_dict(previous["buffer"])
+        if isinstance(donors["critic_target"], str):
+            donors["critic_target"] = (donors["critic"] if donors["critic"] is not None
+                                        else self.state.critic.state_dict())
+        collection = payload["collection_actor"]
+        if isinstance(collection, str):
+            collection = self._actor_base.state_dict()
+        # Preflight every network before changing any network, and retain the
+        # module/parameter identities already bound to fresh Adam and kernels.
+        for name, incoming in (*donors.items(), ("collection_actor", collection)):
+            if incoming is None:
+                continue
+            module = self.state.actor if name == "collection_actor" else getattr(self.state, name)
+            preflight_module_state(module, incoming, f"diagnostic {name}")
+            if any(torch.is_tensor(value) and not torch.isfinite(value).all()
+                   for value in incoming.values()):
+                raise ValueError(f"Nonfinite diagnostic {name} donor.")
+        for name, incoming in donors.items():
+            if incoming is not None:
+                getattr(self.state, name).load_state_dict(incoming)
+        if full_state is not None:
+            for name, incoming in full_state["temperature"].items():
+                if incoming is not None:
+                    getattr(self.state, name).copy_(incoming)
+            for component, incoming in full_state["optimizers"].items():
+                if incoming is not None:
+                    optimizer = getattr(self.state, component + "_optim")
+                    if not optimizer.state:
+                        optimizer.load_state_dict(incoming)
+                    else:
+                        # Exact preflight already checked group options and
+                        # parameter ordering. Preserve allocated moment tensors.
+                        for saved_group, live_group in zip(incoming["param_groups"], optimizer.param_groups):
+                            for identifier, parameter in zip(saved_group["params"], live_group["params"]):
+                                saved = incoming["state"].get(identifier, {})
+                                live = optimizer.state[parameter]
+                                for key, value in saved.items():
+                                    if torch.is_tensor(value) and torch.is_tensor(live.get(key)):
+                                        live[key].copy_(value)
+                                    else:
+                                        live[key] = deepcopy(value)
+                setattr(self.state, component + "_lifetime_steps", full_state["lifetimes"][component])
+        self._diagnostic_previous_replay = replay_candidate
+        self._diagnostic_replay_counts = [0, 0]
+        if self._diagnostic_actor_prior_kl_coef > 0:
+            self.state.actor_anchor = self._actor_base
+        self._diagnostic_collection_actor = None
+        if collection is not None:
+            if self._diagnostic_collection_pool is None:
+                self._diagnostic_collection_pool = deepcopy(self.state.actor).eval().requires_grad_(False)
+            behavior = self._diagnostic_collection_pool
+            behavior.load_state_dict(collection)
+            self._diagnostic_collection_actor = behavior
 
     def _new_rng(self, seed):
         # Keep legacy stream identities and exact-resume schemas unchanged.
@@ -2908,7 +3162,19 @@ class InnerImprovementEngine(RetraceInnerMixin):
             yield from self._collect_stepwise_round(root_z)
         else:
             start = self._timer_start()
-            rollout = self._collect_round(root_z)
+            behavior = self._diagnostic_collection_actor
+            if behavior is None:
+                rollout = self._collect_round(root_z)
+            else:
+                learner = self.state.actor
+                modes = tuple((module, module.training) for module in behavior.modules())
+                try:
+                    self.state.actor = behavior
+                    rollout = self._collect_round(root_z)
+                finally:
+                    self.state.actor = learner
+                    for module, training in modes:
+                        module.training = training
             self._timer_stop("inner_rollout_seconds", start)
             yield rollout
 
@@ -3229,6 +3495,24 @@ class InnerImprovementEngine(RetraceInnerMixin):
         except TypeError:
             # Backward-compatible bridge for custom replay implementations.
             batch = self.state.replay.sample(self.cfg.inner_batch_size, **kwargs)
+        previous = self._diagnostic_previous_replay
+        count = (int(math.floor(self._diagnostic_replay_fraction * self.cfg.inner_batch_size + .5))
+                 if previous is not None and previous.size else 0)
+        if count:
+            old = previous.sample(count, replacement=replacement,
+                                  generator=self.rng.generator("replay"),
+                                  include_ids=self._collect_diagnostics)
+            # Recompute targets during the ordinary updates. Boundary bits,
+            # termination flags and source IDs remain exactly those collected
+            # in the previous solve; origin disambiguates overlapping IDs.
+            batch = {key: torch.cat((old[key], value[count:]), dim=0)
+                     for key, value in batch.items()}
+            origin = torch.zeros(self.cfg.inner_batch_size, dtype=torch.bool, device=self.device)
+            origin[:count] = True
+            batch["previous_solve"] = origin
+        if self._diagnostic_initialization is not None:
+            self._diagnostic_replay_counts[0] += count
+            self._diagnostic_replay_counts[1] += self.cfg.inner_batch_size - count
         self.state.replay_draws += int(batch["z"].shape[0])
         if self._collect_diagnostics and "sample_ids" in batch:
             self.state.sampled_ids.append(batch["sample_ids"].detach())
@@ -3573,6 +3857,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
             **scale_kwargs,
         )
         critic_loss, values, target_q, clip_fraction = outputs[:4]
+        anchor_loss = anchor_grad_norm = None
+        if self._diagnostic_critic_prior_l2_coef:
+            anchor_loss, anchor_grad_norm = self._diagnostic_critic_anchor()
+            critic_loss = critic_loss + self._diagnostic_critic_prior_l2_coef * anchor_loss
         state.policy_evaluations += batch_size
         state.q_evaluations += batch_size
 
@@ -3595,10 +3883,35 @@ class InnerImprovementEngine(RetraceInnerMixin):
             "q_target_clip_fraction": clip_fraction.detach(),
             "td_error_abs_mean": (values - target_q.unsqueeze(0)).abs().mean(),
         }
+        if anchor_loss is not None:
+            metrics.update(
+                critic_prior_anchor_loss=anchor_loss.detach(),
+                critic_prior_anchor_penalty=(self._diagnostic_critic_prior_l2_coef * anchor_loss).detach(),
+                critic_prior_anchor_grad_norm=anchor_grad_norm,
+                critic_prior_anchor_to_total_grad_ratio=anchor_grad_norm / torch.as_tensor(grad_norm).clamp_min(1e-12),
+            )
         if self._split_values:
             metrics.update(outputs[4])
         metrics.update(self._source_td_metrics(batch, values, target_q))
         return metrics
+
+    def _diagnostic_critic_anchor(self):
+        """Equal-tensor relative squared distance to the frozen checkpoint critic."""
+        terms, gradients = [], []
+        prior = dict(self._critic_base.named_parameters())
+        parameters = list(self.state.critic.named_parameters())
+        for name, parameter in parameters:
+            anchor = prior[name].detach()
+            denominator = anchor.square().mean() + 1e-6
+            difference = parameter - anchor
+            terms.append(difference.square().mean() / denominator)
+            with torch.no_grad():
+                derivative = difference.detach() * (
+                    2. * self._diagnostic_critic_prior_l2_coef
+                    / (len(parameters) * parameter.numel() * denominator)
+                )
+                gradients.append(derivative.square().sum())
+        return torch.stack(terms).mean(), torch.stack(gradients).sum().sqrt()
 
     @staticmethod
     def _source_td_metrics(batch, values, target_q, *, prefix=""):
@@ -4089,7 +4402,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 else alpha * info["log_prob"] - actor_q
             )
         kl = torch.zeros_like(actor_loss_values)
-        if float(cfg.inner_outer_policy_kl_coef) > 0.0:
+        prior_kl_coefficient = float(cfg.inner_outer_policy_kl_coef) + self._diagnostic_actor_prior_kl_coef
+        if prior_kl_coefficient > 0.0:
             with torch.no_grad():
                 _, outer_info = self.model.pi(
                     z,
@@ -4098,9 +4412,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                     **self._actor_options,
                 )
             kl = self._gaussian_kl(info, outer_info)
-            actor_loss_values = actor_loss_values + float(
-                cfg.inner_outer_policy_kl_coef
-            ) * kl
+            actor_loss_values = actor_loss_values + prior_kl_coefficient * kl
         return (
             info["log_prob"],
             info["entropy"],
@@ -4244,7 +4556,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 )
             if update_actor:
                 state.q_evaluations += batch_size
-                if float(cfg.inner_outer_policy_kl_coef) > 0.0:
+                if float(cfg.inner_outer_policy_kl_coef) + self._diagnostic_actor_prior_kl_coef > 0.0:
                     state.policy_evaluations += batch_size
 
                 state.actor_optim.zero_grad(set_to_none=True)
@@ -4279,6 +4591,11 @@ class InnerImprovementEngine(RetraceInnerMixin):
                     # regularizer is disabled, omit it instead of publishing a
                     # zero that could be mistaken for an evaluated KL.
                     metrics["outer_policy_kl"] = kl_mean.detach()
+                if self._diagnostic_actor_prior_kl_coef > 0.:
+                    metrics["actor_prior_anchor_kl"] = kl_mean.detach()
+                    metrics["actor_prior_anchor_penalty"] = (
+                        self._diagnostic_actor_prior_kl_coef * kl_mean.detach()
+                    )
             if update_temperature:
                 target_entropy = self._resolved_inner_target_entropy()
                 if self._scaled_actor_entropy_enabled:
@@ -5192,18 +5509,25 @@ class InnerImprovementEngine(RetraceInnerMixin):
                     replay_indices=actor_indices[actor_index:actor_index + 1],
                 ))
             return metrics
+        trace = self._active_trace
+        first_critic_block = bool(
+            trace is not None and trace.capture_learners and critic_count > 0
+            and self.state.critic_steps == 0
+        )
         metrics = self._run_update_counts(
             critic_count=critic_count,
             actor_count=0,
             temperature_count=0,
             actor_loss_scale=actor_loss_scale,
         )
-        trace = self._active_trace
+        if first_critic_block:
+            trace.capture_learner(self, stage="after_first_critic_block",
+                                  actor_loss_scale=actor_loss_scale)
         first_actor_block = bool(
-            trace is not None and trace.transfer_probes and actor_count > 0
+            trace is not None and (trace.transfer_probes or trace.capture_learners) and actor_count > 0
             and self.state.actor_steps == 0
         )
-        if first_actor_block:
+        if first_actor_block and trace.transfer_probes:
             trace.transfer_probe(
                 self, root_z, self.state.actor, stage="before_first_actor_block"
             )
@@ -5221,9 +5545,12 @@ class InnerImprovementEngine(RetraceInnerMixin):
             )
         )
         if first_actor_block:
-            trace.transfer_probe(
-                self, root_z, self.state.actor, stage="after_first_actor_block"
-            )
+            trace.capture_learner(self, stage="after_first_actor_block",
+                                  actor_loss_scale=actor_loss_scale)
+            if trace.transfer_probes:
+                trace.transfer_probe(
+                    self, root_z, self.state.actor, stage="after_first_actor_block"
+                )
         return metrics
 
     def _maybe_update_explorer_critic_target(self, *, critic_updated):
@@ -6438,6 +6765,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         # outer learner's global RNG.
         with self.rng.fork("initialization"):
             self._prepare_workspace(t0=t0)
+        self._apply_diagnostic_initialization()
         self._timer_stop("inner_setup_seconds", setup_start)
         actor_loss_scale = None
         if self._sac_actor_loss_scale_enabled:
@@ -6445,6 +6773,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
             # default freezes this scale for the action; per-update mode commits
             # each successful actor kernel's proposal only to this local copy.
             actor_loss_scale = self._critic_owner.actor_loss_scale.detach().clone()
+            if self._diagnostic_initialization is not None:
+                carried = self._diagnostic_initialization["learner_state"]
+                if carried is not None:
+                    actor_loss_scale.copy_(carried["actor_loss_scale"])
         alpha_initial = self.alpha.detach().clone()
         actor_lifetime_initial = state.actor_lifetime_steps
         critic_transfer_metrics = ({
@@ -6461,7 +6793,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 if cfg.inner_operator == "tdambi" else {"alpha": alpha_initial}
             ))
             trace.events[-1]["metrics"].update(critic_transfer_metrics)
-            if trace.transfer_probes:
+            if trace.transfer_probes or trace.capture_learners:
                 trace.events[-1]["metrics"].update(
                     inner_actor_transferred=float(actor_transferred),
                     inner_actor_lifetime_updates_initial=float(actor_lifetime_initial),
@@ -6469,6 +6801,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                     **trace.optimizer_initial_metrics(state, self.device),
                 )
             trace.capture_actor(self, state.actor)
+            trace.capture_learner(self, stage="initial", actor_loss_scale=actor_loss_scale)
             if trace.transfer_probes:
                 trace.transfer_probe(self, root_z, state.actor, stage="initial")
             elif trace.probes:
@@ -6515,7 +6848,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
                            if "rollout_step" in rollout else {}),
                         "collection_reward_sum_mean": rollout["reward_sums"].float().mean(),
                         "collection_discounted_reward_mean": rollout["discounted_rewards"].float().mean(),
-                    })
+                    }, **({"replay_sha256": trace.replay_sha256(state.replay)}
+                          if trace.capture_learners else {}))
                 update_start = self._timer_start()
                 scheduled_update_count = None
                 if self._uses_steps_per_update:
@@ -6604,6 +6938,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
 
             if trace is not None:
                 trace.capture_actor(self, state.actor)
+                trace.capture_learner(self, stage="post_round", actor_loss_scale=actor_loss_scale)
                 if trace.transfer_probes:
                     trace.transfer_probe(self, root_z, state.actor, stage="post_round")
                 elif trace.probes:
@@ -6860,6 +7195,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 )
 
         metrics.update(self._parameter_noise_metrics())
+        if self._diagnostic_initialization is not None:
+            self._diagnostic_last_actor_loss_scale = (
+                None if actor_loss_scale is None else actor_loss_scale.detach().clone()
+            )
         if actor_loss_scale is not None:
             metrics["inner_actor_loss_scale"] = actor_loss_scale.reshape(())
             metrics["inner_effective_alpha"] = alpha_final.mean()
@@ -7121,6 +7460,11 @@ class InnerImprovementEngine(RetraceInnerMixin):
         trace=None,
     ):
         """Run an action with an optional single-use observational recorder."""
+        if self._diagnostic_initialization is not None or getattr(trace, "capture_learners", False):
+            self._validate_transfer_diagnostic(
+                eval_mode=eval_mode, apply_inner_writeback=apply_inner_writeback,
+                allow_compile=self._diagnostic_allow_compile,
+            )
         if int(getattr(self.cfg, "inner_solve_interval", 1)) > 1 and not eval_mode:
             raise ValueError("inner_solve_interval>1 is supported only for frozen evaluation.")
         if eval_mode and getattr(self.cfg, "inner_eval_execution_action", "mean") == "policy_sample" and (
@@ -7200,6 +7544,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         return_behavior_policy=False,
         apply_inner_writeback=False,
     ):
+        self._diagnostic_last_metadata = None
         self._pending_timers = {}
         self._eval_execution_metrics = {}
         start = self._timer_start()
@@ -7329,6 +7674,22 @@ class InnerImprovementEngine(RetraceInnerMixin):
 
             # Action-scoped tensors are explicitly released after producing
             # the action; episode/run scopes survive by configuration.
+            if self._active_trace is not None and self._active_trace.capture_learners:
+                self._active_trace.capture_learner(self, stage="pre_reset")
+            if self._diagnostic_initialization is not None:
+                self._diagnostic_last_metadata = {
+                    component: int(getattr(self.state, component + "_lifetime_steps"))
+                    for component in ("actor", "critic", "temperature")
+                }
+                old, current = self._diagnostic_replay_counts
+                metrics.update(
+                    inner_previous_replay_samples=float(old),
+                    inner_current_replay_samples=float(current),
+                    inner_previous_replay_fraction=old / max(1, old + current),
+                    inner_transfer_full_state=float(self._diagnostic_initialization["learner_state"] is not None),
+                    inner_actor_prior_anchor_coef=self._diagnostic_actor_prior_kl_coef,
+                    inner_critic_prior_anchor_coef=self._diagnostic_critic_prior_l2_coef,
+                )
             self._clear_expired(t0=False, include_action=True)
         self._episode_decision_index += 1
         if return_behavior_policy:

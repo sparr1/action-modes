@@ -48,6 +48,38 @@ class FrozenActorSnapshot:
         return policy.eval().requires_grad_(False)
 
 
+@dataclass(frozen=True)
+class FrozenLearnerSnapshot:
+    """Immutable local exports of the three networks at a diagnostic boundary.
+
+    Payloads contain trusted, process-local module serializations, not portable
+    checkpoints. Each accessor returns independent storage. Optimizers, replay,
+    and temperature are deliberately not transferable through this object.
+    """
+
+    stage: str
+    round_index: int
+    actor_updates: int
+    critic_updates: int
+    temperature_updates: int
+    alpha: float
+    actor_loss_scale: float | None
+    bounds: tuple
+    payloads: tuple
+
+    @property
+    def policy_bounds(self):
+        return dict(self.bounds)
+
+    def make_module(self, component, device="cpu"):
+        payload = dict(self.payloads)[component]
+        module = torch.load(io.BytesIO(payload), map_location=device, weights_only=False)
+        return module.eval().requires_grad_(False)
+
+    def state_dict(self, component, device="cpu"):
+        return self.make_module(component, device=device).state_dict()
+
+
 @torch.no_grad()
 def evaluate_frozen_outer_q(model, z, action, *, reduction, pair_indices=None, critic=None):
     """Use the ordinary online-Q decoding/reduction without compiling a probe.
@@ -356,13 +388,20 @@ class InnerActionTrace:
 
     def __init__(self, *, probes=False, probe_seed=0, probe_rollouts=8, probe_horizon=3,
                  probe_mode="legacy", capture_actors=False, actor_rounds=None,
-                 transfer_probes=False):
+                 transfer_probes=False, capture_learners=False, learner_rounds=None):
         if not isinstance(probes, bool):
             raise TypeError("probes must be bool.")
         if not isinstance(capture_actors, bool):
             raise TypeError("capture_actors must be bool.")
         if not isinstance(transfer_probes, bool):
             raise TypeError("transfer_probes must be bool.")
+        if not isinstance(capture_learners, bool):
+            raise TypeError("capture_learners must be bool.")
+        if learner_rounds is not None:
+            learner_rounds = tuple(learner_rounds)
+            if any(isinstance(r, bool) or not isinstance(r, Integral) or r < 0
+                   for r in learner_rounds) or len(set(learner_rounds)) != len(learner_rounds):
+                raise ValueError("learner_rounds must contain unique nonnegative integer indices.")
         if transfer_probes and probes and probe_mode != "outer_tail":
             raise ValueError("transfer_probes with rollouts requires probe_mode='outer_tail'.")
         if actor_rounds is not None:
@@ -392,6 +431,10 @@ class InnerActionTrace:
         self.capture_actors = capture_actors
         self.actor_rounds = None if actor_rounds is None else frozenset(actor_rounds)
         self.actor_snapshots = []
+        self.capture_learners = capture_learners
+        self.learner_rounds = None if learner_rounds is None else frozenset(learner_rounds)
+        self.learner_snapshots = []
+        self._learner_actor_loss_scale = None
         self.events = []
         self.round_index = 0
         self._started = False
@@ -501,6 +544,56 @@ class InnerActionTrace:
             self.events[-1]["stage"] = stage
 
     @torch.no_grad()
+    def capture_learner(self, engine, *, stage, actor_loss_scale=None):
+        """Export networks without changing their modes or any RNG stream."""
+        if not self.capture_learners:
+            return
+        if stage not in {"initial", "after_first_critic_block", "after_first_actor_block",
+                         "post_round", "pre_reset"}:
+            raise ValueError(f"Unknown learner snapshot stage: {stage!r}.")
+        if actor_loss_scale is not None:
+            self._learner_actor_loss_scale = float(actor_loss_scale.detach().item())
+        # Boundary snapshots remain available even when round exports are sparse.
+        if stage == "post_round" and self.learner_rounds is not None and (
+            self.round_index not in self.learner_rounds
+        ):
+            return
+        started = time.perf_counter()
+        payloads = []
+        for component in ("actor", "critic", "critic_target"):
+            source = getattr(engine.state, component)
+            if source is None:
+                raise RuntimeError(f"Learner snapshot requires a live {component}.")
+            frozen = deepcopy(source).to("cpu").eval().requires_grad_(False)
+            output = io.BytesIO()
+            torch.save(frozen, output)
+            payloads.append((component, output.getvalue()))
+        state = engine.state
+        snapshot = FrozenLearnerSnapshot(
+            stage=stage, round_index=self.round_index,
+            actor_updates=int(state.actor_steps), critic_updates=int(state.critic_steps),
+            temperature_updates=int(state.temperature_steps), alpha=float(engine.alpha.item()),
+            actor_loss_scale=self._learner_actor_loss_scale,
+            bounds=tuple(self._policy_bounds(engine.cfg).items()), payloads=tuple(payloads),
+        )
+        self.learner_snapshots.append(snapshot)
+        self.record("learner_snapshot", state, {
+            "learner_snapshot_seconds": time.perf_counter() - started,
+            "learner_snapshot_bytes": sum(len(payload) for _, payload in payloads),
+        }, stage=stage, measurement="diagnostic_network_snapshot")
+
+    @staticmethod
+    def replay_sha256(replay):
+        """Hash active physical slots and ring metadata, excluding unused memory."""
+        digest = hashlib.sha256()
+        digest.update(str((replay.size, replay.pos, replay.full, replay.next_sample_id,
+                           replay.store_horizon, replay.store_source)).encode())
+        digest.update(replay._storage[:replay.size].detach().cpu().contiguous().numpy().tobytes())
+        if replay.source is not None:
+            digest.update(replay.source[:replay.size].detach().cpu().contiguous().numpy().tobytes())
+        return digest.hexdigest()
+
+    @torch.no_grad()
     def capture_actor(self, engine, policy, *, inner=True):
         """Copy the actual actor at an initialization/completed-round boundary."""
         if not self.capture_actors or (
@@ -540,6 +633,7 @@ class InnerActionTrace:
         """Discard incomplete measurements and release device references on error."""
         self.events.clear()
         self.actor_snapshots.clear()
+        self.learner_snapshots.clear()
         self._probe_timings.clear()
         self._noise = self._outer_probe = self._outer_stats = self._outer_q = self._alpha = None
         self._togo_initial = self._togo_pair_indices = None

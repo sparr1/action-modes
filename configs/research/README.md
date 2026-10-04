@@ -1,5 +1,17 @@
 # Frozen-checkpoint AMBI research
 
+[The 575k transfer discovery campaign](TRANSFER_DISCOVERY.md) screens 14
+mechanisms across H=1,2,3 and J=1,2,4,6,8,10 with three paired full episodes
+per configuration. It includes independent actor/critic retention strengths,
+rollout behavior, recent imagined replay, complete learner state and prior
+anchoring. Its Oscar launcher gates production on real-checkpoint smoke runs.
+
+[Inner SAC transfer diagnostics](TRANSFER_DIAGNOSTICS.md) provides same-state
+actor/critic/joint forks, independent critic references, target initialization
+crossings, horizon/support checks, stationary learning tests, and optional real
+simulator interventions. Horizons are configurable; the default grid is
+H=1,2,3,5,7. This is a separate diagnostic protocol from production evaluation.
+
 The [575k critic hidden-layer transfer examples](CRITIC_HIDDEN_TRANSFER_575K.md)
 retain trainable critic hidden layers and normalization while creating a fresh
 Xavier-uniform, zero-bias output head at every solve, including the first.
