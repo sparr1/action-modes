@@ -1,8 +1,9 @@
 """Lean full-episode discovery of transfer between successive inner SAC solves.
 
 The previous solve is the only weight donor. Networks blend toward frozen
-priors; replay, optimizer and temperature reuse are explicit arm properties.
-No expensive model probes or learner-module serializations run in this loop.
+priors or retain individual parameters with a Bernoulli mask; replay, optimizer
+and temperature reuse are explicit arm properties. Optional observational
+diagnostics report their overhead separately from controller work.
 """
 from __future__ import annotations
 
@@ -66,13 +67,19 @@ def load_campaign(path):
 
 def validate_arm(arm):
     allowed = {"actor_rho", "critic_rho", "collection", "replay_fraction", "full_state",
-               "actor_prior_kl_coef", "critic_prior_l2_coef", "description", "compile"}
+               "actor_prior_kl_coef", "critic_prior_l2_coef", "description", "compile",
+               "actor_bernoulli_p", "critic_bernoulli_p"}
     if set(arm) - allowed:
         raise ValueError(f"Unknown transfer arm fields: {sorted(set(arm) - allowed)}")
-    for key in ("actor_rho", "critic_rho", "replay_fraction"):
+    for key in ("actor_rho", "critic_rho", "replay_fraction", "actor_bernoulli_p", "critic_bernoulli_p"):
         value = arm.get(key, 0.)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
             raise ValueError(f"{key} must be finite in [0,1].")
+    for component in ("actor", "critic"):
+        if f"{component}_bernoulli_p" in arm and f"{component}_rho" in arm:
+            raise ValueError(f"{component} Bernoulli copying and deterministic blending are exclusive.")
+    if arm.get("full_state", False) and any(f"{name}_bernoulli_p" in arm for name in ("actor", "critic")):
+        raise ValueError("Bernoulli copying is weight-only and cannot carry full learner state.")
     for key in ("actor_prior_kl_coef", "critic_prior_l2_coef"):
         value = arm.get(key, 0.)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
@@ -139,7 +146,80 @@ def blend_state(prior, donor, rho):
     return result
 
 
-def arm_initialization(engine, arm, donor):
+def needs_donor(arm):
+    return bool(any(arm.get(f"{name}_{method}", 0.) for name in ("actor", "critic")
+                    for method in ("rho", "bernoulli_p"))
+        or arm.get("replay_fraction", 0.) or arm.get("full_state", False)
+        or arm.get("collection", "learner") == "previous_actor")
+
+
+def make_transfer_generators(engine, *, controller_seed, episode_seed):
+    """Episode-local mask RNGs, separate from learner/probe/global RNG streams.
+
+    Component-specific seeds pair the actor mask in actor-only and joint arms
+    (and likewise the critic), regardless of other components' mask draws.
+    Calling this again starts a fresh reproducible episode, never cross-episode
+    carry. No global generator is seeded or sampled here.
+    """
+    return {name: torch.Generator(device=engine.device).manual_seed(
+        solver_seed(controller_seed, "bernoulli_transfer", name, int(episode_seed)))
+        for name in ("actor", "critic")}
+
+
+@torch.no_grad()
+def bernoulli_state(prior, donor, probability, *, parameter_names, generator=None, metrics=None):
+    """Copy each scalar parameter from donor with p, otherwise from prior.
+
+    This includes biases and normalization affine parameters. Module buffers
+    retain the prior values. Values are selected exactly, without 1/p scaling,
+    interpolation, in-place mutations, or new random parameter initialization.
+    Endpoints do not draw masks. Optional metrics synchronize only once after
+    all parameter reductions have been accumulated on device.
+    """
+    if (isinstance(probability, bool) or not isinstance(probability, (int, float))
+            or not math.isfinite(probability) or not 0 <= probability <= 1):
+        raise ValueError("Bernoulli keep probability must be finite in [0,1].")
+    if set(prior) != set(donor):
+        raise ValueError("Transfer donor and prior state keys differ.")
+    names = set(parameter_names)
+    if not names <= set(prior):
+        raise ValueError("Transfer parameter names are absent from the prior.")
+    for key, base in prior.items():
+        value = donor[key]
+        if (not torch.is_tensor(base) or not torch.is_tensor(value)
+                or base.shape != value.shape or base.dtype != value.dtype or base.device != value.device):
+            raise ValueError(f"Incompatible transfer tensor {key}.")
+        if key in names and not base.is_floating_point():
+            raise ValueError(f"Bernoulli transfer requires real floating parameters: {key}.")
+    if 0 < probability < 1 and generator is None:
+        raise ValueError("Bernoulli transfer requires an explicit isolated generator.")
+    result, reductions, total = {}, [], 0
+    for key, base in prior.items():
+        value = donor[key]
+        if key not in names or probability == 0:
+            selected = base.detach().clone()
+        elif probability == 1:
+            selected = value.detach().clone()
+        else:
+            mask = torch.rand(base.shape, device=base.device, generator=generator) < probability
+            selected = torch.where(mask, value.detach(), base.detach())
+        result[key] = selected
+        if metrics is not None and key in names:
+            total += base.numel()
+            kept = (mask.sum(dtype=torch.float64) if 0 < probability < 1 else
+                    base.new_tensor(base.numel() * probability, dtype=torch.float64))
+            reductions.append(torch.stack((kept,
+                (selected - base).square().sum(dtype=torch.float64),
+                base.square().sum(dtype=torch.float64))))
+    if metrics is not None:
+        kept, delta_squared, prior_squared = (torch.stack(reductions).sum(0).cpu().tolist()
+                                             if reductions else (0., 0., 0.))
+        metrics.update(retained_fraction=kept / total if total else 0.,
+            relative_parameter_delta_l2=math.sqrt(delta_squared) / max(math.sqrt(prior_squared), 1e-12))
+    return result
+
+
+def arm_initialization(engine, arm, donor, *, transfer_generators=None, transfer_metrics=None):
     """Translate one reviewed arm into an explicit engine intervention."""
     validate_arm(arm)
     options = dict(allow_compile=bool(engine.cfg.compile),
@@ -149,6 +229,12 @@ def arm_initialization(engine, arm, donor):
         # Initialization overrides run after the ordinary fresh target copy.
         # Explicitly recopy the selected (possibly blended) online critic.
         options["target"] = "online"
+    if transfer_metrics is not None:
+        for component in ("actor", "critic"):
+            if f"{component}_bernoulli_p" in arm:
+                transfer_metrics.update({f"inner_{component}_bernoulli_retained_fraction": 0.,
+                    f"inner_{component}_relative_parameter_delta_l2": 0.,
+                    f"inner_{component}_bernoulli_applied": 0.})
     if donor is None:
         return options
     if arm.get("full_state", False):
@@ -156,7 +242,20 @@ def arm_initialization(engine, arm, donor):
     else:
         for component in ("actor", "critic"):
             rho = float(arm.get(f"{component}_rho", 0.))
-            if rho:
+            probability = arm.get(f"{component}_bernoulli_p")
+            if probability is not None and probability > 0:
+                module = getattr(engine, f"_{component}_base")
+                sampled_metrics = {} if transfer_metrics is not None else None
+                options[component] = bernoulli_state(module.state_dict(), donor["modules"][component],
+                    probability, parameter_names=dict(module.named_parameters()),
+                    generator=None if transfer_generators is None else transfer_generators[component],
+                    metrics=sampled_metrics)
+                if transfer_metrics is not None:
+                    transfer_metrics.update({
+                        f"inner_{component}_bernoulli_retained_fraction": sampled_metrics["retained_fraction"],
+                        f"inner_{component}_relative_parameter_delta_l2": sampled_metrics["relative_parameter_delta_l2"],
+                        f"inner_{component}_bernoulli_applied": 1.})
+            elif rho:
                 base = getattr(engine, f"_{component}_base").state_dict()
                 options[component] = blend_state(base, donor["modules"][component], rho)
         if arm.get("replay_fraction", 0.):
@@ -185,8 +284,8 @@ def selected_metrics(metrics):
 
 
 def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_steps,
-                     on_step=None, smoke=False):
-    """One paired environment episode, with no learner snapshots or probe trace."""
+                     on_step=None, smoke=False, diagnostics=None):
+    """One paired episode with optional separately timed observational probes."""
     from evaluate_ambi_checkpoint import _seed_spaces
     validate_arm(arm)
     _positive_integer(max_steps, "max_steps")
@@ -196,28 +295,36 @@ def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_st
     _seed_spaces(env, int(episode_seed))
     observation, _ = env.reset(seed=int(episode_seed))
     donor = None
-    needs_donor = bool(arm.get("actor_rho", 0.) or arm.get("critic_rho", 0.)
-        or arm.get("replay_fraction", 0.) or arm.get("full_state", False)
-        or arm.get("collection", "learner") == "previous_actor")
-    rewards, latencies, transfer_times = [], [], []
+    carry_donor = needs_donor(arm)
+    transfer_generators = make_transfer_generators(engine, controller_seed=controller_seed,
+                                                   episode_seed=episode_seed)
+    rewards, latencies, transfer_times, diagnostic_times = [], [], [], []
     terminated = truncated = False
     started = time.perf_counter()
     for decision in range(max_steps):
         if wrapped.agent.device.type == "cuda":
             torch.cuda.synchronize(wrapped.agent.device)
         transfer_started = time.perf_counter()
-        options = arm_initialization(engine, arm, donor)
+        transfer_metrics = {}
+        options = arm_initialization(engine, arm, donor, transfer_generators=transfer_generators,
+                                     transfer_metrics=transfer_metrics)
         if wrapped.agent.device.type == "cuda":
             torch.cuda.synchronize(wrapped.agent.device)
         initialization_seconds = time.perf_counter() - transfer_started
+        trace = None if diagnostics is None else diagnostics.begin(wrapped, observation, decision, donor)
         predict_started = time.perf_counter()
         with engine.diagnostic_initialization(**options):
-            action, _ = wrapped.predict(observation, deterministic=True, episode_start=decision == 0)
+            extra = {} if trace is None else {"trace": trace}
+            action, _ = wrapped.predict(observation, deterministic=True, episode_start=decision == 0, **extra)
         if wrapped.agent.device.type == "cuda":
             torch.cuda.synchronize(wrapped.agent.device)
         prediction_seconds = time.perf_counter() - predict_started
+        diagnostic_record = None if diagnostics is None else diagnostics.finish(trace)
+        diagnostic_seconds = 0. if diagnostics is None else diagnostics.decision_seconds
+        if diagnostics is not None:
+            prediction_seconds -= diagnostics.in_prediction_seconds
         transfer_started = time.perf_counter()
-        if needs_donor:
+        if carry_donor:
             donor = engine.export_diagnostic_state(include_optimizers=bool(arm.get("full_state", False)),
                 include_replay=bool(arm.get("replay_fraction", 0.)))
         if wrapped.agent.device.type == "cuda":
@@ -233,12 +340,16 @@ def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_st
         rewards.append(reward)
         latencies.append(prediction_seconds)
         transfer_times.append(transfer_seconds)
+        diagnostic_times.append(diagnostic_seconds)
         row = dict(seed=int(episode_seed), decision=decision, reward=reward,
             cumulative_reward=float(sum(rewards)), action=action.tolist(),
             prediction_seconds=prediction_seconds, transfer_seconds=transfer_seconds,
             control_seconds=prediction_seconds + transfer_seconds,
-            metrics=selected_metrics(wrapped.agent.last_inner_metrics),
+            diagnostic_seconds=diagnostic_seconds,
+            metrics={**selected_metrics(wrapped.agent.last_inner_metrics), **transfer_metrics},
             terminated=bool(terminated), truncated=bool(truncated))
+        if diagnostic_record is not None:
+            row["diagnostics"] = diagnostic_record
         if on_step is not None:
             on_step(row)
         if terminated or truncated:
@@ -250,6 +361,7 @@ def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_st
         truncated_by_evaluator=not (terminated or truncated) and len(rewards) == max_steps,
         smoke=bool(smoke), wall_seconds=elapsed,
         prediction_seconds=float(sum(latencies)), transfer_seconds=float(sum(transfer_times)),
+        diagnostic_seconds=float(sum(diagnostic_times)),
         control_seconds=float(sum(latencies) + sum(transfer_times)),
         mean_prediction_seconds=float(np.mean(latencies)),
         p50_prediction_seconds=float(np.percentile(latencies, 50)),
@@ -257,6 +369,13 @@ def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_st
         first_decision_seconds=latencies[0],
         subsequent_mean_prediction_seconds=float(np.mean(latencies[1:])) if len(latencies) > 1 else None,
         rng_protocol="solver_seed(controller_seed, 'episode', environment_seed); persistent private streams")
+    if any(f"{name}_bernoulli_p" in arm for name in ("actor", "critic")):
+        result["transfer_rng_protocol"] = (
+            "solver_seed(controller_seed, 'bernoulli_transfer', component, environment_seed); "
+            "independent episode-local torch.Generator per component")
+    if diagnostics is not None:
+        result["diagnostics"] = diagnostics.coverage(len(rewards))
+        result["diagnostic_samples"] = result["diagnostics"]["samples"]
     result.update({"return": result["reward"], "length": result["steps"], "solver_seed": episode_solver_seed})
     return result
 

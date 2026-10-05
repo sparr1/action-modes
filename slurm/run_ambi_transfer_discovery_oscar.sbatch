@@ -29,8 +29,10 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}" OPENBLAS_NUM_THREADS=1 TORCHI
 export MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0
 case "$EVAL_MODE" in
   prepare)
-    exec "$PYTHON_BIN" slurm/ambi_transfer_discovery_campaign.py prepare \
-      --root "$CAMPAIGN_ROOT" --checkpoint "${CHECKPOINT_PATH:?}"
+    args=(prepare --root "$CAMPAIGN_ROOT" --checkpoint "${CHECKPOINT_PATH:?}"
+      --matrix "${CAMPAIGN_MATRIX:-configs/research/ambi_transfer_discovery_575k.json}")
+    if [[ -n "${REFERENCE_CAMPAIGN_ROOT:-}" ]]; then args+=(--reference-root "$REFERENCE_CAMPAIGN_ROOT"); fi
+    exec "$PYTHON_BIN" slurm/ambi_transfer_discovery_campaign.py "${args[@]}"
     ;;
   worker)
     args=(worker --root "$CAMPAIGN_ROOT" --index "${SLURM_ARRAY_TASK_ID:?}")

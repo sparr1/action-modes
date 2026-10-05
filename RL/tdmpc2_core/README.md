@@ -1763,6 +1763,36 @@ and every-decision/hold-H cadences through the frozen evaluator. They enable
 actor probes as the actor-transfer route. These probes observe value estimates;
 they do not establish real-return accuracy.
 
+### Bernoulli weight-only transfer evaluation
+
+The transfer campaign helper supports `actor_bernoulli_p` and
+`critic_bernoulli_p`, independently in `[0, 1]`. For every scalar parameter in
+the selected component, the next solve receives the previous solve's final
+value with probability `p`, or the frozen pretrained prior value otherwise.
+This includes matrix weights, biases, and LayerNorm affine parameters. Module
+buffers stay at the prior. Masks are independent across scalar parameters and
+are resampled between real decisions; there is no inverse-probability scaling,
+random weight reinitialization, or averaging of the two values. Bernoulli and
+deterministic `rho` transfer are mutually exclusive within a component.
+
+The first solve in each episode is fresh. Episode-local, component-specific
+Torch generators use
+`solver_seed(controller_seed, "bernoulli_transfer", component, environment_seed)`.
+They do not consume learner, collection, diagnostic, or global randomness;
+actor-only and joint arms receive matching actor masks, and similarly for the
+critic. Resetting an episode discards the donor and reconstructs both mask
+streams. The `p=0` and `p=1` endpoints draw no masks.
+
+This is an evaluation-only initialization intervention through
+`diagnostic_initialization`, retaining action-local scopes. The target critic
+starts from the selected online critic after masking. Optimizers, replay,
+temperature, and update counters reset normally; there is no outer writeback.
+Every subsequent parameter remains trainable. Each decision records the actual
+mask retention fraction, the selected parameter delta's L2 norm divided by the
+prior parameter norm, and whether copying was applied. Preparation, masking,
+and donor export count toward transfer and total controller time. Optional
+observational diagnostics report their additional time separately.
+
 ### Checkpoints, evaluation, and rendering
 
 Train this variant jointly from scratch. Enabled checkpoints preserve the

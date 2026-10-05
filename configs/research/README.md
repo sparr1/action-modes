@@ -1,5 +1,9 @@
 # Frozen-checkpoint AMBI research
 
+[The Bernoulli p=0.5 transfer screen](BERNOULLI_TRANSFER_575K.md) tests actor,
+critic and joint random copying across H1/2/3 and J1/2/4/6 at the frozen 575k
+checkpoint, with verified sampled-root diagnostics and separate probe timing.
+
 [The 575k transfer discovery campaign](TRANSFER_DISCOVERY.md) screens 14
 mechanisms across H=1,2,3 and J=1,2,4,6,8,10 with three paired full episodes
 per configuration. It includes independent actor/critic retention strengths,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
@@ -22,6 +23,10 @@ from utils.ambi_research import load_preset_matrix, resolve_preset
 from utils.checkpoint_context import load_checkpoint_context
 from utils.transfer_campaign import (
     PROTOCOL, cells, evaluate_episode, load_campaign, resolved_cell, summarize_episodes,
+)
+from utils.transfer_campaign_diagnostics import (
+    CampaignDiagnostics, diagnostic_settings, verify_episode_diagnostics,
+    verify_observational_isolation,
 )
 
 
@@ -56,7 +61,9 @@ def source_identity():
     root = Path(__file__).resolve().parent
     files = [Path(__file__), root / "utils/transfer_campaign.py",
         root / "RL/tdmpc2_core/inner_improvement.py", root / "RL/tdmpc2_core/inner_trace.py",
-        root / "RL/tdmpc2_core/common/inner_utils.py"]
+        root / "RL/tdmpc2_core/common/inner_utils.py",
+        root / "utils/transfer_campaign_diagnostics.py",
+        root / "utils/transfer_diagnostic_metrics.py", root / "utils/transfer_diagnostics.py"]
     digests = {str(path.relative_to(root)): _file_sha256(path) for path in files}
     git = shutil.which("git")
     if git is None:
@@ -89,6 +96,7 @@ def validate_args(args, campaign):
 
 def run(args):
     campaign = load_campaign(args.campaign)
+    diagnostics_config = diagnostic_settings(campaign.get("diagnostics"))
     if args.list_cells:
         return listed_cells(campaign)
     seeds, max_steps, controller_seed = validate_args(args, campaign)
@@ -108,6 +116,7 @@ def run(args):
     manifest = dict(schema_version=1, protocol=PROTOCOL, cell_id=cell_id, arm=args.arm,
         arm_definition=arm, horizon=args.horizon, rounds=args.rounds, seeds=seeds,
         controller_seed=controller_seed, max_steps=max_steps, smoke=bool(args.smoke),
+        diagnostics=diagnostics_config,
         checkpoint=str(args.checkpoint.resolve()), checkpoint_sha256=_file_sha256(args.checkpoint),
         checkpoint_step=context.metadata["checkpoint"]["step"],
         campaign=str(args.campaign.resolve()), campaign_sha256=_file_sha256(args.campaign),
@@ -118,7 +127,8 @@ def run(args):
             action="adapted_actor_mean", solve_interval=1, first_action_rounds="selected_J",
             seed_scheme="solver_seed(controller_seed, 'episode', seed); persistent private streams",
             reuse="No historical return/timing is silently substituted.",
-            timing="Prediction wall time plus explicit donor construction/export; no diagnostic rollouts or full traces.",
+            timing="Prediction wall time plus donor construction/export; sampled diagnostic snapshots and probes measured separately and excluded from control_seconds.",
+            diagnostics="Fixed prior-continuation model targets shared by prior/donor/initial/final stages. Disposable fixed-target fits; no learner updates or real-return ground-truth claim.",
             selection="Three development seeds; exploratory mechanism screen, not confirmatory.",
             compute="Fixed J,C,A,N per cell; imagination transitions scale with H; no equal-compute claim.",
             replay="Previous solve only, fixed requested minibatch fraction; no real replay.",
@@ -143,8 +153,21 @@ def run(args):
         frozen = _outer_state_digest(model)
         atomic_json(output / "runtime.json", dict(config=runtime_config, outer_digest=frozen))
         for episode_index, episode_seed in enumerate(seeds):
+            diagnostics = (CampaignDiagnostics(diagnostics_config, episode_seed=episode_seed,
+                controller_seed=controller_seed, smoke=args.smoke) if diagnostics_config else None)
+            reference_rows, observed_rows = [], []
+            reference_state = None
+            if args.smoke and diagnostics is not None:
+                progress("verifying_diagnostic_isolation", seed=episode_seed, episode_index=episode_index)
+                evaluate_episode(model, env, arm, episode_seed=episode_seed,
+                    controller_seed=controller_seed, max_steps=max_steps,
+                    on_step=reference_rows.append, smoke=True)
+                reference_state = dict(learner=model.agent.inner_engine.export_diagnostic_state(),
+                    rng=deepcopy(model.agent.inner_engine.rng.training_state_dict()))
             with (output / f"decisions-seed-{episode_seed}.jsonl").open("x") as stream:
                 def on_step(row):
+                    if reference_state is not None:
+                        observed_rows.append(row)
                     stream.write(json.dumps(row, allow_nan=False, separators=(",", ":")) + "\n")
                     stream.flush()
                     progress("running", seed=episode_seed, episode_index=episode_index,
@@ -152,7 +175,14 @@ def run(args):
                         completed_decisions=sum(ep["steps"] for ep in episodes) + row["decision"] + 1,
                         total_decisions=max_steps * len(seeds))
                 episode = evaluate_episode(model, env, arm, episode_seed=episode_seed,
-                    controller_seed=controller_seed, max_steps=max_steps, on_step=on_step, smoke=args.smoke)
+                    controller_seed=controller_seed, max_steps=max_steps, on_step=on_step, smoke=args.smoke,
+                    **({"diagnostics": diagnostics} if diagnostics is not None else {}))
+            verify_episode_diagnostics(episode, diagnostics_config, smoke=args.smoke)
+            if reference_state is not None:
+                observed_state = dict(learner=model.agent.inner_engine.export_diagnostic_state(),
+                    rng=deepcopy(model.agent.inner_engine.rng.training_state_dict()))
+                verify_observational_isolation(reference_rows, observed_rows, reference_state, observed_state)
+                episode["diagnostic_isolation_verified"] = True
             if _outer_state_digest(model) != frozen:
                 raise RuntimeError("Frozen outer model or optimizer changed during discovery evaluation.")
             atomic_json(output / f"episode-seed-{episode_seed}.json", episode)

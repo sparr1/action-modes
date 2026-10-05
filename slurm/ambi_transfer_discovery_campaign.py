@@ -45,29 +45,84 @@ def source():
                 source_dir=str(ROOT))
 
 
+def reference_manifest(root, horizons, rounds):
+    """Pin completed historical fresh controls without rerunning or rewriting them."""
+    if root is None:
+        return None
+    root = root.resolve()
+    historical = read(root/'campaign.json')
+    if (historical['checkpoint_sha256'] != CHECKPOINT_SHA or historical['seeds'] != SEEDS
+            or historical['controller_seed'] != 55 or historical['max_steps'] != 500):
+        raise ValueError('Historical fresh controls differ from the paired checkpoint protocol.')
+    cells = [c for c in historical['cells'] if c['arm'] == 'rho_a0_c0'
+             and c['H'] in horizons and c['J'] in rounds]
+    if {(c['H'], c['J']) for c in cells} != {(h,j) for h in horizons for j in rounds}:
+        raise ValueError('Historical fresh reference panel is incomplete.')
+    records = []
+    for cell in cells:
+        directory = root/'settings'/cell['name']
+        result, manifest = validate_result(directory, historical, cell)
+        receipt = read(directory/'worker-completion.json')
+        hashes = {name: digest(directory/name) for name in ('results.json','manifest.json','worker-completion.json')}
+        if (receipt['status'] != 'complete' or receipt['cell'] != cell or receipt['smoke']
+                or receipt['source_commit'] != historical['source_commit']
+                or receipt['campaign_sha256'] != digest(root/'campaign.json')
+                or receipt['result_sha256'] != hashes['results.json']
+                or receipt['manifest_sha256'] != hashes['manifest.json']):
+            raise ValueError('Historical fresh reference receipt binding differs.')
+        records.append(dict(cell=cell, hashes=hashes))
+    return dict(root=str(root), campaign_sha256=digest(root/'campaign.json'),
+        source_commit=historical['source_commit'], records=records,
+        provenance='Historical fresh controls, original source and timing retained; paired environment/solver seeds, not identical visited states.')
+
+
 def prepare(args):
     checkpoint = args.checkpoint.resolve()
     metadata = Path(str(checkpoint) + '.metadata.json')
     if digest(checkpoint) != CHECKPOINT_SHA or digest(metadata) != METADATA_SHA:
         raise ValueError('The checkpoint or sidecar differs from the audited 575K source.')
     cells = json.loads(subprocess.check_output([sys.executable, str(ROOT/'evaluate_ambi_transfer_campaign.py'),
-                                               '--list-cells'], text=True))
-    if len(cells) != 252 or {c['H'] for c in cells} != {1, 2, 3} or {c['J'] for c in cells} != {1, 2, 4, 6, 8, 10}:
-        raise ValueError('Discovery grid differs from the authorized H/J grid.')
-    if sorted(c['index'] for c in cells) != list(range(252)) or len({c['name'] for c in cells}) != 252:
+                                               '--campaign', str(args.matrix.resolve()), '--list-cells'], text=True))
+    matrix_path = args.matrix.resolve()
+    matrix = read(matrix_path)
+    horizons, rounds, arms = matrix['horizons'], matrix['rounds'], list(matrix['arms'])
+    expected_count = len(horizons) * len(rounds) * len(arms)
+    if (matrix['checkpoint_contract'] != dict(step=575000, sha256=CHECKPOINT_SHA)
+            or matrix['seeds'] != SEEDS or matrix['controller_seed'] != 55
+            or matrix['max_steps'] != 500 or horizons != [1, 2, 3]):
+        raise ValueError('Campaign differs from the audited checkpoint and paired protocol.')
+    if (len(cells) != expected_count or {c['H'] for c in cells} != set(horizons)
+            or {c['J'] for c in cells} != set(rounds) or {c['arm'] for c in cells} != set(arms)):
+        raise ValueError('Evaluator cells differ from the versioned matrix.')
+    if sorted(c['index'] for c in cells) != list(range(expected_count)) or len({c['name'] for c in cells}) != expected_count:
         raise ValueError('Cell identities are not unique and contiguous.')
-    # Every mechanism exercises two handoffs. Full-state carry also checks the
-    # shorter horizons; high-J fresh controls exercise capacity/update limits.
-    smoke = [c['index'] for c in cells if (c['J'] == 2 and
-        (c['H'] == 3 or c['arm'] == 'full_state_replay25')) or
-        (c['J'] == 10 and c['arm'] == 'rho_a0_c0')]
+    bernoulli = matrix.get('campaign_kind') == 'bernoulli-weight-transfer-v1'
+    if bernoulli:
+        if rounds != [1, 2, 4, 6] or arms != ['bernoulli_a05_c0', 'bernoulli_a0_c05', 'bernoulli_a05_c05']:
+            raise ValueError('Bernoulli screen differs from the authorized 36-cell grid.')
+        # Every mechanism, all horizons, two transfer boundaries and max J.
+        smoke = [c['index'] for c in cells if
+            (c['J'] == 2 and (c['H'] == 3 or c['arm'] == 'bernoulli_a05_c05'))
+            or (c['H'] == 3 and c['J'] == 6 and c['arm'] == 'bernoulli_a05_c05')]
+    else:
+        if expected_count != 252 or rounds != [1, 2, 4, 6, 8, 10]:
+            raise ValueError('Discovery grid differs from the authorized H/J grid.')
+        smoke = [c['index'] for c in cells if (c['J'] == 2 and
+            (c['H'] == 3 or c['arm'] == 'full_state_replay25')) or
+            (c['J'] == 10 and c['arm'] == 'rho_a0_c0')]
+    reference = reference_manifest(args.reference_root, horizons, rounds)
     args.root.mkdir(parents=True, exist_ok=False)
     campaign = dict(schema_version=1, protocol='inner-sac-transfer-discovery-v1', **source(),
         checkpoint=str(checkpoint), checkpoint_sha256=CHECKPOINT_SHA, metadata_sha256=METADATA_SHA,
         checkpoint_step=575000, seeds=SEEDS, controller_seed=55, max_steps=500,
-        H=[1, 2, 3], J=[1, 2, 4, 6, 8, 10], cells=cells, smoke_indices=smoke,
+        H=horizons, J=rounds, cells=cells, smoke_indices=smoke,
+        matrix_path=str(matrix_path), matrix_sha256=digest(matrix_path),
+        campaign_kind=matrix.get('campaign_kind', 'transfer-discovery-v1'),
+        diagnostics=matrix.get('diagnostics', {}), publication=matrix.get('publication', {}),
+        historical_reference=reference,
         smoke_seeds=[101, 102], smoke_steps=3, gpu_hardware='L40S',
-        historical_reuse='none; matched controls rerun under this implementation',
+        historical_reuse=('No new controls; historical discovery references are separate and retain their original provenance.'
+            if bernoulli else 'none; matched controls rerun under this implementation'),
         selection='exploratory development screen; three paired episodes per cell')
     write(args.root/'campaign.json', campaign)
     print(json.dumps({k: v for k, v in campaign.items() if k != 'cells'}), flush=True)
@@ -99,6 +154,14 @@ def validate_result(directory, campaign, cell, *, smoke=False):
         raise ValueError('Result evaluation protocol differs.')
     if any(e['length'] != limit and not e.get('terminated') and not e.get('truncated') for e in episodes):
         raise ValueError('Incomplete episode was recorded as complete.')
+    if campaign.get('diagnostics', {}).get('enabled'):
+        from utils.transfer_campaign_diagnostics import verify_episode_diagnostics
+        for episode in episodes:
+            verify_episode_diagnostics(episode, campaign['diagnostics'], smoke=smoke)
+            if smoke and episode.get('diagnostic_isolation_verified') is not True:
+                raise ValueError('Diagnostic smoke lacks exact controller/RNG isolation verification.')
+    if campaign.get('matrix_sha256') and manifest.get('campaign_sha256') != campaign['matrix_sha256']:
+        raise ValueError('Result campaign matrix differs from the prepared input.')
     return result, manifest
 
 
@@ -127,11 +190,15 @@ def worker(args):
     hardware = subprocess.check_output(['nvidia-smi', '--query-gpu=name,uuid,driver_version', '--format=csv,noheader'], text=True).strip()
     if 'L40S' not in hardware:
         raise ValueError('Timing campaign requires an L40S allocation.')
+    if campaign.get('matrix_sha256') and digest(campaign['matrix_path']) != campaign['matrix_sha256']:
+        raise ValueError('Versioned campaign matrix changed after preparation.')
     command = [sys.executable, str(ROOT/'evaluate_ambi_transfer_campaign.py'),
                '--checkpoint', campaign['checkpoint'], '--horizon', str(cell['H']), '--rounds', str(cell['J']),
                '--arm', cell['arm'], '--output-dir', str(directory), '--device', 'cuda',
                '--seeds', *map(str, campaign['smoke_seeds'] if args.smoke else campaign['seeds']),
                '--max-steps', str(campaign['smoke_steps'] if args.smoke else campaign['max_steps'])]
+    if campaign.get('matrix_path'):
+        command.extend(['--campaign', campaign['matrix_path']])
     if args.smoke:
         command.append('--smoke')
     start = time.time()
@@ -155,6 +222,8 @@ def main():
     sub = parser.add_subparsers(dest='mode', required=True)
     prep = sub.add_parser('prepare'); prep.add_argument('--root', type=Path, required=True)
     prep.add_argument('--checkpoint', type=Path, required=True)
+    prep.add_argument('--reference-root', type=Path, help='Read-only historical discovery root for matched fresh controls.')
+    prep.add_argument('--matrix', type=Path, default=ROOT/'configs/research/ambi_transfer_discovery_575k.json')
     work = sub.add_parser('worker'); work.add_argument('--root', type=Path, required=True)
     work.add_argument('--index', type=int, required=True); work.add_argument('--smoke', action='store_true')
     args = parser.parse_args()
