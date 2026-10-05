@@ -18,6 +18,7 @@ from utils.ambi_benchmark import read_json, solver_seed
 
 
 PROTOCOL = "inner-sac-transfer-discovery-v1"
+METRIC_POLICIES = ("legacy", "all_scalars")
 METRICS = (
     "inner_actor_loss", "inner_critic_loss", "inner_alpha", "inner_alpha_initial",
     "inner_alpha_final", "inner_actor_grad_norm", "inner_critic_grad_norm",
@@ -166,9 +167,20 @@ def arm_initialization(engine, arm, donor):
     return options
 
 
-def selected_metrics(metrics):
+def selected_metrics(metrics, *, policy="legacy"):
+    """Serialize computed scalar metrics without running extra solver probes.
+
+    ``legacy`` preserves the discovery campaign's original output contract.
+    New checkpoint curves select ``all_scalars`` to retain every available
+    scalar inner metric, including the already-computed Q/TD/entropy values.
+    Missing or nonscalar values remain absent; nonfinite scalars fail closed.
+    """
+    if policy not in METRIC_POLICIES:
+        raise ValueError(f"Unknown inner metric policy: {policy}")
     result = {}
-    for key in METRICS:
+    keys = METRICS if policy == "legacy" else (
+        key for key in metrics if isinstance(key, str) and key.startswith("inner_"))
+    for key in keys:
         if key not in metrics:
             continue
         value = metrics[key]
@@ -185,9 +197,11 @@ def selected_metrics(metrics):
 
 
 def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_steps,
-                     on_step=None, smoke=False):
+                     on_step=None, smoke=False, metric_policy="legacy"):
     """One paired environment episode, with no learner snapshots or probe trace."""
     from evaluate_ambi_checkpoint import _seed_spaces
+    if metric_policy not in METRIC_POLICIES:
+        raise ValueError(f"Unknown inner metric policy: {metric_policy}")
     validate_arm(arm)
     _positive_integer(max_steps, "max_steps")
     engine = wrapped.agent.inner_engine
@@ -237,7 +251,7 @@ def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_st
             cumulative_reward=float(sum(rewards)), action=action.tolist(),
             prediction_seconds=prediction_seconds, transfer_seconds=transfer_seconds,
             control_seconds=prediction_seconds + transfer_seconds,
-            metrics=selected_metrics(wrapped.agent.last_inner_metrics),
+            metrics=selected_metrics(wrapped.agent.last_inner_metrics, policy=metric_policy),
             terminated=bool(terminated), truncated=bool(truncated))
         if on_step is not None:
             on_step(row)

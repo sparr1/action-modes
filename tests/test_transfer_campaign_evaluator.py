@@ -140,14 +140,16 @@ def test_invalid_full_state_fraction_and_unknown_mechanism_fail_closed():
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_output_bundle_is_exclusive_and_records_completion_or_failure(tmp_path, monkeypatch, fail):
+@pytest.mark.parametrize("metric_policy", ["legacy", "all_scalars"])
+def test_output_bundle_is_exclusive_and_records_completion_or_failure(tmp_path, monkeypatch, fail, metric_policy):
     import json
     import evaluate_ambi_transfer_campaign as evaluator
     campaign = load_campaign(CAMPAIGN)
     output = tmp_path / "cell"
     args = parser().parse_args(["--campaign", str(CAMPAIGN), "--checkpoint", str(tmp_path / "checkpoint"),
         "--horizon", "1", "--rounds", "1", "--arm", "rho_a0_c0",
-        "--output-dir", str(output), "--smoke", "--seeds", "101", "--no-compile"])
+        "--output-dir", str(output), "--smoke", "--seeds", "101", "--no-compile",
+        "--metric-policy", metric_policy])
     monkeypatch.setattr(evaluator, "load_preset_matrix", lambda path: {"checkpoint_contract": campaign["checkpoint_contract"]})
     monkeypatch.setattr(evaluator, "load_checkpoint_context", lambda *a, **k: SimpleNamespace(metadata={"checkpoint": {"step": 575000}}))
     monkeypatch.setattr(evaluator, "resolve_preset", lambda *a, **k: {"algorithm_config": {"alg_params": {}}, "selector": "test"})
@@ -159,6 +161,7 @@ def test_output_bundle_is_exclusive_and_records_completion_or_failure(tmp_path, 
     monkeypatch.setattr(evaluator, "_outer_state_digest", lambda *a: "frozen")
     monkeypatch.setattr(evaluator, "_close_resources", lambda *a: None)
     def episode(*a, **kwargs):
+        assert kwargs["metric_policy"] == metric_policy
         kwargs["on_step"](dict(decision=0, cumulative_reward=2.))
         if fail:
             raise RuntimeError("controlled failure")
@@ -177,5 +180,8 @@ def test_output_bundle_is_exclusive_and_records_completion_or_failure(tmp_path, 
         assert json.loads((output / "results.json").read_text())["summary"]["episodes"] == 1
     with pytest.raises(FileExistsError):
         evaluator.run(args)
-    assert (output / "manifest.json").is_file()
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["metric_policy"] == metric_policy
+    assert manifest["metric_coverage"] == dict(policy=metric_policy, computed_scalars_only=True,
+                                               extra_solver_probes=False, per_update_traces=False)
     assert (output / "decisions-seed-101.jsonl").is_file()

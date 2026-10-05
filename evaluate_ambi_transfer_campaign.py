@@ -21,7 +21,8 @@ from utils.ambi_benchmark import atomic_json
 from utils.ambi_research import load_preset_matrix, resolve_preset
 from utils.checkpoint_context import load_checkpoint_context
 from utils.transfer_campaign import (
-    PROTOCOL, cells, evaluate_episode, load_campaign, resolved_cell, summarize_episodes,
+    METRIC_POLICIES, PROTOCOL, cells, evaluate_episode, load_campaign, resolved_cell,
+    summarize_episodes,
 )
 
 
@@ -38,6 +39,9 @@ def parser():
     p.add_argument("--seeds", type=int, nargs="+")
     p.add_argument("--controller-seed", type=int)
     p.add_argument("--max-steps", type=int)
+    p.add_argument("--metric-policy", choices=METRIC_POLICIES, default="legacy",
+                   help="legacy preserves discovery fields; all_scalars saves every already-computed "
+                        "scalar inner metric without additional probes.")
     p.add_argument("--smoke", action="store_true", help="Two decisions by default; explicitly --max-steps may extend the smoke.")
     p.add_argument("--no-compile", action="store_true", help="Explicit eager override, recorded in the manifest.")
     p.add_argument("--dry-run", action="store_true")
@@ -113,6 +117,9 @@ def run(args):
         campaign=str(args.campaign.resolve()), campaign_sha256=_file_sha256(args.campaign),
         base_matrix_sha256=_file_sha256(matrix_path), resolved=resolved, source=source_identity(),
         device=args.device, compile=resolved["algorithm_config"]["alg_params"]["compile"],
+        metric_policy=args.metric_policy,
+        metric_coverage=dict(policy=args.metric_policy, computed_scalars_only=True,
+            extra_solver_probes=False, per_update_traces=False),
         runtime=dict(python=platform.python_version(), torch=torch.__version__, numpy=np.__version__),
         semantics=dict(scope="successive_real_decisions_within_episode", objective="return_return",
             action="adapted_actor_mean", solve_interval=1, first_action_rounds="selected_J",
@@ -152,7 +159,8 @@ def run(args):
                         completed_decisions=sum(ep["steps"] for ep in episodes) + row["decision"] + 1,
                         total_decisions=max_steps * len(seeds))
                 episode = evaluate_episode(model, env, arm, episode_seed=episode_seed,
-                    controller_seed=controller_seed, max_steps=max_steps, on_step=on_step, smoke=args.smoke)
+                    controller_seed=controller_seed, max_steps=max_steps, on_step=on_step,
+                    smoke=args.smoke, metric_policy=args.metric_policy)
             if _outer_state_digest(model) != frozen:
                 raise RuntimeError("Frozen outer model or optimizer changed during discovery evaluation.")
             atomic_json(output / f"episode-seed-{episode_seed}.json", episode)

@@ -1,5 +1,9 @@
 # Frozen-checkpoint AMBI research
 
+[Transfer checkpoint curves](TRANSFER_CHECKPOINT_CURVES.md) evaluate the six
+promising actor, critic and mixed-transfer settings across the full checkpoint
+bank, reusing matched prior references and compatible 575k selection results.
+
 [The 575k transfer discovery campaign](TRANSFER_DISCOVERY.md) screens 14
 mechanisms across H=1,2,3 and J=1,2,4,6,8,10 with three paired full episodes
 per configuration. It includes independent actor/critic retention strengths,

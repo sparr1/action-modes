@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "protocol": "inner-sac-transfer-checkpoint-curves-v1",
+  "source_run": "rwgao_b-brown-university/ambi/aux6428346x0",
+  "description": "Full-episode transfer candidates across the available checkpoint bank; paired gains use the same-checkpoint frozen prior. Selected on the exploratory 575k screen, not a confirmatory comparison.",
+  "discovery_template": "ambi_transfer_discovery_575k.json",
+  "seeds": [101, 102, 103],
+  "controller_seed": 55,
+  "max_steps": 500,
+  "critic_updates": 16,
+  "actor_updates": 4,
+  "rollouts": 128,
+  "batch_size": 256,
+  "gpu_hardware": "L40S",
+  "smoke_seeds": [101, 102],
+  "smoke_steps": 3,
+  "candidates": [
+    {"setting_id": "h2_j10_rho_a05_c0", "H": 2, "J": 10, "arm": "rho_a05_c0", "label": "H2 J10 · actor 50%"},
+    {"setting_id": "h1_j4_rho_a05_c0", "H": 1, "J": 4, "arm": "rho_a05_c0", "label": "H1 J4 · actor 50%"},
+    {"setting_id": "h2_j6_rho_a0_c05", "H": 2, "J": 6, "arm": "rho_a0_c05", "label": "H2 J6 · critic 50%"},
+    {"setting_id": "h3_j6_rho_a0_c05", "H": 3, "J": 6, "arm": "rho_a0_c05", "label": "H3 J6 · critic 50%"},
+    {"setting_id": "h2_j2_rho_a1_c05", "H": 2, "J": 2, "arm": "rho_a1_c05", "label": "H2 J2 · actor 100%, critic 50%"},
+    {"setting_id": "h1_j1_rho_a1_c0", "H": 1, "J": 1, "arm": "rho_a1_c0", "label": "H1 J1 · actor 100%"}
+  ]
+}
