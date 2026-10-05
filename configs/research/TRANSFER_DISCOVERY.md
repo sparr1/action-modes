@@ -96,3 +96,28 @@ The publisher exposes complete three-seed results and separate live progress,
 verifies output receipts and installs its own W&B sections without replacing
 existing workspace content. Scheduler concurrency is selected from live
 account GPU/CPU/memory limits, independently of the scientific grid.
+
+Reporting defaults to `rwgao_b-brown-university/ambi-inner-bench`. The CPU
+publisher creates a dedicated saved workspace filtered to the run's
+`config.publication_id`, preserving existing personal and saved workspaces.
+It accepts explicit `--entity` and `--project` overrides:
+
+```bash
+python slurm/ambi_transfer_discovery_publish.py \
+  --root /path/to/existing/campaign \
+  --publication-root /path/to/new/publication-inner-bench \
+  --entity rwgao_b-brown-university --project ambi-inner-bench \
+  --gpu-job-id 1234567
+```
+
+Publication state binds the W&B entity/project, run ID, campaign file hash,
+evaluation source commit and campaign path. A restart resumes that same run
+only when these bindings match. Legacy state without an explicit destination
+binding is rejected; changing projects requires a new publication root and
+creates a new reporting run. The reporting checkout may be updated separately
+while the evaluator remains pinned to its original source. Existing campaign
+manifests, GPU jobs, result bundles and scientific identities are preserved.
+Local campaign/state reads, receipt snapshots and atomic publication writes
+retry only `ESTALE` (stale file handle), for at most five attempts with delays
+of 1, 2, 4 and 8 seconds. Persistent stale handles and all other errors remain
+explicit failures; retrying reporting never resubmits evaluation work.
