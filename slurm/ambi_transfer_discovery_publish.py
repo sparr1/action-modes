@@ -25,13 +25,13 @@ PROJECT = 'ambi-inner-bench'
 PUBLICATION_STATE_VERSION = 2
 ESTALE_RETRY_DELAYS = (1, 2, 4, 8)
 COLUMNS = {
-    'settings': ['name','H','J','arm','state','completed_episodes','current_seed','decision','error'],
-    'results': ['name','H','J','arm','provenance','state','return_mean','return_std','paired_vs_fresh_mean',
+    'settings': ['name','H','J','arm','component','retention_probability','state','completed_episodes','current_seed','decision','error'],
+    'results': ['name','H','J','arm','component','retention_probability','provenance','state','return_mean','return_std','paired_vs_fresh_mean',
                 'paired_vs_fresh_std','controller_seconds_per_decision','diagnostic_seconds_per_decision',
                 'diagnostic_seconds_per_sample','diagnostic_samples','episodes'],
-    'episodes': ['name','H','J','arm','provenance','seed','solver_seed','return','length','control_seconds',
+    'episodes': ['name','H','J','arm','component','retention_probability','provenance','seed','solver_seed','return','length','control_seconds',
                  'diagnostic_seconds','diagnostic_samples'],
-    'diagnostics': ['name','H','J','arm','metric','mean','episode_std','episodes','samples'],
+    'diagnostics': ['name','H','J','arm','component','retention_probability','provenance','metric','mean','episode_std','episodes','samples'],
 }
 
 
@@ -94,24 +94,76 @@ def episode_time(episode):
     return episode['control_seconds']
 
 
-def historical_fresh(campaign):
-    reference = campaign.get('historical_reference')
-    if not reference:
-        return []
-    root = Path(reference['root'])
-    if _digest(root/'campaign.json') != reference['campaign_sha256']:
-        raise ValueError('Historical reference campaign changed after preparation.')
-    old_campaign = _read(root/'campaign.json')
-    if old_campaign['source_commit'] != reference['source_commit']:
-        raise ValueError('Historical reference source changed.')
+def historical_references(campaign):
+    references = campaign.get('historical_references')
+    if references is None:
+        references = [campaign['historical_reference']] if campaign.get('historical_reference') else []
+    return references
+
+
+def historical_results(campaign):
+    """Recheck pinned historical panels without counting them as new work."""
     found = []
-    for record in reference['records']:
-        cell = record['cell']; directory = root/'settings'/cell['name']
-        if any(_digest(directory/name) != checksum for name,checksum in record['hashes'].items()):
-            raise ValueError('Pinned historical reference changed: ' + cell['name'])
-        result, _ = _validate_result(directory, old_campaign, cell)
-        found.append((cell, result['episodes']))
+    for reference in historical_references(campaign):
+        root = Path(reference['root'])
+        if _digest(root/'campaign.json') != reference['campaign_sha256']:
+            raise ValueError('Historical reference campaign changed after preparation.')
+        old_campaign = _read(root/'campaign.json')
+        if old_campaign['source_commit'] != reference['source_commit']:
+            raise ValueError('Historical reference source changed.')
+        kind = reference.get('kind', 'fresh')
+        if kind not in ('fresh', 'bernoulli'):
+            raise ValueError('Unknown historical reference kind: ' + kind)
+        if kind == 'bernoulli' and old_campaign.get('diagnostics') != campaign.get('diagnostics'):
+            raise ValueError('Historical Bernoulli diagnostic configuration differs.')
+        for record in reference['records']:
+            cell = record['cell']; directory = root/'settings'/cell['name']
+            if any(_digest(directory/name) != checksum for name,checksum in record['hashes'].items()):
+                raise ValueError('Pinned historical reference changed: ' + cell['name'])
+            result, _ = _validate_result(directory, old_campaign, cell)
+            found.append((cell, result['episodes'], reference))
     return found
+
+
+def historical_fresh(campaign):
+    """Compatibility accessor for earlier fresh-only publication clients."""
+    return [(cell, episodes) for cell, episodes, reference in historical_results(campaign)
+            if reference.get('kind', 'fresh') == 'fresh']
+
+
+def _cell_metadata(cell, campaign):
+    publication = campaign.get('publication', {})
+    arm = cell['arm']
+    return dict(cell, component=publication.get('arm_components', {}).get(arm),
+                retention_probability=publication.get('arm_probabilities', {}).get(arm))
+
+
+def _measurement_rows(cell, data, provenance, state):
+    row = dict(cell, provenance=provenance, state=state, return_mean=None, return_std=None,
+        paired_vs_fresh_mean=None, paired_vs_fresh_std=None, controller_seconds_per_decision=None,
+        diagnostic_seconds_per_decision=None, diagnostic_seconds_per_sample=None, diagnostic_samples=0, episodes=0)
+    diagnostics = []
+    if not data:
+        return row, diagnostics
+    returns = [e['return'] for e in data]
+    row.update(return_mean=statistics.mean(returns), return_std=statistics.stdev(returns), episodes=len(data),
+        controller_seconds_per_decision=sum(episode_time(e) for e in data)/sum(e['length'] for e in data))
+    diagnostic_episodes = [e for e in data if e.get('diagnostics', {}).get('enabled')]
+    if diagnostic_episodes:
+        samples = sum(e['diagnostic_samples'] for e in diagnostic_episodes)
+        seconds = sum(e['diagnostic_seconds'] for e in diagnostic_episodes)
+        row.update(diagnostic_seconds_per_decision=seconds / sum(e['length'] for e in data),
+            diagnostic_seconds_per_sample=seconds / samples if samples else None, diagnostic_samples=samples)
+        metric_names = sorted(set().union(*(e['diagnostics']['summary'] for e in diagnostic_episodes)))
+        for metric in metric_names:
+            measurements = [e['diagnostics']['summary'][metric] for e in diagnostic_episodes
+                if isinstance(e['diagnostics']['summary'].get(metric), (int, float))
+                and math.isfinite(e['diagnostics']['summary'][metric])]
+            if measurements:
+                diagnostics.append(dict(cell, provenance=provenance, metric=metric, mean=statistics.mean(measurements),
+                    episode_std=statistics.stdev(measurements) if len(measurements) > 1 else None,
+                    episodes=len(measurements), samples=samples))
+    return row, diagnostics
 
 
 def _snapshot_once(root, campaign, active, completed):
@@ -133,52 +185,36 @@ def _snapshot_once(root, campaign, active, completed):
             completed[name] = result['episodes']
         state = 'complete' if name in completed else 'failed' if failure else 'running' if directory.exists() and active else 'pending' if active else 'incomplete'
         data = completed.get(name)
-        settings.append(dict(cell, state=state, completed_episodes=len(data) if data else progress.get('completed_episodes', 0),
+        decorated = _cell_metadata(cell, campaign)
+        settings.append(dict(decorated, state=state, completed_episodes=len(data) if data else progress.get('completed_episodes', 0),
             current_seed=progress.get('seed'), decision=progress.get('decision'), error=failure.get('error')))
-        row = dict(cell, provenance='current campaign', state=state, return_mean=None, return_std=None, paired_vs_fresh_mean=None,
-                   paired_vs_fresh_std=None, controller_seconds_per_decision=None,
-                   diagnostic_seconds_per_decision=None, diagnostic_seconds_per_sample=None,
-                   diagnostic_samples=0, episodes=0)
+        row, measured = _measurement_rows(decorated, data, 'current campaign', state)
+        results.append(row); diagnostics.extend(measured)
         if data:
-            returns = [e['return'] for e in data]
-            row.update(return_mean=statistics.mean(returns), return_std=statistics.stdev(returns), episodes=len(data),
-                controller_seconds_per_decision=sum(episode_time(e) for e in data)/sum(e['length'] for e in data))
-            diagnostic_episodes = [e for e in data if e.get('diagnostics', {}).get('enabled')]
-            if diagnostic_episodes:
-                samples = sum(e['diagnostic_samples'] for e in diagnostic_episodes)
-                seconds = sum(e['diagnostic_seconds'] for e in diagnostic_episodes)
-                row.update(diagnostic_seconds_per_decision=seconds / sum(e['length'] for e in data),
-                    diagnostic_seconds_per_sample=seconds / samples if samples else None,
-                    diagnostic_samples=samples)
-                metric_names = sorted(set().union(*(e['diagnostics']['summary'] for e in diagnostic_episodes)))
-                for metric in metric_names:
-                    measurements = [e['diagnostics']['summary'][metric] for e in diagnostic_episodes
-                        if isinstance(e['diagnostics']['summary'].get(metric), (int, float))
-                        and math.isfinite(e['diagnostics']['summary'][metric])]
-                    if measurements:
-                        diagnostics.append(dict(cell, metric=metric, mean=statistics.mean(measurements),
-                            episode_std=statistics.stdev(measurements) if len(measurements) > 1 else None,
-                            episodes=len(measurements), samples=samples))
-            for episode in data:
-                episodes.append(dict(cell, provenance='current campaign', **episode))
-        results.append(row)
+            episodes.extend(dict(decorated, provenance='current campaign', **episode) for episode in data)
+    all_data = dict(completed)
     fresh = {(c['H'], c['J']): completed[c['name']] for c in campaign['cells']
              if c['arm'] == 'rho_a0_c0' and c['name'] in completed}
-    historical = historical_fresh(campaign)
-    for cell, data in historical:
-        identity = (cell['H'], cell['J'])
-        if identity in fresh:
-            raise ValueError('Fresh baseline would be duplicated by historical reuse.')
-        fresh[identity] = data
-        values = [e['return'] for e in data]
-        results.append(dict(cell, provenance='historical fresh; '+campaign['historical_reference']['source_commit'],
-            state='historical_complete', return_mean=statistics.mean(values), return_std=statistics.stdev(values),
-            paired_vs_fresh_mean=0., paired_vs_fresh_std=0., episodes=len(data),
-            controller_seconds_per_decision=sum(episode_time(e) for e in data)/sum(e['length'] for e in data),
-            diagnostic_seconds_per_decision=None, diagnostic_seconds_per_sample=None, diagnostic_samples=0))
-        episodes.extend(dict(cell, provenance='historical fresh', **episode) for episode in data)
+    known_names = {cell['name'] for cell in campaign['cells']}
+    for cell, data, reference in historical_results(campaign):
+        if cell['name'] in known_names:
+            raise ValueError('Historical evaluation would be duplicated: ' + cell['name'])
+        known_names.add(cell['name']); all_data[cell['name']] = data
+        if reference.get('kind', 'fresh') == 'fresh':
+            identity = (cell['H'], cell['J'])
+            if identity in fresh:
+                raise ValueError('Fresh baseline would be duplicated by historical reuse.')
+            fresh[identity] = data
+            label = 'historical fresh'
+        else:
+            label = 'historical Bernoulli p=' + str(reference['probability'])
+        provenance = label + '; ' + reference['source_commit']
+        decorated = _cell_metadata(cell, campaign)
+        row, measured = _measurement_rows(decorated, data, provenance, 'historical_complete')
+        results.append(row); diagnostics.extend(measured)
+        episodes.extend(dict(decorated, provenance=provenance, **episode) for episode in data)
     for row in results:
-        data = completed.get(row['name']); reference = fresh.get((row['H'], row['J']))
+        data = all_data.get(row['name']); reference = fresh.get((row['H'], row['J']))
         if data and reference:
             lookup = {(e['seed'],e['solver_seed']): e['return'] for e in reference}
             if {(e['seed'],e['solver_seed']) for e in data} != set(lookup):
@@ -198,31 +234,30 @@ def snapshot(root, campaign, active, completed):
 def payload(wandb, value, campaign):
     result = {'discovery/'+key: wandb.Table(columns=columns, data=[[row.get(k) for k in columns] for row in value[key]])
               for key, columns in COLUMNS.items() if key != 'diagnostics' or campaign.get('diagnostics', {}).get('enabled')}
-    arms = list(dict.fromkeys([c['arm'] for c in campaign['cells']] +
-        (['rho_a0_c0'] if campaign.get('historical_reference') else [])))
-    for h in campaign['H']:
-        for axis, field in [('j','J'), ('compute','controller_seconds_per_decision')]:
-            series = [sorted([r for r in value['results'] if r['H']==h and r['arm']==arm and r['return_mean'] is not None],
-                             key=lambda r:r[field]) for arm in arms]
-            result[f'discovery/h{h}_return_vs_{axis}'] = wandb.plot.line_series(
-                xs=[[r[field] for r in group] for group in series],
-                ys=[[r['return_mean'] for r in group] for group in series], keys=arms,
-                title=f'H{h}: complete three-seed return versus {axis}',
-                xname='J rounds per solve' if axis=='j' else 'Controller seconds per decision')
-    if campaign.get('diagnostics', {}).get('enabled'):
-        from utils.wandb_transfer_discovery_layout import DIAGNOSTIC_CHARTS
-        for metric, title in DIAGNOSTIC_CHARTS:
-            for h in campaign['H']:
-                if metric == 'diagnostic_seconds_per_decision':
-                    rows = [dict(r, mean=r.get(metric)) for r in value['results'] if r['H'] == h]
-                else:
-                    rows = [r for r in value['diagnostics'] if r['H'] == h and r['metric'] == metric]
-                groups = [sorted((r for r in rows if r['arm'] == arm and r.get('mean') is not None),
-                                 key=lambda r: r['J']) for arm in arms]
-                result[f'discovery/h{h}_{metric}_vs_j'] = wandb.plot.line_series(
-                    xs=[[r['J'] for r in group] for group in groups],
-                    ys=[[r['mean'] for r in group] for group in groups], keys=arms,
-                    title=f'H{h}: {title}', xname='J rounds per solve')
+    from utils.wandb_transfer_discovery_layout import DIAGNOSTIC_CHARTS, campaign_curve_groups
+    for prefix, label, arms in campaign_curve_groups(campaign):
+        for h in campaign['H']:
+            for axis, field in [('j','J'), ('compute','controller_seconds_per_decision')]:
+                series = [sorted([r for r in value['results'] if r['H']==h and r['arm']==arm and r['return_mean'] is not None],
+                                 key=lambda r:r[field]) for arm in arms]
+                result[f'discovery/{prefix}h{h}_return_vs_{axis}'] = wandb.plot.line_series(
+                    xs=[[r[field] for r in group] for group in series],
+                    ys=[[r['return_mean'] for r in group] for group in series], keys=arms,
+                    title=f'{label}H{h}: complete three-seed return versus {axis}',
+                    xname='J rounds per solve' if axis=='j' else 'Controller seconds per decision')
+        if campaign.get('diagnostics', {}).get('enabled'):
+            for metric, title in DIAGNOSTIC_CHARTS:
+                for h in campaign['H']:
+                    if metric == 'diagnostic_seconds_per_decision':
+                        rows = [dict(r, mean=r.get(metric)) for r in value['results'] if r['H'] == h]
+                    else:
+                        rows = [r for r in value['diagnostics'] if r['H'] == h and r['metric'] == metric]
+                    groups = [sorted((r for r in rows if r['arm'] == arm and r.get('mean') is not None),
+                                     key=lambda r: r['J']) for arm in arms]
+                    result[f'discovery/{prefix}h{h}_{metric}_vs_j'] = wandb.plot.line_series(
+                        xs=[[r['J'] for r in group] for group in groups],
+                        ys=[[r['mean'] for r in group] for group in groups], keys=arms,
+                        title=f'{label}H{h}: {title}', xname='J rounds per solve')
     result.update({'campaign/completed':value['completed'],'campaign/total':value['total'],'campaign/failed':value['failed']})
     return result
 

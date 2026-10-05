@@ -32,16 +32,18 @@ _CREATE_CHART = '''mutation CreateTransferChart($entity:String!,$name:String!,
 }'''
 
 
-def campaign_chart_definition(campaign):
+def campaign_chart_definition(campaign, component=None):
     """Map color to the mechanism, not to the single publication run."""
-    styles = list(campaign['publication']['arm_styles'])
+    publication = campaign['publication']
+    styles = [row for row in publication['arm_styles'] if component is None
+              or publication.get('arm_components', {}).get(row[0]) == component]
     if campaign.get('historical_reference'):
         styles.append(['rho_a0_c0', 'Fresh prior reset (historical)', '#000000'])
     if (len({row[0] for row in styles}) != len(styles)
             or len({row[2] for row in styles}) != len(styles)):
         raise ResultsLayoutError('Campaign arm styles must have unique identities and colors.')
     labels = {arm: label for arm, label, _ in styles}
-    return {
+    definition = {
         '$schema':'https://vega.github.io/schema/vega-lite/v5.json',
         'data':{'name':'wandb'}, 'width':'container', 'height':280,
         'autosize':{'type':'fit','contains':'padding'},
@@ -66,15 +68,50 @@ def campaign_chart_definition(campaign):
         'config':{'view':{'stroke':None}, 'axis':{'gridColor':'#e8edf2'}, 'legend':{'labelFontSize':11}},
     }
 
+    if publication.get('probability_sweep'):
+        probabilities = {arm: f'{100 * probability:g}%' for arm, probability
+                         in publication['arm_probabilities'].items()}
+        probabilities['rho_a0_c0'] = 'Fresh'
+        definition['transform'].append({'calculate':json.dumps(probabilities, separators=(',', ':'))
+            + "[datum['${field:lineKey}']]", 'as':'Retention'})
+        definition['encoding']['strokeDash'] = {'field':'Retention', 'type':'nominal',
+            'scale':{'domain':['25%', '50%', '75%', 'Fresh'], 'range':[[2,3], [], [8,3], []]}, 'legend':None}
+    return definition
 
-def campaign_chart_id(entity, campaign):
-    return entity + '/bernoulli_transfer_' + _hash(campaign_chart_definition(campaign))[:16]
+
+def campaign_chart_id(entity, campaign, component=None):
+    if campaign['publication'].get('probability_sweep') and component is None:
+        return {component: campaign_chart_id(entity, campaign, component) for component in ('actor', 'critic', 'joint')}
+    return entity + '/bernoulli_transfer_' + _hash(campaign_chart_definition(campaign, component))[:16]
 
 
-def ensure_campaign_chart(api, *, entity, campaign):
+def campaign_curve_groups(campaign):
+    publication = campaign.get('publication', {})
+    fresh = ['rho_a0_c0'] if campaign.get('historical_reference') else []
+    if publication.get('probability_sweep'):
+        return [(component+'/', component.capitalize()+' | ',
+                 [arm for arm, _, _ in publication['arm_styles']
+                  if publication['arm_components'][arm] == component] + fresh)
+                for component in ('actor', 'critic', 'joint')]
+    return [('', '', list(dict.fromkeys([c['arm'] for c in campaign['cells']] + fresh)))]
+
+
+def expected_campaign_chart_keys(campaign):
+    keys = []
+    for prefix, _, _ in campaign_curve_groups(campaign):
+        keys.extend(f'discovery/{prefix}h{h}_return_vs_{axis}' for axis in ('j', 'compute') for h in campaign['H'])
+        if campaign.get('diagnostics', {}).get('enabled'):
+            keys.extend(f'discovery/{prefix}h{h}_{metric}_vs_j' for metric, _ in DIAGNOSTIC_CHARTS for h in campaign['H'])
+    return keys
+
+
+def ensure_campaign_chart(api, *, entity, campaign, component=None):
     """Create an immutable content-addressed chart, reconcile, and verify it."""
-    identifier = campaign_chart_id(entity, campaign)
-    expected = campaign_chart_definition(campaign)
+    if campaign['publication'].get('probability_sweep') and component is None:
+        return {component: ensure_campaign_chart(api, entity=entity, campaign=campaign, component=component)
+                for component in ('actor', 'critic', 'joint')}
+    identifier = campaign_chart_id(entity, campaign, component)
+    expected = campaign_chart_definition(campaign, component)
     chart = _execute(api, _CHART_QUERY, {'id':identifier}).get('customChart')
     mutation_error = None
     if chart is None:
@@ -102,12 +139,21 @@ def _campaign_curve(key, title, xname, yname, chart_id):
 def campaign_sections(campaign, chart_id):
     diagnostics = bool(campaign.get('diagnostics', {}).get('enabled'))
     reference = campaign.get('historical_reference')
+    sweep = campaign['publication'].get('probability_sweep', False)
+    count = len(campaign['cells'])
     intro = ('### ' + campaign['publication']['view_title'] + '\n\n'
-        '**36 configurations, three paired development seeds (101–103), 500 decisions per episode.** '
+        f'**{count} new configurations, three paired development seeds (101–103), 500 decisions per episode.** '
         'H=1,2,3; J=1,2,4,6; C16/A4/N128/B256; solve every decision. '
-        'Blue: actor-only; orange: critic-only; green: joint Bernoulli copying. '
-        'p=0.5 retains each adapted scalar parameter with probability one half; other parameters restore their frozen prior. '
-        'Adam, replay and temperature reset; target critic copies the resulting online critic. '
+        'Blue: actor-only; orange: critic-only; green: joint Bernoulli copying. ')
+    if sweep:
+        intro += ('**25% and 75% are new evaluations; 50% reuses the completed screen.** '
+            'Separate actor, critic and joint panels compare at most four curves each. '
+            'Dotted/light: 25%; solid/medium: 50%; dashed/dark: 75%; black: fresh. '
+            'p is the independent probability of retaining each adapted scalar parameter. ')
+    else:
+        intro += 'p=0.5 retains each adapted scalar parameter with probability one half. '
+    intro += ('Other parameters restore their frozen prior. Adam, replay and temperature reset; '
+        'target critic copies the resulting online critic. '
         '**Pending values are null, never zero. Partial episodes are progress only.** '
         'Curves require complete three-seed panels. Return uncertainty in the table is episode sample SD. '
         'Diagnostic probes are isolated from controller learning and their measured time is reported separately. '
@@ -116,34 +162,46 @@ def campaign_sections(campaign, chart_id):
     if reference:
         intro += ('**Black is a reused historical fresh-prior baseline**, pinned to source `' + reference['source_commit'][:12] + '`. '
             'Paired gains use the same environment and solver seeds; trajectories visit different states. '
-            'Historical controls have no new diagnostic measurements and are excluded from new-run completion counts. '
+            'Fresh controls have no new diagnostic measurements. Reused panels are excluded from new-run completion counts. '
             'Controller time includes first-solve compilation and transfer bookkeeping. ')
     else:
-        intro += 'Historical controls are not present in this view; paired-versus-fresh values remain unavailable. '
+        intro += 'Historical fresh controls are not present in this view; paired-versus-fresh values remain unavailable. '
+    for item in campaign.get('historical_references', []):
+        if item.get('kind') == 'bernoulli':
+            intro += ('**Reused 50% results and diagnostics** are pinned to source `' + item['source_commit'][:12]
+                + '` with matching diagnostic settings. Tables label provenance explicitly. '
+                'Diagnostic sections are initially collapsed to keep the return comparison quick to read. ')
     blocks = [
         ('progress', 'Bernoulli transfer | protocol and live progress', 1, [
-            _panel('intro','Markdown Panel',{'value':intro},width=24,height=7),
-            _panel('settings','Media Browser',{'chartTitle':'36 new settings and live progress','mediaKeys':['discovery/settings']},width=24,height=9)]),
-        ('curves', 'Bernoulli transfer | environment return and controller time', 3, [
-            _campaign_curve(f'discovery/h{h}_return_vs_{axis}', f'H{h}: return versus ' + ('J' if axis == 'j' else 'controller time'),
-                'J rounds per solve' if axis == 'j' else 'Controller seconds per decision', 'Mean episode return', chart_id)
-            for axis in ('j','compute') for h in campaign['H']]),
-        ('results', 'Bernoulli transfer | complete results and provenance', 1, [
-            _panel('results','Media Browser',{'chartTitle':'Complete returns, paired fresh gains, control and diagnostic timing','mediaKeys':['discovery/results']},width=24,height=10),
-            _panel('episodes','Media Browser',{'chartTitle':'Per-seed results; historical rows explicitly labeled','mediaKeys':['discovery/episodes']},width=24,height=8)]),
+            _panel('intro','Markdown Panel',{'value':intro},width=24,height=9 if sweep else 7),
+            _panel('settings','Media Browser',{'chartTitle':f'{count} new settings and live progress','mediaKeys':['discovery/settings']},width=24,height=9)]),
     ]
+    groups = campaign_curve_groups(campaign)
+    for prefix, label, _ in groups:
+        identifier = chart_id[prefix.rstrip('/')] if isinstance(chart_id, dict) else chart_id
+        suffix = '-' + prefix.rstrip('/') if prefix else ''
+        blocks.append(('curves'+suffix, 'Bernoulli transfer | '+label+'environment return and controller time', 3, [
+            _campaign_curve(f'discovery/{prefix}h{h}_return_vs_{axis}', f'{label}H{h}: return versus ' + ('J' if axis == 'j' else 'controller time'),
+                'J rounds per solve' if axis == 'j' else 'Controller seconds per decision', 'Mean episode return', identifier)
+            for axis in ('j','compute') for h in campaign['H']]))
+    blocks.append(('results', 'Bernoulli transfer | complete results and provenance', 1, [
+        _panel('results','Media Browser',{'chartTitle':'Complete returns, paired fresh gains, control and diagnostic timing','mediaKeys':['discovery/results']},width=24,height=10),
+        _panel('episodes','Media Browser',{'chartTitle':'Per-seed results; historical rows explicitly labeled','mediaKeys':['discovery/episodes']},width=24,height=8)]))
     if diagnostics:
-        blocks.append(('diagnostics', 'Bernoulli transfer | sampled-root diagnostics', 3, [
-            _campaign_curve(f'discovery/h{h}_{metric}_vs_j', f'H{h}: {title}', 'J rounds per solve', title, chart_id)
-            for metric, title in DIAGNOSTIC_CHARTS for h in campaign['H']]))
+        for prefix, label, _ in groups:
+            identifier = chart_id[prefix.rstrip('/')] if isinstance(chart_id, dict) else chart_id
+            suffix = '-' + prefix.rstrip('/') if prefix else ''
+            blocks.append(('diagnostics'+suffix, 'Bernoulli transfer | '+label+'sampled-root diagnostics', 3, [
+                _campaign_curve(f'discovery/{prefix}h{h}_{metric}_vs_j', f'{label}H{h}: {title}', 'J rounds per solve', title, identifier)
+                for metric, title in DIAGNOSTIC_CHARTS for h in campaign['H']]))
         blocks.append(('diagnostic-table', 'Bernoulli transfer | complete diagnostic measurements', 1, [
-            _panel('diagnostic-table','Media Browser',{'chartTitle':'All diagnostic means, episode SDs and coverage','mediaKeys':['discovery/diagnostics']},width=24,height=12)]))
+            _panel('diagnostic-table','Media Browser',{'chartTitle':'All diagnostic means, episode SDs, coverage and provenance','mediaKeys':['discovery/diagnostics']},width=24,height=12)]))
     sections = []
     for suffix, title, columns, panels in blocks:
         identifier = 'ambi-bernoulli-transfer-v1-' + suffix
         for index, panel in enumerate(panels):
             panel['__id__'] = identifier + '-panel-' + str(index)
-        sections.append(dict(__id__=identifier, name=title, isOpen=True, type='flow',
+        sections.append(dict(__id__=identifier, name=title, isOpen=not (sweep and suffix.startswith('diagnostic')), type='flow',
             flowConfig=dict(snapToColumns=True, columnsPerPage=columns, rowsPerPage=2,
                 gutterWidth=16, boxWidth=460, boxHeight=430 if columns == 3 else 320),
             sorted=0, pinned=True, isPanelsAuto=False, panels=panels))
@@ -366,9 +424,7 @@ def ensure_discovery_saved_view(api, *, entity, project, receipt_dir, run_id, ca
         url=url, workspace_url=url,
         run_url=f'https://wandb.ai/{entity}/{project}/runs/{run_id}?nw={name[3:-2]}',
         owned_section_ids=[s['__id__'] for s in discovery_sections(campaign, chart_id)],
-        expected_chart_keys=list(CHART_KEYS) + ([f'discovery/h{h}_{metric}_vs_j'
-            for metric, _ in DIAGNOSTIC_CHARTS for h in campaign['H']]
-            if (campaign or {}).get('diagnostics', {}).get('enabled') else []), custom_chart_id=chart_id,
+        expected_chart_keys=expected_campaign_chart_keys(campaign) if campaign else list(CHART_KEYS), custom_chart_id=chart_id,
         expected_table_keys=list(TABLE_KEYS) + (['discovery/diagnostics'] if (campaign or {}).get('diagnostics', {}).get('enabled') else []),
         verification='saved workspace schema read back; browser rendering must be checked separately')
     views = _views(api, entity, project)

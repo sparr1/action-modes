@@ -1,5 +1,9 @@
 # Frozen-checkpoint AMBI research
 
+[The Bernoulli probability extension](BERNOULLI_PROBABILITY_575K.md) adds 25%
+and 75% retention to the same H/J grid, with audited reuse of the completed 50%
+screen and historical fresh controls.
+
 [The Bernoulli p=0.5 transfer screen](BERNOULLI_TRANSFER_575K.md) tests actor,
 critic and joint random copying across H1/2/3 and J1/2/4/6 at the frozen 575k
 checkpoint, with verified sampled-root diagnostics and separate probe timing.

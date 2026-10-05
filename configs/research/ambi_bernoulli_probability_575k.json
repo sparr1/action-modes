@@ -1,0 +1,177 @@
+{
+  "schema_version": 1,
+  "protocol": "inner-sac-transfer-discovery-v1",
+  "description": "Exploratory Bernoulli p=0.25 and p=0.75 transfer between successive decisions; actor-only, critic-only, and joint across H1/2/3 and J1/2/4/6. Reuse the completed p=0.5 screen and historical fresh controls. Three paired full episodes per new cell with isolated sampled-root diagnostics.",
+  "base_matrix": "ambi_critic_transfer_575k.json",
+  "base_preset": "return_return/fresh",
+  "checkpoint_contract": {
+    "step": 575000,
+    "sha256": "0c6955db7cb8555a67d7863344b70be68f4b3250814d131e647ee6f9ef01a042"
+  },
+  "horizons": [
+    1,
+    2,
+    3
+  ],
+  "rounds": [
+    1,
+    2,
+    4,
+    6
+  ],
+  "seeds": [
+    101,
+    102,
+    103
+  ],
+  "controller_seed": 55,
+  "max_steps": 500,
+  "critic_updates": 16,
+  "actor_updates": 4,
+  "rollouts": 128,
+  "batch_size": 256,
+  "arms": {
+    "bernoulli_a025_c0": {
+      "actor_bernoulli_p": 0.25,
+      "critic_rho": 0.0,
+      "description": "Copy each adapted actor scalar parameter independently with probability 0.25; restore the remaining values to the frozen prior."
+    },
+    "bernoulli_a0_c025": {
+      "actor_rho": 0.0,
+      "critic_bernoulli_p": 0.25,
+      "description": "Copy each adapted critic scalar parameter independently with probability 0.25; restore the remaining values to the frozen prior."
+    },
+    "bernoulli_a025_c025": {
+      "actor_bernoulli_p": 0.25,
+      "critic_bernoulli_p": 0.25,
+      "description": "Copy each adapted joint scalar parameter independently with probability 0.25; restore the remaining values to the frozen prior."
+    },
+    "bernoulli_a075_c0": {
+      "actor_bernoulli_p": 0.75,
+      "critic_rho": 0.0,
+      "description": "Copy each adapted actor scalar parameter independently with probability 0.75; restore the remaining values to the frozen prior."
+    },
+    "bernoulli_a0_c075": {
+      "actor_rho": 0.0,
+      "critic_bernoulli_p": 0.75,
+      "description": "Copy each adapted critic scalar parameter independently with probability 0.75; restore the remaining values to the frozen prior."
+    },
+    "bernoulli_a075_c075": {
+      "actor_bernoulli_p": 0.75,
+      "critic_bernoulli_p": 0.75,
+      "description": "Copy each adapted joint scalar parameter independently with probability 0.75; restore the remaining values to the frozen prior."
+    }
+  },
+  "campaign_kind": "bernoulli-weight-transfer-v1",
+  "diagnostics": {
+    "enabled": true,
+    "decisions": [
+      0,
+      1,
+      25,
+      100,
+      250,
+      499
+    ],
+    "stationary_decisions": [
+      25,
+      250
+    ],
+    "mc_rollouts": 8,
+    "action_count": 8,
+    "state_count": 32,
+    "fit_steps": 4
+  },
+  "publication": {
+    "title": "575K Bernoulli retention probabilities | H1/2/3 J1/2/4/6",
+    "view_title": "575K Bernoulli weight transfer \u00b7 25% / 50% / 75%",
+    "slug_prefix": "bernoullip575",
+    "group_prefix": "bernoulli-probabilities-575k",
+    "tags": [
+      "575k",
+      "bernoulli-transfer",
+      "probability-sweep",
+      "full-episode",
+      "development-screen"
+    ],
+    "probability_sweep": true,
+    "probabilities": [
+      0.25,
+      0.5,
+      0.75
+    ],
+    "arm_styles": [
+      [
+        "bernoulli_a025_c0",
+        "Random actor 25%",
+        "#56b4e9"
+      ],
+      [
+        "bernoulli_a0_c025",
+        "Random critic 25%",
+        "#e69f00"
+      ],
+      [
+        "bernoulli_a025_c025",
+        "Random joint 25%",
+        "#7fcdbb"
+      ],
+      [
+        "bernoulli_a05_c0",
+        "Random actor 50%",
+        "#0072b2"
+      ],
+      [
+        "bernoulli_a0_c05",
+        "Random critic 50%",
+        "#d55e00"
+      ],
+      [
+        "bernoulli_a05_c05",
+        "Random joint 50%",
+        "#009e73"
+      ],
+      [
+        "bernoulli_a075_c0",
+        "Random actor 75%",
+        "#003f5c"
+      ],
+      [
+        "bernoulli_a0_c075",
+        "Random critic 75%",
+        "#8c2d04"
+      ],
+      [
+        "bernoulli_a075_c075",
+        "Random joint 75%",
+        "#005a32"
+      ]
+    ],
+    "arm_components": {
+      "bernoulli_a025_c0": "actor",
+      "bernoulli_a0_c025": "critic",
+      "bernoulli_a025_c025": "joint",
+      "bernoulli_a05_c0": "actor",
+      "bernoulli_a0_c05": "critic",
+      "bernoulli_a05_c05": "joint",
+      "bernoulli_a075_c0": "actor",
+      "bernoulli_a0_c075": "critic",
+      "bernoulli_a075_c075": "joint"
+    },
+    "arm_probabilities": {
+      "bernoulli_a025_c0": 0.25,
+      "bernoulli_a0_c025": 0.25,
+      "bernoulli_a025_c025": 0.25,
+      "bernoulli_a05_c0": 0.5,
+      "bernoulli_a0_c05": 0.5,
+      "bernoulli_a05_c05": 0.5,
+      "bernoulli_a075_c0": 0.75,
+      "bernoulli_a0_c075": 0.75,
+      "bernoulli_a075_c075": 0.75
+    }
+  },
+  "probabilities": [
+    0.25,
+    0.75
+  ]
+}
