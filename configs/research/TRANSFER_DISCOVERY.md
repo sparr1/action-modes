@@ -100,6 +100,12 @@ account GPU/CPU/memory limits, independently of the scientific grid.
 Reporting defaults to `rwgao_b-brown-university/ambi-inner-bench`. The CPU
 publisher creates a dedicated saved workspace filtered to the run's
 `config.publication_id`, preserving existing personal and saved workspaces.
+Saved views use the native `nw-<alphanumeric slug>-v` name and the project-root
+URL `https://wandb.ai/<entity>/<project>?nw=<slug>`. The slug is `transfer575`
+followed by the publication run ID; IDs containing hyphens or underscores use a
+deterministic SHA-256 suffix instead. Internal hyphens in a saved-view slug were
+observed to stall workspace loading before panels rendered. Earlier views are
+preserved when the publisher creates or reuses the native-format view.
 It accepts explicit `--entity` and `--project` overrides:
 
 ```bash

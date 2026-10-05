@@ -1,6 +1,7 @@
 """Visible, idempotent W&B panels for the 575K mechanism discovery campaign."""
 from copy import deepcopy
 import errno
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -206,9 +207,14 @@ def ensure_discovery_saved_view(api, *, entity, project, receipt_dir, run_id):
     if not isinstance(run_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', run_id):
         raise ResultsLayoutError('A valid explicit publication run ID is required.')
     root = Path(receipt_dir)
-    name = 'nw-transfer575-' + run_id + '-v'
+    # Internal hyphens in the saved-view slug stall the authenticated W&B UI
+    # before panels render. Keep the native slug alphanumeric, preserving the
+    # full publication ID in the run filter and receipts.
+    suffix = (run_id if re.fullmatch(r'[A-Za-z0-9]+', run_id)
+              else 'h' + hashlib.sha256(run_id.encode('utf-8')).hexdigest())
+    name = 'nw-transfer575' + suffix + '-v'
     display_name = '575K transfer discovery · H1/2/3 · J sweep'
-    url = f'https://wandb.ai/{entity}/{project}/workspace?nw={name[3:-2]}'
+    url = f'https://wandb.ai/{entity}/{project}?nw={name[3:-2]}'
     receipt = dict(schema_version=1, layout_version=LAYOUT_VERSION, entity=entity,
         project=project, view_name=name, view_type='project-view', run_id=run_id,
         layout_scope='dedicated campaign-filtered saved project workspace',

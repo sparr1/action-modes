@@ -1,7 +1,9 @@
 """A dedicated campaign view must not inherit unrelated project filters."""
 from copy import deepcopy
 import errno
+import hashlib
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -54,8 +56,36 @@ def test_saved_view_selects_exact_publication_and_preserves_all_existing_views(t
     panels = [p for s in layout._bank(spec)['sections'] for p in s['panels']]
     assert sum(p['viewType'] == 'Vega2' for p in panels) == 6
     assert sum(p['viewType'] == 'Media Browser' for p in panels) == 3
-    assert receipt['url'].endswith('/workspace?nw=transfer575-publication123')
+    assert receipt['url'] == 'https://wandb.ai/entity/project?nw=transfer575publication123'
+    assert receipt['view_name'] == 'nw-transfer575publication123-v'
     assert '/runs/publication123?' in receipt['run_url']
+    assert not install(tmp_path, service)['changed'] and service.writes == 1
+
+
+@pytest.mark.parametrize('run_id', ['publication123', 'trial-1', 'trial_1'])
+def test_saved_view_slug_is_alphanumeric_and_keeps_exact_publication_filter(tmp_path, run_id):
+    service = Service()
+    receipt = install(tmp_path, service, run_id)
+    slug = receipt['view_name'][3:-2]
+    assert re.fullmatch(r'[A-Za-z0-9]+', slug)
+    suffix = (run_id if run_id.isalnum()
+              else 'h' + hashlib.sha256(run_id.encode('utf-8')).hexdigest())
+    assert slug == 'transfer575' + suffix
+    assert receipt['url'] == f'https://wandb.ai/entity/project?nw={slug}'
+    assert receipt['run_url'] == f'https://wandb.ai/entity/project/runs/{run_id}?nw={slug}'
+    assert layout._saved_installed(json.loads(service.views[-1]['spec']), run_id)
+    assert not install(tmp_path, service, run_id)['changed'] and service.writes == 1
+
+
+def test_legacy_hyphenated_view_is_preserved_when_creating_native_view(tmp_path):
+    service = Service()
+    legacy = view(name='nw-transfer575-publication123-v', id='legacy-discovery')
+    service.views.append(legacy)
+    before = deepcopy(service.views)
+    receipt = install(tmp_path, service)
+    assert service.views[:3] == before
+    assert receipt['changed'] and receipt['preserved_existing_views'] == 3
+    assert service.views[-1]['name'] == 'nw-transfer575publication123-v'
     assert not install(tmp_path, service)['changed'] and service.writes == 1
 
 
