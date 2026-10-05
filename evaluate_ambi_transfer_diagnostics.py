@@ -53,6 +53,9 @@ def parser():
     p.add_argument("--fit-states", type=int, default=16)
     p.add_argument("--capture-rounds", type=int, nargs="+", default=None,
                    help="Optional post-round snapshot filter; initial/block/final snapshots remain.")
+    p.add_argument("--full-trace-probes", action="store_true",
+                   help="Persist per-update events and boundary/outer-tail probes for sampled-root forks; "
+                        "uses mc-rollouts and the current H, without adding probes to source/replanning solves.")
     p.add_argument("--no-target-cross", action="store_true")
     p.add_argument("--real-rollouts", type=int, default=0,
                    help="Optional matched model/real prefix and finite prior-tail branches per root/arm.")
@@ -214,7 +217,8 @@ def run(args):
     settings = [(h, j, resolved_setting(base, h, j)) for h in args.horizons for j in args.rounds]
     options = dict(mc_rollouts=args.mc_rollouts, action_count=args.action_count,
         data_lanes=args.data_lanes, fit_steps=args.fit_steps, fit_states=args.fit_states,
-        capture_rounds=args.capture_rounds, target_cross=not args.no_target_cross,
+        capture_rounds=args.capture_rounds, full_trace_probes=args.full_trace_probes,
+        target_cross=not args.no_target_cross,
         real_rollouts=args.real_rollouts, real_tail_steps=args.real_tail_steps,
         replan_steps=args.replan_steps, replan_repeats=args.replan_repeats)
     manifest = dict(protocol=PROTOCOL, status="resolved", checkpoint=str(args.checkpoint.resolve()),

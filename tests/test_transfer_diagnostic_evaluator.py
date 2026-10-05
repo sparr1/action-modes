@@ -13,6 +13,7 @@ from tests.test_aux_critic_transfer import critic_params
 from tests.test_ambi_root_local_sac import _model_from_params
 from utils.ambi_benchmark import solver_seed
 from utils.transfer_diagnostics import Reference, evaluating, expected_reduction, solve_fork, validate_controller
+import utils.transfer_diagnostics as diagnostics
 
 
 def arguments(transfer_matrix, output, *extra):
@@ -135,6 +136,52 @@ def test_end_to_end_horizon_forks_preserve_source_and_write_complete_evidence(tr
                 "critic_prior", "critic_carried", "actor_prior", "actor_carried",
             }
             assert all(len(curve) == 2 for curve in diagnostic["stationary"]["curves"].values())
+
+
+def test_full_trace_probes_are_saved_for_every_root_fork_without_changing_source(
+    transfer_matrix, tmp_path, monkeypatch,
+):
+    args = arguments(transfer_matrix, tmp_path / "full-traces", "--full-trace-probes")
+    args.horizons, args.rounds, args.histories = [2], [2], ["joint"]
+    calls = []
+    original = diagnostics.solve_fork
+
+    def observe(*positional, **options):
+        calls.append(dict(options))
+        return original(*positional, **options)
+
+    monkeypatch.setattr(diagnostics, "solve_fork", observe)
+    monkeypatch.setattr(evaluator, "solve_fork", observe)
+    result = evaluator.run(args)
+    assert result["options"]["full_trace_probes"] is True
+    assert sum(call.get("full_trace_probes", False) for call in calls) == 12
+    assert sum(not call.get("full_trace_probes", False) for call in calls) == 2
+    probed = [call for call in calls if call.get("full_trace_probes", False)]
+    assert {call["probe_rollouts"] for call in probed} == {args.mc_rollouts}
+    assert len({call["probe_seed"] for call in probed}) == 1
+    directory = args.output_dir / "h2-j2/joint/seed-101"
+    root = read_json(directory / "decision-1/diagnostics.json")
+    rows = root["diagnostics"]["branches"] + root["diagnostics"]["target_cross"]
+    assert len(rows) == 12
+    for row in rows:
+        events = row["trace_events"]
+        assert events and all(isinstance(event["metrics"], dict) for event in events)
+        for phase, key in (("transfer_probe", "transfer_root_q_inner_actor_mean_all"),
+                           ("probe", "togo_return_mean")):
+            probes = [event for event in events if event["phase"] == phase]
+            assert [(event["stage"], event["round_index"]) for event in probes] == [
+                ("initial", 0), ("before_first_actor_block", 1),
+                ("after_first_actor_block", 1), ("post_round", 1), ("post_round", 2),
+            ]
+            assert all(np.isfinite(event["metrics"][key]) for event in probes)
+        # Scalar per-update observations survive JSON serialization too.
+        assert any("critic_loss" in event["metrics"] for event in events)
+        assert any("actor_loss" in event["metrics"] for event in events)
+    episode = read_json(directory / "episode.json")
+    direct_return, direct_roots = direct_episode(args, result["settings"][0]["resolved"], "joint")
+    assert episode["real_return"] == pytest.approx(direct_return, abs=0, rel=0)
+    np.testing.assert_array_equal(root["observation"], direct_roots[1])
+    assert result["outer_state_unchanged"] is True
 
 
 @pytest.mark.parametrize("key,value", [

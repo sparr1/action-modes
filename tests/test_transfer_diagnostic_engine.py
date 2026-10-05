@@ -3,12 +3,14 @@
 from copy import deepcopy
 
 import pytest
+import numpy as np
 import torch
 
 from RL.tdmpc2_core.inner_trace import InnerActionTrace
 from tests.test_aux_critic_transfer import critic_params, assert_optimizer_reset
 from tests.test_ambi_inner_decoupling import _assert_tree_equal, _clone_tree
 from tests.test_ambi_root_local_sac import _model_from_params
+from utils.transfer_diagnostics import solve_fork
 
 
 def params(objective="return", horizon=3, **overrides):
@@ -22,6 +24,35 @@ def changed_state(module, amount):
         if torch.is_floating_point(value):
             value.add_(amount)
     return result
+
+
+def test_full_trace_probes_preserve_solve_weights_optimizers_and_rng():
+    model = _model_from_params(params())
+    try:
+        engine = model.agent.inner_engine
+        observation = np.array([1., .2, -.1], dtype=np.float32)
+        rng = deepcopy(engine.rng.training_state_dict())
+        _, _, donor = solve_fork(model, observation, rng, capture_rounds=())
+        global_rng = torch.random.get_rng_state().clone()
+        records = []
+        for enabled in (False, True):
+            action, trace, final = solve_fork(model, observation, rng, donor=donor,
+                branch="joint", full_trace_probes=enabled, probe_seed=192, probe_rollouts=4)
+            records.append(dict(action=action, trace=trace, final=final,
+                rng=deepcopy(engine.rng.training_state_dict()),
+                optimizers={name: _clone_tree(getattr(engine._action_pool, name).state_dict())
+                    for name in ("actor_optim", "critic_optim", "temperature_optim")}))
+        plain, observed = records
+        np.testing.assert_array_equal(plain["action"], observed["action"])
+        for component in ("actor", "critic", "critic_target"):
+            _assert_tree_equal(plain["final"].state_dict(component), observed["final"].state_dict(component))
+        _assert_tree_equal(plain["rng"], observed["rng"])
+        _assert_tree_equal(plain["optimizers"], observed["optimizers"])
+        torch.testing.assert_close(torch.random.get_rng_state(), global_rng, rtol=0, atol=0)
+        assert not any(event["phase"] == "transfer_probe" for event in plain["trace"].events)
+        assert any("togo_return_mean" in event["metrics"] for event in observed["trace"].events)
+    finally:
+        model.close()
 
 
 @pytest.mark.parametrize("objective", ["return", "soft"])

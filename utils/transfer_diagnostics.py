@@ -213,7 +213,8 @@ def raw_entropy_coefficient(snapshot):
 
 
 def solve_fork(wrapped, observation, rng, *, donor=None, branch="fresh", target="online",
-               collection_actor=None, capture_rounds=None):
+               collection_actor=None, capture_rounds=None, full_trace_probes=False,
+               probe_seed=0, probe_rollouts=8):
     if branch not in BRANCHES:
         raise ValueError(f"Unknown component branch: {branch}")
     actor_carry, critic_carry = BRANCHES[branch]
@@ -226,7 +227,10 @@ def solve_fork(wrapped, observation, rng, *, donor=None, branch="fresh", target=
     critic = donor.state_dict("critic") if critic_carry else None
     target_state = (donor.state_dict("critic") if target == "carried" else
                     engine._critic_base if target == "prior" else target)
-    trace = InnerActionTrace(capture_learners=True, learner_rounds=capture_rounds)
+    trace = InnerActionTrace(capture_learners=True, learner_rounds=capture_rounds,
+        transfer_probes=full_trace_probes, probes=full_trace_probes,
+        probe_mode="outer_tail", probe_seed=probe_seed, probe_rollouts=probe_rollouts,
+        probe_horizon=int(wrapped.cfg.inner_rollout_horizon))
     options = dict(actor=actor, critic=critic, target=target_state)
     if collection_actor is not None:
         options["collection_actor"] = collection_actor
@@ -418,11 +422,16 @@ def audit_root(wrapped, observation, rng, donor, *, previous_observation, previo
     actions = reference.action_bank(z, prior, carried, seed=seed, count=options["action_count"])
     results, finals = [], {}
     evaluation_coefficient = None
+    # The same independent stream pairs probes across all root interventions.
+    # Source-history and future-replanning solves do not receive these options.
+    trace_options = (dict(full_trace_probes=True,
+        probe_seed=solver_seed(seed, "full-trace-probes"),
+        probe_rollouts=options["mc_rollouts"]) if options.get("full_trace_probes", False) else {})
     for lane in options["data_lanes"]:
         collection = prior if lane == "common" else None
         for branch in BRANCHES:
             action, trace, final = solve_fork(wrapped, observation, rng, donor=donor, branch=branch,
-                collection_actor=collection, capture_rounds=options.get("capture_rounds"))
+                collection_actor=collection, capture_rounds=options.get("capture_rounds"), **trace_options)
             if evaluation_coefficient is None:
                 evaluation_coefficient = raw_entropy_coefficient(next(
                     snap for snap in trace.learner_snapshots if snap.stage == "initial"))
@@ -444,6 +453,8 @@ def audit_root(wrapped, observation, rng, donor, *, previous_observation, previo
                        action=action.tolist(), stages=checks, final=final_check,
                        replay_sha256=hashes,
                        solver_metrics=deepcopy(wrapped.agent.last_inner_metrics))
+            if trace_options:
+                row["trace_events"] = json_value(deepcopy(trace.events))
             results.append(row)
             finals[(lane, branch)] = (action, final)
     targets = []
@@ -452,7 +463,7 @@ def audit_root(wrapped, observation, rng, donor, *, previous_observation, previo
             for target in ("prior", "carried"):
                 action, trace, final = solve_fork(wrapped, observation, rng, donor=donor,
                     branch=branch, target=target, collection_actor=prior,
-                    capture_rounds=options.get("capture_rounds"))
+                    capture_rounds=options.get("capture_rounds"), **trace_options)
                 targets.append(dict(online="carried" if branch == "critic" else "prior", target=target,
                     action=action.tolist(), stages=[audit_snapshot(reference, snap, z, actions,
                         {"prior": prior, "carried": carried}, horizon=horizon, seed=seed,
@@ -461,6 +472,8 @@ def audit_root(wrapped, observation, rng, donor, *, previous_observation, previo
                     final=audit_snapshot(reference, final, z, actions,
                         {"prior": prior, "carried": carried}, horizon=horizon, seed=seed,
                         evaluation_coefficient=evaluation_coefficient)))
+                if trace_options:
+                    targets[-1]["trace_events"] = json_value(deepcopy(trace.events))
     portability = portability_audit(reference, donor, z,
         reference.encode(np.asarray(previous_observation)[None]),
         torch.as_tensor(previous_action, device=reference.device, dtype=torch.float32)[None],

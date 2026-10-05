@@ -118,6 +118,46 @@ decision's donor. It is not a snapshot before the next solve's initialization.
 remain. Every snapshot contains independent actor/online/target payloads,
 temperature, policy bounds, and the actual actor Q divisor.
 
+`--full-trace-probes` additionally saves `trace_events` for all eight
+sampled-root lane/initialization forks and the four target-crossing forks.
+Events include individual optimizer-update metrics, root policy KL and spread,
+per-head online/target/frozen critic comparisons, and paired frozen-model
+outer-tail probes at initialization, immediately before/after the first actor
+block, and after every completed round. Outer-tail probes use `--mc-rollouts`
+and the current H, with one separate named RNG stream shared across root forks.
+They do not consume source or learner RNG. Source-prefix decisions and future
+replanning decisions retain their ordinary learner snapshots but do not run
+these additional probes. The flag is off by default; it does not replace the
+saved-root critic, stationary, portability, or optional real-branch audits.
+
+### Measuring diagnostic runtime
+
+`profile_ambi_transfer_diagnostics.py` accepts the evaluator options plus a new
+`--profile-dir`. It requires every measurement family, all round snapshots,
+the extra trace probes, and saved donor/simulator snapshots. It synchronizes
+CUDA at phase boundaries and records incremental `progress.jsonl`, nested
+inclusive/exclusive wall times in `timings.json`, hardware, and an output
+coverage receipt. A missing measurement fails verification instead of producing
+a successful timing result. Inclusive nested phase totals overlap; exclusive
+times can be added. The wrapper restores its observation hooks on exit.
+
+`slurm/run_transfer_diagnostic_timing_oscar.sbatch` maps array indices 0–8 to
+H1/2/3 × J1/4/10. Each cell uses the 575k checkpoint, joint-carry source history,
+seed101, and decision25 after 25 source solves. It uses 32 model MC replicates,
+8 actions, all snapshots, 32 stationary fit steps on 16 states, three real
+replicates with 1,000-step prior tails, and all three replanning interventions
+for 25 decisions with three repeats. Each root compares all four weight-transfer
+arms in both collection lanes; it does not benchmark the separate 14-arm
+production discovery campaign. The evaluator runs eagerly with C16/A4/N128/B256.
+These are runtime samples, not an adequately replicated scientific study.
+
+Submit from a clean, exact Git checkout with `TIMING_ROOT`, `CHECKPOINT_PATH`,
+and `EXPECTED_ACTION_MODES_SHA` set. Request one L40S per array task and select
+concurrency from live limits. The launcher records `/usr/bin/time -v` separately
+so total process time includes imports and final coverage verification. Queue
+wait is not execution time. The output root must exist; each cell refuses an
+existing directory.
+
 Critic references use the snapshot's own entropy coefficient and Q scale.
 For causal comparisons of actor objectives across branches/stages, all forks
 are scored with the **fresh branch's initial** coefficient in reward units.
