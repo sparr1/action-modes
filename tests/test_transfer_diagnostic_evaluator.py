@@ -1,6 +1,7 @@
 """End-to-end saved-root diagnostics on an actual tiny frozen checkpoint."""
 
 from copy import deepcopy
+from collections import Counter
 import json
 
 import numpy as np
@@ -13,6 +14,7 @@ from tests.test_aux_critic_transfer import critic_params
 from tests.test_ambi_root_local_sac import _model_from_params
 from utils.ambi_benchmark import solver_seed
 from utils.transfer_diagnostics import Reference, evaluating, expected_reduction, solve_fork, validate_controller
+from utils.transfer_diagnostic_coverage import _fork
 import utils.transfer_diagnostics as diagnostics
 
 
@@ -164,6 +166,7 @@ def test_full_trace_probes_are_saved_for_every_root_fork_without_changing_source
     rows = root["diagnostics"]["branches"] + root["diagnostics"]["target_cross"]
     assert len(rows) == 12
     for row in rows:
+        _fork(row, 2, result["options"], "actual-checkpoint-root", Counter())
         events = row["trace_events"]
         assert events and all(isinstance(event["metrics"], dict) for event in events)
         for phase, key in (("transfer_probe", "transfer_root_q_inner_actor_mean_all"),
