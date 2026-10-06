@@ -36,6 +36,19 @@ case "$EVAL_MODE" in
     exec "$PYTHON_BIN" slurm/ambi_transfer_discovery_campaign.py "${args[@]}"
     ;;
   worker)
+    # Fail before evaluation if the allocation cannot actually execute CUDA.
+    # A visible GPU in nvidia-smi alone does not prevent CPU fallback.
+    "$PYTHON_BIN" - <<'PY'
+import torch
+
+assert torch.cuda.is_available(), "CUDA is unavailable; refusing CPU fallback"
+assert torch.cuda.device_count() == 1, "Expected one allocated GPU"
+assert "L40S" in torch.cuda.get_device_name(0), "Expected L40S timing hardware"
+probe = torch.ones(1024, device="cuda").square().sum()
+torch.cuda.synchronize()
+assert probe.item() == 1024.0, "CUDA arithmetic preflight failed"
+print("CUDA health preflight passed: " + torch.cuda.get_device_name(0), flush=True)
+PY
     args=(worker --root "$CAMPAIGN_ROOT" --index "${SLURM_ARRAY_TASK_ID:?}")
     if [[ "${EVAL_SMOKE:-0}" == 1 ]]; then args+=(--smoke); fi
     exec "$PYTHON_BIN" slurm/ambi_transfer_discovery_campaign.py "${args[@]}"

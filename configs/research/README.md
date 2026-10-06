@@ -1,5 +1,10 @@
 # Frozen-checkpoint AMBI research
 
+[The Bernoulli J8 extension](ambi_bernoulli_j8_575k.json) adds nine p=0.5 cells:
+actor-only, critic-only and joint transfer at H1/2/3, with three paired full
+episodes each. It retains the sampled diagnostics, reuses p=0.5 J1/2/4/6 results
+and fresh J1/2/4/6/8 controls, and gates production on three H3/J8 smoke cells.
+
 [The Bernoulli probability extension](BERNOULLI_PROBABILITY_575K.md) adds 25%
 and 75% retention to the same H/J grid, with audited reuse of the completed 50%
 screen and historical fresh controls.

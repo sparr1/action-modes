@@ -135,11 +135,20 @@ def prepare(args):
     if sorted(c['index'] for c in cells) != list(range(expected_count)) or len({c['name'] for c in cells}) != expected_count:
         raise ValueError('Cell identities are not unique and contiguous.')
     bernoulli = matrix.get('campaign_kind') == 'bernoulli-weight-transfer-v1'
+    reference_rounds = dict(fresh=rounds, bernoulli=rounds)
     if bernoulli:
         probabilities = bernoulli_probabilities(matrix)
-        if rounds != [1, 2, 4, 6]:
+        j8_extension = probabilities == [0.5] and rounds == [8]
+        if rounds != [1, 2, 4, 6] and not j8_extension:
             raise ValueError('Bernoulli screen differs from the authorized H/J grid.')
-        if probabilities == [0.5]:
+        if j8_extension:
+            reference_rounds = dict(fresh=[1, 2, 4, 6, 8], bernoulli=[1, 2, 4, 6])
+            if matrix.get('reference_rounds') != reference_rounds:
+                raise ValueError('J8 extension requires the audited lower-J and fresh-J8 reference panel.')
+            smoke = [c['index'] for c in cells if c['H'] == 3]
+        elif 'reference_rounds' in matrix:
+            raise ValueError('Reference-round overrides are only authorized for the p=0.5 J8 extension.')
+        elif probabilities == [0.5]:
             # Every mechanism, all horizons, two transfer boundaries and max J.
             smoke = [c['index'] for c in cells if
                 (c['J'] == 2 and (c['H'] == 3 or c['arm'] == 'bernoulli_a05_c05'))
@@ -155,9 +164,9 @@ def prepare(args):
         smoke = [c['index'] for c in cells if (c['J'] == 2 and
             (c['H'] == 3 or c['arm'] == 'full_state_replay25')) or
             (c['J'] == 10 and c['arm'] == 'rho_a0_c0')]
-    reference = reference_manifest(args.reference_root, horizons, rounds)
+    reference = reference_manifest(args.reference_root, horizons, reference_rounds['fresh'])
     bernoulli_reference = reference_manifest(getattr(args, 'bernoulli_reference_root', None),
-        horizons, rounds, kind='bernoulli', expected_matrix=matrix)
+        horizons, reference_rounds['bernoulli'], kind='bernoulli', expected_matrix=matrix)
     args.root.mkdir(parents=True, exist_ok=False)
     campaign = dict(schema_version=1, protocol='inner-sac-transfer-discovery-v1', **source(),
         checkpoint=str(checkpoint), checkpoint_sha256=CHECKPOINT_SHA, metadata_sha256=METADATA_SHA,
@@ -168,6 +177,7 @@ def prepare(args):
         diagnostics=matrix.get('diagnostics', {}), publication=matrix.get('publication', {}),
         historical_reference=reference,
         historical_references=[r for r in (reference, bernoulli_reference) if r is not None],
+        reference_rounds=reference_rounds,
         smoke_seeds=[101, 102], smoke_steps=3, gpu_hardware='L40S',
         historical_reuse=('No new controls; historical discovery references are separate and retain their original provenance.'
             if bernoulli else 'none; matched controls rerun under this implementation'),

@@ -141,9 +141,17 @@ def campaign_sections(campaign, chart_id):
     reference = campaign.get('historical_reference')
     sweep = campaign['publication'].get('probability_sweep', False)
     count = len(campaign['cells'])
+    reference_rounds = {record['cell']['J'] for item in campaign.get('historical_references', [])
+                        for record in item.get('records', [])}
+    new_rounds = set(campaign['J'])
+    round_label = 'J=' + ','.join(map(str, campaign['J']))
+    if reference_rounds - new_rounds:
+        round_label = ('new ' + round_label + '; plotted J='
+                       + ','.join(map(str, sorted(reference_rounds | new_rounds))))
+    scope = 'H=' + ','.join(map(str, campaign['H'])) + '; ' + round_label
     intro = ('### ' + campaign['publication']['view_title'] + '\n\n'
         f'**{count} new configurations, three paired development seeds (101–103), 500 decisions per episode.** '
-        'H=1,2,3; J=1,2,4,6; C16/A4/N128/B256; solve every decision. '
+        + scope + '; C16/A4/N128/B256; solve every decision. '
         'Blue: actor-only; orange: critic-only; green: joint Bernoulli copying. ')
     if sweep:
         intro += ('**25% and 75% are new evaluations; 50% reuses the completed screen.** '
@@ -169,8 +177,9 @@ def campaign_sections(campaign, chart_id):
     for item in campaign.get('historical_references', []):
         if item.get('kind') == 'bernoulli':
             intro += ('**Reused 50% results and diagnostics** are pinned to source `' + item['source_commit'][:12]
-                + '` with matching diagnostic settings. Tables label provenance explicitly. '
-                'Diagnostic sections are initially collapsed to keep the return comparison quick to read. ')
+                + '` with matching diagnostic settings. Tables label provenance explicitly. ')
+            if sweep:
+                intro += 'Diagnostic sections are initially collapsed to keep the return comparison quick to read. '
     blocks = [
         ('progress', 'Bernoulli transfer | protocol and live progress', 1, [
             _panel('intro','Markdown Panel',{'value':intro},width=24,height=9 if sweep else 7),
