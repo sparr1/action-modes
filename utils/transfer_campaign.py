@@ -61,14 +61,17 @@ def load_campaign(path):
         validate_arm(arm)
         if not name or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789_" for char in name):
             raise ValueError("Arm names must use lowercase letters, digits and underscores.")
-    campaign["base_matrix_path"] = str((path.parent / campaign["base_matrix"]).resolve())
+    base_dir = (Path(__file__).resolve().parents[1] / "configs/research"
+                if campaign.get("family") == "spectral_transfer" else path.parent)
+    campaign["base_matrix_path"] = str((base_dir / campaign["base_matrix"]).resolve())
     return campaign
 
 
 def validate_arm(arm):
     allowed = {"actor_rho", "critic_rho", "collection", "replay_fraction", "full_state",
                "actor_prior_kl_coef", "critic_prior_l2_coef", "description", "compile",
-               "actor_bernoulli_p", "critic_bernoulli_p"}
+               "actor_bernoulli_p", "critic_bernoulli_p", "parameter_scope",
+               "actor_spectral", "critic_spectral"}
     if set(arm) - allowed:
         raise ValueError(f"Unknown transfer arm fields: {sorted(set(arm) - allowed)}")
     for key in ("actor_rho", "critic_rho", "replay_fraction", "actor_bernoulli_p", "critic_bernoulli_p"):
@@ -78,6 +81,21 @@ def validate_arm(arm):
     for component in ("actor", "critic"):
         if f"{component}_bernoulli_p" in arm and f"{component}_rho" in arm:
             raise ValueError(f"{component} Bernoulli copying and deterministic blending are exclusive.")
+        if f"{component}_spectral" in arm:
+            from utils.spectral_transfer import validate_spectral_spec
+            validate_spectral_spec(arm[f"{component}_spectral"])
+            if any(f"{component}_{key}" in arm for key in ("rho", "bernoulli_p")):
+                raise ValueError(f"{component} spectral, Bernoulli and rho transfer are exclusive.")
+            if arm.get("parameter_scope") != "matrices":
+                raise ValueError("Spectral arms require explicit parameter_scope='matrices'.")
+            if (arm.get("full_state") or arm.get("replay_fraction", 0.) or
+                    arm.get("collection", "learner") != "learner" or
+                    arm.get("actor_prior_kl_coef", 0.) or arm.get("critic_prior_l2_coef", 0.)):
+                raise ValueError("Spectral transfer requires fresh replay/optimizers and no extra intervention.")
+    if arm.get("parameter_scope", "all") not in {"all", "matrices"}:
+        raise ValueError("parameter_scope must be all or matrices.")
+    if arm.get("parameter_scope") == "matrices" and arm.get("full_state"):
+        raise ValueError("Matrix-only transfer cannot carry full learner state.")
     if arm.get("full_state", False) and any(f"{name}_bernoulli_p" in arm for name in ("actor", "critic")):
         raise ValueError("Bernoulli copying is weight-only and cannot carry full learner state.")
     for key in ("actor_prior_kl_coef", "critic_prior_l2_coef"):
@@ -150,7 +168,8 @@ def needs_donor(arm):
     return bool(any(arm.get(f"{name}_{method}", 0.) for name in ("actor", "critic")
                     for method in ("rho", "bernoulli_p"))
         or arm.get("replay_fraction", 0.) or arm.get("full_state", False)
-        or arm.get("collection", "learner") == "previous_actor")
+        or arm.get("collection", "learner") == "previous_actor"
+        or any(f"{name}_spectral" in arm for name in ("actor", "critic")))
 
 
 def make_transfer_generators(engine, *, controller_seed, episode_seed):
@@ -219,7 +238,8 @@ def bernoulli_state(prior, donor, probability, *, parameter_names, generator=Non
     return result
 
 
-def arm_initialization(engine, arm, donor, *, transfer_generators=None, transfer_metrics=None):
+def arm_initialization(engine, arm, donor, *, transfer_generators=None, transfer_metrics=None,
+                       spectral_context=None):
     """Translate one reviewed arm into an explicit engine intervention."""
     validate_arm(arm)
     options = dict(allow_compile=bool(engine.cfg.compile),
@@ -231,6 +251,8 @@ def arm_initialization(engine, arm, donor, *, transfer_generators=None, transfer
         options["target"] = "online"
     if transfer_metrics is not None:
         for component in ("actor", "critic"):
+            if f"{component}_spectral" in arm:
+                transfer_metrics[f"inner_{component}_spectral_applied"] = 0.
             if f"{component}_bernoulli_p" in arm:
                 transfer_metrics.update({f"inner_{component}_bernoulli_retained_fraction": 0.,
                     f"inner_{component}_relative_parameter_delta_l2": 0.,
@@ -243,11 +265,28 @@ def arm_initialization(engine, arm, donor, *, transfer_generators=None, transfer
         for component in ("actor", "critic"):
             rho = float(arm.get(f"{component}_rho", 0.))
             probability = arm.get(f"{component}_bernoulli_p")
-            if probability is not None and probability > 0:
-                module = getattr(engine, f"_{component}_base")
+            module = getattr(engine, f"_{component}_base")
+            names = {key for key, value in module.named_parameters()
+                     if arm.get("parameter_scope", "all") == "all" or value.ndim == 2}
+            spec = arm.get(f"{component}_spectral")
+            if spec is not None:
+                from utils.spectral_transfer import spectral_state
+                sampled_metrics = {} if transfer_metrics is not None else None
+                context = spectral_context or {}
+                options[component] = spectral_state(module.state_dict(), donor["modules"][component],
+                    parameter_names=names, spec=spec,
+                    inputs=context.get("inputs", {}).get(component),
+                    gradients=context.get("gradients", {}).get(component), metrics=sampled_metrics,
+                    include_layer_metrics=False)
+                if transfer_metrics is not None:
+                    transfer_metrics[f"inner_{component}_spectral_applied"] = float(spec.get("strength", 1.) > 0)
+                    transfer_metrics.update({f"inner_{component}_spectral_{key}": value
+                        for key, value in sampled_metrics.items()
+                        if isinstance(value, (int, float)) and not isinstance(value, bool)})
+            elif probability is not None and probability > 0:
                 sampled_metrics = {} if transfer_metrics is not None else None
                 options[component] = bernoulli_state(module.state_dict(), donor["modules"][component],
-                    probability, parameter_names=dict(module.named_parameters()),
+                    probability, parameter_names=names,
                     generator=None if transfer_generators is None else transfer_generators[component],
                     metrics=sampled_metrics)
                 if transfer_metrics is not None:
@@ -258,6 +297,9 @@ def arm_initialization(engine, arm, donor, *, transfer_generators=None, transfer
             elif rho:
                 base = getattr(engine, f"_{component}_base").state_dict()
                 options[component] = blend_state(base, donor["modules"][component], rho)
+                if arm.get("parameter_scope") == "matrices":
+                    for key in set(base) - names:
+                        options[component][key] = base[key].detach().clone()
         if arm.get("replay_fraction", 0.):
             options.update(replay=donor["replay"], replay_fraction=float(arm["replay_fraction"]))
     if arm.get("collection", "learner") == "previous_actor":
@@ -284,7 +326,7 @@ def selected_metrics(metrics):
 
 
 def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_steps,
-                     on_step=None, smoke=False, diagnostics=None):
+                     on_step=None, smoke=False, diagnostics=None, spectral_probe=None):
     """One paired episode with optional separately timed observational probes."""
     from evaluate_ambi_checkpoint import _seed_spaces
     validate_arm(arm)
@@ -299,6 +341,7 @@ def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_st
     transfer_generators = make_transfer_generators(engine, controller_seed=controller_seed,
                                                    episode_seed=episode_seed)
     rewards, latencies, transfer_times, diagnostic_times = [], [], [], []
+    spectral_probe_times, spectral_filter_times, export_times = [], [], []
     terminated = truncated = False
     started = time.perf_counter()
     for decision in range(max_steps):
@@ -306,11 +349,28 @@ def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_st
             torch.cuda.synchronize(wrapped.agent.device)
         transfer_started = time.perf_counter()
         transfer_metrics = {}
-        options = arm_initialization(engine, arm, donor, transfer_generators=transfer_generators,
-                                     transfer_metrics=transfer_metrics)
+        context = None
+        components = tuple(name for name in ("actor", "critic")
+            if arm.get(f"{name}_spectral", {}).get("method") in {"activation", "gradient"}
+            and arm[f"{name}_spectral"].get("strength", 1.) > 0)
+        if donor is not None and components:
+            from utils.spectral_transfer_probes import build_spectral_context
+            context = build_spectral_context(wrapped, observation, controller_seed=controller_seed,
+                episode_seed=episode_seed, decision=decision, settings=spectral_probe,
+                components=components, compute_gradients=any(
+                    arm[f"{name}_spectral"]["method"] == "gradient" for name in components))
         if wrapped.agent.device.type == "cuda":
             torch.cuda.synchronize(wrapped.agent.device)
-        initialization_seconds = time.perf_counter() - transfer_started
+        probe_seconds = time.perf_counter() - transfer_started if context is not None else 0.
+        filter_started = time.perf_counter()
+        options = arm_initialization(engine, arm, donor, transfer_generators=transfer_generators,
+                                     transfer_metrics=transfer_metrics, spectral_context=context)
+        if wrapped.agent.device.type == "cuda":
+            torch.cuda.synchronize(wrapped.agent.device)
+        initialization_finished = time.perf_counter()
+        initialization_seconds = initialization_finished - transfer_started
+        filter_seconds = (initialization_finished - filter_started if donor is not None and
+            any(f"{name}_spectral" in arm for name in ("actor", "critic")) else 0.)
         trace = None if diagnostics is None else diagnostics.begin(wrapped, observation, decision, donor)
         predict_started = time.perf_counter()
         with engine.diagnostic_initialization(**options):
@@ -324,12 +384,18 @@ def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_st
         if diagnostics is not None:
             prediction_seconds -= diagnostics.in_prediction_seconds
         transfer_started = time.perf_counter()
-        if carry_donor:
+        diagnostic_donor = diagnostics is not None and getattr(diagnostics, "needs_donor", False)
+        if carry_donor or diagnostic_donor:
             donor = engine.export_diagnostic_state(include_optimizers=bool(arm.get("full_state", False)),
                 include_replay=bool(arm.get("replay_fraction", 0.)))
         if wrapped.agent.device.type == "cuda":
             torch.cuda.synchronize(wrapped.agent.device)
-        transfer_seconds = initialization_seconds + time.perf_counter() - transfer_started
+        export_seconds = time.perf_counter() - transfer_started
+        # A fresh arm exports a donor only for observational measurements.
+        if diagnostic_donor and not carry_donor:
+            diagnostic_seconds += export_seconds
+            export_seconds = 0.
+        transfer_seconds = initialization_seconds + export_seconds
         action = np.asarray(action)
         if not np.isfinite(action).all():
             raise ValueError("Controller emitted a nonfinite action.")
@@ -341,15 +407,22 @@ def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_st
         latencies.append(prediction_seconds)
         transfer_times.append(transfer_seconds)
         diagnostic_times.append(diagnostic_seconds)
+        spectral_probe_times.append(probe_seconds)
+        spectral_filter_times.append(filter_seconds)
+        export_times.append(export_seconds)
         row = dict(seed=int(episode_seed), decision=decision, reward=reward,
             cumulative_reward=float(sum(rewards)), action=action.tolist(),
             prediction_seconds=prediction_seconds, transfer_seconds=transfer_seconds,
             control_seconds=prediction_seconds + transfer_seconds,
             diagnostic_seconds=diagnostic_seconds,
+            spectral_probe_seconds=probe_seconds, spectral_filter_seconds=filter_seconds,
+            donor_export_seconds=export_seconds,
             metrics={**selected_metrics(wrapped.agent.last_inner_metrics), **transfer_metrics},
             terminated=bool(terminated), truncated=bool(truncated))
         if diagnostic_record is not None:
             row["diagnostics"] = diagnostic_record
+        if context is not None:
+            row["spectral_selection"] = context["metadata"]
         if on_step is not None:
             on_step(row)
         if terminated or truncated:
@@ -362,6 +435,9 @@ def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_st
         smoke=bool(smoke), wall_seconds=elapsed,
         prediction_seconds=float(sum(latencies)), transfer_seconds=float(sum(transfer_times)),
         diagnostic_seconds=float(sum(diagnostic_times)),
+        spectral_probe_seconds=float(sum(spectral_probe_times)),
+        spectral_filter_seconds=float(sum(spectral_filter_times)),
+        donor_export_seconds=float(sum(export_times)),
         control_seconds=float(sum(latencies) + sum(transfer_times)),
         mean_prediction_seconds=float(np.mean(latencies)),
         p50_prediction_seconds=float(np.percentile(latencies, 50)),

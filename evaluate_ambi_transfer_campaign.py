@@ -28,6 +28,10 @@ from utils.transfer_campaign_diagnostics import (
     CampaignDiagnostics, diagnostic_settings, verify_episode_diagnostics,
     verify_observational_isolation,
 )
+from utils.spectral_campaign import (
+    SpectralCampaignDiagnostics, spectral_settings, validate_probe_settings,
+    verify_spectral_diagnostics,
+)
 
 
 def parser():
@@ -63,7 +67,9 @@ def source_identity():
         root / "RL/tdmpc2_core/inner_improvement.py", root / "RL/tdmpc2_core/inner_trace.py",
         root / "RL/tdmpc2_core/common/inner_utils.py",
         root / "utils/transfer_campaign_diagnostics.py",
-        root / "utils/transfer_diagnostic_metrics.py", root / "utils/transfer_diagnostics.py"]
+        root / "utils/transfer_diagnostic_metrics.py", root / "utils/transfer_diagnostics.py",
+        root / "utils/spectral_transfer.py", root / "utils/spectral_transfer_probes.py",
+        root / "utils/spectral_campaign.py"]
     digests = {str(path.relative_to(root)): _file_sha256(path) for path in files}
     git = shutil.which("git")
     if git is None:
@@ -97,6 +103,8 @@ def validate_args(args, campaign):
 def run(args):
     campaign = load_campaign(args.campaign)
     diagnostics_config = diagnostic_settings(campaign.get("diagnostics"))
+    spectral_config = spectral_settings(campaign.get("spectral_diagnostics"))
+    spectral_probe = validate_probe_settings(campaign.get("spectral_probe"))
     if args.list_cells:
         return listed_cells(campaign)
     seeds, max_steps, controller_seed = validate_args(args, campaign)
@@ -117,6 +125,7 @@ def run(args):
         arm_definition=arm, horizon=args.horizon, rounds=args.rounds, seeds=seeds,
         controller_seed=controller_seed, max_steps=max_steps, smoke=bool(args.smoke),
         diagnostics=diagnostics_config,
+        spectral_diagnostics=spectral_config, spectral_probe=spectral_probe,
         checkpoint=str(args.checkpoint.resolve()), checkpoint_sha256=_file_sha256(args.checkpoint),
         checkpoint_step=context.metadata["checkpoint"]["step"],
         campaign=str(args.campaign.resolve()), campaign_sha256=_file_sha256(args.campaign),
@@ -133,6 +142,14 @@ def run(args):
             compute="Fixed J,C,A,N per cell; imagination transitions scale with H; no equal-compute claim.",
             replay="Previous solve only, fixed requested minibatch fraction; no real replay.",
             anchors="Actor KL(current||frozen prior); critic mean over tensors of MSE/(mean prior squared+1e-6)."))
+    if campaign.get("family") == "spectral_transfer":
+        metadata_path = (args.metadata or Path(str(args.checkpoint) + ".metadata.json")).resolve()
+        manifest.update(metadata_path=str(metadata_path), metadata_sha256=_file_sha256(metadata_path))
+        manifest["semantics"].update(
+            spectral="Layerwise donor-minus-frozen-prior matrix deltas; nonmatrix parameters reset. Dense SAC after initialization. Rank clamps to each matrix dimension.",
+            spectral_scoring="Prior-root bank, frozen-prior anchor. Actor: negative frozen-prior Q at deterministic mean, no entropy. Critic: per-head decoded MSE versus fixed prior model returns.",
+            spectral_evaluation="Independent heldout stream; same bank and labels at prior/donor/initial/post-J. Model surrogates, not environment ground truth.",
+            timing="Controller includes selection probes, SVD/covariance/gradient filtering, initialization and donor export. Heldout diagnostic probes and snapshot time excluded and reported separately.")
     if args.dry_run:
         return manifest
     output = args.output_dir.resolve()
@@ -155,13 +172,16 @@ def run(args):
         for episode_index, episode_seed in enumerate(seeds):
             diagnostics = (CampaignDiagnostics(diagnostics_config, episode_seed=episode_seed,
                 controller_seed=controller_seed, smoke=args.smoke) if diagnostics_config else None)
+            if spectral_config:
+                diagnostics = SpectralCampaignDiagnostics(spectral_config, basic_settings=diagnostics_config,
+                    episode_seed=episode_seed, controller_seed=controller_seed, smoke=args.smoke)
             reference_rows, observed_rows = [], []
             reference_state = None
             if args.smoke and diagnostics is not None:
                 progress("verifying_diagnostic_isolation", seed=episode_seed, episode_index=episode_index)
                 evaluate_episode(model, env, arm, episode_seed=episode_seed,
                     controller_seed=controller_seed, max_steps=max_steps,
-                    on_step=reference_rows.append, smoke=True)
+                    on_step=reference_rows.append, smoke=True, spectral_probe=spectral_probe)
                 reference_state = dict(learner=model.agent.inner_engine.export_diagnostic_state(),
                     rng=deepcopy(model.agent.inner_engine.rng.training_state_dict()))
             with (output / f"decisions-seed-{episode_seed}.jsonl").open("x") as stream:
@@ -176,8 +196,10 @@ def run(args):
                         total_decisions=max_steps * len(seeds))
                 episode = evaluate_episode(model, env, arm, episode_seed=episode_seed,
                     controller_seed=controller_seed, max_steps=max_steps, on_step=on_step, smoke=args.smoke,
+                    spectral_probe=spectral_probe,
                     **({"diagnostics": diagnostics} if diagnostics is not None else {}))
             verify_episode_diagnostics(episode, diagnostics_config, smoke=args.smoke)
+            verify_spectral_diagnostics(episode, spectral_config, smoke=args.smoke)
             if reference_state is not None:
                 observed_state = dict(learner=model.agent.inner_engine.export_diagnostic_state(),
                     rng=deepcopy(model.agent.inner_engine.rng.training_state_dict()))

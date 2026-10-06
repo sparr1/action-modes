@@ -35,6 +35,21 @@ COLUMNS = {
 }
 
 
+SPECTRAL_METHOD_COLUMNS = ['method','requested_rank','strength','norm_matched','parameter_scope']
+SPECTRAL_TIMERS = ('spectral_probe_seconds', 'spectral_filter_seconds')
+
+
+def table_columns(campaign):
+    columns = {key: list(values) for key, values in COLUMNS.items()}
+    if campaign.get('family') == 'spectral_transfer':
+        for key in columns:
+            columns[key] += SPECTRAL_METHOD_COLUMNS
+        columns['results'] += [name for timer in SPECTRAL_TIMERS for name in (timer, timer+'_per_decision')]
+        columns['episodes'] += list(SPECTRAL_TIMERS)
+        columns['diagnostics'] += ['sample_count_basis']
+    return columns
+
+
 def _retry_estale(operation, *args, **kwargs):
     """Retry only transient stale file handles, at most five attempts total."""
     for attempt in range(len(ESTALE_RETRY_DELAYS) + 1):
@@ -132,37 +147,64 @@ def historical_fresh(campaign):
 
 
 def _cell_metadata(cell, campaign):
+    if campaign.get('family') == 'spectral_transfer':
+        from utils.wandb_transfer_discovery_layout import spectral_arm_metadata
+        metadata = spectral_arm_metadata(campaign, cell['arm'])
+        return dict(cell, **{key: value for key, value in metadata.items() if key not in ('label', 'color')})
     publication = campaign.get('publication', {})
     arm = cell['arm']
     return dict(cell, component=publication.get('arm_components', {}).get(arm),
                 retention_probability=publication.get('arm_probabilities', {}).get(arm))
 
 
-def _measurement_rows(cell, data, provenance, state):
+def _measurement_rows(cell, data, provenance, state, *, spectral=False):
     row = dict(cell, provenance=provenance, state=state, return_mean=None, return_std=None,
         paired_vs_fresh_mean=None, paired_vs_fresh_std=None, controller_seconds_per_decision=None,
         diagnostic_seconds_per_decision=None, diagnostic_seconds_per_sample=None, diagnostic_samples=0, episodes=0)
     diagnostics = []
+    if spectral:
+        row.update({name: None for timer in SPECTRAL_TIMERS for name in (timer, timer+'_per_decision')})
     if not data:
         return row, diagnostics
     returns = [e['return'] for e in data]
     row.update(return_mean=statistics.mean(returns), return_std=statistics.stdev(returns), episodes=len(data),
         controller_seconds_per_decision=sum(episode_time(e) for e in data)/sum(e['length'] for e in data))
-    diagnostic_episodes = [e for e in data if e.get('diagnostics', {}).get('enabled')]
+    if spectral:
+        for timer in SPECTRAL_TIMERS:
+            if all(timer in episode for episode in data):
+                values = [episode[timer] for episode in data]
+                if any(isinstance(value, bool) or not isinstance(value, (int,float))
+                       or not math.isfinite(value) or value < 0 for value in values):
+                    raise ValueError('Invalid spectral controller timer: ' + timer)
+                row[timer] = sum(values)
+                row[timer+'_per_decision'] = sum(values) / sum(e['length'] for e in data)
+    diagnostic_episodes = [e for e in data if e.get('diagnostics', {}).get('enabled')
+        or (spectral and any(key.startswith('spectral_') for key in e.get('diagnostics', {}).get('summary', {})))]
     if diagnostic_episodes:
-        samples = sum(e['diagnostic_samples'] for e in diagnostic_episodes)
-        seconds = sum(e['diagnostic_seconds'] for e in diagnostic_episodes)
+        samples = sum(e.get('diagnostic_samples', 0) for e in diagnostic_episodes)
+        seconds = sum(e.get('diagnostic_seconds', 0.) for e in diagnostic_episodes)
         row.update(diagnostic_seconds_per_decision=seconds / sum(e['length'] for e in data),
             diagnostic_seconds_per_sample=seconds / samples if samples else None, diagnostic_samples=samples)
         metric_names = sorted(set().union(*(e['diagnostics']['summary'] for e in diagnostic_episodes)))
         for metric in metric_names:
             measurements = [e['diagnostics']['summary'][metric] for e in diagnostic_episodes
                 if isinstance(e['diagnostics']['summary'].get(metric), (int, float))
-                and math.isfinite(e['diagnostics']['summary'][metric])]
+                and math.isfinite(e['diagnostics']['summary'][metric])
+                and not (spectral and isinstance(e['diagnostics']['summary'][metric], bool))]
             if measurements:
-                diagnostics.append(dict(cell, provenance=provenance, metric=metric, mean=statistics.mean(measurements),
+                entry = dict(cell, provenance=provenance, metric=metric, mean=statistics.mean(measurements),
                     episode_std=statistics.stdev(measurements) if len(measurements) > 1 else None,
-                    episodes=len(measurements), samples=samples))
+                    episodes=len(measurements), samples=samples)
+                if spectral:
+                    counts = [episode['diagnostics'].get('summary_counts', {}).get(metric)
+                              for episode in diagnostic_episodes
+                              if isinstance(episode['diagnostics']['summary'].get(metric), (int,float))
+                              and not isinstance(episode['diagnostics']['summary'][metric], bool)
+                              and math.isfinite(episode['diagnostics']['summary'][metric])]
+                    known = all(isinstance(count, int) and not isinstance(count, bool) and count >= 0 for count in counts)
+                    entry.update(samples=sum(counts) if known else None,
+                        sample_count_basis='per-metric contributing roots' if known else 'metric root coverage unavailable')
+                diagnostics.append(entry)
     return row, diagnostics
 
 
@@ -188,13 +230,14 @@ def _snapshot_once(root, campaign, active, completed):
         decorated = _cell_metadata(cell, campaign)
         settings.append(dict(decorated, state=state, completed_episodes=len(data) if data else progress.get('completed_episodes', 0),
             current_seed=progress.get('seed'), decision=progress.get('decision'), error=failure.get('error')))
-        row, measured = _measurement_rows(decorated, data, 'current campaign', state)
+        row, measured = _measurement_rows(decorated, data, 'current campaign', state, spectral=campaign.get('family') == 'spectral_transfer')
         results.append(row); diagnostics.extend(measured)
         if data:
             episodes.extend(dict(decorated, provenance='current campaign', **episode) for episode in data)
     all_data = dict(completed)
     fresh = {(c['H'], c['J']): completed[c['name']] for c in campaign['cells']
-             if c['arm'] == 'rho_a0_c0' and c['name'] in completed}
+             if (c['arm'] == 'rho_a0_c0' or (campaign.get('family') == 'spectral_transfer'
+                 and _cell_metadata(c, campaign)['component'] == 'fresh')) and c['name'] in completed}
     known_names = {cell['name'] for cell in campaign['cells']}
     for cell, data, reference in historical_results(campaign):
         if cell['name'] in known_names:
@@ -210,7 +253,7 @@ def _snapshot_once(root, campaign, active, completed):
             label = 'historical Bernoulli p=' + str(reference['probability'])
         provenance = label + '; ' + reference['source_commit']
         decorated = _cell_metadata(cell, campaign)
-        row, measured = _measurement_rows(decorated, data, provenance, 'historical_complete')
+        row, measured = _measurement_rows(decorated, data, provenance, 'historical_complete', spectral=campaign.get('family') == 'spectral_transfer')
         results.append(row); diagnostics.extend(measured)
         episodes.extend(dict(decorated, provenance=provenance, **episode) for episode in data)
     for row in results:
@@ -233,8 +276,9 @@ def snapshot(root, campaign, active, completed):
 
 def payload(wandb, value, campaign):
     result = {'discovery/'+key: wandb.Table(columns=columns, data=[[row.get(k) for k in columns] for row in value[key]])
-              for key, columns in COLUMNS.items() if key != 'diagnostics' or campaign.get('diagnostics', {}).get('enabled')}
-    from utils.wandb_transfer_discovery_layout import DIAGNOSTIC_CHARTS, campaign_curve_groups
+              for key, columns in table_columns(campaign).items() if key != 'diagnostics'
+              or campaign.get('diagnostics', {}).get('enabled') or campaign.get('family') == 'spectral_transfer'}
+    from utils.wandb_transfer_discovery_layout import campaign_diagnostic_charts, campaign_curve_groups
     for prefix, label, arms in campaign_curve_groups(campaign):
         for h in campaign['H']:
             for axis, field in [('j','J'), ('compute','controller_seconds_per_decision')]:
@@ -243,12 +287,13 @@ def payload(wandb, value, campaign):
                 result[f'discovery/{prefix}h{h}_return_vs_{axis}'] = wandb.plot.line_series(
                     xs=[[r[field] for r in group] for group in series],
                     ys=[[r['return_mean'] for r in group] for group in series], keys=arms,
-                    title=f'{label}H{h}: complete three-seed return versus {axis}',
+                    title=f'{label}H{h}: complete seed-panel return versus {axis}' if campaign.get('family') == 'spectral_transfer'
+                          else f'{label}H{h}: complete three-seed return versus {axis}',
                     xname='J rounds per solve' if axis=='j' else 'Controller seconds per decision')
-        if campaign.get('diagnostics', {}).get('enabled'):
-            for metric, title in DIAGNOSTIC_CHARTS:
+        if campaign_diagnostic_charts(campaign, prefix):
+            for metric, title in campaign_diagnostic_charts(campaign, prefix):
                 for h in campaign['H']:
-                    if metric == 'diagnostic_seconds_per_decision':
+                    if metric in ('diagnostic_seconds_per_decision', 'spectral_probe_seconds_per_decision', 'spectral_filter_seconds_per_decision'):
                         rows = [dict(r, mean=r.get(metric)) for r in value['results'] if r['H'] == h]
                     else:
                         rows = [r for r in value['diagnostics'] if r['H'] == h and r['metric'] == metric]
@@ -339,7 +384,7 @@ def watch(args):
                 artifact.add_file(str(out/'snapshot.json'))
                 for cell in campaign['cells']:
                     filenames = ['manifest.json','results.json','worker-completion.json']
-                    if campaign.get('diagnostics', {}).get('enabled'):
+                    if campaign.get('family') == 'spectral_transfer' or campaign.get('diagnostics', {}).get('enabled'):
                         filenames += ['runtime.json'] + [f'decisions-seed-{seed}.jsonl' for seed in campaign['seeds']]
                     for filename in filenames:
                         artifact.add_file(str(root/'settings'/cell['name']/filename), name=cell['name']+'/'+filename)

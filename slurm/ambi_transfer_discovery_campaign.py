@@ -240,6 +240,25 @@ def validate_result(directory, campaign, cell, *, smoke=False):
                 raise ValueError('Diagnostic smoke lacks exact controller/RNG isolation verification.')
     if campaign.get('matrix_sha256') and manifest.get('campaign_sha256') != campaign['matrix_sha256']:
         raise ValueError('Result campaign matrix differs from the prepared input.')
+    if campaign.get('family') == 'spectral_transfer':
+        from utils.spectral_campaign import verify_spectral_diagnostics
+        if (manifest.get('arm_definition') != campaign['arms'][cell['arm']]
+                or manifest.get('spectral_diagnostics') != campaign['spectral_diagnostics']
+                or manifest.get('spectral_probe') != campaign['spectral_probe']
+                or manifest.get('metadata_sha256') != campaign['metadata_sha256']
+                or manifest.get('base_matrix_sha256') != campaign['base_matrix_sha256']):
+            raise ValueError('Spectral arm or probe protocol differs from prepared campaign.')
+        for episode in episodes:
+            verify_spectral_diagnostics(episode, campaign['spectral_diagnostics'], smoke=smoke)
+            if smoke and episode.get('diagnostic_isolation_verified') is not True:
+                raise ValueError('Spectral smoke lacks exact controller/RNG isolation verification.')
+            transfer = episode.get('transfer_seconds', float('nan'))
+            prediction = episode.get('prediction_seconds', float('nan'))
+            parts = sum(episode[key] for key in ('spectral_probe_seconds', 'spectral_filter_seconds', 'donor_export_seconds'))
+            if (not math.isfinite(transfer) or not math.isfinite(prediction)
+                    or min(transfer, prediction) < 0 or parts > transfer + 1e-6
+                    or not math.isclose(episode['control_seconds'], prediction + transfer, rel_tol=1e-9, abs_tol=1e-6)):
+                raise ValueError('Spectral controller timing is incomplete or double counted.')
     return result, manifest
 
 
@@ -248,6 +267,12 @@ def worker(args):
     actual = source()
     if any(campaign[k] != actual[k] for k in actual):
         raise ValueError('Worker source differs from campaign pin.')
+    if campaign.get('family') == 'spectral_transfer':
+        for path_key, hash_key in (('checkpoint', 'checkpoint_sha256'),
+                                  ('metadata_path', 'metadata_sha256'),
+                                  ('base_matrix_path', 'base_matrix_sha256')):
+            if digest(campaign[path_key]) != campaign[hash_key]:
+                raise ValueError(f'Spectral pinned input changed: {path_key}.')
     if not 0 <= args.index < len(campaign['cells']):
         raise ValueError('Worker index outside campaign.')
     cell = campaign['cells'][args.index]
@@ -261,6 +286,14 @@ def worker(args):
             receipt = read(args.root/'smoke'/prior['name']/'worker-completion.json')
             if receipt['source_commit'] != campaign['source_commit'] or receipt['campaign_sha256'] != digest(args.root/'campaign.json'):
                 raise ValueError('Production requires all smoke receipts at this commit.')
+            if campaign.get('family') == 'spectral_transfer':
+                smoke_directory = args.root/'smoke'/prior['name']
+                if (receipt.get('status') != 'complete' or receipt.get('smoke') is not True
+                        or receipt.get('cell') != prior
+                        or receipt.get('result_sha256') != digest(smoke_directory/'results.json')
+                        or receipt.get('manifest_sha256') != digest(smoke_directory/'manifest.json')):
+                    raise ValueError('Spectral smoke receipt does not bind completed evidence.')
+                validate_result(smoke_directory, campaign, prior, smoke=True)
     directory = args.root/('smoke' if args.smoke else 'settings')/cell['name']
     directory.parent.mkdir(exist_ok=True)
     if directory.exists():

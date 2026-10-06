@@ -1,5 +1,12 @@
 # Frozen-checkpoint AMBI research
 
+[The spectral transfer campaign](SPECTRAL_TRANSFER_575K.md) implements plain,
+activation-weighted and gradient-scored SVD initialization, with per-layer
+norm-matched dense controls and actor/critic/joint variants. It records sampled
+spectral energy, directional usefulness, independent held-out initialization
+and post-J objectives, and all required transfer costs. Its 575k example matrix
+and Oscar wrapper are configuration for a future reviewed launch.
+
 [The Bernoulli J12 extension](ambi_bernoulli_j12_575k.json) adds nine p=0.5 cells
 at H1/2/3, preserving the three transfer mechanisms, paired full episodes and
 sampled diagnostics. Pass all four historical reference roots, including

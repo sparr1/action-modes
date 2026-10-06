@@ -32,15 +32,106 @@ _CREATE_CHART = '''mutation CreateTransferChart($entity:String!,$name:String!,
 }'''
 
 
+def spectral_arm_metadata(campaign, arm):
+    """Describe the declared transfer operator without inferring measured rank."""
+    specification = campaign.get('arms', {}).get(arm)
+    if specification is None:
+        if arm == 'rho_a0_c0':
+            specification = {'actor_rho': 0., 'critic_rho': 0., 'parameter_scope': 'matrices'}
+        else:
+            raise ResultsLayoutError('Spectral publication requires the prepared arms mapping: ' + arm)
+    active = []
+    for component in ('actor', 'critic'):
+        spectral = specification.get(component + '_spectral')
+        if spectral is not None:
+            method = spectral['method']
+            if method not in ('svd', 'activation', 'gradient'):
+                raise ResultsLayoutError('Unknown spectral method: ' + method)
+            active.append(dict(component=component, method=method, requested_rank=spectral['rank'],
+                strength=spectral['strength'], norm_matched=spectral['norm_matched']))
+        elif specification.get(component + '_bernoulli_p', 0.) > 0:
+            active.append(dict(component=component, method='bernoulli', requested_rank=None,
+                strength=specification[component + '_bernoulli_p'], norm_matched=False))
+        elif specification.get(component + '_rho', 0.) > 0:
+            active.append(dict(component=component, method='blend' if specification[component + '_rho'] < 1 else 'carry',
+                requested_rank=None, strength=specification[component + '_rho'], norm_matched=False))
+    if not active:
+        return dict(component='fresh', method='fresh', requested_rank=None, strength=0.,
+            norm_matched=False, parameter_scope=specification.get('parameter_scope', 'matrices'),
+            label='Fresh prior reset', color='#000000')
+    component = active[0]['component'] if len(active) == 1 else 'joint'
+    names = dict(svd='SVD', activation='Activation weighted', gradient='Gradient ranked',
+                 bernoulli='Bernoulli', blend='Dense blend', carry='Dense carry')
+    def describe(item):
+        if item['requested_rank'] is not None:
+            mode = 'Dense norm match to ' if item['norm_matched'] else ''
+            return f"{mode}{names[item['method']]} r{item['requested_rank']} s{item['strength']:g}"
+        return f"{names[item['method']]} {100 * item['strength']:g}%"
+    shared = {key: active[0][key] if all(item[key] == active[0][key] for item in active) else None
+              for key in ('method', 'requested_rank', 'strength', 'norm_matched')}
+    label = describe(active[0]) if all(describe(item) == describe(active[0]) for item in active) else ' / '.join(
+        item['component'] + ': ' + describe(item) for item in active)
+    colors = {'svd': ('#0072b2', '#56b4e9'), 'activation': ('#d55e00', '#e69f00'),
+              'gradient': ('#009e73', '#7fcdbb'), 'bernoulli': ('#cc79a7', '#cc79a7'),
+              'blend': ('#777777', '#777777'), 'carry': ('#333333', '#333333')}
+    method = shared['method'] or 'mixed'
+    color = colors.get(method, ('#8c564b', '#b4948f'))[int(bool(shared['norm_matched']))]
+    return dict(component=component, **{**shared, 'method': method},
+        parameter_scope=specification.get('parameter_scope', 'matrices'), label=label, color=color)
+
+
+def _spectral_groups(campaign):
+    arms = list(dict.fromkeys(c['arm'] for c in campaign['cells']))
+    if campaign.get('historical_reference') and 'rho_a0_c0' not in arms:
+        arms.append('rho_a0_c0')
+    metadata = {arm: spectral_arm_metadata(campaign, arm) for arm in arms}
+    fresh = [arm for arm in arms if metadata[arm]['component'] == 'fresh']
+    return [(component+'/', component.capitalize()+' | ',
+             [arm for arm in arms if metadata[arm]['component'] == component] + fresh)
+            for component in ('actor', 'critic', 'joint')
+            if any(value['component'] == component for value in metadata.values())]
+
+
+def campaign_diagnostic_charts(campaign, prefix=''):
+    if campaign.get('family') != 'spectral_transfer':
+        return DIAGNOSTIC_CHARTS if campaign.get('diagnostics', {}).get('enabled') else ()
+    component = prefix.rstrip('/')
+    components = ('actor', 'critic') if component == 'joint' else (component,)
+    charts = []
+    for name in components:
+        for stage, title in (('prior', 'Prior'), ('initial', 'Initial'), ('final', 'Post-J')):
+            charts.append((f'spectral_{stage}_{name}_loss', f'{name.capitalize()} {title.lower()} heldout loss; fixed-model proxy'))
+        for suffix, title in (
+            ('initial_loss_gain_vs_prior', 'Initial heldout loss reduction versus prior; fixed-model proxy'),
+            ('post_j_loss_gain_vs_prior', 'Post-J heldout loss reduction versus prior; fixed-model proxy'),
+            ('transferred_energy_ratio', 'Transfer / donor squared norm; may exceed one'),
+            ('initial_squared_norm', 'Transferred matrix-delta squared norm'),
+            ('mean_rank_90', 'Donor rank capturing 90% spectral energy; layer mean'),
+            ('mean_effective_rank', 'Donor effective spectral rank; layer mean'),
+            ('mean_positive_benefit_energy_fraction', 'Donor energy with positive first-order benefit; fixed-model proxy'),
+            ('initial_first_order_benefit', 'Transferred first-order benefit; fixed-model proxy')):
+            charts.append((f'spectral_{name}_{suffix}', name.capitalize()+': '+title))
+    charts.extend((('spectral_probe_seconds_per_decision', 'Scoring probe seconds per decision; included in controller'),
+                   ('spectral_filter_seconds_per_decision', 'Spectral filter seconds per decision; included in controller')))
+    return tuple(charts)
+
+
 def campaign_chart_definition(campaign, component=None):
     """Map color to the mechanism, not to the single publication run."""
-    publication = campaign['publication']
-    styles = [row for row in publication['arm_styles'] if component is None
-              or publication.get('arm_components', {}).get(row[0]) == component]
-    if campaign.get('historical_reference'):
+    publication = campaign.get('publication', {})
+    spectral = campaign.get('family') == 'spectral_transfer'
+    if spectral:
+        selected = [arm for prefix, _, arms in _spectral_groups(campaign)
+                    if component is None or prefix == component+'/' for arm in arms]
+        styles = [[arm, spectral_arm_metadata(campaign, arm)['label'], spectral_arm_metadata(campaign, arm)['color']]
+                  for arm in dict.fromkeys(selected)]
+    else:
+        styles = [row for row in publication['arm_styles'] if component is None
+                  or publication.get('arm_components', {}).get(row[0]) == component]
+    if campaign.get('historical_reference') and not (spectral and any(row[0] == 'rho_a0_c0' for row in styles)):
         styles.append(['rho_a0_c0', 'Fresh prior reset (historical)', '#000000'])
     if (len({row[0] for row in styles}) != len(styles)
-            or len({row[2] for row in styles}) != len(styles)):
+            or (not spectral and len({row[2] for row in styles}) != len(styles))):
         raise ResultsLayoutError('Campaign arm styles must have unique identities and colors.')
     labels = {arm: label for arm, label, _ in styles}
     definition = {
@@ -68,6 +159,15 @@ def campaign_chart_definition(campaign, component=None):
         'config':{'view':{'stroke':None}, 'axis':{'gridColor':'#e8edf2'}, 'legend':{'labelFontSize':11}},
     }
 
+    if spectral:
+        forms = {arm: ('Dense norm-matched control' if spectral_arm_metadata(campaign, arm)['norm_matched']
+                      else 'Filtered transfer' if spectral_arm_metadata(campaign, arm)['method'] in ('svd','activation','gradient')
+                      else 'Weight-copy control') for arm, _, _ in styles}
+        definition['transform'].append({'calculate':json.dumps(forms, separators=(',', ':'))
+            + "[datum['${field:lineKey}']]", 'as':'Transfer form'})
+        definition['encoding']['strokeDash'] = {'field':'Transfer form', 'type':'nominal',
+            'scale':{'domain':['Filtered transfer','Dense norm-matched control','Weight-copy control'],
+                     'range':[[],[8,3],[2,3]]}, 'legend':None}
     if publication.get('probability_sweep'):
         probabilities = {arm: f'{100 * probability:g}%' for arm, probability
                          in publication['arm_probabilities'].items()}
@@ -80,12 +180,18 @@ def campaign_chart_definition(campaign, component=None):
 
 
 def campaign_chart_id(entity, campaign, component=None):
-    if campaign['publication'].get('probability_sweep') and component is None:
+    if campaign.get('family') == 'spectral_transfer' and component is None:
+        return {prefix.rstrip('/'): campaign_chart_id(entity, campaign, prefix.rstrip('/'))
+                for prefix, _, _ in _spectral_groups(campaign)}
+    if campaign.get('publication', {}).get('probability_sweep') and component is None:
         return {component: campaign_chart_id(entity, campaign, component) for component in ('actor', 'critic', 'joint')}
-    return entity + '/bernoulli_transfer_' + _hash(campaign_chart_definition(campaign, component))[:16]
+    family = 'spectral_transfer_' if campaign.get('family') == 'spectral_transfer' else 'bernoulli_transfer_'
+    return entity + '/' + family + _hash(campaign_chart_definition(campaign, component))[:16]
 
 
 def campaign_curve_groups(campaign):
+    if campaign.get('family') == 'spectral_transfer':
+        return _spectral_groups(campaign)
     publication = campaign.get('publication', {})
     fresh = ['rho_a0_c0'] if campaign.get('historical_reference') else []
     if publication.get('probability_sweep'):
@@ -100,14 +206,16 @@ def expected_campaign_chart_keys(campaign):
     keys = []
     for prefix, _, _ in campaign_curve_groups(campaign):
         keys.extend(f'discovery/{prefix}h{h}_return_vs_{axis}' for axis in ('j', 'compute') for h in campaign['H'])
-        if campaign.get('diagnostics', {}).get('enabled'):
-            keys.extend(f'discovery/{prefix}h{h}_{metric}_vs_j' for metric, _ in DIAGNOSTIC_CHARTS for h in campaign['H'])
+        keys.extend(f'discovery/{prefix}h{h}_{metric}_vs_j' for metric, _ in campaign_diagnostic_charts(campaign, prefix) for h in campaign['H'])
     return keys
 
 
 def ensure_campaign_chart(api, *, entity, campaign, component=None):
     """Create an immutable content-addressed chart, reconcile, and verify it."""
-    if campaign['publication'].get('probability_sweep') and component is None:
+    if campaign.get('family') == 'spectral_transfer' and component is None:
+        return {prefix.rstrip('/'): ensure_campaign_chart(api, entity=entity, campaign=campaign, component=prefix.rstrip('/'))
+                for prefix, _, _ in _spectral_groups(campaign)}
+    if campaign.get('publication', {}).get('probability_sweep') and component is None:
         return {component: ensure_campaign_chart(api, entity=entity, campaign=campaign, component=component)
                 for component in ('actor', 'critic', 'joint')}
     identifier = campaign_chart_id(entity, campaign, component)
@@ -117,7 +225,8 @@ def ensure_campaign_chart(api, *, entity, campaign, component=None):
     if chart is None:
         try:
             _execute(api, _CREATE_CHART, dict(entity=entity, name=identifier.split('/', 1)[1],
-                displayName='Bernoulli transfer mechanisms and diagnostics', type='vega2', access='PRIVATE',
+                displayName=('Spectral transfer methods and fixed-model proxies' if campaign.get('family') == 'spectral_transfer'
+                             else 'Bernoulli transfer mechanisms and diagnostics'), type='vega2', access='PRIVATE',
                 spec=json.dumps(expected, separators=(',', ':'))))
         except Exception as exc:
             mutation_error = exc
@@ -225,6 +334,65 @@ def campaign_sections(campaign, chart_id):
     return sections
 
 
+def spectral_sections(campaign, chart_id):
+    """Install pending result panels and explicit fixed-model proxy labels."""
+    publication = campaign.get('publication', {})
+    count = len(campaign['cells'])
+    seed_text = ', '.join(map(str, campaign.get('seeds', []))) or 'the configured paired seeds'
+    intro = ('### ' + publication.get('view_title', 'Spectral transfer') + '\n\n'
+        f'**{count} configurations; seeds {seed_text}; up to {campaign.get("max_steps", 500)} real decisions per episode.** '
+        'Panels separate actor, critic and joint transfer, with a separate plot for each horizon. '
+        'Only weight matrices transfer; vector parameters restore their frozen prior. '
+        'SVD is blue, activation-weighted selection orange, gradient-ranked selection green; '
+        'lighter dashed curves are the corresponding **dense norm-matched controls**, not rank-constrained transfers. '
+        'Bernoulli is purple, dense carry/blend gray, and fresh reset black. Labels state requested rank and strength. '
+        '**Scoring-probe and spectral-filter time are controller work**, included in return-versus-controller-time curves. '
+        'Their additional timing panels show components of that total and must not be added to it again. '
+        'Heldout diagnostic time is reported separately. '
+        '**Heldout losses, gains and first-order benefits are fixed-model proxies, not environment returns.** '
+        'Actor loss is negative frozen-prior Q at the candidate mean action; critic loss is decoded-Q squared error '
+        'against fixed prior-continuation model labels. Lower loss and positive loss reduction are favorable. '
+        'Spectral energy concentration describes donor matrices; the transfer/donor squared-norm ratio can exceed one. '
+        'Requested rank, donor effective rank and actual transfer norm describe different quantities. '
+        '**Pending values are null, never zero. Partial episodes are progress only.** '
+        'Curves require complete seed panels; tables retain episode uncertainty, coverage and provenance. '
+        'Donor geometry excludes donorless first decisions; heldout objectives retain valid first-decision measurements. '
+        'This screen is exploratory; model-proxy changes alone do not establish a causal explanation for return gains.')
+    blocks = [('progress', 'Spectral transfer | protocol and live progress', 1, True, [
+        _panel('intro','Markdown Panel',{'value':intro},width=24,height=10),
+        _panel('settings','Media Browser',{'chartTitle':f'{count} settings and live progress','mediaKeys':['discovery/settings']},width=24,height=9)])]
+    for prefix, label, _ in campaign_curve_groups(campaign):
+        component = prefix.rstrip('/'); identifier = chart_id[component]
+        blocks.append(('curves-'+component, 'Spectral transfer | '+label+'return and controller time', 3, True, [
+            _campaign_curve(f'discovery/{prefix}h{h}_return_vs_{axis}', f'{label}H{h}: return versus '+('J' if axis=='j' else 'controller time'),
+                'J rounds per solve' if axis=='j' else 'Controller seconds per decision; includes scoring and filtering',
+                'Mean episode return', identifier)
+            for axis in ('j','compute') for h in campaign['H']]))
+        charts = campaign_diagnostic_charts(campaign, prefix)
+        for suffix, title, visible, selected in (
+            ('overhead', 'controller overhead', True, [(k,t) for k,t in charts if '_seconds_per_decision' in k]),
+            ('proxies', 'heldout losses and transfer geometry; fixed-model proxies', False,
+             [(k,t) for k,t in charts if '_seconds_per_decision' not in k])):
+            blocks.append((suffix+'-'+component, 'Spectral transfer | '+label+title, 3, visible, [
+                _campaign_curve(f'discovery/{prefix}h{h}_{metric}_vs_j', f'{label}H{h}: {description}',
+                    'J rounds per solve', description, identifier)
+                for metric, description in selected for h in campaign['H']]))
+    blocks.append(('results', 'Spectral transfer | complete measurements and provenance', 1, True, [
+        _panel('results','Media Browser',{'chartTitle':'Complete return, controller time, method and requested rank','mediaKeys':['discovery/results']},width=24,height=10),
+        _panel('episodes','Media Browser',{'chartTitle':'Per-seed outcomes; scoring and filtering are included controller work','mediaKeys':['discovery/episodes']},width=24,height=8),
+        _panel('diagnostics','Media Browser',{'chartTitle':'All numeric diagnostic summaries, episode SDs and per-metric root counts; fixed-model proxies','mediaKeys':['discovery/diagnostics']},width=24,height=12)]))
+    sections = []
+    for suffix, title, columns, visible, panels in blocks:
+        identifier = 'ambi-spectral-transfer-v1-' + suffix
+        for index, panel in enumerate(panels):
+            panel['__id__'] = identifier + '-panel-' + str(index)
+        sections.append(dict(__id__=identifier, name=title, isOpen=visible, type='flow',
+            flowConfig=dict(snapToColumns=True, columnsPerPage=columns, rowsPerPage=2,
+                gutterWidth=16, boxWidth=460, boxHeight=430 if columns == 3 else 320),
+            sorted=0, pinned=True, isPanelsAuto=False, panels=panels))
+    return sections
+
+
 _CREATE_VIEW = '''mutation CreateDiscoveryView($entityName:String,$projectName:String,
   $type:String,$name:String,$displayName:String,$spec:String){
   upsertView(input:{entityName:$entityName,projectName:$projectName,type:$type,
@@ -234,6 +402,8 @@ _CREATE_VIEW = '''mutation CreateDiscoveryView($entityName:String,$projectName:S
 }'''
 
 def discovery_sections(campaign=None, chart_id=None):
+    if campaign and campaign.get('family') == 'spectral_transfer':
+        return spectral_sections(campaign, chart_id or campaign_chart_id('rwgao_b-brown-university', campaign))
     if campaign and campaign.get('publication', {}).get('arm_styles'):
         return campaign_sections(campaign, chart_id or campaign_chart_id('rwgao_b-brown-university', campaign))
     intro = ('### 575K transfer mechanism discovery · H1/2/3 · J1/2/4/6/8/10\n\n'
@@ -428,12 +598,13 @@ def ensure_discovery_saved_view(api, *, entity, project, receipt_dir, run_id, ca
     suffix = (run_id if re.fullmatch(r'[A-Za-z0-9]+', run_id)
               else 'h' + hashlib.sha256(run_id.encode('utf-8')).hexdigest())
     publication = (campaign or {}).get('publication', {})
-    prefix = publication.get('slug_prefix', 'transfer575')
+    spectral = (campaign or {}).get('family') == 'spectral_transfer'
+    prefix = publication.get('slug_prefix', 'spectral575' if spectral else 'transfer575')
     if not re.fullmatch(r'[A-Za-z0-9]+', prefix):
         raise ResultsLayoutError('Campaign view prefix must be alphanumeric.')
-    chart_id = ensure_campaign_chart(api, entity=entity, campaign=campaign) if publication.get('arm_styles') else None
+    chart_id = ensure_campaign_chart(api, entity=entity, campaign=campaign) if spectral or publication.get('arm_styles') else None
     name = 'nw-' + prefix + suffix + '-v'
-    display_name = publication.get('view_title', '575K transfer discovery · H1/2/3 · J sweep')
+    display_name = publication.get('view_title', 'Spectral transfer' if spectral else '575K transfer discovery · H1/2/3 · J sweep')
     url = f'https://wandb.ai/{entity}/{project}?nw={name[3:-2]}'
     receipt = dict(schema_version=1, layout_version=LAYOUT_VERSION, entity=entity,
         project=project, view_name=name, view_type='project-view', run_id=run_id,
@@ -442,7 +613,7 @@ def ensure_discovery_saved_view(api, *, entity, project, receipt_dir, run_id, ca
         run_url=f'https://wandb.ai/{entity}/{project}/runs/{run_id}?nw={name[3:-2]}',
         owned_section_ids=[s['__id__'] for s in discovery_sections(campaign, chart_id)],
         expected_chart_keys=expected_campaign_chart_keys(campaign) if campaign else list(CHART_KEYS), custom_chart_id=chart_id,
-        expected_table_keys=list(TABLE_KEYS) + (['discovery/diagnostics'] if (campaign or {}).get('diagnostics', {}).get('enabled') else []),
+        expected_table_keys=list(TABLE_KEYS) + (['discovery/diagnostics'] if spectral or (campaign or {}).get('diagnostics', {}).get('enabled') else []),
         verification='saved workspace schema read back; browser rendering must be checked separately')
     views = _views(api, entity, project)
     matches = [v for v in views if v['name'] == name]

@@ -1795,6 +1795,15 @@ observational diagnostics report their additional time separately.
 
 ### Checkpoints, evaluation, and rendering
 
+The evaluation-only [spectral transfer campaign](../../configs/research/SPECTRAL_TRANSFER_575K.md)
+filters donor-minus-prior matrix updates using SVD, activation geometry or
+fixed-reference gradient scores. It uses the same explicit initialization
+intervention boundary and resumes dense SAC optimization. Matrix-only
+Bernoulli, full carry and dense norm-matched controls reset the same nonmatrix
+parameters; these controls differ from the historical all-parameter Bernoulli
+screen above. Sampled held-out diagnostics are separate from controller
+selection work and cannot affect its RNG or updates.
+
 Train this variant jointly from scratch. Enabled checkpoints preserve the
 auxiliary networks, target networks, independent actor optimizer, scalar state,
 RNG state, and training semantics. Missing auxiliary weights or actor state are
