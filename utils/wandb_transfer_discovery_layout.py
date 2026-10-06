@@ -172,6 +172,14 @@ def campaign_sections(campaign, chart_id):
             'Paired gains use the same environment and solver seeds; trajectories visit different states. '
             'Fresh controls have no new diagnostic measurements. Reused panels are excluded from new-run completion counts. '
             'Controller time includes first-solve compilation and transfer bookkeeping. ')
+        fresh_rounds = {record['cell']['J'] for item in campaign.get('historical_references', [reference])
+                        if item.get('kind', 'fresh') == 'fresh' for record in item.get('records', [])}
+        missing_fresh_rounds = new_rounds - fresh_rounds
+        if missing_fresh_rounds:
+            intro += ('**No fresh-prior controls are available at J='
+                + ','.join(map(str, sorted(missing_fresh_rounds)))
+                + '; paired gains at these rounds remain unavailable.** '
+                'The black curve stops at the available historical controls. ')
     else:
         intro += 'Historical fresh controls are not present in this view; paired-versus-fresh values remain unavailable. '
     for item in campaign.get('historical_references', []):

@@ -34,6 +34,7 @@ case "$EVAL_MODE" in
     if [[ -n "${REFERENCE_CAMPAIGN_ROOT:-}" ]]; then args+=(--reference-root "$REFERENCE_CAMPAIGN_ROOT"); fi
     if [[ -n "${BERNOULLI_REFERENCE_CAMPAIGN_ROOT:-}" ]]; then args+=(--bernoulli-reference-root "$BERNOULLI_REFERENCE_CAMPAIGN_ROOT"); fi
     if [[ -n "${BERNOULLI_J8_REFERENCE_CAMPAIGN_ROOT:-}" ]]; then args+=(--bernoulli-j8-reference-root "$BERNOULLI_J8_REFERENCE_CAMPAIGN_ROOT"); fi
+    if [[ -n "${BERNOULLI_J10_REFERENCE_CAMPAIGN_ROOT:-}" ]]; then args+=(--bernoulli-j10-reference-root "$BERNOULLI_J10_REFERENCE_CAMPAIGN_ROOT"); fi
     exec "$PYTHON_BIN" slurm/ambi_transfer_discovery_campaign.py "${args[@]}"
     ;;
   worker)

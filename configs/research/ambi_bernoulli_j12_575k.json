@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "protocol": "inner-sac-transfer-discovery-v1",
+  "description": "Bernoulli p=0.5 weight-transfer J12 extension: actor-only, critic-only and joint transfer across H1/2/3, with three paired full episodes per cell and isolated sampled-root diagnostics. Reuse completed p50 J1/2/4/6, J8 and J10 results and fresh J1/2/4/6/8/10 controls. No fresh J12 control or paired fresh J12 gain is available.",
+  "base_matrix": "ambi_critic_transfer_575k.json",
+  "base_preset": "return_return/fresh",
+  "checkpoint_contract": {
+    "step": 575000,
+    "sha256": "0c6955db7cb8555a67d7863344b70be68f4b3250814d131e647ee6f9ef01a042"
+  },
+  "horizons": [
+    1,
+    2,
+    3
+  ],
+  "rounds": [
+    12
+  ],
+  "seeds": [
+    101,
+    102,
+    103
+  ],
+  "controller_seed": 55,
+  "max_steps": 500,
+  "critic_updates": 16,
+  "actor_updates": 4,
+  "rollouts": 128,
+  "batch_size": 256,
+  "arms": {
+    "bernoulli_a05_c0": {
+      "actor_bernoulli_p": 0.5,
+      "critic_rho": 0.0,
+      "description": "Independently copy each actor parameter with probability 0.5; otherwise restore frozen prior. Fresh critic."
+    },
+    "bernoulli_a0_c05": {
+      "actor_rho": 0.0,
+      "critic_bernoulli_p": 0.5,
+      "description": "Fresh actor. Independently copy each critic parameter with probability 0.5; otherwise restore frozen prior."
+    },
+    "bernoulli_a05_c05": {
+      "actor_bernoulli_p": 0.5,
+      "critic_bernoulli_p": 0.5,
+      "description": "Independent scalar Bernoulli 0.5 copying of actor and critic parameters; restore the remaining parameters to frozen priors."
+    }
+  },
+  "campaign_kind": "bernoulli-weight-transfer-v1",
+  "diagnostics": {
+    "enabled": true,
+    "decisions": [
+      0,
+      1,
+      25,
+      100,
+      250,
+      499
+    ],
+    "stationary_decisions": [
+      25,
+      250
+    ],
+    "mc_rollouts": 8,
+    "action_count": 8,
+    "state_count": 32,
+    "fit_steps": 4
+  },
+  "publication": {
+    "title": "575K Bernoulli p=0.5 | J12 extension with J1/2/4/6/8/10 references",
+    "view_title": "575K Bernoulli weight transfer \u00b7 50% \u00b7 J12 extension",
+    "slug_prefix": "bernoullij12575",
+    "group_prefix": "bernoulli-j12-575k",
+    "tags": [
+      "575k",
+      "bernoulli-transfer",
+      "full-episode",
+      "development-screen",
+      "j12-extension"
+    ],
+    "arm_styles": [
+      [
+        "bernoulli_a05_c0",
+        "Random actor 50%",
+        "#0072b2"
+      ],
+      [
+        "bernoulli_a0_c05",
+        "Random critic 50%",
+        "#d55e00"
+      ],
+      [
+        "bernoulli_a05_c05",
+        "Random joint 50%",
+        "#009e73"
+      ]
+    ]
+  },
+  "probabilities": [
+    0.5
+  ],
+  "reference_rounds": {
+    "fresh": [
+      1,
+      2,
+      4,
+      6,
+      8,
+      10
+    ],
+    "bernoulli": [
+      1,
+      2,
+      4,
+      6
+    ],
+    "bernoulli_j8": [
+      8
+    ],
+    "bernoulli_j10": [
+      10
+    ]
+  }
+}

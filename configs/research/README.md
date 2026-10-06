@@ -1,5 +1,13 @@
 # Frozen-checkpoint AMBI research
 
+[The Bernoulli J12 extension](ambi_bernoulli_j12_575k.json) adds nine p=0.5 cells
+at H1/2/3, preserving the three transfer mechanisms, paired full episodes and
+sampled diagnostics. Pass all four historical reference roots, including
+`--bernoulli-j10-reference-root`; three H3/J12 smoke cells gate production.
+The existing replay-capacity rule retains all 4608 imagined transitions at H3/J12.
+Fresh controls stop at J10: the J12 comparison reports return and controller
+time, with no matched fresh J12 gain or newly scheduled fresh controls.
+
 [The Bernoulli J10 extension](ambi_bernoulli_j10_575k.json) adds nine p=0.5 cells
 at H1/2/3 with the same three transfer mechanisms and paired episode protocol.
 It reuses the completed lower-J and J8 Bernoulli campaigns plus fresh controls

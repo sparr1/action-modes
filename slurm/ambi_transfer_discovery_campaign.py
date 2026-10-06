@@ -137,24 +137,29 @@ def prepare(args):
     bernoulli = matrix.get('campaign_kind') == 'bernoulli-weight-transfer-v1'
     reference_rounds = dict(fresh=rounds, bernoulli=rounds)
     j8_reference_root = getattr(args, 'bernoulli_j8_reference_root', None)
-    j10_extension = False
+    j10_reference_root = getattr(args, 'bernoulli_j10_reference_root', None)
+    j10_extension = j12_extension = False
     if bernoulli:
         probabilities = bernoulli_probabilities(matrix)
         j8_extension = probabilities == [0.5] and rounds == [8]
         j10_extension = probabilities == [0.5] and rounds == [10]
-        if rounds != [1, 2, 4, 6] and not (j8_extension or j10_extension):
+        j12_extension = probabilities == [0.5] and rounds == [12]
+        if rounds != [1, 2, 4, 6] and not (j8_extension or j10_extension or j12_extension):
             raise ValueError('Bernoulli screen differs from the authorized H/J grid.')
-        if j8_extension or j10_extension:
+        if j8_extension or j10_extension or j12_extension:
             reference_rounds = (dict(fresh=[1, 2, 4, 6, 8, 10], bernoulli=[1, 2, 4, 6], bernoulli_j8=[8])
-                if j10_extension else dict(fresh=[1, 2, 4, 6, 8], bernoulli=[1, 2, 4, 6]))
+                if j10_extension or j12_extension else dict(fresh=[1, 2, 4, 6, 8], bernoulli=[1, 2, 4, 6]))
+            if j12_extension:
+                reference_rounds['bernoulli_j10'] = [10]
             if matrix.get('reference_rounds') != reference_rounds:
                 raise ValueError(f'J{rounds[0]} extension requires its audited historical reference panel.')
-            if j10_extension and (args.reference_root is None
-                    or getattr(args, 'bernoulli_reference_root', None) is None or j8_reference_root is None):
-                raise ValueError('J10 extension requires fresh, lower-J Bernoulli and J8 Bernoulli reference roots.')
+            if (j10_extension or j12_extension) and (args.reference_root is None
+                    or getattr(args, 'bernoulli_reference_root', None) is None or j8_reference_root is None
+                    or (j12_extension and j10_reference_root is None)):
+                raise ValueError(f'J{rounds[0]} extension requires all audited historical reference roots.')
             smoke = [c['index'] for c in cells if c['H'] == 3]
         elif 'reference_rounds' in matrix:
-            raise ValueError('Reference-round overrides are only authorized for the p=0.5 J8/J10 extensions.')
+            raise ValueError('Reference-round overrides are only authorized for the p=0.5 J8/J10/J12 extensions.')
         elif probabilities == [0.5]:
             # Every mechanism, all horizons, two transfer boundaries and max J.
             smoke = [c['index'] for c in cells if
@@ -171,13 +176,17 @@ def prepare(args):
         smoke = [c['index'] for c in cells if (c['J'] == 2 and
             (c['H'] == 3 or c['arm'] == 'full_state_replay25')) or
             (c['J'] == 10 and c['arm'] == 'rho_a0_c0')]
-    if j8_reference_root is not None and not j10_extension:
-        raise ValueError('A J8 Bernoulli reference root is only authorized for the J10 extension.')
+    if j8_reference_root is not None and not (j10_extension or j12_extension):
+        raise ValueError('A J8 Bernoulli reference root is only authorized for the J10/J12 extensions.')
+    if j10_reference_root is not None and not j12_extension:
+        raise ValueError('A J10 Bernoulli reference root is only authorized for the J12 extension.')
     reference = reference_manifest(args.reference_root, horizons, reference_rounds['fresh'])
     bernoulli_reference = reference_manifest(getattr(args, 'bernoulli_reference_root', None),
         horizons, reference_rounds['bernoulli'], kind='bernoulli', expected_matrix=matrix)
     j8_reference = (reference_manifest(j8_reference_root, horizons, reference_rounds['bernoulli_j8'],
-        kind='bernoulli', expected_matrix=matrix) if j10_extension else None)
+        kind='bernoulli', expected_matrix=matrix) if j10_extension or j12_extension else None)
+    j10_reference = (reference_manifest(j10_reference_root, horizons, reference_rounds['bernoulli_j10'],
+        kind='bernoulli', expected_matrix=matrix) if j12_extension else None)
     args.root.mkdir(parents=True, exist_ok=False)
     campaign = dict(schema_version=1, protocol='inner-sac-transfer-discovery-v1', **source(),
         checkpoint=str(checkpoint), checkpoint_sha256=CHECKPOINT_SHA, metadata_sha256=METADATA_SHA,
@@ -187,7 +196,7 @@ def prepare(args):
         campaign_kind=matrix.get('campaign_kind', 'transfer-discovery-v1'),
         diagnostics=matrix.get('diagnostics', {}), publication=matrix.get('publication', {}),
         historical_reference=reference,
-        historical_references=[r for r in (reference, bernoulli_reference, j8_reference) if r is not None],
+        historical_references=[r for r in (reference, bernoulli_reference, j8_reference, j10_reference) if r is not None],
         reference_rounds=reference_rounds,
         smoke_seeds=[101, 102], smoke_steps=3, gpu_hardware='L40S',
         historical_reuse=('No new controls; historical discovery references are separate and retain their original provenance.'
@@ -293,7 +302,8 @@ def main():
     prep.add_argument('--checkpoint', type=Path, required=True)
     prep.add_argument('--reference-root', type=Path, help='Read-only historical discovery root for matched fresh controls.')
     prep.add_argument('--bernoulli-reference-root', type=Path, help='Read-only completed p=0.5 Bernoulli campaign.')
-    prep.add_argument('--bernoulli-j8-reference-root', type=Path, help='Read-only completed p=0.5 J8 campaign; J10 extension only.')
+    prep.add_argument('--bernoulli-j8-reference-root', type=Path, help='Read-only completed p=0.5 J8 campaign; J10/J12 extensions only.')
+    prep.add_argument('--bernoulli-j10-reference-root', type=Path, help='Read-only completed p=0.5 J10 campaign; J12 extension only.')
     prep.add_argument('--matrix', type=Path, default=ROOT/'configs/research/ambi_transfer_discovery_575k.json')
     work = sub.add_parser('worker'); work.add_argument('--root', type=Path, required=True)
     work.add_argument('--index', type=int, required=True); work.add_argument('--smoke', action='store_true')
