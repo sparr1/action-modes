@@ -35,7 +35,8 @@ COLUMNS = {
 }
 
 
-SPECTRAL_METHOD_COLUMNS = ['method','requested_rank','strength','norm_matched','parameter_scope']
+SPECTRAL_METHOD_COLUMNS = ['method','requested_rank','strength','norm_matched','parameter_scope',
+                           'source_commit','evaluation_origin']
 SPECTRAL_TIMERS = ('spectral_probe_seconds', 'spectral_filter_seconds')
 
 
@@ -120,6 +121,10 @@ def historical_results(campaign):
     """Recheck pinned historical panels without counting them as new work."""
     found = []
     for reference in historical_references(campaign):
+        if reference.get('kind') == 'spectral':
+            from slurm.ambi_spectral_transfer_campaign import verify_spectral_reference
+            found.extend(verify_spectral_reference(reference, campaign))
+            continue
         root = Path(reference['root'])
         if _digest(root/'campaign.json') != reference['campaign_sha256']:
             raise ValueError('Historical reference campaign changed after preparation.')
@@ -228,6 +233,8 @@ def _snapshot_once(root, campaign, active, completed):
         state = 'complete' if name in completed else 'failed' if failure else 'running' if directory.exists() and active else 'pending' if active else 'incomplete'
         data = completed.get(name)
         decorated = _cell_metadata(cell, campaign)
+        if campaign.get('family') == 'spectral_transfer':
+            decorated.update(source_commit=campaign.get('source_commit'), evaluation_origin='new')
         settings.append(dict(decorated, state=state, completed_episodes=len(data) if data else progress.get('completed_episodes', 0),
             current_seed=progress.get('seed'), decision=progress.get('decision'), error=failure.get('error')))
         row, measured = _measurement_rows(decorated, data, 'current campaign', state, spectral=campaign.get('family') == 'spectral_transfer')
@@ -243,16 +250,23 @@ def _snapshot_once(root, campaign, active, completed):
         if cell['name'] in known_names:
             raise ValueError('Historical evaluation would be duplicated: ' + cell['name'])
         known_names.add(cell['name']); all_data[cell['name']] = data
-        if reference.get('kind', 'fresh') == 'fresh':
+        decorated = _cell_metadata(cell, campaign)
+        spectral_reference = reference.get('kind') == 'spectral'
+        if reference.get('kind', 'fresh') == 'fresh' or (spectral_reference and decorated['component'] == 'fresh'):
             identity = (cell['H'], cell['J'])
             if identity in fresh:
                 raise ValueError('Fresh baseline would be duplicated by historical reuse.')
             fresh[identity] = data
-            label = 'historical fresh'
+            label = 'reused spectral fresh' if spectral_reference else 'historical fresh'
+        elif spectral_reference:
+            label = 'reused spectral'
         else:
             label = 'historical Bernoulli p=' + str(reference['probability'])
         provenance = label + '; ' + reference['source_commit']
-        decorated = _cell_metadata(cell, campaign)
+        if spectral_reference:
+            decorated.update(source_commit=reference['source_commit'], evaluation_origin='reused')
+            settings.append(dict(decorated, state='historical_complete', completed_episodes=len(data),
+                                 current_seed=None, decision=None, error=None))
         row, measured = _measurement_rows(decorated, data, provenance, 'historical_complete', spectral=campaign.get('family') == 'spectral_transfer')
         results.append(row); diagnostics.extend(measured)
         episodes.extend(dict(decorated, provenance=provenance, **episode) for episode in data)
@@ -264,7 +278,9 @@ def _snapshot_once(root, campaign, active, completed):
                 raise ValueError('Solver/environment seed pairs differ.')
             differences = [e['return']-lookup[(e['seed'],e['solver_seed'])] for e in data]
             row.update(paired_vs_fresh_mean=statistics.mean(differences), paired_vs_fresh_std=statistics.stdev(differences))
-    return dict(settings=settings, results=results, episodes=episodes, diagnostics=diagnostics, completed=len(completed), total=len(settings),
+    return dict(settings=settings, results=results, episodes=episodes, diagnostics=diagnostics,
+                completed=len(completed), total=len(campaign['cells']),
+                comparison_total=len(results), reused_settings=len(results)-len(campaign['cells']),
                 failed=sum(s['state']=='failed' for s in settings))
 
 
@@ -275,6 +291,15 @@ def snapshot(root, campaign, active, completed):
 
 
 def payload(wandb, value, campaign):
+    # SDK 0.17's run-table serializer defaults to 10,000 rows even when its
+    # summary metadata advertises the full size. Keep every diagnostic row in
+    # the actual uploaded JSON; the prior 192-cell campaign had 26,112 rows.
+    # This publisher process owns these limits, and serialization may occur
+    # after payload returns, so do not restore a smaller limit prematurely.
+    if campaign.get('family') == 'spectral_transfer' and hasattr(wandb.Table, 'MAX_ROWS'):
+        needed = max((len(value[key]) for key in table_columns(campaign)), default=0)
+        wandb.Table.MAX_ROWS = max(wandb.Table.MAX_ROWS, needed)
+        wandb.Table.MAX_ARTIFACT_ROWS = max(wandb.Table.MAX_ARTIFACT_ROWS, needed)
     result = {'discovery/'+key: wandb.Table(columns=columns, data=[[row.get(k) for k in columns] for row in value[key]])
               for key, columns in table_columns(campaign).items() if key != 'diagnostics'
               or campaign.get('diagnostics', {}).get('enabled') or campaign.get('family') == 'spectral_transfer'}
@@ -304,6 +329,9 @@ def payload(wandb, value, campaign):
                         ys=[[r['mean'] for r in group] for group in groups], keys=arms,
                         title=f'{label}H{h}: {title}', xname='J rounds per solve')
     result.update({'campaign/completed':value['completed'],'campaign/total':value['total'],'campaign/failed':value['failed']})
+    if campaign.get('family') == 'spectral_transfer':
+        result.update({'campaign/comparison_total':value.get('comparison_total',len(value['results'])),
+                       'campaign/reused_settings':value.get('reused_settings',0)})
     return result
 
 

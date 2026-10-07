@@ -207,7 +207,7 @@ def test_production_requires_verified_smoke_receipts_and_bound_results(tmp_path,
 def test_oscar_wrapper_requires_pinned_source_and_real_cuda_without_fixing_array_concurrency():
     script = (ROOT / 'slurm/run_ambi_spectral_transfer_oscar.sbatch').read_text()
     assert 'EXPECTED_ACTION_MODES_SHA' in script and 'git status --porcelain' in script
-    assert 'slurm/ambi_spectral_transfer_campaign.py prepare' in script
+    assert 'args=(prepare' in script and 'slurm/ambi_spectral_transfer_campaign.py "${args[@]}"' in script
     assert 'slurm/ambi_transfer_discovery_campaign.py "${args[@]}"' in script
     assert 'torch.cuda.is_available()' in script and 'probe.item() == 1024.0' in script
     assert 'Expected L40S timing hardware' in script and '--array' not in script

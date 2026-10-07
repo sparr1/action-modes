@@ -248,6 +248,8 @@ def validate_result(directory, campaign, cell, *, smoke=False):
                 or manifest.get('metadata_sha256') != campaign['metadata_sha256']
                 or manifest.get('base_matrix_sha256') != campaign['base_matrix_sha256']):
             raise ValueError('Spectral arm or probe protocol differs from prepared campaign.')
+        if campaign.get('reuse') and manifest.get('runtime') != campaign['runtime']:
+            raise ValueError('Spectral rank extension runtime differs from the matched reference.')
         for episode in episodes:
             verify_spectral_diagnostics(episode, campaign['spectral_diagnostics'], smoke=smoke)
             if smoke and episode.get('diagnostic_isolation_verified') is not True:
@@ -278,6 +280,19 @@ def worker(args):
     cell = campaign['cells'][args.index]
     if cell['index'] != args.index:
         raise ValueError('Cell index mismatch.')
+    if campaign.get('family') == 'spectral_transfer' and campaign.get('reuse'):
+        from slurm.ambi_spectral_transfer_campaign import RANK_EXTENSION_REUSE, evaluation_runtime
+        arm = campaign['arms'][cell['arm']]
+        specs = [arm[key] for key in ('actor_spectral', 'critic_spectral') if key in arm]
+        reference_names = {record['cell']['name'] for reference in campaign.get('historical_references', [])
+                           for record in reference['records']}
+        if (campaign['reuse'] != RANK_EXTENSION_REUSE or not specs
+                or any(spec['rank'] not in (1, 4) or spec['method'] != 'svd' for spec in specs)
+                or cell['name'] in reference_names
+                or args.index not in campaign.get('production_indices', [])):
+            raise ValueError('Refusing to rerun a reused spectral reference or unassigned rank cell.')
+        if evaluation_runtime() != campaign['runtime']:
+            raise ValueError('Spectral rank extension runtime differs from the matched reference.')
     if args.smoke and args.index not in campaign['smoke_indices']:
         raise ValueError('Unexpected smoke cell.')
     if not args.smoke:

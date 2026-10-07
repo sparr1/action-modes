@@ -147,3 +147,33 @@ with immediate and post-J surrogate behavior as explanatory evidence.
 
 No commit, push, cluster synchronization, submission or online publication is
 performed by generating or reviewing these files.
+
+## Rank1/rank4 extension with audited rank32 reuse
+
+`ambi_spectral_transfer_r1_r4_575k.json` adds rank1 and rank4 at strength1 for
+actor-only, critic-only and joint transfer, each with its dense norm-matched
+control. H remains 1/2/3 and J remains 1/2/4/6. This schedules **144 new cells /
+432 full episodes**. The comparison also reads the 192 completed rank32 and
+matrix-control cells from the original campaign, giving 336 comparison cells.
+The original rank32 configuration and result files are unchanged.
+
+Prepare this matrix with `--spectral-reference-root` pointing to the completed
+original campaign. The Oscar wrapper forwards `SPECTRAL_REFERENCE_CAMPAIGN_ROOT`
+to that argument. Preparation fails before creating output if references are
+missing or incompatible; it does not fall back to rerunning controls.
+
+Reuse pins the original campaign, matrix, source commit, checkpoint, metadata,
+and base-matrix hashes. All shared learner settings, paired seeds, full-episode
+lengths, normalized diagnostic settings, compiled CUDA execution, L40S hardware,
+and Python/Torch/NumPy versions must match. A broad Git-blob fingerprint requires
+identical runtime source and dependency locks, allowing only the reviewed
+orchestration/publication changes, new rank matrix, tests and Markdown. Each
+original result is checked against its manifest and bound worker receipt, and
+its complete resolved learner configuration is compared with the new matrix.
+
+Prepared `cells` contain only the 144 new cells with contiguous worker indices.
+Twelve H3/J6 smoke cells cover every new rank/component/control arm before
+production. Original reference cell indices, episode data, source and timing
+remain attached to the historical records; no result is copied or relabeled.
+Workers reject reference-cell execution. The publisher rechecks pinned evidence
+and reports new-work progress separately from the combined comparison.

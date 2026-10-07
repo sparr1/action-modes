@@ -29,13 +29,15 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}" OPENBLAS_NUM_THREADS=1 TORCHI
 export MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0
 case "$EVAL_MODE" in
   prepare)
-    # Fresh same-implementation controls are part of this matrix. Historical
-    # reference roots from an earlier shell must not silently leak into it.
+    # Legacy all-parameter references must not leak into matrix-only campaigns.
     [[ -z "${REFERENCE_CAMPAIGN_ROOT:-}${BERNOULLI_REFERENCE_CAMPAIGN_ROOT:-}${BERNOULLI_J8_REFERENCE_CAMPAIGN_ROOT:-}${BERNOULLI_J10_REFERENCE_CAMPAIGN_ROOT:-}" ]]
-    exec "$PYTHON_BIN" slurm/ambi_spectral_transfer_campaign.py prepare \
-      --root "$CAMPAIGN_ROOT" --checkpoint "${CHECKPOINT_PATH:?}" \
-      --matrix "${CAMPAIGN_MATRIX:-configs/research/ambi_spectral_transfer_575k.json}" \
-      --expected-source "$EXPECTED_ACTION_MODES_SHA"
+    args=(prepare --root "$CAMPAIGN_ROOT" --checkpoint "${CHECKPOINT_PATH:?}"
+      --matrix "${CAMPAIGN_MATRIX:-configs/research/ambi_spectral_transfer_575k.json}"
+      --expected-source "$EXPECTED_ACTION_MODES_SHA")
+    if [[ -n "${SPECTRAL_REFERENCE_CAMPAIGN_ROOT:-}" ]]; then
+      args+=(--spectral-reference-root "$SPECTRAL_REFERENCE_CAMPAIGN_ROOT")
+    fi
+    exec "$PYTHON_BIN" slurm/ambi_spectral_transfer_campaign.py "${args[@]}"
     ;;
   worker)
     # Fail before evaluation if the allocation cannot actually execute CUDA.

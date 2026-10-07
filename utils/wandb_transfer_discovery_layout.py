@@ -76,12 +76,35 @@ def spectral_arm_metadata(campaign, arm):
               'blend': ('#777777', '#777777'), 'carry': ('#333333', '#333333')}
     method = shared['method'] or 'mixed'
     color = colors.get(method, ('#8c564b', '#b4948f'))[int(bool(shared['norm_matched']))]
+    svd_ranks = _spectral_svd_ranks(campaign)
+    if method == 'svd' and len(svd_ranks) > 1:
+        # One rank keeps the original method palette and saved-view identity.
+        # The rank screen needs distinguishable directions within plain SVD;
+        # light shades plus dashed strokes identify each dense norm control.
+        rank_colors = (('#0072b2', '#56b4e9'), ('#d55e00', '#e69f00'),
+                       ('#009e73', '#7fcdbb'), ('#882255', '#cc6677'),
+                       ('#332288', '#9999cc'), ('#996600', '#ddcc77'))
+        rank = shared['requested_rank']
+        if rank in svd_ranks:
+            color = rank_colors[svd_ranks.index(rank) % len(rank_colors)][int(bool(shared['norm_matched']))]
     return dict(component=component, **{**shared, 'method': method},
         parameter_scope=specification.get('parameter_scope', 'matrices'), label=label, color=color)
 
 
+def _spectral_svd_ranks(campaign):
+    return sorted({specification[key]['rank'] for specification in campaign.get('arms', {}).values()
+                   for key in ('actor_spectral', 'critic_spectral')
+                   if specification.get(key, {}).get('method') == 'svd'})
+
+
+def _spectral_reference_records(campaign):
+    return [record for reference in campaign.get('historical_references', [])
+            if reference.get('kind') == 'spectral' for record in reference.get('records', [])]
+
+
 def _spectral_groups(campaign):
-    arms = list(dict.fromkeys(c['arm'] for c in campaign['cells']))
+    comparison_cells = list(campaign['cells']) + [record['cell'] for record in _spectral_reference_records(campaign)]
+    arms = list(dict.fromkeys(c['arm'] for c in comparison_cells))
     if campaign.get('historical_reference') and 'rho_a0_c0' not in arms:
         arms.append('rho_a0_c0')
     metadata = {arm: spectral_arm_metadata(campaign, arm) for arm in arms}
@@ -338,6 +361,7 @@ def spectral_sections(campaign, chart_id):
     """Install pending result panels and explicit fixed-model proxy labels."""
     publication = campaign.get('publication', {})
     count = len(campaign['cells'])
+    reused = len(_spectral_reference_records(campaign))
     seed_text = ', '.join(map(str, campaign.get('seeds', []))) or 'the configured paired seeds'
     intro = ('### ' + publication.get('view_title', 'Spectral transfer') + '\n\n'
         f'**{count} configurations; seeds {seed_text}; up to {campaign.get("max_steps", 500)} real decisions per episode.** '
@@ -358,9 +382,26 @@ def spectral_sections(campaign, chart_id):
         'Curves require complete seed panels; tables retain episode uncertainty, coverage and provenance. '
         'Donor geometry excludes donorless first decisions; heldout objectives retain valid first-decision measurements. '
         'This screen is exploratory; model-proxy changes alone do not establish a causal explanation for return gains.')
+    if len(_spectral_svd_ranks(campaign)) > 1:
+        intro = intro.replace('SVD is blue, activation-weighted selection orange, gradient-ranked selection green; ',
+            ('SVD ranks 1, 4 and 32 are blue, orange and green, respectively; '
+             if _spectral_svd_ranks(campaign) == [1, 4, 32] else 'Each SVD rank has a distinct color; '))
+    if reused:
+        intro = intro.replace(f'**{count} configurations;',
+            f'**{count + reused} comparison configurations: {count} new and {reused} reused;')
+        sources = ', '.join('`' + reference['source_commit'][:12] + '`'
+                           for reference in campaign.get('historical_references', [])
+                           if reference.get('kind') == 'spectral')
+        intro += (' **Reused rank-32 and matrix-control results are complete**, pinned to source ' + sources + '. '
+                  'Their original episode outcomes, controller times and diagnostics are preserved. '
+                  'Scientific implementation and paired protocol compatibility were verified before reuse. '
+                  'New rank-1/rank-4 cells remain pending until evaluated; completion counts cover only new cells. '
+                  'Paired gains use the reused fresh control at the same H/J and environment/controller seeds. '
+                  'The source and new/reused origin of every row are shown in the tables.')
     blocks = [('progress', 'Spectral transfer | protocol and live progress', 1, True, [
         _panel('intro','Markdown Panel',{'value':intro},width=24,height=10),
-        _panel('settings','Media Browser',{'chartTitle':f'{count} settings and live progress','mediaKeys':['discovery/settings']},width=24,height=9)])]
+        _panel('settings','Media Browser',{'chartTitle':(f'{count} new settings and {reused} reused complete settings'
+            if reused else f'{count} settings and live progress'),'mediaKeys':['discovery/settings']},width=24,height=9)])]
     for prefix, label, _ in campaign_curve_groups(campaign):
         component = prefix.rstrip('/'); identifier = chart_id[component]
         blocks.append(('curves-'+component, 'Spectral transfer | '+label+'return and controller time', 3, True, [

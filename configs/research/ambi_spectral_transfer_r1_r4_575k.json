@@ -1,0 +1,565 @@
+{
+  "actor_updates": 4,
+  "arms": {
+    "fresh": {
+      "actor_rho": 0.0,
+      "critic_rho": 0.0,
+      "description": "Fresh actor and critic from the frozen prior at every decision.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_bernoulli05_actor": {
+      "actor_bernoulli_p": 0.5,
+      "description": "actor: matrix-only bernoulli05; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_bernoulli05_critic": {
+      "critic_bernoulli_p": 0.5,
+      "description": "critic: matrix-only bernoulli05; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_bernoulli05_joint": {
+      "actor_bernoulli_p": 0.5,
+      "critic_bernoulli_p": 0.5,
+      "description": "joint: matrix-only bernoulli05; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_blend05_actor": {
+      "actor_rho": 0.5,
+      "description": "actor: matrix-only blend05; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_blend05_critic": {
+      "critic_rho": 0.5,
+      "description": "critic: matrix-only blend05; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_blend05_joint": {
+      "actor_rho": 0.5,
+      "critic_rho": 0.5,
+      "description": "joint: matrix-only blend05; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_full_actor": {
+      "actor_rho": 1.0,
+      "description": "actor: matrix-only full; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_full_critic": {
+      "critic_rho": 1.0,
+      "description": "critic: matrix-only full; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_full_joint": {
+      "actor_rho": 1.0,
+      "critic_rho": 1.0,
+      "description": "joint: matrix-only full; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r1_s1_actor": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": false,
+        "rank": 1,
+        "strength": 1.0
+      },
+      "description": "actor: svd candidate rank 1, strength 1.0; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r1_s1_actor_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": true,
+        "rank": 1,
+        "strength": 1.0
+      },
+      "description": "actor: svd candidate rank 1, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r1_s1_critic": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": false,
+        "rank": 1,
+        "strength": 1.0
+      },
+      "description": "critic: svd candidate rank 1, strength 1.0; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r1_s1_critic_norm": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": true,
+        "rank": 1,
+        "strength": 1.0
+      },
+      "description": "critic: svd candidate rank 1, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r1_s1_joint": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": false,
+        "rank": 1,
+        "strength": 1.0
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": false,
+        "rank": 1,
+        "strength": 1.0
+      },
+      "description": "joint: svd candidate rank 1, strength 1.0; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r1_s1_joint_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": true,
+        "rank": 1,
+        "strength": 1.0
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": true,
+        "rank": 1,
+        "strength": 1.0
+      },
+      "description": "joint: svd candidate rank 1, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r32_s1_actor": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": false,
+        "rank": 32,
+        "strength": 1.0
+      },
+      "description": "actor: svd candidate rank 32, strength 1.0; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r32_s1_actor_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": true,
+        "rank": 32,
+        "strength": 1.0
+      },
+      "description": "actor: svd candidate rank 32, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r32_s1_critic": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": false,
+        "rank": 32,
+        "strength": 1.0
+      },
+      "description": "critic: svd candidate rank 32, strength 1.0; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r32_s1_critic_norm": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": true,
+        "rank": 32,
+        "strength": 1.0
+      },
+      "description": "critic: svd candidate rank 32, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r32_s1_joint": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": false,
+        "rank": 32,
+        "strength": 1.0
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": false,
+        "rank": 32,
+        "strength": 1.0
+      },
+      "description": "joint: svd candidate rank 32, strength 1.0; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r32_s1_joint_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": true,
+        "rank": 32,
+        "strength": 1.0
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": true,
+        "rank": 32,
+        "strength": 1.0
+      },
+      "description": "joint: svd candidate rank 32, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r4_s1_actor": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": false,
+        "rank": 4,
+        "strength": 1.0
+      },
+      "description": "actor: svd candidate rank 4, strength 1.0; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r4_s1_actor_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": true,
+        "rank": 4,
+        "strength": 1.0
+      },
+      "description": "actor: svd candidate rank 4, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r4_s1_critic": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": false,
+        "rank": 4,
+        "strength": 1.0
+      },
+      "description": "critic: svd candidate rank 4, strength 1.0; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r4_s1_critic_norm": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": true,
+        "rank": 4,
+        "strength": 1.0
+      },
+      "description": "critic: svd candidate rank 4, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r4_s1_joint": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": false,
+        "rank": 4,
+        "strength": 1.0
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": false,
+        "rank": 4,
+        "strength": 1.0
+      },
+      "description": "joint: svd candidate rank 4, strength 1.0; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_svd_r4_s1_joint_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": true,
+        "rank": 4,
+        "strength": 1.0
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "svd",
+        "norm_matched": true,
+        "rank": 4,
+        "strength": 1.0
+      },
+      "description": "joint: svd candidate rank 4, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    }
+  },
+  "base_matrix": "ambi_critic_transfer_575k.json",
+  "base_preset": "return_return/fresh",
+  "batch_size": 256,
+  "campaign_kind": "spectral-transfer-v1",
+  "checkpoint_contract": {
+    "sha256": "0c6955db7cb8555a67d7863344b70be68f4b3250814d131e647ee6f9ef01a042",
+    "step": 575000
+  },
+  "controller_seed": 55,
+  "critic_updates": 16,
+  "description": "Truncated SVD rank1/rank4 extension: 144 new cells, with 192 completed rank32 and matrix-control cells reused under the identical scientific implementation. H1/2/3, J1/2/4/6; three paired full episodes; matrix-only transfer, strength1.",
+  "diagnostics": {
+    "action_count": 8,
+    "decisions": [
+      0,
+      1,
+      25,
+      100,
+      250,
+      499
+    ],
+    "enabled": true,
+    "fit_steps": 4,
+    "mc_rollouts": 8,
+    "state_count": 32,
+    "stationary_decisions": [
+      25,
+      250
+    ]
+  },
+  "family": "spectral_transfer",
+  "horizons": [
+    1,
+    2,
+    3
+  ],
+  "max_steps": 500,
+  "protocol": "inner-sac-transfer-discovery-v1",
+  "publication": {
+    "arm_styles": [
+      [
+        "fresh",
+        "fresh",
+        "#000000"
+      ],
+      [
+        "matrix_full_actor",
+        "matrix full actor",
+        "#0072b2"
+      ],
+      [
+        "matrix_blend05_actor",
+        "matrix blend05 actor",
+        "#d55e00"
+      ],
+      [
+        "matrix_bernoulli05_actor",
+        "matrix bernoulli05 actor",
+        "#009e73"
+      ],
+      [
+        "matrix_full_critic",
+        "matrix full critic",
+        "#cc79a7"
+      ],
+      [
+        "matrix_blend05_critic",
+        "matrix blend05 critic",
+        "#e69f00"
+      ],
+      [
+        "matrix_bernoulli05_critic",
+        "matrix bernoulli05 critic",
+        "#56b4e9"
+      ],
+      [
+        "matrix_full_joint",
+        "matrix full joint",
+        "#332288"
+      ],
+      [
+        "matrix_blend05_joint",
+        "matrix blend05 joint",
+        "#aa4499"
+      ],
+      [
+        "matrix_bernoulli05_joint",
+        "matrix bernoulli05 joint",
+        "#44aa99"
+      ],
+      [
+        "spectral_svd_r1_s1_actor",
+        "spectral svd r1 s1 actor",
+        "#882255"
+      ],
+      [
+        "spectral_svd_r1_s1_actor_norm",
+        "spectral svd r1 s1 actor norm",
+        "#999933"
+      ],
+      [
+        "spectral_svd_r1_s1_critic",
+        "spectral svd r1 s1 critic",
+        "#661100"
+      ],
+      [
+        "spectral_svd_r1_s1_critic_norm",
+        "spectral svd r1 s1 critic norm",
+        "#6699cc"
+      ],
+      [
+        "spectral_svd_r1_s1_joint",
+        "spectral svd r1 s1 joint",
+        "#117733"
+      ],
+      [
+        "spectral_svd_r1_s1_joint_norm",
+        "spectral svd r1 s1 joint norm",
+        "#aa7744"
+      ],
+      [
+        "spectral_svd_r4_s1_actor",
+        "spectral svd r4 s1 actor",
+        "#000000"
+      ],
+      [
+        "spectral_svd_r4_s1_actor_norm",
+        "spectral svd r4 s1 actor norm",
+        "#0072b2"
+      ],
+      [
+        "spectral_svd_r4_s1_critic",
+        "spectral svd r4 s1 critic",
+        "#d55e00"
+      ],
+      [
+        "spectral_svd_r4_s1_critic_norm",
+        "spectral svd r4 s1 critic norm",
+        "#009e73"
+      ],
+      [
+        "spectral_svd_r4_s1_joint",
+        "spectral svd r4 s1 joint",
+        "#cc79a7"
+      ],
+      [
+        "spectral_svd_r4_s1_joint_norm",
+        "spectral svd r4 s1 joint norm",
+        "#e69f00"
+      ],
+      [
+        "spectral_svd_r32_s1_actor",
+        "spectral svd r32 s1 actor",
+        "#56b4e9"
+      ],
+      [
+        "spectral_svd_r32_s1_actor_norm",
+        "spectral svd r32 s1 actor norm",
+        "#332288"
+      ],
+      [
+        "spectral_svd_r32_s1_critic",
+        "spectral svd r32 s1 critic",
+        "#aa4499"
+      ],
+      [
+        "spectral_svd_r32_s1_critic_norm",
+        "spectral svd r32 s1 critic norm",
+        "#44aa99"
+      ],
+      [
+        "spectral_svd_r32_s1_joint",
+        "spectral svd r32 s1 joint",
+        "#882255"
+      ],
+      [
+        "spectral_svd_r32_s1_joint_norm",
+        "spectral svd r32 s1 joint norm",
+        "#999933"
+      ]
+    ],
+    "group_prefix": "spectral-rank-transfer-575k",
+    "slug_prefix": "spectralrank575",
+    "tags": [
+      "575k",
+      "spectral-transfer",
+      "matrix-only",
+      "full-episode",
+      "development-screen"
+    ],
+    "title": "575K truncated SVD ranks 1, 4 and 32",
+    "view_title": "575K spectral rank comparison \u00b7 paired controls"
+  },
+  "reuse": {
+    "campaign_sha256": "05fde2d334411915699a487ad7746dc3f5dafb9e8da9229ec6134745c253c02d",
+    "kind": "spectral-same-implementation-v1",
+    "matrix_sha256": "0c5c04be502c10394ae1df104c5fbd04fa6974406a7d8415f3a454e59ae15e9c",
+    "new_ranks": [
+      1,
+      4
+    ],
+    "reused_ranks": [
+      32
+    ],
+    "source_commit": "b1f576d6d9b2d9750dbff93c52fa83f7428ead2c"
+  },
+  "rollouts": 128,
+  "rounds": [
+    1,
+    2,
+    4,
+    6
+  ],
+  "schema_version": 1,
+  "seeds": [
+    101,
+    102,
+    103
+  ],
+  "spectral_diagnostics": {
+    "action_count": 8,
+    "decisions": [
+      0,
+      1,
+      25,
+      100,
+      250,
+      499
+    ],
+    "enabled": true,
+    "mc_rollouts": 8,
+    "ranks": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32,
+      64,
+      128
+    ],
+    "state_count": 32
+  },
+  "spectral_grid": {
+    "components": [
+      "actor",
+      "critic",
+      "joint"
+    ],
+    "methods": [
+      "svd"
+    ],
+    "ranks": [
+      1,
+      4,
+      32
+    ],
+    "strengths": [
+      1.0
+    ]
+  },
+  "spectral_probe": {
+    "action_count": 8,
+    "mc_rollouts": 8,
+    "state_count": 32
+  }
+}
