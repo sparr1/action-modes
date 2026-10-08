@@ -2,8 +2,9 @@
 """Publish validated transfer checkpoint curves using durable eval-series runs.
 
 ``prepare`` is local-only and allocates exactly one new run per setting plus a
-prior run. ``watch`` serially publishes completed records and summary-only
-progress tables; it never inserts non-result rows into immutable curve history.
+prior run. ``watch`` serially publishes completed scientific records, retains
+per-run summary tables, and logs combined display tables on a separate overview
+run. It never inserts non-result rows into immutable scientific curve history.
 """
 from __future__ import annotations
 
@@ -162,6 +163,57 @@ def publish_snapshot(campaign,state,snapshot,output,wandb):
         write(output/'publication.json',state)
 
 
+def overview_payload(wandb, snapshot):
+    """One publication-only stream registers tables without changing result history."""
+    points=[row for curve in snapshot['curves'].values() for row in curve['points']]
+    progress=[row for curve in snapshot['curves'].values() for row in curve['progress']]
+    return {TABLE_KEY:wandb.Table(columns=POINT_COLUMNS,data=[[row.get(key) for key in POINT_COLUMNS] for row in points]),
+        PROGRESS_KEY:wandb.Table(columns=PROGRESS_COLUMNS,data=[[row.get(key) for key in PROGRESS_COLUMNS] for row in progress]),
+        'campaign/completed':snapshot['completed'],'campaign/total':snapshot['total'],
+        'campaign/failed':len(snapshot['failures'])}
+
+
+def publish_overview(campaign,state,snapshot,output,wandb):
+    """W&B hides summary-only tables; explicitly log them on a separate run.
+
+    Scientific checkpoint runs retain their immutable result-only histories.
+    Allocation is persisted before network access so interrupted retries resume
+    the same overview. Logging a repeated snapshot after an uncertain response
+    is harmless here: this run is presentation state, never scientific records.
+    """
+    output=Path(output)
+    if 'overview' not in state:
+        state['overview']=dict(run_id=uuid.uuid4().hex)
+        write(output/'publication.json',state)
+    entry=state['overview']
+    stamp=fingerprint(dict(snapshot=snapshot,layout=state.get('layout')))
+    if entry.get('snapshot_sha256')==stamp:
+        return
+    run=wandb.init(entity=state['entity'],project=state['project'],id=entry['run_id'],resume='allow',
+        mode='online',name='Transfer backbone · live comparison',job_type='transfer-checkpoint-overview',
+        group='transfer-backbone-'+state['publication_id'][:8],
+        tags=['transfer-backbone','publication-only','five-seed','full-episode'],
+        config=dict(transfer_curve_overview=state['publication_id'],source_campaign_sha256=state['campaign_sha256'],
+            scientific_run_ids={key:entry['run_id'] for key,entry in state['runs'].items()},
+            source_commit=campaign['source_commit'],seeds=campaign['seeds'],
+            max_steps=campaign['max_steps'],source_run=campaign['source_run']),
+        dir=str(output),reinit=True)
+    try:
+        run.log(overview_payload(wandb,snapshot))
+        run.summary.update({'status':'complete' if snapshot['completed']==snapshot['total'] else 'running',
+            'completed_settings':snapshot['completed'],'total_settings':snapshot['total'],
+            'publication_only':True})
+        if state.get('layout'):
+            run.summary.update({'results_layout/status':state['layout']['status'],
+                'results_layout/url':state['layout']['url'],'results_layout/schema_verified':True})
+        run.finish()
+    except BaseException:
+        run.finish(exit_code=1)
+        raise
+    entry['snapshot_sha256']=stamp
+    write(output/'publication.json',state)
+
+
 def watch(args):
     root=Path(args.root).resolve(); output=Path(args.publication_root).resolve()
     with publisher_lock(output):
@@ -178,6 +230,7 @@ def watch(args):
             write(output/'snapshot.json',snapshot)
             try:
                 publish_snapshot(campaign,state,snapshot,output,wandb)
+                publish_overview(campaign,state,snapshot,output,wandb)
                 if not layout_checked:
                     previous_layout=state.get('layout')
                     state['layout']=ensure_saved_view(wandb.Api(timeout=30),campaign=campaign,
@@ -186,10 +239,11 @@ def watch(args):
                     layout_checked=True
                     # Reflect a newly installed view in every run, while a
                     # resumed publisher rechecks the view without extra writes.
-                    if previous_layout is None:
+                    if previous_layout != state['layout']:
                         for entry in state['runs'].values():entry.pop('snapshot_sha256',None)
                     write(output/'publication.json',state)
                     publish_snapshot(campaign,state,snapshot,output,wandb)
+                    publish_overview(campaign,state,snapshot,output,wandb)
             except Exception as exc:
                 write(output/'publisher-failure.json',dict(error=f'{type(exc).__name__}: {exc}',
                     phase='publication_or_layout',completed=snapshot['completed'],total=snapshot['total']))

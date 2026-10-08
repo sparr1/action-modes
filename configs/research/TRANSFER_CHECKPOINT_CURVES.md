@@ -80,3 +80,19 @@ pending/running/completed progress. Error bands are sample SD across five
 paired episodes, not confidence intervals. Checkpoints are repeated
 measurements of one trained backbone, not independent training seeds; 575k
 remains the exploratory selection point.
+
+The six scientific runs retain immutable checkpoint-result histories. A
+separate publication-only overview logs the combined points and progress
+tables with `run.log`, which registers their table metric types for the W&B
+workspace. Summary-only table updates were readable through the API but did
+not render as panels. The saved workspace selects only the overview so the
+six curves are not duplicated; legend selection emphasizes individual curves.
+The overview is presentation state and is not an additional evaluated method.
+
+The publisher persists its overview run ID before contacting W&B and resumes
+that ID after interruptions. Restarting the CPU publisher with `watch` safely
+adds the overview to an existing prepared campaign. Workspace version 3 can
+upgrade only an exact recognized version-2 layout, preserving its URL and all
+other saved views; unknown user edits cause a visible setup failure instead
+of an overwrite. API table/schema checks and authenticated browser rendering
+are both required before calling the comparison visible.

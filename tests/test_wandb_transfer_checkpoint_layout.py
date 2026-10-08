@@ -32,7 +32,12 @@ class Service:
         if 'TransferCurveChart' in query:return {'customChart':deepcopy(self.chart)}
         if 'mutation ' in query:
             self.view_writes+=1
-            if self.apply:self.views.append(dict(id='new',name=variables['name'],type=variables['type'],spec=variables['spec'],displayName=variables['displayName']))
+            if self.apply:
+                if variables.get('id'):
+                    row=next(row for row in self.views if row['id']==variables['id'])
+                    row['spec']=variables['spec']
+                else:
+                    self.views.append(dict(id='new',name=variables['name'],type=variables['type'],spec=variables['spec'],displayName=variables['displayName']))
             if self.timeout:raise TimeoutError('response lost')
             return {'upsertView':{'view':{'id':'new'}}}
         return {'project':{'allViews':{'edges':[{'node':deepcopy(row)} for row in self.views]}}}
@@ -48,6 +53,7 @@ def test_layout_has_distinct_fixed_colors_bands_and_pending_progress():
     assert definition['encoding']['color']['scale']['range']==['#000000',*adapter.COLORS[:5]]
     assert len(set(definition['encoding']['color']['scale']['range']))==6
     assert definition['encoding']['strokeDash']['scale']['range']==[[1,0]]*4+[[6,3]]*2
+    assert definition['params'][0]['bind']=='legend'
     assert any(layer['mark']['type']=='area' for layer in definition['layer'])
     assert any(row['field']=='${field:segment}' for row in definition['encoding']['detail'])
     sections=layout.sections(data,'entity');panels=[panel for section in sections for panel in section['panels']]
@@ -57,6 +63,7 @@ def test_layout_has_distinct_fixed_colors_bands_and_pending_progress():
     assert {p['config']['mediaKeys'][0] for p in panels if p['viewType']=='Media Browser'}=={layout.TABLE_KEY,layout.PROGRESS_KEY}
     assert 'Pending' in panels[0]['config']['value'] and 'sample SD' in panels[0]['config']['value']
     assert 'Five paired' in panels[0]['config']['value'] and '3 transfer settings' in panels[0]['config']['value']
+    assert 'use the run list' not in panels[0]['config']['value']
     assert charts[2]['config']['fieldSettings']['segment']=='fresh_segment'
     assert all(charts[i]['config']['fieldSettings']['lower']=='interval_not_applicable' for i in [3,4])
     assert all(not panel['isAuto'] for panel in panels)
@@ -107,3 +114,31 @@ def test_content_addressed_chart_changes_with_candidate_palette():
     data=campaign();first=layout.chart_id(data,'entity')
     data['candidates']=data['candidates'][:1]
     assert layout.chart_id(data,'entity')!=first
+
+
+@pytest.mark.parametrize('timeout',[False,True])
+def test_exact_summary_only_v2_is_upgraded_in_place_without_touching_other_views(tmp_path,timeout):
+    service=Service(timeout=timeout)
+    old=layout.saved_spec(spec(),campaign(),'entity','abc123',legacy=True)
+    service.views.append(dict(id='old-owned',name='nw-transfercurvesabc123-v',type='project-view',
+        displayName='Transfer mechanisms across checkpoints',spec=json.dumps(old)))
+    others=deepcopy(service.views[:2])
+    result=install(tmp_path,service)
+    assert result['changed'] and result['upgraded_from']==layout.LEGACY_VERSION
+    assert result['view_id']=='old-owned' and len(service.views)==3 and service.views[:2]==others
+    new=json.loads(service.views[-1]['spec'])
+    assert layout._installed(new,campaign(),'entity','abc123')
+    assert new['section']['runSets'][0]['filters']['filters'][0]['key']['name']=='transfer_curve_overview'
+    assert new['section']['runSets'][0]['filters']['filters'][0]['value']=='abc123'
+    assert not install(tmp_path,service)['changed'] and service.view_writes==1
+
+
+def test_modified_v2_is_not_upgraded(tmp_path):
+    service=Service()
+    old=layout.saved_spec(spec(),campaign(),'entity','abc123',legacy=True)
+    old['section']['panelBankConfig']['sections'][0]['panels'][0]['config']['value']+=' User annotation'
+    service.views.append(dict(id='old-owned',name='nw-transfercurvesabc123-v',type='project-view',
+        displayName='Transfer mechanisms across checkpoints',spec=json.dumps(old)))
+    before=deepcopy(service.views)
+    with pytest.raises(layout.ResultsLayoutError,match='preserving user edits'):install(tmp_path,service)
+    assert service.views==before and service.view_writes==0

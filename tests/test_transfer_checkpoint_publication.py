@@ -267,3 +267,48 @@ def test_fresh_gain_has_its_own_gaps_when_returns_are_already_complete(campaign)
     assert points[0]['segment']==points[2]['segment']
     assert points[0]['fresh_segment']!=points[2]['fresh_segment']
     assert points[1]['fresh_gain_mean'] is None
+
+
+def test_overview_logs_registered_tables_separately_and_resumes_one_persisted_identity(campaign,tmp_path,monkeypatch):
+    args,state=prepare(campaign,tmp_path)
+    snapshot=publish.collect(args.root,campaign,state,jobs_active=True)
+    calls=[];logged=[];finished=[]
+    def init(**kwargs):
+        persisted=adapter.read(args.publication_root/'publication.json')
+        assert persisted['overview']['run_id']==kwargs['id']
+        assert kwargs['id'] not in [row['run_id'] for row in state['runs'].values()]
+        calls.append(kwargs)
+        return SimpleNamespace(log=lambda value:logged.append(value),summary={},finish=lambda **kw:finished.append(kw))
+    def forbidden(*args,**kwargs):raise AssertionError('Overview cannot own scientific publication.')
+    monkeypatch.setattr(publish,'Publisher',forbidden)
+    sdk=SimpleNamespace(init=init,Table=lambda **kwargs:kwargs)
+    before={key:adapter.read(Path(entry['run_dir'])/'publication.json') for key,entry in state['runs'].items()}
+    publish.publish_overview(campaign,state,snapshot,args.publication_root,sdk)
+    assert len(calls)==1 and calls[0]['job_type']=='transfer-checkpoint-overview'
+    assert calls[0]['config']['transfer_curve_overview']==state['publication_id']
+    assert calls[0]['config']['scientific_run_ids']=={key:value['run_id'] for key,value in state['runs'].items()}
+    assert len(logged[0][publish.TABLE_KEY]['data'])==len(logged[0][publish.PROGRESS_KEY]['data'])==6
+    assert logged[0]['campaign/completed']==0 and logged[0]['campaign/total']==3
+    publish.publish_overview(campaign,state,snapshot,args.publication_root,sdk)
+    assert len(calls)==1
+    state['layout']=dict(status='verified',url='https://example.test/view')
+    publish.publish_overview(campaign,state,snapshot,args.publication_root,sdk)
+    assert len(calls)==2 and calls[0]['id']==calls[1]['id'] and all(not entry for entry in finished)
+    assert before=={key:adapter.read(Path(entry['run_dir'])/'publication.json') for key,entry in state['runs'].items()}
+
+
+def test_overview_uncertain_failure_reuses_allocated_run_without_marking_snapshot_published(campaign,tmp_path):
+    args,state=prepare(campaign,tmp_path)
+    snapshot=publish.collect(args.root,campaign,state,jobs_active=True)
+    calls=[]
+    def init(**kwargs):
+        calls.append(kwargs['id'])
+        def fail(value):raise RuntimeError('uncertain logging response')
+        return SimpleNamespace(log=fail,summary={},finish=lambda **kw:None)
+    sdk=SimpleNamespace(init=init,Table=lambda **kwargs:kwargs)
+    for _ in range(2):
+        with pytest.raises(RuntimeError,match='uncertain logging'):
+            publish.publish_overview(campaign,state,snapshot,args.publication_root,sdk)
+        state=adapter.read(args.publication_root/'publication.json')
+        assert 'snapshot_sha256' not in state['overview']
+    assert calls[0]==calls[1]
