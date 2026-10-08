@@ -96,3 +96,18 @@ upgrade only an exact recognized version-2 layout, preserving its URL and all
 other saved views; unknown user edits cause a visible setup failure instead
 of an overwrite. API table/schema checks and authenticated browser rendering
 are both required before calling the comparison visible.
+
+Newly accepted W&B checkpoint artifacts store decision traces as lossless
+`decisions-seed-<seed>.jsonl.gz` files. The publisher compresses them only after
+validating the raw worker results; raw JSONL files on Oscar remain unchanged.
+Every scalar and diagnostic row is retained. Gzip output has a zero timestamp
+and no original-filename header, and decompression is checked against the raw
+SHA256 and byte count before publication. The normalized record's
+`provenance.decision_trace_storage.files` maps each compressed artifact name to
+its original filename, raw/compressed hashes and sizes, and encoding.
+
+Read a downloaded trace with `gzip.open(path, 'rt')` in Python, or recover the
+raw bytes with `gzip -dc decisions-seed-101.jsonl.gz > decisions-seed-101.jsonl`.
+The recorded raw SHA256 verifies the recovered file. Compression affects only
+new records; previously accepted records and their publication identities are
+never repacked or rewritten.

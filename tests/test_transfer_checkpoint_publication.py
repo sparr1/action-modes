@@ -1,5 +1,6 @@
 """The curve adapter preserves pairing, provenance and absent measurements."""
 from copy import deepcopy
+import gzip
 import json
 from pathlib import Path
 import statistics
@@ -312,3 +313,64 @@ def test_overview_uncertain_failure_reuses_allocated_run_without_marking_snapsho
         state=adapter.read(args.publication_root/'publication.json')
         assert 'snapshot_sha256' not in state['overview']
     assert calls[0]==calls[1]
+
+
+def test_trace_packing_is_lossless_deterministic_and_keeps_raw_worker_files(campaign,tmp_path):
+    record=transfer(campaign);before=deepcopy(record)
+    raw={name:Path(path).read_bytes() for name,path in record['artifact_files'].items() if name.startswith('decisions-seed-')}
+    stat={name:Path(record['artifact_files'][name]).stat().st_mtime_ns for name in raw}
+    packed=publish.pack_decision_traces(record,tmp_path/'cache')
+    assert record==before and packed['identity']==record['identity'] and packed['metrics']==record['metrics']
+    assert packed['episodes']==record['episodes'] and packed['record_id']==record['record_id']
+    evidence=packed['provenance']['decision_trace_storage']
+    assert evidence['lossless'] and len(evidence['files'])==5
+    for name,data in raw.items():
+        path=Path(packed['artifact_files'][name+'.gz']);proof=evidence['files'][name+'.gz']
+        assert name not in packed['artifact_files']
+        assert gzip.decompress(path.read_bytes())==data
+        assert proof['original_filename']==name and proof['encoding']=='gzip' and proof['roundtrip_verified']
+        assert proof['raw_sha256']==adapter.digest(record['artifact_files'][name]) and proof['raw_bytes']==len(data)
+        assert proof['compressed_sha256']==adapter.digest(path) and proof['compressed_bytes']==path.stat().st_size
+        assert path.read_bytes()[3:8]==b'\0'*5
+        assert Path(record['artifact_files'][name]).read_bytes()==data
+        assert Path(record['artifact_files'][name]).stat().st_mtime_ns==stat[name]
+    assert packed==publish.pack_decision_traces(record,tmp_path/'cache')
+    other=publish.pack_decision_traces(record,tmp_path/'independent-cache')
+    assert other['provenance']==packed['provenance']
+    assert all(Path(other['artifact_files'][name+'.gz']).read_bytes()==Path(packed['artifact_files'][name+'.gz']).read_bytes() for name in raw)
+    assert not list((tmp_path/'cache').rglob('.packing-*'))
+
+
+def test_unknown_trace_cache_is_rejected_without_overwrite(campaign,tmp_path):
+    record=transfer(campaign);directory=tmp_path/'cache'/record['record_id'];directory.mkdir(parents=True)
+    target=directory/'decisions-seed-101.jsonl.gz';target.write_bytes(b'foreign-cache-contents')
+    with pytest.raises(SeriesError,match='gzip header'):
+        publish.pack_decision_traces(record,tmp_path/'cache')
+    assert target.read_bytes()==b'foreign-cache-contents'
+
+
+def test_accepted_uncompressed_record_is_not_repacked_or_replaced(campaign,tmp_path,monkeypatch):
+    args,state=prepare(campaign,tmp_path);record=transfer(campaign);key=campaign['candidates'][0]['setting_id']
+    run=state['runs'][key]['run_dir'];stage_record(run,record)
+    before={path: path.read_bytes() for path in Path(run).rglob('*.json')}
+    def forbidden(*args,**kwargs):raise AssertionError('Accepted records must never be repacked.')
+    monkeypatch.setattr(publish,'pack_decision_traces',forbidden)
+    snapshot=publish.collect(args.root,campaign,state,jobs_active=True)
+    assert snapshot['completed']==1 and not snapshot['failures']
+    assert before=={path:path.read_bytes() for path in before}
+    assert publish.records_by_step(run)[25000]['artifact_files']==record['artifact_files']
+
+
+def test_new_completed_record_is_packed_before_stage(campaign,tmp_path,monkeypatch):
+    args,state=prepare(campaign,tmp_path);record=transfer(campaign);cell=campaign['cells'][0]
+    from slurm import ambi_transfer_curve_campaign as worker
+    marker=args.root/'receipts'/'0.json';save(marker,{'complete':True})
+    directory=Path(cell['result_dir'])
+    monkeypatch.setattr(worker,'validate_receipt',lambda *a,**kw:adapter.read(directory/'receipt.json'))
+    monkeypatch.setattr(worker,'validate_result',lambda *a,**kw:(adapter.read(directory/'results.json'),adapter.read(directory/'manifest.json')))
+    snapshot=publish.collect(args.root,campaign,state,jobs_active=True)
+    assert snapshot['completed']==1 and not snapshot['failures']
+    accepted=publish.records_by_step(state['runs'][cell['setting_id']]['run_dir'])[25000]
+    assert len([name for name in accepted['artifact_files'] if name.endswith('.jsonl.gz')])==5
+    assert accepted['provenance']['decision_trace_storage']['lossless']
+    assert all(Path(path).is_relative_to(args.publication_root/'packed-traces') for name,path in accepted['artifact_files'].items() if name.endswith('.jsonl.gz'))

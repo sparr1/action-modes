@@ -9,10 +9,15 @@ run. It never inserts non-result rows into immutable scientific curve history.
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
+import gzip
 import hashlib
 import json
+import os
 from pathlib import Path
+import re
 import sys
+import tempfile
 import time
 import uuid
 
@@ -83,6 +88,62 @@ def records_by_step(run_dir):
     return records
 
 
+def pack_decision_traces(record, cache_root):
+    """Losslessly pack new artifact traces, leaving worker files/records untouched.
+
+    gzip headers contain no filename and mtime=0. An existing cache entry is
+    accepted only after a complete roundtrip/hash check; unknown contents are
+    never overwritten. Atomic hard-link publication also handles a raced writer.
+    """
+    result=deepcopy(record)
+    require(re.fullmatch(r'[0-9a-f]{64}',record['record_id']) is not None,'Invalid trace-cache record identity.')
+    expected={f"decisions-seed-{episode['seed']}.jsonl" for episode in record['episodes']}
+    selected={name:path for name,path in record['artifact_files'].items()
+              if re.fullmatch(r'decisions-seed-\d+\.jsonl',name)}
+    require(set(selected)==expected,'Complete decision traces are required before compression.')
+    directory=Path(cache_root).resolve()/record['record_id']
+    directory.mkdir(parents=True,exist_ok=True)
+    packed={}
+    for name,path in sorted(selected.items()):
+        source=Path(path);raw_sha=digest(source);raw_bytes=source.stat().st_size
+        target=directory/(name+'.gz')
+        def verify(candidate):
+            require(not candidate.is_symlink(),'Trace cache must not be a symlink.')
+            with candidate.open('rb') as stream:
+                header=stream.read(10)
+            require(len(header)==10 and header[:3]==b'\x1f\x8b\x08' and header[3]==0
+                    and header[4:8]==b'\0'*4,'Trace cache has a non-deterministic gzip header.')
+            decoded=hashlib.sha256();count=0
+            with gzip.open(candidate,'rb') as stream:
+                for chunk in iter(lambda:stream.read(1024*1024),b''):
+                    decoded.update(chunk);count+=len(chunk)
+            require(count==raw_bytes and decoded.hexdigest()==raw_sha,'Trace cache roundtrip differs from raw worker output.')
+        if not target.exists():
+            temporary=None
+            try:
+                with tempfile.NamedTemporaryFile(dir=directory,prefix='.packing-',delete=False) as handle:
+                    temporary=Path(handle.name)
+                    with source.open('rb') as stream,gzip.GzipFile(filename='',mode='wb',fileobj=handle,
+                                                                  compresslevel=6,mtime=0) as zipped:
+                        for chunk in iter(lambda:stream.read(1024*1024),b''):zipped.write(chunk)
+                    handle.flush();os.fsync(handle.fileno())
+                verify(temporary)
+                try:os.link(temporary,target)
+                except FileExistsError:pass
+            finally:
+                if temporary is not None:temporary.unlink(missing_ok=True)
+        verify(target)
+        require(source.stat().st_size==raw_bytes and digest(source)==raw_sha,'Raw decision trace changed during compression.')
+        result['artifact_files'].pop(name)
+        result['artifact_files'][name+'.gz']=str(target)
+        packed[name+'.gz']=dict(original_filename=name,raw_sha256=raw_sha,raw_bytes=raw_bytes,
+            encoding='gzip',gzip_mtime=0,gzip_filename='',compression_level=6,
+            compressed_sha256=digest(target),compressed_bytes=target.stat().st_size,
+            roundtrip_verified=True)
+    result['provenance']['decision_trace_storage']=dict(format_version=1,lossless=True,files=packed)
+    return result
+
+
 def collect(root,campaign,state,*,jobs_active):
     """Only receipt-verified complete seed panels can become data points."""
     from slurm.ambi_transfer_curve_campaign import validate_receipt,validate_result,receipt_path
@@ -100,6 +161,10 @@ def collect(root,campaign,state,*,jobs_active):
                 receipt=validate_receipt(root,campaign,cell)
                 result,manifest=validate_result(directory,campaign,cell,allow_historical=receipt['historical_reuse'])
                 record=normalize_transfer(campaign,cell,receipt,result,manifest,records[PRIOR_ID][step],receipt_path=marker)
+                # Registry is publication_root/registry/setting/run_id. Existing
+                # accepted records were skipped above, preserving their hashes.
+                cache_root=Path(state['runs'][key]['run_dir']).parents[2]/'packed-traces'
+                record=pack_decision_traces(record,cache_root)
                 stage_record(state['runs'][key]['run_dir'],record)
                 records[key][step]=record
                 continue
