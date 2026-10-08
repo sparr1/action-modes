@@ -188,6 +188,35 @@ def test_handoff_reports_spectrum_true_norm_alignment_and_post_j_losses(wrapped)
     json.dumps(result, allow_nan=False)
 
 
+@pytest.mark.parametrize("component", ["actor", "critic"])
+def test_global_projection_handoff_marks_nonzero_over_zero_layer_ratios_undefined(wrapped, component):
+    from utils.spectral_transfer import spectral_state
+    bank = context(wrapped, purpose="heldout")
+    prior = bank["prior_states"]
+    donor, initial = deepcopy(prior), deepcopy(prior)
+    gradients = bank["gradients"][component]
+    source, gradient = max(gradients.items(), key=lambda pair: float(pair[1].norm()))
+    assert gradient.norm() > 1e-5
+    donor[component][source].add_(.2 * gradient / gradient.norm())
+    initial[component] = spectral_state(prior[component], donor[component],
+        parameter_names=gradients.keys(), gradients=gradients,
+        spec={"method": "gradient_projection"}, include_layer_metrics=False)
+    result = evaluate_spectral_handoff(wrapped, donor={"modules": donor},
+        initial_states=initial, final_states=initial, context=bank, ranks=(1, 2))
+    introduced = [row for row in result["layers"][component].values()
+                  if row["donor_squared_norm"] == 0 and row["initial_squared_norm"] > 0]
+    assert introduced
+    assert any(row["prior_input_output_mse"] > 0 for row in introduced)
+    for row in introduced:
+        assert row["transferred_energy_ratio"] is None
+        assert row["parameter_residual_energy_ratio"] is None
+        if row["prior_input_output_mse"] > 0:
+            assert row["prior_input_output_relative_mse"] is None
+    # Component totals still have a nonzero donor denominator.
+    assert np.isfinite(result["summary"][f"{component}_transferred_energy_ratio"])
+    json.dumps(result, allow_nan=False)
+
+
 def test_first_decision_zero_donor_and_component_only_activation_context(wrapped):
     inputs_only = context(wrapped, components=("actor",), compute_gradients=False)
     assert set(inputs_only["inputs"]) == {"actor"}

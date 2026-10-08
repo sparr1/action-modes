@@ -1,0 +1,1104 @@
+{
+  "actor_updates": 4,
+  "arms": {
+    "fresh": {
+      "actor_rho": 0.0,
+      "critic_rho": 0.0,
+      "description": "Fresh actor and critic from the frozen prior at every decision.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_bernoulli05_actor": {
+      "actor_bernoulli_p": 0.5,
+      "description": "actor: matrix-only bernoulli05; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_bernoulli05_critic": {
+      "critic_bernoulli_p": 0.5,
+      "description": "critic: matrix-only bernoulli05; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_bernoulli05_joint": {
+      "actor_bernoulli_p": 0.5,
+      "critic_bernoulli_p": 0.5,
+      "description": "joint: matrix-only bernoulli05; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_blend05_actor": {
+      "actor_rho": 0.5,
+      "description": "actor: matrix-only blend05; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_blend05_critic": {
+      "critic_rho": 0.5,
+      "description": "critic: matrix-only blend05; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_blend05_joint": {
+      "actor_rho": 0.5,
+      "critic_rho": 0.5,
+      "description": "joint: matrix-only blend05; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_full_actor": {
+      "actor_rho": 1.0,
+      "description": "actor: matrix-only full; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_full_critic": {
+      "critic_rho": 1.0,
+      "description": "critic: matrix-only full; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "matrix_full_joint": {
+      "actor_rho": 1.0,
+      "critic_rho": 1.0,
+      "description": "joint: matrix-only full; biases, normalization and buffers reset.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_gate_s0p5_actor": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_gate",
+        "norm_matched": false,
+        "rank": null,
+        "strength": 0.5
+      },
+      "description": "actor: coordinate-wise gradient-gated weight copying, strength 0.5; carry only donor matrix coordinates with negative gradient-times-delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_gate_s0p5_actor_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_gate",
+        "norm_matched": true,
+        "rank": null,
+        "strength": 0.5
+      },
+      "description": "actor: coordinate-wise gradient-gated weight copying, strength 0.5; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_gate_s0p5_critic": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_gate",
+        "norm_matched": false,
+        "rank": null,
+        "strength": 0.5
+      },
+      "description": "critic: coordinate-wise gradient-gated weight copying, strength 0.5; carry only donor matrix coordinates with negative gradient-times-delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_gate_s0p5_critic_norm": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_gate",
+        "norm_matched": true,
+        "rank": null,
+        "strength": 0.5
+      },
+      "description": "critic: coordinate-wise gradient-gated weight copying, strength 0.5; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_gate_s0p5_joint": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_gate",
+        "norm_matched": false,
+        "rank": null,
+        "strength": 0.5
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_gate",
+        "norm_matched": false,
+        "rank": null,
+        "strength": 0.5
+      },
+      "description": "joint: coordinate-wise gradient-gated weight copying, strength 0.5; carry only donor matrix coordinates with negative gradient-times-delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_gate_s0p5_joint_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_gate",
+        "norm_matched": true,
+        "rank": null,
+        "strength": 0.5
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_gate",
+        "norm_matched": true,
+        "rank": null,
+        "strength": 0.5
+      },
+      "description": "joint: coordinate-wise gradient-gated weight copying, strength 0.5; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_gate_s1_actor": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_gate",
+        "norm_matched": false,
+        "rank": null,
+        "strength": 1.0
+      },
+      "description": "actor: coordinate-wise gradient-gated weight copying, strength 1.0; carry only donor matrix coordinates with negative gradient-times-delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_gate_s1_actor_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_gate",
+        "norm_matched": true,
+        "rank": null,
+        "strength": 1.0
+      },
+      "description": "actor: coordinate-wise gradient-gated weight copying, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_gate_s1_critic": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_gate",
+        "norm_matched": false,
+        "rank": null,
+        "strength": 1.0
+      },
+      "description": "critic: coordinate-wise gradient-gated weight copying, strength 1.0; carry only donor matrix coordinates with negative gradient-times-delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_gate_s1_critic_norm": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_gate",
+        "norm_matched": true,
+        "rank": null,
+        "strength": 1.0
+      },
+      "description": "critic: coordinate-wise gradient-gated weight copying, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_gate_s1_joint": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_gate",
+        "norm_matched": false,
+        "rank": null,
+        "strength": 1.0
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_gate",
+        "norm_matched": false,
+        "rank": null,
+        "strength": 1.0
+      },
+      "description": "joint: coordinate-wise gradient-gated weight copying, strength 1.0; carry only donor matrix coordinates with negative gradient-times-delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_gate_s1_joint_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_gate",
+        "norm_matched": true,
+        "rank": null,
+        "strength": 1.0
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_gate",
+        "norm_matched": true,
+        "rank": null,
+        "strength": 1.0
+      },
+      "description": "joint: coordinate-wise gradient-gated weight copying, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_projection_s0p5_actor": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_projection",
+        "norm_matched": false,
+        "rank": null,
+        "strength": 0.5
+      },
+      "description": "actor: signed gradient-line projection, strength 0.5; project the complete matrix-delta vector onto the initial proxy gradient; no descent gate or matrix-rank constraint; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_projection_s0p5_actor_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_projection",
+        "norm_matched": true,
+        "rank": null,
+        "strength": 0.5
+      },
+      "description": "actor: signed gradient-line projection, strength 0.5; dense donor delta with the same global component norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_projection_s0p5_critic": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_projection",
+        "norm_matched": false,
+        "rank": null,
+        "strength": 0.5
+      },
+      "description": "critic: signed gradient-line projection, strength 0.5; project the complete matrix-delta vector onto the initial proxy gradient; no descent gate or matrix-rank constraint; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_projection_s0p5_critic_norm": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_projection",
+        "norm_matched": true,
+        "rank": null,
+        "strength": 0.5
+      },
+      "description": "critic: signed gradient-line projection, strength 0.5; dense donor delta with the same global component norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_projection_s0p5_joint": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_projection",
+        "norm_matched": false,
+        "rank": null,
+        "strength": 0.5
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_projection",
+        "norm_matched": false,
+        "rank": null,
+        "strength": 0.5
+      },
+      "description": "joint: signed gradient-line projection, strength 0.5; project the complete matrix-delta vector onto the initial proxy gradient; no descent gate or matrix-rank constraint; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_projection_s0p5_joint_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_projection",
+        "norm_matched": true,
+        "rank": null,
+        "strength": 0.5
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_projection",
+        "norm_matched": true,
+        "rank": null,
+        "strength": 0.5
+      },
+      "description": "joint: signed gradient-line projection, strength 0.5; dense donor delta with the same global component norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_projection_s1_actor": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_projection",
+        "norm_matched": false,
+        "rank": null,
+        "strength": 1.0
+      },
+      "description": "actor: signed gradient-line projection, strength 1.0; project the complete matrix-delta vector onto the initial proxy gradient; no descent gate or matrix-rank constraint; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_projection_s1_actor_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_projection",
+        "norm_matched": true,
+        "rank": null,
+        "strength": 1.0
+      },
+      "description": "actor: signed gradient-line projection, strength 1.0; dense donor delta with the same global component norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_projection_s1_critic": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_projection",
+        "norm_matched": false,
+        "rank": null,
+        "strength": 1.0
+      },
+      "description": "critic: signed gradient-line projection, strength 1.0; project the complete matrix-delta vector onto the initial proxy gradient; no descent gate or matrix-rank constraint; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_projection_s1_critic_norm": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_projection",
+        "norm_matched": true,
+        "rank": null,
+        "strength": 1.0
+      },
+      "description": "critic: signed gradient-line projection, strength 1.0; dense donor delta with the same global component norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_projection_s1_joint": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_projection",
+        "norm_matched": false,
+        "rank": null,
+        "strength": 1.0
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_projection",
+        "norm_matched": false,
+        "rank": null,
+        "strength": 1.0
+      },
+      "description": "joint: signed gradient-line projection, strength 1.0; project the complete matrix-delta vector onto the initial proxy gradient; no descent gate or matrix-rank constraint; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_projection_s1_joint_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_projection",
+        "norm_matched": true,
+        "rank": null,
+        "strength": 1.0
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient_projection",
+        "norm_matched": true,
+        "rank": null,
+        "strength": 1.0
+      },
+      "description": "joint: signed gradient-line projection, strength 1.0; dense donor delta with the same global component norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r1_s0p5_actor": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": false,
+        "rank": 1,
+        "strength": 0.5
+      },
+      "description": "actor: gradient candidate rank 1, strength 0.5; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r1_s0p5_actor_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": true,
+        "rank": 1,
+        "strength": 0.5
+      },
+      "description": "actor: gradient candidate rank 1, strength 0.5; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r1_s0p5_critic": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": false,
+        "rank": 1,
+        "strength": 0.5
+      },
+      "description": "critic: gradient candidate rank 1, strength 0.5; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r1_s0p5_critic_norm": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": true,
+        "rank": 1,
+        "strength": 0.5
+      },
+      "description": "critic: gradient candidate rank 1, strength 0.5; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r1_s0p5_joint": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": false,
+        "rank": 1,
+        "strength": 0.5
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": false,
+        "rank": 1,
+        "strength": 0.5
+      },
+      "description": "joint: gradient candidate rank 1, strength 0.5; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r1_s0p5_joint_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": true,
+        "rank": 1,
+        "strength": 0.5
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": true,
+        "rank": 1,
+        "strength": 0.5
+      },
+      "description": "joint: gradient candidate rank 1, strength 0.5; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r1_s1_actor": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": false,
+        "rank": 1,
+        "strength": 1.0
+      },
+      "description": "actor: gradient candidate rank 1, strength 1.0; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r1_s1_actor_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": true,
+        "rank": 1,
+        "strength": 1.0
+      },
+      "description": "actor: gradient candidate rank 1, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r1_s1_critic": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": false,
+        "rank": 1,
+        "strength": 1.0
+      },
+      "description": "critic: gradient candidate rank 1, strength 1.0; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r1_s1_critic_norm": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": true,
+        "rank": 1,
+        "strength": 1.0
+      },
+      "description": "critic: gradient candidate rank 1, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r1_s1_joint": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": false,
+        "rank": 1,
+        "strength": 1.0
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": false,
+        "rank": 1,
+        "strength": 1.0
+      },
+      "description": "joint: gradient candidate rank 1, strength 1.0; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r1_s1_joint_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": true,
+        "rank": 1,
+        "strength": 1.0
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": true,
+        "rank": 1,
+        "strength": 1.0
+      },
+      "description": "joint: gradient candidate rank 1, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r4_s0p5_actor": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": false,
+        "rank": 4,
+        "strength": 0.5
+      },
+      "description": "actor: gradient candidate rank 4, strength 0.5; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r4_s0p5_actor_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": true,
+        "rank": 4,
+        "strength": 0.5
+      },
+      "description": "actor: gradient candidate rank 4, strength 0.5; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r4_s0p5_critic": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": false,
+        "rank": 4,
+        "strength": 0.5
+      },
+      "description": "critic: gradient candidate rank 4, strength 0.5; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r4_s0p5_critic_norm": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": true,
+        "rank": 4,
+        "strength": 0.5
+      },
+      "description": "critic: gradient candidate rank 4, strength 0.5; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r4_s0p5_joint": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": false,
+        "rank": 4,
+        "strength": 0.5
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": false,
+        "rank": 4,
+        "strength": 0.5
+      },
+      "description": "joint: gradient candidate rank 4, strength 0.5; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r4_s0p5_joint_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": true,
+        "rank": 4,
+        "strength": 0.5
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": true,
+        "rank": 4,
+        "strength": 0.5
+      },
+      "description": "joint: gradient candidate rank 4, strength 0.5; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r4_s1_actor": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": false,
+        "rank": 4,
+        "strength": 1.0
+      },
+      "description": "actor: gradient candidate rank 4, strength 1.0; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r4_s1_actor_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": true,
+        "rank": 4,
+        "strength": 1.0
+      },
+      "description": "actor: gradient candidate rank 4, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r4_s1_critic": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": false,
+        "rank": 4,
+        "strength": 1.0
+      },
+      "description": "critic: gradient candidate rank 4, strength 1.0; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r4_s1_critic_norm": {
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": true,
+        "rank": 4,
+        "strength": 1.0
+      },
+      "description": "critic: gradient candidate rank 4, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r4_s1_joint": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": false,
+        "rank": 4,
+        "strength": 1.0
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": false,
+        "rank": 4,
+        "strength": 1.0
+      },
+      "description": "joint: gradient candidate rank 4, strength 1.0; carry selected matrix delta; continue dense SAC training.",
+      "parameter_scope": "matrices"
+    },
+    "spectral_gradient_r4_s1_joint_norm": {
+      "actor_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": true,
+        "rank": 4,
+        "strength": 1.0
+      },
+      "critic_spectral": {
+        "covariance_damping": 0.0001,
+        "method": "gradient",
+        "norm_matched": true,
+        "rank": 4,
+        "strength": 1.0
+      },
+      "description": "joint: gradient candidate rank 4, strength 1.0; dense donor delta with the same per-layer transferred norm.",
+      "parameter_scope": "matrices"
+    }
+  },
+  "base_matrix": "ambi_critic_transfer_575k.json",
+  "base_preset": "return_return/fresh",
+  "batch_size": 256,
+  "campaign_kind": "spectral-transfer-v1",
+  "checkpoint_contract": {
+    "sha256": "0c6955db7cb8555a67d7863344b70be68f4b3250814d131e647ee6f9ef01a042",
+    "step": 575000
+  },
+  "controller_seed": 55,
+  "critic_updates": 16,
+  "description": "H1 gradient-aligned transfer screen on the frozen 575k checkpoint: gradient-selected SVD ranks 1/4, coordinate-wise descent-gated copying, and signed gradient-line projection; strengths 0.5/1, J1/2/4/6, actor/critic/joint. 232 newly evaluated settings, three paired full episodes each. Same-implementation fresh, full matrix carry, dense blend, Bernoulli and per-candidate dense norm controls; per-layer norm matching for SVD/gating, global component norm matching for projection. All arms reset nonmatrix parameters, replay, optimizer and temperature state.",
+  "diagnostics": {
+    "action_count": 8,
+    "decisions": [
+      0,
+      1,
+      25,
+      100,
+      250,
+      499
+    ],
+    "enabled": true,
+    "fit_steps": 4,
+    "mc_rollouts": 8,
+    "state_count": 32,
+    "stationary_decisions": [
+      25,
+      250
+    ]
+  },
+  "family": "spectral_transfer",
+  "horizons": [
+    1
+  ],
+  "max_steps": 500,
+  "protocol": "inner-sac-transfer-discovery-v1",
+  "publication": {
+    "arm_styles": [
+      [
+        "fresh",
+        "fresh",
+        "#000000"
+      ],
+      [
+        "matrix_full_actor",
+        "matrix full actor",
+        "#0072b2"
+      ],
+      [
+        "matrix_blend05_actor",
+        "matrix blend05 actor",
+        "#d55e00"
+      ],
+      [
+        "matrix_bernoulli05_actor",
+        "matrix bernoulli05 actor",
+        "#009e73"
+      ],
+      [
+        "matrix_full_critic",
+        "matrix full critic",
+        "#cc79a7"
+      ],
+      [
+        "matrix_blend05_critic",
+        "matrix blend05 critic",
+        "#e69f00"
+      ],
+      [
+        "matrix_bernoulli05_critic",
+        "matrix bernoulli05 critic",
+        "#56b4e9"
+      ],
+      [
+        "matrix_full_joint",
+        "matrix full joint",
+        "#332288"
+      ],
+      [
+        "matrix_blend05_joint",
+        "matrix blend05 joint",
+        "#aa4499"
+      ],
+      [
+        "matrix_bernoulli05_joint",
+        "matrix bernoulli05 joint",
+        "#44aa99"
+      ],
+      [
+        "spectral_gradient_r1_s0p5_actor",
+        "spectral gradient r1 s0p5 actor",
+        "#882255"
+      ],
+      [
+        "spectral_gradient_r1_s0p5_actor_norm",
+        "spectral gradient r1 s0p5 actor norm",
+        "#999933"
+      ],
+      [
+        "spectral_gradient_r1_s0p5_critic",
+        "spectral gradient r1 s0p5 critic",
+        "#661100"
+      ],
+      [
+        "spectral_gradient_r1_s0p5_critic_norm",
+        "spectral gradient r1 s0p5 critic norm",
+        "#6699cc"
+      ],
+      [
+        "spectral_gradient_r1_s0p5_joint",
+        "spectral gradient r1 s0p5 joint",
+        "#117733"
+      ],
+      [
+        "spectral_gradient_r1_s0p5_joint_norm",
+        "spectral gradient r1 s0p5 joint norm",
+        "#aa7744"
+      ],
+      [
+        "spectral_gradient_r1_s1_actor",
+        "spectral gradient r1 s1 actor",
+        "#000000"
+      ],
+      [
+        "spectral_gradient_r1_s1_actor_norm",
+        "spectral gradient r1 s1 actor norm",
+        "#0072b2"
+      ],
+      [
+        "spectral_gradient_r1_s1_critic",
+        "spectral gradient r1 s1 critic",
+        "#d55e00"
+      ],
+      [
+        "spectral_gradient_r1_s1_critic_norm",
+        "spectral gradient r1 s1 critic norm",
+        "#009e73"
+      ],
+      [
+        "spectral_gradient_r1_s1_joint",
+        "spectral gradient r1 s1 joint",
+        "#cc79a7"
+      ],
+      [
+        "spectral_gradient_r1_s1_joint_norm",
+        "spectral gradient r1 s1 joint norm",
+        "#e69f00"
+      ],
+      [
+        "spectral_gradient_r4_s0p5_actor",
+        "spectral gradient r4 s0p5 actor",
+        "#56b4e9"
+      ],
+      [
+        "spectral_gradient_r4_s0p5_actor_norm",
+        "spectral gradient r4 s0p5 actor norm",
+        "#332288"
+      ],
+      [
+        "spectral_gradient_r4_s0p5_critic",
+        "spectral gradient r4 s0p5 critic",
+        "#aa4499"
+      ],
+      [
+        "spectral_gradient_r4_s0p5_critic_norm",
+        "spectral gradient r4 s0p5 critic norm",
+        "#44aa99"
+      ],
+      [
+        "spectral_gradient_r4_s0p5_joint",
+        "spectral gradient r4 s0p5 joint",
+        "#882255"
+      ],
+      [
+        "spectral_gradient_r4_s0p5_joint_norm",
+        "spectral gradient r4 s0p5 joint norm",
+        "#999933"
+      ],
+      [
+        "spectral_gradient_r4_s1_actor",
+        "spectral gradient r4 s1 actor",
+        "#661100"
+      ],
+      [
+        "spectral_gradient_r4_s1_actor_norm",
+        "spectral gradient r4 s1 actor norm",
+        "#6699cc"
+      ],
+      [
+        "spectral_gradient_r4_s1_critic",
+        "spectral gradient r4 s1 critic",
+        "#117733"
+      ],
+      [
+        "spectral_gradient_r4_s1_critic_norm",
+        "spectral gradient r4 s1 critic norm",
+        "#aa7744"
+      ],
+      [
+        "spectral_gradient_r4_s1_joint",
+        "spectral gradient r4 s1 joint",
+        "#000000"
+      ],
+      [
+        "spectral_gradient_r4_s1_joint_norm",
+        "spectral gradient r4 s1 joint norm",
+        "#0072b2"
+      ],
+      [
+        "spectral_gradient_gate_s0p5_actor",
+        "spectral gradient gate s0p5 actor",
+        "#d55e00"
+      ],
+      [
+        "spectral_gradient_gate_s0p5_actor_norm",
+        "spectral gradient gate s0p5 actor norm",
+        "#009e73"
+      ],
+      [
+        "spectral_gradient_gate_s0p5_critic",
+        "spectral gradient gate s0p5 critic",
+        "#cc79a7"
+      ],
+      [
+        "spectral_gradient_gate_s0p5_critic_norm",
+        "spectral gradient gate s0p5 critic norm",
+        "#e69f00"
+      ],
+      [
+        "spectral_gradient_gate_s0p5_joint",
+        "spectral gradient gate s0p5 joint",
+        "#56b4e9"
+      ],
+      [
+        "spectral_gradient_gate_s0p5_joint_norm",
+        "spectral gradient gate s0p5 joint norm",
+        "#332288"
+      ],
+      [
+        "spectral_gradient_gate_s1_actor",
+        "spectral gradient gate s1 actor",
+        "#aa4499"
+      ],
+      [
+        "spectral_gradient_gate_s1_actor_norm",
+        "spectral gradient gate s1 actor norm",
+        "#44aa99"
+      ],
+      [
+        "spectral_gradient_gate_s1_critic",
+        "spectral gradient gate s1 critic",
+        "#882255"
+      ],
+      [
+        "spectral_gradient_gate_s1_critic_norm",
+        "spectral gradient gate s1 critic norm",
+        "#999933"
+      ],
+      [
+        "spectral_gradient_gate_s1_joint",
+        "spectral gradient gate s1 joint",
+        "#661100"
+      ],
+      [
+        "spectral_gradient_gate_s1_joint_norm",
+        "spectral gradient gate s1 joint norm",
+        "#6699cc"
+      ],
+      [
+        "spectral_gradient_projection_s0p5_actor",
+        "spectral gradient projection s0p5 actor",
+        "#117733"
+      ],
+      [
+        "spectral_gradient_projection_s0p5_actor_norm",
+        "spectral gradient projection s0p5 actor norm",
+        "#aa7744"
+      ],
+      [
+        "spectral_gradient_projection_s0p5_critic",
+        "spectral gradient projection s0p5 critic",
+        "#000000"
+      ],
+      [
+        "spectral_gradient_projection_s0p5_critic_norm",
+        "spectral gradient projection s0p5 critic norm",
+        "#0072b2"
+      ],
+      [
+        "spectral_gradient_projection_s0p5_joint",
+        "spectral gradient projection s0p5 joint",
+        "#d55e00"
+      ],
+      [
+        "spectral_gradient_projection_s0p5_joint_norm",
+        "spectral gradient projection s0p5 joint norm",
+        "#009e73"
+      ],
+      [
+        "spectral_gradient_projection_s1_actor",
+        "spectral gradient projection s1 actor",
+        "#cc79a7"
+      ],
+      [
+        "spectral_gradient_projection_s1_actor_norm",
+        "spectral gradient projection s1 actor norm",
+        "#e69f00"
+      ],
+      [
+        "spectral_gradient_projection_s1_critic",
+        "spectral gradient projection s1 critic",
+        "#56b4e9"
+      ],
+      [
+        "spectral_gradient_projection_s1_critic_norm",
+        "spectral gradient projection s1 critic norm",
+        "#332288"
+      ],
+      [
+        "spectral_gradient_projection_s1_joint",
+        "spectral gradient projection s1 joint",
+        "#aa4499"
+      ],
+      [
+        "spectral_gradient_projection_s1_joint_norm",
+        "spectral gradient projection s1 joint norm",
+        "#44aa99"
+      ]
+    ],
+    "gradient_alignment_view": true,
+    "group_prefix": "gradient-h1-transfer-575k",
+    "slug_prefix": "gradienth1575",
+    "tags": [
+      "575k",
+      "gradient-transfer",
+      "h1",
+      "matrix-only",
+      "full-episode",
+      "development-screen"
+    ],
+    "title": "575K H1 gradient transfer \u00b7 SVD, gating and projection",
+    "view_title": "575K H1 gradient transfer \u00b7 paired controls"
+  },
+  "rollouts": 128,
+  "rounds": [
+    1,
+    2,
+    4,
+    6
+  ],
+  "schema_version": 1,
+  "seeds": [
+    101,
+    102,
+    103
+  ],
+  "spectral_diagnostics": {
+    "action_count": 8,
+    "decisions": [
+      0,
+      1,
+      25,
+      100,
+      250,
+      499
+    ],
+    "enabled": true,
+    "mc_rollouts": 8,
+    "ranks": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32,
+      64,
+      128
+    ],
+    "state_count": 32
+  },
+  "spectral_grid": {
+    "components": [
+      "actor",
+      "critic",
+      "joint"
+    ],
+    "methods": [
+      "gradient",
+      "gradient_gate",
+      "gradient_projection"
+    ],
+    "ranks": [
+      1,
+      4
+    ],
+    "strengths": [
+      0.5,
+      1.0
+    ]
+  },
+  "spectral_probe": {
+    "action_count": 8,
+    "mc_rollouts": 8,
+    "state_count": 32
+  }
+}

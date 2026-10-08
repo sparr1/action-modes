@@ -35,6 +35,11 @@ METRICS = (
     "inner_critic_prior_anchor_grad_norm", "inner_critic_prior_anchor_to_total_grad_ratio",
 )
 
+SELECTION_METRICS = (
+    "retained_fraction", "projection_coefficient", "gradient_squared_norm",
+    "donor_gradient_inner_product", "predicted_benefit", "transferred_energy_fraction",
+)
+
 
 def _positive_integer(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -342,6 +347,10 @@ def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_st
                                                    episode_seed=episode_seed)
     rewards, latencies, transfer_times, diagnostic_times = [], [], [], []
     spectral_probe_times, spectral_filter_times, export_times = [], [], []
+    selection_components = tuple(name for name in ("actor", "critic")
+        if arm.get(f"{name}_spectral", {}).get("method") in {"gradient", "gradient_projection", "gradient_gate"}
+        and arm[f"{name}_spectral"].get("strength", 1.) > 0)
+    selection_values = {}
     terminated = truncated = False
     started = time.perf_counter()
     for decision in range(max_steps):
@@ -351,14 +360,15 @@ def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_st
         transfer_metrics = {}
         context = None
         components = tuple(name for name in ("actor", "critic")
-            if arm.get(f"{name}_spectral", {}).get("method") in {"activation", "gradient"}
+            if arm.get(f"{name}_spectral", {}).get("method") in {"activation", "gradient", "gradient_projection", "gradient_gate"}
             and arm[f"{name}_spectral"].get("strength", 1.) > 0)
         if donor is not None and components:
             from utils.spectral_transfer_probes import build_spectral_context
             context = build_spectral_context(wrapped, observation, controller_seed=controller_seed,
                 episode_seed=episode_seed, decision=decision, settings=spectral_probe,
                 components=components, compute_gradients=any(
-                    arm[f"{name}_spectral"]["method"] == "gradient" for name in components))
+                    arm[f"{name}_spectral"]["method"] in {"gradient", "gradient_projection", "gradient_gate"}
+                    for name in components))
         if wrapped.agent.device.type == "cuda":
             torch.cuda.synchronize(wrapped.agent.device)
         probe_seconds = time.perf_counter() - transfer_started if context is not None else 0.
@@ -423,6 +433,19 @@ def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_st
             row["diagnostics"] = diagnostic_record
         if context is not None:
             row["spectral_selection"] = context["metadata"]
+            # These are every-decision selection-bank measurements, separate
+            # from sparse held-out diagnostics. No donor or zero strength means
+            # no gradient probe and therefore no contributing observation.
+            for component in selection_components:
+                for quantity in SELECTION_METRICS:
+                    source = f"inner_{component}_spectral_{quantity}"
+                    if source not in transfer_metrics:
+                        continue
+                    value = transfer_metrics[source]
+                    if isinstance(value, bool) or not isinstance(value, (int, float, np.number)) or not math.isfinite(value):
+                        raise ValueError(f"Nonfinite or nonnumeric selection metric {source}.")
+                    key = f"selection_{component}_{quantity}"
+                    selection_values.setdefault(key, []).append(float(value))
         if on_step is not None:
             on_step(row)
         if terminated or truncated:
@@ -452,6 +475,18 @@ def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_st
     if diagnostics is not None:
         result["diagnostics"] = diagnostics.coverage(len(rewards))
         result["diagnostic_samples"] = result["diagnostics"]["samples"]
+    if selection_values:
+        # Scale before summing so individually finite measurements cannot
+        # overflow merely because an episode has many contributing decisions.
+        summary = {key: math.fsum(value / len(values) for value in values)
+                   for key, values in selection_values.items()}
+        if not all(math.isfinite(value) for value in summary.values()):
+            raise ValueError("Nonfinite selection diagnostic episode mean.")
+        counts = {key: len(values) for key, values in selection_values.items()}
+        result["selection_diagnostics"] = {"summary": summary, "summary_counts": counts}
+        if diagnostics is not None:
+            result["diagnostics"].setdefault("summary", {}).update(summary)
+            result["diagnostics"].setdefault("summary_counts", {}).update(counts)
     result.update({"return": result["reward"], "length": result["steps"], "solver_seed": episode_solver_seed})
     return result
 

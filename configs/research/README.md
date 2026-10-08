@@ -2,10 +2,21 @@
 
 [The spectral transfer campaign](SPECTRAL_TRANSFER_575K.md) implements plain,
 activation-weighted and gradient-scored SVD initialization, with per-layer
-norm-matched dense controls and actor/critic/joint variants. It records sampled
+norm-matched dense controls and actor/critic/joint variants. It also supports
+gradient-gated coordinate copying with per-layer norm controls and
+signed projection of the donor delta onto the new decision's initial surrogate
+gradient, with one coefficient and a global norm-matched control per component.
+This projection uses no SVD in the controller and has no matrix-rank parameter.
+It records sampled
 spectral energy, directional usefulness, independent held-out initialization
 and post-J objectives, and all required transfer costs. Its 575k example matrix
 and Oscar wrapper are configuration for a future reviewed launch.
+
+The [H1 gradient-alignment screen](ambi_gradient_transfer_h1_575k.json) crosses
+J1/2/4/6 with gradient-selected SVD ranks 1/4, gated copying and signed gradient
+projection at strengths 0.5/1, including actor/critic/joint and matched controls.
+Its 232 settings retain all spectral and held-out diagnostics, with separate
+dashboard panels for each component and transfer strength.
 
 [The Bernoulli J12 extension](ambi_bernoulli_j12_575k.json) adds nine p=0.5 cells
 at H1/2/3, preserving the three transfer mechanisms, paired full episodes and

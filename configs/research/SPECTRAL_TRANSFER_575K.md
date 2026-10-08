@@ -18,6 +18,8 @@ branches and B=256. H changes imagination depth; J changes the number of rounds.
 | `svd` | Largest r singular components of D | Best rank-r approximation in parameter Frobenius norm; magnitude is not evidence of transfer usefulness. |
 | `activation` | Truncate `D L`, then solve `R L = (D L)_r`, with `C=L Lᵀ` | Minimizes `||(D-R)L||²` for the damped prior-input covariance. Preserves layer preactivations on that distribution, not full-network behavior. |
 | `gradient` | Score each donor mode `D_i` by `-<G_new,D_i>` and keep up to r positive modes | Selects locally beneficial directions for a specified frozen-reference surrogate. It does not guarantee improvement after J updates or in real return. |
+| `gradient_gate` | Retain each donor coordinate `D_j` only when `G_j D_j < 0` | Copies individually descent-aligned changes; zero products reset. There is no rank constraint or SVD in the controller. |
+| `gradient_projection` | Project the full matrix-parameter delta vector onto the initial new-decision gradient: `R = (<D,G> / ||G||²) G` | Preserves the signed component along the gradient line. This is one direction in parameter space, not a rank-one constraint on each matrix. |
 
 The activation covariance is the uncentered second moment `XᵀX/n`, plus
 `covariance_damping * mean(diag(C)) * I`; the scale is one when all inputs are
@@ -27,15 +29,74 @@ rank32 is a different fraction in a hidden layer and an output layer.
 Gradient selection within a repeated-singular-value subspace can depend on
 the SVD basis. All decompositions are exact rather than randomized SVD.
 
+### Gradient-gated copying
+
+`gradient_gate` replaces a Bernoulli mask with the deterministic sign test
+`G_j D_j < 0` at each matrix coordinate. The gate is computed before strength
+scaling, with the same initial new-decision frozen-reference gradient used by
+gradient-selected SVD and gradient projection. Zero-gradient and zero-delta
+coordinates reset. Numeric ranks are rejected; `rank` is null or omitted.
+Only the retained coordinates carry their donor values at strength one.
+
+The retained sum has nonpositive first-order selection loss change, but this
+does not guarantee an improvement for a finite transfer or after SAC training.
+It can discard groups of weights whose coordinated change would be useful.
+Its dense control matches the retained norm per layer. Decision metrics record
+retained counts/fractions, donor-gradient alignment, actual predicted benefit
+and displacement norms. Selection probes are controller work; full spectra are
+computed only by sampled held-out diagnostics.
+
+### Initial-gradient line projection
+
+`gradient_projection` concatenates all eligible matrix parameters conceptually
+and uses one projection coefficient per component: one for the actor, and one
+for the complete online critic (including all its heads). It does not project
+each layer independently. `G` is evaluated once at the frozen-prior
+initialization on the new decision's selection bank, using the same fixed
+surrogate as gradient-selected SVD below. It is not an Adam-preconditioned step
+or a gradient from the first SAC replay minibatch.
+
+The projection is signed. If `<D,G> > 0`, it preserves the uphill component;
+it does not clip to the descent ray. A zero gradient produces zero transfer.
+At strength one and before floating-point rounding, `<G,R> = <G,D>`,
+`<G,D-R> = 0`, and `||R|| <= ||D||`. Consequently this tests the effect of
+discarding orthogonal donor changes while preserving the first-order selection
+loss change; it does not guarantee a favorable change. Strength scales `R`
+before initialization, and ordinary dense SAC follows.
+
+This method accepts `rank: null` (or no rank). Numeric ranks are rejected.
+Mixed campaign grids enumerate gate and projection once per strength/component,
+without duplicating them for each SVD rank. Grids containing only these
+nonrank methods have `ranks: []`.
+The controller computes dot products and norms without SVD. Required selection
+probe/backward-pass time remains part of controller time; sampled spectral and
+held-out diagnostics remain separately timed. Decision metrics record the
+projection coefficient, donor-gradient inner product, gradient squared norm,
+actual transferred norm and predicted benefit. Unselected mode/rank quantities
+are null rather than implying a rank-one weight matrix.
+
+The gradient-alignment campaign also aggregates computed selection metrics over
+applicable transfer decisions in each episode, excluding the donorless first
+decision. These means retain their contributing-decision counts and remain
+separate from sampled held-out measurements. Retention, signed projection
+coefficient and predicted-benefit charts use this selection bank; undefined or
+uncomputed fields remain absent. Their raw per-decision values remain in JSONL.
+
 ## Matched comparisons
 
 Actor-only, critic-only and joint transfer are independent choices. Each
-spectral candidate has a paired dense control: for each layer, replace its
+SVD-method or gated-copy candidate has a paired dense control: for each layer, replace its
 filtered update R by `D * ||strength * R|| / ||D||`. This matches transferred
 norm layer by layer. It tests direction selection against attenuation with the
 same norm, while still paying the selection cost. Zero donor deltas remain
 zero. Activation-weighted transfer can have greater parameter norm than D, so
 its dense norm-matched coefficient can exceed one.
+
+For `gradient_projection` only, the dense control uses a single coefficient
+matching the **whole component's** transferred norm. A global projection can
+introduce changes in a layer whose donor delta was zero, so per-layer matching
+cannot always be satisfied. This control is labeled separately from the
+per-layer controls used by the three SVD methods and gated copying.
 
 Additional controls are fresh initialization, full matrix carry, deterministic
 50% matrix blending, and Bernoulli 50% matrix copying. All new arms transfer
@@ -110,7 +171,8 @@ all three component choices plus the matrix controls. That is 16 arms and 192
 cells, each with three paired full episodes (576 episodes). The rank and strength
 are held fixed in this screen; these settings are not a claim of optimality.
 
-The generator supports all three methods and finer rank/strength/J choices.
+The generator supports all five methods, explicit horizon subsets of H1/2/3,
+and finer rank/strength/J choices.
 For example, this writes a configuration only:
 
 ```bash
@@ -121,7 +183,10 @@ python slurm/ambi_spectral_transfer_campaign.py generate \
 ```
 
 Each added method/rank/strength/component combination also adds its matched
-control. Review the printed cell count before selecting a launch grid.
+control; gradient gating and projection have no rank axis. For example, select
+`--methods gradient_projection --strengths 1 --components actor critic joint`
+to generate the new candidate and global norm controls with the same H/J and
+paired-episode protocol. Review the printed cell count before selecting a launch grid.
 Use `evaluate_ambi_transfer_campaign.py --campaign PATH --list-cells` to inspect
 the exact high-J-first task ordering without loading a checkpoint.
 For this family the named base matrix is resolved inside the checked-out
@@ -147,6 +212,31 @@ with immediate and post-J surrogate behavior as explanatory evidence.
 
 No commit, push, cluster synchronization, submission or online publication is
 performed by generating or reviewing these files.
+
+## H1 gradient-alignment screen
+
+`ambi_gradient_transfer_h1_575k.json` selects H1 and J1/2/4/6 for
+gradient-selected SVD at ranks 1 and 4, gradient-gated copying, and signed
+gradient-line projection. Every method uses strengths 0.5 and 1.0 with
+actor-only, critic-only and joint variants. Each candidate has its appropriate
+norm-matched dense control, plus shared matrix-only fresh/full/half-blend/
+Bernoulli-50% controls. This is 58 arms, 232 settings and 696 full episodes on
+paired seeds 101–103 at the audited 575k checkpoint.
+
+All controls execute under this implementation; historical rank-extension
+reuse remains a separate strict contract. Preparation binds 59 GPU smoke cells:
+all 58 arms at H1/J6 plus fresh H1/J1, each with two seeds and three decisions.
+Every worker verifies all smoke receipts before production. The same C16/A4,
+N128/B256, 500-decision, fresh optimizer/replay/temperature protocol and
+independent selection/held-out streams remain in force.
+
+The dedicated `ambi-inner-bench` workspace separates actor/critic/joint and
+strength 0.5/1.0 panels. Each panel repeats the shared controls and displays
+only candidates at its selected strength. Gate, projection and the two
+gradient-SVD ranks have distinct colors; lighter dashed curves identify dense
+norm controls. The norm-matching scope is recorded in result tables. Return
+and controller time remain primary outcomes, with spectral geometry and
+initial/post-J probe losses as explanatory metrics.
 
 ## Rank1/rank4 extension with audited rank32 reuse
 

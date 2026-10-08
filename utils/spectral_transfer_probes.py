@@ -236,8 +236,10 @@ def evaluate_spectral_handoff(wrapped, *, donor, initial_states, final_states=No
     ``donor`` may be the exported diagnostic state (with ``modules``), a plain
     actor/critic state mapping, or None at the first decision. Energy ratios are
     actual squared parameter norms, not probabilities or rank fractions. Zero
-    donor norms produce zero ratios and are explicitly flagged. No nonzero
-    donor is assumed at the first decision.
+    donor norms are explicitly flagged: zero/zero retains the zero convention,
+    while a nonzero numerator over zero is null. Global gradient projection
+    can introduce a nonzero change into a donor-zero layer. No nonzero donor
+    is assumed at the first decision.
     """
     from utils.spectral_transfer import spectral_energy
 
@@ -269,14 +271,15 @@ def evaluate_spectral_handoff(wrapped, *, donor, initial_states, final_states=No
             output = inputs @ delta.T
             output_error = inputs @ (carried - delta).T
             output2 = float(output.square().mean())
+            output_error2 = float(output_error.square().mean())
             row = dict(spectrum=spectral_energy(delta, ranks=ranks, gradient=gradient),
                 donor_squared_norm=d2, initial_squared_norm=c2, zero_donor=d2 == 0.,
-                transferred_energy_ratio=c2 / d2 if d2 else 0.,
-                parameter_residual_energy_ratio=error2 / d2 if d2 else 0.,
+                transferred_energy_ratio=c2 / d2 if d2 else (None if c2 else 0.),
+                parameter_residual_energy_ratio=error2 / d2 if d2 else (None if error2 else 0.),
                 donor_initial_cosine=dot / math.sqrt(d2 * c2) if d2 and c2 else 0.,
                 donor_projection_coefficient=dot / d2 if d2 else 0.,
-                prior_input_output_mse=float(output_error.square().mean()),
-                prior_input_output_relative_mse=float(output_error.square().mean()) / output2 if output2 else 0.,
+                prior_input_output_mse=output_error2,
+                prior_input_output_relative_mse=output_error2 / output2 if output2 else (None if output_error2 else 0.),
                 zero_donor_prior_input_output=output2 == 0.,
                 donor_first_order_benefit=-float((gradient * delta).sum()),
                 initial_first_order_benefit=-float((gradient * carried).sum()),

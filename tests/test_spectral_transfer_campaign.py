@@ -56,6 +56,51 @@ def test_generator_exposes_all_filters_and_independent_rank_strength_j_choices()
     assert not any(name.endswith('_critic') for name in matrix['arms'])
 
 
+def test_gradient_projection_has_no_rank_axis_or_duplicate_settings():
+    options = dict(methods=['gradient_projection'], strengths=[.25, 1.],
+                   rounds=[1, 4], components=['actor', 'joint'])
+    matrix = launcher.generate_matrix(ranks=[1, 4, 32], **options)
+    assert matrix == launcher.generate_matrix(ranks=[], **options)
+    launcher.validate_matrix(matrix)
+    assert matrix['spectral_grid']['ranks'] == []
+    assert len(matrix['arms']) == 1 + 3 * 2 + 2 * 2 * 2
+    projected = {name: arm for name, arm in matrix['arms'].items() if name.startswith('spectral_')}
+    assert set(projected) == {f'spectral_gradient_projection_s{strength}_{component}{suffix}'
+        for strength in ('0p25', '1') for component in ('actor', 'joint') for suffix in ('', '_norm')}
+    for name, arm in projected.items():
+        for component in ('actor', 'critic'):
+            if component + '_spectral' in arm:
+                assert arm[component + '_spectral']['rank'] is None
+                assert arm[component + '_spectral']['norm_matched'] == name.endswith('_norm')
+        assert ('global component norm' if name.endswith('_norm') else 'no descent gate') in arm['description']
+    cells = listed_cells(matrix)
+    assert len(cells) == len({cell['name'] for cell in cells}) == len(matrix['arms']) * 3 * 2
+
+
+def test_mixed_svd_projection_grid_only_expands_rank_based_methods():
+    matrix = launcher.generate_matrix(methods=['gradient', 'gradient_projection'], ranks=[1, 4],
+        strengths=[1.], rounds=[1], components=['critic'])
+    launcher.validate_matrix(matrix)
+    assert matrix['spectral_grid']['ranks'] == [1, 4]
+    assert len(matrix['arms']) == 1 + 3 + 2 * 2 + 2
+    assert sum(name.startswith('spectral_gradient_projection_') for name in matrix['arms']) == 2
+    assert all(f'spectral_gradient_r{rank}_s1_critic' in matrix['arms'] for rank in (1, 4))
+    with pytest.raises(ValueError, match='ranks'):
+        launcher.generate_matrix(methods=['gradient', 'gradient_projection'], ranks=[])
+
+
+def test_projection_generator_cli_needs_no_artificial_rank(tmp_path, monkeypatch):
+    output = tmp_path / 'projection.json'
+    monkeypatch.setattr(launcher.sys, 'argv', ['generate', 'generate', '--output', str(output),
+        '--methods', 'gradient_projection', '--components', 'critic'])
+    monkeypatch.setattr(launcher.subprocess, 'run', lambda *args, **kwargs: pytest.fail('Generation must not submit.'))
+    launcher.main()
+    matrix = load_campaign(output)
+    launcher.validate_matrix(matrix)
+    assert matrix['spectral_grid']['ranks'] == []
+    assert matrix['arms']['spectral_gradient_projection_s1_critic']['critic_spectral']['rank'] is None
+
+
 def test_generated_sorted_json_roundtrip_is_portable_and_never_launches(tmp_path, monkeypatch):
     output = tmp_path / 'generated.json'
     monkeypatch.setattr(launcher.sys, 'argv', ['generate', 'generate', '--output', str(output),
@@ -91,7 +136,7 @@ def test_manifest_cannot_drop_controls_or_drift_protocol(change):
     elif change == 'seeds':
         matrix['seeds'] = [1, 2, 3]
     elif change == 'horizon':
-        matrix['horizons'] = [1, 3]
+        matrix['horizons'] = [1, 4]
     elif change == 'budget':
         matrix['actor_updates'] = 8
     elif change == 'missing_norm':

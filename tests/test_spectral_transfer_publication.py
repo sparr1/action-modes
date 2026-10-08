@@ -68,6 +68,46 @@ def test_spectral_styles_separate_methods_dense_norm_controls_and_components():
     assert spec['encoding']['strokeDash']['scale']['range']==[[],[8,3],[2,3]]
 
 
+def test_projection_publication_has_null_rank_distinct_style_and_signed_global_norm_contract(tmp_path):
+    from evaluate_ambi_transfer_campaign import listed_cells
+    from slurm.ambi_spectral_transfer_campaign import generate_matrix
+    matrix = generate_matrix(methods=['svd', 'gradient', 'gradient_projection'], ranks=[1, 4],
+                             strengths=[1.], rounds=[1], components=['actor', 'critic', 'joint'])
+    value = dict(matrix, cells=listed_cells(matrix), H=matrix['horizons'], J=matrix['rounds'])
+    for component in ('actor', 'critic', 'joint'):
+        arm = f'spectral_gradient_projection_s1_{component}'
+        direct = layout.spectral_arm_metadata(value, arm)
+        control = layout.spectral_arm_metadata(value, arm + '_norm')
+        assert direct['requested_rank'] is control['requested_rank'] is None
+        assert direct['method'] == control['method'] == 'gradient_projection'
+        assert direct['component'] == component and control['norm_matched']
+        assert direct['label'] == 'Gradient-line projection (signed) s1'
+        assert control['label'].startswith('Global norm match to Gradient-line projection (signed)')
+        other_colors = {layout.spectral_arm_metadata(value, name)['color']
+                        for name in value['arms'] if name != arm and name != arm + '_norm'
+                        and layout.spectral_arm_metadata(value, name)['component'] in (component, 'fresh')}
+        assert direct['color'] != control['color']
+        assert {direct['color'], control['color']}.isdisjoint(other_colors)
+        metadata = publisher._cell_metadata(next(cell for cell in value['cells'] if cell['arm'] == arm), value)
+        row, diagnostics = publisher._measurement_rows(metadata, None, 'current campaign', 'pending', spectral=True)
+        assert row['requested_rank'] is None and row['return_mean'] is None and diagnostics == []
+    service = MultiChartService()
+    layout.ensure_discovery_saved_view(SimpleNamespace(_service_api=service), entity='entity',
+        project='project', receipt_dir=tmp_path, run_id='projection', campaign=value)
+    sections = layout._bank(json.loads(service.views[-1]['spec']))['sections']
+    intro = sections[0]['panels'][0]['config']['value']
+    for phrase in ('Gradient-line projection is signed', 'not descent-gated', 'not a rank-1 matrix approximation',
+                   'global component norm', 'requested rank is null'):
+        assert phrase in intro
+
+
+def test_projection_publication_rejects_a_misleading_matrix_rank():
+    value = campaign()
+    value['arms']['projection'] = dict(actor_spectral=spectral('gradient_projection', rank=1))
+    with pytest.raises(layout.ResultsLayoutError, match='no matrix rank'):
+        layout.spectral_arm_metadata(value, 'projection')
+
+
 def test_spectral_layout_is_visible_before_any_result_and_idempotent(tmp_path):
     value=campaign(); service=MultiChartService(); before=deepcopy(service.views)
     options=dict(entity='entity',project='project',receipt_dir=tmp_path,run_id='spectral123',campaign=value)

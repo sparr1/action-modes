@@ -27,7 +27,8 @@ from utils.transfer_campaign import PROTOCOL, load_campaign, validate_arm
 CHECKPOINT_SHA, METADATA_SHA, SEEDS = common.CHECKPOINT_SHA, common.METADATA_SHA, common.SEEDS
 DEFAULT_MATRIX = ROOT / 'configs/research/ambi_spectral_transfer_575k.json'
 COMPONENTS = {'actor': ('actor',), 'critic': ('critic',), 'joint': ('actor', 'critic')}
-METHODS = ('svd', 'activation', 'gradient')
+METHODS = ('svd', 'activation', 'gradient', 'gradient_gate', 'gradient_projection')
+NONRANK_METHODS = frozenset({'gradient_gate', 'gradient_projection'})
 RANK_EXTENSION_REUSE = dict(kind='spectral-same-implementation-v1',
     source_commit='b1f576d6d9b2d9750dbff93c52fa83f7428ead2c',
     matrix_sha256='0c5c04be502c10394ae1df104c5fbd04fa6974406a7d8415f3a454e59ae15e9c',
@@ -52,10 +53,16 @@ def _unique(values, name, check):
     return values
 
 
-def _grid(*, methods, ranks, strengths, rounds, components):
+def _grid(*, methods, ranks, strengths, rounds, components, horizons=(1, 2, 3)):
+    methods = _unique(methods, 'methods', lambda v: v in METHODS)
+    ranks = list(ranks)
+    rank_based = any(method not in NONRANK_METHODS for method in methods)
+    if ranks or rank_based:
+        ranks = _unique(ranks, 'ranks', lambda v: isinstance(v, int) and not isinstance(v, bool) and v > 0)
     return dict(
-        methods=_unique(methods, 'methods', lambda v: v in METHODS),
-        ranks=_unique(ranks, 'ranks', lambda v: isinstance(v, int) and not isinstance(v, bool) and v > 0),
+        horizons=_unique(horizons, 'horizons', lambda v: isinstance(v, int) and not isinstance(v, bool) and v in (1, 2, 3)),
+        methods=methods,
+        ranks=ranks if rank_based else [],
         strengths=_unique(strengths, 'strengths', lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and 0 <= v <= 1),
         rounds=_unique(rounds, 'rounds', lambda v: isinstance(v, int) and not isinstance(v, bool) and v > 0),
         components=_unique(components, 'components', lambda v: v in COMPONENTS))
@@ -74,36 +81,53 @@ def _arms(grid):
                 **{f'{name}_{field}': value for name in COMPONENTS[component]},
                 description=f'{component}: matrix-only {label}; biases, normalization and buffers reset.')
     for method in grid['methods']:
-        for rank in grid['ranks']:
+        for rank in ([None] if method in NONRANK_METHODS else grid['ranks']):
             for strength in grid['strengths']:
                 for component in grid['components']:
-                    name = f'spectral_{method}_r{rank}_s{_strength_token(strength)}_{component}'
+                    rank_token = '' if rank is None else f'_r{rank}'
+                    name = f'spectral_{method}{rank_token}_s{_strength_token(strength)}_{component}'
                     for norm_matched in (False, True):
                         spec = validate_spectral_spec(dict(method=method, rank=rank,
                             strength=strength, norm_matched=norm_matched))
+                        if method == 'gradient_projection':
+                            description = (f'{component}: signed gradient-line projection, strength {strength}; '
+                                + ('dense donor delta with the same global component norm.' if norm_matched
+                                   else 'project the complete matrix-delta vector onto the initial proxy gradient; '
+                                        'no descent gate or matrix-rank constraint; continue dense SAC training.'))
+                        elif method == 'gradient_gate':
+                            description = (f'{component}: coordinate-wise gradient-gated weight copying, strength {strength}; '
+                                + ('dense donor delta with the same per-layer transferred norm.' if norm_matched
+                                   else 'carry only donor matrix coordinates with negative gradient-times-delta; '
+                                        'continue dense SAC training.'))
+                        else:
+                            description = (f'{component}: {method} candidate rank {rank}, strength {strength}; '
+                                + ('dense donor delta with the same per-layer transferred norm.' if norm_matched
+                                   else 'carry selected matrix delta; continue dense SAC training.'))
                         arms[name + ('_norm' if norm_matched else '')] = dict(parameter_scope='matrices',
                             **{f'{part}_spectral': deepcopy(spec) for part in COMPONENTS[component]},
-                            description=(f'{component}: {method} candidate rank {rank}, strength {strength}; '
-                                + ('dense donor delta with the same per-layer transferred norm.' if norm_matched
-                                   else 'carry selected matrix delta; continue dense SAC training.')))
+                            description=description)
     return arms
 
 
 def generate_matrix(*, methods=('svd',), ranks=(32,), strengths=(1.0,), rounds=(1, 2, 4, 6),
-                    components=('actor', 'critic', 'joint')):
+                    components=('actor', 'critic', 'joint'), horizons=(1, 2, 3)):
     """Construct a complete paired grid including per-candidate norm controls."""
-    grid = _grid(methods=methods, ranks=ranks, strengths=strengths, rounds=rounds, components=components)
+    grid = _grid(methods=methods, ranks=ranks, strengths=strengths, rounds=rounds,
+                 components=components, horizons=horizons)
     arms = _arms(grid)
+    norm_scope = ('per-candidate norm-matched controls (global component norm for gradient projection; '
+                  'per-layer norm for SVD methods)' if 'gradient_projection' in grid['methods']
+                  else 'per-layer norm-matched controls')
     return dict(schema_version=1, protocol=PROTOCOL, family='spectral_transfer',
         campaign_kind='spectral-transfer-v1',
         description='Spectral matrix-transfer screen on the frozen 575k checkpoint. '
-            'Same-implementation fresh, full carry, dense blend, Bernoulli and per-layer norm-matched controls. '
+            f'Same-implementation fresh, full carry, dense blend, Bernoulli and {norm_scope}. '
             'All arms reset nonmatrix parameters, replay, optimizer and temperature state.',
         base_matrix='ambi_critic_transfer_575k.json', base_preset='return_return/fresh',
         checkpoint_contract=dict(step=575000, sha256=CHECKPOINT_SHA),
-        horizons=[1, 2, 3], rounds=grid['rounds'], seeds=list(SEEDS), controller_seed=55,
+        horizons=grid['horizons'], rounds=grid['rounds'], seeds=list(SEEDS), controller_seed=55,
         max_steps=500, critic_updates=16, actor_updates=4, rollouts=128, batch_size=256,
-        spectral_grid={key: value for key, value in grid.items() if key != 'rounds'}, arms=arms,
+        spectral_grid={key: value for key, value in grid.items() if key not in {'rounds', 'horizons'}}, arms=arms,
         diagnostics=dict(enabled=True, decisions=[0, 1, 25, 100, 250, 499],
             stationary_decisions=[25, 250], mc_rollouts=8, action_count=8, state_count=32, fit_steps=4),
         spectral_diagnostics=dict(enabled=True, decisions=[0, 1, 25, 100, 250, 499],
@@ -115,6 +139,25 @@ def generate_matrix(*, methods=('svd',), ranks=(32,), strengths=(1.0,), rounds=(
             slug_prefix='spectral575', group_prefix='spectral-transfer-575k',
             tags=['575k', 'spectral-transfer', 'matrix-only', 'full-episode', 'development-screen'],
             arm_styles=[[name, name.replace('_', ' '), PALETTE[index % len(PALETTE)]] for index, name in enumerate(arms)]))
+
+
+
+def generate_gradient_h1():
+    """H1 screen of three gradient mechanisms with fresh paired controls."""
+    matrix = generate_matrix(methods=('gradient', 'gradient_gate', 'gradient_projection'),
+        ranks=(1, 4), strengths=(.5, 1.), horizons=(1,), rounds=(1, 2, 4, 6))
+    matrix['description'] = ('H1 gradient-aligned transfer screen on the frozen 575k checkpoint: '
+        'gradient-selected SVD ranks 1/4, coordinate-wise descent-gated copying, and signed '
+        'gradient-line projection; strengths 0.5/1, J1/2/4/6, actor/critic/joint. '
+        '232 newly evaluated settings, three paired full episodes each. Same-implementation '
+        'fresh, full matrix carry, dense blend, Bernoulli and per-candidate dense norm controls; '
+        'per-layer norm matching for SVD/gating, global component norm matching for projection. '
+        'All arms reset nonmatrix parameters, replay, optimizer and temperature state.')
+    matrix['publication'].update(title='575K H1 gradient transfer · SVD, gating and projection',
+        view_title='575K H1 gradient transfer · paired controls', slug_prefix='gradienth1575',
+        group_prefix='gradient-h1-transfer-575k', gradient_alignment_view=True,
+        tags=['575k', 'gradient-transfer', 'h1', 'matrix-only', 'full-episode', 'development-screen'])
+    return matrix
 
 
 def generate_rank_extension():
@@ -134,7 +177,7 @@ def validate_matrix(matrix):
     expected = dict(schema_version=1, protocol=PROTOCOL, family='spectral_transfer',
         campaign_kind='spectral-transfer-v1', base_matrix='ambi_critic_transfer_575k.json',
         base_preset='return_return/fresh', checkpoint_contract=dict(step=575000, sha256=CHECKPOINT_SHA),
-        horizons=[1, 2, 3], seeds=SEEDS, controller_seed=55, max_steps=500,
+        seeds=SEEDS, controller_seed=55, max_steps=500,
         critic_updates=16, actor_updates=4, rollouts=128, batch_size=256)
     if any(matrix.get(key) != value for key, value in expected.items()):
         raise ValueError('Spectral campaign differs from the audited checkpoint and paired protocol.')
@@ -143,7 +186,7 @@ def validate_matrix(matrix):
     raw_grid = matrix.get('spectral_grid', {})
     if set(raw_grid) != {'methods', 'ranks', 'strengths', 'components'}:
         raise ValueError('Spectral grid requires methods, ranks, strengths and components.')
-    grid = _grid(**raw_grid, rounds=matrix.get('rounds', []))
+    grid = _grid(**raw_grid, rounds=matrix.get('rounds', []), horizons=matrix.get('horizons', []))
     wanted = _arms(grid)
     actual = matrix.get('arms', {})
     strip = lambda arm: {key: value for key, value in arm.items() if key != 'description'}
@@ -162,7 +205,7 @@ def validate_matrix(matrix):
         raise ValueError('Spectral launch requires explicit selection probe settings.')
     validate_probe_settings(matrix.get('spectral_probe'))
     if 'reuse' in matrix:
-        if (matrix['reuse'] != RANK_EXTENSION_REUSE or grid != dict(methods=['svd'], ranks=[1, 4, 32],
+        if (matrix['reuse'] != RANK_EXTENSION_REUSE or grid != dict(horizons=[1, 2, 3], methods=['svd'], ranks=[1, 4, 32],
                 strengths=[1.0], rounds=[1, 2, 4, 6], components=['actor', 'critic', 'joint'])):
             raise ValueError('Reuse is restricted to the audited rank1/rank4 extension of rank32.')
     return matrix
@@ -382,6 +425,7 @@ def main():
     generate.add_argument('--ranks', type=int, nargs='+', default=[32])
     generate.add_argument('--strengths', type=float, nargs='+', default=[1.0])
     generate.add_argument('--rounds', type=int, nargs='+', default=[1, 2, 4, 6])
+    generate.add_argument('--horizons', type=int, nargs='+', default=[1, 2, 3])
     generate.add_argument('--components', choices=tuple(COMPONENTS), nargs='+', default=list(COMPONENTS))
     prep = sub.add_parser('prepare')
     prep.add_argument('--root', type=Path, required=True)
@@ -394,7 +438,7 @@ def main():
     if args.mode == 'prepare':
         prepare(args)
     else:
-        matrix = generate_matrix(**{key: getattr(args, key) for key in ('methods', 'ranks', 'strengths', 'rounds', 'components')})
+        matrix = generate_matrix(**{key: getattr(args, key) for key in ('methods', 'ranks', 'strengths', 'rounds', 'components', 'horizons')})
         validate_matrix(matrix)
         common.write(args.output, matrix)
         print(json.dumps(dict(output=str(args.output.resolve()), arms=len(matrix['arms']),

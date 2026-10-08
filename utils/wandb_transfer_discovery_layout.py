@@ -45,9 +45,12 @@ def spectral_arm_metadata(campaign, arm):
         spectral = specification.get(component + '_spectral')
         if spectral is not None:
             method = spectral['method']
-            if method not in ('svd', 'activation', 'gradient'):
+            if method not in ('svd', 'activation', 'gradient', 'gradient_projection', 'gradient_gate'):
                 raise ResultsLayoutError('Unknown spectral method: ' + method)
-            active.append(dict(component=component, method=method, requested_rank=spectral['rank'],
+            if method in ('gradient_projection', 'gradient_gate') and spectral.get('rank') is not None:
+                raise ResultsLayoutError('Gradient-line projection or coordinate gate has no matrix rank.')
+            active.append(dict(component=component, method=method,
+                requested_rank=None if method in ('gradient_projection', 'gradient_gate') else spectral['rank'],
                 strength=spectral['strength'], norm_matched=spectral['norm_matched']))
         elif specification.get(component + '_bernoulli_p', 0.) > 0:
             active.append(dict(component=component, method='bernoulli', requested_rank=None,
@@ -61,8 +64,18 @@ def spectral_arm_metadata(campaign, arm):
             label='Fresh prior reset', color='#000000')
     component = active[0]['component'] if len(active) == 1 else 'joint'
     names = dict(svd='SVD', activation='Activation weighted', gradient='Gradient ranked',
+                 gradient_projection='Gradient-line projection (signed)',
+                 gradient_gate='Coordinate gradient gate',
                  bernoulli='Bernoulli', blend='Dense blend', carry='Dense carry')
+    if _gradient_alignment_view(campaign):
+        names['gradient'] = 'Gradient-ranked SVD'
     def describe(item):
+        if item['method'] == 'gradient_projection':
+            mode = 'Global norm match to ' if item['norm_matched'] else ''
+            return f"{mode}{names[item['method']]} s{item['strength']:g}"
+        if item['method'] == 'gradient_gate':
+            mode = 'Per-layer norm match to ' if item['norm_matched'] else ''
+            return f"{mode}{names[item['method']]} s{item['strength']:g}"
         if item['requested_rank'] is not None:
             mode = 'Dense norm match to ' if item['norm_matched'] else ''
             return f"{mode}{names[item['method']]} r{item['requested_rank']} s{item['strength']:g}"
@@ -73,6 +86,8 @@ def spectral_arm_metadata(campaign, arm):
         item['component'] + ': ' + describe(item) for item in active)
     colors = {'svd': ('#0072b2', '#56b4e9'), 'activation': ('#d55e00', '#e69f00'),
               'gradient': ('#009e73', '#7fcdbb'), 'bernoulli': ('#cc79a7', '#cc79a7'),
+              'gradient_projection': ('#332288', '#9999cc'),
+              'gradient_gate': ('#882255', '#cc6677'),
               'blend': ('#777777', '#777777'), 'carry': ('#333333', '#333333')}
     method = shared['method'] or 'mixed'
     color = colors.get(method, ('#8c564b', '#b4948f'))[int(bool(shared['norm_matched']))]
@@ -87,8 +102,32 @@ def spectral_arm_metadata(campaign, arm):
         rank = shared['requested_rank']
         if rank in svd_ranks:
             color = rank_colors[svd_ranks.index(rank) % len(rank_colors)][int(bool(shared['norm_matched']))]
+    if _gradient_alignment_view(campaign) and method not in ('fresh', 'bernoulli', 'blend', 'carry'):
+        variants = _gradient_alignment_variants(campaign)
+        palette = (('#0072b2', '#56b4e9'), ('#332288', '#9999cc'),
+                   ('#d55e00', '#e69f00'), ('#009e73', '#7fcdbb'),
+                   ('#882255', '#cc6677'), ('#996600', '#ddcc77'),
+                   ('#117733', '#88ccaa'), ('#664400', '#c4a484'))
+        if len(variants) > len(palette):
+            raise ResultsLayoutError('Gradient comparison needs more distinct method/rank colors than the palette provides.')
+        identity = (method, shared['requested_rank'])
+        if identity not in variants:
+            raise ResultsLayoutError('Gradient comparison requires the same method and rank within each joint arm.')
+        color = palette[variants.index(identity)][int(bool(shared['norm_matched']))]
     return dict(component=component, **{**shared, 'method': method},
         parameter_scope=specification.get('parameter_scope', 'matrices'), label=label, color=color)
+
+
+def _gradient_alignment_view(campaign):
+    return campaign.get('publication', {}).get('gradient_alignment_view') is True
+
+
+def _gradient_alignment_variants(campaign):
+    variants = {(specification[key]['method'], specification[key].get('rank'))
+                for specification in campaign.get('arms', {}).values()
+                for key in ('actor_spectral', 'critic_spectral') if key in specification}
+    order = {'gradient_gate': 0, 'gradient_projection': 1, 'gradient': 2, 'svd': 3, 'activation': 4}
+    return sorted(variants, key=lambda item: (order.get(item[0], 5), item[0], item[1] or 0))
 
 
 def _spectral_svd_ranks(campaign):
@@ -109,16 +148,31 @@ def _spectral_groups(campaign):
         arms.append('rho_a0_c0')
     metadata = {arm: spectral_arm_metadata(campaign, arm) for arm in arms}
     fresh = [arm for arm in arms if metadata[arm]['component'] == 'fresh']
-    return [(component+'/', component.capitalize()+' | ',
+    groups = [(component+'/', component.capitalize()+' | ',
              [arm for arm in arms if metadata[arm]['component'] == component] + fresh)
             for component in ('actor', 'critic', 'joint')
             if any(value['component'] == component for value in metadata.values())]
+    if not _gradient_alignment_view(campaign):
+        return groups
+    split = []
+    controls = {'fresh', 'bernoulli', 'blend', 'carry'}
+    for prefix, label, selected in groups:
+        strengths = {metadata[arm]['strength'] for arm in selected
+                     if metadata[arm]['method'] not in controls}
+        if not strengths or any(strength is None for strength in strengths):
+            raise ResultsLayoutError('Gradient comparison needs explicit strengths for each component.')
+        for strength in sorted(strengths):
+            token = f'{strength:g}'.replace('.', 'p').replace('-', 'm')
+            split.append((f'{prefix}s{token}/', f'{label}strength {strength:g} | ',
+                          [arm for arm in selected if metadata[arm]['method'] in controls
+                           or metadata[arm]['strength'] == strength]))
+    return split
 
 
 def campaign_diagnostic_charts(campaign, prefix=''):
     if campaign.get('family') != 'spectral_transfer':
         return DIAGNOSTIC_CHARTS if campaign.get('diagnostics', {}).get('enabled') else ()
-    component = prefix.rstrip('/')
+    component = prefix.rstrip('/').split('/')[0]
     components = ('actor', 'critic') if component == 'joint' else (component,)
     charts = []
     for name in components:
@@ -134,6 +188,12 @@ def campaign_diagnostic_charts(campaign, prefix=''):
             ('mean_positive_benefit_energy_fraction', 'Donor energy with positive first-order benefit; fixed-model proxy'),
             ('initial_first_order_benefit', 'Transferred first-order benefit; fixed-model proxy')):
             charts.append((f'spectral_{name}_{suffix}', name.capitalize()+': '+title))
+        if _gradient_alignment_view(campaign):
+            for suffix, title in (
+                ('retained_fraction', 'Gate coordinate retention fraction; selection bank'),
+                ('projection_coefficient', 'Signed projected-candidate coefficient before transfer strength; selection bank'),
+                ('predicted_benefit', 'Predicted first-order loss reduction; selection bank')):
+                charts.append((f'selection_{name}_{suffix}', name.capitalize()+': '+title))
     charts.extend((('spectral_probe_seconds_per_decision', 'Scoring probe seconds per decision; included in controller'),
                    ('spectral_filter_seconds_per_decision', 'Spectral filter seconds per decision; included in controller')))
     return tuple(charts)
@@ -184,7 +244,7 @@ def campaign_chart_definition(campaign, component=None):
 
     if spectral:
         forms = {arm: ('Dense norm-matched control' if spectral_arm_metadata(campaign, arm)['norm_matched']
-                      else 'Filtered transfer' if spectral_arm_metadata(campaign, arm)['method'] in ('svd','activation','gradient')
+                      else 'Filtered transfer' if spectral_arm_metadata(campaign, arm)['method'] in ('svd','activation','gradient','gradient_projection','gradient_gate')
                       else 'Weight-copy control') for arm, _, _ in styles}
         definition['transform'].append({'calculate':json.dumps(forms, separators=(',', ':'))
             + "[datum['${field:lineKey}']]", 'as':'Transfer form'})
@@ -386,6 +446,32 @@ def spectral_sections(campaign, chart_id):
         intro = intro.replace('SVD is blue, activation-weighted selection orange, gradient-ranked selection green; ',
             ('SVD ranks 1, 4 and 32 are blue, orange and green, respectively; '
              if _spectral_svd_ranks(campaign) == [1, 4, 32] else 'Each SVD rank has a distinct color; '))
+    if _gradient_alignment_view(campaign):
+        intro = intro.replace('SVD is blue, activation-weighted selection orange, gradient-ranked selection green; ',
+                              'Each gradient method and SVD rank has a distinct color; ')
+        intro += (' **Strengths are shown in separate panels for each component**, with the same fresh, dense carry, '
+                  'dense blend and Bernoulli controls repeated in each strength panel. '
+                  'Coordinate gradient gating retains donor coordinates whose signed change lowers the initial '
+                  'new-decision proxy loss to first order. Its norm control matches each layer. '
+                  'Gradient-ranked SVD selects beneficial donor singular modes; rank labels distinguish its variants. '
+                  'The initial gradient is evaluated at the frozen prior on the new decision probe bank, '
+                  'not the first SAC replay minibatch. Selection panels average every applicable transfer decision, '
+                  'excluding the donorless first decision; their table counts are transfer decisions, not sampled '
+                  'heldout roots. Gate retention counts strictly beneficial coordinates before norm matching. '
+                  'Projection coefficients are signed and measured before multiplying by transfer strength; '
+                  'for dense norm controls, they describe the projected candidate used to set the control norm, '
+                  'not the dense control direction. Selection-bank first-order predictions remain separate '
+                  'from heldout measurements and do not guarantee real-return improvement.')
+    if any(specification.get(key, {}).get('method') == 'gradient_projection'
+           for specification in campaign.get('arms', {}).values()
+           for key in ('actor_spectral', 'critic_spectral')):
+        projection_style = ('with a lighter dashed global norm control. ' if _gradient_alignment_view(campaign)
+                            else 'shown in indigo with a lighter dashed global norm control. ')
+        intro += (' **Gradient-line projection is signed**, ' + projection_style +
+                  'It projects the complete matrix-parameter delta vector onto the initial new-decision proxy gradient, '
+                  'separately for actor and critic. It is not descent-gated and is not a rank-1 matrix approximation; '
+                  'its requested rank is null. Its dense control matches the global component norm; '
+                  'SVD-method dense controls match per-layer norms. A positive predicted benefit is not guaranteed.')
     if reused:
         intro = intro.replace(f'**{count} configurations;',
             f'**{count + reused} comparison configurations: {count} new and {reused} reused;')
@@ -404,24 +490,34 @@ def spectral_sections(campaign, chart_id):
             if reused else f'{count} settings and live progress'),'mediaKeys':['discovery/settings']},width=24,height=9)])]
     for prefix, label, _ in campaign_curve_groups(campaign):
         component = prefix.rstrip('/'); identifier = chart_id[component]
-        blocks.append(('curves-'+component, 'Spectral transfer | '+label+'return and controller time', 3, True, [
+        section_group = component.replace('/', '-') if _gradient_alignment_view(campaign) else component
+        columns = min(3, 2 * len(campaign['H'])) if _gradient_alignment_view(campaign) else 3
+        blocks.append(('curves-'+section_group, 'Spectral transfer | '+label+'return and controller time', columns, True, [
             _campaign_curve(f'discovery/{prefix}h{h}_return_vs_{axis}', f'{label}H{h}: return versus '+('J' if axis=='j' else 'controller time'),
                 'J rounds per solve' if axis=='j' else 'Controller seconds per decision; includes scoring and filtering',
                 'Mean episode return', identifier)
             for axis in ('j','compute') for h in campaign['H']]))
         charts = campaign_diagnostic_charts(campaign, prefix)
-        for suffix, title, visible, selected in (
+        chart_groups = [
             ('overhead', 'controller overhead', True, [(k,t) for k,t in charts if '_seconds_per_decision' in k]),
             ('proxies', 'heldout losses and transfer geometry; fixed-model proxies', False,
-             [(k,t) for k,t in charts if '_seconds_per_decision' not in k])):
-            blocks.append((suffix+'-'+component, 'Spectral transfer | '+label+title, 3, visible, [
+             [(k,t) for k,t in charts if '_seconds_per_decision' not in k and not k.startswith('selection_')])]
+        if _gradient_alignment_view(campaign):
+            chart_groups.insert(1, ('selection', 'selection-bank diagnostics; every applicable transfer decision', True,
+                [(k,t) for k,t in charts if k.startswith('selection_')]))
+        for suffix, title, visible, selected in chart_groups:
+            blocks.append((suffix+'-'+section_group, 'Spectral transfer | '+label+title, columns, visible, [
                 _campaign_curve(f'discovery/{prefix}h{h}_{metric}_vs_j', f'{label}H{h}: {description}',
                     'J rounds per solve', description, identifier)
                 for metric, description in selected for h in campaign['H']]))
     blocks.append(('results', 'Spectral transfer | complete measurements and provenance', 1, True, [
         _panel('results','Media Browser',{'chartTitle':'Complete return, controller time, method and requested rank','mediaKeys':['discovery/results']},width=24,height=10),
         _panel('episodes','Media Browser',{'chartTitle':'Per-seed outcomes; scoring and filtering are included controller work','mediaKeys':['discovery/episodes']},width=24,height=8),
-        _panel('diagnostics','Media Browser',{'chartTitle':'All numeric diagnostic summaries, episode SDs and per-metric root counts; fixed-model proxies','mediaKeys':['discovery/diagnostics']},width=24,height=12)]))
+        _panel('diagnostics','Media Browser',{'chartTitle':(
+            'All numeric diagnostics, episode SDs and per-metric coverage; selection decisions and heldout roots labeled separately'
+            if _gradient_alignment_view(campaign) else
+            'All numeric diagnostic summaries, episode SDs and per-metric root counts; fixed-model proxies'),
+            'mediaKeys':['discovery/diagnostics']},width=24,height=12)]))
     sections = []
     for suffix, title, columns, visible, panels in blocks:
         identifier = 'ambi-spectral-transfer-v1-' + suffix

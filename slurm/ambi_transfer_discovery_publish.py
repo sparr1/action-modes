@@ -48,6 +48,9 @@ def table_columns(campaign):
         columns['results'] += [name for timer in SPECTRAL_TIMERS for name in (timer, timer+'_per_decision')]
         columns['episodes'] += list(SPECTRAL_TIMERS)
         columns['diagnostics'] += ['sample_count_basis']
+        if campaign.get('publication', {}).get('gradient_alignment_view') is True:
+            for key in columns:
+                columns[key] += ['norm_matching_scope']
     return columns
 
 
@@ -155,6 +158,9 @@ def _cell_metadata(cell, campaign):
     if campaign.get('family') == 'spectral_transfer':
         from utils.wandb_transfer_discovery_layout import spectral_arm_metadata
         metadata = spectral_arm_metadata(campaign, cell['arm'])
+        if campaign.get('publication', {}).get('gradient_alignment_view') is True:
+            metadata['norm_matching_scope'] = ('component-global' if metadata['method'] == 'gradient_projection'
+                else 'per-layer' if metadata['method'] in ('svd', 'activation', 'gradient', 'gradient_gate') else None)
         return dict(cell, **{key: value for key, value in metadata.items() if key not in ('label', 'color')})
     publication = campaign.get('publication', {})
     arm = cell['arm']
@@ -183,8 +189,20 @@ def _measurement_rows(cell, data, provenance, state, *, spectral=False):
                     raise ValueError('Invalid spectral controller timer: ' + timer)
                 row[timer] = sum(values)
                 row[timer+'_per_decision'] = sum(values) / sum(e['length'] for e in data)
-    diagnostic_episodes = [e for e in data if e.get('diagnostics', {}).get('enabled')
-        or (spectral and any(key.startswith('spectral_') for key in e.get('diagnostics', {}).get('summary', {})))]
+    diagnostic_episodes = []
+    for episode in data:
+        coverage = episode.get('diagnostics', {})
+        selection = episode.get('selection_diagnostics', {}) if spectral else {}
+        if selection.get('summary'):
+            # Selection runs at every applicable transfer decision and also
+            # exists when the sampled held-out collector is disabled. Merge
+            # without mutating artifacts or double-counting duplicated keys.
+            coverage = dict(coverage,
+                summary={**coverage.get('summary', {}), **selection['summary']},
+                summary_counts={**coverage.get('summary_counts', {}), **selection.get('summary_counts', {})})
+        if coverage.get('enabled') or (spectral and any(
+                key.startswith(('spectral_', 'selection_')) for key in coverage.get('summary', {}))):
+            diagnostic_episodes.append(dict(episode, diagnostics=coverage))
     if diagnostic_episodes:
         samples = sum(e.get('diagnostic_samples', 0) for e in diagnostic_episodes)
         seconds = sum(e.get('diagnostic_seconds', 0.) for e in diagnostic_episodes)
@@ -207,8 +225,10 @@ def _measurement_rows(cell, data, provenance, state, *, spectral=False):
                               and not isinstance(episode['diagnostics']['summary'][metric], bool)
                               and math.isfinite(episode['diagnostics']['summary'][metric])]
                     known = all(isinstance(count, int) and not isinstance(count, bool) and count >= 0 for count in counts)
+                    selection = metric.startswith('selection_')
                     entry.update(samples=sum(counts) if known else None,
-                        sample_count_basis='per-metric contributing roots' if known else 'metric root coverage unavailable')
+                        sample_count_basis=(('applicable transfer decisions' if known else 'transfer-decision coverage unavailable')
+                            if selection else ('per-metric contributing roots' if known else 'metric root coverage unavailable')))
                 diagnostics.append(entry)
     return row, diagnostics
 

@@ -31,10 +31,11 @@ def model(horizon=2, **overrides):
 
 def spectral_arm(method, components, norm_matched=False):
     return dict(parameter_scope="matrices", **{f"{component}_spectral": dict(
-        method=method, rank=2, strength=.5, norm_matched=norm_matched) for component in components})
+        method=method, rank=None if method in {"gradient_projection", "gradient_gate"} else 2,
+        strength=.5, norm_matched=norm_matched) for component in components})
 
 
-@pytest.mark.parametrize("method", ["svd", "activation", "gradient"])
+@pytest.mark.parametrize("method", ["svd", "activation", "gradient", "gradient_projection", "gradient_gate"])
 @pytest.mark.parametrize("components", [("actor",), ("critic",), ("actor", "critic")])
 @pytest.mark.parametrize("norm_matched", [False, True])
 def test_all_spectral_initializations_reset_nonmatrix_parameters_and_learning_state(method, components, norm_matched):
@@ -56,7 +57,7 @@ def test_all_spectral_initializations_reset_nonmatrix_parameters_and_learning_st
         unchanged = _clone_tree(donor)
         context = (build_spectral_context(wrapped, OBSERVATION, controller_seed=55,
             episode_seed=101, decision=1, settings=PROBE, components=components,
-            compute_gradients=method == "gradient") if method != "svd" else None)
+            compute_gradients=method in {"gradient", "gradient_projection", "gradient_gate"}) if method != "svd" else None)
         rng = _clone_tree(engine.rng.training_state_dict())
         options = arm_initialization(engine, arm, donor, spectral_context=context, transfer_metrics={})
         _assert_tree_equal(rng, engine.rng.training_state_dict())
@@ -108,10 +109,55 @@ def test_matrix_only_dense_and_bernoulli_controls_reset_bias_and_normalization(k
         wrapped.close()
 
 
+@pytest.mark.parametrize("method", ["gradient_projection", "gradient_gate"])
+@pytest.mark.parametrize("components", [("actor",), ("critic",), ("actor", "critic")])
+def test_gradient_coordinate_controller_uses_new_root_gradient_without_svd(monkeypatch, method, components):
+    import utils.spectral_transfer as filters
+    import utils.spectral_transfer_probes as probes
+    original_context = probes.build_spectral_context
+    calls = []
+
+    def context(*args, **kwargs):
+        calls.append((kwargs["decision"], kwargs["components"], kwargs["compute_gradients"]))
+        return original_context(*args, **kwargs)
+
+    def no_svd(*args, **kwargs):
+        raise AssertionError("Gradient gate or line projection must not decompose donor matrices")
+
+    monkeypatch.setattr(probes, "build_spectral_context", context)
+    monkeypatch.setattr(filters, "_svd", no_svd)
+    wrapped = model()
+    try:
+        rows = []
+        output = evaluate_episode(wrapped, wrapped.env,
+            spectral_arm(method, components),
+            episode_seed=101, controller_seed=55, max_steps=3,
+            on_step=rows.append, spectral_probe=PROBE)
+        assert calls == [(1, components, True), (2, components, True)]
+        assert output["spectral_probe_seconds"] > 0 and output["diagnostic_seconds"] == 0
+        for row in rows[1:]:
+            for component in components:
+                prefix = f"inner_{component}_spectral_"
+                quantity = "retained_fraction" if method == "gradient_gate" else "projection_coefficient"
+                assert np.isfinite(row["metrics"][prefix + quantity])
+                assert row["metrics"][prefix + "gradient_squared_norm"] >= 0
+                if method == "gradient_gate":
+                    assert 0 <= row["metrics"][prefix + "retained_fraction"] <= 1
+                    assert row["metrics"][prefix + "predicted_benefit"] >= 0
+                assert prefix + "selected_rank_sum" not in row["metrics"]
+    finally:
+        wrapped.close()
+
+
 @pytest.mark.parametrize("horizon,method,components,norm_matched", [
     (1, "svd", ("actor",), False),
     (2, "activation", ("critic",), False),
     (3, "gradient", ("actor", "critic"), True),
+    (2, "gradient_projection", ("actor", "critic"), False),
+    (2, "gradient_projection", ("actor", "critic"), True),
+    (1, "gradient_gate", ("actor",), False),
+    (1, "gradient_gate", ("critic",), True),
+    (1, "gradient_gate", ("actor", "critic"), False),
 ])
 def test_sampled_spectral_and_basic_diagnostics_preserve_full_controller_and_account_for_costs(
         horizon, method, components, norm_matched):
@@ -154,9 +200,30 @@ def test_sampled_spectral_and_basic_diagnostics_preserve_full_controller_and_acc
         summary = outputs[1]["diagnostics"]["summary"]
         spectral_rows = [row["diagnostics"]["spectral"] for row in trajectories[1][:2]]
         assert not spectral_rows[0]["donor_available"] and spectral_rows[1]["donor_available"]
+        if method in {"gradient", "gradient_projection", "gradient_gate"}:
+            selection = outputs[0]["selection_diagnostics"]
+            assert selection == outputs[1]["selection_diagnostics"]
+            assert selection["summary"]
+            for key, value in selection["summary"].items():
+                # Three controller decisions have two donors, while the
+                # sampled held-out roots above contain only one donor.
+                assert selection["summary_counts"][key] == 2
+                assert outputs[1]["diagnostics"]["summary_counts"][key] == 2
+                assert summary[key] == value
+                raw_key = key.replace("selection_", "inner_", 1).replace("_actor_", "_actor_spectral_").replace("_critic_", "_critic_spectral_")
+                assert raw_key not in trajectories[0][0]["metrics"]
+                assert value == pytest.approx(np.mean([row["metrics"][raw_key] for row in trajectories[0][1:]]))
+            for component in components:
+                assert f"selection_{component}_predicted_benefit" in selection["summary"]
+                assert (f"selection_{component}_retained_fraction" in selection["summary"]) == (method == "gradient_gate")
+                assert (f"selection_{component}_projection_coefficient" in selection["summary"]) == (method == "gradient_projection")
+        else:
+            assert "selection_diagnostics" not in outputs[0]
+            assert "selection_diagnostics" not in outputs[1]
         for component in ("actor", "critic"):
             geometry = f"{component}_donor_squared_norm"
             assert summary[f"spectral_{geometry}"] == spectral_rows[1]["summary"][geometry]
+            assert outputs[1]["diagnostics"]["summary_counts"][f"spectral_{geometry}"] == 1
             objective = f"initial_{component}_loss"
             assert summary[f"spectral_{objective}"] == pytest.approx(np.mean([
                 row["summary"][objective] for row in spectral_rows]))
@@ -204,7 +271,51 @@ def test_fresh_control_observational_donor_does_not_change_controller_or_first_s
         wrapped.close()
 
 
-def test_compiled_and_eager_gradient_joint_transfer_preserve_exact_controller_rng(monkeypatch):
+@pytest.mark.parametrize("method", ["gradient", "gradient_projection", "gradient_gate"])
+@pytest.mark.parametrize("strength,max_steps", [(0., 3), (1., 1)])
+def test_uncomputed_gradient_selection_diagnostics_remain_absent(method, strength, max_steps):
+    wrapped = model()
+    try:
+        arm = spectral_arm(method, ("actor", "critic"))
+        for component in ("actor", "critic"):
+            arm[f"{component}_spectral"]["strength"] = strength
+        output = evaluate_episode(wrapped, wrapped.env, arm, episode_seed=101,
+            controller_seed=55, max_steps=max_steps, spectral_probe=PROBE)
+        assert "selection_diagnostics" not in output
+    finally:
+        wrapped.close()
+
+
+def test_selection_diagnostic_counts_use_only_each_metrics_available_decisions(monkeypatch):
+    import utils.transfer_campaign as campaign
+    original = campaign.arm_initialization
+    calls = []
+
+    def missing_first_benefit(*args, **kwargs):
+        options = original(*args, **kwargs)
+        metrics = kwargs["transfer_metrics"]
+        if "inner_actor_spectral_predicted_benefit" in metrics:
+            calls.append(1)
+            if len(calls) == 1:
+                metrics.pop("inner_actor_spectral_predicted_benefit")
+        return options
+
+    monkeypatch.setattr(campaign, "arm_initialization", missing_first_benefit)
+    wrapped = model()
+    try:
+        rows = []
+        output = evaluate_episode(wrapped, wrapped.env, spectral_arm("gradient_gate", ("actor",)),
+            episode_seed=101, controller_seed=55, max_steps=3, spectral_probe=PROBE, on_step=rows.append)
+        selection = output["selection_diagnostics"]
+        assert selection["summary_counts"]["selection_actor_predicted_benefit"] == 1
+        assert selection["summary_counts"]["selection_actor_retained_fraction"] == 2
+        assert selection["summary"]["selection_actor_predicted_benefit"] == rows[2]["metrics"]["inner_actor_spectral_predicted_benefit"]
+    finally:
+        wrapped.close()
+
+
+@pytest.mark.parametrize("method", ["gradient", "gradient_projection", "gradient_gate"])
+def test_compiled_and_eager_gradient_joint_transfer_preserve_exact_controller_rng(monkeypatch, method):
     torch._dynamo.reset()
     original_compile = torch.compile
     monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: original_compile(fn, backend="eager", **kwargs))
@@ -215,7 +326,7 @@ def test_compiled_and_eager_gradient_joint_transfer_preserve_exact_controller_rn
         trajectories, states = [], []
         for wrapped in (eager, compiled):
             rows = []
-            evaluate_episode(wrapped, wrapped.env, spectral_arm("gradient", ("actor", "critic")),
+            evaluate_episode(wrapped, wrapped.env, spectral_arm(method, ("actor", "critic")),
                 episode_seed=101, controller_seed=55, max_steps=3, on_step=rows.append,
                 smoke=True, spectral_probe=PROBE)
             trajectories.append(rows)
@@ -229,13 +340,14 @@ def test_compiled_and_eager_gradient_joint_transfer_preserve_exact_controller_rn
         torch._dynamo.reset()
 
 
-def test_smoke_evaluator_runs_real_spectral_episode_and_persists_complete_coverage(tmp_path, monkeypatch):
+@pytest.mark.parametrize("method", ["gradient", "gradient_projection", "gradient_gate"])
+def test_smoke_evaluator_runs_real_spectral_episode_and_persists_complete_coverage(tmp_path, monkeypatch, method):
     import evaluate_ambi_transfer_campaign as evaluator
     from utils.transfer_campaign import load_campaign
     source = Path(__file__).resolve().parents[1] / "configs/research/ambi_transfer_discovery_575k.json"
     campaign = load_campaign(source)
     campaign.update(family="spectral_transfer", horizons=[2], rounds=[1], seeds=[101],
-        arms={"spectral_joint": spectral_arm("gradient", ("actor", "critic"))},
+        arms={"spectral_joint": spectral_arm(method, ("actor", "critic"))},
         diagnostics=BASIC, spectral_diagnostics=SPECTRAL, spectral_probe=PROBE,
         critic_updates=2, actor_updates=2, rollouts=2, batch_size=4)
     wrapped = model()

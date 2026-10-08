@@ -12,6 +12,10 @@ solve implement the objective without explicitly inverting C. Gradient
 transfer instead ranks donor SVD components by their *positive* first-order
 loss reduction, ``-<G, sigma_i u_i v_i.T>``. Those scores are local predictions,
 not guarantees of post-adaptation or environment return improvement.
+Gradient projection instead retains the literal signed projection of the full
+matrix-parameter delta onto one gradient direction, including uphill transfer.
+Gradient gating keeps only coordinates whose donor change strictly opposes the
+new-decision gradient. Its dense norm control matches each layer separately.
 """
 
 from collections.abc import Mapping, MutableMapping
@@ -33,9 +37,12 @@ def validate_spectral_spec(spec):
     if unknown:
         raise ValueError(f"Unknown spectral options: {sorted(unknown)}")
     method, rank = spec.get("method"), spec.get("rank")
-    if method not in ("svd", "activation", "gradient"):
-        raise ValueError("spectral method must be svd, activation or gradient")
-    if isinstance(rank, bool) or not isinstance(rank, Integral) or rank < 1:
+    if method not in ("svd", "activation", "gradient", "gradient_projection", "gradient_gate"):
+        raise ValueError("spectral method must be svd, activation, gradient, gradient_projection or gradient_gate")
+    if method in ("gradient_projection", "gradient_gate"):
+        if rank is not None:
+            raise ValueError(f"{method} rank must be absent or None; this method does not select a matrix rank")
+    elif isinstance(rank, bool) or not isinstance(rank, Integral) or rank < 1:
         raise ValueError("spectral rank must be a positive integer")
     strength = spec.get("strength", 1.0)
     damping = spec.get("covariance_damping", 1e-4)
@@ -49,7 +56,7 @@ def validate_spectral_spec(spec):
     norm_matched = spec.get("norm_matched", False)
     if not isinstance(norm_matched, bool):
         raise ValueError("spectral norm_matched must be boolean")
-    return {"method": method, "rank": int(rank), "strength": float(strength),
+    return {"method": method, "rank": int(rank) if rank is not None else None, "strength": float(strength),
             "norm_matched": norm_matched, "covariance_damping": float(damping)}
 
 
@@ -172,6 +179,229 @@ def spectral_energy(delta, ranks=DEFAULT_ENERGY_RANKS, gradient=None):
     return _energy_from_svd(u, s, vh, ranks, g)
 
 
+def _finite_sum(values, name):
+    """Accumulate matrix reductions without fp32 overflow or silent NaNs."""
+    try:
+        result = math.fsum(values)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{name} is not representable as a finite real number") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{name} is not representable as a finite real number")
+    return result
+
+
+def _check_finite_metrics(value):
+    if isinstance(value, Mapping):
+        for item in value.values():
+            _check_finite_metrics(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _check_finite_metrics(item)
+    elif isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("gradient projection diagnostics are not finite")
+
+
+def _gradient_projection_state(prior, donor, matrices, spec, gradients, metrics,
+                               include_layer_metrics):
+    """Project in the concatenated parameter space of one actor or critic."""
+    result = {key: value.detach().clone() for key, value in prior.items()}
+    # Form deltas and all reductions in double even for fp16/fp32 parameters.
+    # This also avoids overflow in ordinary fp32 squared gradient norms.
+    bases = {key: prior[key].detach().double() for key in matrices}
+    deltas = {key: donor[key].detach().double() - bases[key] for key in matrices}
+    for key, delta in deltas.items():
+        _matrix(delta, f"delta[{key}]")
+    donor_square = _finite_sum((float(value.square().sum().item()) for value in deltas.values()), "donor squared norm")
+    prior_square = _finite_sum((float(value.square().sum().item()) for value in bases.values()), "prior squared norm")
+    payload = {
+        "layers": {}, "matrix_count": len(matrices),
+        "selected_rank_sum": None,
+        "matrix_rank_capacity_sum": sum(min(prior[key].shape) for key in matrices),
+        "selected_rank_fraction": None, "donor_delta_l2": math.sqrt(donor_square),
+        "transferred_delta_l2": 0.0, "transferred_energy_fraction": 0.0,
+        "relative_parameter_delta_l2": 0.0 if prior_square else None,
+        "predicted_benefit": 0.0, "positive_benefit_count": None,
+        "scored_component_count": None, "positive_benefit_fraction": None,
+        "positive_benefit_energy_fraction": None,
+        "projection_coefficient": None, "donor_gradient_inner_product": None,
+        "gradient_squared_norm": None, "norm_matching_scale": 0.0,
+        "norm_matching_scope": "component-global",
+    }
+    if spec["strength"] == 0:
+        if metrics is not None:
+            metrics.update(payload)
+        return result
+    g = {key: gradients[key].detach().double() for key in matrices}
+    inner = _finite_sum((float((deltas[key] * g[key]).sum().item()) for key in matrices), "donor-gradient inner product")
+    gradient_square = _finite_sum((float(value.square().sum().item()) for value in g.values()), "gradient squared norm")
+    # A numerically underflowed nonzero gradient must not silently mean G=0.
+    if gradient_square == 0 and any(bool(value.ne(0).any()) for value in g.values()):
+        raise ValueError("gradient squared norm underflows float64")
+    coefficient = inner / gradient_square if gradient_square else 0.0
+    if not math.isfinite(coefficient):
+        raise ValueError("gradient projection coefficient is not finite")
+    filtered = {key: value * coefficient * spec["strength"] for key, value in g.items()}
+    for key, value in filtered.items():
+        _matrix(value, f"projection[{key}]")
+    projected_square = _finite_sum((float(value.square().sum().item()) for value in filtered.values()), "projected squared norm")
+    # Projection can change a layer with zero donor delta. Only one global
+    # dense scale can provide a valid matched-norm control in that case.
+    norm_scale = math.sqrt(projected_square) / math.sqrt(donor_square) if donor_square else 0.0
+    actuals, actual_squares, benefits = {}, {}, {}
+    for key in matrices:
+        transfer = deltas[key] * norm_scale if spec["norm_matched"] else filtered[key]
+        result[key] = (bases[key] + transfer).to(prior[key].dtype)
+        _finite_tensor(result[key], f"transferred[{key}]")
+        actuals[key] = result[key].double() - bases[key]
+        actual_squares[key] = float(actuals[key].square().sum().item())
+        benefits[key] = -float((g[key] * actuals[key]).sum().item())
+    transfer_square = _finite_sum(actual_squares.values(), "transferred squared norm")
+    benefit = _finite_sum(benefits.values(), "predicted benefit")
+    payload.update({
+        "projection_coefficient": coefficient,
+        "donor_gradient_inner_product": inner, "gradient_squared_norm": gradient_square,
+        "norm_matching_scale": norm_scale, "predicted_benefit": benefit,
+        "transferred_delta_l2": math.sqrt(transfer_square),
+        "transferred_energy_fraction": transfer_square / donor_square if donor_square else 0.0,
+        "relative_parameter_delta_l2": math.sqrt(transfer_square) / math.sqrt(prior_square) if prior_square else None,
+    })
+    if metrics is not None and include_layer_metrics:
+        positive_count = scored_count = 0
+        positive_energies = []
+        for key in matrices:
+            delta, actual = deltas[key], actuals[key]
+            u, s, vh = _svd(delta)
+            scores = _benefits(u, s, vh, g[key])
+            info = _energy_from_svd(u, s, vh, DEFAULT_ENERGY_RANKS, g[key], benefits=scores)
+            current_square = float(delta.square().sum().item())
+            delta_norm = math.sqrt(current_square)
+            info.update({
+                "requested_rank": None, "selected_rank": None,
+                "selected_component_indices": None, "selected_rank_fraction": None,
+                "projection_coefficient": coefficient,
+                "norm_matching_scale": norm_scale, "norm_matching_scope": "component-global",
+                "transferred_delta_l2": math.sqrt(actual_squares[key]),
+                # A globally projected direction can enter a donor-zero layer.
+                "transferred_energy_fraction": actual_squares[key] / current_square if current_square else (None if actual_squares[key] else 0.0),
+                "relative_parameter_residual": float(torch.linalg.vector_norm(delta - actual).item()) / delta_norm if delta_norm else (None if actual_squares[key] else 0.0),
+                "predicted_transfer_benefit": benefits[key],
+            })
+            payload["layers"][key] = info
+            positive_count += int((scores > 0).sum().item())
+            scored_count += len(scores)
+            positive_energies.append(float(s[scores > 0].square().sum().item()))
+        payload.update({
+            "positive_benefit_count": positive_count if scored_count else None,
+            "scored_component_count": scored_count or None,
+            "positive_benefit_fraction": positive_count / scored_count if scored_count else None,
+            "positive_benefit_energy_fraction": _finite_sum(positive_energies, "positive-benefit energy") / donor_square if donor_square else (0.0 if scored_count else None),
+        })
+    _check_finite_metrics(payload)
+    if metrics is not None:
+        metrics.update(payload)
+    return result
+
+
+def _gradient_gate_state(prior, donor, matrices, spec, gradients, metrics,
+                         include_layer_metrics):
+    """Keep donor coordinates with strictly beneficial first-order changes."""
+    result = {key: value.detach().clone() for key, value in prior.items()}
+    bases = {key: prior[key].detach().double() for key in matrices}
+    deltas = {key: donor[key].detach().double() - bases[key] for key in matrices}
+    for key, delta in deltas.items():
+        _matrix(delta, f"delta[{key}]")
+    donor_square = _finite_sum((float(value.square().sum().item()) for value in deltas.values()), "donor squared norm")
+    prior_square = _finite_sum((float(value.square().sum().item()) for value in bases.values()), "prior squared norm")
+    parameter_count = sum(value.numel() for value in deltas.values())
+    payload = {
+        "layers": {}, "matrix_count": len(matrices), "selected_rank_sum": None,
+        "matrix_rank_capacity_sum": sum(min(prior[key].shape) for key in matrices),
+        "selected_rank_fraction": None, "donor_delta_l2": math.sqrt(donor_square),
+        "transferred_delta_l2": 0.0, "transferred_energy_fraction": 0.0,
+        "relative_parameter_delta_l2": 0.0 if prior_square else None,
+        "predicted_benefit": 0.0, "positive_benefit_count": None,
+        "scored_component_count": None, "positive_benefit_fraction": None,
+        "positive_benefit_energy_fraction": None,
+        "retained_fraction": None, "retained_parameter_count": None,
+        "parameter_count": parameter_count, "donor_gradient_inner_product": None,
+        "gradient_squared_norm": None, "norm_matching_scope": "per-layer",
+    }
+    if spec["strength"] == 0:
+        if metrics is not None:
+            metrics.update(payload)
+        return result
+    g = {key: gradients[key].detach().double() for key in matrices}
+    gradient_square = _finite_sum((float(value.square().sum().item()) for value in g.values()), "gradient squared norm")
+    actual_squares, benefits, donor_inners = [], [], []
+    retained_count = positive_count = scored_count = 0
+    positive_energies = []
+    for key in matrices:
+        base, delta, gradient = bases[key], deltas[key], g[key]
+        # The sign comparison is exactly the real-valued G_j * D_j < 0 rule,
+        # without numerical underflow turning a tiny negative product into -0.
+        keep = ((gradient < 0) & (delta > 0)) | ((gradient > 0) & (delta < 0))
+        selected = int(keep.sum().item())
+        retained_count += selected
+        filtered = torch.where(keep, delta, torch.zeros_like(delta)) * spec["strength"]
+        current_square = float(delta.square().sum().item())
+        filtered_square = float(filtered.square().sum().item())
+        norm_scale = math.sqrt(filtered_square) / math.sqrt(current_square) if current_square else 0.0
+        transfer = delta * norm_scale if spec["norm_matched"] else filtered
+        if spec["strength"] == 1 and not spec["norm_matched"]:
+            result[key] = torch.where(keep, donor[key].detach(), prior[key].detach())
+        else:
+            result[key] = (base + transfer).to(prior[key].dtype)
+        _finite_tensor(result[key], f"transferred[{key}]")
+        actual = result[key].double() - base
+        actual_square = float(actual.square().sum().item())
+        benefit = -float((gradient * actual).sum().item())
+        donor_inner = float((gradient * delta).sum().item())
+        actual_squares.append(actual_square)
+        benefits.append(benefit)
+        donor_inners.append(donor_inner)
+        if metrics is not None and include_layer_metrics:
+            # Full donor spectra belong only to sampled diagnostics. The
+            # every-decision gate above has no decomposition or random draws.
+            u, s, vh = _svd(delta)
+            scores = _benefits(u, s, vh, gradient)
+            info = _energy_from_svd(u, s, vh, DEFAULT_ENERGY_RANKS, gradient, benefits=scores)
+            info.update({
+                "requested_rank": None, "selected_rank": None,
+                "selected_component_indices": None, "selected_rank_fraction": None,
+                "retained_fraction": selected / delta.numel(),
+                "retained_parameter_count": selected, "parameter_count": delta.numel(),
+                "donor_gradient_inner_product": donor_inner,
+                "norm_matching_scale": norm_scale, "norm_matching_scope": "per-layer",
+                "transferred_delta_l2": math.sqrt(actual_square),
+                "transferred_energy_fraction": actual_square / current_square if current_square else 0.0,
+                "relative_parameter_residual": float(torch.linalg.vector_norm(delta - actual).item()) / math.sqrt(current_square) if current_square else 0.0,
+                "predicted_transfer_benefit": benefit,
+            })
+            payload["layers"][key] = info
+            positive_count += int((scores > 0).sum().item())
+            scored_count += len(scores)
+            positive_energies.append(float(s[scores > 0].square().sum().item()))
+    transfer_square = _finite_sum(actual_squares, "transferred squared norm")
+    payload.update({
+        "retained_fraction": retained_count / parameter_count if parameter_count else 0.0,
+        "retained_parameter_count": retained_count,
+        "donor_gradient_inner_product": _finite_sum(donor_inners, "donor-gradient inner product"),
+        "gradient_squared_norm": gradient_square,
+        "predicted_benefit": _finite_sum(benefits, "predicted benefit"),
+        "transferred_delta_l2": math.sqrt(transfer_square),
+        "transferred_energy_fraction": transfer_square / donor_square if donor_square else 0.0,
+        "relative_parameter_delta_l2": math.sqrt(transfer_square) / math.sqrt(prior_square) if prior_square else None,
+        "positive_benefit_count": positive_count if scored_count else None,
+        "scored_component_count": scored_count or None,
+        "positive_benefit_fraction": positive_count / scored_count if scored_count else None,
+        "positive_benefit_energy_fraction": (_finite_sum(positive_energies, "positive-benefit energy") / donor_square if donor_square else 0.0) if scored_count else None,
+    })
+    _check_finite_metrics(payload)
+    if metrics is not None:
+        metrics.update(payload)
+    return result
+
+
 @torch.no_grad()
 def spectral_state(prior, donor, *, parameter_names, spec, inputs=None, gradients=None, metrics=None,
                    include_layer_metrics=True):
@@ -179,9 +409,17 @@ def spectral_state(prior, donor, *, parameter_names, spec, inputs=None, gradient
 
     ``inputs`` maps each matrix key to an N-by-input-width activation tensor;
     ``gradients`` maps each key to a gradient matrix. Both must match parameter
-    device and dtype. Norm matching is per layer: it replaces filtered transfer
-    by a scalar multiple of the dense donor delta with the same Frobenius norm.
+    device and dtype. Norm matching is per layer for SVD methods: it replaces
+    filtered transfer by a scalar multiple of the dense donor delta with the
+    same Frobenius norm.
     Norm matching may exceed unit dense strength for activation-weighted SVD.
+    Gradient projection uses a single signed coefficient across all matrix
+    parameters, and its dense control matches their combined norm. Its rank
+    is None: a parameter-space direction need not be a rank-one matrix.
+    Gradient gating instead keeps each coordinate only when its donor delta
+    strictly opposes its gradient; its rank is None and norm matching is per
+    layer. Its retained fraction counts selected matrix coordinates, including
+    zero-delta coordinates in the denominator, before dense norm matching.
     ``relative_parameter_delta_l2`` divides by the prior norm over transferred
     matrix parameters only, matching matrix-only baseline controls.
     Set ``include_layer_metrics=False`` for the every-decision controller path:
@@ -216,7 +454,14 @@ def spectral_state(prior, donor, *, parameter_names, spec, inputs=None, gradient
     method = normalized["method"]
     nonzero = normalized["strength"] > 0
     inputs = _validate_auxiliary(inputs, "inputs", prior, matrices, required=nonzero and method == "activation")
-    gradients = _validate_auxiliary(gradients, "gradients", prior, matrices, required=nonzero and method == "gradient")
+    gradients = _validate_auxiliary(gradients, "gradients", prior, matrices,
+                                    required=nonzero and method in ("gradient", "gradient_projection", "gradient_gate"))
+    if method == "gradient_projection":
+        return _gradient_projection_state(prior, donor, matrices, normalized, gradients,
+                                          metrics, include_layer_metrics)
+    if method == "gradient_gate":
+        return _gradient_gate_state(prior, donor, matrices, normalized, gradients,
+                                    metrics, include_layer_metrics)
     result = {key: value.detach().clone() for key, value in prior.items()}
     if not nonzero:
         # The exact zero endpoint does not need a probe or decomposition. Do
