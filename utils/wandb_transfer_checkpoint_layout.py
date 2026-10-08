@@ -9,7 +9,8 @@ from utils.wandb_results_layout import (_views,_selected,_spec,_bank,_hash,_writ
 from utils.wandb_transfer_discovery_layout import _CREATE_VIEW
 from utils.transfer_checkpoint_publication import settings
 
-VERSION='transfer-checkpoint-curves-v3'
+VERSION='transfer-checkpoint-curves-v4'
+PREVIOUS_VERSION='transfer-checkpoint-curves-v3'
 LEGACY_VERSION='transfer-checkpoint-curves-v2'
 TABLE_KEY='transfer_curves/points'
 PROGRESS_KEY='transfer_curves/progress'
@@ -19,7 +20,15 @@ $type:String!,$access:String!,$spec:JSONString!){createCustomChart(input:{entity
 name:$name,displayName:$displayName,type:$type,access:$access,spec:$spec}){chart{id name type spec}}}'''
 
 
-def chart_definition(campaign, *, legacy=False):
+def _version(legacy=False, version=None):
+    chosen=LEGACY_VERSION if legacy else VERSION if version is None else version
+    if chosen not in (LEGACY_VERSION,PREVIOUS_VERSION,VERSION):
+        raise ValueError('Unknown transfer checkpoint layout version.')
+    return chosen
+
+
+def chart_definition(campaign, *, legacy=False, version=None):
+    version=_version(legacy,version)
     styles=settings(campaign)
     definition = {'$schema':'https://vega.github.io/schema/vega-lite/v5.json',
         'data':{'name':'wandb'},'width':'container','height':360,
@@ -51,14 +60,14 @@ def chart_definition(campaign, *, legacy=False):
              'mark':{'type':'line','strokeWidth':3.5},'encoding':{'color':{'value':'#000000'}}}],
         'config':{'view':{'stroke':None},'axis':{'gridColor':'#e8edf2'},
                   'legend':{'labelFontSize':11,'rowPadding':4}}}
-    if not legacy:
+    if version==PREVIOUS_VERSION:
         definition['params']=[{'name':'selected_curves','select':{'type':'point','fields':['${field:label}']},'bind':'legend'}]
         definition['encoding']['opacity']={'condition':{'param':'selected_curves','value':1},'value':.12}
     return definition
 
 
-def chart_id(campaign,entity, *, legacy=False):
-    return entity+'/transfer_checkpoint_'+_hash(chart_definition(campaign,legacy=legacy))[:16]
+def chart_id(campaign,entity, *, legacy=False, version=None):
+    return entity+'/transfer_checkpoint_'+_hash(chart_definition(campaign,legacy=legacy,version=version))[:16]
 
 
 def ensure_chart(api,campaign,entity):
@@ -90,7 +99,8 @@ def runset(publication_id, *, legacy=False):
         selections={'root':1,'bounds':[],'tree':[]},expandedRowAddresses=[])
 
 
-def sections(campaign,entity, *, legacy=False):
+def sections(campaign,entity, *, legacy=False, version=None):
+    version=_version(legacy,version)
     styles=settings(campaign)
     intro=('### Transfer across the checkpoint bank\n\n'
         f"**{len(campaign['checkpoints'])} checkpoints · {sum(row.get('role')=='transfer' for row in styles)} transfer settings, "
@@ -103,9 +113,11 @@ def sections(campaign,entity, *, legacy=False):
         '**Pending/failed points remain visible in progress; missing measurements are null and never plotted as zero.** '
         'One run per setting; use the run list to hide/show curves. All colors are fixed across panels. '
         'This is a frozen-checkpoint screen, not a measurement of online training speedup.')
-    if not legacy:
+    if version!=LEGACY_VERSION:
+        overview_intro=('The live overview displays six curves with fixed colors; click legend entries to emphasize selected curves. '
+                        if version==PREVIOUS_VERSION else 'The live overview displays six curves with fixed colors. ')
         intro=intro.replace('One run per setting; use the run list to hide/show curves. All colors are fixed across panels. ',
-            'The live overview displays six curves with fixed colors; click legend entries to emphasize selected curves. ')
+                            overview_intro)
     panels=[_panel('curve-intro','Markdown Panel',{'value':intro},width=24,height=5),
         _panel('curve-progress','Media Browser',{'chartTitle':'Checkpoint progress, including pending and failed evaluations',
             'mediaKeys':[PROGRESS_KEY]},width=24,height=9)]
@@ -124,7 +136,7 @@ def sections(campaign,entity, *, legacy=False):
             'userQuery':{'queryFields':[{'name':'runSets','args':[{'name':'runSets','value':'${runSets}'},{'name':'limit','value':500.}],
                 'fields':[{'name':'summaryTable','args':[{'name':'tableKey','value':TABLE_KEY}],'fields':[]},
                           {'name':'id','value':[]},{'name':'name','value':[]}]}]},
-            'panelDefId':chart_id(campaign,entity,legacy=legacy),
+            'panelDefId':chart_id(campaign,entity,version=version),
             'fieldSettings':dict(step='step',setting='setting',label='label',
                 segment='fresh_segment' if key=='fresh_gain' else 'segment',value=value,
                 sd='interval_not_applicable' if scalar else key+'_std',
@@ -136,7 +148,6 @@ def sections(campaign,entity, *, legacy=False):
     tables=[_panel('curve-values','Media Browser',{'chartTitle':'Exact completed means, episode SDs, gains and timing',
         'mediaKeys':[TABLE_KEY]},width=24,height=9)]
     result=[]
-    version=LEGACY_VERSION if legacy else VERSION
     for suffix,name,items,columns in [('progress','Transfer curves | progress',panels,1),
             ('curves','Transfer curves | performance, variance and computation',curves,2),
             ('values','Transfer curves | measurements',tables,1)]:
@@ -147,17 +158,19 @@ def sections(campaign,entity, *, legacy=False):
     return result
 
 
-def saved_spec(template,campaign,entity,publication_id, *, legacy=False):
+def saved_spec(template,campaign,entity,publication_id, *, legacy=False, version=None):
+    version=_version(legacy,version)
     result=deepcopy(template)
-    result['section'].update(runSets=[runset(publication_id,legacy=legacy)],openRunSet=0,
+    result['section'].update(runSets=[runset(publication_id,legacy=version==LEGACY_VERSION)],openRunSet=0,
         workspaceSettings={'shouldAutoGeneratePanels':False})
-    bank=_bank(result);bank['sections']=sections(campaign,entity,legacy=legacy);bank['panelPlacementOverrides']={}
+    bank=_bank(result);bank['sections']=sections(campaign,entity,version=version);bank['panelPlacementOverrides']={}
     return result
 
 
-def _installed(spec,campaign,entity,publication_id, *, legacy=False):
-    expected=sections(campaign,entity,legacy=legacy); actual=deepcopy(_bank(spec)['sections'])
-    if len(actual)!=len(expected) or spec['section'].get('runSets')!=[runset(publication_id,legacy=legacy)]: return False
+def _installed(spec,campaign,entity,publication_id, *, legacy=False, version=None):
+    version=_version(legacy,version)
+    expected=sections(campaign,entity,version=version); actual=deepcopy(_bank(spec)['sections'])
+    if len(actual)!=len(expected) or spec['section'].get('runSets')!=[runset(publication_id,legacy=version==LEGACY_VERSION)]: return False
     for section,wanted in zip(actual,expected):
         section.setdefault('type',wanted['type'])
         for key,value in wanted['flowConfig'].items(): section.setdefault('flowConfig',{}).setdefault(key,value)
@@ -167,7 +180,7 @@ def _installed(spec,campaign,entity,publication_id, *, legacy=False):
 
 
 def ensure_saved_view(api,*,campaign,entity,project,publication_id,receipt_dir):
-    """Create a view or upgrade our exact v2; preserve unknown edits and other views."""
+    """Create or upgrade our exact v2/v3; preserve unknown edits and other views."""
     if not re.fullmatch(r'[A-Za-z0-9]+',publication_id):
         raise ResultsLayoutError('Publication ID must be alphanumeric for the W&B saved-view URL.')
     root=Path(receipt_dir);root.mkdir(parents=True,exist_ok=True)
@@ -185,10 +198,12 @@ def ensure_saved_view(api,*,campaign,entity,project,publication_id,receipt_dir):
             if _installed(_spec(before),campaign,entity,publication_id):
                 receipt.update(status='verified',changed=False,view_id=before['id'])
                 _write(root/'results-layout-receipt.json',receipt);return receipt
-            if not _installed(_spec(before),campaign,entity,publication_id,legacy=True):
+            installed_version=next((version for version in (PREVIOUS_VERSION,LEGACY_VERSION)
+                if _installed(_spec(before),campaign,entity,publication_id,version=version)),None)
+            if installed_version is None:
                 raise ResultsLayoutError('Existing comparison view differs; preserving user edits.')
             proposed=saved_spec(_spec(before),campaign,entity,publication_id)
-            receipt['upgraded_from']=LEGACY_VERSION
+            receipt['upgraded_from']=installed_version
         else:
             before=None
             proposed=saved_spec(_spec(_selected(views,DEFAULT_VIEW_NAME)),campaign,entity,publication_id)

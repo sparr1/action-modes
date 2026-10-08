@@ -86,7 +86,7 @@ separate publication-only overview logs the combined points and progress
 tables with `run.log`, which registers their table metric types for the W&B
 workspace. Summary-only table updates were readable through the API but did
 not render as panels. The saved workspace selects only the overview so the
-six curves are not duplicated; legend selection emphasizes individual curves.
+six curves are not duplicated; their fixed colors remain consistent across panels.
 The overview is presentation state and is not an additional evaluated method.
 
 The publisher persists its overview run ID before contacting W&B and resumes

@@ -53,7 +53,9 @@ def test_layout_has_distinct_fixed_colors_bands_and_pending_progress():
     assert definition['encoding']['color']['scale']['range']==['#000000',*adapter.COLORS[:5]]
     assert len(set(definition['encoding']['color']['scale']['range']))==6
     assert definition['encoding']['strokeDash']['scale']['range']==[[1,0]]*4+[[6,3]]*2
-    assert definition['params'][0]['bind']=='legend'
+    assert 'params' not in definition
+    assert 'opacity' not in definition['encoding']
+    assert 'selected_curves' not in json.dumps(definition)
     assert any(layer['mark']['type']=='area' for layer in definition['layer'])
     assert any(row['field']=='${field:segment}' for row in definition['encoding']['detail'])
     sections=layout.sections(data,'entity');panels=[panel for section in sections for panel in section['panels']]
@@ -64,6 +66,7 @@ def test_layout_has_distinct_fixed_colors_bands_and_pending_progress():
     assert 'Pending' in panels[0]['config']['value'] and 'sample SD' in panels[0]['config']['value']
     assert 'Five paired' in panels[0]['config']['value'] and '3 transfer settings' in panels[0]['config']['value']
     assert 'use the run list' not in panels[0]['config']['value']
+    assert 'click legend' not in panels[0]['config']['value']
     assert charts[2]['config']['fieldSettings']['segment']=='fresh_segment'
     assert all(charts[i]['config']['fieldSettings']['lower']=='interval_not_applicable' for i in [3,4])
     assert all(not panel['isAuto'] for panel in panels)
@@ -117,14 +120,15 @@ def test_content_addressed_chart_changes_with_candidate_palette():
 
 
 @pytest.mark.parametrize('timeout',[False,True])
-def test_exact_summary_only_v2_is_upgraded_in_place_without_touching_other_views(tmp_path,timeout):
+@pytest.mark.parametrize('version',[layout.LEGACY_VERSION,layout.PREVIOUS_VERSION])
+def test_exact_owned_v2_or_v3_is_upgraded_in_place_without_touching_other_views(tmp_path,timeout,version):
     service=Service(timeout=timeout)
-    old=layout.saved_spec(spec(),campaign(),'entity','abc123',legacy=True)
+    old=layout.saved_spec(spec(),campaign(),'entity','abc123',version=version)
     service.views.append(dict(id='old-owned',name='nw-transfercurvesabc123-v',type='project-view',
         displayName='Transfer mechanisms across checkpoints',spec=json.dumps(old)))
     others=deepcopy(service.views[:2])
     result=install(tmp_path,service)
-    assert result['changed'] and result['upgraded_from']==layout.LEGACY_VERSION
+    assert result['changed'] and result['upgraded_from']==version
     assert result['view_id']=='old-owned' and len(service.views)==3 and service.views[:2]==others
     new=json.loads(service.views[-1]['spec'])
     assert layout._installed(new,campaign(),'entity','abc123')
@@ -133,12 +137,22 @@ def test_exact_summary_only_v2_is_upgraded_in_place_without_touching_other_views
     assert not install(tmp_path,service)['changed'] and service.view_writes==1
 
 
-def test_modified_v2_is_not_upgraded(tmp_path):
+@pytest.mark.parametrize('version',[layout.LEGACY_VERSION,layout.PREVIOUS_VERSION])
+def test_modified_v2_or_v3_is_not_upgraded(tmp_path,version):
     service=Service()
-    old=layout.saved_spec(spec(),campaign(),'entity','abc123',legacy=True)
+    old=layout.saved_spec(spec(),campaign(),'entity','abc123',version=version)
     old['section']['panelBankConfig']['sections'][0]['panels'][0]['config']['value']+=' User annotation'
     service.views.append(dict(id='old-owned',name='nw-transfercurvesabc123-v',type='project-view',
         displayName='Transfer mechanisms across checkpoints',spec=json.dumps(old)))
     before=deepcopy(service.views)
     with pytest.raises(layout.ResultsLayoutError,match='preserving user edits'):install(tmp_path,service)
     assert service.views==before and service.view_writes==0
+
+
+def test_v3_recognition_preserves_exact_broken_chart_for_safe_upgrade():
+    data=campaign()
+    previous=layout.chart_definition(data,version=layout.PREVIOUS_VERSION)
+    assert previous['params'][0]['bind']=='legend'
+    assert previous['encoding']['opacity']['condition']['param']=='selected_curves'
+    assert layout.chart_id(data,'entity',version=layout.PREVIOUS_VERSION)!=layout.chart_id(data,'entity')
+    assert layout.chart_definition(data,legacy=True)==layout.chart_definition(data)
