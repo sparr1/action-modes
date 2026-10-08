@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "protocol": "inner-sac-transfer-checkpoint-curves-v1",
+  "source_run": "rwgao_b-brown-university/ambi/aux6428346x0",
+  "description": "Five-seed selected transfer candidates and fresh SAC controls across the auxiliary-return backbone checkpoint bank.",
+  "discovery_template": "ambi_transfer_checkpoint_shortlist.json",
+  "seeds": [
+    101,
+    102,
+    103,
+    104,
+    105
+  ],
+  "controller_seed": 55,
+  "max_steps": 500,
+  "critic_updates": 16,
+  "actor_updates": 4,
+  "rollouts": 128,
+  "batch_size": 256,
+  "gpu_hardware": "L40S",
+  "smoke_seeds": [
+    101,
+    102
+  ],
+  "smoke_steps": 3,
+  "candidates": [
+    {
+      "setting_id": "h1_j2_bernoulli_a075_c075",
+      "H": 1,
+      "J": 2,
+      "arm": "bernoulli_a075_c075",
+      "label": "H1 J2 \u00b7 Bernoulli 75% joint (all parameters)",
+      "role": "transfer",
+      "fresh_setting_id": "h1_j2_fresh"
+    },
+    {
+      "setting_id": "h1_j4_bernoulli_a0_c05",
+      "H": 1,
+      "J": 4,
+      "arm": "bernoulli_a0_c05",
+      "label": "H1 J4 \u00b7 Bernoulli 50% critic (all parameters)",
+      "role": "transfer",
+      "fresh_setting_id": "h1_j4_fresh"
+    },
+    {
+      "setting_id": "h1_j4_matrix_blend05_actor",
+      "H": 1,
+      "J": 4,
+      "arm": "matrix_blend05_actor",
+      "label": "H1 J4 \u00b7 Actor shrink 50% (matrices)",
+      "role": "transfer",
+      "fresh_setting_id": "h1_j4_fresh"
+    },
+    {
+      "setting_id": "h1_j2_fresh",
+      "H": 1,
+      "J": 2,
+      "arm": "fresh",
+      "label": "H1 J2 \u00b7 Fresh SAC",
+      "role": "fresh"
+    },
+    {
+      "setting_id": "h1_j4_fresh",
+      "H": 1,
+      "J": 4,
+      "arm": "fresh",
+      "label": "H1 J4 \u00b7 Fresh SAC",
+      "role": "fresh"
+    }
+  ]
+}

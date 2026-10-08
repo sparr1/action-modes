@@ -23,6 +23,15 @@ from utils.transfer_diagnostics import Reference, evaluating, json_value
 
 
 FAMILIES = ("fixed_target", "action_gradient", "policy", "features", "stationary")
+# Only elapsed-time observations are exempt from exact smoke equality. These
+# names are the complete explicit _timer_stop keys in InnerImprovementEngine;
+# scalar losses, counts, state and RNG remain strict even with all_scalars.
+OBSERVATIONAL_TIMING_METRICS = frozenset({
+    "inner_action_seconds", "inner_setup_seconds", "inner_rollout_seconds",
+    "inner_update_seconds", "inner_execution_seconds", "inner_diagnostic_seconds",
+    "inner_selector_seconds", "inner_mppi_seconds",
+    "inner_param_noise_calibration_seconds", "inner_tdambi_calibration_seconds",
+})
 DEFAULTS = dict(enabled=True, decisions=[0, 1, 25, 100, 250, 499],
     stationary_decisions=[25, 250], mc_rollouts=8, action_count=8,
     state_count=32, fit_steps=4)
@@ -363,9 +372,18 @@ def verify_observational_isolation(reference_rows, observed_rows, reference_stat
     if len(reference_rows) != len(observed_rows):
         raise RuntimeError("Diagnostic isolation changed the episode length.")
     for before, after in zip(reference_rows, observed_rows):
-        for name in ("action", "reward", "terminated", "truncated", "metrics"):
+        for name in ("action", "reward", "terminated", "truncated"):
             if before[name] != after[name]:
                 raise RuntimeError(f"Diagnostic isolation changed {name} at decision {before['decision']}.")
+        # Timing values necessarily differ between independent smoke forks and
+        # include diagnostic snapshot work. Filter views without altering the
+        # saved rows, so all observed timings remain available for analysis.
+        before_metrics = {key: value for key, value in before["metrics"].items()
+                          if key not in OBSERVATIONAL_TIMING_METRICS}
+        after_metrics = {key: value for key, value in after["metrics"].items()
+                         if key not in OBSERVATIONAL_TIMING_METRICS}
+        if before_metrics != after_metrics:
+            raise RuntimeError(f"Diagnostic isolation changed metrics at decision {before['decision']}.")
     def compare(left, right, path):
         if torch.is_tensor(left):
             same = torch.is_tensor(right) and left.shape == right.shape and torch.equal(left, right)

@@ -22,7 +22,7 @@ from utils.ambi_benchmark import atomic_json
 from utils.ambi_research import load_preset_matrix, resolve_preset
 from utils.checkpoint_context import load_checkpoint_context
 from utils.transfer_campaign import (
-    PROTOCOL, cells, evaluate_episode, load_campaign, resolved_cell, summarize_episodes,
+    METRIC_POLICIES, PROTOCOL, cells, evaluate_episode, load_campaign, resolved_cell, summarize_episodes,
 )
 from utils.transfer_campaign_diagnostics import (
     CampaignDiagnostics, diagnostic_settings, verify_episode_diagnostics,
@@ -47,6 +47,8 @@ def parser():
     p.add_argument("--seeds", type=int, nargs="+")
     p.add_argument("--controller-seed", type=int)
     p.add_argument("--max-steps", type=int)
+    p.add_argument("--metric-policy", choices=METRIC_POLICIES, default="legacy",
+                   help="Retain legacy fields or all already-computed scalar inner metrics without extra probes.")
     p.add_argument("--smoke", action="store_true", help="Two decisions by default; explicitly --max-steps may extend the smoke.")
     p.add_argument("--no-compile", action="store_true", help="Explicit eager override, recorded in the manifest.")
     p.add_argument("--dry-run", action="store_true")
@@ -131,6 +133,9 @@ def run(args):
         campaign=str(args.campaign.resolve()), campaign_sha256=_file_sha256(args.campaign),
         base_matrix_sha256=_file_sha256(matrix_path), resolved=resolved, source=source_identity(),
         device=args.device, compile=resolved["algorithm_config"]["alg_params"]["compile"],
+        metric_policy=args.metric_policy,
+        metric_coverage=dict(policy=args.metric_policy, computed_scalars_only=True,
+            extra_solver_probes=False, per_update_traces=False),
         runtime=dict(python=platform.python_version(), torch=torch.__version__, numpy=np.__version__),
         semantics=dict(scope="successive_real_decisions_within_episode", objective="return_return",
             action="adapted_actor_mean", solve_interval=1, first_action_rounds="selected_J",
@@ -138,7 +143,7 @@ def run(args):
             reuse="No historical return/timing is silently substituted.",
             timing="Prediction wall time plus donor construction/export; sampled diagnostic snapshots and probes measured separately and excluded from control_seconds.",
             diagnostics="Fixed prior-continuation model targets shared by prior/donor/initial/final stages. Disposable fixed-target fits; no learner updates or real-return ground-truth claim.",
-            selection="Three development seeds; exploratory mechanism screen, not confirmatory.",
+            selection=f"{len(seeds)} paired evaluation seeds; exploratory transfer evaluation, not confirmatory.",
             compute="Fixed J,C,A,N per cell; imagination transitions scale with H; no equal-compute claim.",
             replay="Previous solve only, fixed requested minibatch fraction; no real replay.",
             anchors="Actor KL(current||frozen prior); critic mean over tensors of MSE/(mean prior squared+1e-6)."))
@@ -181,7 +186,8 @@ def run(args):
                 progress("verifying_diagnostic_isolation", seed=episode_seed, episode_index=episode_index)
                 evaluate_episode(model, env, arm, episode_seed=episode_seed,
                     controller_seed=controller_seed, max_steps=max_steps,
-                    on_step=reference_rows.append, smoke=True, spectral_probe=spectral_probe)
+                    on_step=reference_rows.append, smoke=True, spectral_probe=spectral_probe,
+                    metric_policy=args.metric_policy)
                 reference_state = dict(learner=model.agent.inner_engine.export_diagnostic_state(),
                     rng=deepcopy(model.agent.inner_engine.rng.training_state_dict()))
             with (output / f"decisions-seed-{episode_seed}.jsonl").open("x") as stream:
@@ -196,7 +202,7 @@ def run(args):
                         total_decisions=max_steps * len(seeds))
                 episode = evaluate_episode(model, env, arm, episode_seed=episode_seed,
                     controller_seed=controller_seed, max_steps=max_steps, on_step=on_step, smoke=args.smoke,
-                    spectral_probe=spectral_probe,
+                    spectral_probe=spectral_probe, metric_policy=args.metric_policy,
                     **({"diagnostics": diagnostics} if diagnostics is not None else {}))
             verify_episode_diagnostics(episode, diagnostics_config, smoke=args.smoke)
             verify_spectral_diagnostics(episode, spectral_config, smoke=args.smoke)

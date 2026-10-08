@@ -19,6 +19,7 @@ from utils.ambi_benchmark import read_json, solver_seed
 
 
 PROTOCOL = "inner-sac-transfer-discovery-v1"
+METRIC_POLICIES = ("legacy", "all_scalars")
 METRICS = (
     "inner_actor_loss", "inner_critic_loss", "inner_alpha", "inner_alpha_initial",
     "inner_alpha_final", "inner_actor_grad_norm", "inner_critic_grad_norm",
@@ -312,9 +313,14 @@ def arm_initialization(engine, arm, donor, *, transfer_generators=None, transfer
     return options
 
 
-def selected_metrics(metrics):
+def selected_metrics(metrics, *, policy="legacy"):
+    """Retain computed scalar measurements without extra solver probes."""
+    if policy not in METRIC_POLICIES:
+        raise ValueError(f"Unknown inner metric policy: {policy}")
     result = {}
-    for key in METRICS:
+    keys = METRICS if policy == "legacy" else (
+        key for key in metrics if isinstance(key, str) and key.startswith("inner_"))
+    for key in keys:
         if key not in metrics:
             continue
         value = metrics[key]
@@ -331,9 +337,12 @@ def selected_metrics(metrics):
 
 
 def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_steps,
-                     on_step=None, smoke=False, diagnostics=None, spectral_probe=None):
+                     on_step=None, smoke=False, diagnostics=None, spectral_probe=None,
+                     metric_policy="legacy"):
     """One paired episode with optional separately timed observational probes."""
     from evaluate_ambi_checkpoint import _seed_spaces
+    if metric_policy not in METRIC_POLICIES:
+        raise ValueError(f"Unknown inner metric policy: {metric_policy}")
     validate_arm(arm)
     _positive_integer(max_steps, "max_steps")
     engine = wrapped.agent.inner_engine
@@ -427,7 +436,7 @@ def evaluate_episode(wrapped, env, arm, *, episode_seed, controller_seed, max_st
             diagnostic_seconds=diagnostic_seconds,
             spectral_probe_seconds=probe_seconds, spectral_filter_seconds=filter_seconds,
             donor_export_seconds=export_seconds,
-            metrics={**selected_metrics(wrapped.agent.last_inner_metrics), **transfer_metrics},
+            metrics={**selected_metrics(wrapped.agent.last_inner_metrics, policy=metric_policy), **transfer_metrics},
             terminated=bool(terminated), truncated=bool(truncated))
         if diagnostic_record is not None:
             row["diagnostics"] = diagnostic_record
