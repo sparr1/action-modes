@@ -14,6 +14,11 @@ def campaign():
         role='transfer' if i<4 else 'fresh',label=f'Setting {i}') for i in range(1,6)])
 
 
+def comparisons():
+    return [dict(setting_id='mppi_h3_return_q',label='MPPI H3 · Return Q',color='#cc79a7',role='comparison'),
+            dict(setting_id='mppi_h3_soft_q',label='MPPI H3 · Soft Q',color='#56b4e9',role='comparison')]
+
+
 def spec():
     return dict(section=dict(runSets=[{'preserve':'filters'}],settings={'preserve':'yes'},
         panelBankConfig=dict(sections=[dict(__id__='old',panels=[])],panelPlacementOverrides={'old':1})))
@@ -120,8 +125,8 @@ def test_content_addressed_chart_changes_with_candidate_palette():
 
 
 @pytest.mark.parametrize('timeout',[False,True])
-@pytest.mark.parametrize('version',[layout.LEGACY_VERSION,layout.PREVIOUS_VERSION])
-def test_exact_owned_v2_or_v3_is_upgraded_in_place_without_touching_other_views(tmp_path,timeout,version):
+@pytest.mark.parametrize('version',[layout.LEGACY_VERSION,layout.INTERACTIVE_VERSION,layout.PREVIOUS_VERSION])
+def test_exact_owned_previous_view_is_upgraded_in_place_without_touching_other_views(tmp_path,timeout,version):
     service=Service(timeout=timeout)
     old=layout.saved_spec(spec(),campaign(),'entity','abc123',version=version)
     service.views.append(dict(id='old-owned',name='nw-transfercurvesabc123-v',type='project-view',
@@ -137,8 +142,8 @@ def test_exact_owned_v2_or_v3_is_upgraded_in_place_without_touching_other_views(
     assert not install(tmp_path,service)['changed'] and service.view_writes==1
 
 
-@pytest.mark.parametrize('version',[layout.LEGACY_VERSION,layout.PREVIOUS_VERSION])
-def test_modified_v2_or_v3_is_not_upgraded(tmp_path,version):
+@pytest.mark.parametrize('version',[layout.LEGACY_VERSION,layout.INTERACTIVE_VERSION,layout.PREVIOUS_VERSION])
+def test_modified_previous_view_is_not_upgraded(tmp_path,version):
     service=Service()
     old=layout.saved_spec(spec(),campaign(),'entity','abc123',version=version)
     old['section']['panelBankConfig']['sections'][0]['panels'][0]['config']['value']+=' User annotation'
@@ -151,8 +156,70 @@ def test_modified_v2_or_v3_is_not_upgraded(tmp_path,version):
 
 def test_v3_recognition_preserves_exact_broken_chart_for_safe_upgrade():
     data=campaign()
-    previous=layout.chart_definition(data,version=layout.PREVIOUS_VERSION)
+    previous=layout.chart_definition(data,version=layout.INTERACTIVE_VERSION)
     assert previous['params'][0]['bind']=='legend'
     assert previous['encoding']['opacity']['condition']['param']=='selected_curves'
-    assert layout.chart_id(data,'entity',version=layout.PREVIOUS_VERSION)!=layout.chart_id(data,'entity')
+    assert layout.chart_id(data,'entity',version=layout.INTERACTIVE_VERSION)!=layout.chart_id(data,'entity')
     assert layout.chart_definition(data,legacy=True)==layout.chart_definition(data)
+
+
+@pytest.mark.parametrize(('version','digest'),[
+    ('transfer-checkpoint-curves-v2','ac470be0a207522b02bfbc512cfe08e85e1120d775833a2b804bf11750e1680c'),
+    ('transfer-checkpoint-curves-v3','702a368d86f5d8a7dd79d428a3ee3455e194428208a24156cfd14039cbe12d2e'),
+    ('transfer-checkpoint-curves-v4','11bfa3c3dac47ef914fef7c8f2fc996136d2bfb313cb59a6c958f58809059589'),
+])
+def test_legacy_recognition_is_byte_exact_even_with_new_comparison_styles(version,digest):
+    # Pins captured from deployed 69160834 before extending this layout.
+    data=dict(campaign(),comparison_styles=comparisons())
+    assert layout._hash(layout.saved_spec(spec(),data,'entity','abc123',version=version))==digest
+
+
+def test_eight_curve_view_selects_both_overviews_and_preserves_all_seven_panels():
+    data=dict(campaign(),comparison_styles=comparisons())
+    definition=layout.chart_definition(data)
+    scale=definition['encoding']['color']['scale']
+    assert scale['range']==['#000000',*adapter.COLORS[:5],'#cc79a7','#56b4e9']
+    assert len(set(scale['domain']))==len(set(scale['range']))==8
+    view=layout.saved_spec(spec(),data,'entity','abc123')
+    selected=view['section']['runSets'][0]
+    assert selected['selections']=={'root':1,'bounds':[],'tree':[]}
+    assert selected['filters']['filters']==[dict(key={'section':'config','name':'transfer_curve_overview'},
+        op='=',value='abc123',disabled=False)]
+    panels=[panel for section in view['section']['panelBankConfig']['sections'] for panel in section['panels']]
+    charts=[panel for panel in panels if panel['viewType']=='Vega2']
+    assert len(charts)==7
+    for chart in charts:
+        config=chart['config']
+        assert config['transform']['name']=='tableWithLeafColNames'
+        query=config['userQuery']['queryFields'][0]
+        assert query['name']=='runSets' and query['args'][0]['value']=='${runSets}'
+        assert query['fields'][0]['args'][0]['value']==layout.TABLE_KEY
+    intro=panels[0]['config']['value']
+    assert '8 curves' in intro and 'two existing H3 MPPI comparisons' in intro
+    assert 'actor mean' in intro and 'proposal mean' in intro and 'mean-action episodes' not in intro
+    assert 'no matched fresh SAC control' in intro and 'mixed GPUs' in intro
+    assert 'matching steady-time measurements' in intro
+
+
+def test_exact_six_curve_v4_upgrades_to_eight_curve_v5_with_same_url(tmp_path):
+    service=Service();data=dict(campaign(),comparison_styles=comparisons())
+    old=layout.saved_spec(spec(),campaign(),'entity','abc123',version=layout.PREVIOUS_VERSION)
+    service.views.append(dict(id='old-owned',name='nw-transfercurvesabc123-v',type='project-view',
+        displayName='My comparison title',spec=json.dumps(old)))
+    others=deepcopy(service.views[:2])
+    kwargs=dict(campaign=data,entity='entity',project='ambi-inner-bench',publication_id='abc123',receipt_dir=tmp_path)
+    result=layout.ensure_saved_view(SimpleNamespace(_service_api=service),**kwargs)
+    assert result['view_id']=='old-owned' and result['url'].endswith('?nw=transfercurvesabc123')
+    assert result['upgraded_from']=='transfer-checkpoint-curves-v4'
+    assert service.views[:2]==others and service.views[-1]['displayName']=='My comparison title'
+    assert layout._installed(json.loads(service.views[-1]['spec']),data,'entity','abc123')
+    assert not layout.ensure_saved_view(SimpleNamespace(_service_api=service),**kwargs)['changed']
+    assert service.view_writes==1
+
+
+@pytest.mark.parametrize('field,value',[
+    ('setting_id','prior'),('label','Setting 1'),('color','#000000'),('role','transfer'),('color','red')])
+def test_invalid_or_ambiguous_comparison_style_is_rejected(field,value):
+    external=comparisons();external[0][field]=value
+    with pytest.raises(layout.ResultsLayoutError):
+        layout.chart_definition(dict(campaign(),comparison_styles=external))

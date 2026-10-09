@@ -11,6 +11,7 @@ import pytest
 from utils import transfer_checkpoint_publication as adapter
 from utils.ambi_benchmark import solver_seed
 from utils.eval_series import SeriesError,stage_record
+from utils.wandb_results_layout import ResultsLayoutError
 from slurm import ambi_transfer_checkpoint_publish as publish
 
 
@@ -313,6 +314,72 @@ def test_overview_uncertain_failure_reuses_allocated_run_without_marking_snapsho
         state=adapter.read(args.publication_root/'publication.json')
         assert 'snapshot_sha256' not in state['overview']
     assert calls[0]==calls[1]
+
+
+def overlay_receipt(state):
+    return dict(format_version=1,publication_id=state['publication_id'],campaign_sha256=state['campaign_sha256'],
+        run_id='externalmppioverview',status='published',curves=[
+            dict(setting_id='mppi_h3_return_q',label='MPPI H3 · Return Q',color='#cc79a7',role='comparison'),
+            dict(setting_id='mppi_h3_soft_q',label='MPPI H3 · Soft Q',color='#56b4e9',role='comparison')])
+
+
+def test_external_overlay_is_layout_only_and_does_not_change_campaign_or_journals(campaign,tmp_path):
+    args,state=prepare(campaign,tmp_path)
+    assert publish.comparison_layout_campaign(campaign,state,args.publication_root) is campaign
+    before=deepcopy(campaign);before_state=deepcopy(state)
+    journals={key:(Path(row['run_dir'])/'publication.json').read_bytes() for key,row in state['runs'].items()}
+    receipt=overlay_receipt(state);save(args.publication_root/'mppi-overlay.json',receipt)
+    displayed=publish.comparison_layout_campaign(campaign,state,args.publication_root)
+    assert displayed['comparison_styles']==receipt['curves']
+    assert adapter.settings(displayed)==adapter.settings(campaign)
+    assert len(displayed['cells'])==len(campaign['cells'])
+    assert campaign==before and state==before_state
+    assert all((Path(state['runs'][key]['run_dir'])/'publication.json').read_bytes()==value for key,value in journals.items())
+    assert 'comparison_styles' not in adapter.read(args.root/'campaign.json')
+
+
+def test_watch_passes_external_styles_only_to_layout(campaign,tmp_path,monkeypatch):
+    args,state=prepare(campaign,tmp_path)
+    args.once=True;args.gpu_job_id=[]
+    save(args.publication_root/'mppi-overlay.json',overlay_receipt(state))
+    before={key:(Path(row['run_dir'])/'publication.json').read_bytes() for key,row in state['runs'].items()}
+    seen=[]
+    def scientific_publish(data,current,snapshot,*rest):
+        assert 'comparison_styles' not in data
+        assert set(snapshot['curves'])==set(state['runs'])
+        assert snapshot['total']==len(campaign['cells'])
+        seen.append('science')
+    def install(api,**kwargs):
+        assert len(kwargs['campaign']['comparison_styles'])==2
+        assert kwargs['publication_id']==state['publication_id']
+        seen.append('layout')
+        return dict(status='verified',url='https://example.test/same-view')
+    monkeypatch.setattr(publish,'publish_snapshot',scientific_publish)
+    monkeypatch.setattr(publish,'publish_overview',scientific_publish)
+    monkeypatch.setattr(publish,'ensure_saved_view',install)
+    monkeypatch.setitem(publish.sys.modules,'wandb',SimpleNamespace(Api=lambda **kwargs:object()))
+    snapshot=publish.watch(args)
+    assert seen.count('layout')==1 and snapshot['completed']==0
+    assert adapter.read(args.publication_root/'publication.json')['runs'].keys()==state['runs'].keys()
+    assert all((Path(state['runs'][key]['run_dir'])/'publication.json').read_bytes()==value for key,value in before.items())
+
+
+@pytest.mark.parametrize('defect',['version','boolean_version','campaign','publication','pending','run','collision','count','role','color'])
+def test_unbound_or_unpublished_overlay_receipt_is_rejected(campaign,tmp_path,defect):
+    args,state=prepare(campaign,tmp_path);receipt=overlay_receipt(state)
+    if defect=='version':receipt['format_version']=2
+    if defect=='boolean_version':receipt['format_version']=True
+    if defect=='campaign':receipt['campaign_sha256']='other'
+    if defect=='publication':receipt['publication_id']='other'
+    if defect=='pending':receipt['status']='pending'
+    if defect=='run':receipt['run_id']='../run'
+    if defect=='collision':receipt['run_id']=state['runs']['prior']['run_id']
+    if defect=='count':receipt['curves'].pop()
+    if defect=='role':receipt['curves'][0]['role']='fresh'
+    if defect=='color':receipt['curves'][0]['color']='#000000'
+    save(args.publication_root/'mppi-overlay.json',receipt)
+    with pytest.raises((SeriesError,ResultsLayoutError)):
+        publish.comparison_layout_campaign(campaign,state,args.publication_root)
 
 
 def test_trace_packing_is_lossless_deterministic_and_keeps_raw_worker_files(campaign,tmp_path):

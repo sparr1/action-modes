@@ -27,7 +27,7 @@ from utils.ambi_benchmark import atomic_json
 from utils.eval_series import create_run, load_run, stage_record, Publisher
 from utils.transfer_checkpoint_publication import (read,digest,require,identity,settings,
     normalize_prior,normalize_transfer,table_rows,fresh_setting,POINT_COLUMNS,PROGRESS_COLUMNS,PRIOR_ID)
-from utils.wandb_transfer_checkpoint_layout import (ensure_saved_view,TABLE_KEY,PROGRESS_KEY)
+from utils.wandb_transfer_checkpoint_layout import (ensure_saved_view,display_settings,TABLE_KEY,PROGRESS_KEY)
 from slurm.ambi_transfer_sweep_publish import publisher_lock
 from slurm.ambi_closed_loop_publish import gpu_jobs_active
 
@@ -279,6 +279,35 @@ def publish_overview(campaign,state,snapshot,output,wandb):
     write(output/'publication.json',state)
 
 
+def comparison_layout_campaign(campaign,state,output):
+    """Bind a separately published MPPI overview to presentation only.
+
+    The receipt is deliberately separate from publication.json, which the live
+    publisher rewrites from its in-memory state. No new scientific run, record,
+    or campaign cell is introduced by this display overlay.
+    """
+    path=Path(output)/'mppi-overlay.json'
+    if not path.exists():
+        return campaign
+    overlay=read(path)
+    require(type(overlay.get('format_version')) is int and overlay['format_version']==1,
+            'Unsupported MPPI overlay receipt format.')
+    require(overlay.get('publication_id')==state['publication_id']
+            and overlay.get('campaign_sha256')==state['campaign_sha256'],
+            'MPPI overlay belongs to a different publication or campaign.')
+    require(overlay.get('status')=='published','MPPI overview has not been published.')
+    run_id=overlay.get('run_id')
+    require(isinstance(run_id,str) and re.fullmatch(r'[A-Za-z0-9]+',run_id) is not None,
+            'Invalid MPPI overview run ID.')
+    reserved={row['run_id'] for row in state['runs'].values()}|{state.get('overview',{}).get('run_id')}
+    require(run_id not in reserved,'MPPI overview must use a separate presentation run.')
+    curves=overlay.get('curves')
+    require(isinstance(curves,list) and len(curves)==2,'Expected two MPPI overlay curves.')
+    result=dict(campaign,comparison_styles=deepcopy(curves))
+    display_settings(result)
+    return result
+
+
 def watch(args):
     root=Path(args.root).resolve(); output=Path(args.publication_root).resolve()
     with publisher_lock(output):
@@ -298,7 +327,8 @@ def watch(args):
                 publish_overview(campaign,state,snapshot,output,wandb)
                 if not layout_checked:
                     previous_layout=state.get('layout')
-                    state['layout']=ensure_saved_view(wandb.Api(timeout=30),campaign=campaign,
+                    layout_campaign=comparison_layout_campaign(campaign,state,output)
+                    state['layout']=ensure_saved_view(wandb.Api(timeout=30),campaign=layout_campaign,
                         entity=state['entity'],project=state['project'],publication_id=state['publication_id'],
                         receipt_dir=output/'results-layout')
                     layout_checked=True

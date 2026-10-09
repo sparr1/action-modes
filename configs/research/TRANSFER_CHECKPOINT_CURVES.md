@@ -111,3 +111,28 @@ raw bytes with `gzip -dc decisions-seed-101.jsonl.gz > decisions-seed-101.jsonl`
 The recorded raw SHA256 verifies the recovered file. Compression affects only
 new records; previously accepted records and their publication identities are
 never repacked or rewritten.
+
+The existing H3 MPPI return-Q and soft-Q results can be displayed alongside
+these curves without adding evaluation cells. `utils/transfer_mppi_comparison.py`
+validates the two original 80-checkpoint registries against their published
+record fingerprints, this campaign's checkpoint hashes and five paired seeds.
+It recomputes return statistics and prior gains directly from the saved episodes.
+The original sources remain `24f3f6be21b74961beeb7e846b880613` (return Q) and
+`88e1989e3f31474c987798c1bd5a0370` (soft Q). Both use the same frozen SAC
+proposal/terminal actor and MPPI H3/N512/E64/pi24/I8 with proposal-mean execution;
+only the terminal critic route differs.
+
+A separate publication-only run logs 160 MPPI table rows under the existing
+overview selection. Its run ID, source pins and content hash are persisted in
+`publication_root/mppi-overlay.json` before upload. Copy the verified published
+receipt to the Oscar publication root before starting a publisher that should
+retain this overlay. The publisher reads that receipt solely for the v5 layout;
+it does not add scientific runs, rewrite the six existing histories, or change
+the 400-cell completion count. The v5 upgrade preserves the saved view URL and
+recognizes exact earlier layouts, rejecting unknown user edits.
+
+MPPI has no matching H1 fresh-SAC control, so its matched-fresh gains stay null.
+MPPI timing is also omitted: the first 40 checkpoints reuse a historical GPU
+pool and include different diagnostic timing, while no matching decisions
+10–499 timing is available. Return, paired-prior gain, sample SD and minimum
+seed return use all five existing episodes at each checkpoint.
