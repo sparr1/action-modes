@@ -31,6 +31,9 @@ ANCHOR_METADATA_SHA = "8acc74b7ad4993050a5cc0d3c4c0860441fceb48f36a79540f5e1943e
 J6_SELECTION = "h1-j6-post500k-v1"
 J6_CHECKPOINT_RANGE = dict(start=525000, stop=2000000, step=25000)
 J6_SETTINGS = {"h1_j6_fresh", "h1_j6_bernoulli_a0_c05", "h1_j6_matrix_blend05_actor"}
+J8_SELECTION = "h1-j8-post500k-v1"
+J8_CHECKPOINT_RANGE = dict(start=525000, stop=2000000, step=25000)
+J8_SETTINGS = {"h1_j8_fresh", "h1_j8_bernoulli_a0_c05", "h1_j8_matrix_blend05_actor"}
 
 
 def require(condition, message):
@@ -78,20 +81,23 @@ def validate_configuration(config, selected=None):
     candidates = config.get("candidates", [])
     require(candidates and len({row["setting_id"] for row in candidates}) == len(candidates), "Candidates must be unique and nonempty.")
     selection = config.get("selection_id")
-    require(selection in (None, J6_SELECTION), "Unknown versioned curve selection.")
-    if selection == J6_SELECTION:
-        require(config.get("checkpoint_range") == J6_CHECKPOINT_RANGE,
-                "J6 checkpoint range must be 525k through 2M inclusive at 25k intervals.")
-        require({row["setting_id"] for row in candidates} == J6_SETTINGS,
-                "J6 selection requires fresh SAC, critic Bernoulli50%, and actor matrix shrink50%.")
-        require(selected is None or (len(selected) == len(J6_SETTINGS) and set(selected) == J6_SETTINGS),
-                "J6 selection must retain all three matched settings.")
+    profiles = {J6_SELECTION: (6, J6_CHECKPOINT_RANGE, J6_SETTINGS),
+                J8_SELECTION: (8, J8_CHECKPOINT_RANGE, J8_SETTINGS)}
+    require(selection is None or selection in profiles, "Unknown versioned curve selection.")
+    if selection in profiles:
+        rounds, checkpoint_range, required_settings = profiles[selection]
+        require(config.get("checkpoint_range") == checkpoint_range,
+                f"J{rounds} checkpoint range must be 525k through 2M inclusive at 25k intervals.")
+        require({row["setting_id"] for row in candidates} == required_settings,
+                f"J{rounds} selection requires fresh SAC, critic Bernoulli50%, and actor matrix shrink50%.")
+        require(selected is None or (len(selected) == len(required_settings) and set(selected) == required_settings),
+                f"J{rounds} selection must retain all three matched settings.")
     else:
         require(config.get("checkpoint_range") is None, "Checkpoint range requires an explicit versioned selection.")
     lookup = {row["setting_id"]: row for row in candidates}
     for row in candidates:
         require(row["setting_id"] == f"h{row['H']}_j{row['J']}_{row['arm']}", "Candidate identity mismatch.")
-        require(row["H"] == 1 and row["J"] in ((6,) if selection == J6_SELECTION else (2, 4)),
+        require(row["H"] == 1 and row["J"] in ((profiles[selection][0],) if selection in profiles else (2, 4)),
                 "Shortlist budget differs.")
         require(row.get("role") == ("fresh" if row["arm"] == "fresh" else "transfer"), "Candidate role differs.")
         if row["role"] == "transfer":
@@ -190,7 +196,7 @@ def prepare(args):
         diagnostics=deepcopy(template["diagnostics"]))
     if config.get("selection_id") is not None:
         campaign.update(selection_id=config["selection_id"], checkpoint_range=deepcopy(config["checkpoint_range"]),
-            selection="Post-500k H1 J6 matched-budget comparison; checkpoints are repeated measurements of one trained backbone.")
+            selection=f"Post-500k H1 J{candidates[0]['J']} matched-budget comparison; checkpoints are repeated measurements of one trained backbone.")
     generated = []
     for checkpoint_index, checkpoint in enumerate(checkpoints):
         step = checkpoint["step"]

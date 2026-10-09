@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "protocol": "inner-sac-transfer-discovery-v1",
+  "description": "Five-seed H1 J8 fresh SAC, critic Bernoulli50%, and actor matrix shrink50% after 500k on the existing auxiliary-return backbone.",
+  "base_matrix": "ambi_critic_transfer_575k.json",
+  "base_preset": "return_return/fresh",
+  "checkpoint_contract": {
+    "step": 575000,
+    "sha256": "0c6955db7cb8555a67d7863344b70be68f4b3250814d131e647ee6f9ef01a042"
+  },
+  "horizons": [
+    1
+  ],
+  "rounds": [
+    8
+  ],
+  "seeds": [
+    101,
+    102,
+    103,
+    104,
+    105
+  ],
+  "controller_seed": 55,
+  "max_steps": 500,
+  "critic_updates": 16,
+  "actor_updates": 4,
+  "rollouts": 128,
+  "batch_size": 256,
+  "diagnostics": {
+    "enabled": true,
+    "decisions": [
+      0,
+      1,
+      25,
+      100,
+      250,
+      499
+    ],
+    "stationary_decisions": [
+      25,
+      250
+    ],
+    "mc_rollouts": 8,
+    "action_count": 8,
+    "state_count": 32,
+    "fit_steps": 4
+  },
+  "arms": {
+    "fresh": {
+      "actor_rho": 0.0,
+      "critic_rho": 0.0,
+      "parameter_scope": "all",
+      "description": "Fresh prior actor and critic before SAC at every real decision."
+    },
+    "bernoulli_a0_c05": {
+      "critic_bernoulli_p": 0.5,
+      "parameter_scope": "all",
+      "description": "Bernoulli 50% copying of all critic learned parameters; actor and remaining entries reset to prior."
+    },
+    "matrix_blend05_actor": {
+      "actor_rho": 0.5,
+      "parameter_scope": "matrices",
+      "description": "Actor matrices shrink halfway toward the frozen prior; biases, normalization, buffers and critic reset."
+    }
+  }
+}

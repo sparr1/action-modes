@@ -177,3 +177,19 @@ time. Invalid JSON and scientific validation failures still stop immediately.
 Collection failures now write a phase-specific `publisher-failure.json`, so
 an interrupted upload can be diagnosed and resumed against the same registry
 without repeating completed evaluations.
+
+## J8 extension after 500k
+
+`ambi_transfer_checkpoint_j8_after500k_curves.json` and its matching shortlist
+repeat the three J6 mechanisms at H1/J8 over the same 60 checkpoints from 525k
+through 2M. All five seeds, diagnostics, transfer definitions, inherited
+temperature, controller timing and frozen-backbone checks are unchanged.
+Each decision uses 1,024 imagined H1 transitions, 128 critic updates and
+32 actor updates. The extension has 180 new cells and 900 full episodes, with
+smoke checks for all three settings at 525k, 575k and 2M.
+
+Use a separate campaign and publication directory with the new selection
+through `CAMPAIGN_CONFIG`. Reuse the validated historical prior and retain the
+completed J2/J4/J6 and MPPI comparisons. J8 transfer gains against fresh SAC
+must use its new matched J8 fresh control. The scientific evaluator and learner
+implementation remain unchanged.
