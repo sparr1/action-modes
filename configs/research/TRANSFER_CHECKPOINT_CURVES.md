@@ -170,3 +170,10 @@ allocates three new scientific runs and one overview, and upgrades the exact
 original v5 view to v6 at the same URL. It preserves unknown view edits by
 refusing the upgrade. The combined tables contain 820 rows: 480 original,
 160 MPPI, and 180 J6, including pending rows with null metrics.
+
+The publisher retries transient shared-filesystem JSON read failures
+(`ESTALE`, `EAGAIN`, `ETIMEDOUT`) up to four attempts, reopening the file each
+time. Invalid JSON and scientific validation failures still stop immediately.
+Collection failures now write a phase-specific `publisher-failure.json`, so
+an interrupted upload can be diagnosed and resumed against the same registry
+without repeating completed evaluations.

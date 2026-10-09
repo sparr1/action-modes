@@ -575,3 +575,79 @@ def test_hosted_resume_rejects_changed_prior_or_receipt(hosted):
     path.write_text(path.read_text()+'\n')
     with pytest.raises(SeriesError,match='prior record changed'):
         publish.collect(args.root,campaign,state,jobs_active=True)
+
+
+def watch_fixture(campaign,tmp_path,monkeypatch):
+    args,state=prepare(campaign,tmp_path);args.once=True;args.gpu_job_id=[]
+    monkeypatch.setitem(publish.sys.modules,'wandb',SimpleNamespace(Api=lambda **kwargs:object()))
+    monkeypatch.setattr(publish,'publish_snapshot',lambda *args:None)
+    monkeypatch.setattr(publish,'publish_overview',lambda *args:None)
+    monkeypatch.setattr(publish,'ensure_saved_view',lambda *args,**kwargs:dict(status='verified',url='https://example.test/view'))
+    path=Path(campaign['cells'][0]['result_dir'])/'progress.json'
+    save(path,dict(status='running',seed=102,decision=25,completed_episodes=1))
+    journals={key:(Path(row['run_dir'])/'publication.json').read_bytes() for key,row in state['runs'].items()}
+    return args,state,path,journals
+
+
+@pytest.mark.parametrize('error_number',[publish.errno.ESTALE,publish.errno.EAGAIN,publish.errno.ETIMEDOUT])
+def test_watch_reopens_transient_progress_reads_without_changing_records(campaign,tmp_path,monkeypatch,error_number):
+    args,state,path,journals=watch_fixture(campaign,tmp_path,monkeypatch)
+    original=Path.read_text;attempts=[];sleeps=[]
+    def flaky_read(self,*args,**kwargs):
+        if self==path:
+            attempts.append(self)
+            if len(attempts)<=2:raise OSError(error_number,'Temporary shared filesystem read failure',str(self))
+        return original(self,*args,**kwargs)
+    monkeypatch.setattr(Path,'read_text',flaky_read)
+    monkeypatch.setattr(publish.time,'sleep',lambda seconds:sleeps.append(seconds))
+    snapshot=publish.watch(args)
+    assert len(attempts)==3 and sleeps==[.25,1.]
+    row=snapshot['curves'][campaign['candidates'][0]['setting_id']]['progress'][0]
+    assert row['state']=='running' and row['completed_episodes']==1 and row['decision']==25
+    assert not (args.publication_root/'publisher-failure.json').exists()
+    assert all((Path(state['runs'][key]['run_dir'])/'publication.json').read_bytes()==value for key,value in journals.items())
+
+
+@pytest.mark.parametrize('failure_kind',['stale','permission','missing','invalid_json','scientific'])
+def test_collection_read_failures_are_bounded_recorded_and_never_publish(campaign,tmp_path,monkeypatch,failure_kind):
+    args,state,path,journals=watch_fixture(campaign,tmp_path,monkeypatch)
+    original=Path.read_text;attempts=[];sleeps=[];published=[]
+    failure={'stale':OSError(publish.errno.ESTALE,'Stale file handle',str(path)),
+        'permission':PermissionError(publish.errno.EACCES,'Permission denied',str(path)),
+        'missing':FileNotFoundError(publish.errno.ENOENT,'Missing required file',str(path)),
+        'invalid_json':json.JSONDecodeError('Corrupt JSON','{broken',1),
+        'scientific':SeriesError('Pinned scientific identity changed')}[failure_kind]
+    def failing_read(self,*args,**kwargs):
+        if self==path:
+            attempts.append(self);raise failure
+        return original(self,*args,**kwargs)
+    monkeypatch.setattr(Path,'read_text',failing_read)
+    monkeypatch.setattr(publish.time,'sleep',lambda seconds:sleeps.append(seconds))
+    monkeypatch.setattr(publish,'publish_snapshot',lambda *args:published.append(args))
+    with pytest.raises(type(failure)) as caught:publish.watch(args)
+    assert caught.value is failure
+    assert len(attempts)==(4 if failure_kind=='stale' else 1)
+    assert sleeps==([.25,1.,4.] if failure_kind=='stale' else [])
+    receipt=adapter.read(args.publication_root/'publisher-failure.json')
+    assert receipt['phase']=='collection' and receipt['completed'] is None and receipt['total']==3
+    assert receipt['error']==f'{type(failure).__name__}: {failure}'
+    assert not published and not (args.publication_root/'snapshot.json').exists()
+    assert all((Path(state['runs'][key]['run_dir'])/'publication.json').read_bytes()==value for key,value in journals.items())
+
+
+def test_failure_receipt_write_error_keeps_original_collection_exception(campaign,tmp_path,monkeypatch,capsys):
+    args,state,path,journals=watch_fixture(campaign,tmp_path,monkeypatch)
+    failure=OSError(publish.errno.ESTALE,'Stale file handle',str(path))
+    def fail_collect(*args,**kwargs):raise failure
+    original=publish.write
+    def fail_receipt(target,value):
+        if Path(target).name=='publisher-failure.json':raise OSError(publish.errno.EIO,'Shared filesystem unavailable')
+        return original(target,value)
+    monkeypatch.setattr(publish,'collect',fail_collect)
+    monkeypatch.setattr(publish,'write',fail_receipt)
+    with pytest.raises(OSError) as caught:publish.watch(args)
+    assert caught.value is failure
+    diagnostic=json.loads(capsys.readouterr().err)
+    assert diagnostic['event']=='publisher_failure_receipt_write_failed'
+    assert diagnostic['failure']['phase']=='collection'
+    assert 'Shared filesystem unavailable' in diagnostic['receipt_error']

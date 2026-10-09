@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+import errno
 import gzip
 import hashlib
 import json
@@ -26,11 +27,33 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 from utils.ambi_benchmark import atomic_json
 from utils.eval_series import create_run, load_run, stage_record, Publisher
-from utils.transfer_checkpoint_publication import (read,digest,require,identity,settings,
+from utils.transfer_checkpoint_publication import (read as read_json,digest,require,identity,settings,
     normalize_prior,normalize_transfer,table_rows,fresh_setting,POINT_COLUMNS,PROGRESS_COLUMNS,PRIOR_ID)
 from utils.wandb_transfer_checkpoint_layout import (ensure_saved_view,display_settings,TABLE_KEY,PROGRESS_KEY)
 from slurm.ambi_transfer_sweep_publish import publisher_lock
 from slurm.ambi_closed_loop_publish import gpu_jobs_active
+
+
+_READ_RETRY_DELAYS=(0.25,1.,4.)
+_TRANSIENT_READ_ERRNOS=frozenset((errno.ESTALE,errno.EAGAIN,errno.ETIMEDOUT))
+
+
+def read(path):
+    """Reopen a JSON file after a transient shared-filesystem read failure.
+
+    Four attempts allow a stale handle to expire without retrying corruption,
+    missing files, permissions, scientific validation, or any external write.
+    """
+    for attempt in range(len(_READ_RETRY_DELAYS)+1):
+        try:
+            return read_json(path)
+        except OSError as exc:
+            if exc.errno not in _TRANSIENT_READ_ERRNOS or attempt==len(_READ_RETRY_DELAYS):
+                raise
+            delay=_READ_RETRY_DELAYS[attempt]
+            print(json.dumps(dict(event='transient_json_read_retry',path=str(path),errno=exc.errno,
+                next_attempt=attempt+2,delay_seconds=delay)),file=sys.stderr,flush=True)
+            time.sleep(delay)
 
 
 def write(path,value):
@@ -457,10 +480,14 @@ def watch(args):
         # setting runs, including empty pending curves, then installs the view.
         ended=None;layout_checked=False
         while True:
-            active=True if args.once and not args.gpu_job_id else gpu_jobs_active(args.gpu_job_id)
-            snapshot=collect(root,campaign,state,jobs_active=active)
-            write(output/'snapshot.json',snapshot)
+            snapshot=None;phase='scheduler_status'
             try:
+                active=True if args.once and not args.gpu_job_id else gpu_jobs_active(args.gpu_job_id)
+                phase='collection'
+                snapshot=collect(root,campaign,state,jobs_active=active)
+                phase='snapshot_write'
+                write(output/'snapshot.json',snapshot)
+                phase='publication_or_layout'
                 publish_snapshot(campaign,state,snapshot,output,wandb)
                 publish_overview(campaign,state,snapshot,output,wandb)
                 if not layout_checked:
@@ -479,8 +506,15 @@ def watch(args):
                     publish_snapshot(campaign,state,snapshot,output,wandb)
                     publish_overview(campaign,state,snapshot,output,wandb)
             except Exception as exc:
-                write(output/'publisher-failure.json',dict(error=f'{type(exc).__name__}: {exc}',
-                    phase='publication_or_layout',completed=snapshot['completed'],total=snapshot['total']))
+                failure=dict(error=f'{type(exc).__name__}: {exc}',phase=phase,
+                    completed=snapshot['completed'] if snapshot is not None else None,total=len(campaign['cells']))
+                try:
+                    write(output/'publisher-failure.json',failure)
+                except OSError as receipt_error:
+                    # A shared-filesystem outage can also prevent its receipt.
+                    # Preserve the original exception and expose both in Slurm stderr.
+                    print(json.dumps(dict(event='publisher_failure_receipt_write_failed',failure=failure,
+                        receipt_error=f'{type(receipt_error).__name__}: {receipt_error}')),file=sys.stderr,flush=True)
                 raise
             print(json.dumps(dict(completed=snapshot['completed'],total=snapshot['total'],
                 failures=snapshot['failures'],url=state['layout']['url'])),flush=True)
