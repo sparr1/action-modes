@@ -266,3 +266,50 @@ def test_host_extension_rejects_unknown_v5_user_edits(tmp_path):
         layout.ensure_saved_view(SimpleNamespace(_service_api=service),campaign=data,entity='entity',
             project='ambi-inner-bench',publication_id='abc123',receipt_dir=tmp_path)
     assert service.views==before and service.view_writes==0
+
+
+def followups():
+    return [dict(setting_id=key,label='J8 '+key,role='fresh' if key.endswith('_fresh') else 'transfer',color=color)
+            for key,color in adapter.J8_COLORS.items()]
+
+
+def test_j8_view_preserves_exact_v6_colors_and_upgrades_same_view_to_fourteen_curves(tmp_path):
+    original=dict(campaign(),comparison_styles=comparisons(),extension_styles=extensions())
+    data=dict(original,followup_styles=followups())
+    old=layout.saved_spec(spec(),data,'entity','abc123',version=layout.HOST_VERSION)
+    assert old==layout.saved_spec(spec(),original,'entity','abc123')
+    # Captured from deployed dc72b61 before adding J8.
+    assert layout._hash(old)=='abc45cde5522c0629d82e5600c3c8c4537161b865c19dd4e2d240e1c5e1062be'
+    original_scale=layout.chart_definition(original)['encoding']['color']['scale']
+    definition=layout.chart_definition(data);scale=definition['encoding']['color']['scale']
+    assert scale['range']==original_scale['range']+list(adapter.J8_COLORS.values())
+    assert len(set(scale['domain']))==len(set(scale['range']))==14
+    assert definition['encoding']['strokeDash']['scale']['range'][-3:]==[[6,3],[1,0],[1,0]]
+    service=Service();service.views.append(dict(id='owned',name='nw-transfercurvesabc123-v',type='project-view',
+        displayName='My saved comparison',spec=json.dumps(old)))
+    others=deepcopy(service.views[:2]);kwargs=dict(campaign=data,entity='entity',project='ambi-inner-bench',
+        publication_id='abc123',receipt_dir=tmp_path)
+    result=layout.ensure_saved_view(SimpleNamespace(_service_api=service),**kwargs)
+    assert result['upgraded_from']==layout.HOST_VERSION and result['layout_version']==layout.FOLLOWUP_VERSION
+    assert result['view_id']=='owned' and result['url'].endswith('?nw=transfercurvesabc123')
+    assert service.views[:2]==others and service.views[-1]['displayName']=='My saved comparison'
+    installed=json.loads(service.views[-1]['spec']);panels=[p for s in installed['section']['panelBankConfig']['sections'] for p in s['panels']]
+    charts=[p for p in panels if p['viewType']=='Vega2']
+    assert len(charts)==7 and '14 curves' in panels[0]['config']['value']
+    assert 'own matched fresh J8 control' in panels[0]['config']['value']
+    assert installed['section']['runSets'][0]['selections']=={'root':1,'bounds':[],'tree':[]}
+    assert all(p['config']['panelDefId']==layout.chart_id(data,'entity') for p in charts)
+    assert not layout.ensure_saved_view(SimpleNamespace(_service_api=service),**kwargs)['changed']
+    assert service.view_writes==1
+
+
+def test_j8_preserves_user_modified_v6_view(tmp_path):
+    data=dict(campaign(),comparison_styles=comparisons(),extension_styles=extensions(),followup_styles=followups())
+    service=Service();old=layout.saved_spec(spec(),data,'entity','abc123',version=layout.HOST_VERSION)
+    old['section']['panelBankConfig']['sections'][1]['panels'][0]['config']['stringSettings']['title']='Custom title'
+    service.views.append(dict(id='owned',name='nw-transfercurvesabc123-v',type='project-view',displayName='Custom',spec=json.dumps(old)))
+    before=deepcopy(service.views)
+    with pytest.raises(layout.ResultsLayoutError,match='preserving user edits'):
+        layout.ensure_saved_view(SimpleNamespace(_service_api=service),campaign=data,entity='entity',
+            project='ambi-inner-bench',publication_id='abc123',receipt_dir=tmp_path)
+    assert service.views==before and service.view_writes==0

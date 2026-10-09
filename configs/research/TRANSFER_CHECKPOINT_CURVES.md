@@ -193,3 +193,14 @@ through `CAMPAIGN_CONFIG`. Reuse the validated historical prior and retain the
 completed J2/J4/J6 and MPPI comparisons. J8 transfer gains against fresh SAC
 must use its new matched J8 fresh control. The scientific evaluator and learner
 implementation remain unchanged.
+
+For publication, pass the original completed comparison as
+`--comparison-host-publication-root ORIGINAL/publication` and the completed
+J6 publication as `--comparison-extension-publication-root J6/publication`.
+The CPU wrapper exposes the latter as `COMPARISON_EXTENSION_PUBLICATION_ROOT`.
+Both inputs are read-only references. The new J8 overview shares the original
+comparison selector, and the exact v6 view upgrades to v7 at the same URL.
+The 14 curves contain 1,000 unique checkpoint/setting rows: 480 original,
+160 MPPI, 180 J6 and 180 J8. The old 11 colors and scientific histories remain
+unchanged; J8 receives three new colors and pending progress before results
+complete.

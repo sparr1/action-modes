@@ -64,10 +64,98 @@ def fingerprint(value):
     return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
 
 
-def comparison_host_receipt(campaign, campaign_path, host_root, entity, project):
+def comparison_extension_receipt(campaign, extension_root, host_root, entity, project):
+    """Verify the completed J6 display source and pin its accepted records."""
+    from utils.eval_series import validate_record, _record_fingerprint
+    from utils.transfer_checkpoint_publication import J6_COLORS, _episodes
+    root=Path(extension_root).resolve(); state=read(root/'publication.json')
+    path=Path(state['campaign_root'])/'campaign.json'; previous=read(path)
+    require(state.get('prepared') is True and state['campaign_sha256']==digest(path)
+            and state['entity']==entity and state['project']==project,'J6 extension publication binding differs.')
+    require(len(previous['candidates'])==3 and {row['setting_id'] for row in previous['candidates']}==set(J6_COLORS)
+            and all(row['H']==1 and row['J']==6 for row in previous['candidates']),
+            'Comparison extension must contain exactly the three H1 J6 settings.')
+    previous_host=validate_comparison_host(previous,state,root)
+    require(previous_host and previous_host['kind']=='h1-j6-after500k-comparison-host'
+            and previous_host['host_publication_root']==str(Path(host_root).resolve()),
+            'J6 extension must reuse the same original comparison host.')
+    require(all(campaign.get(key)==previous.get(key) for key in
+                ('protocol','source_run','seeds','controller_seed','max_steps','scientific_source','diagnostics','gpu_hardware')),
+            'J6 extension science or episode protocol differs.')
+    require([(cp['step'],cp['checkpoint_sha256'],cp['metadata_sha256'],cp['prior_pin']) for cp in campaign['checkpoints']]
+            ==[(cp['step'],cp['checkpoint_sha256'],cp['metadata_sha256'],cp['prior_pin']) for cp in previous['checkpoints']],
+            'J6 extension checkpoint coverage or prior pins differ.')
+    for current in campaign['candidates']:
+        matched=next(row for row in previous['candidates'] if row['setting_id']==current['setting_id'].replace('_j8_','_j6_'))
+        require(all(current[key]==matched[key] for key in ('H','arm','arm_definition','role')),
+                'J8 methods must match their J6 comparison definitions.')
+    require(state.get('layout',{}).get('status')=='verified'
+            and state['layout']['layout_version']=='transfer-checkpoint-curves-v6',
+            'J6 extension must have its verified v6 layout.')
+    completion=read(root/'publisher-complete.json');snapshot=read(root/'snapshot.json')
+    require(completion.get('status')=='complete' and completion.get('completed')==completion.get('total')==180
+            and snapshot.get('completed')==snapshot.get('total')==180 and not snapshot.get('failures'),
+            'J6 extension publication must be complete.')
+    require(state.get('overview',{}).get('snapshot_sha256')==fingerprint(dict(snapshot=snapshot,layout=state['layout'])),
+            'J6 overview does not contain the final published snapshot.')
+    require(set(state['runs'])=={PRIOR_ID,*J6_COLORS} and set(snapshot['curves'])==set(J6_COLORS),
+            'J6 extension curve coverage differs.')
+    pins={};records={};checkpoints={cp['step']:cp['checkpoint_sha256'] for cp in campaign['checkpoints']}
+    for setting in settings(previous)[1:]:
+        key=setting['setting_id'];entry=state['runs'][key];directory=Path(entry['run_dir'])
+        registry=load_run(directory);journal=read(directory/'publication.json')
+        require(registry['run_id']==entry['run_id'] and registry['identity']==identity(previous,setting)
+                and registry['entity']==entity and registry['project']==project,'J6 registry identity differs.')
+        require(len(journal['records'])==60 and {row['checkpoint_step'] for row in journal['records'].values()}==set(checkpoints)
+                and all(row['status']=='published' for row in journal['records'].values()),
+                'J6 extension requires 60 published records per setting.')
+        files={};records[key]={}
+        for rid,accepted in journal['records'].items():
+            record_path=directory/'records'/(rid+'.json');record=validate_record(read(record_path),registry['identity'])
+            step=accepted['checkpoint_step']
+            require(record['record_id']==rid and record['checkpoint']==dict(step=step,sha256=checkpoints[step])
+                    and _record_fingerprint(record,accepted['artifact_sha256'])==accepted['record_sha256'],
+                    'J6 published record fingerprint differs.')
+            require(len(record['episodes'])==5 and _episodes(record['episodes'],campaign)==record['episodes']
+                    and record['metrics']['eval/episodes']==5 and record['metrics']['eval/frozen_state_unchanged'] is True,
+                    'J6 record episode protocol differs.')
+            files[rid]=digest(record_path);records[key][step]=record
+        pins[key]=dict(run_dir=str(directory),run_id=registry['run_id'],registry_sha256=digest(directory/'run.json'),
+            journal_sha256=digest(directory/'publication.json'),record_files=files)
+    for setting in settings(previous)[1:]:
+        key=setting['setting_id'];matched=fresh_setting(previous,setting)
+        points,progress=table_rows(previous,setting,records[key],{},fresh_records=records[matched])
+        require(snapshot['curves'][key]==dict(points=points,progress=progress,completed=60,total=60),
+                'J6 published snapshot differs from its accepted records.')
+    styles=[{key:row[key] for key in ('setting_id','label','color','role')} for row in settings(previous)[1:]]
+    require(styles==previous_host['extension_styles'],'J6 display styles differ from its pinned host receipt.')
+    return dict(publication_root=str(root),publication_sha256=digest(root/'publication.json'),
+        campaign_path=str(path),campaign_sha256=digest(path),host_receipt_sha256=digest(root/'comparison-host.json'),
+        completion_sha256=digest(root/'publisher-complete.json'),snapshot_sha256=digest(root/'snapshot.json'),
+        overview_run_id=state['overview']['run_id'],runs=pins,styles=styles)
+
+
+def validate_comparison_extension(pin):
+    """Only read the pinned completed J6 publication on J8 resume."""
+    root=Path(pin['publication_root'])
+    for name,key in (('publication.json','publication_sha256'),('comparison-host.json','host_receipt_sha256'),
+                     ('publisher-complete.json','completion_sha256'),('snapshot.json','snapshot_sha256')):
+        require(digest(root/name)==pin[key],'Pinned J6 extension changed: '+name)
+    require(digest(pin['campaign_path'])==pin['campaign_sha256'],'Pinned J6 campaign changed.')
+    for run in pin['runs'].values():
+        directory=Path(run['run_dir'])
+        require(digest(directory/'run.json')==run['registry_sha256']
+                and digest(directory/'publication.json')==run['journal_sha256'],'Pinned J6 registry or journal changed.')
+        for rid,expected in run['record_files'].items():
+            require(digest(directory/'records'/(rid+'.json'))==expected,'Pinned J6 published record changed.')
+
+
+def comparison_host_receipt(campaign, campaign_path, host_root, entity, project, extension_root=None):
     """Pin the completed original comparison without allocating/copying its runs."""
     from utils.eval_series import validate_record, _record_fingerprint
-    from utils.transfer_checkpoint_publication import J6_COLORS
+    from utils.transfer_checkpoint_publication import J6_COLORS, J8_COLORS
+    rounds=campaign['candidates'][0]['J'];palette=J8_COLORS if rounds==8 else J6_COLORS
+    require(rounds in (6,8) and (rounds==8)==bool(extension_root),'J8 requires the explicit completed J6 extension; J6 must not provide one.')
     host_root=Path(host_root).resolve(); path=host_root/'publication.json'; host=read(path)
     host_campaign_path=Path(host['campaign_root'])/'campaign.json'; original=read(host_campaign_path)
     require(host.get('prepared') is True and host['campaign_sha256']==digest(host_campaign_path),
@@ -80,10 +168,10 @@ def comparison_host_receipt(campaign, campaign_path, host_root, entity, project)
     require([cp['step'] for cp in original['checkpoints']]==list(range(25000,2000001,25000)),
             'Comparison host must contain the original 80 checkpoints.')
     require([cp['step'] for cp in campaign['checkpoints']]==list(range(525000,2000001,25000)),
-            'Hosted H1 J6 requires exactly the 60 checkpoints after 500k.')
-    require(len(campaign['candidates'])==3 and {row['setting_id'] for row in campaign['candidates']}==set(J6_COLORS)
-            and all(row['H']==1 and row['J']==6 for row in campaign['candidates']),
-            'Comparison host supports only the three H1 J6 settings.')
+            'Hosted H1 J6/J8 requires exactly the 60 checkpoints after 500k.')
+    require(len(campaign['candidates'])==3 and {row['setting_id'] for row in campaign['candidates']}==set(palette)
+            and all(row['H']==1 and row['J']==rounds for row in campaign['candidates']),
+            'Comparison host supports only the three H1 J6 or J8 settings.')
     require(all(campaign[key]==original[key] for key in ('protocol','source_run','seeds','controller_seed','max_steps')),
             'Comparison host backbone or episode protocol differs.')
     require(all(campaign.get(key)==original.get(key) for key in ('scientific_source','diagnostics','gpu_hardware')),
@@ -121,14 +209,18 @@ def comparison_host_receipt(campaign, campaign_path, host_root, entity, project)
             record_file_sha256=digest(record_path),checkpoint=deepcopy(record['checkpoint']),
             artifact=f"{entity}/{project}/eval-{registry['run_id']}-{step}:{alias}")
     styles=[{key:row[key] for key in ('setting_id','label','color','role')} for row in settings(campaign)[1:]]
-    result=dict(format_version=1,kind='h1-j6-after500k-comparison-host',campaign_sha256=digest(campaign_path),
+    result=dict(format_version=1,kind=f'h1-j{rounds}-after500k-comparison-host',campaign_sha256=digest(campaign_path),
         host_publication_root=str(host_root),host_publication_id=host['publication_id'],
         host_publication_sha256=digest(path),host_campaign_path=str(host_campaign_path),
         host_campaign_sha256=digest(host_campaign_path),mppi_overlay_sha256=digest(host_root/'mppi-overlay.json'),
         host_overview_run_id=host['overview']['run_id'],prior_run=dict(run_dir=str(directory),run_id=registry['run_id'],
             identity_sha256=registry['identity_sha256'],journal_sha256=digest(directory/'publication.json')),
         prior_records=pins,extension_styles=styles)
-    display_settings(dict(layout_campaign,extension_styles=styles))
+    if extension_root:
+        extension=comparison_extension_receipt(campaign,extension_root,host_root,entity,project)
+        result.update(comparison_extension=extension,extension_styles=extension['styles'],followup_styles=styles)
+    display_settings(dict(layout_campaign,extension_styles=result['extension_styles'],
+                          **({'followup_styles':styles} if extension_root else {})))
     return result
 
 
@@ -139,7 +231,7 @@ def validate_comparison_host(campaign,state,output):
     path=Path(output)/'comparison-host.json'
     require(digest(path)==expected,'Comparison host receipt changed.')
     host=read(path)
-    require(host.get('format_version')==1 and host.get('kind')=='h1-j6-after500k-comparison-host'
+    require(host.get('format_version')==1 and host.get('kind') in ('h1-j6-after500k-comparison-host','h1-j8-after500k-comparison-host')
             and host['campaign_sha256']==state['campaign_sha256']
             and host['host_publication_id']==state.get('comparison_publication_id'),'Comparison host receipt binding differs.')
     root=Path(host['host_publication_root'])
@@ -159,6 +251,9 @@ def validate_comparison_host(campaign,state,output):
     for pin in host['prior_records'].values():
         require(digest(directory/'records'/(pin['record_id']+'.json'))==pin['record_file_sha256'],
                 'Pinned published prior record changed.')
+    if host['kind']=='h1-j8-after500k-comparison-host':
+        require('comparison_extension' in host and 'followup_styles' in host,'J8 extension receipt is incomplete.')
+        validate_comparison_extension(host['comparison_extension'])
     return host
 
 
@@ -178,7 +273,9 @@ def prepare(args):
         entity=args.entity,project=args.project,owner=args.owner,attempt_label=args.attempt_label)
     require(args.project=='ambi-inner-bench','Transfer curves belong in ambi-inner-bench.')
     requested_host=getattr(args,'comparison_host_publication_root',None)
-    host=(comparison_host_receipt(campaign,root/'campaign.json',requested_host,args.entity,args.project)
+    requested_extension=getattr(args,'comparison_extension_publication_root',None)
+    require(not requested_extension or requested_host,'A comparison extension requires its original host.')
+    host=(comparison_host_receipt(campaign,root/'campaign.json',requested_host,args.entity,args.project,requested_extension)
           if requested_host else None)
     binding['comparison_host_sha256']=None
     with publisher_lock(output):
@@ -408,7 +505,7 @@ def publish_overview(campaign,state,snapshot,output,wandb):
     if entry.get('snapshot_sha256')==stamp:
         return
     run=wandb.init(entity=state['entity'],project=state['project'],id=entry['run_id'],resume='allow',
-        mode='online',name='J6 after 500k · live comparison' if state.get('comparison_host_sha256') else 'Transfer backbone · live comparison',
+        mode='online',name=f"J{campaign['candidates'][0]['J']} after 500k · live comparison" if state.get('comparison_host_sha256') else 'Transfer backbone · live comparison',
         job_type='transfer-checkpoint-overview',
         group='transfer-backbone-'+state['publication_id'][:8],
         tags=['transfer-backbone','publication-only','five-seed','full-episode'],
@@ -445,6 +542,7 @@ def comparison_layout_campaign(campaign,state,output):
         root=Path(host['host_publication_root']); original=read(host['host_campaign_path'])
         result=comparison_layout_campaign(original,read(root/'publication.json'),root)
         result['extension_styles']=deepcopy(host['extension_styles'])
+        if 'followup_styles' in host:result['followup_styles']=deepcopy(host['followup_styles'])
         display_settings(result)
         return result
     path=Path(output)/'mppi-overlay.json'
@@ -541,7 +639,9 @@ def parser():
         child.add_argument('--root',type=Path,required=True)
         child.add_argument('--publication-root',type=Path,required=True)
     prepare_parser.add_argument('--comparison-host-publication-root',type=Path,
-        help='Reuse the completed original comparison and its prior read-only for the H1 J6 extension.')
+        help='Reuse the completed original comparison and its prior read-only for H1 J6/J8.')
+    prepare_parser.add_argument('--comparison-extension-publication-root',type=Path,
+        help='For H1 J8, retain the completed J6 comparison from this publication root.')
     prepare_parser.add_argument('--attempt-label',required=True)
     prepare_parser.add_argument('--owner',default='oscar-rgao48')
     prepare_parser.add_argument('--entity',default='rwgao_b-brown-university')

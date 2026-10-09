@@ -20,6 +20,8 @@ PRIOR_ID = 'prior'
 COLORS = ('#0072b2', '#d55e00', '#009e73', '#777777', '#b59b71', '#cc79a7')
 J6_COLORS = {'h1_j6_fresh':'#6f4c9b', 'h1_j6_bernoulli_a0_c05':'#c43c39',
              'h1_j6_matrix_blend05_actor':'#087e8b'}
+J8_COLORS = {'h1_j8_fresh':'#8c564b', 'h1_j8_bernoulli_a0_c05':'#e69f00',
+             'h1_j8_matrix_blend05_actor':'#78a22f'}
 POINT_COLUMNS = ['step','setting','label','segment','state','return_mean','return_std',
     'return_lower','return_upper','gain_mean','gain_std','gain_lower','gain_upper',
     'fresh_setting','fresh_gain_mean','fresh_gain_std','fresh_gain_lower','fresh_gain_upper',
@@ -58,7 +60,7 @@ def moments(values):
 def settings(campaign):
     rows = [dict(setting_id=PRIOR_ID, label='Prior mean (no inner solve)', color='#000000')]
     require(len(campaign['candidates']) <= len(COLORS), 'Add explicit colors before publishing more than six candidates.')
-    rows.extend(dict(candidate, color=J6_COLORS.get(candidate['setting_id'],COLORS[index])) for index,candidate in enumerate(campaign['candidates']))
+    rows.extend(dict(candidate, color={**J6_COLORS,**J8_COLORS}.get(candidate['setting_id'],COLORS[index])) for index,candidate in enumerate(campaign['candidates']))
     require(len({row['setting_id'] for row in rows}) == len(rows), 'Duplicate setting IDs.')
     require(len({row['label'] for row in rows}) == len(rows), 'Duplicate curve labels.')
     return rows

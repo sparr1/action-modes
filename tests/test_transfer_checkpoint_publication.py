@@ -651,3 +651,123 @@ def test_failure_receipt_write_error_keeps_original_collection_exception(campaig
     assert diagnostic['event']=='publisher_failure_receipt_write_failed'
     assert diagnostic['failure']['phase']=='collection'
     assert 'Shared filesystem unavailable' in diagnostic['receipt_error']
+
+
+@pytest.fixture
+def hosted_j8(hosted,tmp_path):
+    """Pin a complete real registry and final J6 snapshot before creating J8."""
+    previous,j6_args,host_args,host_state=hosted;j6_state=publish.prepare(j6_args)
+    priors=publish.records_by_step(j6_state['runs']['prior']['run_dir'])
+    for setting in adapter.settings(previous)[1:]:
+        directory=Path(j6_state['runs'][setting['setting_id']]['run_dir'])
+        for checkpoint in previous['checkpoints']:
+            record=deepcopy(priors[checkpoint['step']]);record.update(identity=adapter.identity(previous,setting),
+                record_id=publish.fingerprint([setting['setting_id'],checkpoint['step']]),label=setting['label'])
+            stage_record(directory,record)
+        journal=adapter.read(directory/'publication.json')
+        for entry in journal['records'].values():entry.update(status='published',wandb_step=entry['accepted_order'])
+        save(directory/'publication.json',journal)
+    snapshot=publish.collect(j6_args.root,previous,j6_state,jobs_active=False)
+    j6_state['layout']=dict(status='verified',layout_version='transfer-checkpoint-curves-v6',url='https://example.test/same-view')
+    j6_state['overview']=dict(run_id='j6overview',snapshot_sha256=publish.fingerprint(dict(snapshot=snapshot,layout=j6_state['layout'])))
+    save(j6_args.publication_root/'publication.json',j6_state)
+    save(j6_args.publication_root/'snapshot.json',snapshot)
+    save(j6_args.publication_root/'publisher-complete.json',dict(status='complete',completed=180,total=180))
+    current=deepcopy(previous)
+    for setting in current['candidates']:
+        setting.update(setting_id=setting['setting_id'].replace('_j6_','_j8_'),J=8,
+            label=setting['label'].replace('J6','J8'),fresh_setting_id='h1_j8_fresh')
+    for cell in current['cells']:
+        cell.update(setting_id=cell['setting_id'].replace('_j6_','_j8_'),J=8,
+            label=cell['label'].replace('J6','J8'),fresh_setting_id='h1_j8_fresh',
+            result_dir=str(tmp_path/'j8-results'/str(cell['index'])),name=cell['name'].replace('_j6_','_j8_'))
+    args=deepcopy(j6_args);args.root=tmp_path/'j8-campaign';args.publication_root=tmp_path/'j8-publication'
+    args.comparison_extension_publication_root=j6_args.publication_root;args.attempt_label='J8 New'
+    save(args.root/'campaign.json',current)
+    return current,args,previous,j6_args,j6_state,host_args,host_state
+
+
+def test_j8_adds_only_three_new_runs_and_keeps_completed_j6_and_original_host_immutable(hosted_j8,monkeypatch):
+    campaign,args,previous,j6_args,j6_state,host_args,host_state=hosted_j8
+    before={str(path):path.read_bytes() for root in (j6_args.publication_root,host_args.publication_root) for path in root.rglob('*.json')}
+    state=publish.prepare(args);assert publish.prepare(args)==state
+    assert set(state['runs'])=={'prior',*adapter.J8_COLORS}
+    assert state['runs']['prior']['read_only'] and state['runs']['prior']['run_id']==host_state['runs']['prior']['run_id']
+    assert state['publication_id'] not in (host_state['publication_id'],j6_state['publication_id'])
+    assert not (args.publication_root/'registry'/'prior').exists()
+    host=publish.validate_comparison_host(campaign,state,args.publication_root)
+    assert host['kind']=='h1-j8-after500k-comparison-host' and len(host['comparison_extension']['runs'])==3
+    assert all(len(row['record_files'])==60 for row in host['comparison_extension']['runs'].values())
+    assert {row['setting_id'] for row in host['extension_styles']}==set(adapter.J6_COLORS)
+    assert {row['setting_id'] for row in host['followup_styles']}==set(adapter.J8_COLORS)
+    layout_campaign=publish.comparison_layout_campaign(campaign,state,args.publication_root)
+    assert len(publish.display_settings(layout_campaign))==14
+    snapshot=publish.collect(args.root,campaign,state,jobs_active=True)
+    assert snapshot['completed']==0 and snapshot['total']==180 and set(snapshot['curves'])==set(adapter.J8_COLORS)
+    calls=[];logged=[];opened=[]
+    class OnlyJ8Publisher:
+        def __init__(self,path,**kwargs):
+            opened.append(path)
+            assert path in {state['runs'][key]['run_dir'] for key in adapter.J8_COLORS}
+            self.run=SimpleNamespace(name=None,config=SimpleNamespace(update=lambda *a,**kw:None),summary={})
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def publish_pending(self):pass
+    monkeypatch.setattr(publish,'Publisher',OnlyJ8Publisher)
+    sdk=SimpleNamespace(Table=lambda **kwargs:kwargs,
+        init=lambda **kwargs:(calls.append(kwargs) or SimpleNamespace(summary={},log=logged.append,finish=lambda **kwargs:None)))
+    publish.publish_snapshot(campaign,state,snapshot,args.publication_root,sdk)
+    assert len(opened)==3
+    publish.publish_overview(campaign,state,snapshot,args.publication_root,sdk)
+    assert calls[0]['config']['transfer_curve_overview']==host_state['publication_id']
+    assert calls[0]['name']=='J8 after 500k · live comparison'
+    assert calls[0]['id'] not in (j6_state['overview']['run_id'],host_state['overview']['run_id'])
+    assert len(logged[0][publish.TABLE_KEY]['data'])==180
+    assert all(Path(path).read_bytes()==value for path,value in before.items())
+    transfer(campaign);cell=campaign['cells'][0];directory=Path(cell['result_dir'])
+    old_prior=publish.records_by_step(state['runs']['prior']['run_dir'])[525000]
+    record=adapter.normalize_transfer(campaign,cell,adapter.read(directory/'receipt.json'),adapter.read(directory/'results.json'),
+        adapter.read(directory/'manifest.json'),old_prior,receipt_path=directory/'receipt.json',prior_reference=host['prior_records']['525000'])
+    assert not any(name.startswith('reference/') for name in record['artifact_files'])
+    assert record['provenance']['legacy_artifacts']==[host['prior_records']['525000']['artifact']]
+
+
+@pytest.mark.parametrize('defect',['missing_extension','incomplete','queued','record_hash','identity','snapshot','method'])
+def test_j8_rejects_incomplete_or_unbound_previous_results_before_allocation(hosted_j8,defect):
+    campaign,args,previous,j6_args,j6_state,host_args,host_state=hosted_j8
+    key=next(iter(adapter.J6_COLORS));directory=Path(j6_state['runs'][key]['run_dir'])
+    if defect=='missing_extension':args.comparison_extension_publication_root=None
+    if defect=='incomplete':save(j6_args.publication_root/'publisher-complete.json',dict(status='incomplete',completed=179,total=180))
+    if defect=='queued':
+        journal=adapter.read(directory/'publication.json');next(iter(journal['records'].values()))['status']='queued'
+        save(directory/'publication.json',journal)
+    if defect=='record_hash':
+        journal=adapter.read(directory/'publication.json');rid=next(iter(journal['records']))
+        record=adapter.read(directory/'records'/(rid+'.json'));record['episodes'][0]['return']+=1
+        save(directory/'records'/(rid+'.json'),record)
+    if defect=='identity':
+        registry=adapter.read(directory/'run.json');registry['identity']['planner']['settings']['inner_rounds']=8
+        registry['identity_sha256']=publish.fingerprint(registry['identity']);save(directory/'run.json',registry)
+    if defect=='snapshot':
+        snapshot=adapter.read(j6_args.publication_root/'snapshot.json')
+        snapshot['curves'][key]['points'][0]['return_mean']+=1
+        save(j6_args.publication_root/'snapshot.json',snapshot)
+        j6_state['overview']['snapshot_sha256']=publish.fingerprint(dict(snapshot=snapshot,layout=j6_state['layout']))
+        save(j6_args.publication_root/'publication.json',j6_state)
+    if defect=='method':
+        campaign['candidates'][1]['arm_definition']['actor_rho']=.9;save(args.root/'campaign.json',campaign)
+    with pytest.raises(SeriesError):publish.prepare(args)
+    assert not (args.publication_root/'registry').exists()
+
+
+@pytest.mark.parametrize('changed',['journal','record','snapshot','campaign'])
+def test_j8_resume_detects_changed_completed_j6_pins(hosted_j8,changed):
+    campaign,args,previous,j6_args,j6_state,host_args,host_state=hosted_j8
+    state=publish.prepare(args);directory=Path(j6_state['runs'][next(iter(adapter.J6_COLORS))]['run_dir'])
+    if changed=='journal':path=directory/'publication.json'
+    if changed=='record':path=next((directory/'records').glob('*.json'))
+    if changed=='snapshot':path=j6_args.publication_root/'snapshot.json'
+    if changed=='campaign':path=j6_args.root/'campaign.json'
+    path.write_text(path.read_text()+'\n')
+    with pytest.raises(SeriesError,match='Pinned J6'):
+        publish.collect(args.root,campaign,state,jobs_active=True)

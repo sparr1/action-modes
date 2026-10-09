@@ -37,6 +37,9 @@ case "$CAMPAIGN_MODE" in
     if [[ -n "${COMPARISON_HOST_PUBLICATION_ROOT:-}" ]]; then
       args+=(--comparison-host-publication-root "$COMPARISON_HOST_PUBLICATION_ROOT")
     fi
+    if [[ -n "${COMPARISON_EXTENSION_PUBLICATION_ROOT:-}" ]]; then
+      args+=(--comparison-extension-publication-root "$COMPARISON_EXTENSION_PUBLICATION_ROOT")
+    fi
     exec "$PYTHON_BIN" slurm/ambi_transfer_checkpoint_publish.py "${args[@]}"
     ;;
   publish)
