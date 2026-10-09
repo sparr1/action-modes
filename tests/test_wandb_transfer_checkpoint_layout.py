@@ -273,13 +273,15 @@ def followups():
             for key,color in adapter.J8_COLORS.items()]
 
 
-def test_j8_view_preserves_exact_v6_colors_and_upgrades_same_view_to_fourteen_curves(tmp_path):
+@pytest.mark.parametrize('previous_version',[layout.HOST_VERSION,layout.FOLLOWUP_VERSION])
+def test_j8_view_preserves_colors_and_upgrades_same_view_to_fourteen_curves(tmp_path,previous_version):
     original=dict(campaign(),comparison_styles=comparisons(),extension_styles=extensions())
     data=dict(original,followup_styles=followups())
-    old=layout.saved_spec(spec(),data,'entity','abc123',version=layout.HOST_VERSION)
-    assert old==layout.saved_spec(spec(),original,'entity','abc123')
+    old=layout.saved_spec(spec(),data,'entity','abc123',version=previous_version)
     # Captured from deployed dc72b61 before adding J8.
-    assert layout._hash(old)=='abc45cde5522c0629d82e5600c3c8c4537161b865c19dd4e2d240e1c5e1062be'
+    if previous_version==layout.HOST_VERSION:
+        assert old==layout.saved_spec(spec(),original,'entity','abc123')
+        assert layout._hash(old)=='abc45cde5522c0629d82e5600c3c8c4537161b865c19dd4e2d240e1c5e1062be'
     original_scale=layout.chart_definition(original)['encoding']['color']['scale']
     definition=layout.chart_definition(data);scale=definition['encoding']['color']['scale']
     assert scale['range']==original_scale['range']+list(adapter.J8_COLORS.values())
@@ -290,7 +292,7 @@ def test_j8_view_preserves_exact_v6_colors_and_upgrades_same_view_to_fourteen_cu
     others=deepcopy(service.views[:2]);kwargs=dict(campaign=data,entity='entity',project='ambi-inner-bench',
         publication_id='abc123',receipt_dir=tmp_path)
     result=layout.ensure_saved_view(SimpleNamespace(_service_api=service),**kwargs)
-    assert result['upgraded_from']==layout.HOST_VERSION and result['layout_version']==layout.FOLLOWUP_VERSION
+    assert result['upgraded_from']==previous_version and result['layout_version']==layout.LEGEND_VERSION
     assert result['view_id']=='owned' and result['url'].endswith('?nw=transfercurvesabc123')
     assert service.views[:2]==others and service.views[-1]['displayName']=='My saved comparison'
     installed=json.loads(service.views[-1]['spec']);panels=[p for s in installed['section']['panelBankConfig']['sections'] for p in s['panels']]

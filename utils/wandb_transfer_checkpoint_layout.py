@@ -12,6 +12,7 @@ from utils.transfer_checkpoint_publication import settings
 VERSION='transfer-checkpoint-curves-v5'
 HOST_VERSION='transfer-checkpoint-curves-v6'
 FOLLOWUP_VERSION='transfer-checkpoint-curves-v7'
+LEGEND_VERSION='transfer-checkpoint-curves-v8'
 PREVIOUS_VERSION='transfer-checkpoint-curves-v4'
 INTERACTIVE_VERSION='transfer-checkpoint-curves-v3'
 LEGACY_VERSION='transfer-checkpoint-curves-v2'
@@ -24,10 +25,10 @@ name:$name,displayName:$displayName,type:$type,access:$access,spec:$spec}){chart
 
 
 def _version(legacy=False, version=None, campaign=None):
-    default=(FOLLOWUP_VERSION if campaign and campaign.get('followup_styles') else
+    default=(LEGEND_VERSION if campaign and campaign.get('followup_styles') else
              HOST_VERSION if campaign and campaign.get('extension_styles') else VERSION)
     chosen=LEGACY_VERSION if legacy else default if version is None else version
-    if chosen not in (LEGACY_VERSION,INTERACTIVE_VERSION,PREVIOUS_VERSION,VERSION,HOST_VERSION,FOLLOWUP_VERSION):
+    if chosen not in (LEGACY_VERSION,INTERACTIVE_VERSION,PREVIOUS_VERSION,VERSION,HOST_VERSION,FOLLOWUP_VERSION,LEGEND_VERSION):
         raise ValueError('Unknown transfer checkpoint layout version.')
     return chosen
 
@@ -36,7 +37,7 @@ def display_settings(campaign, *, version=None):
     """External display styles never become scientific campaign candidates."""
     rows=settings(campaign)
     chosen=_version(version=version,campaign=campaign)
-    if chosen not in (VERSION,HOST_VERSION,FOLLOWUP_VERSION):
+    if chosen not in (VERSION,HOST_VERSION,FOLLOWUP_VERSION,LEGEND_VERSION):
         return rows
     comparisons=campaign.get('comparison_styles',[])
     if not isinstance(comparisons,list) or (comparisons and len(comparisons)!=2):
@@ -50,7 +51,7 @@ def display_settings(campaign, *, version=None):
                 or not re.fullmatch(r'#[0-9A-Fa-f]{6}',row['color'])):
             raise ResultsLayoutError('Invalid MPPI comparison style.')
     rows.extend(deepcopy(comparisons))
-    if chosen in (HOST_VERSION,FOLLOWUP_VERSION):
+    if chosen in (HOST_VERSION,FOLLOWUP_VERSION,LEGEND_VERSION):
         extensions=campaign.get('extension_styles')
         from utils.transfer_checkpoint_publication import J6_COLORS
         if (not isinstance(extensions,list) or len(extensions)!=3
@@ -62,7 +63,7 @@ def display_settings(campaign, *, version=None):
             if row.get('role')!=expected_role or row.get('color')!=J6_COLORS[row['setting_id']] or not row.get('label'):
                 raise ResultsLayoutError('Invalid H1 J6 extension style.')
         rows.extend(deepcopy(extensions))
-    if chosen==FOLLOWUP_VERSION:
+    if chosen in (FOLLOWUP_VERSION,LEGEND_VERSION):
         from utils.transfer_checkpoint_publication import J8_COLORS
         followups=campaign.get('followup_styles')
         if (not isinstance(followups,list) or len(followups)!=3
@@ -118,6 +119,10 @@ def chart_definition(campaign, *, legacy=False, version=None):
     if version==INTERACTIVE_VERSION:
         definition['params']=[{'name':'selected_curves','select':{'type':'point','fields':['${field:label}']},'bind':'legend'}]
         definition['encoding']['opacity']={'condition':{'param':'selected_curves','value':1},'value':.12}
+    if version==LEGEND_VERSION:
+        # The shared legend otherwise inherits the uncertainty area's 0.1 opacity.
+        definition['encoding']['color']['legend'].update(symbolOpacity=1,symbolSize=160,
+            labelColor={'expr':"scale('color', datum.value)"})
     return definition
 
 
@@ -173,7 +178,7 @@ def sections(campaign,entity, *, legacy=False, version=None):
                         if version==INTERACTIVE_VERSION else 'The live overview displays six curves with fixed colors. ')
         intro=intro.replace('One run per setting; use the run list to hide/show curves. All colors are fixed across panels. ',
                             overview_intro)
-    if version in (VERSION,HOST_VERSION,FOLLOWUP_VERSION):
+    if version in (VERSION,HOST_VERSION,FOLLOWUP_VERSION,LEGEND_VERSION):
         intro=intro.replace('The live overview displays six curves with fixed colors. ',
                             f'The comparison displays {len(styles)} curves with fixed colors. ')
         if campaign.get('comparison_styles'):
@@ -185,9 +190,9 @@ def sections(campaign,entity, *, legacy=False, version=None):
                 'they stay pending until both settings finish. MPPI has no matched fresh SAC control, so its fresh-control gains are not applicable. ')
             intro=intro.replace('Historical prior timing is unavailable. ',
                 'Historical prior timing is unavailable. MPPI runtime is omitted because the historical runs used mixed GPUs and lack matching steady-time measurements. ')
-    if version in (HOST_VERSION,FOLLOWUP_VERSION):
+    if version in (HOST_VERSION,FOLLOWUP_VERSION,LEGEND_VERSION):
         intro+=' H1 J6 fresh, critic 50% copying and actor 50% shrink are evaluated only at the 60 checkpoints from 525k through 2M. Earlier checkpoints for these three curves were not requested.'
-    if version==FOLLOWUP_VERSION:
+    if version in (FOLLOWUP_VERSION,LEGEND_VERSION):
         intro+=' The three H1 J8 curves use the same 60-checkpoint range and five paired seeds, with their own matched fresh J8 control.'
     panels=[_panel('curve-intro','Markdown Panel',{'value':intro},width=24,height=5),
         _panel('curve-progress','Media Browser',{'chartTitle':'Checkpoint progress, including pending and failed evaluations',
@@ -251,7 +256,7 @@ def _installed(spec,campaign,entity,publication_id, *, legacy=False, version=Non
 
 
 def ensure_saved_view(api,*,campaign,entity,project,publication_id,receipt_dir):
-    """Create or upgrade our exact v2/v3/v4/v5/v6; preserve unknown edits and other views."""
+    """Upgrade exact prior layouts; preserve unknown edits and other views."""
     if not re.fullmatch(r'[A-Za-z0-9]+',publication_id):
         raise ResultsLayoutError('Publication ID must be alphanumeric for the W&B saved-view URL.')
     root=Path(receipt_dir);root.mkdir(parents=True,exist_ok=True)
@@ -269,7 +274,8 @@ def ensure_saved_view(api,*,campaign,entity,project,publication_id,receipt_dir):
             if _installed(_spec(before),campaign,entity,publication_id):
                 receipt.update(status='verified',changed=False,view_id=before['id'])
                 _write(root/'results-layout-receipt.json',receipt);return receipt
-            installed_version=next((version for version in (HOST_VERSION,VERSION,PREVIOUS_VERSION,INTERACTIVE_VERSION,LEGACY_VERSION)
+            installed_version=next((version for version in (FOLLOWUP_VERSION,HOST_VERSION,VERSION,PREVIOUS_VERSION,INTERACTIVE_VERSION,LEGACY_VERSION)
+                if (version!=FOLLOWUP_VERSION or campaign.get('followup_styles'))
                 if (version!=HOST_VERSION or campaign.get('extension_styles'))
                 if _installed(_spec(before),campaign,entity,publication_id,version=version)),None)
             if installed_version is None:
