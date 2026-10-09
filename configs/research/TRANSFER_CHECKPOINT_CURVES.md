@@ -136,3 +136,37 @@ MPPI timing is also omitted: the first 40 checkpoints reuse a historical GPU
 pool and include different diagnostic timing, while no matching decisions
 10–499 timing is available. Return, paired-prior gain, sample SD and minimum
 seed return use all five existing episodes at each checkpoint.
+
+## J6 extension after 500k
+
+`ambi_transfer_checkpoint_j6_after500k_curves.json` selects H1/J6 fresh SAC,
+critic Bernoulli 50% copying of all learned critic parameters, and 50% actor
+matrix shrinkage. It uses `ambi_transfer_checkpoint_j6_after500k_shortlist.json`
+and restricts the existing backbone inventory to 525k–2M, inclusive, every 25k.
+The 500k checkpoint itself is excluded. This is 60 checkpoints, 180 new cells,
+and 900 full episodes on seeds 101–105. The joint Bernoulli 75% arm is omitted.
+All C16/A4/N128/B256 settings, independent solver/transfer randomness, frozen
+outer state, diagnostics and controller timing definitions above are retained.
+J6 uses 768 imagined H1 transitions, 96 critic updates, and 24 actor updates per
+real decision. Smoke checks cover all three settings at 525k, 575k and 2M.
+
+Pass the new selection through `CAMPAIGN_CONFIG` to the existing Oscar CPU
+preparation wrapper. The default remains the original J2/J4 campaign. Keep the
+new campaign and publication directories separate from the completed original
+campaign, and pin the new tested source commit before preparation.
+
+The completed J2/J4, base actor and H3 MPPI evaluations remain reference data.
+The J6 publication uses new scientific run identities and adds only its three
+new curves to the existing comparison view. Its prior registry is a validated
+read-only reference to the original published prior records. New transfer
+artifacts link the existing prior artifact rather than uploading its traces
+again. The new overview excludes prior rows, so the shared display contains
+each checkpoint/setting once. Paired gains over fresh SAC use the new J6 fresh
+control; they remain pending until both J6 settings complete at a checkpoint.
+Use `prepare --comparison-host-publication-root ORIGINAL/publication` (or
+`COMPARISON_HOST_PUBLICATION_ROOT` in the CPU wrapper) to bind the existing
+comparison. The publisher pins the completed host and prior record hashes,
+allocates three new scientific runs and one overview, and upgrades the exact
+original v5 view to v6 at the same URL. It preserves unknown view edits by
+refusing the upgrade. The combined tables contain 820 rows: 480 original,
+160 MPPI, and 180 J6, including pending rows with null metrics.

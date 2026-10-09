@@ -2,8 +2,9 @@
 """Publish validated transfer checkpoint curves using durable eval-series runs.
 
 ``prepare`` is local-only and allocates exactly one new run per setting plus a
-prior run. ``watch`` serially publishes completed scientific records, retains
-per-run summary tables, and logs combined display tables on a separate overview
+prior run unless an explicit comparison host reuses its published prior read-only.
+``watch`` serially publishes completed scientific records, retains per-run summary
+tables, and logs combined display tables on a separate overview
 run. It never inserts non-result rows into immutable scientific curve history.
 """
 from __future__ import annotations
@@ -40,6 +41,112 @@ def fingerprint(value):
     return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
 
 
+def comparison_host_receipt(campaign, campaign_path, host_root, entity, project):
+    """Pin the completed original comparison without allocating/copying its runs."""
+    from utils.eval_series import validate_record, _record_fingerprint
+    from utils.transfer_checkpoint_publication import J6_COLORS
+    host_root=Path(host_root).resolve(); path=host_root/'publication.json'; host=read(path)
+    host_campaign_path=Path(host['campaign_root'])/'campaign.json'; original=read(host_campaign_path)
+    require(host.get('prepared') is True and host['campaign_sha256']==digest(host_campaign_path),
+            'Comparison host campaign binding differs.')
+    require(host['entity']==entity and host['project']==project,'Comparison host W&B project differs.')
+    require(re.fullmatch(r'[A-Za-z0-9]+',host['publication_id']) is not None,'Invalid comparison host ID.')
+    require(host.get('layout',{}).get('status')=='verified'
+            and host['layout']['layout_version']=='transfer-checkpoint-curves-v5',
+            'Comparison host must be the verified original v5 view.')
+    require([cp['step'] for cp in original['checkpoints']]==list(range(25000,2000001,25000)),
+            'Comparison host must contain the original 80 checkpoints.')
+    require([cp['step'] for cp in campaign['checkpoints']]==list(range(525000,2000001,25000)),
+            'Hosted H1 J6 requires exactly the 60 checkpoints after 500k.')
+    require(len(campaign['candidates'])==3 and {row['setting_id'] for row in campaign['candidates']}==set(J6_COLORS)
+            and all(row['H']==1 and row['J']==6 for row in campaign['candidates']),
+            'Comparison host supports only the three H1 J6 settings.')
+    require(all(campaign[key]==original[key] for key in ('protocol','source_run','seeds','controller_seed','max_steps')),
+            'Comparison host backbone or episode protocol differs.')
+    require(all(campaign.get(key)==original.get(key) for key in ('scientific_source','diagnostics','gpu_hardware')),
+            'Comparison host science, diagnostics or timing hardware differs.')
+    layout_campaign=comparison_layout_campaign(original,host,host_root)
+    require(len(display_settings(layout_campaign))==8,'Comparison host requires the original six curves and two published MPPI curves.')
+    completion=read(host_root/'publisher-complete.json')
+    require(completion.get('status')=='complete' and completion.get('completed')==completion.get('total')==400,
+            'Comparison host publication must be complete.')
+    prior_entry=deepcopy(host['runs'][PRIOR_ID]); directory=Path(prior_entry['run_dir'])
+    registry=load_run(directory); journal=read(directory/'publication.json')
+    require(registry['run_id']==prior_entry['run_id'] and registry['identity']==identity(original,settings(original)[0]),
+            'Comparison host prior identity differs.')
+    require(len(journal['records'])==80 and all(row['status']=='published' for row in journal['records'].values()),
+            'Comparison host prior must contain 80 published records.')
+    indexed={row['checkpoint_step']:(rid,row) for rid,row in journal['records'].items()}
+    require(len(indexed)==80,'Repeated host prior checkpoint.')
+    original_checkpoints={row['step']:row for row in original['checkpoints']}; pins={}
+    for checkpoint in campaign['checkpoints']:
+        step=checkpoint['step']; old=original_checkpoints[step]
+        require(all(checkpoint[key]==old[key] for key in
+                    ('checkpoint_sha256','metadata_sha256','prior_manifest_code','prior_pin')),
+                'Comparison host checkpoint or historical prior pin differs.')
+        rid,entry=indexed[step]; record_path=directory/'records'/(rid+'.json')
+        record=validate_record(read(record_path),registry['identity'])
+        require(record['record_id']==rid and record['checkpoint']==dict(step=step,sha256=checkpoint['checkpoint_sha256'])
+                and _record_fingerprint(record,entry['artifact_sha256'])==entry['record_sha256'],
+                'Published host prior record fingerprint differs.')
+        normalized=normalize_prior(campaign,checkpoint,checkpoint['prior_pin'])
+        require(record['episodes']==normalized['episodes'] and record['metrics']==normalized['metrics']
+                and record['provenance']==normalized['provenance'],
+                'Published prior episodes or provenance differ from the pinned reference.')
+        alias='record-'+hashlib.sha256(rid.encode()).hexdigest()[:20]
+        pins[str(step)]=dict(record_id=rid,record_sha256=entry['record_sha256'],
+            record_file_sha256=digest(record_path),checkpoint=deepcopy(record['checkpoint']),
+            artifact=f"{entity}/{project}/eval-{registry['run_id']}-{step}:{alias}")
+    styles=[{key:row[key] for key in ('setting_id','label','color','role')} for row in settings(campaign)[1:]]
+    result=dict(format_version=1,kind='h1-j6-after500k-comparison-host',campaign_sha256=digest(campaign_path),
+        host_publication_root=str(host_root),host_publication_id=host['publication_id'],
+        host_publication_sha256=digest(path),host_campaign_path=str(host_campaign_path),
+        host_campaign_sha256=digest(host_campaign_path),mppi_overlay_sha256=digest(host_root/'mppi-overlay.json'),
+        host_overview_run_id=host['overview']['run_id'],prior_run=dict(run_dir=str(directory),run_id=registry['run_id'],
+            identity_sha256=registry['identity_sha256'],journal_sha256=digest(directory/'publication.json')),
+        prior_records=pins,extension_styles=styles)
+    display_settings(dict(layout_campaign,extension_styles=styles))
+    return result
+
+
+def validate_comparison_host(campaign,state,output):
+    """Read-only resume guard; never normalize/stage or rewrite a host record."""
+    expected=state.get('comparison_host_sha256')
+    if not expected:return None
+    path=Path(output)/'comparison-host.json'
+    require(digest(path)==expected,'Comparison host receipt changed.')
+    host=read(path)
+    require(host.get('format_version')==1 and host.get('kind')=='h1-j6-after500k-comparison-host'
+            and host['campaign_sha256']==state['campaign_sha256']
+            and host['host_publication_id']==state.get('comparison_publication_id'),'Comparison host receipt binding differs.')
+    root=Path(host['host_publication_root'])
+    require(digest(root/'publication.json')==host['host_publication_sha256']
+            and digest(host['host_campaign_path'])==host['host_campaign_sha256']
+            and digest(root/'mppi-overlay.json')==host['mppi_overlay_sha256'],
+            'Pinned comparison host changed.')
+    require(set(host['prior_records'])=={str(cp['step']) for cp in campaign['checkpoints']},
+            'Comparison host checkpoint selection changed.')
+    entry=host['prior_run']; directory=Path(entry['run_dir']); registry=load_run(directory)
+    require(registry['run_id']==entry['run_id'] and registry['identity_sha256']==entry['identity_sha256']
+            and digest(directory/'publication.json')==entry['journal_sha256'],
+            'Published prior registry or journal changed.')
+    require(state['runs'][PRIOR_ID]['run_dir']==entry['run_dir']
+            and state['runs'][PRIOR_ID]['run_id']==entry['run_id']
+            and state['runs'][PRIOR_ID].get('read_only') is True,'Hosted prior must remain read-only.')
+    for pin in host['prior_records'].values():
+        require(digest(directory/'records'/(pin['record_id']+'.json'))==pin['record_file_sha256'],
+                'Pinned published prior record changed.')
+    return host
+
+
+def owned_settings(campaign,state):
+    return [row for row in settings(campaign) if not state['runs'][row['setting_id']].get('read_only')]
+
+
+def comparison_publication_id(state):
+    return state.get('comparison_publication_id',state['publication_id'])
+
+
 def prepare(args):
     """Allocate once, recover an interrupted allocation, and stage pinned priors."""
     root=Path(args.root).resolve(); output=Path(args.publication_root).resolve()
@@ -47,7 +154,18 @@ def prepare(args):
     binding=dict(campaign_root=str(root),campaign_sha256=digest(root/'campaign.json'),
         entity=args.entity,project=args.project,owner=args.owner,attempt_label=args.attempt_label)
     require(args.project=='ambi-inner-bench','Transfer curves belong in ambi-inner-bench.')
+    requested_host=getattr(args,'comparison_host_publication_root',None)
+    host=(comparison_host_receipt(campaign,root/'campaign.json',requested_host,args.entity,args.project)
+          if requested_host else None)
+    binding['comparison_host_sha256']=None
     with publisher_lock(output):
+        host_path=output/'comparison-host.json'
+        if host:
+            if host_path.exists():
+                require(read(host_path)==host,'Comparison host receipt differs.')
+            else:write(host_path,host)
+            # Receipt hash is its exact on-disk bytes, not its JSON encoding.
+            binding['comparison_host_sha256']=digest(host_path)
         path=output/'publication.json'
         if path.exists():
             state=read(path)
@@ -55,7 +173,14 @@ def prepare(args):
         else:
             state=dict(schema_version=1,publication_id=uuid.uuid4().hex,**binding,runs={})
             write(path,state)
+        if host:
+            state['comparison_publication_id']=host['host_publication_id']
+            inherited=host['prior_run']
+            state['runs'][PRIOR_ID]=dict(run_dir=inherited['run_dir'],run_id=inherited['run_id'],read_only=True,
+                label=settings(campaign)[0]['label'],color='#000000',order=0)
+            write(path,state)
         for order,setting in enumerate(settings(campaign)):
+            if host and setting['setting_id']==PRIOR_ID:continue
             key=setting['setting_id']; template=dict(identity=identity(campaign,setting),label=setting['label'])
             registry_root=output/'registry'/key
             if key not in state['runs']:
@@ -69,7 +194,7 @@ def prepare(args):
                 write(path,state)
             registry=load_run(state['runs'][key]['run_dir'])
             require(registry['identity']==template['identity'],'Registry identity differs.')
-        for checkpoint in campaign['checkpoints']:
+        for checkpoint in ([] if host else campaign['checkpoints']):
             record=normalize_prior(campaign,checkpoint,checkpoint['prior_pin'])
             stage_record(state['runs'][PRIOR_ID]['run_dir'],record)
         state['prepared']=True
@@ -148,7 +273,11 @@ def collect(root,campaign,state,*,jobs_active):
     """Only receipt-verified complete seed panels can become data points."""
     from slurm.ambi_transfer_curve_campaign import validate_receipt,validate_result,receipt_path
     root=Path(root)
-    records={key:records_by_step(row['run_dir']) for key,row in state['runs'].items()}
+    output=Path(state['runs'][campaign['candidates'][0]['setting_id']]['run_dir']).parents[2]
+    host=validate_comparison_host(campaign,state,output)
+    selected_steps={row['step'] for row in campaign['checkpoints']}
+    records={key:{step:record for step,record in records_by_step(row['run_dir']).items() if step in selected_steps}
+             for key,row in state['runs'].items()}
     progress={key:{} for key in state['runs']}
     failures={}
     for cell in campaign['cells']:
@@ -160,7 +289,8 @@ def collect(root,campaign,state,*,jobs_active):
             try:
                 receipt=validate_receipt(root,campaign,cell)
                 result,manifest=validate_result(directory,campaign,cell,allow_historical=receipt['historical_reuse'])
-                record=normalize_transfer(campaign,cell,receipt,result,manifest,records[PRIOR_ID][step],receipt_path=marker)
+                record=normalize_transfer(campaign,cell,receipt,result,manifest,records[PRIOR_ID][step],receipt_path=marker,
+                    prior_reference=host['prior_records'][str(step)] if host else None)
                 # Registry is publication_root/registry/setting/run_id. Existing
                 # accepted records were skipped above, preserving their hashes.
                 cache_root=Path(state['runs'][key]['run_dir']).parents[2]/'packed-traces'
@@ -183,7 +313,7 @@ def collect(root,campaign,state,*,jobs_active):
         progress[key][step]=dict(state=status_name,completed_episodes=status.get('completed_episodes',0),
             seed=status.get('seed'),decision=status.get('decision'),error=failures.get(cell['name']))
     curves={}
-    for setting in settings(campaign):
+    for setting in owned_settings(campaign,state):
         key=setting['setting_id']
         matched=fresh_setting(campaign,setting)
         points,states=table_rows(campaign,setting,records[key],progress[key],
@@ -205,7 +335,7 @@ def summary_payload(wandb,curve):
 def publish_snapshot(campaign,state,snapshot,output,wandb):
     """Summary tables update in place; only eval-series owns the history stream."""
     output=Path(output)
-    for setting in settings(campaign):
+    for setting in owned_settings(campaign,state):
         key=setting['setting_id']; entry=state['runs'][key]; curve=snapshot['curves'][key]
         stamp=fingerprint(curve)
         journal=read(Path(entry['run_dir'])/'publication.json')
@@ -255,10 +385,11 @@ def publish_overview(campaign,state,snapshot,output,wandb):
     if entry.get('snapshot_sha256')==stamp:
         return
     run=wandb.init(entity=state['entity'],project=state['project'],id=entry['run_id'],resume='allow',
-        mode='online',name='Transfer backbone · live comparison',job_type='transfer-checkpoint-overview',
+        mode='online',name='J6 after 500k · live comparison' if state.get('comparison_host_sha256') else 'Transfer backbone · live comparison',
+        job_type='transfer-checkpoint-overview',
         group='transfer-backbone-'+state['publication_id'][:8],
         tags=['transfer-backbone','publication-only','five-seed','full-episode'],
-        config=dict(transfer_curve_overview=state['publication_id'],source_campaign_sha256=state['campaign_sha256'],
+        config=dict(transfer_curve_overview=comparison_publication_id(state),source_campaign_sha256=state['campaign_sha256'],
             scientific_run_ids={key:entry['run_id'] for key,entry in state['runs'].items()},
             source_commit=campaign['source_commit'],seeds=campaign['seeds'],
             max_steps=campaign['max_steps'],source_run=campaign['source_run']),
@@ -286,6 +417,13 @@ def comparison_layout_campaign(campaign,state,output):
     publisher rewrites from its in-memory state. No new scientific run, record,
     or campaign cell is introduced by this display overlay.
     """
+    if state.get('comparison_host_sha256'):
+        host=validate_comparison_host(campaign,state,output)
+        root=Path(host['host_publication_root']); original=read(host['host_campaign_path'])
+        result=comparison_layout_campaign(original,read(root/'publication.json'),root)
+        result['extension_styles']=deepcopy(host['extension_styles'])
+        display_settings(result)
+        return result
     path=Path(output)/'mppi-overlay.json'
     if not path.exists():
         return campaign
@@ -329,13 +467,14 @@ def watch(args):
                     previous_layout=state.get('layout')
                     layout_campaign=comparison_layout_campaign(campaign,state,output)
                     state['layout']=ensure_saved_view(wandb.Api(timeout=30),campaign=layout_campaign,
-                        entity=state['entity'],project=state['project'],publication_id=state['publication_id'],
+                        entity=state['entity'],project=state['project'],publication_id=comparison_publication_id(state),
                         receipt_dir=output/'results-layout')
                     layout_checked=True
                     # Reflect a newly installed view in every run, while a
                     # resumed publisher rechecks the view without extra writes.
                     if previous_layout != state['layout']:
-                        for entry in state['runs'].values():entry.pop('snapshot_sha256',None)
+                        for entry in state['runs'].values():
+                            if not entry.get('read_only'):entry.pop('snapshot_sha256',None)
                     write(output/'publication.json',state)
                     publish_snapshot(campaign,state,snapshot,output,wandb)
                     publish_overview(campaign,state,snapshot,output,wandb)
@@ -367,6 +506,8 @@ def parser():
     for child in (prepare_parser,watch_parser):
         child.add_argument('--root',type=Path,required=True)
         child.add_argument('--publication-root',type=Path,required=True)
+    prepare_parser.add_argument('--comparison-host-publication-root',type=Path,
+        help='Reuse the completed original comparison and its prior read-only for the H1 J6 extension.')
     prepare_parser.add_argument('--attempt-label',required=True)
     prepare_parser.add_argument('--owner',default='oscar-rgao48')
     prepare_parser.add_argument('--entity',default='rwgao_b-brown-university')

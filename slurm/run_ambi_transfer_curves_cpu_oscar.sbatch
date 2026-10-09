@@ -32,9 +32,12 @@ case "$CAMPAIGN_MODE" in
     ;;
   publication_prepare)
     export WANDB_MODE=disabled
-    exec "$PYTHON_BIN" slurm/ambi_transfer_checkpoint_publish.py prepare \
-      --root "$CAMPAIGN_ROOT" --publication-root "${PUBLICATION_ROOT:?}" \
-      --attempt-label "${ATTEMPT_LABEL:?}" --project ambi-inner-bench
+    args=(prepare --root "$CAMPAIGN_ROOT" --publication-root "${PUBLICATION_ROOT:?}"
+      --attempt-label "${ATTEMPT_LABEL:?}" --project ambi-inner-bench)
+    if [[ -n "${COMPARISON_HOST_PUBLICATION_ROOT:-}" ]]; then
+      args+=(--comparison-host-publication-root "$COMPARISON_HOST_PUBLICATION_ROOT")
+    fi
+    exec "$PYTHON_BIN" slurm/ambi_transfer_checkpoint_publish.py "${args[@]}"
     ;;
   publish)
     export WANDB_MODE=online

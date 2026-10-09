@@ -10,6 +10,7 @@ from utils.wandb_transfer_discovery_layout import _CREATE_VIEW
 from utils.transfer_checkpoint_publication import settings
 
 VERSION='transfer-checkpoint-curves-v5'
+HOST_VERSION='transfer-checkpoint-curves-v6'
 PREVIOUS_VERSION='transfer-checkpoint-curves-v4'
 INTERACTIVE_VERSION='transfer-checkpoint-curves-v3'
 LEGACY_VERSION='transfer-checkpoint-curves-v2'
@@ -21,9 +22,10 @@ $type:String!,$access:String!,$spec:JSONString!){createCustomChart(input:{entity
 name:$name,displayName:$displayName,type:$type,access:$access,spec:$spec}){chart{id name type spec}}}'''
 
 
-def _version(legacy=False, version=None):
-    chosen=LEGACY_VERSION if legacy else VERSION if version is None else version
-    if chosen not in (LEGACY_VERSION,INTERACTIVE_VERSION,PREVIOUS_VERSION,VERSION):
+def _version(legacy=False, version=None, campaign=None):
+    default=HOST_VERSION if campaign and campaign.get('extension_styles') else VERSION
+    chosen=LEGACY_VERSION if legacy else default if version is None else version
+    if chosen not in (LEGACY_VERSION,INTERACTIVE_VERSION,PREVIOUS_VERSION,VERSION,HOST_VERSION):
         raise ValueError('Unknown transfer checkpoint layout version.')
     return chosen
 
@@ -31,7 +33,8 @@ def _version(legacy=False, version=None):
 def display_settings(campaign, *, version=None):
     """External display styles never become scientific campaign candidates."""
     rows=settings(campaign)
-    if _version(version=version)!=VERSION:
+    chosen=_version(version=version,campaign=campaign)
+    if chosen not in (VERSION,HOST_VERSION):
         return rows
     comparisons=campaign.get('comparison_styles',[])
     if not isinstance(comparisons,list) or (comparisons and len(comparisons)!=2):
@@ -45,6 +48,18 @@ def display_settings(campaign, *, version=None):
                 or not re.fullmatch(r'#[0-9A-Fa-f]{6}',row['color'])):
             raise ResultsLayoutError('Invalid MPPI comparison style.')
     rows.extend(deepcopy(comparisons))
+    if chosen==HOST_VERSION:
+        extensions=campaign.get('extension_styles')
+        from utils.transfer_checkpoint_publication import J6_COLORS
+        if (not isinstance(extensions,list) or len(extensions)!=3
+                or not all(isinstance(row,dict) for row in extensions)
+                or {row.get('setting_id') for row in extensions}!=set(J6_COLORS)):
+            raise ResultsLayoutError('Expected the three H1 J6 extension styles.')
+        for row in extensions:
+            expected_role='fresh' if row['setting_id']=='h1_j6_fresh' else 'transfer'
+            if row.get('role')!=expected_role or row.get('color')!=J6_COLORS[row['setting_id']] or not row.get('label'):
+                raise ResultsLayoutError('Invalid H1 J6 extension style.')
+        rows.extend(deepcopy(extensions))
     for key in ('setting_id','label','color'):
         values=[row[key].lower() if key=='color' else row[key] for row in rows]
         if len(set(values))!=len(rows):
@@ -53,7 +68,7 @@ def display_settings(campaign, *, version=None):
 
 
 def chart_definition(campaign, *, legacy=False, version=None):
-    version=_version(legacy,version)
+    version=_version(legacy,version,campaign)
     styles=display_settings(campaign,version=version)
     definition = {'$schema':'https://vega.github.io/schema/vega-lite/v5.json',
         'data':{'name':'wandb'},'width':'container','height':360,
@@ -125,7 +140,7 @@ def runset(publication_id, *, legacy=False):
 
 
 def sections(campaign,entity, *, legacy=False, version=None):
-    version=_version(legacy,version)
+    version=_version(legacy,version,campaign)
     styles=display_settings(campaign,version=version)
     intro=('### Transfer across the checkpoint bank\n\n'
         f"**{len(campaign['checkpoints'])} checkpoints · {sum(row.get('role')=='transfer' for row in styles)} transfer settings, "
@@ -143,7 +158,7 @@ def sections(campaign,entity, *, legacy=False, version=None):
                         if version==INTERACTIVE_VERSION else 'The live overview displays six curves with fixed colors. ')
         intro=intro.replace('One run per setting; use the run list to hide/show curves. All colors are fixed across panels. ',
                             overview_intro)
-    if version==VERSION:
+    if version in (VERSION,HOST_VERSION):
         intro=intro.replace('The live overview displays six curves with fixed colors. ',
                             f'The comparison displays {len(styles)} curves with fixed colors. ')
         if campaign.get('comparison_styles'):
@@ -155,6 +170,8 @@ def sections(campaign,entity, *, legacy=False, version=None):
                 'they stay pending until both settings finish. MPPI has no matched fresh SAC control, so its fresh-control gains are not applicable. ')
             intro=intro.replace('Historical prior timing is unavailable. ',
                 'Historical prior timing is unavailable. MPPI runtime is omitted because the historical runs used mixed GPUs and lack matching steady-time measurements. ')
+    if version==HOST_VERSION:
+        intro+=' H1 J6 fresh, critic 50% copying and actor 50% shrink are evaluated only at the 60 checkpoints from 525k through 2M. Earlier checkpoints for these three curves were not requested.'
     panels=[_panel('curve-intro','Markdown Panel',{'value':intro},width=24,height=5),
         _panel('curve-progress','Media Browser',{'chartTitle':'Checkpoint progress, including pending and failed evaluations',
             'mediaKeys':[PROGRESS_KEY]},width=24,height=9)]
@@ -196,7 +213,7 @@ def sections(campaign,entity, *, legacy=False, version=None):
 
 
 def saved_spec(template,campaign,entity,publication_id, *, legacy=False, version=None):
-    version=_version(legacy,version)
+    version=_version(legacy,version,campaign)
     result=deepcopy(template)
     result['section'].update(runSets=[runset(publication_id,legacy=version==LEGACY_VERSION)],openRunSet=0,
         workspaceSettings={'shouldAutoGeneratePanels':False})
@@ -205,7 +222,7 @@ def saved_spec(template,campaign,entity,publication_id, *, legacy=False, version
 
 
 def _installed(spec,campaign,entity,publication_id, *, legacy=False, version=None):
-    version=_version(legacy,version)
+    version=_version(legacy,version,campaign)
     expected=sections(campaign,entity,version=version); actual=deepcopy(_bank(spec)['sections'])
     if len(actual)!=len(expected) or spec['section'].get('runSets')!=[runset(publication_id,legacy=version==LEGACY_VERSION)]: return False
     for section,wanted in zip(actual,expected):
@@ -217,13 +234,13 @@ def _installed(spec,campaign,entity,publication_id, *, legacy=False, version=Non
 
 
 def ensure_saved_view(api,*,campaign,entity,project,publication_id,receipt_dir):
-    """Create or upgrade our exact v2/v3/v4; preserve unknown edits and other views."""
+    """Create or upgrade our exact v2/v3/v4/v5; preserve unknown edits and other views."""
     if not re.fullmatch(r'[A-Za-z0-9]+',publication_id):
         raise ResultsLayoutError('Publication ID must be alphanumeric for the W&B saved-view URL.')
     root=Path(receipt_dir);root.mkdir(parents=True,exist_ok=True)
     name='nw-transfercurves'+publication_id+'-v'
     url=f'https://wandb.ai/{entity}/{project}?nw={name[3:-2]}'
-    receipt=dict(layout_version=VERSION,view_name=name,url=url,browser_verified=False)
+    receipt=dict(layout_version=_version(campaign=campaign),view_name=name,url=url,browser_verified=False)
     try:
         receipt['chart_id']=ensure_chart(api,campaign,entity)
         views=_views(api,entity,project)
@@ -235,7 +252,7 @@ def ensure_saved_view(api,*,campaign,entity,project,publication_id,receipt_dir):
             if _installed(_spec(before),campaign,entity,publication_id):
                 receipt.update(status='verified',changed=False,view_id=before['id'])
                 _write(root/'results-layout-receipt.json',receipt);return receipt
-            installed_version=next((version for version in (PREVIOUS_VERSION,INTERACTIVE_VERSION,LEGACY_VERSION)
+            installed_version=next((version for version in (VERSION,PREVIOUS_VERSION,INTERACTIVE_VERSION,LEGACY_VERSION)
                 if _installed(_spec(before),campaign,entity,publication_id,version=version)),None)
             if installed_version is None:
                 raise ResultsLayoutError('Existing comparison view differs; preserving user edits.')

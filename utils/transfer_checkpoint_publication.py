@@ -18,6 +18,8 @@ from utils.eval_series import SeriesError, validate_record
 PROTOCOL = 'inner-sac-transfer-checkpoint-curves-v1'
 PRIOR_ID = 'prior'
 COLORS = ('#0072b2', '#d55e00', '#009e73', '#777777', '#b59b71', '#cc79a7')
+J6_COLORS = {'h1_j6_fresh':'#6f4c9b', 'h1_j6_bernoulli_a0_c05':'#c43c39',
+             'h1_j6_matrix_blend05_actor':'#087e8b'}
 POINT_COLUMNS = ['step','setting','label','segment','state','return_mean','return_std',
     'return_lower','return_upper','gain_mean','gain_std','gain_lower','gain_upper',
     'fresh_setting','fresh_gain_mean','fresh_gain_std','fresh_gain_lower','fresh_gain_upper',
@@ -56,7 +58,7 @@ def moments(values):
 def settings(campaign):
     rows = [dict(setting_id=PRIOR_ID, label='Prior mean (no inner solve)', color='#000000')]
     require(len(campaign['candidates']) <= len(COLORS), 'Add explicit colors before publishing more than six candidates.')
-    rows.extend(dict(candidate, color=COLORS[index]) for index,candidate in enumerate(campaign['candidates']))
+    rows.extend(dict(candidate, color=J6_COLORS.get(candidate['setting_id'],COLORS[index])) for index,candidate in enumerate(campaign['candidates']))
     require(len({row['setting_id'] for row in rows}) == len(rows), 'Duplicate setting IDs.')
     require(len({row['label'] for row in rows}) == len(rows), 'Duplicate curve labels.')
     return rows
@@ -176,7 +178,7 @@ def normalize_prior(campaign, checkpoint, pin):
     return _record(campaign,settings(campaign)[0],checkpoint,episodes,files,provenance,path,metrics)
 
 
-def normalize_transfer(campaign, cell, receipt, result, manifest, prior, *, receipt_path):
+def normalize_transfer(campaign, cell, receipt, result, manifest, prior, *, receipt_path, prior_reference=None):
     """The worker's strict receipt verifier must run before this adapter."""
     cp = campaign['checkpoints'][cell['checkpoint_index']]
     require(prior['checkpoint'] == dict(step=cp['step'],sha256=cp['checkpoint_sha256']), 'Paired prior checkpoint differs.')
@@ -193,7 +195,12 @@ def normalize_transfer(campaign, cell, receipt, result, manifest, prior, *, rece
     episodes = _episodes(result['episodes'],campaign)
     lookup = {row['seed']:row for row in prior['episodes']}
     files = {'manifest.json':directory/'manifest.json','results.json':directory/'results.json',
-             'worker-receipt.json':receipt_path, **{'reference/'+key:value for key,value in prior['artifact_files'].items()}}
+             'worker-receipt.json':receipt_path}
+    if prior_reference is None:
+        files.update({'reference/'+key:value for key,value in prior['artifact_files'].items()})
+    else:
+        require(prior_reference.get('record_id') == prior['record_id']
+                and prior_reference.get('checkpoint') == prior['checkpoint'], 'Published prior reference differs.')
     late=[]; full=[]
     for episode in episodes:
         path = directory/f"decisions-seed-{episode['seed']}.jsonl"
@@ -225,6 +232,9 @@ def normalize_transfer(campaign, cell, receipt, result, manifest, prior, *, rece
         original_campaign_sha256=manifest['campaign_sha256'], worker_receipt=deepcopy(receipt),
         prior_record_id=prior['record_id'], prior_source=deepcopy(prior['provenance']),
         resolved_config=manifest['resolved'], timing_decision_range=[10,499])
+    if prior_reference is not None:
+        provenance.update(published_prior_reference=deepcopy(prior_reference),
+                          legacy_artifacts=[prior_reference['artifact']])
     return _record(campaign,setting,cp,episodes,files,provenance,directory/'results.json',metrics)
 
 

@@ -223,3 +223,46 @@ def test_invalid_or_ambiguous_comparison_style_is_rejected(field,value):
     external=comparisons();external[0][field]=value
     with pytest.raises(layout.ResultsLayoutError):
         layout.chart_definition(dict(campaign(),comparison_styles=external))
+
+
+def extensions():
+    return [dict(setting_id=key,label='J6 '+key,role='fresh' if key.endswith('_fresh') else 'transfer',color=color)
+            for key,color in adapter.J6_COLORS.items()]
+
+
+def test_host_extension_preserves_exact_v5_and_eleven_curve_style_contract(tmp_path):
+    original=dict(campaign(),comparison_styles=comparisons())
+    data=dict(original,extension_styles=extensions())
+    assert layout.saved_spec(spec(),data,'entity','abc123',version=layout.VERSION)==layout.saved_spec(spec(),original,'entity','abc123')
+    # Captured from deployed e1a7e94a before adding hosted extensions.
+    assert layout._hash(layout.saved_spec(spec(),data,'entity','abc123',version=layout.VERSION))=='e5aab93f95dbd914b65790f6904b055a4148d773961b301b8c2139af7c1b9540'
+    definition=layout.chart_definition(data)
+    assert definition['encoding']['color']['scale']['range']==['#000000',*adapter.COLORS[:5],'#cc79a7','#56b4e9',*adapter.J6_COLORS.values()]
+    assert definition['encoding']['strokeDash']['scale']['range'][-3:]==[[6,3],[1,0],[1,0]]
+    assert len(set(definition['encoding']['color']['scale']['range']))==11
+    service=Service();old=layout.saved_spec(spec(),original,'entity','abc123')
+    service.views.append(dict(id='owned',name='nw-transfercurvesabc123-v',type='project-view',
+        displayName='My saved comparison',spec=json.dumps(old)))
+    before=deepcopy(service.views[:2]);kwargs=dict(campaign=data,entity='entity',project='ambi-inner-bench',
+        publication_id='abc123',receipt_dir=tmp_path)
+    result=layout.ensure_saved_view(SimpleNamespace(_service_api=service),**kwargs)
+    assert result['upgraded_from']==layout.VERSION and result['layout_version']==layout.HOST_VERSION
+    assert result['view_id']=='owned' and result['url'].endswith('?nw=transfercurvesabc123')
+    assert service.views[:2]==before and service.views[-1]['displayName']=='My saved comparison'
+    panels=[p for s in json.loads(service.views[-1]['spec'])['section']['panelBankConfig']['sections'] for p in s['panels']]
+    assert len([p for p in panels if p['viewType']=='Vega2'])==7
+    assert '11 curves' in panels[0]['config']['value'] and '60 checkpoints from 525k through 2M' in panels[0]['config']['value']
+    assert not layout.ensure_saved_view(SimpleNamespace(_service_api=service),**kwargs)['changed']
+    assert service.view_writes==1
+
+
+def test_host_extension_rejects_unknown_v5_user_edits(tmp_path):
+    data=dict(campaign(),comparison_styles=comparisons(),extension_styles=extensions())
+    service=Service();old=layout.saved_spec(spec(),data,'entity','abc123',version=layout.VERSION)
+    old['section']['panelBankConfig']['sections'][1]['panels'][0]['config']['stringSettings']['title']='My title'
+    service.views.append(dict(id='owned',name='nw-transfercurvesabc123-v',type='project-view',displayName='Title',spec=json.dumps(old)))
+    before=deepcopy(service.views)
+    with pytest.raises(layout.ResultsLayoutError,match='preserving user edits'):
+        layout.ensure_saved_view(SimpleNamespace(_service_api=service),campaign=data,entity='entity',
+            project='ambi-inner-bench',publication_id='abc123',receipt_dir=tmp_path)
+    assert service.views==before and service.view_writes==0

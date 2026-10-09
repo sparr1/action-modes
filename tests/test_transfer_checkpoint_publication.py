@@ -441,3 +441,137 @@ def test_new_completed_record_is_packed_before_stage(campaign,tmp_path,monkeypat
     assert len([name for name in accepted['artifact_files'] if name.endswith('.jsonl.gz')])==5
     assert accepted['provenance']['decision_trace_storage']['lossless']
     assert all(Path(path).is_relative_to(args.publication_root/'packed-traces') for name,path in accepted['artifact_files'].items() if name.endswith('.jsonl.gz'))
+
+
+@pytest.fixture
+def hosted(campaign,tmp_path):
+    """An actual published 80-prior registry, with a distinct 60-checkpoint campaign."""
+    old=deepcopy(campaign);old['checkpoints']=[];old['cells']=[]
+    base=campaign['candidates'][0]
+    old['candidates']=[dict(base,setting_id=f'old{i}',label=f'Old setting {i}') for i in range(5)]
+    template=adapter.read(Path(campaign['checkpoints'][0]['prior_pin']['bundle'])/'manifest.json')
+    for index,step in enumerate(range(25000,2000001,25000)):
+        bundle=tmp_path/'host-priors'/str(step);manifest=deepcopy(template)
+        sha=publish.fingerprint(step);metadata={'checkpoint':{'step':step}}
+        manifest['checkpoint'].update(sha256=sha,metadata=metadata)
+        save(bundle/'manifest.json',manifest);save(bundle/'checkpoint.metadata.json',metadata)
+        (bundle/'traces.jsonl').write_text('{}\n')
+        cp=dict(step=step,checkpoint_sha256=sha,metadata=str(bundle/'checkpoint.metadata.json'),
+            metadata_sha256=adapter.digest(bundle/'checkpoint.metadata.json'),prior_manifest_code=manifest['code'],
+            prior_pin=dict(bundle=str(bundle),manifest_sha256=adapter.digest(bundle/'manifest.json'),
+                checkpoint_step=step,checkpoint_sha256=sha,selector='prior',trace_sha256={'traces.jsonl':adapter.digest(bundle/'traces.jsonl')}))
+        old['checkpoints'].append(cp)
+    host_args,host_state=prepare(old,tmp_path/'host')
+    prior_dir=Path(host_state['runs']['prior']['run_dir']);journal=adapter.read(prior_dir/'publication.json')
+    for entry in journal['records'].values():entry.update(status='published',wandb_step=entry['accepted_order'])
+    save(prior_dir/'publication.json',journal)
+    host_state.update(overview={'run_id':'originaloverview'},layout={'status':'verified','layout_version':'transfer-checkpoint-curves-v5'})
+    save(host_args.publication_root/'publication.json',host_state)
+    save(host_args.publication_root/'publisher-complete.json',dict(status='complete',completed=400,total=400))
+    save(host_args.publication_root/'mppi-overlay.json',overlay_receipt(host_state))
+    new=deepcopy(old);new['checkpoints']=new['checkpoints'][20:]
+    new['source_commit']='d'*40
+    new['candidates']=[dict(base,setting_id=key,label=f'J6 {key}',H=1,J=6,
+        role='fresh' if key.endswith('_fresh') else 'transfer',fresh_setting_id='h1_j6_fresh') for key in adapter.J6_COLORS]
+    for cp_index,cp in enumerate(new['checkpoints']):
+        for setting in new['candidates']:
+            index=len(new['cells']);new['cells'].append(dict(setting,index=index,checkpoint_index=cp_index,step=cp['step'],
+                name=f"{cp['step']}/{setting['setting_id']}",result_dir=str(tmp_path/'new-results'/str(index))))
+    root=tmp_path/'new-campaign';save(root/'campaign.json',new)
+    args=SimpleNamespace(root=root,publication_root=tmp_path/'new-publication',entity='entity',project='ambi-inner-bench',
+        owner='owner',attempt_label='J6 new',comparison_host_publication_root=host_args.publication_root)
+    return new,args,host_args,host_state
+
+
+def test_hosted_prepare_is_idempotent_and_never_allocates_or_mutates_old_prior(hosted):
+    campaign,args,host_args,host_state=hosted
+    before={str(p):p.read_bytes() for p in host_args.publication_root.rglob('*.json')}
+    state=publish.prepare(args);assert publish.prepare(args)==state
+    assert len(state['runs'])==4 and state['runs']['prior']['read_only'] is True
+    assert state['runs']['prior']['run_id']==host_state['runs']['prior']['run_id']
+    assert not (args.publication_root/'registry'/'prior').exists()
+    assert state['publication_id']!=host_state['publication_id']
+    assert state['comparison_publication_id']==host_state['publication_id']
+    host=publish.validate_comparison_host(campaign,state,args.publication_root)
+    assert len(host['prior_records'])==60 and set(host['prior_records'])=={str(x) for x in range(525000,2000001,25000)}
+    assert all(Path(path).read_bytes()==value for path,value in before.items())
+    snapshot=publish.collect(args.root,campaign,state,jobs_active=True)
+    assert snapshot['total']==180 and snapshot['completed']==0 and len(snapshot['curves'])==3
+    assert all(row['completed']==0 and row['total']==60 for row in snapshot['curves'].values())
+    payload=publish.overview_payload(SimpleNamespace(Table=lambda **kw:kw),snapshot)
+    assert len(payload[publish.TABLE_KEY]['data'])==len(payload[publish.PROGRESS_KEY]['data'])==180
+    layout_campaign=publish.comparison_layout_campaign(campaign,state,args.publication_root)
+    assert len(publish.display_settings(layout_campaign))==11 and len(layout_campaign['checkpoints'])==80
+    assert all(Path(path).read_bytes()==value for path,value in before.items())
+
+
+@pytest.mark.parametrize('defect',['unpublished','record_hash','episodes','checkpoint_pin','mppi','range','science','diagnostics','hardware'])
+def test_hosted_prepare_rejects_unverified_references(hosted,defect):
+    campaign,args,host_args,host_state=hosted
+    directory=Path(host_state['runs']['prior']['run_dir']);journal=adapter.read(directory/'publication.json')
+    rid,entry=next((rid,row) for rid,row in journal['records'].items() if row['checkpoint_step']==525000)
+    if defect=='unpublished':
+        entry['status']='queued';save(directory/'publication.json',journal)
+    if defect in ('record_hash','episodes'):
+        record=adapter.read(directory/'records'/(rid+'.json'));record['episodes'][0]['return']+=1
+        save(directory/'records'/(rid+'.json'),record)
+        if defect=='episodes':
+            from utils.eval_series import _record_fingerprint
+            entry['record_sha256']=_record_fingerprint(record,entry['artifact_sha256']);save(directory/'publication.json',journal)
+    if defect=='checkpoint_pin':
+        campaign['checkpoints'][0]['prior_pin']['manifest_sha256']='0'*64;save(args.root/'campaign.json',campaign)
+    if defect=='mppi':
+        receipt=overlay_receipt(host_state);receipt['status']='pending';save(host_args.publication_root/'mppi-overlay.json',receipt)
+    if defect in ('science','diagnostics','hardware'):
+        key={'science':'scientific_source','diagnostics':'diagnostics','hardware':'gpu_hardware'}[defect]
+        campaign[key]='changed';save(args.root/'campaign.json',campaign)
+    if defect=='range':
+        campaign['checkpoints'].pop(0);save(args.root/'campaign.json',campaign)
+    with pytest.raises(SeriesError):publish.prepare(args)
+    assert not (args.publication_root/'registry').exists()
+
+
+def test_hosted_publisher_uses_only_new_runs_and_original_overview_selector(hosted,monkeypatch):
+    campaign,args,host_args,host_state=hosted;state=publish.prepare(args)
+    before={str(p):p.read_bytes() for p in host_args.publication_root.rglob('*.json')}
+    snapshot=publish.collect(args.root,campaign,state,jobs_active=True);opened=[];calls=[]
+    class FakePublisher:
+        def __init__(self,path,**kwargs):
+            opened.append(path);self.run=SimpleNamespace(name=None,config=SimpleNamespace(update=lambda *a,**kw:None),summary={})
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def publish_pending(self):pass
+    def init(**kwargs):
+        calls.append(kwargs);return SimpleNamespace(log=lambda value:None,summary={},finish=lambda **kw:None)
+    monkeypatch.setattr(publish,'Publisher',FakePublisher)
+    sdk=SimpleNamespace(Table=lambda **kw:kw,init=init)
+    publish.publish_snapshot(campaign,state,snapshot,args.publication_root,sdk)
+    publish.publish_overview(campaign,state,snapshot,args.publication_root,sdk)
+    assert len(opened)==3 and host_state['runs']['prior']['run_dir'] not in opened
+    assert calls[0]['config']['transfer_curve_overview']==host_state['publication_id']
+    assert calls[0]['id']!=host_state['overview']['run_id']
+    assert calls[0]['name']=='J6 after 500k · live comparison'
+    assert all(Path(path).read_bytes()==value for path,value in before.items())
+
+
+def test_hosted_new_records_reference_existing_prior_artifact_without_copying_raw_traces(hosted):
+    campaign,args,host_args,host_state=hosted;state=publish.prepare(args)
+    transfer(campaign);cell=campaign['cells'][0];directory=Path(cell['result_dir'])
+    host=publish.validate_comparison_host(campaign,state,args.publication_root)
+    old_prior=publish.records_by_step(state['runs']['prior']['run_dir'])[525000]
+    record=adapter.normalize_transfer(campaign,cell,adapter.read(directory/'receipt.json'),adapter.read(directory/'results.json'),
+        adapter.read(directory/'manifest.json'),old_prior,receipt_path=directory/'receipt.json',prior_reference=host['prior_records']['525000'])
+    assert not any(name.startswith('reference/') for name in record['artifact_files'])
+    assert record['provenance']['legacy_artifacts']==[host['prior_records']['525000']['artifact']]
+    assert record['provenance']['published_prior_reference']['record_id']==old_prior['record_id']
+    assert record['metrics']['eval/paired_gain_mean']==pytest.approx((10-5+20+20+20)/5)
+    for path in old_prior['artifact_files'].values():assert Path(path).exists()
+
+
+def test_hosted_resume_rejects_changed_prior_or_receipt(hosted):
+    campaign,args,host_args,host_state=hosted;state=publish.prepare(args)
+    host=publish.validate_comparison_host(campaign,state,args.publication_root)
+    pin=next(iter(host['prior_records'].values()));path=Path(host['prior_run']['run_dir'])/'records'/(pin['record_id']+'.json')
+    path.write_text(path.read_text()+'\n')
+    with pytest.raises(SeriesError,match='prior record changed'):
+        publish.collect(args.root,campaign,state,jobs_active=True)
