@@ -28,6 +28,9 @@ PROTOCOL = "inner-sac-transfer-checkpoint-curves-v1"
 SOURCE_RUN = "rwgao_b-brown-university/ambi/aux6428346x0"
 ANCHOR_SHA = "0c6955db7cb8555a67d7863344b70be68f4b3250814d131e647ee6f9ef01a042"
 ANCHOR_METADATA_SHA = "8acc74b7ad4993050a5cc0d3c4c0860441fceb48f36a79540f5e1943e6b3e1d2"
+J6_SELECTION = "h1-j6-post500k-v1"
+J6_CHECKPOINT_RANGE = dict(start=525000, stop=2000000, step=25000)
+J6_SETTINGS = {"h1_j6_fresh", "h1_j6_bernoulli_a0_c05", "h1_j6_matrix_blend05_actor"}
 
 
 def require(condition, message):
@@ -74,10 +77,22 @@ def validate_configuration(config, selected=None):
     require(all(config.get(key) == value for key, value in fixed.items()), "Configuration changed the authorized evaluation protocol.")
     candidates = config.get("candidates", [])
     require(candidates and len({row["setting_id"] for row in candidates}) == len(candidates), "Candidates must be unique and nonempty.")
+    selection = config.get("selection_id")
+    require(selection in (None, J6_SELECTION), "Unknown versioned curve selection.")
+    if selection == J6_SELECTION:
+        require(config.get("checkpoint_range") == J6_CHECKPOINT_RANGE,
+                "J6 checkpoint range must be 525k through 2M inclusive at 25k intervals.")
+        require({row["setting_id"] for row in candidates} == J6_SETTINGS,
+                "J6 selection requires fresh SAC, critic Bernoulli50%, and actor matrix shrink50%.")
+        require(selected is None or (len(selected) == len(J6_SETTINGS) and set(selected) == J6_SETTINGS),
+                "J6 selection must retain all three matched settings.")
+    else:
+        require(config.get("checkpoint_range") is None, "Checkpoint range requires an explicit versioned selection.")
     lookup = {row["setting_id"]: row for row in candidates}
     for row in candidates:
         require(row["setting_id"] == f"h{row['H']}_j{row['J']}_{row['arm']}", "Candidate identity mismatch.")
-        require(row["H"] == 1 and row["J"] in (2, 4), "Shortlist budget differs.")
+        require(row["H"] == 1 and row["J"] in ((6,) if selection == J6_SELECTION else (2, 4)),
+                "Shortlist budget differs.")
         require(row.get("role") == ("fresh" if row["arm"] == "fresh" else "transfer"), "Candidate role differs.")
         if row["role"] == "transfer":
             control = lookup.get(row.get("fresh_setting_id"), {})
@@ -88,6 +103,25 @@ def validate_configuration(config, selected=None):
     require(selected and len(set(selected)) == len(selected), "Selected settings must be unique and nonempty.")
     require(set(selected) <= {row["setting_id"] for row in candidates}, "Unknown selected setting.")
     return [row for row in candidates if row["setting_id"] in selected]
+
+
+def select_checkpoints(checkpoints, config):
+    """Apply an explicit inclusive grid without silently accepting missing checkpoints."""
+    interval = config.get("checkpoint_range")
+    if interval is None:
+        return checkpoints
+    require(isinstance(interval, dict) and set(interval) == {"start", "stop", "step"}
+            and all(type(value) is int for value in interval.values()), "Malformed checkpoint range.")
+    start, stop, step = (interval[key] for key in ("start", "stop", "step"))
+    require(start >= 0 and stop >= start and step > 0 and (stop - start) % step == 0,
+            "Invalid inclusive checkpoint grid.")
+    expected = list(range(start, stop + 1, step))
+    require(575000 in expected, "Selected checkpoint grid must include the audited 575k anchor.")
+    wanted = set(expected)
+    selected = [row for row in checkpoints if row["step"] in wanted]
+    require([row["step"] for row in selected] == expected,
+            "Inventory does not contain every checkpoint in the requested range.")
+    return selected
 
 
 def validate_inventory(inventory):
@@ -125,7 +159,7 @@ def prepare(args):
     current = source(args.expected_source_sha)
     config = read_json(args.config)
     candidates = deepcopy(validate_configuration(config, args.settings))
-    checkpoints = validate_inventory(read_json(args.inventory))
+    checkpoints = select_checkpoints(validate_inventory(read_json(args.inventory)), config)
     require(not getattr(args, "reuse_575k_root", None),
             "This five-seed shortlist does not reuse historical transfer results.")
     from utils.ambi_research import load_preset_matrix, resolve_preset
@@ -154,6 +188,9 @@ def prepare(args):
         selection="Exploratory 575k-selected candidates; checkpoints are repeated measurements of one trained backbone.",
         prior_reference=read_json(args.inventory).get("prior_reference"),
         diagnostics=deepcopy(template["diagnostics"]))
+    if config.get("selection_id") is not None:
+        campaign.update(selection_id=config["selection_id"], checkpoint_range=deepcopy(config["checkpoint_range"]),
+            selection="Post-500k H1 J6 matched-budget comparison; checkpoints are repeated measurements of one trained backbone.")
     generated = []
     for checkpoint_index, checkpoint in enumerate(checkpoints):
         step = checkpoint["step"]

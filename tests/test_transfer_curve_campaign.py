@@ -11,6 +11,7 @@ from utils.ambi_benchmark import canonical_hash, solver_seed
 
 
 CONFIG = campaign.ROOT / "configs/research/ambi_transfer_checkpoint_curves.json"
+J6_CONFIG = CONFIG.parent / "ambi_transfer_checkpoint_j6_after500k_curves.json"
 
 
 def save(path, value):
@@ -235,6 +236,103 @@ def test_shortlist_preserves_all_parameter_bernoulli_and_matrix_shrink():
     assert recipe["arms"]["matrix_blend05_actor"]["parameter_scope"] == "matrices"
     assert recipe["arms"]["matrix_blend05_actor"]["actor_rho"] == .5
     assert recipe["diagnostics"]["enabled"] is True
+
+
+def test_j6_selection_preserves_recipe_and_requires_all_matched_controls():
+    config = campaign.read_json(J6_CONFIG)
+    candidates = campaign.validate_configuration(config)
+    assert {row["setting_id"] for row in candidates} == campaign.J6_SETTINGS
+    assert all((row["H"], row["J"]) == (1, 6) for row in candidates)
+    original = campaign.read_json(CONFIG)
+    original_recipe = campaign.read_json(CONFIG.parent / original["discovery_template"])
+    recipe = campaign.read_json(CONFIG.parent / config["discovery_template"])
+    assert recipe["rounds"] == [6] and recipe["horizons"] == [1]
+    assert recipe["arms"] == {name: original_recipe["arms"][name] for name in
+                              ("fresh", "bernoulli_a0_c05", "matrix_blend05_actor")}
+    for key in ("base_matrix", "base_preset", "checkpoint_contract", "seeds", "controller_seed", "max_steps",
+                "critic_updates", "actor_updates", "rollouts", "batch_size", "diagnostics"):
+        assert recipe[key] == original_recipe[key]
+    with pytest.raises(ValueError, match="all three"):
+        campaign.validate_configuration(config, ["h1_j6_fresh"])
+    with pytest.raises(ValueError, match="matched settings"):
+        campaign.validate_configuration(config, list(campaign.J6_SETTINGS) + ["h1_j6_fresh"])
+
+
+@pytest.mark.parametrize("mutation,match", [
+    (lambda value: value.pop("selection_id"), "explicit versioned selection"),
+    (lambda value: value.update(selection_id="unreviewed"), "Unknown versioned"),
+    (lambda value: value["checkpoint_range"].update(start=500000), "J6 checkpoint range"),
+    (lambda value: value["checkpoint_range"].update(stop=1975000), "J6 checkpoint range"),
+    (lambda value: value["checkpoint_range"].update(step=50000), "J6 checkpoint range"),
+    (lambda value: value["candidates"].pop(), "J6 selection requires"),
+    (lambda value: value["candidates"][1].update(fresh_setting_id="h1_j4_fresh"), "matching fresh"),
+])
+def test_j6_scope_drift_is_rejected(mutation, match):
+    config = campaign.read_json(J6_CONFIG)
+    mutation(config)
+    with pytest.raises(ValueError, match=match):
+        campaign.validate_configuration(config)
+
+
+def test_j6_does_not_expand_legacy_shortlist_budgets():
+    config = campaign.read_json(CONFIG)
+    config["candidates"] = [dict(setting_id="h1_j6_fresh", H=1, J=6, arm="fresh", role="fresh")]
+    with pytest.raises(ValueError, match="budget"):
+        campaign.validate_configuration(config)
+
+
+def test_j6_range_requires_every_selected_checkpoint_and_excludes_500k():
+    config = campaign.read_json(J6_CONFIG)
+    inventory = [dict(step=step) for step in range(25000, 2000001, 25000)]
+    selected = campaign.select_checkpoints(inventory, config)
+    assert [row["step"] for row in selected] == list(range(525000, 2000001, 25000))
+    assert len(selected) == 60 and all(row["step"] > 500000 for row in selected)
+    assert campaign.select_checkpoints(inventory, campaign.read_json(CONFIG)) is inventory
+    with pytest.raises(ValueError, match="every checkpoint"):
+        campaign.select_checkpoints([row for row in inventory if row["step"] != 525000], config)
+    config["checkpoint_range"]["step"] = 25000.0
+    with pytest.raises(ValueError, match="Malformed checkpoint range"):
+        campaign.select_checkpoints(inventory, config)
+
+
+def test_j6_preparation_creates_180_cells_and_nine_smokes_from_full_bank(prepared):
+    original_args, original_definition = prepared
+    inventory = campaign.read_json(original_args.inventory)
+    present = {row["step"] for row in inventory["checkpoints"]}
+    anchor = next(row for row in inventory["checkpoints"] if row["step"] == 575000)
+    metadata = campaign.read_json(anchor["checkpoint"] + ".metadata.json")
+    for step in range(25000, 2000001, 25000):
+        if step in present:
+            continue
+        checkpoint = Path(anchor["checkpoint"]).parent / str(step)
+        checkpoint.write_text(f"checkpoint {step}")
+        sidecar = Path(str(checkpoint) + ".metadata.json")
+        value = deepcopy(metadata)
+        value["checkpoint"]["step"] = step
+        save(sidecar, value)
+        inventory["checkpoints"].append(dict(step=step, checkpoint=str(checkpoint),
+            checkpoint_sha256=campaign.digest(checkpoint), metadata_sha256=campaign.digest(sidecar),
+            prior_reference=f"prior/{step}", prior_pin=dict(selector="reference/prior", manifest_sha256="prior-digest")))
+    save(original_args.inventory, inventory)
+    args = SimpleNamespace(**vars(original_args))
+    args.root = original_args.root.parent / "j6-campaign"
+    args.config, args.settings = J6_CONFIG, None
+    definition = campaign.prepare(args)
+    assert len(definition["checkpoints"]) == 60 and len(definition["cells"]) == 180
+    assert definition["selection_id"] == campaign.J6_SELECTION
+    assert definition["checkpoint_range"] == campaign.J6_CHECKPOINT_RANGE
+    assert definition["smoke_checkpoint_steps"] == [525000, 575000, 2000000]
+    assert len(definition["smoke_indices"]) == 9
+    assert definition["production_indices"] == list(range(180)) and definition["reused_indices"] == []
+    assert len({cell["result_dir"] for cell in definition["cells"]}) == 180
+    for cell in definition["cells"]:
+        assert (cell["H"], cell["J"]) == (1, 6) and cell["step"] > 500000
+        assert definition["checkpoints"][cell["checkpoint_index"]]["step"] == cell["step"]
+    assert definition["diagnostics"] == original_definition["diagnostics"]
+    assert definition["scientific_source"] == original_definition["scientific_source"]
+    for cell in definition["cells"][:3]:
+        directory = write_result(args.root, definition, cell, smoke=True)
+        campaign.validate_result(directory, definition, cell, smoke=True)
 
 
 def test_diagnostic_coverage_and_isolation_are_required(prepared):

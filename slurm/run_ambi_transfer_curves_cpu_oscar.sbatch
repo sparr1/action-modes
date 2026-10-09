@@ -27,6 +27,7 @@ case "$CAMPAIGN_MODE" in
     export WANDB_MODE=disabled
     exec "$PYTHON_BIN" slurm/ambi_transfer_curve_campaign.py prepare \
       --root "$CAMPAIGN_ROOT" --inventory "${CHECKPOINT_INVENTORY:?}" \
+      --config "${CAMPAIGN_CONFIG:-configs/research/ambi_transfer_checkpoint_curves.json}" \
       --expected-source-sha "$EXPECTED_ACTION_MODES_SHA"
     ;;
   publication_prepare)
