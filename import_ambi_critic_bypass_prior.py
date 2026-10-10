@@ -191,6 +191,7 @@ def import_prior(campaign_root, manifest, smoke_root):
             write(directory / "result.json", result)
             write(directory / "manifest.json", dict(schema_version=1, protocol=PROTOCOL,
                 campaign_id=campaign["campaign_id"], task_id=result["task_id"], status="complete",
+                arm="prior", env_seed=result["env_seed"], controller_seed=55, runtime=result["runtime"],
                 source_commit=campaign["source_commit"], reused_reference=True,
                 result_sha256=sha256(directory / "result.json")))
             write(directory / "progress.json", dict(task_id=result["task_id"], arm="prior", env_seed=result["env_seed"],
