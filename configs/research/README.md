@@ -1,5 +1,10 @@
 # Frozen-checkpoint AMBI research
 
+The [800k matched-state action audit](ACTION_AUDIT_800K.md) compares fresh SAC
+J4/J6/J8, MPPI H1/H3, replay and broad action candidates on identical saved
+states. It separates learned-Q ranking, held-out model scores, real prefixes
+and finite prior-tail calibration, with compact W&B progress and result panels.
+
 [The spectral transfer campaign](SPECTRAL_TRANSFER_575K.md) implements plain,
 activation-weighted and gradient-scored SVD initialization, with per-layer
 norm-matched dense controls and actor/critic/joint variants. It also supports

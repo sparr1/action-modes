@@ -1,0 +1,35 @@
+{
+  "protocol": "matched-action-audit-v1",
+  "checkpoint": {
+    "step": 800000,
+    "sha256": "62606f9d905be4798db89f916993355ff0c6edc994d2780636edbf876b1726a4",
+    "metadata_sha256": "dc1c98a9b6937b193c2d19821875323dd3cff5097c5f8caf426bbbe1f9842eab"
+  },
+  "matrix": "configs/research/ambi_critic_transfer_575k.json",
+  "histories": ["prior", "sac_j6", "mppi_h3"],
+  "seeds": [101, 102, 103, 104, 105],
+  "controller_seed": 55,
+  "decisions": [25, 100, 250, 400],
+  "source_max_steps": 401,
+  "J": [4, 6, 8],
+  "mc_rollouts": 32,
+  "real_rollouts": 8,
+  "real_tail_steps": 500,
+  "policy_samples": 16,
+  "uniform_actions": 64,
+  "local_actions_per_scale": 32,
+  "local_scales": [0.5, 1.0, 2.0],
+  "mppi": {
+    "iterations": 8,
+    "num_samples": 512,
+    "num_elites": 64,
+    "num_pi_trajs": 24,
+    "temperature": 0.5,
+    "min_std": 0.05,
+    "max_std": 2.0
+  },
+  "publication_candidates": [
+    "prior_mean", "sac_j4_mean", "sac_j6_mean", "sac_j8_mean", "mppi_h1_mean", "mppi_h3_mean",
+    "broad_best_h1", "broad_best_h3", "replay_best_h1", "replay_best_h3"
+  ]
+}
