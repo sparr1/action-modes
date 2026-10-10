@@ -285,8 +285,13 @@ def acknowledged(api, state, snapshot):
     summary = api.run(f'{state["entity"]}/{state["project"]}/{state["run_id"]}').summary
     if summary.get('critic_bypass/snapshot_sha256') != snapshot['snapshot_sha256']:
         return False
-    return all(isinstance(summary.get(key), dict) and summary[key].get('nrows') == len(snapshot[name]) and summary[key].get('ncols') == len(columns)
-               for key, (name, columns) in TABLES.items())
+    for key, (name, columns) in TABLES.items():
+        # The public SDK wraps nested summary values in SummarySubDict rather
+        # than dict. Use its mapping interface, as for the outer summary.
+        value = summary.get(key)
+        if value is None or value.get('nrows') != len(snapshot[name]) or value.get('ncols') != len(columns):
+            return False
+    return True
 
 
 def publish_once(wandb, state, campaign, snapshot, out, *, acknowledgement_seconds=30):

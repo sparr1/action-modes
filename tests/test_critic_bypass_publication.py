@@ -172,6 +172,26 @@ def test_snapshot_report_identity_and_acknowledgement(tmp_path):
     assert not pub.acknowledged(api, state, snap)
 
 
+def test_acknowledgement_accepts_sdk_nested_summary_mapping(tmp_path):
+    class SummarySubDictLike:
+        """SDK nested summary wrappers expose get without being a dict."""
+        def __init__(self, values): self.values = values
+        def get(self, key, default=None): return self.values.get(key, default)
+
+    snapshot = pub.collect(tmp_path, campaign())
+    values = {'critic_bypass/snapshot_sha256': snapshot['snapshot_sha256']}
+    values.update({key: SummarySubDictLike(dict(nrows=len(snapshot[name]), ncols=len(columns)))
+                   for key, (name, columns) in pub.TABLES.items()})
+    summary = SummarySubDictLike(values)
+    api = SimpleNamespace(run=lambda _: SimpleNamespace(summary=summary))
+    state = dict(entity='entity', project='project', run_id='run')
+    assert pub.acknowledged(api, state, snapshot)
+    values[pub.PROGRESS_KEY].values['nrows'] += 1
+    assert not pub.acknowledged(api, state, snapshot)
+    values[pub.PROGRESS_KEY] = None
+    assert not pub.acknowledged(api, state, snapshot)
+
+
 def test_lost_ack_reconciles_without_duplicate_upload(tmp_path, monkeypatch):
     cfg = campaign(); snap = pub.collect(tmp_path, cfg)
     state = dict(entity='e', project='p', run_id='same', campaign_sha256='abc')
