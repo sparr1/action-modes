@@ -250,16 +250,17 @@ def test_non_return_semantics_fail_closed():
         bank(reference)
 
 
-def test_frozen_prior_continuation_keeps_outer_policy_bounds():
+@pytest.mark.parametrize("outer_options", [{}, {"log_std_min": -3.}])
+def test_frozen_prior_continuation_keeps_outer_policy_bounds(outer_options):
     reference = AnalyticReference(noise_scale=.2)
     reference.bounds = {"log_std_min": -.1}
-    reference.engine._actor_options = {"log_std_min": -3.}
-    reference.engine._horizon_actor_options = {"log_std_min": -3.}
+    reference.engine._actor_options = deepcopy(outer_options)
+    reference.engine._horizon_actor_options = deepcopy(outer_options)
     bank(reference)
     env = Accumulator()
     real(reference, env, capture_simulator_snapshot(env))
     assert reference.model.seen_policy_options
-    assert all(value == {"log_std_min": -3.} for value in reference.model.seen_policy_options)
+    assert all(value == outer_options for value in reference.model.seen_policy_options)
     assert reference.bounds == {"log_std_min": -.1}
 
 

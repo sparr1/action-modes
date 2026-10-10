@@ -99,10 +99,11 @@ def sections(entity):
     intro = ('### 800k matched-action audit\n\n'
         '**Progress and integrity checks are explicit; pending or failed measurements never become zeros.** '
         'Each point is one saved root, candidate and audit horizon. Shapes distinguish the controller that visited the root; colors identify the action candidate. '
-        'Selection uses a separate model-noise bank. Plots use independently evaluated model/real estimates with paired continuation noise; a separate held-out 32-draw model bank is retained in the measurements table. '
+        'Model/real comparisons use fresh noise independent of selection, shared within each model/real pair. A separate held-out 32-draw model bank is retained in the measurements table. '
         'Real-prefix value uses simulator rewards followed by the frozen terminal estimate. The real-tail comparison uses a finite 500-step continuation, not an infinite-horizon ground truth. '
         'Gains subtract the prior action at the same root and horizon. Root histories differ; this is not a full-episode policy comparison. '
         'Integrity pass/fail refers to execution checks, not whether a candidate improves reward. '
+        'Critic bank metrics describe this constructed candidate mixture, including replay actions; they are not population estimates over all states or actions. '
         'Raw banks, simulator branches and detailed records stay in the campaign directory on Oscar; W&B receives compact summaries only.')
     groups = [('progress', 'Action audit | progress and checks', [
         _panel('intro', 'Markdown Panel', {'value': intro}, width=24, height=6),
@@ -110,8 +111,8 @@ def sections(entity):
         _panel('checks', 'Media Browser', {'chartTitle': 'Execution integrity checks: pass, fail or pending', 'mediaKeys': [CHECKS_KEY]}, width=24)], 1)]
     plots = []
     specs = (
-        ('prefix', 'Independent model gain versus real-prefix value gain', 'model_gain', 'prefix_gain', 'Paired model gain', 'Real-prefix value gain'),
-        ('tail', 'Independent model gain versus finite real-tail gain', 'model_gain', 'tail_gain', 'Paired model gain', 'Finite real-tail gain'),
+        ('prefix', 'Paired model gain versus real-prefix value gain', 'model_gain', 'prefix_gain', 'Paired model gain', 'Real-prefix value gain'),
+        ('tail', 'Paired model gain versus finite real-tail gain', 'model_gain', 'tail_gain', 'Paired model gain', 'Finite real-tail gain'),
         ('bias', 'Model-prefix bias versus terminal bias', 'model_prefix_bias', 'terminal_bias', 'Model-prefix bias', 'Terminal bias'),
     )
     for h in (1, 3):
@@ -122,7 +123,7 @@ def sections(entity):
                     'fields': [{'name': 'summaryTable', 'args': [{'name': 'tableKey', 'value': TABLE_KEY}], 'fields': []}, {'name': 'id', 'value': []}, {'name': 'name', 'value': []}]}]},
                 'panelDefId': chart_id(entity),
                 'fieldSettings': dict(x=x, y=y, candidate='candidate', history='history', seed='seed', decision='decision', horizon='horizon', state='state'),
-                'stringSettings': dict(title=f'H{h}: {title}', subtitle='One point per root and candidate; compact paired estimates', horizon=str(h), xname=xtitle, yname=ytitle),
+                'stringSettings': dict(title=f'H{h}: {title}', subtitle='Independent of selection; model and real share continuation noise', horizon=str(h), xname=xtitle, yname=ytitle),
             }, width=12, height=9))
     groups.append(('scores', 'Action audit | model and real simulator comparisons', plots, 2))
     groups.append(('values', 'Action audit | exact compact measurements', [
