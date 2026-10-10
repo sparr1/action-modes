@@ -1,0 +1,28 @@
+{
+  "protocol": "closed-loop-critic-bypass-v1",
+  "checkpoint": {
+    "step": 800000,
+    "sha256": "62606f9d905be4798db89f916993355ff0c6edc994d2780636edbf876b1726a4",
+    "metadata_sha256": "dc1c98a9b6937b193c2d19821875323dd3cff5097c5f8caf426bbbe1f9842eab"
+  },
+  "matrix": "configs/research/ambi_critic_transfer_575k.json",
+  "arms": ["actor_mean", "learned_q", "model_score", "prior", "mppi_h3"],
+  "seeds": [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120],
+  "controller_seed": 55,
+  "max_steps": 500,
+  "horizon": 1,
+  "rounds": 6,
+  "mc_rollouts": 32,
+  "validation_rollouts": 32,
+  "max_expanded_batch": 4096,
+  "diagnostic_decisions": [0, 25, 100, 250, 400, 499],
+  "mppi": {
+    "iterations": 8,
+    "num_samples": 512,
+    "num_elites": 64,
+    "num_pi_trajs": 24,
+    "temperature": 0.5,
+    "min_std": 0.05,
+    "max_std": 2.0
+  }
+}
