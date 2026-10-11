@@ -1,5 +1,9 @@
 # Frozen-checkpoint AMBI research
 
+The [800k critic update budget comparison](CRITIC_DOSE_800K.md) tests C32/C64
+against the completed C16 H1/J6 controller with fixed actor and rollout budgets,
+paired full episodes, and comparable action-ranking diagnostics.
+
 The [800k matched-state action audit](ACTION_AUDIT_800K.md) compares fresh SAC
 J4/J6/J8, MPPI H1/H3, replay and broad action candidates on identical saved
 states. It separates learned-Q ranking, held-out model scores, real prefixes

@@ -41,11 +41,15 @@ def _integer(value, name, minimum=0):
     return int(value)
 
 
-def validate_bypass_controller(wrapped):
+def validate_bypass_controller(wrapped, *, critic_updates_per_round=16):
     """Fail closed when a config would change the fixed fresh-solve treatment."""
+    dose = _integer(critic_updates_per_round, "critic_updates_per_round", 1)
+    if dose not in (16, 32, 64):
+        raise ValueError("Critic bypass supports only the explicit C16/C32/C64 doses.")
     validate_controller(wrapped)
+    expected = {**SOLVE_CONTRACT, "inner_critic_updates_per_round": dose}
     differences = {key: (getattr(wrapped.cfg, key, None), value)
-        for key, value in SOLVE_CONTRACT.items()
+        for key, value in expected.items()
         if getattr(wrapped.cfg, key, None) != value}
     if differences:
         raise ValueError(f"Critic bypass requires the fixed fresh H1/J6 solve: {differences}")
@@ -155,7 +159,7 @@ def _stats(samples):
 
 def run_bypass_decision(wrapped, observation, *, arm, solve_seed, selection_seed,
                         validation_seed, shadow=False, mc_rollouts=32,
-                        max_expanded_batch=4096):
+                        max_expanded_batch=4096, critic_updates_per_round=16):
     """Run exactly one fresh solve and select its executed environment action.
 
     Timings synchronize CUDA and include all required solve/bank/selection work
@@ -177,7 +181,7 @@ def run_bypass_decision(wrapped, observation, *, arm, solve_seed, selection_seed
     if torch.device(wrapped.agent.device).type == "cuda":
         torch.cuda.synchronize(wrapped.agent.device)
     started = time.perf_counter()
-    validate_bypass_controller(wrapped)
+    validate_bypass_controller(wrapped, critic_updates_per_round=critic_updates_per_round)
     reference = Reference(wrapped, rollouts=count)
     engine = reference.engine
     engine.reset_for_evaluation(int(solve_seed), reuse_action_pool=True)
@@ -187,7 +191,7 @@ def run_bypass_decision(wrapped, observation, *, arm, solve_seed, selection_seed
     work = dict(actor_updates=int(metrics["inner_actor_optimizer_steps"]),
                 critic_updates=int(metrics["inner_critic_optimizer_steps"]),
                 model_steps=int(metrics["inner_model_steps"]))
-    if work != dict(actor_updates=24, critic_updates=96, model_steps=768):
+    if work != dict(actor_updates=24, critic_updates=6 * critic_updates_per_round, model_steps=768):
         raise RuntimeError(f"Realized SAC work differs from the fixed solve: {work}")
     _synchronize(reference)
     solve_done = time.perf_counter()

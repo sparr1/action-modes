@@ -1,0 +1,61 @@
+{
+  "protocol": "closed-loop-critic-dose-v1",
+  "checkpoint": {
+    "step": 800000,
+    "sha256": "62606f9d905be4798db89f916993355ff0c6edc994d2780636edbf876b1726a4",
+    "metadata_sha256": "dc1c98a9b6937b193c2d19821875323dd3cff5097c5f8caf426bbbe1f9842eab"
+  },
+  "matrix": "configs/research/ambi_critic_transfer_575k.json",
+  "arms": [
+    "actor_mean_c32",
+    "learned_q_c32",
+    "actor_mean_c64",
+    "learned_q_c64"
+  ],
+  "seeds": [
+    101,
+    102,
+    103,
+    104,
+    105,
+    106,
+    107,
+    108,
+    109,
+    110,
+    111,
+    112,
+    113,
+    114,
+    115,
+    116,
+    117,
+    118,
+    119,
+    120
+  ],
+  "controller_seed": 55,
+  "max_steps": 500,
+  "horizon": 1,
+  "rounds": 6,
+  "mc_rollouts": 32,
+  "validation_rollouts": 32,
+  "max_expanded_batch": 4096,
+  "diagnostic_decisions": [
+    0,
+    25,
+    100,
+    250,
+    400,
+    499
+  ],
+  "rollouts_per_round": 128,
+  "actor_updates_per_round": 4,
+  "batch_size": 256,
+  "critic_updates_per_round": [
+    32,
+    64
+  ],
+  "reference_campaign_id": "8e726a66d2e61924c611d8207795e33801edffcdd08d657d80311c6cd021eb70",
+  "reference_snapshot_sha256": "0db43b26c71a7b946118679aea3a3d0eddbcd9ff68dde608104a1f12596e12e4"
+}
