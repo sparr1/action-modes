@@ -34,6 +34,9 @@ J6_SETTINGS = {"h1_j6_fresh", "h1_j6_bernoulli_a0_c05", "h1_j6_matrix_blend05_ac
 J8_SELECTION = "h1-j8-post500k-v1"
 J8_CHECKPOINT_RANGE = dict(start=525000, stop=2000000, step=25000)
 J8_SETTINGS = {"h1_j8_fresh", "h1_j8_bernoulli_a0_c05", "h1_j8_matrix_blend05_actor"}
+J10_SELECTION = "h1-j10-800k-bernoulli-v1"
+J10_CHECKPOINT_RANGE = dict(start=800000, stop=800000, step=25000)
+J10_SETTINGS = {"h1_j10_bernoulli_a0_c05"}
 
 
 def require(condition, message):
@@ -82,16 +85,17 @@ def validate_configuration(config, selected=None):
     require(candidates and len({row["setting_id"] for row in candidates}) == len(candidates), "Candidates must be unique and nonempty.")
     selection = config.get("selection_id")
     profiles = {J6_SELECTION: (6, J6_CHECKPOINT_RANGE, J6_SETTINGS),
-                J8_SELECTION: (8, J8_CHECKPOINT_RANGE, J8_SETTINGS)}
+                J8_SELECTION: (8, J8_CHECKPOINT_RANGE, J8_SETTINGS),
+                J10_SELECTION: (10, J10_CHECKPOINT_RANGE, J10_SETTINGS)}
     require(selection is None or selection in profiles, "Unknown versioned curve selection.")
     if selection in profiles:
         rounds, checkpoint_range, required_settings = profiles[selection]
         require(config.get("checkpoint_range") == checkpoint_range,
-                f"J{rounds} checkpoint range must be 525k through 2M inclusive at 25k intervals.")
+                f"J{rounds} checkpoint range differs from its versioned selection.")
         require({row["setting_id"] for row in candidates} == required_settings,
-                f"J{rounds} selection requires fresh SAC, critic Bernoulli50%, and actor matrix shrink50%.")
+                f"J{rounds} selection requires its exact versioned settings.")
         require(selected is None or (len(selected) == len(required_settings) and set(selected) == required_settings),
-                f"J{rounds} selection must retain all three matched settings.")
+                f"J{rounds} selection must retain all requested settings.")
     else:
         require(config.get("checkpoint_range") is None, "Checkpoint range requires an explicit versioned selection.")
     lookup = {row["setting_id"]: row for row in candidates}
@@ -101,6 +105,10 @@ def validate_configuration(config, selected=None):
                 "Shortlist budget differs.")
         require(row.get("role") == ("fresh" if row["arm"] == "fresh" else "transfer"), "Candidate role differs.")
         if row["role"] == "transfer":
+            if selection == J10_SELECTION:
+                require("fresh_setting_id" not in row,
+                        "The single-setting J10 test has no matching fresh J10 control.")
+                continue
             control = lookup.get(row.get("fresh_setting_id"), {})
             require(control.get("role") == "fresh" and (control.get("H"), control.get("J")) == (row["H"], row["J"]),
                     "Transfer candidate requires its matching fresh SAC control.")
@@ -122,7 +130,10 @@ def select_checkpoints(checkpoints, config):
     require(start >= 0 and stop >= start and step > 0 and (stop - start) % step == 0,
             "Invalid inclusive checkpoint grid.")
     expected = list(range(start, stop + 1, step))
-    require(575000 in expected, "Selected checkpoint grid must include the audited 575k anchor.")
+    if config.get("selection_id") == J10_SELECTION:
+        require(interval == J10_CHECKPOINT_RANGE, "J10 evaluates only the 800k checkpoint.")
+    else:
+        require(575000 in expected, "Selected checkpoint grid must include the audited 575k anchor.")
     wanted = set(expected)
     selected = [row for row in checkpoints if row["step"] in wanted]
     require([row["step"] for row in selected] == expected,
@@ -197,6 +208,8 @@ def prepare(args):
     if config.get("selection_id") is not None:
         campaign.update(selection_id=config["selection_id"], checkpoint_range=deepcopy(config["checkpoint_range"]),
             selection=f"Post-500k H1 J{candidates[0]['J']} matched-budget comparison; checkpoints are repeated measurements of one trained backbone.")
+    if config.get("selection_id") == J10_SELECTION:
+        campaign["selection"] = "800k H1 J10 critic Bernoulli50% extension of the paired J4/J6/J8 curve; no fresh J10 control."
     generated = []
     for checkpoint_index, checkpoint in enumerate(checkpoints):
         step = checkpoint["step"]
@@ -216,7 +229,7 @@ def prepare(args):
             campaign["cells"].append(dict(index=len(campaign["cells"]), name=name, step=step,
                 checkpoint_index=checkpoint_index, **candidate, config_path=str(recipe_path),
                 resolved_sha256=canonical_hash(resolved), result_dir=str(args.root.resolve() / "settings" / name)))
-    smoke_steps = {checkpoints[0]["step"], 575000, checkpoints[-1]["step"]}
+    smoke_steps = {800000} if config.get("selection_id") == J10_SELECTION else {checkpoints[0]["step"], 575000, checkpoints[-1]["step"]}
     campaign["smoke_indices"] = [row["index"] for row in campaign["cells"] if row["step"] in smoke_steps]
     campaign["smoke_checkpoint_steps"] = sorted(smoke_steps)
     campaign["reused_indices"] = []

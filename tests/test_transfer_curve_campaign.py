@@ -13,6 +13,7 @@ from utils.ambi_benchmark import canonical_hash, solver_seed
 CONFIG = campaign.ROOT / "configs/research/ambi_transfer_checkpoint_curves.json"
 J6_CONFIG = CONFIG.parent / "ambi_transfer_checkpoint_j6_after500k_curves.json"
 J8_CONFIG = CONFIG.parent / "ambi_transfer_checkpoint_j8_after500k_curves.json"
+J10_CONFIG = CONFIG.parent / "ambi_transfer_800k_bernoulli_j10_curves.json"
 EXTENSIONS = [(6, J6_CONFIG), (8, J8_CONFIG)]
 
 
@@ -256,9 +257,9 @@ def test_extension_selection_preserves_recipe_and_requires_all_matched_controls(
     for key in ("base_matrix", "base_preset", "checkpoint_contract", "seeds", "controller_seed", "max_steps",
                 "critic_updates", "actor_updates", "rollouts", "batch_size", "diagnostics"):
         assert recipe[key] == original_recipe[key]
-    with pytest.raises(ValueError, match="all three"):
+    with pytest.raises(ValueError, match="all requested settings"):
         campaign.validate_configuration(config, [f"h1_j{rounds}_fresh"])
-    with pytest.raises(ValueError, match="matched settings"):
+    with pytest.raises(ValueError, match="all requested settings"):
         campaign.validate_configuration(config, list(required_settings) + [f"h1_j{rounds}_fresh"])
 
 
@@ -350,6 +351,118 @@ def test_extension_preparation_creates_180_cells_and_nine_smokes_from_full_bank(
     for cell in definition["cells"][:3]:
         directory = write_result(args.root, definition, cell, smoke=True)
         campaign.validate_result(directory, definition, cell, smoke=True)
+
+
+def test_j10_preserves_j8_recipe_with_only_requested_rounds_and_arm():
+    config = campaign.read_json(J10_CONFIG)
+    candidates = campaign.validate_configuration(config)
+    assert len(candidates) == 1
+    assert candidates[0]["setting_id"] == "h1_j10_bernoulli_a0_c05"
+    assert (candidates[0]["H"], candidates[0]["J"], candidates[0]["role"]) == (1, 10, "transfer")
+    assert "fresh_setting_id" not in candidates[0]
+    assert campaign.validate_configuration(config, [candidates[0]["setting_id"]]) == candidates
+    j8 = campaign.read_json(J8_CONFIG)
+    old = campaign.read_json(CONFIG.parent / j8["discovery_template"])
+    new = campaign.read_json(CONFIG.parent / config["discovery_template"])
+    assert new["rounds"] == [10]
+    assert new["arms"] == {"bernoulli_a0_c05": old["arms"]["bernoulli_a0_c05"]}
+    normalized = deepcopy(new)
+    for key in ("rounds", "arms", "description"):
+        normalized[key] = old[key]
+    assert normalized == old
+
+
+@pytest.mark.parametrize("mutation,match", [
+    (lambda value: value.pop("selection_id"), "explicit versioned selection"),
+    (lambda value: value["checkpoint_range"].update(start=575000), "checkpoint range"),
+    (lambda value: value["candidates"].append(dict(setting_id="h1_j10_fresh", H=1, J=10,
+                                                 arm="fresh", role="fresh")), "exact versioned settings"),
+    (lambda value: value["candidates"][0].update(H=2), "identity mismatch"),
+    (lambda value: value["candidates"][0].update(J=8), "identity mismatch"),
+    (lambda value: value["candidates"][0].update(arm="fresh"), "identity mismatch"),
+    (lambda value: value["candidates"][0].update(role="fresh"), "role differs"),
+    (lambda value: value["candidates"][0].update(fresh_setting_id="h1_j8_fresh"), "no matching fresh J10"),
+    (lambda value: value.update(seeds=[101]), "protocol"),
+    (lambda value: value.update(critic_updates=32), "protocol"),
+])
+def test_j10_scope_drift_is_rejected(mutation, match):
+    config = campaign.read_json(J10_CONFIG)
+    mutation(config)
+    with pytest.raises(ValueError, match=match):
+        campaign.validate_configuration(config)
+
+
+def test_j10_selection_requires_800k_and_does_not_relax_other_profiles():
+    config = campaign.read_json(J10_CONFIG)
+    inventory = [dict(step=575000), dict(step=800000), dict(step=2000000)]
+    assert campaign.select_checkpoints(inventory, config) == [dict(step=800000)]
+    with pytest.raises(ValueError, match="every checkpoint"):
+        campaign.select_checkpoints([dict(step=575000)], config)
+    with pytest.raises(ValueError, match="all requested settings"):
+        campaign.validate_configuration(config, [])
+    legacy = campaign.read_json(CONFIG)
+    legacy["candidates"] = deepcopy(config["candidates"])
+    with pytest.raises(ValueError, match="budget"):
+        campaign.validate_configuration(legacy)
+    legacy["checkpoint_range"] = config["checkpoint_range"]
+    with pytest.raises(ValueError, match="audited 575k anchor"):
+        campaign.select_checkpoints(inventory, legacy)
+
+
+def test_j10_preparation_keeps_anchor_validation_and_full_seed_receipts(prepared):
+    original_args, original_definition = prepared
+    inventory = campaign.read_json(original_args.inventory)
+    anchor = next(row for row in inventory["checkpoints"] if row["step"] == 575000)
+    checkpoint = Path(anchor["checkpoint"]).parent / "800000"
+    checkpoint.write_text("checkpoint 800000")
+    metadata = campaign.read_json(anchor["checkpoint"] + ".metadata.json")
+    metadata["checkpoint"]["step"] = 800000
+    sidecar = Path(str(checkpoint) + ".metadata.json")
+    save(sidecar, metadata)
+    inventory["checkpoints"].append(dict(step=800000, checkpoint=str(checkpoint),
+        checkpoint_sha256=campaign.digest(checkpoint), metadata_sha256=campaign.digest(sidecar)))
+    without_anchor = deepcopy(inventory)
+    without_anchor["checkpoints"] = [row for row in without_anchor["checkpoints"] if row["step"] != 575000]
+    with pytest.raises(ValueError, match="audited 575k anchor"):
+        campaign.validate_inventory(without_anchor)
+    save(original_args.inventory, inventory)
+    args = SimpleNamespace(**vars(original_args))
+    args.root = original_args.root.parent / "j10-campaign"
+    args.config, args.settings = J10_CONFIG, None
+    definition = campaign.prepare(args)
+    assert [row["step"] for row in definition["checkpoints"]] == [800000]
+    assert len(definition["cells"]) == 1
+    assert definition["smoke_indices"] == definition["production_indices"] == [0]
+    assert definition["smoke_checkpoint_steps"] == [800000] and definition["reused_indices"] == []
+    assert definition["seeds"] == [101, 102, 103, 104, 105]
+    assert definition["diagnostics"] == original_definition["diagnostics"]
+    assert definition["scientific_source"] == original_definition["scientific_source"]
+    cell = definition["cells"][0]
+    assert cell["name"] == "step-800000/h1_j10_bernoulli_a0_c05"
+    assert "fresh_setting_id" not in cell
+    for smoke in (True, False):
+        directory = write_result(args.root, definition, cell, smoke=smoke)
+        receipt = campaign.make_receipt(args.root, definition, cell, directory,
+            smoke=smoke, hardware="NVIDIA L40S, uuid, driver")
+        campaign.write(campaign.receipt_path(args.root, cell, smoke=smoke), receipt)
+        assert campaign.validate_receipt(args.root, definition, cell, smoke=smoke) == receipt
+        assert receipt["episodes"] == (2 if smoke else 5)
+    from utils.transfer_campaign import load_campaign, resolved_cell
+    manifest = campaign.read_json(Path(cell["result_dir"]) / "manifest.json")
+    j10_resolved = manifest["resolved"]
+    j8_config = campaign.read_json(J8_CONFIG)
+    j8_recipe = load_campaign(CONFIG.parent / j8_config["discovery_template"])
+    j8_resolved = resolved_cell(j10_resolved, j8_recipe, horizon=1, rounds=8, arm=cell["arm"])
+    expected = deepcopy(j8_resolved)
+    expected["algorithm_config"]["alg_params"]["inner_rounds"] = 10
+    expected["selector"] = "transfer_discovery/bernoulli_a0_c05/H1/J10"
+    assert j10_resolved == expected
+    assert j10_resolved["algorithm_config"]["alg_params"]["inner_replay_capacity"] >= 1280
+    partial = campaign.read_json(Path(cell["result_dir"]) / "results.json")
+    partial["episodes"].pop()
+    save(Path(cell["result_dir"]) / "results.json", partial)
+    with pytest.raises(ValueError, match="seed panel"):
+        campaign.validate_result(cell["result_dir"], definition, cell)
 
 
 def test_diagnostic_coverage_and_isolation_are_required(prepared):

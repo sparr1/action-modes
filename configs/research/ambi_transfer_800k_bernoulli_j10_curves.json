@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "protocol": "inner-sac-transfer-checkpoint-curves-v1",
+  "source_run": "rwgao_b-brown-university/ambi/aux6428346x0",
+  "description": "Single 800k H1 J10 critic Bernoulli50% test, extending the paired J4/J6/J8 curve with unchanged C16/A4/N128/B256 and five seeds.",
+  "discovery_template": "ambi_transfer_800k_bernoulli_j10.json",
+  "seeds": [
+    101,
+    102,
+    103,
+    104,
+    105
+  ],
+  "controller_seed": 55,
+  "max_steps": 500,
+  "critic_updates": 16,
+  "actor_updates": 4,
+  "rollouts": 128,
+  "batch_size": 256,
+  "gpu_hardware": "L40S",
+  "smoke_seeds": [
+    101,
+    102
+  ],
+  "smoke_steps": 3,
+  "candidates": [
+    {
+      "setting_id": "h1_j10_bernoulli_a0_c05",
+      "H": 1,
+      "J": 10,
+      "arm": "bernoulli_a0_c05",
+      "label": "H1 J10 \u00b7 Bernoulli 50% critic (all parameters)",
+      "role": "transfer"
+    }
+  ],
+  "selection_id": "h1-j10-800k-bernoulli-v1",
+  "checkpoint_range": {
+    "start": 800000,
+    "stop": 800000,
+    "step": 25000
+  }
+}

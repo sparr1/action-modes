@@ -206,3 +206,20 @@ unchanged; J8 receives three new colors and pending progress before results
 complete.
 Legend markers use full opacity and labels use the exact curve colors; the
 uncertainty bands retain their separate low opacity.
+
+## Single 800k J10 Bernoulli extension
+
+`ambi_transfer_800k_bernoulli_j10_curves.json` selects only the 800k checkpoint
+and H1/J10 critic Bernoulli 50% transfer. It uses the same C16/A4/N128/B256,
+five environment seeds 101–105, controller seed 55, persistent per-episode
+solver streams, compiled L40S execution, and diagnostics as the J4/J6/J8
+curves. Each decision uses 1,280 imagined transitions, 160 critic updates,
+and 40 actor updates. The actor, optimizer, temperature, and replay reset at
+each decision; selected critic parameter entries copy the previous solve.
+
+This is one cell containing five full 500-decision episodes. Only that cell
+is smoke-tested (two seeds, three decisions), and no additional fresh J10
+control or other checkpoint is evaluated. Gains against fresh J10 are therefore
+unavailable. Preparation still verifies the full inventory's 575k anchor and
+shared backbone identity before selecting 800k. Existing J4/J6/J8 results are
+read-only comparison inputs.
