@@ -40,6 +40,9 @@ case "$CAMPAIGN_MODE" in
     if [[ -n "${COMPARISON_EXTENSION_PUBLICATION_ROOT:-}" ]]; then
       args+=(--comparison-extension-publication-root "$COMPARISON_EXTENSION_PUBLICATION_ROOT")
     fi
+    if [[ -n "${COMPARISON_MPPI_DATA:-}" ]]; then
+      args+=(--comparison-mppi-data "$COMPARISON_MPPI_DATA")
+    fi
     exec "$PYTHON_BIN" slurm/ambi_transfer_checkpoint_publish.py "${args[@]}"
     ;;
   publish)

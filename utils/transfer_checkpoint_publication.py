@@ -244,6 +244,11 @@ def fresh_setting(campaign, setting):
     """Resolve the exact H/J fresh control, independently of publication order."""
     if setting['setting_id'] == PRIOR_ID:
         return None
+    # An explicitly selected follow-up has no new matched fresh-control arm.
+    if campaign.get('publication_without_fresh_control') or (
+            campaign.get('selection_id') == 'h2-j8-post500k-bernoulli-v1'
+            and setting['setting_id'] == 'h2_j8_bernoulli_a0_c05'):
+        return None
     choices = [row for row in campaign['candidates']
                if row['H'] == setting['H'] and row['J'] == setting['J']
                and row.get('role') == 'fresh']

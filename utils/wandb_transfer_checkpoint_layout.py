@@ -9,6 +9,7 @@ from utils.wandb_results_layout import (_views,_selected,_spec,_bank,_hash,_writ
 from utils.wandb_transfer_discovery_layout import _CREATE_VIEW
 from utils.transfer_checkpoint_publication import settings
 
+SELECTED_VERSION='transfer-checkpoint-selected-references-v1'
 VERSION='transfer-checkpoint-curves-v5'
 HOST_VERSION='transfer-checkpoint-curves-v6'
 FOLLOWUP_VERSION='transfer-checkpoint-curves-v7'
@@ -25,10 +26,11 @@ name:$name,displayName:$displayName,type:$type,access:$access,spec:$spec}){chart
 
 
 def _version(legacy=False, version=None, campaign=None):
-    default=(LEGEND_VERSION if campaign and campaign.get('followup_styles') else
+    default=(SELECTED_VERSION if campaign and campaign.get('selected_reference_styles') else
+             LEGEND_VERSION if campaign and campaign.get('followup_styles') else
              HOST_VERSION if campaign and campaign.get('extension_styles') else VERSION)
     chosen=LEGACY_VERSION if legacy else default if version is None else version
-    if chosen not in (LEGACY_VERSION,INTERACTIVE_VERSION,PREVIOUS_VERSION,VERSION,HOST_VERSION,FOLLOWUP_VERSION,LEGEND_VERSION):
+    if chosen not in (LEGACY_VERSION,INTERACTIVE_VERSION,PREVIOUS_VERSION,VERSION,HOST_VERSION,FOLLOWUP_VERSION,LEGEND_VERSION,SELECTED_VERSION):
         raise ValueError('Unknown transfer checkpoint layout version.')
     return chosen
 
@@ -37,6 +39,25 @@ def display_settings(campaign, *, version=None):
     """External display styles never become scientific campaign candidates."""
     rows=settings(campaign)
     chosen=_version(version=version,campaign=campaign)
+    if chosen == SELECTED_VERSION:
+        from utils.transfer_mppi_comparison import STYLES
+        from utils.transfer_checkpoint_publication import J8_COLORS
+        references=campaign.get('selected_reference_styles', [])
+        require_ids={'h1_j8_bernoulli_a0_c05', *[r['setting_id'] for r in STYLES]}
+        if (campaign.get('selection_id') != 'h2-j8-post500k-bernoulli-v1'
+                or len(campaign['candidates']) != 1 or campaign['candidates'][0]['setting_id'] != 'h2_j8_bernoulli_a0_c05'
+                or len(references) != 3 or {r.get('setting_id') for r in references} != require_ids):
+            raise ResultsLayoutError('Selected view requires H2 J8, H1 J8 and both MPPI references.')
+        for ref in references:
+            expected=next((r for r in STYLES if r['setting_id']==ref['setting_id']), None)
+            if (not ref.get('label') or (expected and ref != expected) or
+                    (expected is None and (ref.get('color') != J8_COLORS['h1_j8_bernoulli_a0_c05'] or ref.get('role') != 'transfer'))):
+                raise ResultsLayoutError('Selected reference style differs.')
+        rows.extend(deepcopy(references))
+        for key in ('setting_id','label','color'):
+            if len({r[key].lower() if key=='color' else r[key] for r in rows}) != len(rows):
+                raise ResultsLayoutError('Selected curves require distinct '+key+'.')
+        return rows
     if chosen not in (VERSION,HOST_VERSION,FOLLOWUP_VERSION,LEGEND_VERSION):
         return rows
     comparisons=campaign.get('comparison_styles',[])
@@ -119,7 +140,7 @@ def chart_definition(campaign, *, legacy=False, version=None):
     if version==INTERACTIVE_VERSION:
         definition['params']=[{'name':'selected_curves','select':{'type':'point','fields':['${field:label}']},'bind':'legend'}]
         definition['encoding']['opacity']={'condition':{'param':'selected_curves','value':1},'value':.12}
-    if version==LEGEND_VERSION:
+    if version in (LEGEND_VERSION,SELECTED_VERSION):
         # The shared legend otherwise inherits the uncertainty area's 0.1 opacity.
         definition['encoding']['color']['legend'].update(symbolOpacity=1,symbolSize=160,
             labelColor={'expr':"scale('color', datum.value)"})
@@ -194,6 +215,18 @@ def sections(campaign,entity, *, legacy=False, version=None):
         intro+=' H1 J6 fresh, critic 50% copying and actor 50% shrink are evaluated only at the 60 checkpoints from 525k through 2M. Earlier checkpoints for these three curves were not requested.'
     if version in (FOLLOWUP_VERSION,LEGEND_VERSION):
         intro+=' The three H1 J8 curves use the same 60-checkpoint range and five paired seeds, with their own matched fresh J8 control.'
+    if version == SELECTED_VERSION:
+        intro=('### H2 versus H1 across the checkpoint bank\n\n'
+            '**60 checkpoints, 525k–2M; H2 J8 critic Bernoulli 50% is the sole new setting.** '
+            'H1 J8 critic Bernoulli 50%, the base actor and both MPPI H3 curves are verified published references. '
+            'Five paired environment seeds 101–105, controller seed55, full500-decision episodes. '
+            'SAC executes the adapted actor mean and MPPI its proposal mean. '
+            'Bands show episode sample SD, not confidence intervals; gains subtract the same checkpoint/seed prior. '
+            'No matched H2 fresh control was requested, so no fresh-control gain is displayed. '
+            'Controller timing includes initialization and transfer; steady timing excludes decisions0–9. '
+            'Both exclude diagnostics. SAC timings use compiled L40S execution; historical prior/MPPI timing is omitted. '
+            '**Pending and failed checkpoints are explicit in progress; missing values are never zero.** '
+            'All curve and legend colors are fixed. Only compact metadata artifacts are uploaded; full traces remain on Oscar.')
     panels=[_panel('curve-intro','Markdown Panel',{'value':intro},width=24,height=5),
         _panel('curve-progress','Media Browser',{'chartTitle':'Checkpoint progress, including pending and failed evaluations',
             'mediaKeys':[PROGRESS_KEY]},width=24,height=9)]
@@ -205,6 +238,8 @@ def sections(campaign,entity, *, legacy=False, version=None):
                             ('return_min','Lowest observed seed return','Lowest episode return'),
                             ('control','Full controller time, including initialization','Seconds per real decision'),
                             ('late','Steady controller time, decisions 10–499','Seconds per real decision')):
+        if version == SELECTED_VERSION and key == 'fresh_gain':
+            continue
         scalar = key in ('return_std','return_min')
         value = key if scalar else key+'_seconds' if key in ('late','control') else key+'_mean'
         curves.append(_panel('curve-'+key,'Vega2',{
@@ -219,7 +254,8 @@ def sections(campaign,entity, *, legacy=False, version=None):
                 lower='interval_not_applicable' if scalar else key+'_lower',
                 upper='interval_not_applicable' if scalar else key+'_upper'),
             'stringSettings':dict(title=title,ytitle=ytitle,statistic=ytitle if scalar else 'Mean',
-                subtitle=('Five paired episodes; base actor in black; fresh controls dashed' if scalar else
+                subtitle=('Five paired episodes; base actor in black' if scalar and version==SELECTED_VERSION else
+                          'Five paired episodes; base actor in black; fresh controls dashed' if scalar else
                           'Mean ± episode sample SD; five paired seeds; base actor in black'))},width=12,height=9))
     tables=[_panel('curve-values','Media Browser',{'chartTitle':'Exact completed means, episode SDs, gains and timing',
         'mediaKeys':[TABLE_KEY]},width=24,height=9)]
@@ -274,6 +310,8 @@ def ensure_saved_view(api,*,campaign,entity,project,publication_id,receipt_dir):
             if _installed(_spec(before),campaign,entity,publication_id):
                 receipt.update(status='verified',changed=False,view_id=before['id'])
                 _write(root/'results-layout-receipt.json',receipt);return receipt
+            if _version(campaign=campaign) == SELECTED_VERSION:
+                raise ResultsLayoutError('Existing selected comparison view differs; preserving user edits.')
             installed_version=next((version for version in (FOLLOWUP_VERSION,HOST_VERSION,VERSION,PREVIOUS_VERSION,INTERACTIVE_VERSION,LEGACY_VERSION)
                 if (version!=FOLLOWUP_VERSION or campaign.get('followup_styles'))
                 if (version!=HOST_VERSION or campaign.get('extension_styles'))

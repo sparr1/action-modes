@@ -150,8 +150,11 @@ def validate_comparison_extension(pin):
             require(digest(directory/'records'/(rid+'.json'))==expected,'Pinned J6 published record changed.')
 
 
-def comparison_host_receipt(campaign, campaign_path, host_root, entity, project, extension_root=None):
+def comparison_host_receipt(campaign, campaign_path, host_root, entity, project, extension_root=None, mppi_data=None):
     """Pin the completed original comparison without allocating/copying its runs."""
+    from utils.transfer_checkpoint_references import selected_campaign, selected_reference_receipt
+    if selected_campaign(campaign):
+        return selected_reference_receipt(campaign, campaign_path, host_root, extension_root, mppi_data, entity, project)
     from utils.eval_series import validate_record, _record_fingerprint
     from utils.transfer_checkpoint_publication import J6_COLORS, J8_COLORS
     rounds=campaign['candidates'][0]['J'];palette=J8_COLORS if rounds==8 else J6_COLORS
@@ -231,6 +234,9 @@ def validate_comparison_host(campaign,state,output):
     path=Path(output)/'comparison-host.json'
     require(digest(path)==expected,'Comparison host receipt changed.')
     host=read(path)
+    from utils.transfer_checkpoint_references import KIND, validate_selected_reference_receipt
+    if host.get('kind') == KIND:
+        return validate_selected_reference_receipt(host, campaign, state)
     require(host.get('format_version')==1 and host.get('kind') in ('h1-j6-after500k-comparison-host','h1-j8-after500k-comparison-host')
             and host['campaign_sha256']==state['campaign_sha256']
             and host['host_publication_id']==state.get('comparison_publication_id'),'Comparison host receipt binding differs.')
@@ -275,7 +281,7 @@ def prepare(args):
     requested_host=getattr(args,'comparison_host_publication_root',None)
     requested_extension=getattr(args,'comparison_extension_publication_root',None)
     require(not requested_extension or requested_host,'A comparison extension requires its original host.')
-    host=(comparison_host_receipt(campaign,root/'campaign.json',requested_host,args.entity,args.project,requested_extension)
+    host=(comparison_host_receipt(campaign,root/'campaign.json',requested_host,args.entity,args.project,requested_extension,getattr(args,'comparison_mppi_data',None))
           if requested_host else None)
     binding['comparison_host_sha256']=None
     with publisher_lock(output):
@@ -294,7 +300,8 @@ def prepare(args):
             state=dict(schema_version=1,publication_id=uuid.uuid4().hex,**binding,runs={})
             write(path,state)
         if host:
-            state['comparison_publication_id']=host['host_publication_id']
+            from utils.transfer_checkpoint_references import KIND
+            state['comparison_publication_id']=(state['publication_id'] if host['kind']==KIND else host['host_publication_id'])
             inherited=host['prior_run']
             state['runs'][PRIOR_ID]=dict(run_dir=inherited['run_dir'],run_id=inherited['run_id'],read_only=True,
                 label=settings(campaign)[0]['label'],color='#000000',order=0)
@@ -414,7 +421,8 @@ def collect(root,campaign,state,*,jobs_active):
                 # Registry is publication_root/registry/setting/run_id. Existing
                 # accepted records were skipped above, preserving their hashes.
                 cache_root=Path(state['runs'][key]['run_dir']).parents[2]/'packed-traces'
-                record=pack_decision_traces(record,cache_root)
+                from utils.transfer_checkpoint_references import selected_campaign, compact_scientific_record
+                record=(compact_scientific_record(record) if selected_campaign(campaign) else pack_decision_traces(record,cache_root))
                 stage_record(state['runs'][key]['run_dir'],record)
                 records[key][step]=record
                 continue
@@ -439,6 +447,9 @@ def collect(root,campaign,state,*,jobs_active):
         points,states=table_rows(campaign,setting,records[key],progress[key],
                                  fresh_records=records.get(matched,{}))
         curves[key]=dict(points=points,progress=states,completed=len(records[key]),total=len(campaign['checkpoints']))
+    if host and 'reference_curves' in host:
+        require(not set(curves).intersection(host['reference_curves']), 'Reference curves collide with new science.')
+        curves.update(deepcopy(host['reference_curves']))
     return dict(curves=curves,failures=failures,
         completed=sum(len(value) for key,value in records.items() if key!=PRIOR_ID),total=len(campaign['cells']),
         jobs_active=jobs_active)
@@ -505,7 +516,8 @@ def publish_overview(campaign,state,snapshot,output,wandb):
     if entry.get('snapshot_sha256')==stamp:
         return
     run=wandb.init(entity=state['entity'],project=state['project'],id=entry['run_id'],resume='allow',
-        mode='online',name=f"J{campaign['candidates'][0]['J']} after 500k · live comparison" if state.get('comparison_host_sha256') else 'Transfer backbone · live comparison',
+        mode='online',name=("H2 J8 after 500k · live comparison" if campaign.get('selection_id')=='h2-j8-post500k-bernoulli-v1' else
+              f"J{campaign['candidates'][0]['J']} after 500k · live comparison" if state.get('comparison_host_sha256') else 'Transfer backbone · live comparison'),
         job_type='transfer-checkpoint-overview',
         group='transfer-backbone-'+state['publication_id'][:8],
         tags=['transfer-backbone','publication-only','five-seed','full-episode'],
@@ -539,6 +551,11 @@ def comparison_layout_campaign(campaign,state,output):
     """
     if state.get('comparison_host_sha256'):
         host=validate_comparison_host(campaign,state,output)
+        if 'selected_reference_styles' in host:
+            result=dict(campaign,selected_reference_styles=deepcopy(host['selected_reference_styles']),
+                        publication_without_fresh_control=True)
+            display_settings(result)
+            return result
         root=Path(host['host_publication_root']); original=read(host['host_campaign_path'])
         result=comparison_layout_campaign(original,read(root/'publication.json'),root)
         result['extension_styles']=deepcopy(host['extension_styles'])
@@ -642,6 +659,8 @@ def parser():
         help='Reuse the completed original comparison and its prior read-only for H1 J6/J8.')
     prepare_parser.add_argument('--comparison-extension-publication-root',type=Path,
         help='For H1 J8, retain the completed J6 comparison from this publication root.')
+    prepare_parser.add_argument('--comparison-mppi-data',type=Path,
+        help='For selected H2, compact MPPI overlay JSON pinned by the original published receipt.')
     prepare_parser.add_argument('--attempt-label',required=True)
     prepare_parser.add_argument('--owner',default='oscar-rgao48')
     prepare_parser.add_argument('--entity',default='rwgao_b-brown-university')
