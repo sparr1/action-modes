@@ -210,3 +210,47 @@ def test_cpu_prepare_wrapper_forwards_pinned_mppi_data_intact(tmp_path):
     assert args[args.index('--comparison-mppi-data')+1]=='/reference data/mppi overlay.json'
     assert args[args.index('--comparison-host-publication-root')+1]=='/host data'
     assert args[args.index('--comparison-extension-publication-root')+1]=='/H1 J8 data'
+
+
+@pytest.fixture
+def publish_wrapper(tmp_path):
+    import os
+    import subprocess
+    bin_dir=tmp_path/'bin';bin_dir.mkdir()
+    git=bin_dir/'git';git.write_text('#!/bin/sh\nif [ "$1" = rev-parse ]; then echo abc123; fi\n');git.chmod(0o755)
+    python=bin_dir/'capture-python';python.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n');python.chmod(0o755)
+    script=Path(__file__).resolve().parents[1]/'slurm/run_ambi_transfer_curves_cpu_oscar.sbatch'
+    env={key:value for key,value in os.environ.items() if key not in {'GPU_JOB_ID','GPU_JOB_IDS','PUBLISH_ONCE'}}
+    env.update(PATH=str(bin_dir)+os.pathsep+os.environ['PATH'],SLURM_SUBMIT_DIR=str(script.parents[1]),
+        CAMPAIGN_ROOT=str(tmp_path/'campaign'),EXPECTED_ACTION_MODES_SHA='abc123',CAMPAIGN_MODE='publish',
+        PYTHON_BIN=str(python),SLURM_JOB_ID='test',SLURM_RESTART_COUNT='0',PUBLICATION_ROOT=str(tmp_path/'publication'))
+    return lambda extra:subprocess.run(['bash',str(script)],env=dict(env,**extra),text=True,capture_output=True)
+
+
+@pytest.mark.parametrize('extra,expected',[
+    ({'GPU_JOB_ID':'7330868'},['--gpu-job-id','7330868']),
+    ({'GPU_JOB_IDS':'7330868,7330999'},['--gpu-job-id','7330868','--gpu-job-id','7330999']),
+    ({'GPU_JOB_IDS':'7330868,7330999','GPU_JOB_ID':'1'},['--gpu-job-id','7330868','--gpu-job-id','7330999']),
+    ({'GPU_JOB_IDS':'','GPU_JOB_ID':'7330868'},['--gpu-job-id','7330868']),
+    ({'PUBLISH_ONCE':'1'},['--once']),
+])
+def test_cpu_publish_wrapper_forwards_all_gpu_arrays(publish_wrapper,extra,expected):
+    result=publish_wrapper(extra)
+    assert result.returncode==0,result.stderr
+    args=result.stdout.splitlines()
+    assert args[:2]==['slurm/ambi_transfer_checkpoint_publish.py','watch']
+    assert args[6:]==expected
+
+
+@pytest.mark.parametrize('extra',[
+    {},{'GPU_JOB_ID':'abc'},{'GPU_JOB_IDS':'7330868,abc'},
+    {'GPU_JOB_IDS':',7330868'},{'GPU_JOB_IDS':'7330868,'},
+    {'GPU_JOB_IDS':'7330868,,7330999'},{'GPU_JOB_IDS':'7330868, 7330999'},
+    {'GPU_JOB_IDS':'7330868\n7330999'},{'GPU_JOB_IDS':'7330868;echo unsafe'},
+    {'GPU_JOB_IDS':'invalid','GPU_JOB_ID':'7330868'},
+])
+def test_cpu_publish_wrapper_rejects_invalid_gpu_ids_before_python(publish_wrapper,extra):
+    result=publish_wrapper(extra)
+    assert result.returncode==2
+    assert 'must contain numeric job IDs separated by commas' in result.stderr
+    assert not result.stdout

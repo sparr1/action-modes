@@ -51,7 +51,15 @@ case "$CAMPAIGN_MODE" in
     if [[ "${PUBLISH_ONCE:-0}" == 1 ]]; then
       args+=(--once)
     else
-      args+=(--gpu-job-id "${GPU_JOB_ID:?}")
+      gpu_job_ids="${GPU_JOB_IDS:-${GPU_JOB_ID:-}}"
+      if [[ ! "$gpu_job_ids" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+        echo "GPU_JOB_IDS (or GPU_JOB_ID) must contain numeric job IDs separated by commas" >&2
+        exit 2
+      fi
+      IFS=',' read -r -a gpu_jobs <<< "$gpu_job_ids"
+      for gpu_job_id in "${gpu_jobs[@]}"; do
+        args+=(--gpu-job-id "$gpu_job_id")
+      done
     fi
     exec "$PYTHON_BIN" slurm/ambi_transfer_checkpoint_publish.py "${args[@]}"
     ;;
