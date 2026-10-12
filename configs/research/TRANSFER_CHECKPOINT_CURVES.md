@@ -234,3 +234,30 @@ controller timing, and sampled critic diagnostics remain visible in the owned
 view. Raw traces stay on Oscar; historical artifacts are not uploaded again.
 The CPU wrapper is `slurm/run_ambi_transfer_j10_publisher.sbatch`; run its
 `VALIDATE_ONLY=1` mode before publication against the actual reference roots.
+
+## H2 Bernoulli extension after 500k
+
+`ambi_transfer_checkpoint_h2_j8_after500k_curves.json` and its matching shortlist
+select only H2/J8 critic Bernoulli 50% over 525k–2M, every 25k. These 60 cells
+contain 300 full episodes on the same five seeds as the H1/J8 comparison.
+Only the imagination horizon changes: C16/A4/N128/B256, inherited temperature,
+critic parameter copying, fresh actor and optimizer state, execution at every
+real decision, diagnostics, and compiled L40S timing remain unchanged.
+Each decision collects 2,048 imagined transitions and performs 128 critic and
+32 actor updates; replay capacity remains 3,072. Smoke gates cover 525k, 575k
+and 2M, with two seeds and three decisions each.
+
+This tests horizon sensitivity at a fixed optimizer dose, rather than a fixed
+model-transition budget. H2 introduces interior Bellman targets using the
+adapted target critic, whereas H1 transitions immediately reach the frozen
+terminal value boundary. No H2 fresh control is included, so a gain over H1
+does not by itself isolate the causal benefit of transfer.
+
+The existing checkpoint publisher accepts the original publication through
+`--comparison-host-publication-root` and the completed H1/J8 publication through
+`--comparison-extension-publication-root`. For this explicit H2 selection it
+creates a separate view comparing H2/J8, H1/J8 critic Bernoulli, the frozen
+prior, and both H3 MPPI objectives. Historical evaluations are validated and
+reused. Pending checkpoints remain visible; new return points require all five
+episodes and trace validation. Compact new result artifacts retain provenance
+and trace hashes, while raw decision traces remain on Oscar to limit W&B storage.
