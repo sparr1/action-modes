@@ -223,3 +223,14 @@ control or other checkpoint is evaluated. Gains against fresh J10 are therefore
 unavailable. Preparation still verifies the full inventory's 575k anchor and
 shared backbone identity before selecting 800k. Existing J4/J6/J8 results are
 read-only comparison inputs.
+
+`slurm/publish_ambi_transfer_j10.py` publishes a separate 800k comparison with
+J on the x-axis. Supply the original J4, J6, and J8 publication directories
+using three `--reference-publication-root` arguments. It verifies their accepted
+record fingerprints and paired seeds before reusing their compact summaries.
+The J10 point appears only after all five episodes and decision traces pass
+validation. Progress, paired gains over the prior and J8, return variability,
+controller timing, and sampled critic diagnostics remain visible in the owned
+view. Raw traces stay on Oscar; historical artifacts are not uploaded again.
+The CPU wrapper is `slurm/run_ambi_transfer_j10_publisher.sbatch`; run its
+`VALIDATE_ONLY=1` mode before publication against the actual reference roots.
