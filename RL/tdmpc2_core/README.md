@@ -2037,3 +2037,37 @@ for PAVE. Timing and memory measure this diagnostic workload, which performs
 separate parameter-gradient passes; they are not estimates of full training
 update overhead. GPU measurements require running on the target GPU. Confirm
 selected weights in a short training smoke before launching a full backbone.
+
+### Complete-update PAVE timing
+
+`benchmark_pave.py` measures actual learner updates on disposable copies of a
+saved backbone with an auxiliary return critic:
+
+```bash
+environments/dmcontrol/.venv/bin/python benchmark_pave.py \
+  --checkpoint /absolute/path/to/model \
+  --bank /absolute/path/to/real-transition-bank.npz \
+  --output-dir /absolute/path/to/new-timing-results
+```
+
+The four cases are PAVE disabled and auxiliary-only PAVE at 64, 256, and all
+sampled transitions. Auxiliary MPR/VFC/curvature weights are fixed at
+`.005/.005/.0005`, noise at `.01`, and margin at `1`; primary PAVE weights are
+zero. Ordinary losses use strict CUDA Inductor compilation and PAVE geometry
+stays eager. Defaults are ten warmup and 100 measured updates per case, repeated
+four times with rotated case order, on the same allocated GPU. Each case starts
+in a fresh process with the same checkpoint, including its saved optimizer state, and
+receives paired, pre-sampled GPU-resident batches within each repeat.
+
+Synchronized wall-clock timing wraps public `agent.update`, including the
+world/critic optimizer, actor, temperature, target updates, and ordinary learner
+metrics. Environment stepping, bank I/O, batch preparation/transfer, warmup,
+extra validation, and reporting are outside the timer. Optional outer-policy
+and value-equivalence diagnostics are disabled in all cases. This measures
+learner cost rather than end-to-end training throughput. The source checkpoint
+and bank remain unchanged; no trained weights or W&B runs are saved.
+
+The new output directory contains raw update timings, peak CUDA memory,
+per-repeat and paired summaries, configuration and source/input hashes, and
+child logs. Nonfinite metrics/parameters or compilation fallback fail the run.
+Use a scheduled GPU allocation, never a cluster login node.
