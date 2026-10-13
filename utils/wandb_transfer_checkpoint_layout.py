@@ -11,6 +11,9 @@ from utils.transfer_checkpoint_publication import settings
 
 SELECTED_VERSION='transfer-checkpoint-selected-references-v1'
 HORIZON_VERSION='transfer-checkpoint-horizon-references-v1'
+HOVER_SELECTED_VERSION='transfer-checkpoint-selected-references-hover-v1'
+HOVER_HORIZON_VERSION='transfer-checkpoint-horizon-references-hover-v1'
+HOVER_LEGEND_VERSION='transfer-checkpoint-curves-hover-v1'
 VERSION='transfer-checkpoint-curves-v5'
 HOST_VERSION='transfer-checkpoint-curves-v6'
 FOLLOWUP_VERSION='transfer-checkpoint-curves-v7'
@@ -18,6 +21,9 @@ LEGEND_VERSION='transfer-checkpoint-curves-v8'
 PREVIOUS_VERSION='transfer-checkpoint-curves-v4'
 INTERACTIVE_VERSION='transfer-checkpoint-curves-v3'
 LEGACY_VERSION='transfer-checkpoint-curves-v2'
+_HOVER_BASES={HOVER_SELECTED_VERSION:SELECTED_VERSION,
+              HOVER_HORIZON_VERSION:HORIZON_VERSION,
+              HOVER_LEGEND_VERSION:LEGEND_VERSION}
 TABLE_KEY='transfer_curves/points'
 PROGRESS_KEY='transfer_curves/progress'
 _QUERY='query TransferCurveChart($id:ID!){customChart(id:$id){id name type spec}}'
@@ -27,12 +33,12 @@ name:$name,displayName:$displayName,type:$type,access:$access,spec:$spec}){chart
 
 
 def _version(legacy=False, version=None, campaign=None):
-    default=(HORIZON_VERSION if campaign and campaign.get('selection_id') == 'horizon-j8-post500k-followup-v1' else
-             SELECTED_VERSION if campaign and campaign.get('selected_reference_styles') else
-             LEGEND_VERSION if campaign and campaign.get('followup_styles') else
+    default=(HOVER_HORIZON_VERSION if campaign and campaign.get('selection_id') == 'horizon-j8-post500k-followup-v1' else
+             HOVER_SELECTED_VERSION if campaign and campaign.get('selected_reference_styles') else
+             HOVER_LEGEND_VERSION if campaign and campaign.get('followup_styles') else
              HOST_VERSION if campaign and campaign.get('extension_styles') else VERSION)
     chosen=LEGACY_VERSION if legacy else default if version is None else version
-    if chosen not in (LEGACY_VERSION,INTERACTIVE_VERSION,PREVIOUS_VERSION,VERSION,HOST_VERSION,FOLLOWUP_VERSION,LEGEND_VERSION,SELECTED_VERSION,HORIZON_VERSION):
+    if chosen not in (LEGACY_VERSION,INTERACTIVE_VERSION,PREVIOUS_VERSION,VERSION,HOST_VERSION,FOLLOWUP_VERSION,LEGEND_VERSION,SELECTED_VERSION,HORIZON_VERSION,*_HOVER_BASES):
         raise ValueError('Unknown transfer checkpoint layout version.')
     return chosen
 
@@ -41,6 +47,7 @@ def display_settings(campaign, *, version=None):
     """External display styles never become scientific campaign candidates."""
     rows=settings(campaign)
     chosen=_version(version=version,campaign=campaign)
+    chosen=_HOVER_BASES.get(chosen,chosen)
     if chosen in (SELECTED_VERSION, HORIZON_VERSION):
         from utils.transfer_mppi_comparison import STYLES
         from utils.transfer_checkpoint_publication import J8_COLORS, HORIZON_COLORS
@@ -113,9 +120,32 @@ def display_settings(campaign, *, version=None):
     return rows
 
 
+def _add_hover_interaction(definition):
+    """Scope one selection to one layer; layered root params duplicate signals."""
+    line=definition['layer'][2]
+    line['name']='curve_hover'
+    line['params']=[dict(name='hovered_curve',select=dict(type='point',
+        fields=['${field:label}'],toggle=False,clear='pointerout',
+        on=dict(type='pointerover',
+            filter="event.item && datum && isValid(datum['${field:setting}'])")),
+        bind=dict(legend='pointerover'))]
+    for layer in definition['layer']:
+        mark=layer['mark']; opacity=mark.pop('opacity',1)
+        encoding=layer.setdefault('encoding',{})
+        encoding['opacity']=dict(condition=dict(param='hovered_curve',value=opacity),
+            value=opacity*.08)
+        mark['cursor']='pointer'
+        if mark['type']=='line':
+            encoding['strokeWidth']=dict(condition=dict(param='hovered_curve',empty=False,value=4.5),
+                value=mark.pop('strokeWidth'))
+    return definition
+
+
 def chart_definition(campaign, *, legacy=False, version=None):
     version=_version(legacy,version,campaign)
     styles=display_settings(campaign,version=version)
+    hover=version in _HOVER_BASES
+    version=_HOVER_BASES.get(version,version)
     definition = {'$schema':'https://vega.github.io/schema/vega-lite/v5.json',
         'data':{'name':'wandb'},'width':'container','height':360,
         'autosize':{'type':'fit','contains':'padding'},
@@ -153,7 +183,7 @@ def chart_definition(campaign, *, legacy=False, version=None):
         # The shared legend otherwise inherits the uncertainty area's 0.1 opacity.
         definition['encoding']['color']['legend'].update(symbolOpacity=1,symbolSize=160,
             labelColor={'expr':"scale('color', datum.value)"})
-    return definition
+    return _add_hover_interaction(definition) if hover else definition
 
 
 def chart_id(campaign,entity, *, legacy=False, version=None):
@@ -192,6 +222,9 @@ def runset(publication_id, *, legacy=False):
 def sections(campaign,entity, *, legacy=False, version=None):
     version=_version(legacy,version,campaign)
     styles=display_settings(campaign,version=version)
+    layout_version=version
+    hover=version in _HOVER_BASES
+    version=_HOVER_BASES.get(version,version)
     intro=('### Transfer across the checkpoint bank\n\n'
         f"**{len(campaign['checkpoints'])} checkpoints · {sum(row.get('role')=='transfer' for row in styles)} transfer settings, "
         f"{sum(row.get('role')=='fresh' for row in styles)} fresh SAC controls and the matched base actor.** "
@@ -251,6 +284,8 @@ def sections(campaign,entity, *, legacy=False, version=None):
             'Both exclude diagnostics. SAC uses compiled L40S execution; historical prior/MPPI timing is omitted. '
             '**Progress counts only the 120 new evaluations; missing measurements remain null.** '
             'Curve and legend colors match; fresh SAC is dashed. Only compact metadata artifacts are uploaded; full traces remain on Oscar.')
+    if hover:
+        intro+=' Hover over a curve or its legend name to highlight that setting and fade the others; move away to restore all curves.'
     panels=[_panel('curve-intro','Markdown Panel',{'value':intro},width=24,height=5),
         _panel('curve-progress','Media Browser',{'chartTitle':'Checkpoint progress, including pending and failed evaluations',
             'mediaKeys':[PROGRESS_KEY]},width=24,height=9)]
@@ -273,7 +308,7 @@ def sections(campaign,entity, *, legacy=False, version=None):
             'userQuery':{'queryFields':[{'name':'runSets','args':[{'name':'runSets','value':'${runSets}'},{'name':'limit','value':500.}],
                 'fields':[{'name':'summaryTable','args':[{'name':'tableKey','value':TABLE_KEY}],'fields':[]},
                           {'name':'id','value':[]},{'name':'name','value':[]}]}]},
-            'panelDefId':chart_id(campaign,entity,version=version),
+            'panelDefId':chart_id(campaign,entity,version=layout_version),
             'fieldSettings':dict(step='step',setting='setting',label='label',
                 segment='fresh_segment' if key=='fresh_gain' else 'segment',value=value,
                 sd='interval_not_applicable' if scalar else key+'_std',
@@ -289,8 +324,8 @@ def sections(campaign,entity, *, legacy=False, version=None):
     for suffix,name,items,columns in [('progress','Transfer curves | progress',panels,1),
             ('curves','Transfer curves | performance, variance and computation',curves,2),
             ('values','Transfer curves | measurements',tables,1)]:
-        for index,panel in enumerate(items): panel['__id__']=f'ambi-{version}-{suffix}-{index}'
-        result.append(dict(__id__=f'ambi-{version}-{suffix}',name=name,isOpen=True,type='flow',
+        for index,panel in enumerate(items): panel['__id__']=f'ambi-{layout_version}-{suffix}-{index}'
+        result.append(dict(__id__=f'ambi-{layout_version}-{suffix}',name=name,isOpen=True,type='flow',
             flowConfig=dict(snapToColumns=True,columnsPerPage=columns,rowsPerPage=4 if suffix=='curves' else 2 if suffix=='progress' else 1,
                 gutterWidth=16,boxWidth=540,boxHeight=500),sorted=0,pinned=True,isPanelsAuto=False,panels=items))
     return result
@@ -336,9 +371,13 @@ def ensure_saved_view(api,*,campaign,entity,project,publication_id,receipt_dir):
             if _installed(_spec(before),campaign,entity,publication_id):
                 receipt.update(status='verified',changed=False,view_id=before['id'])
                 _write(root/'results-layout-receipt.json',receipt);return receipt
-            if _version(campaign=campaign) in (SELECTED_VERSION, HORIZON_VERSION):
-                raise ResultsLayoutError('Existing selected comparison view differs; preserving user edits.')
-            installed_version=next((version for version in (FOLLOWUP_VERSION,HOST_VERSION,VERSION,PREVIOUS_VERSION,INTERACTIVE_VERSION,LEGACY_VERSION)
+            current_version=_version(campaign=campaign)
+            if current_version in (HOVER_SELECTED_VERSION,HOVER_HORIZON_VERSION):
+                previous_versions=(_HOVER_BASES[current_version],)
+            else:
+                previous_versions=(LEGEND_VERSION,FOLLOWUP_VERSION,HOST_VERSION,VERSION,PREVIOUS_VERSION,INTERACTIVE_VERSION,LEGACY_VERSION)
+            installed_version=next((version for version in previous_versions
+                if (version!=LEGEND_VERSION or campaign.get('followup_styles'))
                 if (version!=FOLLOWUP_VERSION or campaign.get('followup_styles'))
                 if (version!=HOST_VERSION or campaign.get('extension_styles'))
                 if _installed(_spec(before),campaign,entity,publication_id,version=version)),None)

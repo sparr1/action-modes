@@ -176,7 +176,8 @@ def horizon_reference_receipt(campaign, campaign_path, host_root, entity, projec
         and snapshot.get('completed') == snapshot.get('total') == 60 and not snapshot.get('failures'),
         'H2 reference publication must be complete without failures.')
     require(state.get('layout', {}).get('status') == 'verified' and
-        state['layout'].get('layout_version') == 'transfer-checkpoint-selected-references-v1'
+        state['layout'].get('layout_version') in ('transfer-checkpoint-selected-references-v1',
+            'transfer-checkpoint-selected-references-hover-v1')
         and state.get('overview', {}).get('snapshot_sha256') == fingerprint(dict(snapshot=snapshot, layout=state['layout'])),
         'H2 overview must contain its verified final snapshot.')
     setting = next(s for s in settings(previous) if s['setting_id'] == SETTING)

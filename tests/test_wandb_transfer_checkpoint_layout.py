@@ -292,7 +292,7 @@ def test_j8_view_preserves_colors_and_upgrades_same_view_to_fourteen_curves(tmp_
     others=deepcopy(service.views[:2]);kwargs=dict(campaign=data,entity='entity',project='ambi-inner-bench',
         publication_id='abc123',receipt_dir=tmp_path)
     result=layout.ensure_saved_view(SimpleNamespace(_service_api=service),**kwargs)
-    assert result['upgraded_from']==previous_version and result['layout_version']==layout.LEGEND_VERSION
+    assert result['upgraded_from']==previous_version and result['layout_version']==layout.HOVER_LEGEND_VERSION
     assert result['view_id']=='owned' and result['url'].endswith('?nw=transfercurvesabc123')
     assert service.views[:2]==others and service.views[-1]['displayName']=='My saved comparison'
     installed=json.loads(service.views[-1]['spec']);panels=[p for s in installed['section']['panelBankConfig']['sections'] for p in s['panels']]
@@ -310,6 +310,101 @@ def test_j8_preserves_user_modified_v6_view(tmp_path):
     service=Service();old=layout.saved_spec(spec(),data,'entity','abc123',version=layout.HOST_VERSION)
     old['section']['panelBankConfig']['sections'][1]['panels'][0]['config']['stringSettings']['title']='Custom title'
     service.views.append(dict(id='owned',name='nw-transfercurvesabc123-v',type='project-view',displayName='Custom',spec=json.dumps(old)))
+    before=deepcopy(service.views)
+    with pytest.raises(layout.ResultsLayoutError,match='preserving user edits'):
+        layout.ensure_saved_view(SimpleNamespace(_service_api=service),campaign=data,entity='entity',
+            project='ambi-inner-bench',publication_id='abc123',receipt_dir=tmp_path)
+    assert service.views==before and service.view_writes==0
+
+
+def hover_campaign(family):
+    from utils.transfer_mppi_comparison import STYLES
+    base=dict(checkpoints=[dict(step=525000)],candidates=[dict(setting_id='s1',label='Setting 1',role='transfer')])
+    if family=='legend':
+        return dict(base,comparison_styles=STYLES,extension_styles=extensions(),followup_styles=followups())
+    references=[dict(setting_id='h1_j8_bernoulli_a0_c05',label='H1 transfer',
+        color=adapter.J8_COLORS['h1_j8_bernoulli_a0_c05'],role='transfer'),*deepcopy(STYLES)]
+    if family=='selected':
+        return dict(base,selection_id='h2-j8-post500k-bernoulli-v1',
+            candidates=[dict(setting_id='h2_j8_bernoulli_a0_c05',label='H2 transfer',role='transfer')],
+            selected_reference_styles=references)
+    references.append(dict(setting_id='h2_j8_bernoulli_a0_c05',label='H2 transfer',
+        color=adapter.HORIZON_COLORS['h2_j8_bernoulli_a0_c05'],role='transfer'))
+    return dict(base,selection_id='horizon-j8-post500k-followup-v1',
+        candidates=[dict(setting_id='h3_j8_bernoulli_a0_c05',label='H3 transfer',role='transfer'),
+                    dict(setting_id='h2_j8_fresh',label='H2 fresh',role='fresh')],
+        selected_reference_styles=references)
+
+
+HOVER_CASES=[
+    ('legend',layout.LEGEND_VERSION,layout.HOVER_LEGEND_VERSION,'f6830d05fa58bf5a0eaaf5ea0ca6e3aeeebe8cf2a7ff57e4d19d92c7ebae6d02'),
+    ('selected',layout.SELECTED_VERSION,layout.HOVER_SELECTED_VERSION,'a75131facd5d6f6bd20d60c2582c18a48bc0a5fda31c2dce9125a92feada9c37'),
+    ('horizon',layout.HORIZON_VERSION,layout.HOVER_HORIZON_VERSION,'0bd60fe6f7040d0a9dfbde7750954806913f75377703598eeed1f0118493e100'),
+]
+
+
+@pytest.mark.parametrize('family,old_version,new_version,digest',HOVER_CASES)
+def test_hover_has_one_selection_scope_and_preserves_uncertainty_opacity(
+        family,old_version,new_version,digest):
+    data=hover_campaign(family)
+    before=layout.chart_definition(data,version=old_version)
+    after=layout.chart_definition(data,version=new_version)
+    # Root-level layered selections previously caused duplicate Vega signals.
+    assert 'params' not in after
+    owners=[layer for layer in after['layer'] if layer.get('params')]
+    assert len(owners)==1 and len(owners[0]['params'])==1
+    selection=owners[0]['params'][0]
+    assert selection['select']['clear']=='pointerout'
+    assert selection['select']['toggle'] is False
+    assert selection['bind']=={'legend':'pointerover'}
+    assert "datum['${field:setting}']" in selection['select']['on']['filter']
+    assert after['encoding']==before['encoding']
+    for old,new in zip(before['layer'],after['layer']):
+        base=old['mark'].get('opacity',1)
+        condition=new['encoding']['opacity']['condition']
+        assert condition=={'param':'hovered_curve','value':base}
+        assert new['encoding']['opacity']['value']==base*.08
+        if old['mark']['type']=='line':
+            width=new['encoding']['strokeWidth']
+            assert width['condition']['empty'] is False
+            assert width['value']==old['mark']['strokeWidth']
+
+
+@pytest.mark.parametrize('family,old_version,new_version,digest',HOVER_CASES)
+@pytest.mark.parametrize('lost_response',[False,True])
+def test_hover_upgrade_preserves_exact_previous_layouts_and_same_view(
+        tmp_path,family,old_version,new_version,digest,lost_response):
+    data=hover_campaign(family)
+    old=layout.saved_spec(spec(),data,'entity','abc123',version=old_version)
+    # Captured from the deployed 64a49c89 publisher before adding hover behavior.
+    assert layout._hash(old)==digest
+    service=Service(timeout=lost_response)
+    service.views.append(dict(id='owned',name='nw-transfercurvesabc123-v',type='project-view',
+        displayName='My existing comparison',spec=json.dumps(old)))
+    others=deepcopy(service.views[:2])
+    kwargs=dict(campaign=data,entity='entity',project='ambi-inner-bench',publication_id='abc123',receipt_dir=tmp_path)
+    api=SimpleNamespace(_service_api=service)
+    result=layout.ensure_saved_view(api,**kwargs)
+    assert result['upgraded_from']==old_version and result['layout_version']==new_version
+    assert result['view_id']=='owned' and result['url'].endswith('?nw=transfercurvesabc123')
+    assert service.views[:2]==others and service.views[-1]['displayName']=='My existing comparison'
+    installed=json.loads(service.views[-1]['spec'])
+    assert installed['section']['runSets']==old['section']['runSets']
+    assert layout._installed(installed,data,'entity','abc123')
+    panels=[p for s in installed['section']['panelBankConfig']['sections'] for p in s['panels']]
+    assert 'Hover over a curve or its legend name' in panels[0]['config']['value']
+    assert len([p for p in panels if p['viewType']=='Vega2'])==(6 if family=='selected' else 7)
+    assert not layout.ensure_saved_view(api,**kwargs)['changed']
+    assert service.view_writes==service.chart_writes==1
+
+
+@pytest.mark.parametrize('family,old_version,new_version,digest',HOVER_CASES)
+def test_hover_upgrade_preserves_user_edits(tmp_path,family,old_version,new_version,digest):
+    data=hover_campaign(family)
+    old=layout.saved_spec(spec(),data,'entity','abc123',version=old_version)
+    old['section']['panelBankConfig']['sections'][0]['name']='My section'
+    service=Service();service.views.append(dict(id='owned',name='nw-transfercurvesabc123-v',
+        type='project-view',displayName='My comparison',spec=json.dumps(old)))
     before=deepcopy(service.views)
     with pytest.raises(layout.ResultsLayoutError,match='preserving user edits'):
         layout.ensure_saved_view(SimpleNamespace(_service_api=service),campaign=data,entity='entity',

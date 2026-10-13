@@ -97,6 +97,33 @@ def test_horizon_rejects_incomplete_or_unpublished_h2_host(horizon):
     with pytest.raises(SeriesError,match='complete without failures'):publish.prepare(args)
 
 
+@pytest.mark.parametrize('verified_snapshot',[False,True])
+def test_horizon_accepts_hover_host_only_with_matching_final_snapshot(horizon,verified_snapshot):
+    _,args=horizon;root=args.comparison_host_publication_root
+    path=root/'publication.json';state=json.loads(path.read_text())
+    snapshot=json.loads((root/'snapshot.json').read_text())
+    state['layout']['layout_version']=layout.HOVER_SELECTED_VERSION
+    if verified_snapshot:
+        state['overview']['snapshot_sha256']=publish.fingerprint(dict(snapshot=snapshot,layout=state['layout']))
+    save(path,state);before=path.read_bytes()
+    if verified_snapshot:
+        prepared=publish.prepare(args)
+        assert prepared['prepared'] and prepared['runs']['prior']['read_only']
+    else:
+        with pytest.raises(SeriesError,match='verified final snapshot'):publish.prepare(args)
+    assert path.read_bytes()==before
+
+
+def test_horizon_rejects_unknown_host_layout_even_with_matching_snapshot(horizon):
+    _,args=horizon;root=args.comparison_host_publication_root
+    path=root/'publication.json';state=json.loads(path.read_text())
+    snapshot=json.loads((root/'snapshot.json').read_text())
+    state['layout']['layout_version']='unknown-layout'
+    state['overview']['snapshot_sha256']=publish.fingerprint(dict(snapshot=snapshot,layout=state['layout']))
+    save(path,state)
+    with pytest.raises(SeriesError,match='verified final snapshot'):publish.prepare(args)
+
+
 def test_horizon_rejects_wrong_horizon_in_reference_config(horizon):
     campaign,args=horizon;root=args.comparison_host_publication_root
     state=json.loads((root/'publication.json').read_text());directory=Path(state['runs'][refs.SETTING]['run_dir'])

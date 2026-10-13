@@ -89,6 +89,19 @@ not render as panels. The saved workspace selects only the overview so the
 six curves are not duplicated; their fixed colors remain consistent across panels.
 The overview is presentation state and is not an additional evaluated method.
 
+The J8, H2-only, and H2/H3 comparison views support hover highlighting. Hover
+over a curve, one of its points, or its legend name to emphasize that setting
+and fade the other curves and uncertainty bands. Moving away restores all
+curves. The interaction applies within each chart; fixed colors, fresh-control
+dash patterns, and tooltips remain available. It changes presentation only,
+without rerunning evaluations or modifying logged measurements.
+
+Hover layouts upgrade only their exact recognized predecessor at the existing
+saved-view URL, preserving other workspaces and rejecting unknown user edits.
+The publisher should resume from a commit supporting the hover layout after
+an upgrade. Completed reference publications and their pinned files remain
+unchanged when updating an existing dashboard.
+
 The publisher persists its overview run ID before contacting W&B and resumes
 that ID after interruptions. Restarting the CPU publisher with `watch` safely
 adds the overview to an existing prepared campaign. Workspace version 3 can
