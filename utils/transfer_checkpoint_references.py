@@ -1,4 +1,4 @@
-"""Read-only, content-pinned references for the selected H2 checkpoint follow-up."""
+"""Read-only, content-pinned references for the selected checkpoint follow-ups."""
 from copy import deepcopy
 import hashlib
 import math
@@ -14,10 +14,15 @@ SELECTION = 'h2-j8-post500k-bernoulli-v1'
 KIND = 'h2-j8-after500k-selected-references'
 SETTING = 'h2_j8_bernoulli_a0_c05'
 REFERENCE = 'h1_j8_bernoulli_a0_c05'
+HORIZON_SELECTION = 'horizon-j8-post500k-followup-v1'
+HORIZON_KIND = 'horizon-j8-after500k-selected-references'
+HORIZON_TRANSFER = 'h3_j8_bernoulli_a0_c05'
+HORIZON_FRESH = 'h2_j8_fresh'
+SELECTED_KINDS = (KIND, HORIZON_KIND)
 
 
 def selected_campaign(campaign):
-    return campaign.get('selection_id') == SELECTION
+    return campaign.get('selection_id') in (SELECTION, HORIZON_SELECTION)
 
 
 def _verify_protocol(campaign, previous):
@@ -35,7 +40,7 @@ def _verify_protocol(campaign, previous):
 def selected_reference_receipt(campaign, campaign_path, host_root, reference_root, mppi_data, entity, project):
     from slurm.ambi_transfer_checkpoint_publish import read, fingerprint
     from slurm.publish_ambi_transfer_j10 import _validate_episodes
-    require(selected_campaign(campaign) and len(campaign['candidates']) == 1 and
+    require(campaign.get('selection_id') == SELECTION and len(campaign['candidates']) == 1 and
         campaign['candidates'][0]['setting_id'] == SETTING and
         (campaign['candidates'][0]['H'], campaign['candidates'][0]['J'], campaign['candidates'][0]['arm']) == (2, 8, 'bernoulli_a0_c05'),
         'Selected references require the exact H2 J8 Bernoulli critic follow-up.')
@@ -122,7 +127,8 @@ def selected_reference_receipt(campaign, campaign_path, host_root, reference_roo
 
 
 def validate_selected_reference_receipt(host, campaign, state):
-    require(host.get('format_version') == 1 and host.get('kind') == KIND and selected_campaign(campaign)
+    require(host.get('format_version') == 1 and host.get('kind') == (HORIZON_KIND if campaign.get('selection_id') == HORIZON_SELECTION else KIND)
+        and selected_campaign(campaign)
         and host['campaign_sha256'] == state['campaign_sha256'] and
         state.get('comparison_publication_id') == state['publication_id'], 'Selected reference binding differs.')
     require(set(host['prior_records']) == {str(cp['step']) for cp in campaign['checkpoints']}, 'Selected prior coverage changed.')
@@ -131,6 +137,90 @@ def validate_selected_reference_receipt(host, campaign, state):
     require(prior.get('read_only') is True and all(prior[k] == host['prior_run'][k] for k in ('run_id', 'run_dir')),
         'Selected prior must remain read-only.')
     return host
+
+
+def horizon_reference_receipt(campaign, campaign_path, host_root, entity, project):
+    """Reuse the final H2 publication and its pinned references without new artifacts."""
+    from slurm.ambi_transfer_checkpoint_publish import read, fingerprint, validate_comparison_host
+    from slurm.publish_ambi_transfer_j10 import _validate_episodes
+    require(campaign.get('selection_id') == HORIZON_SELECTION and
+        {(s['setting_id'], s['H'], s['J'], s['arm'], s['role']) for s in campaign['candidates']} ==
+        {(HORIZON_TRANSFER, 3, 8, 'bernoulli_a0_c05', 'transfer'), (HORIZON_FRESH, 2, 8, 'fresh', 'fresh')}
+        and len(campaign['candidates']) == 2, 'Horizon references require exactly H3 transfer and H2 fresh at J8.')
+    require([cp['step'] for cp in campaign['checkpoints']] == list(range(525000, 2000001, 25000)),
+        'Horizon references require the 60 checkpoints after 500k.')
+    require(len(campaign['cells']) == 120 and
+        {(c['setting_id'], c['step']) for c in campaign['cells']} ==
+        {(s['setting_id'], cp['step']) for s in campaign['candidates'] for cp in campaign['checkpoints']},
+        'Horizon references require exactly the 120 distinct setting/checkpoint cells.')
+    root = Path(host_root).resolve(); files = {}
+    def pinned(path):
+        path = Path(path).resolve(); value = read(path); files[str(path)] = digest(path); return value
+    state = pinned(root/'publication.json')
+    oldpath = Path(state['campaign_root'])/'campaign.json'; previous = pinned(oldpath)
+    require(previous.get('selection_id') == SELECTION and len(previous['candidates']) == 1
+        and tuple(previous['candidates'][0].get(k) for k in ('setting_id', 'H', 'J', 'arm', 'role')) ==
+        (SETTING, 2, 8, 'bernoulli_a0_c05', 'transfer'),
+        'Horizon comparison host must be the completed selected H2 J8 campaign.')
+    require(state.get('prepared') is True and state.get('entity') == entity and state.get('project') == project
+        and state['campaign_sha256'] == digest(oldpath), 'H2 reference publication identity changed.')
+    _verify_protocol(campaign, previous)
+    transfer = next(s for s in campaign['candidates'] if s['setting_id'] == HORIZON_TRANSFER)
+    require(transfer['arm_definition'] == previous['candidates'][0]['arm_definition'],
+        'H2/H3 Bernoulli definitions differ.')
+    inherited = validate_comparison_host(previous, state, root); pinned(root/'comparison-host.json')
+    require(inherited and inherited['kind'] == KIND, 'H2 inherited references are missing.')
+    files.update(inherited['reference_files'])
+    completion = pinned(root/'publisher-complete.json'); snapshot = pinned(root/'snapshot.json')
+    require(completion.get('status') == 'complete' and completion.get('completed') == completion.get('total') == 60
+        and snapshot.get('completed') == snapshot.get('total') == 60 and not snapshot.get('failures'),
+        'H2 reference publication must be complete without failures.')
+    require(state.get('layout', {}).get('status') == 'verified' and
+        state['layout'].get('layout_version') == 'transfer-checkpoint-selected-references-v1'
+        and state.get('overview', {}).get('snapshot_sha256') == fingerprint(dict(snapshot=snapshot, layout=state['layout'])),
+        'H2 overview must contain its verified final snapshot.')
+    setting = next(s for s in settings(previous) if s['setting_id'] == SETTING)
+    entry = state['runs'][SETTING]; directory = Path(entry['run_dir'])
+    registry = load_run(directory); pinned(directory/'run.json'); journal = pinned(directory/'publication.json')
+    require(registry['run_id'] == entry['run_id'] and registry['identity'] == identity(previous, setting)
+        and registry['entity'] == entity and registry['project'] == project, 'H2 reference registry differs.')
+    steps = {cp['step']: cp['checkpoint_sha256'] for cp in campaign['checkpoints']}
+    records = {}; record_paths = {}
+    for rid, accepted in journal['records'].items():
+        step = accepted['checkpoint_step']
+        require(step in steps and step not in records and accepted.get('status') == 'published',
+            'Unexpected, duplicate or unpublished H2 reference checkpoint.')
+        path = directory/'records'/(rid+'.json'); record = validate_record(pinned(path), registry['identity'])
+        require(record['record_id'] == rid and record['checkpoint'] == dict(step=step, sha256=steps[step])
+            and _record_fingerprint(record, accepted['artifact_sha256']) == accepted['record_sha256'],
+            'H2 reference fingerprint/checkpoint differs.')
+        _validate_episodes(record, campaign, horizon=2)
+        records[step] = record; record_paths[str(step)] = str(path)
+    require(set(records) == set(steps), 'H2 reference does not cover all requested checkpoints.')
+    points, progress = table_rows(previous, setting, records, {})
+    curve = dict(points=points, progress=progress, completed=60, total=60)
+    expected = dict(inherited['reference_curves'], **{SETTING: curve})
+    require(snapshot['curves'] == expected, 'H2 final snapshot differs from its accepted references/results.')
+    return dict(format_version=1, kind=HORIZON_KIND, campaign_sha256=digest(campaign_path),
+        host_publication_root=str(root), host_publication_id=state['publication_id'],
+        prior_run=deepcopy(inherited['prior_run']), prior_records=deepcopy(inherited['prior_records']),
+        reference_files=files, reference_curves=expected, paired_reference_records=record_paths,
+        paired_reference_setting=deepcopy(setting),
+        selected_reference_styles=[{k:setting[k] for k in ('setting_id', 'label', 'color', 'role')},
+                                   *deepcopy(inherited['selected_reference_styles'])])
+
+
+def reference_curves_with_fresh(campaign, host, fresh_records):
+    """Derived paired display only; reused scientific histories remain immutable."""
+    from slurm.ambi_transfer_checkpoint_publish import read
+    curves = deepcopy(host['reference_curves'])
+    if host['kind'] == HORIZON_KIND:
+        setting = host['paired_reference_setting']
+        records = {int(step): read(path) for step, path in host['paired_reference_records'].items()}
+        matched = dict(campaign, candidates=[*campaign['candidates'], setting])
+        points, progress = table_rows(matched, setting, records, {}, fresh_records=fresh_records)
+        curves[SETTING] = dict(points=points, progress=progress, completed=len(records), total=len(campaign['checkpoints']))
+    return curves
 
 
 def compact_scientific_record(record):

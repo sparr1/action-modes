@@ -64,7 +64,7 @@ def validate_campaign(campaign):
             'Expected critic-only Bernoulli 50% copying of all parameters.')
 
 
-def _validate_episodes(record, campaign, *, prior=False):
+def _validate_episodes(record, campaign, *, prior=False, horizon=1):
     require(len(record['episodes']) == 5 and _episodes(record['episodes'], campaign) == record['episodes'],
             'Reference must contain exactly the ordered five full episodes.')
     require(record['metrics'].get('eval/episodes') == 5
@@ -91,7 +91,7 @@ def _validate_episodes(record, campaign, *, prior=False):
             'Reference timing hardware/frozen-state proof differs.')
     params = record['provenance']['resolved_config']['algorithm_config']['alg_params']
     expected = {'compile': True, 'inner_critic_updates_per_round': 16, 'inner_actor_updates_per_round': 4,
-                'inner_rollouts_per_round': 128, 'inner_batch_size': 256, 'inner_rollout_horizon': 1}
+                'inner_rollouts_per_round': 128, 'inner_batch_size': 256, 'inner_rollout_horizon': horizon}
     require(all(params.get(k) == v for k, v in expected.items()), 'Reference C/A/N/B or compile protocol differs.')
 
 

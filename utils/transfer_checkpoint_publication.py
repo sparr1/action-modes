@@ -22,6 +22,8 @@ J6_COLORS = {'h1_j6_fresh':'#6f4c9b', 'h1_j6_bernoulli_a0_c05':'#c43c39',
              'h1_j6_matrix_blend05_actor':'#087e8b'}
 J8_COLORS = {'h1_j8_fresh':'#8c564b', 'h1_j8_bernoulli_a0_c05':'#e69f00',
              'h1_j8_matrix_blend05_actor':'#78a22f'}
+HORIZON_COLORS = {'h2_j8_bernoulli_a0_c05':'#0072b2', 'h3_j8_bernoulli_a0_c05':'#009e73',
+                  'h2_j8_fresh':'#d55e00'}
 POINT_COLUMNS = ['step','setting','label','segment','state','return_mean','return_std',
     'return_lower','return_upper','gain_mean','gain_std','gain_lower','gain_upper',
     'fresh_setting','fresh_gain_mean','fresh_gain_std','fresh_gain_lower','fresh_gain_upper',
@@ -60,7 +62,7 @@ def moments(values):
 def settings(campaign):
     rows = [dict(setting_id=PRIOR_ID, label='Prior mean (no inner solve)', color='#000000')]
     require(len(campaign['candidates']) <= len(COLORS), 'Add explicit colors before publishing more than six candidates.')
-    rows.extend(dict(candidate, color={**J6_COLORS,**J8_COLORS}.get(candidate['setting_id'],COLORS[index])) for index,candidate in enumerate(campaign['candidates']))
+    rows.extend(dict(candidate, color={**J6_COLORS,**J8_COLORS,**HORIZON_COLORS}.get(candidate['setting_id'],COLORS[index])) for index,candidate in enumerate(campaign['candidates']))
     require(len({row['setting_id'] for row in rows}) == len(rows), 'Duplicate setting IDs.')
     require(len({row['label'] for row in rows}) == len(rows), 'Duplicate curve labels.')
     return rows
@@ -247,7 +249,9 @@ def fresh_setting(campaign, setting):
     # An explicitly selected follow-up has no new matched fresh-control arm.
     if campaign.get('publication_without_fresh_control') or (
             campaign.get('selection_id') == 'h2-j8-post500k-bernoulli-v1'
-            and setting['setting_id'] == 'h2_j8_bernoulli_a0_c05'):
+            and setting['setting_id'] == 'h2_j8_bernoulli_a0_c05') or (
+            campaign.get('selection_id') == 'horizon-j8-post500k-followup-v1'
+            and setting['setting_id'] == 'h3_j8_bernoulli_a0_c05'):
         return None
     choices = [row for row in campaign['candidates']
                if row['H'] == setting['H'] and row['J'] == setting['J']

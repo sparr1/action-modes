@@ -152,7 +152,11 @@ def validate_comparison_extension(pin):
 
 def comparison_host_receipt(campaign, campaign_path, host_root, entity, project, extension_root=None, mppi_data=None):
     """Pin the completed original comparison without allocating/copying its runs."""
-    from utils.transfer_checkpoint_references import selected_campaign, selected_reference_receipt
+    from utils.transfer_checkpoint_references import (selected_campaign, selected_reference_receipt,
+        HORIZON_SELECTION, horizon_reference_receipt)
+    if campaign.get('selection_id') == HORIZON_SELECTION:
+        require(not extension_root and not mppi_data, 'Horizon comparison reuses its H2 host references; omit extension/MPPI paths.')
+        return horizon_reference_receipt(campaign, campaign_path, host_root, entity, project)
     if selected_campaign(campaign):
         return selected_reference_receipt(campaign, campaign_path, host_root, extension_root, mppi_data, entity, project)
     from utils.eval_series import validate_record, _record_fingerprint
@@ -234,8 +238,8 @@ def validate_comparison_host(campaign,state,output):
     path=Path(output)/'comparison-host.json'
     require(digest(path)==expected,'Comparison host receipt changed.')
     host=read(path)
-    from utils.transfer_checkpoint_references import KIND, validate_selected_reference_receipt
-    if host.get('kind') == KIND:
+    from utils.transfer_checkpoint_references import SELECTED_KINDS, validate_selected_reference_receipt
+    if host.get('kind') in SELECTED_KINDS:
         return validate_selected_reference_receipt(host, campaign, state)
     require(host.get('format_version')==1 and host.get('kind') in ('h1-j6-after500k-comparison-host','h1-j8-after500k-comparison-host')
             and host['campaign_sha256']==state['campaign_sha256']
@@ -300,8 +304,8 @@ def prepare(args):
             state=dict(schema_version=1,publication_id=uuid.uuid4().hex,**binding,runs={})
             write(path,state)
         if host:
-            from utils.transfer_checkpoint_references import KIND
-            state['comparison_publication_id']=(state['publication_id'] if host['kind']==KIND else host['host_publication_id'])
+            from utils.transfer_checkpoint_references import SELECTED_KINDS
+            state['comparison_publication_id']=(state['publication_id'] if host['kind'] in SELECTED_KINDS else host['host_publication_id'])
             inherited=host['prior_run']
             state['runs'][PRIOR_ID]=dict(run_dir=inherited['run_dir'],run_id=inherited['run_id'],read_only=True,
                 label=settings(campaign)[0]['label'],color='#000000',order=0)
@@ -449,7 +453,8 @@ def collect(root,campaign,state,*,jobs_active):
         curves[key]=dict(points=points,progress=states,completed=len(records[key]),total=len(campaign['checkpoints']))
     if host and 'reference_curves' in host:
         require(not set(curves).intersection(host['reference_curves']), 'Reference curves collide with new science.')
-        curves.update(deepcopy(host['reference_curves']))
+        from utils.transfer_checkpoint_references import reference_curves_with_fresh, HORIZON_FRESH
+        curves.update(reference_curves_with_fresh(campaign, host, records.get(HORIZON_FRESH, {})))
     return dict(curves=curves,failures=failures,
         completed=sum(len(value) for key,value in records.items() if key!=PRIOR_ID),total=len(campaign['cells']),
         jobs_active=jobs_active)
@@ -516,7 +521,8 @@ def publish_overview(campaign,state,snapshot,output,wandb):
     if entry.get('snapshot_sha256')==stamp:
         return
     run=wandb.init(entity=state['entity'],project=state['project'],id=entry['run_id'],resume='allow',
-        mode='online',name=("H2 J8 after 500k · live comparison" if campaign.get('selection_id')=='h2-j8-post500k-bernoulli-v1' else
+        mode='online',name=("Horizon J8 after 500k · live comparison" if campaign.get('selection_id')=='horizon-j8-post500k-followup-v1' else
+              "H2 J8 after 500k · live comparison" if campaign.get('selection_id')=='h2-j8-post500k-bernoulli-v1' else
               f"J{campaign['candidates'][0]['J']} after 500k · live comparison" if state.get('comparison_host_sha256') else 'Transfer backbone · live comparison'),
         job_type='transfer-checkpoint-overview',
         group='transfer-backbone-'+state['publication_id'][:8],
@@ -552,8 +558,7 @@ def comparison_layout_campaign(campaign,state,output):
     if state.get('comparison_host_sha256'):
         host=validate_comparison_host(campaign,state,output)
         if 'selected_reference_styles' in host:
-            result=dict(campaign,selected_reference_styles=deepcopy(host['selected_reference_styles']),
-                        publication_without_fresh_control=True)
+            result=dict(campaign,selected_reference_styles=deepcopy(host['selected_reference_styles']))
             display_settings(result)
             return result
         root=Path(host['host_publication_root']); original=read(host['host_campaign_path'])
