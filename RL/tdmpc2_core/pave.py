@@ -46,6 +46,14 @@ def _action_gradient(value, action):
     return gradient + action * 0.0
 
 
+def _head_predictions(critic, latents, actions):
+    """Eager, independent head forwards with head-specific action coordinates."""
+    return torch.stack([
+        member(torch.cat((latents, actions[index]), dim=-1))
+        for index, member in enumerate(critic)
+    ], dim=0)
+
+
 def critic_pave_loss(
     critic, decode, z, action, *, noisy_z=None, next_z=None, probe=None,
     mpr_coef=0.0, vfc_coef=0.0, curvature_coef=0.0, curvature_margin=1.0,
@@ -77,10 +85,7 @@ def critic_pave_loss(
         latents = latents.detach()
         # Call the members directly: Ensemble.forward may invoke a compiled
         # wrapper whose AOT backward does not support the higher derivatives.
-        predictions = torch.stack([
-            member(torch.cat((latents, actions[index]), dim=-1))
-            for index, member in enumerate(critic)
-        ], dim=0)
+        predictions = _head_predictions(critic, latents, actions)
         values = decode(predictions)
         if values.shape != (*actions.shape[:-1], 1):
             raise ValueError("PAVE requires a single decoded scalar per critic head and row.")

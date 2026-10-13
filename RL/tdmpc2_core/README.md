@@ -2071,3 +2071,40 @@ The new output directory contains raw update timings, peak CUDA memory,
 per-repeat and paired summaries, configuration and source/input hashes, and
 child logs. Nonfinite metrics/parameters or compilation fallback fail the run.
 Use a scheduled GPU allocation, never a cluster login node.
+
+### Critic-head vectorization benchmark
+
+`benchmark_ensemble_vmap.py` compares the current ensemble loop with an
+experimental `torch.vmap` backend, both without PAVE and with auxiliary-only
+PAVE over the full sampled batch:
+
+```bash
+environments/dmcontrol/.venv/bin/python benchmark_ensemble_vmap.py \
+  --checkpoint /absolute/path/to/model \
+  --bank /absolute/path/to/real-transition-bank.npz \
+  --output-dir /absolute/path/to/new-vmap-results
+```
+
+The protocol retains the complete-update timer, saved optimizer state, paired
+GPU-resident batches, strict ordinary compilation, eager PAVE geometry, four
+rotated repeats, ten warmup updates, and 100 measured updates per case described
+above. PAVE weights are `.005/.005/.0005`, noise is `.01`, margin is `1`, and
+primary PAVE weights are zero. It changes only the execution of critic heads;
+the three PAVE observation views retain separate forwards.
+
+The experimental backend vmaps homogeneous Linear/NormedLinear critic heads,
+including primary, auxiliary, target, and detached actor-loss forwards. It
+differentiably stacks the existing parameters on every call; that cost is part
+of the measurement. Original parameter identities, optimizer slots, and
+checkpoint keys remain intact. This is not upstream's persistent stacked
+parameter layout, and timings do not establish its performance ceiling.
+Ordinary dropout retains independent masks across heads but consumes randomness
+in a different order from the loop. Paired inputs therefore do not imply
+bitwise-identical training trajectories. Geometry dropout remains disabled.
+
+The backend is a temporary, process-wide benchmark context in
+`utils/ensemble_vmap_benchmark.py`; production defaults remain unchanged. Each
+worker creates, loads, compiles, uses, and discards its model inside that context.
+Do not share the context across threads or reuse its compiled models afterward.
+Interpret results as synchronized outer learner latency on the reported GPU,
+not full environment throughput or inner-adaptation performance.
