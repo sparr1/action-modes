@@ -15,6 +15,7 @@ J6_CONFIG = CONFIG.parent / "ambi_transfer_checkpoint_j6_after500k_curves.json"
 J8_CONFIG = CONFIG.parent / "ambi_transfer_checkpoint_j8_after500k_curves.json"
 J10_CONFIG = CONFIG.parent / "ambi_transfer_800k_bernoulli_j10_curves.json"
 H2_J8_CONFIG = CONFIG.parent / "ambi_transfer_checkpoint_h2_j8_after500k_curves.json"
+HORIZON_J8_CONFIG = CONFIG.parent / "ambi_transfer_checkpoint_horizon_j8_after500k_curves.json"
 EXTENSIONS = [(6, J6_CONFIG), (8, J8_CONFIG)]
 
 
@@ -613,6 +614,148 @@ def test_h2_j8_prepares_sixty_cells_three_smokes_and_only_changes_resolved_horiz
     (directory/"decisions-seed-101.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
     with pytest.raises(ValueError, match="budget differs"):
         campaign.validate_result(directory, definition, cell)
+
+
+def test_horizon_followup_contains_exactly_h3_transfer_and_h2_fresh():
+    from utils.transfer_campaign import load_campaign, needs_donor
+    from utils.transfer_campaign_diagnostics import diagnostic_settings
+    config = campaign.read_json(HORIZON_J8_CONFIG)
+    candidates = campaign.validate_configuration(config)
+    assert [(row["H"], row["J"], row["arm"], row["role"]) for row in candidates] == [
+        (3, 8, "bernoulli_a0_c05", "transfer"), (2, 8, "fresh", "fresh")]
+    assert {row["setting_id"] for row in candidates} == campaign.HORIZON_J8_SETTINGS
+    assert all("fresh_setting_id" not in row for row in candidates)
+    recipe = load_campaign(CONFIG.parent / config["discovery_template"])
+    recipe["diagnostics"] = diagnostic_settings(recipe["diagnostics"])
+    reference = campaign.validate_horizon_j8_template(recipe)
+    h2 = load_campaign(CONFIG.parent / campaign.read_json(H2_J8_CONFIG)["discovery_template"])
+    h2["diagnostics"] = diagnostic_settings(h2["diagnostics"])
+    for key in set(h2) - {"description", "horizons", "arms"}:
+        assert recipe[key] == h2[key]
+    assert recipe["arms"]["bernoulli_a0_c05"] == h2["arms"]["bernoulli_a0_c05"]
+    assert recipe["arms"]["fresh"] == reference["arms"]["fresh"]
+    assert not needs_donor(recipe["arms"]["fresh"])
+    assert needs_donor(recipe["arms"]["bernoulli_a0_c05"])
+    assert recipe["arms"]["bernoulli_a0_c05"].get("actor_bernoulli_p", 0.) == 0.
+    assert recipe["arms"]["bernoulli_a0_c05"]["critic_bernoulli_p"] == .5
+    assert recipe["horizons"] == [2, 3] and recipe["rounds"] == [8]
+    assert campaign.validate_configuration(config, sorted(campaign.HORIZON_J8_SETTINGS)) == candidates
+    with pytest.raises(ValueError, match="all requested settings"):
+        campaign.validate_configuration(config, ["h3_j8_bernoulli_a0_c05"])
+
+
+@pytest.mark.parametrize("mutation,match", [
+    (lambda value: value.pop("selection_id"), "explicit versioned selection"),
+    (lambda value: value["checkpoint_range"].update(start=500000), "checkpoint range"),
+    (lambda value: value["checkpoint_range"].update(stop=1975000), "checkpoint range"),
+    (lambda value: value["checkpoint_range"].update(step=50000), "checkpoint range"),
+    (lambda value: value["candidates"].pop(), "exact versioned settings"),
+    (lambda value: value["candidates"][0].update(H=2), "identity mismatch"),
+    (lambda value: value["candidates"][1].update(H=3), "identity mismatch"),
+    (lambda value: value["candidates"][0].update(J=6), "identity mismatch"),
+    (lambda value: value["candidates"][0].update(role="fresh"), "role differs"),
+    (lambda value: value["candidates"][0].update(fresh_setting_id="h2_j8_fresh"), "no matching fresh H3"),
+    (lambda value: value["candidates"][1].update(fresh_setting_id="h2_j8_fresh"), "no matching fresh H3"),
+    (lambda value: value.update(seeds=[101]), "protocol"),
+    (lambda value: value.update(selection_id=campaign.H2_J8_SELECTION), "exact versioned settings"),
+])
+def test_horizon_followup_rejects_scope_drift(mutation, match):
+    config = campaign.read_json(HORIZON_J8_CONFIG)
+    mutation(config)
+    with pytest.raises(ValueError, match=match):
+        campaign.validate_configuration(config)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda recipe: recipe["arms"]["bernoulli_a0_c05"].update(actor_bernoulli_p=.5),
+    lambda recipe: recipe["arms"]["bernoulli_a0_c05"].update(critic_bernoulli_p=.75),
+    lambda recipe: recipe["arms"]["fresh"].update(critic_rho=.5),
+    lambda recipe: recipe["arms"]["fresh"].update(full_state=True),
+    lambda recipe: recipe["arms"]["fresh"].update(compile=False),
+    lambda recipe: recipe.update(actor_updates=8),
+    lambda recipe: recipe["diagnostics"].update(mc_rollouts=4),
+])
+def test_horizon_followup_rejects_recipe_changes(mutation):
+    from utils.transfer_campaign import load_campaign
+    from utils.transfer_campaign_diagnostics import diagnostic_settings
+    config = campaign.read_json(HORIZON_J8_CONFIG)
+    recipe = load_campaign(CONFIG.parent / config["discovery_template"])
+    recipe["diagnostics"] = diagnostic_settings(recipe["diagnostics"])
+    mutation(recipe)
+    with pytest.raises(ValueError, match="may only change horizons"):
+        campaign.validate_horizon_j8_template(recipe)
+
+
+def test_horizon_followup_prepares_120_interleaved_cells_and_six_smokes(prepared):
+    from utils.transfer_campaign import load_campaign, resolved_cell
+    original_args, original_definition = prepared
+    inventory = campaign.read_json(original_args.inventory)
+    present = {row["step"] for row in inventory["checkpoints"]}
+    anchor = next(row for row in inventory["checkpoints"] if row["step"] == 575000)
+    metadata = campaign.read_json(anchor["checkpoint"] + ".metadata.json")
+    for step in range(525000, 2000001, 25000):
+        if step in present:
+            continue
+        checkpoint = Path(anchor["checkpoint"]).parent / str(step)
+        checkpoint.write_text(f"checkpoint {step}")
+        sidecar = Path(str(checkpoint) + ".metadata.json")
+        value = deepcopy(metadata)
+        value["checkpoint"]["step"] = step
+        save(sidecar, value)
+        inventory["checkpoints"].append(dict(step=step, checkpoint=str(checkpoint),
+            checkpoint_sha256=campaign.digest(checkpoint), metadata_sha256=campaign.digest(sidecar)))
+    save(original_args.inventory, inventory)
+    args = SimpleNamespace(**vars(original_args))
+    args.root = original_args.root.parent / "horizon-j8-campaign"
+    args.config, args.settings = HORIZON_J8_CONFIG, None
+    definition = campaign.prepare(args)
+    assert len(definition["checkpoints"]) == 60 and len(definition["cells"]) == 120
+    assert definition["selection_id"] == campaign.HORIZON_J8_SELECTION
+    assert definition["checkpoint_range"] == campaign.HORIZON_J8_CHECKPOINT_RANGE
+    assert definition["smoke_checkpoint_steps"] == [525000, 575000, 2000000]
+    assert definition["smoke_indices"] == [0, 1, 4, 5, 118, 119]
+    assert definition["production_indices"] == list(range(120)) and definition["reused_indices"] == []
+    assert len({cell["result_dir"] for cell in definition["cells"]}) == 120
+    assert definition["seeds"] == [101, 102, 103, 104, 105]
+    assert definition["diagnostics"] == original_definition["diagnostics"]
+    assert definition["scientific_source"] == original_definition["scientific_source"]
+    expected_settings = ["h3_j8_bernoulli_a0_c05", "h2_j8_fresh"]
+    for index, cell in enumerate(definition["cells"]):
+        assert cell["index"] == index and cell["checkpoint_index"] == index // 2
+        assert cell["setting_id"] == expected_settings[index % 2]
+        assert cell["step"] == 525000 + 25000 * (index // 2)
+        assert "fresh_setting_id" not in cell
+    for index in definition["smoke_indices"]:
+        cell = definition["cells"][index]
+        directory = write_result(args.root, definition, cell, smoke=True)
+        receipt = campaign.make_receipt(args.root, definition, cell, directory,
+            smoke=True, hardware="NVIDIA L40S, uuid, driver")
+        campaign.write(campaign.receipt_path(args.root, cell, smoke=True), receipt)
+        assert campaign.validate_receipt(args.root, definition, cell, smoke=True) == receipt
+    reference = load_campaign(CONFIG.parent / campaign.read_json(J8_CONFIG)["discovery_template"])
+    for cell in definition["cells"][:2]:
+        directory = write_result(args.root, definition, cell)
+        result, manifest = campaign.validate_result(directory, definition, cell)
+        resolved = manifest["resolved"]
+        expected = resolved_cell(resolved, reference, horizon=1, rounds=8, arm=cell["arm"])
+        expected["algorithm_config"]["alg_params"]["inner_rollout_horizon"] = cell["H"]
+        expected["selector"] = f"transfer_discovery/{cell['arm']}/H{cell['H']}/J8"
+        assert resolved == expected
+        params = resolved["algorithm_config"]["alg_params"]
+        assert params["inner_replay_capacity"] == 3072
+        assert params["compile"] is params["compile_strict"] is True
+        assert all(params[f"inner_{name}_scope"] == "action" for name in
+            ("actor", "critic", "replay", "temperature", "actor_optimizer", "critic_optimizer", "temperature_optimizer"))
+        assert len(result["episodes"]) == 5
+        path = directory / "decisions-seed-101.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        assert rows[0]["metrics"]["inner_model_steps_budget"] == 1024 * cell["H"]
+        assert rows[0]["metrics"]["inner_actor_optimizer_steps"] == 32
+        assert rows[0]["metrics"]["inner_critic_optimizer_steps"] == 128
+        rows[0]["metrics"]["inner_model_steps_budget"] = 1024
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        with pytest.raises(ValueError, match="budget differs"):
+            campaign.validate_result(directory, definition, cell)
 
 
 def test_diagnostic_coverage_and_isolation_are_required(prepared):

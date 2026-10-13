@@ -40,6 +40,9 @@ J10_SETTINGS = {"h1_j10_bernoulli_a0_c05"}
 H2_J8_SELECTION = "h2-j8-post500k-bernoulli-v1"
 H2_J8_CHECKPOINT_RANGE = dict(start=525000, stop=2000000, step=25000)
 H2_J8_SETTINGS = {"h2_j8_bernoulli_a0_c05"}
+HORIZON_J8_SELECTION = "horizon-j8-post500k-followup-v1"
+HORIZON_J8_CHECKPOINT_RANGE = dict(start=525000, stop=2000000, step=25000)
+HORIZON_J8_SETTINGS = {"h3_j8_bernoulli_a0_c05", "h2_j8_fresh"}
 
 
 def require(condition, message):
@@ -90,7 +93,8 @@ def validate_configuration(config, selected=None):
     profiles = {J6_SELECTION: (6, J6_CHECKPOINT_RANGE, J6_SETTINGS),
                 J8_SELECTION: (8, J8_CHECKPOINT_RANGE, J8_SETTINGS),
                 J10_SELECTION: (10, J10_CHECKPOINT_RANGE, J10_SETTINGS),
-                H2_J8_SELECTION: (8, H2_J8_CHECKPOINT_RANGE, H2_J8_SETTINGS)}
+                H2_J8_SELECTION: (8, H2_J8_CHECKPOINT_RANGE, H2_J8_SETTINGS),
+                HORIZON_J8_SELECTION: (8, HORIZON_J8_CHECKPOINT_RANGE, HORIZON_J8_SETTINGS)}
     require(selection is None or selection in profiles, "Unknown versioned curve selection.")
     if selection in profiles:
         rounds, checkpoint_range, required_settings = profiles[selection]
@@ -105,10 +109,15 @@ def validate_configuration(config, selected=None):
     lookup = {row["setting_id"]: row for row in candidates}
     for row in candidates:
         require(row["setting_id"] == f"h{row['H']}_j{row['J']}_{row['arm']}", "Candidate identity mismatch.")
-        require(row["H"] == (2 if selection == H2_J8_SELECTION else 1)
+        horizons = (2, 3) if selection == HORIZON_J8_SELECTION else (2,) if selection == H2_J8_SELECTION else (1,)
+        require(row["H"] in horizons
                 and row["J"] in ((profiles[selection][0],) if selection in profiles else (2, 4)),
                 "Shortlist budget differs.")
         require(row.get("role") == ("fresh" if row["arm"] == "fresh" else "transfer"), "Candidate role differs.")
+        if selection == HORIZON_J8_SELECTION:
+            require("fresh_setting_id" not in row,
+                    "The horizon follow-up has no matching fresh H3 control; H2 fresh is a separate setting.")
+            continue
         if row["role"] == "transfer":
             if selection == J10_SELECTION:
                 require("fresh_setting_id" not in row,
@@ -194,6 +203,20 @@ def validate_h2_j8_template(template):
     return reference
 
 
+def validate_horizon_j8_template(template):
+    """Use the same J8 recipe for H3 critic transfer and the missing H2 fresh control."""
+    from utils.transfer_campaign import load_campaign
+    from utils.transfer_campaign_diagnostics import diagnostic_settings
+    reference = load_campaign(ROOT / "configs/research/ambi_transfer_checkpoint_j8_after500k_shortlist.json")
+    reference["diagnostics"] = diagnostic_settings(reference.get("diagnostics"))
+    expected = deepcopy(reference)
+    expected.update(description=template.get("description"), horizons=[2, 3],
+                    arms={arm: reference["arms"][arm] for arm in ("bernoulli_a0_c05", "fresh")})
+    require(template == expected,
+            "The horizon follow-up may only change horizons and select existing fresh/critic Bernoulli50% arms.")
+    return reference
+
+
 def prepare(args):
     require(not args.root.exists(), f"Refusing to overwrite {args.root}")
     current = source(args.expected_source_sha)
@@ -211,6 +234,8 @@ def prepare(args):
     template["diagnostics"] = diagnostic_settings(template.get("diagnostics"))
     require(template["diagnostics"] is not None, "Sampled transfer diagnostics must remain enabled.")
     h1_reference = validate_h2_j8_template(template) if config.get("selection_id") == H2_J8_SELECTION else None
+    if config.get("selection_id") == HORIZON_J8_SELECTION:
+        h1_reference = validate_horizon_j8_template(template)
     require(template["seeds"] == config["seeds"] and template["controller_seed"] == config["controller_seed"]
             and all(template[key] == config[key] for key in ("critic_updates", "actor_updates", "rollouts", "batch_size", "max_steps")),
             "Shortlist template and curve evaluation protocol disagree.")
@@ -236,6 +261,8 @@ def prepare(args):
         campaign["selection"] = "800k H1 J10 critic Bernoulli50% extension of the paired J4/J6/J8 curve; no fresh J10 control."
     if config.get("selection_id") == H2_J8_SELECTION:
         campaign["selection"] = "Post-500k H2 J8 critic Bernoulli50% horizon comparison; no fresh H2 J8 control."
+    if config.get("selection_id") == HORIZON_J8_SELECTION:
+        campaign["selection"] = "Post-500k H3 J8 critic Bernoulli50% and H2 J8 fresh follow-up; no fresh H3 J8 control."
     generated = []
     for checkpoint_index, checkpoint in enumerate(checkpoints):
         step = checkpoint["step"]
@@ -253,10 +280,10 @@ def prepare(args):
             resolved = resolved_cell(base, recipe, horizon=candidate["H"], rounds=candidate["J"], arm=candidate["arm"])
             if h1_reference is not None:
                 expected = resolved_cell(base, h1_reference, horizon=1, rounds=8, arm=candidate["arm"])
-                expected["algorithm_config"]["alg_params"]["inner_rollout_horizon"] = 2
-                expected["selector"] = "transfer_discovery/bernoulli_a0_c05/H2/J8"
+                expected["algorithm_config"]["alg_params"]["inner_rollout_horizon"] = candidate["H"]
+                expected["selector"] = f"transfer_discovery/{candidate['arm']}/H{candidate['H']}/J8"
                 require(resolved == expected and resolved["algorithm_config"]["alg_params"]["inner_replay_capacity"] == 3072,
-                        "H2 J8 resolved controller must differ from H1 J8 only in horizon, retaining replay capacity 3072.")
+                        "Resolved J8 controller must differ from its H1 J8 arm only in horizon, retaining replay capacity 3072.")
             name = f"step-{step}/{candidate['setting_id']}"
             campaign["cells"].append(dict(index=len(campaign["cells"]), name=name, step=step,
                 checkpoint_index=checkpoint_index, **candidate, config_path=str(recipe_path),

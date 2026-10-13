@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "protocol": "inner-sac-transfer-checkpoint-curves-v1",
+  "source_run": "rwgao_b-brown-university/ambi/aux6428346x0",
+  "description": "Five-seed H3 J8 critic Bernoulli50% and H2 J8 fresh follow-up over 525k\u20132M on the existing auxiliary-return backbone; no fresh H3 control.",
+  "discovery_template": "ambi_transfer_checkpoint_horizon_j8_after500k_shortlist.json",
+  "seeds": [
+    101,
+    102,
+    103,
+    104,
+    105
+  ],
+  "controller_seed": 55,
+  "max_steps": 500,
+  "critic_updates": 16,
+  "actor_updates": 4,
+  "rollouts": 128,
+  "batch_size": 256,
+  "gpu_hardware": "L40S",
+  "smoke_seeds": [
+    101,
+    102
+  ],
+  "smoke_steps": 3,
+  "candidates": [
+    {
+      "setting_id": "h3_j8_bernoulli_a0_c05",
+      "H": 3,
+      "J": 8,
+      "arm": "bernoulli_a0_c05",
+      "label": "H3 J8 \u00b7 Bernoulli 50% critic (all parameters)",
+      "role": "transfer"
+    },
+    {
+      "setting_id": "h2_j8_fresh",
+      "H": 2,
+      "J": 8,
+      "arm": "fresh",
+      "label": "H2 J8 \u00b7 Fresh SAC (no transfer)",
+      "role": "fresh"
+    }
+  ],
+  "selection_id": "horizon-j8-post500k-followup-v1",
+  "checkpoint_range": {
+    "start": 525000,
+    "stop": 2000000,
+    "step": 25000
+  }
+}

@@ -261,3 +261,34 @@ prior, and both H3 MPPI objectives. Historical evaluations are validated and
 reused. Pending checkpoints remain visible; new return points require all five
 episodes and trace validation. Compact new result artifacts retain provenance
 and trace hashes, while raw decision traces remain on Oscar to limit W&B storage.
+
+## H3 transfer and H2 fresh follow-up
+
+`ambi_transfer_checkpoint_horizon_j8_after500k_curves.json` and its matching
+shortlist select exactly two new settings: H3/J8 critic Bernoulli 50% with a
+fresh actor, and H2/J8 fresh SAC with no transfer. The versioned selection is
+`horizon-j8-post500k-followup-v1`. Both evaluate the same 60 checkpoints from
+525k through 2M every 25k, using environment seeds 101–105, controller seed 55,
+and five full 500-decision episodes per setting/checkpoint. There are 120 new
+cells and 600 episodes. Each checkpoint schedules H3 transfer followed by H2
+fresh; existing H1/H2 transfer and prior evaluations are reference data.
+
+All inherited temperature, C16/A4/N128/B256, return/return objective, optimizer
+and replay resets, mean-action execution at every decision, frozen-backbone
+checks, diagnostics, and compiled L40S settings remain unchanged. H3 uses
+3,072 imagined transitions per decision and H2 uses 2,048; both perform 128
+critic updates and 32 actor updates. Replay capacity stays 3,072. Preparation
+checks the exact existing J8 arm definitions and rejects any resolved change
+beyond the horizon relative to the corresponding H1/J8 arm.
+
+The H2 fresh control measures the benefit of the completed H2 critic-transfer
+setting at the same horizon and update dose. H3 transfer probes whether a
+longer model horizon helps; it has no matched H3 fresh control in this campaign.
+H2 fresh must not be used as a matched H3 control. All horizon comparisons keep
+optimizer dose fixed while changing model-transition count.
+
+Use the existing Oscar wrappers with this configuration and a new campaign
+directory. Production is gated by both settings at 525k, 575k and 2M: smoke
+indices `0,1,4,5,118,119`, each with two seeds and three decisions. The manifest
+contains only the two requested settings, despite the discovery template
+supporting both horizons and arm definitions.
