@@ -11,9 +11,12 @@ from utils.transfer_checkpoint_publication import settings
 
 SELECTED_VERSION='transfer-checkpoint-selected-references-v1'
 HORIZON_VERSION='transfer-checkpoint-horizon-references-v1'
-HOVER_SELECTED_VERSION='transfer-checkpoint-selected-references-hover-v1'
-HOVER_HORIZON_VERSION='transfer-checkpoint-horizon-references-hover-v1'
-HOVER_LEGEND_VERSION='transfer-checkpoint-curves-hover-v1'
+HOVER_SELECTED_VERSION='transfer-checkpoint-selected-references-hover-v2'
+HOVER_HORIZON_VERSION='transfer-checkpoint-horizon-references-hover-v2'
+HOVER_LEGEND_VERSION='transfer-checkpoint-curves-hover-v2'
+PREVIOUS_HOVER_SELECTED_VERSION='transfer-checkpoint-selected-references-hover-v1'
+PREVIOUS_HOVER_HORIZON_VERSION='transfer-checkpoint-horizon-references-hover-v1'
+PREVIOUS_HOVER_LEGEND_VERSION='transfer-checkpoint-curves-hover-v1'
 VERSION='transfer-checkpoint-curves-v5'
 HOST_VERSION='transfer-checkpoint-curves-v6'
 FOLLOWUP_VERSION='transfer-checkpoint-curves-v7'
@@ -23,7 +26,13 @@ INTERACTIVE_VERSION='transfer-checkpoint-curves-v3'
 LEGACY_VERSION='transfer-checkpoint-curves-v2'
 _HOVER_BASES={HOVER_SELECTED_VERSION:SELECTED_VERSION,
               HOVER_HORIZON_VERSION:HORIZON_VERSION,
-              HOVER_LEGEND_VERSION:LEGEND_VERSION}
+              HOVER_LEGEND_VERSION:LEGEND_VERSION,
+              PREVIOUS_HOVER_SELECTED_VERSION:SELECTED_VERSION,
+              PREVIOUS_HOVER_HORIZON_VERSION:HORIZON_VERSION,
+              PREVIOUS_HOVER_LEGEND_VERSION:LEGEND_VERSION}
+_PREVIOUS_HOVERS={HOVER_SELECTED_VERSION:PREVIOUS_HOVER_SELECTED_VERSION,
+                  HOVER_HORIZON_VERSION:PREVIOUS_HOVER_HORIZON_VERSION,
+                  HOVER_LEGEND_VERSION:PREVIOUS_HOVER_LEGEND_VERSION}
 TABLE_KEY='transfer_curves/points'
 PROGRESS_KEY='transfer_curves/progress'
 _QUERY='query TransferCurveChart($id:ID!){customChart(id:$id){id name type spec}}'
@@ -120,15 +129,22 @@ def display_settings(campaign, *, version=None):
     return rows
 
 
-def _add_hover_interaction(definition):
+def _add_hover_interaction(definition, *, pointer_events=False):
     """Scope one selection to one layer; layered root params duplicate signals."""
+    # Older embedded Vega canvas handlers synthesize mouse events when the
+    # picked scene item changes. Preserve pointer specs only for exact migration.
+    event_filter=("event.item && datum && isValid(datum['${field:setting}'])" if pointer_events else
+        "event.item && event.item.datum && isValid(event.item.datum['${field:setting}'])")
+    event_stream=(dict(type='pointerover',filter=event_filter) if pointer_events else
+        dict(merge=[dict(type=event,filter=event_filter) for event in ('mouseover','pointerover')]))
     line=definition['layer'][2]
     line['name']='curve_hover'
     line['params']=[dict(name='hovered_curve',select=dict(type='point',
-        fields=['${field:label}'],toggle=False,clear='pointerout',
-        on=dict(type='pointerover',
-            filter="event.item && datum && isValid(datum['${field:setting}'])")),
-        bind=dict(legend='pointerover'))]
+        fields=['${field:label}'],toggle=False,clear='pointerout' if pointer_events else 'mouseout, pointerout',
+        on=event_stream),
+        bind=dict(legend='pointerover' if pointer_events else dict(merge=[
+            dict(type=event,filter="event.item && indexof(event.item.mark.role, 'legend') >= 0")
+            for event in ('mouseover','pointerover')])))]
     for layer in definition['layer']:
         mark=layer['mark']; opacity=mark.pop('opacity',1)
         encoding=layer.setdefault('encoding',{})
@@ -145,6 +161,7 @@ def chart_definition(campaign, *, legacy=False, version=None):
     version=_version(legacy,version,campaign)
     styles=display_settings(campaign,version=version)
     hover=version in _HOVER_BASES
+    pointer_events=version in _PREVIOUS_HOVERS.values()
     version=_HOVER_BASES.get(version,version)
     definition = {'$schema':'https://vega.github.io/schema/vega-lite/v5.json',
         'data':{'name':'wandb'},'width':'container','height':360,
@@ -183,7 +200,7 @@ def chart_definition(campaign, *, legacy=False, version=None):
         # The shared legend otherwise inherits the uncertainty area's 0.1 opacity.
         definition['encoding']['color']['legend'].update(symbolOpacity=1,symbolSize=160,
             labelColor={'expr':"scale('color', datum.value)"})
-    return _add_hover_interaction(definition) if hover else definition
+    return _add_hover_interaction(definition,pointer_events=pointer_events) if hover else definition
 
 
 def chart_id(campaign,entity, *, legacy=False, version=None):
@@ -373,10 +390,11 @@ def ensure_saved_view(api,*,campaign,entity,project,publication_id,receipt_dir):
                 _write(root/'results-layout-receipt.json',receipt);return receipt
             current_version=_version(campaign=campaign)
             if current_version in (HOVER_SELECTED_VERSION,HOVER_HORIZON_VERSION):
-                previous_versions=(_HOVER_BASES[current_version],)
+                previous_versions=(_PREVIOUS_HOVERS[current_version],_HOVER_BASES[current_version])
             else:
-                previous_versions=(LEGEND_VERSION,FOLLOWUP_VERSION,HOST_VERSION,VERSION,PREVIOUS_VERSION,INTERACTIVE_VERSION,LEGACY_VERSION)
+                previous_versions=(PREVIOUS_HOVER_LEGEND_VERSION,LEGEND_VERSION,FOLLOWUP_VERSION,HOST_VERSION,VERSION,PREVIOUS_VERSION,INTERACTIVE_VERSION,LEGACY_VERSION)
             installed_version=next((version for version in previous_versions
+                if (version!=PREVIOUS_HOVER_LEGEND_VERSION or campaign.get('followup_styles'))
                 if (version!=LEGEND_VERSION or campaign.get('followup_styles'))
                 if (version!=FOLLOWUP_VERSION or campaign.get('followup_styles'))
                 if (version!=HOST_VERSION or campaign.get('extension_styles'))

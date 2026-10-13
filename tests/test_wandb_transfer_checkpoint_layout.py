@@ -341,6 +341,11 @@ HOVER_CASES=[
     ('selected',layout.SELECTED_VERSION,layout.HOVER_SELECTED_VERSION,'a75131facd5d6f6bd20d60c2582c18a48bc0a5fda31c2dce9125a92feada9c37'),
     ('horizon',layout.HORIZON_VERSION,layout.HOVER_HORIZON_VERSION,'0bd60fe6f7040d0a9dfbde7750954806913f75377703598eeed1f0118493e100'),
 ]
+POINTER_HOVER_CASES=[
+    ('legend',layout.PREVIOUS_HOVER_LEGEND_VERSION,layout.HOVER_LEGEND_VERSION,'a0df34e7225af5d952936f551bc1f601f90f58d3287b2681ced01c26b89863c3'),
+    ('selected',layout.PREVIOUS_HOVER_SELECTED_VERSION,layout.HOVER_SELECTED_VERSION,'fcb9c4a813155aa10cf3329c9d08ee4335b45651c16e69614175ea338e49e6da'),
+    ('horizon',layout.PREVIOUS_HOVER_HORIZON_VERSION,layout.HOVER_HORIZON_VERSION,'3cead8944f1b097ccf33a9ed203fcb8d013e6240810285ea09043af2499638dc'),
+]
 
 
 @pytest.mark.parametrize('family,old_version,new_version,digest',HOVER_CASES)
@@ -354,10 +359,17 @@ def test_hover_has_one_selection_scope_and_preserves_uncertainty_opacity(
     owners=[layer for layer in after['layer'] if layer.get('params')]
     assert len(owners)==1 and len(owners[0]['params'])==1
     selection=owners[0]['params'][0]
-    assert selection['select']['clear']=='pointerout'
+    assert selection['select']['clear']=='mouseout, pointerout'
+    events=selection['select']['on']['merge']
+    assert [event['type'] for event in events]==['mouseover','pointerover']
     assert selection['select']['toggle'] is False
-    assert selection['bind']=={'legend':'pointerover'}
-    assert "datum['${field:setting}']" in selection['select']['on']['filter']
+    assert all("event.item.datum['${field:setting}']" in event['filter'] for event in events)
+    legend_events=selection['bind']['legend']['merge']
+    assert [event['type'] for event in legend_events]==['mouseover','pointerover']
+    # Generic legend listeners must not reapply the previous legend selection
+    # when the next event comes from another curve or an axis label.
+    assert all("indexof(event.item.mark.role, 'legend') >= 0" in event['filter']
+        for event in legend_events)
     assert after['encoding']==before['encoding']
     for old,new in zip(before['layer'],after['layer']):
         base=old['mark'].get('opacity',1)
@@ -370,13 +382,13 @@ def test_hover_has_one_selection_scope_and_preserves_uncertainty_opacity(
             assert width['value']==old['mark']['strokeWidth']
 
 
-@pytest.mark.parametrize('family,old_version,new_version,digest',HOVER_CASES)
+@pytest.mark.parametrize('family,old_version,new_version,digest',HOVER_CASES+POINTER_HOVER_CASES)
 @pytest.mark.parametrize('lost_response',[False,True])
 def test_hover_upgrade_preserves_exact_previous_layouts_and_same_view(
         tmp_path,family,old_version,new_version,digest,lost_response):
     data=hover_campaign(family)
     old=layout.saved_spec(spec(),data,'entity','abc123',version=old_version)
-    # Captured from the deployed 64a49c89 publisher before adding hover behavior.
+    # Pins captured before each deployed layout's interaction upgrade.
     assert layout._hash(old)==digest
     service=Service(timeout=lost_response)
     service.views.append(dict(id='owned',name='nw-transfercurvesabc123-v',type='project-view',
@@ -398,7 +410,7 @@ def test_hover_upgrade_preserves_exact_previous_layouts_and_same_view(
     assert service.view_writes==service.chart_writes==1
 
 
-@pytest.mark.parametrize('family,old_version,new_version,digest',HOVER_CASES)
+@pytest.mark.parametrize('family,old_version,new_version,digest',HOVER_CASES+POINTER_HOVER_CASES)
 def test_hover_upgrade_preserves_user_edits(tmp_path,family,old_version,new_version,digest):
     data=hover_campaign(family)
     old=layout.saved_spec(spec(),data,'entity','abc123',version=old_version)

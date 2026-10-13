@@ -98,11 +98,12 @@ def test_horizon_rejects_incomplete_or_unpublished_h2_host(horizon):
 
 
 @pytest.mark.parametrize('verified_snapshot',[False,True])
-def test_horizon_accepts_hover_host_only_with_matching_final_snapshot(horizon,verified_snapshot):
+@pytest.mark.parametrize('version',[layout.PREVIOUS_HOVER_SELECTED_VERSION,layout.HOVER_SELECTED_VERSION])
+def test_horizon_accepts_hover_host_only_with_matching_final_snapshot(horizon,verified_snapshot,version):
     _,args=horizon;root=args.comparison_host_publication_root
     path=root/'publication.json';state=json.loads(path.read_text())
     snapshot=json.loads((root/'snapshot.json').read_text())
-    state['layout']['layout_version']=layout.HOVER_SELECTED_VERSION
+    state['layout']['layout_version']=version
     if verified_snapshot:
         state['overview']['snapshot_sha256']=publish.fingerprint(dict(snapshot=snapshot,layout=state['layout']))
     save(path,state);before=path.read_bytes()
