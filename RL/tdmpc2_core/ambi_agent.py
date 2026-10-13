@@ -19,6 +19,7 @@ from .common.soft_world_model import SoftWorldModel
 from .auxiliary_return import AuxiliaryReturnLearner
 from .inner_improvement import InnerImprovementEngine, polyak_update
 from .outer_policy_diagnostics import diagnostics_due, policy_diagnostics
+from .pave import outer_pave_loss, pave_enabled
 from .common.training_state import (
     load_optimizer_state_preserving_hyperparameters,
     preflight_adam_state,
@@ -889,6 +890,9 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "inner_sac_critic_target": str(self.cfg.inner_sac_critic_target),
             "entropy_semantics": critic_entropy_spec(vars(self.cfg)),
         }
+        if pave_enabled(self.cfg):
+            from utils.pave_identity import pave_training_signature
+            spec["outer_pave"] = pave_training_signature(vars(self.cfg))
         if getattr(self, "aux_return", None) is not None:
             from .common.control_sources import source_metadata
             spec["control_sources"] = source_metadata(self.cfg)
@@ -3212,6 +3216,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
                     "aux_return_q_target_clip_fraction": aux_clipping,
                 }
 
+        pave_info = {}
+        if pave_enabled(self.cfg):
+            pave_loss, pave_info = outer_pave_loss(
+                self.model, obs, action, self.cfg, update_number=self.num_updates + 1,
+            )
+            total_loss = total_loss + pave_loss
+
         value_equivalence_info = {}
         value_equivalence_loss_coef = float(
             self.cfg.value_equivalence_loss_coef
@@ -3377,6 +3388,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         info.update(actor_info)
         info.update(component_info)
         info.update(value_equivalence_info)
+        info.update(pave_info)
         info.update(auxiliary_info)
         if self._outer_policy_diagnostics_packet is not None:
             diagnostic_started = time.perf_counter()

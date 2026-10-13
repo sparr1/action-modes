@@ -1778,3 +1778,262 @@ training-minibatch counts/sums when set true, including for unconditioned contro
 See [horizon SAC diagnostics](../../configs/research/HORIZON_SAC_DIAGNOSTICS.md)
 for target equations, replay metadata, metric units, aggregation and the prepared
 eight-setting comparison.
+
+## PAVE regularization of outer critics
+
+AMBI can add the three losses from
+[PAVE](https://github.com/AIRLABkhu/PAVE) to its persistent outer critics:
+mixed partial regularization (MPR), vector field consistency (VFC), and the
+action-curvature penalty. Each loss has an independent coefficient for the
+primary critic and independent auxiliary return critic. All six coefficients
+default to zero, preserving existing training, random-number use, and checkpoint
+identity. This option does not add losses to inner SAC or standalone TD-MPC2.
+
+| Configuration | Default | Meaning |
+| --- | --- | --- |
+| `outer_pave_mpr_coef` | `0.0` | Primary critic MPR weight |
+| `outer_pave_vfc_coef` | `0.0` | Primary critic VFC weight |
+| `outer_pave_curvature_coef` | `0.0` | Primary critic curvature weight |
+| `aux_return_pave_mpr_coef` | `0.0` | Auxiliary return critic MPR weight |
+| `aux_return_pave_vfc_coef` | `0.0` | Auxiliary return critic VFC weight |
+| `aux_return_pave_curvature_coef` | `0.0` | Auxiliary return critic curvature weight |
+| `outer_pave_batch_size` | `64` | Maximum sampled real transitions; `null` uses the full sampled sequence batch |
+| `outer_pave_obs_noise_std` | `0.01` | Gaussian observation perturbation standard deviation |
+| `outer_pave_curvature_margin` | `1.0` | Margin in the curvature penalty |
+
+Coefficients, noise standard deviation, and margin must be finite and
+nonnegative. A finite batch cap must be a positive integer. Active PAVE requires
+state observations and `critic_value_mode="single"`; scalar and distributional
+Q representations are supported. Nonzero auxiliary coefficients also require
+`aux_return_mode="sac"` or `"return_actor"`. RGB and split return/entropy
+critics are not supported by this version.
+
+### Real-observation geometry and gradient ownership
+
+For every outer update, PAVE flattens the real replay sequences across time and
+batch, then samples up to the configured cap uniformly without replacement.
+It uses aligned current observation, recorded normalized action, and successor
+observation tuples, including valid terminal transitions. Its transition mean
+is independent of the ordinary backbone's horizon weighting.
+
+Let `g_i(o, a)` be the action gradient of decoded scalar Q head `i`, with
+`z = encode(o)`. PAVE computes:
+
+```text
+MPR       = sum_i mean_transitions,actions (g_i(o, a) - g_i(o + noise, a))²
+VFC       = sum_i mean_transitions,actions (g_i(o, a) - g_i(next_o, a))²
+curvature = sum_i mean_transitions relu(vᵀ Hessian_action(Q_i) v + margin)
+```
+
+The same recorded action is used at all three observations; VFC does not sample
+a next-policy action. Observation noise is isotropic Gaussian in the existing
+observation coordinates, without additional normalization or clipping.
+Perturbed observations pass through the encoder and its SimNorm, preserving the
+latent simplex structure. PAVE detaches every encoded latent, so these losses
+update only the selected online critic parameters. Normal backbone losses
+retain their existing representation gradients.
+
+One Rademacher probe `v` per sampled transition estimates curvature through a
+Hessian-vector product, without constructing an explicit Hessian. Selected
+rows, noise, and probes are shared between the two critics and across their
+heads. Gradients use independent action leaves for each head; the losses never
+combine head gradients before applying their penalties. The reductions above match the official
+SAC code: **head losses are summed**, so increasing the ensemble size changes
+the strength for fixed coefficients. This differs from the backbone TD loss's
+head average.
+
+PAVE contributions are added directly to the total world/critic objective,
+outside `critic_coef` and `aux_return_critic_coef`, before its existing single
+backward, gradient clipping, and optimizer step. Geometry forwards run eagerly
+with critic dropout temporarily disabled. Ordinary TD losses keep their
+dropout and optional compilation. Only enabled terms are evaluated. A dedicated
+stateless generator derives samples from the training seed and outer update
+number, preserving the global training RNG and reproducing the samples on
+exact continuation.
+
+### Example settings and diagnostics
+
+Add these fields to an algorithm's `alg_params` for primary-only PAVE:
+
+```json
+{
+  "outer_pave_mpr_coef": 0.1,
+  "outer_pave_vfc_coef": 0.1,
+  "outer_pave_curvature_coef": 0.01
+}
+```
+
+For auxiliary-only PAVE, leave the primary coefficients at zero:
+
+```json
+{
+  "aux_return_mode": "sac",
+  "aux_return_pave_mpr_coef": 0.1,
+  "aux_return_pave_vfc_coef": 0.1,
+  "aux_return_pave_curvature_coef": 0.01
+}
+```
+
+For both critics:
+
+```json
+{
+  "aux_return_mode": "sac",
+  "outer_pave_mpr_coef": 0.1,
+  "outer_pave_vfc_coef": 0.1,
+  "outer_pave_curvature_coef": 0.01,
+  "aux_return_pave_mpr_coef": 0.1,
+  "aux_return_pave_vfc_coef": 0.1,
+  "aux_return_pave_curvature_coef": 0.01,
+  "outer_pave_batch_size": 64
+}
+```
+
+The authors' `.1/.1/.01` weights are starting points requiring tuning for this
+backbone, Q scale, ensemble size, and observation units. Higher-order autograd
+adds training cost; the independent batch cap controls that cost without
+changing the ordinary TD minibatch.
+
+Each enabled critic logs `{prefix}_{mpr,vfc,curvature}_loss`, the corresponding
+`{prefix}_{term}_weighted_loss`, combined `{prefix}_weighted_loss`,
+`{prefix}_sample_count`, and `{prefix}_curvature_violation_fraction`, with
+`prefix` equal to `outer_pave` or `aux_return_pave`. Individual term metrics
+are emitted only when that term is enabled; the violation fraction requires
+the curvature term.
+
+The existing distributional Q decoder is retained. Its `symexp` applied to
+expected symlog value is mathematically C1 rather than C2 at zero; PyTorch's
+existing sign/absolute-value implementation also has its existing derivative
+convention at exactly zero. PAVE uses those autograd derivatives and does not
+claim the paper's global C2 assumption holds for this decoder. The scalar
+critic avoids that decoder issue. Monitor finite losses and curvature metrics
+when tuning either representation.
+
+Active coefficients, sampling settings, and loss semantics are saved in
+checkpoint provenance and exact-resume identity. Portable weight transfer can
+enable, disable, or retune PAVE without changing critic architecture. Exact
+continuation requires the same PAVE configuration; the saved update counter
+reproduces the next regularization sample without extra persistent RNG state.
+
+### Frozen PAVE gradient probe
+
+`probe_pave.py` measures PAVE against the actual weighted outer TD gradients
+without optimizer, actor, or target updates. Supply an early trained checkpoint
+and a mature checkpoint to examine how scale changes during learning. A mature
+checkpoint alone does not establish suitable weights for fresh training.
+Checkpoint files and their metadata sidecars are required. This version supports
+AMBI state observations, single-value scalar/distributional critics, and optional
+auxiliary return critics. Active value-equivalence loss is rejected explicitly.
+
+Run from the repository root using the locked DMControl interpreter:
+
+```bash
+environments/dmcontrol/.venv/bin/python probe_pave.py \
+  --checkpoint /absolute/path/to/early-checkpoint \
+  --checkpoint /absolute/path/to/575k-checkpoint \
+  --bank /absolute/path/to/early-replay.npz \
+  --bank /absolute/path/to/575k-replay.npz \
+  --device cuda --batches 32 --pave-batch-size 64 \
+  --obs-noise-std 0.01 --curvature-margin 1 \
+  --output-dir /absolute/path/to/new-probe-directory
+```
+
+One `--bank` can also be shared across checkpoints, provided the saved environment
+and wrappers match. The report retains its source-checkpoint provenance so this
+does not imply that the bank came from each checkpoint's training replay.
+Use `--critics primary` or `--critics auxiliary` to narrow the probe; by default
+it measures all available critics, reporting separate and combined scopes.
+
+Portable model snapshots do not contain replay. If no saved replay bank is
+available, explicitly collect a small bank with the loaded stochastic primary
+prior (no inner adaptation):
+
+```bash
+environments/dmcontrol/.venv/bin/python probe_pave.py \
+  --checkpoint /absolute/path/to/early-checkpoint \
+  --checkpoint /absolute/path/to/575k-checkpoint \
+  --collect-episodes 10 --max-steps 500 --seed 12345 \
+  --device cuda --output-dir /absolute/path/to/new-collected-probe
+```
+
+Each checkpoint gets its own saved NPZ bank, marked `stochastic_prior_proxy`.
+The collection cap is per episode; forced cutoffs are recorded as truncations.
+The actor emits normalized actions, which are converted to the environment's
+action bounds for stepping. Bank actions remain normalized. Only true
+termination enters the TD bootstrap mask. State noise uses existing observation
+coordinates before encoding; there is no direct SimNorm perturbation.
+
+Banks use `utils.pave_probe_data.PaveProbeBank`, with float32
+`observations[T,S]`, `next_observations[T,S]`, `actions[T,A]`, `rewards[T,1]`,
+boolean `terminated[T,1]` / `truncated[T,1]`, and integer `episode_ids[T]` /
+`episode_steps[T]`. Observations must connect exactly within each contiguous
+episode block. Save/load with `save_probe_bank` / `load_probe_bank`; NPZ loading
+disables pickle. Provenance includes `source_kind`, an `env_signature` mapping
+(`id`, `params`, `wrappers` from the checkpoint sidecar), and optionally
+`source_checkpoint_sha256`.
+
+For a live populated training wrapper, export resident real replay without
+sampling or changing its generator:
+
+```python
+from utils.pave_probe_data import export_buffer_bank, save_probe_bank
+
+bank = export_buffer_bank(model.buffer, provenance={
+    "env_signature": {"id": "DMControl-v0", "params": saved_env_params,
+                      "wrappers": saved_wrappers},
+    "source_checkpoint_sha256": checkpoint_sha256,
+})
+save_probe_bank("/absolute/path/to/new-replay-bank.npz", bank)
+```
+
+The exporter preserves resident episode boundaries, including partially evicted
+episodes. The source Buffer does not store truncation flags; the export records
+that limitation and uses its episode blocks to prevent cross-episode windows.
+The sampler draws uniformly with replacement over all valid full-horizon
+windows, then PAVE uses the training sampler to select up to 64 flattened rows
+without replacement. Valid terminal transitions may appear at the window end.
+`--pave-batch-size all` uses every sampled transition without rescaling weights.
+TD batch size, horizon, rho, target construction, decoder, and loss coefficients
+come from the saved training configuration. TD retains model-unrolled latents
+and training dropout; PAVE retains independently encoded detached observations
+and disabled critic dropout. The complete world/critic baseline gradient is
+used for the shared clipping calculation. Existing saved PAVE coefficients are
+replaced by the probe candidates, not added to them.
+
+Each batch differentiates all three PAVE terms once per critic. A gradient Gram
+matrix then evaluates the default `k` grid `.01 .03 .1 .3 1 3 10` for both
+`k*(.1,.1,.01)` and `k*(.1,.1,.1)` without more differentiation. Override it
+with `--scales`. Results include raw losses, weighted per-term gradient norms
+and TD ratios, gradient cosines and cancellation, full gradient norms,
+baseline/candidate clipping multipliers, action-gradient RMS, curvature
+violation fraction, timing, and CUDA allocated-memory peaks. Nonfinite values
+and ratios with unreliable TD denominators become JSON nulls with finite
+gradient fractions retained. No minimum or combined ensemble Q is differentiated.
+
+`results.json` contains per-batch measurements, checkpoint/bank/source hashes,
+resolved settings, and state hashes confirming that learned state is unchanged.
+`report.md` provides comparison tables. Per-checkpoint JSON files preserve
+completed measurements if a later checkpoint fails; `failure.json` marks an
+incomplete invocation. Existing output directories and banks are never replaced.
+
+The common-scale screen is deliberately heuristic: every supplied checkpoint
+and selected critic must have median PAVE/TD norm ratio 0.1–0.3, combined and
+individual-term P90 ratios at most 1, and no sampled global clipping multiplier
+below 90% of baseline. The individual-term check prevents cancellation from
+hiding large opposing gradients. Among passing
+grid points, it selects the one closest to 0.2 in the worst checkpoint/critic.
+It reports no recommendation when none pass or gradients are unreliable.
+Stronger curvature is reported at the same `k`, preserving that comparison.
+These thresholds are engineering starting points, not the paper's tuning rule
+or evidence of better return. Adam update ratios can differ from gradient ratios;
+random directional curvature checks do not certify negative definiteness.
+
+By default ordinary losses run eagerly to avoid compilation startup costs.
+`--ordinary-execution saved` retains the checkpoint's ordinary compilation
+settings while PAVE geometry stays eager. One unreported warmup batch precedes
+the 32 measured batches by default. All sampling is reproducible, with separate
+probe seeds for TD randomness and the training seed/update-number convention
+for PAVE. Timing and memory measure this diagnostic workload, which performs
+separate parameter-gradient passes; they are not estimates of full training
+update overhead. GPU measurements require running on the target GPU. Confirm
+selected weights in a short training smoke before launching a full backbone.

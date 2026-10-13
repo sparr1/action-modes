@@ -24,6 +24,7 @@ from RL.tdmpc2_core.common.auxiliary_config import (
     validate_auxiliary_config,
 )
 from utils.utils import setup_logs
+from utils.pave_identity import PAVE_COEFFICIENT_KEYS, PAVE_DEFAULTS, resolve_pave_controls
 
 
 _Q_REDUCTIONS = {"min_pair", "mean_pair", "min_all", "mean_all"}
@@ -55,6 +56,8 @@ _INNER_EXECUTION_POLICY_SOURCES = {
 
 
 _AMBI_DEFAULTS = {
+    # PAVE regularizes action derivatives of independently selected outer critics.
+    **PAVE_DEFAULTS,
     # Outer latent SAC. Q representation, ensemble reduction, and whether
     # entropy enters policy evaluation are independent controls.
     "mpc": False,
@@ -1560,6 +1563,19 @@ class AMBITDMPC2(TDMPC2Baseline):
                 inner_temperature_mode="inherit_outer",
             )
         cfg = super()._build_cfg(merged)
+        pave_controls = resolve_pave_controls(cfg)
+        for key, value in pave_controls.items():
+            setattr(cfg, key, value)
+        if any(pave_controls[key] > 0 for key in PAVE_COEFFICIENT_KEYS):
+            if cfg.obs != "state":
+                raise ValueError("Active PAVE losses require state observations.")
+            if cfg.critic_value_mode != "single":
+                raise ValueError("Active PAVE losses require critic_value_mode='single'.")
+            if cfg.aux_return_mode == "off" and any(
+                pave_controls[key] > 0 for key in PAVE_COEFFICIENT_KEYS
+                if key.startswith("aux_return_")
+            ):
+                raise ValueError("Auxiliary PAVE losses require an auxiliary return critic.")
         resolve_auxiliary_actor_config(cfg)
         # Resolve policy inheritance before the existing inner validations.
         if cfg.aux_return_mode != "off" and cfg.inner_actor_source == "return_actor":
