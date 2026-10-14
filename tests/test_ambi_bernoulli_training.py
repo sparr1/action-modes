@@ -150,6 +150,21 @@ def test_real_training_loop_transfers_with_outer_updates_and_resets_each_episode
     assert len({version for _, version, _ in seen}) > 1
 
 
+def test_transfer_diagnostics_reach_training_logging_window(models):
+    model = models(inner_diagnostics_every=1)
+    model._reset_wandb_window()
+    retained = []
+    for first in (True, False):
+        model.agent.act(torch.zeros(3), t0=first)
+        retained.append(float(model.agent.last_inner_metrics["inner_critic_bernoulli_retained_fraction"]))
+        model._record_action_metrics(planned=True, action_seconds=0.0)
+    payload = model._wandb_train_window.pop()
+    assert payload["train/inner_critic_bernoulli_p"] == .5
+    assert payload["train/inner_critic_bernoulli_applied"] == .5
+    assert payload["train/inner_critic_bernoulli_retained_fraction"] == pytest.approx(sum(retained) / 2)
+    assert payload["train/inner_critic_transfer_outer_updates"] == 0.
+
+
 def test_paired_evaluation_has_its_own_donor_and_correct_metric_names(models, monkeypatch):
     model = models()
     agent, live = model.agent, model.agent.inner_engine

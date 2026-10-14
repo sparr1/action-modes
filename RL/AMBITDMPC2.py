@@ -3706,6 +3706,10 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_explorer_temperature_grad_norm",
         }
         action_gauges = {
+            "inner_critic_bernoulli_p",
+            "inner_critic_bernoulli_applied",
+            "inner_critic_bernoulli_retained_fraction",
+            "inner_critic_transfer_outer_updates",
             "inner_steps_per_update",
             "inner_finite_horizon",
             "inner_outer_replay_fraction_requested",
