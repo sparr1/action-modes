@@ -11,6 +11,7 @@
 
 # Share the tested runtime body; only the directives above apply on Oscar.
 # Submit one smoke job, then --array=0-5 --dependency=afterok:<smoke>.
+# AMBI_TRANSFER_MANIFEST is forwarded to the shared launcher; omission keeps J6.
 set -Eeuo pipefail
 : "${AMBI_PROJECT_DIR:?Set the clean source checkout.}"
 exec bash "$AMBI_PROJECT_DIR/slurm/run_ambi_transfer_training_hydra.sbatch"

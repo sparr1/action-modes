@@ -107,6 +107,15 @@ This supports main training, prediction, and isolated paired evaluation.
 See [the transfer contract](RL/tdmpc2_core/README.md#bernoulli-critic-transfer)
 for supported settings, logging, and exact resume behavior.
 
+The full-training manifests `ambi_transfer_training.json` (J6) and
+`ambi_transfer_training_j8.json` (J8) pair H1/H2/H3 with fresh or Bernoulli 50%
+critics. Both retain all checkpoints every 25k decisions through 500k decisions.
+The Hydra and Oscar transfer-training launchers default to J6. Set
+`AMBI_TRANSFER_MANIFEST=configs/dmcontrol/experiments/ambi_transfer_training_j8.json`
+for both the GPU smoke job and its dependent training array to select J8, with
+a separate `AMBI_TRANSFER_OUTPUT` directory. The gate binds the selected manifest
+and its configurations to the pinned commit; a J6 gate cannot authorize J8.
+
 ### Optional random inner initialization
 
 Set `inner_actor_initialization="random"` and/or

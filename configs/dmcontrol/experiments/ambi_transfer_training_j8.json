@@ -1,0 +1,31 @@
+{
+  "study_type": "single_seed_exploratory_full_training_transfer",
+  "study_note": "Six fresh Humanoid Walk training runs: H1/H2/H3 crossed with no transfer and critic Bernoulli p=0.5. J8/C16/A4/N128/B256; auxiliary return critic for inner and terminal values; SAC actor. Outer recipe matches aux6428346x0, including shared representation and automatic entropy target -10.5. Training uses sampled actions; benchmark evaluation used mean actions. All use seed55, 500k decisions (1M raw environment steps), 2500 warmup decisions and 2500 pretraining updates. Save all 20 checkpoints every25k decisions. Evaluation remains disabled as in the source training recipe; W&B shows actual training returns, diagnostics and costs. The prior-only outer-policy diagnostic bank is disabled because it does not support inner-SAC collection; native training and inner metrics remain enabled.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 500000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_full_h1_j8_fresh",
+    "ambi_full_h1_j8_bernoulli50",
+    "ambi_full_h2_j8_fresh",
+    "ambi_full_h2_j8_bernoulli50",
+    "ambi_full_h3_j8_fresh",
+    "ambi_full_h3_j8_bernoulli50"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

@@ -12,6 +12,8 @@
 
 # Submit one AMBI_TRANSFER_MODE=smoke job, then all six training cells with
 # --array=0-5 --dependency=afterok:<smoke>. Supply absolute output/error paths.
+# AMBI_TRANSFER_MANIFEST optionally selects the J8 manifest; both smoke and
+# training must receive the same selection and a separate campaign output.
 set -Eeuo pipefail
 umask 077
 : "${SLURM_JOB_ID:?Submit through Slurm.}"
@@ -20,6 +22,7 @@ umask 077
 : "${AMBI_EXPECTED_COMMIT:?Set the full tested commit.}"
 : "${AMBI_TRANSFER_OUTPUT:?Set durable campaign storage outside source.}"
 mode="${AMBI_TRANSFER_MODE:-train}"
+manifest="${AMBI_TRANSFER_MANIFEST:-configs/dmcontrol/experiments/ambi_transfer_training.json}"
 [[ "$mode" == smoke || "$mode" == train ]]
 [[ "${SLURM_RESTART_COUNT:-0}" == 0 ]]
 [[ "$AMBI_PROJECT_DIR" == /* && "$AMBI_PYTHON" == /* && "$AMBI_TRANSFER_OUTPUT" == /* ]]
@@ -42,13 +45,14 @@ export WANDB_DATA_DIR="$local_root/data" WANDB_ARTIFACT_DIR="$local_root/artifac
 if [[ "$mode" == smoke ]]; then
   [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]
   export WANDB_MODE=disabled
-  srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" slurm/ambi_transfer_training.py smoke --output "$AMBI_TRANSFER_OUTPUT/gate"
+  srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" slurm/ambi_transfer_training.py smoke \
+    --manifest "$manifest" --output "$AMBI_TRANSFER_OUTPUT/gate"
 else
   : "${SLURM_ARRAY_TASK_ID:?Train as a six-cell array.}"
   [[ "$SLURM_ARRAY_TASK_ID" =~ ^[0-5]$ ]]
   export WANDB_MODE=online WANDB_RESUME=never
   export WANDB_RUN_ID="full${SLURM_ARRAY_JOB_ID}x${SLURM_ARRAY_TASK_ID}"
   exec srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" slurm/ambi_transfer_training.py train \
-    --index "$SLURM_ARRAY_TASK_ID" --output "$AMBI_TRANSFER_OUTPUT/cell-${SLURM_ARRAY_TASK_ID}" \
+    --manifest "$manifest" --index "$SLURM_ARRAY_TASK_ID" --output "$AMBI_TRANSFER_OUTPUT/cell-${SLURM_ARRAY_TASK_ID}" \
     --gate "$AMBI_TRANSFER_OUTPUT/gate/receipt.json"
 fi
