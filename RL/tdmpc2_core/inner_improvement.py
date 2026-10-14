@@ -7,7 +7,8 @@ the rest of the world model, and the entropy coefficient remain untouched.
 """
 
 from copy import deepcopy
-from dataclasses import dataclass, field, fields as dataclass_fields
+from contextlib import nullcontext
+from dataclasses import dataclass, field, fields as dataclass_fields, replace
 import math
 import time
 import warnings
@@ -17,7 +18,11 @@ import torch
 from .common import init as td_init
 from .common import math as td_math
 from .common.compile_regions import CompileRegion
+from .common.bernoulli_transfer import reset_critic_with_bernoulli_
 from .common.entropy import policy_entropy
+from .common.control_sources import (
+    actor_module, actor_options, actor_owner, critic_module, critic_owner, source_metadata,
+)
 from .common.inner_utils import (
     InnerRNG,
     allocate_across_rounds,
@@ -26,11 +31,15 @@ from .common.inner_utils import (
     trainable_parameter_count,
 )
 from .common.latent_buffer import LatentReplayBuffer
+from .common.latent_trajectory_buffer import LatentTrajectoryReplayBuffer
+from .inner_retrace import RetraceInnerMixin
+from .common.horizon_conditioning import reset_horizon_module, widen_horizon_module
 from .common.scale import percentile_range
 from .common.lora import (
     dense_lora_rl_critic,
     lora_rl_parameter_groups,
     make_lora_rl_critic,
+    reset_lora_rl_adapters_,
     reset_lora_rl_critic_,
     trainable_parameters,
     update_lora_rl_target_,
@@ -82,8 +91,11 @@ class InnerWorkspace:
     critic_optim: torch.optim.Optimizer | None = None
     log_alpha: torch.nn.Parameter | None = None
     alpha_fixed: torch.Tensor | None = None
+    # Decoded composition U + c W; independent of any later inner alpha.
+    value_composition: torch.Tensor | None = None
+    value_roles: tuple[str, ...] | None = None
     temperature_optim: torch.optim.Optimizer | None = None
-    replay: LatentReplayBuffer | None = None
+    replay: LatentReplayBuffer | LatentTrajectoryReplayBuffer | None = None
     outer_version: int = -1
     critic_steps: int = 0
     critic_lifetime_steps: int = 0
@@ -94,7 +106,7 @@ class InnerWorkspace:
     target_steps: int = 0
     critic_target_steps: int = 0
     actor_target_steps: int = 0
-    replay_draws: int = 0
+    replay_draws: int | torch.Tensor = 0
     policy_evaluations: int = 0
     q_evaluations: int = 0
     sampled_ids: list[torch.Tensor] = field(default_factory=list)
@@ -135,7 +147,7 @@ class InnerWorkspace:
     explorer_transitions: int = 0
 
 
-class InnerImprovementEngine:
+class InnerImprovementEngine(RetraceInnerMixin):
     """Run none/SAC/TD3 inner improvement behind ``AMBI.agent.act``."""
 
     def __init__(self, agent):
@@ -155,13 +167,48 @@ class InnerImprovementEngine:
         self._active_trace = None
         self._pending_timers = {}
         self._parameter_noise_spec = None
+        self._clear_critic_transfer()
         self._clear_parameter_noise_action_state()
         self._initialize_compile_regions()
 
     def _new_rng(self, seed):
         # Keep legacy stream identities and exact-resume schemas unchanged.
         extra = ("tdambi_calibration",) if self.cfg.inner_operator == "tdambi" else ()
+        if self._critic_bernoulli_p > 0:
+            extra += ("critic_bernoulli",)
         return InnerRNG(seed, self.device, extra_streams=extra)
+
+    @property
+    def _critic_bernoulli_p(self):
+        return float(getattr(self.cfg, "inner_critic_bernoulli_p", 0.0))
+
+    def _critic_transfer_spec(self):
+        if self._critic_bernoulli_p == 0:
+            return None
+        return {"version": 1, "probability": self._critic_bernoulli_p,
+                "parameters": "all", "donor": "previous_solve", "reset": "episode",
+                "replacement": "current_prior", "target": "selected_online"}
+
+    def _clear_critic_transfer(self):
+        # The successful donor lives in the existing allocation pool. A pooled
+        # module alone is never proof of a donor (resets also retain that pool).
+        self._critic_transfer_ready = False
+        self._critic_transfer_eval_mode = None
+        self._critic_transfer_metrics = {}
+
+    def _new_replay(self):
+        """Use the same replay contract for allocation and checkpoint preflight."""
+        if self._retrace_enabled:
+            return self._new_trajectory_replay()
+        return LatentReplayBuffer(
+            capacity=self.cfg.inner_replay_capacity,
+            latent_dim=self.cfg.latent_dim,
+            action_dim=self.cfg.action_dim,
+            device=self.device,
+            store_source=self._explorer_active,
+            store_horizon=bool(getattr(self.cfg, "inner_finite_horizon", False)),
+            horizon_conditioning_horizon=self._horizon_conditioning_horizon,
+        )
 
     def _initialize_compile_regions(self):
         enabled = bool(getattr(self.cfg, "compile", False))
@@ -169,6 +216,13 @@ class InnerImprovementEngine:
         operator = str(self.cfg.inner_operator)
         critic_kernel = (
             self._td3_critic_kernel if operator == "td3" else self._sac_critic_kernel
+        )
+        if self._retrace_enabled:
+            critic_kernel = self._retrace_critic_kernel
+        rollout_kernel = (
+            self._retrace_dense_rollout_kernel if self._retrace_enabled
+            else self._rollout_step_kernel if self._interleaves_updates
+            else self._dense_rollout_kernel
         )
         if operator == "td3":
             actor_kernel = self._td3_actor_kernel
@@ -181,7 +235,7 @@ class InnerImprovementEngine:
         self._compile_regions = {
             "rollout": CompileRegion(
                 ("inner rollout step" if self._interleaves_updates else "fixed-shape inner rollout"),
-                (self._rollout_step_kernel if self._interleaves_updates else self._dense_rollout_kernel),
+                rollout_kernel,
                 enabled=enabled,
                 strict=strict,
             ),
@@ -205,24 +259,105 @@ class InnerImprovementEngine:
             )
 
     @property
+    def _horizon_conditioning_horizon(self):
+        if getattr(self.cfg, "inner_horizon_conditioning", "none") == "one_hot":
+            return int(self.cfg.inner_rollout_horizon)
+        return None
+
+    def _remaining_horizon(self, z, step=0):
+        horizon = self._horizon_conditioning_horizon
+        if horizon is None:
+            return None
+        return torch.full(
+            (*z.shape[:-1], 1), horizon - step, device=z.device, dtype=torch.long,
+        )
+
+    def _horizon_kwargs(self, remaining_horizon):
+        if self._horizon_conditioning_horizon is None:
+            return {}
+        if remaining_horizon is None:
+            raise ValueError("Conditioned inner SAC requires remaining_horizon.")
+        return {"remaining_horizon": remaining_horizon.to(dtype=torch.long)}
+
+    @property
+    def _aux_return_active(self):
+        return getattr(self.cfg, "aux_return_mode", "off") != "off"
+
+    @property
+    def _actor_source(self):
+        return getattr(self.cfg, "inner_actor_source", "sac")
+
+    @property
+    def _actor_base(self):
+        return actor_module(self.agent, self._actor_source)
+
+    @property
+    def _actor_owner(self):
+        return actor_owner(self.agent, self._actor_source)
+
+    @property
+    def _actor_options(self):
+        return actor_options(self.agent, self._actor_source)
+
+    @property
+    def _critic_source(self):
+        return getattr(self.cfg, "inner_critic_source", "sac")
+
+    @property
+    def _critic_base(self):
+        return critic_module(self.agent, self._critic_source)
+
+    @property
+    def _critic_outer_target(self):
+        return critic_module(self.agent, self._critic_source, target=True)
+
+    @property
+    def _critic_owner(self):
+        return critic_owner(self.agent, self._critic_source)
+
+    @property
+    def _horizon_actor(self):
+        return actor_module(self.agent, getattr(self.cfg, "inner_horizon_actor_source", "sac"))
+
+    @property
+    def _horizon_actor_options(self):
+        return actor_options(self.agent, getattr(self.cfg, "inner_horizon_actor_source", "sac"))
+
+    @property
+    def _horizon_critic(self):
+        return critic_module(self.agent, getattr(self.cfg, "inner_horizon_critic_source", "sac"))
+
+    @property
+    def _split_values(self):
+        return getattr(self.cfg, "critic_value_mode", "single") == "return_entropy"
+
+    @property
+    def _inner_entropy_enabled(self):
+        if self._aux_return_active:
+            return bool(getattr(self.cfg, "inner_entropy_enabled", True))
+        return not self._split_values or bool(getattr(self.cfg, "inner_entropy_enabled", False))
+
+    @property
     def alpha(self):
+        if not self._inner_entropy_enabled:
+            return self._actor_owner.alpha.detach().new_zeros(())
         if self.state.log_alpha is not None:
             return self.state.log_alpha.exp().clamp_min(_INNER_ALPHA_FLOOR)
         if self.state.alpha_fixed is not None:
             if str(self.cfg.inner_temperature_mode) == "inherit_outer":
                 alpha = self.state.alpha_fixed
-                if getattr(self.agent, "log_ent_coef", None) is not None:
+                if getattr(self._actor_owner, "log_ent_coef", None) is not None:
                     return alpha.clamp_min(_INNER_ALPHA_FLOOR)
                 return alpha
             return self.state.alpha_fixed
-        alpha = self.agent.alpha.detach()
+        alpha = self._actor_owner.alpha.detach()
         if (
             str(self.cfg.inner_operator) == "sac"
             and (
                 str(self.cfg.inner_temperature_mode) == "auto"
                 or (
                     str(self.cfg.inner_temperature_mode) == "inherit_outer"
-                    and getattr(self.agent, "log_ent_coef", None) is not None
+                    and getattr(self._actor_owner, "log_ent_coef", None) is not None
                 )
             )
         ):
@@ -264,6 +399,8 @@ class InnerImprovementEngine:
 
     @property
     def _sac_actor_loss_scale_enabled(self):
+        if self._aux_return_active:
+            return self.cfg.inner_operator == "sac" and self._critic_owner.actor_loss_scale_enabled
         return (
             str(self.cfg.inner_operator) == "sac"
             and str(
@@ -327,6 +464,8 @@ class InnerImprovementEngine:
     def _component_has_updates(self, component):
         """Whether an optimizer is needed for this action's resolved schedule."""
         cfg = self.cfg
+        if component == "temperature" and not self._inner_entropy_enabled:
+            return False
         if self._uses_canonical_schedule:
             if self._uses_component_update_schedule:
                 if component == "temperature":
@@ -351,9 +490,9 @@ class InnerImprovementEngine:
     def _resolved_inner_target_entropy(self):
         value = getattr(self.cfg, "inner_target_entropy", "auto")
         if value == "inherit_outer":
-            if hasattr(self.agent, "target_entropy"):
-                return float(self.agent.target_entropy)
-            value = getattr(self.cfg, "target_entropy", "auto")
+            if hasattr(self._actor_owner, "target_entropy"):
+                return float(self._actor_owner.target_entropy)
+            value = getattr(self._actor_owner.cfg, "target_entropy", "auto")
         if value == "auto":
             return -float(self.cfg.action_dim)
         return float(value)
@@ -370,7 +509,7 @@ class InnerImprovementEngine:
             getattr(self.cfg, "inner_temperature_initialization", "fixed")
         )
         if initialization == "inherit_outer":
-            initial_alpha = self.agent.alpha.detach().reshape(-1)[0]
+            initial_alpha = self._actor_owner.alpha.detach().reshape(-1)[0]
         elif initialization == "fixed":
             initial_alpha = torch.as_tensor(
                 float(self.cfg.inner_temperature), device=self.device
@@ -398,6 +537,7 @@ class InnerImprovementEngine:
         self._mppi_prev_mean = None
         self._pending_timers = {}
         self._parameter_noise_spec = None
+        self._clear_critic_transfer()
         self._clear_parameter_noise_action_state()
         # A checkpoint load invalidates action-local module identities. Rebuild
         # only the non-serialized compile callables; model/checkpoint keys stay
@@ -412,7 +552,8 @@ class InnerImprovementEngine:
         a fresh root-local workspace and an episode-private RNG stream. The
         default discards allocations. Opt-in reuse retains only a single-policy,
         fully action-scoped allocation pool; ordinary workspace preparation
-        restores priors, target networks, optimizer moments, replay and alpha
+        applies configured initialization, resets target networks, optimizer
+        moments, replay and alpha
         before use. Keeping module identities also avoids recompiling Dynamo
         guards after every root. Other lifecycles still discard their pools.
         """
@@ -446,6 +587,7 @@ class InnerImprovementEngine:
         self._mppi_prev_mean = None
         self._collect_diagnostics = True
         self._pending_timers = {}
+        self._clear_critic_transfer()
         self._clear_parameter_noise_action_state()
         return self
 
@@ -500,6 +642,7 @@ class InnerImprovementEngine:
     def reset_episode(self):
         """Clear action/episode state while preserving explicitly run-scoped state."""
         self.episode_index += 1
+        self._clear_critic_transfer()
         self._clear_expired(t0=True, include_action=True)
         if str(self.cfg.inner_mppi_warm_start_scope) != "run":
             self._mppi_prev_mean = None
@@ -601,6 +744,8 @@ class InnerImprovementEngine:
                 "replay",
             )
         }
+        if self._split_values:
+            fields.update(value_composition=False, value_roles=False)
         if not initialized:
             return fields
 
@@ -672,6 +817,8 @@ class InnerImprovementEngine:
 
     def _require_resume_boundary(self):
         """Reject snapshots that would silently discard transient inner state."""
+        if self._critic_transfer_ready or self._critic_transfer_eval_mode is not None or self._critic_transfer_metrics:
+            raise RuntimeError("Bernoulli transfer state must be cleared at the episode resume boundary.")
         if self._pending_timers:
             raise RuntimeError(
                 "AMBI inner timing must be finalized before capturing training state."
@@ -775,32 +922,68 @@ class InnerImprovementEngine:
             "weight_decay": float(self.cfg.inner_critic_lora_weight_decay),
         }
 
+    def _random_initialization_spec(self):
+        """Identify scratch solves while leaving historical payloads unchanged."""
+        spec = {
+            component: str(getattr(self.cfg, f"inner_{component}_initialization", "prior"))
+            for component in ("actor", "critic")
+        }
+        if getattr(self.cfg, "inner_actor_initial_std", None) is not None:
+            spec["actor_initial_std"] = float(self.cfg.inner_actor_initial_std)
+        return spec if "random" in spec.values() else None
+
+    def _split_value_spec(self):
+        if not self._split_values:
+            return None
+        return {
+            "critic_value_mode": "return_entropy",
+            "inner_value_initialization": str(self.cfg.inner_value_initialization),
+            "inner_entropy_enabled": self._inner_entropy_enabled,
+            "outer_roles": ["return", "entropy"],
+            "inner_roles": ["primary", "initialization_residual"],
+            "composition": "primary + frozen_initial_coefficient * initialization_residual",
+        }
+
+    def _horizon_conditioning_spec(self):
+        horizon = self._horizon_conditioning_horizon
+        if horizon is None:
+            return None
+        return {"mode": "one_hot", "horizon": horizon, "protocol_version": 1}
+
     def training_state_dict(self):
         """Return persistent inner scientific state at an episode boundary."""
         self._require_resume_boundary()
         state = self.state
         payload = {
             "schema": "ambi-inner-engine-training-state",
-            # Version 1 remains byte-for-byte compatible for feature-off runs.
+            # Versions retain their existing method meanings. Backend execution
+            # is an additive field; missing historical metadata means loop.
             # Version 2 records the active population identity; all R modules
             # are action-local and are therefore intentionally absent here.
             # Version 3 identifies the LoRA-RL solve even at an empty boundary.
+            # Version 4 records random initialization and optional LoRA-RL.
             "version": (
-                3 if self._lora_rl_spec() is not None
+                8 if self._retrace_enabled
+                else 7 if self._horizon_conditioning_horizon is not None
+                else 6 if self._aux_return_active
+                else 5 if self._split_values
+                else 4 if self._random_initialization_spec() is not None
+                else 3 if self._lora_rl_spec() is not None
                 else 2 if self._explorer_active else 1
             ),
+            "critic_ensemble_backend": getattr(self.cfg, "critic_ensemble_backend", "loop"),
             "action_index": int(self.action_index),
             "episode_index": int(self.episode_index),
             "rng": self.rng.training_state_dict(),
             "workspace": {
                 "actor": self._module_training_state(state.actor),
                 "actor_anchor": self._module_training_state(
-                    state.actor_anchor, outer=self.model._pi
+                    state.actor_anchor, outer=self._actor_base
                 ),
                 "actor_target": self._module_training_state(state.actor_target),
                 "critic": self._module_training_state(state.critic),
                 "critic_anchor": self._module_training_state(
-                    state.critic_anchor, outer=self.model._Qs
+                    state.critic_anchor, outer=self._critic_base
                 ),
                 "critic_target": self._module_training_state(state.critic_target),
                 "actor_optim": (
@@ -830,11 +1013,29 @@ class InnerImprovementEngine:
             },
             "mppi_prev_mean": self._mppi_prev_mean,
         }
+        if self._aux_return_active:
+            payload["control_sources"] = source_metadata(self.cfg)
+        if self._split_values:
+            payload["split_value_spec"] = self._split_value_spec()
+            payload["workspace"].update(
+                value_composition=None if state.value_composition is None else state.value_composition.detach().clone(),
+                value_roles=state.value_roles,
+            )
         if self._explorer_active:
             payload["explorer_mode"] = self._explorer_mode
         lora_rl_spec = self._lora_rl_spec()
         if lora_rl_spec is not None:
             payload["lora_rl_spec"] = lora_rl_spec
+        initialization_spec = self._random_initialization_spec()
+        if initialization_spec is not None:
+            payload["initialization_spec"] = initialization_spec
+        horizon_spec = self._horizon_conditioning_spec()
+        if horizon_spec is not None:
+            payload["horizon_conditioning_spec"] = horizon_spec
+        if self._retrace_enabled:
+            payload["retrace_spec"] = self._retrace_spec()
+        if self._critic_transfer_spec() is not None:
+            payload["critic_transfer_spec"] = self._critic_transfer_spec()
         return payload
 
     def _load_module_candidate(
@@ -891,22 +1092,107 @@ class InnerImprovementEngine:
 
     def _preflight_training_state_dict(self, state):
         state = require_mapping(state, "AMBI inner-engine training state")
+        configured_backend = getattr(self.cfg, "critic_ensemble_backend", "loop")
+        saved_backend = state.get("critic_ensemble_backend", "loop")
+        if not isinstance(saved_backend, str) or saved_backend != configured_backend:
+            raise ValueError(
+                "Inner critic_ensemble_backend is incompatible with exact continuation: "
+                f"checkpoint={saved_backend!r}, configured={configured_backend!r}."
+            )
+        # Normalize a copy before exact-key validation; direct inner restoration
+        # has the same historical-loop rule as full-agent exact restoration.
+        state = dict(state)
+        state.setdefault("critic_ensemble_backend", "loop")
         version = state.get("version")
         common_keys = {
                 "schema",
                 "version",
+                "critic_ensemble_backend",
                 "action_index",
                 "episode_index",
                 "rng",
                 "workspace",
                 "mppi_prev_mean",
         }
+        transfer_spec = self._critic_transfer_spec()
+        if state.get("critic_transfer_spec") != transfer_spec:
+            raise ValueError("Inner Bernoulli transfer specification is incompatible with exact continuation.")
+        if transfer_spec is not None:
+            saved_transfer = require_exact_keys(state["critic_transfer_spec"], set(transfer_spec),
+                                                "Inner Bernoulli transfer specification")
+            if any(type(saved_transfer[key]) is not type(value) for key, value in transfer_spec.items()):
+                raise ValueError("Inner Bernoulli transfer specification is incompatible.")
+            common_keys.add("critic_transfer_spec")
         lora_rl_spec = self._lora_rl_spec()
-        if version != 3 and lora_rl_spec is not None:
+        initialization_spec = self._random_initialization_spec()
+        horizon_spec = self._horizon_conditioning_spec()
+        if self._retrace_enabled != (version == 8):
+            raise ValueError("Retrace exact resume requires matching estimator metadata version 8.")
+        if horizon_spec is not None and version not in {7, 8}:
+            raise ValueError("Horizon-conditioned inner state requires metadata version 7.")
+        if self._aux_return_active and version not in {6, 8}:
+            raise ValueError("Auxiliary-return inner state requires source metadata version 6.")
+        if version != 5 and self._split_values:
+            raise ValueError("Split-value inner state requires semantic metadata version 5.")
+        if version not in {4, 8} and initialization_spec is not None:
+            raise ValueError(
+                "Random initialization is incompatible with prior-initialized "
+                "AMBI inner-engine state."
+            )
+        if version not in {3, 4, 5, 6, 8} and lora_rl_spec is not None:
             raise ValueError(
                 "LoRA-RL exact resume is incompatible with legacy AMBI inner-engine state."
             )
-        if version == 1:
+        if version == 8:
+            specs = {"retrace_spec": self._retrace_spec()}
+            if horizon_spec is not None:
+                specs["horizon_conditioning_spec"] = horizon_spec
+            if self._aux_return_active:
+                specs["control_sources"] = source_metadata(self.cfg)
+            if initialization_spec is not None:
+                specs["initialization_spec"] = initialization_spec
+            if lora_rl_spec is not None:
+                specs["lora_rl_spec"] = lora_rl_spec
+            expected_keys = common_keys | set(specs)
+            for name, spec in specs.items():
+                saved_spec = require_exact_keys(state.get(name), set(spec), f"Inner {name}")
+                if any(type(saved_spec[key]) is not type(value) or saved_spec[key] != value
+                       for key, value in spec.items()):
+                    raise ValueError(f"Inner {name} is incompatible.")
+        elif version == 7:
+            if horizon_spec is None:
+                raise ValueError("Horizon-conditioned inner state requires one_hot conditioning.")
+            expected_keys = common_keys | {"horizon_conditioning_spec"}
+            saved_spec = require_exact_keys(
+                state.get("horizon_conditioning_spec"), set(horizon_spec),
+                "Inner horizon-conditioning specification",
+            )
+            if any(type(saved_spec[key]) is not type(value) or saved_spec[key] != value
+                   for key, value in horizon_spec.items()):
+                raise ValueError("Inner horizon-conditioning specification is incompatible.")
+        elif version == 6:
+            if not self._aux_return_active or self._split_values or self._explorer_active or initialization_spec is not None:
+                raise ValueError("Auxiliary-return inner state is incompatible with the configured method.")
+            expected_keys = common_keys | {"control_sources"}
+            if state.get("control_sources") != source_metadata(self.cfg):
+                raise ValueError("Inner control sources are incompatible.")
+            if ("lora_rl_spec" in state) != (lora_rl_spec is not None):
+                raise ValueError("LoRA-RL inner-engine protocol specification is incompatible.")
+            if lora_rl_spec is not None:
+                expected_keys |= {"lora_rl_spec"}
+        elif version == 5:
+            if not self._split_values or self._explorer_active or initialization_spec is not None:
+                raise ValueError("Split-value inner state is incompatible with the configured method.")
+            expected_keys = common_keys | {"split_value_spec"}
+            saved_spec = require_exact_keys(state.get("split_value_spec"),
+                                           set(self._split_value_spec()), "Inner split-value specification")
+            if saved_spec != self._split_value_spec():
+                raise ValueError("Inner split-value semantics are incompatible.")
+            if ("lora_rl_spec" in state) != (lora_rl_spec is not None):
+                raise ValueError("LoRA-RL inner-engine protocol specification is incompatible.")
+            if lora_rl_spec is not None:
+                expected_keys |= {"lora_rl_spec"}
+        elif version == 1:
             if self._explorer_active:
                 raise ValueError(
                     "Legacy AMBI inner-engine state can only be loaded with "
@@ -926,12 +1212,39 @@ class InnerImprovementEngine:
                     f"checkpoint={state.get('explorer_mode')!r}, "
                     f"configured={self._explorer_mode!r}."
                 )
+        elif version == 4:
+            if initialization_spec is None or self._explorer_active:
+                raise ValueError(
+                    "Random initialization inner-engine state is incompatible "
+                    "with the configured method."
+                )
+            expected_keys = common_keys | {"initialization_spec"}
+            saved_initialization = require_exact_keys(
+                state.get("initialization_spec"), set(initialization_spec),
+                "Inner initialization specification",
+            )
+            if any(
+                type(saved_initialization[key]) is not type(value)
+                or saved_initialization[key] != value
+                for key, value in initialization_spec.items()
+            ):
+                raise ValueError(
+                    "Inner initialization specification is incompatible: "
+                    f"checkpoint={saved_initialization!r}, configured={initialization_spec!r}."
+                )
+            if ("lora_rl_spec" in state) != (lora_rl_spec is not None):
+                raise ValueError("LoRA-RL inner-engine protocol specification is incompatible.")
+            if lora_rl_spec is not None:
+                expected_keys |= {"lora_rl_spec"}
         elif version == 3:
             expected_keys = common_keys | {"lora_rl_spec"}
             if lora_rl_spec is None or self._explorer_active:
                 raise ValueError(
                     "LoRA-RL inner-engine state is incompatible with the configured method."
                 )
+        else:
+            raise ValueError("Unsupported AMBI inner-engine training-state version.")
+        if version in {3, 4, 5, 6} and lora_rl_spec is not None:
             saved_spec = require_exact_keys(
                 state.get("lora_rl_spec"), set(lora_rl_spec), "LoRA-RL protocol specification"
             )
@@ -943,8 +1256,6 @@ class InnerImprovementEngine:
                     "LoRA-RL inner-engine protocol specification is incompatible: "
                     f"checkpoint={saved_spec!r}, configured={lora_rl_spec!r}."
                 )
-        else:
-            raise ValueError("Unsupported AMBI inner-engine training-state version.")
         state = require_exact_keys(
             state,
             expected_keys,
@@ -952,7 +1263,7 @@ class InnerImprovementEngine:
         )
         if (
             state["schema"] != "ambi-inner-engine-training-state"
-            or state["version"] not in {1, 2, 3}
+            or state["version"] not in {1, 2, 3, 4, 5, 6, 7, 8}
         ):
             raise ValueError("Unsupported AMBI inner-engine training-state version.")
         action_index = self._validate_index(state["action_index"], "action_index")
@@ -973,7 +1284,7 @@ class InnerImprovementEngine:
                 "temperature_optim",
                 "replay",
                 "counters",
-            },
+            } | ({"value_composition", "value_roles"} if self._split_values else set()),
             "AMBI inner workspace training state",
         )
         counters = require_exact_keys(
@@ -1012,34 +1323,34 @@ class InnerImprovementEngine:
             )
         # Build the complete destination off to the side. Failures below do
         # not mutate the current engine or its RNG streams.
-        probe_rng = InnerRNG(self.cfg.seed, self.device)
+        probe_rng = self._new_rng(self.cfg.seed)
         with probe_rng.action_fork():
             with probe_rng.fork("initialization"):
                 candidate = InnerWorkspace()
                 module_specs = (
                     (
                         "actor",
-                        lambda: self._adapt_module(self.model._pi, "actor"),
+                        lambda: self._adapt_module(self._actor_base, "actor"),
                         None,
                     ),
                     (
                         "critic",
-                        lambda: self._adapt_module(self.model._Qs, "critic"),
+                        lambda: self._adapt_module(self._critic_base, "critic"),
                         None,
                     ),
                     (
                         "actor_anchor",
-                        lambda: deepcopy(self.model._pi)
+                        lambda: deepcopy(self._actor_base)
                         .to(self.device)
                         .requires_grad_(False),
-                        self.model._pi,
+                        self._actor_base,
                     ),
                     (
                         "critic_anchor",
-                        lambda: deepcopy(self.model._Qs)
+                        lambda: deepcopy(self._critic_base)
                         .to(self.device)
                         .requires_grad_(False),
-                        self.model._Qs,
+                        self._critic_base,
                     ),
                     (
                         "actor_target",
@@ -1105,7 +1416,7 @@ class InnerImprovementEngine:
                 log_alpha,
                 "inner log_alpha",
                 shape=(),
-                dtype=self.agent.alpha.dtype,
+                dtype=self._actor_owner.alpha.dtype,
             )
             if not bool(torch.isfinite(log_alpha).all().item()):
                 raise ValueError("inner log_alpha must be finite.")
@@ -1118,7 +1429,7 @@ class InnerImprovementEngine:
         if alpha_fixed is not None:
             temperature_mode = str(self.cfg.inner_temperature_mode)
             expected_shape = (
-                self.agent.alpha.shape
+                self._actor_owner.alpha.shape
                 if temperature_mode == "inherit_outer"
                 else torch.Size([])
             )
@@ -1126,7 +1437,7 @@ class InnerImprovementEngine:
                 alpha_fixed,
                 "inner alpha_fixed",
                 shape=expected_shape,
-                dtype=self.agent.alpha.dtype,
+                dtype=self._actor_owner.alpha.dtype,
             )
             if not bool(torch.isfinite(alpha_fixed).all().item()):
                 raise ValueError("inner alpha_fixed must be finite.")
@@ -1136,7 +1447,7 @@ class InnerImprovementEngine:
                 raise ValueError("inherited inner alpha_fixed must be non-negative.")
             candidate.alpha_fixed = alpha_fixed.detach().to(self.device).clone()
             if temperature_mode == "inherit_outer" and (
-                getattr(self.agent, "log_ent_coef", None) is not None
+                getattr(self._actor_owner, "log_ent_coef", None) is not None
                 or bool((candidate.alpha_fixed <= 0).any().item())
             ):
                 candidate.alpha_fixed.clamp_min_(_INNER_ALPHA_FLOOR)
@@ -1160,13 +1471,7 @@ class InnerImprovementEngine:
             )
 
         if workspace["replay"] is not None:
-            candidate.replay = LatentReplayBuffer(
-                capacity=self.cfg.inner_replay_capacity,
-                latent_dim=self.cfg.latent_dim,
-                action_dim=self.cfg.action_dim,
-                device=self.device,
-                store_horizon=bool(getattr(self.cfg, "inner_finite_horizon", False)),
-            )
+            candidate.replay = self._new_replay()
             candidate.replay.load_training_state_dict(workspace["replay"])
 
         for field, value in normalized_counters.items():
@@ -1195,7 +1500,7 @@ class InnerImprovementEngine:
                 raise ValueError("Inner MPPI previous mean must be floating point.")
             previous_mean = previous_mean.detach().to(self.device).clone()
 
-        candidate_rng = InnerRNG(self.cfg.seed, self.device)
+        candidate_rng = self._new_rng(self.cfg.seed)
         candidate_rng.load_training_state_dict(state["rng"])
         return {
             "state": candidate,
@@ -1221,6 +1526,7 @@ class InnerImprovementEngine:
         self._collect_diagnostics = True
         self._pending_timers = {}
         self._parameter_noise_spec = None
+        self._clear_critic_transfer()
         self._clear_parameter_noise_action_state()
         self._initialize_compile_regions()
         return self
@@ -1285,6 +1591,7 @@ class InnerImprovementEngine:
             state.critic_params = []
             state.critic_trainable_count = 0
             state.critic_lifetime_steps = 0
+            state.value_composition = state.value_roles = None
         elif self._scope_expires(
             cfg.inner_critic_optimizer_scope, t0=t0, include_action=include_action
         ):
@@ -1305,7 +1612,10 @@ class InnerImprovementEngine:
                 self._action_pool.log_alpha = state.log_alpha
                 self._action_pool.alpha_fixed = state.alpha_fixed
                 self._action_pool.temperature_optim = state.temperature_optim
-            else:
+            elif str(cfg.inner_temperature_scope) != "action":
+                # Repeated expiration can find an already pooled action-local
+                # alpha. Its optimizer still owns that same parameter; retain
+                # its allocations until workspace preparation resets moments.
                 self._action_pool.temperature_optim = None
             state.log_alpha = state.alpha_fixed = state.temperature_optim = None
             state.temperature_lifetime_steps = 0
@@ -1388,12 +1698,71 @@ class InnerImprovementEngine:
                 elif isinstance(value, (int, float)):
                     parameter_state[key] = type(value)(0)
 
+    @torch.no_grad()
+    def _reset_random_component(self, component, module):
+        """Reset dense parameters in construction order, including LoRA bases.
+
+        The critic retains Linear constructor initialization rather than the
+        actor's TD-MPC initializer. Traversal reaches wrapped Linear bases but
+        never samples adapter factors; those are reset after the entire base.
+        """
+        if component == "actor":
+            module.apply(td_init.weight_init)
+            initial_std = getattr(self.cfg, "inner_actor_initial_std", None)
+            if initial_std is not None:
+                # Keep the sampled mean network. A constant std head makes
+                # the requested pre-tanh exploration scale exact at all roots,
+                # while leaving its weights trainable after initialization.
+                head = module[-1]
+                action_dim = int(self.cfg.action_dim)
+                if not isinstance(head, torch.nn.Linear) or head.out_features != 2 * action_dim:
+                    raise ValueError("Explicit inner actor std requires a Gaussian Linear output head.")
+                raw_std = math.log(initial_std)
+                if self.cfg.inner_log_std_mapping == "tdmpc2_tanh":
+                    lower, upper = self.cfg.inner_log_std_min, self.cfg.inner_log_std_max
+                    raw_std = math.atanh(2.0 * (raw_std - lower) / (upper - lower) - 1.0)
+                head.weight[action_dim:].zero_()
+                head.bias[action_dim:].fill_(raw_std)
+        elif component == "critic":
+            for layer in module.modules():
+                if isinstance(layer, torch.nn.Linear):
+                    layer.reset_parameters()
+            for head in module:
+                head[-1].weight.zero_()
+        else:
+            raise ValueError(f"Unknown inner component: {component!r}")
+        for layer in module.modules():
+            if isinstance(layer, torch.nn.LayerNorm):
+                layer.reset_parameters()
+
     def _reset_action_component(self, component, module, outer):
         mode = str(getattr(self.cfg, f"inner_{component}_adaptation"))
-        if mode == "lora_rl":
+        initialization = getattr(self.cfg, f"inner_{component}_initialization", "prior")
+        if component == "critic" and self._critic_bernoulli_p > 0 and self._critic_transfer_ready:
+            retained = reset_critic_with_bernoulli_(
+                module, outer, self._critic_bernoulli_p,
+                generator=self.rng.generator("critic_bernoulli"), measure=self._collect_diagnostics,
+            )
+            self._critic_transfer_metrics.update(
+                inner_critic_bernoulli_applied=1.0,
+                inner_critic_transfer_outer_updates=float(self.agent.outer_version - self.state.outer_version),
+            )
+            if retained is not None:
+                self._critic_transfer_metrics["inner_critic_bernoulli_retained_fraction"] = retained
+            module.requires_grad_(True)
+        elif initialization == "random":
+            self._reset_random_component(component, module)
+            if mode == "lora_rl":
+                reset_lora_rl_adapters_(module)
+            else:
+                module.requires_grad_(mode != "frozen")
+        elif mode == "lora_rl":
             reset_lora_rl_critic_(module, outer)
         else:
-            module.load_state_dict(outer.state_dict())
+            if self._horizon_conditioning_horizon is not None:
+                reset_horizon_module(module, outer)
+            else:
+                module.load_state_dict(outer.state_dict())
             module.requires_grad_(mode != "frozen")
 
     def _restore_action_component(self, component, outer):
@@ -1428,23 +1797,31 @@ class InnerImprovementEngine:
                 update_lora_rl_target_(module, target, tau=1.0)
             else:
                 target_base = (
-                    self.model._target_Qs
+                    self._critic_outer_target
                     if component == "critic" and self._initialize_critic_from_outer_target
                     else module
                 )
-                target.load_state_dict(target_base.state_dict())
+                if self._horizon_conditioning_horizon is not None and target_base is not module:
+                    reset_horizon_module(target, target_base)
+                else:
+                    target.load_state_dict(target_base.state_dict())
             target.requires_grad_(False)
         return True
 
     def _adapt_module(self, base, component):
         mode = str(getattr(self.cfg, f"inner_{component}_adaptation"))
-        if mode == "frozen":
+        random = getattr(self.cfg, f"inner_{component}_initialization", "prior") == "random"
+        if mode in {"frozen", "clone"}:
             module = deepcopy(base).to(self.device)
-            module.requires_grad_(False)
-        elif mode == "clone":
-            module = deepcopy(base).to(self.device)
-            module.requires_grad_(True)
+            if random:
+                self._reset_random_component(component, module)
+            if self._horizon_conditioning_horizon is not None:
+                widen_horizon_module(module, self._horizon_conditioning_horizon)
+            module.requires_grad_(mode != "frozen")
         elif mode == "lora_rl" and component == "critic":
+            if random:
+                base = deepcopy(base).to(self.device)
+                self._reset_random_component(component, base)
             module = make_lora_rl_critic(
                 base,
                 rank=self.cfg.inner_critic_lora_rank,
@@ -1514,7 +1891,7 @@ class InnerImprovementEngine:
         if explorer_actor is None:
             # Deepcopy supplies only the architecture and device placement; the
             # next line overwrites every initialized TD-MPC parameter.
-            explorer_actor = deepcopy(self.model._pi).to(self.device)
+            explorer_actor = deepcopy(self._actor_base).to(self.device)
         else:
             pool.explorer_actor = None
         explorer_actor.apply(td_init.weight_init)
@@ -1552,9 +1929,9 @@ class InnerImprovementEngine:
             explorer_critic = pool.explorer_critic
             pool.explorer_critic = None
             if explorer_critic is None:
-                explorer_critic = deepcopy(self.model._Qs).to(self.device)
+                explorer_critic = deepcopy(self._critic_base).to(self.device)
             else:
-                explorer_critic.load_state_dict(self.model._Qs.state_dict())
+                explorer_critic.load_state_dict(self._critic_base.state_dict())
             explorer_critic.requires_grad_(True)
             explorer_critic.train(bool(cfg.inner_critic_dropout_enabled))
             state.explorer_critic = explorer_critic
@@ -1626,7 +2003,7 @@ class InnerImprovementEngine:
             else:
                 explorer_log_alpha = explorer_temperature_optim = None
                 inherited = (
-                    self.agent.alpha.detach().clone()
+                    self._actor_owner.alpha.detach().clone()
                     if temperature_mode == "inherit_outer"
                     else torch.tensor(float(cfg.inner_temperature), device=self.device)
                 )
@@ -1648,6 +2025,16 @@ class InnerImprovementEngine:
 
     def _prepare_workspace(self, *, t0):
         state, cfg = self.state, self.cfg
+        if t0:
+            self._critic_transfer_ready = False
+        if self._critic_bernoulli_p > 0:
+            self._critic_transfer_metrics = {
+                "inner_critic_bernoulli_p": self._critic_bernoulli_p,
+                "inner_critic_bernoulli_applied": 0.0,
+                "inner_critic_transfer_outer_updates": 0.0,
+            }
+            if self._collect_diagnostics:
+                self._critic_transfer_metrics["inner_critic_bernoulli_retained_fraction"] = 0.0
         self._clear_expired(t0=t0, include_action=True)
 
         actor_was_missing = state.actor is None
@@ -1657,36 +2044,39 @@ class InnerImprovementEngine:
         if actor_was_missing:
             actor_restored = (
                 str(cfg.inner_actor_scope) == "action"
-                and self._restore_action_component("actor", self.model._pi)
+                and self._restore_action_component("actor", self._actor_base)
             )
             if not actor_restored:
-                state.actor = self._adapt_module(self.model._pi, "actor")
+                state.actor = self._adapt_module(self._actor_base, "actor")
             needs_actor_anchor = (
                 float(cfg.inner_outer_policy_kl_coef) > 0.0
                 or float(cfg.inner_outer_action_l2_coef) > 0.0
             )
             if str(cfg.inner_actor_scope) == "action":
                 # The immutable outer policy is the exact action-local anchor.
-                state.actor_anchor = self.model._pi if needs_actor_anchor else None
+                state.actor_anchor = self._actor_base if needs_actor_anchor else None
             elif not actor_restored or state.actor_anchor is None:
                 state.actor_anchor = (
-                    deepcopy(self.model._pi).to(self.device).requires_grad_(False)
+                    deepcopy(self._actor_base).to(self.device).requires_grad_(False)
                 )
             state.actor_lifetime_steps = 0
         if critic_was_missing:
             critic_restored = (
                 str(cfg.inner_critic_scope) == "action"
-                and self._restore_action_component("critic", self.model._Qs)
+                and self._restore_action_component("critic", self._critic_base)
             )
             if not critic_restored:
-                state.critic = self._adapt_module(self.model._Qs, "critic")
+                state.critic = self._adapt_module(self._critic_base, "critic")
             if str(cfg.inner_critic_scope) == "action":
                 state.critic_anchor = None
             elif not critic_restored or state.critic_anchor is None:
                 state.critic_anchor = (
-                    deepcopy(self.model._Qs).to(self.device).requires_grad_(False)
+                    deepcopy(self._critic_base).to(self.device).requires_grad_(False)
                 )
             state.critic_lifetime_steps = 0
+
+        # Only a subsequent successfully completed act() can provide a donor.
+        self._critic_transfer_ready = False
 
         if bool(getattr(cfg, "compile", False)) and hasattr(
             state.critic, "enable_compile"
@@ -1698,9 +2088,9 @@ class InnerImprovementEngine:
         outer_changed = state.outer_version >= 0 and state.outer_version != self.agent.outer_version
         if outer_changed and bool(cfg.inner_rebase_persistent):
             if not actor_was_missing:
-                self._refresh_persistent_component("actor", self.model._pi)
+                self._refresh_persistent_component("actor", self._actor_base)
             if not critic_was_missing:
-                self._refresh_persistent_component("critic", self.model._Qs)
+                self._refresh_persistent_component("critic", self._critic_base)
 
         if (
             cfg.inner_bootstrap_source == "inner_target"
@@ -1748,8 +2138,19 @@ class InnerImprovementEngine:
         ):
             state.critic_optim = self._new_optimizer(state.critic, "critic")
 
+        if self._split_values and critic_was_missing:
+            coefficient = self._actor_owner.alpha.detach().reshape(())
+            if self._critic_owner.actor_loss_scale_enabled:
+                coefficient = coefficient * self._critic_owner.actor_loss_scale.detach().reshape(())
+            if getattr(cfg, "inner_value_initialization", "return") == "return":
+                coefficient = torch.zeros_like(coefficient)
+            state.value_composition = torch.stack((torch.ones_like(coefficient), coefficient)).clone()
+            state.value_roles = ("primary", "initialization_residual")
+
         mode = str(cfg.inner_temperature_mode)
-        if cfg.inner_operator == "tdambi":
+        if not self._inner_entropy_enabled:
+            state.log_alpha = state.alpha_fixed = state.temperature_optim = None
+        elif cfg.inner_operator == "tdambi":
             state.log_alpha = state.alpha_fixed = state.temperature_optim = None
             state.tdambi_scale = self._action_pool.tdambi_scale
             self._action_pool.tdambi_scale = None
@@ -1770,8 +2171,8 @@ class InnerImprovementEngine:
                 raise RuntimeError("TDAMBI requires a loaded checkpoint Q scale before acting.")
         elif mode == "inherit_outer":
             state.log_alpha = state.temperature_optim = None
-            inherited_alpha = self.agent.alpha.detach()
-            if getattr(self.agent, "log_ent_coef", None) is not None:
+            inherited_alpha = self._actor_owner.alpha.detach()
+            if getattr(self._actor_owner, "log_ent_coef", None) is not None:
                 inherited_alpha = inherited_alpha.clamp_min(_INNER_ALPHA_FLOOR)
             if (
                 str(cfg.inner_temperature_scope) == "action"
@@ -1835,14 +2236,7 @@ class InnerImprovementEngine:
                 self._action_pool.replay = None
                 state.replay.clear()
             else:
-                state.replay = LatentReplayBuffer(
-                    capacity=cfg.inner_replay_capacity,
-                    latent_dim=cfg.latent_dim,
-                    action_dim=cfg.action_dim,
-                    device=self.device,
-                    store_source=self._explorer_active,
-                    store_horizon=bool(getattr(cfg, "inner_finite_horizon", False)),
-                )
+                state.replay = self._new_replay()
         elif outer_changed:
             # Latents are coordinates of the current encoder/dynamics and may
             # never survive a representation update.
@@ -1888,8 +2282,7 @@ class InnerImprovementEngine:
     @property
     def _initialize_critic_from_outer_target(self):
         return (
-            self.cfg.inner_operator == "tdambi"
-            or getattr(self.cfg, "inner_critic_target_initialization", "online")
+            getattr(self.cfg, "inner_critic_target_initialization", "online")
             == "outer_target"
         )
 
@@ -1897,14 +2290,22 @@ class InnerImprovementEngine:
         if self.cfg.inner_critic_adaptation == "lora_rl":
             return dense_lora_rl_critic(critic).to(self.device)
         target_base = (
-            self.model._target_Qs if self._initialize_critic_from_outer_target else critic
+            self._critic_outer_target if self._initialize_critic_from_outer_target else critic
         )
-        return deepcopy(target_base).to(self.device).requires_grad_(False)
+        target = deepcopy(target_base).to(self.device)
+        if self._horizon_conditioning_horizon is not None and self._initialize_critic_from_outer_target:
+            widen_horizon_module(target, self._horizon_conditioning_horizon)
+        return target.requires_grad_(False)
 
     def make_modules_for_compatibility(self):
         """Legacy test/debug hook returning freshly created inner modules."""
-        actor = self._adapt_module(self.model._pi, "actor")
-        critic = self._adapt_module(self.model._Qs, "critic")
+        context = (
+            self.rng.fork("initialization")
+            if self._random_initialization_spec() is not None else nullcontext()
+        )
+        with context:
+            actor = self._adapt_module(self._actor_base, "actor")
+            critic = self._adapt_module(self._critic_base, "critic")
         target = self._new_critic_target(critic)
         actor_optim = self._new_optimizer(actor, "actor")
         critic_optim = self._new_optimizer(critic, "critic")
@@ -1930,14 +2331,17 @@ class InnerImprovementEngine:
         noise_std=0.0,
         inner_bounds=True,
         return_info=False,
+        remaining_horizon=None,
     ):
-        kwargs = {}
+        kwargs = {} if inner_bounds else self._actor_options
         if inner_bounds:
             kwargs = {
                 "log_std_mapping": self.cfg.inner_log_std_mapping,
                 "log_std_min": self.cfg.inner_log_std_min,
                 "log_std_max": self.cfg.inner_log_std_max,
             }
+        if remaining_horizon is not None:
+            kwargs["remaining_horizon"] = remaining_horizon
         if mode == "policy_sample":
             if hasattr(self.model, "pi_action") and not return_info:
                 return self.model.pi_action(
@@ -2028,7 +2432,7 @@ class InnerImprovementEngine:
             state.policy_evaluations += active_count
             transition_count += active_count
             joint = self.model.joint_input(active_z, action)
-            reward = td_math.two_hot_inv(self.model.reward_from_joint(joint), cfg)
+            reward = self.model.decode_reward(self.model.reward_from_joint(joint))
             next_z = self.model.next_from_joint(joint)
             terminated = (
                 (
@@ -2307,7 +2711,7 @@ class InnerImprovementEngine:
             state.policy_evaluations += 2 * count
             transition_count += active_count
             joint = self.model.joint_input(active_z, action)
-            reward = td_math.two_hot_inv(self.model.reward_from_joint(joint), cfg)
+            reward = self.model.decode_reward(self.model.reward_from_joint(joint))
             next_z = self.model.next_from_joint(joint)
             terminated = (
                 (
@@ -2544,7 +2948,7 @@ class InnerImprovementEngine:
             self._timer_stop("inner_rollout_seconds", start)
             yield rollout
 
-    def _rollout_step_kernel(self, z, policy_noise, reward_support):
+    def _rollout_step_kernel(self, z, policy_noise, reward_support, remaining_horizon=None):
         """One pure parallel model step; replay and optimization stay outside."""
         cfg = self.cfg
         std_scale = float(cfg.inner_behavior_std_scale)
@@ -2556,13 +2960,14 @@ class InnerImprovementEngine:
             noise=policy_noise if policy_noise.numel() else None,
             std_scale=max(std_scale, 1e-12),
             noise_std=cfg.inner_behavior_noise_std,
+            remaining_horizon=remaining_horizon,
         )
         joint = self.model.joint_input(z, action)
         reward_prediction = self.model.reward_from_joint(joint)
         if bool(getattr(cfg, "compile", False)):
-            reward = td_math.two_hot_inv(reward_prediction, cfg, support=reward_support)
+            reward = self.model.decode_reward(reward_prediction, support=reward_support)
         else:
-            reward = td_math.two_hot_inv(reward_prediction, cfg)
+            reward = self.model.decode_reward(reward_prediction)
         return action, reward, self.model.next_from_joint(joint)
 
     @torch.no_grad()
@@ -2614,7 +3019,11 @@ class InnerImprovementEngine:
                     self._rollout_step_kernel if cfg.episodic
                     else self._compile_regions["rollout"]
                 )
-                action, reward, next_z = kernel(active_z, noise, reward_support)
+                remaining_horizon = self._remaining_horizon(active_z, step)
+                action, reward, next_z = kernel(
+                    active_z, noise, reward_support,
+                    **self._horizon_kwargs(remaining_horizon),
+                )
                 done = (
                     (self.model.termination(next_z) > float(cfg.inner_termination_threshold)).float()
                     if cfg.episodic else reward.new_zeros(active_count, 1)
@@ -2623,6 +3032,8 @@ class InnerImprovementEngine:
                 active_z, action, reward, next_z, done,
                 **({"horizon_end": torch.full_like(done, float(step == horizon - 1))}
                    if getattr(cfg, "inner_finite_horizon", False) else {}),
+                **({"remaining_horizon": remaining_horizon, "validate": False}
+                   if remaining_horizon is not None else {}),
             )
             state.policy_evaluations += active_count
             rows = active if active is not None else slice(None)
@@ -2661,6 +3072,8 @@ class InnerImprovementEngine:
                 "transition_count": 0,
             }
 
+        if self._retrace_enabled:
+            return self._collect_retrace_round(root_z)
         if not cfg.episodic:
             return self._collect_dense_round(root_z, count=count, horizon=horizon)
 
@@ -2676,6 +3089,7 @@ class InnerImprovementEngine:
         self.model.eval()
         transition_fields = ([], [], [], [], [])
         horizon_flags = []
+        remaining_horizons = []
         transition_count = 0
         with self.rng.fork("collection") as generator:
             for step in range(horizon):
@@ -2695,12 +3109,11 @@ class InnerImprovementEngine:
                     generator=generator,
                     std_scale=max(std_scale, 1e-12),
                     noise_std=cfg.inner_behavior_noise_std,
+                    remaining_horizon=self._remaining_horizon(active_z, step),
                 )
                 state.policy_evaluations += int(active.numel())
                 joint = self.model.joint_input(active_z, action)
-                reward = td_math.two_hot_inv(
-                    self.model.reward_from_joint(joint), cfg
-                )
+                reward = self.model.decode_reward(self.model.reward_from_joint(joint))
                 next_z = self.model.next_from_joint(joint)
                 if cfg.episodic:
                     terminated = (
@@ -2714,6 +3127,8 @@ class InnerImprovementEngine:
                 transition_fields[4].append(terminated)
                 if getattr(cfg, "inner_finite_horizon", False):
                     horizon_flags.append(torch.full_like(terminated, float(step == horizon - 1)))
+                if self._horizon_conditioning_horizon is not None:
+                    remaining_horizons.append(self._remaining_horizon(active_z, step))
                 reward_vector = reward.squeeze(-1)
                 lengths[active] += 1
                 reward_sums[active] += reward_vector
@@ -2728,6 +3143,8 @@ class InnerImprovementEngine:
             state.replay.add_batch(
                 *(torch.cat(values, dim=0) for values in transition_fields),
                 **({"horizon_end": torch.cat(horizon_flags, dim=0)} if horizon_flags else {}),
+                **({"remaining_horizon": torch.cat(remaining_horizons, dim=0), "validate": False}
+                   if remaining_horizons else {}),
             )
 
         if cfg.inner_actor_adaptation != "frozen":
@@ -2767,22 +3184,21 @@ class InnerImprovementEngine:
                 noise=(policy_noise[step] if policy_noise.numel() else None),
                 std_scale=max(std_scale, 1e-12),
                 noise_std=cfg.inner_behavior_noise_std,
+                remaining_horizon=self._remaining_horizon(z, step),
             )
             joint = self.model.joint_input(z, action)
             reward_prediction = self.model.reward_from_joint(joint)
             if bool(getattr(cfg, "compile", False)):
-                reward = td_math.two_hot_inv(
-                    reward_prediction,
-                    cfg,
-                    support=reward_support,
-                )
+                reward = self.model.decode_reward(reward_prediction, support=reward_support)
             else:
-                reward = td_math.two_hot_inv(reward_prediction, cfg)
+                reward = self.model.decode_reward(reward_prediction)
             next_z = self.model.next_from_joint(joint)
             terminated = reward.new_zeros(count, 1)
             fields = (z, action, reward, next_z, terminated)
             if getattr(cfg, "inner_finite_horizon", False):
                 fields += (torch.full_like(terminated, float(step == horizon - 1)),)
+            if self._horizon_conditioning_horizon is not None:
+                fields += (self._remaining_horizon(z, step),)
             transitions.append(torch.cat(fields, dim=-1))
             reward_vector = reward.squeeze(-1)
             reward_sums = reward_sums + reward_vector
@@ -2834,7 +3250,10 @@ class InnerImprovementEngine:
                 reward_support,
             )
 
-        state.replay.add_packed(rollout[0])
+        state.replay.add_packed(
+            rollout[0],
+            **({"validate": False} if self._horizon_conditioning_horizon is not None else {}),
+        )
         state.policy_evaluations += count * horizon
         if cfg.inner_actor_adaptation != "frozen":
             state.actor.train()
@@ -2947,15 +3366,21 @@ class InnerImprovementEngine:
         *,
         pair_indices=None,
         trusted_pair_indices=False,
+        remaining_horizon=None,
     ):
         source = str(self.cfg.inner_bootstrap_source)
         kwargs = {"reduction": self.cfg.inner_q_target_reduction}
+        kwargs.update(self._horizon_kwargs(remaining_horizon))
         if source == "inner_target":
             kwargs["qs"] = self.state.critic_target
         elif source == "outer_target":
-            kwargs["target"] = True
+            if self._aux_return_active:
+                kwargs["qs"] = self._critic_outer_target
+            else:
+                kwargs["target"] = True
         elif source == "outer_online":
-            pass
+            if self._aux_return_active:
+                kwargs["qs"] = self._critic_base
         else:
             raise ValueError(f"Unknown inner bootstrap source: {source!r}")
         return self.model.Q(
@@ -2985,10 +3410,19 @@ class InnerImprovementEngine:
     def _prior_bootstrap(self, next_z, noise):
         """The MPPI tail: outer distribution, online Q, no extra entropy."""
         with torch.no_grad():
+            if self._aux_return_active:
+                action, _ = self.model.pi(
+                    next_z, policy=self._horizon_actor, noise=noise,
+                    **self._horizon_actor_options,
+                )
+                return self.model.Q(
+                    next_z, action, qs=self._horizon_critic,
+                    reduction=self.cfg.mppi_terminal_q_reduction,
+                )
             action, _ = self.model.pi(next_z, noise=noise)
-            return self.model.Q(
-                next_z, action, reduction=self.cfg.mppi_terminal_q_reduction
-            )
+            kwargs = {"projection": "return"} if self._split_values else {}
+            reduction = "min_pair" if self._split_values else self.cfg.mppi_terminal_q_reduction
+            return self.model.Q(next_z, action, reduction=reduction, **kwargs)
 
     def _sac_target(self, reward, terminated, bootstrap):
         if (getattr(self.cfg, "inner_finite_horizon", False)
@@ -3012,9 +3446,21 @@ class InnerImprovementEngine:
         prior_noise=None,
         *,
         actor_loss_scale=None,
+        remaining_horizon=None,
     ):
         """Pure SAC critic loss region; the optimizer step stays eager."""
+        if self._split_values:
+            return self._split_sac_critic_kernel(
+                z, action, reward, next_z, terminated, alpha, policy_noise,
+                pair_indices, horizon_end, prior_noise, actor_loss_scale=actor_loss_scale,
+            )
         state, cfg = self.state, self.cfg
+        current_horizon_kwargs = self._horizon_kwargs(remaining_horizon)
+        # Boundary rows use only the frozen prior. Keep their unused inner
+        # continuation index valid without introducing a learned h=0 slot.
+        next_horizon_kwargs = self._horizon_kwargs(
+            None if remaining_horizon is None else (remaining_horizon - 1).clamp_min(1)
+        )
         with torch.no_grad():
             next_action, next_info = self.model.pi(
                 next_z,
@@ -3024,15 +3470,17 @@ class InnerImprovementEngine:
                 log_std_min=cfg.inner_log_std_min,
                 log_std_max=cfg.inner_log_std_max,
                 **self.agent._inner_critic_entropy_kwargs(),
+                **next_horizon_kwargs,
             )
             if pair_indices is None:
-                next_q = self._bootstrap_q(next_z, next_action)
+                next_q = self._bootstrap_q(next_z, next_action, **next_horizon_kwargs)
             else:
                 next_q = self._bootstrap_q(
                     next_z,
                     next_action,
                     pair_indices=pair_indices,
                     trusted_pair_indices=True,
+                    **next_horizon_kwargs,
                 )
             bootstrap = next_q
             if cfg.inner_sac_critic_target == "entropy_augmented":
@@ -3052,7 +3500,9 @@ class InnerImprovementEngine:
                 bootstrap = torch.where(horizon_end.bool(), prior_value, bootstrap)
             target_q = self._sac_target(reward, terminated, bootstrap)
 
-        predictions = self.model.q_predictions(z, action, qs=state.critic)
+        predictions = self.model.q_predictions(
+            z, action, qs=state.critic, **current_horizon_kwargs,
+        )
         critic_loss = self.model.critic_loss(predictions, target_q)
         loss_coef = float(getattr(cfg, "inner_critic_loss_coef", 1.0))
         if loss_coef != 1.0:
@@ -3066,6 +3516,82 @@ class InnerImprovementEngine:
                 | (symlog_target >= float(cfg.q_vmax))
             ).float().mean()
         return critic_loss, values, target_q, clip_fraction
+
+    def _split_sac_targets(self, reward, terminated, next_components, next_entropy,
+                           alpha, horizon_end=None, prior_value=None, *, actor_loss_scale=None):
+        """Targets for a primary value and homogeneous initialization residual.
+
+        Their weighted sum obeys the scalar inner SAC Bellman equation. A
+        frozen-prior boundary replaces the entire continuation, including the
+        residual and the immediate next-action entropy bonus.
+        """
+        primary = next_components[..., 0, :]
+        residual = next_components[..., 1, :]
+        if self._inner_entropy_enabled:
+            coefficient = alpha.detach()
+            if self._sac_actor_loss_scale_enabled:
+                if actor_loss_scale is None:
+                    raise RuntimeError("Split inner SAC requires its frozen action scale.")
+                coefficient = coefficient * actor_loss_scale.detach().reshape(())
+            primary = primary + coefficient * next_entropy
+        if horizon_end is not None:
+            primary = torch.where(horizon_end.bool(), prior_value, primary)
+            residual = torch.where(horizon_end.bool(), 0.0, residual)
+        return torch.stack((
+            self._sac_target(reward, terminated, primary),
+            self._sac_target(torch.zeros_like(reward), terminated, residual),
+        ), dim=-2)
+
+    def _split_sac_critic_kernel(
+        self, z, action, reward, next_z, terminated, alpha, policy_noise,
+        pair_indices, horizon_end=None, prior_noise=None, *, actor_loss_scale=None,
+    ):
+        state, cfg = self.state, self.cfg
+        weights = state.value_composition
+        with torch.no_grad():
+            next_action, next_info = self.model.pi(
+                next_z, policy=state.actor, noise=policy_noise,
+                log_std_mapping=cfg.inner_log_std_mapping,
+                log_std_min=cfg.inner_log_std_min, log_std_max=cfg.inner_log_std_max,
+            )
+            next_values = self.model.q_values(next_z, next_action, qs=state.critic_target)
+            next_components = self.model.reduce_components(
+                next_values, cfg.inner_q_target_reduction, weights=weights,
+                pair_indices=pair_indices, trusted_pair_indices=pair_indices is not None,
+            )
+            prior_value = None if horizon_end is None else self._prior_bootstrap(next_z, prior_noise)
+            targets = self._split_sac_targets(
+                reward, terminated, next_components, -next_info["log_prob"],
+                alpha, horizon_end, prior_value, actor_loss_scale=actor_loss_scale,
+            )
+        predictions = self.model.q_predictions(z, action, qs=state.critic)
+        component_losses = self.model.critic_loss(predictions, targets, reduction="none")
+        # c=0 trains only the primary head at the legacy full coefficient.
+        # A nonzero residual receives equal CE weight, independent of c's size.
+        has_residual = weights[1] != 0
+        primary_weight = torch.where(has_residual, 0.5, 1.0)
+        residual_weight = torch.where(has_residual, 0.5, 0.0)
+        loss = (primary_weight * component_losses[..., 0, :]
+                + residual_weight * component_losses[..., 1, :]).mean()
+        loss = float(getattr(cfg, "inner_critic_loss_coef", 1.0)) * loss
+        components = self.model.q_backend.decode(predictions.detach())
+        values = self.model.project_values(components, weights=weights)
+        target_q = self.model.project_values(targets, weights=weights)
+        support = self.model.q_backend.value_codec.support(targets)
+        clipped = ((targets < support[0]) | (targets > support[-1])).float()
+        metrics = {}
+        for index, role in enumerate(state.value_roles):
+            metrics[f"{role}_critic_loss"] = component_losses[..., index, :].detach().mean()
+            metrics[f"{role}_q_mean"] = components[..., index, :].mean()
+            metrics[f"{role}_target_mean"] = targets[..., index, :].mean()
+            metrics[f"{role}_target_clip_fraction"] = clipped[..., index, :].mean()
+        metrics["value_composition_coefficient"] = weights[1].detach()
+        alpha_used = alpha.detach() if self._inner_entropy_enabled else alpha.new_zeros(())
+        metrics["alpha_used"] = alpha_used.reshape(())
+        metrics["effective_entropy_coefficient"] = (
+            alpha_used if actor_loss_scale is None else alpha_used * actor_loss_scale.detach().reshape(())
+        ).reshape(())
+        return loss, values, target_q, clipped.mean(), metrics
 
     def _sac_critic_step(self, batch, alpha, *, actor_loss_scale=None):
         state, cfg = self.state, self.cfg
@@ -3086,12 +3612,10 @@ class InnerImprovementEngine:
         scale_kwargs = (
             {"actor_loss_scale": actor_loss_scale}
             if self._sac_actor_loss_scale_enabled
-            and cfg.inner_sac_critic_target == "entropy_augmented"
+            and (self._split_values or cfg.inner_sac_critic_target == "entropy_augmented")
             else {}
         )
-        critic_loss, values, target_q, clip_fraction = self._compile_regions[
-            "critic"
-        ](
+        outputs = self._compile_regions["critic"](
             batch["z"],
             batch["action"],
             batch["reward"],
@@ -3102,7 +3626,9 @@ class InnerImprovementEngine:
             pair_indices,
             *horizon_args,
             **scale_kwargs,
+            **self._horizon_kwargs(batch.get("remaining_horizon")),
         )
+        critic_loss, values, target_q, clip_fraction = outputs[:4]
         state.policy_evaluations += batch_size
         state.q_evaluations += batch_size
 
@@ -3125,6 +3651,8 @@ class InnerImprovementEngine:
             "q_target_clip_fraction": clip_fraction.detach(),
             "td_error_abs_mean": (values - target_q.unsqueeze(0)).abs().mean(),
         }
+        if self._split_values:
+            metrics.update(outputs[4])
         metrics.update(self._source_td_metrics(batch, values, target_q))
         return metrics
 
@@ -3518,9 +4046,12 @@ class InnerImprovementEngine:
         update_actor,
         *,
         q_scale=None,
+        remaining_horizon=None,
     ):
         """Pure SAC policy/loss region; optimizer mutation stays eager."""
         state, cfg = self.state, self.cfg
+        if not self._inner_entropy_enabled:
+            alpha = alpha.new_zeros(())
         scaled_entropy_enabled = self._scaled_actor_entropy_enabled
         action, info = self.model.pi(
             z,
@@ -3530,6 +4061,7 @@ class InnerImprovementEngine:
             log_std_min=cfg.inner_log_std_min,
             log_std_max=cfg.inner_log_std_max,
             **({"include_scaled_entropy": True} if scaled_entropy_enabled else {}),
+            **self._horizon_kwargs(remaining_horizon),
         )
         # Keep the feature-off tuple contract unchanged. The optional statistic
         # remains connected for the actor objective and is detached only by the
@@ -3568,6 +4100,8 @@ class InnerImprovementEngine:
             qs=state.critic,
             detach=True,
             reduction="all",
+            **({"weights": state.value_composition} if self._split_values else {}),
+            **self._horizon_kwargs(remaining_horizon),
         )
         q_pi = self.model.q_backend.reduce(
             q_pi_all,
@@ -3587,7 +4121,7 @@ class InnerImprovementEngine:
         # Match TD-MPC2's Q-only normalization. Entropy and the optional
         # outer-policy KL retain their configured coefficients.
         scale_payload = ()
-        if q_scale is not None and (
+        if q_scale is not None and not self._split_values and (
             getattr(cfg, "inner_actor_loss_scale_update", "per_action") == "per_update"
         ):
             # Propose the update from this sample without mutating the input.
@@ -3598,18 +4132,21 @@ class InnerImprovementEngine:
                     q_pi.detach(), q_pi.new_tensor([5.0, 95.0])
                 )
                 proposed_scale = q_scale.detach().lerp(
-                    robust_range, float(cfg.sac_actor_loss_scale_tau)
+                    robust_range, float(self._critic_owner.cfg.sac_actor_loss_scale_tau)
                 )
             actor_divisor = proposed_scale.reshape(())
             scale_payload = (proposed_scale,)
         else:
             actor_divisor = None if q_scale is None else q_scale.detach().reshape(())
         actor_q = q_pi if actor_divisor is None else q_pi / actor_divisor
-        actor_loss_values = (
-            -actor_q - alpha * info["scaled_entropy"]
-            if scaled_entropy_enabled
-            else alpha * info["log_prob"] - actor_q
-        )
+        if not self._inner_entropy_enabled:
+            actor_loss_values = -actor_q
+        else:
+            actor_loss_values = (
+                -actor_q - alpha * info["scaled_entropy"]
+                if scaled_entropy_enabled
+                else alpha * info["log_prob"] - actor_q
+            )
         kl = torch.zeros_like(actor_loss_values)
         if float(cfg.inner_outer_policy_kl_coef) > 0.0:
             with torch.no_grad():
@@ -3617,6 +4154,7 @@ class InnerImprovementEngine:
                     z,
                     policy=state.actor_anchor,
                     deterministic=True,
+                    **self._actor_options,
                 )
             kl = self._gaussian_kl(info, outer_info)
             actor_loss_values = actor_loss_values + float(
@@ -3644,6 +4182,8 @@ class InnerImprovementEngine:
         policy_noise,
         pair_indices,
         update_actor,
+        *,
+        remaining_horizon=None,
     ):
         """SAC policy region with an explicit action-local Q scale."""
         return self._sac_actor_kernel(
@@ -3653,6 +4193,7 @@ class InnerImprovementEngine:
             pair_indices,
             update_actor,
             q_scale=actor_loss_scale,
+            **self._horizon_kwargs(remaining_horizon),
         )
 
     def _sac_policy_step(
@@ -3665,6 +4206,9 @@ class InnerImprovementEngine:
         actor_loss_scale=None,
     ):
         state, cfg = self.state, self.cfg
+        update_temperature = update_temperature and self._inner_entropy_enabled
+        if not self._inner_entropy_enabled:
+            alpha = alpha.new_zeros(())
         scale_enabled = self._sac_actor_loss_scale_enabled
         if scale_enabled and actor_loss_scale is None:
             scale_scope = (
@@ -3698,6 +4242,7 @@ class InnerImprovementEngine:
                     policy_noise,
                     pair_indices,
                     update_actor,
+                    **self._horizon_kwargs(batch.get("remaining_horizon")),
                 )
             else:
                 actor_outputs = self._compile_regions["actor"](
@@ -3707,9 +4252,11 @@ class InnerImprovementEngine:
                     policy_noise,
                     pair_indices,
                     update_actor,
+                    **self._horizon_kwargs(batch.get("remaining_horizon")),
                 )
             update_scale = (
                 scale_enabled
+                and not self._split_values
                 and update_actor
                 and getattr(cfg, "inner_actor_loss_scale_update", "per_action") == "per_update"
             )
@@ -3743,6 +4290,15 @@ class InnerImprovementEngine:
             state.policy_evaluations += batch_size
 
             metrics = {}
+            if self._split_values:
+                metrics.update(
+                    actor_alpha_used=alpha.detach().reshape(()),
+                    actor_effective_entropy_coefficient=(
+                        alpha.detach() if actor_loss_scale is None
+                        else alpha.detach() * actor_loss_scale.detach().reshape(())
+                    ).reshape(()),
+                    actor_value_composition_coefficient=state.value_composition[1].detach(),
+                )
             if self._scaled_actor_entropy_enabled:
                 metrics.update(
                     actor_scaled_entropy=selected_entropy.detach().mean(),
@@ -4188,12 +4744,12 @@ class InnerImprovementEngine:
             )
             modes = tuple(
                 (module, module.training)
-                for root in (self.model._pi, self.model._Qs)
+                for root in (self._actor_base, self._critic_base)
                 for module in root.modules()
             )
             try:
-                self.model._pi.eval()
-                self.model._Qs.eval()
+                self._actor_base.eval()
+                self._critic_base.eval()
                 action = self.model.pi_action(batch["z"], generator=generator)
                 all_values = self.model.q_values(batch["z"], action)
                 pair = torch.randperm(cfg.num_q, device=self.device, generator=generator)[:2]
@@ -4561,6 +5117,11 @@ class InnerImprovementEngine:
         temperature_count,
         actor_loss_scale=None,
     ):
+        if self._retrace_enabled:
+            return self._run_retrace_update_counts(
+                critic_count=critic_count, actor_count=actor_count,
+                temperature_count=temperature_count, actor_loss_scale=actor_loss_scale,
+            )
         slots = max(critic_count, actor_count, temperature_count)
         if self.cfg.inner_operator == "tdambi":
             if critic_count != actor_count or temperature_count:
@@ -4601,11 +5162,11 @@ class InnerImprovementEngine:
         for slot in range(slots):
             do_critic = slot < critic_count
             do_actor = slot < actor_count
-            do_temperature = slot < temperature_count
+            do_temperature = slot < temperature_count and self._inner_entropy_enabled
             batch = self._sample_batch(
                 None if replay_indices is None else replay_indices[slot]
             )
-            alpha = self.alpha.detach()
+            alpha = self.alpha.detach().clone() if self._split_values else self.alpha.detach()
             slot_metrics = {}
             if self.cfg.inner_operator == "sac":
                 if do_critic:
@@ -4615,7 +5176,7 @@ class InnerImprovementEngine:
                         scale_kwargs = (
                             {"actor_loss_scale": actor_loss_scale}
                             if self._sac_actor_loss_scale_enabled
-                            and self.cfg.inner_sac_critic_target == "entropy_augmented"
+                            and (self._split_values or self.cfg.inner_sac_critic_target == "entropy_augmented")
                             else {}
                         )
                         slot_metrics.update(
@@ -4984,6 +5545,11 @@ class InnerImprovementEngine:
                     noise_std=self.cfg.inner_execution_noise_std,
                     inner_bounds=inner_bounds,
                     return_info=return_info,
+                    remaining_horizon=(
+                        self._remaining_horizon(root_z)
+                        if getattr(policy, "horizon_conditioning_horizon", None) is not None
+                        else None
+                    ),
                 )
         finally:
             for module, was_training in training_modes:
@@ -5003,7 +5569,7 @@ class InnerImprovementEngine:
         score = z.new_zeros(samples, 1)
         continuation = z.new_ones(samples, 1)
         discount = z.new_ones(samples, 1)
-        outer_alpha = self.agent.alpha.detach()
+        outer_alpha = self._actor_owner.alpha.detach()
         for _ in range(horizon):
             action, info = self.model.pi(
                 z,
@@ -5013,9 +5579,7 @@ class InnerImprovementEngine:
             )
             self.state.policy_evaluations += samples
             joint = self.model.joint_input(z, action)
-            reward = td_math.two_hot_inv(
-                self.model.reward_from_joint(joint), cfg
-            )
+            reward = self.model.decode_reward(self.model.reward_from_joint(joint))
             score += discount * continuation * (
                 reward - outer_alpha * info["log_prob"]
             )
@@ -5032,7 +5596,7 @@ class InnerImprovementEngine:
         # selector appends one outer-prior action/value tail.
         terminal_action, terminal_info = self.model.pi(
             z,
-            policy=self.model._pi,
+            policy=self._actor_base,
             generator=generator,
         )
         terminal_q = self.model.Q(
@@ -5054,13 +5618,13 @@ class InnerImprovementEngine:
         state = self.state
         training_modes = tuple(
             (module, bool(module.training))
-            for root in (state.actor, state.explorer_actor, self.model._target_Qs)
+            for root in (state.actor, state.explorer_actor, self._critic_outer_target)
             for module in root.modules()
         )
         try:
             state.actor.eval()
             state.explorer_actor.eval()
-            self.model._target_Qs.eval()
+            self._critic_outer_target.eval()
             primary_stats = self.model.policy_stats(
                 root_z,
                 policy=state.actor,
@@ -5255,9 +5819,9 @@ class InnerImprovementEngine:
         discount = torch.ones(count, 1, device=self.device)
         score = torch.zeros(count, 1, device=self.device)
         soft_score = torch.zeros(count, 1, device=self.device)
-        alpha = self.agent.alpha.detach()
+        alpha = self._actor_owner.alpha.detach()
         scaled_entropy_target = (
-            self.agent.actor_loss_scale_enabled
+            self._critic_owner.actor_loss_scale_enabled
             and self.cfg.outer_critic_target == "entropy_augmented"
         )
         entropy_mode = (
@@ -5267,7 +5831,7 @@ class InnerImprovementEngine:
             {"include_scaled_entropy": True} if entropy_mode == "tdmpc2_scaled" else {}
         )
         if scaled_entropy_target:
-            alpha = alpha * self.agent.actor_loss_scale.detach()
+            alpha = alpha * self._critic_owner.actor_loss_scale.detach()
         for _ in range(int(self.cfg.inner_rollout_horizon)):
             action, info = self.model.pi(
                 z,
@@ -5281,9 +5845,7 @@ class InnerImprovementEngine:
             )
             self.state.policy_evaluations += count
             joint = self.model.joint_input(z, action)
-            reward = td_math.two_hot_inv(
-                self.model.reward_from_joint(joint), self.cfg
-            )
+            reward = self.model.decode_reward(self.model.reward_from_joint(joint))
             score += discount * continuation * reward
             soft_score += discount * continuation * (
                 reward + alpha * policy_entropy(info, entropy_mode)
@@ -5297,28 +5859,34 @@ class InnerImprovementEngine:
                 continuation *= 1.0 - terminated
             discount *= float(self.agent.discount)
 
-        terminal_action, terminal_info = self.model.pi(
-            z,
-            policy=policy,
-            deterministic=not stochastic,
-            generator=generator,
-            log_std_mapping=log_std_mapping,
-            log_std_min=log_std_min,
-            log_std_max=log_std_max,
-            **entropy_kwargs,
-        )
+        if self._aux_return_active:
+            terminal_action, _ = self.model.pi(
+                z, policy=self._horizon_actor, generator=generator,
+                **self._horizon_actor_options,
+            )
+            terminal_q = self.model.Q(
+                z, terminal_action, qs=self._horizon_critic,
+                reduction=self.cfg.mppi_terminal_q_reduction,
+            )
+            terminal_soft = terminal_q
+        elif self._split_values:
+            # Diagnostics use the same reward-only frozen-prior boundary as the
+            # learner. Prefix entropy may still be reported separately.
+            terminal_action, terminal_info = self.model.pi(z, generator=generator)
+            terminal_q = self.model.Q(z, terminal_action, reduction="min_pair", projection="return")
+            terminal_soft = terminal_q
+        else:
+            terminal_action, terminal_info = self.model.pi(
+                z, policy=policy, deterministic=not stochastic, generator=generator,
+                log_std_mapping=log_std_mapping, log_std_min=log_std_min,
+                log_std_max=log_std_max, **entropy_kwargs,
+            )
+            terminal_q = self.model.Q(z, terminal_action, target=True, reduction="mean_all")
+            terminal_soft = terminal_q + alpha * policy_entropy(terminal_info, entropy_mode)
         self.state.policy_evaluations += count
-        terminal_q = self.model.Q(
-            z,
-            terminal_action,
-            target=True,
-            reduction="mean_all",
-        )
         self.state.q_evaluations += count
         score += discount * continuation * terminal_q
-        soft_score += discount * continuation * (
-            terminal_q + alpha * policy_entropy(terminal_info, entropy_mode)
-        )
+        soft_score += discount * continuation * terminal_soft
         return {
             "score": score.mean(),
             "soft_score": soft_score.mean(),
@@ -5332,16 +5900,17 @@ class InnerImprovementEngine:
             if self.cfg.inner_operator in {"sac", "tdambi"}:
                 policy_training_modes = tuple(
                     (module, bool(module.training))
-                    for policy in (self.model._pi, improved_policy)
+                    for policy in (self._actor_base, improved_policy)
                     for module in policy.modules()
                 )
                 try:
-                    self.model._pi.eval()
+                    self._actor_base.eval()
                     improved_policy.eval()
                     outer_action, outer_info = self.model.pi(
                         root_z,
-                        policy=self.model._pi,
+                        policy=self._actor_base,
                         deterministic=True,
+                        **self._actor_options,
                     )
                     improved_action, improved_info = self.model.pi(
                         root_z,
@@ -5350,6 +5919,7 @@ class InnerImprovementEngine:
                         log_std_mapping=self.cfg.inner_log_std_mapping,
                         log_std_min=self.cfg.inner_log_std_min,
                         log_std_max=self.cfg.inner_log_std_max,
+                        **self._horizon_kwargs(self._remaining_horizon(root_z)),
                     )
                 finally:
                     for module, was_training in policy_training_modes:
@@ -5369,16 +5939,22 @@ class InnerImprovementEngine:
                 )
             self.state.policy_evaluations += 2 * int(root_z.shape[0])
             outer_predictions = self.model.q_predictions(
-                root_z, outer_action, target=True
+                root_z, outer_action,
+                **({"qs": self._horizon_critic} if self._aux_return_active else {"target": True}),
             )
             improved_predictions = self.model.q_predictions(
-                root_z, improved_action, target=True
+                root_z, improved_action,
+                **({"qs": self._horizon_critic} if self._aux_return_active else {"target": True}),
             )
             decode = (
                 lambda predictions: td_math.two_hot_inv(predictions, self.cfg)
             ) if self.cfg.inner_operator == "tdambi" else self.model.q_backend.decode
-            outer_q = self.model.q_backend.reduce(decode(outer_predictions), "mean_all")
-            improved_q = self.model.q_backend.reduce(decode(improved_predictions), "mean_all")
+            outer_values, improved_values = decode(outer_predictions), decode(improved_predictions)
+            if self._split_values:
+                outer_values = self.model.project_values(outer_values, projection="return")
+                improved_values = self.model.project_values(improved_values, projection="return")
+            outer_q = self.model.q_backend.reduce(outer_values, "mean_all")
+            improved_q = self.model.q_backend.reduce(improved_values, "mean_all")
             self.state.q_evaluations += 2 * int(root_z.shape[0])
             action_delta = torch.linalg.vector_norm(
                 improved_action - outer_action, dim=-1
@@ -5388,9 +5964,10 @@ class InnerImprovementEngine:
                 state_before = generator.get_state()
                 outer_eval = self._evaluate_policy_trajectory(
                     root_z,
-                    self.model._pi,
+                    self._actor_base,
                     generator,
                     stochastic=self.cfg.inner_operator in {"sac", "tdambi"},
+                    **self._actor_options,
                 )
                 generator.set_state(state_before)
                 improved_eval = self._evaluate_policy_trajectory(
@@ -5417,7 +5994,7 @@ class InnerImprovementEngine:
             "inner_fixed_target_q_abs_mean": torch.stack(
                 (outer_q.abs().mean(), improved_q.abs().mean())
             ).mean(),
-            "inner_fixed_evaluator_alpha": self.agent.alpha.detach().mean(),
+            "inner_fixed_evaluator_alpha": self._actor_owner.alpha.detach().mean(),
         }
         if final_outer_policy_kl is not None:
             metrics["inner_final_outer_policy_kl"] = final_outer_policy_kl
@@ -5724,9 +6301,9 @@ class InnerImprovementEngine:
             "inner_rollout_len_min": 0.0,
             "inner_rollout_len_max": 0.0,
             "inner_termination_rate": 0.0,
-            "inner_alpha": self.agent.alpha.detach().mean(),
-            "inner_alpha_initial": self.agent.alpha.detach().mean(),
-            "inner_alpha_final": self.agent.alpha.detach().mean(),
+            "inner_alpha": self._actor_owner.alpha.detach().mean(),
+            "inner_alpha_initial": self._actor_owner.alpha.detach().mean(),
+            "inner_alpha_final": self._actor_owner.alpha.detach().mean(),
             "inner_alpha_delta": 0.0,
             "inner_target_entropy": (
                 float(self._resolved_inner_target_entropy())
@@ -5797,7 +6374,7 @@ class InnerImprovementEngine:
         capture_behavior = bool(return_behavior_policy and not eval_mode)
         executed = self._execute_policy(
             root_z,
-            self.model._pi,
+            self._actor_base,
             eval_mode=eval_mode,
             inner_bounds=False,
             return_info=capture_behavior,
@@ -5839,7 +6416,7 @@ class InnerImprovementEngine:
             # Start from the outer estimator without sharing its storage. The
             # default freezes this scale for the action; per-update mode commits
             # each successful actor kernel's proposal only to this local copy.
-            actor_loss_scale = self.agent.actor_loss_scale.detach().clone()
+            actor_loss_scale = self._critic_owner.actor_loss_scale.detach().clone()
         alpha_initial = self.alpha.detach().clone()
         trace = self._active_trace
         if trace is not None:
@@ -5847,6 +6424,7 @@ class InnerImprovementEngine:
                 {"tdambi_entropy_coef": float(cfg.tdambi_entropy_coef)}
                 if cfg.inner_operator == "tdambi" else {"alpha": alpha_initial}
             ))
+            trace.capture_actor(self, state.actor)
             if trace.probes:
                 trace.probe(self, root_z, state.actor)
         explorer_alpha_initial = (
@@ -5973,8 +6551,10 @@ class InnerImprovementEngine:
                 )
                 transition_sources.append(rollout["transition_sources"])
 
-            if trace is not None and trace.probes:
-                trace.probe(self, root_z, state.actor)
+            if trace is not None:
+                trace.capture_actor(self, state.actor)
+                if trace.probes:
+                    trace.probe(self, root_z, state.actor)
 
         execution_start = self._timer_start()
         capture_behavior = bool(return_behavior_policy and not eval_mode)
@@ -6090,7 +6670,9 @@ class InnerImprovementEngine:
             inner_actor_target_updates=float(state.actor_target_steps),
             inner_policy_evaluations=float(state.policy_evaluations),
             inner_q_evaluations=float(state.q_evaluations),
-            inner_replay_draws=float(state.replay_draws),
+            inner_replay_draws=(
+                state.replay_draws if self._retrace_enabled else float(state.replay_draws)
+            ),
             inner_buffer_size=float(state.replay.size),
             inner_buffer_capacity=float(state.replay.capacity),
             inner_buffer_fill_ratio=float(state.replay.size / state.replay.capacity),
@@ -6241,6 +6823,12 @@ class InnerImprovementEngine:
                 explorer_samples.float() / float(max(1, total_samples))
             )
         metrics.update(self._average_update_metrics(update_history))
+        if self._retrace_enabled:
+            for name in ("retrace_trajectory_draws", "retrace_critic_rows"):
+                metrics[f"inner_{name}"] = sum(item.get(name, 0.0) for item in update_history)
+            metrics["inner_retrace_replay_trajectories"] = state.replay.trajectory_count
+            metrics["inner_retrace_effective_capacity"] = state.replay.capacity
+            metrics["inner_retrace_requested_capacity"] = state.replay.requested_capacity
         metrics["inner_outer_replay_samples"] = sum(
             (item.get("outer_replay_samples", 0.0) for item in update_history), 0.0
         )
@@ -6280,7 +6868,29 @@ class InnerImprovementEngine:
 
     @torch.no_grad()
     def _act_mppi(self, root_z, *, t0, eval_mode, start):
-        from .mppi import mppi_plan
+        from .mppi import mppi_plan, _model_callbacks
+
+        planner_model = {"model": self.model}
+        if self._aux_return_active:
+            if self.model.training:
+                raise ValueError("MPPI requires model.eval() so critic dropout stays disabled.")
+            callbacks = _model_callbacks(self.model)
+            callbacks = replace(
+                callbacks,
+                policy=lambda z, *, generator: self.model.pi_action(
+                    z, policy=self._actor_base, generator=generator,
+                    **self._actor_options,
+                ),
+                terminal_policy=lambda z, *, generator: self.model.pi_action(
+                    z, policy=self._horizon_actor, generator=generator,
+                    **self._horizon_actor_options,
+                ),
+                terminal_q=lambda z, action, *, reduction, generator: self.model.Q(
+                    z, action, qs=self._horizon_critic,
+                    reduction=reduction, generator=generator,
+                ),
+            )
+            planner_model = {"callbacks": callbacks}
 
         iterations = self._mppi_iterations
         scope = str(self.cfg.inner_mppi_warm_start_scope)
@@ -6291,7 +6901,7 @@ class InnerImprovementEngine:
         planner_start = self._timer_start()
         with self.rng.fork("mppi") as generator:
             result = mppi_plan(
-                model=self.model,
+                **planner_model,
                 root_z=root_z,
                 horizon=self.cfg.inner_rollout_horizon,
                 iterations=iterations,
@@ -6340,14 +6950,20 @@ class InnerImprovementEngine:
             diagnostic_start = self._timer_start()
             with torch.no_grad():
                 if hasattr(self.model, "pi_action"):
-                    outer_action = self.model.pi_action(root_z, deterministic=True)
+                    outer_action = self.model.pi_action(
+                        root_z, deterministic=True,
+                        **({"policy": self._actor_base, **self._actor_options}
+                           if self._aux_return_active else {}),
+                    )
                 else:
                     outer_action, _ = self.model.pi(root_z, deterministic=True)
                 outer_predictions = self.model.q_predictions(
-                    root_z, outer_action, target=True
+                    root_z, outer_action,
+                    **({"qs": self._horizon_critic} if self._aux_return_active else {"target": True}),
                 )
                 improved_predictions = self.model.q_predictions(
-                    root_z, result.action.unsqueeze(0), target=True
+                    root_z, result.action.unsqueeze(0),
+                    **({"qs": self._horizon_critic} if self._aux_return_active else {"target": True}),
                 )
                 outer_q = self.model.q_backend.reduce(
                     self.model.q_backend.decode(outer_predictions), "mean_all"
@@ -6364,10 +6980,10 @@ class InnerImprovementEngine:
                 (outer_q.abs().mean(), improved_q.abs().mean())
             ).mean()
             metrics["inner_fixed_target_q_abs_mean"] = q_scale
-            metrics["inner_fixed_evaluator_alpha"] = self.agent.alpha.detach().mean()
+            metrics["inner_fixed_evaluator_alpha"] = self._actor_owner.alpha.detach().mean()
             metrics["inner_q_abs_mean"] = q_scale
             metrics["inner_alpha_to_abs_q"] = (
-                self.agent.alpha.detach().mean() / q_scale.clamp_min(1e-8)
+                self._actor_owner.alpha.detach().mean() / q_scale.clamp_min(1e-8)
             )
             proposal_action = result.next_mean[0].clamp(-1.0, 1.0).unsqueeze(0)
             proposal_delta = torch.linalg.vector_norm(
@@ -6425,12 +7041,12 @@ class InnerImprovementEngine:
         # Preflight both components before either mutation so an invalid joint
         # request cannot leave only one persistent prior written back.
         if actor_coef > 0.0:
-            polyak_update(state.actor, self.model._pi, actor_coef)
+            polyak_update(state.actor, self._actor_base, actor_coef)
             applied["inner_actor_writeback_applied"] = 1.0
         if critic_coef > 0.0:
             # Deliberately update only the online value prior. The persistent
             # target critic retains its ordinary real-update EMA cadence.
-            polyak_update(state.critic, self.model._Qs, critic_coef)
+            polyak_update(state.critic, self._critic_base, critic_coef)
             applied["inner_critic_writeback_applied"] = 1.0
         return applied
 
@@ -6462,7 +7078,24 @@ class InnerImprovementEngine:
                 raise ValueError(
                     "Fixed-noise trace probes require SAC or no inner optimization."
                 )
-            trace.begin()
+            if trace.probes and self._horizon_conditioning_horizon is not None:
+                if trace.probe_mode != "outer_tail":
+                    raise ValueError("Horizon conditioning requires probe_mode='outer_tail'.")
+                if trace.probe_horizon != self._horizon_conditioning_horizon:
+                    raise ValueError("Conditioned probe horizon must match inner_rollout_horizon.")
+            if self._aux_return_active:
+                auxiliary_tail = self.cfg.inner_horizon_critic_source == "aux_return"
+                trace.begin(value_routing={
+                    **source_metadata(self.cfg),
+                    "aux_return_mode": self.cfg.aux_return_mode,
+                    "horizon_critic_continuation_actor": (
+                        "return_actor" if auxiliary_tail and self.cfg.aux_return_mode == "return_actor" else "sac"
+                    ),
+                    "horizon_critic_target": "reward_only" if auxiliary_tail else self.cfg.outer_critic_target,
+                    "terminal_entropy_bonus": False,
+                })
+            else:
+                trace.begin()
         self._active_trace = trace
         try:
             return self._act(
@@ -6471,6 +7104,11 @@ class InnerImprovementEngine:
                 return_behavior_policy=return_behavior_policy,
                 apply_inner_writeback=apply_inner_writeback,
             )
+        except BaseException:
+            self._clear_critic_transfer()
+            if trace is not None:
+                trace.abort()
+            raise
         finally:
             self._active_trace = None
 
@@ -6488,6 +7126,10 @@ class InnerImprovementEngine:
         start = self._timer_start()
         self.action_index += 1
         self._collect_diagnostics = bool(collect_diagnostics)
+        if self._critic_bernoulli_p > 0:
+            if t0 or self._critic_transfer_eval_mode != bool(eval_mode):
+                self._clear_critic_transfer()
+            self._critic_transfer_eval_mode = bool(eval_mode)
         with self.rng.action_fork():
             operator = str(self.cfg.inner_operator)
             inactive = operator == "none" or (
@@ -6502,11 +7144,12 @@ class InnerImprovementEngine:
                     self._active_trace.record(
                         "initial", self.state,
                         ({"tdambi_entropy_coef": float(self.cfg.tdambi_entropy_coef)}
-                         if operator == "tdambi" else {"alpha": self.agent.alpha.detach()})
+                         if operator == "tdambi" else {"alpha": self._actor_owner.alpha.detach()})
                     )
+                    self._active_trace.capture_actor(self, self._actor_base, inner=False)
                     if self._active_trace.probes:
                         self._active_trace.probe(
-                            self, root_z, self.model._pi, inner=False
+                            self, root_z, self._actor_base, inner=False
                         )
                 result = self._act_none(
                     root_z,
@@ -6586,6 +7229,9 @@ class InnerImprovementEngine:
             # Action-scoped tensors are explicitly released after producing
             # the action; episode/run scopes survive by configuration.
             self._clear_expired(t0=False, include_action=True)
+            if self._critic_bernoulli_p > 0:
+                self._critic_transfer_ready = bool(not inactive and operator == "sac")
+                metrics.update(self._critic_transfer_metrics)
         if return_behavior_policy:
             if operator != "sac":
                 behavior_policy = None

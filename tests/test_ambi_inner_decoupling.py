@@ -1012,6 +1012,7 @@ def test_version_three_checkpoint_records_observation_contract():
         "dtype": "float32",
     }
     assert checkpoint["critic_target_spec"] == {
+        "critic_ensemble_backend": "vmap",
         "outer_critic_target": "entropy_augmented",
         "inner_sac_critic_target": "entropy_augmented",
         "entropy_semantics": {"outer": "squashed_action_entropy", "inner": "squashed_action_entropy"},
@@ -1032,6 +1033,7 @@ def test_portable_checkpoint_allows_intentional_critic_target_ablation():
     reward_return.agent.load(checkpoint)
 
     assert reward_return.agent._critic_target_spec() == {
+        "critic_ensemble_backend": "vmap",
         "outer_critic_target": "reward_only",
         "inner_sac_critic_target": "reward_only",
         "entropy_semantics": {"outer": "none", "inner": "none"},

@@ -18,7 +18,16 @@ from RL.TDMPC2 import TDMPC2Baseline, _normalize_horizon_params
 from RL.tdmpc2_core.ambi_agent import AMBITDMPC2Agent
 from RL.tdmpc2_core.common.inner_utils import updates_for_transitions
 from RL.tdmpc2_core.common.soft_world_model import normalize_log_std_mapping
+from RL.tdmpc2_core.common.value_semantics import ValueSpecification
+from RL.tdmpc2_core.common.auxiliary_config import (
+    normalize_auxiliary_params, resolve_auxiliary_actor_config,
+    validate_auxiliary_config,
+)
 from utils.utils import setup_logs
+from utils.pave_identity import PAVE_COEFFICIENT_KEYS, PAVE_DEFAULTS, resolve_pave_controls
+from utils.ensemble_identity import (
+    DEFAULT_CRITIC_ENSEMBLE_BACKEND, normalize_critic_ensemble_backend,
+)
 
 
 _Q_REDUCTIONS = {"min_pair", "mean_pair", "min_all", "mean_all"}
@@ -50,10 +59,26 @@ _INNER_EXECUTION_POLICY_SOURCES = {
 
 
 _AMBI_DEFAULTS = {
+    # PAVE regularizes action derivatives of independently selected outer critics.
+    **PAVE_DEFAULTS,
     # Outer latent SAC. Q representation, ensemble reduction, and whether
     # entropy enters policy evaluation are independent controls.
     "mpc": False,
     "q_representation": "distributional",
+    "critic_ensemble_backend": DEFAULT_CRITIC_ENSEMBLE_BACKEND,
+    "critic_value_mode": "single",
+    "aux_return_mode": "off",
+    "aux_return_critic_coef": 0.1,
+    "aux_return_detach_representation": False,
+    "aux_return_critic_lr": None,
+    "inner_actor_source": "sac",
+    "inner_critic_source": "sac",
+    "inner_horizon_actor_source": "sac",
+    "inner_horizon_critic_source": "sac",
+    # Resolved by value mode: preserve legacy entropy, but default the split
+    # critic's inner learner to reward maximization.
+    "inner_entropy_enabled": None,
+    "inner_value_initialization": "return",
     "q_num_bins": None,
     "q_vmin": None,
     "q_vmax": None,
@@ -65,6 +90,11 @@ _AMBI_DEFAULTS = {
     "mppi_terminal_q_reduction": "mean_pair",
     "outer_critic_target": "entropy_augmented",
     "inner_sac_critic_target": "entropy_augmented",
+    "inner_sac_return_estimator": "one_step",
+    "inner_retrace_lambda": 1.0,
+    # Active Retrace defaults to ceil(inner_batch_size / rollout horizon).
+    # Actor/temperature minibatches retain their transition-count semantics.
+    "inner_retrace_batch_trajectories": None,
     # Actor, temperature, and entropy-augmented critic objectives share a statistic.
     "outer_actor_entropy_mode": "squashed",
     "inner_actor_entropy_mode": "squashed",
@@ -101,6 +131,14 @@ _AMBI_DEFAULTS = {
     "tau": 0.005,
     "target_update_interval": 1,
     "compile_strict": False,
+    # Observational outer-policy telemetry; opt-in for the SAC prior study.
+    "outer_policy_diagnostics": False,
+    "outer_policy_diagnostics_early_every": 100,
+    "outer_policy_diagnostics_early_until": 10_000,
+    "outer_policy_diagnostics_every": 1_000,
+    "outer_policy_diagnostics_states": 32,
+    "outer_policy_diagnostics_samples": 32,
+    "outer_policy_diagnostics_seed": 12345,
 
     # Optional trajectory-level intervention used by value-calibration
     # experiments. Eligible training episodes draw once between the canonical
@@ -123,6 +161,7 @@ _AMBI_DEFAULTS = {
     # rollout timesteps so the next imagined action uses the adapted actor.
     "inner_update_timing": "round",
     "inner_finite_horizon": False,
+    "inner_horizon_conditioning": "none",
     "inner_outer_replay_fraction": 0.0,
     # Optional canonical component schedule. Both values must be specified;
     # unlike the shared-G schedule, critic phases precede actor phases.
@@ -161,7 +200,12 @@ _AMBI_DEFAULTS = {
     "inner_replay_capacity": None,
     "inner_replay_sampling": "with_replacement",
 
-    # Independently adaptable inner components.
+    # Initialization and trainability are independent for each inner component.
+    "inner_actor_initialization": "prior",
+    "inner_actor_initial_std": None,
+    "inner_critic_initialization": "prior",
+    # Previous-solve critic weights only; all other inner state stays action-local.
+    "inner_critic_bernoulli_p": 0.0,
     "inner_actor_adaptation": "clone",
     "inner_critic_adaptation": "clone",
     "inner_critic_dropout_enabled": True,
@@ -419,6 +463,100 @@ def _normalize_choice(value, key, choices):
     if value not in choices:
         raise ValueError(f"{key} must be one of {sorted(choices)}, got {value!r}.")
     return value
+
+
+def _validate_horizon_conditioning_config(cfg):
+    """Keep the opt-in time-aware learner within its supported SAC contract."""
+    if cfg.inner_horizon_conditioning == "none":
+        # This is derived metadata, not an independent architecture control.
+        vars(cfg).pop("horizon_conditioning_horizon", None)
+        return
+    requirements = {
+        "inner_operator": "sac",
+        "inner_schedule_mode": "canonical",
+        "inner_finite_horizon": True,
+        "inner_actor_initialization": "prior",
+        "inner_critic_initialization": "prior",
+        "inner_actor_adaptation": "clone",
+        "inner_critic_adaptation": "clone",
+        "inner_bootstrap_source": "inner_target",
+        "inner_explorer_mode": "none",
+        "inner_execution_policy_source": "primary",
+        "critic_value_mode": "single",
+        "aux_return_mode": "off",
+        "inner_outer_replay_fraction": 0.0,
+        "inner_actor_writeback_coef": 0.0,
+        "inner_critic_writeback_coef": 0.0,
+        "value_equivalence_diagnostics": False,
+        "value_equivalence_loss_coef": 0.0,
+        "inner_diagnostic_rollouts": 0,
+    }
+    for component in (
+        "actor", "critic", "temperature", "replay",
+        "actor_optimizer", "critic_optimizer", "temperature_optimizer",
+    ):
+        requirements[f"inner_{component}_scope"] = "action"
+    for key, expected in requirements.items():
+        if getattr(cfg, key) != expected:
+            raise ValueError(
+                "inner_horizon_conditioning='one_hot' requires "
+                f"{key}={expected!r}."
+            )
+    cfg.horizon_conditioning_horizon = int(cfg.inner_rollout_horizon)
+
+
+def _validate_retrace_config(cfg):
+    """Bound trajectory Retrace to the supported fresh finite-horizon solve."""
+    if cfg.inner_sac_return_estimator != "retrace":
+        return
+    requirements = {
+        "inner_operator": "sac",
+        "inner_schedule_mode": "canonical",
+        "inner_finite_horizon": True,
+        "inner_bootstrap_source": "inner_target",
+        "inner_update_timing": "round",
+        "inner_explorer_mode": "none",
+        "inner_execution_policy_source": "primary",
+        "inner_behavior_action": "policy_sample",
+        "critic_value_mode": "single",
+        "inner_outer_replay_fraction": 0.0,
+        "inner_actor_writeback_coef": 0.0,
+        "inner_critic_writeback_coef": 0.0,
+    }
+    for component in (
+        "actor", "critic", "temperature", "replay",
+        "actor_optimizer", "critic_optimizer", "temperature_optimizer",
+    ):
+        requirements[f"inner_{component}_scope"] = "action"
+    for key, expected in requirements.items():
+        if getattr(cfg, key) != expected:
+            raise ValueError(
+                "inner_sac_return_estimator='retrace' requires "
+                f"{key}={expected!r}."
+            )
+    if cfg.inner_behavior_std_scale <= 0.0:
+        raise ValueError(
+            "inner_sac_return_estimator='retrace' requires a strictly positive "
+            "inner_behavior_std_scale for a continuous behavior density."
+        )
+    if (cfg.inner_replay_sampling == "without_replacement"
+            and cfg.inner_critic_updates_per_action > 0):
+        # Capacity remains measured in nominal transitions; storage owns whole
+        # H-step slots, including masked padding after an early termination.
+        slots = cfg.inner_replay_capacity // cfg.inner_rollout_horizon
+        batch = cfg.inner_retrace_batch_trajectories
+        if batch > slots:
+            raise ValueError(
+                "Without-replacement Retrace requires "
+                "inner_retrace_batch_trajectories <= "
+                "floor(inner_replay_capacity / inner_rollout_horizon)."
+            )
+        if cfg.inner_rounds > 0 and batch > cfg.inner_rollouts_per_round:
+            raise ValueError(
+                "Without-replacement Retrace cannot fill "
+                "inner_retrace_batch_trajectories before the first update; "
+                "reduce it or increase inner_rollouts_per_round."
+            )
 
 
 def _integral_weighted_count(total, weight, *, total_key, weight_key):
@@ -1090,6 +1228,106 @@ def _normalize_legacy_params(params):
     return params, schedule_mode
 
 
+def _resolve_split_value_params(params):
+    """Resolve the opt-in value semantics before deriving update budgets."""
+
+    params = dict(params)
+    mode = _normalize_choice(
+        params.get("critic_value_mode", "single"),
+        "critic_value_mode", {"single", "return_entropy"},
+    )
+    params["critic_value_mode"] = mode
+    entropy = _strict_bool(
+        params.get("inner_entropy_enabled", mode == "single"),
+        "inner_entropy_enabled",
+    )
+    params["inner_entropy_enabled"] = entropy
+    params["inner_value_initialization"] = _normalize_choice(
+        params.get("inner_value_initialization", "return"),
+        "inner_value_initialization", {"return", "soft"},
+    )
+    if mode == "single":
+        if ((not entropy and params.get("aux_return_mode", "off") == "off")
+                or params["inner_value_initialization"] != "return"):
+            raise ValueError(
+                "inner_entropy_enabled=false and inner_value_initialization='soft' "
+                "require critic_value_mode='return_entropy'."
+            )
+        return params
+
+    operator = str(params.get("inner_operator", "sac")).lower()
+    params.setdefault("inner_finite_horizon", operator == "sac")
+    params.setdefault("inner_rebase_persistent", False)
+    params.setdefault("mppi_terminal_q_reduction", "min_pair")
+    expected_target = "entropy_augmented" if entropy else "reward_only"
+    if "inner_sac_critic_target" in params and str(
+        params["inner_sac_critic_target"]
+    ).lower() != expected_target:
+        raise ValueError(
+            f"inner_entropy_enabled={entropy} requires "
+            f"inner_sac_critic_target={expected_target!r} in split-value mode."
+        )
+    params["inner_sac_critic_target"] = expected_target
+    if not entropy:
+        if params.get("inner_temperature_mode") is not None:
+            _normalize_choice(
+                params["inner_temperature_mode"], "inner_temperature_mode",
+                {"inherit_outer", "fixed", "auto"},
+            )
+        # The entropy switch disables even an explicitly configured automatic
+        # temperature. Clear inactive legacy budget input before schedule
+        # detection so it cannot accidentally select the legacy scheduler.
+        params.pop("inner_temperature_updates_per_action", None)
+        params["inner_temperature_mode"] = "inherit_outer"
+    return params
+
+
+def _validate_split_value_config(cfg):
+    """Fail unsupported combinations before a split model is constructed."""
+
+    if cfg.critic_value_mode == "single":
+        return
+    requirements = {
+        "q_representation": "distributional",
+        "outer_actor_entropy_mode": "squashed",
+        "inner_actor_entropy_mode": "squashed",
+        "outer_critic_target": "entropy_augmented",
+        "inner_explorer_mode": "none",
+        "inner_actor_initialization": "prior",
+        "inner_critic_initialization": "prior",
+        "inner_bootstrap_source": "inner_target",
+        "inner_actor_loss_scale_update": "per_action",
+        "inner_critic_target_initialization": "online",
+        "inner_execution_policy_source": "primary",
+        "inner_rebase_persistent": False,
+        "inner_actor_writeback_coef": 0.0,
+        "inner_critic_writeback_coef": 0.0,
+        "value_equivalence_loss_coef": 0.0,
+        "mppi_terminal_q_reduction": "min_pair",
+    }
+    for key in (
+        "outer_q_target_reduction", "outer_q_actor_reduction",
+        "inner_q_target_reduction", "inner_q_actor_reduction",
+    ):
+        requirements[key] = "min_pair"
+    for component in (
+        "actor", "critic", "temperature", "replay",
+        "actor_optimizer", "critic_optimizer", "temperature_optimizer",
+    ):
+        requirements[f"inner_{component}_scope"] = "action"
+    for key, required in requirements.items():
+        if getattr(cfg, key) != required:
+            raise ValueError(
+                "critic_value_mode='return_entropy' requires "
+                f"{key}={required!r}; received {getattr(cfg, key)!r}."
+            )
+    if cfg.inner_operator not in {"none", "sac"}:
+        raise ValueError("Split-value critics support inner_operator='none' or 'sac'.")
+    if cfg.inner_operator == "sac" and not cfg.inner_finite_horizon:
+        raise ValueError("Split-value inner SAC requires inner_finite_horizon=true.")
+    cfg.critic_value_spec = ValueSpecification.from_config(cfg).signature()
+
+
 class AMBITDMPC2(TDMPC2Baseline):
     """TOLD learning with canonical cloned inner SAC and optional ablations."""
 
@@ -1215,6 +1453,8 @@ class AMBITDMPC2(TDMPC2Baseline):
         # legacy inner-loop aliases. This rejects only combinations the caller
         # actually supplied while allowing an all-legacy configuration to make
         # its one-release migration cleanly.
+        params = normalize_auxiliary_params(params)
+        params = _resolve_split_value_params(params)
         params = _normalize_horizon_params(params, resolve_defaults=False)
         params, schedule_mode = _normalize_legacy_params(params)
         component_update_schedule = bool(set(params) & _COMPONENT_SCHEDULE_KEYS)
@@ -1271,6 +1511,30 @@ class AMBITDMPC2(TDMPC2Baseline):
         if schedule_mode == "legacy" and requested_operator in {"sac", "td3"}:
             merged.update(_LEGACY_SCHEDULE_DEFAULTS)
         merged.update(params)
+        merged["inner_sac_return_estimator"] = _normalize_choice(
+            merged["inner_sac_return_estimator"],
+            "inner_sac_return_estimator", {"one_step", "retrace"},
+        )
+        if (merged["inner_sac_return_estimator"] == "retrace"
+                and (requested_operator != "sac" or schedule_mode != "canonical")):
+            raise ValueError(
+                "inner_sac_return_estimator='retrace' requires the canonical "
+                "inner_operator='sac' schedule."
+            )
+        merged["inner_retrace_lambda"] = _strict_probability(
+            merged["inner_retrace_lambda"], "inner_retrace_lambda",
+        )
+        if merged["inner_retrace_batch_trajectories"] is not None:
+            merged["inner_retrace_batch_trajectories"] = _strict_positive_int(
+                merged["inner_retrace_batch_trajectories"],
+                "inner_retrace_batch_trajectories",
+            )
+        merged["inner_horizon_conditioning"] = _normalize_choice(
+            merged["inner_horizon_conditioning"],
+            "inner_horizon_conditioning", {"none", "one_hot"},
+        )
+        if merged["inner_horizon_conditioning"] != "none" and requested_operator != "sac":
+            raise ValueError("inner_horizon_conditioning='one_hot' requires inner_operator='sac'.")
         timing = merged["inner_update_timing"]
         if not isinstance(timing, str) or timing.lower() not in {"round", "step"}:
             raise ValueError("inner_update_timing must be 'round' or 'step'.")
@@ -1360,6 +1624,53 @@ class AMBITDMPC2(TDMPC2Baseline):
                 inner_temperature_mode="inherit_outer",
             )
         cfg = super()._build_cfg(merged)
+        cfg.critic_ensemble_backend = normalize_critic_ensemble_backend(
+            cfg.critic_ensemble_backend
+        )
+        pave_controls = resolve_pave_controls(cfg)
+        for key, value in pave_controls.items():
+            setattr(cfg, key, value)
+        if any(pave_controls[key] > 0 for key in PAVE_COEFFICIENT_KEYS):
+            if cfg.obs != "state":
+                raise ValueError("Active PAVE losses require state observations.")
+            if cfg.critic_value_mode != "single":
+                raise ValueError("Active PAVE losses require critic_value_mode='single'.")
+            if cfg.aux_return_mode == "off" and any(
+                pave_controls[key] > 0 for key in PAVE_COEFFICIENT_KEYS
+                if key.startswith("aux_return_")
+            ):
+                raise ValueError("Auxiliary PAVE losses require an auxiliary return critic.")
+        resolve_auxiliary_actor_config(cfg)
+        # Resolve policy inheritance before the existing inner validations.
+        if cfg.aux_return_mode != "off" and cfg.inner_actor_source == "return_actor":
+            for key in ("log_std_mapping", "log_std_min", "log_std_max"):
+                if getattr(cfg, f"inner_{key}") is None:
+                    setattr(cfg, f"inner_{key}", cfg.aux_return_actor_cfg[key])
+            if cfg.inner_operator == "sac" and "inner_actor_entropy_mode" not in params:
+                cfg.inner_actor_entropy_mode = cfg.aux_return_actor_cfg["outer_actor_entropy_mode"]
+        cfg.outer_policy_diagnostics = _strict_bool(
+            cfg.outer_policy_diagnostics, "outer_policy_diagnostics"
+        )
+        for key in (
+            "outer_policy_diagnostics_early_every", "outer_policy_diagnostics_every",
+            "outer_policy_diagnostics_states", "outer_policy_diagnostics_samples",
+        ):
+            value = _strict_nonnegative_int(getattr(cfg, key), key)
+            if value == 0:
+                raise ValueError(f"{key} must be positive.")
+            setattr(cfg, key, value)
+        for key in ("outer_policy_diagnostics_early_until", "outer_policy_diagnostics_seed"):
+            setattr(cfg, key, _strict_nonnegative_int(getattr(cfg, key), key))
+        if cfg.outer_policy_diagnostics and cfg.obs != "state":
+            raise ValueError("outer_policy_diagnostics currently requires state observations.")
+        if cfg.outer_policy_diagnostics and bool(getattr(cfg, "wandb", False)) and not bool(
+            getattr(cfg, "wandb_event_indexed", False)
+        ):
+            raise ValueError("outer_policy_diagnostics with W&B requires wandb_event_indexed=true.")
+        if cfg.outer_policy_diagnostics and (
+            cfg.inner_operator != "none" or bool(cfg.mpc)
+        ):
+            raise ValueError("outer_policy_diagnostics currently requires prior-only collection (inner_operator=none, mpc=false).")
         cfg.inner_schedule_mode = schedule_mode
         cfg.inner_component_update_schedule = component_update_schedule
         cfg.outer_policy_episode_probability = float(
@@ -1736,6 +2047,12 @@ class AMBITDMPC2(TDMPC2Baseline):
                 raise ValueError(f"{key} must be positive, got {value}.")
             setattr(cfg, key, value)
 
+        if (cfg.inner_sac_return_estimator == "retrace"
+                and cfg.inner_retrace_batch_trajectories is None):
+            cfg.inner_retrace_batch_trajectories = (
+                cfg.inner_batch_size + cfg.inner_rollout_horizon - 1
+            ) // cfg.inner_rollout_horizon
+
         if cfg.inner_actor_target_update_interval is None:
             cfg.inner_actor_target_update_interval = (
                 cfg.inner_critic_target_update_interval
@@ -1747,10 +2064,19 @@ class AMBITDMPC2(TDMPC2Baseline):
             raise ValueError("inner_actor_target_update_interval must be positive.")
 
         if cfg.inner_replay_capacity is None:
-            cfg.inner_replay_capacity = max(1, cfg.inner_model_step_budget)
+            minimum_capacity = (
+                cfg.inner_rollout_horizon if cfg.inner_sac_return_estimator == "retrace" else 1
+            )
+            cfg.inner_replay_capacity = max(minimum_capacity, cfg.inner_model_step_budget)
         cfg.inner_replay_capacity = int(cfg.inner_replay_capacity)
         if cfg.inner_replay_capacity <= 0:
             raise ValueError("inner_replay_capacity must be positive.")
+        if (cfg.inner_sac_return_estimator == "retrace"
+                and cfg.inner_replay_capacity < cfg.inner_rollout_horizon):
+            raise ValueError(
+                "inner_sac_return_estimator='retrace' requires "
+                "inner_replay_capacity >= inner_rollout_horizon for one trajectory slot."
+            )
         cfg.inner_replay_sampling = str(cfg.inner_replay_sampling).lower()
         if cfg.inner_replay_sampling not in {"with_replacement", "without_replacement"}:
             raise ValueError(
@@ -1764,10 +2090,15 @@ class AMBITDMPC2(TDMPC2Baseline):
                 "inner_temperature_updates_per_action",
             )
         )
+        has_transition_updates = has_inner_updates and (
+            cfg.inner_sac_return_estimator != "retrace"
+            or cfg.inner_actor_updates_per_action > 0
+            or cfg.inner_temperature_updates_per_action > 0
+        )
         if (
             cfg.inner_operator in {"sac", "td3"}
             and cfg.inner_replay_sampling == "without_replacement"
-            and has_inner_updates
+            and has_transition_updates
             and cfg.inner_batch_size > cfg.inner_replay_capacity
         ):
             raise ValueError(
@@ -1787,7 +2118,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         if (
             cfg.inner_operator in {"sac", "td3"}
             and cfg.inner_replay_sampling == "without_replacement"
-            and has_inner_updates
+            and has_transition_updates
             and cfg.inner_rounds > 0
             and cfg.inner_batch_size > first_collection_size
         ):
@@ -1797,6 +2128,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             )
 
         for key, modes in (
+            ("inner_actor_initialization", {"prior", "random"}),
+            ("inner_critic_initialization", {"prior", "random"}),
             ("inner_actor_adaptation", _ACTOR_ADAPTATION_MODES),
             ("inner_critic_adaptation", _CRITIC_ADAPTATION_MODES),
         ):
@@ -2082,6 +2415,22 @@ class AMBITDMPC2(TDMPC2Baseline):
         )
         if cfg.inner_log_std_min >= cfg.inner_log_std_max:
             raise ValueError("inner_log_std_min must be less than inner_log_std_max.")
+        if cfg.inner_actor_initial_std is not None:
+            cfg.inner_actor_initial_std = _finite_float(
+                cfg.inner_actor_initial_std, "inner_actor_initial_std"
+            )
+            if cfg.inner_actor_initialization != "random":
+                raise ValueError(
+                    "inner_actor_initial_std requires inner_actor_initialization='random'."
+                )
+            if cfg.inner_actor_initial_std <= 0 or not (
+                cfg.inner_log_std_min < math.log(cfg.inner_actor_initial_std)
+                < cfg.inner_log_std_max
+            ):
+                raise ValueError(
+                    "inner_actor_initial_std must be positive with its log strictly "
+                    "inside the inner log-standard-deviation bounds."
+                )
 
         scope_keys = (
             "inner_actor_scope",
@@ -2421,7 +2770,9 @@ class AMBITDMPC2(TDMPC2Baseline):
             )
         if (
             cfg.inner_actor_loss_scale_update == "per_update"
-            and cfg.sac_actor_loss_scale_mode != "tdmpc2_percentile_range"
+            and (cfg.aux_return_actor_cfg["sac_actor_loss_scale_mode"]
+                 if cfg.aux_return_mode != "off" and cfg.inner_critic_source == "aux_return"
+                 else cfg.sac_actor_loss_scale_mode) != "tdmpc2_percentile_range"
         ):
             raise ValueError(
                 "inner_actor_loss_scale_update='per_update' requires "
@@ -2434,6 +2785,43 @@ class AMBITDMPC2(TDMPC2Baseline):
                 "inner_critic_target_initialization='outer_target' requires an "
                 "action-local cloned critic."
             )
+
+        random_initialization = any(
+            getattr(cfg, f"inner_{component}_initialization") == "random"
+            for component in ("actor", "critic")
+        )
+        if random_initialization:
+            if cfg.inner_operator != "sac" or cfg.inner_explorer_mode != "none":
+                raise ValueError(
+                    "Random inner initialization requires inner_operator='sac' "
+                    "and inner_explorer_mode='none'."
+                )
+            for key in scope_keys[:-1]:
+                if getattr(cfg, key) != "action":
+                    raise ValueError(
+                        "Random inner initialization requires fresh per-decision "
+                        f"state; {key} must be 'action'."
+                    )
+            if writeback_active:
+                raise ValueError(
+                    "Random inner initialization requires zero "
+                    "inner_actor_writeback_coef and inner_critic_writeback_coef."
+                )
+            if cfg.value_equivalence_diagnostics or cfg.value_equivalence_loss_coef > 0.0:
+                raise ValueError(
+                    "Random inner initialization requires "
+                    "value_equivalence_diagnostics=false and "
+                    "value_equivalence_loss_coef=0; those probes assume "
+                    "prior-initialized inner networks."
+                )
+            if (
+                cfg.inner_critic_initialization == "random"
+                and cfg.inner_critic_target_initialization == "outer_target"
+            ):
+                raise ValueError(
+                    "inner_critic_initialization='random' requires "
+                    "inner_critic_target_initialization='online'."
+                )
 
         for key in ("actor_lr", "critic_lr", "ent_coef_lr"):
             value = _finite_float(getattr(cfg, key), key)
@@ -2487,14 +2875,29 @@ class AMBITDMPC2(TDMPC2Baseline):
                 cfg.inner_temperature_mode == "auto"
                 and cfg.inner_target_entropy in {"auto", "inherit_outer"}
             ):
-                raise ValueError(
-                    "inner_actor_entropy_mode='tdmpc2_scaled' with automatic "
-                    "temperature requires an explicit numeric inner_target_entropy."
+                selected_actor = (
+                    cfg.aux_return_actor_cfg
+                    if cfg.aux_return_mode != "off" and cfg.inner_actor_source == "return_actor"
+                    else vars(cfg)
                 )
+                numeric_inheritance = (
+                    cfg.aux_return_mode != "off"
+                    and cfg.inner_target_entropy == "inherit_outer"
+                    and selected_actor["outer_actor_entropy_mode"] == "tdmpc2_scaled"
+                    and selected_actor["target_entropy"] != "auto"
+                )
+                if not numeric_inheritance:
+                    raise ValueError(
+                        "inner_actor_entropy_mode='tdmpc2_scaled' with automatic "
+                        "temperature requires an explicit numeric inner_target_entropy "
+                        "or a numeric target inherited from the selected scaled-entropy actor."
+                    )
         elif (
             cfg.inner_temperature_mode == "auto"
             and cfg.inner_target_entropy == "inherit_outer"
-            and cfg.outer_actor_entropy_mode != cfg.inner_actor_entropy_mode
+            and (cfg.aux_return_actor_cfg["outer_actor_entropy_mode"]
+                 if cfg.aux_return_mode != "off" and cfg.inner_actor_source == "return_actor"
+                 else cfg.outer_actor_entropy_mode) != cfg.inner_actor_entropy_mode
         ):
             raise ValueError(
                 "Automatic inner temperature can inherit_outer target entropy only "
@@ -2508,7 +2911,9 @@ class AMBITDMPC2(TDMPC2Baseline):
                 conflicts.append(
                     f"ent_coef={cfg.ent_coef!r} (set a fixed numeric coefficient)"
                 )
-            if cfg.inner_operator == "sac":
+            if cfg.inner_operator == "sac" and not (
+                cfg.aux_return_mode != "off" and cfg.inner_critic_source == "aux_return"
+            ):
                 if cfg.inner_temperature_mode == "auto":
                     conflicts.append(
                         "inner_temperature_mode='auto' (set 'fixed' or 'inherit_outer')"
@@ -2529,6 +2934,37 @@ class AMBITDMPC2(TDMPC2Baseline):
                     + "; ".join(conflicts)
                     + ". Alternatively, set sac_actor_loss_scale_mode='none'."
                 )
+
+        _validate_retrace_config(cfg)
+        _validate_horizon_conditioning_config(cfg)
+        _validate_split_value_config(cfg)
+        validate_auxiliary_config(cfg)
+
+        cfg.inner_critic_bernoulli_p = _strict_probability(
+            cfg.inner_critic_bernoulli_p, "inner_critic_bernoulli_p"
+        )
+        if cfg.inner_critic_bernoulli_p > 0:
+            requirements = {
+                "inner_operator": "sac", "inner_schedule_mode": "canonical",
+                "inner_explorer_mode": "none", "critic_value_mode": "single",
+                "inner_actor_adaptation": "clone", "inner_critic_adaptation": "clone",
+                "inner_actor_initialization": "prior", "inner_critic_initialization": "prior",
+                "inner_bootstrap_source": "inner_target", "inner_critic_target_initialization": "online",
+                "inner_update_timing": "round", "inner_sac_return_estimator": "one_step",
+                "inner_horizon_conditioning": "none", "inner_execution_policy_source": "primary",
+                "inner_actor_writeback_coef": 0.0,
+                "inner_critic_writeback_coef": 0.0, "inner_outer_replay_fraction": 0.0,
+                "outer_policy_episode_probability": 0.0, "value_equivalence_loss_coef": 0.0,
+                "value_equivalence_diagnostics": False,
+            }
+            for component in ("actor", "critic", "temperature", "replay",
+                              "actor_optimizer", "critic_optimizer", "temperature_optimizer"):
+                requirements[f"inner_{component}_scope"] = "action"
+            for key, required in requirements.items():
+                if getattr(cfg, key) != required:
+                    raise ValueError(f"inner_critic_bernoulli_p>0 requires {key}={required!r}.")
+            if cfg.inner_rounds <= 0 or cfg.inner_critic_updates_per_action <= 0:
+                raise ValueError("inner_critic_bernoulli_p>0 requires an active SAC solve with critic updates.")
 
         # Read-only aliases keep legacy integrations working for one release.
         # Canonical agent code must not use these for scheduling mixed updates.
@@ -2935,12 +3371,18 @@ class AMBITDMPC2(TDMPC2Baseline):
             raise RuntimeError(
                 "AMBI training state requires consumed behavior-policy metadata."
             )
-        return {
+        state = {
             "schema": "ambi-wrapper-training-state",
             "version": 2,
             "inner_steps_total": int(self._inner_steps_total),
             "inner_updates_total": int(self._inner_updates_total),
         }
+        if self.cfg.outer_policy_diagnostics:
+            recorder = self._outer_policy_recorder
+            state["outer_policy_diagnostics"] = (
+                recorder.state_dict() if recorder is not None else self._outer_policy_recorder_state
+            )
+        return state
 
     def _preflight_training_resume_algorithm_state(self, state):
         expected = {
@@ -2949,11 +3391,18 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_steps_total",
             "inner_updates_total",
         }
+        if self.cfg.outer_policy_diagnostics:
+            expected.add("outer_policy_diagnostics")
         if not isinstance(state, Mapping) or set(state) != expected:
             raise ValueError("AMBI wrapper training-state fields are invalid.")
         if state["schema"] != "ambi-wrapper-training-state" or state["version"] != 2:
             raise ValueError("Unsupported AMBI wrapper training-state version.")
         normalized = dict(state)
+        if self.cfg.outer_policy_diagnostics and state["outer_policy_diagnostics"] is not None:
+            from utils.outer_policy_diagnostics import OuterPolicyDiagnostics
+            normalized["outer_policy_diagnostics"] = OuterPolicyDiagnostics.validate_state(
+                state["outer_policy_diagnostics"], self.cfg
+            )
         for key in ("inner_steps_total", "inner_updates_total"):
             value = normalized[key]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -2964,6 +3413,8 @@ class AMBITDMPC2(TDMPC2Baseline):
         state = self._preflight_training_resume_algorithm_state(state)
         self._inner_steps_total = state["inner_steps_total"]
         self._inner_updates_total = state["inner_updates_total"]
+        if self.cfg.outer_policy_diagnostics:
+            self._outer_policy_recorder_state = state["outer_policy_diagnostics"]
         self._wandb_inner_seconds = 0.0
         self._wandb_inner_actions = 0
         self._wandb_inner_steps = 0
@@ -3192,6 +3643,17 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_q_target_mean",
             "inner_q_target_clip_fraction",
             "inner_td_error_abs_mean",
+            "inner_primary_critic_loss",
+            "inner_primary_q_mean",
+            "inner_primary_target_mean",
+            "inner_primary_target_clip_fraction",
+            "inner_initialization_residual_critic_loss",
+            "inner_initialization_residual_q_mean",
+            "inner_initialization_residual_target_mean",
+            "inner_initialization_residual_target_clip_fraction",
+            "inner_value_composition_coefficient",
+            "inner_alpha_used",
+            "inner_effective_entropy_coefficient",
         }
         explorer_critic_metrics = {
             "inner_explorer_critic_loss",
@@ -3203,6 +3665,9 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_explorer_critic_td_error_abs_mean",
         }
         actor_metrics = {
+            "inner_actor_alpha_used",
+            "inner_actor_effective_entropy_coefficient",
+            "inner_actor_value_composition_coefficient",
             "inner_actor_loss",
             "inner_actor_grad_norm",
             "inner_actor_q_mean",

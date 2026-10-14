@@ -35,9 +35,10 @@ The local learner is then discarded, while the world model and control priors
 continue learning from real replay.
 
 The reference implementation uses full cloned actor and critic priors with
-inner SAC. LoRA adaptation, TD3, no inner improvement, persistent inner state,
-and MPPI are auxiliary ablations or comparison operators. In particular, MPPI
-is the TD-MPC-style planning comparator; it is not AMBI's core action-selection
+inner SAC. Random inner initialization, LoRA adaptation, TD3, no inner
+improvement, persistent inner state, and MPPI are auxiliary ablations or
+comparison operators. In particular, MPPI is the TD-MPC-style planning
+comparator; it is not AMBI's core action-selection
 algorithm.
 
 The [TD-AMBI training preset](RL/tdmpc2_core/README.md#td-ambi-training-preset)
@@ -52,13 +53,79 @@ reward-only and entropy-augmented critics, Q scaling and learned temperatures,
 and fixed versus adaptive inner Q scales. Full runs use one paired actor/critic
 update per batched imagined step with six rounds and 512 branches.
 
+The [SAC prior parameterization study](configs/dmcontrol/SAC_PRIOR_DIAGNOSTICS.md)
+compares clipping and smooth log-std mappings with corrected action-entropy
+targets −21 and −10.5. Its four configurations run two seeds each and add
+outer-policy saturation, entropy, temperature and fixed-observation diagnostics
+to the prior-only checkpoint banks.
+
 The optional [critic-only LoRA-RL adapter](RL/tdmpc2_core/README.md#critic-only-lora-rl)
-uses `inner_critic_adaptation="lora_rl"` with a fully cloned actor. The default
+uses `inner_critic_adaptation="lora_rl"` with a densely trained actor. The default
 rank is 96, direct adapter scale is one, and AdamW adapter weight decay is
 `2e-4`. Its explicitly named Humanoid base-v2 presets compare input-and-hidden
 versus hidden-only placement and ranks 64, 96, and 128; they retain the base
 training and evaluation budgets. They replace the retired joint actor/critic
 LoRA presets without reusing their configuration or run names.
+
+### Optional independent return critic
+
+AMBI also supports an [independent return critic and optional return actor](RL/tdmpc2_core/README.md#independent-auxiliary-return-critic).
+Set `aux_return_mode="sac"` to evaluate reward return under the SAC prior, or
+`"return_actor"` to train a separate stochastic actor against that reward-only
+critic. Actor and critic sources for inner initialization and the horizon tail
+are independently selectable. The existing split return/entropy heads remain
+available as a separate, unchanged variant; the two variants cannot be enabled
+together. The auxiliary mode defaults to `"off"`.
+
+### Critic ensemble execution
+
+AMBI and TDAMBI default to `alg_params.critic_ensemble_backend="vmap"`.
+Existing main-experiment configurations inherit this setting automatically.
+It vectorizes dense critic heads in the primary and auxiliary critics, their
+targets, cloned inner critics, and eager PAVE geometry. Parameters and optimizer
+slots retain their existing ownership and checkpoint names. Set the option to
+`"loop"` to select the historical head loop. LoRA and custom heads retain their
+compatible loop execution; the standalone TD-MPC2 comparator is unchanged.
+
+Portable checkpoints load across either backend. Vmap preserves independent
+dropout across heads but changes RNG ordering and floating-point arithmetic,
+so exact continuation requires the same backend. See the
+[execution and compatibility details](RL/tdmpc2_core/README.md#critic-ensemble-execution).
+
+### Optional Bernoulli critic transfer
+
+Set `alg_params.inner_critic_bernoulli_p=0.5` to retain each scalar critic
+parameter from the previous successful inner SAC solve with probability 50%.
+Other entries reset to the **current** outer critic prior. This includes biases
+and normalization parameters, while buffers always reset to the prior. The
+default `0.0` preserves fresh initialization; `1.0` carries all critic weights.
+
+Transfer stays within an episode. The actor, target, Adam moments, imagined
+replay, and temperature are freshly initialized at every decision; the target
+starts from the selected online critic. Both loop and vmap ensembles work.
+This supports main training, prediction, and isolated paired evaluation.
+See [the transfer contract](RL/tdmpc2_core/README.md#bernoulli-critic-transfer)
+for supported settings, logging, and exact resume behavior.
+
+### Optional random inner initialization
+
+Set `inner_actor_initialization="random"` and/or
+`inner_critic_initialization="random"` to initialize those inner networks from
+scratch for every active inner solve. Both independently default to `"prior"`.
+Initialization is separate from adaptation: `inner_actor_adaptation="clone"`
+and `inner_critic_adaptation="clone"` select full dense training even when
+initialization is random. Random critic initialization also works with
+`inner_critic_adaptation="lora_rl"`: selected random critic matrices freeze,
+while adapters, critic biases, normalization, and value heads train; the actor
+continues dense training.
+
+This option supports single-policy, action-local inner SAC and the native
+TDAMBI frozen-checkpoint evaluator. Native TDAMBI retains its TD-MPC2 objectives
+and explicit Q-scale initialization policy. Setting `inner_rounds=0` retains
+the existing outer-policy bypass. The learned world model and outer control
+priors retain their existing training behavior. See
+[inner-network initialization](RL/tdmpc2_core/README.md#inner-network-initialization)
+for examples, initialization rules, compatibility limits, and checkpoint use.
 
 ### Optional adapted-prior writeback
 
@@ -117,9 +184,11 @@ Checkpoint files are model snapshots and do not universally contain replay or
 environment state for full training resume.
 
 Native TD-MPC2 periodic and final checkpoints also save the learned Q percentile
-scale `S`, frozen at the same step as the networks. AMBI preserves its actor Q
-scale when scaling is enabled. Older native snapshots without `S` reset the
-unavailable scale to one when loaded into the native learner.
+scale `S`, frozen at the same step as the networks. Frozen TDAMBI evaluation
+uses that saved scale to initialize each independent inner solve. AMBI already
+preserves its actor Q scale when scaling is enabled. Older native snapshots
+without `S` retain the documented local-calibration fallback; see the
+[evaluation scale options](RL/tdmpc2_core/README.md#tdambi-native-inner-learning).
 
 ### Oscar durable checkpoint storage
 
@@ -173,8 +242,8 @@ environments/dmcontrol/.venv/bin/python main.py \
 The Humanoid Walk MC-value base also has three paired analytic behavior-KL
 entry points under `configs/dmcontrol/experiments`: `ambi_anchor_kl_smooth`,
 `ambi_anchor_kl_quantile`, and `ambi_anchor_kl_dual`. They retain the same
-five-head `min_all`, reward-only critic configuration, three seeds, 14-million
-decision budget, and value-evaluation cadence.
+five-head `min_all`, reward-only critic configuration, three seeds, one-million
+decision budget, and value-evaluation/checkpoint cadence.
 
 The default observation is the same state representation used by TD-MPC2's
 single-task benchmarks: DMControl observation components are flattened in their
@@ -238,6 +307,13 @@ for each of seeds 1--3. Submit its three-cell A6000 array separately:
 ```bash
 sbatch slurm/run_tdmpc2_humanoid_walk_state.sbatch
 ```
+
+That Humanoid configuration also runs five fixed-seed paired auxiliary
+episodes at step zero and each 100,000-decision evaluation point. Under the shared AMBI
+metric names, `outer` is TD-MPC2's deterministic network policy and
+`fresh_inner` is eval-mode MPC. This adds five MPC episodes plus five cheap
+network-policy episodes beyond the ordinary ten MPC episodes, while leaving
+training compute and the training environment unchanged.
 
 The launcher is for TD-MPC2 comparator runs only. Add AMBI benchmark cells only
 after explicitly freezing and profiling an inner-loop compute schedule; the

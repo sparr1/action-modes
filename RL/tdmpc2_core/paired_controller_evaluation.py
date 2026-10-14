@@ -1,7 +1,8 @@
 """Isolated, seed-paired controller evaluation for AMBI and TD-MPC2.
 
 Both evaluators use independent auxiliary environments and the same reset-seed
-bank.  AMBI compares its outer policy with a dedicated fresh inner engine;
+bank. AMBI compares its outer policy with a dedicated inner engine, including
+configured within-episode Bernoulli transfer;
 TD-MPC2 compares its deterministic network mean with fixed-seed eval-mode MPPI.
 Neither probe consumes training-environment experience or live controller RNG.
 """
@@ -104,12 +105,13 @@ def _mean_std(values: list[float], name: str) -> tuple[float, float]:
 
 
 class PairedControllerEvaluator:
-    """Compare deterministic outer control with deterministic fresh-inner AMBI.
+    """Compare deterministic outer control with the configured inner controller.
 
     Every episode index receives one explicit environment reset seed shared by
     the two auxiliary environments.  The evaluator-owned inner engine is reset
     from a distinct namespaced controller seed before the corresponding
-    fresh-inner episode.  Episode returns are undiscounted.
+    inner episode. Configured Bernoulli copying applies between that episode's
+    decisions; otherwise each solve initializes fresh. Returns are undiscounted.
     """
 
     def __init__(
@@ -460,6 +462,13 @@ class PairedControllerEvaluator:
                 ),
             }
             metrics.update(self._q_gain_metrics(q_gains))
+            probability = float(getattr(getattr(self.agent, "cfg", None), "inner_critic_bernoulli_p", 0.0))
+            if probability > 0:
+                # Preserve historical keys for fresh solves without describing
+                # the configured transferring controller as fresh initialization.
+                metrics = {key.replace("paired_fresh_inner", "paired_bernoulli_inner"): value
+                           for key, value in metrics.items()}
+                metrics["eval/paired_bernoulli_inner_critic_p"] = probability
             metrics["time/paired_inner_comparison_seconds"] = max(
                 0.0, time.perf_counter() - started
             )

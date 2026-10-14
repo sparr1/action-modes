@@ -8,11 +8,29 @@ after any lazy compiler/backend failure.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import random
 import warnings
 
 import numpy as np
 import torch
+
+
+@contextmanager
+def _preserve_host_rng_state():
+    """Isolate lazy compiler host work while retaining tensor RNG consumption.
+
+    Compiled regions contain tensor operations, so Python/NumPy draws belong
+    to compiler machinery rather than the learner. Compilation can happen on
+    the first invocation or after a new guard, not only in ``torch.compile``.
+    """
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
 
 
 def _rng_dependencies(value, devices, generators):
@@ -138,7 +156,8 @@ class CompileRegion:
             _restore_rng_state(construction_rng_state)
             self._compiled = compiled
         try:
-            return self._compiled(*args, **kwargs)
+            with _preserve_host_rng_state():
+                return self._compiled(*args, **kwargs)
         except Exception as error:
             if self.strict:
                 raise

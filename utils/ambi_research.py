@@ -16,7 +16,9 @@ from pathlib import Path
 
 _NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _MAX_NUMPY_SEED = 2**32 - 1
-_CHECKPOINT_RUNTIME_PARAMS = {"device", "compile", "compile_strict", "wandb"}
+_CHECKPOINT_RUNTIME_PARAMS = {
+    "device", "compile", "compile_strict", "wandb", "critic_ensemble_backend",
+}
 _CHECKPOINT_INNER_PARAMS = {"tdambi_scale_initialization"}
 
 

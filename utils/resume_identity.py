@@ -15,6 +15,9 @@ from typing import Any
 import numpy as np
 
 from utils.lora_identity import normalize_lora_rl_identity
+from utils.aux_return_identity import normalize_aux_return_identity
+from utils.pave_identity import normalize_pave_identity
+from utils.ensemble_identity import normalize_ensemble_backend_identity
 
 
 LINEAGE_IDENTITY_SCHEMA_VERSION = 1
@@ -199,6 +202,13 @@ def scientific_trial_parameters(
             # Preserve each default's scalar kind so omitted and explicit
             # defaults describe the same scientific lineage.
             for field, default in resolved_defaults.items():
+                if (
+                    projected.get("alg") == _AMBI_ALGORITHM
+                    and (str(algorithm.get("critic_value_mode", "single")).lower() != "single"
+                         or str(algorithm.get("aux_return_mode", "off")).lower() != "off")
+                    and field == "inner_finite_horizon"
+                ):
+                    default = str(algorithm.get("inner_operator", "sac")).lower() == "sac"
                 value = algorithm.get(field, default)
                 if isinstance(default, bool) and isinstance(
                     value, (bool, np.bool_)
@@ -216,7 +226,37 @@ def scientific_trial_parameters(
                         value = 0.0
                 algorithm[field] = value
             if projected.get("alg") == _AMBI_ALGORITHM:
+                algorithm = normalize_ensemble_backend_identity(algorithm)
                 algorithm = normalize_lora_rl_identity(algorithm)
+                algorithm = normalize_pave_identity(algorithm)
+                algorithm = normalize_aux_return_identity(algorithm)
+                estimator = algorithm.get("inner_sac_return_estimator", "one_step")
+                if isinstance(estimator, str):
+                    estimator = estimator.lower()
+                if estimator == "one_step":
+                    for field in ("inner_sac_return_estimator", "inner_retrace_lambda",
+                                  "inner_retrace_batch_trajectories"):
+                        algorithm.pop(field, None)
+                elif estimator == "retrace":
+                    algorithm["inner_sac_return_estimator"] = estimator
+                    algorithm["inner_retrace_lambda"] = float(algorithm.get("inner_retrace_lambda", 1.0))
+                    trajectories = algorithm.get("inner_retrace_batch_trajectories")
+                    if trajectories is None:
+                        horizon = int(algorithm.get("inner_rollout_horizon", 3))
+                        batch = int(algorithm.get("inner_batch_size", 128))
+                        trajectories = (batch + horizon - 1) // horizon
+                    algorithm["inner_retrace_batch_trajectories"] = int(trajectories)
+                conditioning = algorithm.get("inner_horizon_conditioning", "none")
+                if isinstance(conditioning, str):
+                    conditioning = conditioning.lower()
+                if conditioning == "none":
+                    algorithm.pop("inner_horizon_conditioning", None)
+                    algorithm.pop("horizon_conditioning_horizon", None)
+                else:
+                    algorithm["inner_horizon_conditioning"] = conditioning
+                    algorithm["horizon_conditioning_horizon"] = int(
+                        algorithm.get("inner_rollout_horizon", algorithm.get("inner_horizon", 3))
+                    )
                 # Keep pre-interleaving lineage hashes unchanged: an omitted
                 # or explicit round default has no new scientific field.
                 timing = algorithm.get("inner_update_timing", "round")
@@ -229,7 +269,15 @@ def scientific_trial_parameters(
                 # Preserve historical identities for unchanged inner SAC.
                 # TD-AMBI's explicit loss/initialization changes remain part
                 # of the scientific configuration even though state is local.
+                split_values = str(algorithm.get("critic_value_mode", "single")).lower() != "single"
                 for field, default in (
+                    ("critic_value_mode", "single"),
+                    ("inner_entropy_enabled", not split_values),
+                    ("inner_value_initialization", "return"),
+                    ("inner_actor_initialization", "prior"),
+                    ("inner_actor_initial_std", None),
+                    ("inner_critic_initialization", "prior"),
+                    ("inner_critic_bernoulli_p", 0.0),
                     ("inner_critic_loss_coef", 1.0),
                     ("inner_actor_loss_scale_update", "per_action"),
                     ("inner_critic_target_initialization", "online"),

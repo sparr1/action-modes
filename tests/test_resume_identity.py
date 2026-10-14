@@ -67,6 +67,7 @@ def test_ambi_inner_comparison_defaults_canonicalize_scientific_lineage():
     assert omitted_projection == scientific_trial_parameters(explicit)
     assert omitted_projection["alg_params"] == {
         "batch_size": 256,
+        "critic_ensemble_backend": "vmap",
         "inner_finite_horizon": False,
         "inner_steps_per_update": None,
         "inner_outer_replay_fraction": 0.0,
@@ -302,7 +303,9 @@ def test_pre_lora_rl_lineage_projection_hashes_are_unchanged(
 ):
     # These hashes were captured before adding lora_rl. Raw dense configurations
     # sometimes contained inactive adapter defaults and must keep their lineage.
+    # Historical runs used loop critics; the current default is now vmap.
     trial = _lora_trial({
+        "critic_ensemble_backend": "loop",
         "inner_operator": "sac",
         "inner_actor_adaptation": adaptation,
         "inner_critic_adaptation": adaptation,

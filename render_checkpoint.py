@@ -23,28 +23,23 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 import domains  # noqa: F401  # Register project environments before build_env/gym.make.
+from utils.checkpoint_context import (
+    CheckpointContext as RenderContext,
+    CheckpointContextError as RenderCheckpointError,
+    load_checkpoint_context,
+    load_json_object as _load_json_object,
+    validate_context_params as _validate_context_params,
+)
+from utils.aux_return_identity import AUX_RETURN_SOURCE_DEFAULTS, auxiliary_return_routing
 from utils.cleanup import add_cleanup_notes, raise_cleanup_errors
 from utils.core import build_env, initialize_alg
 
 
-METADATA_SCHEMA_VERSION = 1
 _MAX_NUMPY_SEED = 2**32 - 1
 _NATIVE_SAC = "SAC/SAC"
 _TDMPC2 = "TDMPC2/TDMPC2Baseline"
 _AMBI_TDMPC2 = "AMBITDMPC2/AMBITDMPC2"
 _SB3_REPLAY_ALGORITHMS = {"DDPG", "DQN", "SAC", "TD3"}
-
-
-class RenderCheckpointError(RuntimeError):
-    """An actionable checkpoint rendering error."""
-
-
-@dataclass(frozen=True)
-class RenderContext:
-    trial_run_params: dict[str, Any]
-    experiment_params: dict[str, Any]
-    source: Path
-    metadata: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +91,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Sample actions instead of using deterministic inference.",
     )
+    for key in AUX_RETURN_SOURCE_DEFAULTS:
+        choices = ("sac", "return_actor") if "actor" in key else ("sac", "aux_return")
+        parser.add_argument(
+            "--" + key.replace("_", "-"), choices=choices,
+            help="Override this AMBI source for rendering; requires matching learned checkpoint modules.",
+        )
     parser.add_argument(
         "--max-steps",
         type=int,
@@ -124,112 +125,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _load_json_object(path: Path, description: str) -> dict[str, Any]:
-    try:
-        with path.open("r", encoding="utf-8") as stream:
-            value = json.load(stream)
-    except FileNotFoundError as exc:
-        raise RenderCheckpointError(f"{description} does not exist: {path}") from exc
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RenderCheckpointError(f"Could not read {description} {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise RenderCheckpointError(
-            f"Malformed {description} {path}: expected a JSON object."
-        )
-    return value
-
-
 def _is_int(value: object) -> bool:
     return isinstance(value, Integral) and not isinstance(value, bool)
-
-
-def _validate_sidecar(metadata: dict[str, Any], path: Path) -> RenderContext:
-    version = metadata.get("schema_version")
-    if not _is_int(version) or int(version) != METADATA_SCHEMA_VERSION:
-        raise RenderCheckpointError(
-            f"Unsupported checkpoint metadata schema_version={version!r} in {path}; "
-            f"expected {METADATA_SCHEMA_VERSION}."
-        )
-
-    run_params = metadata.get("trial_run_params")
-    experiment_params = metadata.get("experiment_params")
-    checkpoint = metadata.get("checkpoint")
-    if not isinstance(run_params, dict):
-        raise RenderCheckpointError(
-            f"Malformed checkpoint metadata {path}: trial_run_params must be an object."
-        )
-    if not isinstance(experiment_params, dict):
-        raise RenderCheckpointError(
-            f"Malformed checkpoint metadata {path}: experiment_params must be an object."
-        )
-    if not isinstance(checkpoint, dict):
-        raise RenderCheckpointError(
-            f"Malformed checkpoint metadata {path}: checkpoint must be an object."
-        )
-
-    kind = checkpoint.get("kind")
-    step = checkpoint.get("step")
-    episode = checkpoint.get("episode")
-    best_score = checkpoint.get("best_score")
-    best_window = checkpoint.get("best_window")
-    if not isinstance(kind, str) or not kind:
-        raise RenderCheckpointError(
-            f"Malformed checkpoint metadata {path}: checkpoint.kind must be a non-empty string."
-        )
-    if not _is_int(step) or int(step) < 0:
-        raise RenderCheckpointError(
-            f"Malformed checkpoint metadata {path}: checkpoint.step must be non-negative."
-        )
-    if not _is_int(episode) or int(episode) < 0:
-        raise RenderCheckpointError(
-            f"Malformed checkpoint metadata {path}: checkpoint.episode must be non-negative."
-        )
-    if best_score is not None and (
-        isinstance(best_score, bool)
-        or not isinstance(best_score, Real)
-        or not math.isfinite(float(best_score))
-    ):
-        raise RenderCheckpointError(
-            f"Malformed checkpoint metadata {path}: checkpoint.best_score must be finite or null."
-        )
-    if not _is_int(best_window) or int(best_window) <= 0:
-        raise RenderCheckpointError(
-            f"Malformed checkpoint metadata {path}: checkpoint.best_window must be positive."
-        )
-
-    _validate_context_params(run_params, experiment_params, path)
-    return RenderContext(
-        trial_run_params=copy.deepcopy(run_params),
-        experiment_params=copy.deepcopy(experiment_params),
-        source=path,
-        metadata=copy.deepcopy(metadata),
-    )
-
-
-def _validate_context_params(
-    run_params: Mapping[str, Any],
-    experiment_params: Mapping[str, Any],
-    source: Path,
-) -> None:
-    algorithm = run_params.get("alg")
-    if not isinstance(algorithm, str) or not algorithm:
-        raise RenderCheckpointError(
-            f"Configuration from {source} is missing a non-empty trial_run_params.alg."
-        )
-    if not isinstance(run_params.get("env"), str) or not run_params.get("env"):
-        raise RenderCheckpointError(
-            f"Configuration from {source} is missing a non-empty trial_run_params.env."
-        )
-    if not isinstance(run_params.get("alg_params", {}), dict):
-        raise RenderCheckpointError(
-            f"Configuration from {source} has a non-object trial_run_params.alg_params."
-        )
-    if "env_params" in experiment_params and not isinstance(
-        experiment_params["env_params"], dict
-    ):
-        raise RenderCheckpointError(
-            f"Configuration from {source} has a non-object experiment_params.env_params."
-        )
 
 
 def _find_experiment_root(checkpoint: Path) -> Path | None:
@@ -295,10 +192,7 @@ def resolve_render_context(
         )
 
     if metadata_path is not None:
-        path = Path(metadata_path).expanduser().resolve()
-        return _validate_sidecar(
-            _load_json_object(path, "checkpoint metadata"), path
-        )
+        return load_checkpoint_context(checkpoint, metadata_path)
 
     if has_trial:
         trial_path = Path(trial_settings).expanduser().resolve()
@@ -318,9 +212,7 @@ def resolve_render_context(
     if adjacent.exists():
         # A present sidecar is authoritative.  Never hide stale/corrupt metadata
         # by silently falling back to a legacy directory.
-        return _validate_sidecar(
-            _load_json_object(adjacent, "checkpoint metadata"), adjacent
-        )
+        return load_checkpoint_context(checkpoint)
 
     experiment_root = _find_experiment_root(checkpoint)
     if experiment_root is None:
@@ -384,12 +276,20 @@ def _prepare_run_params(
     backend: str,
     device: str,
     controller_seed: int,
+    source_overrides: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     run_params = copy.deepcopy(context.trial_run_params)
     experiment_params = copy.deepcopy(context.experiment_params)
     alg_params = run_params.setdefault("alg_params", {})
     if not isinstance(alg_params, dict):
         raise RenderCheckpointError("alg_params must be an object.")
+    if source_overrides:
+        if backend != "ambi_tdmpc2":
+            raise RenderCheckpointError("Actor/critic source overrides require an AMBI checkpoint.")
+        unknown = set(source_overrides) - set(AUX_RETURN_SOURCE_DEFAULTS)
+        if unknown:
+            raise RenderCheckpointError(f"Unknown actor/critic source overrides: {sorted(unknown)}.")
+        alg_params.update(source_overrides)
 
     run_params["device"] = str(device)
     run_params["seed"] = int(controller_seed)
@@ -888,6 +788,7 @@ def _results_payload(
     deterministic: bool,
     max_steps: int | None,
     results: Sequence[EpisodeResult],
+    effective_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     returns = [float(result.episode_return) for result in results]
     lengths = [int(result.length) for result in results]
@@ -935,6 +836,12 @@ def _results_payload(
         payload["checkpoint_metadata"] = copy.deepcopy(
             context.metadata.get("checkpoint", {})
         )
+    routing = auxiliary_return_routing(
+        effective_config if effective_config is not None
+        else context.trial_run_params.get("alg_params", {})
+    )
+    if routing is not None:
+        payload["value_routing"] = routing
     return payload
 
 
@@ -997,6 +904,10 @@ def render_checkpoint(
     metadata_path: Path | None = None,
     trial_settings: Path | None = None,
     experiment_settings: Path | None = None,
+    inner_actor_source: str | None = None,
+    inner_critic_source: str | None = None,
+    inner_horizon_actor_source: str | None = None,
+    inner_horizon_critic_source: str | None = None,
     overwrite: bool = False,
 ) -> list[EpisodeResult]:
     """Load one checkpoint and run complete deterministic or sampled rollouts."""
@@ -1024,6 +935,12 @@ def render_checkpoint(
         backend=backend,
         device=device,
         controller_seed=first_seed,
+        source_overrides={key: value for key, value in {
+            "inner_actor_source": inner_actor_source,
+            "inner_critic_source": inner_critic_source,
+            "inner_horizon_actor_source": inner_horizon_actor_source,
+            "inner_horizon_critic_source": inner_horizon_critic_source,
+        }.items() if value is not None},
     )
     resolved_video_dir = (
         None if video_dir is None else Path(video_dir).expanduser().resolve()
@@ -1090,6 +1007,8 @@ def render_checkpoint(
                     deterministic=not stochastic,
                     max_steps=max_steps,
                     results=results,
+                    effective_config=(vars(model.cfg) if hasattr(model, "cfg")
+                                      else run_params.get("alg_params", {})),
                 ),
                 overwrite=overwrite,
             )
@@ -1124,6 +1043,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             metadata_path=args.metadata,
             trial_settings=args.trial_settings,
             experiment_settings=args.experiment_settings,
+            inner_actor_source=args.inner_actor_source,
+            inner_critic_source=args.inner_critic_source,
+            inner_horizon_actor_source=args.inner_horizon_actor_source,
+            inner_horizon_critic_source=args.inner_horizon_critic_source,
             overwrite=args.overwrite,
         )
     except RenderCheckpointError as exc:
