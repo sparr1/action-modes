@@ -116,6 +116,18 @@ for both the GPU smoke job and its dependent training array to select J8, with
 a separate `AMBI_TRANSFER_OUTPUT` directory. The gate binds the selected manifest
 and its configurations to the pinned commit; a J6 gate cannot authorize J8.
 
+For a short CPU-allocation comparison, run
+`python slurm/benchmark_ambi_training_cpu.py --output /absolute/scratch/directory`
+inside one Slurm allocation with a GPU, eight physical CPU cores
+(`--cpus-per-task=8 --hint=nomultithread`) and 32 GB RAM. It measures the J8 H3
+Bernoulli recipe in separate 1/2/4/8-core subprocesses using the same GPU and
+seed. Each case excludes 20 active warmup decisions, then measures 128 complete
+training decisions including the environment, replay and outer updates. JSON
+results include throughput, controller latency, CPU occupancy and per-decision
+timings; W&B and checkpoints are disabled. This early-replay screen excludes
+long-run logging, periodic diagnostics and checkpoint costs. It does not change
+the training recipes or establish a production walltime guarantee.
+
 ### Optional random inner initialization
 
 Set `inner_actor_initialization="random"` and/or
