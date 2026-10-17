@@ -7,7 +7,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.func import functional_call
 
-from .compile_regions import _capture_rng_state, _restore_rng_state
+from .compile_regions import (
+	_capture_rng_state, _preserve_host_rng_state, _restore_rng_state,
+)
+from .ensemble_vmap import ensemble_vmap_spec, vectorized_forward
 
 
 _DETACHED_PARAMETER_VIEWS = weakref.WeakKeyDictionary()
@@ -33,13 +36,16 @@ class Ensemble(nn.Module):
 	"""
 	Q-function ensemble.
 
-	The official TD-MPC2 code vectorizes this with newer tensordict helpers.
-	AMBI keeps the same ensemble semantics with a plain ModuleList so the
-	vendored core works on older torch/tensordict stacks.
+	Parameters remain in an ordinary ModuleList for checkpoint compatibility.
+	The vmap backend batches supported dense heads without changing ownership;
+	custom heads and LoRA adapters retain their ordinary module execution.
 	"""
 
-	def __init__(self, modules, **kwargs):
+	def __init__(self, modules, *, backend="loop", **kwargs):
 		super().__init__()
+		if backend not in ("loop", "vmap"):
+			raise ValueError("Ensemble backend must be 'loop' or 'vmap'.")
+		self._backend = backend
 		self.modules_list = nn.ModuleList(modules)
 		self._repr = str(modules[0])
 		self._compile_enabled = False
@@ -66,6 +72,7 @@ class Ensemble(nn.Module):
 		object.__setattr__(self, "_compiled_forward", None)
 		object.__setattr__(self, "_compiled_detached_forward", None)
 		for name, default in (
+			("_backend", "loop"),
 			("_compile_enabled", False),
 			("_compile_strict", False),
 			("_compile_failed", False),
@@ -76,6 +83,11 @@ class Ensemble(nn.Module):
 
 	def __len__(self):
 		return len(self.modules_list)
+
+	@property
+	def backend(self):
+		"""Requested backend; unsupported custom heads always use their module loop."""
+		return self._backend
 
 	def __iter__(self):
 		return iter(self.modules_list)
@@ -92,7 +104,25 @@ class Ensemble(nn.Module):
 		return result
 
 	def _forward_eager(self, *args, **kwargs):
+		if self._backend == "vmap" and len(args) == 1 and not kwargs:
+			spec = ensemble_vmap_spec(self.modules_list, NormedLinear)
+			if spec is not None:
+				return vectorized_forward(self.modules_list, args[0], spec)
 		return torch.stack([m(*args, **kwargs) for m in self.modules_list], dim=0)
+
+	def forward_heads_eager(self, inputs):
+		"""Evaluate independent head inputs eagerly, including higher derivatives.
+
+		``inputs`` has shape [heads, ..., features]. This bypasses compiled
+		wrappers so PAVE can differentiate each head's own action coordinates.
+		"""
+		if inputs.ndim < 2 or inputs.shape[0] != len(self.modules_list):
+			raise ValueError("Independent inputs require one leading row per critic head.")
+		if self._backend == "vmap":
+			spec = ensemble_vmap_spec(self.modules_list, NormedLinear)
+			if spec is not None:
+				return vectorized_forward(self.modules_list, inputs, spec, head_inputs=True)
+		return torch.stack([module(inputs[index]) for index, module in enumerate(self.modules_list)], dim=0)
 
 	def enable_compile(self, *, strict=False):
 		"""Compile the fixed ensemble forward while retaining state-dict keys."""
@@ -181,7 +211,8 @@ class Ensemble(nn.Module):
 			_restore_rng_state(construction_rng_snapshot)
 			object.__setattr__(self, "_compiled_forward", compiled)
 		try:
-			result = compiled(*args, **kwargs)
+			with _preserve_host_rng_state():
+				result = compiled(*args, **kwargs)
 		except Exception as exc:
 			if self._compile_strict:
 				raise
@@ -192,6 +223,10 @@ class Ensemble(nn.Module):
 
 	def _forward_detached_eager(self, *args, **kwargs):
 		"""Evaluate Qs with frozen Q parameters while preserving input gradients."""
+		if self._backend == "vmap" and len(args) == 1 and not kwargs:
+			spec = ensemble_vmap_spec(self.modules_list, NormedLinear)
+			if spec is not None:
+				return vectorized_forward(self.modules_list, args[0], spec, detached=True)
 		compiling = (
 			hasattr(torch, "compiler")
 			and hasattr(torch.compiler, "is_compiling")
@@ -280,7 +315,8 @@ class Ensemble(nn.Module):
 			_restore_rng_state(construction_rng_snapshot)
 			object.__setattr__(self, "_compiled_detached_forward", compiled)
 		try:
-			result = compiled(*args, **kwargs)
+			with _preserve_host_rng_state():
+				result = compiled(*args, **kwargs)
 		except Exception as exc:
 			if self._compile_strict:
 				raise

@@ -646,6 +646,8 @@ class TDMPC2Baseline(Algorithm):
         )
         self._eval_csv_initialized = False
         self._paired_controller_evaluator = None
+        self._outer_policy_recorder = None
+        self._outer_policy_recorder_state = None
 
         print("Architecture:", self.agent.model)
 
@@ -2098,6 +2100,35 @@ class TDMPC2Baseline(Algorithm):
             return resume_session.clean_handoff(self, generation)
         return None
 
+    def _start_outer_policy_diagnostics(self, observation):
+        if not bool(getattr(self.cfg, "outer_policy_diagnostics", False)):
+            return
+        if self._outer_policy_recorder is not None:
+            return
+        from pathlib import Path
+        import tempfile
+        from utils.outer_policy_diagnostics import OuterPolicyDiagnostics
+
+        tracker = self._checkpointing
+        if isinstance(tracker, CheckpointTracker):
+            directory = tracker.save_path / f"{tracker.name_prefix}_outer_diagnostics"
+        elif isinstance(tracker, tuple):
+            directory = Path(tracker[1]) / f"{tracker[2]}_outer_diagnostics"
+        else:
+            directory = Path(tempfile.mkdtemp(prefix="ambi-outer-diagnostics-"))
+        self._outer_policy_recorder = OuterPolicyDiagnostics(
+            self.cfg, directory, state=self._outer_policy_recorder_state,
+        )
+        self._outer_policy_recorder_state = None
+        print(f"Outer policy diagnostics: {directory}", flush=True)
+        if self._global_step == 0 and observation is not None:
+            obs_t = self._obs_to_tensor(observation)
+            self._outer_policy_recorder.observe(obs_t, 0)
+            self._outer_policy_recorder.probe(
+                self.agent, env_step=0, updates=0, phase="initialization",
+                run=self._wandb_run, observation=obs_t,
+            )
+
     def _run_training_episode(self, obs, total_timesteps, *, eval_pending):
         """Run the one shared environment-step/update loop to a safe boundary."""
 
@@ -2122,11 +2153,14 @@ class TDMPC2Baseline(Algorithm):
                 planned=planned,
                 action_seconds=time.perf_counter() - action_start,
             )
+            recorder = getattr(self, "_outer_policy_recorder", None)
 
             action_env = self._unscale_action(action_norm)
             next_obs, reward, terminated, truncated, info = self.env.step(
                 action_env
             )
+            if recorder is not None:
+                recorder.action(action_norm, prior=planned)
             done = bool(terminated or truncated)
             true_terminated = bool(terminated)
             next_obs_t = self._reuse_observation_tensor(next_obs)
@@ -2139,6 +2173,8 @@ class TDMPC2Baseline(Algorithm):
             )
             episode_rows += 1
             self._global_step += 1
+            if recorder is not None:
+                recorder.observe(next_obs_t, self._global_step)
             if (
                 self._eval_freq is not None
                 and self._global_step % self._eval_freq == 0
@@ -2168,17 +2204,42 @@ class TDMPC2Baseline(Algorithm):
                 num_updates = (
                     self.cfg.pretrain_steps if not self._pretrained else self.cfg.utd
                 )
+                pretraining = not self._pretrained
                 if not self._pretrained:
+                    if recorder is not None:
+                        recorder.probe(self.agent, env_step=self._global_step,
+                                       updates=self._num_updates, phase="pretrain_before", run=self._wandb_run)
                     print("Pretraining TD-MPC2 on seed data...")
                     self._pretrained = True
                 burst_metrics = _DeviceMeanAccumulator()
                 train_start = time.perf_counter()
-                for _ in range(num_updates):
-                    train_metrics = self.agent.update(self.buffer)
+                diagnostic_before = sum(recorder.timing.values()) if recorder is not None else 0.
+                for update_index in range(num_updates):
+                    force_diagnostic = (pretraining or self._global_step == total_timesteps) and update_index == num_updates - 1
+                    if recorder is not None:
+                        self.agent._outer_policy_diagnostics_force = force_diagnostic
+                    try:
+                        train_metrics = self.agent.update(self.buffer)
+                    finally:
+                        if recorder is not None:
+                            self.agent._outer_policy_diagnostics_force = False
                     self._num_updates += 1
                     burst_metrics.update(train_metrics)
                     self._accumulate_train_metrics(train_metrics)
-                self._wandb_train_seconds += time.perf_counter() - train_start
+                    if recorder is not None:
+                        packet = self.agent.drain_outer_policy_diagnostics()
+                        phase = "pretrain_after" if pretraining and force_diagnostic else (
+                            "pretraining" if pretraining else "training"
+                        )
+                        if force_diagnostic and self._global_step == total_timesteps:
+                            phase = "final"
+                        if packet is not None:
+                            recorder.learner(packet, env_step=self._global_step,
+                                             updates=self._num_updates, phase=phase, run=self._wandb_run)
+                            recorder.probe(self.agent, env_step=self._global_step,
+                                           updates=self._num_updates, phase=phase, run=self._wandb_run)
+                diagnostic_elapsed = sum(recorder.timing.values()) - diagnostic_before if recorder is not None else 0.
+                self._wandb_train_seconds += max(0., time.perf_counter() - train_start - diagnostic_elapsed)
                 self._last_train_metrics = burst_metrics.snapshot()
 
             self._log_wandb_step(
@@ -2208,11 +2269,23 @@ class TDMPC2Baseline(Algorithm):
             self._resume_phase == "before_initial_seeded_reset"
             and self._eval_pending
         ):
+            # A prior segment may have committed its final training state and
+            # then failed during artifact publication. Restore the saved trace
+            # before retrying final publication, without a simulator reset.
+            self._start_outer_policy_diagnostics(None)
+            recorder = self._outer_policy_recorder
+            if recorder is not None:
+                recorder.finish(self.agent, env_step=self._global_step,
+                                updates=self._num_updates, run=self._wandb_run,
+                                publish_artifact=False)
             generation = (
                 resume_session.publish(self, reason="target-recovery")
                 if resume_session.mode == "required"
                 else resume_session.last_generation
             )
+            if recorder is not None:
+                recorder.attach(self._wandb_run, env_step=self._global_step,
+                                updates=self._num_updates)
             return None, resume_session.complete(self, generation)
 
         phase = self._resume_phase
@@ -2265,6 +2338,11 @@ class TDMPC2Baseline(Algorithm):
         """Commit/evaluate one completed episode before the next reset."""
 
         if self._global_step == total_timesteps:
+            recorder = getattr(self, "_outer_policy_recorder", None)
+            if recorder is not None:
+                recorder.finish(self.agent, env_step=self._global_step,
+                                updates=self._num_updates, run=self._wandb_run,
+                                publish_artifact=False)
             self._final_checkpoint()
         self._episode_idx += 1
         self._episode_return = 0.0
@@ -2277,6 +2355,12 @@ class TDMPC2Baseline(Algorithm):
                 self._eval_pending = False
                 self._prepare_resume_boundary()
             generation = resume_session.publish(self, reason="target")
+            recorder = self._outer_policy_recorder
+            if recorder is not None:
+                # The diagnostic artifact must not get ahead of the durable
+                # training state and its committed W&B event journal.
+                recorder.attach(self._wandb_run, env_step=self._global_step,
+                                updates=self._num_updates)
             return None, resume_session.complete(self, generation)
 
         drain = resume_session.drain_requested()
@@ -2329,6 +2413,7 @@ class TDMPC2Baseline(Algorithm):
             )
             if result is not None:
                 return result
+            self._start_outer_policy_diagnostics(obs)
             while self._global_step < total_timesteps:
                 completed, self._eval_pending = self._run_training_episode(
                     obs,
@@ -2348,6 +2433,17 @@ class TDMPC2Baseline(Algorithm):
             raise AssertionError("Resumable loop exited without a boundary result.")
         except BaseException as primary_error:
             failed = True
+            if self._outer_policy_recorder is not None:
+                try:
+                    # Keep a complete local trace even if the resumable W&B
+                    # owner must abort its journal after this failure.
+                    self._outer_policy_recorder.finish(
+                        self.agent, env_step=self._global_step,
+                        updates=self._num_updates, run=None, failed=True,
+                    )
+                except BaseException as cleanup_error:
+                    add_cleanup_notes(primary_error, (cleanup_error,),
+                                      prefix="Additional diagnostic cleanup failure")
             resume_session.abort_wandb(self, primary_error)
             try:
                 self._checkpoint_writer.shutdown()
@@ -2386,6 +2482,7 @@ class TDMPC2Baseline(Algorithm):
         try:
             self._reset_wandb_window()
             obs, _ = self._reset_env(seed=self.cfg.seed)
+            self._start_outer_policy_diagnostics(obs)
             if self._eval_freq is not None:
                 self._prepare_eval_csv()
                 # Reuse the authoritative seeded reset as evaluation episode
@@ -2416,6 +2513,13 @@ class TDMPC2Baseline(Algorithm):
             primary_error = exc
             raise
         finally:
+            recorder = getattr(self, "_outer_policy_recorder", None)
+            if recorder is not None:
+                try:
+                    recorder.finish(self.agent, env_step=self._global_step, updates=self._num_updates,
+                                    run=self._wandb_run, failed=primary_error is not None)
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
             if self._wandb_run is not None:
                 try:
                     self._log_wandb_step(

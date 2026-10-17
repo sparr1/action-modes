@@ -36,6 +36,7 @@ class MPPIModelCallbacks:
         dynamics(z, action) -> next_z
         reward(z, action) -> scalar_reward
         policy(z, *, generator) -> action | (action, info)
+        terminal_policy(z, *, generator) -> action | (action, info)  # optional
         terminal_q(z, action, *, reduction, generator) -> scalar_q
         termination(z) -> probability  # optional
         transition(z, action) -> (next_z, scalar_reward)  # optional fused path
@@ -48,6 +49,8 @@ class MPPIModelCallbacks:
     terminal_q: Callable[..., torch.Tensor]
     termination: Optional[Callable[..., torch.Tensor]] = None
     transition: Optional[Callable[..., tuple[torch.Tensor, torch.Tensor]]] = None
+    # Without an override, one policy supplies candidates and terminal actions.
+    terminal_policy: Optional[Callable[..., Any]] = None
 
 
 @dataclass(frozen=True)
@@ -121,8 +124,9 @@ def _as_scalar_column(value, batch_size, *, name, like):
     return value
 
 
-def _policy_action(callbacks, z, generator):
-    output = callbacks.policy(z, generator=generator)
+def _policy_action(callbacks, z, generator, *, terminal=False):
+    policy = callbacks.terminal_policy if terminal else None
+    output = (policy or callbacks.policy)(z, generator=generator)
     action = output[0] if isinstance(output, (tuple, list)) else output
     if not torch.is_tensor(action):
         raise TypeError("MPPI policy callback must return a tensor or (tensor, info).")
@@ -323,7 +327,7 @@ def _estimate_value(
             )
             continuation = continuation * (termination <= termination_threshold).to(root_z.dtype)
 
-    terminal_action = _policy_action(callbacks, z, generator)
+    terminal_action = _policy_action(callbacks, z, generator, terminal=True)
     terminal_q = callbacks.terminal_q(
         z,
         terminal_action,

@@ -13,7 +13,10 @@ import torch
 import torch.nn as nn
 
 from . import init, layers, math
-from .q_representation import QRepresentation
+from .ensemble_vmap import grouped_vmap_spec, grouped_vectorized_forward
+from .horizon_conditioning import pack_horizon_input
+from .q_representation import QRepresentation, SymexpTwoHotCodec
+from .value_semantics import ValueSpecification, reduce_components
 
 
 DEFAULT_LOG_STD_MAPPING = "direct_clamp"
@@ -43,7 +46,12 @@ class SoftWorldModel(nn.Module):
             raise NotImplementedError("AMBI-TD-MPC2 currently supports single-task training only.")
 
         self.cfg = cfg
+        self.value_spec = ValueSpecification.from_config(cfg)
         self.q_backend = QRepresentation.from_config(cfg)
+        self.reward_codec = (
+            SymexpTwoHotCodec(cfg.num_bins, cfg.vmin, cfg.vmax)
+            if self.value_spec.is_split else None
+        )
         self._encoder = layers.enc(cfg)
         self._dynamics = layers.mlp(
             cfg.latent_dim + cfg.action_dim,
@@ -67,11 +75,12 @@ class SoftWorldModel(nn.Module):
                 layers.mlp(
                     cfg.latent_dim + cfg.action_dim,
                     2 * [cfg.mlp_dim],
-                    self.q_backend.output_dim,
+                    self.q_backend.output_dim * self.value_spec.num_components,
                     dropout=cfg.dropout,
                 )
                 for _ in range(self.q_backend.num_q)
-            ]
+            ],
+            backend=getattr(cfg, "critic_ensemble_backend", "loop"),
         )
 
         # Upstream's TensorDict critics retain nn.Linear's constructor samples.
@@ -80,6 +89,10 @@ class SoftWorldModel(nn.Module):
             if name != "_Qs":
                 module.apply(init.weight_init)
         init.zero_([self._reward[-1].weight] + [q[-1].weight for q in self._Qs])
+        if self.value_spec.is_split:
+            # The raw expectation is sensitive to asymmetric probability mass
+            # in the tails. Start new split heads at a symmetric distribution.
+            init.zero_([self._reward[-1].bias] + [q[-1].bias for q in self._Qs])
 
         self._log_std_min_value = float(cfg.log_std_min)
         self._log_std_max_value = float(cfg.log_std_max)
@@ -92,6 +105,29 @@ class SoftWorldModel(nn.Module):
             torch.tensor(self._log_std_max_value - self._log_std_min_value),
         )
         self.init()
+        if str(getattr(cfg, "aux_return_mode", "off")) != "off":
+            # Auxiliary construction must not change the original learner's
+            # initialization samples or subsequent default RNG stream.
+            with torch.random.fork_rng(devices=[]):
+                # torch.manual_seed also seeds CUDA; these modules are created
+                # on CPU and must not alter any CUDA generator.
+                torch.random.default_generator.manual_seed(int(getattr(cfg, "seed", 0)) + 104729)
+                self._aux_return_Qs = layers.Ensemble([
+                    layers.mlp(
+                        cfg.latent_dim + cfg.action_dim,
+                        2 * [cfg.mlp_dim], self.q_backend.output_dim,
+                        dropout=cfg.dropout,
+                    ) for _ in range(self.q_backend.num_q)
+                ], backend=getattr(cfg, "critic_ensemble_backend", "loop"))
+                init.zero_([q[-1].weight for q in self._aux_return_Qs])
+                self._target_aux_return_Qs = deepcopy(self._aux_return_Qs)
+                self._target_aux_return_Qs.requires_grad_(False)
+                self._target_aux_return_Qs.train(False)
+                if cfg.aux_return_mode == "return_actor":
+                    self._return_pi = layers.mlp(
+                        cfg.latent_dim, 2 * [cfg.mlp_dim], 2 * cfg.action_dim,
+                    )
+                    self._return_pi.apply(init.weight_init)
 
     def init(self):
         """Create a frozen EMA target critic."""
@@ -156,6 +192,8 @@ class SoftWorldModel(nn.Module):
     def train(self, mode=True):
         super().train(mode)
         self._target_Qs.train(False)
+        if hasattr(self, "_target_aux_return_Qs"):
+            self._target_aux_return_Qs.train(False)
         return self
 
     @torch.no_grad()
@@ -169,6 +207,86 @@ class SoftWorldModel(nn.Module):
             torch._foreach_lerp_(target_parameters, online_parameters, tau)
         for target_buffer, buffer in zip(self._target_Qs.buffers(), self._Qs.buffers()):
             target_buffer.copy_(buffer)
+        if hasattr(self, "_aux_return_Qs"):
+            target_parameters = tuple(self._target_aux_return_Qs.parameters())
+            online_parameters = tuple(self._aux_return_Qs.parameters())
+            if tau == 1.0:
+                torch._foreach_copy_(target_parameters, online_parameters)
+            elif tau != 0.0:
+                torch._foreach_lerp_(target_parameters, online_parameters, tau)
+            for target_buffer, buffer in zip(
+                self._target_aux_return_Qs.buffers(), self._aux_return_Qs.buffers()
+            ):
+                target_buffer.copy_(buffer)
+
+    def _joint_q_ensembles(self, target):
+        if target:
+            return self._target_Qs, self._target_aux_return_Qs
+        return self._Qs, self._aux_return_Qs
+
+    def joint_q_compatible(self, *, target=False):
+        """Preflight both dense ensembles without tensor work or random draws."""
+        return self.joint_q_spec(target=target) is not None
+
+    def joint_q_spec(self, *, target=False):
+        """Return the eager-validated layout to pass into compiled tensor regions."""
+        if self.value_spec.is_split or not hasattr(self, "_aux_return_Qs"):
+            return None
+        return grouped_vmap_spec(
+            self._joint_q_ensembles(target), layers.NormedLinear,
+        )
+
+    def joint_q_predictions(
+        self, z, action, aux_z, aux_action, *, target=False, specifications=None,
+    ):
+        """Batch independent primary/return heads, keeping their outputs separate.
+
+        The caller selects this path before sampling. Unsupported layouts are
+        never retried here, and all parameters remain in their original modules.
+        """
+        primary_input = self.joint_input(z, action)
+        auxiliary_input = (
+            primary_input if aux_z is z and aux_action is action
+            else self.joint_input(aux_z, aux_action)
+        )
+        return self.joint_q_predictions_from_joint(
+            primary_input, auxiliary_input, target=target, specifications=specifications,
+        )
+
+    def joint_q_predictions_from_joint(
+        self, primary_input, auxiliary_input, *, target=False, specifications=None,
+    ):
+        """Use already packed inputs, shared with the reward model when possible."""
+        ensembles = self._joint_q_ensembles(target)
+        if specifications is None:
+            specifications = grouped_vmap_spec(ensembles, layers.NormedLinear)
+        if specifications is None:
+            raise ValueError("Joint critic vmap requires compatible dense ensembles.")
+        return grouped_vectorized_forward(
+            ensembles, (primary_input, auxiliary_input), specifications,
+        )
+
+    def aux_return_q_predictions(self, z, action, *, target=False, detach=False):
+        """Evaluate the independent, reward-only ensemble without split layout."""
+        if target and detach:
+            raise ValueError("target=True cannot be combined with detach=True.")
+        ensemble = self._target_aux_return_Qs if target else self._aux_return_Qs
+        joint = self.joint_input(z, action)
+        return ensemble.forward_detached(joint) if detach else ensemble(joint)
+
+    def aux_return_Q(
+        self, z, action, *, target=False, detach=False, reduction="min_pair",
+        pair_indices=None, generator=None, trusted_pair_indices=False,
+    ):
+        """Decode and reduce auxiliary reward returns in their own ensemble."""
+        predictions = self.aux_return_q_predictions(
+            z, action, target=target, detach=detach,
+        )
+        return self.q_backend.reduce(
+            self.q_backend.decode(predictions), reduction,
+            pair_indices=pair_indices, generator=generator,
+            trusted_pair_indices=trusted_pair_indices,
+        )
 
     def encode(self, obs, task=None):
         if task is not None:
@@ -202,6 +320,33 @@ class SoftWorldModel(nn.Module):
             raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
         return self.reward_from_joint(self.joint_input(z, a))
 
+    def encode_reward(self, target):
+        """Encode observed rewards with the model's declared numeric codec."""
+        if self.reward_codec is not None:
+            return self.reward_codec.encode_target(target)
+        return math.two_hot(target, self.cfg)
+
+    def decode_reward(self, predictions, *, support=None):
+        """Decode reward predictions, retaining exact legacy arithmetic."""
+        if self.reward_codec is not None:
+            return self.reward_codec.decode(predictions)
+        if support is None:
+            return math.two_hot_inv(predictions, self.cfg)
+        return math.two_hot_inv(predictions, self.cfg, support=support)
+
+    def reward_loss(self, predictions, target, *, reduction="none"):
+        """Regress rewards using the same support and mean convention as decode."""
+        if self.reward_codec is not None:
+            return self.reward_codec.loss(predictions, target, reduction=reduction)
+        losses = math.soft_ce(predictions, target, self.cfg)
+        if reduction == "none":
+            return losses
+        if reduction == "mean":
+            return losses.mean()
+        if reduction == "sum":
+            return losses.sum()
+        raise ValueError(f"Unknown reward loss reduction: {reduction!r}.")
+
     def termination(self, z, task=None, unnormalized=False):
         if task is not None:
             raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
@@ -224,6 +369,7 @@ class SoftWorldModel(nn.Module):
         log_std_min=None,
         log_std_max=None,
         log_std_mapping=None,
+        remaining_horizon=None,
     ):
         """Return policy parameters and one isolated standard-normal sample."""
         mean_raw, log_std = self._policy_parameters(
@@ -235,6 +381,7 @@ class SoftWorldModel(nn.Module):
             log_std_min=log_std_min,
             log_std_max=log_std_max,
             log_std_mapping=log_std_mapping,
+            remaining_horizon=remaining_horizon,
         )
         if noise is not None and generator is not None:
             raise ValueError("Specify either policy noise or a generator, not both.")
@@ -269,11 +416,13 @@ class SoftWorldModel(nn.Module):
         log_std_min=None,
         log_std_max=None,
         log_std_mapping=None,
+        remaining_horizon=None,
     ):
         """Return the policy's differentiable pre-tanh Gaussian parameters."""
         if task is not None:
             raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
         policy = self._pi if policy is None else policy
+        policy_input = pack_horizon_input(policy, z, remaining_horizon)
 
         std_scale = float(std_scale)
         if not 0.0 < std_scale < float("inf"):
@@ -282,9 +431,9 @@ class SoftWorldModel(nn.Module):
         # Detached policy probes are evaluated eagerly outside the compiled
         # TOLD kernel; the default path keeps existing compiled callers intact.
         policy_output = (
-            layers.detached_module_forward(policy, z)
+            layers.detached_module_forward(policy, policy_input)
             if detach_policy
-            else policy(z)
+            else policy(policy_input)
         )
         mean_raw, log_std = policy_output.chunk(2, dim=-1)
         lower_bound = (
@@ -330,6 +479,7 @@ class SoftWorldModel(nn.Module):
         log_std_min=None,
         log_std_max=None,
         log_std_mapping=None,
+        remaining_horizon=None,
     ):
         """Return differentiable squashed-Gaussian statistics without sampling."""
         mean_raw, log_std = self._policy_parameters(
@@ -341,6 +491,7 @@ class SoftWorldModel(nn.Module):
             log_std_min=log_std_min,
             log_std_max=log_std_max,
             log_std_mapping=log_std_mapping,
+            remaining_horizon=remaining_horizon,
         )
         return {
             "mean": torch.tanh(mean_raw),
@@ -458,6 +609,7 @@ class SoftWorldModel(nn.Module):
         log_std_min=None,
         log_std_max=None,
         log_std_mapping=None,
+        remaining_horizon=None,
     ):
         """Sample only an action, omitting policy statistics and log-probability."""
         mean_raw, log_std, eps = self._policy_sample(
@@ -472,6 +624,7 @@ class SoftWorldModel(nn.Module):
             log_std_min=log_std_min,
             log_std_max=log_std_max,
             log_std_mapping=log_std_mapping,
+            remaining_horizon=remaining_horizon,
         )
         return torch.tanh(mean_raw + eps * log_std.exp())
 
@@ -490,6 +643,7 @@ class SoftWorldModel(nn.Module):
         log_std_max=None,
         log_std_mapping=None,
         include_scaled_entropy=False,
+        remaining_horizon=None,
     ):
         """Sample once, optionally also returning literal TD-MPC2 scaled entropy."""
         mean_raw, log_std, eps = self._policy_sample(
@@ -504,6 +658,7 @@ class SoftWorldModel(nn.Module):
             log_std_min=log_std_min,
             log_std_max=log_std_max,
             log_std_mapping=log_std_mapping,
+            remaining_horizon=remaining_horizon,
         )
         log_prob = math.gaussian_logprob(eps, log_std)
         gaussian_log_prob = log_prob
@@ -524,7 +679,7 @@ class SoftWorldModel(nn.Module):
             )
         return action, info
 
-    def pi_tdmpc2(self, z, *, policy=None, generator=None, noise=None):
+    def pi_tdmpc2(self, z, *, policy=None, generator=None, noise=None, remaining_horizon=None):
         """Native TD-MPC2 actor information, without changing SAC's policy API.
 
         In particular, ``scaled_entropy`` uses the native pre-squash Gaussian
@@ -533,6 +688,7 @@ class SoftWorldModel(nn.Module):
         """
         mean_raw, log_std, eps = self._policy_sample(
             z, policy=policy, generator=generator, noise=noise,
+            remaining_horizon=remaining_horizon,
         )
         log_prob = math.gaussian_logprob(eps, log_std)
         scaled_log_prob = log_prob * eps.shape[-1]
@@ -549,7 +705,18 @@ class SoftWorldModel(nn.Module):
     @property
     def critic_signature(self):
         """Serializable critic architecture metadata for checkpoint preflight."""
-        return self.q_backend.signature.as_dict()
+        signature = self.q_backend.signature.as_dict()
+        if self.value_spec.is_split:
+            signature.update(self.value_spec.signature())
+            signature.update({
+                "q_value_codec": self.q_backend.value_codec.name,
+                "q_layout": "packed_component_bins_v1",
+                "reward_value_codec": self.reward_codec.name,
+                "reward_num_bins": self.reward_codec.num_bins,
+                "reward_vmin": self.reward_codec.vmin,
+                "reward_vmax": self.reward_codec.vmax,
+            })
+        return signature
 
     def q_predictions(
         self,
@@ -560,12 +727,14 @@ class SoftWorldModel(nn.Module):
         target=False,
         detach=False,
         qs=None,
+        remaining_horizon=None,
     ):
         """Return raw predictions from every selected critic head.
 
         Scalar critics return values with shape ``[num_q, ..., 1]``;
         distributional critics return logits with shape
-        ``[num_q, ..., q_num_bins]``.
+        ``[num_q, ..., q_num_bins]``. Split critics insert a component axis
+        immediately before the bins: ``[num_q, ..., components, q_num_bins]``.
         """
         if task is not None:
             raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
@@ -578,6 +747,7 @@ class SoftWorldModel(nn.Module):
             target=target,
             detach=detach,
             qs=qs,
+            remaining_horizon=remaining_horizon,
         )
 
     def q_predictions_from_joint(
@@ -587,10 +757,13 @@ class SoftWorldModel(nn.Module):
         target=False,
         detach=False,
         qs=None,
+        remaining_horizon=None,
     ):
         """Run critics on an already packed latent/action tensor."""
         if target and (detach or qs is not None):
             raise ValueError("target=True cannot be combined with detach=True or an explicit critic.")
+        ensemble = qs if qs is not None else (self._target_Qs if target else self._Qs)
+        q_input = pack_horizon_input(ensemble, q_input, remaining_horizon)
         if qs is not None:
             out = qs.forward_detached(q_input) if detach else qs(q_input)
         elif target:
@@ -599,9 +772,11 @@ class SoftWorldModel(nn.Module):
             out = self._Qs.forward_detached(q_input)
         else:
             out = self._Qs(q_input)
+        if self.value_spec.is_split:
+            out = out.reshape(*out.shape[:-1], self.value_spec.num_components, self.q_backend.output_dim)
         return out
 
-    def q_values(self, z, a, task=None, *, target=False, detach=False, qs=None):
+    def q_values(self, z, a, task=None, *, target=False, detach=False, qs=None, remaining_horizon=None):
         """Return decoded scalar values from every selected critic head."""
         predictions = self.q_predictions(
             z,
@@ -610,6 +785,7 @@ class SoftWorldModel(nn.Module):
             target=target,
             detach=detach,
             qs=qs,
+            remaining_horizon=remaining_horizon,
         )
         if getattr(self.cfg, "inner_operator", None) == "tdambi":
             # Native TD-MPC2 uses exp(abs(x)) - 1, whereas AMBI's backend
@@ -620,6 +796,22 @@ class SoftWorldModel(nn.Module):
     def critic_loss(self, predictions, scalar_target, *, reduction="mean"):
         """Compute MSE or two-hot cross entropy against one scalar target."""
         return self.q_backend.loss(predictions, scalar_target, reduction=reduction)
+
+    def project_values(self, values, *, projection=None, beta=None, weights=None):
+        """Select or compose named decoded values before scalar operations."""
+        return self.value_spec.project(values, projection=projection, beta=beta, weights=weights)
+
+    def reduce_components(
+        self, values, reduction, *, projection=None, beta=None, weights=None,
+        pair_indices=None, generator=None, trusted_pair_indices=False,
+    ):
+        """Gather all components from one ensemble member chosen by projection."""
+        return reduce_components(
+            values, self.q_backend, self.value_spec, reduction,
+            projection=projection, beta=beta, weights=weights,
+            pair_indices=pair_indices, generator=generator,
+            trusted_pair_indices=trusted_pair_indices,
+        )
 
     def Q(
         self,
@@ -635,6 +827,10 @@ class SoftWorldModel(nn.Module):
         pair_indices=None,
         generator=None,
         trusted_pair_indices=False,
+        projection=None,
+        beta=None,
+        weights=None,
+        remaining_horizon=None,
     ):
         """Evaluate critics and return decoded scalar Q-values.
 
@@ -652,7 +848,17 @@ class SoftWorldModel(nn.Module):
             target=target,
             detach=detach,
             qs=qs,
+            remaining_horizon=remaining_horizon,
         )
+        if self.value_spec.is_split:
+            # Validate explicit scalar semantics even for mean/all reductions.
+            projected = self.project_values(values, projection=projection, beta=beta, weights=weights)
+            return self.q_backend.reduce(
+                projected, reduction, pair_indices=pair_indices,
+                generator=generator, trusted_pair_indices=trusted_pair_indices,
+            )
+        if projection is not None or beta is not None or weights is not None:
+            raise ValueError("Explicit component projections require a split critic.")
         return self.q_backend.reduce(
             values,
             reduction,

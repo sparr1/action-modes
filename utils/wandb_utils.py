@@ -6,11 +6,13 @@ explicitly enabled with `wandb: true` in an algorithm config.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from numbers import Real
+from numbers import Integral, Real
+from pathlib import Path
 
 import numpy as np
 
@@ -32,6 +34,44 @@ DEFAULT_WANDB_PROJECT = "ambi"
 SUPPORTED_WANDB_MODES = frozenset(
     {"dryrun", "run", "offline", "online", "disabled", "shared"}
 )
+INTERNAL_EVENT_INDEX_KEY = "internal_event_index"
+OUTER_DIAGNOSTIC_UPDATE_KEY = "outer_diag/updates_completed"
+
+
+class EventIndexedWandbRun:
+    """Keep repeated environment-step events in a non-resumable W&B run.
+
+    Environment and learner progress are explicit custom axes. Only W&B's
+    internal history step uses this adapter's event counter. Exact training
+    resume continues to use ``CheckpointedWandbRun`` and its durable journal.
+    """
+
+    def __init__(self, run, *, wandb_module):
+        if not callable(getattr(run, "log", None)):
+            raise WandbCapabilityError("An event-indexed W&B run requires log().")
+        self._run = run
+        self._wandb_module = wandb_module
+        self._next_event_index = 0
+
+    @property
+    def raw_run(self):
+        return self._run
+
+    def log(self, payload: Mapping, *, env_step: int):
+        if isinstance(env_step, bool) or not isinstance(env_step, Integral) or env_step < 0:
+            raise ValueError("env_step must be a nonnegative integer.")
+        values = dict(payload)
+        if "env_step" in values and values["env_step"] != env_step:
+            raise ValueError("Payload env_step does not match the requested log step.")
+        if INTERNAL_EVENT_INDEX_KEY in values:
+            raise ValueError(f"{INTERNAL_EVENT_INDEX_KEY} is owned by the W&B event adapter.")
+        values["env_step"] = int(env_step)
+        values[INTERNAL_EVENT_INDEX_KEY] = self._next_event_index
+        self._run.log(values, step=self._next_event_index)
+        self._next_event_index += 1
+
+    def __getattr__(self, name):
+        return getattr(self._run, name)
 
 
 def _finite_float(value) -> float | None:
@@ -352,6 +392,8 @@ def wandb_enabled(params: Mapping | None) -> bool:
     enabled = params.get("wandb", False)
     if not isinstance(enabled, bool):
         raise ValueError("'wandb' must be a boolean when provided.")
+    if not isinstance(params.get("wandb_event_indexed", False), bool):
+        raise ValueError("'wandb_event_indexed' must be a boolean when provided.")
     mode = params.get("wandb_mode")
     if mode is not None and (
         not isinstance(mode, str) or mode not in SUPPORTED_WANDB_MODES
@@ -451,6 +493,12 @@ def init_wandb(
         wandb.define_metric("episode/*", step_metric="env_step")
         wandb.define_metric("time/*", step_metric="env_step")
         wandb.define_metric("eval/*", step_metric="env_step")
+        if params.get("wandb_event_indexed", False):
+            wandb.define_metric(OUTER_DIAGNOSTIC_UPDATE_KEY)
+            wandb.define_metric("outer_diag/*", step_metric=OUTER_DIAGNOSTIC_UPDATE_KEY)
+            if resume_context is None:
+                wandb.define_metric(INTERNAL_EVENT_INDEX_KEY)
+                return EventIndexedWandbRun(run, wandb_module=wandb)
     except BaseException as exc:
         if resume_context is not None and isinstance(exc, Exception):
             error = WandbInitializationError(
@@ -509,12 +557,52 @@ def init_wandb(
 def log_wandb(run, payload: dict, *, step: int) -> None:
     if run is None:
         return
-    if isinstance(run, CheckpointedWandbRun):
+    if isinstance(run, (CheckpointedWandbRun, EventIndexedWandbRun)):
         run.log(payload, env_step=step)
         return
     payload = dict(payload)
     payload.setdefault("env_step", int(step))
     run.log(payload, step=int(step))
+
+
+def publish_outer_policy_diagnostics(run, path, *, wandb_module=None):
+    """Attach one completed local diagnostic bundle before finishing its run.
+
+    ``path`` contains a JSON-object ``manifest.json`` and its nested diagnostic
+    files. Upload errors propagate so a training finalizer can report them;
+    this helper never starts a W&B run or publishes training-history events.
+    Disabled W&B remains a no-op, with the local bundle as the durable result.
+    """
+    if run is None:
+        return None
+    directory = Path(path)
+    if not directory.is_dir():
+        raise ValueError(f"Outer policy diagnostic bundle is not a directory: {directory}")
+    manifest_path = directory / "manifest.json"
+    with manifest_path.open(encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if not isinstance(manifest, dict):
+        raise ValueError("Outer policy diagnostic manifest must be a JSON object.")
+    wrapped = isinstance(run, (CheckpointedWandbRun, EventIndexedWandbRun))
+    raw_run = run.raw_run if wrapped else run
+    if wandb_module is None:
+        if wrapped:
+            wandb_module = run._wandb_module
+        else:
+            import wandb as wandb_module
+    if not callable(getattr(raw_run, "log_artifact", None)):
+        raise WandbCapabilityError("W&B diagnostic publication requires log_artifact().")
+    if not callable(getattr(wandb_module, "Artifact", None)):
+        raise WandbCapabilityError("W&B diagnostic publication requires Artifact().")
+    identity = str(getattr(raw_run, "id", None) or directory.name)
+    identity = re.sub(r"[^a-zA-Z0-9_.-]", "-", identity).strip(".-") or "run"
+    artifact = wandb_module.Artifact(
+        "outer-policy-diagnostics-" + identity,
+        type="outer-policy-diagnostics",
+        metadata=manifest,
+    )
+    artifact.add_dir(str(directory))
+    return raw_run.log_artifact(artifact)
 
 
 def finish_wandb(run) -> None:

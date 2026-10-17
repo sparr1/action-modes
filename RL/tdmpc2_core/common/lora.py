@@ -1,7 +1,7 @@
 """Critic-only low-rank updates inspired by LoRA-RL (arXiv:2604.18978).
 
-AMBI adapts a learned prior, so B starts at zero instead of perturbing and
-renormalizing the prior as in the upstream from-scratch BRC initialization.
+AMBI starts from either a learned prior or a fresh random critic. B starts at
+zero instead of perturbing and renormalizing the base as in upstream BRC.
 Selected kernels are frozen; biases, LayerNorm, and the value head train normally.
 """
 
@@ -150,6 +150,12 @@ def reset_lora_rl_critic_(adapted, dense_prior):
     torch._foreach_copy_(
         list(destination.values()), [source[name] for name in destination]
     )
+    reset_lora_rl_adapters_(adapted)
+
+
+@torch.no_grad()
+def reset_lora_rl_adapters_(adapted):
+    """Draw fresh adapters after the complete dense base has been initialized."""
     for adapter in _adapters(adapted).values():
         adapter.reset_adapters_()
 
