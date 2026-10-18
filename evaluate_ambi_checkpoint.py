@@ -659,6 +659,7 @@ def evaluate_preset(
     probe_rollouts=8,
     probe_horizon=3,
     togo_return_rollouts=0,
+    togo_return_every=1,
 ):
     """Evaluate one resolved preset and verify outer-state immutability."""
     checkpoint = Path(checkpoint).resolve()
@@ -684,6 +685,12 @@ def evaluate_preset(
         raise ValueError("togo_return_rollouts must be a nonnegative integer.")
     if togo_return_rollouts and bundle is None:
         raise ValueError("To-go return probes require a benchmark bundle.")
+    if (isinstance(togo_return_every, bool) or not isinstance(togo_return_every, int)
+            or togo_return_every < 1):
+        raise ValueError("togo_return_every must be a positive integer.")
+    from utils.ambi_benchmark import frozen_execution_action
+    execution_action = frozen_execution_action(resolved)
+    deterministic = execution_action == "mean"
     _validate_horizon_probe_selection(
         [resolved], root_bank_requested=root_bank is not None,
         togo_return_rollouts=togo_return_rollouts,
@@ -719,6 +726,8 @@ def evaluate_preset(
                     "version": 2, "rollouts": togo_return_rollouts,
                     "horizon": int(model.cfg.inner_rollout_horizon),
                     "cadence": "initial_and_after_each_round",
+                    "decision_cadence": togo_return_every,
+                    "first_decision": 0,
                     "tail_actor": "outer", "tail_critic": "outer_online",
                     "tail_q_reduction": model.cfg.mppi_terminal_q_reduction,
                     "entropy_bonus": False, "policy_actions": "sampled",
@@ -737,7 +746,7 @@ def evaluate_preset(
             warm_observation = (np.asarray(root_bank["roots"][0]["observation"], dtype=np.float32)
                                 if root_bank is not None else env.reset(seed=int(seeds[0]))[0])
             started = time.perf_counter()
-            model.predict(warm_observation, deterministic=True, episode_start=True)
+            model.predict(warm_observation, deterministic=deterministic, episode_start=True)
             bundle_run["warmup_including_compile_seconds"] = time.perf_counter() - started
 
         if root_bank is not None:
@@ -754,7 +763,7 @@ def evaluate_preset(
                     phase_id = f"{root['root_id']}-repeat-{repeat}"
                     started = time.perf_counter()
                     model.predict(np.asarray(root["observation"], dtype=np.float32),
-                                  deterministic=True, episode_start=True, trace=trace)
+                                  deterministic=deterministic, episode_start=True, trace=trace)
                     elapsed = time.perf_counter() - started
                     pending_events = [{"root_id": root["root_id"], "repeat": repeat,
                                        "decision_index": root["decision_index"], **event}
@@ -812,23 +821,26 @@ def evaluate_preset(
             while not (terminated or truncated):
                 if captured_roots is not None and episode_steps in root_decisions:
                     captured_roots.append(capture_root(observation, seed, episode_steps, episode_return))
+                probe_this_decision = bool(
+                    togo_return_rollouts and episode_steps % togo_return_every == 0
+                )
                 trace = (InnerActionTrace(
                     probes=True, probe_mode="outer_tail",
                     probe_rollouts=togo_return_rollouts,
                     probe_horizon=int(model.cfg.inner_rollout_horizon),
                     probe_seed=solver_seed(controller_seed, "togo_probe", seed, episode_steps),
-                ) if togo_return_rollouts else InnerActionTrace()) if bundle is not None else None
+                ) if probe_this_decision else InnerActionTrace()) if bundle is not None else None
                 predict_options = {"trace": trace} if trace is not None else {}
                 started = time.perf_counter()
                 action, _ = model.predict(
                     observation,
-                    deterministic=True,
+                    deterministic=deterministic,
                     episode_start=(episode_steps == 0),
                     **predict_options,
                 )
                 action_seconds = time.perf_counter() - started
                 togo_metrics = {}
-                if togo_return_rollouts:
+                if probe_this_decision:
                     probes = [event["metrics"] for event in trace.events if event["phase"] == "probe"]
                     if not probes:
                         raise RuntimeError("Enabled to-go return probes produced no measurements.")
@@ -944,6 +956,7 @@ def evaluate_preset(
             "controller_seed": int(controller_seed),
             "environment_seeds": [int(seed) for seed in seeds],
             "seed_scheme": "sha256-v1",
+            "execution_action": execution_action,
             "outer_updates_before": updates_before,
             "outer_updates_after": updates_after,
             "outer_state_unchanged": True,
@@ -1033,11 +1046,15 @@ def evaluate_matrix(
     probe_rollouts = evaluation.get("diagnostic_rollouts", 8)
     probe_horizon = evaluation.get("diagnostic_horizon", 3)
     togo_return_rollouts = evaluation.get("togo_return_rollouts", 0)
+    togo_return_every = evaluation.get("togo_return_every", 1)
     if (isinstance(togo_return_rollouts, bool) or not isinstance(togo_return_rollouts, int)
             or togo_return_rollouts < 0):
         raise ValueError("evaluation.togo_return_rollouts must be a nonnegative integer.")
     if togo_return_rollouts and bundle_dir is None:
         raise ValueError("To-go return probes require --bundle-dir.")
+    if (isinstance(togo_return_every, bool) or not isinstance(togo_return_every, int)
+            or togo_return_every < 1):
+        raise ValueError("evaluation.togo_return_every must be a positive integer.")
     if (not isinstance(root_decisions, list) or not root_decisions
             or any(isinstance(step, bool) or not isinstance(step, int) or step < 0 for step in root_decisions)
             or len(set(root_decisions)) != len(root_decisions)):
@@ -1184,6 +1201,7 @@ def evaluate_matrix(
                     captured_roots=captured_roots, root_decisions=root_decisions,
                     probe_rollouts=probe_rollouts, probe_horizon=probe_horizon,
                     togo_return_rollouts=togo_return_rollouts,
+                    togo_return_every=togo_return_every,
                 )
                 results.append(result)
                 if bundle is not None and resolved["algorithm_config"]["alg_params"].get("inner_operator") == "none":
@@ -1230,7 +1248,7 @@ def evaluate_matrix(
         "matrix_sha256": _file_sha256(matrix_path),
         "frozen_outer_learning": True,
         "deterministic_execution": all(
-            item["action_rule"] != "mppi_weighted_elite" for item in protocols
+            item["action_rule"] == "tanh_mean" for item in protocols
         ),
         "environment": copy.deepcopy(resolved_presets[0]["environment"]),
         "common_model_metrics": sorted(set.intersection(*metric_sets)) if metric_sets else [],

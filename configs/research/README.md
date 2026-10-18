@@ -113,8 +113,8 @@ python3 evaluate_ambi_checkpoint.py \
 
 Select individual presets with repeatable `--preset comparison/variant`, or an
 entire axis with repeatable `--comparison comparison`. The evaluator creates a
-fresh model for every preset, uses paired environment seeds, always returns the
-policy mean to the real environment, never calls the outer update, and hashes
+fresh model for every preset, uses paired environment seeds, defaults to the
+policy mean in the real environment, never calls the outer update, and hashes
 outer model/optimizer/temperature state before and after each run. Its output
 contains per-episode real returns and all finite model-predicted inner metrics.
 Output is written atomically, and an existing `--output` path is preserved
@@ -141,3 +141,36 @@ axes. Deterministic evaluation returns the policy mean, which collapses the
 execution-noise variants. Prior writeback is deliberately disabled outside
 training, so its variants would likewise collapse under a frozen outer
 checkpoint. Materialize and train those axes instead.
+
+## Early H3/J8 checkpoint diagnosis
+
+`ambi_early_h3_j8.json` applies the production fresh H3/J8 inner SAC recipe
+(C16/A4/N128/B256, auxiliary return critic initialization and horizon tail,
+reward-only targets, and automatic temperature initialized from the saved
+outer temperature) to checkpoint-derived configurations. The campaign pins
+the MPPI-aux and SAC-aux source runs and checkpoint hashes externally; the
+matrix preserves each checkpoint's outer networks, optimizer state, learned
+temperature and environment. MPPI schedule controls are explicitly removed
+before selecting inner SAC. This is frozen evaluation, with no outer learning
+or weight writeback.
+
+The `early_h3_j8/mean` and `early_h3_j8/sample` selectors differ only in real
+action execution. The latter explicitly sets variant
+`evaluation.execution_action="sample"`, which invokes the public prediction
+API with `deterministic=False`; imagined learning still uses the same recipe.
+Sampled execution uses the actor's squashed Gaussian, as in training. Protocol
+identity records `tanh_sample`, keeping these results distinct from
+`tanh_mean`. Evaluate the selectors in separate invocations and bundle
+directories because one benchmark bundle has one action protocol. This
+sampled variant is an explicit extension to the mean-action closed-loop
+refinement procedure.
+
+Five paired environment seeds (101–105), controller seed 55, and complete
+500-decision episodes are the defaults. Bundles retain optimizer and decision
+metrics throughout each episode. At decisions 0, 100, 200, 300 and 400, 32
+paired model rollouts measure reward prefix, auxiliary online-Q horizon tail,
+total predicted return and change from initialization, initially and after
+each of the eight rounds. The probe uses independent fixed noise and critic
+pairs; its time and model steps are reported separately. The generic
+`evaluation.togo_return_every` option defaults to 1, preserving older matrix
+behavior. Model predictions are diagnostics, not measured real policy gains.

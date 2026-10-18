@@ -39,6 +39,25 @@ def solver_seed(base, *identity):
     return int(canonical_hash([SEED_SCHEME, int(base), *identity])[:8], 16)
 
 
+def frozen_execution_action(resolved):
+    """Explicit frozen SAC execution mode; old matrices retain mean actions."""
+    mode = resolved.get("evaluation", {}).get("execution_action", "mean")
+    if mode not in {"mean", "sample"}:
+        raise ValueError("evaluation.execution_action must be 'mean' or 'sample'.")
+    if mode == "sample":
+        config = resolved.get("algorithm_config", {})
+        params = config.get("alg_params", {})
+        if (config.get("alg") != "AMBITDMPC2/AMBITDMPC2"
+                or params.get("inner_operator", "sac") != "sac"
+                or params.get("inner_execution_action", "policy_sample") != "policy_sample"
+                or float(params.get("inner_execution_std_scale", 1.0)) <= 0.0):
+            raise ValueError(
+                "Sampled frozen evaluation requires AMBI inner SAC and "
+                "inner_execution_action='policy_sample'."
+            )
+    return mode
+
+
 def protocol_for(resolved, controller_seed, max_steps):
     config = resolved["algorithm_config"]
     params = config.get("alg_params", {})
@@ -51,7 +70,8 @@ def protocol_for(resolved, controller_seed, max_steps):
         "env_wrappers": copy.deepcopy(config.get("env_wrappers", [])),
         "env_wrapper": copy.deepcopy(config.get("env_wrapper")),
         "observation": config.get("alg_params", {}).get("obs", "state"),
-        "action_rule": "mppi_weighted_elite" if weighted_mppi else "tanh_mean",
+        "action_rule": ("tanh_sample" if frozen_execution_action(resolved) == "sample"
+                        else "mppi_weighted_elite" if weighted_mppi else "tanh_mean"),
         "max_steps": max_steps,
         "controller_seed": int(controller_seed),
         "seed_scheme": SEED_SCHEME,
