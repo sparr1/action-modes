@@ -263,8 +263,8 @@ def install_workspace(campaign, receipt, rows, path):
 
 Both sources use the same H3 J8 auxiliary-return inner controller. Source labels
 identify how the frozen backbone was trained; every curve here evaluates inner
-SAC. Mean and sampled execution are separate curves, with seeds101–105,
-controller seed55 and500 decisions per episode. No outer learning occurs.
+SAC. Mean and sampled execution are separate curves, with seeds 101–105,
+controller seed 55 and 500 decisions per episode. No outer learning occurs.
 
 The live progress panels and run table show completed checkpoints, out of four
 per curve. Empty result panels mean pending or unavailable measurements;
@@ -287,12 +287,17 @@ runs, with native hover highlighting and no aggregation.
             line_colors={row["run_id"] + ":" + metric: row["color"] for row in rows},
             line_titles={row["run_id"] + ":" + metric: row["name"] for row in rows},
             layout=wr.Layout(w=12, h=8))
+    def progress_plot(title, metric):
+        return wr.BarPlot(title=title, metrics=[metric], orientation="h",
+            aggregate=False, max_runs_to_show=4, max_bars_to_show=4,
+            legend_template="${run:displayName}",
+            line_colors={row["run_id"] + ":" + metric: row["color"] for row in rows},
+            line_titles={row["run_id"] + ":" + metric: row["name"] for row in rows},
+            layout=wr.Layout(w=12, h=6))
     sections = [ws.Section(name=PREFIX + "Protocol and progress", is_open=True,
         panels=[wr.MarkdownPanel(markdown=markdown, layout=wr.Layout(w=24, h=10)),
-                wr.ScalarChart(title="Completed checkpoints per curve (of4)",
-                    metric="progress/checkpoints_complete", legend_template="${run:name}", layout=wr.Layout(w=12, h=6)),
-                wr.ScalarChart(title="Failed validation cells", metric="progress/failed_cells",
-                    legend_template="${run:name}", layout=wr.Layout(w=12, h=6))])]
+                progress_plot("Completed checkpoints per curve (of 4)", "progress/checkpoints_complete"),
+                progress_plot("Failed validation cells", "progress/failed_cells")])]
     sections += [ws.Section(name=PREFIX + name, is_open=True,
         panels=[plot(title, metric) for title, metric in metrics],
         layout_settings=ws.SectionLayoutSettings(columns=2, rows=2)) for name, metrics in METRICS.items()]
