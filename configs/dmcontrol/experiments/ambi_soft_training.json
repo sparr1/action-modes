@@ -1,0 +1,26 @@
+{
+  "study_type": "single_seed_exploratory_full_training_soft_sac_control",
+  "study_note": "One fresh H3/J8 inner-SAC Humanoid Walk training run without an auxiliary critic. J8/C16/A4/N128/B256 and the primary outer learning recipe match the launched full AMBI experiments. Both inner initialization and terminal bootstrap use the primary SAC critic, and interior inner-SAC targets are entropy-augmented. The retained finite-horizon boundary uses a sampled outer SAC action and online primary-Q mean_pair bootstrap without an additional terminal entropy bonus. The auxiliary learner is disabled: no auxiliary online/target critic or optimizer is allocated, and its shared-representation loss is removed. No Bernoulli transfer. Sampled actions during training, automatic entropy target -10.5, seed55, 500k decisions (1M raw environment steps), 2500 warmup decisions and 2500 pretraining updates. Retain all checkpoints every25k decisions. Evaluation remains disabled as in the source training recipe; W&B shows actual training returns, diagnostics and costs.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 500000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_full_h3_j8_soft"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

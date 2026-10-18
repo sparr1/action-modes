@@ -116,6 +116,16 @@ for both the GPU smoke job and its dependent training array to select J8, with
 a separate `AMBI_TRANSFER_OUTPUT` directory. The gate binds the selected manifest
 and its configurations to the pinned commit; a J6 gate cannot authorize J8.
 
+The single-cell `configs/dmcontrol/experiments/ambi_soft_training.json` control
+uses fresh H3/J8 inner SAC with the same C16/A4/N128/B256 update schedule, primary
+outer training recipe, seed 55 and complete 25k checkpoint cadence. It disables
+auxiliary critic allocation and training, initializes the inner critic from the
+primary SAC critic, uses that critic for the horizon bootstrap, and selects
+entropy-augmented inner targets. The finite-horizon boundary keeps the existing
+sampled outer action and online primary-Q `mean_pair` bootstrap, without an
+additional terminal entropy bonus. Removing auxiliary training also removes its
+loss contribution to the shared representation. There is no Bernoulli transfer.
+
 For a short CPU-allocation comparison, run
 `python slurm/benchmark_ambi_training_cpu.py --output /absolute/scratch/directory`
 inside one Slurm allocation with a GPU, eight physical CPU cores
