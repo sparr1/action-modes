@@ -41,12 +41,17 @@ def solver_seed(base, *identity):
 
 def protocol_for(resolved, controller_seed, max_steps):
     config = resolved["algorithm_config"]
+    params = config.get("alg_params", {})
+    weighted_mppi = (
+        str(params.get("inner_operator", "sac")).lower() == "mppi"
+        and str(params.get("inner_mppi_eval_action", "mean")).lower() == "weighted_elite"
+    )
     protocol = {
         "environment": copy.deepcopy(resolved["environment"]),
         "env_wrappers": copy.deepcopy(config.get("env_wrappers", [])),
         "env_wrapper": copy.deepcopy(config.get("env_wrapper")),
         "observation": config.get("alg_params", {}).get("obs", "state"),
-        "action_rule": "tanh_mean",
+        "action_rule": "mppi_weighted_elite" if weighted_mppi else "tanh_mean",
         "max_steps": max_steps,
         "controller_seed": int(controller_seed),
         "seed_scheme": SEED_SCHEME,

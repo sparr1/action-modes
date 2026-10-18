@@ -1,0 +1,27 @@
+{
+  "study_type": "single_seed_exploratory_full_training_mppi_critic_comparison",
+  "study_note": "Two H3 MPPI full-training controls with the same primary outer learning recipe as the full AMBI J6/J8 experiments. Both use 8 effective planning iterations, 512 candidates, 64 elites, 24 SAC-policy trajectories, temperature 0.5, std 0.05\u20132, and episode-scoped shifted plan means. The aux-return cell retains its shared-representation auxiliary reward-return critic and uses it for the terminal score. The soft-Q cell disables auxiliary critic allocation and training and uses the original online entropy-augmented SAC critic for the terminal score; removing the auxiliary learner also removes its loss contribution to the shared representation. Both score model rewards plus terminal Q at sampled SAC actions with mean_pair reduction, without explicit rollout entropy additions. TD-MPC2-style weighted elite selection; training adds proposal-scaled Gaussian noise and evaluation does not. No inner gradient updates or Bernoulli transfer. Seed 55, 500k decisions/1M raw environment steps, 2500 warmup and 2500 pretrain updates; retain checkpoints every 25k decisions. Separate primary/auxiliary ensemble execution in the aux-return cell matches the launched SAC campaign. Existing evaluation cadence remains disabled; paired checkpoint evaluation and CUDA throughput gating are separate prelaunch work.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 500000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_full_h3_mppi_aux_return",
+    "ambi_full_h3_mppi_soft"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

@@ -1229,7 +1229,9 @@ def evaluate_matrix(
         "checkpoint_sha256": checkpoint_sha256,
         "matrix_sha256": _file_sha256(matrix_path),
         "frozen_outer_learning": True,
-        "deterministic_execution": True,
+        "deterministic_execution": all(
+            item["action_rule"] != "mppi_weighted_elite" for item in protocols
+        ),
         "environment": copy.deepcopy(resolved_presets[0]["environment"]),
         "common_model_metrics": sorted(set.intersection(*metric_sets)) if metric_sets else [],
         "available_model_metrics": sorted(set.union(*metric_sets)) if metric_sets else [],

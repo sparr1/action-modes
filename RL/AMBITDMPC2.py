@@ -284,6 +284,7 @@ _AMBI_DEFAULTS = {
     "inner_mppi_min_std": 0.05,
     "inner_mppi_max_std": 2.0,
     "inner_mppi_warm_start_scope": "action",
+    "inner_mppi_eval_action": "mean",
 
     # Diagnostics-only paired model rollouts; excluded from the optimization
     # model-step budget. Zero preserves legacy runtime.
@@ -2543,6 +2544,10 @@ class AMBITDMPC2(TDMPC2Baseline):
 
         _resolve_random_explorer_config(cfg)
 
+        cfg.inner_mppi_eval_action = _normalize_choice(
+            cfg.inner_mppi_eval_action, "inner_mppi_eval_action",
+            {"mean", "weighted_elite"},
+        )
         cfg.inner_mppi_num_elites = int(cfg.inner_mppi_num_elites)
         cfg.inner_mppi_num_pi_trajs = int(cfg.inner_mppi_num_pi_trajs)
         if cfg.inner_mppi_num_elites <= 0:

@@ -182,6 +182,49 @@ normalization and use the configured `rho`. Inner SAC minibatch losses have no
 timestep weighting. Termination BCE keeps its unweighted upstream reduction.
 The optional Q-only percentile scaling described below is unchanged.
 
+### MPPI evaluation action selection
+
+`inner_operator="mppi"` uses the selected model rewards, proposal actor,
+terminal actor and terminal critic without inner gradient updates. With
+`aux_return_mode="sac"`, set `inner_horizon_critic_source="aux_return"` and
+`inner_horizon_actor_source="sac"` to score reward return under the SAC prior.
+`mppi_terminal_q_reduction="mean_pair"` averages two sampled online critic heads.
+
+`inner_mppi_eval_action="mean"` retains historical AMBI evaluation: execute the
+first optimized proposal mean without an execution RNG draw. Explicit
+`"weighted_elite"` matches the pinned TD-MPC2 implementation: sample a final
+elite with probability proportional to its score weight, including during
+evaluation. Evaluation adds no Gaussian execution noise. Training uses weighted
+elite selection plus proposal-standard-deviation Gaussian noise for either
+setting. Sampling stays on the planner's isolated RNG stream. These modes have
+distinct evaluation identities; omitted and explicit `"mean"` remain equivalent.
+The frozen evaluator records weighted-elite actions as stochastic execution;
+its legacy benchmark-bundle path still supports only prior/SAC/TDAMBI operators.
+
+The two-run `configs/dmcontrol/experiments/ambi_mppi_training.json` comparison
+keeps the full AMBI H3 J8 experiment's primary outer learning settings and replaces
+its inner solve with H3 MPPI: 8 effective iterations, 512 candidates including 24
+policy trajectories, 64 elites, temperature 0.5 and std bounds 0.05–2. It shifts
+the proposal mean within each episode and resets at episode boundaries. The
+exact model-transition budget is `8*512*3 + 24*(3-1) = 12336` per decision.
+It retains seed 55, 500k decisions and checkpoints every 25k decisions. Separate
+primary/auxiliary ensemble execution is pinned explicitly to match the launched
+SAC campaign. The `aux_return` cell retains auxiliary reward-return training and
+its terminal bootstrap. The `soft` cell sets `aux_return_mode="off"` and both
+critic source selectors to `"sac"`, so no auxiliary critic, target or optimizer
+is allocated or trained; the terminal value uses the online entropy-augmented
+primary critic. Neither MPPI cell adds explicit entropy terms to rollout rewards.
+Disabling the auxiliary learner also removes its loss contribution to the shared
+encoder and dynamics, because the retained auxiliary recipe does not detach the
+representation. Evaluation scheduling is unchanged. The dedicated
+`slurm/ambi_mppi_training.py` gate checks both configurations through real
+Humanoid training, strict CUDA compilation and checkpoint round-trips, and
+compares one versus two physical CPU cores. Its receipt binds the production
+launcher to the tested source, configuration, runtime and GPU model.
+`slurm/run_ambi_mppi_training_oscar.sbatch` requires explicit CPU, GPU, memory
+and walltime requests; choose them from the gate measurements and live account
+limits. The six-cell SAC gate and launcher do not apply to this comparison.
+
 ### Bernoulli critic transfer
 
 Main AMBI training and evaluation support `inner_critic_bernoulli_p` (default

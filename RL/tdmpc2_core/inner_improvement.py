@@ -6919,6 +6919,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 t0=t0,
                 eval_mode=eval_mode,
                 materialize_metrics=False,
+                eval_action=getattr(self.cfg, "inner_mppi_eval_action", "mean"),
             )
         self._timer_stop("inner_mppi_seconds", planner_start)
         self._mppi_prev_mean = None if scope == "action" else result.next_mean.detach()

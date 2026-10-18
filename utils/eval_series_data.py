@@ -403,6 +403,16 @@ def planner_identity(config, result, algorithm, action_rule):
         # MPPI uses proposal and boundary actors plus a boundary critic; it
         # never allocates or adapts the selected interior critic.
         active.pop("inner_critic_source", None)
+        # Historical evaluations execute the optimized proposal mean. Keep
+        # omitted and explicit defaults on the same curve, while preserving
+        # the distinct TD-MPC2 weighted-elite action rule in its identity.
+        eval_action = active.get("inner_mppi_eval_action", "mean")
+        if isinstance(eval_action, str):
+            eval_action = eval_action.lower()
+        if eval_action == "mean":
+            active.pop("inner_mppi_eval_action", None)
+        else:
+            active["inner_mppi_eval_action"] = eval_action
     # Historical inner networks always started from the learned priors. Keep
     # that omitted/default spelling out of existing curve identities.
     for component in ("actor", "critic"):

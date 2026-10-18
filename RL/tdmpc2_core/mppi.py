@@ -364,6 +364,7 @@ def mppi_plan(
     previous_mean=None,
     t0=False,
     eval_mode=False,
+    eval_action="mean",
     task=None,
     materialize_metrics=True,
 ):
@@ -384,7 +385,14 @@ def mppi_plan(
     may persist the returned ``next_mean`` without any planner-owned state.
     Set ``materialize_metrics=False`` to keep diagnostic scalars on-device for
     packing with another boundary transfer; the default preserves float metrics.
+
+    ``eval_action="mean"`` preserves historical AMBI evaluation. Select
+    ``"weighted_elite"`` for TD-MPC2 evaluation: sample a final elite using
+    its score weight, without execution noise. Training always samples a
+    weighted elite and adds proposal-standard-deviation Gaussian noise.
     """
+    if eval_action not in {"mean", "weighted_elite"}:
+        raise ValueError("eval_action must be 'mean' or 'weighted_elite'.")
     if (model is None) == (callbacks is None):
         raise ValueError("Supply exactly one of model or callbacks to MPPI.")
     if model is not None and bool(model.training):
@@ -495,7 +503,7 @@ def mppi_plan(
         ).sum(dim=1)
         std = variance.sqrt().clamp(min_std, max_std)
 
-    if bool(eval_mode):
+    if bool(eval_mode) and eval_action == "mean":
         # Evaluation is the deterministic optimized proposal. It deliberately
         # consumes no categorical-selection or execution-noise randomness.
         action = mean[0]
@@ -508,13 +516,14 @@ def mppi_plan(
         )
         selected_actions = elite_actions.index_select(1, selected_elite).squeeze(1)
         action = selected_actions[0]
-        action_noise = torch.randn(
-            (action_dim,),
-            device=root_z.device,
-            dtype=root_z.dtype,
-            generator=generator,
-        )
-        action = action + std[0] * action_noise
+        if not bool(eval_mode):
+            action_noise = torch.randn(
+                (action_dim,),
+                device=root_z.device,
+                dtype=root_z.dtype,
+                generator=generator,
+            )
+            action = action + std[0] * action_noise
     action = action.clamp(-1.0, 1.0)
 
     policy_model_steps = num_pi_trajs * max(0, horizon - 1)
