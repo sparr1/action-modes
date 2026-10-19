@@ -1,5 +1,22 @@
 # Frozen-checkpoint AMBI research
 
+### Base-policy references for the early H3/J8 campaign
+
+`ambi_early_prior_baselines.json` evaluates the saved SAC actor with no inner
+planning or learning. Run `early_prior/mean` and `early_prior/sample` in separate
+bundles, matching the adapted controller's checkpoint, environment seeds
+101–105, controller seed 55, and 500-decision environment limit. The sampled
+reference uses the saved outer action distribution and the same isolated
+execution RNG convention as inner SAC. The baseline launcher validates zero
+inner updates and model steps, complete episodes, checkpoint and metadata
+hashes, and unchanged outer state before accepting results.
+
+For each source, checkpoint and action mode, report episode-paired improvement
+as adapted return minus reference return. Compute variability from those paired
+differences; do not subtract independently aggregated standard deviations or
+use imagined model-return gains as real-episode baselines. Prior evaluation
+disables compilation for inexpensive inference; it does not alter saved weights.
+
 The frozen evaluator supports finite-horizon inner SAC and transition-based
 update counts. It rejects `inner_outer_replay_fraction > 0` because these model
 snapshots do not include real replay. Test replay mixing through a populated

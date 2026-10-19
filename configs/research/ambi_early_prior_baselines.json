@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "base_alg_config": "checkpoint",
+  "description": "Frozen learned outer-SAC actor baselines for the early H3/J8 checkpoint evaluation. Pin each source checkpoint and SHA256 through the same external inventory. No imagined transitions, adaptation, transfer, outer updates, or new MPPI evaluations.",
+  "shared_alg_params": {
+    "inner_actor_adam_eps": null,
+    "inner_actor_adaptation": "frozen",
+    "inner_actor_entropy_mode": null,
+    "inner_actor_grad_clip_norm": null,
+    "inner_actor_initialization": null,
+    "inner_actor_loss_scale_update": null,
+    "inner_actor_lr": null,
+    "inner_actor_optimizer_scope": "action",
+    "inner_actor_scope": "action",
+    "inner_actor_source": "sac",
+    "inner_actor_updates_per_round": null,
+    "inner_actor_writeback_coef": 0.0,
+    "inner_adam_eps": null,
+    "inner_batch_size": null,
+    "inner_behavior_action": null,
+    "inner_bootstrap_source": null,
+    "inner_critic_adaptation": "frozen",
+    "inner_critic_bernoulli_p": 0.0,
+    "inner_critic_dropout_enabled": null,
+    "inner_critic_grad_clip_norm": null,
+    "inner_critic_initialization": null,
+    "inner_critic_loss_coef": null,
+    "inner_critic_lr": null,
+    "inner_critic_optimizer_scope": "action",
+    "inner_critic_scope": "action",
+    "inner_critic_source": null,
+    "inner_critic_target_initialization": null,
+    "inner_critic_target_tau": null,
+    "inner_critic_target_update_interval": null,
+    "inner_critic_updates_per_round": null,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_diagnostic_rollouts": 0,
+    "inner_diagnostics_every": null,
+    "inner_entropy_enabled": null,
+    "inner_execution_action": "policy_sample",
+    "inner_explorer_mode": "none",
+    "inner_finite_horizon": false,
+    "inner_horizon_actor_source": "sac",
+    "inner_horizon_critic_source": null,
+    "inner_log_std_mapping": null,
+    "inner_log_std_max": null,
+    "inner_log_std_min": null,
+    "inner_model_step_budget": null,
+    "inner_mppi_eval_action": null,
+    "inner_mppi_iterations": null,
+    "inner_mppi_max_std": null,
+    "inner_mppi_min_std": null,
+    "inner_mppi_num_elites": null,
+    "inner_mppi_num_pi_trajs": null,
+    "inner_mppi_temperature": null,
+    "inner_mppi_warm_start_scope": null,
+    "inner_operator": "none",
+    "inner_outer_action_l2_coef": null,
+    "inner_outer_policy_kl_coef": null,
+    "inner_outer_replay_fraction": 0.0,
+    "inner_q_actor_reduction": null,
+    "inner_q_target_reduction": null,
+    "inner_rebase_persistent": false,
+    "inner_replay_capacity": null,
+    "inner_replay_sampling": null,
+    "inner_replay_scope": "action",
+    "inner_rollout_horizon": null,
+    "inner_rollouts_per_round": null,
+    "inner_rounds": null,
+    "inner_sac_critic_target": null,
+    "inner_steps_per_update": null,
+    "inner_target_entropy": null,
+    "inner_temperature": null,
+    "inner_temperature_initialization": null,
+    "inner_temperature_lr": null,
+    "inner_temperature_mode": "inherit_outer",
+    "inner_temperature_optimizer_scope": "action",
+    "inner_temperature_scope": "action",
+    "inner_update_timing": null,
+    "inner_execution_std_scale": 1.0,
+    "inner_execution_noise_std": 0.0,
+    "compile": false,
+    "compile_strict": false,
+    "wandb": false
+  },
+  "evaluation": {
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "controller_seed": 55,
+    "max_steps": 500,
+    "togo_return_rollouts": 0,
+    "default_presets": [
+      "early_prior/mean",
+      "early_prior/sample"
+    ]
+  },
+  "comparisons": {
+    "early_prior": {
+      "description": "The saved outer SAC actor, with matched mean or sampled execution; separate bundles preserve each H3/J8 evaluation action protocol.",
+      "reference": "mean",
+      "variants": {
+        "mean": {
+          "description": "Execute the saved outer actor mean; no inner improvement.",
+          "evaluation": {
+            "execution_action": "mean"
+          }
+        },
+        "sample": {
+          "description": "Sample the saved outer actor distribution; no inner improvement.",
+          "evaluation": {
+            "execution_action": "sample"
+          }
+        }
+      }
+    }
+  }
+}
