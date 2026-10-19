@@ -9,7 +9,9 @@ from contextlib import contextmanager
 
 import torch
 
-from .common.layers import Ensemble
+from .common.ensemble_vmap import grouped_vmap_spec
+from .common.layers import Ensemble, NormedLinear
+from .common.q_representation import QRepresentation
 
 
 _TERMS = ("mpr", "vfc", "curvature")
@@ -60,6 +62,22 @@ def _head_predictions(critic, latents, actions):
     ], dim=0)
 
 
+def _can_batch_views(critic, decode):
+    """Only fuse known row-independent critics and decoders.
+
+    Custom heads, hooks, forwards or decoders can couple rows or observe call
+    boundaries. Preserve their existing per-view execution, including errors.
+    Check this inside geometry mode, after dropout has been disabled.
+    """
+    return (
+        type(critic) is Ensemble
+        and getattr(critic.forward_heads_eager, "__func__", None) is Ensemble.forward_heads_eager
+        and type(getattr(decode, "__self__", None)) is QRepresentation
+        and getattr(decode, "__func__", None) is QRepresentation.decode
+        and grouped_vmap_spec((critic,), NormedLinear) is not None
+    )
+
+
 def critic_pave_loss(
     critic, decode, z, action, *, noisy_z=None, next_z=None, probe=None,
     mpr_coef=0.0, vfc_coef=0.0, curvature_coef=0.0, curvature_margin=1.0,
@@ -68,8 +86,10 @@ def critic_pave_loss(
     """Return weighted loss and detached metrics for one independent ensemble.
 
     Inputs are flat transition batches. ``decode`` receives every head at once
-    and must return [heads, rows, 1]. Separate action coordinates for each head
-    let a single autograd call compute all head gradients without cancellation.
+    and must return [heads, rows, 1]. Supported dense vmap critics concatenate
+    enabled state views along the row axis, stacking parameters only once.
+    Independent action coordinates for every head, view and row let one
+    autograd call compute their gradients without cancellation or view mixing.
     Encoder graphs and replay actions are deliberately detached here as well as
     at the outer call site. Only the selected online critic is differentiated.
     """
@@ -84,9 +104,6 @@ def critic_pave_loss(
     if curvature_coef > 0.0 and (probe is None or probe.shape != action.shape):
         raise ValueError("PAVE curvature requires one action-shaped probe per transition.")
 
-    actions = action.detach().unsqueeze(0).expand(len(critic), -1, -1).clone()
-    actions.requires_grad_(True)
-
     def gradient(latents):
         latents = latents.detach()
         predictions = _head_predictions(critic, latents, actions)
@@ -98,16 +115,39 @@ def critic_pave_loss(
     losses = {}
     metrics = {}
     with _geometry_mode(critic):
-        original = gradient(z)
+        views = [z]
+        if mpr_coef > 0.0:
+            views.append(noisy_z)
+        if vfc_coef > 0.0:
+            views.append(next_z)
+        batched = len(views) > 1 and _can_batch_views(critic, decode)
+        if batched:
+            # Repeat into an independent leaf, rather than differentiating
+            # expanded aliases of the recorded action. Otherwise gradients
+            # from different state views would be summed before the penalties.
+            actions = action.detach().unsqueeze(0).repeat(len(critic), len(views), 1)
+            actions.requires_grad_(True)
+            latents = torch.cat([view.detach() for view in views], dim=0)
+            gradients = gradient(latents).split(action.shape[0], dim=1)
+        else:
+            actions = action.detach().unsqueeze(0).expand(len(critic), -1, -1).clone()
+            actions.requires_grad_(True)
+            gradients = tuple(gradient(view) for view in views)
+        original, *other_gradients = gradients
+        other_gradients = iter(other_gradients)
         if return_components:
             metrics["action_gradient_rms"] = original.detach().square().mean().sqrt()
         if mpr_coef > 0.0:
-            losses["mpr"] = (original - gradient(noisy_z)).square().mean(dim=(1, 2)).sum()
+            losses["mpr"] = (original - next(other_gradients)).square().mean(dim=(1, 2)).sum()
         if vfc_coef > 0.0:
-            losses["vfc"] = (original - gradient(next_z)).square().mean(dim=(1, 2)).sum()
+            losses["vfc"] = (original - next(other_gradients)).square().mean(dim=(1, 2)).sum()
         if curvature_coef > 0.0:
             vectors = probe.detach().unsqueeze(0)
             hvp = _action_gradient((original * vectors).sum(), actions)
+            if batched:
+                # Only the current-state block contributes to curvature. The
+                # other views have independent coordinates and zero cotangents.
+                hvp = hvp[:, :action.shape[0]]
             margin_error = (hvp * vectors).sum(dim=-1) + curvature_margin
             losses["curvature"] = margin_error.relu().mean(dim=1).sum()
             metrics["curvature_violation_fraction"] = (margin_error.detach() > 0).float().mean()
