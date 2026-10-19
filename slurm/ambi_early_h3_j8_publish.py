@@ -573,7 +573,7 @@ def publish_once(campaign, root, *, wandb_module=None, workspace_verifier=verify
                 publisher.run.config.update({"campaign_id": campaign["campaign_id"],
                     "campaign_sha256": receipt["campaign_sha256"], "source_commit": evaluation_commit,
                     "campaign_source_commit": campaign["source_commit"],
-                    "selection_sha256": campaign.get("selection", {}).get("sha256"),
+                    "selection_sha256": (campaign.get("selection") or {}).get("sha256"),
                     "source_backbone": cells[0]["backbone_id"], "execution_action": cells[0]["execution"],
                     "curve_role": cells[0].get("role", "inner"),
                     "checkpoint_pins": [{k: cell[k] for k in ("step", "checkpoint_sha256", "metadata_sha256")} for cell in cells]})
