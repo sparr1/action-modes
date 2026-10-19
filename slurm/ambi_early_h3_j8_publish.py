@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 import importlib
 import json
 from pathlib import Path
+import re
+import statistics
 import sys
 from urllib.parse import parse_qs, urlparse
 
@@ -63,25 +65,76 @@ def now():
 
 
 def curve_key(cell):
-    return cell["backbone_id"] + "_" + cell["execution"]
+    return cell.get("curve_key", cell["backbone_id"] + "_" + cell["execution"])
+
+
+def curve_definitions(campaign):
+    """Derive display identity from the pinned manifest, never from run names."""
+    sources = campaign.get("sources", {key: {"source_run": source} for key, source in BACKBONES.items()})
+    result = {}
+    palette = [("#2563EB", "#14B8A6"), ("#E87924", "#A855F7")]
+    for number, (backbone, source) in enumerate(sources.items()):
+        label = source.get("label", backbone.replace("_", " "))
+        for execution, color in zip(("mean", "sample"), palette[number % len(palette)]):
+            key = backbone + "_" + execution
+            legacy = CURVES.get(key) if "sources" not in campaign else None
+            result[key] = {"name": legacy[0] if legacy else f"{label} | H3 J8 | {execution}",
+                           "color": legacy[1] if legacy else color, "role": "inner",
+                           "backbone_id": backbone, "source_run": source["source_run"], "execution": execution}
+            if campaign.get("baseline_root"):
+                result[backbone + "_base_" + execution] = {
+                    "name": f"{label} | Base policy | {execution}",
+                    "color": "#E87924" if execution == "mean" else "#A855F7", "role": "base",
+                    "backbone_id": backbone, "source_run": source["source_run"], "execution": execution}
+    return result
+
+
+def baseline_cell(campaign, cell):
+    return {**cell, "role": "base", "curve_key": cell["backbone_id"] + "_base_" + cell["execution"],
+            "selector": "early_prior/" + cell["execution"],
+            "output_dir": str(Path(campaign["baseline_root"]) / f'cell-{cell["index"]:02d}')}
+
+
+def publication_cells(campaign):
+    cells = campaign["cells"]
+    return cells + [baseline_cell(campaign, cell) for cell in cells] if campaign.get("baseline_root") else cells
+
+
+def metric_sections(campaign):
+    result = {key: list(value) for key, value in METRICS.items()}
+    if campaign.get("baseline_root"):
+        result["Paired improvement over matching base"] = [
+            ("Paired return improvement — mean of five seeds", "eval/paired_gain_mean"),
+            ("Paired improvement — sample standard deviation", "eval/paired_gain_sample_std"),
+            ("Seeds improved over base — fraction", "eval/paired_win_fraction"),
+            ("Matched baseline episodes", "eval/paired_episodes"),
+        ]
+    return result
 
 
 def load_campaign(path):
     campaign = series._read(path)
-    if campaign.get("campaign_id") != "early-h3-j8-20261018":
-        raise ValueError("This publisher is restricted to early-h3-j8-20261018")
+    if campaign.get("selection"):
+        from slurm.ambi_early_h3_j8_campaign import validate_campaign_selection
+        validate_campaign_selection(campaign)
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", campaign.get("campaign_id", "")):
+        raise ValueError("Campaign requires a stable publication identifier")
     if campaign.get("seeds") != [101, 102, 103, 104, 105] or campaign.get("controller_seed") != 55 or campaign.get("max_steps") != 500:
         raise ValueError("Campaign must preserve the authorized five-seed episode protocol")
     if not isinstance(campaign.get("source_commit"), str) or len(campaign["source_commit"]) != 40:
         raise ValueError("A full committed source SHA is required")
     cells = campaign.get("cells", [])
-    wanted = {(backbone, execution, step) for backbone in BACKBONES
-              for execution in ("mean", "sample") for step in STEPS}
+    sources = campaign.get("sources", {key: {"source_run": source} for key, source in BACKBONES.items()})
+    steps = campaign.get("steps", STEPS)
+    if not sources or not steps or len(set(steps)) != len(steps) or any(type(step) is not int or step < 0 for step in steps):
+        raise ValueError("Manifest must declare distinct checkpoint steps and source backbones")
+    wanted = {(backbone, execution, step) for backbone in sources
+              for execution in ("mean", "sample") for step in steps}
     actual = {(cell["backbone_id"], cell["execution"], cell["step"]) for cell in cells}
-    if len(cells) != 16 or actual != wanted or len({cell["index"] for cell in cells}) != 16:
-        raise ValueError("Expected the sixteen distinct authorized evaluation cells")
+    if len(cells) != len(wanted) or actual != wanted or len({cell["index"] for cell in cells}) != len(cells):
+        raise ValueError("Evaluation cells must exactly cover the declared source/action/checkpoint matrix")
     for cell in cells:
-        if cell["source_run"] != BACKBONES[cell["backbone_id"]] or cell["selector"] != "early_h3_j8/" + cell["execution"]:
+        if cell["source_run"] != sources[cell["backbone_id"]]["source_run"] or cell["selector"] != "early_h3_j8/" + cell["execution"]:
             raise ValueError("Cell source or selector differs from the authorized comparison")
         for key in ("checkpoint_sha256", "metadata_sha256"):
             value = cell[key]
@@ -90,14 +143,17 @@ def load_campaign(path):
         for key in ("checkpoint", "metadata", "output_dir"):
             if not Path(cell[key]).is_absolute():
                 raise ValueError("Campaign paths must be absolute")
-    if len({cell["output_dir"] for cell in cells}) != 16:
+    if len({cell["output_dir"] for cell in cells}) != len(cells):
         raise ValueError("Each evaluation cell must own a distinct output directory")
+    if campaign.get("baseline_root") and not Path(campaign["baseline_root"]).is_absolute():
+        raise ValueError("Baseline root must be absolute")
     return campaign
 
 
 def validate_spec(campaign, cell, spec):
     identity = spec["identity"]
-    if spec.get("selector") != cell["selector"] or identity["backbone"] != cell["source_run"]:
+    base = cell.get("role") == "base"
+    if (not base and spec.get("selector") != cell["selector"]) or identity["backbone"] != cell["source_run"]:
         raise ValueError("Specification source/selector does not match its campaign cell")
     action = "tanh_" + cell["execution"]
     protocol = identity["protocol"]
@@ -105,6 +161,11 @@ def validate_spec(campaign, cell, spec):
         raise ValueError("Specification does not describe the actual execution action")
     if protocol.get("environment_seeds") != campaign["seeds"] or protocol.get("max_steps") != 500 or protocol.get("controller_seed") != 55:
         raise ValueError("Specification episode protocol does not match campaign")
+    if base:
+        if identity["planner"].get("type") != "prior":
+            raise ValueError("Baseline specification must be a no-adaptation prior")
+        # Reused controls retain their audited historical scientific identity.
+        return
     from utils.eval_series_data import scientific_identity
     # The generic identity contains an executable-source digest, not the Git SHA.
     science = identity["science"]
@@ -117,7 +178,7 @@ def validate_spec(campaign, cell, spec):
 
 
 def publication_prepare(campaign, root, spec_root):
-    """Allocate exactly four generic registries; this function never contacts W&B.
+    """Allocate manifest-defined generic registries; never contact W&B here.
 
     ``spec_root/<backbone>_<execution>/<selector with / replaced by __>.json``
     is written by the evaluator's metadata-only --eval-series-spec-dir mode.
@@ -133,9 +194,17 @@ def publication_prepare(campaign, root, spec_root):
         }
         if receipt["campaign_sha256"] != series._digest(campaign):
             raise ValueError("Prepared campaign changed; do not reuse its publication identity")
-        for key in CURVES:
-            cell = next(cell for cell in campaign["cells"] if curve_key(cell) == key)
-            spec = series._read(spec_root / key / (cell["selector"].replace("/", "__") + ".json"))
+        for key, definition in curve_definitions(campaign).items():
+            cell = next(cell for cell in publication_cells(campaign) if curve_key(cell) == key)
+            candidates = list((spec_root / key).glob("*.json"))
+            if cell.get("role") == "base" and not candidates:
+                record, _ = completed_record(campaign, cell)
+                if record is None:
+                    raise ValueError("Base curve needs a specification or a validated reused baseline")
+                spec = {"identity": record["identity"], "selector": record["selector"], "label": record["label"]}
+            else:
+                expected = spec_root / key / (cell["selector"].replace("/", "__") + ".json")
+                spec = series._read(candidates[0] if cell.get("role") == "base" and len(candidates) == 1 else expected)
             validate_spec(campaign, cell, spec)
             if key in receipt["curves"]:
                 registry = series.validate_identity(receipt["curves"][key]["run_dir"], spec["identity"])
@@ -150,10 +219,13 @@ def publication_prepare(campaign, root, spec_root):
                     registry = series.create_run(root / "runs" / key, spec, campaign["campaign_id"],
                                                  PROJECT, ENTITY, campaign["campaign_id"])
                 receipt["curves"][key] = {"run_dir": registry["run_dir"], "run_id": registry["run_id"],
-                    "name": CURVES[key][0], "color": CURVES[key][1], "spec_sha256": series._digest(spec)}
+                    **definition, "spec_sha256": series._digest(spec)}
                 series._atomic_json(receipt_path, receipt)
         receipt["cell_run_dirs"] = {str(cell["index"]): receipt["curves"][curve_key(cell)]["run_dir"]
                                     for cell in campaign["cells"]}
+        if campaign.get("baseline_root"):
+            receipt["baseline_run_dirs"] = {str(cell["index"]): receipt["curves"][curve_key(baseline_cell(campaign, cell))]["run_dir"]
+                                             for cell in campaign["cells"]}
         series._atomic_json(receipt_path, receipt)
     return receipt
 
@@ -166,87 +238,170 @@ def find_manifest(cell):
     return matches[0] if matches else None
 
 
-def stage_completed(campaign, receipt):
-    """Only complete, protocol-verified five-episode bundles become curve points."""
+def validated_files(cell):
+    path = find_manifest(cell)
+    receipt_path = Path(cell["output_dir"]) / "receipt.json"
+    if path is None or not receipt_path.is_file():
+        return None
+    validation = series._read(receipt_path)
+    if (validation.get("validated") is not True or validation.get("smoke") is not False
+            or validation.get("cell_index") != cell["index"]):
+        raise ValueError("Only explicitly validated production cell receipts can be published")
+    results = Path(cell["output_dir"]) / "results.json"
+    if (validation.get("manifest_sha256") != series._file_digest(path)
+            or validation.get("results_sha256") != series._file_digest(results)):
+        raise ValueError("Validated cell files changed before publication")
+    return {"manifest.json": str(path), "results.json": str(results), "validation-receipt.json": str(receipt_path)}
+
+
+def completed_record(campaign, cell, *, cached=None):
+    """Load a validated result, preserving historical baseline identity verbatim."""
     from utils.eval_series_data import load_records
-    status = {}
-    for cell in campaign["cells"]:
-        key = str(cell["index"])
-        path = find_manifest(cell)
-        validation_path = Path(cell["output_dir"]) / "receipt.json"
-        if path is None or not validation_path.exists():
-            status[key] = "pending"
-            continue
-        validation = series._read(validation_path)
-        if (validation.get("validated") is not True or validation.get("smoke") is not False
-                or validation.get("cell_index") != cell["index"]):
-            raise ValueError("Only explicitly validated production cell receipts can be published")
-        results_path = Path(cell["output_dir"]) / "results.json"
-        if (validation.get("manifest_sha256") != series._file_digest(path)
-                or validation.get("results_sha256") != series._file_digest(results_path)):
-            raise ValueError("Validated cell files changed before publication")
-        run_dir = Path(receipt["cell_run_dirs"][key])
-        journal = series._read(run_dir / "publication.json")
-        previous = [entry for entry in journal["records"].values() if entry["checkpoint_step"] == cell["step"]]
-        if previous:
-            files = previous[0]["artifact_sha256"]
-            if (previous[0]["checkpoint_sha256"] != cell["checkpoint_sha256"]
-                    or files.get("manifest.json") != validation["manifest_sha256"]
-                    or files.get("results.json") != validation["results_sha256"]
-                    or files.get("validation-receipt.json") != series._file_digest(validation_path)):
+    files = validated_files(cell)
+    if files is None:
+        return None, "pending"
+    if cached is not None:
+        if cached["checkpoint"] != {"step": cell["step"], "sha256": cell["checkpoint_sha256"]}:
+            raise ValueError("Previously accepted cell changed")
+        for name, source in files.items():
+            if series._file_digest(source) != cached["_artifact_sha256"].get(name):
                 raise ValueError("Previously accepted cell changed")
-            status[key] = "complete"
-            continue
-        manifest = series._read(path)
-        selected = [run for run in manifest["runs"] if run["selector"] == cell["selector"]]
-        if len(selected) != 1:
-            raise ValueError("Cell bundle must contain its exact selected planner")
-        state = selected[0].get("status")
-        if state != "complete":
-            status[key] = state or "pending"
-            continue
-        records = load_records(path, source_run=cell["source_run"], inventory_path=cell.get("inventory_path"))
+        return {key: value for key, value in cached.items() if key != "_artifact_sha256"}, "complete"
+    path = Path(files["manifest.json"])
+    manifest = series._read(path)
+    base = cell.get("role") == "base"
+    selected = [run for run in manifest["runs"] if base or run["selector"] == cell["selector"]]
+    if not selected or (not base and len(selected) != 1):
+        raise ValueError("Cell bundle must contain its exact selected planner")
+    if not all(run.get("status") == "complete" for run in selected):
+        return None, "pending"
+    records = load_records(path, source_run=cell["source_run"], inventory_path=cell.get("inventory_path"))
+    if base:
+        records = [record for record in records if record["identity"]["planner"].get("type") == "prior"
+                   and record["identity"]["planner"].get("action_rule") == "tanh_" + cell["execution"]]
+    else:
         records = [record for record in records if record.get("selector") == cell["selector"]]
-        if len(records) != 1:
-            raise ValueError("Completed bundle must normalize to one selected record")
-        record = records[0]
-        if record["checkpoint"] != {"step": cell["step"], "sha256": cell["checkpoint_sha256"]}:
-            raise ValueError("Completed result checkpoint does not match campaign")
-        if sorted(ep["seed"] for ep in record["episodes"]) != campaign["seeds"]:
-            raise ValueError("Completed result does not contain all five seeds")
-        # Keep large decision traces on Oscar. The small artifact retains exact
-        # paths/hashes for them, alongside manifest/config/episodes/provenance.
-        trace_names = set(selected[0].get("trace_files", []))
-        retained = {}
-        remote_traces = []
-        for name, source in record["artifact_files"].items():
-            if name in trace_names:
-                remote_traces.append({"name": name, "path": source, "sha256": series._file_digest(source),
-                                      "size_bytes": Path(source).stat().st_size})
+    if len(records) != 1:
+        raise ValueError("Completed bundle must normalize to one selected record")
+    record = records[0]
+    if record["checkpoint"] != {"step": cell["step"], "sha256": cell["checkpoint_sha256"]}:
+        raise ValueError("Completed result checkpoint does not match campaign")
+    if sorted(ep["seed"] for ep in record["episodes"]) != campaign["seeds"]:
+        raise ValueError("Completed result does not contain all five seeds")
+    if record["identity"]["backbone"] != cell["source_run"]:
+        raise ValueError("Completed result source does not match campaign")
+    selected = [run for run in manifest["runs"] if run["selector"] == record["selector"]]
+    if len(selected) != 1:
+        raise ValueError("Normalized record does not identify exactly one bundle run")
+    trace_names = set(selected[0].get("trace_files", []))
+    retained, remote_traces = {}, []
+    for name, source in record["artifact_files"].items():
+        if name in trace_names:
+            remote_traces.append({"name": name, "path": source, "sha256": series._file_digest(source),
+                                  "size_bytes": Path(source).stat().st_size})
+        else:
+            retained[name] = source
+    retained.update(files)
+    record["artifact_files"] = retained
+    record["provenance"]["artifact_policy"] = "summary-only; full traces retained on Oscar"
+    record["provenance"]["remote_trace_files"] = remote_traces
+    return record, "complete"
+
+
+def pair_with_baseline(record, baseline):
+    """Pair environment seeds only; solver streams remain controller-specific."""
+    if record["checkpoint"] != baseline["checkpoint"] or record["identity"]["backbone"] != baseline["identity"]["backbone"]:
+        raise ValueError("Paired baseline has a different checkpoint or source")
+    left, right = record["identity"]["protocol"], baseline["identity"]["protocol"]
+    keys = ("environment", "env_wrapper", "env_wrappers", "observation", "action_rule",
+            "max_steps", "environment_seeds", "controller_seed")
+    if any(left.get(key) != right.get(key) for key in keys):
+        raise ValueError("Paired baseline environment/action/seed protocol differs")
+    if baseline["identity"]["planner"].get("type") != "prior":
+        raise ValueError("Paired baseline must be the frozen base policy")
+    base_episodes = {episode["seed"]: episode for episode in baseline["episodes"]}
+    if len(base_episodes) != len(baseline["episodes"]) or set(base_episodes) != {ep["seed"] for ep in record["episodes"]}:
+        raise ValueError("Paired baseline seed coverage differs")
+    gains = []
+    for episode in record["episodes"]:
+        delta = episode["return"] - base_episodes[episode["seed"]]["return"]
+        episode["paired_return_delta"] = delta
+        gains.append(delta)
+    record["metrics"].update({"eval/paired_gain_mean": statistics.mean(gains),
+        "eval/paired_gain_sample_std": statistics.stdev(gains) if len(gains) > 1 else None,
+        "eval/paired_win_fraction": sum(gain > 0 for gain in gains) / len(gains),
+        "eval/paired_episodes": len(gains), "eval/base_return_mean": baseline["metrics"]["eval/return_mean"]})
+    record["provenance"]["paired_baseline"] = {"record_id": baseline["record_id"],
+        "identity": baseline["identity"], "checkpoint": baseline["checkpoint"],
+        "source_result_path": baseline["source_result_path"],
+        "episodes": [{key: ep[key] for key in ("seed", "solver_seed", "return", "length") if key in ep}
+                     for ep in baseline["episodes"]],
+        "pairing": "same environment seeds and action mode; controller-specific solver streams"}
+    record["record_id"] = series._digest({"result": record["record_id"], "paired_baseline": baseline["record_id"]})
+    record["artifact_files"].update({"paired-base/" + name: source for name, source in baseline["artifact_files"].items()})
+    return record
+
+
+def status_key(cell):
+    return ("base:" if cell.get("role") == "base" else "") + str(cell["index"])
+
+
+def stage_completed(campaign, receipt):
+    """Stage immutable points only after their complete matched controls exist."""
+    status, baseline_records = {}, {}
+    cells = publication_cells(campaign)
+    cells = sorted(cells, key=lambda cell: cell.get("role") != "base")
+    for cell in cells:
+        base = cell.get("role") == "base"
+        mapping = receipt["baseline_run_dirs"] if base else receipt["cell_run_dirs"]
+        run_dir = Path(mapping[str(cell["index"])])
+        journal = series._read(run_dir / "publication.json")
+        entries = [(rid, entry) for rid, entry in journal["records"].items() if entry["checkpoint_step"] == cell["step"]]
+        cached = None
+        if entries:
+            rid, entry = entries[0]
+            cached = {**series._read(run_dir / "records" / (rid + ".json")), "_artifact_sha256": entry["artifact_sha256"]}
+        record, state = completed_record(campaign, cell, cached=cached)
+        if record is None:
+            status[status_key(cell)] = state
+            continue
+        if base:
+            baseline_records[cell["index"]] = record
+        elif campaign.get("baseline_root"):
+            baseline = baseline_records.get(cell["index"])
+            if baseline is None:
+                status[status_key(cell)] = "waiting for matched base"
+                continue
+            if cached:
+                expected = cached["provenance"].get("paired_baseline", {}).get("record_id")
+                if expected != baseline["record_id"]:
+                    raise ValueError("Previously accepted paired baseline changed")
+                for name, source in baseline["artifact_files"].items():
+                    if cached["_artifact_sha256"].get("paired-base/" + name) != series._file_digest(source):
+                        raise ValueError("Previously accepted paired baseline artifacts changed")
             else:
-                retained[name] = source
-        retained.update({"results.json": str(results_path), "validation-receipt.json": str(validation_path)})
-        if sum(Path(source).stat().st_size for source in retained.values()) > 16 * 1024 * 1024:
-            raise ValueError("Summary artifact unexpectedly exceeds16MiB; refusing a large upload")
-        record["artifact_files"] = retained
-        record["provenance"]["artifact_policy"] = "summary-only; full traces retained on Oscar"
-        record["provenance"]["remote_trace_files"] = remote_traces
-        series.stage_record(receipt["cell_run_dirs"][key], record)
-        status[key] = "complete"
+                record = pair_with_baseline(record, baseline)
+        if not cached:
+            if sum(Path(source).stat().st_size for source in record["artifact_files"].values()) > 16 * 1024 * 1024:
+                raise ValueError("Summary artifact unexpectedly exceeds 16 MiB; refusing a large upload")
+            series.stage_record(run_dir, record)
+        status[status_key(cell)] = "complete"
     return status
 
 
 def progress_rows(campaign, receipt, statuses):
     rows = []
     for key, spec in receipt["curves"].items():
-        cells = [cell for cell in campaign["cells"] if curve_key(cell) == key]
+        cells = [cell for cell in publication_cells(campaign) if curve_key(cell) == key]
         journal = series._read(Path(spec["run_dir"]) / "publication.json")
         uploaded = sum(entry["status"] == "published" for entry in journal["records"].values())
-        complete = sum(statuses.get(str(cell["index"])) == "complete" for cell in cells)
-        failed = sum(statuses.get(str(cell["index"])) in ("failed", "error") for cell in cells)
+        complete = sum(statuses.get(status_key(cell)) == "complete" for cell in cells)
+        failed = sum(statuses.get(status_key(cell)) in ("failed", "error") for cell in cells)
+        waiting = sum(statuses.get(status_key(cell)) == "waiting for matched base" for cell in cells)
         rows.append({**spec, "curve": key, "complete": complete, "published": uploaded,
                      "expected": len(cells), "failed": failed,
-                     "status": "complete" if uploaded == len(cells) else "failed cells" if failed else "pending results"})
+                     "status": "complete" if uploaded == len(cells) else "failed cells" if failed else
+                               "waiting for matched base" if waiting else "pending results"})
     return rows
 
 
@@ -259,20 +414,32 @@ def install_workspace(campaign, receipt, rows, path):
     previous = series._read(path) if path.exists() else {}
     if previous and previous.get("campaign_id") != campaign["campaign_id"]:
         raise ValueError("Workspace receipt belongs to a different campaign")
+    paired = bool(campaign.get("baseline_root"))
+    metrics = metric_sections(campaign)
+    title = campaign.get("workspace_title", "Original backbone: H3 J8 vs matched base, mean and sample"
+                         if paired else "Early backbones: H3 J8 fresh SAC, mean vs sample")
+    comparison = ("H3 J8 curves evaluate fresh auxiliary-return inner SAC. Base-policy curves execute "
+                  "the same checkpoint's actor without adaptation. Mean and sampled execution each "
+                  "have their own matched base control." if paired else
+                  "Source labels identify how each frozen backbone was trained; all curves evaluate "
+                  "the same fresh H3 J8 auxiliary-return inner SAC controller.")
+    pairing = ("Paired improvement subtracts the matching base return separately for each environment seed. "
+               "Controls have the same checkpoint, action mode and episode conditions. Controller RNG "
+               "streams remain distinct. Reused controls retain their original scientific provenance. "
+               "An improved point waits for its validated base so its gain is published atomically."
+               if paired else "There is no paired-prior improvement curve in this campaign.")
     markdown = f"""**Fresh H3 J8 inner SAC on early frozen backbones.**
 
-Both sources use the same H3 J8 auxiliary-return inner controller. Source labels
-identify how the frozen backbone was trained; every curve here evaluates inner
-SAC. Mean and sampled execution are separate curves, with seeds 101–105,
+{comparison} Mean and sampled execution are separate curves, with seeds 101–105,
 controller seed 55 and 500 decisions per episode. No outer learning occurs.
 
-The live progress panels and run table show completed checkpoints, out of four
+The live progress panels and run table show completed checkpoints, out of {len(campaign.get('steps', STEPS))}
 per curve. Empty result panels mean pending or unavailable measurements;
 pending checkpoints are never represented as zero-return points. Return is the
 mean of five episodes; the separate SD panel shows seed variability, not a
 confidence interval. Timing includes the actual evaluator's controller cost.
-The x-axis is source-training decisions, not raw environment steps. There is no
-paired-prior improvement curve in this campaign. Diagnostic losses are not returns.
+The x-axis is source-training decisions, not raw environment steps. {pairing}
+Diagnostic losses are not returns.
 Model-probe gains and components are predictions at sampled decision roots after
 the final inner round; they are not measured environment improvement. Probes use
 paired noise and a common frozen outer critic within each source checkpoint.
@@ -283,24 +450,24 @@ runs, with native hover highlighting and no aggregation.
     def plot(title, metric):
         return wr.LinePlot(title=title, x=series.X_AXIS, y=[metric],
             title_x="Source training decisions", aggregate=False, smoothing_type="none",
-            legend_template="${run:name}", max_runs_to_show=4,
+            legend_template="${run:displayName}", max_runs_to_show=len(rows),
             line_colors={row["run_id"] + ":" + metric: row["color"] for row in rows},
             line_titles={row["run_id"] + ":" + metric: row["name"] for row in rows},
             layout=wr.Layout(w=12, h=8))
     def progress_plot(title, metric):
         return wr.BarPlot(title=title, metrics=[metric], orientation="h",
-            aggregate=False, max_runs_to_show=4, max_bars_to_show=4,
+            aggregate=False, max_runs_to_show=len(rows), max_bars_to_show=len(rows),
             legend_template="${run:displayName}",
             line_colors={row["run_id"] + ":" + metric: row["color"] for row in rows},
             line_titles={row["run_id"] + ":" + metric: row["name"] for row in rows},
             layout=wr.Layout(w=12, h=6))
     sections = [ws.Section(name=PREFIX + "Protocol and progress", is_open=True,
         panels=[wr.MarkdownPanel(markdown=markdown, layout=wr.Layout(w=24, h=10)),
-                progress_plot("Completed checkpoints per curve (of 4)", "progress/checkpoints_complete"),
+                progress_plot(f"Completed checkpoints per curve (of {len(campaign.get('steps', STEPS))})", "progress/checkpoints_complete"),
                 progress_plot("Failed validation cells", "progress/failed_cells")])]
     sections += [ws.Section(name=PREFIX + name, is_open=True,
-        panels=[plot(title, metric) for title, metric in metrics],
-        layout_settings=ws.SectionLayoutSettings(columns=2, rows=2)) for name, metrics in METRICS.items()]
+        panels=[plot(title, metric) for title, metric in specs],
+        layout_settings=ws.SectionLayoutSettings(columns=2, rows=2)) for name, specs in metrics.items()]
     if previous.get("url"):
         work = ws.Workspace.from_url(previous["url"])
         if work.entity != ENTITY or work.project != PROJECT:
@@ -315,9 +482,9 @@ runs, with native hover highlighting and no aggregation.
             work.runset_settings.run_settings[row["run_id"]] = setting
     else:
         work = ws.Workspace(entity=ENTITY, project=PROJECT,
-            name="Early backbones: H3 J8 fresh SAC, mean vs sample", sections=sections,
+            name=title, sections=sections,
             auto_generate_panels=False,
-            settings=ws.WorkspaceSettings(x_axis=series.X_AXIS, max_runs=4,
+            settings=ws.WorkspaceSettings(x_axis=series.X_AXIS, max_runs=len(rows),
                 tooltip_number_of_runs="all_runs", tooltip_color_run_names=True,
                 remove_legends_from_panels=False),
             runset_settings=ws.RunsetSettings(filters=[expr.Metric("ID").isin([r["run_id"] for r in rows])],
@@ -331,7 +498,7 @@ runs, with native hover highlighting and no aggregation.
     readback = ws.Workspace.from_url(work.url)
     owned = [section for section in readback.sections if section.name in {s.name for s in sections}]
     panels = [panel for section in owned for panel in section.panels]
-    if len(owned) != len(sections) or len(panels) != 3 + sum(map(len, METRICS.values())):
+    if len(owned) != len(sections) or len(panels) != 3 + sum(map(len, metrics.values())):
         raise RuntimeError("Workspace panel read-back failed")
     for row in rows:
         if readback.runset_settings.run_settings[row["run_id"]].color != row["color"]:
@@ -378,7 +545,9 @@ def verify_workspace(campaign, receipt, path, wandb_module=None):
         raise ValueError("Installed campaign workspace was not found")
     raw = edges[0]["node"]["spec"]
     wire = json.dumps(json.loads(raw) if isinstance(raw, str) else raw, sort_keys=True)
-    if any(token not in wire for token in [*wanted, series.X_AXIS, "eval/return_mean", "progress/checkpoints_complete", *[color for _, color in CURVES.values()]]):
+    expected_metrics = [metric for specs in metric_sections(campaign).values() for _, metric in specs]
+    if any(token not in wire for token in [*wanted, series.X_AXIS, *expected_metrics, "progress/checkpoints_complete",
+                                          *[row["color"] for row in receipt["curves"].values()]]):
         raise ValueError("Installed workspace lost expected campaign panels or run colors")
     return saved
 
@@ -393,14 +562,22 @@ def publish_once(campaign, root, *, wandb_module=None, workspace_verifier=verify
         statuses = stage_completed(campaign, receipt)
         rows = progress_rows(campaign, receipt, statuses)
         for row in rows:
-            cells = [cell for cell in campaign["cells"] if curve_key(cell) == row["curve"]]
+            cells = [cell for cell in publication_cells(campaign) if curve_key(cell) == row["curve"]]
+            evaluation_commit = campaign["source_commit"]
+            if cells[0].get("role") == "base":
+                baseline_receipt = Path(cells[0]["output_dir"]) / "receipt.json"
+                if baseline_receipt.is_file():
+                    evaluation_commit = series._read(baseline_receipt).get("source_commit", evaluation_commit)
             with series.Publisher(row["run_dir"], owner=campaign["campaign_id"], wandb_module=wandb_module) as publisher:
                 publisher.run.name = row["name"]
                 publisher.run.config.update({"campaign_id": campaign["campaign_id"],
-                    "campaign_sha256": receipt["campaign_sha256"], "source_commit": campaign["source_commit"],
+                    "campaign_sha256": receipt["campaign_sha256"], "source_commit": evaluation_commit,
+                    "campaign_source_commit": campaign["source_commit"],
+                    "selection_sha256": campaign.get("selection", {}).get("sha256"),
                     "source_backbone": cells[0]["backbone_id"], "execution_action": cells[0]["execution"],
+                    "curve_role": cells[0].get("role", "inner"),
                     "checkpoint_pins": [{k: cell[k] for k in ("step", "checkpoint_sha256", "metadata_sha256")} for cell in cells]})
-                for specs in METRICS.values():
+                for specs in metric_sections(campaign).values():
                     for _, metric in specs:
                         publisher.run.define_metric(metric, step_metric=series.X_AXIS, step_sync=False, hidden=False)
                 publisher.publish_pending()
@@ -433,7 +610,8 @@ def main():
             receipt = series._read(args.root / "publication-map.json")
             if receipt["campaign_sha256"] != series._digest(campaign):
                 raise ValueError("Campaign changed after publication preparation")
-            rows = [{**spec, "curve": key, "complete": 0, "published": 0, "expected": 4,
+            rows = [{**spec, "curve": key, "complete": 0, "published": 0,
+                     "expected": len(campaign.get("steps", STEPS)),
                      "failed": 0, "status": "pending results"} for key, spec in receipt["curves"].items()]
             result = install_workspace(campaign, receipt, rows, args.root / "workspace.json")
         else:

@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "campaign_id": "original-bank-h3-j8-20261018",
+  "include_paired_baselines": true,
+  "sources": {
+    "original_aux": {
+      "source_run": "rwgao_b-brown-university/ambi/aux6428346x0",
+      "inner_operator": "none",
+      "label": "Original prior-trained backbone"
+    }
+  },
+  "steps": [
+    200000,
+    400000,
+    475000,
+    500000
+  ],
+  "checkpoint_pins": [
+    {
+      "backbone_id": "original_aux",
+      "step": 200000,
+      "checkpoint_sha256": "59e4d07ea2386d49cece5469e36bc4fd52f9e3dfd30a3444d8c2769ea22fd4fc",
+      "metadata_sha256": "9978b151ecb5c301afd8de59a146b94128764de0103f5100fd2c16e02061b802"
+    },
+    {
+      "backbone_id": "original_aux",
+      "step": 400000,
+      "checkpoint_sha256": "801c7df60f859bde7b5793b62f963be15e28d2547d18a8aa5bbbf8ad2463561b",
+      "metadata_sha256": "9f38b3645d1209811ceda5be6fbfc210d82521df12caf18274d58e7def3375f9"
+    },
+    {
+      "backbone_id": "original_aux",
+      "step": 475000,
+      "checkpoint_sha256": "6dc0085e28f094fd2e550ddb43482f0557a32c57462e5c4cdfa622b17d6f0aff",
+      "metadata_sha256": "0ae8ed1eb18c5715313147941ace76e14853075eca338ac460068104f0187b71"
+    },
+    {
+      "backbone_id": "original_aux",
+      "step": 500000,
+      "checkpoint_sha256": "cf5bb8044e6a42d7bbd9724fc716c476f0d06f96d05e954978dc4b00b695fe9e",
+      "metadata_sha256": "0f00b27de519ff592f478cb680cea3a84811f41d872d80710169379195d3ee97"
+    }
+  ]
+}

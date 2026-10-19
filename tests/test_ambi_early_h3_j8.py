@@ -19,7 +19,8 @@ from utils.ambi_research import PresetMatrixError, load_preset_matrix, resolve_p
 
 ROOT = Path(__file__).resolve().parents[1]
 MATRIX = ROOT / "configs/research/ambi_early_h3_j8.json"
-SOURCE_CONFIGS = ("ambi_full_h3_j8_fresh", "ambi_full_h3_mppi_aux_return")
+SOURCE_CONFIGS = ("ambi_full_h3_j8_fresh", "ambi_full_h3_mppi_aux_return",
+                  "ambi_aux_return_sac_clip_target10p5_shared")
 
 
 def _resolve(config, mode="mean"):
@@ -44,9 +45,10 @@ def test_production_recipe_preserves_each_source_outer_state_contract(source_nam
             if key.startswith("inner_"):
                 assert getattr(actual, key) == getattr(expected, key), key
         for key, value in source["alg_params"].items():
-            if not key.startswith("inner_") and key != "wandb":
+            if not key.startswith("inner_") and key not in {"wandb", "outer_policy_diagnostics"}:
                 assert params[key] == value, key
         assert actual.inner_operator == "sac"
+        assert actual.outer_policy_diagnostics is False
         assert (actual.inner_rounds, actual.inner_rollout_horizon) == (8, 3)
         assert (actual.inner_critic_updates_per_round, actual.inner_actor_updates_per_round) == (16, 4)
         assert actual.inner_model_step_budget == 3072
@@ -60,6 +62,15 @@ def test_production_recipe_preserves_each_source_outer_state_contract(source_nam
         assert frozen_execution_action(resolved) == mode
         assert resolved["evaluation"]["seeds"] == [101, 102, 103, 104, 105]
     assert source == before
+
+
+def test_checkpoint_preset_can_only_disable_training_collector_recorder():
+    from utils.ambi_research import validate_preset_matrix
+    matrix = load_preset_matrix(MATRIX)
+    assert matrix["shared_alg_params"]["outer_policy_diagnostics"] is False
+    matrix["shared_alg_params"]["outer_policy_diagnostics"] = True
+    with pytest.raises(PresetMatrixError, match="incompatible overrides"):
+        validate_preset_matrix(matrix)
 
 
 def test_execution_identity_is_explicit_and_old_matrices_remain_mean():
@@ -93,6 +104,11 @@ def _tiny_checkpoint(tmp_path, source_operator):
                           ent_coef="auto_0.37", inner_operator=source_operator,
                           inner_actor_source="sac", inner_horizon_actor_source="sac",
                           inner_critic_source="aux_return", inner_horizon_critic_source="aux_return")
+    if source_operator == "none":
+        params["outer_policy_diagnostics"] = True
+        params["mpc"] = False
+        for key in ("inner_rounds", "inner_rollouts_per_round", "inner_updates_per_round"):
+            params.pop(key, None)
     if source_operator == "mppi":
         for key in ("inner_rounds", "inner_rollouts_per_round", "inner_updates_per_round"):
             params.pop(key)
@@ -141,7 +157,7 @@ def _evaluate(monkeypatch, path, resolved, *, bundle_dir=None, rollouts=0, caden
     return result, actions, bundle, run
 
 
-@pytest.mark.parametrize("source_operator", ["sac", "mppi"])
+@pytest.mark.parametrize("source_operator", ["sac", "mppi", "none"])
 def test_real_portable_checkpoint_execution_samples_and_keeps_outer_frozen(
         tmp_path, monkeypatch, source_operator):
     path, mean = _tiny_checkpoint(tmp_path, source_operator)

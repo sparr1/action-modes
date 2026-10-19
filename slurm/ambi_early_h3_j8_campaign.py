@@ -19,6 +19,14 @@ SOURCES = {
     "mppi_aux": "rwgao_b-brown-university/ambi/mppi7530927x0",
     "sac_aux": "rwgao_b-brown-university/ambi/full7391933x4",
 }
+SOURCE_DEFINITIONS = {
+    "mppi_aux": {"source_run": SOURCES["mppi_aux"], "inner_operator": "mppi",
+                 "label": "MPPI-trained backbone"},
+    "sac_aux": {"source_run": SOURCES["sac_aux"], "inner_operator": "sac",
+                "label": "SAC-trained backbone"},
+    "original_aux": {"source_run": "rwgao_b-brown-university/ambi/aux6428346x0",
+                     "inner_operator": "none", "label": "Original prior-trained backbone"},
+}
 MATRIX = "configs/research/ambi_early_h3_j8.json"
 
 
@@ -53,10 +61,18 @@ def verify_source(campaign=None):
     if campaign and (sha != campaign["source_commit"] or
                      sha256(REPO / MATRIX) != campaign["matrix_sha256"]):
         raise RuntimeError("Campaign source/configuration changed")
+    if campaign and campaign.get("selection"):
+        selection = campaign["selection"]
+        if sha256(REPO / selection["path"]) != selection["sha256"]:
+            raise RuntimeError("Campaign checkpoint selection changed")
+        validate_campaign_selection(campaign)
     return sha
 
 
 def verify_checkpoint(row):
+    source = SOURCE_DEFINITIONS.get(row["backbone_id"])
+    if source is None or row["source_run"] != source["source_run"]:
+        raise ValueError("Wrong checkpoint source run")
     for path_key, hash_key in (("checkpoint", "checkpoint_sha256"),
                                ("metadata", "metadata_sha256")):
         if sha256(row[path_key]) != row[hash_key]:
@@ -65,30 +81,124 @@ def verify_checkpoint(row):
     if metadata["checkpoint"]["step"] != row["step"]:
         raise ValueError("Checkpoint step and sidecar disagree")
     params = metadata["trial_run_params"]["alg_params"]
-    expected_operator = "mppi" if row["backbone_id"] == "mppi_aux" else "sac"
-    if params["inner_operator"] != expected_operator or params["aux_return_mode"] != "sac":
+    if params["inner_operator"] != source["inner_operator"] or params["aux_return_mode"] != "sac":
         raise ValueError("Unexpected source backbone")
 
 
-def prepare(inventory_path, root):
+def selection_definition(selection_path=None):
+    """Use explicit checkpoint pins without changing the original campaign."""
+    if selection_path is None:
+        return {"campaign_id": "early-h3-j8-20261018",
+                "sources": {key: SOURCE_DEFINITIONS[key] for key in SOURCES},
+                "steps": STEPS, "checkpoint_pins": []}, None
+    path = Path(selection_path).resolve()
+    relative = str(path.relative_to(REPO))
+    selection = read(path)
+    if selection.get("schema_version") != 1:
+        raise ValueError("Unsupported checkpoint selection schema")
+    sources = selection.get("sources", {})
+    steps = selection.get("steps", [])
+    if not sources or not isinstance(sources, dict):
+        raise ValueError("Checkpoint selection requires explicit sources")
+    for backbone, source in sources.items():
+        known = SOURCE_DEFINITIONS.get(backbone)
+        if known is None or any(source.get(key) != known[key] for key in ("source_run", "inner_operator")):
+            raise ValueError("Checkpoint selection has an unknown source identity")
+    if (not steps or steps != sorted(set(steps))
+            or any(type(step) is not int or step <= 0 for step in steps)):
+        raise ValueError("Checkpoint selection steps must be sorted unique positive integers")
+    expected = {(backbone, step) for backbone in sources for step in steps}
+    pins = selection.get("checkpoint_pins", [])
+    if len(pins) != len(expected) or {(row["backbone_id"], row["step"]) for row in pins} != expected:
+        raise ValueError("Checkpoint selection requires exactly one hash pin per selected checkpoint")
+    for pin in pins:
+        for key in ("checkpoint_sha256", "metadata_sha256"):
+            value = pin.get(key, "")
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise ValueError("Checkpoint selection contains an invalid SHA256")
+    if not isinstance(selection.get("campaign_id"), str) or not selection["campaign_id"]:
+        raise ValueError("Checkpoint selection requires a campaign_id")
+    return selection, {"path": relative, "sha256": sha256(path)}
+
+
+def select_inventory_rows(inventory, selection, *, exact_inventory=False):
+    """Resolve only the requested source/step pairs, preserving inventory hashes."""
+    sources, steps = selection["sources"], selection["steps"]
+    expected = {(backbone, step) for backbone in sources for step in steps}
+    source_ids = {source["source_run"]: backbone for backbone, source in sources.items()}
+    rows = []
+    for item in inventory["checkpoints"]:
+        source_run = item.get("source_run", inventory.get("source_run"))
+        backbone = item.get("backbone_id", source_ids.get(source_run))
+        if (backbone, item["step"]) not in expected:
+            continue
+        if source_run != sources[backbone]["source_run"]:
+            raise ValueError("Wrong checkpoint source run")
+        rows.append({**item, "backbone_id": backbone, "source_run": source_run})
+    if (len(rows) != len(expected) or {(row["backbone_id"], row["step"]) for row in rows} != expected
+            or (exact_inventory and len(inventory["checkpoints"]) != len(expected))):
+        message = ("Inventory must contain exactly the selected eight checkpoints" if exact_inventory
+                   else "Inventory must contain exactly one of each selected source/checkpoint pair")
+        raise ValueError(message)
+    pins = {(row["backbone_id"], row["step"]): row for row in selection.get("checkpoint_pins", [])}
+    for row in rows:
+        pin = pins.get((row["backbone_id"], row["step"]))
+        if pin and any(row[key] != pin[key] for key in ("checkpoint_sha256", "metadata_sha256")):
+            raise ValueError("Inventory disagrees with selected checkpoint SHA256 pins")
+    return rows
+
+
+def validate_campaign_selection(campaign):
+    """Bind a generated manifest back to its tracked, hash-pinned selection."""
+    provenance = campaign.get("selection")
+    if not provenance:
+        return
+    selection, actual_provenance = selection_definition(REPO / provenance["path"])
+    if provenance != actual_provenance:
+        raise ValueError("Campaign checkpoint selection hash changed")
+    for key in ("campaign_id", "sources", "steps"):
+        if campaign.get(key) != selection[key]:
+            raise ValueError(f"Campaign {key} disagrees with checkpoint selection")
+    if (campaign.get("matrix") != MATRIX or campaign.get("seeds") != SEEDS
+            or campaign.get("controller_seed") != 55 or campaign.get("max_steps") != 500):
+        raise ValueError("Campaign protocol disagrees with selected H3/J8 evaluation")
+    identities = [(backbone, step, execution)
+                  for backbone in selection["sources"] for step in selection["steps"]
+                  for execution in ("mean", "sample")]
+    cells = campaign["cells"]
+    if len(cells) != len(identities):
+        raise ValueError("Campaign does not contain exactly the selected cells")
+    pins = {(pin["backbone_id"], pin["step"]): pin for pin in selection["checkpoint_pins"]}
+    for index, (cell, identity) in enumerate(zip(cells, identities)):
+        backbone, step, execution = identity
+        if (cell["index"] != index or (cell["backbone_id"], cell["step"], cell["execution"]) != identity
+                or cell["source_run"] != selection["sources"][backbone]["source_run"]
+                or cell["selector"] != f"early_h3_j8/{execution}"):
+            raise ValueError("Campaign cell identity disagrees with checkpoint selection")
+        pin = pins[(backbone, step)]
+        if any(cell[key] != pin[key] for key in ("checkpoint_sha256", "metadata_sha256")):
+            raise ValueError("Campaign cell hash disagrees with checkpoint selection")
+
+
+def prepare(inventory_path, root, *, selection_path=None):
     root = Path(root).resolve()
     sha = verify_source()
-    rows = read(inventory_path)["checkpoints"]
-    expected = {(backbone, step) for backbone in SOURCES for step in STEPS}
-    if len(rows) != len(expected) or {(r["backbone_id"], r["step"]) for r in rows} != expected:
-        raise ValueError("Inventory must contain exactly the selected eight checkpoints")
+    selection, provenance = selection_definition(selection_path)
+    sources = selection["sources"]
+    rows = select_inventory_rows(read(inventory_path), selection, exact_inventory=selection_path is None)
     for row in rows:
-        if row["source_run"] != SOURCES[row["backbone_id"]]:
-            raise ValueError("Wrong checkpoint source run")
         verify_checkpoint(row)
-    campaign = dict(schema="ambi-early-h3-j8-v1", campaign_id="early-h3-j8-20261018",
+    campaign = dict(schema="ambi-early-h3-j8-v1", campaign_id=selection["campaign_id"],
                     source_commit=sha, source_tree=git("rev-parse", "HEAD^{tree}"),
                     matrix=MATRIX, matrix_sha256=sha256(REPO / MATRIX),
+                    sources=sources, steps=selection["steps"], selection=provenance,
                     seeds=SEEDS, controller_seed=55, max_steps=500, cells=[])
-    for backbone in SOURCES:
+    if selection.get("include_paired_baselines"):
+        campaign["baseline_root"] = str(root / "baselines")
+    for backbone in sources:
         inventory = root / "inputs" / f"{backbone}.json"
         selected = sorted((r for r in rows if r["backbone_id"] == backbone), key=lambda r: r["step"])
-        write_new(inventory, {"source_run": SOURCES[backbone], "checkpoints": [
+        write_new(inventory, {"source_run": sources[backbone]["source_run"], "checkpoints": [
             {**row, "path": row["checkpoint"], "sha256": row["checkpoint_sha256"]} for row in selected]})
         for row in selected:
             for execution in ("mean", "sample"):
@@ -96,6 +206,7 @@ def prepare(inventory_path, root):
                 campaign["cells"].append({**row, "index": index, "execution": execution,
                     "selector": f"early_h3_j8/{execution}", "inventory_path": str(inventory),
                     "output_dir": str(root / "production" / f"cell-{index:02d}")})
+    validate_campaign_selection(campaign)
     write_new(root / "campaign.json", campaign)
     return campaign
 
@@ -161,13 +272,15 @@ def main():
     p = sub.add_parser("prepare")
     p.add_argument("--inventory", required=True, type=Path)
     p.add_argument("--root", required=True, type=Path)
+    p.add_argument("--selection", type=Path,
+                   help="Tracked source/checkpoint selection; omission preserves the original two-backbone campaign")
     p = sub.add_parser("run")
     p.add_argument("--campaign", required=True, type=Path)
     p.add_argument("--index", required=True, type=int)
     p.add_argument("--smoke-steps", type=int, choices=(32, 500))
     args = parser.parse_args()
     if args.command == "prepare":
-        result = prepare(args.inventory, args.root)
+        result = prepare(args.inventory, args.root, selection_path=args.selection)
         print(json.dumps({"cells": len(result["cells"]), "root": str(args.root)}))
     else:
         print(json.dumps(run_cell(args.campaign, args.index, args.smoke_steps), allow_nan=False))

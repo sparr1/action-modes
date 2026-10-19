@@ -73,6 +73,7 @@ def _validate_checkpoint_overrides(alg_params, run_params, location):
         if not key.startswith(("inner_", "wandb_"))
         and key not in _CHECKPOINT_RUNTIME_PARAMS
         and key not in _CHECKPOINT_INNER_PARAMS
+        and not (key == "outer_policy_diagnostics" and alg_params[key] is False)
     ]
     forbidden_run = sorted(set(run_params) - {"device"})
     if forbidden or forbidden_run:

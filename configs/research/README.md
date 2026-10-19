@@ -161,6 +161,20 @@ checkpoint. Materialize and train those axes instead.
 
 ## Early H3/J8 checkpoint diagnosis
 
+`ambi_original_bank_h3_j8_campaign.json` selects the original prior-only
+`ambi/aux6428346x0` bank at 200k, 400k, 475k and 500k training decisions.
+Pass it with `slurm/ambi_early_h3_j8_campaign.py prepare --selection ...`;
+the selection pins both checkpoint and metadata hashes and creates eight cells
+(mean and sampled execution at each checkpoint). The original default campaign
+remains available for its two separately trained backbones.
+
+The frozen H3/J8 preset disables the prior-only training collector recorder,
+which cannot run with an active inner controller. This does not change learned
+weights, policy parameterization or the evaluation's own diagnostics. Historical
+mean-action references retain their original scientific provenance; sampled
+references use `ambi_early_prior_baselines.json`. Paired episode differences are
+published only after both the adapted and matching base results pass validation.
+
 `ambi_early_h3_j8.json` applies the production fresh H3/J8 inner SAC recipe
 (C16/A4/N128/B256, auxiliary return critic initialization and horizon tail,
 reward-only targets, and automatic temperature initialized from the saved
