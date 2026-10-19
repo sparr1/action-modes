@@ -1,0 +1,26 @@
+{
+  "study_type": "single_seed_exploratory_full_training_held_policy",
+  "study_note": "One fresh auxiliary-return H3/J8/K3 Humanoid Walk full-training run. Matches the launched H3/J8 aux-return recipe with runtime aux_return_joint_vmap=false; the scientific change is inner_solve_interval=3. Solve at real episode decisions0,3,6,... using J8/C16/A4/N128/B256, and hold the adapted feedback actor plus solve-time encoder snapshot between solves. Every held decision still observes the new real state, samples a fresh action, appends real replay, and performs the ordinary outer update. Inner actor, critic, temperature, replay and optimizers start fresh at each solve; no Bernoulli transfer. The primary outer critic is entropy-augmented; inner critic initialization and horizon bootstrap use the auxiliary return critic with reward-only inner targets. Shared representation receives the auxiliary loss. Seed55,500k decisions (1M raw environment steps),2500 warmup decisions and2500 pretraining updates. Preserve every25k portable checkpoint and use durable exact-resume generations at episode boundaries. Evaluation remains disabled; W&B ambi reports actual training returns, solve/held counts, diagnostics and costs.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 500000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_full_h3_j8_k3_fresh"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

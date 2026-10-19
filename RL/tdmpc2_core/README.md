@@ -277,6 +277,91 @@ Diagnostic decisions additionally report the actual sampled
 `inner_critic_bernoulli_retained_fraction`; measuring it consumes no extra RNG.
 Timing includes mask application in the ordinary inner setup/action timings.
 
+### Held-policy execution in full training
+
+`inner_solve_interval=K` controls the number of real decisions per inner solve
+and defaults to 1. It is independent of `inner_rollout_horizon=H`, the length
+of imagined rollouts. K=H executes H feedback actions per solve: solve at
+episode decisions 0, K, 2K, etc., and evaluate the same adapted actor on each
+new real observation until the next solve. The first policy-controlled
+decision after random seeding starts a new block. A termination, timeout, or
+training-budget boundary can end a partial block.
+
+For K>1, the complete held observation-to-action policy consists of the
+adapted actor and an independent, evaluation-mode encoder snapshot from its
+solve. The derived configuration field `inner_hold_encoder="solve_snapshot"`
+records this contract. The live outer encoder, actor, critics, dynamics, and
+replay keep learning normally. Each new solve uses the latest outer encoder
+and priors. Snapshot allocations are reused; they do not share mutable outer
+parameters, change the outer optimizer, or become outer model checkpoint keys.
+
+To enable this in an existing H3/J8 algorithm's `alg_params`, add:
+
+```json
+{
+  "inner_solve_interval": 3
+}
+```
+
+Add the key to the complete algorithm configuration. A partial
+`overrides_alg.alg_params` in an experiment manifest replaces the entire
+parameter mapping rather than merging it. No shipped training recipe enables
+holding implicitly.
+
+The initial implementation supports state observations, active canonical
+single-policy SAC, dense prior-initialized actor/critic clones, one-step
+targets, round updates, and action-scoped learner components. Primary soft
+and auxiliary-return critics and both loop/vmap execution are supported.
+RGB, persistent inner components, random initialization, LoRA, split values,
+Retrace, horizon conditioning, explorer populations, outer-replay mixing,
+prior writeback, and outer-policy episode interventions are rejected with
+K>1. K=1 retains the historical behavior and supported combinations.
+
+Held training decisions honor `inner_execution_action`; sampled actions use
+only the private execution RNG stream. Requested behavior-policy metadata
+describes the actual held distribution at the new observation. Deterministic
+evaluation uses the held mean without sampling. Held decisions skip workspace
+initialization, imagination, replay draws, optimizers, and model/critic
+diagnostics. With Bernoulli transfer, the previous successful solve's critic
+survives every held decision unchanged. The next solve draws its mask against
+the then-current outer critic and resets targets, optimizer moments, replay,
+and temperature as usual.
+
+Episode resets, mode switches, checkpoint loads, and failed actions invalidate
+the held policy, cadence, and transfer donor. Isolated evaluation does not
+alter the training cache. Portable model snapshots can initialize a different
+cadence; exact training resume binds K and encoder semantics and remains
+episode-boundary-only. Boundary capture clears transient caches in both the
+continuing and restored process. There is no mid-block resume payload. Missing
+or explicit K=1 preserves historical checkpoint and scientific identities.
+
+Every K>1 controlled decision reports `inner_solve_performed`,
+`inner_policy_held`, `inner_solve_interval`, zero-based `inner_solve_index`,
+`inner_episode_decision_index`, and `inner_action_age` (0 through K-1).
+W&B sums solve/held counts under `train/`, averages the cadence gauges, and
+sums `inner_solve_seconds`, `inner_held_seconds`, and
+`inner_encoder_snapshot_seconds` under `time/`. These are component timings;
+ordinary controller wall time still includes encoding and action
+materialization. Held decisions report zero imagined work and optimizer
+updates, and omit stale loss/temperature measurements. Existing default-run
+metrics remain unchanged.
+
+Paired controller evaluation aggregates Q-gain probes over solve decisions
+only, with explicit solve/held counts. Episode returns and average control
+cost still include every real decision, and no held decision repeats an old
+Q diagnostic.
+
+The focused suite is `tests/test_ambi_held_policy_*.py`. The strict CUDA gate
+is opt-in and must run on a compute allocation before a production launch:
+
+```bash
+AMBI_RUN_HELD_POLICY_CUDA_GATE=1 environments/dmcontrol/.venv/bin/python \
+  -m pytest -q tests/test_ambi_held_policy_cuda_gate.py
+```
+
+This smoke check validates compiled execution and reports timings; it does
+not establish a full-training speedup or production walltime estimate.
+
 ### Inner-network initialization
 
 `inner_actor_initialization` and `inner_critic_initialization` independently

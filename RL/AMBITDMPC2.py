@@ -151,6 +151,8 @@ _AMBI_DEFAULTS = {
     # were actually generated in that round.
     "inner_operator": "sac",
     "inner_rounds": 4,
+    # Real decisions per inner solve; independent of imagined rollout horizon.
+    "inner_solve_interval": 1,
     "inner_rollouts_per_round": 64,
     "inner_rollout_horizon": 3,
     "inner_updates_per_round": "auto",
@@ -2945,6 +2947,35 @@ class AMBITDMPC2(TDMPC2Baseline):
         _validate_split_value_config(cfg)
         validate_auxiliary_config(cfg)
 
+        cfg.inner_solve_interval = _strict_positive_int(
+            cfg.inner_solve_interval, "inner_solve_interval"
+        )
+        # This is a derived scientific contract, not a selectable live-encoder
+        # variant. Keeping it absent at K=1 preserves historical identities.
+        vars(cfg).pop("inner_hold_encoder", None)
+        if cfg.inner_solve_interval > 1:
+            requirements = {
+                "obs": "state", "inner_operator": "sac",
+                "inner_schedule_mode": "canonical", "critic_value_mode": "single",
+                "inner_actor_adaptation": "clone", "inner_critic_adaptation": "clone",
+                "inner_actor_initialization": "prior", "inner_critic_initialization": "prior",
+                "inner_sac_return_estimator": "one_step", "inner_update_timing": "round",
+                "inner_horizon_conditioning": "none", "inner_explorer_mode": "none",
+                "inner_execution_policy_source": "primary",
+                "inner_actor_writeback_coef": 0.0, "inner_critic_writeback_coef": 0.0,
+                "inner_outer_replay_fraction": 0.0, "outer_policy_episode_probability": 0.0,
+                "value_equivalence_loss_coef": 0.0, "value_equivalence_diagnostics": False,
+            }
+            for component in ("actor", "critic", "temperature", "replay",
+                              "actor_optimizer", "critic_optimizer", "temperature_optimizer"):
+                requirements[f"inner_{component}_scope"] = "action"
+            for key, required in requirements.items():
+                if getattr(cfg, key) != required:
+                    raise ValueError(f"inner_solve_interval>1 requires {key}={required!r}.")
+            if cfg.inner_rounds <= 0:
+                raise ValueError("inner_solve_interval>1 requires an active SAC solve.")
+            cfg.inner_hold_encoder = "solve_snapshot"
+
         cfg.inner_critic_bernoulli_p = _strict_probability(
             cfg.inner_critic_bernoulli_p, "inner_critic_bernoulli_p"
         )
@@ -3542,6 +3573,8 @@ class AMBITDMPC2(TDMPC2Baseline):
         # weighted by their own optimizer, and action-level gauges are averaged
         # by planned actions. New metrics must be deliberately classified here.
         counter_metrics = {
+            "inner_solve_performed",
+            "inner_policy_held",
             "inner_model_steps_budget",
             "inner_nominal_model_steps",
             "inner_realized_model_steps",
@@ -3602,6 +3635,9 @@ class AMBITDMPC2(TDMPC2Baseline):
                 self._wandb_train_window.add_sum(f"train/{key}", metrics[key])
 
         timing_metrics = {
+            "inner_solve_seconds",
+            "inner_held_seconds",
+            "inner_encoder_snapshot_seconds",
             "inner_setup_seconds",
             "inner_rollout_seconds",
             "inner_update_seconds",
@@ -3711,6 +3747,10 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_explorer_temperature_grad_norm",
         }
         action_gauges = {
+            "inner_solve_interval",
+            "inner_solve_index",
+            "inner_action_age",
+            "inner_episode_decision_index",
             "inner_critic_bernoulli_p",
             "inner_critic_bernoulli_applied",
             "inner_critic_bernoulli_retained_fraction",

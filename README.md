@@ -101,11 +101,60 @@ and normalization parameters, while buffers always reset to the prior. The
 default `0.0` preserves fresh initialization; `1.0` carries all critic weights.
 
 Transfer stays within an episode. The actor, target, Adam moments, imagined
-replay, and temperature are freshly initialized at every decision; the target
+replay, and temperature are freshly initialized at every inner solve; the target
 starts from the selected online critic. Both loop and vmap ensembles work.
 This supports main training, prediction, and isolated paired evaluation.
 See [the transfer contract](RL/tdmpc2_core/README.md#bernoulli-critic-transfer)
 for supported settings, logging, and exact resume behavior.
+
+### Execute several real actions per inner solve
+
+Set `alg_params.inner_solve_interval=K` to run inner SAC once per K real
+decisions. The default is 1. This is independent of `inner_rollout_horizon=H`;
+for example, adding `"inner_solve_interval": 3` to a full H3/J8 recipe solves
+at episode decisions 0, 3, 6, and so on, with eight rounds at each solve.
+
+Each intervening action evaluates the adapted actor at the new real
+observation using a frozen snapshot of the encoder from that solve. The actor
+and encoder stay fixed for the block, while the outer learner and real replay
+continue their ordinary updates. Training retains the configured sampled or
+mean action execution; deterministic evaluation executes policy means.
+Bernoulli critic transfer, when enabled, occurs between solves. Episode
+boundaries discard the held policy, including a partial final block.
+
+This supports the current state-observation fresh/Bernoulli SAC recipes with
+primary soft or auxiliary-return critics. Existing experiment configurations
+remain unchanged. See [held-policy execution](RL/tdmpc2_core/README.md#held-policy-execution-in-full-training)
+for compatibility, metrics, checkpointing, and the opt-in CUDA smoke gate.
+
+The one-cell `configs/dmcontrol/experiments/ambi_held_training.json` runs fresh
+aux-return H3/J8/K3 with sampled actions, seed 55, 500k decisions, and all 25k
+model snapshots. Its Oscar wrapper is
+`slurm/run_ambi_held_training_oscar.sbatch`. Set `AMBI_PROJECT_DIR`, the locked
+`AMBI_PYTHON`, full `AMBI_EXPECTED_COMMIT`, and an external `AMBI_HELD_OUTPUT`.
+Submit `AMBI_HELD_MODE=smoke` with three physical CPU cores and explicit GPU,
+memory and walltime resources. This runs the exact K3 CUDA case followed by
+1/2/3-core timing of complete training decisions with CPU replay, matching
+production exact resume. The gate writes `gate/receipt.json` bound to the source,
+configuration, runtime and GPU model. The CPU comparison alone can be run inside
+an allocated GPU job as:
+
+```bash
+python slurm/benchmark_ambi_training_cpu.py \
+  --manifest configs/dmcontrol/experiments/ambi_held_training.json \
+  --cell-index 0 --cpu-counts 1,2,3 --warmup 12 --decisions 120 \
+  --output /absolute/scratch/held-cpu-comparison
+```
+
+After the gate passes, submit the same wrapper with `AMBI_HELD_MODE=train`, a
+measured CPU count, the same GPU model, an explicit `AMBI_DRAIN_AFTER_SECONDS`
+below the requested walltime, and a unique `AMBI_LINEAGE_DIR` under
+`/oscar/home/rgao48/ambi-durable`. A production-only `--signal=USR1@900` provides
+an additional drain trigger; omit it for the short smoke. The canonical Oscar launcher owns quota checks,
+episode-boundary exact resume, W&B continuity, and verified requeue. Numbered
+model snapshots remain under each durable segment's `model_snapshots`; pruning
+old resume generations does not remove these snapshots. The wrapper specifies
+no default CPU, GPU, memory, or walltime request.
 
 The full-training manifests `ambi_transfer_training.json` (J6) and
 `ambi_transfer_training_j8.json` (J8) pair H1/H2/H3 with fresh or Bernoulli 50%

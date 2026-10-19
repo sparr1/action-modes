@@ -33,6 +33,58 @@ def test_benchmark_preserves_production_work_and_only_shortens_collection():
     assert manifest == expected_manifest
 
 
+def test_held_benchmark_selects_exact_production_recipe_without_changing_solve_dose():
+    path = bench.ROOT / "configs/dmcontrol/experiments/ambi_held_training.json"
+    name, _, original = bench.recipe(0, path)
+    selected, _, run, overrides = bench.benchmark_recipe(12, 120, manifest_path=path, cell_index=0)
+    expected = deepcopy(original)
+    expected["alg_params"].update(overrides)
+    expected.update(total_steps=633, checkpoint_every=None, save_strat="none")
+    assert name == selected == "ambi_full_h3_j8_k3_fresh"
+    assert run == expected
+    params = run["alg_params"]
+    assert (params["inner_solve_interval"], params["inner_rounds"], params["inner_rollout_horizon"]) == (3, 8, 3)
+    assert params["inner_critic_bernoulli_p"] == 0
+    assert params["aux_return_joint_vmap"] is False
+    assert params["compile"] and params["compile_strict"]
+
+
+def test_selectable_cpu_counts_do_not_require_eight_core_allocation():
+    assert bench.cpu_counts("1,2,3") == (1, 2, 3)
+    for invalid in ("", "0,1", "1,1", "-1,2", "1,two"):
+        with pytest.raises(ValueError):
+            bench.cpu_counts(invalid)
+
+
+def test_phase_summary_preserves_controller_and_outer_timing_scope():
+    rows = [{"solve": solve, "action_seconds": seconds, "outer_update_enqueue_seconds": .2}
+            for solve, seconds in ((True, 6.), (False, .1), (False, .3))]
+    result = bench.phase_summary(rows)
+    assert result["solve_decisions"] == 1 and result["held_decisions"] == 2
+    assert result["solve_action_seconds_mean"] == 6.
+    assert result["held_action_seconds_mean"] == pytest.approx(.2)
+    assert result["outer_update_enqueue_seconds_mean"] == pytest.approx(.2)
+
+
+@pytest.mark.parametrize("probability", [0., .5])
+def test_benchmark_work_validator_accepts_actual_held_metrics_and_rejects_work(probability):
+    import torch
+    from tests.test_ambi_root_local_sac import _tiny_model
+    model = _tiny_model(inner_solve_interval=3, inner_critic_bernoulli_p=probability,
+                        inner_finite_horizon=True, inner_execution_action="policy_sample")
+    try:
+        model.agent.act(torch.zeros(3), t0=True, collect_diagnostics=False)
+        model.agent.act(torch.ones(3), collect_diagnostics=False)
+        metrics = dict(model.agent.last_inner_metrics)
+        assert not bench.action_work(metrics, decision=1, interval=3, probability=probability)
+        metrics["inner_replay_draws"] = 1
+        with pytest.raises(AssertionError):
+            bench.action_work(metrics, decision=1, interval=3, probability=probability)
+    finally:
+        model.close()
+        model.env.close()
+
+
 def test_timer_excludes_warmup_but_includes_outer_updates(monkeypatch):
     clock = {"wall": 100., "cpu": 50.}
     monkeypatch.setattr(bench.time, "perf_counter", lambda: clock["wall"])
