@@ -1,0 +1,26 @@
+{
+  "study_type": "single_seed_exploratory_full_training_reward_only_primary",
+  "study_note": "One H3 MPPI full-training run with a reward-only primary critic and no auxiliary critic. The entropy-regularized SAC prior actor retains automatic temperature initialized at 1.0 and target entropy -10.5. This changes the Bellman target of the previous primary-soft-Q MPPI recipe to reward-only while preserving the planner: 8 iterations, 512 candidates, 64 elites, 24 SAC-policy trajectories, temperature 0.5, std 0.05\u20132, episode-scoped shifted plan means, weighted-elite selection and proposal-scaled Gaussian training noise. Plan at every real decision (K1). Score model rewards plus online primary-Q mean_pair at a sampled SAC terminal action, with no rollout or terminal entropy bonus. No inner gradient updates or Bernoulli transfer. All critic-source selectors are named sac to select the primary learner; this primary critic now predicts reward return. Disabling the auxiliary learner removes its critic modules, optimizer and shared-representation loss. Preserve the five-head distributional Q ensemble, seed 55, 500k decisions (1M raw environment steps), 2500 warmup decisions and 2500 pretraining updates. Retain all 25k portable checkpoints and durable exact-resume generations. Evaluation remains disabled; publish actual training returns, diagnostics and costs in W&B ambi, group ambi-return-only-training-20261019.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 500000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_full_h3_mppi_reward_only"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

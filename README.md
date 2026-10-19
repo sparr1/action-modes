@@ -175,6 +175,19 @@ sampled outer action and online primary-Q `mean_pair` bootstrap, without an
 additional terminal entropy bonus. Removing auxiliary training also removes its
 loss contribution to the shared representation. There is no Bernoulli transfer.
 
+The one-cell `ambi_return_only_mppi_training.json` and
+`ambi_return_only_sac_training.json` manifests instead train the primary
+five-head distributional critic with reward-only Bellman targets and disable
+the auxiliary critic. The actor retains automatic entropy regularization,
+initialized at 1.0 with target entropy −10.5. The `sac` source selectors refer to
+this primary learner; its critic now predicts reward return. MPPI keeps H3,
+8 iterations, 512 candidates, 64 elites and 24 policy trajectories, replanning
+every decision (K1). Fresh inner SAC keeps H3/J8/C16/A4/N128/B256 with reward-only
+inner targets and K3 held-policy execution. Both keep sampled training actions,
+seed 55, 500k decisions, all 25k checkpoints and durable exact resume, and publish
+to AMBI group `ambi-return-only-training-20261019`. Their finite-horizon terminal
+score uses online primary-Q `mean_pair` without an added entropy bonus.
+
 For a short CPU-allocation comparison, run
 `python slurm/benchmark_ambi_training_cpu.py --output /absolute/scratch/directory`
 inside one Slurm allocation with a GPU, eight physical CPU cores
