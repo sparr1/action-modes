@@ -145,17 +145,26 @@ def vectorized_forward(
             expected = (len(modules), *batch_shape, specifications[index][1])
             if tuple(mask.shape) != expected:
                 raise ValueError("Dropout masks require one full-shaped mask per critic head.")
+    parameters = stack_parameters(modules, detached=detached)
+    return _tensor_mlp_vmap(parameters, inputs, specifications, head_inputs, dropout_masks)
+
+
+def stack_parameters(modules, *, detached=False):
+    """Stack original parameters for one forward/loss graph, never across steps.
+
+    Eager geometry may reuse these tensors across several independent forwards
+    in the same loss. All gradients still reach the optimizer-owned leaves.
+    """
     parameter_maps = tuple(dict(head.named_parameters(remove_duplicate=False)) for head in modules)
     # stack_module_state would create unrelated leaf Parameters. Stack these
     # existing tensors instead so gradients reach every original optimizer slot.
-    parameters = {
+    return {
         name: torch.stack([
             mapping[name].detach() if detached else mapping[name]
             for mapping in parameter_maps
         ], dim=0)
         for name in parameter_maps[0]
     }
-    return _tensor_mlp_vmap(parameters, inputs, specifications, head_inputs, dropout_masks)
 
 
 @torch._dynamo.allow_in_graph

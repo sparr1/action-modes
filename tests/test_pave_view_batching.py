@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from RL.tdmpc2_core import pave
-from RL.tdmpc2_core.common import layers
+from RL.tdmpc2_core.common import ensemble_vmap
 from RL.tdmpc2_core.common.layers import Ensemble, mlp
 from RL.tdmpc2_core.common.q_representation import QRepresentation
 from tests.pave_reference import separate_critic_pave_loss
@@ -101,20 +101,33 @@ def test_all_term_combinations_match_separate_loss_metrics_and_each_parameter_gr
 
 
 @pytest.mark.parametrize("terms", TERMS)
-def test_dense_views_share_one_forward_and_parameter_stack(monkeypatch, terms):
+def test_dense_views_share_parameters_and_keep_curvature_graph_small(monkeypatch, terms):
     critic, decoder, inputs = make_case()
     calls = []
-    forward = layers.vectorized_forward
+    forward = ensemble_vmap._tensor_mlp_vmap
+    stack = ensemble_vmap.stack_parameters
+    stacks = []
+    parameter_ids = []
 
-    def record(modules, values, *args, **kwargs):
+    def record(parameters, values, *args, **kwargs):
         calls.append(tuple(values.shape))
-        return forward(modules, values, *args, **kwargs)
+        parameter_ids.append(id(parameters))
+        return forward(parameters, values, *args, **kwargs)
 
-    monkeypatch.setattr(layers, "vectorized_forward", record)
+    def record_stack(*args, **kwargs):
+        stacks.append(1)
+        return stack(*args, **kwargs)
+
+    monkeypatch.setattr(ensemble_vmap, "_tensor_mlp_vmap", record)
+    monkeypatch.setattr(ensemble_vmap, "stack_parameters", record_stack)
     coefficients = dict(zip(("mpr_coef", "vfc_coef", "curvature_coef"), map(float, terms)))
     loss, _ = pave.critic_pave_loss(critic, decoder.decode, **inputs, **coefficients)
     loss.backward()
-    assert calls == [(len(critic), 5 * (1 + int(terms[0]) + int(terms[1])), 7)]
+    other_views = int(terms[0]) + int(terms[1])
+    sizes = [5, 5 * other_views] if terms[2] and other_views else [5 * (1 + other_views)]
+    assert calls == [(len(critic), rows, 7) for rows in sizes]
+    assert stacks == [1]
+    assert len(set(parameter_ids)) == 1
 
 
 @pytest.mark.parametrize("reason", ["loop", "custom", "lora", "head_hook", "ensemble_hook",
@@ -167,7 +180,7 @@ def test_fused_error_restores_modes_and_is_not_retried(monkeypatch):
         calls.append(1)
         raise RuntimeError("intentional fused failure")
 
-    monkeypatch.setattr(layers, "vectorized_forward", fail)
+    monkeypatch.setattr(ensemble_vmap, "_tensor_mlp_vmap", fail)
     with pytest.raises(RuntimeError, match="intentional fused failure"):
         pave.critic_pave_loss(critic, decoder.decode, **inputs, mpr_coef=.1, vfc_coef=.1)
     assert calls == [1]
