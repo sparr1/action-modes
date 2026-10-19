@@ -1,9 +1,11 @@
-"""Pinned 400k common-root gradient probes; no training or publication."""
+"""Pinned common-root gradient probes; legacy 400k defaults, no training/publication."""
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import resource
@@ -19,10 +21,24 @@ SOURCES = {
 BENCHMARKS = (("cpu1", "cpu", 1), ("cpu2", "cpu", 2), ("cuda1", "cuda", 1))
 PAIRS = (("mppi_aux", "mppi_aux"), ("sac_aux", "mppi_aux"),
          ("sac_aux", "sac_aux"), ("mppi_aux", "sac_aux"))
+DEFAULT_PROTOCOL = dict(
+    schema="ambi-gradient-probe-protocol-v1", checkpoint_step=400000,
+    controller_seed=55, q_reduction="mean_all",
+    production=dict(seeds=[101, 102], decisions=[0, 100], horizon=3, tail_steps=1000,
+                    rollouts=4, gradient_rollouts=32, epsilons=[.03, .1], random_directions=1),
+    benchmark=dict(seeds=[101], decisions=[0], tail_steps=100),
+)
 
 
 def read(path):
-    return json.loads(Path(path).read_text())
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Duplicate JSON key: {key}")
+            result[key] = value
+        return result
+    return json.loads(Path(path).read_text(), object_pairs_hook=unique)
 
 
 def write_new(path, data):
@@ -46,6 +62,71 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def validate_protocol(protocol):
+    """Require a complete, explicit profile; never fill a misspelled/missing key."""
+    def keys(value, expected, name):
+        if not isinstance(value, dict) or set(value) != set(expected):
+            raise ValueError(f"Unexpected or missing {name} protocol keys")
+
+    def integer(value, name, lower=1, upper=None):
+        if (type(value) is not int or value < lower or (upper is not None and value >= upper)):
+            raise ValueError(f"Invalid protocol {name}")
+
+    def coverage(values, name, upper):
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"Invalid protocol {name}")
+        for value in values:
+            integer(value, name, 0, upper)
+        if values != sorted(set(values)):
+            raise ValueError(f"Protocol {name} must be unique and sorted")
+
+    keys(protocol, DEFAULT_PROTOCOL, "top-level")
+    if protocol["schema"] != DEFAULT_PROTOCOL["schema"]:
+        raise ValueError("Unknown gradient probe protocol schema")
+    integer(protocol["checkpoint_step"], "checkpoint_step")
+    integer(protocol["controller_seed"], "controller_seed", 0, 2**32)
+    if protocol["q_reduction"] not in ("mean_all", "mean_pair", "min_all", "min_pair"):
+        raise ValueError("Invalid protocol q_reduction")
+    for section in ("production", "benchmark"):
+        values = protocol[section]
+        keys(values, DEFAULT_PROTOCOL[section], section)
+        coverage(values["seeds"], section + ".seeds", 2**32)
+        coverage(values["decisions"], section + ".decisions", 500)
+        integer(values["tail_steps"], section + ".tail_steps")
+    production, benchmark = protocol["production"], protocol["benchmark"]
+    for key in ("horizon", "rollouts", "gradient_rollouts"):
+        integer(production[key], "production." + key)
+    integer(production["random_directions"], "production.random_directions", 0)
+    epsilons = production["epsilons"]
+    if (not isinstance(epsilons, list) or not epsilons
+            or any(type(x) not in (float, int) or not math.isfinite(x) or x <= 0 for x in epsilons)
+            or len(epsilons) != len(set(epsilons))):
+        raise ValueError("Invalid protocol production.epsilons")
+    if any(not set(benchmark[key]).issubset(production[key]) for key in ("seeds", "decisions")):
+        raise ValueError("Benchmark roots must be a subset of production coverage")
+    return copy.deepcopy(protocol)
+
+
+def campaign_protocol(campaign):
+    """Old, already-published campaigns retain exactly the original 400k recipe."""
+    if "protocol" not in campaign:
+        if (campaign.get("schema") != "ambi-gradient-probe-campaign-v1"
+                or "protocol_sha256" in campaign
+                or campaign["seeds"] != DEFAULT_PROTOCOL["production"]["seeds"]
+                or campaign["decisions"] != DEFAULT_PROTOCOL["production"]["decisions"]
+                or campaign["controller_seed"] != DEFAULT_PROTOCOL["controller_seed"]):
+            raise ValueError("Changed legacy 400k campaign protocol")
+        return copy.deepcopy(DEFAULT_PROTOCOL)
+    protocol = validate_protocol(campaign["protocol"])
+    if (campaign.get("schema") != "ambi-gradient-probe-campaign-v2"
+            or campaign.get("protocol_sha256") != canonical_hash(protocol)
+            or campaign["seeds"] != protocol["production"]["seeds"]
+            or campaign["decisions"] != protocol["production"]["decisions"]
+            or campaign["controller_seed"] != protocol["controller_seed"]):
+        raise ValueError("Campaign protocol hash or coverage changed")
+    return protocol
+
+
 def verify_source(expected):
     def git(*args):
         return subprocess.check_output(["git", "-C", str(REPO), *args], text=True).strip()
@@ -55,42 +136,53 @@ def verify_source(expected):
     return actual
 
 
-def verify_checkpoint(row):
+def verify_checkpoint(row, checkpoint_step=400000):
     if row["backbone_id"] not in SOURCES or row["source_run"] != SOURCES[row["backbone_id"]]:
         raise ValueError("Unexpected backbone/source run")
-    if row["step"] != 400000:
-        raise ValueError("This campaign selects only the 400k checkpoints")
+    if type(row["step"]) is not int or row["step"] != checkpoint_step:
+        raise ValueError(f"This campaign selects only step {checkpoint_step} checkpoints")
     for key in ("checkpoint", "metadata"):
         if not Path(row[key]).is_absolute() or sha256(row[key]) != row[key + "_sha256"]:
             raise RuntimeError(f"Changed or nonabsolute {key}: {row[key]}")
     metadata = read(row["metadata"])
     params = metadata["trial_run_params"]["alg_params"]
     operator = "mppi" if row["backbone_id"] == "mppi_aux" else "sac"
-    if (metadata["checkpoint"]["step"] != 400000 or params["inner_operator"] != operator
+    if (type(metadata["checkpoint"]["step"]) is not int
+            or metadata["checkpoint"]["step"] != checkpoint_step or params["inner_operator"] != operator
             or params["aux_return_mode"] != "sac" or params.get("obs", "state") != "state"
             or params.get("episodic", False) or params.get("critic_value_mode", "single") != "single"):
         raise ValueError("Unexpected checkpoint metadata/auxiliary reward semantics")
 
 
-def prepare(inventory_path, root, expected_sha):
+def prepare(inventory_path, root, expected_sha, protocol_path=None):
     verify_source(expected_sha)
+    protocol = validate_protocol(read(protocol_path)) if protocol_path is not None else copy.deepcopy(DEFAULT_PROTOCOL)
     root = Path(root).resolve()
     if root == REPO or REPO in root.parents:
         raise ValueError("Campaign outputs must be outside the source checkout")
     rows = read(inventory_path)["checkpoints"]
     if len(rows) != 2 or {r["backbone_id"] for r in rows} != set(SOURCES):
-        raise ValueError("Inventory must contain exactly one 400k checkpoint per backbone")
+        raise ValueError("Inventory must contain exactly one selected checkpoint per backbone")
     for row in rows:
-        verify_checkpoint(row)
+        verify_checkpoint(row, protocol["checkpoint_step"])
     campaign = dict(schema="ambi-gradient-probe-campaign-v1", source_commit=expected_sha,
                     inventory_sha256=sha256(inventory_path), checkpoints={r["backbone_id"]: r for r in rows},
-                    seeds=[101, 102], decisions=[0, 100], controller_seed=55)
+                    seeds=protocol["production"]["seeds"], decisions=protocol["production"]["decisions"],
+                    controller_seed=protocol["controller_seed"])
+    if protocol_path is not None:
+        campaign.update(schema="ambi-gradient-probe-campaign-v2", protocol=protocol,
+                        protocol_sha256=canonical_hash(protocol))
     campaign["sha256"] = canonical_hash(campaign)
     write_new(root / "campaign.json", campaign)
     return campaign
 
 
-def stage_spec(root, stage, index, device=None, torch_threads=None):
+def stage_spec(root, stage, index, device=None, torch_threads=None, *, protocol=None):
+    protocol = validate_protocol(DEFAULT_PROTOCOL if protocol is None else protocol)
+    production, benchmark = protocol["production"], protocol["benchmark"]
+    horizon, tail, rollouts, gradients, epsilons, random = (
+        production[key] for key in ("horizon", "tail_steps", "rollouts", "gradient_rollouts", "epsilons", "random_directions"))
+    seeds, decisions = production["seeds"], production["decisions"]
     root = Path(root)
     count = {"banks": 2, "benchmark": 3, "production": 4}.get(stage, 0)
     if not 0 <= index < count:
@@ -101,25 +193,24 @@ def stage_spec(root, stage, index, device=None, torch_threads=None):
             raise ValueError("Benchmark device/thread settings are fixed")
         device, torch_threads = selected_device, selected_threads
         target, source = "mppi_aux", None
-        horizon, tail, rollouts, gradients, epsilons, random = 3, 100, 4, 32, [.03, .1], 1
-        seeds, decisions = [101], [0]
+        tail = benchmark["tail_steps"]
+        seeds, decisions = benchmark["seeds"], benchmark["decisions"]
     elif stage == "banks":
         name = target = list(SOURCES)[index]
         source = None
         device = "cpu" if device is None else device
         torch_threads = 1 if torch_threads is None else torch_threads
         horizon, tail, rollouts, gradients, epsilons, random = 1, 1, 1, 1, [.03], 0
-        seeds, decisions = [101, 102], [0, 100]
     else:
         if device is None or torch_threads is None:
             raise ValueError("Production requires device and torch_threads selected from the benchmark")
         target, source = PAIRS[index]
         name = f"cell-{index:02d}"
-        horizon, tail, rollouts, gradients, epsilons, random = 3, 1000, 4, 32, [.03, .1], 1
-        seeds, decisions = [101, 102], [0, 100]
-    if device not in ("cpu", "cuda") or torch_threads < 1:
+    if device not in ("cpu", "cuda") or type(torch_threads) is not int or torch_threads < 1:
         raise ValueError("Select cpu/cuda and a positive torch thread count")
     return dict(stage=stage, index=index, target=target, source=source, device=device,
+                checkpoint_step=protocol["checkpoint_step"], controller_seed=protocol["controller_seed"],
+                q_reduction=protocol["q_reduction"],
                 purpose={"banks": "root_bank_smoke_not_production", "benchmark": "timing_smoke_not_production",
                          "production": "inherited_gradient_diagnostic"}[stage],
                 torch_threads=torch_threads, horizon=horizon, tail_steps=tail, rollouts=rollouts,
@@ -128,12 +219,26 @@ def stage_spec(root, stage, index, device=None, torch_threads=None):
                 root_bank=None if source is None else str(root / "banks" / source / "bundle/root-bank.json"))
 
 
+def verify_spec(campaign, spec):
+    protocol = campaign_protocol(campaign)
+    if "protocol" not in campaign:
+        # Completed v1 receipts predate these explicit fields. Only their
+        # known legacy defaults may be filled; conflicting saved values fail.
+        spec = {**{key: protocol[key] for key in ("checkpoint_step", "controller_seed", "q_reduction")}, **spec}
+    expected = stage_spec(Path(spec["output"]).parent.parent, spec["stage"], spec["index"],
+                          spec["device"], spec["torch_threads"], protocol=protocol)
+    if spec != expected:
+        raise ValueError("Stage specification differs from the pinned campaign protocol")
+    return protocol
+
+
 def probe_command(campaign, spec, python):
+    protocol = verify_spec(campaign, spec)
     row = campaign["checkpoints"][spec["target"]]
     command = [str(python), str(REPO / "probe_ambi_gradients.py"), "--checkpoint", row["checkpoint"],
                "--metadata", row["metadata"], "--output", str(Path(spec["output"]) / "bundle"),
                "--device", spec["device"], "--torch-threads", str(spec["torch_threads"]),
-               "--seed", str(campaign["controller_seed"]), "--q-reduction", "mean_all"]
+               "--seed", str(protocol["controller_seed"]), "--q-reduction", protocol["q_reduction"]]
     for key in ("horizon", "tail_steps", "rollouts", "gradient_rollouts", "random_directions"):
         command += ["--" + key.replace("_", "-"), str(spec[key])]
     command += ["--epsilons", *map(str, spec["epsilons"])]
@@ -145,6 +250,7 @@ def probe_command(campaign, spec, python):
 
 
 def verify_result(bundle, campaign, spec):
+    configured = verify_spec(campaign, spec)
     bundle = Path(bundle)
     result, bank = read(bundle / "result.json"), read(bundle / "root-bank.json")
     row = campaign["checkpoints"][spec["target"]]
@@ -156,9 +262,13 @@ def verify_result(bundle, campaign, spec):
     coverage = [(r["seed"], r["decision_index"]) for r in bank["roots"]]
     if len(coverage) != len(expected) or set(coverage) != expected:
         raise ValueError("Incomplete root coverage")
+    if any(bank["protocol"].get(key) != value for key, value in dict(
+            seeds=spec["seeds"], decisions=spec["decisions"], controller_seed=configured["controller_seed"],
+            action_rule="tanh_mean", max_steps=max(spec["decisions"]) + 1).items()):
+        raise ValueError("Changed root-bank collection protocol")
     if (result.get("kind") != "ambi_inherited_gradient_probe" or not result.get("complete")
             or not result.get("outer_state_unchanged") or not bank.get("complete")
-            or result["checkpoint"] != dict(sha256=row["checkpoint_sha256"], step=400000,
+            or result["checkpoint"] != dict(sha256=row["checkpoint_sha256"], step=configured["checkpoint_step"],
                                             metadata_sha256=row["metadata_sha256"])
             or result["root_bank_id"] != bank["id"]
             or result["root_bank_checkpoint_sha256"] != source["checkpoint_sha256"]
@@ -170,9 +280,14 @@ def verify_result(bundle, campaign, spec):
     for key in ("horizon", "tail_steps", "rollouts", "gradient_rollouts", "epsilons"):
         if protocol[key] != spec[key]:
             raise ValueError(f"Changed probe protocol: {key}")
-    if (protocol["roots"] != len(expected) or protocol["seed"] != campaign["controller_seed"]
-            or protocol["q_reduction"] != "mean_all" or protocol["entropy_bonus"] is not False):
+    if (protocol["roots"] != len(expected) or protocol["seed"] != configured["controller_seed"]
+            or protocol["q_reduction"] != configured["q_reduction"] or protocol["entropy_bonus"] is not False):
         raise ValueError("Changed root/noise/value protocol")
+    candidates = 1 + 2 * len(spec["epsilons"]) * ((2 if spec["horizon"] == 1 else 3) + spec["random_directions"])
+    if (protocol["candidate_actions_per_root_upper_bound"] != candidates
+            or protocol["branch_simulator_decisions_upper_bound"] !=
+            len(expected) * candidates * spec["rollouts"] * (spec["horizon"] + spec["tail_steps"])):
+        raise ValueError("Changed direction count or simulator workload")
     if len(result["root_records"]) != len(expected):
         raise ValueError("Missing root records")
     decisions, root_ids = 0, set()
@@ -210,10 +325,11 @@ def run(campaign_path, stage, index, expected_sha, python, device=None, torch_th
             canonical_hash({k: v for k, v in campaign.items() if k != "sha256"})):
         raise ValueError("Campaign source or checksum changed")
     verify_source(expected_sha)
-    spec = stage_spec(campaign_path.parent, stage, index, device, torch_threads)
-    verify_checkpoint(campaign["checkpoints"][spec["target"]])
+    protocol = campaign_protocol(campaign)
+    spec = stage_spec(campaign_path.parent, stage, index, device, torch_threads, protocol=protocol)
+    verify_checkpoint(campaign["checkpoints"][spec["target"]], protocol["checkpoint_step"])
     if spec["source"]:
-        bank_spec = stage_spec(campaign_path.parent, "banks", list(SOURCES).index(spec["source"]))
+        bank_spec = stage_spec(campaign_path.parent, "banks", list(SOURCES).index(spec["source"]), protocol=protocol)
         bank_output = Path(bank_spec["output"])
         validation = verify_result(bank_output / "bundle", campaign, bank_spec)
         bank_receipt = read(bank_output / "receipt.json")
@@ -257,6 +373,7 @@ def main():
     prepare_parser.add_argument("--inventory", type=Path, required=True)
     prepare_parser.add_argument("--root", type=Path, required=True)
     prepare_parser.add_argument("--expected-sha", required=True)
+    prepare_parser.add_argument("--protocol", type=Path, help="Complete pinned protocol JSON; omission preserves the legacy 400k pilot.")
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--campaign", type=Path, required=True)
     run_parser.add_argument("--stage", choices=("banks", "benchmark", "production"), required=True)
@@ -267,7 +384,7 @@ def main():
     run_parser.add_argument("--torch-threads", type=int)
     args = parser.parse_args()
     if args.command == "prepare":
-        result = prepare(args.inventory, args.root, args.expected_sha)
+        result = prepare(args.inventory, args.root, args.expected_sha, args.protocol)
     else:
         result = run(args.campaign, args.stage, args.index, args.expected_sha, args.python,
                      args.device, args.torch_threads)

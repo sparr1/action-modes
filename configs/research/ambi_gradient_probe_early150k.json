@@ -1,0 +1,21 @@
+{
+  "schema": "ambi-gradient-probe-protocol-v1",
+  "checkpoint_step": 150000,
+  "controller_seed": 55,
+  "q_reduction": "mean_all",
+  "production": {
+    "seeds": [101, 102, 103, 104],
+    "decisions": [0, 10, 25, 50],
+    "horizon": 3,
+    "tail_steps": 1500,
+    "rollouts": 8,
+    "gradient_rollouts": 32,
+    "epsilons": [0.03, 0.1],
+    "random_directions": 1
+  },
+  "benchmark": {
+    "seeds": [101],
+    "decisions": [0, 50],
+    "tail_steps": 100
+  }
+}

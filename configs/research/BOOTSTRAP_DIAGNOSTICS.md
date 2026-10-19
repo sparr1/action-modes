@@ -184,10 +184,21 @@ AMBI_RUN_REAL_DMCONTROL_TESTS=1 MUJOCO_GL=disable \
 ## Oscar campaign launcher
 
 `slurm/ambi_gradient_probe_campaign.py prepare` consumes an external inventory
-with exactly the two 400k checkpoints above, their source run IDs, absolute
-checkpoint/metadata paths, and SHA256 hashes. Pass `--inventory`, `--root`, and
-`--expected-sha`. Preparation verifies the hashes and requires a clean checkout
-at that commit; campaign outputs must be outside the checkout.
+with exactly one selected checkpoint from each of the two source runs above,
+their source run IDs, absolute checkpoint/metadata paths, and SHA256 hashes.
+Pass `--inventory`, `--root`, and `--expected-sha`. Omitting `--protocol` retains
+the original 400k recipe and campaign format. An optional complete protocol JSON
+pins the checkpoint step, root coverage, controller seed, ensemble reduction,
+production dose and benchmark coverage. Preparation rejects missing, unknown or
+duplicate protocol keys, verifies input hashes, and requires a clean checkout
+at the expected commit. Campaign outputs must be outside the checkout.
+
+The protocol is embedded in the campaign with its canonical SHA256; edits to
+the original JSON do not alter a prepared campaign. New runs validate both the
+campaign and protocol hashes. `campaign_protocol(campaign)` resolves and
+validates either format; pass its return value as `protocol=` to `stage_spec`.
+Legacy receipts lacking the three newer explicit step/seed/reduction fields
+remain readable using only their original 400k defaults.
 
 `slurm/run_ambi_gradient_probe_oscar.sbatch` takes `CAMPAIGN_ROOT`,
 `EXPECTED_ACTION_MODES_SHA`, `PYTHON_BIN`, `STAGE`, and `CELL_INDEX` (or a Slurm
@@ -198,9 +209,10 @@ capacity. The stages are:
   H1/T1/R1 probes validate restoration cheaply. These returns are smoke results
   and are excluded from production summaries.
 - `benchmark`, indices 0/1/2: CPU with one thread, CPU with two threads, and
-  CUDA with one thread. Each uses the actual MPPI checkpoint at one root,
-  H3/T100/R4 and the production direction/sample settings. Allocate at least
-  two CPUs for the CPU2 cell and a GPU for CUDA.
+  CUDA with one thread. Each uses the selected MPPI checkpoint, configured
+  benchmark roots and shortened tail, with production H/R/G/direction settings.
+  The legacy recipe uses one root and H3/T100/R4. Allocate at least two CPUs
+  for the CPU2 cell and a GPU for CUDA.
 - `production`, indices 0/1/2/3: the four combinations in the table above.
   Set `DEVICE` and `TORCH_THREADS` from the benchmark. Every cell reads a
   validated completed bank, so all four can run independently after bank
@@ -210,3 +222,41 @@ Every stage writes an immutable receipt with source/input verification, complete
 root and result checksums, elapsed time, child CPU time, and peak child memory.
 The runner requires `srun` inside a Slurm allocation. None of these commands
 submits jobs or publishes W&B results by itself.
+
+## Early 150k pilot
+
+`ambi_gradient_probe_early150k.json` evaluates the onset of the training
+divergence with four source episodes (seeds 101–104) and roots at decisions
+0, 10, 25 and 50. It selects the 150,000-step checkpoint from each source run,
+H=3, eight sampled real continuations, 32 gradient samples, tail length 1500,
+epsilon values 0.03 and 0.1, one random control direction, `mean_all` reduction
+and controller seed 55. The earlier roots sample behavior before the prolonged
+fallen states that can dominate later episode decisions. This remains an
+exploratory diagnostic with one training seed per backbone.
+
+```bash
+"$AMBI_PROBE_PY" slurm/ambi_gradient_probe_campaign.py prepare \
+  --inventory /absolute/path/to/150k-inventory.json \
+  --root /absolute/path/to/fresh-150k-campaign \
+  --expected-sha "$EXPECTED_ACTION_MODES_SHA" \
+  --protocol configs/research/ambi_gradient_probe_early150k.json
+```
+
+Each bank smoke captures all 16 roots using H1/T1/R1. Its short returns remain
+excluded from production summaries. Benchmark cells use the selected MPPI
+checkpoint at seed 101, decisions 0 and 50, with H3/T100/R8/G32. Benchmark the
+available production hardware and measure CPU1/CPU2 on the same node before
+selecting resources; these short tails measure throughput, not calibration.
+
+The four production cells preserve the original target/source pairing and each
+own a complete 16-root result. Their upper bound is 3,270,528 branch simulator
+decisions per cell, or 13,082,112 across all four, plus bank/benchmark work.
+The longer tail reduces the recorded truncation bounds; it does not remove
+Monte Carlo uncertainty or make roots from one episode independent.
+
+The historical 400k pilot used four continuation samples; this profile uses
+eight. The generated R4 noise is not a prefix/subset of the R8 noise tensor, so
+these checkpoints do not form an exactly noise-paired longitudinal comparison.
+Root coverage and tail length also differ. Pair comparisons within the new
+campaign through its shared physical banks and common evaluation noise; report
+the 400k results as a separate diagnostic reference.
