@@ -1,5 +1,10 @@
 # Frozen-checkpoint AMBI research
 
+The [inherited-critic gradient diagnostic](BOOTSTRAP_DIAGNOSTICS.md) compares
+reward-Q gradients, differentiable model gradients, and paired real-simulator
+action interventions at common states across backbones. It supports the
+auxiliary SAC-return critic and complements full-episode refinement evaluation.
+
 The frozen evaluator supports finite-horizon inner SAC and transition-based
 update counts. It rejects `inner_outer_replay_fraction > 0` because these model
 snapshots do not include real replay. Test replay mixing through a populated
