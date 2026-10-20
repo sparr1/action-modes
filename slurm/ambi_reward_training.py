@@ -33,6 +33,19 @@ MANIFESTS = {
     "mppi": ROOT / "configs/dmcontrol/experiments/ambi_return_only_mppi_training.json",
     "none": ROOT / "configs/dmcontrol/experiments/ambi_return_only_no_inner_training.json",
 }
+ENTROPY_MANIFESTS = {
+    -10.5: ROOT / "configs/dmcontrol/experiments/ambi_return_only_no_inner_1m_entropy10p5.json",
+    -21.: ROOT / "configs/dmcontrol/experiments/ambi_return_only_no_inner_1m_entropy21.json",
+}
+# Deliberately enumerate approved identities instead of accepting arbitrary
+# budgets/entropy settings from a renamed or edited manifest.
+CAMPAIGNS = {
+    MANIFESTS["sac"]: ("ambi_full_h3_j8_k3_reward_only", "sac", 500000, -10.5),
+    MANIFESTS["mppi"]: ("ambi_full_h3_mppi_reward_only", "mppi", 500000, -10.5),
+    MANIFESTS["none"]: ("ambi_full_no_inner_reward_only", "none", 500000, -10.5),
+    ENTROPY_MANIFESTS[-10.5]: ("ambi_full_no_inner_reward_only_1m_entropy10p5", "none", 1000000, -10.5),
+    ENTROPY_MANIFESTS[-21.]: ("ambi_full_no_inner_reward_only_1m_entropy21", "none", 1000000, -21.),
+}
 
 
 def cpu_counts(operator):
@@ -46,10 +59,13 @@ def smoke_defaults(operator):
 
 def validate_campaign(manifest_path):
     path = resolve_manifest(manifest_path)
+    assert path in CAMPAIGNS, "Unapproved reward-only campaign manifest"
+    expected_name, operator, total_steps, target_entropy = CAMPAIGNS[path]
     manifest = read(path)
     assert len(manifest["configs"]) == 1 and manifest["trials"] == 1
     name, _, run = recipe(0, path)
-    assert (run["seed"], run["total_steps"], run["checkpoint_every"], run["save_strat"]) == (55, 500000, 25000, "all")
+    assert name == expected_name, "Campaign configuration identity changed"
+    assert (run["seed"], run["total_steps"], run["checkpoint_every"], run["save_strat"]) == (55, total_steps, 25000, "all")
     assert manifest["env_params"] == {"task": "humanoid-walk", "obs": "state", "render_mode": None}
     # These unchanged defaults are omitted by the older MPPI/SAC recipes.
     # Validate the explicit resolved meaning without modifying the manifest.
@@ -62,7 +78,7 @@ def validate_campaign(manifest_path):
         "outer_critic_target": "reward_only", "inner_sac_critic_target": "reward_only",
         "inner_actor_source": "sac", "inner_critic_source": "sac",
         "inner_horizon_actor_source": "sac", "inner_horizon_critic_source": "sac",
-        "ent_coef": "auto_1.0", "target_entropy": -10.5,
+        "ent_coef": "auto_1.0", "target_entropy": target_entropy,
         "outer_actor_entropy_mode": "squashed", "inner_actor_entropy_mode": "squashed",
         "inner_entropy_enabled": True, "sac_actor_loss_scale_mode": "none",
         "compile": True, "compile_strict": True, "critic_ensemble_backend": "vmap",
@@ -72,7 +88,7 @@ def validate_campaign(manifest_path):
         "inner_critic_bernoulli_p": 0., "mppi_terminal_q_reduction": "mean_pair",
     }
     assert all(p.get(key) == value for key, value in expected.items()), "Reward-only production recipe changed"
-    assert p["inner_operator"] in MANIFESTS
+    assert p["inner_operator"] == operator
     interval = p.get("inner_solve_interval", 1)
     if p["inner_operator"] == "sac":
         assert interval in (1, 3)
@@ -103,7 +119,7 @@ def smoke_recipe(warmup, decisions, manifest_path):
     return _smoke_recipe(0, warmup, decisions, manifest_path)
 
 
-def validate_learner(cfg, agent):
+def validate_learner(cfg, agent, *, target_entropy):
     assert cfg.compile and cfg.compile_strict and cfg.critic_ensemble_backend == "vmap"
     assert (cfg.model_size, cfg.enc_dim, cfg.mlp_dim, cfg.latent_dim, cfg.num_q) == (5, 256, 512, 512, 5)
     assert (cfg.action_dim, cfg.batch_size, cfg.train_unroll_horizon) == (21, 256, 3)
@@ -114,7 +130,8 @@ def validate_learner(cfg, agent):
     assert not any("aux_return" in key for key in agent.model.state_dict())
     assert agent.inner_engine._critic_base is agent.inner_engine._horizon_critic is agent.model._Qs
     assert agent.ent_coef_optim is not None and agent.log_ent_coef is not None
-    assert agent.target_entropy == -10.5 and cfg.sac_actor_loss_scale_mode == "none"
+    assert cfg.target_entropy == agent.target_entropy == target_entropy
+    assert cfg.sac_actor_loss_scale_mode == "none"
     assert cfg.inner_entropy_enabled and cfg.utd == 1
     assert cfg.mppi_terminal_q_reduction == "mean_pair" and cfg.inner_critic_bernoulli_p == 0.
     assert cfg.outer_actor_entropy_mode == cfg.inner_actor_entropy_mode == "squashed"
@@ -168,6 +185,14 @@ def training_phases(rows, operator):
     return summary
 
 
+def production_projection(seconds_per_decision, total_steps):
+    assert math.isfinite(seconds_per_decision) and seconds_per_decision > 0
+    assert isinstance(total_steps, int) and total_steps > 0
+    seconds = seconds_per_decision * total_steps
+    return {"production_total_steps": total_steps, "projected_production_seconds": seconds,
+            "projected_production_hours": seconds / 3600}
+
+
 def _optimizer_steps(optimizer):
     steps = [int(state["step"].item()) for state in optimizer.state.values() if "step" in state]
     assert steps and len(set(steps)) == 1, "Optimizer parameters did not receive equal update counts"
@@ -196,7 +221,8 @@ def worker(args):
     try:
         learner = AMBITDMPC2(name + "-gpu-gate", env, run["alg_params"], run, manifest)
         cfg, agent = learner.cfg, learner.agent
-        validate_learner(cfg, agent)
+        target_entropy = production["alg_params"]["target_entropy"]
+        validate_learner(cfg, agent, target_entropy=target_entropy)
         learner.buffer.enable_resumable_storage()
         operator, interval = cfg.inner_operator, cfg.inner_solve_interval
         assert args.warmup % interval == args.decisions % interval == 0
@@ -300,7 +326,7 @@ def worker(args):
             assert actor_steps == alpha_steps == agent.num_updates == learner._num_updates == 2 + len(rows)
             assert any(not torch.equal(value, initial_actor[key]) for key, value in agent.model._pi.state_dict().items())
             alpha_after = float(agent.alpha.item())
-            assert math.isfinite(alpha_after) and alpha_after > 0
+            assert math.isfinite(alpha_after) and alpha_after > 0 and alpha_after != alpha_before
             checkpoint = models / f"smoke_{run['total_steps']}"
             assert checkpoint.is_file() and Path(str(checkpoint) + ".metadata.json").is_file()
             saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
@@ -317,9 +343,12 @@ def worker(args):
             assert agent.training_state_dict()["boundary_prepared"] is True
             assert _optimizer_steps(agent.pi_optim) == actor_steps
             assert _optimizer_steps(agent.ent_coef_optim) == alpha_steps
+            assert cfg.target_entropy == agent.target_entropy == target_entropy
         assert learner.buffer.resumable_storage and str(learner.buffer._storage_device) == "cpu"
         assert torch.get_num_threads() == len(cpus) and os.sched_getaffinity(0) == set(cpus)
         measured = timer.result
+        measured.pop("projected_500k_decision_days", None)
+        measured.update(production_projection(measured["seconds_per_decision"], production["total_steps"]))
         measured_rows = rows[args.warmup:]
         measured.update(training_phases(measured_rows, operator))
         measured["action_rows"] = measured_rows
@@ -364,6 +393,10 @@ def worker(args):
 
 
 def validate_receipt(receipt, campaign_binding, current_runtime, cpus, *, name, operator, interval):
+    approved = [spec for spec in CAMPAIGNS.values() if spec[0] == name]
+    assert len(approved) == 1, "Unapproved reward-only configuration identity"
+    _, expected_operator, total_steps, target_entropy = approved[0]
+    assert operator == expected_operator
     assert receipt["passed"] is True and receipt["binding"] == campaign_binding, "Gate source/configuration mismatch"
     counts = cpu_counts(operator)
     assert cpus in counts, "Production CPU allocation was not measured"
@@ -379,7 +412,7 @@ def validate_receipt(receipt, campaign_binding, current_runtime, cpus, *, name, 
         for key in ("reward_only_targets", "primary_critic_sources", "outer_actor_entropy_auto",
                     "checkpoint_roundtrip", "checkpoint_sidecars", "boundary_training_state_roundtrip"):
             assert row[key] is True, key
-        assert row["outer_target_entropy"] == -10.5
+        assert row["outer_target_entropy"] == target_entropy
         measured = row["measured"]
         assert measured["decisions"] >= 100 and measured["decisions"] == measured["outer_updates"]
         if operator == "none":
@@ -392,6 +425,8 @@ def validate_receipt(receipt, campaign_binding, current_runtime, cpus, *, name, 
             assert measured["held_decisions"] == measured["decisions"] - measured["solve_decisions"]
         assert row["outer_actor_optimizer_steps"] == row["outer_temperature_optimizer_steps"] == 2 + row["warmup_active_decisions"] + measured["decisions"]
         assert math.isfinite(measured["seconds_per_decision"]) and measured["seconds_per_decision"] > 0
+        for key, value in production_projection(measured["seconds_per_decision"], total_steps).items():
+            assert measured[key] == value, "Gate production budget/projection mismatch"
         if operator == "mppi":
             assert row["mppi_primary_online_mean_pair_no_entropy_verified"] is True
 

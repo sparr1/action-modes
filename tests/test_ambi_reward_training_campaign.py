@@ -10,9 +10,9 @@ import pytest
 from slurm import ambi_reward_training as campaign
 
 
-@pytest.mark.parametrize("operator", ["sac", "mppi", "none"])
-def test_actual_campaigns_validate_and_smoke_preserves_production_shapes(operator):
-    path = campaign.MANIFESTS[operator]
+@pytest.mark.parametrize("path", list(campaign.CAMPAIGNS))
+def test_actual_campaigns_validate_and_smoke_preserves_production_shapes(path):
+    _, operator, total_steps, target_entropy = campaign.CAMPAIGNS[path]
     name, manifest, original = campaign.validate_campaign(path)
     selected, small_manifest, run, overrides = campaign.smoke_recipe(12, 120, path)
     expected = deepcopy(original)
@@ -26,6 +26,37 @@ def test_actual_campaigns_validate_and_smoke_preserves_production_shapes(operato
     assert original["alg_params"]["inner_operator"] == operator
     assert original["alg_params"]["inner_solve_interval"] == (3 if operator == "sac" else 1)
     assert original["checkpoint_every"] == 25000 and original["save_strat"] == "all"
+    assert original["total_steps"] == total_steps
+    assert run["alg_params"]["target_entropy"] == original["alg_params"]["target_entropy"] == target_entropy
+
+
+@pytest.mark.parametrize("path", list(campaign.CAMPAIGNS))
+def test_campaign_binds_config_name_budget_and_entropy_to_approved_manifest(monkeypatch, path):
+    name, manifest, original = campaign.validate_campaign(path)
+    changed = deepcopy(original)
+    monkeypatch.setattr(campaign, "recipe", lambda index, selected: (name, manifest, changed))
+    for key, value in (("total_steps", original["total_steps"] + 500000),
+                       ("target_entropy", -21. if original["alg_params"]["target_entropy"] == -10.5 else -10.5)):
+        changed = deepcopy(original)
+        (changed["alg_params"] if key == "target_entropy" else changed)[key] = value
+        with pytest.raises(AssertionError):
+            campaign.validate_campaign(path)
+    monkeypatch.setattr(campaign, "recipe", lambda index, selected: (name + "-renamed", manifest, original))
+    with pytest.raises(AssertionError, match="identity"):
+        campaign.validate_campaign(path)
+
+
+def test_campaign_rejects_unapproved_manifest():
+    with pytest.raises(AssertionError, match="Unapproved"):
+        campaign.validate_campaign(campaign.ROOT / "configs/dmcontrol/experiments/ambi_held_training.json")
+
+
+def test_projection_uses_selected_training_budget():
+    short = campaign.production_projection(.02, 500000)
+    long = campaign.production_projection(.02, 1000000)
+    assert short["production_total_steps"] == 500000 and long["production_total_steps"] == 1000000
+    assert long["projected_production_seconds"] == 20000
+    assert long["projected_production_hours"] == 2 * short["projected_production_hours"]
 
 
 def test_no_inner_gate_uses_longer_window_and_benchmarks_four_cores():
@@ -94,8 +125,8 @@ def test_optimizer_step_check_rejects_incomplete_actor_or_temperature_updates():
             campaign._optimizer_steps(optimizer(counts))
 
 
-def receipt_fixture(operator):
-    name, _, run = campaign.validate_campaign(campaign.MANIFESTS[operator])
+def receipt_fixture(operator, manifest=None):
+    name, _, run = campaign.validate_campaign(manifest or campaign.MANIFESTS[operator])
     interval = run["alg_params"]["inner_solve_interval"]
     runtime = {"python": "3.10", "torch": "2.3.1", "cuda": "12.1", "executable": "/locked/python", "gpu": "L40S"}
     binding = {"commit": "pinned", "manifest_sha256": "manifest", "config_sha256": {name: "config"}}
@@ -108,20 +139,22 @@ def receipt_fixture(operator):
               "compile_graph_counts": {"before": 9, "after": 9}, "auxiliary_critic_present": False,
               "reward_only_targets": True, "primary_critic_sources": True, "outer_actor_entropy_auto": True,
               "checkpoint_roundtrip": True, "checkpoint_sidecars": True, "boundary_training_state_roundtrip": True,
-              "outer_target_entropy": -10.5, "warmup_active_decisions": warmup,
+              "outer_target_entropy": run["alg_params"]["target_entropy"], "warmup_active_decisions": warmup,
               "outer_actor_optimizer_steps": 2 + warmup + decisions, "outer_temperature_optimizer_steps": 2 + warmup + decisions,
               "mppi_primary_online_mean_pair_no_entropy_verified": operator == "mppi",
               "sampled_prior_execution_verified": operator == "none", "zero_inner_work_verified": operator == "none",
               "measured": {"decisions": decisions, "outer_updates": decisions, "seconds_per_decision": .3,
-                           "solve_decisions": solves, "held_decisions": held, "prior_decisions": decisions if operator == "none" else 0}}
+                           "solve_decisions": solves, "held_decisions": held, "prior_decisions": decisions if operator == "none" else 0,
+                           **campaign.production_projection(.3, run["total_steps"])}}
              for count in campaign.cpu_counts(operator)]
     receipt = {"passed": True, "binding": binding, "runtime": runtime, "cases": cases, "artifacts": {}}
     return receipt, binding, runtime, dict(name=name, operator=operator, interval=interval)
 
 
-@pytest.mark.parametrize("operator", ["sac", "mppi", "none"])
-def test_receipt_requires_exact_semantics_complete_training_and_measured_resources(operator):
-    receipt, binding, runtime, identity = receipt_fixture(operator)
+@pytest.mark.parametrize("manifest", list(campaign.CAMPAIGNS))
+def test_receipt_requires_exact_semantics_complete_training_and_measured_resources(manifest):
+    operator = campaign.CAMPAIGNS[manifest][1]
+    receipt, binding, runtime, identity = receipt_fixture(operator, manifest)
     for count in campaign.cpu_counts(operator):
         campaign.validate_receipt(receipt, binding, runtime, count, **identity)
     with pytest.raises(AssertionError, match="configuration"):
@@ -139,6 +172,9 @@ def test_receipt_requires_exact_semantics_complete_training_and_measured_resourc
         lambda r: r["cases"][0]["measured"].update(outer_updates=119),
         lambda r: r["cases"][0]["measured"].update(held_decisions=1),
         lambda r: r["cases"][0]["compile_graph_counts"].update(after=10),
+        lambda r: r["cases"][0].update(outer_target_entropy=-9.),
+        lambda r: r["cases"][0]["measured"].update(production_total_steps=123),
+        lambda r: r["cases"][0]["measured"].update(projected_production_seconds=1.),
     ]
     if operator == "mppi":
         mutations.append(lambda r: r["cases"][0].update(mppi_primary_online_mean_pair_no_entropy_verified=False))
@@ -156,10 +192,11 @@ def test_receipt_requires_exact_semantics_complete_training_and_measured_resourc
             campaign.validate_receipt(bad, binding, runtime, 1, **identity)
 
 
-@pytest.mark.parametrize("operator", ["sac", "mppi", "none"])
+@pytest.mark.parametrize("manifest", list(campaign.CAMPAIGNS))
 @pytest.mark.parametrize("restart", [0, 1])
-def test_launch_delegates_exact_recipe_and_lineage_to_canonical_resume(monkeypatch, tmp_path, operator, restart):
-    receipt, binding, runtime, identity = receipt_fixture(operator)
+def test_launch_delegates_exact_recipe_and_lineage_to_canonical_resume(monkeypatch, tmp_path, manifest, restart):
+    operator = campaign.CAMPAIGNS[manifest][1]
+    receipt, binding, runtime, identity = receipt_fixture(operator, manifest)
     gate = tmp_path / "receipt.json"
     campaign.write_new(gate, receipt)
     monkeypatch.setattr(campaign, "binding", lambda path: binding)
@@ -173,7 +210,7 @@ def test_launch_delegates_exact_recipe_and_lineage_to_canonical_resume(monkeypat
         monkeypatch.setenv(key, "test-placeholder")
     executions = []
     monkeypatch.setattr(campaign.os, "execv", lambda *args: executions.append(args))
-    args = Namespace(manifest=campaign.MANIFESTS[operator], gate=gate, output=tmp_path / "campaign")
+    args = Namespace(manifest=manifest, gate=gate, output=tmp_path / "campaign")
     campaign.launch(args)
     record = campaign.read(args.output / f"launch-123.{restart}.json")
     assert record["run_params"] == campaign.recipe(0, args.manifest)[2]

@@ -1,0 +1,26 @@
+{
+  "study_type": "single_seed_exploratory_full_training_reward_only_primary",
+  "study_note": "Fresh no-inner-loop 1M-decision training run with automatic actor entropy target -10.5. Paired with the other target (-10.5 or -21) under the same seed and settings; this starts a new lineage rather than extending the earlier 500k run. Sample the current outer SAC prior after 2500 random warmup decisions, with no planning, imagined transitions, inner updates, transfer or held policy. Preserve the H3 replay unroll, model size 5, five-head distributional primary critic with reward-only Bellman targets, no auxiliary critic, and automatic actor entropy temperature initialized at 1.0. Reward-only targets do not remove actor entropy regularization. Apart from total training budget, entropy target and publication identity, retain the previous no-inner control exactly, including its one-million-row replay capacity, 2500 pretraining updates, strict compilation and vmap. Use seed 55 and 1M decisions (2M raw environment steps). Retain all 40 numbered 25k checkpoints and durable exact-resume generations. Evaluation remains disabled; publish training returns, diagnostics and costs in W&B ambi, group ambi-return-only-training-20261019.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_full_no_inner_reward_only_1m_entropy10p5"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

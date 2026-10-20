@@ -197,6 +197,16 @@ checkpoints remain the same. It publishes as
 `No inner | reward-only Q | auto entropy | seed55` in the same AMBI group, so the
 comparison isolates the collection policy while preserving outer learning.
 
+The separate one-cell manifests
+`ambi_return_only_no_inner_1m_entropy10p5.json` and
+`ambi_return_only_no_inner_1m_entropy21.json` start fresh seed-55 runs for
+1M decisions (2M raw environment steps), with automatic actor entropy targets
+−10.5 and −21 respectively. They preserve the no-inner reward-only control's
+remaining settings, including its 1M-row replay capacity, and retain all forty
+25k model checkpoints. Their names include the entropy target and 1M-decision
+budget in the same AMBI group. The earlier 500k recipe remains available;
+these are new training lineages, not continuations of that run.
+
 For a short CPU-allocation comparison, run
 `python slurm/benchmark_ambi_training_cpu.py --output /absolute/scratch/directory`
 inside one Slurm allocation with a GPU, eight physical CPU cores
