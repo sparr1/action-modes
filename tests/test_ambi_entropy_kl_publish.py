@@ -33,7 +33,9 @@ def campaign(tmp_path):
                 inner_critic_source="aux_return", inner_horizon_critic_source="aux_return",
                 inner_sac_critic_target="reward_only")
             identity = dict(backbone=source, science={"version":1,"algorithm":"AMBITDMPC2/AMBITDMPC2","source_sha256":"b"*64},
-                planner=dict(type="sac", action_rule="tanh_sample", settings=settings),
+                planner=data.planner_identity(
+                    {**settings, "inner_operator":"sac", "aux_return_mode":"sac"},
+                    {}, "AMBITDMPC2/AMBITDMPC2", "tanh_sample"),
                 protocol=dict(action_rule="tanh_sample",environment_seeds=campaign["seeds"],max_steps=500,controller_seed=55))
             registry = series.create_run(tmp_path/"runs", dict(identity=identity, selector=selector,label="entropy + KL"),
                 campaign["campaign_id"],pub.PROJECT,pub.ENTITY,pub.OWNER)
@@ -296,4 +298,24 @@ def test_all_four_driver_interventions_match_publication_cells(campaign):
     for cell in campaign["cells"]:
         expected = driver.intervention(cell["checkpoint_id"], cell["beta_multiplier"])
         assert all(cell[key] == value for key, value in expected.items())
+        pub.validate_registry(cell)
+
+
+def test_serialized_primary_actor_defaults_are_accepted(campaign):
+    for cell in campaign["cells"]:
+        registry = pub.validate_registry(cell)
+        settings = registry["identity"]["planner"]["settings"]
+        assert "inner_actor_source" not in settings
+        assert "inner_horizon_actor_source" not in settings
+        assert settings["inner_critic_source"] == "aux_return"
+        assert settings["inner_horizon_critic_source"] == "aux_return"
+
+
+@pytest.mark.parametrize("field", ["inner_actor_source", "inner_horizon_actor_source"])
+def test_serialized_nondefault_actor_routing_is_still_rejected(campaign, monkeypatch, field):
+    cell = campaign["cells"][0]
+    registry = series.load_run(cell["run_dir"])
+    registry["identity"]["planner"]["settings"][field] = "return_actor"
+    monkeypatch.setattr(series, "load_run", lambda _: registry)
+    with pytest.raises(ValueError, match="entropy-plus-KL controller"):
         pub.validate_registry(cell)

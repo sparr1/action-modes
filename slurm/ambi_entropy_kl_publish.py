@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils import eval_series as series
+from utils.aux_return_identity import AUX_RETURN_SOURCE_DEFAULTS
 
 ENTITY, PROJECT, OWNER = "rwgao_b-brown-university", "ambi-inner-bench", "oscar-rgao48"
 PREFIX = "Inner entropy + KL / "
@@ -144,7 +145,8 @@ def validate_registry(cell):
                     inner_sac_critic_target="reward_only")
     settings = planner.get("settings", {})
     if (planner.get("type") != "sac" or planner.get("action_rule") != "tanh_sample"
-            or any(settings.get(k) != v for k, v in expected.items())):
+            or any(settings.get(k, AUX_RETURN_SOURCE_DEFAULTS.get(k)) != v
+                   for k, v in expected.items())):
         raise PublicationError("Allocated run does not match the authorized entropy-plus-KL controller")
     return registry
 
