@@ -1,5 +1,9 @@
 # Frozen-checkpoint AMBI research
 
+The [joint entropy and prior-KL evaluation](ENTROPY_KL_EVAL.md) keeps automatic
+temperature learning enabled while testing two fixed prior-KL penalties on
+the same saved roots and sampled full episodes.
+
 The [inner temperature learning-rate diagnostic](ALPHA_LR_PROBE.md) tests faster
 log-alpha adaptation on identical saved roots and paired sampled episodes while
 keeping actor/critic learning rates, initialization and update counts fixed.

@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "description": "Joint automatic entropy plus fixed prior-KL penalties on the same 50 pinned saved roots; beta = 0, 1, or 3 times inherited outer alpha, with unchanged inner temperature LR 0.0003. Soft penalties, not hard KL budgets.",
+  "matrix": "ambi_early_h3_j8.json",
+  "matrix_sha256": "78bfa4eb44434fbe165197cbed12967609fd295c1725d214b54c01b33bf436a8",
+  "preset": "early_h3_j8/mean",
+  "environment_seeds": [
+    101,
+    102,
+    103,
+    104,
+    105
+  ],
+  "decisions": [
+    0,
+    10,
+    50,
+    100,
+    250
+  ],
+  "controller_seed": 55,
+  "actor_steps": 32,
+  "anchor_samples": 128,
+  "checkpoints": {
+    "sac_aux_100k": {
+      "backbone_id": "sac_aux",
+      "source_run": "rwgao_b-brown-university/ambi/full7391933x4",
+      "step": 100000,
+      "checkpoint": "/oscar/scratch/rgao48/ambi/full-training/transfer-j8-20261014/cell-4/ambi_transfer_training_j8_2026-10-15_02-21-54/models/model:ambi_full_h3_j8_fresh_0_100000",
+      "metadata": "/oscar/scratch/rgao48/ambi/full-training/transfer-j8-20261014/cell-4/ambi_transfer_training_j8_2026-10-15_02-21-54/models/model:ambi_full_h3_j8_fresh_0_100000.metadata.json",
+      "checkpoint_sha256": "e4e99ba6eb40dd6b0634e4ea6b1ea3a0d883686bb7a5899f701eb2e9e7784595",
+      "metadata_sha256": "bc7f9bdb748f8eed8c4d8bf2a4572bffdf38bb8846c121c1e2fa9918838c4cb3",
+      "checkpoint_bytes": 119720730
+    },
+    "mppi_aux_400k": {
+      "backbone_id": "mppi_aux",
+      "source_run": "rwgao_b-brown-university/ambi/mppi7530927x0",
+      "step": 400000,
+      "checkpoint": "/oscar/scratch/rgao48/ambi/full-training/mppi-20261017/core/cell-0/ambi_mppi_training_2026-10-17_20-34-41/models/model:ambi_full_h3_mppi_aux_return_0_400000",
+      "metadata": "/oscar/scratch/rgao48/ambi/full-training/mppi-20261017/core/cell-0/ambi_mppi_training_2026-10-17_20-34-41/models/model:ambi_full_h3_mppi_aux_return_0_400000.metadata.json",
+      "checkpoint_sha256": "6efaf10a557e39dd396f735014e35d632ecd8cbbba5c28f6dbbe5841c6b1b561",
+      "metadata_sha256": "5e1ae9fa53c00adff4424c9a1f2d05eed7233619de0997fbae9b09575f38ba76",
+      "checkpoint_bytes": 119764666
+    }
+  },
+  "source_profile_sha256": "02915504abdf49cffcb09aa8b865ff14a3b7498c2cd7c785319d63c7b8a11c7c",
+  "source_git_commit": "b62b0c55545769a8f1e2b98d63c403cac5e9c664",
+  "root_banks": {
+    "mppi_aux_400k": {
+      "101": {
+        "id": "63ed3f307f65f5a6a2e2c541ea192e64763c85c305159948b3aa628ecaaed6ef",
+        "path": "/oscar/scratch/rgao48/ambi/entropy-probe/20261019-b62b0c55/results/mppi_aux_400k/seed101/root-bank.json"
+      },
+      "102": {
+        "id": "d7b1c4c6b78b0ffb514cd57c47e9f74cf753e805beebb596ba8e8986b10b72b8",
+        "path": "/oscar/scratch/rgao48/ambi/entropy-probe/20261019-b62b0c55/results/mppi_aux_400k/seed102-retry/root-bank.json"
+      },
+      "103": {
+        "id": "1caaaace00d94c3f468fd0f76427e18176f74560be7ef1cb11cd8056697c2fad",
+        "path": "/oscar/scratch/rgao48/ambi/entropy-probe/20261019-b62b0c55/results/mppi_aux_400k/seed103/root-bank.json"
+      },
+      "104": {
+        "id": "468b98d0bab1cc4974812a2e8ffe41cfdaa3ec98237b0946c691be596634a984",
+        "path": "/oscar/scratch/rgao48/ambi/entropy-probe/20261019-b62b0c55/results/mppi_aux_400k/seed104/root-bank.json"
+      },
+      "105": {
+        "id": "3f5f5f4b735f4395ed3155bf70eb536f52622ea7bd871d76dfb85dca9180a2ac",
+        "path": "/oscar/scratch/rgao48/ambi/entropy-probe/20261019-b62b0c55/results/mppi_aux_400k/seed105/root-bank.json"
+      }
+    },
+    "sac_aux_100k": {
+      "101": {
+        "id": "d2788786fd02f0fb5ef9e76bb08ba040b8e0186269dc53033cc0cec46e3df7ec",
+        "path": "/oscar/scratch/rgao48/ambi/entropy-probe/20261019-b62b0c55/results/sac_aux_100k/seed101/root-bank.json"
+      },
+      "102": {
+        "id": "c383586dfb2362f55c37087f1bb708dd93ba8febec6043bfa3c74749b957a2d6",
+        "path": "/oscar/scratch/rgao48/ambi/entropy-probe/20261019-b62b0c55/results/sac_aux_100k/seed102/root-bank.json"
+      },
+      "103": {
+        "id": "30de1a03152e16553ab38dd841f0afac1ceb600e958f7d712d1ad6f4b3452d33",
+        "path": "/oscar/scratch/rgao48/ambi/entropy-probe/20261019-b62b0c55/results/sac_aux_100k/seed103/root-bank.json"
+      },
+      "104": {
+        "id": "5cb0c47adc29867e6f781d6c4c24f0119e01a247f4d09f97f629d951d2808308",
+        "path": "/oscar/scratch/rgao48/ambi/entropy-probe/20261019-b62b0c55/results/sac_aux_100k/seed104/root-bank.json"
+      },
+      "105": {
+        "id": "1c072c90b476623a2cf9da75f1a1ee0bd0ac15d56ce8aaa08b3045b0063755c6",
+        "path": "/oscar/scratch/rgao48/ambi/entropy-probe/20261019-b62b0c55/results/sac_aux_100k/seed105/root-bank.json"
+      }
+    }
+  },
+  "beta_multipliers": [
+    0.0,
+    1.0,
+    3.0
+  ]
+}
