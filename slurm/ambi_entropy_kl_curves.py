@@ -181,7 +181,10 @@ def derive(profile, source, raw, provenance, prior, root):
                for ep, gain in zip(episodes, gains)]
     rid = series._digest({"family": profile["family"], "mode": mode, "checkpoint": raw["checkpoint"],
         "source_record_id": raw["record_id"]})
-    return dict(identity=identity, checkpoint=raw["checkpoint"], metrics=metrics, episodes=compact,
+    # W&B's config read-back can represent an integral float as an int. The
+    # equality check above is semantic; use the catalog's stable JSON encoding
+    # for the derived identity while retaining the original in provenance.
+    return dict(identity=deepcopy(profile["identities"][mode]), checkpoint=raw["checkpoint"], metrics=metrics, episodes=compact,
         artifact_files={"source-reference.json": str(path.resolve())}, provenance=reference,
         record_id=rid, source_result_path=raw["source_result_path"], label=METHODS[mode][0])
 

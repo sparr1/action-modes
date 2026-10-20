@@ -120,6 +120,19 @@ def test_prior_only_exposes_return_metrics_and_zero_paired_gain(tmp_path):
     assert not any(key.startswith(("runtime/", "diagnostics/")) for key in derived["metrics"])
 
 
+def test_semantically_equal_numeric_config_uses_stable_catalog_encoding(tmp_path):
+    p = profile(tmp_path)
+    p["identities"]["entropy"]["planner"]["settings"]["grad_clip_norm"] = 20
+    raw, prior = record(tmp_path, "entropy"), record(tmp_path, "prior")
+    raw["identity"]["planner"]["settings"]["grad_clip_norm"] = 20.0
+    derived = curves.derive(p, {"mode": "entropy"}, raw, {}, prior, tmp_path / "derived")
+    catalog = curves.prepare(p)
+    directory = next(c["run_dir"] for c in catalog["curves"] if c["mode"] == "entropy")
+    assert series.stage_record(directory, derived)["status"] == "staged"
+    assert series._json(derived["identity"]) == series._json(p["identities"]["entropy"])
+    assert type(derived["provenance"]["source_identity"]["planner"]["settings"]["grad_clip_norm"]) is float
+
+
 @pytest.mark.parametrize("field", ["backbone", "protocol", "science", "checkpoint", "solver_seed"])
 def test_prior_must_match_identity_checkpoint_and_rng(tmp_path, field):
     raw, prior = record(tmp_path, "entropy"), record(tmp_path, "prior")
