@@ -34,8 +34,8 @@ MATRIX_PATH = Path(__file__).resolve().parents[1] / "configs/research/ambi_entro
 COLORS = {"sac_aux_100k": ("#D97706", "#DC2626"),
           "mppi_aux_400k": ("#2563EB", "#7C3AED")}
 EXISTING = [
-    dict(run_id="9edcea495bf243a5ab9a6e139e603b19", name="MPPI-trained | entropy only | H3 J8 sampled", color="#0F766E"),
-    dict(run_id="566a5d7c358b4cbfa056bc22ec715929", name="SAC-trained | entropy only | H3 J8 sampled", color="#6B7280"),
+    dict(run_id="9edcea495bf243a5ab9a6e139e603b19", name="MPPI-trained | entropy only | H3 J8 sampled", color="#0F766E", line_mark="solid"),
+    dict(run_id="566a5d7c358b4cbfa056bc22ec715929", name="SAC-trained | entropy only | H3 J8 sampled", color="#6B7280", line_mark="solid"),
     dict(run_id="56876f4215b6415c9e759df678df6db3", name="SAC-trained | KL only, beta=outer alpha | H3 J8 sampled", color="#A16207"),
     dict(run_id="db24d8d0c7a245189b2ccc896d1e8cc6", name="MPPI-trained | KL only, beta=outer alpha | H3 J8 sampled", color="#DB2777"),
 ]
@@ -278,7 +278,9 @@ Entropy-only and entropy-OFF KL-only results are reused without modification.
 KL-only uses beta=outer alpha and zero temperature updates. X is source-training
 decisions; existing entropy points at other checkpoints are context only.
 Compare interventions within a checkpoint. Curves have readable method/backbone
-labels, distinct colors, native hover and no aggregation. Pending results never
+labels, distinct colors, native hover and no aggregation. Existing multi-checkpoint
+entropy baselines use connected lines; single-checkpoint interventions use points.
+Pending results never
 appear as zero returns. Progress expects one result per new run; a terminal
 worker without validated output is explicitly marked failed.
 
@@ -295,7 +297,7 @@ summary artifacts are uploaded.
             smoothing_type="none", legend_template="${run:name}", max_runs_to_show=len(rows),
             title_x="Source training decisions", layout=wr.Layout(w=12, h=8),
             line_colors={r["run_id"] + ":" + metric: r["color"] for r in rows},
-            line_marks={r["run_id"] + ":" + metric: "points" for r in rows},
+            line_marks={r["run_id"] + ":" + metric: r.get("line_mark", "points") for r in rows},
             line_titles={r["run_id"] + ":" + metric: r["name"] for r in rows})
     sections = [ws.Section(name=PREFIX + "Protocol and progress", is_open=True, panels=[
         wr.MarkdownPanel(markdown=markdown, layout=wr.Layout(w=24, h=10)),
@@ -331,6 +333,8 @@ summary artifacts are uploaded.
         metric = getattr(panel.y[0], "name", panel.y[0])
         if any(panel.line_titles.get(r["run_id"] + ":" + metric) != r["name"] for r in rows):
             raise PublicationError("Native workspace lost readable curve aliases")
+        if any(panel.line_marks.get(r["run_id"] + ":" + metric) != r.get("line_mark", "points") for r in rows):
+            raise PublicationError("Native workspace lost connected baseline lines or single-checkpoint markers")
     saved.update(api_verified=True, panel_count=len(panels))
     series._atomic_json(path, saved)
     return saved

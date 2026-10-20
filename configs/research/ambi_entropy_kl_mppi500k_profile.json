@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "checkpoint_id": "mppi_aux_500k",
+  "environment_seeds": [
+    101,
+    102,
+    103,
+    104,
+    105
+  ],
+  "controller_seed": 55,
+  "max_steps": 500,
+  "execution_action": "sample",
+  "checkpoints": {
+    "mppi_aux_500k": {
+      "checkpoint": "/oscar/scratch/rgao48/ambi/full-training/mppi-20261017/core/cell-0/ambi_mppi_training_2026-10-17_20-34-41/models/model:ambi_full_h3_mppi_aux_return_0_500000",
+      "metadata": "/oscar/scratch/rgao48/ambi/full-training/mppi-20261017/core/cell-0/ambi_mppi_training_2026-10-17_20-34-41/models/model:ambi_full_h3_mppi_aux_return_0_500000.metadata.json",
+      "checkpoint_bytes": 119764666,
+      "checkpoint_sha256": "bc4350c9b603b3b888f344eb91f0ff65c81a342bb60dec235388cd6acc580345",
+      "metadata_sha256": "8586897f7f6521f2789994099a85bf48a2de7418a7d87d48bb64c8dfd94dde7f",
+      "outer_alpha": 0.023066775873303413,
+      "checkpoint_version": 3,
+      "entropy_spec": {
+        "mode": "auto",
+        "target_entropy": -10.5,
+        "actor_entropy_mode": "squashed",
+        "target_entropy_semantics": "squashed_action_entropy",
+        "inner": {
+          "actor_entropy_mode": "squashed",
+          "target_entropy_semantics": "squashed_action_entropy",
+          "temperature_mode": "inherit_outer",
+          "target_entropy_setting": "inherit_outer",
+          "target_entropy": -10.5
+        }
+      },
+      "backbone_id": "mppi_aux",
+      "source_run": "rwgao_b-brown-university/ambi/mppi7530927x0",
+      "step": 500000
+    }
+  }
+}

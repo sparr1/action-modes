@@ -230,6 +230,11 @@ def test_native_layout_is_idempotent_and_readback_verified_without_network(campa
     assert len(saved[-1].sections)==4
     panels=[p for s in saved[-1].sections for p in s.panels if isinstance(p,wr.LinePlot)]
     assert len(panels)==12 and all(not p.aggregate and len(p.line_marks)==8 for p in panels)
+    for panel in panels:
+        metric = getattr(panel.y[0], "name", panel.y[0])
+        for row in second["runs"]:
+            expected_mark = "solid" if row["run_id"] in {r["run_id"] for r in pub.EXISTING[:2]} else "points"
+            assert panel.line_marks[row["run_id"] + ":" + metric] == expected_mark
     assert len(second["runs"])==8
 
 
