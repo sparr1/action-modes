@@ -1,5 +1,9 @@
 # Frozen-checkpoint AMBI research
 
+The [inner temperature learning-rate diagnostic](ALPHA_LR_PROBE.md) tests faster
+log-alpha adaptation on identical saved roots and paired sampled episodes while
+keeping actor/critic learning rates, initialization and update counts fixed.
+
 The [prior-KL entropy mitigation diagnostic](PRIOR_KL_PROBE.md) compares
 entropy-regularized inner SAC with KL-to-base refinement on identical saved
 roots, followed by a separately identified sampled-action episode evaluation.
