@@ -6,7 +6,7 @@ by SHA256. Its learned outer temperature is **0.023066775873303413** and its
 squashed-action target entropy is **−10.5**. No outer parameters or optimizers
 are updated.
 
-Four new independent evaluation series share environment seeds 101–105,
+Four independent raw evaluation records share environment seeds 101–105,
 controller seed55, sampled actions, and all500 decisions of each episode:
 
 | Mode | Actor objective | Temperature updates per decision |
@@ -43,7 +43,8 @@ output paths; reruns cannot overwrite saved results.
 
 The launcher requires explicit Slurm resources and the exact source SHA.
 Workers do not initialize W&B. The separate publisher verifies complete
-receipts and installs a dedicated native view. These are four methods at one
-checkpoint, so checkpoint-axis panels are single points; temporal diagnostics
-must use their actual decision or solver-round axes rather than connecting
-different methods into a fictitious training curve.
+receipts and appends each method to its persistent checkpoint curve, including
+compatible historical results. See
+[ENTROPY_KL_CHECKPOINT_CURVES.md](ENTROPY_KL_CHECKPOINT_CURVES.md) for the catalog,
+layout and future-append contract. The four methods have distinct native runs,
+colors and legends; each line connects only the same method across checkpoints.

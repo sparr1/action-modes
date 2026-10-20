@@ -1,0 +1,507 @@
+{
+  "schema_version": 1,
+  "family": "mppi-aux-entropy-kl-h3j8-sampled-v1",
+  "root": "/oscar/scratch/rgao48/ambi/evaluation-series/mppi-entropy-kl-v1",
+  "entity": "rwgao_b-brown-university",
+  "project": "ambi-inner-bench",
+  "owner": "oscar-rgao48",
+  "workspace_url": "https://wandb.ai/rwgao_b-brown-university/ambi-inner-bench?nw=3w61ds5ze92",
+  "identities": {
+    "prior": {
+      "planner": {
+        "type": "prior",
+        "action_rule": "tanh_sample"
+      },
+      "science": {
+        "version": 1,
+        "algorithm": "AMBITDMPC2/AMBITDMPC2",
+        "source_sha256": "c6905ebf5d51447bcdbf7440c30b3ec578657b032e44381e1c6f39be55c47dd3"
+      },
+      "backbone": "rwgao_b-brown-university/ambi/mppi7530927x0",
+      "protocol": {
+        "mode": "episodes",
+        "max_steps": 500,
+        "action_rule": "tanh_sample",
+        "env_wrapper": null,
+        "environment": {
+          "id": "DMControl-v0",
+          "params": {
+            "obs": "state",
+            "task": "humanoid-walk",
+            "render_mode": null
+          }
+        },
+        "observation": "state",
+        "seed_scheme": "sha256-v1",
+        "env_wrappers": [],
+        "controller_seed": 55,
+        "environment_seeds": [
+          101,
+          102,
+          103,
+          104,
+          105
+        ]
+      }
+    },
+    "entropy": {
+      "planner": {
+        "type": "sac",
+        "backend": "AMBITDMPC2/AMBITDMPC2",
+        "settings": {
+          "dropout": 0.01,
+          "discount": 0.99,
+          "episodic": false,
+          "inner_rounds": 8,
+          "grad_clip_norm": 20,
+          "inner_actor_lr": 0.0003,
+          "inner_adam_eps": 1e-08,
+          "inner_operator": "sac",
+          "inner_critic_lr": 0.0003,
+          "inner_batch_size": 256,
+          "inner_actor_scope": "action",
+          "inner_log_std_max": 2,
+          "inner_log_std_min": -10,
+          "inner_critic_scope": "action",
+          "inner_replay_scope": "action",
+          "inner_critic_source": "aux_return",
+          "inner_schedule_mode": "canonical",
+          "inner_actor_adam_eps": 1e-05,
+          "inner_finite_horizon": true,
+          "inner_target_entropy": "inherit_outer",
+          "inner_temperature_lr": 0.0003,
+          "inner_behavior_action": "policy_sample",
+          "inner_entropy_enabled": true,
+          "inner_log_std_mapping": "direct_clamp",
+          "inner_replay_capacity": 3072,
+          "inner_replay_sampling": "with_replacement",
+          "inner_rollout_horizon": 3,
+          "inner_actor_adaptation": "clone",
+          "inner_bootstrap_source": "inner_target",
+          "inner_critic_loss_coef": 1,
+          "inner_temperature_mode": "auto",
+          "critic_ensemble_backend": "vmap",
+          "inner_critic_adaptation": "clone",
+          "inner_critic_target_tau": 0.01,
+          "inner_model_step_budget": 3072,
+          "inner_q_actor_reduction": "mean_pair",
+          "inner_sac_critic_target": "reward_only",
+          "inner_temperature_scope": "action",
+          "inner_actor_entropy_mode": "squashed",
+          "inner_behavior_noise_std": 0,
+          "inner_behavior_std_scale": 1,
+          "inner_q_target_reduction": "min_pair",
+          "inner_rollouts_per_round": 128,
+          "sac_actor_loss_scale_mode": "none",
+          "inner_actor_grad_clip_norm": 20,
+          "inner_outer_action_l2_coef": 0,
+          "inner_outer_policy_kl_coef": 0,
+          "inner_prior_rollout_weight": 0.5,
+          "inner_value_initialization": "return",
+          "inner_actor_optimizer_scope": "action",
+          "inner_critic_grad_clip_norm": 20,
+          "inner_horizon_critic_source": "aux_return",
+          "inner_outer_replay_fraction": 0,
+          "inner_termination_threshold": 0.5,
+          "inner_critic_dropout_enabled": true,
+          "inner_critic_optimizer_scope": "action",
+          "inner_actor_loss_scale_update": "per_action",
+          "inner_actor_updates_per_round": 4,
+          "inner_execution_policy_source": "primary",
+          "inner_actor_updates_per_action": 32,
+          "inner_critic_updates_per_round": 16,
+          "inner_component_update_schedule": true,
+          "inner_critic_updates_per_action": 128,
+          "inner_temperature_grad_clip_norm": 20,
+          "inner_temperature_initialization": "inherit_outer",
+          "inner_temperature_optimizer_scope": "action",
+          "inner_critic_target_initialization": "online",
+          "inner_critic_target_update_interval": 1,
+          "inner_temperature_updates_per_action": 32
+        },
+        "action_rule": "tanh_sample"
+      },
+      "science": {
+        "version": 1,
+        "algorithm": "AMBITDMPC2/AMBITDMPC2",
+        "source_sha256": "c6905ebf5d51447bcdbf7440c30b3ec578657b032e44381e1c6f39be55c47dd3"
+      },
+      "backbone": "rwgao_b-brown-university/ambi/mppi7530927x0",
+      "protocol": {
+        "mode": "episodes",
+        "max_steps": 500,
+        "action_rule": "tanh_sample",
+        "env_wrapper": null,
+        "environment": {
+          "id": "DMControl-v0",
+          "params": {
+            "obs": "state",
+            "task": "humanoid-walk",
+            "render_mode": null
+          }
+        },
+        "observation": "state",
+        "seed_scheme": "sha256-v1",
+        "env_wrappers": [],
+        "controller_seed": 55,
+        "environment_seeds": [
+          101,
+          102,
+          103,
+          104,
+          105
+        ]
+      }
+    },
+    "kl": {
+      "planner": {
+        "type": "sac",
+        "backend": "AMBITDMPC2/AMBITDMPC2",
+        "settings": {
+          "dropout": 0.01,
+          "discount": 0.99,
+          "episodic": false,
+          "inner_rounds": 8,
+          "grad_clip_norm": 20,
+          "inner_actor_lr": 0.0003,
+          "inner_adam_eps": 1e-08,
+          "inner_operator": "sac",
+          "inner_critic_lr": 0.0003,
+          "inner_batch_size": 256,
+          "inner_actor_scope": "action",
+          "inner_log_std_max": 2,
+          "inner_log_std_min": -10,
+          "inner_critic_scope": "action",
+          "inner_replay_scope": "action",
+          "inner_critic_source": "aux_return",
+          "inner_schedule_mode": "canonical",
+          "inner_actor_adam_eps": 1e-05,
+          "inner_finite_horizon": true,
+          "inner_target_entropy": "inherit_outer",
+          "inner_behavior_action": "policy_sample",
+          "inner_entropy_enabled": false,
+          "inner_log_std_mapping": "direct_clamp",
+          "inner_replay_capacity": 3072,
+          "inner_replay_sampling": "with_replacement",
+          "inner_rollout_horizon": 3,
+          "inner_actor_adaptation": "clone",
+          "inner_bootstrap_source": "inner_target",
+          "inner_critic_loss_coef": 1,
+          "inner_temperature_mode": "inherit_outer",
+          "critic_ensemble_backend": "vmap",
+          "inner_critic_adaptation": "clone",
+          "inner_critic_target_tau": 0.01,
+          "inner_model_step_budget": 3072,
+          "inner_q_actor_reduction": "mean_pair",
+          "inner_sac_critic_target": "reward_only",
+          "inner_temperature_scope": "action",
+          "inner_actor_entropy_mode": "squashed",
+          "inner_behavior_noise_std": 0,
+          "inner_behavior_std_scale": 1,
+          "inner_q_target_reduction": "min_pair",
+          "inner_rollouts_per_round": 128,
+          "sac_actor_loss_scale_mode": "none",
+          "inner_actor_grad_clip_norm": 20,
+          "inner_outer_action_l2_coef": 0,
+          "inner_prior_rollout_weight": 0.5,
+          "inner_value_initialization": "return",
+          "inner_actor_optimizer_scope": "action",
+          "inner_critic_grad_clip_norm": 20,
+          "inner_horizon_critic_source": "aux_return",
+          "inner_outer_replay_fraction": 0,
+          "inner_termination_threshold": 0.5,
+          "inner_critic_dropout_enabled": true,
+          "inner_critic_optimizer_scope": "action",
+          "inner_actor_loss_scale_update": "per_action",
+          "inner_actor_updates_per_round": 4,
+          "inner_execution_policy_source": "primary",
+          "inner_actor_updates_per_action": 32,
+          "inner_critic_updates_per_round": 16,
+          "inner_component_update_schedule": true,
+          "inner_critic_updates_per_action": 128,
+          "inner_temperature_initialization": "inherit_outer",
+          "inner_critic_target_initialization": "online",
+          "inner_critic_target_update_interval": 1,
+          "inner_outer_policy_kl_coef_rule": {
+            "kind": "checkpoint_outer_alpha",
+            "multiplier": 1.0,
+            "within_solve": "fixed"
+          }
+        },
+        "action_rule": "tanh_sample"
+      },
+      "science": {
+        "version": 1,
+        "algorithm": "AMBITDMPC2/AMBITDMPC2",
+        "source_sha256": "c6905ebf5d51447bcdbf7440c30b3ec578657b032e44381e1c6f39be55c47dd3"
+      },
+      "backbone": "rwgao_b-brown-university/ambi/mppi7530927x0",
+      "protocol": {
+        "mode": "episodes",
+        "max_steps": 500,
+        "action_rule": "tanh_sample",
+        "env_wrapper": null,
+        "environment": {
+          "id": "DMControl-v0",
+          "params": {
+            "obs": "state",
+            "task": "humanoid-walk",
+            "render_mode": null
+          }
+        },
+        "observation": "state",
+        "seed_scheme": "sha256-v1",
+        "env_wrappers": [],
+        "controller_seed": 55,
+        "environment_seeds": [
+          101,
+          102,
+          103,
+          104,
+          105
+        ]
+      }
+    },
+    "both": {
+      "planner": {
+        "type": "sac",
+        "backend": "AMBITDMPC2/AMBITDMPC2",
+        "settings": {
+          "dropout": 0.01,
+          "discount": 0.99,
+          "episodic": false,
+          "inner_rounds": 8,
+          "grad_clip_norm": 20,
+          "inner_actor_lr": 0.0003,
+          "inner_adam_eps": 1e-08,
+          "inner_operator": "sac",
+          "inner_critic_lr": 0.0003,
+          "inner_batch_size": 256,
+          "inner_actor_scope": "action",
+          "inner_log_std_max": 2,
+          "inner_log_std_min": -10,
+          "inner_critic_scope": "action",
+          "inner_replay_scope": "action",
+          "inner_critic_source": "aux_return",
+          "inner_schedule_mode": "canonical",
+          "inner_actor_adam_eps": 1e-05,
+          "inner_finite_horizon": true,
+          "inner_target_entropy": "inherit_outer",
+          "inner_temperature_lr": 0.0003,
+          "inner_behavior_action": "policy_sample",
+          "inner_entropy_enabled": true,
+          "inner_log_std_mapping": "direct_clamp",
+          "inner_replay_capacity": 3072,
+          "inner_replay_sampling": "with_replacement",
+          "inner_rollout_horizon": 3,
+          "inner_actor_adaptation": "clone",
+          "inner_bootstrap_source": "inner_target",
+          "inner_critic_loss_coef": 1,
+          "inner_temperature_mode": "auto",
+          "critic_ensemble_backend": "vmap",
+          "inner_critic_adaptation": "clone",
+          "inner_critic_target_tau": 0.01,
+          "inner_model_step_budget": 3072,
+          "inner_q_actor_reduction": "mean_pair",
+          "inner_sac_critic_target": "reward_only",
+          "inner_temperature_scope": "action",
+          "inner_actor_entropy_mode": "squashed",
+          "inner_behavior_noise_std": 0,
+          "inner_behavior_std_scale": 1,
+          "inner_q_target_reduction": "min_pair",
+          "inner_rollouts_per_round": 128,
+          "sac_actor_loss_scale_mode": "none",
+          "inner_actor_grad_clip_norm": 20,
+          "inner_outer_action_l2_coef": 0,
+          "inner_prior_rollout_weight": 0.5,
+          "inner_value_initialization": "return",
+          "inner_actor_optimizer_scope": "action",
+          "inner_critic_grad_clip_norm": 20,
+          "inner_horizon_critic_source": "aux_return",
+          "inner_outer_replay_fraction": 0,
+          "inner_termination_threshold": 0.5,
+          "inner_critic_dropout_enabled": true,
+          "inner_critic_optimizer_scope": "action",
+          "inner_actor_loss_scale_update": "per_action",
+          "inner_actor_updates_per_round": 4,
+          "inner_execution_policy_source": "primary",
+          "inner_actor_updates_per_action": 32,
+          "inner_critic_updates_per_round": 16,
+          "inner_component_update_schedule": true,
+          "inner_critic_updates_per_action": 128,
+          "inner_temperature_grad_clip_norm": 20,
+          "inner_temperature_initialization": "inherit_outer",
+          "inner_temperature_optimizer_scope": "action",
+          "inner_critic_target_initialization": "online",
+          "inner_critic_target_update_interval": 1,
+          "inner_temperature_updates_per_action": 32,
+          "inner_outer_policy_kl_coef_rule": {
+            "kind": "checkpoint_outer_alpha",
+            "multiplier": 1.0,
+            "within_solve": "fixed"
+          }
+        },
+        "action_rule": "tanh_sample"
+      },
+      "science": {
+        "version": 1,
+        "algorithm": "AMBITDMPC2/AMBITDMPC2",
+        "source_sha256": "c6905ebf5d51447bcdbf7440c30b3ec578657b032e44381e1c6f39be55c47dd3"
+      },
+      "backbone": "rwgao_b-brown-university/ambi/mppi7530927x0",
+      "protocol": {
+        "mode": "episodes",
+        "max_steps": 500,
+        "action_rule": "tanh_sample",
+        "env_wrapper": null,
+        "environment": {
+          "id": "DMControl-v0",
+          "params": {
+            "obs": "state",
+            "task": "humanoid-walk",
+            "render_mode": null
+          }
+        },
+        "observation": "state",
+        "seed_scheme": "sha256-v1",
+        "env_wrappers": [],
+        "controller_seed": 55,
+        "environment_seeds": [
+          101,
+          102,
+          103,
+          104,
+          105
+        ]
+      }
+    }
+  },
+  "sources": [
+    {
+      "mode": "entropy",
+      "run_dir": "/oscar/scratch/rgao48/ambi/early-h3-j8-eval/20261018-a0d73c82/publication/runs/mppi_aux_sample/9edcea495bf243a5ab9a6e139e603b19",
+      "run_id": "9edcea495bf243a5ab9a6e139e603b19",
+      "expected_checkpoint_steps": [
+        100000,
+        150000,
+        200000,
+        400000
+      ],
+      "expected_identity_sha256": "618c98764bea2230ffb904362ff580927c3200f03fbaabe4ecd22b8118853214"
+    },
+    {
+      "mode": "kl",
+      "run_dir": "/oscar/scratch/rgao48/ambi/prior-kl/20261020-6c61e2c7/episodes/publication/runs/db24d8d0c7a245189b2ccc896d1e8cc6",
+      "run_id": "db24d8d0c7a245189b2ccc896d1e8cc6",
+      "expected_checkpoint_steps": [
+        400000
+      ],
+      "expected_identity_sha256": "b92e1a4e07b3aaf36265da22efe654a3575c5e00ca97460c129f905f44e71472",
+      "outer_alpha_by_step": {
+        "400000": 0.013081684708595276
+      }
+    },
+    {
+      "mode": "both",
+      "run_dir": "/oscar/scratch/rgao48/ambi/entropy-kl/20261020-433c181b/episodes/publication/runs/44c306e7c69c4625a1b1b7dce156fde3",
+      "run_id": "44c306e7c69c4625a1b1b7dce156fde3",
+      "expected_checkpoint_steps": [
+        400000
+      ],
+      "expected_identity_sha256": "dcfa8aaf6fbf34ff677eb890730324b2c47cbd8d5eda3b25c1f85ae2955704b6",
+      "outer_alpha_by_step": {
+        "400000": 0.013081684708595276
+      }
+    },
+    {
+      "mode": "prior",
+      "run_dir": "/oscar/scratch/rgao48/ambi/entropy-kl-mppi500k/20261020-v2/episodes/publication/runs/9759c4ae74f94f338cba6ec0515b536f",
+      "run_id": "9759c4ae74f94f338cba6ec0515b536f",
+      "expected_checkpoint_steps": [
+        500000
+      ],
+      "expected_identity_sha256": "809cff2328bf412d96d6a15546be9cba90dd3e3c8aa5d8f13af06c3e15938682"
+    },
+    {
+      "mode": "entropy",
+      "run_dir": "/oscar/scratch/rgao48/ambi/entropy-kl-mppi500k/20261020-v2/episodes/publication/runs/b2d97b9d1aed4be0a38dfcfba31c9949",
+      "run_id": "b2d97b9d1aed4be0a38dfcfba31c9949",
+      "expected_checkpoint_steps": [
+        500000
+      ],
+      "expected_identity_sha256": "618c98764bea2230ffb904362ff580927c3200f03fbaabe4ecd22b8118853214"
+    },
+    {
+      "mode": "kl",
+      "run_dir": "/oscar/scratch/rgao48/ambi/entropy-kl-mppi500k/20261020-v2/episodes/publication/runs/d4bde3bdd9cd4fafbd0c343ff0087c60",
+      "run_id": "d4bde3bdd9cd4fafbd0c343ff0087c60",
+      "expected_checkpoint_steps": [
+        500000
+      ],
+      "expected_identity_sha256": "91098d526f49384c3e7a0f31d8ff1170c772bf568d82e7b25ae277b91f14173b",
+      "outer_alpha_by_step": {
+        "500000": 0.023066775873303413
+      }
+    },
+    {
+      "mode": "both",
+      "run_dir": "/oscar/scratch/rgao48/ambi/entropy-kl-mppi500k/20261020-v2/episodes/publication/runs/92c1baa42f0346a185f44db40610f3e4",
+      "run_id": "92c1baa42f0346a185f44db40610f3e4",
+      "expected_checkpoint_steps": [
+        500000
+      ],
+      "expected_identity_sha256": "6c63586e30f3f40125e11cf6b0fb2fd9351400d0ddbf422e65cc5e34599ba1d2",
+      "outer_alpha_by_step": {
+        "500000": 0.023066775873303413
+      }
+    },
+    {
+      "mode": "prior",
+      "bundle": "/oscar/scratch/rgao48/ambi/early-h3-j8-eval/20261018-a0d73c82/baselines-8401ce40/cell-01/bundle",
+      "receipt": "/oscar/scratch/rgao48/ambi/early-h3-j8-eval/20261018-a0d73c82/baselines-8401ce40/cell-01/receipt.json",
+      "receipt_sha256": "9504b96915bd42646a2b4c9fbf3b1a13675c7a9daa6f0718b60a74baf45b4a80",
+      "manifest_sha256": "46d707972cc78f21e2465c1b8d45663281486562115ecf73a25fb6c863b48f66",
+      "backbone": "rwgao_b-brown-university/ambi/mppi7530927x0",
+      "inventory_path": "/oscar/scratch/rgao48/ambi/early-h3-j8-eval/20261018-a0d73c82/inputs/mppi_aux.json",
+      "expected_checkpoint_steps": [
+        100000
+      ]
+    },
+    {
+      "mode": "prior",
+      "bundle": "/oscar/scratch/rgao48/ambi/early-h3-j8-eval/20261018-a0d73c82/baselines-8401ce40/cell-03/bundle",
+      "receipt": "/oscar/scratch/rgao48/ambi/early-h3-j8-eval/20261018-a0d73c82/baselines-8401ce40/cell-03/receipt.json",
+      "receipt_sha256": "d07102abf2f79927259c1307ce8864fa964aba33cf29818a71ca16f93fd69270",
+      "manifest_sha256": "7ccfefd01bf1d99a06f176af3896513920747609a8bfd6a80cc0051b6844e53c",
+      "backbone": "rwgao_b-brown-university/ambi/mppi7530927x0",
+      "inventory_path": "/oscar/scratch/rgao48/ambi/early-h3-j8-eval/20261018-a0d73c82/inputs/mppi_aux.json",
+      "expected_checkpoint_steps": [
+        150000
+      ]
+    },
+    {
+      "mode": "prior",
+      "bundle": "/oscar/scratch/rgao48/ambi/early-h3-j8-eval/20261018-a0d73c82/baselines-8401ce40/cell-05/bundle",
+      "receipt": "/oscar/scratch/rgao48/ambi/early-h3-j8-eval/20261018-a0d73c82/baselines-8401ce40/cell-05/receipt.json",
+      "receipt_sha256": "de4806bba8337a8a1edc71fba39e253997970edf0f6eea6be7b5d443a15300ad",
+      "manifest_sha256": "6c3f1ae12b3cb9029003fb3c45f33a4177f13ac3fc9f825692ba1e1f9bdd7752",
+      "backbone": "rwgao_b-brown-university/ambi/mppi7530927x0",
+      "inventory_path": "/oscar/scratch/rgao48/ambi/early-h3-j8-eval/20261018-a0d73c82/inputs/mppi_aux.json",
+      "expected_checkpoint_steps": [
+        200000
+      ]
+    },
+    {
+      "mode": "prior",
+      "bundle": "/oscar/scratch/rgao48/ambi/early-h3-j8-eval/20261018-a0d73c82/baselines-8401ce40/cell-07/bundle",
+      "receipt": "/oscar/scratch/rgao48/ambi/early-h3-j8-eval/20261018-a0d73c82/baselines-8401ce40/cell-07/receipt.json",
+      "receipt_sha256": "2f1fd07e9bf14ca4b00b1e5515772374a3a52f8ab3e0e4e9865de05d227dde09",
+      "manifest_sha256": "1588d096ce9a030f78140ad67c334886609f8f075cefb0008dbec0364d8608de",
+      "backbone": "rwgao_b-brown-university/ambi/mppi7530927x0",
+      "inventory_path": "/oscar/scratch/rgao48/ambi/early-h3-j8-eval/20261018-a0d73c82/inputs/mppi_aux.json",
+      "expected_checkpoint_steps": [
+        400000
+      ]
+    }
+  ]
+}

@@ -327,6 +327,7 @@ def test_native_layout_idempotence_and_readback(campaign, tmp_path, monkeypatch,
 
 def test_final_cli_marks_missing_results_failed(campaign, tmp_path, monkeypatch):
     monkeypatch.setattr(pub, "load_campaign", lambda path: campaign)
+    monkeypatch.setattr(pub, "_persistent_curves", lambda: (None, {}, {}))
     monkeypatch.setattr(pub, "publish_once", lambda *a, **k: {"all_complete": False})
     root = tmp_path / "pub"
     monkeypatch.setattr(pub.sys, "argv", ["publish", "publish", "--campaign", str(tmp_path / "campaign.json"),
@@ -334,3 +335,13 @@ def test_final_cli_marks_missing_results_failed(campaign, tmp_path, monkeypatch)
     with pytest.raises(SystemExit, match="marked failed"):
         pub.main()
     assert "marked failed" in series._read(root / "publication-failure.json")["message"]
+
+
+def test_cli_requires_persistent_curves_instead_of_single_checkpoint_view(campaign, tmp_path, monkeypatch):
+    monkeypatch.setattr(pub, "load_campaign", lambda path: campaign)
+    monkeypatch.setattr(pub, "_persistent_curves", lambda: None)
+    monkeypatch.setattr(pub.sys, "argv", ["publish", "publish", "--campaign", str(tmp_path / "campaign.json"),
+        "--root", str(tmp_path / "pub"), "--once"])
+    with pytest.raises(SystemExit, match="persistent checkpoint catalog"):
+        pub.main()
+    assert "persistent checkpoint catalog" in series._read(tmp_path / "pub/publication-failure.json")["message"]

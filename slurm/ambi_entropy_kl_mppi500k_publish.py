@@ -1,8 +1,7 @@
 """Publish the four matched MPPI-trained 500k objective comparisons.
 
-GPU workers remain offline. Install the dedicated layout in the separate pinned
-workspace runtime, then copy its receipt to this CPU publisher. Existing 400k
-context runs are read-only; four new curve identities own the new results.
+GPU workers remain offline. Raw per-campaign records remain immutable; the
+persistent checkpoint catalog owns the user-facing curves across campaigns.
 """
 from __future__ import annotations
 
@@ -60,6 +59,13 @@ PANEL_COUNT = len(METRICS) + 3
 def _line_color(value):
     # W&B expands a saved hex color into {color, transparentColor} on read-back.
     return value.get("color") if isinstance(value, dict) else value
+
+
+def _persistent_curves():
+    from slurm import ambi_entropy_kl_curves as curves
+    profile = series._read(curves.PROFILE)
+    path = Path(profile["root"]) / "catalog.json"
+    return (curves, profile, series._read(path)) if path.exists() else None
 
 
 def load_campaign(path):
@@ -312,6 +318,13 @@ def progress_rows(campaign, status):
 
 
 def install_workspace(campaign, path):
+    persistent = _persistent_curves()
+    if persistent is not None:
+        from slurm.ambi_entropy_kl_curves_layout import install_catalog
+        _, _, catalog = persistent
+        saved = install_catalog(catalog, Path(catalog["root"]) / "workspace.json")
+        series._atomic_json(path, saved)
+        return saved
     for package, version in (("wandb", "0.28.1"), ("wandb-workspaces", "0.4.5")):
         if importlib.metadata.version(package) != version:
             raise PublicationError(f"Layout requires separate runtime {package}=={version}")
@@ -398,6 +411,11 @@ uploaded summaries are bounded to 16 MiB per result.
 
 
 def verify_workspace(campaign, path, wandb_module=None):
+    persistent = _persistent_curves()
+    if persistent is not None:
+        from slurm.ambi_entropy_kl_curves_layout import verify_installed_catalog
+        _, _, catalog = persistent
+        return verify_installed_catalog(catalog, Path(catalog["root"]) / "workspace.json", wandb_module)
     if not Path(path).exists():
         raise PublicationError("Install and verify the dedicated native layout before publication")
     saved = series._read(path)
@@ -464,6 +482,12 @@ def publish_once(campaign, root, *, wandb_module=None, workspace_verifier=verify
         result = dict(updated_at=now(), campaign_id=campaign["campaign_id"], cells=statuses, runs=rows,
                       workspace_url=workspace["url"], require_complete=require_complete,
                       all_complete=all(r["published"] == 1 for r in rows))
+        persistent = _persistent_curves()
+        if persistent is not None:
+            curves, profile, _ = persistent
+            catalog = curves.register_campaign(profile, campaign)
+            result["checkpoint_curves"] = curves.publish(profile, catalog, require_complete=require_complete,
+                                                        wandb_module=wandb_module)
         series._atomic_json(root / "status.json", result)
         return result
 
@@ -482,6 +506,9 @@ def main():
     campaign = load_campaign(args.campaign)
     args.root.mkdir(parents=True, exist_ok=True)
     try:
+        if _persistent_curves() is None:
+            raise PublicationError("Prepare the persistent checkpoint catalog and install its layout first; "
+                                   "new per-checkpoint-only dashboards are no longer created by this CLI")
         if args.command == "layout":
             result = install_workspace(campaign, args.root / "workspace.json")
         else:
