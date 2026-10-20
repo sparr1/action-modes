@@ -62,8 +62,9 @@ def _summary(summary, values, label):
         _require(math.isclose(number, value, rel_tol=1e-7, abs_tol=1e-6), f"{label}/{key} disagrees with episodes")
 
 
-def _metric_constants(metrics, *, prefix="", aggregate_count=None):
-    for key, expected in METRICS.items():
+def _metric_constants(metrics, *, prefix="", aggregate_count=None, expected_temperature_steps=32):
+    constants = {**METRICS, "inner_temperature_optimizer_steps": expected_temperature_steps}
+    for key, expected in constants.items():
         value = metrics.get(prefix + key)
         if aggregate_count is None:
             _require(value == expected, f"Unexpected {prefix + key}: {value!r}, expected {expected}")
@@ -85,17 +86,30 @@ def _probe_summaries(rows, count):
                 _finite(value, f"Non-finite probe summary {key}")
 
 
-def validate_result(result_path, bundle_dir, expected_seeds=SEEDS, max_steps=500):
+def validate_result(result_path, bundle_dir, expected_seeds=SEEDS, max_steps=500, *,
+                    expected_temperature_steps=32, config_overrides=None):
     """Require one complete controller result; return compact performance metrics.
 
     Smoke callers may select fewer seeds and decisions. Every requested decision
     must still execute the full H3/J8 solve. Trace shards are read one line at a
     time so validation does not duplicate the full episode trace in memory.
+
+    Entropy-disabled variants select zero temperature updates and explicitly
+    override their resolved configuration (including temperature mode). Actor,
+    critic, rollout, and probe work retain the same H3/J8 contract. Default
+    validation remains the original 32-temperature-update protocol.
     """
     seeds = tuple(expected_seeds)
     _require(bool(seeds) and len(seeds) == len(set(seeds))
              and all(type(seed) is int for seed in seeds), "Expected seeds must be distinct integers")
     _require(type(max_steps) is int and 1 <= max_steps <= 500, "max_steps must be in [1, 500]")
+    _require(type(expected_temperature_steps) is int and expected_temperature_steps in (0, 32),
+             "expected_temperature_steps must be 0 or 32 for the H3/J8 protocol")
+    _require(config_overrides is None or isinstance(config_overrides, dict),
+             "config_overrides must be a mapping or None")
+    config = {**CONFIG, **(config_overrides or {})}
+    counters = {**COUNTERS, "temperature": expected_temperature_steps}
+    temperature_steps_per_round = expected_temperature_steps // 8
     payload = _read(result_path)
     root = Path(bundle_dir).resolve(strict=True)
     manifest = _read(root / "manifest.json")
@@ -110,8 +124,8 @@ def validate_result(result_path, bundle_dir, expected_seeds=SEEDS, max_steps=500
     _require(result["outer_updates_before"] == result["outer_updates_after"], "Outer update count changed")
     _require(not result["nonfinite_model_metrics"] and not result["nonfinite_trace_metrics"], "Result contains non-finite metrics")
     _require(not run.get("nonfinite_trace_metrics", {}), "Bundle contains non-finite trace metrics")
-    _same(result["resolved_config"], CONFIG, "Resolved config")
-    _same(run["resolved_config"], CONFIG, "Bundle resolved config")
+    _same(result["resolved_config"], config, "Resolved config")
+    _same(run["resolved_config"], config, "Bundle resolved config")
     _require(str(result["resolved_device"]).startswith("cuda"), "GPU result did not use CUDA")
     _same(result, {"controller_seed": 55, "seed_scheme": "sha256-v1"}, "Controller RNG")
     mode = result["execution_action"]
@@ -139,12 +153,13 @@ def validate_result(result_path, bundle_dir, expected_seeds=SEEDS, max_steps=500
         control_seconds += _finite(episode["control_seconds"], "Invalid control time", nonnegative=True)
         probe_seconds += _finite(episode["togo_probe_seconds"], "Invalid probe time", nonnegative=True)
         _require(not episode["nonfinite_model_metrics"], "Episode contains non-finite metrics")
-        _metric_constants(episode["model_metrics"])
+        _metric_constants(episode["model_metrics"], expected_temperature_steps=expected_temperature_steps)
         _require(episode["togo_probe_model_steps"] == len(probe_decisions) * 960, "Incorrect probe model-step count")
         _probe_summaries(episode["togo_round_summaries"], len(probe_decisions))
         for key in ("seed", "length", "return", "control_seconds", "solver_seed"):
             _require(saved[key] == episode[key], f"Saved episode differs: {key}")
-    _metric_constants(result["model_metrics"], aggregate_count=decisions)
+    _metric_constants(result["model_metrics"], aggregate_count=decisions,
+                      expected_temperature_steps=expected_temperature_steps)
     _summary(result["return"], [episode["return"] for episode in episodes], "Return summary")
     _summary(result["episode_length"], [episode["length"] for episode in episodes], "Length summary")
     _probe_summaries(result["togo_round_summaries"], len(probe_decisions) * len(seeds))
@@ -181,11 +196,11 @@ def validate_result(result_path, bundle_dir, expected_seeds=SEEDS, max_steps=500
                 for name, value in event["metrics"].items():
                     _finite(value, f"Non-finite trace metric {name}")
                 if event["phase"] == "update":
-                    for name in COUNTERS:
+                    for name in counters:
                         flag = event[f"updated_{name}"]
                         _require(type(flag) is bool, "Invalid update flag")
                         state["counts"][name] += int(flag)
-                for name in COUNTERS:
+                for name in counters:
                     _require(event[f"{name}_updates"] == state["counts"][name], "Trace cumulative optimizer counter mismatch")
                 if event["phase"] == "probe":
                     probe_key = (*key, event["round_index"])
@@ -193,11 +208,12 @@ def validate_result(result_path, bundle_dir, expected_seeds=SEEDS, max_steps=500
                     seen_probes.add(probe_key)
                     _require(event["metrics"] == recorded_probes[probe_key], "Probe trace/summary row mismatch")
                     _same(event, {"critic_updates": 16 * event["round_index"], "actor_updates": 4 * event["round_index"],
-                                  "temperature_updates": 4 * event["round_index"]}, "Probe counters")
+                                  "temperature_updates": temperature_steps_per_round * event["round_index"]}, "Probe counters")
                     _same(event["metrics"], {"probe_model_steps": 192 if event["round_index"] == 0 else 96}, "Probe workload")
                 elif event["phase"] == "decision":
-                    _require(state["counts"] == COUNTERS, "Trace optimizer update count mismatch")
-                    _metric_constants(event["metrics"], prefix="decision/")
+                    _require(state["counts"] == counters, "Trace optimizer update count mismatch")
+                    _metric_constants(event["metrics"], prefix="decision/",
+                                      expected_temperature_steps=expected_temperature_steps)
                     _require(event["round_index"] == 8, "Incomplete inner rounds")
                     state["complete"] = True
     _require(set(states) == expected_decisions and all(state["complete"] for state in states.values()), "Incomplete decision trace coverage")

@@ -7,7 +7,7 @@ import statistics
 
 import pytest
 
-from slurm.ambi_early_h3_j8_validation import CONFIG, METRICS, PROBE, validate_result
+from slurm.ambi_early_h3_j8_validation import CONFIG, COUNTERS, METRICS, PROBE, validate_result
 from utils.ambi_benchmark import solver_seed
 
 
@@ -16,10 +16,13 @@ def summary(values):
             "std": statistics.pstdev(values), "min": min(values), "max": max(values)}
 
 
-def artifact(tmp_path, *, seeds=(101, 102), steps=2, mode="mean"):
+def artifact(tmp_path, *, seeds=(101, 102), steps=2, mode="mean", temperature_steps=32,
+             config_overrides=None):
     """Build complete real-schema traces, including every optimizer event."""
     bundle = tmp_path / "bundle"
     bundle.mkdir()
+    config = {**CONFIG, **(config_overrides or {})}
+    constants = {**METRICS, "inner_temperature_optimizer_steps": temperature_steps}
     run_id = f"early_h3_j8__{mode}"
     (bundle / run_id).mkdir()
     episode_rows, bundle_episodes, probe_rows, trace_files = [], [], [], []
@@ -57,14 +60,15 @@ def artifact(tmp_path, *, seeds=(101, 102), steps=2, mode="mean"):
                 probe(0)
             for round_index in range(1, 9):
                 event("collection", round_index, {"collection_transitions": 384})
-                for critic, actor, temperature in [(True, False, False)] * 16 + [(False, True, True)] * 4:
+                for critic, actor, temperature in ([(True, False, False)] * 16
+                                                   + [(False, True, temperature_steps == 32)] * 4):
                     for key, flag in zip(counters, (critic, actor, temperature)):
                         counters[key] += int(flag)
                     event("update", round_index, {"loss": .25},
                           updated_critic=critic, updated_actor=actor, updated_temperature=temperature)
                 if decision in probe_decisions:
                     probe(round_index)
-            event("decision", 8, {**{f"decision/{key}": value for key, value in METRICS.items()},
+            event("decision", 8, {**{f"decision/{key}": value for key, value in constants.items()},
                                   "decision/reward": .1, "decision/control_seconds": .2})
         relative = f"{run_id}/{episode_id}.jsonl.gz"
         with gzip.open(bundle / relative, "wt") as stream:
@@ -83,7 +87,7 @@ def artifact(tmp_path, *, seeds=(101, 102), steps=2, mode="mean"):
                    "truncated_by_evaluator": steps < 500, "control_seconds": .2 * steps,
                    "togo_probe_seconds": .09 * len(probe_decisions),
                    "togo_probe_model_steps": 960 * len(probe_decisions),
-                   "togo_round_summaries": round_summaries, "model_metrics": dict(METRICS),
+                   "togo_round_summaries": round_summaries, "model_metrics": dict(constants),
                    "nonfinite_model_metrics": {}}
         episode_rows.append(episode)
         bundle_episodes.append({**episode, "episode_id": episode_id})
@@ -97,18 +101,18 @@ def artifact(tmp_path, *, seeds=(101, 102), steps=2, mode="mean"):
     result = {"selector": f"early_h3_j8/{mode}", "environment_seeds": list(seeds),
               "controller_seed": 55, "seed_scheme": "sha256-v1", "execution_action": mode,
               "outer_updates_before": 99999, "outer_updates_after": 99999, "outer_state_unchanged": True,
-              "resolved_config": dict(CONFIG), "resolved_device": "cuda:0", "episodes": episode_rows,
+              "resolved_config": dict(config), "resolved_device": "cuda:0", "episodes": episode_rows,
               "nonfinite_model_metrics": {}, "nonfinite_trace_metrics": {},
               "togo_return_probe": dict(PROBE), "togo_round_summaries": round_summaries,
               "return": summary([row["return"] for row in episode_rows]), "episode_length": summary([steps] * len(seeds)),
-              "model_metrics": {key: summary([value] * (steps * len(seeds))) for key, value in METRICS.items()}}
+              "model_metrics": {key: summary([value] * (steps * len(seeds))) for key, value in constants.items()}}
     payload = {"schema_version": 1, "frozen_outer_learning": True, "checkpoint_sha256": "abc",
                "deterministic_execution": mode == "mean", "results": [result]}
     manifest = {"schema_version": 1, "status": "complete", "checkpoint": {"sha256": "abc"},
                 "elapsed_seconds": 1., "protocol": {"action_rule": "tanh_mean" if mode == "mean" else "tanh_sample",
                 "controller_seed": 55, "seed_scheme": "sha256-v1", "max_steps": steps},
                 "runs": [{"selector": result["selector"], "status": "complete", "id": run_id,
-                "initialization_seconds": .1, "resolved_config": dict(CONFIG), "result": deepcopy(result),
+                "initialization_seconds": .1, "resolved_config": dict(config), "result": deepcopy(result),
                 "togo_return_probe": dict(PROBE), "togo_probe_rows": probe_rows,
                 "episodes": bundle_episodes, "trace_files": trace_files}]}
     result_path = tmp_path / "result.json"
@@ -188,3 +192,68 @@ def test_rejects_missing_probe_boundary_even_if_trace_remains_complete(tmp_path)
     save(bundle / "manifest.json", manifest)
     with pytest.raises(ValueError, match="probe coverage"):
         validate_result(path, bundle, (101, 102), 2)
+
+
+KL_CONFIG = {"inner_entropy_enabled": False, "inner_temperature_mode": "inherit_outer",
+             "inner_outer_policy_kl_coef": 0.0033654973}
+
+
+def test_prior_kl_accepts_zero_temperature_work_without_changing_defaults(tmp_path):
+    constants_before = deepcopy((CONFIG, COUNTERS, METRICS))
+    kl_root, baseline_root = tmp_path / "kl", tmp_path / "baseline"
+    kl_root.mkdir()
+    baseline_root.mkdir()
+    path, bundle, _, _ = artifact(kl_root, mode="sample", temperature_steps=0,
+                                  config_overrides=KL_CONFIG)
+    overrides = deepcopy(KL_CONFIG)
+    result = validate_result(path, bundle, (101, 102), 2,
+                             expected_temperature_steps=0, config_overrides=overrides)
+    assert result["passed"] and result["decisions"] == 4
+    assert (CONFIG, COUNTERS, METRICS) == constants_before
+    assert overrides == KL_CONFIG
+
+    # A subsequent default call must still require and validate all 32 updates.
+    path, bundle, _, _ = artifact(baseline_root)
+    default = validate_result(path, bundle, (101, 102), 2)
+    explicit = validate_result(path, bundle, (101, 102), 2,
+                               expected_temperature_steps=32, config_overrides={})
+    assert default == explicit
+
+
+@pytest.mark.parametrize("location", ["episode", "aggregate", "decision", "probe", "update"])
+def test_prior_kl_rejects_unexpected_temperature_work_at_every_layer(tmp_path, location):
+    path, bundle, payload, manifest = artifact(tmp_path, temperature_steps=0,
+                                              config_overrides=KL_CONFIG)
+    if location == "episode":
+        payload["results"][0]["episodes"][0]["model_metrics"]["inner_temperature_optimizer_steps"] = 32
+        manifest["runs"][0]["result"] = deepcopy(payload["results"][0])
+    elif location == "aggregate":
+        payload["results"][0]["model_metrics"]["inner_temperature_optimizer_steps"]["mean"] = 32
+    else:
+        def change(rows):
+            event = next(row for row in rows if row["phase"] == location)
+            if location == "decision":
+                event["metrics"]["decision/inner_temperature_optimizer_steps"] = 32
+            elif location == "probe":
+                event["temperature_updates"] = 1
+            else:
+                event["updated_temperature"] = True
+        alter_trace(bundle, manifest, change)
+    save(path, payload)
+    save(bundle / "manifest.json", manifest)
+    with pytest.raises(ValueError, match="temperature|counter"):
+        validate_result(path, bundle, (101, 102), 2,
+                        expected_temperature_steps=0, config_overrides=KL_CONFIG)
+
+
+def test_prior_kl_rejects_wrong_regularizer_coefficient(tmp_path):
+    path, bundle, _, _ = artifact(tmp_path, temperature_steps=0, config_overrides=KL_CONFIG)
+    with pytest.raises(ValueError, match="inner_outer_policy_kl_coef"):
+        validate_result(path, bundle, (101, 102), 2, expected_temperature_steps=0,
+                        config_overrides={**KL_CONFIG, "inner_outer_policy_kl_coef": 0.01})
+
+
+@pytest.mark.parametrize("count", [True, -1, 4, 16, 32.0])
+def test_validator_rejects_unsupported_temperature_schedules(tmp_path, count):
+    with pytest.raises(ValueError, match="expected_temperature_steps"):
+        validate_result(tmp_path / "unused.json", tmp_path, expected_temperature_steps=count)

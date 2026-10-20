@@ -1,5 +1,9 @@
 # Frozen-checkpoint AMBI research
 
+The [prior-KL entropy mitigation diagnostic](PRIOR_KL_PROBE.md) compares
+entropy-regularized inner SAC with KL-to-base refinement on identical saved
+roots, followed by a separately identified sampled-action episode evaluation.
+
 The [inherited-critic gradient diagnostic](BOOTSTRAP_DIAGNOSTICS.md) compares
 reward-Q gradients, differentiable model gradients, and paired real-simulator
 action interventions at common states across backbones. It supports the
