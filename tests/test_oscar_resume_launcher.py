@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +21,10 @@ from utils.oscar_resume_launcher import (
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "run_ambi_oscar.sh"
+APPROVED_STORAGE_ROOTS = {
+    "home": "/oscar/home/rgao48/ambi-durable",
+    "scratch": "/oscar/scratch/rgao48/ambi-training-lineages",
+}
 
 
 def _write_lineage(
@@ -82,7 +87,8 @@ def _executable(path: Path, contents: str) -> None:
 
 
 def _launcher_environment(
-    tmp_path: Path, *, status: int, restart: int = 0, quota_state: str = "OK"
+    tmp_path: Path, *, status: int, restart: int = 0, quota_state: str = "OK",
+    storage: str = "home",
 ):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -130,8 +136,19 @@ conda() { return 0; }
 """,
         encoding="utf-8",
     )
-    durable = tmp_path / "durable"
-    durable.mkdir()
+    # Replace only the literal allowed roots in a test copy. All production
+    # guards and the root-to-quota mapping still run without a test bypass.
+    contents = LAUNCHER.read_text(encoding="utf-8")
+    storage_roots = {}
+    for name, approved in APPROVED_STORAGE_ROOTS.items():
+        temporary = tmp_path / f"{name}-durable"
+        temporary.mkdir()
+        storage_roots[name] = temporary
+        assert contents.count(approved) == 1
+        contents = contents.replace(approved, shlex.quote(str(temporary)))
+    launcher_copy = tmp_path / "run_ambi_oscar_test.sh"
+    _executable(launcher_copy, contents)
+    durable = storage_roots[storage]
     lineage = durable / "lineage"
     env = os.environ.copy()
     env.update(
@@ -143,13 +160,14 @@ conda() { return 0; }
             "AMBI_DURABLE_ROOT": str(durable),
             "AMBI_LINEAGE_DIR": str(lineage),
             "AMBI_DURABLE_QUOTA_LABEL": "rgao48",
-            "AMBI_DURABLE_QUOTA_PATH": "/oscar/home",
+            "AMBI_DURABLE_QUOTA_PATH": f"/oscar/{storage}",
             "AMBI_PYTHON": sys.executable,
             "MAMBA_ROOT_PREFIX": str(mamba),
             "FAKE_GIT_ROOT": str(ROOT),
             "FAKE_QUOTA": (
-                f"rgao48 /oscar/home 1 TB 2 TB {quota_state} None"
+                f"rgao48 /oscar/{storage} 1 TB 2 TB {quota_state} None"
             ),
+            "FAKE_LAUNCHER": str(launcher_copy),
             "FAKE_STATUS": str(status),
             "FAKE_SRUN_ARGS": str(srun_args),
             "FAKE_SCONTROL_CALLS": str(scontrol_calls),
@@ -160,7 +178,7 @@ conda() { return 0; }
 
 def _run(env):
     return subprocess.run(
-        ["bash", str(LAUNCHER)],
+        ["bash", env["FAKE_LAUNCHER"]],
         cwd=ROOT,
         env=env,
         text=True,
@@ -173,7 +191,7 @@ def _run(env):
 def test_launcher_accepts_slurm_spooled_script_copy(tmp_path):
     env, _, args_path, _ = _launcher_environment(tmp_path, status=23)
     spool = tmp_path / "slurm-spool-script"
-    spool.write_bytes(LAUNCHER.read_bytes())
+    spool.write_bytes(Path(env["FAKE_LAUNCHER"]).read_bytes())
     result = subprocess.run(
         ["bash", str(spool)],
         cwd=tmp_path,
@@ -209,9 +227,13 @@ def test_resources_and_foreground_signal_contract_are_explicit():
     assert '--filesystem-path "$AMBI_DURABLE_QUOTA_PATH"' in contents
     assert '[[ "$AMBI_DURABLE_QUOTA_LABEL" != "data+rbalestr" ]]' in contents
     assert '[[ "$AMBI_DURABLE_QUOTA_LABEL" == "rgao48" ]]' in contents
-    assert '[[ "$AMBI_DURABLE_QUOTA_PATH" == "/oscar/home" ]]' in contents
-    assert 'approved_durable_root="/oscar/home/rgao48/ambi-durable"' in contents
-    assert '[[ "$AMBI_DURABLE_ROOT" == "$approved_durable_root" ]]' in contents
+    assert 'case "$AMBI_DURABLE_ROOT" in' in contents
+    for storage, approved in APPROVED_STORAGE_ROOTS.items():
+        assert f'{approved}) expected_quota_path=/oscar/{storage} ;;' in contents
+    assert '*) fail "AMBI_DURABLE_ROOT is not an approved Oscar AMBI storage root" ;;' in contents
+    assert '[[ "$AMBI_DURABLE_QUOTA_PATH" == "$expected_quota_path" ]]' in contents
+    assert contents.index('case "$AMBI_DURABLE_ROOT" in') < contents.index('project_dir=')
+    assert "FAKE_LAUNCHER" not in contents
 
 
 @pytest.mark.parametrize(
@@ -229,8 +251,9 @@ def test_launcher_requires_explicit_durable_quota_selection(
     assert not args_path.exists()
 
 
-def test_launcher_rejects_data_rbalestr_before_quota_or_training(tmp_path):
-    env, _, args_path, _ = _launcher_environment(tmp_path, status=23)
+@pytest.mark.parametrize("storage", APPROVED_STORAGE_ROOTS)
+def test_launcher_rejects_data_rbalestr_before_quota_or_training(tmp_path, storage):
+    env, _, args_path, _ = _launcher_environment(tmp_path, status=23, storage=storage)
     env["AMBI_DURABLE_QUOTA_LABEL"] = "data+rbalestr"
     result = _run(env)
     assert result.returncode != 0
@@ -253,7 +276,7 @@ def test_launcher_rejects_data_rbalestr_before_quota_or_training(tmp_path):
         ),
     ),
 )
-def test_launcher_rejects_non_home_quota_selection_before_training(
+def test_launcher_rejects_wrong_home_quota_selection_before_training(
     tmp_path, variable, value, message
 ):
     env, _, args_path, _ = _launcher_environment(tmp_path, status=23)
@@ -261,6 +284,28 @@ def test_launcher_rejects_non_home_quota_selection_before_training(
     result = _run(env)
     assert result.returncode != 0
     assert message in result.stderr
+    assert not args_path.exists()
+
+
+@pytest.mark.parametrize("kind", ["unknown", "source", "nested"])
+def test_launcher_rejects_unapproved_root_before_quota_or_training(tmp_path, kind):
+    env, _, args_path, _ = _launcher_environment(tmp_path, status=23)
+    invalid = {"unknown": tmp_path / "other-storage", "source": ROOT,
+               "nested": Path(env["AMBI_DURABLE_ROOT"]) / "nested"}[kind]
+    env["AMBI_DURABLE_ROOT"] = str(invalid)
+    env["AMBI_LINEAGE_DIR"] = str(invalid / "lineage")
+    result = _run(env)
+    assert result.returncode != 0
+    assert "not an approved Oscar AMBI storage root" in result.stderr
+    assert not args_path.exists()
+
+
+def test_launcher_rejects_home_quota_for_scratch_root(tmp_path):
+    env, _, args_path, _ = _launcher_environment(tmp_path, status=23, storage="scratch")
+    env["AMBI_DURABLE_QUOTA_PATH"] = "/oscar/home"
+    result = _run(env)
+    assert result.returncode != 0
+    assert "AMBI_DURABLE_QUOTA_PATH must be /oscar/scratch" in result.stderr
     assert not args_path.exists()
 
 
@@ -297,15 +342,17 @@ def test_quota_can_select_exact_filesystem_path_for_shared_allocation():
         verify_quota_output(output, "rgao48", "/oscar/home path")
 
 
-def test_launcher_passes_explicit_home_quota_selection(tmp_path):
-    env, _, args_path, scontrol = _launcher_environment(tmp_path, status=23)
+@pytest.mark.parametrize("storage", APPROVED_STORAGE_ROOTS)
+def test_launcher_passes_explicit_root_and_quota_selection(tmp_path, storage):
+    env, _, args_path, scontrol = _launcher_environment(tmp_path, status=23, storage=storage)
+    other = "scratch" if storage == "home" else "home"
     env.update(
         {
             "AMBI_DURABLE_QUOTA_LABEL": "rgao48",
-            "AMBI_DURABLE_QUOTA_PATH": "/oscar/home",
+            "AMBI_DURABLE_QUOTA_PATH": f"/oscar/{storage}",
             "FAKE_QUOTA": (
-                "rgao48 /oscar/scratch 1 TB 2 TB GRACE_EXPIRED None\n"
-                "rgao48 /oscar/home 80 GB 100 GB OK None"
+                f"rgao48 /oscar/{other} 1 TB 2 TB GRACE_EXPIRED None\n"
+                f"rgao48 /oscar/{storage} 80 GB 100 GB OK None"
             ),
         }
     )

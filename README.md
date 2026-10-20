@@ -304,9 +304,9 @@ without `S` retain the documented local-calibration fallback; see the
 
 ### Oscar durable checkpoint storage
 
-AMBI jobs submitted by `rgao48` on Oscar store resumable state under
-`/oscar/home/rgao48/ambi-durable`. The quota preflight must select the user home
-row that owns that path:
+AMBI jobs submitted by `rgao48` on Oscar use
+`/oscar/home/rgao48/ambi-durable` by default. The quota preflight must select the
+filesystem row that owns the chosen root:
 
 ```bash
 AMBI_DURABLE_ROOT=/oscar/home/rgao48/ambi-durable
@@ -317,12 +317,24 @@ AMBI_DURABLE_QUOTA_PATH=/oscar/home
 
 Pass all four values through `sbatch --export`. Use a new lineage for a fresh
 run and the same lineage only for its exact resume. `data+rbalestr` is a
-separate allocation and is not an approved AMBI durable target; both Oscar
-launchers reject that label and any quota selection other than exactly
-`rgao48` plus `/oscar/home`. On Oscar they also require the exact durable root
-shown above, so the checked quota row and the checkpoint filesystem cannot
-diverge. Oscar scratch and job-local storage are not substitutes for the
-durable checkpoint root.
+separate allocation and is not an approved AMBI storage target.
+
+For new reward-only training lineages, scratch is an explicit alternative:
+
+```bash
+AMBI_DURABLE_ROOT=/oscar/scratch/rgao48/ambi-training-lineages
+AMBI_LINEAGE_DIR=/oscar/scratch/rgao48/ambi-training-lineages/<unique-lineage>
+AMBI_DURABLE_QUOTA_LABEL=rgao48
+AMBI_DURABLE_QUOTA_PATH=/oscar/scratch
+```
+
+The reward-only wrapper and canonical resume launcher accept only these two
+root/quota pairs. Both retain containment, quota, write/fsync and exact-resume
+checks. A lineage keeps its resume generations, segment logs and every requested
+25k portable checkpoint together; scratch survives job boundaries and requeues,
+but is not a backup. Oscar [purges scratch files not accessed for 30 days](https://docs.ccv.brown.edu/oscar/managing-files/filesystem),
+so archive results needed for long-term retention. Job-local temporary storage
+is not supported for lineages. Existing home lineages remain in place.
 
 The compact AMBI branch-count and imagination-horizon suite lives under
 `configs/ambi/`. Each algorithm file has one matching runnable

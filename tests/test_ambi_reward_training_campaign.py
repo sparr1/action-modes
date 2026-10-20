@@ -194,7 +194,8 @@ def test_receipt_requires_exact_semantics_complete_training_and_measured_resourc
 
 @pytest.mark.parametrize("manifest", list(campaign.CAMPAIGNS))
 @pytest.mark.parametrize("restart", [0, 1])
-def test_launch_delegates_exact_recipe_and_lineage_to_canonical_resume(monkeypatch, tmp_path, manifest, restart):
+@pytest.mark.parametrize("storage_root", list(campaign.STORAGE_ROOTS))
+def test_launch_delegates_exact_recipe_and_lineage_to_canonical_resume(monkeypatch, tmp_path, manifest, restart, storage_root):
     operator = campaign.CAMPAIGNS[manifest][1]
     receipt, binding, runtime, identity = receipt_fixture(operator, manifest)
     gate = tmp_path / "receipt.json"
@@ -203,8 +204,10 @@ def test_launch_delegates_exact_recipe_and_lineage_to_canonical_resume(monkeypat
     monkeypatch.setattr(campaign, "runtime", lambda: runtime)
     for key, value in {"SLURM_CPUS_PER_TASK": "1", "SLURM_JOB_ID": "123",
                        "SLURM_RESTART_COUNT": str(restart), "AMBI_DRAIN_AFTER_SECONDS": "3600",
-                       "AMBI_DURABLE_ROOT": "/oscar/home/rgao48/ambi-durable",
-                       "AMBI_LINEAGE_DIR": "/oscar/home/rgao48/ambi-durable/return-only-test"}.items():
+                       "AMBI_DURABLE_ROOT": storage_root,
+                       "AMBI_DURABLE_QUOTA_LABEL": "rgao48",
+                       "AMBI_DURABLE_QUOTA_PATH": campaign.STORAGE_ROOTS[storage_root],
+                       "AMBI_LINEAGE_DIR": storage_root + "/return-only-test"}.items():
         monkeypatch.setenv(key, value)
     for key in ("AMBI_RUN_CONFIG", "AMBI_ALG_DIR", "AMBI_PYTHON", "SLURM_SUBMIT_DIR"):
         monkeypatch.setenv(key, "test-placeholder")
@@ -216,8 +219,27 @@ def test_launch_delegates_exact_recipe_and_lineage_to_canonical_resume(monkeypat
     assert record["run_params"] == campaign.recipe(0, args.manifest)[2]
     assert record["resume_mode"] == ("required" if restart else "new")
     assert "wandb_run_id" not in record
+    assert record["storage"]["AMBI_DURABLE_ROOT"] == storage_root
+    assert record["storage"]["AMBI_DURABLE_QUOTA_PATH"] == campaign.STORAGE_ROOTS[storage_root]
     assert executions == [("/bin/bash", ["/bin/bash", str(campaign.ROOT / "run_ambi_oscar.sh")])]
     assert campaign.os.environ["AMBI_RUN_CONFIG"] == str(args.manifest)
+
+
+@pytest.mark.parametrize("root,quota_path", campaign.STORAGE_ROOTS.items())
+def test_storage_selection_requires_approved_pair_and_contained_lineage(root, quota_path):
+    campaign.validate_storage_selection(root, root + "/new-lineage", "rgao48", quota_path)
+    for values in (
+        (root, root + "/lineage", "data+rbalestr", quota_path),
+        (root, root + "/lineage", "rgao48", "/oscar/other"),
+        (root, root + "/lineage", "rgao48", "/oscar/scratch" if quota_path == "/oscar/home" else "/oscar/home"),
+        (root, root, "rgao48", quota_path),
+        (root, root + "/../outside", "rgao48", quota_path),
+        (root, str(campaign.ROOT / "lineage"), "rgao48", quota_path),
+        (str(campaign.ROOT), str(campaign.ROOT / "lineage"), "rgao48", quota_path),
+        ("/tmp/unapproved", "/tmp/unapproved/lineage", "rgao48", quota_path),
+    ):
+        with pytest.raises((AssertionError, ValueError)):
+            campaign.validate_storage_selection(*values)
 
 
 def test_wrapper_preserves_explicit_resources_and_online_lineage_identity():
@@ -232,3 +254,6 @@ def test_wrapper_preserves_explicit_resources_and_online_lineage_identity():
     assert 'unset WANDB_RUN_ID WANDB_RESUME' in source
     assert 'WANDB_MODE=online' in source and 'WANDB_MODE=disabled' in source
     assert 'slurm/ambi_reward_training.py train' in source
+    assert '${AMBI_DURABLE_ROOT:-/oscar/home/rgao48/ambi-durable}' in source
+    for root, quota_path in campaign.STORAGE_ROOTS.items():
+        assert f'{root}) expected_quota_path={quota_path}' in source

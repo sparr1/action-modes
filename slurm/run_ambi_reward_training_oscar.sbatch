@@ -47,10 +47,17 @@ if [[ "$mode" == smoke ]]; then
     --manifest "$AMBI_RETURN_MANIFEST" --output "$AMBI_RETURN_OUTPUT/gate"
 else
   [[ "$SLURM_CPUS_PER_TASK" == 1 || "$SLURM_CPUS_PER_TASK" == 2 || "$SLURM_CPUS_PER_TASK" == 4 ]]
-  : "${AMBI_LINEAGE_DIR:?Set a unique durable lineage under /oscar/home/rgao48/ambi-durable.}"
+  : "${AMBI_LINEAGE_DIR:?Set a unique lineage below the approved storage root.}"
   : "${AMBI_DRAIN_AFTER_SECONDS:?Set an explicit segment budget below requested walltime.}"
-  export AMBI_DURABLE_ROOT=/oscar/home/rgao48/ambi-durable
-  export AMBI_DURABLE_QUOTA_LABEL=rgao48 AMBI_DURABLE_QUOTA_PATH=/oscar/home
+  export AMBI_DURABLE_ROOT="${AMBI_DURABLE_ROOT:-/oscar/home/rgao48/ambi-durable}"
+  case "$AMBI_DURABLE_ROOT" in
+    /oscar/home/rgao48/ambi-durable) expected_quota_path=/oscar/home ;;
+    /oscar/scratch/rgao48/ambi-training-lineages) expected_quota_path=/oscar/scratch ;;
+    *) echo "Unapproved AMBI storage root" >&2; exit 2 ;;
+  esac
+  export AMBI_DURABLE_QUOTA_LABEL="${AMBI_DURABLE_QUOTA_LABEL:-rgao48}"
+  export AMBI_DURABLE_QUOTA_PATH="${AMBI_DURABLE_QUOTA_PATH:-$expected_quota_path}"
+  [[ "$AMBI_DURABLE_QUOTA_LABEL" == rgao48 && "$AMBI_DURABLE_QUOTA_PATH" == "$expected_quota_path" ]]
   export AMBI_RESUME_CHECKPOINT_MINUTES="${AMBI_RESUME_CHECKPOINT_MINUTES:-30}"
   export WANDB_MODE=online
   unset WANDB_RUN_ID WANDB_RESUME

@@ -46,6 +46,10 @@ CAMPAIGNS = {
     ENTROPY_MANIFESTS[-10.5]: ("ambi_full_no_inner_reward_only_1m_entropy10p5", "none", 1000000, -10.5),
     ENTROPY_MANIFESTS[-21.]: ("ambi_full_no_inner_reward_only_1m_entropy21", "none", 1000000, -21.),
 }
+STORAGE_ROOTS = {
+    "/oscar/home/rgao48/ambi-durable": "/oscar/home",
+    "/oscar/scratch/rgao48/ambi-training-lineages": "/oscar/scratch",
+}
 
 
 def cpu_counts(operator):
@@ -477,6 +481,14 @@ def smoke(args):
     print("REWARD_TRAINING_GATE_PASSED " + str(output / "receipt.json"), flush=True)
 
 
+def validate_storage_selection(root, lineage, quota_label, quota_path):
+    assert root in STORAGE_ROOTS, "Unapproved Oscar AMBI storage root"
+    assert quota_label == "rgao48" and quota_path == STORAGE_ROOTS[root], "Storage root/quota mismatch"
+    lineage = Path(lineage)
+    assert lineage.is_absolute() and lineage != Path(root)
+    assert lineage.resolve().relative_to(Path(root).resolve()).parts, "Lineage must be below storage root"
+
+
 def launch(args):
     name, _, run = validate_campaign(args.manifest)
     current_binding, current_runtime = binding(args.manifest), runtime()
@@ -485,16 +497,17 @@ def launch(args):
                      name=name, operator=run["alg_params"]["inner_operator"], interval=run["alg_params"].get("inner_solve_interval", 1))
     for path, checksum in receipt["artifacts"].items():
         assert digest(path) == checksum, "Gate artifact changed"
-    assert os.environ["AMBI_DURABLE_ROOT"] == "/oscar/home/rgao48/ambi-durable"
-    lineage = Path(os.environ["AMBI_LINEAGE_DIR"])
-    assert lineage.is_absolute() and lineage != Path(os.environ["AMBI_DURABLE_ROOT"])
-    lineage.resolve().relative_to(Path(os.environ["AMBI_DURABLE_ROOT"]).resolve())
+    storage = {key: os.environ[key] for key in ("AMBI_DURABLE_ROOT", "AMBI_LINEAGE_DIR",
+               "AMBI_DURABLE_QUOTA_LABEL", "AMBI_DURABLE_QUOTA_PATH")}
+    validate_storage_selection(storage["AMBI_DURABLE_ROOT"], storage["AMBI_LINEAGE_DIR"],
+                               storage["AMBI_DURABLE_QUOTA_LABEL"], storage["AMBI_DURABLE_QUOTA_PATH"])
+    lineage = Path(storage["AMBI_LINEAGE_DIR"])
     assert int(os.environ["AMBI_DRAIN_AFTER_SECONDS"]) > 0
     segment = os.environ["SLURM_JOB_ID"] + "." + os.environ.get("SLURM_RESTART_COUNT", "0")
     args.output.mkdir(parents=True, exist_ok=True)
     write_new(args.output / f"launch-{segment}.json", {
         "binding": current_binding, "config": name, "run_params": run, "runtime": current_runtime,
-        "gate_receipt": str(args.gate), "gate_sha256": digest(args.gate), "lineage_dir": str(lineage),
+        "gate_receipt": str(args.gate), "gate_sha256": digest(args.gate), "lineage_dir": str(lineage), "storage": storage,
         "segment": segment, "resume_mode": "required" if os.environ.get("SLURM_RESTART_COUNT", "0") != "0" else os.environ.get("AMBI_RESUME_MODE", "new"),
         "created_utc": datetime.now(timezone.utc).isoformat(),
     })
