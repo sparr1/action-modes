@@ -188,6 +188,15 @@ seed 55, 500k decisions, all 25k checkpoints and durable exact resume, and publi
 to AMBI group `ambi-return-only-training-20261019`. Their finite-horizon terminal
 score uses online primary-Q `mean_pair` without an added entropy bonus.
 
+The matching one-cell `ambi_return_only_no_inner_training.json` control samples
+the current outer actor directly after the same random warmup. It performs no
+planning, imagined transitions, inner updates, transfer or held-policy execution.
+The outer H3 replay unroll, world model, reward-only five-head primary critic,
+automatic actor entropy target −10.5, seed 55, 500k decisions and all 25k
+checkpoints remain the same. It publishes as
+`No inner | reward-only Q | auto entropy | seed55` in the same AMBI group, so the
+comparison isolates the collection policy while preserving outer learning.
+
 For a short CPU-allocation comparison, run
 `python slurm/benchmark_ambi_training_cpu.py --output /absolute/scratch/directory`
 inside one Slurm allocation with a GPU, eight physical CPU cores

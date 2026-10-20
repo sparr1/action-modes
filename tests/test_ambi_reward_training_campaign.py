@@ -10,7 +10,7 @@ import pytest
 from slurm import ambi_reward_training as campaign
 
 
-@pytest.mark.parametrize("operator", ["sac", "mppi"])
+@pytest.mark.parametrize("operator", ["sac", "mppi", "none"])
 def test_actual_campaigns_validate_and_smoke_preserves_production_shapes(operator):
     path = campaign.MANIFESTS[operator]
     name, manifest, original = campaign.validate_campaign(path)
@@ -26,6 +26,39 @@ def test_actual_campaigns_validate_and_smoke_preserves_production_shapes(operato
     assert original["alg_params"]["inner_operator"] == operator
     assert original["alg_params"]["inner_solve_interval"] == (3 if operator == "sac" else 1)
     assert original["checkpoint_every"] == 25000 and original["save_strat"] == "all"
+
+
+def test_no_inner_gate_uses_longer_window_and_benchmarks_four_cores():
+    assert campaign.smoke_defaults("none") == (24, 400)
+    assert campaign.cpu_counts("none") == (1, 2, 4)
+    _, _, run, _ = campaign.smoke_recipe(24, 400, campaign.MANIFESTS["none"])
+    assert run["total_steps"] == run["checkpoint_every"] == 925
+    for operator in ("sac", "mppi"):
+        assert campaign.smoke_defaults(operator) == (12, 120)
+        assert campaign.cpu_counts(operator) == (1, 2)
+
+
+def test_no_inner_gate_requires_zero_realized_work_and_counts_prior_actions():
+    metrics = dict.fromkeys(("inner_active", "inner_model_steps_budget", "inner_steps", "inner_model_steps",
+                            "inner_total_model_steps", "inner_realized_model_steps", "inner_nominal_model_steps",
+                            "inner_rounds", "inner_iterations", "inner_mppi_iterations", "inner_rollouts",
+                            "inner_updates", "inner_update_slots", "inner_target_updates", "inner_q_evaluations",
+                            "inner_replay_draws", "inner_buffer_size", "inner_critic_optimizer_steps",
+                            "inner_actor_optimizer_steps", "inner_temperature_optimizer_steps", "inner_compile_fallback"), 0.)
+    metrics["inner_policy_evaluations"] = 1.
+    assert not campaign.validate_action(metrics, operator="none", decision=0, interval=1)
+    for key in metrics:
+        with pytest.raises(AssertionError):
+            campaign.validate_action({**metrics, key: metrics[key] + 1}, operator="none", decision=1, interval=1)
+    rows = [{"solve": False, "action_seconds": seconds, "outer_update_enqueue_seconds": .03}
+            for seconds in (.01, .02)]
+    summary = campaign.training_phases(rows, "none")
+    assert summary["solve_decisions"] == summary["held_decisions"] == 0
+    assert summary["prior_decisions"] == 2
+    assert summary["prior_action_seconds_mean"] == pytest.approx(.015)
+    assert summary["held_action_seconds_mean"] is summary["solve_action_seconds_mean"] is None
+    assert summary["outer_update_enqueue_seconds_mean"] == .03
+    assert campaign.training_phases(rows, "sac")["held_decisions"] == 2
 
 
 def test_mppi_gate_rejects_accidental_inner_learning_or_wrong_model_dose():
@@ -66,26 +99,30 @@ def receipt_fixture(operator):
     interval = run["alg_params"]["inner_solve_interval"]
     runtime = {"python": "3.10", "torch": "2.3.1", "cuda": "12.1", "executable": "/locked/python", "gpu": "L40S"}
     binding = {"commit": "pinned", "manifest_sha256": "manifest", "config_sha256": {name: "config"}}
+    warmup, decisions = campaign.smoke_defaults(operator)
+    solves = 0 if operator == "none" else decisions // interval
+    held = 0 if operator == "none" else decisions - solves
     cases = [{"passed": True, "binding": binding, "runtime": runtime, "config": name,
               "operator": operator, "inner_solve_interval": interval, "physical_cores": count,
               "compile_fallback": False, "replay_storage_device": "cpu",
               "compile_graph_counts": {"before": 9, "after": 9}, "auxiliary_critic_present": False,
               "reward_only_targets": True, "primary_critic_sources": True, "outer_actor_entropy_auto": True,
               "checkpoint_roundtrip": True, "checkpoint_sidecars": True, "boundary_training_state_roundtrip": True,
-              "outer_target_entropy": -10.5, "warmup_active_decisions": 12,
-              "outer_actor_optimizer_steps": 134, "outer_temperature_optimizer_steps": 134,
+              "outer_target_entropy": -10.5, "warmup_active_decisions": warmup,
+              "outer_actor_optimizer_steps": 2 + warmup + decisions, "outer_temperature_optimizer_steps": 2 + warmup + decisions,
               "mppi_primary_online_mean_pair_no_entropy_verified": operator == "mppi",
-              "measured": {"decisions": 120, "outer_updates": 120, "seconds_per_decision": .3,
-                           "solve_decisions": 120 // interval, "held_decisions": 120 - 120 // interval}}
-             for count in campaign.CPU_COUNTS]
+              "sampled_prior_execution_verified": operator == "none", "zero_inner_work_verified": operator == "none",
+              "measured": {"decisions": decisions, "outer_updates": decisions, "seconds_per_decision": .3,
+                           "solve_decisions": solves, "held_decisions": held, "prior_decisions": decisions if operator == "none" else 0}}
+             for count in campaign.cpu_counts(operator)]
     receipt = {"passed": True, "binding": binding, "runtime": runtime, "cases": cases, "artifacts": {}}
     return receipt, binding, runtime, dict(name=name, operator=operator, interval=interval)
 
 
-@pytest.mark.parametrize("operator", ["sac", "mppi"])
+@pytest.mark.parametrize("operator", ["sac", "mppi", "none"])
 def test_receipt_requires_exact_semantics_complete_training_and_measured_resources(operator):
     receipt, binding, runtime, identity = receipt_fixture(operator)
-    for count in campaign.CPU_COUNTS:
+    for count in campaign.cpu_counts(operator):
         campaign.validate_receipt(receipt, binding, runtime, count, **identity)
     with pytest.raises(AssertionError, match="configuration"):
         campaign.validate_receipt(receipt, {**binding, "commit": "other"}, runtime, 1, **identity)
@@ -105,6 +142,13 @@ def test_receipt_requires_exact_semantics_complete_training_and_measured_resourc
     ]
     if operator == "mppi":
         mutations.append(lambda r: r["cases"][0].update(mppi_primary_online_mean_pair_no_entropy_verified=False))
+    if operator == "none":
+        mutations.extend([
+            lambda r: r["cases"][0].update(sampled_prior_execution_verified=False),
+            lambda r: r["cases"][0].update(zero_inner_work_verified=False),
+            lambda r: r["cases"][0]["measured"].update(prior_decisions=399),
+            lambda r: r["cases"][0]["measured"].update(solve_decisions=400),
+        ])
     for mutate in mutations:
         bad = deepcopy(receipt)
         mutate(bad)
@@ -112,7 +156,7 @@ def test_receipt_requires_exact_semantics_complete_training_and_measured_resourc
             campaign.validate_receipt(bad, binding, runtime, 1, **identity)
 
 
-@pytest.mark.parametrize("operator", ["sac", "mppi"])
+@pytest.mark.parametrize("operator", ["sac", "mppi", "none"])
 @pytest.mark.parametrize("restart", [0, 1])
 def test_launch_delegates_exact_recipe_and_lineage_to_canonical_resume(monkeypatch, tmp_path, operator, restart):
     receipt, binding, runtime, identity = receipt_fixture(operator)

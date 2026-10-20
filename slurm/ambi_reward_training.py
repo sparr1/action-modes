@@ -1,7 +1,7 @@
 """Gate one reward-only primary-Q training recipe and launch durable resume.
 
 Each selected manifest has one cell. The GPU gate compares one and two physical
-CPU cores using real short training, production shapes and update dose, strict
+CPU cores (also four for the no-inner baseline), using real short training, production shapes and update dose, strict
 compilation, and the CPU replay placement used by exact resume. Timing excludes
 periodic checkpoint I/O, W&B, mature replay and the production pretraining dose.
 """
@@ -31,7 +31,17 @@ SEED_STEPS = 500
 MANIFESTS = {
     "sac": ROOT / "configs/dmcontrol/experiments/ambi_return_only_sac_training.json",
     "mppi": ROOT / "configs/dmcontrol/experiments/ambi_return_only_mppi_training.json",
+    "none": ROOT / "configs/dmcontrol/experiments/ambi_return_only_no_inner_training.json",
 }
+
+
+def cpu_counts(operator):
+    assert operator in MANIFESTS
+    return (1, 2, 4) if operator == "none" else CPU_COUNTS
+
+
+def smoke_defaults(operator):
+    return (24, 400) if operator == "none" else (12, 120)
 
 
 def validate_campaign(manifest_path):
@@ -74,13 +84,17 @@ def validate_campaign(manifest_path):
         assert all(p.get(key) == value for key, value in expected.items())
         for component in ("actor", "critic", "temperature", "replay", "actor_optimizer", "critic_optimizer", "temperature_optimizer"):
             assert p[f"inner_{component}_scope"] == "action"
-    else:
+    elif p["inner_operator"] == "mppi":
         assert interval == 1, "MPPI does not support held-policy cadence"
         expected = {"inner_mppi_iterations": 8,
                     "inner_mppi_num_elites": 64, "inner_mppi_num_pi_trajs": 24,
                     "inner_mppi_temperature": .5, "inner_mppi_min_std": .05, "inner_mppi_max_std": 2.,
                     "inner_mppi_warm_start_scope": "episode", "inner_mppi_eval_action": "weighted_elite"}
         assert all(p.get(key) == value for key, value in expected.items())
+    else:
+        assert interval == 1 and p["inner_model_step_budget"] == 0
+        assert p["inner_execution_action"] == "policy_sample"
+        assert p.get("inner_execution_std_scale", 1.) == 1.
     return name, manifest, run
 
 
@@ -108,21 +122,50 @@ def validate_learner(cfg, agent):
         assert (cfg.inner_rollout_horizon, cfg.inner_mppi_iterations, cfg.inner_mppi_num_samples) == (3, 8, 512)
         assert (cfg.inner_mppi_num_elites, cfg.inner_mppi_num_pi_trajs) == (64, 24)
         assert cfg.inner_critic_updates_per_action == cfg.inner_actor_updates_per_action == 0
-    else:
+    elif cfg.inner_operator == "sac":
         assert (cfg.inner_rollout_horizon, cfg.inner_rounds, cfg.inner_rollouts_per_round) == (3, 8, 128)
         assert (cfg.inner_critic_updates_per_action, cfg.inner_actor_updates_per_action, cfg.inner_temperature_updates_per_action) == (128, 32, 32)
+    else:
+        assert cfg.inner_operator == "none" and cfg.inner_solve_interval == 1
+        assert cfg.inner_execution_action == "policy_sample" and cfg.inner_execution_std_scale == 1.
+        assert agent.inner_engine._actor_base is agent.model._pi
+        for key in ("inner_model_step_budget", "inner_rounds", "inner_rollouts_per_round",
+                    "inner_critic_updates_per_action", "inner_actor_updates_per_action",
+                    "inner_temperature_updates_per_action", "inner_mppi_iterations"):
+            assert getattr(cfg, key) == 0, key
 
 
 def validate_action(metrics, *, operator, decision, interval):
     if operator == "sac":
         return action_work(metrics, decision=decision, interval=interval, probability=0.)
-    assert operator == "mppi" and interval == 1
+    assert operator in {"none", "mppi"} and interval == 1
     for key in ("inner_critic_optimizer_steps", "inner_actor_optimizer_steps", "inner_temperature_optimizer_steps"):
         assert metrics[key] == 0
-    assert metrics["inner_mppi_iterations"] == 8 and metrics["inner_model_steps"] == 12336
+    if operator == "none":
+        for key in ("inner_active", "inner_model_steps_budget", "inner_steps", "inner_model_steps",
+                    "inner_total_model_steps", "inner_realized_model_steps", "inner_nominal_model_steps",
+                    "inner_rounds", "inner_iterations", "inner_mppi_iterations", "inner_rollouts",
+                    "inner_updates", "inner_update_slots", "inner_target_updates", "inner_q_evaluations",
+                    "inner_replay_draws", "inner_buffer_size"):
+            assert metrics[key] == 0, (decision, key, metrics[key])
+        assert metrics["inner_policy_evaluations"] == 1
+    else:
+        assert metrics["inner_mppi_iterations"] == 8 and metrics["inner_model_steps"] == 12336
     assert metrics["inner_compile_fallback"] == 0
     assert all(math.isfinite(float(value)) for value in metrics.values())
-    return True
+    return operator == "mppi"
+
+
+def training_phases(rows, operator):
+    """A direct prior action is neither a solve nor a held inner policy."""
+    summary = phase_summary(rows)
+    if operator == "none":
+        assert not any(row["solve"] for row in rows)
+        summary.update(solve_decisions=0, held_decisions=0, prior_decisions=len(rows))
+        for statistic in ("mean", "median"):
+            summary[f"prior_action_seconds_{statistic}"] = summary[f"held_action_seconds_{statistic}"]
+            summary[f"held_action_seconds_{statistic}"] = None
+    return summary
 
 
 def _optimizer_steps(optimizer):
@@ -133,7 +176,8 @@ def _optimizer_steps(optimizer):
 
 def worker(args):
     cpus = [int(cpu) for cpu in args.worker_cpus.split(",")]
-    assert len(cpus) in CPU_COUNTS and len(cpus) == len(set(cpus))
+    _, _, production = validate_campaign(args.manifest)
+    assert len(cpus) in cpu_counts(production["alg_params"]["inner_operator"]) and len(cpus) == len(set(cpus))
     assert set(cpus) <= os.sched_getaffinity(0) and len(physical_core_cpus(cpus)) == len(cpus)
     os.sched_setaffinity(0, cpus)
     import torch
@@ -146,7 +190,6 @@ def worker(args):
     assert torch.cuda.is_available(), "Gate requires an allocated CUDA GPU"
     torch.cuda.reset_peak_memory_stats()
     name, manifest, run, overrides = smoke_recipe(args.warmup, args.decisions, args.manifest)
-    production = recipe(0, args.manifest)[2]
     env = gym.make(run["env"], **manifest["env_params"])
     learner = None
     started = time.perf_counter()
@@ -161,7 +204,7 @@ def worker(args):
         alpha_before = float(agent.alpha.item())
         timer = TrainingWindow(SEED_STEPS + args.warmup + 2, args.decisions, torch.cuda.synchronize)
         act, update, log_step = learner._act_agent, agent.update, learner._log_wandb_step
-        rows, compile_counts, startup, terminal_calls = [], {}, {}, []
+        rows, compile_counts, startup, terminal_calls, prior_actions = [], {}, {}, [], []
 
         def observed_act(*positional, **kwargs):
             decision, step = len(rows), learner._global_step + 1
@@ -172,6 +215,7 @@ def worker(args):
             timer.before_action(step, learner._num_updates)
             graphs_before = int(torch._dynamo.utils.counters["stats"]["unique_graphs"])
             original_q, original_pi = agent.model.Q, agent.model.pi
+            original_policy_action = agent.inner_engine._policy_action
 
             def checked_q(*q_args, **q_kwargs):
                 assert q_kwargs.get("qs", agent.model._Qs) is agent.model._Qs
@@ -182,21 +226,40 @@ def worker(args):
             def no_entropy_statistics(*unused_args, **unused_kwargs):
                 raise AssertionError("MPPI requested policy log probability/entropy")
 
+            def checked_prior(z, policy, **policy_kwargs):
+                assert policy is agent.model._pi
+                assert policy_kwargs["mode"] == "policy_sample" and not policy_kwargs["inner_bounds"]
+                assert policy_kwargs["generator"] is not None and policy_kwargs["std_scale"] == 1.
+                sampled, info = original_policy_action(z, policy, **policy_kwargs)
+                mean = agent.model.pi_action(z, policy=policy, deterministic=True,
+                                            **agent.inner_engine._actor_options)
+                assert not torch.equal(sampled, mean), "No-inner action used the deterministic prior mean"
+                prior_actions.append(sampled[0].detach().cpu().clone())
+                return sampled, info
+
             audit_mppi = operator == "mppi" and decision == 0
+            audit_prior = operator == "none" and decision == 0
             if audit_mppi:
                 agent.model.Q, agent.model.pi = checked_q, no_entropy_statistics
+            if audit_prior:
+                agent.inner_engine._policy_action = checked_prior
             action_started = time.perf_counter()
             try:
                 action = act(*positional, **kwargs)
             finally:
                 if audit_mppi:
                     agent.model.Q, agent.model.pi = original_q, original_pi
+                if audit_prior:
+                    agent.inner_engine._policy_action = original_policy_action
             seconds = time.perf_counter() - action_started
             timer.after_action(step, seconds)
             assert action.device.type == "cpu" and torch.isfinite(action).all()
+            if audit_prior:
+                assert len(prior_actions) == 1
+                torch.testing.assert_close(action, prior_actions[0], rtol=0, atol=0)
             solve = validate_action(agent.last_inner_metrics, operator=operator, decision=decision, interval=interval)
             if not solve:
-                assert graphs_before == int(torch._dynamo.utils.counters["stats"]["unique_graphs"]), "Held action captured a graph"
+                assert graphs_before == int(torch._dynamo.utils.counters["stats"]["unique_graphs"]), "Non-solving action captured a graph"
             rows.append({"decision": decision, "step": step, "solve": solve, "action_seconds": seconds,
                          "outer_update_enqueue_seconds": 0., "outer_updates": 0})
             return action
@@ -230,6 +293,7 @@ def worker(args):
             assert timer.result and len(rows) == args.warmup + args.decisions
             assert all(row["outer_updates"] == 1 for row in rows)
             assert operator != "mppi" or terminal_calls
+            assert operator != "none" or prior_actions
             assert all(torch.isfinite(parameter).all() for parameter in agent.model.parameters())
             assert all(torch.isfinite(torch.as_tensor(value)).all() for value in learner._last_train_metrics.values())
             actor_steps, alpha_steps = _optimizer_steps(agent.pi_optim), _optimizer_steps(agent.ent_coef_optim)
@@ -257,10 +321,11 @@ def worker(args):
         assert torch.get_num_threads() == len(cpus) and os.sched_getaffinity(0) == set(cpus)
         measured = timer.result
         measured_rows = rows[args.warmup:]
-        measured.update(phase_summary(measured_rows))
+        measured.update(training_phases(measured_rows, operator))
         measured["action_rows"] = measured_rows
-        assert measured["solve_decisions"] == args.decisions // interval
-        assert measured["held_decisions"] == args.decisions - args.decisions // interval
+        expected_solves = 0 if operator == "none" else args.decisions // interval
+        assert measured["solve_decisions"] == expected_solves
+        assert measured["held_decisions"] == (0 if operator == "none" else args.decisions - expected_solves)
         storage = learner.buffer._buffer._storage._storage
         replay_bytes_per_row = sum(value.numel() * value.element_size() for value in storage.values()) / len(storage)
         report = {"passed": True, "binding": binding(args.manifest), "runtime": runtime(), "config": name,
@@ -274,6 +339,8 @@ def worker(args):
                   "outer_actor_optimizer_steps": actor_steps, "outer_temperature_optimizer_steps": alpha_steps,
                   "alpha_before": alpha_before, "alpha_after": alpha_after,
                   "mppi_primary_online_mean_pair_no_entropy_verified": bool(terminal_calls),
+                  "sampled_prior_execution_verified": bool(prior_actions),
+                  "zero_inner_work_verified": operator == "none",
                   "checkpoint_roundtrip": True, "checkpoint_sidecars": True,
                   "boundary_training_state_roundtrip": True, "full_replay_resume_roundtrip": False,
                   "checkpoint_bytes": checkpoint_bytes, "replay_storage_device": "cpu",
@@ -282,7 +349,7 @@ def worker(args):
                   "peak_host_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
                   "peak_gpu_allocated_bytes": torch.cuda.max_memory_allocated(),
                   "peak_gpu_reserved_bytes": torch.cuda.max_memory_reserved(),
-                  "cold_first_solve_seconds": rows[0]["action_seconds"], "startup": startup,
+                  ("cold_first_prior_action_seconds" if operator == "none" else "cold_first_solve_seconds"): rows[0]["action_seconds"], "startup": startup,
                   "total_seconds": time.perf_counter() - started,
                   "production_overrides": {**overrides, "total_steps": run["total_steps"], "checkpoint_every": run["total_steps"]},
                   "timing_scope": "Synchronized complete training window. Native action latency may include pending preceding outer GPU work; outer timings are host enqueue latency. Excludes W&B, periodic checkpoint I/O and mature replay.",
@@ -298,10 +365,11 @@ def worker(args):
 
 def validate_receipt(receipt, campaign_binding, current_runtime, cpus, *, name, operator, interval):
     assert receipt["passed"] is True and receipt["binding"] == campaign_binding, "Gate source/configuration mismatch"
-    assert cpus in CPU_COUNTS, "Production CPU allocation was not measured"
+    counts = cpu_counts(operator)
+    assert cpus in counts, "Production CPU allocation was not measured"
     assert receipt["runtime"] == current_runtime, "Gate used another runtime or GPU"
     cases = receipt["cases"]
-    assert len(cases) == 2 and {row["physical_cores"] for row in cases} == set(CPU_COUNTS)
+    assert len(cases) == len(counts) and {row["physical_cores"] for row in cases} == set(counts)
     for row in cases:
         assert row["passed"] is True and row["binding"] == campaign_binding and row["runtime"] == current_runtime
         assert (row["config"], row["operator"], row["inner_solve_interval"]) == (name, operator, interval)
@@ -314,8 +382,14 @@ def validate_receipt(receipt, campaign_binding, current_runtime, cpus, *, name, 
         assert row["outer_target_entropy"] == -10.5
         measured = row["measured"]
         assert measured["decisions"] >= 100 and measured["decisions"] == measured["outer_updates"]
-        assert measured["solve_decisions"] == measured["decisions"] // interval
-        assert measured["held_decisions"] == measured["decisions"] - measured["solve_decisions"]
+        if operator == "none":
+            assert measured["decisions"] >= 400 and row["warmup_active_decisions"] >= 24
+            assert measured["solve_decisions"] == measured["held_decisions"] == 0
+            assert measured["prior_decisions"] == measured["decisions"]
+            assert row["sampled_prior_execution_verified"] is row["zero_inner_work_verified"] is True
+        else:
+            assert measured["solve_decisions"] == measured["decisions"] // interval
+            assert measured["held_decisions"] == measured["decisions"] - measured["solve_decisions"]
         assert row["outer_actor_optimizer_steps"] == row["outer_temperature_optimizer_steps"] == 2 + row["warmup_active_decisions"] + measured["decisions"]
         assert math.isfinite(measured["seconds_per_decision"]) and measured["seconds_per_decision"] > 0
         if operator == "mppi":
@@ -323,16 +397,18 @@ def validate_receipt(receipt, campaign_binding, current_runtime, cpus, *, name, 
 
 
 def smoke(args):
-    assert os.environ.get("SLURM_JOB_ID") and int(os.environ.get("SLURM_CPUS_PER_TASK", 0)) >= 2
+    assert os.environ.get("SLURM_JOB_ID")
     name, _, run = validate_campaign(args.manifest)
     operator = run["alg_params"]["inner_operator"]
+    counts = cpu_counts(operator)
+    assert int(os.environ.get("SLURM_CPUS_PER_TASK", 0)) == max(counts)
     interval = run["alg_params"].get("inner_solve_interval", 1)
     cores = physical_core_cpus(os.sched_getaffinity(0))
-    assert len(cores) >= 2, "Request two physical CPUs with --hint=nomultithread"
+    assert len(cores) >= max(counts), f"Request {max(counts)} physical CPUs with --hint=nomultithread"
     output = args.output.resolve()
     assert output != ROOT and ROOT not in output.parents
     output.mkdir(parents=True, exist_ok=False)
-    order = list(CPU_COUNTS)
+    order = list(counts)
     random.Random(55).shuffle(order)
     write_new(output / "protocol.json", {"binding": binding(args.manifest), "config": name,
               "case_order": order, "physical_core_representatives": cores,
@@ -354,7 +430,7 @@ def smoke(args):
             with (output / f"cores-{count}.log").open("x") as log:
                 subprocess.run(command, cwd=ROOT, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True)
             print(f"REWARD_TRAINING_GATE_PROGRESS cores={count}", flush=True)
-    paths = [output / f"cores-{count}.json" for count in CPU_COUNTS]
+    paths = [output / f"cores-{count}.json" for count in counts]
     cases = [read(path) for path in paths]
     receipt = {"passed": True, "binding": binding(args.manifest), "runtime": cases[0]["runtime"], "cases": cases,
                "artifacts": {str(path): digest(path) for path in paths}, "created_utc": datetime.now(timezone.utc).isoformat()}
@@ -398,13 +474,17 @@ def main():
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--gate", type=Path)
-    parser.add_argument("--warmup", type=int, default=12)
-    parser.add_argument("--decisions", type=int, default=120)
+    parser.add_argument("--warmup", type=int)
+    parser.add_argument("--decisions", type=int)
     parser.add_argument("--worker-cpus", help=argparse.SUPPRESS)
     args = parser.parse_args()
     assert binding(args.manifest)["commit"] == os.environ["AMBI_EXPECTED_COMMIT"]
     assert not subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=all"], cwd=ROOT, text=True).strip()
     if args.mode == "smoke":
+        operator = validate_campaign(args.manifest)[2]["alg_params"]["inner_operator"]
+        warmup, decisions = smoke_defaults(operator)
+        args.warmup = warmup if args.warmup is None else args.warmup
+        args.decisions = decisions if args.decisions is None else args.decisions
         assert args.warmup >= 12 and args.decisions >= 100
         assert SEED_STEPS + 1 + args.warmup + args.decisions < 1000
         (worker if args.worker_cpus else smoke)(args)

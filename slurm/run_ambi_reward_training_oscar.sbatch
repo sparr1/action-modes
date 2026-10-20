@@ -6,8 +6,8 @@
 #SBATCH --hint=nomultithread
 #SBATCH --requeue
 
-# Explicit submission resources: smoke needs one GPU/two physical CPUs;
-# production uses the measured one- or two-core allocation and measured time.
+# Explicit resources: smoke needs one GPU and two physical CPUs for SAC/MPPI,
+# or four for the no-inner baseline. Production uses a measured allocation.
 # Supply --signal=USR1@900 for production. Each job selects one one-cell
 # manifest and one durable lineage; independent SAC/MPPI gates may run together.
 set -Eeuo pipefail
@@ -18,7 +18,7 @@ umask 077
 : "${AMBI_PYTHON:?Set the locked DMControl interpreter.}"
 : "${AMBI_EXPECTED_COMMIT:?Set the full tested commit.}"
 : "${AMBI_RETURN_OUTPUT:?Set persistent campaign output outside source.}"
-: "${AMBI_RETURN_MANIFEST:?Select the single-cell SAC or MPPI manifest.}"
+: "${AMBI_RETURN_MANIFEST:?Select the single-cell SAC, MPPI or no-inner manifest.}"
 mode="${AMBI_RETURN_MODE:-train}"
 [[ "$mode" == smoke || "$mode" == train ]]
 [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]
@@ -41,12 +41,12 @@ export XDG_CACHE_HOME="$local_root/cache" TMPDIR="$local_root/tmp"
 export WANDB__REQUIRE_CORE=true WANDB_DISABLE_CODE=true WANDB_DIR="$wandb_root"
 export WANDB_CACHE_DIR="$local_root/cache" WANDB_DATA_DIR="$local_root/data" WANDB_ARTIFACT_DIR="$local_root/artifacts"
 if [[ "$mode" == smoke ]]; then
-  [[ "$SLURM_CPUS_PER_TASK" == 2 && "${SLURM_RESTART_COUNT:-0}" == 0 ]]
+  [[ ( "$SLURM_CPUS_PER_TASK" == 2 || "$SLURM_CPUS_PER_TASK" == 4 ) && "${SLURM_RESTART_COUNT:-0}" == 0 ]]
   export WANDB_MODE=disabled
   exec srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" slurm/ambi_reward_training.py smoke \
     --manifest "$AMBI_RETURN_MANIFEST" --output "$AMBI_RETURN_OUTPUT/gate"
 else
-  [[ "$SLURM_CPUS_PER_TASK" == 1 || "$SLURM_CPUS_PER_TASK" == 2 ]]
+  [[ "$SLURM_CPUS_PER_TASK" == 1 || "$SLURM_CPUS_PER_TASK" == 2 || "$SLURM_CPUS_PER_TASK" == 4 ]]
   : "${AMBI_LINEAGE_DIR:?Set a unique durable lineage under /oscar/home/rgao48/ambi-durable.}"
   : "${AMBI_DRAIN_AFTER_SECONDS:?Set an explicit segment budget below requested walltime.}"
   export AMBI_DURABLE_ROOT=/oscar/home/rgao48/ambi-durable

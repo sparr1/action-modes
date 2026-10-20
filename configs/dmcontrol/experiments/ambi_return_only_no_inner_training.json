@@ -1,0 +1,26 @@
+{
+  "study_type": "single_seed_exploratory_full_training_reward_only_primary",
+  "study_note": "One no-inner-loop full-training control for the reward-only MPPI and fresh SAC runs. Sample the current outer SAC prior at every controlled real decision, with no planning, imagined transitions, inner optimizer updates, transfer or held policy. The outer learner is unchanged: H3 replay unroll, model size 5, five-head distributional primary critic with reward-only Bellman targets, no auxiliary critic, automatic actor entropy temperature initialized at 1.0 and target entropy -10.5. Reward-only targets do not remove actor entropy regularization. Preserve the world-model, actor, critic, replay, update dose, strict compilation and vmap settings. Use seed 55, 500k decisions (1M raw environment steps), 2500 random warmup decisions and 2500 pretraining updates. Retain all 25k portable checkpoints and durable exact-resume generations. Evaluation remains disabled; publish actual training returns, diagnostics and costs in W&B ambi, group ambi-return-only-training-20261019.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 500000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_full_no_inner_reward_only"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}
