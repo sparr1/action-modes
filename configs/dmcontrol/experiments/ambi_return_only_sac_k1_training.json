@@ -1,0 +1,26 @@
+{
+  "study_type": "single_seed_exploratory_full_training_reward_only_primary",
+  "study_note": "One fresh H3/J8/K1 inner-SAC full-training run with a reward-only primary critic and no auxiliary critic. Both outer and inner Bellman targets are reward-only. The outer actor retains automatic temperature initialized at 1.0 with target entropy -10.5; each inner solve inherits the current outer temperature and entropy target and adapts its own temperature. Both actor losses remain entropy-regularized. Use the primary SAC actor and critic for inner initialization and horizon continuation. Preserve J8/C16/A4/N128/B256 and 3072 imagined transitions per solve. Solve at every real decision using the current outer encoder and priors, then sample an action from the newly adapted actor; no policy or encoder is held across decisions. Inner actor, critic, temperature, optimizers and imagined replay initialize fresh per solve; no Bernoulli transfer. Every real decision still feeds real replay and the outer update. The finite-horizon terminal bootstrap uses online primary-Q mean_pair at a sampled SAC action without an extra entropy bonus. All critic-source selectors are named sac to select the primary learner; this primary critic now predicts reward return. Disabling the auxiliary learner removes its critic modules, optimizer and shared-representation loss. Preserve the five-head distributional Q ensemble, seed 55, 500k decisions (1M raw environment steps), 2500 warmup decisions and 2500 pretraining updates. Retain all 25k portable checkpoints and durable exact-resume generations. Evaluation remains disabled; publish actual training returns, diagnostics and costs in W&B ambi, group ambi-return-only-training-20261019. This fresh training lineage matches the K3 reward-only reference except for K1 solve cadence and publication identity.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 500000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_full_h3_j8_k1_reward_only"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

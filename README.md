@@ -188,6 +188,13 @@ seed 55, 500k decisions, all 25k checkpoints and durable exact resume, and publi
 to AMBI group `ambi-return-only-training-20261019`. Their finite-horizon terminal
 score uses online primary-Q `mean_pair` without an added entropy bonus.
 
+The one-cell `ambi_return_only_sac_k1_training.json` matches that reward-only
+SAC recipe with `inner_solve_interval=1`: every real decision starts a fresh
+H3/J8 solve from the current outer priors and encoder. It keeps the same
+C16/A4/N128/B256 dose per solve, sampled actions, automatic entropy target
+−10.5, seed 55, 500k decisions and all 25k checkpoints. Its K1 run name and tags
+distinguish it from the retained K3 recipe in the same AMBI group.
+
 The matching one-cell `ambi_return_only_no_inner_training.json` control samples
 the current outer actor directly after the same random warmup. It performs no
 planning, imagined transitions, inner updates, transfer or held-policy execution.

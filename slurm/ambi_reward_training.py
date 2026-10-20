@@ -37,10 +37,13 @@ ENTROPY_MANIFESTS = {
     -10.5: ROOT / "configs/dmcontrol/experiments/ambi_return_only_no_inner_1m_entropy10p5.json",
     -21.: ROOT / "configs/dmcontrol/experiments/ambi_return_only_no_inner_1m_entropy21.json",
 }
+SAC_K1_MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_return_only_sac_k1_training.json"
+SAC_INTERVALS = {"ambi_full_h3_j8_k3_reward_only": 3, "ambi_full_h3_j8_k1_reward_only": 1}
 # Deliberately enumerate approved identities instead of accepting arbitrary
 # budgets/entropy settings from a renamed or edited manifest.
 CAMPAIGNS = {
     MANIFESTS["sac"]: ("ambi_full_h3_j8_k3_reward_only", "sac", 500000, -10.5),
+    SAC_K1_MANIFEST: ("ambi_full_h3_j8_k1_reward_only", "sac", 500000, -10.5),
     MANIFESTS["mppi"]: ("ambi_full_h3_mppi_reward_only", "mppi", 500000, -10.5),
     MANIFESTS["none"]: ("ambi_full_no_inner_reward_only", "none", 500000, -10.5),
     ENTROPY_MANIFESTS[-10.5]: ("ambi_full_no_inner_reward_only_1m_entropy10p5", "none", 1000000, -10.5),
@@ -95,7 +98,7 @@ def validate_campaign(manifest_path):
     assert p["inner_operator"] == operator
     interval = p.get("inner_solve_interval", 1)
     if p["inner_operator"] == "sac":
-        assert interval in (1, 3)
+        assert interval == SAC_INTERVALS[name], "SAC solve cadence does not match configuration identity"
         expected = {"inner_rounds": 8, "inner_rollouts_per_round": 128,
                     "inner_batch_size": 256, "inner_replay_capacity": 3072,
                     "inner_critic_updates_per_round": 16, "inner_actor_updates_per_round": 4,
@@ -123,7 +126,7 @@ def smoke_recipe(warmup, decisions, manifest_path):
     return _smoke_recipe(0, warmup, decisions, manifest_path)
 
 
-def validate_learner(cfg, agent, *, target_entropy):
+def validate_learner(cfg, agent, *, target_entropy, solve_interval):
     assert cfg.compile and cfg.compile_strict and cfg.critic_ensemble_backend == "vmap"
     assert (cfg.model_size, cfg.enc_dim, cfg.mlp_dim, cfg.latent_dim, cfg.num_q) == (5, 256, 512, 512, 5)
     assert (cfg.action_dim, cfg.batch_size, cfg.train_unroll_horizon) == (21, 256, 3)
@@ -135,6 +138,7 @@ def validate_learner(cfg, agent, *, target_entropy):
     assert agent.inner_engine._critic_base is agent.inner_engine._horizon_critic is agent.model._Qs
     assert agent.ent_coef_optim is not None and agent.log_ent_coef is not None
     assert cfg.target_entropy == agent.target_entropy == target_entropy
+    assert cfg.inner_solve_interval == solve_interval
     assert cfg.sac_actor_loss_scale_mode == "none"
     assert cfg.inner_entropy_enabled and cfg.utd == 1
     assert cfg.mppi_terminal_q_reduction == "mean_pair" and cfg.inner_critic_bernoulli_p == 0.
@@ -226,7 +230,8 @@ def worker(args):
         learner = AMBITDMPC2(name + "-gpu-gate", env, run["alg_params"], run, manifest)
         cfg, agent = learner.cfg, learner.agent
         target_entropy = production["alg_params"]["target_entropy"]
-        validate_learner(cfg, agent, target_entropy=target_entropy)
+        validate_learner(cfg, agent, target_entropy=target_entropy,
+                         solve_interval=production["alg_params"].get("inner_solve_interval", 1))
         learner.buffer.enable_resumable_storage()
         operator, interval = cfg.inner_operator, cfg.inner_solve_interval
         assert args.warmup % interval == args.decisions % interval == 0
@@ -401,6 +406,7 @@ def validate_receipt(receipt, campaign_binding, current_runtime, cpus, *, name, 
     assert len(approved) == 1, "Unapproved reward-only configuration identity"
     _, expected_operator, total_steps, target_entropy = approved[0]
     assert operator == expected_operator
+    assert interval == SAC_INTERVALS.get(name, 1), "Gate solve cadence does not match configuration identity"
     assert receipt["passed"] is True and receipt["binding"] == campaign_binding, "Gate source/configuration mismatch"
     counts = cpu_counts(operator)
     assert cpus in counts, "Production CPU allocation was not measured"

@@ -24,7 +24,7 @@ def test_actual_campaigns_validate_and_smoke_preserves_production_shapes(path):
     expected_manifest.update(checkpoint_every=633, save_strat="all", save_trials="none", logs="none")
     assert small_manifest == expected_manifest
     assert original["alg_params"]["inner_operator"] == operator
-    assert original["alg_params"]["inner_solve_interval"] == (3 if operator == "sac" else 1)
+    assert original["alg_params"]["inner_solve_interval"] == campaign.SAC_INTERVALS.get(name, 1)
     assert original["checkpoint_every"] == 25000 and original["save_strat"] == "all"
     assert original["total_steps"] == total_steps
     assert run["alg_params"]["target_entropy"] == original["alg_params"]["target_entropy"] == target_entropy
@@ -113,6 +113,39 @@ def test_sac_gate_counts_solves_and_rejects_held_work():
     assert not campaign.validate_action(metrics, operator="sac", decision=1, interval=3)
     with pytest.raises(AssertionError):
         campaign.validate_action({**metrics, "inner_critic_optimizer_steps": 1.}, operator="sac", decision=1, interval=3)
+
+
+@pytest.mark.parametrize("decision", [0, 1, 119])
+def test_sac_k1_gate_requires_full_fresh_solve_at_every_decision(decision):
+    metrics = {"inner_critic_optimizer_steps": 128., "inner_actor_optimizer_steps": 32.,
+               "inner_temperature_optimizer_steps": 32., "inner_model_steps": 3072.,
+               "inner_compile_fallback": 0., "inner_critic_bernoulli_applied": 0.}
+    assert campaign.validate_action(metrics, operator="sac", decision=decision, interval=1)
+    for key, value in (("inner_critic_optimizer_steps", 127.), ("inner_actor_optimizer_steps", 0.),
+                       ("inner_temperature_optimizer_steps", 31.), ("inner_model_steps", 1024.),
+                       ("inner_critic_bernoulli_applied", 1.)):
+        with pytest.raises(AssertionError):
+            campaign.validate_action({**metrics, key: value}, operator="sac", decision=decision, interval=1)
+
+
+@pytest.mark.parametrize("manifest", [campaign.MANIFESTS["sac"], campaign.SAC_K1_MANIFEST])
+def test_sac_cadence_is_bound_to_config_and_cannot_relabel_receipt(monkeypatch, manifest):
+    name, document, run = campaign.validate_campaign(manifest)
+    expected = campaign.SAC_INTERVALS[name]
+    wrong = 3 if expected == 1 else 1
+    receipt, binding, runtime, identity = receipt_fixture("sac", manifest)
+    for row in receipt["cases"]:
+        assert row["measured"]["solve_decisions"] == 120 // expected
+        assert row["measured"]["held_decisions"] == 120 - 120 // expected
+        row["inner_solve_interval"] = wrong
+        row["measured"].update(solve_decisions=120 // wrong, held_decisions=120 - 120 // wrong)
+    with pytest.raises(AssertionError, match="cadence"):
+        campaign.validate_receipt(receipt, binding, runtime, 1, **{**identity, "interval": wrong})
+    altered = deepcopy(run)
+    altered["alg_params"]["inner_solve_interval"] = wrong
+    monkeypatch.setattr(campaign, "recipe", lambda index, path: (name, document, altered))
+    with pytest.raises(AssertionError, match="cadence"):
+        campaign.validate_campaign(manifest)
 
 
 def test_optimizer_step_check_rejects_incomplete_actor_or_temperature_updates():
