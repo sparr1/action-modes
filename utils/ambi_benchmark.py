@@ -40,7 +40,7 @@ def solver_seed(base, *identity):
 
 
 def frozen_execution_action(resolved):
-    """Explicit frozen SAC execution mode; old matrices retain mean actions."""
+    """Explicit frozen SAC/prior execution mode; old matrices retain means."""
     mode = resolved.get("evaluation", {}).get("execution_action", "mean")
     if mode not in {"mean", "sample"}:
         raise ValueError("evaluation.execution_action must be 'mean' or 'sample'.")
@@ -48,11 +48,11 @@ def frozen_execution_action(resolved):
         config = resolved.get("algorithm_config", {})
         params = config.get("alg_params", {})
         if (config.get("alg") != "AMBITDMPC2/AMBITDMPC2"
-                or params.get("inner_operator", "sac") != "sac"
+                or params.get("inner_operator", "sac") not in {"sac", "none"}
                 or params.get("inner_execution_action", "policy_sample") != "policy_sample"
                 or float(params.get("inner_execution_std_scale", 1.0)) <= 0.0):
             raise ValueError(
-                "Sampled frozen evaluation requires AMBI inner SAC and "
+                "Sampled frozen evaluation requires AMBI inner SAC or its prior and "
                 "inner_execution_action='policy_sample'."
             )
     return mode

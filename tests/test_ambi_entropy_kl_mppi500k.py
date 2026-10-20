@@ -29,6 +29,7 @@ def campaign(root):
 
 def test_all_four_matrices_materialize_with_correct_actual_update_counts():
     from test_ambi_research_presets import _build_cfg
+    from utils.ambi_benchmark import frozen_execution_action
     matrix = driver.read(driver.REPO / driver.MATRIX)
     driver.validate_matrix(matrix)
     base = driver.read(driver.REPO / 'configs/dmcontrol/algs/ambi_full_h3_mppi_aux_return.json')
@@ -38,6 +39,8 @@ def test_all_four_matrices_materialize_with_correct_actual_update_counts():
         params = {k: v for k, v in params.items() if v is not None}
         run['alg_params'] = params
         cfg = _build_cfg({'algorithm_config': run})
+        assert frozen_execution_action({'algorithm_config': run,
+                                        'evaluation': {'execution_action': 'sample'}}) == 'sample'
         assert cfg.inner_temperature_updates_per_action == driver.intervention(mode)['expected_temperature_steps']
         assert cfg.inner_actor_updates_per_action == (0 if mode == 'prior' else 32)
         assert cfg.inner_critic_updates_per_action == (0 if mode == 'prior' else 128)
