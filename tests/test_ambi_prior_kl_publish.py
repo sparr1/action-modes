@@ -95,7 +95,8 @@ def test_rejects_changed_files_missing_seed_and_missing_pair(campaign,monkeypatc
         pub.stage_completed(campaign)
 
 
-def test_pending_writes_only_two_new_run_summaries(campaign,tmp_path,monkeypatch):
+@pytest.mark.parametrize("require_complete", [False, True])
+def test_pending_writes_only_two_new_run_summaries(campaign,tmp_path,monkeypatch,require_complete):
     sessions=[]
     class Publisher:
         def __init__(self,run_dir,*,owner,**kwargs):
@@ -106,13 +107,34 @@ def test_pending_writes_only_two_new_run_summaries(campaign,tmp_path,monkeypatch
         def __exit__(self,*a): return False
         def publish_pending(self): return {}
     monkeypatch.setattr(series,"Publisher",Publisher)
-    result=pub.publish_once(campaign,tmp_path/"pub",workspace_verifier=lambda *a:{"url":"verified"})
+    result=pub.publish_once(campaign,tmp_path/"pub",workspace_verifier=lambda *a:{"url":"verified"},
+                            require_complete=require_complete)
     assert len(sessions)==2
     assert {directory for directory,_ in sessions}=={c["run_dir"] for c in campaign["cells"]}
     assert not result["all_complete"]
     for _,run in sessions:
         assert run.summary["progress/checkpoints_complete"]==0
+        assert run.summary["progress/failed_cells"]==int(require_complete)
+        assert run.summary["progress/status"]==("failed" if require_complete else "pending results")
+        assert ("progress/failure_reason" in run.summary)==require_complete
         assert not any(key.startswith("eval/") for key in run.summary)
+    assert set(result["cells"].values())=={"failed" if require_complete else "pending"}
+
+
+def test_final_cli_fails_after_publishing_terminal_status(campaign,tmp_path,monkeypatch):
+    campaign_path=tmp_path/"campaign.json"
+    root=tmp_path/"pub"
+    calls=[]
+    def publish(*args, **kwargs):
+        calls.append(kwargs)
+        return {"all_complete":False,"cells":{c["checkpoint_id"]:"failed" for c in campaign["cells"]}}
+    monkeypatch.setattr(pub,"publish_once",publish)
+    monkeypatch.setattr(pub.sys,"argv",["publisher","publish","--campaign",str(campaign_path),
+        "--root",str(root),"--once","--require-complete"])
+    with pytest.raises(SystemExit,match="marked failed"):
+        pub.main()
+    assert calls==[{"require_complete":True}]
+    assert "marked failed" in series._read(root/"publication-failure.json")["message"]
 
 
 def test_missing_layout_fails_before_any_wandb_mutation(campaign,tmp_path,monkeypatch):

@@ -3,6 +3,8 @@
 Layout uses a separate wandb==0.28.1 / wandb-workspaces==0.4.5 runtime.
 Publication uses the existing eval-series SDK adapter and oscar-rgao48 owner.
 GPU workers do not stage or upload data. Existing entropy runs are read-only.
+Use publish --once --require-complete only after all worker jobs have terminated;
+missing validated results then become visible failures instead of pending cells.
 """
 import argparse
 from datetime import datetime, timezone
@@ -262,12 +264,15 @@ def verify_workspace(campaign, path, wandb_module=None):
     return saved
 
 
-def publish_once(campaign, root, *, wandb_module=None, workspace_verifier=verify_workspace):
+def publish_once(campaign, root, *, wandb_module=None, workspace_verifier=verify_workspace,
+                 require_complete=False):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     with series._lock(root / ".publisher.lock", blocking=False):
         workspace = workspace_verifier(campaign, root / "workspace.json", wandb_module)
         statuses = stage_completed(campaign)
+        missing = {key for key, status in statuses.items() if require_complete and status == "pending"}
+        statuses.update({key: "failed" for key in missing})
         rows = progress_rows(campaign, statuses)
         for row in rows:
             with series.Publisher(row["run_dir"], owner=OWNER, wandb_module=wandb_module) as publisher:
@@ -278,8 +283,11 @@ def publish_once(campaign, root, *, wandb_module=None, workspace_verifier=verify
                 publisher.publish_pending()
                 publisher.run.summary.update({"progress/checkpoints_complete": row["complete"], "progress/checkpoints_expected": 1,
                     "progress/failed_cells": row["failed"], "progress/status": "complete" if row["complete"] else row["status"]})
+                if row["checkpoint_id"] in missing:
+                    publisher.run.summary["progress/failure_reason"] = "Worker terminated without a validated production receipt"
         rows = progress_rows(campaign, statuses)
         result = dict(updated_at=now(), campaign_id=campaign["campaign_id"], cells=statuses, runs=rows, workspace_url=workspace["url"],
+                      require_complete=require_complete,
                       all_complete=all(r["published"] == 1 for r in rows))
         series._atomic_json(root / "status.json", result)
         return result
@@ -291,6 +299,8 @@ def main():
     parser.add_argument("--campaign", type=Path, required=True)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--once", action="store_true")
+    parser.add_argument("--require-complete", action="store_true",
+                        help="Final --once after all workers terminate: publish missing cells as failed and exit nonzero")
     parser.add_argument("--jobs", nargs="+", help="Slurm jobs to follow; bounded by max-seconds")
     parser.add_argument("--max-seconds", type=int, default=3600)
     parser.add_argument("--poll-seconds", type=int, default=30)
@@ -301,14 +311,18 @@ def main():
         if args.command == "layout":
             result = install_workspace(campaign, args.root / "workspace.json")
         else:
+            if args.require_complete and not args.once:
+                raise PublicationError("--require-complete requires --once after all worker jobs terminate")
             if not args.once and not args.jobs:
                 raise PublicationError("Use --once or explicit --jobs for bounded publication")
             if args.max_seconds < 1 or not 1 <= args.poll_seconds <= 60:
                 raise PublicationError("Use positive bounded polling, at most 60 seconds per wait")
             deadline = time.monotonic() + args.max_seconds
             while True:
-                result = publish_once(campaign, args.root)
+                result = publish_once(campaign, args.root, require_complete=args.require_complete)
                 print(series._json(result), flush=True)
+                if args.require_complete and not result["all_complete"]:
+                    raise PublicationError("Final publication is incomplete; missing worker results are marked failed")
                 if args.once or result["all_complete"]:
                     break
                 states = subprocess.check_output(["squeue", "-h", "-j", ",".join(args.jobs), "-o", "%T"], text=True).strip()
