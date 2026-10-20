@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "description": "Frozen inner-SAC entropy diagnosis: matched H3/J8 mean prefixes, followed by exact solver instrumentation and paired fixed-replay actor arms.",
+  "matrix": "ambi_early_h3_j8.json",
+  "matrix_sha256": "78bfa4eb44434fbe165197cbed12967609fd295c1725d214b54c01b33bf436a8",
+  "preset": "early_h3_j8/mean",
+  "environment_seeds": [
+    101,
+    102,
+    103,
+    104,
+    105
+  ],
+  "decisions": [
+    0,
+    10,
+    50,
+    100,
+    250
+  ],
+  "controller_seed": 55,
+  "actor_steps": 32,
+  "anchor_samples": 128,
+  "checkpoints": {
+    "sac_aux_100k": {
+      "backbone_id": "sac_aux",
+      "source_run": "rwgao_b-brown-university/ambi/full7391933x4",
+      "step": 100000,
+      "checkpoint": "/oscar/scratch/rgao48/ambi/full-training/transfer-j8-20261014/cell-4/ambi_transfer_training_j8_2026-10-15_02-21-54/models/model:ambi_full_h3_j8_fresh_0_100000",
+      "metadata": "/oscar/scratch/rgao48/ambi/full-training/transfer-j8-20261014/cell-4/ambi_transfer_training_j8_2026-10-15_02-21-54/models/model:ambi_full_h3_j8_fresh_0_100000.metadata.json",
+      "checkpoint_sha256": "e4e99ba6eb40dd6b0634e4ea6b1ea3a0d883686bb7a5899f701eb2e9e7784595",
+      "metadata_sha256": "bc7f9bdb748f8eed8c4d8bf2a4572bffdf38bb8846c121c1e2fa9918838c4cb3",
+      "checkpoint_bytes": 119720730
+    },
+    "mppi_aux_400k": {
+      "backbone_id": "mppi_aux",
+      "source_run": "rwgao_b-brown-university/ambi/mppi7530927x0",
+      "step": 400000,
+      "checkpoint": "/oscar/scratch/rgao48/ambi/full-training/mppi-20261017/core/cell-0/ambi_mppi_training_2026-10-17_20-34-41/models/model:ambi_full_h3_mppi_aux_return_0_400000",
+      "metadata": "/oscar/scratch/rgao48/ambi/full-training/mppi-20261017/core/cell-0/ambi_mppi_training_2026-10-17_20-34-41/models/model:ambi_full_h3_mppi_aux_return_0_400000.metadata.json",
+      "checkpoint_sha256": "6efaf10a557e39dd396f735014e35d632ecd8cbbba5c28f6dbbe5841c6b1b561",
+      "metadata_sha256": "5e1ae9fa53c00adff4424c9a1f2d05eed7233619de0997fbae9b09575f38ba76",
+      "checkpoint_bytes": 119764666
+    }
+  }
+}

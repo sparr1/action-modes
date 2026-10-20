@@ -179,3 +179,10 @@ each of the eight rounds. The probe uses independent fixed noise and critic
 pairs; its time and model steps are reported separately. The generic
 `evaluation.togo_return_every` option defaults to 1, preserving older matrix
 behavior. Model predictions are diagnostics, not measured real policy gains.
+
+`ambi_entropy_probe.json` pins a smaller follow-up diagnosis on SAC-aux 100k
+and MPPI-aux 400k. It first saves fresh mean-action H3/J8 trajectory prefixes,
+then measures exact inner-solver entropy dynamics and paired fixed-replay actor
+updates at roots 0, 10, 50, 100 and 250. See
+[ENTROPY_PROBE.md](ENTROPY_PROBE.md) for checkpoint hashes, source/probe RNG
+separation, frozen-state checks, output ownership and the per-seed worker CLI.
