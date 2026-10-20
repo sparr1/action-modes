@@ -12,8 +12,8 @@ from tests.test_ambi_root_local_sac import _tiny_component_model
 from utils.ambi_entropy_probe import probe_entropy_root
 
 
-def _fixture(representation="scalar"):
-    model = _tiny_component_model(
+def _fixture(representation="scalar", **overrides):
+    options = dict(
         aux_return_mode="sac",
         inner_critic_source="aux_return",
         inner_horizon_critic_source="aux_return",
@@ -33,6 +33,8 @@ def _fixture(representation="scalar"):
         q_representation=representation,
         num_q=2 if representation == "scalar" else 3,
     )
+    options.update(overrides)
+    model = _tiny_component_model(**options)
     with torch.no_grad():
         for module in (model.agent.model._aux_return_Qs, model.agent.model._Qs):
             for parameter in module.parameters():
