@@ -1,4 +1,4 @@
-"""The K1 control changes only the cadence of the reward-only K3 reference."""
+"""The K1 control changes the cadence and training budget of the K3 reference."""
 
 from copy import deepcopy
 import json
@@ -17,12 +17,14 @@ def recipe():
     return json.loads((ROOT / f"configs/dmcontrol/algs/{CONFIG}.json").read_text())
 
 
-def test_k1_changes_only_solve_cadence_and_publication():
+def test_k1_changes_only_solve_cadence_budget_and_publication():
     reference = json.loads((ROOT / "configs/dmcontrol/algs/ambi_full_h3_j8_k3_reward_only.json").read_text())
     assert reference["alg_params"]["inner_solve_interval"] == 3
+    assert reference["total_steps"] == 500000
     current = recipe()
     expected = deepcopy(reference)
     expected["alg_params"]["inner_solve_interval"] = 1
+    expected["total_steps"] = 1000000
     for key in ("wandb_run_name", "wandb_tags"):
         expected["alg_params"][key] = current["alg_params"][key]
     assert current == expected
@@ -51,27 +53,31 @@ def test_k1_changes_only_solve_cadence_and_publication():
     assert cfg.seed_steps == cfg.pretrain_steps == 2500 and cfg.utd == 1
 
 
-def test_single_cell_manifest_and_labels_preserve_reference_budget():
+def test_single_cell_manifest_and_labels_match_requested_million_decisions():
     current = recipe()
     manifest = json.loads((ROOT / "configs/dmcontrol/experiments/ambi_return_only_sac_k1_training.json").read_text())
     expected = json.loads((ROOT / "configs/dmcontrol/experiments/ambi_return_only_sac_training.json").read_text())
     expected["configs"] = [CONFIG]
+    expected["overrides_alg"]["total_steps"] = 1000000
     expected["study_note"] = manifest["study_note"]
     assert manifest == expected
     assert manifest["trials"] == 1 and "alg_params" not in manifest["overrides_alg"]
-    assert manifest["overrides_alg"]["total_steps"] == current["total_steps"] == 500000
+    assert manifest["overrides_alg"]["total_steps"] == current["total_steps"] == 1000000
     assert manifest["overrides_alg"]["seed"] == current["seed"] == 55
     assert manifest["checkpoint_every"] == current["checkpoint_every"] == 25000
+    assert current["total_steps"] // current["checkpoint_every"] == 40
     assert manifest["save_strat"] == current["save_strat"] == "all"
     assert manifest["env_params"] == {"task": "humanoid-walk", "obs": "state", "render_mode": None}
     params = current["alg_params"]
     assert params["wandb_project"] == "ambi"
     assert params["wandb_group"] == "ambi-return-only-training-20261019"
-    assert params["wandb_run_name"] == "H3 | Fresh SAC | J8 | K1 | reward-only Q | seed55"
+    assert params["wandb_run_name"] == "H3 | Fresh SAC | J8 | K1 | reward-only Q | 1M decisions | seed55"
     tags = set(params["wandb_tags"])
     assert {"K1", "solve-every-decision", "H3", "J8", "fresh", "no-auxiliary-critic",
-            "reward-only-primary-critic", "automatic-actor-entropy", "target-entropy-10p5"} <= tags
-    assert not {"K3", "held-feedback-policy", "solve-snapshot-encoder"} & tags
+            "reward-only-primary-critic", "automatic-actor-entropy", "target-entropy-10p5",
+            "1m-decisions", "2m-environment-steps"} <= tags
+    assert not {"K3", "held-feedback-policy", "solve-snapshot-encoder", "500k-decisions",
+                "1m-environment-steps"} & tags
 
 
 def test_k1_runs_fresh_inner_learning_at_each_decision(monkeypatch):

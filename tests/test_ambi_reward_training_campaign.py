@@ -57,6 +57,10 @@ def test_projection_uses_selected_training_budget():
     assert short["production_total_steps"] == 500000 and long["production_total_steps"] == 1000000
     assert long["projected_production_seconds"] == 20000
     assert long["projected_production_hours"] == 2 * short["projected_production_hours"]
+    k1 = campaign.validate_campaign(campaign.SAC_K1_MANIFEST)[2]
+    k3 = campaign.validate_campaign(campaign.MANIFESTS["sac"])[2]
+    assert campaign.production_projection(.02, k1["total_steps"]) == long
+    assert campaign.production_projection(.02, k3["total_steps"]) == short
 
 
 def test_no_inner_gate_uses_longer_window_and_benchmarks_four_cores():

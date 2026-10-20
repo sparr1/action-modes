@@ -43,7 +43,7 @@ SAC_INTERVALS = {"ambi_full_h3_j8_k3_reward_only": 3, "ambi_full_h3_j8_k1_reward
 # budgets/entropy settings from a renamed or edited manifest.
 CAMPAIGNS = {
     MANIFESTS["sac"]: ("ambi_full_h3_j8_k3_reward_only", "sac", 500000, -10.5),
-    SAC_K1_MANIFEST: ("ambi_full_h3_j8_k1_reward_only", "sac", 500000, -10.5),
+    SAC_K1_MANIFEST: ("ambi_full_h3_j8_k1_reward_only", "sac", 1000000, -10.5),
     MANIFESTS["mppi"]: ("ambi_full_h3_mppi_reward_only", "mppi", 500000, -10.5),
     MANIFESTS["none"]: ("ambi_full_no_inner_reward_only", "none", 500000, -10.5),
     ENTROPY_MANIFESTS[-10.5]: ("ambi_full_no_inner_reward_only_1m_entropy10p5", "none", 1000000, -10.5),
