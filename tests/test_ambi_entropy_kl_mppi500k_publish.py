@@ -289,7 +289,8 @@ def test_unique_readable_colors_and_correct_beta1_context(campaign):
     assert pub.EXISTING[0]["line_mark"] == "solid"
 
 
-def test_native_layout_idempotence_and_readback(campaign, tmp_path, monkeypatch):
+@pytest.mark.parametrize("expanded_server_colors", [False, True])
+def test_native_layout_idempotence_and_readback(campaign, tmp_path, monkeypatch, expanded_server_colors):
     ws = pytest.importorskip("wandb_workspaces.workspaces")
     wr = pytest.importorskip("wandb_workspaces.reports.v2")
     if pub.importlib.metadata.version("wandb") != "0.28.1" or pub.importlib.metadata.version("wandb-workspaces") != "0.4.5":
@@ -297,7 +298,18 @@ def test_native_layout_idempotence_and_readback(campaign, tmp_path, monkeypatch)
     saved = []
     monkeypatch.setattr(ws.Workspace, "save", lambda self: saved.append(self))
     monkeypatch.setattr(ws.Workspace, "url", property(lambda self: f"https://wandb.ai/{pub.ENTITY}/{pub.PROJECT}?nw=testview"))
-    monkeypatch.setattr(ws.Workspace, "from_url", classmethod(lambda cls, url: saved[-1]))
+    def read_back(cls, url):
+        if not expanded_server_colors:
+            return saved[-1]
+        restored = deepcopy(saved[-1])
+        for section in restored.sections:
+            for panel in section.panels:
+                if isinstance(panel, wr.LinePlot):
+                    panel.line_colors = {key: {"color": pub._line_color(value),
+                        "transparentColor": pub._line_color(value) + "19"}
+                        for key, value in panel.line_colors.items()}
+        return restored
+    monkeypatch.setattr(ws.Workspace, "from_url", classmethod(read_back))
     path = tmp_path / "workspace.json"
     first = pub.install_workspace(campaign, path)
     saved[-1].sections.append(ws.Section(name="User notes", panels=[]))

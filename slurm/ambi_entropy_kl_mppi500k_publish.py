@@ -57,6 +57,11 @@ METRICS = [
 PANEL_COUNT = len(METRICS) + 3
 
 
+def _line_color(value):
+    # W&B expands a saved hex color into {color, transparentColor} on read-back.
+    return value.get("color") if isinstance(value, dict) else value
+
+
 def load_campaign(path):
     """Validate the driver's exact scientific pins without reading model tensors."""
     from slurm import ambi_entropy_kl_mppi500k as driver
@@ -385,7 +390,7 @@ uploaded summaries are bounded to 16 MiB per result.
         metric = getattr(panel.y[0], "name", panel.y[0])
         if any(panel.line_titles.get(r["run_id"] + ":" + metric) != r["name"]
                or panel.line_marks.get(r["run_id"] + ":" + metric) != r["line_mark"]
-               or panel.line_colors.get(r["run_id"] + ":" + metric) != r["color"] for r in rows):
+               or _line_color(panel.line_colors.get(r["run_id"] + ":" + metric)) != r["color"] for r in rows):
             raise PublicationError("Native workspace lost readable aliases, colors or context lines")
     saved.update(api_verified=True, panel_count=len(panels))
     series._atomic_json(path, saved)
