@@ -1,7 +1,8 @@
 # Entropy and KL checkpoint curves
 
-The MPPI auxiliary-return backbone comparison has four persistent W&B runs:
-sampled prior, entropy-only, KL-only, and entropy plus KL. Their IDs and owner
+The MPPI auxiliary-return backbone comparison has four original persistent W&B runs:
+sampled prior, entropy-only, KL-only, and entropy plus KL. A fifth, orange MPPI
+curve can be explicitly added with its own pinned planner identity. Their IDs and owner
 directories are stored in
 `/oscar/scratch/rgao48/ambi/evaluation-series/mppi-entropy-kl-v1/catalog.json`.
 The saved workspace remains
@@ -43,7 +44,12 @@ Prepare the catalog once, from a clean synchronized checkout on Oscar:
 python slurm/ambi_entropy_kl_curves.py prepare
 ```
 
-Repeated prepare calls reuse exactly the same four run IDs. Install the native
+Repeated prepare calls reuse exactly the same run IDs. An extended profile must
+retain the four original identities exactly and add `identities.mppi`; prepare
+then appends only the missing MPPI run. Existing sources, records, curve IDs and
+colors remain unchanged. Use that extended profile for later staging/publication;
+the historical four-method profile cannot silently remove the added curve.
+Install the native
 layout from the catalog using the isolated `wandb==0.28.1` and
 `wandb-workspaces==0.4.5` runtime:
 
@@ -72,3 +78,24 @@ same final publication call and catalog instead of allocating display runs per
 checkpoint. Layout verification is mandatory before publishing; missing or
 changed panels cause a visible error. The existing `eval_series` journal and
 owner lock provide idempotent uploads and interrupted-publication recovery.
+
+For a matched MPPI comparison, generate a campaign-local extended profile from
+the immutable original profile and the MPPI source registry. Register campaign
+cells with `mode="mppi"`, `step`, `run_id` and `run_dir` before compute finishes;
+no `outer_alpha` is required. For example:
+
+```bash
+python slurm/ambi_entropy_kl_curves.py prepare --profile EXTENDED_PROFILE --campaign MPPI_CAMPAIGN
+python slurm/ambi_entropy_kl_curves_layout.py --catalog CATALOG --receipt WORKSPACE_RECEIPT
+python slurm/ambi_entropy_kl_curves.py publish --profile EXTENDED_PROFILE
+```
+
+Install the new catalog receipt at its root's `workspace.json` before publishing.
+MPPI pending checkpoint counts are visible immediately; only complete published
+five-seed source records become measurements. Gains are recomputed against the
+existing sampled prior with exact checkpoint hashes and matching episode RNG
+seeds. No prior episode is rerun. MPPI's own source fingerprint and action rule
+remain explicit; they are not relabeled as the SAC protocol. Return, paired-gain
+variability and controller timing share the existing panels. Inner actor,
+temperature and prior-KL diagnostics are omitted for MPPI, rather than shown as
+zero, and its raw results and compact provenance are retained.

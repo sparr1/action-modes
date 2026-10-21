@@ -184,7 +184,7 @@ def remote_spec(value):
             overrideSeriesTitles={r['run_id']+':'+metric:r['name'] for r in value['curves']},
             overrideColors={r['run_id']+':'+metric:dict(color=r['color'],transparentColor='#FFFFFF19')
                             for r in value['curves']})) for _,metric in layout.METRICS])],
-        progress=['progress/checkpoints_complete','progress/failed_cells'])
+        progress=['progress/checkpoints_complete','progress/checkpoints_pending','progress/failed_cells'])
 
 
 def receipt_for(value, path):
@@ -250,3 +250,37 @@ def test_cpu_verifier_rejects_deleted_remote_view(tmp_path):
     api,_,response=api_for(remote_spec(value));response['project']['allViews']['edges']=[]
     with pytest.raises(layout.LayoutError,match='missing remotely'):
         layout.verify_installed_catalog(value,path,api)
+
+
+def test_adds_mppi_to_existing_view_without_losing_curves_or_unrelated_sections(tmp_path):
+    value = catalog()
+    sdk, state = backend(value)
+    layout.install_catalog(value, tmp_path / 'original.json', backend=sdk)
+    original = deepcopy(state['saved'][value['workspace_url']])
+    value['curves'].append(dict(mode='mppi', run_id='run4', run_dir='/runs/mppi',
+        name='MPPI-trained | MPPI | auxiliary return terminal | H3', color='#D97706'))
+    updated = layout.install_catalog(value, tmp_path / 'extended.json', backend=sdk)
+    assert updated['api_verified'] and len(updated['curves']) == 5
+    work = state['saved'][value['workspace_url']]
+    assert [s.name for s in work.sections] == [s.name for s in original.sections]
+    assert work.sections[0].panels[0].text == 'Keep me'
+    assert work.settings.max_runs == 5
+    assert layout._filter_model(work.runset_settings.filters[0])['value'] == ['run0', 'run1', 'run2', 'run3', 'run4']
+    for before, after in zip(plots(original), plots(work)):
+        assert all(after.line_colors[key] == value for key, value in before.line_colors.items())
+        assert all(after.line_titles[key] == value for key, value in before.line_titles.items())
+        assert after.line_colors['run4:' + after.y[0]] == '#D97706'
+        assert after.line_marks['run4:' + after.y[0]] == 'solid'
+    receipt = tmp_path / 'verified.json'
+    receipt_for(value, receipt)
+    api, _, _ = api_for(remote_spec(value))
+    assert layout.verify_installed_catalog(value, receipt, api)['api_verified']
+
+
+@pytest.mark.parametrize('extra_mode', ['entropy', 'other'])
+def test_only_explicit_mppi_extension_is_accepted(extra_mode):
+    value = catalog()
+    value['curves'].append(dict(mode=extra_mode, run_id='run4', run_dir='/runs/extra',
+        name='Extra controller', color='#D97706'))
+    with pytest.raises(layout.LayoutError):
+        layout.validate_catalog(value)

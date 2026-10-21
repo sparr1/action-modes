@@ -22,6 +22,9 @@ def identity(mode, step=400000):
             inner_entropy_enabled=mode != "kl",
             inner_temperature_mode="inherit_outer" if mode == "kl" else "auto",
             inner_outer_policy_kl_coef=ALPHAS[step] if mode in ("kl", "both") else 0.)
+    if mode == "mppi":
+        planner = dict(type="mppi", action_rule="weighted_elite_with_noise",
+            settings=dict(planning_horizon=3, terminal_critic="aux_return"))
     return dict(backbone="entity/ambi/mppi7530927x0", planner=planner,
         protocol=dict(environment_seeds=[101, 102, 103, 104, 105], max_steps=500,
                       controller_seed=55, seed_scheme="sha256-v1", action_rule="tanh_sample"),
@@ -32,7 +35,7 @@ def profile(tmp_path):
     return dict(root=str(tmp_path / "curves"), family="test-mppi-entropy-kl", project="test",
         entity="entity", owner="local", workspace_url="https://example.invalid/workspace",
         identities={mode: curves.canonical_identity(identity(mode), mode, ALPHAS[400000])
-                    for mode in curves.METHODS}, sources=[])
+                    for mode in curves.METHODS if mode in curves.BASE_METHODS}, sources=[])
 
 
 def record(tmp_path, mode, step=400000, *, paired=True):
@@ -254,3 +257,63 @@ def test_legacy_prior_requires_exact_validated_manifest_and_receipt(tmp_path, ch
         series._atomic_json(receipt, {"validated": True, "unexpected": "change"})
     with pytest.raises(series.SeriesError):
         curves.read_source(source)
+
+
+def test_optional_mppi_catalog_extension_keeps_existing_runs_and_sources(tmp_path):
+    p = profile(tmp_path)
+    p["sources"] = [source_for(tmp_path, record(tmp_path, "prior"))]
+    original = curves.prepare(p)
+    before_sources = series._read(tmp_path / "curves" / "sources.json")
+    extended = deepcopy(p)
+    extended["identities"]["mppi"] = identity("mppi")
+    # Adding a controller can have a distinct audited scientific fingerprint.
+    extended["identities"]["mppi"]["science"]["source_sha256"] = "b" * 64
+    new = curves.prepare(extended)
+    assert new["curves"][:4] == original["curves"]
+    assert len(new["curves"]) == 5
+    assert new["curves"][-1]["mode"] == "mppi"
+    assert new["curves"][-1]["color"] == "#D97706"
+    assert curves.prepare(extended) == new
+    assert series._read(tmp_path / "curves" / "sources.json") == before_sources
+    with pytest.raises(series.SeriesError, match="retain every existing"):
+        curves.prepare(p)
+    changed = deepcopy(extended)
+    changed["identities"]["both"]["science"]["source_sha256"] = "c" * 64
+    with pytest.raises(series.SeriesError, match="Incompatible append"):
+        curves.prepare(changed)
+    assert series._read(tmp_path / "curves" / "catalog.json") == new
+
+
+def test_mppi_registers_pending_checkpoints_without_temperature_and_publishes_paired_gains(tmp_path):
+    p = profile(tmp_path)
+    p["identities"]["mppi"] = identity("mppi")
+    prior, raw = record(tmp_path, "prior"), record(tmp_path, "mppi", paired=False)
+    raw["metrics"].update({"diagnostics/inner_actor_entropy_mean": 0.,
+        "diagnostics/inner_alpha_final_mean": 0., "diagnostics/inner_final_outer_policy_kl_mean": 0.,
+        "work/temperature_updates": 0, "work/model_steps": 12336})
+    p["sources"] = [source_for(tmp_path, prior)]
+    source = source_for(tmp_path, raw, published=False)
+    cell = {key: source[key] for key in ("mode", "run_dir", "run_id")}
+    cell["step"] = 400000
+    catalog = curves.register_campaign(p, {"cells": [cell]})
+    assert curves.register_campaign(p, {"cells": [cell]}) == catalog
+    state = curves.stage(p, catalog)
+    assert state["missing"] == [("mppi", 400000)]
+    assert state["counts"]["mppi"] == 0
+    registered = series._read(tmp_path / "curves" / "sources.json")
+    assert "outer_alpha_by_step" not in registered[-1]
+    raw_journal = series._read(tmp_path / "raw" / source["run_id"] / "publication.json")
+    raw_journal["records"][raw["record_id"]]["status"] = "published"
+    series._atomic_json(tmp_path / "raw" / source["run_id"] / "publication.json", raw_journal)
+    complete = curves.stage(p, catalog, require_complete=True)
+    assert complete["counts"]["mppi"] == 1 and not complete["missing"]
+    derived = curves.derive(p, {"mode": "mppi"}, raw, {}, prior, tmp_path / "derived")
+    assert derived["metrics"]["eval/paired_gain_mean"] == statistics.mean(GAINS)
+    assert derived["metrics"]["eval/paired_gain_sample_std"] == statistics.stdev(GAINS)
+    assert derived["metrics"]["runtime/control_seconds"] == 10.
+    assert derived["metrics"]["work/model_steps"] == 12336
+    assert "work/temperature_updates" not in derived["metrics"]
+    assert "diagnostics/inner_actor_entropy_mean" not in derived["metrics"]
+    assert "diagnostics/inner_alpha_final_mean" not in derived["metrics"]
+    assert "diagnostics/inner_final_outer_policy_kl_mean" not in derived["metrics"]
+    assert derived["provenance"]["coefficient_rule"] is None

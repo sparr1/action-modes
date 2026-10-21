@@ -26,6 +26,7 @@ import numpy as np
 SCHEMA_VERSION = 1
 SEED_SCHEME = "sha256-v1"
 TDAMBI_PRIOR_REFERENCE = "native_tdmpc2_prior_mean-v1"
+AMBI_SAMPLED_PRIOR_REFERENCE = "ambi_sampled_prior-v1"
 ROOT_DECISIONS = (0, 100, 200, 300, 400)
 
 
@@ -84,8 +85,36 @@ def protocol_for(resolved, controller_seed, max_steps):
     return protocol
 
 
+def reference_protocol_for(resolved, controller_seed, max_steps):
+    """Add an opt-in reference comparison without changing legacy identities."""
+    protocol = protocol_for(resolved, controller_seed, max_steps)
+    reference = resolved.get("evaluation", {}).get("prior_reference")
+    if reference is not None:
+        config = resolved["algorithm_config"]
+        if (reference != AMBI_SAMPLED_PRIOR_REFERENCE
+                or protocol["action_rule"] != "mppi_weighted_elite"
+                or config.get("alg") != "AMBITDMPC2/AMBITDMPC2"):
+            raise ValueError("Sampled-prior pairing requires weighted-elite AMBI MPPI evaluation.")
+        protocol["prior_reference"] = reference
+    return protocol
+
+
 def episode_protocol(protocol):
     return {key: value for key, value in protocol.items() if key != "root_bank_id"}
+
+
+def sampled_prior_protocol(protocol):
+    """Explicitly pair MPPI evaluation with its sampled frozen actor baseline.
+
+    Action rules remain distinct in identities; only this named comparison
+    permits the difference, while all environment and RNG fields must match.
+    """
+    expected = episode_protocol(protocol)
+    if (expected.pop("prior_reference", None) != AMBI_SAMPLED_PRIOR_REFERENCE
+            or expected.get("action_rule") != "mppi_weighted_elite"):
+        raise ValueError("Invalid MPPI/sample-prior pairing protocol.")
+    expected["action_rule"] = "tanh_sample"
+    return expected
 
 
 def atomic_json(path, value, *, overwrite=False):
@@ -238,7 +267,9 @@ def reference_returns(path, checkpoint_sha256, protocol, *, checkpoint_inventory
         raise ValueError("Prior reference must be a completed benchmark bundle.")
     if manifest.get("checkpoint", {}).get("sha256") != checkpoint_sha256:
         raise ValueError("Prior reference checkpoint does not match.")
-    if episode_protocol(manifest.get("protocol", {})) != episode_protocol(protocol):
+    sampled_reference = protocol.get("prior_reference") == AMBI_SAMPLED_PRIOR_REFERENCE
+    expected_protocol = sampled_prior_protocol(protocol) if sampled_reference else episode_protocol(protocol)
+    if episode_protocol(manifest.get("protocol", {})) != expected_protocol:
         raise ValueError("Prior reference environment/action/seed protocol does not match.")
     runs = [run for run in manifest["runs"] if
             run.get("config", {}).get("alg_params", {}).get("inner_operator") == "none"
@@ -250,6 +281,29 @@ def reference_returns(path, checkpoint_sha256, protocol, *, checkpoint_inventory
     values = {episode["seed"]: episode["return"] for episode in episodes}
     if len(values) != len(episodes) or not all(math.isfinite(value) for value in values.values()):
         raise ValueError("Prior reference has duplicate seeds or non-finite returns.")
+    if sampled_reference:
+        checkpoint = manifest["checkpoint"]
+        reference_source = checkpoint.get("source_run")
+        if not reference_source or (source_run is not None and reference_source != source_run):
+            raise ValueError("Sampled prior reference backbone does not match.")
+        result = runs[0].get("result", {})
+        if (result.get("outer_state_unchanged") is not True
+                or not isinstance(result.get("outer_updates_before"), int)
+                or result.get("outer_updates_before") != result.get("outer_updates_after")):
+            raise ValueError("Sampled prior reference lacks frozen-state validation.")
+        if seeds is not None and sorted(values) != sorted(seeds):
+            raise ValueError("Sampled prior reference episode seeds do not match.")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        files = {"reference/manifest.json": str(path.resolve())}
+        provenance = {
+            "format": AMBI_SAMPLED_PRIOR_REFERENCE, "source_run": reference_source,
+            "checkpoint_sha256": checkpoint_sha256,
+            "checkpoint_step": checkpoint.get("metadata", {}).get("checkpoint", {}).get("step"),
+            "source_result_sha256": digest, "source_protocol": expected_protocol,
+            "evaluation_protocol": episode_protocol(protocol), "episodes": episodes,
+            "files": {"reference/manifest.json": digest},
+        }
+        return PriorReference(values, provenance, files)
     return values
 
 

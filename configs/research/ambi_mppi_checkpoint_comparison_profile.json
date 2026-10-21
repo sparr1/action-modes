@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "source_run": "rwgao_b-brown-university/ambi/mppi7530927x0",
+  "checkpoints": [
+    {
+      "metadata": "/oscar/scratch/rgao48/ambi/full-training/mppi-20261017/core/cell-0/ambi_mppi_training_2026-10-17_20-34-41/models/model:ambi_full_h3_mppi_aux_return_0_400000.metadata.json",
+      "metadata_sha256": "5e1ae9fa53c00adff4424c9a1f2d05eed7233619de0997fbae9b09575f38ba76",
+      "checkpoint_bytes": 119764666,
+      "step": 400000,
+      "checkpoint": "/oscar/scratch/rgao48/ambi/full-training/mppi-20261017/core/cell-0/ambi_mppi_training_2026-10-17_20-34-41/models/model:ambi_full_h3_mppi_aux_return_0_400000",
+      "checkpoint_sha256": "6efaf10a557e39dd396f735014e35d632ecd8cbbba5c28f6dbbe5841c6b1b561",
+      "source_run": "rwgao_b-brown-university/ambi/mppi7530927x0",
+      "backbone_id": "mppi_aux",
+      "reference_bundle": "/oscar/scratch/rgao48/ambi/early-h3-j8-eval/20261018-a0d73c82/baselines-8401ce40/cell-07/bundle",
+      "reference_manifest_sha256": "1588d096ce9a030f78140ad67c334886609f8f075cefb0008dbec0364d8608de",
+      "reference_results": "/oscar/scratch/rgao48/ambi/early-h3-j8-eval/20261018-a0d73c82/baselines-8401ce40/cell-07/results.json",
+      "reference_results_sha256": "92c098f4fc6ae7ebab5d3e84449101b2de405ece393261faca5b001c7ff75d0b"
+    },
+    {
+      "metadata": "/oscar/scratch/rgao48/ambi/full-training/mppi-20261017/core/cell-0/ambi_mppi_training_2026-10-17_20-34-41/models/model:ambi_full_h3_mppi_aux_return_0_500000.metadata.json",
+      "metadata_sha256": "8586897f7f6521f2789994099a85bf48a2de7418a7d87d48bb64c8dfd94dde7f",
+      "checkpoint_bytes": 119764666,
+      "step": 500000,
+      "checkpoint": "/oscar/scratch/rgao48/ambi/full-training/mppi-20261017/core/cell-0/ambi_mppi_training_2026-10-17_20-34-41/models/model:ambi_full_h3_mppi_aux_return_0_500000",
+      "checkpoint_sha256": "bc4350c9b603b3b888f344eb91f0ff65c81a342bb60dec235388cd6acc580345",
+      "source_run": "rwgao_b-brown-university/ambi/mppi7530927x0",
+      "backbone_id": "mppi_aux",
+      "reference_bundle": "/oscar/scratch/rgao48/ambi/entropy-kl-mppi500k/20261020-v2/episodes/production/prior/bundle",
+      "reference_manifest_sha256": "b321bb897d2ce61b4fce25eb0c1404dd7d35b86e664b8167719616716cdbe1b6",
+      "reference_results": "/oscar/scratch/rgao48/ambi/entropy-kl-mppi500k/20261020-v2/episodes/production/prior/results.json",
+      "reference_results_sha256": "553f44976ffd17d9ed85cb0909a913f5d56bcccaeb450e4e76621e3e32694b05"
+    }
+  ]
+}

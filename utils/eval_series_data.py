@@ -230,10 +230,17 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
                  "evaluate_tdmpc2_mppi_checkpoint"}
                 if evaluator.startswith("evaluate_tdmpc2") else
                 {"_make_env", "_seed_spaces", "_initialize_frozen_model", "evaluate_preset"})
+    if "AMBI" in algorithm and controller == "mppi":
+        selected = selected | {"evaluate_mppi_preset"}
     try:
         entries = _git_output(root, "ls-tree", "-rz", commit, "--", *paths)
         names = sorted(entry.split(b"\t", 1)[1].decode() for entry in entries.split(b"\0") if entry)
         _require(paths[0] in names, "Pinned algorithm source is incomplete")
+        if ("AMBI" in algorithm and controller == "mppi"
+                and b"def evaluate_mppi_preset(" in _git_output(root, "show", f"{commit}:{evaluator}")):
+            # New native-MPPI bundles pin the planner itself. Keep historical
+            # identities intact for commits predating this evaluation path.
+            names = sorted({*names, "RL/tdmpc2_core/mppi.py"})
         hashes = {}
         helper_selections = ({"utils/ambi_benchmark.py": {"canonical_hash", "solver_seed", "protocol_for"}}
                              if evaluator == "evaluate_ambi_checkpoint.py" else {})
@@ -789,6 +796,21 @@ def validate_tdmpc2_prior_pairing(prior, protocol, seeds=None):
 def _bundle_prior_reference(manifest, path, checkpoint, source):
     """Revalidate a portable native-prior reference before publication."""
     reference = manifest.get("reference", {})
+    if reference.get("format") == "ambi_sampled_prior-v1":
+        from utils.ambi_benchmark import reference_returns
+
+        name = "reference/manifest.json"
+        _require(set(reference.get("files", {})) == {name}, "Missing exact sampled prior reference file")
+        file = (path.parent / name).resolve()
+        _require(file.is_relative_to(path.parent), "Reference artifact path escapes bundle")
+        _require(file.is_file() and _file_hash(file) == reference["files"][name],
+                 "Reference artifact hash mismatch")
+        _require(reference.get("checkpoint_step") == checkpoint["step"], "Reference checkpoint mismatch")
+        validated = reference_returns(file, checkpoint["sha256"], manifest.get("protocol", {}),
+                                      source_run=source)
+        portable = {key: value for key, value in reference.items() if key != "path"}
+        _require(validated.provenance == portable, "Sampled prior provenance differs from saved source")
+        return dict(validated), {name: str(file)}
     if reference.get("format") != "tdmpc2-paired-prior":
         return {}, {}
     _require(reference.get("checkpoint_sha256") == checkpoint["sha256"] and
@@ -868,6 +890,9 @@ def normalize_bundle(path, *, checkpoint_inventory=None, source_run=None):
         elif config.get("inner_operator") == "tdambi":
             _require(not any("paired_return_delta" in episode for episode in episodes),
                      "TDAMBI paired gains require a validated native prior reference")
+        elif protocol.get("prior_reference") == "ambi_sampled_prior-v1":
+            _require(not any("paired_return_delta" in episode for episode in episodes),
+                     "MPPI paired gains require a validated sampled prior reference")
         if result.get("episodes"):
             returned = {ep["seed"]: ep for ep in result["episodes"]}
             _require(set(returned) == set(seeds), "Returned episode seeds differ from bundle")
@@ -896,6 +921,8 @@ def normalize_bundle(path, *, checkpoint_inventory=None, source_run=None):
                       "legacy_run_status": run.get("status"), "missing_artifact_files": missing,
                       "resolved_config": config, "checkpoint_metadata": cp.get("metadata"),
                       "reference": manifest.get("reference"), "source_result_sha256": _file_hash(path)}
+        if run.get("timing_convention") is not None:
+            provenance["timing_convention"] = copy.deepcopy(run["timing_convention"])
         label = descriptive_label(identity, run.get("selector"))
         record = _record(identity, checkpoint, episodes, artifacts, provenance, path, label,
                          run.get("selector", controller), controller)

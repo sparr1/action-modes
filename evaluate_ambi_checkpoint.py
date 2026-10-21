@@ -117,7 +117,7 @@ def build_parser():
         help="Record rather than fail on NaN/Inf model diagnostics.",
     )
     parser.add_argument("--metadata", type=Path, help="Checkpoint sidecar override for checkpoint-based matrices.")
-    parser.add_argument("--bundle-dir", type=Path, help="Create a new portable benchmark bundle with full inner traces.")
+    parser.add_argument("--bundle-dir", type=Path, help="Create a portable benchmark bundle; MPPI records episode metrics without SAC update traces.")
     parser.add_argument("--save-root-bank", type=Path, help="Save shared observations from a prior-only evaluation (requires --bundle-dir).")
     parser.add_argument("--root-bank", type=Path, help="Evaluate the same saved observations with extra policy-quality probes.")
     parser.add_argument("--bank-only", action="store_true", help="Run shared-observation solves without full episodes.")
@@ -1004,6 +1004,32 @@ def evaluate_preset(
         _close_resources(model, env, primary_error=primary_error)
 
 
+def evaluate_mppi_preset(resolved, checkpoint, seeds, *, bundle=None, bundle_run=None, **kwargs):
+    """Publish native MPPI episodes without unsupported SAC update traces.
+
+    The existing frozen loop owns all model execution and RNG. MPPI has no
+    actor/critic updates to trace; its measured episode metrics and timing are
+    preserved without altering the execution of existing SAC evaluations.
+    """
+    if (resolved["algorithm_config"]["alg_params"].get("inner_operator") != "mppi"
+            or kwargs.get("root_bank") is not None or kwargs.get("bank_only")
+            or kwargs.get("captured_roots") is not None or kwargs.get("togo_return_rollouts", 0)):
+        raise ValueError("MPPI bundle evaluation supports full episodes without SAC bank/probe traces.")
+    result = evaluate_preset(resolved, checkpoint, seeds, **kwargs)
+    result["timing_convention"] = {
+        "version": 1, "control_seconds_scope": "model.predict_wall_time",
+        "unscored_warmup_actions": 0, "first_call_startup_included": True,
+        "model_initialization_included": False, "environment_step_included": False,
+    }
+    if bundle is not None:
+        if bundle_run is None:
+            raise ValueError("MPPI bundle evaluation requires its owned run.")
+        bundle_run["timing_convention"] = copy.deepcopy(result["timing_convention"])
+        for episode in result["episodes"]:
+            bundle.episode(bundle_run, episode, [])
+    return result
+
+
 def evaluate_matrix(
     matrix_path,
     checkpoint,
@@ -1075,7 +1101,7 @@ def evaluate_matrix(
         max_steps = evaluation.get("max_steps")
 
     from utils.ambi_benchmark import (
-        BenchmarkBundle, atomic_json, load_bank, make_bank, protocol_for, reference_returns,
+        BenchmarkBundle, atomic_json, load_bank, make_bank, reference_protocol_for, reference_returns,
     )
     context = None
     if matrix["base_alg_config"] == "checkpoint":
@@ -1124,8 +1150,8 @@ def evaluate_matrix(
             params = resolved["algorithm_config"]["alg_params"]
             if _observation_architecture_key(resolved)[0] != "state":
                 raise ValueError("Benchmark bundles currently support state observations only.")
-            if params.get("inner_operator", "sac") not in {"none", "sac", "tdambi"}:
-                raise ValueError("Benchmark bundles currently support prior-only, SAC, and TDAMBI presets.")
+            if params.get("inner_operator", "sac") not in {"none", "sac", "tdambi", "mppi"}:
+                raise ValueError("Benchmark bundles support prior-only, SAC, TDAMBI, and MPPI presets.")
             scopes = [key for key in params if key.startswith("inner_") and key.endswith("_scope")
                       and key != "inner_mppi_warm_start_scope"]
             if any(params[key] != "action" for key in scopes):
@@ -1135,14 +1161,14 @@ def evaluate_matrix(
             if int(params.get("inner_diagnostic_rollouts", 0)) != 0:
                 raise ValueError("Use bank probes for extra imagined evaluations; set inner_diagnostic_rollouts=0.")
     checkpoint_sha256 = _file_sha256(checkpoint)
-    protocols = [protocol_for(resolved, controller_seed, max_steps) for resolved in resolved_presets]
+    protocols = [reference_protocol_for(resolved, controller_seed, max_steps) for resolved in resolved_presets]
     if bundle_dir is not None and any(protocol != protocols[0] for protocol in protocols):
         raise ValueError("A benchmark bundle must use one common environment/action protocol.")
     protocol = protocols[0]
     root_bank = load_bank(root_bank_path, checkpoint_sha256, protocol) if root_bank_path else None
     reference_options = ({"checkpoint_inventory": checkpoint_inventory,
                           "source_run": source_run or matrix.get("source_run"), "seeds": seeds}
-                         if tdambi else {})
+                         if tdambi or protocol.get("prior_reference") == "ambi_sampled_prior-v1" else {})
     reference = (reference_returns(reference_bundle, checkpoint_sha256, protocol, **reference_options)
                  if reference_bundle else None)
     if reference is not None and not bank_only and any(int(seed) not in reference for seed in seeds):
@@ -1186,13 +1212,16 @@ def evaluate_matrix(
                                    else "paired.json")
             reference_metadata = bundle.manifest.setdefault("reference", {})
             reference_metadata["path"] = str(reference_path.resolve())
-            if reference_metadata.get("format") != "tdmpc2-paired-prior":
+            if reference_metadata.get("format") not in {"tdmpc2-paired-prior", "ambi_sampled_prior-v1"}:
                 reference_metadata["manifest_sha256"] = _file_sha256(reference_path)
         for resolved in resolved_presets:
             kind = "bank" if bank_only else "both" if root_bank is not None else "episodes"
             bundle_run = bundle.start_run(resolved, kind) if bundle is not None else None
             try:
-                result = evaluate_preset(
+                evaluate = (evaluate_mppi_preset
+                            if resolved["algorithm_config"]["alg_params"].get("inner_operator") == "mppi"
+                            else evaluate_preset)
+                result = evaluate(
                     resolved, checkpoint, seeds,
                     controller_seed=controller_seed, max_steps=max_steps, device=device,
                     allow_nonfinite_metrics=allow_nonfinite_metrics,

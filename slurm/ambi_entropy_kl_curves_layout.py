@@ -26,7 +26,7 @@ from slurm.ambi_entropy_kl_mppi500k_publish import METRICS
 PREFIX = 'Entropy and KL checkpoint curves / '
 REPLACED_PREFIX = 'MPPI 500k objectives / '
 MODES = {'prior', 'entropy', 'kl', 'both'}
-PANEL_COUNT = len(METRICS) + 3
+PANEL_COUNT = len(METRICS) + 4
 WORKSPACE_NAME = 'MPPI-trained backbone: entropy and KL checkpoint curves'
 
 
@@ -54,8 +54,10 @@ def validate_catalog(catalog):
         if not isinstance(catalog.get(key), str) or not re.fullmatch(r'[A-Za-z0-9_.-]+', catalog[key]):
             raise LayoutError('Invalid catalog ' + key)
     rows = catalog.get('curves')
-    if not isinstance(rows, list) or len(rows) != 4 or {r.get('mode') for r in rows} != MODES:
-        raise LayoutError('Catalog must contain the four independently identified methods')
+    if (not isinstance(rows, list) or len(rows) not in (4, 5)
+            or {r.get('mode') for r in rows} not in (MODES, MODES | {'mppi'})
+            or len({r.get('mode') for r in rows}) != len(rows)):
+        raise LayoutError('Catalog must contain the four original methods and optional independent MPPI')
     for row in rows:
         if (not isinstance(row.get('run_id'), str) or not re.fullmatch(r'[A-Za-z0-9_-]+', row['run_id'])
                 or not isinstance(row.get('name'), str) or not row['name'].strip()
@@ -114,7 +116,7 @@ refinement. No averaging across controllers, smoothing, or synthetic results
 are applied. Missing checkpoints remain missing; a single measurement is one
 point until another compatible checkpoint result is available.
 
-Adapted controllers use H3/J8/C16/A4/N128/B256, sampled execution, five matched
+Inner-SAC controllers use H3/J8/C16/A4/N128/B256, sampled execution, five matched
 environment seeds and frozen outer state. Where KL is enabled, beta equals the
 saved outer alpha for that checkpoint; this is the same coefficient rule across
 checkpoints, not a claim that its numeric value is constant across training.
@@ -128,6 +130,16 @@ prior timing comparisons are omitted: historical prior evaluations used
 different compilation and probe settings. Adapted-controller timings use
 measured episode controller time. Full traces remain on Oscar.
 '''
+    if any(row['mode'] == 'mppi' for row in rows):
+        markdown += '''
+The orange MPPI curve evaluates H3 planning on the same frozen checkpoint,
+using the auxiliary return critic for terminal bootstrap. Its own planner and
+action-selection settings remain explicitly identified in its run configuration.
+MPPI gains use the same sampled-prior episodes; no prior episodes are rerun.
+MPPI has no inner actor, temperature, or prior-KL update, so those diagnostics
+are absent rather than plotted as zero. Pending checkpoints appear in progress
+counts until their complete five-seed results have been verified and published.
+'''
     def plot(title, metric):
         return wr.LinePlot(title=title, x=series.X_AXIS, y=[metric], aggregate=False,
             smoothing_type='none', legend_template='${run:name}', max_runs_to_show=len(rows),
@@ -138,9 +150,11 @@ measured episode controller time. Full traces remain on Oscar.
     return [ws.Section(name=PREFIX + 'Protocol and progress', is_open=True, panels=[
         wr.MarkdownPanel(markdown=markdown, layout=wr.Layout(w=24, h=10)),
         wr.ScalarChart(title='Published checkpoints per method', metric='progress/checkpoints_complete',
-                       layout=wr.Layout(w=12, h=6)),
+                       layout=wr.Layout(w=8, h=6)),
+        wr.ScalarChart(title='Pending checkpoint results', metric='progress/checkpoints_pending',
+                       layout=wr.Layout(w=8, h=6)),
         wr.ScalarChart(title='Failed checkpoint cells', metric='progress/failed_cells',
-                       layout=wr.Layout(w=12, h=6))]),
+                       layout=wr.Layout(w=8, h=6))]),
         ws.Section(name=PREFIX + 'Return and improvement', is_open=True,
                    panels=[plot(*item) for item in METRICS[:5]]),
         ws.Section(name=PREFIX + 'Runtime and policy diagnostics', is_open=True,
@@ -254,7 +268,7 @@ def _verify_view_spec(spec, catalog):
         except json.JSONDecodeError as exc:
             raise LayoutError('Saved native view has invalid JSON') from exc
     wire = json.dumps(spec, ensure_ascii=False)
-    tokens = [PREFIX, series.X_AXIS, 'progress/checkpoints_complete', 'progress/failed_cells',
+    tokens = [PREFIX, series.X_AXIS, 'progress/checkpoints_complete', 'progress/checkpoints_pending', 'progress/failed_cells',
               *[metric for _, metric in METRICS],
               *[row[key] for row in catalog['curves'] for key in ('run_id', 'name', 'color')]]
     if any(token not in wire for token in tokens):

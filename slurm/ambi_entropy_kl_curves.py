@@ -24,7 +24,9 @@ METHODS = {
     "entropy": ("MPPI-trained | entropy only | H3 J8", "#0F766E"),
     "kl": ("MPPI-trained | KL only | beta = checkpoint alpha | H3 J8", "#DB2777"),
     "both": ("MPPI-trained | entropy + KL | beta = checkpoint alpha | H3 J8", "#2563EB"),
+    "mppi": ("MPPI-trained | MPPI | auxiliary return terminal | H3", "#D97706"),
 }
+BASE_METHODS = {"prior", "entropy", "kl", "both"}
 KL_RULE = {"kind": "checkpoint_outer_alpha", "multiplier": 1.0, "within_solve": "fixed"}
 
 
@@ -43,31 +45,42 @@ def canonical_identity(identity, mode, outer_alpha=None):
 
 
 def prepare(profile, root=None):
+    modes = set(profile["identities"])
+    if modes not in (BASE_METHODS, set(METHODS)):
+        raise series.SeriesError("Curve profile requires the four original methods and optional MPPI")
     root = Path(root or profile["root"])
     root.mkdir(parents=True, exist_ok=True)
     with series._lock(root / ".curves.lock"):
         path = root / "catalog.json"
         if path.exists():
             catalog = series._read(path)
-            if catalog["family"] != profile["family"]:
+            if any(catalog[key] != profile[key] for key in
+                   ("family", "entity", "project", "owner", "workspace_url")):
                 raise series.SeriesError("Existing curve catalog belongs to another comparison")
+            existing_modes = {curve["mode"] for curve in catalog["curves"]}
+            if not existing_modes <= modes:
+                raise series.SeriesError("The profile must retain every existing curve identity")
             for curve in catalog["curves"]:
                 series.validate_identity(series.load_run(curve["run_dir"]), profile["identities"][curve["mode"]])
-            return catalog
-        curves = []
+            curves = deepcopy(catalog["curves"])
+        else:
+            catalog = {key: profile[key] for key in ("family", "entity", "project", "owner", "workspace_url")}
+            catalog.update(schema_version=1, root=str(root.resolve()), curves=[])
+            curves = []
+            series._atomic_json(root / "sources.json", profile["sources"])
         for mode, (name, color) in METHODS.items():
+            if mode not in modes or any(row["mode"] == mode for row in curves):
+                continue
             registry = series.create_run(root / "runs", dict(identity=profile["identities"][mode], label=name),
                 profile["family"], profile["project"], profile["entity"], profile["owner"])
             curves.append(dict(mode=mode, name=name, color=color, run_id=registry["run_id"], run_dir=registry["run_dir"]))
-        catalog = {key: profile[key] for key in ("family", "entity", "project", "owner", "workspace_url")}
-        catalog.update(schema_version=1, root=str(root.resolve()), curves=curves)
-        series._atomic_json(root / "sources.json", profile["sources"])
+        catalog["curves"] = curves
         series._atomic_json(path, catalog)
         return catalog
 
 
 def register_campaign(profile, campaign):
-    """Explicitly append a campaign's raw sources to the same four curve IDs."""
+    """Explicitly append raw sources while retaining all existing curve IDs."""
     catalog = prepare(profile)
     root = Path(catalog["root"])
     with series._lock(root / ".curves.lock"):
@@ -75,19 +88,23 @@ def register_campaign(profile, campaign):
         for cell in campaign["cells"]:
             registry = series.load_run(cell["run_dir"])
             mode, step = cell["mode"], cell["step"]
+            if registry["run_id"] != cell["run_id"]:
+                raise series.SeriesError("Campaign run ID differs from its source registry")
             identity = canonical_identity(registry["identity"], mode, cell.get("outer_alpha"))
             if identity != profile["identities"][mode]:
                 raise series.SeriesError("Campaign differs from the selected checkpoint curve recipe")
             source = dict(mode=mode, run_dir=cell["run_dir"], run_id=cell["run_id"],
-                expected_checkpoint_steps=[step], expected_identity_sha256=registry["identity_sha256"],
-                outer_alpha_by_step={str(step): cell["outer_alpha"]})
+                expected_checkpoint_steps=[step], expected_identity_sha256=registry["identity_sha256"])
+            if "outer_alpha" in cell:
+                source["outer_alpha_by_step"] = {str(step): cell["outer_alpha"]}
             existing = next((s for s in sources if s.get("run_id") == cell["run_id"]), None)
             if existing is not None:
                 if any(existing.get(k) != source[k] for k in ("mode", "run_dir", "expected_identity_sha256")):
                     raise series.SeriesError("Registered source identity changed")
                 if step not in existing["expected_checkpoint_steps"]:
                     existing["expected_checkpoint_steps"].append(step)
-                existing.setdefault("outer_alpha_by_step", {})[str(step)] = cell["outer_alpha"]
+                if "outer_alpha" in cell:
+                    existing.setdefault("outer_alpha_by_step", {})[str(step)] = cell["outer_alpha"]
             else:
                 sources.append(source)
         series._atomic_json(root / "sources.json", sources)
@@ -163,6 +180,14 @@ def derive(profile, source, raw, provenance, prior, root):
         # Old prior jobs had different instrumentation/compilation. Their
         # return semantics agree; timing and inner diagnostics are not joined.
         metrics = {k: v for k, v in metrics.items() if k.startswith("eval/")}
+    elif mode == "mppi":
+        # MPPI has no learned inner actor or temperature. Keep actual planner
+        # work and timing, but do not draw zero-valued SAC diagnostics for it.
+        metrics = {k: v for k, v in metrics.items()
+                   if not k.startswith(("diagnostics/inner_actor", "diagnostics/inner_alpha",
+                                        "diagnostics/inner_final_outer_policy_kl",
+                                        "diagnostics/inner_temperature"))
+                   and k not in {"work/actor_updates", "work/critic_updates", "work/temperature_updates"}}
     metrics.update({"eval/paired_gain_mean": statistics.mean(gains),
         "eval/paired_gain_sample_std": statistics.stdev(gains), "eval/paired_episodes": 5,
         "reference/return_mean": statistics.mean(ep["return"] for ep in prior_episodes),
@@ -206,7 +231,7 @@ def stage(profile, catalog, *, require_complete=False):
             loaded.append((source, record, provenance))
     if require_complete and missing:
         raise series.SeriesError(f"Missing published source results: {missing}")
-    counts = {mode: 0 for mode in METHODS}
+    counts = {curve["mode"]: 0 for curve in catalog["curves"]}
     directories = {r["mode"]: r["run_dir"] for r in catalog["curves"]}
     for source, raw, provenance in sorted(loaded, key=lambda row: (row[1]["checkpoint"]["step"], row[0]["mode"])):
         prior = seen.get(("prior", raw["checkpoint"]["step"]))
@@ -239,6 +264,7 @@ def publish(profile, catalog, *, require_complete=False, wandb_module=None):
                 pending = sum(mode == curve["mode"] for mode, _ in result["missing"])
                 publisher.run.summary.update({"progress/checkpoints_complete": result["counts"][curve["mode"]],
                     "progress/checkpoints_expected": result["counts"][curve["mode"]] + pending,
+                    "progress/checkpoints_pending": pending,
                     "progress/status": "pending results" if pending else "complete", "progress/failed_cells": 0})
         series._atomic_json(root / "status.json", result)
         return result
