@@ -8,10 +8,11 @@
 
 # Explicit resources: smoke needs one GPU and two physical CPUs for SAC/MPPI,
 # or four for the no-inner baseline. Production uses a measured allocation.
-# Supply --signal=USR1@900 for production. Each job selects one one-cell
+# Supply --signal=USR1@900 only for exact-continuation production. Each job selects one one-cell
 # manifest and one durable lineage; independent SAC/MPPI gates may run together.
 # For ordinary GPU-eligible replay without continuation, set
-# AMBI_RETURN_CONTINUATION=off and submit with --no-requeue; see REPLAY_PLACEMENT.md.
+# AMBI_RETURN_CONTINUATION=off, submit with --no-requeue, and omit --signal;
+# see REPLAY_PLACEMENT.md.
 set -Eeuo pipefail
 umask 077
 : "${SLURM_JOB_ID:?Submit through Slurm.}"

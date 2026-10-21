@@ -13,7 +13,8 @@ does not guarantee identical free memory at production startup.
 To select this mode with the Oscar wrapper, set
 `AMBI_RETURN_CONTINUATION=off` for **both** the smoke and training submissions,
 and pass `sbatch --no-requeue` for both. The command-line override supersedes
-the wrapper's default `#SBATCH --requeue`. Set the existing
+the wrapper's default `#SBATCH --requeue`. Omit `--signal=USR1@900` in this mode:
+the drain signal handler belongs to exact continuation. Set the existing
 `AMBI_RETURN_MODE=smoke` for the gate and `AMBI_RETURN_MODE=train` for training,
 along with the normal pinned checkout, interpreter, manifest, output, and
 measured resource selections. For example, after setting those campaign
