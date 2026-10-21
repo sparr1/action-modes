@@ -9,7 +9,8 @@ from slurm import ambi_mppi_checkpoint_comparison as driver
 def test_resolved_mppi_recipe_matches_training_planner_and_has_no_updates():
     from test_ambi_research_presets import _build_cfg
     from utils.ambi_benchmark import reference_protocol_for
-    matrix = driver.read(driver.MATRIX)
+    from utils.ambi_research import load_preset_matrix
+    matrix = load_preset_matrix(driver.MATRIX)
     driver.validate_matrix(matrix)
     base = driver.read(driver.REPO/'configs/dmcontrol/algs/ambi_full_h3_mppi_aux_return.json')
     base['alg_params'].update(matrix['shared_alg_params'])

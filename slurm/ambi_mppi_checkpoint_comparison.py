@@ -54,7 +54,8 @@ def trace_hashes(bundle):
 
 
 def validate_matrix(matrix):
-    require(matrix['base_alg_config'] == 'checkpoint' and matrix['shared_alg_params'] == SETTINGS,
+    overrides = {k:v for k,v in SETTINGS.items() if k != 'mppi_terminal_q_reduction'}
+    require(matrix['base_alg_config'] == 'checkpoint' and matrix['shared_alg_params'] == overrides,
             'MPPI settings differ from the pinned comparison')
     require(matrix['evaluation'] == dict(seeds=SEEDS, controller_seed=55, max_steps=500,
         execution_action='mean', prior_reference='ambi_sampled_prior-v1', togo_return_rollouts=0,

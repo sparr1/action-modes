@@ -18,7 +18,6 @@
     "inner_critic_source": "aux_return",
     "inner_horizon_actor_source": "sac",
     "inner_horizon_critic_source": "aux_return",
-    "mppi_terminal_q_reduction": "mean_pair",
     "inner_diagnostic_rollouts": 0,
     "inner_diagnostics_every": 1000,
     "wandb": false,
