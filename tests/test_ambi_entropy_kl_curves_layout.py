@@ -141,13 +141,20 @@ def test_catalog_rejects_ambiguous_or_wrong_target_identity(invalid):
     with pytest.raises(layout.LayoutError):layout.validate_catalog(value)
 
 
-def test_pinned_sdk_serialization_and_server_color_readback(tmp_path, monkeypatch):
+@pytest.mark.parametrize('retrace', [False, True])
+def test_pinned_sdk_serialization_and_server_color_readback(tmp_path, monkeypatch, retrace):
     ws = pytest.importorskip('wandb_workspaces.workspaces')
     wr = pytest.importorskip('wandb_workspaces.reports.v2')
     if (layout.importlib.metadata.version('wandb') != '0.28.1'
             or layout.importlib.metadata.version('wandb-workspaces') != '0.4.5'):
         pytest.skip('Needs the isolated pinned layout runtime')
     value = catalog()
+    if retrace:
+        from slurm.ambi_entropy_kl_curves import METHODS
+        for mode in ('mppi', 'retrace_kl', 'retrace_both'):
+            name, color = METHODS[mode]
+            value['curves'].append(dict(mode=mode, run_id='run' + str(len(value['curves'])),
+                                       run_dir='/runs/' + mode, name=name, color=color))
     initial = ws.Workspace(entity='entity', project='project', sections=[
         ws.Section(name='User notes', panels=[]),
         ws.Section(name=layout.REPLACED_PREFIX+'old', panels=[])])
@@ -168,7 +175,7 @@ def test_pinned_sdk_serialization_and_server_color_readback(tmp_path, monkeypatc
         return work
     monkeypatch.setattr(ws.Workspace, 'from_url', classmethod(read_back))
     result = layout.install_catalog(value, tmp_path/'layout.json')
-    assert result['api_verified'] and result['panel_count'] == layout.PANEL_COUNT
+    assert result['api_verified'] and result['panel_count'] == layout.panel_count(value)
     # Exercise conversion to the service model, including native ID filters.
     model = state['work']._to_model()
     wire = model.model_dump_json()
@@ -183,16 +190,16 @@ def remote_spec(value):
             overrideMarks={r['run_id']+':'+metric:'solid' for r in value['curves']},
             overrideSeriesTitles={r['run_id']+':'+metric:r['name'] for r in value['curves']},
             overrideColors={r['run_id']+':'+metric:dict(color=r['color'],transparentColor='#FFFFFF19')
-                            for r in value['curves']})) for _,metric in layout.METRICS])],
+                            for r in value['curves']})) for _,metric in layout.metrics_for(value)])],
         progress=['progress/checkpoints_complete','progress/checkpoints_pending','progress/failed_cells'])
 
 
 def receipt_for(value, path):
     urls = layout.validate_catalog(value)
     saved = dict(api_verified=True, catalog_sha256=layout.series._digest(value), curves=value['curves'],
-        panel_count=layout.PANEL_COUNT, url=urls[0], views=[dict(url=url,
+        panel_count=layout.panel_count(value), url=urls[0], views=[dict(url=url,
             view_id=layout._workspace_id(url,value['entity'],value['project']),
-            panel_count=layout.PANEL_COUNT, api_verified=True) for url in urls])
+            panel_count=layout.panel_count(value), api_verified=True) for url in urls])
     layout.series._atomic_json(path,saved)
     return saved
 
@@ -284,3 +291,37 @@ def test_only_explicit_mppi_extension_is_accepted(extra_mode):
         name='Extra controller', color='#D97706'))
     with pytest.raises(layout.LayoutError):
         layout.validate_catalog(value)
+
+
+def test_retrace_adds_three_real_diagnostic_panels_and_retains_existing_five_curves(tmp_path):
+    from slurm.ambi_entropy_kl_curves import METHODS
+    value = catalog()
+    name, color = METHODS['mppi']
+    value['curves'].append(dict(mode='mppi', run_id='run4', run_dir='/runs/mppi', name=name, color=color))
+    sdk, state = backend(value)
+    original_receipt = layout.install_catalog(value, tmp_path / 'original.json', backend=sdk)
+    original = deepcopy(state['saved'][value['workspace_url']])
+    assert original_receipt['panel_count'] == 17
+    for mode in ('retrace_kl', 'retrace_both'):
+        name, color = METHODS[mode]
+        value['curves'].append(dict(mode=mode, run_id='run' + str(len(value['curves'])),
+                                   run_dir='/runs/' + mode, name=name, color=color))
+    receipt = layout.install_catalog(value, tmp_path / 'extended.json', backend=sdk)
+    assert receipt['api_verified'] and receipt['panel_count'] == 20
+    work = state['saved'][value['workspace_url']]
+    assert [s.name for s in work.sections] == [s.name for s in original.sections]
+    assert work.sections[0].panels[0].text == 'Keep me'
+    assert work.settings.max_runs == 7
+    before_plots, after_plots = plots(original), plots(work)
+    assert [p.y for p in after_plots[:len(before_plots)]] == [p.y for p in before_plots]
+    for before, after in zip(before_plots, after_plots):
+        assert all(after.line_colors[key] == value for key, value in before.line_colors.items())
+        assert all(after.line_titles[key] == value for key, value in before.line_titles.items())
+    assert [p.y[0] for p in after_plots[-3:]] == [m for _, m in layout.RETRACE_METRICS]
+    api, _, _ = api_for(remote_spec(value))
+    assert layout.verify_installed_catalog(value, tmp_path / 'extended.json', api)['api_verified']
+    bad_spec = remote_spec(value)
+    bad_spec['sections'][0]['panels'].pop()
+    api, _, _ = api_for(bad_spec)
+    with pytest.raises(layout.LayoutError):
+        layout.verify_installed_catalog(value, tmp_path / 'extended.json', api)

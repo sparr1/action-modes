@@ -26,12 +26,27 @@ from slurm.ambi_entropy_kl_mppi500k_publish import METRICS
 PREFIX = 'Entropy and KL checkpoint curves / '
 REPLACED_PREFIX = 'MPPI 500k objectives / '
 MODES = {'prior', 'entropy', 'kl', 'both'}
+OPTIONAL_MODES = {'mppi', 'retrace_kl', 'retrace_both'}
+RETRACE_METRICS = [
+    ('Retrace successor trace coefficient', 'diagnostics/inner_retrace_trace_coefficient_mean_mean'),
+    ('Retrace effective trace length', 'diagnostics/inner_retrace_effective_trace_length_mean'),
+    ('Retrace absolute target correction', 'diagnostics/inner_retrace_correction_abs_mean_mean'),
+]
 PANEL_COUNT = len(METRICS) + 4
 WORKSPACE_NAME = 'MPPI-trained backbone: entropy and KL checkpoint curves'
 
 
 class LayoutError(ValueError):
     """Catalog or persisted workspace does not satisfy the native curve contract."""
+
+
+def metrics_for(catalog):
+    retrace = any(row['mode'] in {'retrace_kl', 'retrace_both'} for row in catalog['curves'])
+    return METRICS + RETRACE_METRICS if retrace else METRICS
+
+
+def panel_count(catalog):
+    return len(metrics_for(catalog)) + 4
 
 
 def _workspace_id(url, entity, project):
@@ -54,10 +69,10 @@ def validate_catalog(catalog):
         if not isinstance(catalog.get(key), str) or not re.fullmatch(r'[A-Za-z0-9_.-]+', catalog[key]):
             raise LayoutError('Invalid catalog ' + key)
     rows = catalog.get('curves')
-    if (not isinstance(rows, list) or len(rows) not in (4, 5)
-            or {r.get('mode') for r in rows} not in (MODES, MODES | {'mppi'})
+    if (not isinstance(rows, list)
+            or not MODES <= {r.get('mode') for r in rows} <= MODES | OPTIONAL_MODES
             or len({r.get('mode') for r in rows}) != len(rows)):
-        raise LayoutError('Catalog must contain the four original methods and optional independent MPPI')
+        raise LayoutError('Catalog must contain the four original methods and only supported independent controllers')
     for row in rows:
         if (not isinstance(row.get('run_id'), str) or not re.fullmatch(r'[A-Za-z0-9_-]+', row['run_id'])
                 or not isinstance(row.get('name'), str) or not row['name'].strip()
@@ -140,6 +155,16 @@ MPPI has no inner actor, temperature, or prior-KL update, so those diagnostics
 are absent rather than plotted as zero. Pending checkpoints appear in progress
 counts until their complete five-seed results have been verified and published.
 '''
+    if any(row['mode'] in {'retrace_kl', 'retrace_both'} for row in rows):
+        markdown += '''
+Purple and green identify the additional Retrace KL-only and Retrace entropy
+plus KL controllers. Their critic uses the explicitly configured Retrace
+estimator; lambda, trajectory batch size and complete resolved settings remain
+part of each curve's scientific identity. They retain the same checkpoint-alpha
+beta rule. Trace coefficient, effective trace length and absolute target
+correction panels show measured critic-update diagnostics averaged over each
+episode; controllers without Retrace have no values in those panels.
+'''
     def plot(title, metric):
         return wr.LinePlot(title=title, x=series.X_AXIS, y=[metric], aggregate=False,
             smoothing_type='none', legend_template='${run:name}', max_runs_to_show=len(rows),
@@ -158,7 +183,7 @@ counts until their complete five-seed results have been verified and published.
         ws.Section(name=PREFIX + 'Return and improvement', is_open=True,
                    panels=[plot(*item) for item in METRICS[:5]]),
         ws.Section(name=PREFIX + 'Runtime and policy diagnostics', is_open=True,
-                   panels=[plot(*item) for item in METRICS[5:]])]
+                   panels=[plot(*item) for item in metrics_for(catalog)[5:]])]
 
 
 def _verify(work, catalog, url, expected_filter, wr, expr):
@@ -168,7 +193,7 @@ def _verify(work, catalog, url, expected_filter, wr, expr):
         raise LayoutError('Saved workspace target changed')
     owned = [section for section in work.sections if section.name.startswith(PREFIX)]
     if (len(owned) != 3 or any(section.name.startswith(REPLACED_PREFIX) for section in work.sections)
-            or sum(len(section.panels) for section in owned) != PANEL_COUNT):
+            or sum(len(section.panels) for section in owned) != panel_count(catalog)):
         raise LayoutError('Connected curve sections are missing, duplicated or stale')
     settings = work.runset_settings
     if (settings.groupby or settings.query
@@ -182,7 +207,7 @@ def _verify(work, catalog, url, expected_filter, wr, expr):
             or not work.settings.tooltip_color_run_names):
         raise LayoutError('Saved checkpoint axis or native legend changed')
     plots = [p for section in owned for p in section.panels if isinstance(p, wr.LinePlot)]
-    expected_metrics = {metric for _, metric in METRICS}
+    expected_metrics = {metric for _, metric in metrics_for(catalog)}
     actual_metrics = set()
     for panel in plots:
         if (panel.aggregate or getattr(panel.x, 'name', panel.x) != series.X_AXIS
@@ -201,7 +226,7 @@ def _verify(work, catalog, url, expected_filter, wr, expr):
     if actual_metrics != expected_metrics:
         raise LayoutError('Saved layout lacks required metrics')
     return {'url': work.url, 'view_id': _workspace_id(url, work.entity, work.project),
-            'panel_count': PANEL_COUNT, 'api_verified': True}
+            'panel_count': panel_count(catalog), 'api_verified': True}
 
 
 def install_catalog(catalog, receipt_path, *, backend=None):
@@ -256,7 +281,7 @@ def install_catalog(catalog, receipt_path, *, backend=None):
         receipt.update(error_type=type(exc).__name__, error=str(exc))
         series._atomic_json(receipt_path, receipt)
         raise
-    receipt.update(api_verified=True, panel_count=PANEL_COUNT)
+    receipt.update(api_verified=True, panel_count=panel_count(catalog))
     series._atomic_json(receipt_path, receipt)
     return receipt
 
@@ -269,7 +294,7 @@ def _verify_view_spec(spec, catalog):
             raise LayoutError('Saved native view has invalid JSON') from exc
     wire = json.dumps(spec, ensure_ascii=False)
     tokens = [PREFIX, series.X_AXIS, 'progress/checkpoints_complete', 'progress/checkpoints_pending', 'progress/failed_cells',
-              *[metric for _, metric in METRICS],
+              *[metric for _, metric in metrics_for(catalog)],
               *[row[key] for row in catalog['curves'] for key in ('run_id', 'name', 'color')]]
     if any(token not in wire for token in tokens):
         raise LayoutError('Native workspace lost required panels, runs, names or colors')
@@ -283,7 +308,7 @@ def _verify_view_spec(spec, catalog):
                 yield from dictionaries(item)
     configs = [node['config'] for node in dictionaries(spec)
                if node.get('viewType') == 'Run History Line Plot' and isinstance(node.get('config'), dict)]
-    for _, metric in METRICS:
+    for _, metric in metrics_for(catalog):
         matches = [config for config in configs if config.get('metrics') == [metric]
                    and config.get('xAxis') == series.X_AXIS and config.get('aggregate') is False
                    and all(config.get('overrideMarks', {}).get(row['run_id'] + ':' + metric) == 'solid'
@@ -306,13 +331,13 @@ def verify_installed_catalog(catalog, receipt_path, wandb_module=None):
         raise LayoutError('Install and verify the native curve layout before publication')
     saved = series._read(receipt_path)
     if (saved.get('api_verified') is not True or saved.get('catalog_sha256') != series._digest(catalog)
-            or saved.get('curves') != catalog['curves'] or saved.get('panel_count') != PANEL_COUNT):
+            or saved.get('curves') != catalog['curves'] or saved.get('panel_count') != panel_count(catalog)):
         raise LayoutError('Native curve receipt does not match the verified catalog')
     expected_views = {_workspace_id(url, catalog['entity'], catalog['project']) for url in urls}
     views = saved.get('views', [])
     if (len(views) != len(expected_views)
             or {view.get('view_id') for view in views} != expected_views
-            or any(view.get('api_verified') is not True or view.get('panel_count') != PANEL_COUNT
+            or any(view.get('api_verified') is not True or view.get('panel_count') != panel_count(catalog)
                    or _workspace_id(view.get('url', ''), catalog['entity'], catalog['project']) != view['view_id']
                    for view in views)):
         raise LayoutError('Native curve receipt does not cover every requested workspace')

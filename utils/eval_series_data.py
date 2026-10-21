@@ -190,7 +190,8 @@ class _WithoutControlTiming(ast.NodeTransformer):
 
 
 @lru_cache(maxsize=128)
-def scientific_identity(algorithm, controller, commit, dirty=False, source_sha256=None):
+def scientific_identity(algorithm, controller, commit, dirty=False, source_sha256=None, *,
+                        return_estimator="one_step"):
     """Conservative scientific-source identity, excluding publisher/report code.
 
     Hash executable ASTs of the controller stack and environment. Evaluator
@@ -198,6 +199,10 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
     require an explicit compatibility audit; they are never silently accepted.
     Dirty legacy trees remain pinned to their saved complete source digest.
     """
+    _require(return_estimator in {"one_step", "retrace"}, "Unknown scientific return estimator")
+    if return_estimator == "retrace":
+        _require("AMBI" in algorithm and controller == "sac",
+                 "Retrace scientific identity requires the AMBI SAC controller")
     if dirty:
         _require(bool(source_sha256), "Dirty results lack saved source fingerprint")
         return {"version": 1, "algorithm": algorithm, "dirty_source_sha256": source_sha256}
@@ -221,6 +226,8 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
     else:
         paths = ["RL/TDMPC2.py", "RL/tdmpc2_core/agent.py", "RL/tdmpc2_core/mppi.py"]
     paths += ["RL/tdmpc2_core/common", "domains", "environments/dmcontrol/uv.lock"]
+    if return_estimator == "retrace":
+        paths.append("RL/tdmpc2_core/inner_retrace.py")
     evaluator = ("evaluate_tdmpc2_mppi_checkpoint.py" if algorithm == "TDMPC2/TDMPC2Baseline"
                  else "evaluate_ambi_checkpoint.py")
     # Main/CLI orchestrate publication; these functions implement scientific
@@ -236,6 +243,9 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
         entries = _git_output(root, "ls-tree", "-rz", commit, "--", *paths)
         names = sorted(entry.split(b"\t", 1)[1].decode() for entry in entries.split(b"\0") if entry)
         _require(paths[0] in names, "Pinned algorithm source is incomplete")
+        if return_estimator == "retrace":
+            _require("RL/tdmpc2_core/inner_retrace.py" in names,
+                     "Pinned Retrace implementation is unavailable")
         if ("AMBI" in algorithm and controller == "mppi"
                 and b"def evaluate_mppi_preset(" in _git_output(root, "show", f"{commit}:{evaluator}")):
             # New native-MPPI bundles pin the planner itself. Keep historical
@@ -581,7 +591,10 @@ def identity_for_ambi_checkpoint(checkpoint, resolved, protocol, seeds, code, *,
     return {"backbone": source, "planner": planner,
             "protocol": _episode_protocol(protocol, seeds, config, action),
             "science": scientific_identity(algorithm, controller, code.get("commit"),
-                                             code.get("dirty"), code.get("source_sha256"))}
+                                             code.get("dirty"), code.get("source_sha256"),
+                                             **({"return_estimator": "retrace"}
+                                                if controller == "sac" and config.get("inner_sac_return_estimator") == "retrace"
+                                                else {}))}
 
 
 def _native_planner(settings, planner_result, controller):
@@ -744,7 +757,9 @@ def _metrics(episodes):
                 metrics[f"work/{component}_updates"] = sum(value * length for value, length in values)
     for metric, candidates in {"model_steps": ("inner_realized_model_steps", "inner_model_steps"),
                                "policy_evaluations": ("inner_policy_evaluations",),
-                               "q_evaluations": ("inner_q_evaluations",)}.items():
+                               "q_evaluations": ("inner_q_evaluations",),
+                               "retrace_trajectory_draws": ("inner_retrace_trajectory_draws",),
+                               "retrace_critic_rows": ("inner_retrace_critic_rows",)}.items():
         for key in candidates:
             values = [(ep.get("model_metrics", {}).get(key), ep["length"]) for ep in episodes]
             if all(value is not None for value, _ in values):
@@ -910,7 +925,10 @@ def normalize_bundle(path, *, checkpoint_inventory=None, source_run=None):
             "inner_xqc" if planner["type"] == "xqc" else planner["type"])
         identity = {"backbone": source, "planner": planner, "protocol": protocol,
                     "science": scientific_identity(algorithm, controller, code.get("commit"),
-                                                     code.get("dirty"), code.get("source_sha256"))}
+                                                     code.get("dirty"), code.get("source_sha256"),
+                                                     **({"return_estimator": "retrace"}
+                                                        if controller == "sac" and config.get("inner_sac_return_estimator") == "retrace"
+                                                        else {}))}
         artifacts = {"manifest.json": str(path), **extra_files, **reference_files}
         missing = []
         for name in run.get("trace_files", []):

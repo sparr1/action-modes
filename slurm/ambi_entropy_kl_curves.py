@@ -25,8 +25,12 @@ METHODS = {
     "kl": ("MPPI-trained | KL only | beta = checkpoint alpha | H3 J8", "#DB2777"),
     "both": ("MPPI-trained | entropy + KL | beta = checkpoint alpha | H3 J8", "#2563EB"),
     "mppi": ("MPPI-trained | MPPI | auxiliary return terminal | H3", "#D97706"),
+    "retrace_kl": ("MPPI-trained | Retrace KL only | beta = checkpoint alpha | H3 J8", "#7C3AED"),
+    "retrace_both": ("MPPI-trained | Retrace entropy + KL | beta = checkpoint alpha | H3 J8", "#65A30D"),
 }
 BASE_METHODS = {"prior", "entropy", "kl", "both"}
+KL_METHODS = {"kl", "both", "retrace_kl", "retrace_both"}
+RETRACE_METHODS = {"retrace_kl", "retrace_both"}
 KL_RULE = {"kind": "checkpoint_outer_alpha", "multiplier": 1.0, "within_solve": "fixed"}
 
 
@@ -34,7 +38,13 @@ def canonical_identity(identity, mode, outer_alpha=None):
     result = deepcopy(identity)
     if mode not in METHODS:
         raise series.SeriesError("Unknown curve objective")
-    if mode in ("kl", "both"):
+    if mode in RETRACE_METHODS:
+        settings = result["planner"].get("settings", {})
+        if (result["planner"]["type"] != "sac"
+                or settings.get("inner_sac_return_estimator") != "retrace"
+                or settings.get("inner_entropy_enabled") is not (mode == "retrace_both")):
+            raise series.SeriesError("Retrace curves require the explicitly selected SAC estimator and entropy arm")
+    if mode in KL_METHODS:
         settings = result["planner"]["settings"]
         beta = settings.pop("inner_outer_policy_kl_coef")
         if (not isinstance(outer_alpha, (int, float)) or not math.isfinite(outer_alpha)
@@ -46,8 +56,8 @@ def canonical_identity(identity, mode, outer_alpha=None):
 
 def prepare(profile, root=None):
     modes = set(profile["identities"])
-    if modes not in (BASE_METHODS, set(METHODS)):
-        raise series.SeriesError("Curve profile requires the four original methods and optional MPPI")
+    if not BASE_METHODS <= modes <= set(METHODS):
+        raise series.SeriesError("Curve profile requires the four original methods and only supported optional controllers")
     root = Path(root or profile["root"])
     root.mkdir(parents=True, exist_ok=True)
     with series._lock(root / ".curves.lock"):
@@ -192,12 +202,12 @@ def derive(profile, source, raw, provenance, prior, root):
         "eval/paired_gain_sample_std": statistics.stdev(gains), "eval/paired_episodes": 5,
         "reference/return_mean": statistics.mean(ep["return"] for ep in prior_episodes),
         "reference/return_sample_std": statistics.stdev(ep["return"] for ep in prior_episodes)})
-    if mode in ("kl", "both"):
+    if mode in KL_METHODS:
         metrics["configuration/inner_outer_policy_kl_coef"] = alpha
         metrics["configuration/checkpoint_outer_alpha"] = alpha
     reference = dict(provenance, source_record_id=raw["record_id"], source_identity=raw["identity"],
         checkpoint=raw["checkpoint"], prior_record_id=prior["record_id"],
-        prior_record_sha256=series._digest(prior), coefficient_rule=KL_RULE if mode in ("kl", "both") else None)
+        prior_record_sha256=series._digest(prior), coefficient_rule=KL_RULE if mode in KL_METHODS else None)
     path = Path(root) / "provenance" / f"{mode}-{step}.json"
     if path.exists() and series._read(path) != reference:
         raise series.SeriesError("Checkpoint source changed; select a separate evaluation attempt")
@@ -255,7 +265,7 @@ def publish(profile, catalog, *, require_complete=False, wandb_module=None):
             with series.Publisher(curve["run_dir"], owner=catalog["owner"], wandb_module=wandb_module) as publisher:
                 publisher.run.name = curve["name"]
                 publisher.run.config.update({"curve_family": profile["family"], "objective_mode": curve["mode"],
-                    "curve_label": curve["name"], "kl_coefficient_rule": KL_RULE if curve["mode"] in ("kl", "both") else None},
+                    "curve_label": curve["name"], "kl_coefficient_rule": KL_RULE if curve["mode"] in KL_METHODS else None},
                     allow_val_change=True)
                 for key in {key for path in (Path(curve["run_dir"]) / "records").glob("*.json")
                             for key in series._read(path)["metrics"]}:

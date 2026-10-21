@@ -19,9 +19,12 @@ def identity(mode, step=400000):
             inner_critic_updates_per_round=16, inner_actor_updates_per_round=4,
             inner_rollouts_per_round=128, inner_batch_size=256,
             inner_actor_lr=.0003, inner_critic_lr=.0003, inner_temperature_lr=.0003,
-            inner_entropy_enabled=mode != "kl",
-            inner_temperature_mode="inherit_outer" if mode == "kl" else "auto",
-            inner_outer_policy_kl_coef=ALPHAS[step] if mode in ("kl", "both") else 0.)
+            inner_entropy_enabled=mode not in ("kl", "retrace_kl"),
+            inner_temperature_mode="inherit_outer" if mode in ("kl", "retrace_kl") else "auto",
+            inner_outer_policy_kl_coef=ALPHAS[step] if mode in curves.KL_METHODS else 0.)
+    if mode in curves.RETRACE_METHODS:
+        planner["settings"].update(inner_sac_return_estimator="retrace", inner_retrace_lambda=1.,
+                                   inner_retrace_batch_trajectories=86)
     if mode == "mppi":
         planner = dict(type="mppi", action_rule="weighted_elite_with_noise",
             settings=dict(planning_horizon=3, terminal_critic="aux_return"))
@@ -73,7 +76,7 @@ def source_for(tmp_path, raw, *, published=True):
         outer_alpha_by_step={str(step): ALPHAS[step]})
 
 
-@pytest.mark.parametrize("mode", ["kl", "both"])
+@pytest.mark.parametrize("mode", ["kl", "both", "retrace_kl", "retrace_both"])
 def test_checkpoint_beta_rule_preserves_every_other_identity_field(mode):
     old, new = identity(mode), identity(mode, 500000)
     snapshot = deepcopy(old)
@@ -317,3 +320,58 @@ def test_mppi_registers_pending_checkpoints_without_temperature_and_publishes_pa
     assert "diagnostics/inner_alpha_final_mean" not in derived["metrics"]
     assert "diagnostics/inner_final_outer_policy_kl_mean" not in derived["metrics"]
     assert derived["provenance"]["coefficient_rule"] is None
+
+
+def test_retrace_extension_preserves_five_ids_and_publishes_four_distinct_paired_points(tmp_path):
+    p = profile(tmp_path)
+    p["identities"]["mppi"] = identity("mppi")
+    p["sources"] = [source_for(tmp_path, record(tmp_path, "prior", step)) for step in ALPHAS]
+    original = curves.prepare(p)
+    original_sources = series._read(tmp_path / "curves" / "sources.json")
+    cells, raws = [], []
+    for mode in ("retrace_kl", "retrace_both"):
+        for step, alpha in ALPHAS.items():
+            raw = record(tmp_path, mode, step)
+            raw["identity"]["science"]["source_sha256"] = "b" * 64
+            raw["metrics"].update({"diagnostics/inner_actor_entropy_mean": -6.,
+                "diagnostics/inner_retrace_trace_coefficient_mean_mean": .7,
+                "diagnostics/inner_retrace_effective_trace_length_mean": 1.6,
+                "diagnostics/inner_retrace_correction_abs_mean_mean": .3,
+                "work/retrace_trajectory_draws": 27520000, "work/retrace_critic_rows": 82560000})
+            source = source_for(tmp_path, raw)
+            cells.append(dict(source, step=step, outer_alpha=alpha))
+            p["identities"][mode] = curves.canonical_identity(raw["identity"], mode, alpha)
+            raws.append(raw)
+    updated = curves.register_campaign(p, {"cells": cells})
+    assert updated["curves"][:5] == original["curves"]
+    assert len(updated["curves"]) == 7
+    assert len({row["color"] for row in updated["curves"]}) == 7
+    assert series._read(tmp_path / "curves" / "sources.json")[:2] == original_sources
+    assert curves.register_campaign(p, {"cells": cells}) == updated
+    result = curves.stage(p, updated, require_complete=True)
+    assert result["counts"]["retrace_kl"] == result["counts"]["retrace_both"] == 2
+    assert not result["missing"]
+    raw = raws[-1]
+    derived = curves.derive(p, cells[-1], raw, {}, record(tmp_path, "prior", 500000), tmp_path / "derived")
+    assert derived["metrics"]["configuration/inner_outer_policy_kl_coef"] == ALPHAS[500000]
+    assert derived["metrics"]["diagnostics/inner_retrace_trace_coefficient_mean_mean"] == .7
+    assert derived["metrics"]["work/retrace_critic_rows"] == 82560000
+    assert derived["metrics"]["diagnostics/inner_actor_entropy_mean"] == -6.
+    assert derived["metrics"]["eval/paired_gain_mean"] == statistics.mean(GAINS)
+    assert derived["provenance"]["coefficient_rule"] == curves.KL_RULE
+
+
+@pytest.mark.parametrize("mode", ["retrace_kl", "retrace_both"])
+@pytest.mark.parametrize("change", ["estimator", "entropy", "lambda", "batch"])
+def test_retrace_curves_reject_changed_estimator_entropy_or_trace_recipe(tmp_path, mode, change):
+    p = profile(tmp_path)
+    p["identities"][mode] = curves.canonical_identity(identity(mode), mode, ALPHAS[400000])
+    raw = record(tmp_path, mode)
+    settings = raw["identity"]["planner"]["settings"]
+    if change == "estimator": settings["inner_sac_return_estimator"] = "one_step"
+    elif change == "entropy": settings["inner_entropy_enabled"] = not settings["inner_entropy_enabled"]
+    elif change == "lambda": settings["inner_retrace_lambda"] = .5
+    elif change == "batch": settings["inner_retrace_batch_trajectories"] = 85
+    with pytest.raises(series.SeriesError):
+        curves.derive(p, dict(mode=mode, outer_alpha_by_step={"400000": ALPHAS[400000]}),
+                      raw, {}, record(tmp_path, "prior"), tmp_path / "derived")

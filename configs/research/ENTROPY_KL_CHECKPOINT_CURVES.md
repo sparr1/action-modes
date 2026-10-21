@@ -99,3 +99,31 @@ remain explicit; they are not relabeled as the SAC protocol. Return, paired-gain
 variability and controller timing share the existing panels. Inner actor,
 temperature and prior-KL diagnostics are omitted for MPPI, rather than shown as
 zero, and its raw results and compact provenance are retained.
+
+## Retrace comparisons
+
+The `retrace_kl` (purple) and `retrace_both` (green) modes add separately
+identified Retrace SAC curves to the same workspace. They preserve every
+existing run ID, measurement, color and panel. A campaign-local extended profile
+retains all existing identities and adds each Retrace identity after applying
+`canonical_identity(raw_identity, mode, outer_alpha)`. Campaign source cells
+include `mode`, `step`, `run_id`, `run_dir` and `outer_alpha`.
+
+The fixed beta rule remains one times checkpoint outer alpha; estimator,
+Retrace lambda, trajectory batch size, entropy setting, actor and critic update
+counts, seeds, execution rule and source fingerprint remain part of the exact
+identity. Retrace curves cannot accept one-step SAC records. KL-only disables
+inner entropy, while the joint curve retains it. Sampled-prior returns at the
+same checkpoint and paired seeds are reused to compute gains.
+
+If a Retrace curve is present, the layout retains the existing 17 panels and
+adds three measured critic diagnostics: successor trace coefficient, effective
+trace length and absolute target correction. They are averaged over critic
+updates, then decisions and evaluation episodes. The exact normalized keys are
+`diagnostics/inner_retrace_trace_coefficient_mean_mean`,
+`diagnostics/inner_retrace_effective_trace_length_mean`, and
+`diagnostics/inner_retrace_correction_abs_mean_mean`. Other controllers have no
+synthetic zeros in these panels. Entropy, alpha, policy KL, return, paired-gain
+variability, controller timing and available Retrace work totals remain in the
+published records. `panel_count(catalog)` reports 20 for the extended layout;
+four- and five-controller catalogs retain 17 panels.
