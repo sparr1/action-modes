@@ -1,8 +1,10 @@
-"""Gate one reward-only primary-Q training recipe and launch durable resume.
+"""Gate one reward-only primary-Q training recipe and launch full training.
 
 Each selected manifest has one cell. The GPU gate compares one and two physical
 CPU cores (also four for the no-inner baseline), using real short training, production shapes and update dose, strict
-compilation, and the CPU replay placement used by exact resume. Timing excludes
+compilation, and the selected replay placement. Exact continuation defaults to
+CPU replay; --continuation off uses ordinary automatic placement and requires
+CUDA replay in its gate. Timing excludes
 periodic checkpoint I/O, W&B, mature replay and the production pretraining dose.
 """
 
@@ -19,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -53,6 +56,12 @@ STORAGE_ROOTS = {
     "/oscar/home/rgao48/ambi-durable": "/oscar/home",
     "/oscar/scratch/rgao48/ambi-training-lineages": "/oscar/scratch",
 }
+
+
+def execution_policy(continuation="exact"):
+    assert continuation in {"exact", "off"}, "Unknown continuation policy"
+    return {"continuation": continuation,
+            "replay_policy": "cpu_exact_resume" if continuation == "exact" else "auto_cuda_gate_required"}
 
 
 def cpu_counts(operator):
@@ -208,6 +217,7 @@ def _optimizer_steps(optimizer):
 
 
 def worker(args):
+    policy = execution_policy(args.continuation)
     cpus = [int(cpu) for cpu in args.worker_cpus.split(",")]
     _, _, production = validate_campaign(args.manifest)
     assert len(cpus) in cpu_counts(production["alg_params"]["inner_operator"]) and len(cpus) == len(set(cpus))
@@ -232,7 +242,8 @@ def worker(args):
         target_entropy = production["alg_params"]["target_entropy"]
         validate_learner(cfg, agent, target_entropy=target_entropy,
                          solve_interval=production["alg_params"].get("inner_solve_interval", 1))
-        learner.buffer.enable_resumable_storage()
+        if args.continuation == "exact":
+            learner.buffer.enable_resumable_storage()
         operator, interval = cfg.inner_operator, cfg.inner_solve_interval
         assert args.warmup % interval == args.decisions % interval == 0
         initial_actor = {key: value.detach().clone() for key, value in agent.model._pi.state_dict().items()}
@@ -353,7 +364,12 @@ def worker(args):
             assert _optimizer_steps(agent.pi_optim) == actor_steps
             assert _optimizer_steps(agent.ent_coef_optim) == alpha_steps
             assert cfg.target_entropy == agent.target_entropy == target_entropy
-        assert learner.buffer.resumable_storage and str(learner.buffer._storage_device) == "cpu"
+        storage_device = str(learner.buffer._storage_device)
+        if args.continuation == "exact":
+            assert learner.buffer.resumable_storage and storage_device == "cpu"
+        else:
+            assert not learner.buffer.resumable_storage and learner.buffer._storage_device.type == "cuda", \
+                "Non-continuation gate requires automatic CUDA replay placement"
         assert torch.get_num_threads() == len(cpus) and os.sched_getaffinity(0) == set(cpus)
         measured = timer.result
         measured.pop("projected_500k_decision_days", None)
@@ -367,6 +383,7 @@ def worker(args):
         storage = learner.buffer._buffer._storage._storage
         replay_bytes_per_row = sum(value.numel() * value.element_size() for value in storage.values()) / len(storage)
         report = {"passed": True, "binding": binding(args.manifest), "runtime": runtime(), "config": name,
+                  "execution_policy": policy,
                   "operator": operator, "inner_solve_interval": interval, "physical_cores": len(cpus),
                   "logical_cpu_ids": cpus, "torch_threads": torch.get_num_threads(),
                   "measured": measured, "warmup_active_decisions": args.warmup,
@@ -381,7 +398,7 @@ def worker(args):
                   "zero_inner_work_verified": operator == "none",
                   "checkpoint_roundtrip": True, "checkpoint_sidecars": True,
                   "boundary_training_state_roundtrip": True, "full_replay_resume_roundtrip": False,
-                  "checkpoint_bytes": checkpoint_bytes, "replay_storage_device": "cpu",
+                  "checkpoint_bytes": checkpoint_bytes, "replay_storage_device": storage_device,
                   "replay_bytes_per_row": replay_bytes_per_row,
                   "estimated_production_replay_bytes": replay_bytes_per_row * min(production["total_steps"], production["alg_params"]["buffer_size"]),
                   "peak_host_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
@@ -401,7 +418,11 @@ def worker(args):
         env.close()
 
 
-def validate_receipt(receipt, campaign_binding, current_runtime, cpus, *, name, operator, interval):
+def validate_receipt(receipt, campaign_binding, current_runtime, cpus, *, name, operator, interval, continuation="exact"):
+    policy = execution_policy(continuation)
+    # Older receipts describe only exact continuation with CPU replay. They
+    # must never authorize the opt-in non-continuation/CUDA path.
+    assert receipt.get("execution_policy", execution_policy()) == policy, "Gate continuation/replay policy mismatch"
     approved = [spec for spec in CAMPAIGNS.values() if spec[0] == name]
     assert len(approved) == 1, "Unapproved reward-only configuration identity"
     _, expected_operator, total_steps, target_entropy = approved[0]
@@ -416,7 +437,10 @@ def validate_receipt(receipt, campaign_binding, current_runtime, cpus, *, name, 
     for row in cases:
         assert row["passed"] is True and row["binding"] == campaign_binding and row["runtime"] == current_runtime
         assert (row["config"], row["operator"], row["inner_solve_interval"]) == (name, operator, interval)
-        assert row["compile_fallback"] is False and row["replay_storage_device"] == "cpu"
+        assert row.get("execution_policy", execution_policy()) == policy, "Gate case continuation/replay policy mismatch"
+        storage_device = row["replay_storage_device"]
+        expected_device = storage_device == "cpu" if continuation == "exact" else storage_device.split(":", 1)[0] == "cuda"
+        assert row["compile_fallback"] is False and expected_device
         assert row["compile_graph_counts"]["before"] == row["compile_graph_counts"]["after"]
         assert row["auxiliary_critic_present"] is False
         for key in ("reward_only_targets", "primary_critic_sources", "outer_actor_entropy_auto",
@@ -442,6 +466,7 @@ def validate_receipt(receipt, campaign_binding, current_runtime, cpus, *, name, 
 
 
 def smoke(args):
+    policy = execution_policy(args.continuation)
     assert os.environ.get("SLURM_JOB_ID")
     name, _, run = validate_campaign(args.manifest)
     operator = run["alg_params"]["inner_operator"]
@@ -456,6 +481,7 @@ def smoke(args):
     order = list(counts)
     random.Random(55).shuffle(order)
     write_new(output / "protocol.json", {"binding": binding(args.manifest), "config": name,
+              "execution_policy": policy,
               "case_order": order, "physical_core_representatives": cores,
               "warmup_active_decisions": args.warmup, "measured_decisions": args.decisions,
               "slurm_job_id": os.environ["SLURM_JOB_ID"]})
@@ -471,6 +497,7 @@ def smoke(args):
                                TRITON_CACHE_DIR=str(cache / "triton"))
             command = [sys.executable, str(Path(__file__).resolve()), "smoke", "--worker-cpus", ",".join(map(str, cores[:count])),
                        "--manifest", str(resolve_manifest(args.manifest)), "--warmup", str(args.warmup),
+                       "--continuation", args.continuation,
                        "--decisions", str(args.decisions), "--output", str(output / f"cores-{count}.json")]
             with (output / f"cores-{count}.log").open("x") as log:
                 subprocess.run(command, cwd=ROOT, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True)
@@ -478,8 +505,10 @@ def smoke(args):
     paths = [output / f"cores-{count}.json" for count in counts]
     cases = [read(path) for path in paths]
     receipt = {"passed": True, "binding": binding(args.manifest), "runtime": cases[0]["runtime"], "cases": cases,
+               "execution_policy": policy,
                "artifacts": {str(path): digest(path) for path in paths}, "created_utc": datetime.now(timezone.utc).isoformat()}
-    validate_receipt(receipt, receipt["binding"], receipt["runtime"], 1, name=name, operator=operator, interval=interval)
+    validate_receipt(receipt, receipt["binding"], receipt["runtime"], 1, name=name, operator=operator,
+                     interval=interval, continuation=args.continuation)
     fastest = min(row["measured"]["seconds_per_decision"] for row in cases)
     receipt["recommended_cpus_within_5pct_of_best"] = min(row["physical_cores"] for row in cases
         if row["measured"]["seconds_per_decision"] <= fastest / .95)
@@ -495,14 +524,79 @@ def validate_storage_selection(root, lineage, quota_label, quota_path):
     assert lineage.resolve().relative_to(Path(root).resolve()).parts, "Lineage must be below storage root"
 
 
+def validate_noncontinuation_job():
+    """Refuse automatic restarts of a run that cannot restore training state."""
+    assert os.environ.get("SLURM_RESTART_COUNT", "0") == "0", "Continuation off cannot restart a Slurm job"
+    job_id = os.environ["SLURM_JOB_ID"]
+    assert job_id.isdecimal(), "Expected a non-array Slurm job ID"
+    details = subprocess.check_output(["scontrol", "show", "job", job_id, "--oneliner"], text=True)
+    requeue = [field for field in details.split() if field.startswith("Requeue=")]
+    assert requeue == ["Requeue=0"], "Continuation off requires sbatch --no-requeue"
+
+
+def noncontinuation_manifest(manifest_path, run):
+    """Change publication/provenance only; main.py shallowly replaces alg_params."""
+    document = deepcopy(read(resolve_manifest(manifest_path)))
+    published = deepcopy(run)
+    tags = [tag for tag in published["alg_params"].get("wandb_tags", []) if tag != "exact-resume"]
+    published["alg_params"]["wandb_tags"] = [*tags, "continuation-off", "auto-replay-placement"]
+    published["execution_policy"] = execution_policy("off")
+    # Always supply the full resolved mapping: a partial override would erase
+    # all other algorithm settings under main.py's shallow override contract.
+    document["overrides_alg"].update(alg_params=deepcopy(published["alg_params"]),
+                                     execution_policy=execution_policy("off"))
+    document["study_note"] = document.get("study_note", "").replace(
+        " and durable exact-resume generations", " without replay/trainer resume generations"
+    ).replace("new lineage", "new training run").replace("fresh training lineage", "fresh training run")
+    document["study_note"] += (
+        " Execution override: continuation is off, replay placement is automatic, "
+        "and the matching gate requires CUDA replay. Production startup reports actual placement."
+    )
+    return document, published
+
+
+def launch_without_continuation(args, *, name, run, current_binding, current_runtime):
+    validate_noncontinuation_job()
+    output = args.output.resolve()
+    assert args.output.is_absolute() and output != ROOT and ROOT not in output.parents, \
+        "Training output must be an absolute path outside the source checkout"
+    # The parent can already contain its gate and W&B directory. Claim a fresh
+    # training child atomically, so manual retries cannot silently start over.
+    training_output = output / "training"
+    training_output.mkdir(parents=True, exist_ok=False)
+    document, published = noncontinuation_manifest(args.manifest, run)
+    generated_manifest = training_output / (Path(args.manifest).stem + "-continuation-off.json")
+    write_new(generated_manifest, document)
+    run_id = uuid.uuid4().hex
+    os.environ.pop("WANDB_RESUME", None)
+    os.environ["WANDB_RUN_ID"] = run_id
+    write_new(training_output / "launch.json", {
+        "binding": current_binding, "config": name, "run_params": published, "runtime": current_runtime,
+        "execution_policy": execution_policy("off"), "gate_receipt": str(args.gate),
+        "gate_sha256": digest(args.gate), "slurm_job_id": os.environ["SLURM_JOB_ID"],
+        "source_manifest": str(resolve_manifest(args.manifest)), "generated_manifest": str(generated_manifest),
+        "generated_manifest_sha256": digest(generated_manifest),
+        "wandb_run_id": run_id, "created_utc": datetime.now(timezone.utc).isoformat(),
+    })
+    command = [sys.executable, "main.py", "--run", str(generated_manifest),
+               "--alg-dir", "configs/dmcontrol/algs", "--log-dir", str(training_output),
+               "--num-runs", "1"]
+    os.execv(sys.executable, command)
+
+
 def launch(args):
+    continuation = getattr(args, "continuation", "exact")
     name, _, run = validate_campaign(args.manifest)
     current_binding, current_runtime = binding(args.manifest), runtime()
     receipt = read(args.gate)
     validate_receipt(receipt, current_binding, current_runtime, int(os.environ["SLURM_CPUS_PER_TASK"]),
-                     name=name, operator=run["alg_params"]["inner_operator"], interval=run["alg_params"].get("inner_solve_interval", 1))
+                     name=name, operator=run["alg_params"]["inner_operator"],
+                     interval=run["alg_params"].get("inner_solve_interval", 1), continuation=continuation)
     for path, checksum in receipt["artifacts"].items():
         assert digest(path) == checksum, "Gate artifact changed"
+    if continuation == "off":
+        return launch_without_continuation(args, name=name, run=run,
+                                           current_binding=current_binding, current_runtime=current_runtime)
     storage = {key: os.environ[key] for key in ("AMBI_DURABLE_ROOT", "AMBI_LINEAGE_DIR",
                "AMBI_DURABLE_QUOTA_LABEL", "AMBI_DURABLE_QUOTA_PATH")}
     validate_storage_selection(storage["AMBI_DURABLE_ROOT"], storage["AMBI_LINEAGE_DIR"],
@@ -513,6 +607,7 @@ def launch(args):
     args.output.mkdir(parents=True, exist_ok=True)
     write_new(args.output / f"launch-{segment}.json", {
         "binding": current_binding, "config": name, "run_params": run, "runtime": current_runtime,
+        "execution_policy": execution_policy(continuation),
         "gate_receipt": str(args.gate), "gate_sha256": digest(args.gate), "lineage_dir": str(lineage), "storage": storage,
         "segment": segment, "resume_mode": "required" if os.environ.get("SLURM_RESTART_COUNT", "0") != "0" else os.environ.get("AMBI_RESUME_MODE", "new"),
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -528,6 +623,8 @@ def main():
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--gate", type=Path)
+    parser.add_argument("--continuation", choices=("exact", "off"), default="exact",
+                        help="Exact CPU-replay continuation (default), or ordinary training with a CUDA-replay gate.")
     parser.add_argument("--warmup", type=int)
     parser.add_argument("--decisions", type=int)
     parser.add_argument("--worker-cpus", help=argparse.SUPPRESS)

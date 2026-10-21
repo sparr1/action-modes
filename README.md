@@ -228,6 +228,25 @@ timings; W&B and checkpoints are disabled. This early-replay screen excludes
 long-run logging, periodic diagnostics and checkpoint costs. It does not change
 the training recipes or establish a production walltime guarantee.
 
+For a controlled **CPU versus GPU replay** comparison of the no-inner reward-only
+backbone, run `python slurm/benchmark_ambi_replay.py --output /absolute/scratch/replay-comparison`
+inside one scheduled GPU allocation with one physical CPU and 8 GB RAM. The
+default compares approximately 10k and 750k resident rows at the unchanged
+1M-row capacity, H3/B256/vmap/strict-compile/UTD1 settings and target entropy
+−10.5. Each occupancy runs CPU/GPU/GPU/CPU in fresh subprocesses on that same
+GPU and CPU. CPU uses the exact-resume placement; GPU uses the historical
+automatic placement and fails if CUDA storage was not selected. One real
+500-decision warmup episode is duplicated with distinct episode IDs to create
+the occupancy fixture. This is a timing experiment, not a comparison of mature
+learning performance. Compilation and 24 active warmup decisions are excluded;
+200 complete native training decisions are timed, followed by separate
+synchronized replay sampling windows. The later microbenchmark cannot consume
+randomness from the integrated training measurement. Results include both
+counterbalanced speedup pairs, actual occupancy, source-episode fingerprints,
+peak memory, runtime/source identities and graph/fallback checks. W&B and
+checkpoints are disabled. This command does not change production recipes or
+running jobs; select the matching −21 manifest with `--manifest` if needed.
+
 ### Optional random inner initialization
 
 Set `inner_actor_initialization="random"` and/or

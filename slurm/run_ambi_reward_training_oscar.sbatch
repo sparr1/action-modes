@@ -10,6 +10,8 @@
 # or four for the no-inner baseline. Production uses a measured allocation.
 # Supply --signal=USR1@900 for production. Each job selects one one-cell
 # manifest and one durable lineage; independent SAC/MPPI gates may run together.
+# For ordinary GPU-eligible replay without continuation, set
+# AMBI_RETURN_CONTINUATION=off and submit with --no-requeue; see REPLAY_PLACEMENT.md.
 set -Eeuo pipefail
 umask 077
 : "${SLURM_JOB_ID:?Submit through Slurm.}"
@@ -20,8 +22,15 @@ umask 077
 : "${AMBI_RETURN_OUTPUT:?Set persistent campaign output outside source.}"
 : "${AMBI_RETURN_MANIFEST:?Select the single-cell SAC, MPPI or no-inner manifest.}"
 mode="${AMBI_RETURN_MODE:-train}"
+continuation="${AMBI_RETURN_CONTINUATION:-exact}"
 [[ "$mode" == smoke || "$mode" == train ]]
+[[ "$continuation" == exact || "$continuation" == off ]]
 [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]
+if [[ "$continuation" == off ]]; then
+  [[ "${SLURM_RESTART_COUNT:-0}" == 0 ]]
+  job_record="$(scontrol show job "$SLURM_JOB_ID" --oneliner)"
+  [[ " $job_record " == *" Requeue=0 "* ]] || { echo "Continuation off requires sbatch --no-requeue" >&2; exit 2; }
+fi
 [[ "$AMBI_PROJECT_DIR" == /* && "$AMBI_PYTHON" == /* && "$AMBI_RETURN_OUTPUT" == /* ]]
 cd "$AMBI_PROJECT_DIR"
 [[ "$(git rev-parse HEAD)" == "$AMBI_EXPECTED_COMMIT" ]]
@@ -44,9 +53,16 @@ if [[ "$mode" == smoke ]]; then
   [[ ( "$SLURM_CPUS_PER_TASK" == 2 || "$SLURM_CPUS_PER_TASK" == 4 ) && "${SLURM_RESTART_COUNT:-0}" == 0 ]]
   export WANDB_MODE=disabled
   exec srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" slurm/ambi_reward_training.py smoke \
-    --manifest "$AMBI_RETURN_MANIFEST" --output "$AMBI_RETURN_OUTPUT/gate"
+    --manifest "$AMBI_RETURN_MANIFEST" --output "$AMBI_RETURN_OUTPUT/gate" --continuation "$continuation"
 else
   [[ "$SLURM_CPUS_PER_TASK" == 1 || "$SLURM_CPUS_PER_TASK" == 2 || "$SLURM_CPUS_PER_TASK" == 4 ]]
+  if [[ "$continuation" == off ]]; then
+    export WANDB_MODE=online
+    unset WANDB_RUN_ID WANDB_RESUME
+    exec srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" slurm/ambi_reward_training.py train \
+      --manifest "$AMBI_RETURN_MANIFEST" --output "$AMBI_RETURN_OUTPUT" --continuation off \
+      --gate "${AMBI_RETURN_GATE:-$AMBI_RETURN_OUTPUT/gate/receipt.json}"
+  fi
   : "${AMBI_LINEAGE_DIR:?Set a unique lineage below the approved storage root.}"
   : "${AMBI_DRAIN_AFTER_SECONDS:?Set an explicit segment budget below requested walltime.}"
   export AMBI_DURABLE_ROOT="${AMBI_DURABLE_ROOT:-/oscar/home/rgao48/ambi-durable}"
