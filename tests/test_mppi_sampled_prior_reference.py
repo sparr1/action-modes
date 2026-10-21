@@ -33,7 +33,7 @@ def _prior(tmp_path):
     resolved["evaluation"] = {"execution_action": "sample"}
     manifest = {
         "schema_version": 1, "status": "complete",
-        "checkpoint": {"sha256": DIGEST, "source_run": SOURCE,
+        "checkpoint": {"sha256": DIGEST, "source_run": SOURCE, "source_run_verified": True,
                        "metadata": {"checkpoint": {"step": 400000}}},
         "protocol": protocol_for(resolved, 55, 500),
         "runs": [{"config": resolved["algorithm_config"], "status": "complete",
@@ -110,6 +110,53 @@ def test_reference_marker_cannot_be_attached_to_other_controllers():
     resolved["algorithm_config"]["alg_params"]["inner_operator"] = "sac"
     with pytest.raises(ValueError, match="weighted-elite"):
         reference_protocol_for(resolved, 55, 500)
+
+
+def test_legacy_null_source_uses_exact_inventory_and_remains_portable(tmp_path, monkeypatch):
+    monkeypatch.setattr("utils.ambi_benchmark.code_identity", lambda: {})
+    path, manifest = _prior(tmp_path)
+    manifest["checkpoint"].update(source_run=None, source_run_verified=False,
+                                  metadata_sha256="b" * 64)
+    path.write_text(json.dumps(manifest))
+    inventory = tmp_path / "inventory.json"
+    inventory.write_text(json.dumps({"source_run": SOURCE, "checkpoints": [
+        {"sha256": DIGEST, "step": 400000, "metadata_sha256": "b" * 64}]}))
+    protocol = reference_protocol_for(_resolved(), 55, 500)
+    with pytest.raises(ValueError, match="cannot substitute for checkpoint provenance"):
+        reference_returns(path, DIGEST, protocol, source_run=SOURCE)
+    reference = reference_returns(path, DIGEST, protocol, source_run=SOURCE,
+                                  checkpoint_inventory=inventory, seeds=[101, 102])
+    assert reference.provenance["source_run"] == SOURCE
+    assert reference.provenance["source_provenance"]["checkpoint_source_verified"]
+    assert not reference.provenance["source_provenance"]["checkpoint_source_declared"]
+    bundle = BenchmarkBundle(tmp_path / "mppi", checkpoint={**manifest["checkpoint"], "source_run": SOURCE},
+                             protocol=protocol, reference=reference)
+    copied = bundle.path / "reference/provenance/checkpoint-inventory-0.json"
+    assert copied.read_bytes() == inventory.read_bytes()
+    inventory.unlink()  # Publication must not depend on the original host path.
+    values, files = _bundle_prior_reference(bundle.manifest, bundle.path / "manifest.json",
+                                           {"sha256": DIGEST, "step": 400000}, SOURCE)
+    assert values == {101: 10., 102: 20.}
+    assert "reference/provenance/checkpoint-inventory-0.json" in files
+    copied.write_text("{}")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        _bundle_prior_reference(bundle.manifest, bundle.path / "manifest.json",
+                                {"sha256": DIGEST, "step": 400000}, SOURCE)
+
+
+@pytest.mark.parametrize("field,wrong", [("sha256", "c" * 64), ("step", 500000),
+                                        ("metadata_sha256", "c" * 64)])
+def test_legacy_null_source_rejects_mismatched_inventory(tmp_path, field, wrong):
+    path, manifest = _prior(tmp_path)
+    manifest["checkpoint"].update(source_run=None, source_run_verified=False,
+                                  metadata_sha256="b" * 64)
+    path.write_text(json.dumps(manifest))
+    row = {"sha256": DIGEST, "step": 400000, "metadata_sha256": "b" * 64, field: wrong}
+    inventory = tmp_path / "inventory.json"
+    inventory.write_text(json.dumps({"source_run": SOURCE, "checkpoints": [row]}))
+    with pytest.raises(ValueError):
+        reference_returns(path, DIGEST, reference_protocol_for(_resolved(), 55, 500),
+                          source_run=SOURCE, checkpoint_inventory=inventory)
 
 
 def test_publication_validates_paired_deltas_against_portable_prior(tmp_path, monkeypatch):

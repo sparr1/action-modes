@@ -58,7 +58,7 @@ def test_smoke_is_separate_and_full_episodes_reuse_reference(tmp_path):
     smoke=driver.evaluator_command(cell,tmp_path,32)
     assert '--reference-bundle' not in smoke
     assert smoke[smoke.index('--seeds')+1:smoke.index('--controller-seed')]==['101']
-    assert '--reference-bundle' not in driver.evaluator_command(cell,tmp_path,specification_only=True)
+    assert '--reference-bundle' in driver.evaluator_command(cell,tmp_path,specification_only=True)
     with pytest.raises(ValueError): driver.evaluator_command(cell,tmp_path,True)
 
 

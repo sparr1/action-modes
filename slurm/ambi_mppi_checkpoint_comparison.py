@@ -91,7 +91,7 @@ def evaluator_command(cell, output, smoke_steps=None, specification_only=False):
         '--controller-seed', '55', '--max-steps', str(smoke_steps or 500),
         '--output', str(output / 'results.json'), '--bundle-dir', str(output / 'bundle'),
         '--checkpoint-inventory', cell['inventory_path']]
-    if smoke_steps is None and not specification_only:
+    if smoke_steps is None:
         args += ['--reference-bundle', cell['reference_bundle']]
     return args
 

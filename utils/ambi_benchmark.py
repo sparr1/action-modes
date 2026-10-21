@@ -282,10 +282,16 @@ def reference_returns(path, checkpoint_sha256, protocol, *, checkpoint_inventory
     if len(values) != len(episodes) or not all(math.isfinite(value) for value in values.values()):
         raise ValueError("Prior reference has duplicate seeds or non-finite returns.")
     if sampled_reference:
+        from utils.eval_series_data import _source
+
         checkpoint = manifest["checkpoint"]
         reference_source = checkpoint.get("source_run")
-        if not reference_source or (source_run is not None and reference_source != source_run):
+        if reference_source and source_run is not None and reference_source != source_run:
             raise ValueError("Sampled prior reference backbone does not match.")
+        checkpoint_step = checkpoint.get("metadata", {}).get("checkpoint", {}).get("step")
+        reference_source, source_evidence, source_files = _source(
+            {**checkpoint, "step": checkpoint_step}, path,
+            checkpoint_inventory=checkpoint_inventory, source_run=source_run)
         result = runs[0].get("result", {})
         if (result.get("outer_state_unchanged") is not True
                 or not isinstance(result.get("outer_updates_before"), int)
@@ -294,14 +300,16 @@ def reference_returns(path, checkpoint_sha256, protocol, *, checkpoint_inventory
         if seeds is not None and sorted(values) != sorted(seeds):
             raise ValueError("Sampled prior reference episode seeds do not match.")
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        files = {"reference/manifest.json": str(path.resolve())}
+        files = {"reference/manifest.json": str(path.resolve()),
+                 **{f"reference/{name}": source for name, source in source_files.items()}}
         provenance = {
             "format": AMBI_SAMPLED_PRIOR_REFERENCE, "source_run": reference_source,
             "checkpoint_sha256": checkpoint_sha256,
-            "checkpoint_step": checkpoint.get("metadata", {}).get("checkpoint", {}).get("step"),
+            "checkpoint_step": checkpoint_step, "source_provenance": source_evidence,
             "source_result_sha256": digest, "source_protocol": expected_protocol,
             "evaluation_protocol": episode_protocol(protocol), "episodes": episodes,
-            "files": {"reference/manifest.json": digest},
+            "files": {name: hashlib.sha256(Path(source).read_bytes()).hexdigest()
+                      for name, source in files.items()},
         }
         return PriorReference(values, provenance, files)
     return values

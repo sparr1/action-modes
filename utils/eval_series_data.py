@@ -800,17 +800,22 @@ def _bundle_prior_reference(manifest, path, checkpoint, source):
         from utils.ambi_benchmark import reference_returns
 
         name = "reference/manifest.json"
-        _require(set(reference.get("files", {})) == {name}, "Missing exact sampled prior reference file")
-        file = (path.parent / name).resolve()
-        _require(file.is_relative_to(path.parent), "Reference artifact path escapes bundle")
-        _require(file.is_file() and _file_hash(file) == reference["files"][name],
-                 "Reference artifact hash mismatch")
+        _require(name in reference.get("files", {}), "Missing exact sampled prior reference file")
+        artifacts = {}
+        for relative, digest in reference["files"].items():
+            file = (path.parent / relative).resolve()
+            _require(file.is_relative_to(path.parent) and relative.startswith("reference/"),
+                     "Reference artifact path escapes bundle")
+            _require(file.is_file() and _file_hash(file) == digest, "Reference artifact hash mismatch")
+            artifacts[relative] = str(file)
         _require(reference.get("checkpoint_step") == checkpoint["step"], "Reference checkpoint mismatch")
-        validated = reference_returns(file, checkpoint["sha256"], manifest.get("protocol", {}),
-                                      source_run=source)
+        inventory = next((file for relative, file in artifacts.items()
+                          if relative.startswith("reference/provenance/checkpoint-inventory-")), None)
+        validated = reference_returns(artifacts[name], checkpoint["sha256"], manifest.get("protocol", {}),
+                                      checkpoint_inventory=inventory, source_run=source)
         portable = {key: value for key, value in reference.items() if key != "path"}
         _require(validated.provenance == portable, "Sampled prior provenance differs from saved source")
-        return dict(validated), {name: str(file)}
+        return dict(validated), artifacts
     if reference.get("format") != "tdmpc2-paired-prior":
         return {}, {}
     _require(reference.get("checkpoint_sha256") == checkpoint["sha256"] and
