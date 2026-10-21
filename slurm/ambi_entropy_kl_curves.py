@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 import math
+import os
 from pathlib import Path
 import statistics
 import sys
@@ -218,6 +219,8 @@ def stage(profile, catalog, *, require_complete=False):
 
 
 def publish(profile, catalog, *, require_complete=False, wandb_module=None):
+    # Oscar's locked SDK0.17.4 requires Core for the current hosted service.
+    os.environ.setdefault("WANDB__REQUIRE_CORE", "true")
     from slurm.ambi_entropy_kl_curves_layout import verify_installed_catalog
     root = Path(catalog["root"])
     with series._lock(root / ".curve-publisher.lock", blocking=False):
