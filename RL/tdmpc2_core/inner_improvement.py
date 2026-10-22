@@ -368,6 +368,14 @@ class InnerImprovementEngine(RetraceInnerMixin):
     def _explorer_mode(self):
         return str(getattr(self.cfg, "inner_explorer_mode", "none"))
 
+    def _temperature_optimizer_step(self):
+        """Snapshot Adam's scalar step without transferring a CUDA value."""
+        state = self.state
+        if state.temperature_optim is None or state.log_alpha is None:
+            return torch.zeros((), device=self.device)
+        step = state.temperature_optim.state.get(state.log_alpha, {}).get("step", 0)
+        return torch.as_tensor(step, device=self.device).detach().clone()
+
     @property
     def _explorer_active(self):
         """Whether replay contains a labelled auxiliary population."""
@@ -4345,30 +4353,43 @@ class InnerImprovementEngine(RetraceInnerMixin):
                     metrics["outer_policy_kl"] = kl_mean.detach()
             if update_temperature:
                 target_entropy = self._resolved_inner_target_entropy()
-                if self._scaled_actor_entropy_enabled:
-                    temperature_loss = (
-                        state.log_alpha
-                        * (selected_entropy - target_entropy).detach()
-                    ).mean()
-                else:
-                    temperature_loss = -(
-                        state.log_alpha * (log_prob + target_entropy).detach()
-                    ).mean()
-                state.temperature_optim.zero_grad(set_to_none=True)
-                temperature_loss.backward()
-                temperature_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    [state.log_alpha], self._temperature_grad_clip_maximum
+                repeats = int(getattr(cfg, "inner_temperature_updates_per_actor", 1))
+                # Keep the original sample and loss reduction order. No new
+                # actor forward, replay draw, or RNG draw occurs in this loop.
+                # The next actor update observes the newly adapted alpha.
+                residual = (
+                    (selected_entropy - target_entropy).detach()
+                    if self._scaled_actor_entropy_enabled
+                    else -(log_prob + target_entropy).detach()
                 )
-                state.temperature_optim.step()
-                with torch.no_grad():
-                    state.log_alpha.clamp_(min=_INNER_LOG_ALPHA_FLOOR)
-                state.temperature_steps += 1
-                state.temperature_lifetime_steps += 1
+                temperature_losses = []
+                for _ in range(repeats):
+                    if self._scaled_actor_entropy_enabled:
+                        temperature_loss = (
+                            state.log_alpha * residual
+                        ).mean()
+                    else:
+                        temperature_loss = -(
+                            state.log_alpha * (-residual)
+                        ).mean()
+                    state.temperature_optim.zero_grad(set_to_none=True)
+                    temperature_loss.backward()
+                    temperature_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        [state.log_alpha], self._temperature_grad_clip_maximum
+                    )
+                    state.temperature_optim.step()
+                    with torch.no_grad():
+                        state.log_alpha.clamp_(min=_INNER_LOG_ALPHA_FLOOR)
+                    state.temperature_steps += 1
+                    state.temperature_lifetime_steps += 1
+                    temperature_losses.append(temperature_loss.detach())
                 metrics.update(
-                    temperature_loss=temperature_loss.detach(),
+                    temperature_loss=torch.stack(temperature_losses).mean(),
                     temperature_grad_norm=torch.as_tensor(
                         temperature_grad_norm
                     ).detach(),
+                    temperature_entropy_residual=residual.mean(),
+                    temperature_updates=float(repeats),
                 )
             return metrics
 
@@ -6418,6 +6439,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
             # each successful actor kernel's proposal only to this local copy.
             actor_loss_scale = self._critic_owner.actor_loss_scale.detach().clone()
         alpha_initial = self.alpha.detach().clone()
+        temperature_lifetime_steps_initial = state.temperature_lifetime_steps
+        temperature_optimizer_step_initial = self._temperature_optimizer_step()
         trace = self._active_trace
         if trace is not None:
             trace.record("initial", state, (
@@ -6665,6 +6688,16 @@ class InnerImprovementEngine(RetraceInnerMixin):
             inner_critic_optimizer_steps=float(state.critic_steps),
             inner_actor_optimizer_steps=float(state.actor_steps),
             inner_temperature_optimizer_steps=float(state.temperature_steps),
+            inner_temperature_updates_per_actor=float(
+                getattr(cfg, "inner_temperature_updates_per_actor", 1)
+            ),
+            inner_temperature_optimizer_step_initial=temperature_optimizer_step_initial,
+            inner_temperature_optimizer_step_final=self._temperature_optimizer_step(),
+            inner_temperature_lifetime_steps_initial=float(temperature_lifetime_steps_initial),
+            inner_temperature_lifetime_steps_final=float(state.temperature_lifetime_steps),
+            inner_temperature_episode_reset=float(
+                t0 and str(cfg.inner_temperature_scope) in {"action", "episode"}
+            ),
             inner_target_updates=float(state.target_steps),
             inner_critic_target_updates=float(state.critic_target_steps),
             inner_actor_target_updates=float(state.actor_target_steps),

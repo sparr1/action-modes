@@ -197,8 +197,10 @@ _DEFINITIONS = {
         "Fraction of sampled action coordinates rounded exactly to a tanh bound."
     ),
     "outer_action_l2": "Pre-update sampled-action L2 anchor penalty for the TD3 actor.",
-    "temperature_loss": "Automatic-temperature objective evaluated before its update.",
+    "temperature_loss": "Mean automatic-temperature objective before each scalar Adam step on this actor sample.",
     "temperature_grad_norm": "Temperature gradient norm before clipping.",
+    "temperature_entropy_residual": "Selected entropy minus target on the shared actor-update sample; positive lowers alpha.",
+    "temperature_updates": "Actual scalar Adam steps sharing this update event's detached entropy residual.",
     "alpha_used": "Temperature used by this update's losses, before temperature adaptation.",
     "alpha": "Inner temperature at this event boundary.",
     "outer_policy_kl": "Pre-update analytic Gaussian KL used by an enabled actor regularizer.",

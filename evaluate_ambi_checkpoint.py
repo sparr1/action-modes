@@ -640,6 +640,26 @@ def _validate_horizon_probe_selection(resolved_presets, *, root_bank_requested,
         )
 
 
+def _validate_benchmark_scopes(params, *, episode_evaluation):
+    """Permit temperature-only episode memory in explicitly matched full episodes."""
+    temperature_keys = ("inner_temperature_scope", "inner_temperature_optimizer_scope")
+    temperature_carry = (
+        episode_evaluation
+        and params.get("inner_operator", "sac") == "sac"
+        and params.get("inner_temperature_mode", "auto") == "auto"
+        and params.get("inner_entropy_enabled", True)
+        and all(params.get(key, "action") == "episode" for key in temperature_keys)
+    )
+    scopes = [key for key in params if key.startswith("inner_") and key.endswith("_scope")
+              and key != "inner_mppi_warm_start_scope"]
+    if any(params[key] != "action" and not (temperature_carry and key in temperature_keys)
+           for key in scopes):
+        raise ValueError(
+            "Benchmark presets require fresh action-local inner state, except "
+            "paired episode-scoped temperature and optimizer in full-episode SAC evaluation."
+        )
+
+
 def evaluate_preset(
     resolved,
     checkpoint,
@@ -1152,10 +1172,7 @@ def evaluate_matrix(
                 raise ValueError("Benchmark bundles currently support state observations only.")
             if params.get("inner_operator", "sac") not in {"none", "sac", "tdambi", "mppi"}:
                 raise ValueError("Benchmark bundles support prior-only, SAC, TDAMBI, and MPPI presets.")
-            scopes = [key for key in params if key.startswith("inner_") and key.endswith("_scope")
-                      and key != "inner_mppi_warm_start_scope"]
-            if any(params[key] != "action" for key in scopes):
-                raise ValueError("Benchmark presets require fresh action-local inner state.")
+            _validate_benchmark_scopes(params, episode_evaluation=not (root_bank_path or bank_only))
             if any(params.get(key, 0) for key in ("inner_actor_writeback_coef", "inner_critic_writeback_coef")):
                 raise ValueError("Benchmark presets must disable prior writeback.")
             if int(params.get("inner_diagnostic_rollouts", 0)) != 0:

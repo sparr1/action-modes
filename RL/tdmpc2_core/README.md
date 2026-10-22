@@ -1259,8 +1259,8 @@ eight rounds, then performs three critic updates followed by one actor update:
 
 Each critic or actor update draws its own minibatch through the existing
 cumulative action-local replay sampler. Automatic SAC temperature optimization
-follows the actor and runs once per actor update; TD3 and fixed-temperature SAC
-add no temperature step. The resolved runtime metadata records both per-round
+follows the actor and defaults to one step per actor update; TD3 and
+fixed-temperature SAC add no temperature step. The resolved runtime metadata records both per-round
 counts, their derived per-action critic, actor, and temperature totals, and the
 summed critic-plus-actor replay rows drawn. A component count may be zero.
 
@@ -1270,6 +1270,31 @@ budget controls. Existing configurations that use a shared integer or
 `"auto"` retain their joint update-slot behavior, batch sharing, and random
 number ordering. These controls do not change replay capacity, retention, or
 sampling semantics.
+
+`inner_temperature_updates_per_actor` is a positive integer, default `1`.
+Values above one require canonical single-policy SAC with explicit critic/actor
+per-round counts and round update timing, automatic temperature, enabled
+entropy, and actor updates. Each actor phase first updates the actor,
+then takes this many scalar Adam steps using the same detached, pre-update
+entropy residual. It does not resample actions, rerun the actor, add replay
+draws, or change critic/actor budgets or RNG consumption. The next actor phase
+uses the adjusted temperature; alpha-only steps cannot change a frozen actor's
+entropy. The derived `inner_temperature_updates_per_action` and actual optimizer
+counters include every scalar step, while update-slot counts remain unchanged.
+The reported temperature loss averages the repeated scalar losses; the entropy
+residual and gradient norm refer to the shared actor sample.
+
+For a temperature-only carryover ablation, set both
+`inner_temperature_scope` and `inner_temperature_optimizer_scope` to `"episode"`,
+leaving actor, critic, replay, and their optimizers action-local. The inner
+log-alpha parameter and its Adam moments then survive successive real decisions;
+both reset from the selected outer actor's temperature on `t0=True`. They never
+write back to the outer learner. This also works with the auxiliary return
+critic under automatic, enabled inner entropy. The normal action-local default
+still resets temperature at every decision. The metrics
+`inner_temperature_optimizer_step_initial/final` and
+`inner_temperature_lifetime_steps_initial/final` expose continuity and reset,
+while `inner_temperature_episode_reset` marks an episode-boundary reset.
 
 For an actor-only inner-SAC ablation, set
 `inner_actor_adaptation="clone"`, `inner_critic_adaptation="frozen"`, and
@@ -2080,7 +2105,10 @@ auxiliary critic fails validation.
 
 Supported operators are prior-only operation, canonical action-local
 finite-horizon SAC, and MPPI. SAC requires prior initialization and the normal
-inner-target bootstrap. Explorer populations, persistent inner state, prior
+inner-target bootstrap. The automatic-temperature ablation may retain only
+log-alpha and its Adam state within an episode, with both temperature scopes set
+to `"episode"` and inner entropy enabled; all other inner scopes remain
+action-local. Explorer populations, other persistent inner state, prior
 writeback, TD3, native TDAMBI, and auxiliary value-equivalence training are
 rejected for this variant. The existing restrictions on each adaptation method
 still apply. Prior-only operation trains the selected auxiliary mode while

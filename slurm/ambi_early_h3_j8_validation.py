@@ -97,17 +97,24 @@ def validate_result(result_path, bundle_dir, expected_seeds=SEEDS, max_steps=500
     Entropy-disabled variants select zero temperature updates and explicitly
     override their resolved configuration (including temperature mode). Actor,
     critic, rollout, and probe work retain the same H3/J8 contract. Default
-    validation remains the original 32-temperature-update protocol.
+    validation remains the original 32-temperature-update protocol. Explicit
+    temperature-repeat variants retain the same actor slots but count each
+    actual Adam step, with a matching resolved repetition configuration.
     """
     seeds = tuple(expected_seeds)
     _require(bool(seeds) and len(seeds) == len(set(seeds))
              and all(type(seed) is int for seed in seeds), "Expected seeds must be distinct integers")
     _require(type(max_steps) is int and 1 <= max_steps <= 500, "max_steps must be in [1, 500]")
-    _require(type(expected_temperature_steps) is int and expected_temperature_steps in (0, 32),
-             "expected_temperature_steps must be 0 or 32 for the H3/J8 protocol")
+    _require(type(expected_temperature_steps) is int and expected_temperature_steps >= 0
+             and expected_temperature_steps % 32 == 0,
+             "expected_temperature_steps must be zero or an integer multiple of 32")
     _require(config_overrides is None or isinstance(config_overrides, dict),
              "config_overrides must be a mapping or None")
     config = {**CONFIG, **(config_overrides or {})}
+    temperature_repeats = expected_temperature_steps // 32
+    if temperature_repeats > 1:
+        _require(config.get("inner_temperature_updates_per_actor") == temperature_repeats,
+                 "Repeated temperature work requires its explicit resolved configuration")
     counters = {**COUNTERS, "temperature": expected_temperature_steps}
     temperature_steps_per_round = expected_temperature_steps // 8
     payload = _read(result_path)
@@ -199,7 +206,14 @@ def validate_result(result_path, bundle_dir, expected_seeds=SEEDS, max_steps=500
                     for name in counters:
                         flag = event[f"updated_{name}"]
                         _require(type(flag) is bool, "Invalid update flag")
-                        state["counts"][name] += int(flag)
+                        increment = int(flag)
+                        if name == "temperature":
+                            _require(not flag or temperature_repeats > 0,
+                                     "Unexpected temperature update flag")
+                            increment *= temperature_repeats
+                            actual = event["metrics"].get("temperature_updates", increment)
+                            _require(actual == increment, "Trace temperature repeat count mismatch")
+                        state["counts"][name] += increment
                 for name in counters:
                     _require(event[f"{name}_updates"] == state["counts"][name], "Trace cumulative optimizer counter mismatch")
                 if event["phase"] == "probe":

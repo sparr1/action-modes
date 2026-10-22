@@ -213,6 +213,8 @@ _AMBI_DEFAULTS = {
     # for operators without an entropy objective.
     "inner_temperature_mode": None,
     "inner_temperature_initialization": "inherit_outer",
+    # Scalar Adam steps on each actor sample's detached entropy residual.
+    "inner_temperature_updates_per_actor": 1,
     "inner_temperature": 1.0,
     "inner_target_entropy": "inherit_outer",
     "inner_bootstrap_source": "inner_target",
@@ -1812,6 +1814,35 @@ class AMBITDMPC2(TDMPC2Baseline):
         if cfg.inner_mppi_iterations < 0:
             raise ValueError("inner_mppi_iterations must be non-negative.")
 
+        cfg.inner_temperature_updates_per_actor = _strict_positive_int(
+            cfg.inner_temperature_updates_per_actor,
+            "inner_temperature_updates_per_actor",
+        )
+        if cfg.inner_temperature_updates_per_actor != 1:
+            for key, required in {
+                "inner_operator": "sac",
+                "inner_schedule_mode": "canonical",
+                "inner_temperature_mode": "auto",
+                "inner_explorer_mode": "none",
+                "inner_update_timing": "round",
+            }.items():
+                if str(getattr(cfg, key)).lower() != required:
+                    raise ValueError(
+                        "inner_temperature_updates_per_actor>1 requires "
+                        f"{key}={required!r}."
+                    )
+            if not cfg.inner_component_update_schedule:
+                raise ValueError(
+                    "inner_temperature_updates_per_actor>1 requires explicit "
+                    "inner_critic_updates_per_round and inner_actor_updates_per_round."
+                )
+            if (not cfg.inner_entropy_enabled
+                    or str(cfg.inner_actor_adaptation).lower() == "frozen"):
+                raise ValueError(
+                    "inner_temperature_updates_per_actor>1 requires enabled "
+                    "inner entropy and an adaptable actor."
+                )
+
         if cfg.inner_operator in {"sac", "td3"}:
             cfg.inner_rounds = int(cfg.inner_rounds)
             if cfg.inner_rounds < 0:
@@ -2022,6 +2053,16 @@ class AMBITDMPC2(TDMPC2Baseline):
             if cfg.inner_model_step_budget > 0
             else 0.0
         )
+        # Repeated scalar updates share an existing actor-phase sample, so
+        # they change the optimizer budget but never add replay/update slots.
+        cfg.inner_temperature_updates_per_action *= (
+            cfg.inner_temperature_updates_per_actor
+        )
+        if (cfg.inner_temperature_updates_per_actor > 1
+                and cfg.inner_actor_updates_per_action <= 0):
+            raise ValueError(
+                "inner_temperature_updates_per_actor>1 requires actor updates."
+            )
 
         if (
             cfg.inner_operator in {"sac", "td3"}
@@ -3705,6 +3746,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         temperature_metrics = {
             "inner_temperature_loss",
             "inner_temperature_grad_norm",
+            "inner_temperature_entropy_residual",
         }
         explorer_temperature_metrics = {
             "inner_explorer_temperature_loss",
@@ -3777,6 +3819,12 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_alpha_initial",
             "inner_alpha_final",
             "inner_alpha_delta",
+            "inner_temperature_updates_per_actor",
+            "inner_temperature_optimizer_step_initial",
+            "inner_temperature_optimizer_step_final",
+            "inner_temperature_lifetime_steps_initial",
+            "inner_temperature_lifetime_steps_final",
+            "inner_temperature_episode_reset",
             "inner_target_entropy",
             "inner_actor_writeback_coef",
             "inner_critic_writeback_coef",

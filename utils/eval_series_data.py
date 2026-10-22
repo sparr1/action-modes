@@ -390,6 +390,10 @@ def planner_identity(config, result, algorithm, action_rule):
               if key.startswith("inner_")}
     if active.get("inner_critic_bernoulli_p", 0.0) == 0.0:
         active.pop("inner_critic_bernoulli_p", None)
+    # One temperature step per actor update is the historical behavior.
+    # Preserve that identity while keeping an actual repeat intervention distinct.
+    if active.get("inner_temperature_updates_per_actor", 1) == 1:
+        active.pop("inner_temperature_updates_per_actor", None)
     estimator = config.get("inner_sac_return_estimator", "one_step")
     if isinstance(estimator, str):
         estimator = estimator.lower()

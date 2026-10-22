@@ -278,6 +278,7 @@ def scientific_trial_parameters(
                     ("inner_actor_initial_std", None),
                     ("inner_critic_initialization", "prior"),
                     ("inner_critic_bernoulli_p", 0.0),
+                    ("inner_temperature_updates_per_actor", 1),
                     ("inner_mppi_eval_action", "mean"),
                     ("inner_critic_loss_coef", 1.0),
                     ("inner_actor_loss_scale_update", "per_action"),
