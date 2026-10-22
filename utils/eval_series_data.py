@@ -513,6 +513,10 @@ def planner_identity(config, result, algorithm, action_rule):
 
 
 def _episode_protocol(protocol, seeds, config=None, action_rule=None):
+    if "temperature_chain" in protocol:
+        raise ValueError(
+            "Temperature-chain episodes are dependent and cannot be imported as an independent-seed eval series."
+        )
     keys = {"environment", "env_wrapper", "env_wrappers", "observation", "action_rule",
             "controller_seed", "seed_scheme", "max_steps", "prior_reference"}
     normalized = {key: copy.deepcopy(value) for key, value in protocol.items() if key in keys}

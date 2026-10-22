@@ -552,7 +552,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
         # untouched and ordinary action/episode resets retain their cache.
         self._initialize_compile_regions()
 
-    def reset_for_evaluation(self, seed, *, reuse_action_pool=False):
+    def reset_for_evaluation(self, seed, *, reuse_action_pool=False,
+                             preserve_run_temperature=False):
         """Reset evaluation state and RNG, optionally retaining safe allocations.
 
         Paired controller evaluation reuses one engine that is never the live
@@ -564,16 +565,42 @@ class InnerImprovementEngine(RetraceInnerMixin):
         moments, replay and alpha
         before use. Keeping module identities also avoids recompiling Dynamo
         guards after every root. Other lifecycles still discard their pools.
+        Explicit temperature-chain evaluation may preserve only run-scoped
+        log-alpha and its Adam state across episode resets. It still resets
+        every other workspace field and the episode-private RNG streams.
         """
 
         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise ValueError("Evaluation inner-engine seed must be non-negative.")
         if not isinstance(reuse_action_pool, bool):
             raise TypeError("reuse_action_pool must be bool.")
+        if not isinstance(preserve_run_temperature, bool):
+            raise TypeError("preserve_run_temperature must be bool.")
         if self.rng._action_fork_depth != 0:
             raise RuntimeError(
                 "Cannot reset the evaluation inner engine during an active action."
             )
+        temperature_state = None
+        if preserve_run_temperature:
+            cfg, state = self.cfg, self.state
+            if not (
+                cfg.inner_operator == "sac"
+                and cfg.inner_temperature_mode == "auto"
+                and self._inner_entropy_enabled
+                and cfg.inner_temperature_scope == cfg.inner_temperature_optimizer_scope == "run"
+                and not self._explorer_active
+                and all(getattr(cfg, f"inner_{component}_scope") == "action"
+                        for component in ("actor", "critic", "replay", "actor_optimizer", "critic_optimizer"))
+                and cfg.inner_actor_writeback_coef == cfg.inner_critic_writeback_coef == 0
+            ):
+                raise ValueError("Temperature-chain reset requires only paired run-scoped automatic SAC temperature.")
+            if state.log_alpha is None or state.temperature_optim is None:
+                raise ValueError("Temperature-chain continuation requires an initialized alpha and Adam state.")
+            owned = [p for group in state.temperature_optim.param_groups for p in group["params"]]
+            if len(owned) != 1 or owned[0] is not state.log_alpha:
+                raise RuntimeError("Temperature optimizer does not own the retained log-alpha parameter.")
+            temperature_state = (state.log_alpha, state.temperature_optim,
+                                 state.temperature_lifetime_steps)
         retain_pool = (
             reuse_action_pool
             and str(self.cfg.inner_operator) in {"sac", "td3", "tdambi"}
@@ -587,6 +614,9 @@ class InnerImprovementEngine(RetraceInnerMixin):
             )
         )
         self.state = InnerWorkspace()
+        if temperature_state is not None:
+            (self.state.log_alpha, self.state.temperature_optim,
+             self.state.temperature_lifetime_steps) = temperature_state
         if not retain_pool:
             self._action_pool = InnerWorkspace()
         self.rng = self._new_rng(seed)
@@ -6429,6 +6459,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         # LoRA adapter initialization uses ordinary PyTorch initializers; fork
         # it onto the private optimization stream so act() cannot advance the
         # outer learner's global RNG.
+        temperature_uninitialized = state.log_alpha is None
         with self.rng.fork("initialization"):
             self._prepare_workspace(t0=t0)
         self._timer_stop("inner_setup_seconds", setup_start)
@@ -6697,6 +6728,9 @@ class InnerImprovementEngine(RetraceInnerMixin):
             inner_temperature_lifetime_steps_final=float(state.temperature_lifetime_steps),
             inner_temperature_episode_reset=float(
                 t0 and str(cfg.inner_temperature_scope) in {"action", "episode"}
+            ),
+            inner_temperature_chain_reset=float(
+                temperature_uninitialized and str(cfg.inner_temperature_scope) == "run"
             ),
             inner_target_updates=float(state.target_steps),
             inner_critic_target_updates=float(state.critic_target_steps),

@@ -177,12 +177,12 @@ def validate_auxiliary_config(cfg):
         requirements[f"inner_{component}_scope"] = "action"
     temperature_scopes = (cfg.inner_temperature_scope, cfg.inner_temperature_optimizer_scope)
     if temperature_scopes != ("action", "action"):
-        if not (temperature_scopes == ("episode", "episode")
+        if not (temperature_scopes in {("episode", "episode"), ("run", "run")}
                 and cfg.inner_operator == "sac" and cfg.inner_temperature_mode == "auto"
                 and cfg.inner_entropy_enabled):
             raise ValueError(
                 "aux_return_mode requires action-scoped temperature and optimizer, "
-                "or both episode-scoped with automatic inner SAC entropy tuning."
+                "or matched episode/run scopes with automatic inner SAC entropy tuning."
             )
     for key, value in requirements.items():
         if getattr(cfg, key) != value:

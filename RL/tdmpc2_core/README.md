@@ -1296,6 +1296,21 @@ still resets temperature at every decision. The metrics
 `inner_temperature_lifetime_steps_initial/final` expose continuity and reset,
 while `inner_temperature_episode_reset` marks an episode-boundary reset.
 
+Setting both temperature scopes to `"run"` instead retains log-alpha and Adam
+across online-training episode boundaries as well. Actor, critic, replay and
+their optimizers must still be action-local for auxiliary-return SAC. Frozen
+checkpoint evaluation requires the explicit `--temperature-chain` flag for
+these scopes: one invocation is one independent temperature stream over the
+ordered `--seeds`. Every episode resets its environment, action caches and
+private RNG using the normal per-seed derivation; only log-alpha, Adam and the
+temperature lifetime count survive. The first episode initializes alpha from
+the selected outer actor. The outer checkpoint remains frozen.
+`inner_temperature_chain_reset` marks the first solve in a new stream, while
+the optimizer and lifetime start/end counters verify continuity across episodes.
+Chain bundles retain seed order and the `run-temperature-chain-v1` protocol.
+Their episodes are dependent: across-episode standard deviation is descriptive,
+and they cannot be imported as ordinary independent-seed evaluation series.
+
 For an actor-only inner-SAC ablation, set
 `inner_actor_adaptation="clone"`, `inner_critic_adaptation="frozen"`, and
 `inner_temperature_mode="inherit_outer"`. The canonical schedule then resolves
@@ -2106,8 +2121,9 @@ auxiliary critic fails validation.
 Supported operators are prior-only operation, canonical action-local
 finite-horizon SAC, and MPPI. SAC requires prior initialization and the normal
 inner-target bootstrap. The automatic-temperature ablation may retain only
-log-alpha and its Adam state within an episode, with both temperature scopes set
-to `"episode"` and inner entropy enabled; all other inner scopes remain
+log-alpha and its Adam state within an episode or across a run, with both
+temperature scopes set to `"episode"` or both to `"run"` and inner entropy enabled;
+all other inner scopes remain
 action-local. Explorer populations, other persistent inner state, prior
 writeback, TD3, native TDAMBI, and auxiliary value-equivalence training are
 rejected for this variant. The existing restrictions on each adaptation method

@@ -27,16 +27,17 @@ def test_repeat_default_is_compatible_but_nondefault_and_carry_are_distinct():
     assert scientific_trial_parameters(trial) != scientific_trial_parameters(changed)
 
 
-def test_auxiliary_allows_only_temperature_and_adam_episode_carry():
-    cfg = _build_cfg(aux_return_mode="sac", inner_temperature_scope="episode",
-                     inner_temperature_optimizer_scope="episode")
+@pytest.mark.parametrize("scope", ["episode", "run"])
+def test_auxiliary_allows_only_temperature_and_adam_carry(scope):
+    cfg = _build_cfg(aux_return_mode="sac", inner_temperature_scope=scope,
+                     inner_temperature_optimizer_scope=scope)
     assert cfg.inner_actor_scope == cfg.inner_critic_scope == cfg.inner_replay_scope == "action"
 
 
 @pytest.mark.parametrize("overrides", [
     {"inner_temperature_optimizer_scope": "action"},
     {"inner_temperature_scope": "action"},
-    {"inner_temperature_scope": "run", "inner_temperature_optimizer_scope": "run"},
+    {"inner_temperature_scope": "run", "inner_temperature_optimizer_scope": "episode"},
     {"inner_temperature_mode": "fixed"},
     {"inner_entropy_enabled": False},
     {"inner_actor_scope": "episode"},

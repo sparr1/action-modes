@@ -3825,6 +3825,7 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_temperature_lifetime_steps_initial",
             "inner_temperature_lifetime_steps_final",
             "inner_temperature_episode_reset",
+            "inner_temperature_chain_reset",
             "inner_target_entropy",
             "inner_actor_writeback_coef",
             "inner_critic_writeback_coef",

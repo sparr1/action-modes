@@ -93,6 +93,10 @@ def build_parser():
         help="Override the common inner-controller RNG seed from the matrix.",
     )
     parser.add_argument(
+        "--temperature-chain", action="store_true",
+        help="Treat ordered episode seeds as one alpha/Adam stream; requires paired run temperature scopes and a local bundle.",
+    )
+    parser.add_argument(
         "--max-steps",
         type=int,
         help="Optional per-episode safety cap; defaults to the matrix evaluation setting.",
@@ -640,15 +644,28 @@ def _validate_horizon_probe_selection(resolved_presets, *, root_bank_requested,
         )
 
 
-def _validate_benchmark_scopes(params, *, episode_evaluation):
+def _validate_benchmark_scopes(params, *, episode_evaluation, temperature_chain=False):
     """Permit temperature-only episode memory in explicitly matched full episodes."""
     temperature_keys = ("inner_temperature_scope", "inner_temperature_optimizer_scope")
+    if not isinstance(temperature_chain, bool):
+        raise TypeError("temperature_chain must be bool.")
+    if temperature_chain and not (
+        episode_evaluation
+        and params.get("inner_operator", "sac") == "sac"
+        and params.get("inner_temperature_mode", "auto") == "auto"
+        and params.get("inner_entropy_enabled", True)
+        and all(params.get(key, "action") == "run" for key in temperature_keys)
+        and params.get("inner_explorer_mode", "none") == "none"
+        and not any(params.get(key, 0) for key in ("inner_actor_writeback_coef", "inner_critic_writeback_coef"))
+    ):
+        raise ValueError("--temperature-chain requires full-episode automatic SAC with only matched run-scoped temperature and optimizer.")
     temperature_carry = (
         episode_evaluation
         and params.get("inner_operator", "sac") == "sac"
         and params.get("inner_temperature_mode", "auto") == "auto"
         and params.get("inner_entropy_enabled", True)
-        and all(params.get(key, "action") == "episode" for key in temperature_keys)
+        and all(params.get(key, "action") == ("run" if temperature_chain else "episode")
+                for key in temperature_keys)
     )
     scopes = [key for key in params if key.startswith("inner_") and key.endswith("_scope")
               and key != "inner_mppi_warm_start_scope"]
@@ -656,7 +673,8 @@ def _validate_benchmark_scopes(params, *, episode_evaluation):
            for key in scopes):
         raise ValueError(
             "Benchmark presets require fresh action-local inner state, except "
-            "paired episode-scoped temperature and optimizer in full-episode SAC evaluation."
+            "paired episode-scoped temperature and optimizer in full-episode SAC evaluation, "
+            "or matched run scopes with explicit --temperature-chain."
         )
 
 
@@ -680,6 +698,7 @@ def evaluate_preset(
     probe_horizon=3,
     togo_return_rollouts=0,
     togo_return_every=1,
+    temperature_chain=False,
 ):
     """Evaluate one resolved preset and verify outer-state immutability."""
     checkpoint = Path(checkpoint).resolve()
@@ -696,6 +715,15 @@ def evaluate_preset(
         raise ValueError("Evaluation seeds must be valid NumPy seed integers.")
     if len(set(int(seed) for seed in seeds)) != len(seeds):
         raise ValueError("Evaluation seeds must not contain duplicates.")
+    if not isinstance(temperature_chain, bool):
+        raise TypeError("temperature_chain must be bool.")
+    params = resolved.get("algorithm_config", {}).get("alg_params", {})
+    if temperature_chain or any(params.get(key) == "run" for key in
+                                ("inner_temperature_scope", "inner_temperature_optimizer_scope")):
+        _validate_benchmark_scopes(params, episode_evaluation=not (root_bank is not None or bank_only),
+                                   temperature_chain=temperature_chain)
+    if temperature_chain and captured_roots is not None:
+        raise ValueError("Temperature chains cannot capture root banks.")
     if isinstance(controller_seed, bool) or not 0 <= int(controller_seed) <= _MAX_NUMPY_SEED:
         raise ValueError("controller_seed must be a valid NumPy seed integer.")
     if max_steps is not None and int(max_steps) <= 0:
@@ -817,12 +845,16 @@ def evaluate_preset(
                     for key in nonfinite:
                         nonfinite_metric_counts[key] = nonfinite_metric_counts.get(key, 0) + 1
 
-        for seed in ([] if bank_only else seeds):
+        for chain_episode_index, seed in enumerate([] if bank_only else seeds):
             seed = int(seed)
             episode_seed = solver_seed(controller_seed, "episode", seed)
             engine = getattr(model.agent, "inner_engine", None)
             if engine is not None:
-                engine.reset_for_evaluation(episode_seed, reuse_action_pool=bundle is not None)
+                engine.reset_for_evaluation(
+                    episode_seed, reuse_action_pool=bundle is not None,
+                    **({"preserve_run_temperature": True}
+                       if temperature_chain and chain_episode_index > 0 else {}),
+                )
             _seed_spaces(env, seed)
             observation, _ = env.reset(seed=seed)
             terminated = truncated = False
@@ -922,6 +954,7 @@ def evaluate_preset(
                 {
                     "seed": seed,
                     "solver_seed": episode_seed,
+                    **({"temperature_chain_episode_index": chain_episode_index} if temperature_chain else {}),
                     "return": episode_return,
                     "length": episode_steps,
                     "terminated": bool(terminated),
@@ -975,6 +1008,11 @@ def evaluate_preset(
                if getattr(model.agent, "aux_return", None) is not None else {}),
             "controller_seed": int(controller_seed),
             "environment_seeds": [int(seed) for seed in seeds],
+            **({"temperature_chain": True,
+                "temperature_chain_seeds": [int(seed) for seed in seeds],
+                "temperature_chain_kind": "run-temperature-chain-v1",
+                "episode_variation_semantics": "dependent episodes within one temperature stream; descriptive only"}
+               if temperature_chain else {}),
             "seed_scheme": "sha256-v1",
             "execution_action": execution_action,
             "outer_updates_before": updates_before,
@@ -1075,9 +1113,17 @@ def evaluate_matrix(
     source_run=None,
     stage_results=True,
     eval_series_spec_dir=None,
+    temperature_chain=False,
 ):
     """Evaluate selected presets from a matrix with paired seeds."""
     evaluation_started = time.perf_counter()
+    if not isinstance(temperature_chain, bool):
+        raise TypeError("temperature_chain must be bool.")
+    if temperature_chain and any(value is not None and value is not False for value in (
+        save_root_bank, root_bank_path, bank_only, reference_bundle, wandb_options,
+        eval_run_dir, eval_run_map, eval_series_spec_dir,
+    )):
+        raise ValueError("Temperature chains require their own protocol: banks, reference bundles and independent-episode publication are not supported.")
     matrix_path = Path(matrix_path).resolve()
     matrix = load_preset_matrix(matrix_path)
     selectors = normalize_selectors(matrix, selectors, comparisons)
@@ -1131,6 +1177,11 @@ def evaluate_matrix(
         raise ValueError("--metadata requires a checkpoint-based preset matrix.")
     resolved_presets = [resolve_preset(matrix_path, selector, matrix=matrix, checkpoint_context=context)
                         for selector in selectors]
+    if temperature_chain:
+        if len(resolved_presets) != 1 or bundle_dir is None:
+            raise ValueError("Temperature chains require one preset and a local benchmark bundle.")
+        _validate_benchmark_scopes(resolved_presets[0]["algorithm_config"]["alg_params"],
+                                   episode_evaluation=True, temperature_chain=True)
     _validate_frozen_selection(matrix, resolved_presets)
     _validate_checkpoint_contract(matrix, checkpoint, context, resolved_presets)
     _validate_horizon_probe_selection(
@@ -1172,7 +1223,8 @@ def evaluate_matrix(
                 raise ValueError("Benchmark bundles currently support state observations only.")
             if params.get("inner_operator", "sac") not in {"none", "sac", "tdambi", "mppi"}:
                 raise ValueError("Benchmark bundles support prior-only, SAC, TDAMBI, and MPPI presets.")
-            _validate_benchmark_scopes(params, episode_evaluation=not (root_bank_path or bank_only))
+            _validate_benchmark_scopes(params, episode_evaluation=not (root_bank_path or bank_only),
+                                       temperature_chain=temperature_chain)
             if any(params.get(key, 0) for key in ("inner_actor_writeback_coef", "inner_critic_writeback_coef")):
                 raise ValueError("Benchmark presets must disable prior writeback.")
             if int(params.get("inner_diagnostic_rollouts", 0)) != 0:
@@ -1182,6 +1234,10 @@ def evaluate_matrix(
     if bundle_dir is not None and any(protocol != protocols[0] for protocol in protocols):
         raise ValueError("A benchmark bundle must use one common environment/action protocol.")
     protocol = protocols[0]
+    if temperature_chain:
+        protocol["temperature_chain"] = {
+            "kind": "run-temperature-chain-v1", "ordered_environment_seeds": [int(seed) for seed in seeds],
+        }
     root_bank = load_bank(root_bank_path, checkpoint_sha256, protocol) if root_bank_path else None
     reference_options = ({"checkpoint_inventory": checkpoint_inventory,
                           "source_run": source_run or matrix.get("source_run"), "seeds": seeds}
@@ -1248,6 +1304,7 @@ def evaluate_matrix(
                     probe_rollouts=probe_rollouts, probe_horizon=probe_horizon,
                     togo_return_rollouts=togo_return_rollouts,
                     togo_return_every=togo_return_every,
+                    **({"temperature_chain": True} if temperature_chain else {}),
                 )
                 results.append(result)
                 if bundle is not None and resolved["algorithm_config"]["alg_params"].get("inner_operator") == "none":
@@ -1357,6 +1414,7 @@ def main(argv=None):
             root_bank_path=args.root_bank,
             bank_only=args.bank_only,
             bank_repetitions=args.bank_repetitions,
+            temperature_chain=args.temperature_chain,
             reference_bundle=args.reference_bundle,
             eval_run_dir=args.eval_run_dir, eval_run_map=args.eval_run_map,
             checkpoint_inventory=args.checkpoint_inventory, eval_series_spec_dir=args.eval_series_spec_dir,
