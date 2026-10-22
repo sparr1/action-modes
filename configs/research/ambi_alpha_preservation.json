@@ -1,0 +1,152 @@
+{
+  "schema_version": 1,
+  "base_alg_config": "checkpoint",
+  "description": "MPPI500k policy-improvement preservation: five independent three-episode alpha/Adam chains, paired with existing sampled prior and fresh-alpha H3/J8 controls.",
+  "shared_alg_params": {
+    "inner_rollout_horizon": 3,
+    "inner_q_target_reduction": "min_pair",
+    "inner_q_actor_reduction": "mean_pair",
+    "inner_sac_critic_target": "reward_only",
+    "inner_operator": "sac",
+    "inner_rounds": 8,
+    "inner_rollouts_per_round": 128,
+    "inner_batch_size": 256,
+    "inner_replay_capacity": 3072,
+    "inner_replay_sampling": "with_replacement",
+    "inner_diagnostic_rollouts": 0,
+    "inner_diagnostics_every": 1000,
+    "inner_actor_adaptation": "clone",
+    "inner_critic_adaptation": "clone",
+    "inner_temperature_mode": "auto",
+    "inner_temperature_initialization": "inherit_outer",
+    "inner_target_entropy": "inherit_outer",
+    "inner_bootstrap_source": "inner_target",
+    "inner_actor_lr": 0.0003,
+    "inner_critic_lr": 0.0003,
+    "inner_temperature_lr": 0.0003,
+    "inner_adam_eps": 1e-08,
+    "inner_critic_target_tau": 0.01,
+    "inner_critic_target_update_interval": 1,
+    "inner_behavior_action": "policy_sample",
+    "inner_execution_action": "policy_sample",
+    "inner_actor_scope": "action",
+    "inner_critic_scope": "action",
+    "inner_temperature_scope": "run",
+    "inner_replay_scope": "action",
+    "inner_actor_optimizer_scope": "action",
+    "inner_critic_optimizer_scope": "action",
+    "inner_temperature_optimizer_scope": "run",
+    "inner_actor_entropy_mode": "squashed",
+    "inner_log_std_mapping": null,
+    "inner_log_std_min": -10,
+    "inner_log_std_max": 2,
+    "inner_temperature": 1.0,
+    "inner_critic_dropout_enabled": true,
+    "inner_actor_grad_clip_norm": 20.0,
+    "inner_critic_grad_clip_norm": 20.0,
+    "inner_outer_policy_kl_coef": 0.0,
+    "inner_outer_action_l2_coef": 0.0,
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_explorer_mode": "none",
+    "inner_update_timing": "round",
+    "inner_finite_horizon": true,
+    "inner_outer_replay_fraction": 0.0,
+    "inner_critic_loss_coef": 1.0,
+    "inner_actor_adam_eps": 1e-05,
+    "inner_actor_loss_scale_update": "per_action",
+    "inner_critic_target_initialization": "online",
+    "inner_steps_per_update": null,
+    "inner_actor_source": "sac",
+    "inner_critic_source": "aux_return",
+    "inner_horizon_actor_source": "sac",
+    "inner_horizon_critic_source": "aux_return",
+    "inner_rebase_persistent": false,
+    "inner_critic_updates_per_round": 16,
+    "inner_actor_updates_per_round": 4,
+    "inner_critic_bernoulli_p": 0.0,
+    "inner_actor_initialization": "prior",
+    "inner_critic_initialization": "prior",
+    "inner_entropy_enabled": true,
+    "inner_mppi_iterations": null,
+    "inner_model_step_budget": null,
+    "inner_mppi_num_elites": null,
+    "inner_mppi_num_pi_trajs": null,
+    "inner_mppi_temperature": null,
+    "inner_mppi_min_std": null,
+    "inner_mppi_max_std": null,
+    "inner_mppi_warm_start_scope": null,
+    "inner_mppi_eval_action": null,
+    "wandb": false,
+    "inner_temperature_updates_per_actor": 1,
+    "inner_sac_return_estimator": "one_step"
+  },
+  "evaluation": {
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
+    "controller_seed": 55,
+    "max_steps": 500,
+    "togo_return_rollouts": 32,
+    "togo_return_every": 100,
+    "default_presets": [
+      "alpha_preservation/run"
+    ],
+    "execution_action": "sample"
+  },
+  "comparisons": {
+    "alpha_preservation": {
+      "description": "Only temperature and its Adam state persist across the ordered episodes of one independent stream.",
+      "reference": "run",
+      "variants": {
+        "run": {
+          "description": "One alpha update per actor step; carry alpha and Adam across decisions and episodes.",
+          "alg_params": {},
+          "evaluation": {
+            "execution_action": "sample"
+          }
+        }
+      }
+    }
+  },
+  "temperature_chain": {
+    "protocol": "run-temperature-chain-v1",
+    "streams": 5,
+    "episodes_per_stream": 3,
+    "ordered_seeds": [
+      [
+        101,
+        102,
+        103
+      ],
+      [
+        102,
+        103,
+        104
+      ],
+      [
+        103,
+        104,
+        105
+      ],
+      [
+        104,
+        105,
+        101
+      ],
+      [
+        105,
+        101,
+        102
+      ]
+    ],
+    "independent_unit": "stream",
+    "checkpoints": [
+      "mppi_aux_500k"
+    ]
+  }
+}
