@@ -358,7 +358,7 @@ def dispatch(campaign_path, worker_repo, python_bin, gpu_type='l40s', smoke_root
         for resource in sizing['cells']:
             index, minutes = resource['index'], resource['walltime_minutes']
             walltime = f'{minutes // 60:02}:{minutes % 60:02}:00'
-            capture = ['srun', 'env', 'OMP_NUM_THREADS=1', 'MKL_NUM_THREADS=1', 'OPENBLAS_NUM_THREADS=1',
+            capture = ['srun', '/usr/bin/env', 'OMP_NUM_THREADS=1', 'MKL_NUM_THREADS=1', 'OPENBLAS_NUM_THREADS=1',
                        str(python_bin), '-c', hardware_capture_code(gpu_type, root / 'production-hardware' / str(index))]
             worker = ['bash', str(worker_repo / 'slurm/run_ambi_alpha_adaptation_episodes_oscar.sbatch'),
                       '--campaign', str(campaign_path), '--index', str(index), '--cpu-threads', str(resource['cpus'])]
@@ -373,7 +373,7 @@ def dispatch(campaign_path, worker_repo, python_bin, gpu_type='l40s', smoke_root
         previous_publisher = None
         for index, gpu_job in enumerate(gpu_jobs):
             dependencies = [gpu_job] + ([previous_publisher] if previous_publisher else [])
-            worker = ['env', 'OMP_NUM_THREADS=1', 'OPENBLAS_NUM_THREADS=1', 'MKL_NUM_THREADS=1',
+            worker = ['/usr/bin/env', 'OMP_NUM_THREADS=1', 'OPENBLAS_NUM_THREADS=1', 'MKL_NUM_THREADS=1',
                 'WANDB_MODE=online', 'WANDB__REQUIRE_CORE=true', 'WANDB_DIR=' + str(root),
                 'WANDB_CACHE_DIR=' + str(root / 'cache'), 'srun', str(python_bin),
                 'slurm/ambi_alpha_adaptation_publish.py', 'publish', '--campaign', str(campaign_path),

@@ -121,6 +121,7 @@ def test_four_parallel_gpus_then_serial_publishers_are_idempotent(tmp_path, monk
         assert not any(arg.startswith('--dependency=') for arg in command)
         assert f'--index {index} --cpu-threads 1' in command[-1]
         assert 'production-hardware' in command[-1] and 'exec bash ' in command[-1]
+        assert 'srun /usr/bin/env OMP_NUM_THREADS=1' in command[-1]
     for index, command in enumerate(commands[4:]):
         expected = f'--dependency=afterany:{1001 + index}'
         if index:
@@ -128,6 +129,7 @@ def test_four_parallel_gpus_then_serial_publishers_are_idempotent(tmp_path, monk
         assert expected in command
         assert '--cpus-per-task=1' in command and '--mem=2G' in command
         assert 'slurm/ambi_alpha_adaptation_publish.py publish' in command[-1]
+        assert command[-1].startswith('/usr/bin/env OMP_NUM_THREADS=1')
         assert '--root ' + str(path.parent / 'publication') in command[-1]
         assert ('--require-complete' in command[-1]) == (index == 3)
     assert dispatch.dispatch(path, repo, py) == receipt and len(commands) == 8
