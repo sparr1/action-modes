@@ -61,3 +61,22 @@ runs seeds 101 and 102 to exercise episode boundaries. Resource requests are
 chosen at submission from measured throughput and current limits, not embedded
 in the launcher. CPU scaling smokes have independent output ownership, as do
 the reset smokes and production. No output is overwritten on retry.
+
+The dispatcher defaults to L40S but supports an explicit `--gpu-type` for other
+Oscar GPUs. Keep the scientific worker at its pinned commit. For a different
+GPU class, place an identical campaign JSON under `ROOT/hardware/GPU_TYPE/`, run
+the seven smokes there, and pass its `smoke/` directory via `--smoke-root` to the
+dispatcher. Each smoke requires an adjacent `.hardware.json` record of the
+allocated GPU and node. Resource sizing then uses measurements from that GPU
+class, and production records its hardware before starting the unchanged worker.
+The numerical baseline check and compile, lifecycle, memory, and walltime gates
+still apply. Historical L40S controller times are not direct speed comparisons
+against evaluations on another GPU class.
+
+A reviewed Quadro comparison may explicitly allow an absolute entropy difference
+of at most `1e-3` in the baseline prefix, while retaining the original reward and
+alpha tolerances. This is opt-in scheduling validation, not a change to policy
+optimization or the evaluator. Preserve the original failed check and a separate
+hash-pinned review receipt; all other baseline invariants and all seven smokes
+must pass. Small return differences against the reused L40S baseline should be
+confirmed with a hardware-matched baseline before drawing a decisive conclusion.
