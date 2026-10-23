@@ -1,0 +1,33 @@
+{
+  "study_type": "single_seed_exploratory_full_training_alpha_carry_factorial",
+  "study_note": "Eight fresh Humanoid Walk full-training runs: inner temperature and its Adam state persist for an episode or the entire run, crossed with auxiliary-return representation gradients shared/detached and target entropy -10.5/-21. Both temperature variants carry across decisions; episode mode resets to current outer alpha at each episode boundary. Both outer and inner SAC use the selected target, with independent learned alphas. H3/J8/C16/A4/N128/B256, seed55, 1M decisions (2M raw environment steps), 2500 warmup decisions and 2500 pretraining updates. Actor, critic, their optimizers and imagined replay remain action-local. Sampled training and imagined actions; auxiliary-return initialization and terminal bootstrap. No KL, Bernoulli or Retrace. Retain all 40 checkpoints every25k decisions. Evaluation stays disabled as in the source recipe; W&B logs actual training return, outer/inner metrics and root entropy before/after adaptation. This is a single-seed factorial screen, not a replicated comparison.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_alpha_carry_h3_j8_episode_shared_ent10p5",
+    "ambi_alpha_carry_h3_j8_episode_shared_ent21",
+    "ambi_alpha_carry_h3_j8_episode_detached_ent10p5",
+    "ambi_alpha_carry_h3_j8_episode_detached_ent21",
+    "ambi_alpha_carry_h3_j8_run_shared_ent10p5",
+    "ambi_alpha_carry_h3_j8_run_shared_ent21",
+    "ambi_alpha_carry_h3_j8_run_detached_ent10p5",
+    "ambi_alpha_carry_h3_j8_run_detached_ent21"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}
