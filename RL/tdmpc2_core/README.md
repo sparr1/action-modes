@@ -715,6 +715,43 @@ intermediate actor-update statistic associated with a positive
 `inner_outer_policy_kl_coef`; when that regularizer is disabled, its update-time
 metric is omitted rather than reported as a false zero.
 
+Single-policy inner SAC also records joint post-tanh policy entropy at the
+encoded real-decision root, with the root's full remaining horizon:
+
+- `train/inner_root_entropy_initial`: the actual initialized inner actor before
+  any collection or optimizer update (including random or transferred actors).
+- `train/inner_root_entropy_final`: the adapted actor after all inner updates.
+- `train/inner_root_entropy_delta`: final minus initial; negative means adaptation
+  reduced entropy at that same root.
+
+These are differential entropies in nats in normalized action coordinates,
+summed over action dimensions. They describe the underlying stochastic actor,
+even when evaluation executes its mean; execution-only standard-deviation
+scaling or added action noise is not included. They are distinct from
+`inner_actor_entropy`, which averages pre-update minibatches across intermediate
+actors and imagined states. Neither root entropy nor its target is expected to
+decrease monotonically as the visited states change.
+
+`inner_root_entropy_samples` defaults to 128; zero disables the observation,
+and positive values must be at least two. It follows `inner_diagnostics_every`
+and is absent on unsampled decisions, bypassed solves, and multi-policy
+explorer configurations. Each boundary needs one policy-statistics forward;
+sampling afterward is only Gaussian/tanh arithmetic, with no extra model or Q
+rollouts. The estimate combines analytic Gaussian entropy with a Monte Carlo
+stable tanh-Jacobian correction. Initial and final estimates share the same
+Gaussian noise, drawn from a clone of the diagnostic generator, so all existing
+RNG streams, action samples, updates, and diagnostics remain unchanged. Module
+training modes are restored. Work is counted in policy evaluations and
+`inner_diagnostic_seconds`.
+
+The corresponding `*_mc_se` metrics report Monte Carlo standard errors, including
+the paired difference's error; they are not dispersion across decisions. W&B
+aggregates root metrics with one observation per sampled decision, rather than
+weighting by actor-update count, and reports its usual mean/std/min/max/count.
+`inner_root_entropy_samples` records the estimator sample count. Frozen-checkpoint
+evaluation retains the same metrics in its ordinary model-metric summaries and
+decision traces. Existing running jobs and historical logs are not modified.
+
 ### Optional replay behavior-policy regularizer
 
 `outer_behavior_policy_kl_schedule` optionally enables a replayed

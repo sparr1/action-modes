@@ -5945,6 +5945,51 @@ class InnerImprovementEngine(RetraceInnerMixin):
         }
 
     @torch.no_grad()
+    def _root_entropy_samples(self, root_z, policy, noise=None):
+        """Estimate joint post-tanh entropy at this root, not update states.
+
+        Use the analytic Gaussian entropy plus a sampled stable tanh Jacobian.
+        One policy forward supplies all sample parameters. Cloning the existing
+        diagnostic generator preserves every learner and diagnostic RNG stream;
+        callers reuse the noise for the initial/final paired difference.
+        """
+        modes = tuple((module, module.training) for module in policy.modules())
+        try:
+            policy.eval()
+            info = self.model.policy_stats(
+                root_z, policy=policy, **self._inner_policy_kwargs(),
+                **self._horizon_kwargs(self._remaining_horizon(root_z)),
+            )
+        finally:
+            for module, training in modes:
+                module.training = training
+        mean, log_std = info["pre_tanh_mean"], info["log_std"]
+        if noise is None:
+            source = self.rng.generator("diagnostics")
+            generator = torch.Generator(device=source.device)
+            generator.set_state(source.get_state())
+            noise = torch.randn(
+                (int(self.cfg.inner_root_entropy_samples), *mean.shape),
+                device=mean.device, dtype=mean.dtype, generator=generator,
+            )
+        pre_tanh = mean.unsqueeze(0) + log_std.exp().unsqueeze(0) * noise
+        gaussian = (log_std + 0.5 * math.log(2 * math.pi * math.e)).sum(-1)
+        correction = td_math.tanh_log_abs_det_jacobian(pre_tanh).squeeze(-1)
+        samples = (gaussian.unsqueeze(0) + correction).flatten(1).mean(-1)
+        self.state.policy_evaluations += int(root_z.shape[0])
+        return samples, noise
+
+    @staticmethod
+    def _root_entropy_metrics(initial, final):
+        metrics = {"inner_root_entropy_samples": float(initial.numel())}
+        for label, samples in (("initial", initial), ("final", final),
+                               ("delta", final - initial)):
+            key = f"inner_root_entropy_{label}"
+            metrics[key] = samples.mean()
+            metrics[key + "_mc_se"] = samples.std(unbiased=True) / math.sqrt(samples.numel())
+        return metrics
+
+    @torch.no_grad()
     def _diagnostics(self, root_z, improved_policy):
         with self.rng.fork("diagnostics") as generator:
             final_outer_policy_kl = None
@@ -6463,6 +6508,15 @@ class InnerImprovementEngine(RetraceInnerMixin):
         with self.rng.fork("initialization"):
             self._prepare_workspace(t0=t0)
         self._timer_stop("inner_setup_seconds", setup_start)
+        root_entropy_initial = root_entropy_noise = None
+        if (self._collect_diagnostics and cfg.inner_operator == "sac"
+                and not self._materialized_explorer_active
+                and int(getattr(cfg, "inner_root_entropy_samples", 0)) > 0):
+            diagnostic_start = self._timer_start()
+            root_entropy_initial, root_entropy_noise = self._root_entropy_samples(
+                root_z, state.actor
+            )
+            self._timer_stop("inner_diagnostic_seconds", diagnostic_start)
         actor_loss_scale = None
         if self._sac_actor_loss_scale_enabled:
             # Start from the outer estimator without sharing its storage. The
@@ -6642,6 +6696,13 @@ class InnerImprovementEngine(RetraceInnerMixin):
         if self._collect_diagnostics:
             diagnostic_start = self._timer_start()
             diagnostic_metrics = self._diagnostics(root_z, selected_policy)
+            if root_entropy_initial is not None:
+                root_entropy_final, _ = self._root_entropy_samples(
+                    root_z, selected_policy, root_entropy_noise
+                )
+                diagnostic_metrics.update(self._root_entropy_metrics(
+                    root_entropy_initial, root_entropy_final
+                ))
             self._timer_stop("inner_diagnostic_seconds", diagnostic_start)
         else:
             diagnostic_metrics = {}

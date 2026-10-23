@@ -292,6 +292,9 @@ _AMBI_DEFAULTS = {
     # model-step budget. Zero preserves legacy runtime.
     "inner_diagnostic_rollouts": 0,
     "inner_diagnostics_every": 1,
+    # Paired root-policy entropy observations at the diagnostic cadence.
+    # Zero disables them; samples only require Gaussian/tanh arithmetic.
+    "inner_root_entropy_samples": 128,
 
     # Sparse, observational value-equivalence monitoring on outer replay
     # updates. Disabled by default so it cannot change the reference runtime.
@@ -2631,6 +2634,11 @@ class AMBITDMPC2(TDMPC2Baseline):
         cfg.inner_diagnostics_every = int(cfg.inner_diagnostics_every)
         if cfg.inner_diagnostics_every <= 0:
             raise ValueError("inner_diagnostics_every must be positive.")
+        cfg.inner_root_entropy_samples = _strict_nonnegative_int(
+            cfg.inner_root_entropy_samples, "inner_root_entropy_samples"
+        )
+        if cfg.inner_root_entropy_samples == 1:
+            raise ValueError("inner_root_entropy_samples must be zero or at least two.")
         cfg.value_equivalence_diagnostics = _strict_bool(
             cfg.value_equivalence_diagnostics,
             "value_equivalence_diagnostics",
@@ -3831,6 +3839,13 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_critic_writeback_coef",
             "inner_policy_mean_delta_l2",
             "inner_final_outer_policy_kl",
+            "inner_root_entropy_initial",
+            "inner_root_entropy_final",
+            "inner_root_entropy_delta",
+            "inner_root_entropy_initial_mc_se",
+            "inner_root_entropy_final_mc_se",
+            "inner_root_entropy_delta_mc_se",
+            "inner_root_entropy_samples",
             "inner_proposal_mean_delta_l2",
             "inner_fixed_target_q_action_gain",
             "inner_outer_q_gain",
