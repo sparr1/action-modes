@@ -63,6 +63,29 @@ def test_checkpoint_config_rejects_non_positive_or_fractional_numbers(key):
             resolve_checkpoint_config({**values, key: invalid}, {})
 
 
+def test_replay_snapshot_flag_is_opt_in_with_algorithm_precedence():
+    assert not resolve_checkpoint_config({}, {"checkpoint_every": 25}).replay
+    assert resolve_checkpoint_config({}, {"checkpoint_every": 25, "checkpoint_replay": True}).replay
+    assert not resolve_checkpoint_config(
+        {"checkpoint_replay": False}, {"checkpoint_every": 25, "checkpoint_replay": True}
+    ).replay
+    assert resolve_checkpoint_config(
+        {"checkpoint_every": 25, "checkpoint_replay": True}, {"checkpoint_replay": False}
+    ).replay
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true", "false", [], {}])
+def test_replay_snapshot_flag_rejects_non_boolean_values(value):
+    with pytest.raises(ValueError, match="checkpoint_replay must be a boolean"):
+        resolve_checkpoint_config({"checkpoint_every": 25, "checkpoint_replay": value}, {})
+
+
+@pytest.mark.parametrize("disabled", [{"checkpoint_every": None}, {"checkpoint_every": 25, "save_strat": "none"}])
+def test_replay_snapshot_cannot_silently_be_disabled(disabled):
+    with pytest.raises(ValueError, match="requires enabled"):
+        resolve_checkpoint_config({**disabled, "checkpoint_replay": True}, {})
+
+
 def test_tracker_uses_partial_finite_window_strict_improvement_and_clean_final(tmp_path):
     tracker = CheckpointTracker(
         10,

@@ -214,6 +214,22 @@ for `latest`; `none` must be used alone. If `save_strat` is omitted, a positive
 Checkpoint files are model snapshots and do not universally contain replay or
 environment state for full training resume.
 
+For state-observation TD-MPC2/AMBI, opt in with top-level
+`"checkpoint_replay": true` beside `checkpoint_every` (algorithm settings take
+precedence over the experiment manifest). Each saved model then retains a
+`<model>.replay/` companion containing every resident replay row, episode IDs,
+writer/sampler state, and any collected current-episode rows not yet inserted
+into replay. CPU replay placement is fixed before collection. Capture streams
+owned 32,768-row shards while training is paused, bounding additional memory;
+model serialization remains asynchronous. The companion manifest binds the
+model step and SHA-256 and checksums every replay payload. The model metadata
+sidecar is published only after both are complete. Load and verify a pair with
+`utils.checkpoint_replay.load_checkpoint_replay(model_path, buffer)`; pending
+episode rows are returned separately to preserve the original replay sampling
+population. This option preserves retained replay for later experiments; exact
+training continuation still uses the native resume lineage, which additionally
+stores environment, learner, optimizer, carried inner state, and RNG state.
+
 Native TD-MPC2 periodic and final checkpoints also save the learned Q percentile
 scale `S`, frozen at the same step as the networks. Frozen TDAMBI evaluation
 uses that saved scale to initialize each independent inner solve. AMBI already

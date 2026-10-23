@@ -83,6 +83,18 @@ def _learn_resets_env_with_seed(alg_path):
     return alg_path in _SEEDED_LEARN_RESET_ALGORITHMS
 
 
+def _checkpoint_replay_kwargs(model, checkpoint_config):
+    """Keep opt-in replay snapshots explicit without changing legacy adapters."""
+    if not checkpoint_config.replay:
+        return {}
+    if not getattr(model, "supports_checkpoint_replay", False):
+        raise ValueError(
+            "checkpoint_replay=true requires a backend that supports complete "
+            "replay snapshots alongside each retained model checkpoint."
+        )
+    return {"checkpoint_replay": True}
+
+
 def _remove_saved_checkpoint(checkpoint_path):
     """Remove superseded cross-trial artifacts and their matching sidecars."""
 
@@ -883,6 +895,7 @@ def _run_resumable_experiment(
                 checkpoint_best_window=checkpoint_config.best_window,
                 trial_run_params=model_run_params,
                 experiment_params=experiment_params,
+                **_checkpoint_replay_kwargs(model, checkpoint_config),
             )
 
         if log_setting != "none":
@@ -1256,6 +1269,7 @@ def main():
                         checkpoint_best_window=checkpoint_config.best_window,
                         trial_run_params=trial_run_params,
                         experiment_params=experiment_params,
+                        **_checkpoint_replay_kwargs(model, checkpoint_config),
                     )
             except BaseException as exc:
                 cleanup_errors = []

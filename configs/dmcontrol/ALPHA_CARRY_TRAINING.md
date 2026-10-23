@@ -35,9 +35,13 @@ possible indirect interactions with the auxiliary critic.
 Each run has 1,000,000 **decisions**, equivalent to 2,000,000 raw environment
 steps at action repeat 2. Episodes last at most 500 decisions. The manifest
 retains all 40 periodic model checkpoints, every 25,000 decisions, with their
-metadata sidecars. Portable model checkpoints are distinct from exact training
-resume state, which additionally requires the replay, environment and optimizer
-state handled by the training-state mechanism.
+metadata sidecars and a **complete resident replay snapshot at that same
+decision** (`checkpoint_replay: true`). Each retained model has its own
+step-matched replay; these are not references to a mutable latest replay file.
+The replay option is a top-level checkpoint setting in both the algorithms and
+manifest. This retained checkpoint bank is distinct from exact training resume
+state, which additionally requires the environment, wrapper and optimizer state
+handled by the training-state mechanism.
 
 The requested Oscar allocation is one L40S for four days per run. CPU and memory
 requests must be selected from the campaign's training benchmark and current
@@ -48,16 +52,17 @@ handoff if the target has not been reached; it does not automatically requeue.
 
 This campaign stores large outputs under Oscar scratch at
 `/oscar/scratch/rgao48/ambi/alpha-carry-training/<campaign>/`, including native
-training-state generations and all model snapshots. This differs from the
+training-state generations and all model/replay snapshots. This differs from the
 older home-only launcher's storage policy because home quota is insufficient
 for the eight checkpoint banks. The launcher checks the scratch quota and
 filesystem writes. Scratch is subject to the cluster's retention policy; these
 files must be preserved elsewhere before their retention window expires.
-Native resume generations publish every 15 minutes at an episode boundary,
+Native resume generations publish separately every 15 minutes at an episode boundary,
 and W&B publishes the committed metric prefix. Thus dashboard data can lag
 training by approximately that interval. The same run ID is retained on exact
 continuation. To continue, use the same source/configuration and campaign path
-with `AMBI_RESUME_MODE=required`.
+with `AMBI_RESUME_MODE=required`. These rolling resume generations do not replace
+the full replay snapshot retained at **every** 25,000-decision model checkpoint.
 
 W&B project `ambi`, group `ambi-alpha-carry-full-20261023`, contains native
 per-run curves with all three factors in the display names and tags. Existing

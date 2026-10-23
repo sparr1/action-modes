@@ -111,7 +111,8 @@
       "root-entropy-samples128",
       "checkpoints-every25k",
       "retain-all-checkpoints",
-      "ambi-alpha-carry-full-20261023"
+      "ambi-alpha-carry-full-20261023",
+      "checkpoint-full-replay"
     ],
     "outer_actor_entropy_mode": "squashed",
     "inner_actor_entropy_mode": "squashed",
@@ -184,5 +185,6 @@
   "total_steps": 1000000,
   "episodes": null,
   "checkpoint_every": 25000,
-  "save_strat": "all"
+  "save_strat": "all",
+  "checkpoint_replay": true
 }

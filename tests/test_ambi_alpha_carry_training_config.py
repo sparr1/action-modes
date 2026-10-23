@@ -74,6 +74,7 @@ def test_resolved_cell_lifetimes_targets_and_update_budget(name, factors):
     assert params["ent_coef_lr"] == cfg.inner_temperature_lr == 3e-4
     assert config["total_steps"] == 1_000_000 and config["seed"] == 55
     assert config["checkpoint_every"] == 25_000 and config["save_strat"] == "all"
+    assert config["checkpoint_replay"] is True
     assert not params.get("pretrained_model_path")
     assert params["wandb_project"] == "ambi" and params["wandb_group"] == GROUP
     assert params["wandb"] and params["wandb_event_indexed"]
@@ -89,6 +90,7 @@ def test_eight_unique_factor_cells_with_no_other_algorithm_changes():
         config = _read(ROOT / "configs/dmcontrol/algs" / f"{name}.json")
         expected = deepcopy(source)
         expected["total_steps"] = 1_000_000
+        expected["checkpoint_replay"] = True
         expected["alg_params"].update(
             inner_temperature_scope=scope,
             inner_temperature_optimizer_scope=scope,
@@ -114,5 +116,6 @@ def test_manifest_cannot_shallow_replace_algorithm_parameters_or_budget():
         "task": "humanoid-walk", "obs": "state", "render_mode": None,
     }
     assert MANIFEST["checkpoint_every"] == 25_000
+    assert MANIFEST["checkpoint_replay"] is True
     assert MANIFEST["save_strat"] == "all" and MANIFEST["save_trials"] == "none"
     assert MANIFEST["logs"] == "timestamp" and MANIFEST["log_type"] == "summary"

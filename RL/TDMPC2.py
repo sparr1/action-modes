@@ -575,6 +575,7 @@ class TDMPC2Baseline(Algorithm):
     """
 
     supports_composable_checkpointing = True
+    supports_checkpoint_replay = True
 
     def __init__(self, name, env, custom_params=None, run_params=None, experiment_params=None):
         super().__init__(name, env, custom_params)
@@ -609,6 +610,7 @@ class TDMPC2Baseline(Algorithm):
         )
         self._predict_t0 = True
         self._checkpointing = None
+        self._checkpoint_replay_enabled = False
         self._checkpoint_writer = AsyncCheckpointWriter()
         self._global_step = 0
         self._episode_idx = 0
@@ -1514,11 +1516,35 @@ class TDMPC2Baseline(Algorithm):
             return
         if self.alg_logger is not None and hasattr(self.alg_logger, "flush"):
             self.alg_logger.flush()
-        self._checkpoint_writer.enqueue_many(
-            self.agent.checkpoint_state(),
-            targets,
-            signature=self._checkpoint_signature(),
-        )
+        self._publish_checkpoint_targets(targets, asynchronous=True)
+
+    def _publish_checkpoint_targets(self, targets, *, asynchronous=False):
+        companion = None
+        options = {}
+        if getattr(self, "_checkpoint_replay_enabled", False):
+            from utils.checkpoint_replay import prepare_checkpoint_replay
+
+            self._checkpoint_writer.flush()
+            pending = None
+            if self._episode_len and not (self._last_terminated or self._last_truncated):
+                pending = {
+                    "episode_index": int(self._episode_idx),
+                    "length": int(self._episode_len),
+                    "return": float(self._episode_return),
+                    "rows": self._episode_staging[:self._episode_len + 1].cpu().clone(),
+                }
+            companion = prepare_checkpoint_replay(
+                self.buffer, targets, step=self._global_step, pending_episode=pending,
+            )
+            options["before_metadata"] = companion
+        writer = self._checkpoint_writer.enqueue_many if asynchronous else self._checkpoint_writer.save_many
+        try:
+            return writer(self.agent.checkpoint_state(), targets,
+                          signature=self._checkpoint_signature(), **options)
+        except BaseException:
+            if companion is not None:
+                companion.close()
+            raise
 
     def _final_checkpoint(self):
         if not isinstance(self._checkpointing, CheckpointTracker):
@@ -1528,11 +1554,7 @@ class TDMPC2Baseline(Algorithm):
             return ()
         if self.alg_logger is not None and hasattr(self.alg_logger, "flush"):
             self.alg_logger.flush()
-        return self._checkpoint_writer.save_many(
-            self.agent.checkpoint_state(),
-            targets,
-            signature=self._checkpoint_signature(),
-        )
+        return self._publish_checkpoint_targets(targets)
 
     def enable_training_resume(self, *, total_timesteps):
         """Enable the explicit boundary-only scientific resume contract."""
@@ -2472,7 +2494,7 @@ class TDMPC2Baseline(Algorithm):
                     "construct a new learner with the intended step budget."
                 )
             self.cfg.steps = total_timesteps
-            self.buffer = Buffer(self.cfg)
+            self.buffer = Buffer(self.cfg, resumable=self._checkpoint_replay_enabled)
         self.cfg.steps = total_timesteps
         if self._wandb_run is None:
             self._wandb_run = self._init_wandb()
@@ -2590,11 +2612,7 @@ class TDMPC2Baseline(Algorithm):
                 trial_run_params=getattr(self, "run_params", {}),
                 experiment_params=getattr(self, "experiment_params", {}),
             )
-        return self._checkpoint_writer.save_many(
-            self.agent.checkpoint_state(),
-            (target,),
-            signature=self._checkpoint_signature(),
-        )[0]
+        return self._publish_checkpoint_targets((target,))[0]
 
     def _checkpoint_signature(self):
         """Version the exact outer state represented by native checkpoints."""
@@ -2624,7 +2642,13 @@ class TDMPC2Baseline(Algorithm):
         checkpoint_best_window=100,
         trial_run_params=None,
         experiment_params=None,
+        checkpoint_replay=False,
     ):
+        if not isinstance(checkpoint_replay, bool):
+            raise ValueError("checkpoint_replay must be boolean.")
+        if checkpoint_replay and not self.buffer.resumable_storage:
+            self.buffer.enable_resumable_storage()
+        self._checkpoint_replay_enabled = checkpoint_replay
         self._checkpointing = CheckpointTracker(
             save_freq,
             save_path,

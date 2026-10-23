@@ -586,6 +586,24 @@ class TrainingResumeSession:
                 source = parents[0]
                 metadata = _load_json(parent_metadata[0], "best model metadata")
         if source is not None:
+            # A retained portable best model may have a hash-bound replay
+            # companion. Keep that relative reference valid when carrying the
+            # model into a new exact-resume generation.
+            if "replay" in metadata:
+                replay_name = metadata["replay"].get("path")
+                expected_name = f"{Path(source).name}.replay"
+                if replay_name != expected_name:
+                    raise ResumeIncompatibilityError("Invalid best-model replay companion reference.")
+                replay_source = Path(source).parent / replay_name
+                manifest_path = replay_source / "manifest.json"
+                manifest = _load_json(manifest_path, "best model replay manifest")
+                for name in ["manifest.json"] + [item["path"] for item in manifest["files"]]:
+                    if not isinstance(name, str) or Path(name).name != name:
+                        raise ResumeIncompatibilityError("Invalid best-model replay payload path.")
+                    files.append(GenerationFile(
+                        f"{relative}.replay/{name}", "model_best_replay",
+                        _copy_writer(replay_source / name),
+                    ))
             files.extend(
                 [
                     GenerationFile(relative, "model_best", _copy_writer(source)),

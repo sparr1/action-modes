@@ -57,6 +57,7 @@ def _write_configs(
     algorithm_checkpoint="missing",
     save_strat=("best", "latest"),
     save_trials="none",
+    checkpoint_replay=False,
 ):
     alg_dir = tmp_path / "algs"
     alg_dir.mkdir()
@@ -79,6 +80,7 @@ def _write_configs(
         "checkpoint_every": experiment_checkpoint,
         "save_strat": list(save_strat),
         "checkpoint_best_window": 7,
+        "checkpoint_replay": checkpoint_replay,
     }
     experiment_path = tmp_path / "Experiment.json"
     experiment_path.write_text(json.dumps(experiment), encoding="utf-8")
@@ -131,6 +133,27 @@ def test_checkpointing_is_configured_without_trajectory_logging(monkeypatch, tmp
     assert call["experiment_params"]["checkpoint_every"] == 5
     assert Path(call["save_path"]) == output_dir / "Experiment_STAMP" / "models"
     assert env.closed
+
+
+def test_replay_snapshot_dispatch_is_opt_in_and_reaches_supported_backend(monkeypatch, tmp_path):
+    model = _Model()
+    model.supports_checkpoint_replay = True
+    _run(monkeypatch, tmp_path, model, checkpoint_replay=True)
+    assert model.checkpoint_calls[0]["checkpoint_replay"] is True
+    assert len(model.learn_calls) == 1
+
+
+def test_replay_snapshot_rejects_unsupported_backend_before_learning(monkeypatch, tmp_path):
+    model = _Model()
+    with pytest.raises(ValueError, match="checkpoint_replay=true requires a backend"):
+        _run(monkeypatch, tmp_path, model, checkpoint_replay=True)
+    assert model.learn_calls == [] and model.checkpoint_calls == []
+
+
+def test_replay_off_preserves_legacy_checkpoint_adapter_arguments(monkeypatch, tmp_path):
+    model = _Model()
+    _run(monkeypatch, tmp_path, model)
+    assert "checkpoint_replay" not in model.checkpoint_calls[0]
 
 
 def test_resolved_runtime_metadata_contains_horizons_critic_and_inner_budget():

@@ -222,19 +222,20 @@ class AsyncCheckpointWriter:
         return tuple(normalized)
 
     @staticmethod
-    def _write_many(snapshot, publications):
-        state = snapshot.wait()
-        first, _ = publications[0]
-        first = Path(first)
-        first.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, staging = tempfile.mkstemp(
-            dir=first.parent,
-            prefix=f".{first.name}.",
-            suffix=".staging",
-        )
-        os.close(descriptor)
-        staging = Path(staging)
+    def _write_many(snapshot, publications, before_metadata=None):
+        staging = None
         try:
+            state = snapshot.wait()
+            first, _ = publications[0]
+            first = Path(first)
+            first.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary = tempfile.mkstemp(
+                dir=first.parent,
+                prefix=f".{first.name}.",
+                suffix=".staging",
+            )
+            os.close(descriptor)
+            staging = Path(temporary)
             _atomic_torch_save(state, staging, durable=False)
             invalidate_metadata_sidecars(path for path, _ in publications)
             os.replace(staging, first)
@@ -243,15 +244,20 @@ class AsyncCheckpointWriter:
                 paths.append(_atomic_clone(first, path))
             fsync_checkpoint_files(path for path, _ in publications)
             fsync_checkpoint_directories(path for path, _ in publications)
+            if before_metadata is not None:
+                before_metadata(publications)
             for path, metadata in publications:
                 if metadata is not None:
                     write_metadata_atomic(path, metadata)
             return tuple(paths)
         finally:
-            try:
-                staging.unlink()
-            except FileNotFoundError:
-                pass
+            if before_metadata is not None:
+                before_metadata.close()
+            if staging is not None:
+                try:
+                    staging.unlink()
+                except FileNotFoundError:
+                    pass
 
     def enqueue(self, state, path, *, signature=None):
         """Queue one periodic save after making its exact-state snapshot."""
@@ -264,7 +270,7 @@ class AsyncCheckpointWriter:
         self._pending_signature = signature
         self._future = self._executor.submit(self._write, snapshot, path)
 
-    def enqueue_many(self, state, publications, *, signature=None):
+    def enqueue_many(self, state, publications, *, signature=None, before_metadata=None):
         """Queue one exact snapshot for several atomically published aliases."""
 
         self.flush()
@@ -272,7 +278,8 @@ class AsyncCheckpointWriter:
         snapshot = freeze_checkpoint(state)
         self._ensure_executor()
         self._pending_signature = signature
-        self._future = self._executor.submit(self._write_many, snapshot, normalized)
+        arguments = (snapshot, normalized) if before_metadata is None else (snapshot, normalized, before_metadata)
+        self._future = self._executor.submit(self._write_many, *arguments)
 
     def flush(self):
         """Wait until the most recently queued periodic checkpoint is durable."""
@@ -299,14 +306,15 @@ class AsyncCheckpointWriter:
 
         return self.save_many(state, (path,), signature=signature)[0]
 
-    def save_many(self, state, publications, *, signature=None):
+    def save_many(self, state, publications, *, signature=None, before_metadata=None):
         """Synchronously publish one exact state under one or more names."""
 
         self.flush()
         normalized = self._normalize_publications(publications)
         targets = tuple(os.path.abspath(os.fspath(path)) for path, _ in normalized)
         if (
-            signature is not None
+            before_metadata is None
+            and signature is not None
             and signature == self._last_signature
             and self._last_path is not None
             and os.path.exists(self._last_path)
@@ -327,7 +335,10 @@ class AsyncCheckpointWriter:
             (target, metadata)
             for target, (_, metadata) in zip(targets, normalized)
         )
-        result = self._write_many(freeze_checkpoint(state), absolute_publications)
+        arguments = (freeze_checkpoint(state), absolute_publications)
+        if before_metadata is not None:
+            arguments += (before_metadata,)
+        result = self._write_many(*arguments)
         self._last_path = targets[0]
         self._last_signature = signature
         return tuple(result)

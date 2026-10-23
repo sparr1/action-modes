@@ -51,12 +51,14 @@ def receipt():
                "gpu": "NVIDIA L40S", "executable": "/locked/python"}
     cases = [{"passed": True, "index": index, "name": campaign.recipe(index)[0],
               "binding": bound, "runtime": runtime, "alpha_and_adam_lifecycle": True,
-              "checkpoint_sidecars": True, "checkpoint_roundtrip": True, "checkpoint_bytes": 100}
+              "checkpoint_sidecars": True, "checkpoint_roundtrip": True, "checkpoint_bytes": 100,
+              "checkpoint_replay_roundtrip": True, "checkpoint_replay_rng_unchanged": True,
+              "memory": {"replay_bytes_per_row": 100}}
              for index in range(8)]
     return {"passed": True, "binding": bound, "runtime": runtime, "cases": cases}
 
 
-@pytest.mark.parametrize("corruption", ["commit", "config", "missing", "duplicate", "lifecycle"])
+@pytest.mark.parametrize("corruption", ["commit", "config", "missing", "duplicate", "lifecycle", "replay", "replay_rng"])
 def test_invalid_gpu_gate_cannot_launch(tmp_path, corruption):
     report = deepcopy(receipt())
     if corruption == "commit":
@@ -68,8 +70,12 @@ def test_invalid_gpu_gate_cannot_launch(tmp_path, corruption):
         report["cases"].pop()
     elif corruption == "duplicate":
         report["cases"][7] = report["cases"][0]
-    else:
+    elif corruption == "lifecycle":
         report["cases"][0]["alpha_and_adam_lifecycle"] = False
+    elif corruption == "replay":
+        report["cases"][0]["checkpoint_replay_roundtrip"] = False
+    else:
+        report["cases"][0]["checkpoint_replay_rng_unchanged"] = False
     gate = tmp_path / "receipt.json"
     gate.write_text(json.dumps(report))
     with pytest.raises(AssertionError):
@@ -89,6 +95,66 @@ def test_seal_requires_all_eight_distinct_matching_cases(tmp_path):
     combined = json.loads((tmp_path / "receipt.json").read_text())
     assert combined["passed"] and len(combined["cases"]) == 8
     assert combined["estimated_all_25k_checkpoint_bytes"] == 40 * 8 * 100
+
+
+def test_replay_bank_estimate_uses_resident_growth_and_fifo_capacity():
+    estimate = campaign.checkpoint_bank_estimate(100, checkpoint_bytes=500)
+    snapshots = estimate["per_checkpoint"]
+    assert len(snapshots) == 40
+    assert snapshots[0] == {"step": 25_000, "resident_rows": 25_050, "replay_payload_bytes": 2_505_000}
+    assert snapshots[-1] == {"step": 1_000_000, "resident_rows": 1_000_000, "replay_payload_bytes": 100_000_000}
+    expected_rows = sum(min(1_000_000, step + step // 500) for step in range(25_000, 1_000_001, 25_000))
+    assert estimate["all_cells_retained_replay_bytes"] == 8 * 100 * expected_rows
+    assert estimate["all_cells_retained_replay_bytes"] < 8 * 40 * 1_000_000 * 100
+    assert estimate["all_cells_retained_models_and_replay_bytes"] == 8 * (100 * expected_rows + 40 * 500)
+
+
+def test_gate_replay_verifier_reads_mid_episode_and_boundary_snapshots(tmp_path, monkeypatch):
+    from tests.test_ambi_alpha_carry_training_state import _training_model
+    from utils.resume_runtime import capture_global_rng_state
+
+    learner = _training_model("run")
+    try:
+        learner.set_checkpointing(3, str(tmp_path), "paired", save_strat="all", checkpoint_replay=True)
+        original = learner._maybe_checkpoint
+        checked = []
+
+        def observe():
+            before = capture_global_rng_state()
+            result = original()
+            if learner._global_step % 3 == 0:
+                learner.flush_checkpoints()
+                checked.append(campaign.verify_checkpoint_replay(
+                    learner, tmp_path / f"paired_{learner._global_step}", learner._global_step))
+                campaign.assert_state_equal(before, capture_global_rng_state())
+            return result
+
+        monkeypatch.setattr(learner, "_maybe_checkpoint", observe)
+        learner.learn(15)
+        assert [row["step"] for row in checked] == [3, 6, 9, 12, 15]
+        assert checked[0]["resident_rows"] == 0 and checked[0]["pending_episode_length"] == 3
+        assert checked[-1]["resident_rows"] > 0 and checked[-1]["pending_episode_length"] == 0
+        assert learner.buffer.resumable_storage
+    finally:
+        learner.close()
+        learner.env.close()
+
+
+def test_benchmark_replay_setup_survives_budget_rebuild_without_writes(tmp_path):
+    from tests.test_ambi_alpha_carry_training_state import _training_model
+
+    learner = _training_model("run")
+    try:
+        campaign.configure_benchmark_replay(learner, tmp_path / "measurement.json")
+        before = learner.buffer
+        learner.learn(15)
+        assert learner.buffer is not before
+        assert learner.buffer.resumable_storage
+        assert str(learner.buffer._storage_device) == "cpu"
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        learner.close()
+        learner.env.close()
 
 
 def test_verified_launch_selects_exact_cell_and_production_budget(tmp_path, monkeypatch):

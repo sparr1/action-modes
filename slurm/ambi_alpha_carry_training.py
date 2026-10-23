@@ -1,6 +1,7 @@
 """CUDA validation, resource measurements and launch for the eight alpha-carry cells."""
 
 import argparse
+from collections.abc import Mapping
 from copy import deepcopy
 from datetime import datetime, timezone
 import gc
@@ -73,6 +74,86 @@ def check_temperature_transition(previous, current, scope):
     assert current["episode_reset"] == float(current["t0"] and scope == "episode")
 
 
+def checkpoint_bank_estimate(bytes_per_row, *, capacity=1_000_000,
+                             total_steps=1_000_000, checkpoint_every=25_000,
+                             episode_length=500, checkpoint_bytes=0, cells=8):
+    """Count resident rows at each retained snapshot, including initial rows.
+
+    State replay stores one extra initial-observation row per episode, and its
+    FIFO capacity counts rows. This estimates the payload rather than assuming
+    all forty early snapshots already contain a full million-row replay.
+    """
+    assert bytes_per_row > 0 and min(capacity, total_steps, checkpoint_every, episode_length, cells) > 0
+    assert total_steps % checkpoint_every == checkpoint_every % episode_length == 0
+    snapshots = []
+    for step in range(checkpoint_every, total_steps + 1, checkpoint_every):
+        rows = min(capacity, step + step // episode_length)
+        snapshots.append({"step": step, "resident_rows": rows,
+                          "replay_payload_bytes": math.ceil(rows * bytes_per_row)})
+    replay_bytes = sum(row["replay_payload_bytes"] for row in snapshots)
+    model_bytes = len(snapshots) * checkpoint_bytes
+    retained = cells * (replay_bytes + model_bytes)
+    # Latest + predecessor plus one in-flight native generation coexist. Their
+    # full optimizer/model states exceed portable models; estimate separately.
+    live_replay_generations = cells * 3 * math.ceil(capacity * bytes_per_row)
+    return {"snapshots_per_cell": len(snapshots), "cells": cells,
+            "per_checkpoint": snapshots, "per_cell_retained_replay_bytes": replay_bytes,
+            "per_cell_retained_model_bytes": model_bytes,
+            "all_cells_retained_replay_bytes": cells * replay_bytes,
+            "all_cells_retained_models_and_replay_bytes": retained,
+            "all_cells_three_full_native_replay_generations_bytes": live_replay_generations,
+            "payload_plus_native_replay_with_20pct_margin_bytes": math.ceil(1.2 * (retained + live_replay_generations)),
+            "excluded": "Native model/optimizer generations, small shard metadata, W&B logs/media and unrelated campaigns; budget these separately."}
+
+
+def assert_state_equal(left, right):
+    """Exact recursive equality for tensors, RNG state, and replay metadata."""
+    import numpy as np
+    import torch
+    if torch.is_tensor(left):
+        assert torch.is_tensor(right)
+        torch.testing.assert_close(left, right, rtol=0, atol=0, equal_nan=True)
+    elif isinstance(left, np.ndarray):
+        np.testing.assert_array_equal(left, right)
+    elif isinstance(left, Mapping):
+        assert isinstance(right, Mapping) and set(left) == set(right)
+        for key in left:
+            assert_state_equal(left[key], right[key])
+    elif isinstance(left, (tuple, list)):
+        assert type(left) is type(right) and len(left) == len(right)
+        for a, b in zip(left, right):
+            assert_state_equal(a, b)
+    else:
+        assert left == right
+
+
+def verify_checkpoint_replay(learner, checkpoint, step):
+    """Read back every replay row while the originating learner is still paused."""
+    from RL.tdmpc2_core.common.buffer import Buffer
+    from utils.checkpoint_replay import load_checkpoint_replay
+
+    restored = Buffer(deepcopy(learner.cfg), resumable=True)
+    loaded = load_checkpoint_replay(checkpoint, restored)
+    assert loaded["step"] == step
+    assert_state_equal(learner.buffer.training_state_metadata(), restored.training_state_metadata())
+    source_shards = list(learner.buffer.iter_training_state_shards(max_rows=32768))
+    restored_shards = list(restored.iter_training_state_shards(max_rows=32768))
+    assert_state_equal(source_shards, restored_shards)
+    pending = loaded["pending_episode"]
+    if learner._last_terminated or learner._last_truncated:
+        assert pending is None
+    else:
+        assert pending["length"] == learner._episode_len
+        assert pending["episode_index"] == learner._episode_idx
+        assert pending["return"] == learner._episode_return
+        expected = learner._episode_staging[:learner._episode_len + 1].cpu()
+        assert_state_equal(expected.to_dict(), pending["rows"].to_dict())
+    replay_dir = Path(str(checkpoint) + ".replay")
+    return {"step": step, "roundtrip": True, "resident_rows": restored.size,
+            "pending_episode_length": 0 if pending is None else pending["length"],
+            "replay_artifact_bytes": sum(path.stat().st_size for path in replay_dir.rglob("*") if path.is_file())}
+
+
 def memory_report(learner, production_capacity):
     """Measure allocated tensors and bound replay growth from its actual schema."""
     import torch
@@ -93,6 +174,7 @@ def memory_report(learner, production_capacity):
         "production_full_replay_bytes": full_replay,
         "production_replay_device": str(learner.buffer._storage_device),
         "conservative_host_rss_plus_full_replay_bytes": rss + full_replay,
+        "retained_25k_replay_bank": checkpoint_bank_estimate(per_row, capacity=production_capacity),
         "note": "Early-training measurement; host bound adds the entire full replay even when storage is on CUDA. Excludes concurrent checkpoint staging and W&B subprocesses.",
     }
 
@@ -102,6 +184,7 @@ def run_smoke_case(index, output):
     import torch
     import domains  # noqa: F401
     from RL.AMBITDMPC2 import AMBITDMPC2
+    from utils.resume_runtime import capture_global_rng_state
 
     assert torch.cuda.is_available(), "Run the gate inside a Slurm GPU allocation"
     name, manifest, production = recipe(index)
@@ -133,6 +216,7 @@ def run_smoke_case(index, output):
         cfg, agent = learner.cfg, learner.agent
         assert_recipe(cfg, agent, production)
         actions = []
+        replay_checks = []
         act = learner._act_agent
 
         def observed_act(*args, **kwargs):
@@ -164,13 +248,31 @@ def run_smoke_case(index, output):
         learner._act_agent = observed_act
         with tempfile.TemporaryDirectory(prefix=name + "-") as temporary:
             models = Path(temporary) / "models"
-            learner.set_checkpointing(258, str(models), "smoke", save_strat="all")
+            learner.set_checkpointing(258, str(models), "smoke", save_strat="all", checkpoint_replay=True)
+            maybe_checkpoint = learner._maybe_checkpoint
+
+            def observed_checkpoint():
+                step = learner._global_step
+                if step % 258:
+                    return maybe_checkpoint()
+                before = capture_global_rng_state()
+                inner_rng_before = agent.inner_engine.rng.training_state_dict()
+                result = maybe_checkpoint()
+                learner.flush_checkpoints()
+                assert_state_equal(before, capture_global_rng_state())
+                replay_checks.append(verify_checkpoint_replay(learner, models / f"smoke_{step}", step))
+                assert_state_equal(before, capture_global_rng_state())
+                assert_state_equal(inner_rng_before, agent.inner_engine.rng.training_state_dict())
+                return result
+
+            learner._maybe_checkpoint = observed_checkpoint
             learner.learn(run["total_steps"])
             learner.flush_checkpoints()
             assert learner._global_step == 516 and agent.num_updates >= 16
             assert len(actions) == 15 and any(row["t0"] for row in actions)
             assert len({row["outer_updates"] for row in actions}) > 1
             assert learner._last_train_metrics["compile_fallback"] == 0
+            assert [check["step"] for check in replay_checks] == [258, 516]
             assert all(torch.isfinite(parameter).all() for parameter in agent.model.parameters())
             for step in (258, 516):
                 checkpoint = models / f"smoke_{step}"
@@ -186,6 +288,8 @@ def run_smoke_case(index, output):
                 "temperature_scope": cfg.inner_temperature_scope, "temperature_optimizer_scope": cfg.inner_temperature_optimizer_scope,
                 "target_entropy": agent.target_entropy, "aux_return_detach_representation": cfg.aux_return_detach_representation,
                 "alpha_and_adam_lifecycle": True, "checkpoint_roundtrip": True, "checkpoint_sidecars": True,
+                "checkpoint_replay_roundtrip": True, "checkpoint_replay_rng_unchanged": True,
+                "checkpoint_replay_checks": replay_checks,
                 "checkpoint_bytes": checkpoint.stat().st_size, "compile_fallback": False,
                 "warm_control_seconds": statistics.median(row["seconds"] for row in actions[-5:]),
                 "memory": measured_memory, "seconds": time.perf_counter() - started,
@@ -210,13 +314,26 @@ def seal(output):
         assert case["index"] == index and case["name"] == recipe(index)[0]
         assert case["passed"] and case["binding"] == expected
         assert case["alpha_and_adam_lifecycle"] and case["checkpoint_sidecars"] and case["checkpoint_roundtrip"]
+        assert case["checkpoint_replay_roundtrip"] and case["checkpoint_replay_rng_unchanged"]
         for key in ("python", "torch", "cuda", "executable", "gpu"):
             assert case["runtime"][key] == selected_runtime[key]
     receipt = {"passed": True, "binding": expected, "runtime": selected_runtime, "cases": cases,
                "created_utc": datetime.now(timezone.utc).isoformat(),
                "estimated_all_25k_checkpoint_bytes": 40 * sum(row["checkpoint_bytes"] for row in cases)}
+    # Equal architecture/replay schemas across all factorial cells are required;
+    # use the measured largest payload to keep this campaign estimate conservative.
+    receipt["retained_checkpoint_bank_estimate"] = checkpoint_bank_estimate(
+        max(row["memory"]["replay_bytes_per_row"] for row in cases),
+        checkpoint_bytes=max(row["checkpoint_bytes"] for row in cases),
+    )
     write_new(output / "receipt.json", receipt)
     print("ALPHA_CARRY_GPU_GATE_PASSED " + str(output / "receipt.json"), flush=True)
+
+
+def configure_benchmark_replay(learner, output):
+    """Keep CPU replay through learn's rebuild without writing checkpoints."""
+    learner.set_checkpointing(25_000, str(output.parent / "checkpointing-disabled"),
+                              "benchmark", save_strat="none", checkpoint_replay=True)
 
 
 def benchmark_worker(args):
@@ -245,7 +362,9 @@ def benchmark_worker(args):
     try:
         torch.cuda.reset_peak_memory_stats()
         learner = AMBITDMPC2(name + "-cpu-benchmark", env, run["alg_params"], run, manifest)
-        learner.buffer.enable_resumable_storage()
+        # Legacy learn() reconstructs replay. Keep the production CPU placement
+        # through that reset while disabling every actual checkpoint write.
+        configure_benchmark_replay(learner, args.output)
         agent = learner.agent
         assert_recipe(learner.cfg, agent, production)
         timer = TrainingWindow(SEED_STEPS + args.warmup + 2, args.decisions, torch.cuda.synchronize)
@@ -276,6 +395,7 @@ def benchmark_worker(args):
 
         learner._act_agent, agent.update, learner._log_wandb_step = observed_act, observed_update, observed_log_step
         learner.learn(run["total_steps"])
+        assert learner.buffer.resumable_storage and str(learner.buffer._storage_device) == "cpu"
         compile_counts["after"] = int(torch._dynamo.utils.counters["stats"]["unique_graphs"])
         assert compile_counts["before"] == compile_counts["after"], "Compilation occurred in timing window"
         assert timer.result is not None
@@ -329,12 +449,14 @@ def launch(index, output, gate):
     for row in cases:
         assert row["passed"] and row["name"] == recipe(row["index"])[0]
         assert row["binding"] == expected and row["alpha_and_adam_lifecycle"]
+        assert row["checkpoint_replay_roundtrip"] and row["checkpoint_replay_rng_unchanged"]
     current_runtime = runtime()
     for key in ("python", "torch", "cuda", "executable", "gpu"):
         assert current_runtime[key] == receipt["runtime"][key], f"GPU gate used another {key}"
     assert "L40S" in current_runtime["gpu"].upper(), "This campaign requests L40S GPUs"
     name, manifest, run = recipe(index)
     assert run["total_steps"] == 1_000_000 and run["checkpoint_every"] == 25_000
+    assert run["checkpoint_replay"] is True
     if not os.environ.get("WANDB_API_KEY"):
         import netrc
         auth = netrc.netrc().authenticators("api.wandb.ai")
