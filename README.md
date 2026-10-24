@@ -238,7 +238,9 @@ fields and extra non-null values remain errors.
 Resuming a pre-fix lineage from a telemetry repair commit requires an explicit
 reviewed-source proof. Set `AMBI_RESUME_TELEMETRY_BASE_COMMIT` to the lineage's
 original full commit and `AMBI_RESUME_TELEMETRY_PATCH_SHA256` to the SHA-256 of
-`git diff --binary BASE HEAD --` after reviewing that patch. Both checkouts must
+`git diff --binary --full-index --no-ext-diff --no-textconv BASE HEAD --`
+after reviewing that patch. Full object IDs keep the digest independent of
+repository size and Git abbreviation settings. Both checkouts must
 be clean, the execution commit must descend from the base, and the change must
 stay within the enumerated W&B repair, compatibility, tests and documentation
 files. All training configuration, dependencies, model code and gate artifact
