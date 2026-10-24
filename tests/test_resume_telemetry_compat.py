@@ -33,7 +33,7 @@ def _commit(root, message):
 
 
 def _approve(root, base, monkeypatch):
-    patch = _git(root, "diff", "--binary", base, "HEAD")
+    patch = _git(root, "diff", "--binary", "--full-index", base, "HEAD")
     digest = hashlib.sha256(patch).hexdigest()
     monkeypatch.setenv(BASE_COMMIT_ENV, base)
     monkeypatch.setenv(PATCH_SHA256_ENV, digest)
@@ -114,6 +114,12 @@ def test_approved_patch_attests_both_sources_without_mutation(repair):
     assert proof["execution_source"]["commit"] == head
     proof["base_source"]["commit"] = "changed returned copy"
     assert before == before_copy and after == after_copy
+
+
+def test_reviewed_patch_digest_is_independent_of_git_abbreviation(repair):
+    root, _, _, before, after, digest = repair
+    _git(root, "config", "core.abbrev", "12")
+    assert telemetry_source_compatibility(root, before, after)["patch_sha256"] == digest
 
 
 @pytest.mark.parametrize("missing", [BASE_COMMIT_ENV, PATCH_SHA256_ENV])

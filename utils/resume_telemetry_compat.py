@@ -108,7 +108,7 @@ def telemetry_source_compatibility(
     Return ``None`` only when neither opt-in environment variable is present.
     Otherwise require the expected source to be the pristine approved base,
     the actual source to equal this clean checkout, and HEAD to descend from
-    the base. The full ``git diff --binary BASE HEAD`` digest must match the
+    the base. The full ``git diff --binary --full-index BASE HEAD`` digest must match the
     operator's reviewed value. Only the exact allowlist above may change, and
     ``utils/wandb_resume.py`` must change. Invalid proofs raise
     :class:`ResumeTelemetryCompatibilityError`; no identity is rewritten.
@@ -142,7 +142,7 @@ def telemetry_source_compatibility(
     if _git(root, "rev-parse", f"{base}^{{commit}}").decode().strip() != base:
         raise ResumeTelemetryCompatibilityError("The approved base is not a commit.")
     _git(root, "merge-base", "--is-ancestor", base, head)
-    patch = _git(root, "diff", "--binary", "--no-ext-diff", "--no-textconv", base, head, "--")
+    patch = _git(root, "diff", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", base, head, "--")
     if hashlib.sha256(patch).hexdigest() != patch_sha256:
         raise ResumeTelemetryCompatibilityError(
             "The committed telemetry patch does not match the reviewed SHA-256 digest."
