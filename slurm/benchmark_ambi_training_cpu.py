@@ -59,16 +59,17 @@ def benchmark_recipe(warmup, decisions, *, manifest_path=MANIFEST, cell_index=5)
     return name, manifest, run, overrides
 
 
-def action_work(metrics, *, decision, interval, probability):
+def action_work(metrics, *, decision, interval, probability, rounds=8):
     """Validate realized work; held decisions must not perform an inner solve."""
+    assert type(rounds) is int and rounds > 0
     solve = decision % interval == 0
     if interval > 1:
         assert metrics["inner_solve_performed"] == float(solve)
         assert metrics["inner_policy_held"] == float(not solve)
         assert metrics["inner_action_age"] == decision % interval
         assert metrics["inner_episode_decision_index"] == decision
-    expected = {"inner_critic_optimizer_steps": 128, "inner_actor_optimizer_steps": 32,
-                "inner_temperature_optimizer_steps": 32, "inner_model_steps": 3072}
+    expected = {"inner_critic_optimizer_steps": 16 * rounds, "inner_actor_optimizer_steps": 4 * rounds,
+                "inner_temperature_optimizer_steps": 4 * rounds, "inner_model_steps": 128 * 3 * rounds}
     for key, count in expected.items():
         assert metrics[key] == (count if solve else 0), (decision, key, metrics[key])
     assert metrics["inner_compile_fallback"] == 0

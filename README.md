@@ -188,6 +188,19 @@ seed 55, 500k decisions, all 25k checkpoints and durable exact resume, and publi
 to AMBI group `ambi-return-only-training-20261019`. Their finite-horizon terminal
 score uses online primary-Q `mean_pair` without an added entropy bonus.
 
+The one-cell `ambi_return_only_sac_j10_training.json` increases the inner
+round count from 8 to 10 relative to the H3/K3 reward-only SAC run above.
+It performs 160 critic, 40 actor and 40 temperature updates and generates 3,840
+imagined transitions per solve. Inner replay increases from 3,072 to 3,840 rows
+(`J*N*H`), preserving every transition as required for action-local replay.
+H3, K3, seed 55, 500k decisions,
+sampled actions, fresh per-solve temperature and all 25k model checkpoints remain
+unchanged. Publication uses group `ambi-return-only-j10-training-20261024`.
+Select this manifest with `AMBI_RETURN_MANIFEST` in
+`slurm/run_ambi_reward_training_oscar.sbatch`, first in smoke mode and then in
+train mode with a fresh lineage. Its gate measures one and two physical CPUs
+and verifies the J10 update counts; a J8 receipt cannot authorize the J10 run.
+
 For a short CPU-allocation comparison, run
 `python slurm/benchmark_ambi_training_cpu.py --output /absolute/scratch/directory`
 inside one Slurm allocation with a GPU, eight physical CPU cores

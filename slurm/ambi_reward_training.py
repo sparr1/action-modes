@@ -32,13 +32,30 @@ MANIFESTS = {
     "sac": ROOT / "configs/dmcontrol/experiments/ambi_return_only_sac_training.json",
     "mppi": ROOT / "configs/dmcontrol/experiments/ambi_return_only_mppi_training.json",
 }
+J10_MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_return_only_sac_j10_training.json"
+# Approved identities bind J and the held-policy cadence independently of H.
+CAMPAIGNS = {
+    MANIFESTS["sac"]: ("ambi_full_h3_j8_k3_reward_only", "sac", 8, 3),
+    J10_MANIFEST: ("ambi_full_h3_j10_k3_reward_only", "sac", 10, 3),
+    MANIFESTS["mppi"]: ("ambi_full_h3_mppi_reward_only", "mppi", 0, 1),
+}
+
+
+def sac_work(rounds):
+    return {"inner_critic_optimizer_steps": 16 * rounds,
+            "inner_actor_optimizer_steps": 4 * rounds,
+            "inner_temperature_optimizer_steps": 4 * rounds,
+            "inner_model_steps": 3 * 128 * rounds}
 
 
 def validate_campaign(manifest_path):
     path = resolve_manifest(manifest_path)
+    assert path in CAMPAIGNS, "Unapproved reward-only campaign manifest"
+    expected_name, operator, rounds, expected_interval = CAMPAIGNS[path]
     manifest = read(path)
     assert len(manifest["configs"]) == 1 and manifest["trials"] == 1
     name, _, run = recipe(0, path)
+    assert name == expected_name, "Campaign configuration identity changed"
     assert (run["seed"], run["total_steps"], run["checkpoint_every"], run["save_strat"]) == (55, 500000, 25000, "all")
     assert manifest["env_params"] == {"task": "humanoid-walk", "obs": "state", "render_mode": None}
     # These unchanged defaults are omitted by the older MPPI/SAC recipes.
@@ -62,12 +79,12 @@ def validate_campaign(manifest_path):
         "inner_critic_bernoulli_p": 0., "mppi_terminal_q_reduction": "mean_pair",
     }
     assert all(p.get(key) == value for key, value in expected.items()), "Reward-only production recipe changed"
-    assert p["inner_operator"] in MANIFESTS
+    assert p["inner_operator"] == operator
     interval = p.get("inner_solve_interval", 1)
+    assert interval == expected_interval, "Campaign solve cadence changed"
     if p["inner_operator"] == "sac":
-        assert interval in (1, 3)
-        expected = {"inner_rounds": 8, "inner_rollouts_per_round": 128,
-                    "inner_batch_size": 256, "inner_replay_capacity": 3072,
+        expected = {"inner_rounds": rounds, "inner_rollouts_per_round": 128,
+                    "inner_batch_size": 256, "inner_replay_capacity": 3 * 128 * rounds,
                     "inner_critic_updates_per_round": 16, "inner_actor_updates_per_round": 4,
                     "inner_execution_action": "policy_sample", "inner_temperature_mode": "auto",
                     "inner_temperature_initialization": "inherit_outer", "inner_target_entropy": "inherit_outer"}
@@ -89,7 +106,7 @@ def smoke_recipe(warmup, decisions, manifest_path):
     return _smoke_recipe(0, warmup, decisions, manifest_path)
 
 
-def validate_learner(cfg, agent):
+def validate_learner(cfg, agent, *, rounds=8):
     assert cfg.compile and cfg.compile_strict and cfg.critic_ensemble_backend == "vmap"
     assert (cfg.model_size, cfg.enc_dim, cfg.mlp_dim, cfg.latent_dim, cfg.num_q) == (5, 256, 512, 512, 5)
     assert (cfg.action_dim, cfg.batch_size, cfg.train_unroll_horizon) == (21, 256, 3)
@@ -109,13 +126,17 @@ def validate_learner(cfg, agent):
         assert (cfg.inner_mppi_num_elites, cfg.inner_mppi_num_pi_trajs) == (64, 24)
         assert cfg.inner_critic_updates_per_action == cfg.inner_actor_updates_per_action == 0
     else:
-        assert (cfg.inner_rollout_horizon, cfg.inner_rounds, cfg.inner_rollouts_per_round) == (3, 8, 128)
-        assert (cfg.inner_critic_updates_per_action, cfg.inner_actor_updates_per_action, cfg.inner_temperature_updates_per_action) == (128, 32, 32)
+        assert cfg.inner_operator == "sac" and rounds in (8, 10)
+        assert (cfg.inner_rollout_horizon, cfg.inner_rounds, cfg.inner_rollouts_per_round) == (3, rounds, 128)
+        assert cfg.inner_solve_interval == 3 and cfg.inner_replay_capacity == 3 * 128 * rounds
+        assert (cfg.inner_critic_updates_per_action, cfg.inner_actor_updates_per_action,
+                cfg.inner_temperature_updates_per_action) == (16 * rounds, 4 * rounds, 4 * rounds)
+        assert cfg.inner_model_step_budget == 3 * 128 * rounds
 
 
-def validate_action(metrics, *, operator, decision, interval):
+def validate_action(metrics, *, operator, decision, interval, rounds=8):
     if operator == "sac":
-        return action_work(metrics, decision=decision, interval=interval, probability=0.)
+        return action_work(metrics, decision=decision, interval=interval, probability=0., rounds=rounds)
     assert operator == "mppi" and interval == 1
     for key in ("inner_critic_optimizer_steps", "inner_actor_optimizer_steps", "inner_temperature_optimizer_steps"):
         assert metrics[key] == 0
@@ -153,7 +174,8 @@ def worker(args):
     try:
         learner = AMBITDMPC2(name + "-gpu-gate", env, run["alg_params"], run, manifest)
         cfg, agent = learner.cfg, learner.agent
-        validate_learner(cfg, agent)
+        rounds = production["alg_params"].get("inner_rounds", 0)
+        validate_learner(cfg, agent, rounds=rounds)
         learner.buffer.enable_resumable_storage()
         operator, interval = cfg.inner_operator, cfg.inner_solve_interval
         assert args.warmup % interval == args.decisions % interval == 0
@@ -161,7 +183,7 @@ def worker(args):
         alpha_before = float(agent.alpha.item())
         timer = TrainingWindow(SEED_STEPS + args.warmup + 2, args.decisions, torch.cuda.synchronize)
         act, update, log_step = learner._act_agent, agent.update, learner._log_wandb_step
-        rows, compile_counts, startup, terminal_calls = [], {}, {}, []
+        rows, compile_counts, startup, terminal_calls, realized_solve_work = [], {}, {}, [], {}
 
         def observed_act(*positional, **kwargs):
             decision, step = len(rows), learner._global_step + 1
@@ -194,7 +216,10 @@ def worker(args):
             seconds = time.perf_counter() - action_started
             timer.after_action(step, seconds)
             assert action.device.type == "cpu" and torch.isfinite(action).all()
-            solve = validate_action(agent.last_inner_metrics, operator=operator, decision=decision, interval=interval)
+            solve = validate_action(agent.last_inner_metrics, operator=operator, decision=decision,
+                                    interval=interval, rounds=rounds)
+            if solve and operator == "sac":
+                realized_solve_work.update({key: agent.last_inner_metrics[key] for key in sac_work(rounds)})
             if not solve:
                 assert graphs_before == int(torch._dynamo.utils.counters["stats"]["unique_graphs"]), "Held action captured a graph"
             rows.append({"decision": decision, "step": step, "solve": solve, "action_seconds": seconds,
@@ -265,6 +290,7 @@ def worker(args):
         replay_bytes_per_row = sum(value.numel() * value.element_size() for value in storage.values()) / len(storage)
         report = {"passed": True, "binding": binding(args.manifest), "runtime": runtime(), "config": name,
                   "operator": operator, "inner_solve_interval": interval, "physical_cores": len(cpus),
+                  "inner_rounds": rounds, "inner_work_per_solve": realized_solve_work,
                   "logical_cpu_ids": cpus, "torch_threads": torch.get_num_threads(),
                   "measured": measured, "warmup_active_decisions": args.warmup,
                   "compile_graph_counts": compile_counts, "compile_fallback": False,
@@ -297,6 +323,10 @@ def worker(args):
 
 
 def validate_receipt(receipt, campaign_binding, current_runtime, cpus, *, name, operator, interval):
+    approved = [spec for spec in CAMPAIGNS.values() if spec[0] == name]
+    assert len(approved) == 1, "Unapproved reward-only configuration identity"
+    _, expected_operator, rounds, expected_interval = approved[0]
+    assert (operator, interval) == (expected_operator, expected_interval), "Gate protocol mismatch"
     assert receipt["passed"] is True and receipt["binding"] == campaign_binding, "Gate source/configuration mismatch"
     assert cpus in CPU_COUNTS, "Production CPU allocation was not measured"
     assert receipt["runtime"] == current_runtime, "Gate used another runtime or GPU"
@@ -305,6 +335,9 @@ def validate_receipt(receipt, campaign_binding, current_runtime, cpus, *, name, 
     for row in cases:
         assert row["passed"] is True and row["binding"] == campaign_binding and row["runtime"] == current_runtime
         assert (row["config"], row["operator"], row["inner_solve_interval"]) == (name, operator, interval)
+        if operator == "sac":
+            assert row["inner_rounds"] == rounds
+            assert row["inner_work_per_solve"] == sac_work(rounds), "Gate inner update dose mismatch"
         assert row["compile_fallback"] is False and row["replay_storage_device"] == "cpu"
         assert row["compile_graph_counts"]["before"] == row["compile_graph_counts"]["after"]
         assert row["auxiliary_critic_present"] is False
