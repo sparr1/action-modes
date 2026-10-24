@@ -302,6 +302,100 @@ def test_exact_remote_prefix_requires_every_metric_and_index():
         validate_remote_prefix(context.buffer.events, foreign)
 
 
+def test_remote_prefix_accepts_top_level_null_padding_for_sparse_events():
+    context = WandbResumeContext.new(run_id="stable-run")
+    context.buffer.append({"train/loss": 0.5}, env_step=10)
+    context.buffer.append({"eval/return": 12.0, "eval/optional": None}, env_step=20)
+    rows = [dict(row) for row in _rows(context)]
+    rows[0].update({"eval/return": None, "eval/optional": None})
+    rows[1]["train/loss"] = None
+
+    assert validate_remote_prefix(context.buffer.events, rows[:1]) == 1
+    restored = WandbResumeContext.resume(
+        run_id="stable-run",
+        checkpoint_state=context.checkpoint_state(),
+        remote_rows=rows,
+    )
+    assert restored.remote_event_count == 2
+    assert restored.checkpoint_state() == context.checkpoint_state()
+    assert rows[0]["eval/return"] is None
+
+
+@pytest.mark.parametrize("extra", [0, False, "", [], {}, {"value": None}])
+@pytest.mark.parametrize("known_metric", [False, True])
+def test_remote_prefix_rejects_extra_nonnull_fields(extra, known_metric):
+    context = _new_context_with_events(10)
+    if known_metric:
+        context.buffer.append({"extra": 1}, env_step=20)
+    rows = list(_rows(context, count=1))
+    rows[0]["extra"] = extra
+    with pytest.raises(WandbRemoteDivergenceError, match="event 0"):
+        validate_remote_prefix(context.buffer.events, rows)
+
+
+def test_remote_prefix_rejects_unknown_null_fields():
+    context = _new_context_with_events(10)
+    rows = list(_rows(context))
+    rows[0]["unknown"] = None
+    with pytest.raises(WandbRemoteDivergenceError, match="event 0"):
+        validate_remote_prefix(context.buffer.events, rows)
+
+
+@pytest.mark.parametrize(
+    "payload, remote_payload",
+    [
+        ({"optional": None}, {}),
+        ({"optional": None}, {"optional": 0}),
+        ({"loss": 0.5}, {}),
+        ({"loss": 0.5}, {"loss": None}),
+        ({"loss": 0.5}, {"loss": 0.5000000000000001}),
+        ({"metrics": {"loss": 0.5}}, {"metrics": {"loss": 0.5, "extra": None}}),
+        ({"metrics": {"optional": None}}, {"metrics": {}}),
+        ({"metrics": [{"loss": 0.5}]}, {"metrics": [{"loss": 0.5, "extra": None}]}),
+    ],
+)
+def test_remote_null_padding_does_not_hide_missing_or_changed_payloads(
+    payload, remote_payload
+):
+    context = WandbResumeContext.new(run_id="stable-run")
+    context.buffer.append(payload, env_step=10)
+    context.buffer.append({"padding": 1}, env_step=20)
+    rows = [{"_step": 0, EVENT_INDEX_KEY: 0, ENV_STEP_KEY: 10, **remote_payload}]
+    rows[0]["padding"] = None
+    with pytest.raises(WandbRemoteDivergenceError, match="event 0"):
+        validate_remote_prefix(context.buffer.events, rows)
+
+
+@pytest.mark.parametrize("key", ["_step", EVENT_INDEX_KEY, ENV_STEP_KEY])
+@pytest.mark.parametrize("value", [None, False, -1, 0.5, float("nan"), float("inf")])
+def test_remote_null_padding_does_not_hide_malformed_indices(key, value):
+    context = _new_context_with_events(10)
+    context.buffer.append({"padding": 1}, env_step=20)
+    rows = list(_rows(context, count=1))
+    rows[0].update({key: value, "padding": None})
+    with pytest.raises(WandbRemoteHistoryError, match="non-negative integer"):
+        validate_remote_prefix(context.buffer.events, rows)
+
+
+@pytest.mark.parametrize("key", ["_step", EVENT_INDEX_KEY, ENV_STEP_KEY])
+def test_remote_null_padding_does_not_hide_missing_indices(key):
+    context = _new_context_with_events(10)
+    context.buffer.append({"padding": 1}, env_step=20)
+    rows = list(_rows(context, count=1))
+    rows[0].pop(key)
+    rows[0]["padding"] = None
+    with pytest.raises(WandbRemoteHistoryError, match="lacks"):
+        validate_remote_prefix(context.buffer.events, rows)
+
+
+def test_remote_null_padding_still_validates_reserved_metric_keys():
+    context = _new_context_with_events(10)
+    rows = list(_rows(context))
+    rows[0]["_foreign"] = None
+    with pytest.raises(WandbRemoteHistoryError, match="reserved"):
+        validate_remote_prefix(context.buffer.events, rows)
+
+
 def test_remote_ahead_makes_same_id_rollback_a_hard_error_but_branch_is_explicit():
     old = _new_context_with_events(10)
     later = _new_context_with_events(10, 20)
