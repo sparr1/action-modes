@@ -322,6 +322,7 @@ def validate_remote_prefix(
     """Return remote length only when it is an exact prefix of ``events``."""
 
     expected = tuple(events)
+    metric_keys = {key for event in expected for key in event.payload}
     rows = tuple(remote_rows)
     if len(rows) > len(expected):
         raise WandbRemoteAheadError(
@@ -345,7 +346,15 @@ def validate_remote_prefix(
             raise WandbRemoteHistoryError(
                 "Remote W&B event indices are not contiguous from zero."
             )
-        if env_step != event.env_step or _remote_payload(row) != _thaw(event.payload):
+        # Columnar history may pad metrics from other events with nulls.
+        # Ignore only known top-level metric keys absent from this event;
+        # expected nulls, unknown keys and nested values remain exact.
+        remote_payload = {
+            key: value
+            for key, value in _remote_payload(row).items()
+            if value is not None or key in event.payload or key not in metric_keys
+        }
+        if env_step != event.env_step or remote_payload != _thaw(event.payload):
             raise WandbRemoteDivergenceError(
                 f"Remote W&B event {index} differs from the durable checkpoint."
             )
