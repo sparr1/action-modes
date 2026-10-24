@@ -232,12 +232,19 @@ def test_receipt_requires_exact_semantics_complete_training_and_measured_resourc
 @pytest.mark.parametrize("manifest", list(campaign.CAMPAIGNS))
 @pytest.mark.parametrize("restart", [0, 1])
 @pytest.mark.parametrize("storage_root", list(campaign.STORAGE_ROOTS))
-def test_launch_delegates_exact_recipe_and_lineage_to_canonical_resume(monkeypatch, tmp_path, manifest, restart, storage_root):
+@pytest.mark.parametrize("telemetry_repair", [False, True])
+def test_launch_delegates_exact_recipe_and_lineage_to_canonical_resume(monkeypatch, tmp_path, manifest, restart, storage_root, telemetry_repair):
     operator = campaign.CAMPAIGNS[manifest][1]
     receipt, binding, runtime, identity = receipt_fixture(operator, manifest)
     gate = tmp_path / "receipt.json"
     campaign.write_new(gate, receipt)
-    monkeypatch.setattr(campaign, "binding", lambda path: binding)
+    execution_binding = {**binding, "commit": "reviewed-repair"} if telemetry_repair else binding
+    proof = {"rule": "wandb-sparse-history-null-padding-v1", "patch_sha256": "reviewed"}
+    def compatibility(root, expected, actual):
+        assert root == campaign.ROOT and expected == binding and actual == execution_binding
+        return proof
+    monkeypatch.setattr(campaign, "binding", lambda path: execution_binding)
+    monkeypatch.setattr(campaign, "compatible_gate_binding", compatibility)
     monkeypatch.setattr(campaign, "runtime", lambda: runtime)
     for key, value in {"SLURM_CPUS_PER_TASK": "1", "SLURM_JOB_ID": "123",
                        "SLURM_RESTART_COUNT": str(restart), "AMBI_DRAIN_AFTER_SECONDS": "3600",
@@ -254,6 +261,9 @@ def test_launch_delegates_exact_recipe_and_lineage_to_canonical_resume(monkeypat
     campaign.launch(args)
     record = campaign.read(args.output / f"launch-123.{restart}.json")
     assert record["run_params"] == campaign.recipe(0, args.manifest)[2]
+    assert record["binding"] == execution_binding
+    assert record["gate_binding"] == binding
+    assert record["source_compatibility"] == (proof if telemetry_repair else None)
     assert record["resume_mode"] == ("required" if restart else "new")
     assert "wandb_run_id" not in record
     assert record["storage"]["AMBI_DURABLE_ROOT"] == storage_root

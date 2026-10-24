@@ -151,6 +151,45 @@ def test_normal_segments_share_one_physical_wandb_run_and_checkpoint_before_uplo
         _close(second_model, second)
 
 
+def test_telemetry_compatible_resume_records_proof_without_rewriting_lineage(monkeypatch, tmp_path):
+    fake_wandb = _FakeWandb()
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+    lineage = tmp_path / "telemetry-repair"
+    first_model = _model(BoundaryEnv())
+    first = _session(lineage, mode="new", segment="part-1")
+    try:
+        first.prepare_learner(first_model)
+        run_id = first_model._wandb_run.checkpoint_state()["run_id"]
+        trainer_path = first.last_generation.files_for_role("trainer")[0]
+        original_trainer = trainer_path.read_bytes()
+    finally:
+        _close(first_model, first)
+    original_lineage = (lineage / "LINEAGE.json").read_bytes()
+    original_latest = (lineage / "LATEST").read_bytes()
+    proof = {"rule": "wandb-sparse-history-null-padding-v1", "execution_source": {"commit": "repair"}}
+    calls = []
+    def compatible(root, expected, actual):
+        calls.append((expected, actual))
+        return proof
+    monkeypatch.setattr(resume_training, "compatible_scientific_identity", compatible)
+    second_model = _model(BoundaryEnv())
+    second = resume_training.TrainingResumeSession.open(
+        lineage, mode="required", scientific_identity={"fingerprint": "repair-tests"},
+        total_steps=4, checkpoint_minutes=60, drain_after_seconds=None, segment_id="part-2",
+    )
+    try:
+        second.prepare_learner(second_model)
+        assert calls == [({"fingerprint": "resume-tests"}, {"fingerprint": "repair-tests"})]
+        record = json.loads((second.segment_dir / "SEGMENT.json").read_text())
+        assert record["source_compatibility"] == proof
+        assert second_model._wandb_run.checkpoint_state()["run_id"] == run_id
+        assert (lineage / "LINEAGE.json").read_bytes() == original_lineage
+        assert (lineage / "LATEST").read_bytes() == original_latest
+        assert trainer_path.read_bytes() == original_trainer
+    finally:
+        _close(second_model, second)
+
+
 def test_committed_upload_failure_keeps_latest_and_is_healed_on_required_resume(
     monkeypatch, tmp_path
 ):

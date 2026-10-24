@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 from slurm.ambi_transfer_training import binding, digest, read, recipe, resolve_manifest, runtime, write_new
 from slurm.ambi_mppi_training import smoke_recipe as _smoke_recipe
 from slurm.benchmark_ambi_training_cpu import TrainingWindow, action_work, phase_summary, physical_core_cpus
+from utils.resume_telemetry_compat import compatible_gate_binding
 
 CPU_COUNTS = (1, 2)
 SEED_STEPS = 500
@@ -499,7 +500,13 @@ def launch(args):
     name, _, run = validate_campaign(args.manifest)
     current_binding, current_runtime = binding(args.manifest), runtime()
     receipt = read(args.gate)
-    validate_receipt(receipt, current_binding, current_runtime, int(os.environ["SLURM_CPUS_PER_TASK"]),
+    source_compatibility = None
+    gate_binding = current_binding
+    if receipt["binding"] != current_binding:
+        source_compatibility = compatible_gate_binding(ROOT, receipt["binding"], current_binding)
+        assert source_compatibility is not None, "Gate source/configuration mismatch"
+        gate_binding = receipt["binding"]
+    validate_receipt(receipt, gate_binding, current_runtime, int(os.environ["SLURM_CPUS_PER_TASK"]),
                      name=name, operator=run["alg_params"]["inner_operator"], interval=run["alg_params"].get("inner_solve_interval", 1))
     for path, checksum in receipt["artifacts"].items():
         assert digest(path) == checksum, "Gate artifact changed"
@@ -513,6 +520,7 @@ def launch(args):
     args.output.mkdir(parents=True, exist_ok=True)
     write_new(args.output / f"launch-{segment}.json", {
         "binding": current_binding, "config": name, "run_params": run, "runtime": current_runtime,
+        "gate_binding": gate_binding, "source_compatibility": source_compatibility,
         "gate_receipt": str(args.gate), "gate_sha256": digest(args.gate), "lineage_dir": str(lineage), "storage": storage,
         "segment": segment, "resume_mode": "required" if os.environ.get("SLURM_RESTART_COUNT", "0") != "0" else os.environ.get("AMBI_RESUME_MODE", "new"),
         "created_utc": datetime.now(timezone.utc).isoformat(),

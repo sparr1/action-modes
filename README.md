@@ -304,6 +304,24 @@ for `latest`; `none` must be used alone. If `save_strat` is omitted, a positive
 Checkpoint files are model snapshots and do not universally contain replay or
 environment state for full training resume.
 
+Exact-resume W&B verification accepts API-added null padding only for metric
+keys present elsewhere in the saved event history. Event indices, environment
+steps and logged values still match exactly; missing logged fields, unknown
+fields and extra non-null values remain errors.
+
+Resuming a pre-fix lineage from a telemetry repair commit requires an explicit
+reviewed-source proof. Set `AMBI_RESUME_TELEMETRY_BASE_COMMIT` to the lineage's
+original full commit and `AMBI_RESUME_TELEMETRY_PATCH_SHA256` to the SHA-256 of
+`git diff --binary BASE HEAD --` after reviewing that patch. Both checkouts must
+be clean, the execution commit must descend from the base, and the change must
+stay within the enumerated W&B repair, compatibility, tests and documentation
+files. All training configuration, dependencies, model code and gate artifact
+hashes must still match. Use `AMBI_RESUME_MODE=required` and the original lineage.
+The original lineage and checkpoint files are preserved; the new `SEGMENT.json`
+and campaign launch receipt record the actual execution commit, original
+source, patch digest and compatibility rule. Without this explicit proof, the
+strict source-identity requirement is unchanged.
+
 Native TD-MPC2 periodic and final checkpoints also save the learned Q percentile
 scale `S`, frozen at the same step as the networks. Frozen TDAMBI evaluation
 uses that saved scale to initialize each independent inner solve. AMBI already
