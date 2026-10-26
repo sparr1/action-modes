@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "description": "Frozen J8 H4 K4 evaluation; reuse completed priors and separate H4 K1 controls.",
+  "base_alg_config": "checkpoint",
+  "evaluation": {
+    "seeds": [101, 102, 103, 104, 105],
+    "controller_seed": 55,
+    "max_steps": 500,
+    "default_presets": ["horizon/h4_k4"]
+  },
+  "comparisons": {
+    "horizon": {
+      "reference": "h4_k4",
+      "variants": {
+        "h4_k4": {
+          "description": "Saved J8 SAC with H4, a fresh solve every four decisions, and capacity for all J*N*H transitions.",
+          "alg_params": {
+            "inner_solve_interval": 4,
+            "inner_rollout_horizon": 4,
+            "inner_replay_capacity": 4096
+          }
+        }
+      }
+    }
+  }
+}

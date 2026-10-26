@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from dataclasses import dataclass
 import importlib
 import json
 from pathlib import Path
@@ -31,20 +32,38 @@ METRICS = [
 _H3_CACHE = {}
 
 
-def validate_spec(entry, index, spec):
+@dataclass(frozen=True)
+class Campaign:
+    attempt: str = ATTEMPT
+    selector: str = SELECTOR
+    eval_K: int = 1
+    context_h4: bool = False
+    root_key: str = "cadence_root"
+    prefix: str = PREFIX
+    title: str = "Frozen J8 checkpoints: H4 versus H3 at K1"
+    metrics: tuple = tuple(METRICS)
+    description: str | None = None
+
+
+DEFAULT = Campaign()
+
+
+def validate_spec(entry, index, spec, *, campaign=DEFAULT):
     if index not in (0, 1) or (entry["J"], entry["K"], entry["step"]) != (8, (1, 3)[index], 500000):
         raise ValueError("H4 comparison requires the two selected J8 500k checkpoints")
     identity = spec["identity"]
     planner, protocol = identity["planner"], identity["protocol"]
     settings = planner.get("settings", {})
-    if (spec.get("selector") != SELECTOR or identity["backbone"] != entry["source_run"]
+    if (spec.get("selector") != campaign.selector or identity["backbone"] != entry["source_run"]
             or planner.get("type") != "sac" or planner.get("action_rule") != "tanh_mean"
             or (settings.get("inner_rounds"), settings.get("inner_rollout_horizon"),
-                settings.get("inner_solve_interval", 1)) != (8, 4, 1)):
-        raise ValueError("Expected the selected checkpoint with SAC J8/H4/K1 mean execution")
+                settings.get("inner_solve_interval", 1)) != (8, 4, campaign.eval_K)):
+        raise ValueError(f"Expected the selected checkpoint with SAC J8/H4/K{campaign.eval_K} mean execution")
     if (protocol.get("action_rule") != "tanh_mean" or protocol.get("environment_seeds") != prior.SEEDS
             or protocol.get("controller_seed") != 55 or protocol.get("max_steps") != 500):
         raise ValueError("H4 requires five paired complete mean-action episodes")
+    if campaign.eval_K > 1 and settings.get("inner_hold_encoder") != "solve_snapshot":
+        raise ValueError("Held H4 policies require their solve-time encoder")
 
 
 def file_pins(output):
@@ -86,7 +105,24 @@ def validate_published_curve(curve, record):
         raise ValueError("Reused curve does not contain the exact validated published control")
 
 
-def prepare(inventory, root, reference_root, cadence_root, prepared_root=None):
+def pending_h4_control(entry, index, curve, pins=None):
+    """Pin the H4/K1 attempt before results exist; its journal may advance later."""
+    registry = series.load_run(curve["run_dir"])
+    validate_spec(entry, index, {"selector": SELECTOR, "identity": registry["identity"]})
+    if (registry["run_id"] != curve["run_id"] or registry["attempt_label"] != ATTEMPT
+            or registry["owner"] != prior.OWNER or curve.get("source_run") != entry["source_run"]
+            or curve.get("step") != entry["step"]):
+        raise ValueError("Pending H4/K1 context has a different source or attempt")
+    observed = {"run_id": registry["run_id"], "run_dir": registry["run_dir"],
+        "identity_sha256": series._digest(registry["identity"]),
+        "registry_sha256": series._file_digest(Path(registry["run_dir"]) / "run.json"),
+        "checkpoint": {"step": entry["step"], "sha256": entry["sha256"]}}
+    if pins is not None and observed != pins:
+        raise ValueError("Pinned H4/K1 context changed")
+    return observed
+
+
+def prepare(inventory, root, reference_root, cadence_root, prepared_root=None, *, campaign=DEFAULT):
     root, reference_root, cadence_root = map(lambda p: Path(p).resolve(), (root, reference_root, cadence_root))
     prepared_root = Path(prepared_root).resolve() if prepared_root else root / "prepare"
     publication = root / "publication"
@@ -95,29 +131,52 @@ def prepare(inventory, root, reference_root, cadence_root, prepared_root=None):
     swaps = series._read(cadence_root / "publication/publication-map.json")
     if any(item["inventory_sha256"] != series._digest(inventory) for item in (original, swaps)):
         raise ValueError("Reference campaign uses a different frozen inventory")
+    if campaign.context_h4 and swaps.get("campaign_id") != ATTEMPT:
+        raise ValueError("Expected the H4/K1 reference campaign")
     path = publication / "publication-map.json"
-    identity = {"campaign_id": ATTEMPT, "inventory_sha256": series._digest(inventory),
-                "reference_root": str(reference_root), "cadence_root": str(cadence_root)}
+    identity = {"campaign_id": campaign.attempt, "inventory_sha256": series._digest(inventory),
+                "reference_root": str(reference_root), campaign.root_key: str(cadence_root)}
     with series._lock(publication / ".prepare.lock"):
         receipt = series._read(path) if path.exists() else {"schema_version": 1, **identity,
-            "owner": prior.OWNER, "attempt_label": ATTEMPT, "curves": {}, "context_curves": {},
+            "owner": prior.OWNER, "attempt_label": campaign.attempt, "curves": {}, "context_curves": {},
             "references": {}, "cell_run_maps": {}}
         if any(receipt.get(key) != value for key, value in identity.items()):
             raise ValueError("Prepared H4 inventory or reference roots changed")
         for index, entry in enumerate(inventory["entries"][:2]):
-            controls, pins = reference_records(entry, index, reference_root, cadence_root, receipt["references"].get(str(index)))
+            previous_pins = receipt["references"].get(str(index))
+            if campaign.context_h4:
+                controls, prior_pins = cadence.reference_records(entry, index, reference_root,
+                    previous_pins["prior"] if previous_pins else None)
+                context = {"prior": original["curves"][f"cell-{index}_prior"],
+                           "h4_k1": swaps["curves"][f"cell-{index}_h4"]}
+                pins = {"prior": prior_pins, "h4_k1_registry": pending_h4_control(entry, index, context["h4_k1"],
+                    previous_pins["h4_k1_registry"] if previous_pins else None)}
+                output = cadence_root / f"production/cell-{index}"
+                # If already complete at first preparation, also pin the exact
+                # result. A pending control can finish without changing our run.
+                if (previous_pins and "h4_k1_result" in previous_pins) or (not previous_pins and (output / "receipt.json").exists()):
+                    result_pins = file_pins(output)
+                    if previous_pins and previous_pins["h4_k1_result"] != result_pins:
+                        raise ValueError("Pinned H4/K1 result changed")
+                    control = completed_record(entry, index, output, swaps["reference_root"], swaps["cadence_root"], swaps["references"][str(index)])
+                    validate_published_curve(context["h4_k1"], control)
+                    pins["h4_k1_result"] = result_pins
+            else:
+                controls, pins = reference_records(entry, index, reference_root, cadence_root, previous_pins)
+                context = {"prior": original["curves"][f"cell-{index}_prior"],
+                           "h3": original["curves"]["cell-0_sac"] if index == 0 else swaps["curves"]["cell-1_swap"]}
             receipt["references"][str(index)] = pins
-            context = {"prior": original["curves"][f"cell-{index}_prior"],
-                       "h3": original["curves"]["cell-0_sac"] if index == 0 else swaps["curves"]["cell-1_swap"]}
             for arm, curve in context.items():
-                validate_published_curve(curve, controls[arm])
-                name = f"Train K{entry['K']} @ 500k | " + ("Prior only" if arm == "prior" else "SAC H3 K1")
+                if arm != "h4_k1":
+                    validate_published_curve(curve, controls[arm])
+                name = f"Train K{entry['K']} @ 500k | " + ("Prior only" if arm == "prior" else
+                    ("SAC H4 K1" if campaign.context_h4 else "SAC H3 K1"))
                 key, row = f"cell-{index}_{arm}", {**curve, "name": name}
                 if key in receipt["context_curves"] and receipt["context_curves"][key] != row:
                     raise ValueError("Previously selected H4 control identity changed")
                 receipt["context_curves"][key] = row
-            spec = series._read(prepared_root / f"cell-{index}/specs/horizon__h4_k1.json")
-            validate_spec(entry, index, spec)
+            spec = series._read(prepared_root / f"cell-{index}/specs" / (campaign.selector.replace("/", "__") + ".json"))
+            validate_spec(entry, index, spec, campaign=campaign)
             key = f"cell-{index}_h4"
             owned = list((publication / "runs" / key).glob("*/run.json"))
             if key in receipt["curves"]:
@@ -127,15 +186,16 @@ def prepare(inventory, root, reference_root, cadence_root, prepared_root=None):
                     raise ValueError("Ambiguous interrupted H4 run allocation")
                 registry = series.validate_identity(owned[0].parent, spec["identity"])
             else:
-                registry = series.create_run(publication / "runs" / key, spec, ATTEMPT, prior.PROJECT, prior.ENTITY, prior.OWNER)
-            if registry["attempt_label"] != ATTEMPT or registry["owner"] != prior.OWNER:
+                registry = series.create_run(publication / "runs" / key, spec, campaign.attempt, prior.PROJECT, prior.ENTITY, prior.OWNER)
+            if registry["attempt_label"] != campaign.attempt or registry["owner"] != prior.OWNER:
                 raise ValueError("H4 run owner or attempt changed")
             receipt["curves"][key] = {"run_id": registry["run_id"], "run_dir": registry["run_dir"], "index": index,
-                "source_run": entry["source_run"], "source_K": entry["K"], "eval_K": 1, "eval_H": 4,
-                "name": f"Train K{entry['K']} @ 500k | SAC H4 K1", "color": ("#14B8A6", "#F97316")[index], "step": entry["step"]}
+                "source_run": entry["source_run"], "source_K": entry["K"], "eval_K": campaign.eval_K, "eval_H": 4,
+                "name": f"Train K{entry['K']} @ 500k | SAC H4 K{campaign.eval_K}",
+                "color": ("#14B8A6", "#F97316")[index] if not campaign.context_h4 else ("#7C3AED", "#DB2777")[index], "step": entry["step"]}
             series._atomic_json(path, receipt)
             run_map = publication / f"cell-{index}/eval-run-map.json"
-            series._atomic_json(run_map, {SELECTOR: registry["run_dir"]})
+            series._atomic_json(run_map, {campaign.selector: registry["run_dir"]})
             receipt["cell_run_maps"][str(index)] = str(run_map)
         series._atomic_json(path, receipt)
     return receipt
@@ -152,14 +212,14 @@ def add_horizon_delta(record, h3):
     return result
 
 
-def completed_record(entry, index, output, reference_root, cadence_root, pins):
+def completed_record(entry, index, output, reference_root, cadence_root, pins, *, campaign=DEFAULT):
     output = Path(output)
     if not (output / "receipt.json").exists():
         return None
     receipt = series._read(output / "receipt.json")
-    expected = {"validated": True, "mode": "run", "campaign_id": ATTEMPT, "source_run": entry["source_run"],
-        "step": entry["step"], "J": 8, "source_K": entry["K"], "eval_K": 1, "source_H": 3, "eval_H": 4,
-        "selector": SELECTOR, "checkpoint_sha256": entry["sha256"], "metadata_sha256": entry["metadata_sha256"]}
+    expected = {"validated": True, "mode": "run", "campaign_id": campaign.attempt, "source_run": entry["source_run"],
+        "step": entry["step"], "J": 8, "source_K": entry["K"], "eval_K": campaign.eval_K, "source_H": 3, "eval_H": 4,
+        "selector": campaign.selector, "checkpoint_sha256": entry["sha256"], "metadata_sha256": entry["metadata_sha256"]}
     if any(receipt.get(key) != value for key, value in expected.items()):
         raise ValueError("H4 receipt disagrees with the authorized checkpoint/controller")
     if any(receipt.get("reference", {}).get(field) != pins["prior"][name] for name, field in (
@@ -176,7 +236,7 @@ def completed_record(entry, index, output, reference_root, cadence_root, pins):
     if len(records) != 1:
         raise ValueError("H4 bundle must normalize to exactly one arm")
     record = records[0]
-    validate_spec(entry, index, record)
+    validate_spec(entry, index, record, campaign=campaign)
     if record["checkpoint"] != {"step": entry["step"], "sha256": entry["sha256"]}:
         raise ValueError("H4 checkpoint changed")
     if sorted(ep["seed"] for ep in record["episodes"]) != prior.SEEDS or any(
@@ -188,17 +248,24 @@ def completed_record(entry, index, output, reference_root, cadence_root, pins):
         for name, path in record["artifact_files"].items() if name in traces]
     record["artifact_files"] = {name: path for name, path in record["artifact_files"].items() if name not in traces}
     record["artifact_files"].update({name: str(output / name) for name in ("results.json", "receipt.json")})
+    if campaign.context_h4:
+        controls, _ = cadence.reference_records(entry, index, reference_root, pins["prior"])
+        control_map = series._read(Path(cadence_root) / "publication/publication-map.json")
+        pending_h4_control(entry, index, control_map["curves"][f"cell-{index}_h4"], pins["h4_k1_registry"])
+        if "h4_k1_result" in pins and file_pins(Path(cadence_root) / f"production/cell-{index}") != pins["h4_k1_result"]:
+            raise ValueError("Pinned H4/K1 result changed")
+        return prior.paired_record(record, controls["prior"])
     controls, _ = reference_records(entry, index, reference_root, cadence_root, pins)
     return add_horizon_delta(prior.paired_record(record, controls["prior"]), controls["h3"])
 
 
-def install_workspace(receipt, path):
+def install_workspace(receipt, path, *, campaign=DEFAULT):
     import wandb_workspaces.workspaces as ws
     import wandb_workspaces.reports.v2 as wr
     from wandb_workspaces import expr
     path = Path(path)
     previous = series._read(path) if path.exists() else {}
-    if previous and previous.get("campaign_id") != ATTEMPT:
+    if previous and previous.get("campaign_id") != campaign.attempt:
         raise ValueError("Workspace belongs to another campaign")
     rows = list(cadence.layout_curves(receipt).values())
     def bar(title, metric):
@@ -213,12 +280,13 @@ def install_workspace(receipt, path):
         "Paired horizon gain is H4 minus H3 for the same checkpoint and environment seed; positive favors H4. "
         "Both horizons solve afresh at every real decision. Missing pending bars are not zero returns. "
         "Sample SD describes episode variability, not training-seed uncertainty; H4 uses more imagined transitions.")
-    sections = [ws.Section(name=PREFIX + "Protocol and progress", is_open=True, panels=[
+    markdown = campaign.description or markdown
+    sections = [ws.Section(name=campaign.prefix + "Protocol and progress", is_open=True, panels=[
         wr.MarkdownPanel(markdown=markdown, layout=wr.Layout(w=24, h=8)),
         bar("Completed checkpoints per run (of one)", "progress/checkpoints_complete"),
         bar("Failed validation cells", "progress/failed_cells")]),
-        ws.Section(name=PREFIX + "Returns, paired gains and cost", is_open=True,
-            panels=[bar(title, metric) for title, metric in METRICS], layout_settings=ws.SectionLayoutSettings(columns=2, rows=3))]
+        ws.Section(name=campaign.prefix + "Returns, paired gains and cost", is_open=True,
+            panels=[bar(title, metric) for title, metric in campaign.metrics], layout_settings=ws.SectionLayoutSettings(columns=2, rows=3))]
     if previous.get("url"):
         work = ws.Workspace.from_url(previous["url"])
         if work.entity != prior.ENTITY or work.project != prior.PROJECT:
@@ -228,20 +296,20 @@ def install_workspace(receipt, path):
         work.sections.extend(replacements.values())
     else:
         work = ws.Workspace(entity=prior.ENTITY, project=prior.PROJECT,
-            name="Frozen J8 checkpoints: H4 versus H3 at K1", sections=sections, auto_generate_panels=False,
+            name=campaign.title, sections=sections, auto_generate_panels=False,
             settings=ws.WorkspaceSettings(max_runs=6, remove_legends_from_panels=False),
             runset_settings=ws.RunsetSettings(filters=[expr.Metric("ID").isin([row["run_id"] for row in rows])], groupby=[],
                 run_settings={row["run_id"]: ws.RunSettings(color=row["color"], disabled=False) for row in rows},
                 pinned_columns=["run:displayName", "summary:progress/checkpoints_complete", "summary:eval/return_mean"]))
     work.save()
-    saved = {**previous, "campaign_id": ATTEMPT, "url": work.url, "updated_at": prior.now(),
+    saved = {**previous, "campaign_id": campaign.attempt, "url": work.url, "updated_at": prior.now(),
         "run_ids": [row["run_id"] for row in rows], "panel_count": 9, "api_verified": False}
     saved.setdefault("browser_verified", False)
     series._atomic_json(path, saved)
     readback = ws.Workspace.from_url(work.url)
-    panels = [panel for section in readback.sections if section.name.startswith(PREFIX) for panel in section.panels]
+    panels = [panel for section in readback.sections if section.name.startswith(campaign.prefix) for panel in section.panels]
     wire = str([getattr(panel, "metrics", []) for panel in panels])
-    if len(panels) != 9 or any(metric not in wire for _, metric in METRICS) or any(
+    if len(panels) != 9 or any(metric not in wire for _, metric in campaign.metrics) or any(
             row["run_id"] not in readback.runset_settings.run_settings for row in rows):
         raise ValueError("H4 workspace failed native API read-back")
     saved["api_verified"] = True
@@ -249,7 +317,7 @@ def install_workspace(receipt, path):
     return saved
 
 
-def verify_workspace(receipt, path, wandb_module=None):
+def verify_workspace(receipt, path, wandb_module=None, *, campaign=DEFAULT):
     path = Path(path)
     if not path.is_file():
         raise ValueError("Install H4 workspace panels before publication")
@@ -257,7 +325,7 @@ def verify_workspace(receipt, path, wandb_module=None):
     wanted = {row["run_id"] for row in cadence.layout_curves(receipt).values()}
     parsed = urlparse(saved["url"])
     view = parse_qs(parsed.query).get("nw", [None])[0]
-    if (saved.get("campaign_id") != ATTEMPT or saved.get("api_verified") is not True or set(saved.get("run_ids", [])) != wanted
+    if (saved.get("campaign_id") != campaign.attempt or saved.get("api_verified") is not True or set(saved.get("run_ids", [])) != wanted
             or parsed.hostname != "wandb.ai" or parsed.path.rstrip("/") != f"/{prior.ENTITY}/{prior.PROJECT}" or not view):
         raise ValueError("H4 workspace must contain the six selected runs")
     if wandb_module is None:
@@ -271,24 +339,26 @@ def verify_workspace(receipt, path, wandb_module=None):
         "name": prior.PROJECT, "viewName": "nw-" + view + "-v"})
     edges = (data.get("project") or {}).get("allViews", {}).get("edges", [])
     if len(edges) != 1 or any(token not in json.dumps(edges) for token in [*wanted,
-            "progress/checkpoints_complete", "progress/failed_cells", *[metric for _, metric in METRICS]]):
+            "progress/checkpoints_complete", "progress/failed_cells", *[metric for _, metric in campaign.metrics]]):
         raise ValueError("H4 workspace lost expected native panels or run IDs")
     return saved
 
 
-def publish_once(inventory, root, reference_root, cadence_root, *, wandb_module=None, workspace_verifier=verify_workspace):
+def publish_once(inventory, root, reference_root, cadence_root, *, wandb_module=None, workspace_verifier=None, campaign=DEFAULT):
     root, reference_root, cadence_root = map(lambda p: Path(p).resolve(), (root, reference_root, cadence_root))
     publication = root / "publication"
     with series._lock(publication / ".publisher.lock", blocking=False):
         receipt = series._read(publication / "publication-map.json")
         if (receipt["inventory_sha256"] != series._digest(inventory) or receipt["reference_root"] != str(reference_root)
-                or receipt["cadence_root"] != str(cadence_root) or receipt["campaign_id"] != ATTEMPT):
+                or receipt[campaign.root_key] != str(cadence_root) or receipt["campaign_id"] != campaign.attempt):
             raise ValueError("H4 inventory/reference identity changed")
-        workspace = workspace_verifier(receipt, publication / "workspace.json", wandb_module)
+        workspace = (workspace_verifier(receipt, publication / "workspace.json", wandb_module) if workspace_verifier else
+                     verify_workspace(receipt, publication / "workspace.json", wandb_module, campaign=campaign))
         failures = {}
         for index, entry in enumerate(inventory["entries"][:2]):
             try:
-                record = completed_record(entry, index, root / f"production/cell-{index}", reference_root, cadence_root, receipt["references"][str(index)])
+                record = completed_record(entry, index, root / f"production/cell-{index}", reference_root, cadence_root,
+                    receipt["references"][str(index)], campaign=campaign)
                 if record is not None:
                     series.stage_record(receipt["curves"][f"cell-{index}_h4"]["run_dir"], record)
             except Exception as exc:
@@ -296,14 +366,14 @@ def publish_once(inventory, root, reference_root, cadence_root, *, wandb_module=
         for row in prior.progress_rows(receipt):
             with series.Publisher(row["run_dir"], owner=prior.OWNER, wandb_module=wandb_module) as publisher:
                 publisher.run.name = row["name"]
-                publisher.run.config.update({"campaign_id": ATTEMPT, "source_K": row["source_K"], "evaluation_K": 1, "evaluation_H": 4, "J": 8})
-                for _, metric in METRICS:
+                publisher.run.config.update({"campaign_id": campaign.attempt, "source_K": row["source_K"], "evaluation_K": campaign.eval_K, "evaluation_H": 4, "J": 8})
+                for _, metric in campaign.metrics:
                     publisher.run.define_metric(metric, step_metric=series.X_AXIS, step_sync=False, hidden=False)
                 publisher.publish_pending()
                 publisher.run.summary.update({"progress/checkpoints_complete": row["complete"], "progress/checkpoints_expected": 1,
                     "progress/failed_cells": int(str(row["index"]) in failures), "progress/status": "failed validation" if str(row["index"]) in failures else
                     ("complete" if row["complete"] else "pending results")})
-        result = {"campaign_id": ATTEMPT, "updated_at": prior.now(), "runs": prior.progress_rows(receipt),
+        result = {"campaign_id": campaign.attempt, "updated_at": prior.now(), "runs": prior.progress_rows(receipt),
                   "failures": failures, "workspace_url": workspace["url"]}
         series._atomic_json(publication / "status.json", result)
         if failures:
@@ -311,35 +381,36 @@ def publish_once(inventory, root, reference_root, cadence_root, *, wandb_module=
         return result
 
 
-def main():
+def main(*, campaign=DEFAULT):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("prepare", "layout", "publish", "watch"))
-    for name in ("inventory", "root", "reference-root", "cadence-root"):
+    for name in ("inventory", "root", "reference-root", campaign.root_key.replace("_", "-")):
         parser.add_argument("--" + name, required=True, type=Path)
     parser.add_argument("--prepared-root", type=Path)
     parser.add_argument("--compute-jobs")
     parser.add_argument("--poll-seconds", type=float, default=30)
     args = parser.parse_args()
+    context_root = getattr(args, campaign.root_key)
     try:
         inventory = prior.load_inventory(args.inventory)
         if args.command == "prepare":
-            result = prepare(inventory, args.root, args.reference_root, args.cadence_root, args.prepared_root)
+            result = prepare(inventory, args.root, args.reference_root, context_root, args.prepared_root, campaign=campaign)
         elif args.command == "layout":
             receipt = series._read(args.root / "publication/publication-map.json")
             if receipt["inventory_sha256"] != series._digest(inventory):
                 raise ValueError("H4 inventory changed")
-            result = install_workspace(receipt, args.root / "publication/workspace.json")
+            result = install_workspace(receipt, args.root / "publication/workspace.json", campaign=campaign)
         else:
             if args.command == "watch" and (not args.compute_jobs or not re.fullmatch(r"\d+(,\d+)*", args.compute_jobs)):
                 raise ValueError("watch requires explicit numeric compute job IDs")
             if not 1 <= args.poll_seconds <= 60:
                 raise ValueError("Polling must be between one and 60 seconds")
             while True:
-                result = publish_once(inventory, args.root, args.reference_root, args.cadence_root)
+                result = publish_once(inventory, args.root, args.reference_root, context_root, campaign=campaign)
                 if args.command != "watch":
                     break
                 if not subprocess.check_output(["squeue", "-h", "-j", args.compute_jobs], text=True).strip():
-                    result = publish_once(inventory, args.root, args.reference_root, args.cadence_root)
+                    result = publish_once(inventory, args.root, args.reference_root, context_root, campaign=campaign)
                     if any(row["published"] != 1 for row in result["runs"]):
                         raise ValueError("Compute ended before both H4 results were published")
                     break

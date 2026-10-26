@@ -76,3 +76,20 @@ Use `slurm/ambi_return_h4_eval.py` with the original campaign as
 `--reference-root`. Publication uses `slurm/ambi_return_h4_publish.py` with both
 `--reference-root` and `--cadence-root`. Each new H4 evaluation gets its own New
 publication identity; existing controls and their workspaces remain reusable.
+
+## H4 refinement with K4 execution
+
+`return_prior_h4_k4.json` uses the same two 500k checkpoints and the same H4/J8
+recipe, changing evaluation cadence to K4. The adapted actor and its solve-time
+encoder are held between solves, but each action is recomputed from the new
+observation. Every episode starts with a fresh solve. Five 500-decision episodes
+therefore use 625 solves, versus 2,500 at K1; each H4 solve still generates
+4,096 imagined transitions with 128 critic, 32 actor, and 32 temperature updates.
+
+Only the two K4 arms are new. Original prior controls and completed H4/K1
+results are reused, with mean execution, environment seeds 101–105, controller
+seed 55, and frozen outer state unchanged. The separate comparison workspace
+displays each checkpoint's prior, H4/K1, and H4/K4 outcomes and controller cost.
+Use `slurm/ambi_return_h4_k4_eval.py` and
+`slurm/ambi_return_h4_k4_publish.py`; the publisher's `--h4-root` identifies the
+existing H4/K1 campaign. Each K4 arm has its own New publication identity.

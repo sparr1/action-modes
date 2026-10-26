@@ -94,13 +94,13 @@ def validate_results(payload, entry, index, *, smoke=False, smoke_steps=6,
         require(cfg.get("inner_replay_capacity") == replay_capacity, "Resolved replay capacity changed")
     require(cfg["inner_temperature_mode"] == "auto" and
             cfg["inner_temperature_initialization"] == "inherit_outer", "Inner alpha changed")
-    if interval == 3:
+    if interval > 1:
         require(cfg.get("inner_hold_encoder") == "solve_snapshot", "Held encoder changed")
     per_episode_solves = math.ceil(steps / interval)
     # Check each episode so a missing reset cannot be hidden by a matching grand total.
     work = {"inner_model_steps": 8 * 128 * horizon, "inner_critic_optimizer_steps": 128,
             "inner_actor_optimizer_steps": 32, "inner_temperature_optimizer_steps": 32}
-    if interval == 3:
+    if interval > 1:
         work["inner_solve_performed"] = 1
     # Episode metrics store flat means; result metrics store count/sum statistics.
     for episode in episodes:
