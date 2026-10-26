@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "description": "Frozen J8 SAC cadence swaps; reuse completed prior and original-cadence episodes.",
+  "base_alg_config": "checkpoint",
+  "evaluation": {
+    "seeds": [101, 102, 103, 104, 105],
+    "controller_seed": 55,
+    "max_steps": 500
+  },
+  "comparisons": {
+    "cadence": {
+      "reference": "k1",
+      "variants": {
+        "k1": {
+          "description": "Saved SAC controller with a fresh solve every decision.",
+          "alg_params": {"inner_solve_interval": 1}
+        },
+        "k3": {
+          "description": "Saved SAC controller with a fresh solve every three decisions.",
+          "alg_params": {"inner_solve_interval": 3}
+        }
+      }
+    }
+  }
+}

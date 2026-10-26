@@ -33,3 +33,25 @@ time for that frozen checkpoint. It does not isolate how refinement affected
 data collection and learning during training. These source runs share one
 training seed; variation across evaluation episodes is not training-seed
 uncertainty.
+
+## Cadence swaps on the same checkpoint
+
+`return_prior_cadence_swap.json` isolates evaluation cadence by evaluating the
+J8/K1-trained checkpoint with K3 and the J8/K3-trained checkpoint with K1.
+Both checkpoints remain at 500k decisions, and only `inner_solve_interval`
+changes from the saved SAC configuration. J8, H3, mean execution, paired seeds
+101–105, controller seed55, and full500-decision episodes remain fixed.
+
+The two missing cells reuse the completed prior-only and original-cadence
+results from the selected-checkpoint comparison. They do not rerun either
+prior or the original SAC controller. The publisher validates the reused
+bundles and pairs by environment seed, reporting improvement over the same
+checkpoint's prior and the change relative to its original evaluation cadence.
+A dedicated view displays both prior controls and all four train-K/eval-K
+combinations. Each new evaluation has its own New publication identity.
+
+Use `slurm/ambi_return_cadence_eval.py` with the frozen inventory and the
+original campaign root as `--reference-root`. Its two selected indices map to
+K1-trained/eval-K3 and K3-trained/eval-K1. This intervention measures the effect
+of evaluation cadence within each learned checkpoint; it does not isolate
+training-seed variation or hold inference compute equal between K1 and K3.
