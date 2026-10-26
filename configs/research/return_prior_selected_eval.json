@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "description": "Paired frozen prior and original SAC controller at selected return-only checkpoints.",
+  "base_alg_config": "checkpoint",
+  "evaluation": {
+    "seeds": [101, 102, 103, 104, 105],
+    "controller_seed": 55,
+    "max_steps": 500,
+    "default_presets": ["comparison/prior", "comparison/sac"]
+  },
+  "comparisons": {
+    "comparison": {
+      "reference": "prior",
+      "variants": {
+        "prior": {
+          "description": "Frozen checkpoint policy mean, without an inner solve.",
+          "alg_params": {
+            "inner_operator": "none",
+            "inner_finite_horizon": false,
+            "inner_solve_interval": 1,
+            "inner_rounds": 0,
+            "inner_rollouts_per_round": 0,
+            "inner_updates_per_round": null,
+            "inner_critic_updates_per_round": null,
+            "inner_actor_updates_per_round": null,
+            "inner_critic_updates_per_action": null,
+            "inner_actor_updates_per_action": null,
+            "inner_temperature_updates_per_action": null,
+            "inner_model_step_budget": null,
+            "inner_mppi_iterations": null
+          }
+        },
+        "sac": {
+          "description": "Original checkpoint SAC settings and solve cadence, with mean execution.",
+          "alg_params": {}
+        }
+      }
+    }
+  }
+}
