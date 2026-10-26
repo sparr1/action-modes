@@ -53,7 +53,7 @@ def test_matrix_changes_only_requested_cadence(inventory, index):
     (lambda r: r["episodes"][0].update(truncated_by_evaluator=True), "native environment"),
     (lambda r: r.update(outer_updates_after=99), "Outer state"),
     (lambda r: r["episodes"][0].update(solver_seed=55), "solver seed"),
-    (lambda r: r["alg_params"].update(inner_rounds=10), "beyond the requested cadence"),
+    (lambda r: r["alg_params"].update(inner_rounds=10), "beyond the requested evaluation overrides"),
     (lambda r: r["resolved_config"].update(inner_temperature_mode="fixed"), "alpha"),
     (lambda r: r["episodes"][0]["model_metrics"].update(inner_model_steps=1), "cadence/work"),
     (lambda r: r["model_metrics"]["inner_solve_performed"].update(sum=834), "cadence/work"),

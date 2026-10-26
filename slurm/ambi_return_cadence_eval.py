@@ -29,7 +29,7 @@ def selection(index):
     return f"cadence/k{interval}", interval
 
 
-def verify_reference(root, index, entry):
+def verify_reference(root, index, entry, *, matrix=MATRIX, selector=None):
     cell = Path(root) / "production" / f"cell-{index}"
     receipt = read_json(cell / "receipt.json")
     require(receipt.get("validated") is True and receipt.get("mode") == "run",
@@ -38,8 +38,8 @@ def verify_reference(root, index, entry):
                         ("bundle/manifest.json", "manifest_sha256")):
         require(file_hash(cell / name) == receipt[field], "Reference file hash changed")
     original.validate_results(read_json(cell / "results.json"), entry)
-    selector, _ = selection(index)
-    resolved = resolve_preset(MATRIX, selector, load_preset_matrix(MATRIX),
+    selector = selection(index)[0] if selector is None else selector
+    resolved = resolve_preset(matrix, selector, load_preset_matrix(matrix),
                              checkpoint_context=load_checkpoint_context(entry["checkpoint"], entry["metadata"]))
     values = reference_returns(cell / "bundle", entry["sha256"], protocol_for(resolved, 55, 500))
     require(set(values) == set(SEEDS), "Reference seed coverage changed")
@@ -49,8 +49,9 @@ def verify_reference(root, index, entry):
             "receipt_sha256": file_hash(cell / "receipt.json")}
 
 
-def validate_results(payload, entry, index, *, smoke=False, smoke_steps=6):
-    selector, interval = selection(index)
+def validate_results(payload, entry, index, *, smoke=False, smoke_steps=6,
+                     selected=None, horizon=3, replay_capacity=None):
+    selector, interval = selection(index) if selected is None else selected
     seeds, steps = ([101], smoke_steps) if smoke else (SEEDS, 500)
     require(payload.get("frozen_outer_learning") is True and
             payload.get("deterministic_execution") is True, "Expected frozen mean-action evaluation")
@@ -78,21 +79,26 @@ def validate_results(payload, entry, index, *, smoke=False, smoke_steps=6):
     require(not result.get("togo_return_probe"), "No to-go probes were requested")
     saved = dict(read_json(entry["metadata"])["trial_run_params"]["alg_params"])
     saved["inner_solve_interval"] = interval
+    saved["inner_rollout_horizon"] = horizon
+    if replay_capacity is not None:
+        saved["inner_replay_capacity"] = replay_capacity
     actual = dict(result["alg_params"])
     for runtime_key in ("device", "wandb"):
         saved.pop(runtime_key, None)
         actual.pop(runtime_key, None)
-    require(actual == saved, "Controller settings changed beyond the requested cadence")
+    require(actual == saved, "Controller settings changed beyond the requested evaluation overrides")
     cfg = result["resolved_config"]
     require((cfg["inner_operator"], cfg["inner_rounds"], cfg["inner_solve_interval"],
-             cfg["inner_rollout_horizon"]) == ("sac", 8, interval, 3), "Resolved controller changed")
+             cfg["inner_rollout_horizon"]) == ("sac", 8, interval, horizon), "Resolved controller changed")
+    if replay_capacity is not None:
+        require(cfg.get("inner_replay_capacity") == replay_capacity, "Resolved replay capacity changed")
     require(cfg["inner_temperature_mode"] == "auto" and
             cfg["inner_temperature_initialization"] == "inherit_outer", "Inner alpha changed")
     if interval == 3:
         require(cfg.get("inner_hold_encoder") == "solve_snapshot", "Held encoder changed")
     per_episode_solves = math.ceil(steps / interval)
     # Check each episode so a missing reset cannot be hidden by a matching grand total.
-    work = {"inner_model_steps": 3072, "inner_critic_optimizer_steps": 128,
+    work = {"inner_model_steps": 8 * 128 * horizon, "inner_critic_optimizer_steps": 128,
             "inner_actor_optimizer_steps": 32, "inner_temperature_optimizer_steps": 32}
     if interval == 3:
         work["inner_solve_performed"] = 1
@@ -112,8 +118,9 @@ def validate_results(payload, entry, index, *, smoke=False, smoke_steps=6):
             "solves": len(seeds) * per_episode_solves}
 
 
-def run(args):
-    selector, interval = selection(args.index)
+def run(args, *, matrix=MATRIX, select=selection, validator=validate_results,
+        campaign_id=CAMPAIGN_ID, receipt_fields=None):
+    selector, interval = select(args.index)
     entry = verify_entry(read_json(args.inventory), args.index)
     require(entry["step"] == 500000 and entry["J"] == 8, "Expected the selected J8 checkpoints at 500k")
     require(1 <= args.smoke_steps <= 6, "Smoke must use at most six decisions")
@@ -123,7 +130,7 @@ def run(args):
     reference = None
     if args.mode != "smoke":
         require(args.reference_root is not None, "Prepare and production require the completed reference root")
-        reference = verify_reference(args.reference_root, args.index, entry)
+        reference = verify_reference(args.reference_root, args.index, entry, matrix=matrix, selector=selector)
     run_map = None
     if args.mode == "run":
         require(args.eval_run_map is not None, "Production requires a prepared publication identity")
@@ -139,7 +146,7 @@ def run(args):
     write_json(native_inventory, {"source_run": entry["source_run"], "checkpoints": [{
         "step": entry["step"], "sha256": entry["sha256"], "metadata_sha256": entry["metadata_sha256"]}]})
     command = [sys.executable, str(ROOT / "evaluate_ambi_checkpoint.py"),
-               "--matrix", str(MATRIX), "--preset", selector, "--checkpoint", entry["checkpoint"],
+               "--matrix", str(matrix), "--preset", selector, "--checkpoint", entry["checkpoint"],
                "--metadata", entry["metadata"], "--checkpoint-inventory", str(native_inventory),
                "--controller-seed", "55", "--device", "cuda"]
     started = time.perf_counter()
@@ -160,19 +167,21 @@ def run(args):
     # Only the CPU publisher normalizes and stages completed results.
     write_json(output / "command.json", command)
     subprocess.run(command, cwd=ROOT, check=True)
-    receipt = {"validated": True, "campaign_id": CAMPAIGN_ID, "mode": args.mode, "source_run": entry["source_run"],
+    receipt = {"validated": True, "campaign_id": campaign_id, "mode": args.mode, "source_run": entry["source_run"],
                "step": entry["step"], "J": 8, "source_K": entry["K"], "eval_K": interval,
                "selector": selector, "checkpoint_sha256": entry["sha256"],
-               "metadata_sha256": entry["metadata_sha256"], "matrix_sha256": file_hash(MATRIX),
+               "metadata_sha256": entry["metadata_sha256"], "matrix_sha256": file_hash(matrix),
                "elapsed_seconds": time.perf_counter() - started,
                "runtime": runtime_info(gpu=args.mode != "prepare")}
+    receipt.update(receipt_fields or {})
     if reference is not None:
-        require(reference == verify_reference(args.reference_root, args.index, entry), "Reference changed during evaluation")
+        require(reference == verify_reference(args.reference_root, args.index, entry, matrix=matrix, selector=selector),
+                "Reference changed during evaluation")
         receipt["reference"] = reference
     if args.mode != "prepare":
         results, manifest_path = output / "results.json", output / "bundle/manifest.json"
-        receipt.update(validate_results(read_json(results), entry, args.index,
-                                        smoke=args.mode == "smoke", smoke_steps=args.smoke_steps))
+        receipt.update(validator(read_json(results), entry, args.index,
+                                 smoke=args.mode == "smoke", smoke_steps=args.smoke_steps))
         manifest = read_json(manifest_path)
         require(manifest.get("status") == "complete" and len(manifest.get("runs", [])) == 1,
                 "Expected one completed benchmark arm")
@@ -187,8 +196,8 @@ def run(args):
     return receipt
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(*, run_fn=run, description=__doc__):
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("mode", choices=("prepare", "run", "smoke"))
     parser.add_argument("--inventory", type=Path, required=True)
     parser.add_argument("--index", type=int, required=True)
@@ -197,7 +206,7 @@ def main():
     parser.add_argument("--eval-run-map", type=Path)
     parser.add_argument("--expected-commit")
     parser.add_argument("--smoke-steps", type=int, default=6)
-    print(json.dumps(run(parser.parse_args()), indent=2))
+    print(json.dumps(run_fn(parser.parse_args()), indent=2))
 
 
 if __name__ == "__main__":

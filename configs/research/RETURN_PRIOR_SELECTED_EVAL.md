@@ -55,3 +55,24 @@ original campaign root as `--reference-root`. Its two selected indices map to
 K1-trained/eval-K3 and K3-trained/eval-K1. This intervention measures the effect
 of evaluation cadence within each learned checkpoint; it does not isolate
 training-seed variation or hold inference compute equal between K1 and K3.
+
+## H4 refinement with K1 execution
+
+`return_prior_h4_k1.json` evaluates the same two J8 checkpoints at 500k with
+K1 and H4. It preserves the saved controller settings except for the requested
+solve interval and rollout horizon, and expands action-local replay from 3,072
+to 4,096 transitions to retain all `J8 * N128 * H4` imagined transitions. Each
+solve still performs 128 critic, 32 actor, and 32 temperature updates.
+
+The five environment seeds, controller seed, mean actions, frozen outer state,
+and full 500-decision episodes match the existing evaluations. Only the two H4
+settings are newly evaluated. Prior controls are reused from the original
+comparison; the H3/K1 reference for the K1-trained checkpoint comes from that
+comparison, while the H3/K1 reference for the K3-trained checkpoint comes from
+the completed cadence swap. A separate six-run view reports H4 return, paired
+gain over the prior, and H4-minus-H3 return at fixed K1.
+
+Use `slurm/ambi_return_h4_eval.py` with the original campaign as
+`--reference-root`. Publication uses `slurm/ambi_return_h4_publish.py` with both
+`--reference-root` and `--cadence-root`. Each new H4 evaluation gets its own New
+publication identity; existing controls and their workspaces remain reusable.
