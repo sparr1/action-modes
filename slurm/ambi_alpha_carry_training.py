@@ -39,12 +39,12 @@ def recipe(index):
     return source_recipe(index, MANIFEST)
 
 
-def assert_recipe(cfg, agent, run):
+def assert_recipe(cfg, agent, run, *, expected_rounds=8):
     """Check resolved settings, rather than trusting only serialized JSON."""
     assert cfg.compile and cfg.compile_strict and cfg.critic_ensemble_backend == "vmap"
-    assert (cfg.inner_rollout_horizon, cfg.inner_rounds) == (3, 8)
-    assert (cfg.inner_rollouts_per_round, cfg.inner_batch_size, cfg.inner_replay_capacity) == (128, 256, 3072)
-    assert (cfg.inner_critic_updates_per_action, cfg.inner_actor_updates_per_action) == (128, 32)
+    assert (cfg.inner_rollout_horizon, cfg.inner_rounds) == (3, expected_rounds)
+    assert (cfg.inner_rollouts_per_round, cfg.inner_batch_size, cfg.inner_replay_capacity) == (128, 256, expected_rounds * 128 * 3)
+    assert (cfg.inner_critic_updates_per_action, cfg.inner_actor_updates_per_action) == (16 * expected_rounds, 4 * expected_rounds)
     assert cfg.inner_execution_action == cfg.inner_behavior_action == "policy_sample"
     assert cfg.inner_temperature_mode == "auto" and cfg.inner_temperature_lr == 3e-4
     assert cfg.inner_temperature_scope == cfg.inner_temperature_optimizer_scope
@@ -60,14 +60,14 @@ def assert_recipe(cfg, agent, run):
     assert cfg.inner_critic_bernoulli_p == 0 and cfg.inner_outer_policy_kl_coef == 0
 
 
-def check_temperature_transition(previous, current, scope):
+def check_temperature_transition(previous, current, scope, *, temperature_steps=32):
     """Both alpha and Adam carry, except at the selected episode boundary."""
     reset = previous is None or (current["t0"] and scope == "episode")
     expected_alpha = current["outer_alpha"] if reset else previous["alpha_final"]
     assert math.isclose(current["alpha_initial"], expected_alpha, rel_tol=2e-6, abs_tol=1e-7)
     expected_step = 0 if reset else previous["optimizer_step_final"]
     assert current["optimizer_step_initial"] == expected_step
-    assert current["optimizer_step_final"] == expected_step + 32
+    assert current["optimizer_step_final"] == expected_step + temperature_steps
     if not reset:
         assert current["alpha_identity"] == previous["alpha_identity"]
         assert current["optimizer_identity"] == previous["optimizer_identity"]

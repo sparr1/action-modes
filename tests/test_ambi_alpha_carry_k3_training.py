@@ -3,6 +3,7 @@
 from copy import deepcopy
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,6 +25,92 @@ def test_k3_only_changes_source_cadence_and_publication_labels():
     original = campaign.read(campaign.ROOT / "configs/dmcontrol/experiments/ambi_alpha_carry_training.json")
     for key in ("overrides_alg", "env_params", "checkpoint_every", "checkpoint_replay", "save_strat", "save_trials", "logs", "log_type"):
         assert manifest[key] == original[key]
+
+
+def test_j10_only_changes_rounds_derived_capacity_and_publication_labels(monkeypatch):
+    monkeypatch.delenv("AMBI_ALPHA_CARRY_K3_MANIFEST", raising=False)
+    _, source_manifest, source = campaign.recipe()
+    monkeypatch.setenv("AMBI_ALPHA_CARRY_K3_MANIFEST", campaign.SUPPORTED_MANIFESTS[1])
+    name, manifest, run = campaign.recipe()
+    source["alg_params"]["inner_rounds"] = 10
+    source["alg_params"]["inner_replay_capacity"] = 10 * 128 * 3
+    for config in (source, run):
+        del config["name"]
+        for key in ("wandb_run_name", "wandb_group", "wandb_tags"):
+            config["alg_params"].pop(key)
+    assert run == source
+    assert run["alg_params"]["inner_replay_capacity"] == 3840
+    assert manifest["configs"] == [name]
+    for key in set(source_manifest) - {"study_note", "study_type", "configs"}:
+        assert manifest[key] == source_manifest[key]
+    assert campaign.binding()["manifest"] == campaign.SUPPORTED_MANIFESTS[1]
+
+
+def test_j10_resolves_full_update_dose_and_no_eviction_replay_capacity(monkeypatch):
+    from tests.test_ambi_root_local_sac import _build_cfg
+    monkeypatch.setenv("AMBI_ALPHA_CARRY_K3_MANIFEST", campaign.SUPPORTED_MANIFESTS[1])
+    _, _, run = campaign.recipe()
+    cfg = _build_cfg(**run["alg_params"])
+    assert (cfg.inner_rounds, cfg.inner_critic_updates_per_action, cfg.inner_actor_updates_per_action) == (10, 160, 40)
+    assert cfg.inner_replay_capacity == cfg.inner_model_step_budget == 3840 and cfg.inner_solve_interval == 3
+    agent = SimpleNamespace(target_entropy=-10.5, aux_return=SimpleNamespace(has_actor=False),
+                            inner_engine=SimpleNamespace(_resolved_inner_target_entropy=lambda: -10.5))
+    campaign.assert_recipe(cfg, agent, run)
+
+
+def test_only_supported_manifests_can_be_selected(monkeypatch):
+    monkeypatch.setenv("AMBI_ALPHA_CARRY_K3_MANIFEST", "configs/dmcontrol/experiments/ambi_alpha_carry_training.json")
+    with pytest.raises(AssertionError, match="supported K3"):
+        campaign.recipe()
+
+
+def test_j10_cadence_requires_160_40_40_and_no_held_updates():
+    metrics = dict(inner_solve_performed=1., inner_policy_held=0., inner_action_age=0.,
+                   inner_compile_fallback=0., inner_critic_optimizer_steps=160.,
+                   inner_actor_optimizer_steps=40., inner_temperature_optimizer_steps=40.)
+    assert campaign.assert_cadence(metrics, 3, expected_rounds=10)
+    with pytest.raises(AssertionError):
+        campaign.assert_cadence(metrics, 3)
+    metrics["inner_temperature_optimizer_steps"] = 32.
+    with pytest.raises(AssertionError):
+        campaign.assert_cadence(metrics, 3, expected_rounds=10)
+    held = dict.fromkeys(campaign.HELD_ZERO_WORK, 0.)
+    held.update(inner_solve_performed=0., inner_policy_held=1., inner_action_age=2., inner_policy_evaluations=1.)
+    assert campaign.assert_cadence(held, 5, expected_rounds=10) is False
+
+
+def test_j10_run_temperature_carries_forty_adam_steps_per_solve():
+    row = dict(t0=False, outer_alpha=.7, alpha_initial=.7, alpha_final=.69,
+               optimizer_step_initial=0., optimizer_step_final=40.,
+               episode_reset=0., alpha_identity=1, optimizer_identity=2)
+    campaign.shared.check_temperature_transition(None, row, "run", temperature_steps=40)
+    following = {**row, "t0": True, "outer_alpha": .8, "alpha_initial": .69,
+                 "optimizer_step_initial": 40., "optimizer_step_final": 80.}
+    campaign.shared.check_temperature_transition(row, following, "run", temperature_steps=40)
+    with pytest.raises(AssertionError):
+        campaign.shared.check_temperature_transition(row, following, "run")
+
+
+def test_benchmark_workers_inherit_selected_j10_manifest(tmp_path, monkeypatch):
+    monkeypatch.setenv("AMBI_ALPHA_CARRY_K3_MANIFEST", campaign.SUPPORTED_MANIFESTS[1])
+    monkeypatch.setenv("SLURM_JOB_ID", "test")
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "2")
+    monkeypatch.setattr(campaign.os, "sched_getaffinity", lambda _: {0, 1}, raising=False)
+    monkeypatch.setattr(campaign, "physical_core_cpus", lambda _: [0, 1])
+    expected_binding = campaign.binding()
+    monkeypatch.setattr(campaign, "binding", lambda: expected_binding)
+    selected = []
+
+    def worker(command, *, cwd, env, **_):
+        selected.append(env["AMBI_ALPHA_CARRY_K3_MANIFEST"])
+        cpus = len(command[command.index("--worker-cpus") + 1].split(","))
+        output = Path(command[command.index("--output") + 1])
+        output.write_text(json.dumps({"runtime": {}, "physical_cores": cpus,
+                                      "measured": {"seconds_per_decision": 1.}}))
+
+    monkeypatch.setattr(campaign.subprocess, "run", worker)
+    campaign.benchmark(SimpleNamespace(output=tmp_path / "benchmark", warmup=24, decisions=96))
+    assert selected == [campaign.SUPPORTED_MANIFESTS[1]] * 2
 
 
 def receipt():

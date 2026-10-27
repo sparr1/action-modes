@@ -19,6 +19,10 @@ from slurm.ambi_transfer_training import binding as source_binding, digest, read
 from slurm.benchmark_ambi_training_cpu import TrainingWindow, physical_core_cpus
 
 MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_alpha_carry_k3_training.json"
+SUPPORTED_MANIFESTS = (
+    str(MANIFEST.relative_to(ROOT)),
+    "configs/dmcontrol/experiments/ambi_alpha_carry_k3_j10_training.json",
+)
 COUNTS = (1, 2)
 SEED_STEPS = 500
 HELD_ZERO_WORK = ("inner_rollouts", "inner_steps", "inner_updates", "inner_model_steps",
@@ -26,22 +30,30 @@ HELD_ZERO_WORK = ("inner_rollouts", "inner_steps", "inner_updates", "inner_model
                   "inner_temperature_optimizer_steps", "inner_q_evaluations")
 
 
+def selected_manifest():
+    selected = os.environ.get("AMBI_ALPHA_CARRY_K3_MANIFEST", SUPPORTED_MANIFESTS[0])
+    assert selected in SUPPORTED_MANIFESTS, "Select a supported K3 campaign manifest"
+    return ROOT / selected
+
+
 def binding():
-    return source_binding(MANIFEST)
+    return source_binding(selected_manifest())
 
 
 def recipe():
-    return source_recipe(0, MANIFEST)
+    return source_recipe(0, selected_manifest())
 
 
 def assert_recipe(cfg, agent, run):
-    shared.assert_recipe(cfg, agent, run)
+    expected_rounds = run["alg_params"]["inner_rounds"]
+    assert expected_rounds in (8, 10)
+    shared.assert_recipe(cfg, agent, run, expected_rounds=expected_rounds)
     assert cfg.inner_solve_interval == 3 and cfg.inner_hold_encoder == "solve_snapshot"
     assert cfg.inner_temperature_scope == cfg.inner_temperature_optimizer_scope == "run"
     assert cfg.aux_return_detach_representation and agent.target_entropy == -10.5
 
 
-def assert_cadence(metrics, decision):
+def assert_cadence(metrics, decision, *, expected_rounds=8):
     solve = decision % 3 == 0
     assert metrics["inner_solve_performed"] == float(solve)
     assert metrics["inner_policy_held"] == float(not solve)
@@ -49,8 +61,8 @@ def assert_cadence(metrics, decision):
     assert all(math.isfinite(float(value)) for value in metrics.values())
     if solve:
         assert metrics["inner_compile_fallback"] == 0
-        assert metrics["inner_critic_optimizer_steps"] == 128
-        assert metrics["inner_actor_optimizer_steps"] == metrics["inner_temperature_optimizer_steps"] == 32
+        assert metrics["inner_critic_optimizer_steps"] == 16 * expected_rounds
+        assert metrics["inner_actor_optimizer_steps"] == metrics["inner_temperature_optimizer_steps"] == 4 * expected_rounds
     else:
         assert all(metrics[key] == 0 for key in HELD_ZERO_WORK)
         assert metrics["inner_policy_evaluations"] == 1
@@ -118,7 +130,7 @@ def smoke(output):
             action = act(*args, **kwargs)
             torch.cuda.synchronize()
             metrics, state = agent.last_inner_metrics, engine.state
-            solve = assert_cadence(metrics, decision)
+            solve = assert_cadence(metrics, decision, expected_rounds=learner.cfg.inner_rounds)
             assert torch.isfinite(action).all()
             row = {"decision": decision, "solve": solve, "t0": bool(kwargs["t0"]),
                    "outer_updates": agent.num_updates, "seconds": time.perf_counter() - begin}
@@ -129,7 +141,8 @@ def smoke(output):
                            optimizer_step_final=float(metrics["inner_temperature_optimizer_step_final"]),
                            episode_reset=float(metrics["inner_temperature_episode_reset"]),
                            alpha_identity=id(state.log_alpha), optimizer_identity=id(state.temperature_optim))
-                shared.check_temperature_transition(solves[-1] if solves else None, row, "run")
+                shared.check_temperature_transition(solves[-1] if solves else None, row, "run",
+                                                    temperature_steps=4 * learner.cfg.inner_rounds)
                 solves.append(row)
             else:
                 shared.assert_state_equal(before_alpha, state.log_alpha)
@@ -176,6 +189,7 @@ def smoke(output):
             agent.load(checkpoint)
             shared.assert_state_equal({k: v.cpu() for k, v in agent.model.state_dict().items()}, saved["model"])
             receipt = {"passed": True, "binding": binding(), "runtime": runtime(), "config": name,
+                       "inner_rounds": learner.cfg.inner_rounds,
                        "real_decisions": 516, "inner_actions": len(actions), "inner_solves": len(solves),
                        "held_cadence": True, "held_alpha_adam_unchanged": True, "alpha_and_adam_lifecycle": True,
                        "checkpoint_roundtrip": True, "checkpoint_replay_roundtrip": True,
@@ -236,7 +250,7 @@ def benchmark_worker(args):
             action = act(*positional, **kwargs)
             timer.after_action(step, time.perf_counter() - started)
             assert action.device.type == "cpu" and torch.isfinite(action).all()
-            solve = assert_cadence(agent.last_inner_metrics, active)
+            solve = assert_cadence(agent.last_inner_metrics, active, expected_rounds=learner.cfg.inner_rounds)
             if timer.first_step <= step <= timer.last_step:
                 measured_solves += solve
             active += 1
@@ -263,6 +277,7 @@ def benchmark_worker(args):
         measured["projected_1m_decision_days"] = measured["seconds_per_decision"] * 1_000_000 / 86400
         measured["inner_solves"] = measured_solves
         report = {"passed": True, "physical_cores": len(cpus), "logical_cpu_ids": cpus,
+                  "inner_rounds": learner.cfg.inner_rounds,
                   "runtime": runtime(), "binding": binding(), "config": name,
                   "warmup_active_decisions": args.warmup, "measured": measured,
                   "compile_graph_counts": compile_counts, "memory": measured_memory(learner, production),
@@ -285,7 +300,8 @@ def benchmark(args):
         environment = dict(os.environ)
         for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
             environment[key] = str(count)
-        environment.update(OMP_DYNAMIC="FALSE", MKL_DYNAMIC="FALSE", WANDB_MODE="disabled")
+        environment.update(OMP_DYNAMIC="FALSE", MKL_DYNAMIC="FALSE", WANDB_MODE="disabled",
+                           AMBI_ALPHA_CARRY_K3_MANIFEST=str(selected_manifest().relative_to(ROOT)))
         command = [sys.executable, str(Path(__file__).resolve()), "benchmark-worker", "--worker-cpus",
                    ",".join(map(str, cores[:count])), "--output", str(args.output / f"cores-{count}.json"),
                    "--warmup", str(args.warmup), "--decisions", str(args.decisions)]
@@ -304,6 +320,7 @@ def benchmark(args):
 def validate_gate(receipt, expected):
     assert receipt["passed"] and receipt["binding"] == expected, "GPU gate source/configuration mismatch"
     assert receipt["config"] == recipe()[0]
+    assert receipt.get("inner_rounds", 8) == recipe()[2]["alg_params"]["inner_rounds"]
     for key in ("held_cadence", "held_alpha_adam_unchanged", "alpha_and_adam_lifecycle",
                 "checkpoint_roundtrip", "checkpoint_replay_roundtrip", "checkpoint_replay_rng_unchanged"):
         assert receipt[key], f"GPU gate missing {key}"

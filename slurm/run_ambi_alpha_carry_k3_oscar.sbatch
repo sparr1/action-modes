@@ -22,6 +22,11 @@ batch_started=$SECONDS
 : "${AMBI_EXPECTED_COMMIT:?Set the full tested commit.}"
 : "${AMBI_ALPHA_CARRY_K3_OUTPUT:?Set campaign storage outside source.}"
 mode="${AMBI_ALPHA_CARRY_K3_MODE:-train}"
+export AMBI_ALPHA_CARRY_K3_MANIFEST="${AMBI_ALPHA_CARRY_K3_MANIFEST:-configs/dmcontrol/experiments/ambi_alpha_carry_k3_training.json}"
+case "$AMBI_ALPHA_CARRY_K3_MANIFEST" in
+  configs/dmcontrol/experiments/ambi_alpha_carry_k3_training.json|configs/dmcontrol/experiments/ambi_alpha_carry_k3_j10_training.json) ;;
+  *) echo "Unsupported K3 campaign manifest." >&2; exit 1 ;;
+esac
 [[ "$mode" == smoke || "$mode" == benchmark || "$mode" == train ]]
 [[ "${SLURM_RESTART_COUNT:-0}" == 0 ]]
 [[ "$AMBI_PROJECT_DIR" == /* && "$AMBI_PYTHON" == /* ]]
