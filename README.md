@@ -318,6 +318,50 @@ shown above, so the checked quota row and the checkpoint filesystem cannot
 diverge. Oscar scratch and job-local storage are not substitutes for the
 durable checkpoint root.
 
+### Extending a completed exact-resume run
+
+`python -m utils.extend_completed_training` creates a continuation of a completed
+lineage with a larger absolute decision target. It preserves the original
+checkpoint artifacts and `DONE` marker, retains the same W&B run and history,
+and makes no W&B requests. Run the utility with the original training Python
+environment, from the checkout containing this utility:
+
+```bash
+python -m utils.extend_completed_training \
+  --source-lineage /path/to/completed-lineage \
+  --destination /path/to/continued-lineage \
+  --total-steps 1000000 \
+  --training-repo /path/to/original-clean-training-checkout
+```
+
+The destination must be new. Its parent filesystem must have space for a full
+copy of the retained trainer and replay generation plus subsequent checkpoints.
+The tool verifies `DONE`, all source payload checksums, the original clean Git
+identity and dependency versions. It stages a complete destination and publishes
+it by atomic rename. A small claim file beside the source lineage reserves the
+destination; the source lease prevents concurrent migrations. Repeating the same
+request recovers an interrupted migration or returns the existing continuation.
+A different destination or target is rejected once claimed. Do not delete the
+claim to create a duplicate continuation of the same W&B run.
+
+The only scientific configuration changes are the larger target and an explicit
+`buffer_size` equal to the saved effective replay capacity. For example, a 500k
+run whose configured `buffer_size` was 1M used a 500k-row buffer; its continuation
+keeps that 500k-row capacity. All resident replay rows, physical writer/sampler
+state, networks, optimizer states, temperature, persistent inner state,
+environment/RNG state and progress counters are preserved. Previously evicted
+history is not reconstructed. The saved learner's absolute target is updated;
+this does not repeat warmup or reset the learner.
+
+The JSON result supplies `run_config`, `alg_dir`, `lineage_dir` and a
+`resume_command`. Launch that command through the scheduler **from the original
+clean training checkout**, using its original environment. The generated full
+configuration lives under the destination's `configs/`; `EXTENSION.json` records
+the source generation/hash, source identity, old/new targets and W&B ID. The
+original source, dependency and scientific-identity checks remain enforced by
+ordinary `--resume-mode required`. Further extensions must use the completed
+continuation as their source.
+
 The compact AMBI branch-count and imagination-horizon suite lives under
 `configs/ambi/`. Each algorithm file has one matching runnable
 manifest under `configs/ambi/experiments/`; the anchor entry point is
