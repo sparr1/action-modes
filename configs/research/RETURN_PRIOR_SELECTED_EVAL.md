@@ -34,6 +34,24 @@ data collection and learning during training. These source runs share one
 training seed; variation across evaluation episodes is not training-seed
 uncertainty.
 
+## Three-seed checkpoint curve
+
+`slurm/ambi_return_prior_curve.py` evaluates the J8/K1 source at 200k–500k
+decisions every 50k, with paired environment seeds 101–103 and the same original
+H3 controller. The 500k point derives those three episodes from its verified
+five-seed result; its source files remain unchanged and no episodes are rerun.
+The seed subset is recorded in provenance and receives a new evaluation identity.
+
+The `prepare` command verifies checkpoint hashes and resolves compatible curve
+identities for all seven checkpoints. `prepare-publication` creates one explicit
+New run per controller. `run` evaluates an individual missing checkpoint;
+`validate` also accepts completed offline bundles produced by the same scientific
+implementation. `publish` or `watch` validates full episodes, computes paired
+gains, and publishes through a single CPU owner after native return, gain, and
+progress panels have been installed and verified. Incomplete points stay pending.
+The 500k inventory entry must specify its original `reuse_output` directory;
+the runner refuses to launch new computation for that entry.
+
 ## Cadence swaps on the same checkpoint
 
 `return_prior_cadence_swap.json` isolates evaluation cadence by evaluating the
