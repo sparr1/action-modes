@@ -294,6 +294,8 @@ _RUNTIME_CONFIG_FIELDS = (
     "inner_operator",
     "inner_schedule_mode",
     "inner_rounds",
+    "inner_solve_interval",
+    "inner_hold_encoder",
     "inner_rollouts_per_round",
     "inner_updates_per_round",
     "inner_component_update_schedule",
@@ -535,6 +537,8 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
         "inner_operator",
         "inner_schedule_mode",
         "inner_rounds",
+        "inner_solve_interval",
+        "inner_hold_encoder",
         "inner_rollouts_per_round",
         "inner_updates_per_round",
         "inner_component_update_schedule",
@@ -624,6 +628,17 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
         inner["replay_rows_drawn_per_action"] = int(
             resolved["inner_expected_update_slots"] * resolved["inner_batch_size"]
         )
+    if int(resolved.get("inner_solve_interval", 1)) > 1:
+        inner["budget_scope"] = "per_solve"
+        # Resolved inner update settings describe a solve. Held real decisions
+        # do no imagined work; the realized totals are recorded by the engine.
+        for key in ("branches_per_action", "transitions_per_action", "replay_rows_drawn_per_action"):
+            if key in inner:
+                value = inner.pop(key)
+                inner[key.replace("_per_action", "_per_solve")] = value
+                inner["nominal_" + key.replace("_per_action", "_per_decision")] = (
+                    value / int(resolved["inner_solve_interval"])
+                )
 
     training = {
         key: resolved[key]

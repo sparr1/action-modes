@@ -230,6 +230,13 @@ def scientific_trial_parameters(
                 algorithm = normalize_lora_rl_identity(algorithm)
                 algorithm = normalize_pave_identity(algorithm)
                 algorithm = normalize_aux_return_identity(algorithm)
+                interval = algorithm.get("inner_solve_interval", 1)
+                if interval == 1:
+                    algorithm.pop("inner_solve_interval", None)
+                    algorithm.pop("inner_hold_encoder", None)
+                else:
+                    algorithm["inner_solve_interval"] = interval
+                    algorithm.setdefault("inner_hold_encoder", "solve_snapshot")
                 estimator = algorithm.get("inner_sac_return_estimator", "one_step")
                 if isinstance(estimator, str):
                     estimator = estimator.lower()

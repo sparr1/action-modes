@@ -1,0 +1,29 @@
+{
+  "study_type": "single_seed_exploratory_full_training_alpha_carry_k3",
+  "study_note": "K=3 variant of W&B run be85c916fcd94d5a813d7857d0ef5efb. The sole scientific change is inner_solve_interval=3: refine on episode decisions 0,3,6,..., execute the retained refined policy with its solve-time encoder at each intervening current observation, and retain ordinary outer updates and real replay collection on every decision. Carry inner alpha and its Adam state for the entire run, advancing only on solves. Preserve source H3/J8/C16/A4/N128/B256, detached auxiliary-return critic, stochastic SAC actions, target entropy -10.5, seed55,1M decisions,2500 warmup and2500 pretraining updates. Retain every25k model checkpoint and full replay bank;15minute rolling exact-resume generations are separate. Evaluation remains disabled.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_alpha_carry_h3_j8_k3_run_detached_ent10p5"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "checkpoint_replay": true,
+  "source_run_url": "https://forge.coreweave.com/wandb/rwgao_b-brown-university/ambi/runs/be85c916fcd94d5a813d7857d0ef5efb",
+  "source_commit": "939a5a6"
+}

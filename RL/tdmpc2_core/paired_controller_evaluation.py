@@ -313,7 +313,12 @@ class PairedControllerEvaluator:
             metrics = self.agent.last_inner_metrics
             if not isinstance(metrics, dict):
                 raise TypeError("agent.last_inner_metrics must be a dictionary.")
-            if _Q_GAIN_KEY not in metrics:
+            held = _finite_float(metrics.get("inner_policy_held", 0.0), "inner_policy_held")
+            if held not in {0.0, 1.0}:
+                raise ValueError("inner_policy_held must be zero or one.")
+            if held and _Q_GAIN_KEY in metrics:
+                raise ValueError("Held-policy decisions must not repeat a previous solve's Q diagnostic.")
+            if not held and _Q_GAIN_KEY not in metrics:
                 raise KeyError(
                     "Fresh-inner evaluation requires diagnostic metric "
                     f"{_Q_GAIN_KEY!r}."
@@ -321,14 +326,16 @@ class PairedControllerEvaluator:
             for key in (
                 "inner_model_steps",
                 "inner_action_seconds",
-                "inner_diagnostic_seconds",
             ):
                 if key not in metrics:
                     raise KeyError(
                         f"Fresh-inner evaluation requires cost metric {key!r}."
                     )
 
-            q_gains.append(_finite_float(metrics[_Q_GAIN_KEY], _Q_GAIN_KEY))
+            if not held:
+                if "inner_diagnostic_seconds" not in metrics:
+                    raise KeyError("Fresh-inner evaluation requires cost metric 'inner_diagnostic_seconds'.")
+                q_gains.append(_finite_float(metrics[_Q_GAIN_KEY], _Q_GAIN_KEY))
             model_steps.append(
                 _nonnegative_float(
                     metrics["inner_model_steps"], "inner_model_steps"
@@ -337,8 +344,14 @@ class PairedControllerEvaluator:
             action_seconds = _nonnegative_float(
                 metrics["inner_action_seconds"], "inner_action_seconds"
             )
+            # Snapshot work precedes engine.act() and therefore its timer;
+            # account for this added control cost on the decisions that solve.
+            action_seconds += _nonnegative_float(
+                metrics.get("inner_encoder_snapshot_seconds", 0.0),
+                "inner_encoder_snapshot_seconds",
+            )
             diagnostics = _nonnegative_float(
-                metrics["inner_diagnostic_seconds"], "inner_diagnostic_seconds"
+                metrics.get("inner_diagnostic_seconds", 0.0), "inner_diagnostic_seconds"
             )
             control_seconds.append(max(0.0, action_seconds - diagnostics))
             diagnostic_seconds.append(diagnostics)
@@ -431,13 +444,12 @@ class PairedControllerEvaluator:
             delta_mean, delta_std = _mean_std(
                 deltas, "paired fresh-inner-minus-outer rewards"
             )
-            action_count = len(q_gains)
+            action_count = len(model_steps)
             if not (
                 action_count
-                == len(model_steps)
                 == len(control_seconds)
                 == len(diagnostic_seconds)
-            ):
+            ) or not 0 < len(q_gains) <= action_count:
                 raise RuntimeError("Fresh-inner action diagnostics became misaligned.")
 
             metrics = {
@@ -461,6 +473,14 @@ class PairedControllerEvaluator:
                     np.mean(np.asarray(diagnostic_seconds, dtype=np.float64))
                 ),
             }
+            interval = int(getattr(getattr(self.agent, "cfg", None), "inner_solve_interval", 1))
+            if interval > 1:
+                metrics.update({
+                    "eval/paired_fresh_inner_actions": float(action_count),
+                    "eval/paired_fresh_inner_solve_decisions": float(len(q_gains)),
+                    "eval/paired_fresh_inner_held_decisions": float(action_count - len(q_gains)),
+                    "eval/paired_fresh_inner_solve_interval": float(interval),
+                })
             metrics.update(self._q_gain_metrics(q_gains))
             probability = float(getattr(getattr(self.agent, "cfg", None), "inner_critic_bernoulli_p", 0.0))
             if probability > 0:

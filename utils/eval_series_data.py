@@ -390,6 +390,12 @@ def planner_identity(config, result, algorithm, action_rule):
               if key.startswith("inner_")}
     if active.get("inner_critic_bernoulli_p", 0.0) == 0.0:
         active.pop("inner_critic_bernoulli_p", None)
+    if config.get("inner_solve_interval", 1) == 1:
+        active.pop("inner_solve_interval", None)
+        active.pop("inner_hold_encoder", None)
+    else:
+        active["inner_solve_interval"] = config["inner_solve_interval"]
+        active["inner_hold_encoder"] = config.get("inner_hold_encoder", "solve_snapshot")
     # One temperature step per actor update is the historical behavior.
     # Preserve that identity while keeping an actual repeat intervention distinct.
     if active.get("inner_temperature_updates_per_actor", 1) == 1:

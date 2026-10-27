@@ -3,6 +3,7 @@
 import math
 import time
 from contextlib import nullcontext
+from copy import deepcopy
 
 import torch
 import torch.nn.functional as F
@@ -920,6 +921,11 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "steps_per_update": getattr(self.cfg, "inner_steps_per_update", None),
             "outer_replay_fraction": float(getattr(self.cfg, "inner_outer_replay_fraction", 0.0)),
         }
+        if int(getattr(self.cfg, "inner_solve_interval", 1)) > 1:
+            options.update(
+                solve_interval=int(self.cfg.inner_solve_interval),
+                hold_encoder=self.cfg.inner_hold_encoder,
+            )
         if getattr(self.cfg, "inner_update_timing", "round") != "round":
             options["update_timing"] = self.cfg.inner_update_timing
         if getattr(self.cfg, "inner_horizon_conditioning", "none") != "none":
@@ -1770,6 +1776,56 @@ class AMBITDMPC2Agent(torch.nn.Module):
         apply_inner_writeback=False,
         trace=None,
     ):
+        try:
+            return self._act_control(
+                obs, t0=t0, eval_mode=eval_mode, task=task,
+                collect_diagnostics=collect_diagnostics,
+                return_behavior_policy=return_behavior_policy,
+                apply_inner_writeback=apply_inner_writeback,
+                trace=trace,
+            )
+        except BaseException:
+            if int(getattr(self.cfg, "inner_solve_interval", 1)) > 1:
+                # Includes encoder failures and action/metric materialization,
+                # which occur outside the inner engine's exception boundary.
+                self.inner_engine.abort_control()
+            raise
+
+    @torch.no_grad()
+    def _encode_held_control(self, obs, *, t0, eval_mode):
+        """Encode with the fixed observation mapping owned by this solve."""
+        engine = self.inner_engine
+        held = engine.prepare_control(t0=t0, eval_mode=eval_mode)
+        if not held:
+            snapshot_start = engine._timer_start()
+            source = self.model._encoder["state"]
+            snapshot = engine._encoder_pool
+            if snapshot is None:
+                snapshot = deepcopy(source).requires_grad_(False)
+                engine._encoder_pool = snapshot
+            else:
+                # Preserve allocations without aliasing the outer parameters
+                # or buffers, which continue changing during real updates.
+                snapshot.load_state_dict(source.state_dict())
+            snapshot.eval()
+            engine._held_encoder = snapshot
+            engine._timer_stop("inner_encoder_snapshot_seconds", snapshot_start)
+        if engine._held_encoder is None:
+            raise RuntimeError("Held control requires its solve's encoder snapshot.")
+        return engine._held_encoder(obs).detach()
+
+    def _act_control(
+        self,
+        obs,
+        t0=False,
+        eval_mode=False,
+        task=None,
+        *,
+        collect_diagnostics=True,
+        return_behavior_policy=False,
+        apply_inner_writeback=False,
+        trace=None,
+    ):
         if task is not None:
             raise ValueError("AMBI-TD-MPC2 currently supports single-task training only.")
         obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
@@ -1802,7 +1858,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
                         )
             else:
                 with torch.no_grad():
-                    root_z = self.model.encode(obs).detach()
+                    if int(getattr(self.cfg, "inner_solve_interval", 1)) > 1:
+                        root_z = self._encode_held_control(obs, t0=t0, eval_mode=eval_mode)
+                    else:
+                        root_z = self.model.encode(obs).detach()
                 # See the pixel-observation branch above. Evaluation controls
                 # the executed action, not whether AMBI performs inner learning.
                 with torch.enable_grad():

@@ -151,6 +151,8 @@ _AMBI_DEFAULTS = {
     # were actually generated in that round.
     "inner_operator": "sac",
     "inner_rounds": 4,
+    # Real decisions per inner solve; independent of imagined rollout horizon.
+    "inner_solve_interval": 1,
     "inner_rollouts_per_round": 64,
     "inner_rollout_horizon": 3,
     "inner_updates_per_round": "auto",
@@ -1349,6 +1351,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         self._outer_policy_action_generator = None
         self._inner_steps_total = 0
         self._inner_updates_total = 0
+        self._held_diagnostics_bucket = 0
         self._wandb_inner_seconds = 0.0
         self._wandb_inner_actions = 0
         self._wandb_inner_steps = 0
@@ -2994,6 +2997,43 @@ class AMBITDMPC2(TDMPC2Baseline):
         _validate_split_value_config(cfg)
         validate_auxiliary_config(cfg)
 
+        cfg.inner_solve_interval = _strict_positive_int(
+            cfg.inner_solve_interval, "inner_solve_interval"
+        )
+        # This is a derived scientific contract, not a selectable live-encoder
+        # variant. Keeping it absent at K=1 preserves historical identities.
+        vars(cfg).pop("inner_hold_encoder", None)
+        if cfg.inner_solve_interval > 1:
+            requirements = {
+                "obs": "state", "inner_operator": "sac",
+                "inner_schedule_mode": "canonical", "critic_value_mode": "single",
+                "inner_actor_adaptation": "clone", "inner_critic_adaptation": "clone",
+                "inner_actor_initialization": "prior", "inner_critic_initialization": "prior",
+                "inner_sac_return_estimator": "one_step", "inner_update_timing": "round",
+                "inner_horizon_conditioning": "none", "inner_explorer_mode": "none",
+                "inner_execution_policy_source": "primary",
+                "inner_actor_writeback_coef": 0.0, "inner_critic_writeback_coef": 0.0,
+                "inner_outer_replay_fraction": 0.0, "outer_policy_episode_probability": 0.0,
+                "value_equivalence_loss_coef": 0.0, "value_equivalence_diagnostics": False,
+            }
+            for component in ("actor", "critic", "replay",
+                              "actor_optimizer", "critic_optimizer"):
+                requirements[f"inner_{component}_scope"] = "action"
+            for key, required in requirements.items():
+                if getattr(cfg, key) != required:
+                    raise ValueError(f"inner_solve_interval>1 requires {key}={required!r}.")
+            temperature_scopes = (cfg.inner_temperature_scope,
+                                  cfg.inner_temperature_optimizer_scope)
+            if temperature_scopes not in {("action", "action"), ("run", "run")}:
+                raise ValueError("inner_solve_interval>1 requires paired action- or run-scoped temperature and optimizer.")
+            if temperature_scopes == ("run", "run") and (
+                cfg.inner_temperature_mode != "auto" or not cfg.inner_entropy_enabled
+            ):
+                raise ValueError("inner_solve_interval>1 with run-scoped temperature requires automatic entropy tuning.")
+            if cfg.inner_rounds <= 0:
+                raise ValueError("inner_solve_interval>1 requires an active SAC solve.")
+            cfg.inner_hold_encoder = "solve_snapshot"
+
         cfg.inner_critic_bernoulli_p = _strict_probability(
             cfg.inner_critic_bernoulli_p, "inner_critic_bernoulli_p"
         )
@@ -3281,6 +3321,17 @@ class AMBITDMPC2(TDMPC2Baseline):
         collect_diagnostics = (
             sampling_step % int(self.cfg.inner_diagnostics_every) == 0
         )
+        held_diagnostics_bucket = None
+        if self.cfg.inner_solve_interval > 1 and not eval_mode:
+            # A cadence boundary can be a held decision (for example the last
+            # decision of each 500-step episode at K3/every1000). Defer that
+            # observation to the next solve; persist the consumed bucket so an
+            # episode boundary or exact continuation cannot lose or repeat it.
+            held_diagnostics_bucket = sampling_step // int(self.cfg.inner_diagnostics_every)
+            held = self.agent.inner_engine.prepare_control(t0=t0, eval_mode=eval_mode)
+            collect_diagnostics = (
+                not held and held_diagnostics_bucket > self._held_diagnostics_bucket
+            )
         if self._stores_behavior_policy and not eval_mode:
             if self._pending_behavior_policy is not None:
                 raise RuntimeError(
@@ -3311,6 +3362,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             self.agent.last_inner_metrics["inner_diagnostics_step"] = float(
                 sampling_step
             )
+        if collect_diagnostics and held_diagnostics_bucket is not None:
+            self._held_diagnostics_bucket = held_diagnostics_bucket
         return action
 
     def predict(
@@ -3431,6 +3484,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_steps_total": int(self._inner_steps_total),
             "inner_updates_total": int(self._inner_updates_total),
         }
+        if self.cfg.inner_solve_interval > 1:
+            state["held_diagnostics_bucket"] = int(self._held_diagnostics_bucket)
         if self.cfg.outer_policy_diagnostics:
             recorder = self._outer_policy_recorder
             state["outer_policy_diagnostics"] = (
@@ -3445,6 +3500,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_steps_total",
             "inner_updates_total",
         }
+        if self.cfg.inner_solve_interval > 1:
+            expected.add("held_diagnostics_bucket")
         if self.cfg.outer_policy_diagnostics:
             expected.add("outer_policy_diagnostics")
         if not isinstance(state, Mapping) or set(state) != expected:
@@ -3457,7 +3514,9 @@ class AMBITDMPC2(TDMPC2Baseline):
             normalized["outer_policy_diagnostics"] = OuterPolicyDiagnostics.validate_state(
                 state["outer_policy_diagnostics"], self.cfg
             )
-        for key in ("inner_steps_total", "inner_updates_total"):
+        for key in ("inner_steps_total", "inner_updates_total", "held_diagnostics_bucket"):
+            if key not in normalized:
+                continue
             value = normalized[key]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"AMBI wrapper {key} must be a non-negative integer.")
@@ -3467,6 +3526,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         state = self._preflight_training_resume_algorithm_state(state)
         self._inner_steps_total = state["inner_steps_total"]
         self._inner_updates_total = state["inner_updates_total"]
+        self._held_diagnostics_bucket = state.get("held_diagnostics_bucket", 0)
         if self.cfg.outer_policy_diagnostics:
             self._outer_policy_recorder_state = state["outer_policy_diagnostics"]
         self._wandb_inner_seconds = 0.0
@@ -3591,6 +3651,8 @@ class AMBITDMPC2(TDMPC2Baseline):
         # weighted by their own optimizer, and action-level gauges are averaged
         # by planned actions. New metrics must be deliberately classified here.
         counter_metrics = {
+            "inner_solve_performed",
+            "inner_policy_held",
             "inner_model_steps_budget",
             "inner_nominal_model_steps",
             "inner_realized_model_steps",
@@ -3651,6 +3713,9 @@ class AMBITDMPC2(TDMPC2Baseline):
                 self._wandb_train_window.add_sum(f"train/{key}", metrics[key])
 
         timing_metrics = {
+            "inner_solve_seconds",
+            "inner_held_seconds",
+            "inner_encoder_snapshot_seconds",
             "inner_setup_seconds",
             "inner_rollout_seconds",
             "inner_update_seconds",
@@ -3761,6 +3826,10 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_explorer_temperature_grad_norm",
         }
         action_gauges = {
+            "inner_solve_interval",
+            "inner_solve_index",
+            "inner_action_age",
+            "inner_episode_decision_index",
             "inner_critic_bernoulli_p",
             "inner_critic_bernoulli_applied",
             "inner_critic_bernoulli_retained_fraction",

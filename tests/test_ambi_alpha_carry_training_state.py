@@ -190,9 +190,9 @@ def test_auxiliary_detach_blocks_representation_loss_but_keeps_critic_and_action
         model.env.close()
 
 
-@pytest.mark.parametrize("scope", ["episode", "run"])
+@pytest.mark.parametrize("scope,interval", [("episode", 1), ("run", 1), ("run", 3)])
 def test_full_trainer_continuation_matches_uninterrupted_temperature_carry(
-    scope, tmp_path, monkeypatch,
+    scope, interval, tmp_path, monkeypatch,
 ):
     fake_wandb = _FakeWandb()
     monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
@@ -201,6 +201,7 @@ def test_full_trainer_continuation_matches_uninterrupted_temperature_carry(
         params = _tiny_params(
             seed_steps=1, train_unroll_horizon=1, inner_rollout_horizon=1, inner_rounds=1,
             inner_updates_per_round=1,
+            inner_solve_interval=interval,
             inner_temperature_scope=scope, inner_temperature_optimizer_scope=scope,
             aux_return_mode="sac", inner_actor_source="sac",
             inner_critic_source="aux_return", inner_horizon_actor_source="sac",

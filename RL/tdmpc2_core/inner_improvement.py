@@ -167,6 +167,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self._active_trace = None
         self._pending_timers = {}
         self._parameter_noise_spec = None
+        self._clear_held_policy(drop_pool=True)
         self._clear_critic_transfer()
         self._clear_parameter_noise_action_state()
         self._initialize_compile_regions()
@@ -177,6 +178,69 @@ class InnerImprovementEngine(RetraceInnerMixin):
         if self._critic_bernoulli_p > 0:
             extra += ("critic_bernoulli",)
         return InnerRNG(seed, self.device, extra_streams=extra)
+
+    @property
+    def _solve_interval(self):
+        return int(getattr(self.cfg, "inner_solve_interval", 1))
+
+    def _held_policy_spec(self):
+        if self._solve_interval == 1:
+            return None
+        return {"version": 1, "solve_interval": self._solve_interval,
+                "encoder": "solve_snapshot", "actor": "fixed_last_solve",
+                "schedule": "episode_decisions", "first_solve": 0,
+                "resume": "empty_episode_boundary"}
+
+    def _clear_held_policy(self, *, drop_pool=False):
+        self._held_actor = None
+        self._held_encoder = None
+        if drop_pool:
+            self._encoder_pool = None
+        self._episode_decision_index = 0
+        self._control_eval_mode = None
+        self._control_prepared = None
+
+    def prepare_control(self, *, t0=False, eval_mode=False):
+        """Prepare cadence before encoding; return whether this action is held.
+
+        The agent snapshots the encoder on solve decisions. Preparation is
+        idempotent until act consumes it, so its encoder timing survives the
+        subsequent engine call. K=1 does not participate in this lifecycle.
+        """
+        if self._solve_interval == 1:
+            return False
+        request = (bool(t0), bool(eval_mode))
+        if self._control_prepared is not None:
+            if self._control_prepared[:2] != request:
+                raise RuntimeError("Held-policy control preparation changed before execution.")
+            return self._control_prepared[2]
+        if t0 or self._control_eval_mode != bool(eval_mode):
+            self._clear_held_policy()
+            self._clear_critic_transfer()
+        self._control_eval_mode = bool(eval_mode)
+        held = self._episode_decision_index % self._solve_interval != 0
+        if held and self._held_actor is None:
+            raise RuntimeError("Held-policy action requires a successful preceding solve.")
+        self._pending_timers = {}
+        self._control_prepared = (*request, held)
+        return held
+
+    def abort_control(self):
+        """Invalidate all cross-decision state after an unsuccessful action."""
+        if self._solve_interval > 1:
+            self._clear_held_policy(drop_pool=True)
+            self._clear_critic_transfer()
+            self._pending_timers = {}
+
+    @torch.no_grad()
+    def _snapshot_held_actor(self):
+        if self.state.actor is None:
+            raise RuntimeError("Held-policy cadence requires a live solved inner actor.")
+        if self._held_actor is None:
+            self._held_actor = deepcopy(self.state.actor)
+        else:
+            self._held_actor.load_state_dict(self.state.actor.state_dict())
+        self._held_actor.requires_grad_(False).eval()
 
     @property
     def _critic_bernoulli_p(self):
@@ -537,6 +601,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         return initial_alpha.clamp_min(_INNER_ALPHA_FLOOR)
 
     def clear_all(self):
+        self._clear_held_policy(drop_pool=True)
         self.state = InnerWorkspace()
         self._action_pool = InnerWorkspace()
         self.rng = self._new_rng(self.cfg.seed)
@@ -625,6 +690,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self._mppi_prev_mean = None
         self._collect_diagnostics = True
         self._pending_timers = {}
+        self._clear_held_policy(drop_pool=True)
         self._clear_critic_transfer()
         self._clear_parameter_noise_action_state()
         return self
@@ -680,6 +746,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
     def reset_episode(self):
         """Clear action/episode state while preserving explicitly run-scoped state."""
         self.episode_index += 1
+        self._clear_held_policy()
         self._clear_critic_transfer()
         self._clear_expired(t0=True, include_action=True)
         if str(self.cfg.inner_mppi_warm_start_scope) != "run":
@@ -700,6 +767,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 "AMBI inner timing must be finalized before preparing a resume boundary."
             )
         self.reset_episode()
+        self._clear_held_policy(drop_pool=True)
         self._action_pool = InnerWorkspace()
         self._clear_action_transients()
         self._require_resume_boundary()
@@ -855,6 +923,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
 
     def _require_resume_boundary(self):
         """Reject snapshots that would silently discard transient inner state."""
+        if (self._held_actor is not None or self._held_encoder is not None
+                or self._encoder_pool is not None or self._control_prepared is not None
+                or self._control_eval_mode is not None or self._episode_decision_index != 0):
+            raise RuntimeError("Held-policy state must be cleared at the episode resume boundary.")
         if self._critic_transfer_ready or self._critic_transfer_eval_mode is not None or self._critic_transfer_metrics:
             raise RuntimeError("Bernoulli transfer state must be cleared at the episode resume boundary.")
         if self._pending_timers:
@@ -1074,6 +1146,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
             payload["retrace_spec"] = self._retrace_spec()
         if self._critic_transfer_spec() is not None:
             payload["critic_transfer_spec"] = self._critic_transfer_spec()
+        if self._held_policy_spec() is not None:
+            payload["held_policy_spec"] = self._held_policy_spec()
         return payload
 
     def _load_module_candidate(
@@ -1161,6 +1235,15 @@ class InnerImprovementEngine(RetraceInnerMixin):
             if any(type(saved_transfer[key]) is not type(value) for key, value in transfer_spec.items()):
                 raise ValueError("Inner Bernoulli transfer specification is incompatible.")
             common_keys.add("critic_transfer_spec")
+        held_spec = self._held_policy_spec()
+        if state.get("held_policy_spec") != held_spec:
+            raise ValueError("Inner held-policy specification is incompatible with exact continuation.")
+        if held_spec is not None:
+            saved_held = require_exact_keys(state["held_policy_spec"], set(held_spec),
+                                            "Inner held-policy specification")
+            if any(type(saved_held[key]) is not type(value) for key, value in held_spec.items()):
+                raise ValueError("Inner held-policy specification is incompatible.")
+            common_keys.add("held_policy_spec")
         lora_rl_spec = self._lora_rl_spec()
         initialization_spec = self._random_initialization_spec()
         horizon_spec = self._horizon_conditioning_spec()
@@ -1555,6 +1638,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
 
     def _commit_training_state_candidate(self, candidate):
         """Install a candidate returned by strict preflight."""
+        self._clear_held_policy(drop_pool=True)
         self.state = candidate["state"]
         self._action_pool = InnerWorkspace()
         self.rng = candidate["rng"]
@@ -7179,7 +7263,82 @@ class InnerImprovementEngine(RetraceInnerMixin):
             applied["inner_critic_writeback_applied"] = 1.0
         return applied
 
+    def _act_held(self, root_z, *, eval_mode, return_behavior_policy=False):
+        """Evaluate the retained actor once, without touching learner state."""
+        capture_behavior = bool(return_behavior_policy and not eval_mode)
+        policy_evaluations = self.state.policy_evaluations
+        try:
+            executed = self._execute_policy(
+                root_z, self._held_actor, eval_mode=eval_mode,
+                inner_bounds=True, return_info=capture_behavior,
+            )
+        finally:
+            self.state.policy_evaluations = policy_evaluations
+        if capture_behavior:
+            action, execution_info = executed
+            behavior_policy = {
+                "pre_tanh_mean": execution_info["pre_tanh_mean"][0].detach(),
+                "log_std": execution_info["log_std"][0].detach(),
+            }
+        else:
+            action, behavior_policy = executed, None
+        # Only measured work counters belong to a held action. In particular,
+        # absent losses, alpha updates and value probes are not zero samples.
+        work_keys = {
+            "inner_active", "inner_actions", "inner_model_steps_budget",
+            "inner_steps", "inner_model_steps", "inner_total_model_steps",
+            "inner_nominal_model_steps", "inner_realized_model_steps",
+            "inner_rounds", "inner_iterations", "inner_mppi_iterations",
+            "inner_requested_rollouts", "inner_rollouts", "inner_updates",
+            "inner_update_slots", "inner_requested_update_slots",
+            "inner_critic_optimizer_steps", "inner_actor_optimizer_steps",
+            "inner_temperature_optimizer_steps", "inner_target_updates",
+            "inner_critic_target_updates", "inner_actor_target_updates",
+            "inner_policy_evaluations", "inner_q_evaluations", "inner_replay_draws",
+            "inner_buffer_size", "inner_outer_replay_samples",
+            "inner_diagnostics_sampled", "inner_diagnostics_sample_count",
+            "inner_primary_rollouts", "inner_explorer_rollouts",
+            "inner_primary_transitions", "inner_explorer_transitions",
+            "inner_primary_replay_samples", "inner_explorer_replay_samples",
+            "inner_optimization_model_steps", "inner_selector_model_steps",
+        }
+        metrics = dict.fromkeys(work_keys, 0.0)
+        metrics.update(inner_actions=1.0, inner_policy_evaluations=float(root_z.shape[0]))
+        if self._critic_bernoulli_p > 0:
+            metrics.update(inner_critic_bernoulli_p=self._critic_bernoulli_p,
+                           inner_critic_bernoulli_applied=0.0)
+        if self._active_trace is not None:
+            self._active_trace.record("held", InnerWorkspace(), {})
+        if return_behavior_policy:
+            return action[0], metrics, [], behavior_policy
+        return action[0], metrics, []
+
     def act(
+        self,
+        root_z,
+        *,
+        t0=False,
+        eval_mode=False,
+        collect_diagnostics=True,
+        return_behavior_policy=False,
+        apply_inner_writeback=False,
+        trace=None,
+    ):
+        try:
+            self.prepare_control(t0=t0, eval_mode=eval_mode)
+            result = self._act_with_trace(
+                root_z, t0=t0, eval_mode=eval_mode,
+                collect_diagnostics=collect_diagnostics,
+                return_behavior_policy=return_behavior_policy,
+                apply_inner_writeback=apply_inner_writeback, trace=trace,
+            )
+        except BaseException:
+            self.abort_control()
+            raise
+        self._control_prepared = None
+        return result
+
+    def _act_with_trace(
         self,
         root_z,
         *,
@@ -7251,7 +7410,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
         return_behavior_policy=False,
         apply_inner_writeback=False,
     ):
-        self._pending_timers = {}
+        cadence_active = self._solve_interval > 1
+        held = cadence_active and self._control_prepared[2]
+        if not cadence_active:
+            self._pending_timers = {}
         start = self._timer_start()
         self.action_index += 1
         self._collect_diagnostics = bool(collect_diagnostics)
@@ -7268,7 +7430,16 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 operator in {"sac", "td3", "tdambi"}
                 and int(self.cfg.inner_rounds) == 0
             )
-            if inactive:
+            if held:
+                result = self._act_held(
+                    root_z, eval_mode=eval_mode,
+                    return_behavior_policy=return_behavior_policy,
+                )
+                if return_behavior_policy:
+                    action, metrics, lengths, behavior_policy = result
+                else:
+                    action, metrics, lengths = result
+            elif inactive:
                 if self._active_trace is not None:
                     self._active_trace.record(
                         "initial", self.state,
@@ -7349,6 +7520,20 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 if self.state.tdambi_scale_initialized:
                     metrics["inner_tdambi_q_scale_final"] = self.state.tdambi_scale.detach().clone().reshape(())
 
+            if cadence_active:
+                if not held:
+                    self._snapshot_held_actor()
+                decision = self._episode_decision_index
+                metrics.update(
+                    inner_solve_performed=float(not held),
+                    inner_policy_held=float(held),
+                    inner_solve_interval=float(self._solve_interval),
+                    inner_solve_index=float(decision // self._solve_interval),
+                    inner_action_age=float(decision % self._solve_interval),
+                    inner_episode_decision_index=float(decision),
+                )
+                self._timer_stop("inner_held_seconds" if held else "inner_solve_seconds", start)
+                self._episode_decision_index += 1
             self._timer_stop("inner_action_seconds", start)
 
             # Refresh after diagnostics/planning, since those calls may be the
@@ -7357,8 +7542,9 @@ class InnerImprovementEngine(RetraceInnerMixin):
 
             # Action-scoped tensors are explicitly released after producing
             # the action; episode/run scopes survive by configuration.
-            self._clear_expired(t0=False, include_action=True)
-            if self._critic_bernoulli_p > 0:
+            if not held:
+                self._clear_expired(t0=False, include_action=True)
+            if self._critic_bernoulli_p > 0 and not held:
                 self._critic_transfer_ready = bool(not inactive and operator == "sac")
                 metrics.update(self._critic_transfer_metrics)
         if return_behavior_policy:
