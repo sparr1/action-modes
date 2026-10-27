@@ -78,6 +78,10 @@ def receipt_fixture(operator):
               "measured": {"decisions": 120, "outer_updates": 120, "seconds_per_decision": .3,
                            "solve_decisions": 120 // interval, "held_decisions": 120 - 120 // interval}}
              for count in campaign.CPU_COUNTS]
+    if operator == "sac":
+        for case in cases:
+            case["inner_rounds"] = run["alg_params"]["inner_rounds"]
+            case["inner_work_per_solve"] = campaign.sac_work(case["inner_rounds"])
     receipt = {"passed": True, "binding": binding, "runtime": runtime, "cases": cases, "artifacts": {}}
     return receipt, binding, runtime, dict(name=name, operator=operator, interval=interval)
 
