@@ -86,6 +86,32 @@ def test_submission_exports_measured_request_and_rerun_is_idempotent(tmp_path, m
     assert len(calls) == 1
 
 
+def test_nested_submission_removes_parent_allocation_and_temporary_environment(tmp_path, monkeypatch):
+    source, campaign, calls = setup(tmp_path, monkeypatch)
+    poisoned = {"SLURM_TRES_PER_TASK": "cpu=1", "SLURM_MEM_PER_CPU": "1024",
+                "SLURM_TMPDIR": "/parent-node/slurm", "SLURM_JOB_ID": "parent-job",
+                "SBATCH_PARTITION": "debug", "SBATCH_EXPORT": "NONE",
+                "SRUN_CPUS_PER_TASK": "1", "CUDA_VISIBLE_DEVICES": "",
+                "TMPDIR": "/parent-node/tmpdir", "TMP": "/parent-node/tmp",
+                "TEMP": "/parent-node/temp"}
+    for key, value in poisoned.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("WANDB_API_KEY", "test-only-auth")
+    monkeypatch.setenv("USER_SETTING", "preserved")
+    scheduler.submit(source, campaign, sys.executable, "a" * 40)
+    command, kwargs = calls[0]
+    environment = kwargs["env"]
+    assert not set(poisoned) & environment.keys()
+    assert not any(key.startswith(("SLURM_", "SBATCH_", "SRUN_")) for key in environment)
+    assert environment["WANDB_API_KEY"] == "test-only-auth"
+    assert environment["USER_SETTING"] == "preserved"
+    assert environment["AMBI_PROJECT_DIR"] == str(source)
+    assert environment["AMBI_ALPHA_CARRY_K3_MODE"] == "train"
+    assert "--partition=gpu" in command and "--qos=pri-gpu+" in command
+    assert "--cpus-per-task=1" in command and "--mem=16G" in command
+    assert "--gres=gpu:l40s:1" in command and "--export=ALL" in command
+
+
 @pytest.mark.parametrize("outcome", ["unexpected response", subprocess.CalledProcessError(1, ["sbatch"])])
 def test_unknown_outcome_preserves_intent_and_never_resubmits(tmp_path, monkeypatch, outcome):
     source, campaign, calls = setup(tmp_path, monkeypatch, outcome)

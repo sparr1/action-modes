@@ -81,7 +81,12 @@ def submit(source_dir, campaign_dir, python, expected_commit):
     assert "L40S" in gate["runtime"]["gpu"].upper() and gate["runtime"]["executable"] == str(python)
     sizing = resources(gate, benchmark)
     wall = sizing["walltime_seconds"]
-    environment = {**os.environ, "AMBI_PROJECT_DIR": str(source_dir), "AMBI_PYTHON": str(python),
+    # A CPU dispatcher must not export its allocation, resource overrides or
+    # node-local temporary paths into the independently scheduled GPU job.
+    inherited = {key: value for key, value in os.environ.items()
+                 if not key.startswith(("SLURM_", "SBATCH_", "SRUN_"))
+                 and key not in {"CUDA_VISIBLE_DEVICES", "TMPDIR", "TMP", "TEMP"}}
+    environment = {**inherited, "AMBI_PROJECT_DIR": str(source_dir), "AMBI_PYTHON": str(python),
                    "AMBI_EXPECTED_COMMIT": expected_commit, "AMBI_ALPHA_CARRY_K3_OUTPUT": str(campaign_dir),
                    "AMBI_ALPHA_CARRY_K3_MODE": "train", "AMBI_RESUME_MODE": "new",
                    "AMBI_TRAIN_WALLTIME_SECONDS": str(wall), "AMBI_DRAIN_AFTER_SECONDS": str(wall - 1800)}
