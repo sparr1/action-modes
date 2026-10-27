@@ -50,7 +50,7 @@ def verify_reference(root, index, entry, *, matrix=MATRIX, selector=None):
 
 
 def validate_results(payload, entry, index, *, smoke=False, smoke_steps=6,
-                     selected=None, horizon=3, replay_capacity=None):
+                     selected=None, horizon=3, replay_capacity=None, rounds=8):
     selector, interval = selection(index) if selected is None else selected
     seeds, steps = ([101], smoke_steps) if smoke else (SEEDS, 500)
     require(payload.get("frozen_outer_learning") is True and
@@ -80,16 +80,19 @@ def validate_results(payload, entry, index, *, smoke=False, smoke_steps=6,
     saved = dict(read_json(entry["metadata"])["trial_run_params"]["alg_params"])
     saved["inner_solve_interval"] = interval
     saved["inner_rollout_horizon"] = horizon
+    saved["inner_rounds"] = rounds
     if replay_capacity is not None:
         saved["inner_replay_capacity"] = replay_capacity
     actual = dict(result["alg_params"])
+    # Older K1 checkpoints omit this key and inherit the resolved default.
+    actual.setdefault("inner_solve_interval", 1)
     for runtime_key in ("device", "wandb"):
         saved.pop(runtime_key, None)
         actual.pop(runtime_key, None)
     require(actual == saved, "Controller settings changed beyond the requested evaluation overrides")
     cfg = result["resolved_config"]
     require((cfg["inner_operator"], cfg["inner_rounds"], cfg["inner_solve_interval"],
-             cfg["inner_rollout_horizon"]) == ("sac", 8, interval, horizon), "Resolved controller changed")
+             cfg["inner_rollout_horizon"]) == ("sac", rounds, interval, horizon), "Resolved controller changed")
     if replay_capacity is not None:
         require(cfg.get("inner_replay_capacity") == replay_capacity, "Resolved replay capacity changed")
     require(cfg["inner_temperature_mode"] == "auto" and
@@ -98,8 +101,8 @@ def validate_results(payload, entry, index, *, smoke=False, smoke_steps=6,
         require(cfg.get("inner_hold_encoder") == "solve_snapshot", "Held encoder changed")
     per_episode_solves = math.ceil(steps / interval)
     # Check each episode so a missing reset cannot be hidden by a matching grand total.
-    work = {"inner_model_steps": 8 * 128 * horizon, "inner_critic_optimizer_steps": 128,
-            "inner_actor_optimizer_steps": 32, "inner_temperature_optimizer_steps": 32}
+    work = {"inner_model_steps": rounds * 128 * horizon, "inner_critic_optimizer_steps": rounds * 16,
+            "inner_actor_optimizer_steps": rounds * 4, "inner_temperature_optimizer_steps": rounds * 4}
     if interval > 1:
         work["inner_solve_performed"] = 1
     # Episode metrics store flat means; result metrics store count/sum statistics.
@@ -119,7 +122,7 @@ def validate_results(payload, entry, index, *, smoke=False, smoke_steps=6,
 
 
 def run(args, *, matrix=MATRIX, select=selection, validator=validate_results,
-        campaign_id=CAMPAIGN_ID, receipt_fields=None):
+        campaign_id=CAMPAIGN_ID, receipt_fields=None, rounds=8):
     selector, interval = select(args.index)
     entry = verify_entry(read_json(args.inventory), args.index)
     require(entry["step"] == 500000 and entry["J"] == 8, "Expected the selected J8 checkpoints at 500k")
@@ -168,7 +171,7 @@ def run(args, *, matrix=MATRIX, select=selection, validator=validate_results,
     write_json(output / "command.json", command)
     subprocess.run(command, cwd=ROOT, check=True)
     receipt = {"validated": True, "campaign_id": campaign_id, "mode": args.mode, "source_run": entry["source_run"],
-               "step": entry["step"], "J": 8, "source_K": entry["K"], "eval_K": interval,
+               "step": entry["step"], "J": rounds, "source_K": entry["K"], "eval_K": interval,
                "selector": selector, "checkpoint_sha256": entry["sha256"],
                "metadata_sha256": entry["metadata_sha256"], "matrix_sha256": file_hash(matrix),
                "elapsed_seconds": time.perf_counter() - started,

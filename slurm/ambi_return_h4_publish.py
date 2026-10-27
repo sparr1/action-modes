@@ -268,9 +268,10 @@ def install_workspace(receipt, path, *, campaign=DEFAULT):
     if previous and previous.get("campaign_id") != campaign.attempt:
         raise ValueError("Workspace belongs to another campaign")
     rows = list(cadence.layout_curves(receipt).values())
+    run_count = max(6, len(rows))
     def bar(title, metric):
         return wr.BarPlot(title=title, metrics=[metric], orientation="h", aggregate=False,
-            max_runs_to_show=6, max_bars_to_show=6, legend_template="${run:displayName}",
+            max_runs_to_show=run_count, max_bars_to_show=run_count, legend_template="${run:displayName}",
             line_colors={row["run_id"] + ":" + metric: row["color"] for row in rows},
             line_titles={row["run_id"] + ":" + metric: row["name"] for row in rows}, layout=wr.Layout(w=12, h=7))
     markdown = ("**Frozen J8 checkpoints: H4 versus H3 at evaluation K1.** Train K labels each 500k checkpoint's "
@@ -297,7 +298,7 @@ def install_workspace(receipt, path, *, campaign=DEFAULT):
     else:
         work = ws.Workspace(entity=prior.ENTITY, project=prior.PROJECT,
             name=campaign.title, sections=sections, auto_generate_panels=False,
-            settings=ws.WorkspaceSettings(max_runs=6, remove_legends_from_panels=False),
+            settings=ws.WorkspaceSettings(max_runs=run_count, remove_legends_from_panels=False),
             runset_settings=ws.RunsetSettings(filters=[expr.Metric("ID").isin([row["run_id"] for row in rows])], groupby=[],
                 run_settings={row["run_id"]: ws.RunSettings(color=row["color"], disabled=False) for row in rows},
                 pinned_columns=["run:displayName", "summary:progress/checkpoints_complete", "summary:eval/return_mean"]))

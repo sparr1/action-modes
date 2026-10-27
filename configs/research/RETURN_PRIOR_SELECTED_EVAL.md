@@ -93,3 +93,26 @@ displays each checkpoint's prior, H4/K1, and H4/K4 outcomes and controller cost.
 Use `slurm/ambi_return_h4_k4_eval.py` and
 `slurm/ambi_return_h4_k4_publish.py`; the publisher's `--h4-root` identifies the
 existing H4/K1 campaign. Each K4 arm has its own New publication identity.
+
+## J10 refinement at each checkpoint's original K
+
+`return_prior_j10.json` evaluates the two J8-trained 500k checkpoints with ten
+inner rounds, retaining H3 and their original K1 and K3 solve intervals.
+Action-local replay capacity increases from 3,072 to 3,840 to retain all
+`J10 * N128 * H3` transitions. Each solve performs 160 critic, 40 actor, and
+40 temperature updates. No other saved controller settings change.
+
+The comparison also includes the J10/K3-trained source at its explicitly
+selected 500k checkpoint, evaluated with its saved H3/J10/K3 controller and
+its own prior. Its earlier 325k results are a separate checkpoint and are not
+used as a paired baseline here. The two J8-trained sources reuse their existing
+500k prior and J8 controller results. This requires 20 new complete episodes:
+five for each J8-to-J10 evaluation, plus five prior and five SAC episodes for
+the J10-trained source. All use mean actions, environment seeds 101–105,
+controller seed 55, and frozen outer state.
+
+Use `slurm/ambi_return_j10_eval.py` and `slurm/ambi_return_j10_publish.py` with
+the original selected campaign as `--reference-root`. The eight-run workspace
+distinguishes training J/K from evaluation J/K. J10-minus-J8 deltas pair the
+same checkpoint and environment seed only; comparing the two trained J values
+is a separate backbone comparison, not a paired refinement effect.

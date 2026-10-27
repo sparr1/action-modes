@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "description": "Frozen J8 checkpoints evaluated with J10; retain saved H3 and K1/K3 and reuse prior controls.",
+  "base_alg_config": "checkpoint",
+  "evaluation": {
+    "seeds": [101, 102, 103, 104, 105],
+    "controller_seed": 55,
+    "max_steps": 500,
+    "default_presets": ["rounds/j10"]
+  },
+  "comparisons": {
+    "rounds": {
+      "reference": "j10",
+      "variants": {
+        "j10": {
+          "description": "Saved SAC controller with ten rounds and capacity for all J*N*H transitions.",
+          "alg_params": {
+            "inner_rounds": 10,
+            "inner_replay_capacity": 3840
+          }
+        }
+      }
+    }
+  }
+}

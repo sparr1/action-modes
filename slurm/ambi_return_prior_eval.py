@@ -155,7 +155,7 @@ def validate_results(payload, entry, *, smoke=False, smoke_steps=6):
     return {"episodes": 2 * len(seeds), "decisions": 2 * len(seeds) * steps}
 
 
-def run(args):
+def run(args, *, receipt_fields=None, validator=validate_results):
     inventory = read_json(args.inventory)
     entry = verify_entry(inventory, args.index)
     if args.expected_commit:
@@ -211,10 +211,11 @@ def run(args):
                "checkpoint_sha256": entry["sha256"], "metadata_sha256": entry["metadata_sha256"],
                "elapsed_seconds": time.perf_counter() - started,
                "matrix_sha256": file_hash(MATRIX), "runtime": runtime_info(gpu=args.mode != "prepare")}
+    receipt.update(receipt_fields or {})
     if args.mode != "prepare":
         results, manifest = output / "results.json", output / "bundle/manifest.json"
-        receipt.update(validate_results(read_json(results), entry, smoke=args.mode == "smoke",
-                                        smoke_steps=args.smoke_steps))
+        receipt.update(validator(read_json(results), entry, smoke=args.mode == "smoke",
+                                 smoke_steps=args.smoke_steps))
         require(read_json(manifest).get("status") == "complete", "Incomplete benchmark bundle")
         receipt.update(results=str(results), bundle=str(output / "bundle"),
                        results_sha256=file_hash(results), manifest_sha256=file_hash(manifest))
