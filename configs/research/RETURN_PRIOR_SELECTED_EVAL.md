@@ -116,3 +116,23 @@ the original selected campaign as `--reference-root`. The eight-run workspace
 distinguishes training J/K from evaluation J/K. J10-minus-J8 deltas pair the
 same checkpoint and environment seed only; comparing the two trained J values
 is a separate backbone comparison, not a paired refinement effect.
+
+## Completing J10 evaluation at K1
+
+`return_prior_j10_k1.json` adds only the missing J10/H3/K1 evaluations for
+the J8/K3-trained and J10/K3-trained checkpoints, both at 500k. The J8/K1-trained
+checkpoint's completed J10/K1 result is reused. Each new arm uses the same five
+seeds and full episodes, with 2,500 fresh solves in total, replay capacity 3,840,
+and 160 critic, 40 actor, and 40 temperature updates per solve.
+
+Both matching priors and the J10/K3 controls are reused. The new comparison
+contains these two K1 arms alongside the eight existing curves. Its cadence
+deltas subtract J10/K3 from J10/K1 for the same checkpoint and environment seed;
+the increased solve count means this is not an equal-compute comparison.
+
+Use `slurm/ambi_return_j10_k1_eval.py` for indices 1 and 2 only. The worker's
+`--reference-root` is the original selected campaign for index 1 and the
+completed J10 campaign for index 2. Publication uses
+`slurm/ambi_return_j10_k1_publish.py` with both the original `--reference-root`
+and completed `--j10-root`. Transient publication acknowledgement failures
+retry through the existing immutable journals and remote-history checks.

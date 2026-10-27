@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "description": "Missing frozen J10/H3/K1 evaluations on the J8/K3 and J10/K3 checkpoints; reuse completed priors.",
+  "base_alg_config": "checkpoint",
+  "evaluation": {
+    "seeds": [101, 102, 103, 104, 105],
+    "controller_seed": 55,
+    "max_steps": 500,
+    "default_presets": ["rounds/j10_k1"]
+  },
+  "comparisons": {
+    "rounds": {
+      "reference": "j10_k1",
+      "variants": {
+        "j10_k1": {
+          "description": "Ten SAC rounds at every decision, with saved H3 and capacity for all imagined transitions.",
+          "alg_params": {
+            "inner_rounds": 10,
+            "inner_solve_interval": 1,
+            "inner_replay_capacity": 3840
+          }
+        }
+      }
+    }
+  }
+}

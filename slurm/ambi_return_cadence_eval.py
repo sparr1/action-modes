@@ -122,10 +122,11 @@ def validate_results(payload, entry, index, *, smoke=False, smoke_steps=6,
 
 
 def run(args, *, matrix=MATRIX, select=selection, validator=validate_results,
-        campaign_id=CAMPAIGN_ID, receipt_fields=None, rounds=8):
+        campaign_id=CAMPAIGN_ID, receipt_fields=None, rounds=8, source_rounds=8):
     selector, interval = select(args.index)
     entry = verify_entry(read_json(args.inventory), args.index)
-    require(entry["step"] == 500000 and entry["J"] == 8, "Expected the selected J8 checkpoints at 500k")
+    require(entry["step"] == 500000 and entry["J"] == source_rounds,
+            f"Expected the selected J{source_rounds} checkpoints at 500k")
     require(1 <= args.smoke_steps <= 6, "Smoke must use at most six decisions")
     if args.expected_commit:
         actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
