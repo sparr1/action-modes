@@ -53,6 +53,19 @@ explicit margin when selecting walltime.
 
 ## Production launch and continuation
 
+`slurm/submit_ambi_alpha_carry_k3.py` can run in a short CPU allocation with an
+`afterok` dependency on both validation jobs. Supply `--source-dir` for the
+clean, validated training checkout, `--expected-commit` for its full commit,
+`--campaign-dir` for the output root, and `--python` for the locked interpreter.
+The submitter selects the benchmark's recommended CPU count, one L40S and
+16 GiB. It rounds walltime up to the next hour after adding 15% to the measured
+million-decision duration, twice the GPU-gate runtime for startup, and ten
+minutes for fixed overhead. Its durable `submission.json` records an intent
+before calling Slurm and the returned job ID afterward. A successful rerun is
+idempotent; an uncertain outcome requires reconciliation before retrying.
+The submitter may live in a newer checkout while training remains pinned to
+the exact source covered by the validation receipts.
+
 Submit one L40S training job, overriding `--cpus-per-task` with the benchmark's
 recommendation and `--time` with the measured estimate. Set
 `AMBI_TRAIN_WALLTIME_SECONDS` to exactly that Slurm duration. The launcher verifies
@@ -70,4 +83,7 @@ separate `WANDB_RUN_ID`. Keep the source configuration and commit fixed for
 continuations and set `AMBI_RESUME_MODE=required` with the same campaign root.
 Exit 75 means a verified clean handoff, not completion; exit 0 requires a valid
 `DONE` marker. The launcher never automatically requeues. Install and verify
-visible run/progress panels before sharing the live run link.
+visible run/progress panels before sharing the live run link. The companion
+`slurm/ambi_alpha_carry_k3_workspace.py` accepts an omitted `--run-id` before
+startup, showing pending status and selecting the source ID plus the unique
+K3 campaign group. Rerunning it after registration binds the two exact run IDs.

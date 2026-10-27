@@ -3,7 +3,8 @@
 Requires isolated wandb==0.28.1 / wandb-workspaces==0.4.5 and normal SDK
 authentication. The --output receipt owns the view; reruns update that view,
 preserve user sections, and fail visibly if server readback loses the layout.
-The new --run-id may be pending registration; no missing data is shown as zero.
+Omit --run-id before registration: the unique campaign group binds its eventual
+run automatically. No missing data is shown as zero.
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ from slurm.ambi_alpha_carry_workspace import (  # noqa: E402
 )
 
 SOURCE_RUN = "be85c916fcd94d5a813d7857d0ef5efb"
+GROUP = "ambi-alpha-carry-k3-20261026"
 NAME = "Alpha run carry: K1 versus K3 / H3 J8 detached target -10.5 seed55"
 PREFIX = "Alpha carry K1 vs K3 / "
 METRICS = [
@@ -47,21 +49,30 @@ METRICS = [
 ]
 
 
-def expected_rows(run_id):
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id) or run_id == SOURCE_RUN:
+def expected_rows(run_id=None):
+    if run_id is not None and (not re.fullmatch(r"[A-Za-z0-9_-]+", run_id) or run_id == SOURCE_RUN):
         raise WorkspaceError("--run-id must be a distinct valid K3 run ID")
     return [dict(run_id=value, k=k, name=f"K={k} | H3 J8 | alpha run | aux detached | target -10.5 | seed55",
-                 color=color, state="pending registration", decisions=None)
+                 color=color, state="pending startup" if value is None else "pending registration", decisions=None)
             for value, k, color in ((SOURCE_RUN, 1, "#0072B2"), (run_id, 3, "#D55E00"))]
 
 
-def discover_rows(api, run_id):
+def discover_rows(api, run_id=None):
     rows = expected_rows(run_id)
-    by_id = {row["run_id"]: row for row in rows}
+    by_id = {row["run_id"]: row for row in rows if row["run_id"] is not None}
     seen = set()
-    for run in api.runs(f"{ENTITY}/{PROJECT}", filters={"name": {"$in": list(by_id)}}, per_page=2):
-        if run.id not in by_id or run.id in seen:
+    filters = ({"name": {"$in": list(by_id)}} if run_id is not None
+               else {"$or": [{"name": SOURCE_RUN}, {"group": GROUP}]})
+    for run in api.runs(f"{ENTITY}/{PROJECT}", filters=filters, per_page=3):
+        if run.id in seen:
             raise WorkspaceError("Run lookup returned an unexpected or duplicate identity")
+        if run.id not in by_id:
+            if run_id is not None:
+                raise WorkspaceError("Run lookup returned an unexpected identity")
+            if rows[1]["run_id"] is not None:
+                raise WorkspaceError("Multiple K3 runs claim the dedicated campaign group")
+            rows[1]["run_id"] = run.id
+            by_id[run.id] = rows[1]
         seen.add(run.id)
         by_id[run.id].update(state=run.state, decisions=dict(run.summary).get(STEP))
     if SOURCE_RUN not in seen:
@@ -71,7 +82,8 @@ def discover_rows(api, run_id):
 
 def _markdown(rows, updated):
     status = "\n".join(f"| K={row['k']} | {row['state']} | "
-                       f"{row['decisions'] if row['decisions'] is not None else 'pending'} | `{row['run_id']}` |"
+                       f"{row['decisions'] if row['decisions'] is not None else 'pending'} | "
+                       f"{('`' + row['run_id'] + '`') if row['run_id'] is not None else 'awaiting registration'} |"
                        for row in rows)
     return f"""**K=1 versus K=3 full-training AMBI: decisions between fresh inner solves.**
 
@@ -79,7 +91,7 @@ K=1 adapts at every real decision. K=3 adapts once, then samples the same adapte
 
 Both runs: **Humanoid Walk state observations; H3/J8; C16/A4/N128/B256 per solve; auxiliary return critic with detached representation; target entropy −10.5; sampled training actions; seed55; 1M decisions = 2M raw environment steps.** Retain full replay checkpoints every25k decisions. The K3 variant changes the solve interval while retaining per-solve update dose, so inner compute per real decision decreases. Training return is stochastic collection return; one seed per setting does not estimate training-seed variance.
 
-Each native curve is one exact run ID, without averaging or smoothing. Main panels use `env_step`; root entropy uses128 paired samples and the actual sampled diagnostic decision axis. K3 diagnostics run on the first fresh solve at or after each1000-decision cadence boundary, so held decisions cannot suppress diagnostics. Solve/hold counts are sums within each logging window, not lifetime totals. Original K1 data may lack newly introduced solve/hold counters; missing curves do not mean zero.
+Each native curve is an independent run, without averaging or smoothing. Before K3 registers, the view selects the original K1 ID plus the unique K3 campaign group; after discovery, rerunning the installer locks the view to the two exact IDs. Main panels use `env_step`; root entropy uses128 paired samples and the actual sampled diagnostic decision axis. K3 diagnostics run on the first fresh solve at or after each1000-decision cadence boundary, so held decisions cannot suppress diagnostics. Solve/hold counts are sums within each logging window, not lifetime totals. Original K1 data may lack newly introduced solve/hold counters; missing curves do not mean zero.
 
 **Startup/progress snapshot: {updated}.** Curves update with uploaded history. Rerun this installer to refresh the table; pending/empty panels mean no observations are uploaded yet.
 
@@ -90,15 +102,16 @@ Each native curve is one exact run ID, without averaging or smoothing. Main pane
 
 
 def _sections(rows, updated, ws, wr):
+    active = [row for row in rows if row["run_id"] is not None]
     sections = [ws.Section(name=PREFIX + "Protocol and progress", is_open=True,
                            panels=[wr.MarkdownPanel(markdown=_markdown(rows, updated), layout=wr.Layout(w=24, h=14))])]
     for category in dict.fromkeys(item[0] for item in METRICS):
         panels = [wr.LinePlot(title=title, x=axis, y=[metric], aggregate=False,
                              smoothing_type="none", legend_template="${run:name}", max_runs_to_show=2,
                              title_x="Sampled diagnostic decision" if axis == DIAGNOSTIC_STEP else "Training decisions",
-                             line_colors={row["run_id"] + ":" + metric: row["color"] for row in rows},
-                             line_titles={row["run_id"] + ":" + metric: row["name"] for row in rows},
-                             line_marks={row["run_id"] + ":" + metric: "solid" for row in rows},
+                             line_colors={row["run_id"] + ":" + metric: row["color"] for row in active},
+                             line_titles={row["run_id"] + ":" + metric: row["name"] for row in active},
+                             line_marks={row["run_id"] + ":" + metric: "solid" for row in active},
                              layout=wr.Layout(w=12, h=8))
                   for section, title, metric, axis in METRICS if section == category]
         sections.append(ws.Section(name=PREFIX + category, is_open=True, panels=panels))
@@ -106,6 +119,7 @@ def _sections(rows, updated, ws, wr):
 
 
 def _verify(work, rows, url, wanted, wr, expr):
+    active = [row for row in rows if row["run_id"] is not None]
     if ((work.entity, work.project, work.name) != (ENTITY, PROJECT, NAME)
             or _view_id(work.url) != _view_id(url)):
         raise WorkspaceError("Saved workspace identity differs from the receipt")
@@ -113,13 +127,18 @@ def _verify(work, rows, url, wanted, wr, expr):
     if (len(owned) != 1 + len({item[0] for item in METRICS})
             or sum(len(section.panels) for section in owned) != len(METRICS) + 1):
         raise WorkspaceError("Saved workspace lost required sections or panels")
+    markdown = [getattr(panel, "markdown", "") for section in owned for panel in section.panels
+                if getattr(panel, "markdown", "")]
+    if (len(markdown) != 1 or any(f"| K={row['k']} | {row['state']} |" not in markdown[0]
+                                 for row in rows)):
+        raise WorkspaceError("Saved workspace lost its startup/progress table")
     settings = work.runset_settings
     if settings.groupby or settings.query or _filter_wire(settings.filters, expr) != _filter_wire(wanted, expr):
         raise WorkspaceError("Saved workspace lost its exact two-run filter")
     if (work.settings.x_axis != STEP or work.settings.remove_legends_from_panels
             or not work.settings.tooltip_color_run_names or work.settings.tooltip_number_of_runs != "all_runs"):
         raise WorkspaceError("Saved workspace lost native hover and legend settings")
-    for row in rows:
+    for row in active:
         run = settings.run_settings.get(row["run_id"])
         if run is None or run.disabled or _color(run.color) != row["color"]:
             raise WorkspaceError("Saved workspace lost run visibility or color")
@@ -138,7 +157,7 @@ def _verify(work, rows, url, wanted, wr, expr):
                     or panel.aggregate or panel.smoothing_type != "none"
                     or panel.legend_template != "${run:name}" or panel.max_runs_to_show < 2):
                 raise WorkspaceError("Saved panel lost its axis or independent line semantics")
-            for row in rows:
+            for row in active:
                 key = row["run_id"] + ":" + metric
                 if (panel.line_titles.get(key) != row["name"] or panel.line_marks.get(key) != "solid"
                         or _color(panel.line_colors.get(key)) != row["color"]):
@@ -147,17 +166,22 @@ def _verify(work, rows, url, wanted, wr, expr):
         raise WorkspaceError("Saved workspace lacks required metrics")
 
 
-def install(output, run_id, *, api=None, backend=None):
+def install(output, run_id=None, *, api=None, backend=None):
     expected_rows(run_id)
     output = Path(output)
     previous = json.loads(output.read_text()) if output.exists() else {}
-    identity = dict(entity=ENTITY, project=PROJECT, source_run_id=SOURCE_RUN, run_id=run_id, name=NAME)
+    identity = dict(entity=ENTITY, project=PROJECT, source_run_id=SOURCE_RUN, group=GROUP, name=NAME)
     if previous and any(previous.get(key) != value for key, value in identity.items()):
         raise WorkspaceError("Refusing to replace another comparison's receipt")
+    if previous.get("run_id"):
+        if run_id is not None and run_id != previous["run_id"]:
+            raise WorkspaceError("Refusing to replace the comparison's bound K3 run ID")
+        run_id = previous["run_id"]
     url = previous.get("url")
     if url:
         _view_id(url)
-    receipt = dict(**identity, url=url, api_verified=False, panel_count=len(METRICS) + 1, metrics=METRICS)
+    receipt = dict(**identity, run_id=run_id, url=url, api_verified=False,
+                   panel_count=len(METRICS) + 1, metrics=METRICS)
     _write(output, receipt)
     try:
         if backend is None:
@@ -173,7 +197,7 @@ def install(output, run_id, *, api=None, backend=None):
             ws, wr, expr = backend
         rows = discover_rows(api, run_id)
         updated = datetime.now(timezone.utc).isoformat()
-        receipt.update(rows=rows, updated_at=updated)
+        receipt.update(rows=rows, run_id=rows[1]["run_id"], updated_at=updated)
         sections = _sections(rows, updated, ws, wr)
         if url:
             work = ws.Workspace.from_url(url)
@@ -191,9 +215,13 @@ def install(output, run_id, *, api=None, backend=None):
         else:
             work = ws.Workspace(entity=ENTITY, project=PROJECT, name=NAME,
                                 sections=sections, auto_generate_panels=False)
-        wanted = expr.Metric("ID").isin([row["run_id"] for row in rows])
-        work.runset_settings = ws.RunsetSettings(filters=[wanted], groupby=[],
-            run_settings={row["run_id"]: ws.RunSettings(color=row["color"], disabled=False) for row in rows},
+        active = [row for row in rows if row["run_id"] is not None]
+        wanted = (expr.Metric("ID").isin([row["run_id"] for row in active])
+                  if rows[1]["run_id"] is not None
+                  else expr.Or(expr.Metric("ID") == SOURCE_RUN, expr.Metric("Group") == GROUP))
+        work.runset_settings = ws.RunsetSettings(
+            filters=[wanted] if rows[1]["run_id"] is not None else wanted, groupby=[],
+            run_settings={row["run_id"]: ws.RunSettings(color=row["color"], disabled=False) for row in active},
             pinned_columns=["run:displayName", "summary:env_step", "summary:episode/return"])
         work.settings = ws.WorkspaceSettings(x_axis=STEP, max_runs=2, tooltip_number_of_runs="all_runs",
             tooltip_color_run_names=True, remove_legends_from_panels=False)
@@ -214,7 +242,7 @@ def install(output, run_id, *, api=None, backend=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--run-id")
     args = parser.parse_args()
     print(json.dumps(install(args.output, args.run_id), indent=2))
 
