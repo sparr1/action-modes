@@ -1,0 +1,26 @@
+{
+  "study_type": "single_seed_exploratory_full_training_reward_only_primary",
+  "study_note": "Fresh single-seed H5/J10/K5 follow-up to H3/J10/K3 reward-only training run de37a4eec8094c67a2a691db04e47a2b. Use the same recipe, not its checkpoint weights. Train for 1M decisions (2M raw environment steps), matching the reference continuation budget, seed 55. Preserve C16/A4/N128/B256: 160 critic, 40 actor and 40 temperature updates per solve, 6400 imagined transitions and action-local replay rows. Solve every 5 real decisions with the adapted feedback actor and solve-time encoder snapshot; sample a fresh action at each new observation. Keep world-model train_unroll_horizon=3 and outer_planning_horizon=3; H denotes only inner_rollout_horizon. H exceeds the recurrent world-model training window, so model extrapolation is part of this screen. Preserve reward-only primary outer/inner critics, no auxiliary critic, automatic inherited per-solve temperature, entropy-regularized actor, fresh actor/critic/temperature/optimizers/replay, 2500 warmup decisions and 2500 pretraining updates, all 25k checkpoints and durable exact resume. Evaluation is disabled during training. J changes both data and update work; changing H=K changes horizon, solve cadence and amortized optimizer dose together. Publish actual training metrics in W&B ambi, group ambi-return-jh-scaling-20261028.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_full_h5_j10_k5_reward_only"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

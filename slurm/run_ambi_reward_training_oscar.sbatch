@@ -43,14 +43,30 @@ export WANDB_CACHE_DIR="$local_root/cache" WANDB_DATA_DIR="$local_root/data" WAN
 if [[ "$mode" == smoke ]]; then
   [[ "$SLURM_CPUS_PER_TASK" == 2 && "${SLURM_RESTART_COUNT:-0}" == 0 ]]
   export WANDB_MODE=disabled
+  smoke_args=(--decisions "${AMBI_RETURN_GATE_DECISIONS:-120}")
+  # The Python gate chooses the approved recipe's warmup (12 historically,
+  # 60 for J/H/K scaling). Only override it when explicitly requested.
+  if [[ -n "${AMBI_RETURN_GATE_WARMUP:-}" ]]; then
+    smoke_args+=(--warmup "$AMBI_RETURN_GATE_WARMUP")
+  fi
   exec srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" slurm/ambi_reward_training.py smoke \
-    --manifest "$AMBI_RETURN_MANIFEST" --output "$AMBI_RETURN_OUTPUT/gate"
+    --manifest "$AMBI_RETURN_MANIFEST" --output "$AMBI_RETURN_OUTPUT/gate" \
+    "${smoke_args[@]}"
 else
   [[ "$SLURM_CPUS_PER_TASK" == 1 || "$SLURM_CPUS_PER_TASK" == 2 ]]
   : "${AMBI_LINEAGE_DIR:?Set a unique durable lineage under /oscar/home/rgao48/ambi-durable.}"
   : "${AMBI_DRAIN_AFTER_SECONDS:?Set an explicit segment budget below requested walltime.}"
-  export AMBI_DURABLE_ROOT=/oscar/home/rgao48/ambi-durable
-  export AMBI_DURABLE_QUOTA_LABEL=rgao48 AMBI_DURABLE_QUOTA_PATH=/oscar/home
+  case "${AMBI_RETURN_STORAGE:-home}" in
+    home)
+      export AMBI_DURABLE_ROOT=/oscar/home/rgao48/ambi-durable
+      export AMBI_DURABLE_QUOTA_LABEL=rgao48 AMBI_DURABLE_QUOTA_PATH=/oscar/home
+      ;;
+    scratch-jh-scaling)
+      export AMBI_DURABLE_ROOT=/oscar/scratch/rgao48/ambi/jh-scaling-training/20261028
+      export AMBI_DURABLE_QUOTA_LABEL=rgao48 AMBI_DURABLE_QUOTA_PATH=/oscar/scratch
+      ;;
+    *) echo "Unapproved AMBI_RETURN_STORAGE" >&2; exit 2 ;;
+  esac
   export AMBI_RESUME_CHECKPOINT_MINUTES="${AMBI_RESUME_CHECKPOINT_MINUTES:-30}"
   export WANDB_MODE=online
   unset WANDB_RUN_ID WANDB_RESUME

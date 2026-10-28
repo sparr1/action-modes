@@ -34,30 +34,37 @@ MANIFESTS = {
     "mppi": ROOT / "configs/dmcontrol/experiments/ambi_return_only_mppi_training.json",
 }
 J10_MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_return_only_sac_j10_training.json"
-# Approved identities bind J and the held-policy cadence independently of H.
+# Each identity binds name, operator, J, K, inner H and training budget.
+SCALING_GROUP = "ambi-return-jh-scaling-20261028"
+SCALING_CASES = {
+    ROOT / f"configs/dmcontrol/experiments/ambi_return_only_sac_h{h}_j{j}_k{k}_training.json":
+        (f"ambi_full_h{h}_j{j}_k{k}_reward_only", "sac", j, k, h, 1000000)
+    for j, h, k in ((12, 3, 3), (10, 4, 4), (10, 5, 5))
+}
 CAMPAIGNS = {
-    MANIFESTS["sac"]: ("ambi_full_h3_j8_k3_reward_only", "sac", 8, 3),
-    J10_MANIFEST: ("ambi_full_h3_j10_k3_reward_only", "sac", 10, 3),
-    MANIFESTS["mppi"]: ("ambi_full_h3_mppi_reward_only", "mppi", 0, 1),
+    MANIFESTS["sac"]: ("ambi_full_h3_j8_k3_reward_only", "sac", 8, 3, 3, 500000),
+    J10_MANIFEST: ("ambi_full_h3_j10_k3_reward_only", "sac", 10, 3, 3, 500000),
+    MANIFESTS["mppi"]: ("ambi_full_h3_mppi_reward_only", "mppi", 0, 1, 3, 500000),
+    **SCALING_CASES,
 }
 
 
-def sac_work(rounds):
+def sac_work(rounds, horizon=3):
     return {"inner_critic_optimizer_steps": 16 * rounds,
             "inner_actor_optimizer_steps": 4 * rounds,
             "inner_temperature_optimizer_steps": 4 * rounds,
-            "inner_model_steps": 3 * 128 * rounds}
+            "inner_model_steps": horizon * 128 * rounds}
 
 
 def validate_campaign(manifest_path):
     path = resolve_manifest(manifest_path)
     assert path in CAMPAIGNS, "Unapproved reward-only campaign manifest"
-    expected_name, operator, rounds, expected_interval = CAMPAIGNS[path]
+    expected_name, operator, rounds, expected_interval, horizon, decisions = CAMPAIGNS[path]
     manifest = read(path)
     assert len(manifest["configs"]) == 1 and manifest["trials"] == 1
     name, _, run = recipe(0, path)
     assert name == expected_name, "Campaign configuration identity changed"
-    assert (run["seed"], run["total_steps"], run["checkpoint_every"], run["save_strat"]) == (55, 500000, 25000, "all")
+    assert (run["seed"], run["total_steps"], run["checkpoint_every"], run["save_strat"]) == (55, decisions, 25000, "all")
     assert manifest["env_params"] == {"task": "humanoid-walk", "obs": "state", "render_mode": None}
     # These unchanged defaults are omitted by the older MPPI/SAC recipes.
     # Validate the explicit resolved meaning without modifying the manifest.
@@ -76,7 +83,7 @@ def validate_campaign(manifest_path):
         "compile": True, "compile_strict": True, "critic_ensemble_backend": "vmap",
         "wandb": True, "wandb_project": "ambi", "wandb_mode": "online",
         "seed_steps": 2500, "pretrain_steps": 2500, "utd": 1,
-        "inner_rollout_horizon": 3, "num_q": 5, "q_pair_size": 2,
+        "inner_rollout_horizon": horizon, "num_q": 5, "q_pair_size": 2,
         "inner_critic_bernoulli_p": 0., "mppi_terminal_q_reduction": "mean_pair",
     }
     assert all(p.get(key) == value for key, value in expected.items()), "Reward-only production recipe changed"
@@ -85,7 +92,7 @@ def validate_campaign(manifest_path):
     assert interval == expected_interval, "Campaign solve cadence changed"
     if p["inner_operator"] == "sac":
         expected = {"inner_rounds": rounds, "inner_rollouts_per_round": 128,
-                    "inner_batch_size": 256, "inner_replay_capacity": 3 * 128 * rounds,
+                    "inner_batch_size": 256, "inner_replay_capacity": horizon * 128 * rounds,
                     "inner_critic_updates_per_round": 16, "inner_actor_updates_per_round": 4,
                     "inner_execution_action": "policy_sample", "inner_temperature_mode": "auto",
                     "inner_temperature_initialization": "inherit_outer", "inner_target_entropy": "inherit_outer"}
@@ -99,15 +106,35 @@ def validate_campaign(manifest_path):
                     "inner_mppi_temperature": .5, "inner_mppi_min_std": .05, "inner_mppi_max_std": 2.,
                     "inner_mppi_warm_start_scope": "episode", "inner_mppi_eval_action": "weighted_elite"}
         assert all(p.get(key) == value for key, value in expected.items())
+    if path in SCALING_CASES:
+        # Bind the complete recipe to the reference, permitting only the
+        # requested axes, derived replay, approved budget and publication.
+        _, base_manifest, expected_run = recipe(0, J10_MANIFEST)
+        expected_run = deepcopy(expected_run)
+        expected_run.update(name=name, total_steps=decisions)
+        expected_run["alg_params"].update(inner_rounds=rounds, inner_rollout_horizon=horizon,
+            inner_solve_interval=expected_interval, inner_replay_capacity=horizon * 128 * rounds)
+        for key in ("wandb_tags", "wandb_group", "wandb_run_name"):
+            expected_run["alg_params"][key] = run["alg_params"][key]
+        assert run == expected_run, "Scaling recipe differs outside approved axes"
+        expected_manifest = deepcopy(base_manifest)
+        expected_manifest.update(configs=[name], study_note=manifest["study_note"])
+        expected_manifest["overrides_alg"]["total_steps"] = decisions
+        assert manifest == expected_manifest, "Scaling manifest changed outside approved fields"
+        assert p["wandb_group"] == SCALING_GROUP and SCALING_GROUP in p["wandb_tags"]
+        assert p["wandb_run_name"] == f"H{horizon} | Fresh SAC | J{rounds} | K{expected_interval} | reward-only Q | seed55"
+        assert {f"H{horizon}", f"J{rounds}", f"K{expected_interval}", "1m-decisions", "2m-environment-steps"} <= set(p["wandb_tags"])
     return name, manifest, run
 
 
 def smoke_recipe(warmup, decisions, manifest_path):
-    validate_campaign(manifest_path)
+    _, _, run = validate_campaign(manifest_path)
+    interval = run["alg_params"].get("inner_solve_interval", 1)
+    assert warmup % interval == decisions % interval == 0, "Smoke windows must contain complete solve cycles"
     return _smoke_recipe(0, warmup, decisions, manifest_path)
 
 
-def validate_learner(cfg, agent, *, rounds=8):
+def validate_learner(cfg, agent, *, rounds=8, horizon=3, interval=3):
     assert cfg.compile and cfg.compile_strict and cfg.critic_ensemble_backend == "vmap"
     assert (cfg.model_size, cfg.enc_dim, cfg.mlp_dim, cfg.latent_dim, cfg.num_q) == (5, 256, 512, 512, 5)
     assert (cfg.action_dim, cfg.batch_size, cfg.train_unroll_horizon) == (21, 256, 3)
@@ -127,17 +154,19 @@ def validate_learner(cfg, agent, *, rounds=8):
         assert (cfg.inner_mppi_num_elites, cfg.inner_mppi_num_pi_trajs) == (64, 24)
         assert cfg.inner_critic_updates_per_action == cfg.inner_actor_updates_per_action == 0
     else:
-        assert cfg.inner_operator == "sac" and rounds in (8, 10)
-        assert (cfg.inner_rollout_horizon, cfg.inner_rounds, cfg.inner_rollouts_per_round) == (3, rounds, 128)
-        assert cfg.inner_solve_interval == 3 and cfg.inner_replay_capacity == 3 * 128 * rounds
+        assert cfg.inner_operator == "sac"
+        assert any(spec[1:5] == ("sac", rounds, interval, horizon) for spec in CAMPAIGNS.values())
+        assert (cfg.inner_rollout_horizon, cfg.inner_rounds, cfg.inner_rollouts_per_round) == (horizon, rounds, 128)
+        assert cfg.inner_solve_interval == interval and cfg.inner_replay_capacity == horizon * 128 * rounds
+        assert cfg.outer_planning_horizon == 3 and cfg.inner_hold_encoder == "solve_snapshot"
         assert (cfg.inner_critic_updates_per_action, cfg.inner_actor_updates_per_action,
                 cfg.inner_temperature_updates_per_action) == (16 * rounds, 4 * rounds, 4 * rounds)
-        assert cfg.inner_model_step_budget == 3 * 128 * rounds
+        assert cfg.inner_model_step_budget == horizon * 128 * rounds
 
 
-def validate_action(metrics, *, operator, decision, interval, rounds=8):
+def validate_action(metrics, *, operator, decision, interval, rounds=8, horizon=3):
     if operator == "sac":
-        return action_work(metrics, decision=decision, interval=interval, probability=0., rounds=rounds)
+        return action_work(metrics, decision=decision, interval=interval, probability=0., rounds=rounds, horizon=horizon)
     assert operator == "mppi" and interval == 1
     for key in ("inner_critic_optimizer_steps", "inner_actor_optimizer_steps", "inner_temperature_optimizer_steps"):
         assert metrics[key] == 0
@@ -176,7 +205,8 @@ def worker(args):
         learner = AMBITDMPC2(name + "-gpu-gate", env, run["alg_params"], run, manifest)
         cfg, agent = learner.cfg, learner.agent
         rounds = production["alg_params"].get("inner_rounds", 0)
-        validate_learner(cfg, agent, rounds=rounds)
+        horizon = production["alg_params"]["inner_rollout_horizon"]
+        validate_learner(cfg, agent, rounds=rounds, horizon=horizon, interval=cfg.inner_solve_interval)
         learner.buffer.enable_resumable_storage()
         operator, interval = cfg.inner_operator, cfg.inner_solve_interval
         assert args.warmup % interval == args.decisions % interval == 0
@@ -218,9 +248,9 @@ def worker(args):
             timer.after_action(step, seconds)
             assert action.device.type == "cpu" and torch.isfinite(action).all()
             solve = validate_action(agent.last_inner_metrics, operator=operator, decision=decision,
-                                    interval=interval, rounds=rounds)
+                                    interval=interval, rounds=rounds, horizon=horizon)
             if solve and operator == "sac":
-                realized_solve_work.update({key: agent.last_inner_metrics[key] for key in sac_work(rounds)})
+                realized_solve_work.update({key: agent.last_inner_metrics[key] for key in sac_work(rounds, horizon)})
             if not solve:
                 assert graphs_before == int(torch._dynamo.utils.counters["stats"]["unique_graphs"]), "Held action captured a graph"
             rows.append({"decision": decision, "step": step, "solve": solve, "action_seconds": seconds,
@@ -291,7 +321,7 @@ def worker(args):
         replay_bytes_per_row = sum(value.numel() * value.element_size() for value in storage.values()) / len(storage)
         report = {"passed": True, "binding": binding(args.manifest), "runtime": runtime(), "config": name,
                   "operator": operator, "inner_solve_interval": interval, "physical_cores": len(cpus),
-                  "inner_rounds": rounds, "inner_work_per_solve": realized_solve_work,
+                  "inner_rounds": rounds, "inner_rollout_horizon": horizon, "inner_work_per_solve": realized_solve_work,
                   "logical_cpu_ids": cpus, "torch_threads": torch.get_num_threads(),
                   "measured": measured, "warmup_active_decisions": args.warmup,
                   "compile_graph_counts": compile_counts, "compile_fallback": False,
@@ -326,7 +356,7 @@ def worker(args):
 def validate_receipt(receipt, campaign_binding, current_runtime, cpus, *, name, operator, interval):
     approved = [spec for spec in CAMPAIGNS.values() if spec[0] == name]
     assert len(approved) == 1, "Unapproved reward-only configuration identity"
-    _, expected_operator, rounds, expected_interval = approved[0]
+    _, expected_operator, rounds, expected_interval, horizon, _ = approved[0]
     assert (operator, interval) == (expected_operator, expected_interval), "Gate protocol mismatch"
     assert receipt["passed"] is True and receipt["binding"] == campaign_binding, "Gate source/configuration mismatch"
     assert cpus in CPU_COUNTS, "Production CPU allocation was not measured"
@@ -338,7 +368,11 @@ def validate_receipt(receipt, campaign_binding, current_runtime, cpus, *, name, 
         assert (row["config"], row["operator"], row["inner_solve_interval"]) == (name, operator, interval)
         if operator == "sac":
             assert row["inner_rounds"] == rounds
-            assert row["inner_work_per_solve"] == sac_work(rounds), "Gate inner update dose mismatch"
+            assert row["inner_work_per_solve"] == sac_work(rounds, horizon), "Gate inner update dose mismatch"
+            # Historical H3 receipts predate this explicit field. New identities
+            # must carry it so a different rollout horizon cannot be relabeled.
+            if name in {spec[0] for spec in SCALING_CASES.values()}:
+                assert row["inner_rollout_horizon"] == horizon, "Gate rollout horizon mismatch"
         assert row["compile_fallback"] is False and row["replay_storage_device"] == "cpu"
         assert row["compile_graph_counts"]["before"] == row["compile_graph_counts"]["after"]
         assert row["auxiliary_critic_present"] is False
@@ -347,6 +381,7 @@ def validate_receipt(receipt, campaign_binding, current_runtime, cpus, *, name, 
             assert row[key] is True, key
         assert row["outer_target_entropy"] == -10.5
         measured = row["measured"]
+        assert row["warmup_active_decisions"] % interval == measured["decisions"] % interval == 0
         assert measured["decisions"] >= 100 and measured["decisions"] == measured["outer_updates"]
         assert measured["solve_decisions"] == measured["decisions"] // interval
         assert measured["held_decisions"] == measured["decisions"] - measured["solve_decisions"]
@@ -414,23 +449,51 @@ def launch(args):
                      name=name, operator=run["alg_params"]["inner_operator"], interval=run["alg_params"].get("inner_solve_interval", 1))
     for path, checksum in receipt["artifacts"].items():
         assert digest(path) == checksum, "Gate artifact changed"
-    assert os.environ["AMBI_DURABLE_ROOT"] == "/oscar/home/rgao48/ambi-durable"
+    storage = os.environ.get("AMBI_RETURN_STORAGE", "home")
+    assert storage in ("home", "scratch-jh-scaling"), "Unapproved training storage mode"
+    launcher = ROOT / "run_ambi_oscar.sh"
     lineage = Path(os.environ["AMBI_LINEAGE_DIR"])
+    restart = os.environ.get("SLURM_RESTART_COUNT", "0")
+    assert restart.isdigit(), "Restart count must be non-negative"
+    resume_mode = "required" if int(restart) else os.environ.get("AMBI_RESUME_MODE", "new")
+    if storage == "scratch-jh-scaling":
+        assert resolve_manifest(args.manifest) in SCALING_CASES, "Scratch is limited to the three J/H scaling recipes"
+        root = Path("/oscar/scratch/rgao48/ambi/jh-scaling-training/20261028")
+        _, _, rounds, interval, horizon, _ = SCALING_CASES[resolve_manifest(args.manifest)]
+        expected = root / "lineages" / f"h{horizon}-j{rounds}-k{interval}-seed55"
+        assert os.environ["AMBI_DURABLE_ROOT"] == str(root), "Scratch campaign root changed"
+        assert os.environ["AMBI_DURABLE_QUOTA_LABEL"] == "rgao48"
+        assert os.environ["AMBI_DURABLE_QUOTA_PATH"] == "/oscar/scratch"
+        assert lineage == expected, "Scratch lineage does not match the selected recipe"
+        for path in (lineage, *lineage.parents):
+            assert not path.is_symlink(), "Scratch lineage ancestors must not be symlinks"
+        if int(restart) == 0:
+            assert resume_mode == "new" and not lineage.exists(), "Scratch first launch requires a new lineage"
+        else:
+            assert (lineage / "LINEAGE.json").is_file() and (lineage / "LATEST").is_file(), "Scratch restart requires an existing lineage"
+        launcher = ROOT / "slurm/run_ambi_jh_scaling_scratch.sh"
+    else:
+        assert os.environ["AMBI_DURABLE_ROOT"] == "/oscar/home/rgao48/ambi-durable"
     assert lineage.is_absolute() and lineage != Path(os.environ["AMBI_DURABLE_ROOT"])
     lineage.resolve().relative_to(Path(os.environ["AMBI_DURABLE_ROOT"]).resolve())
     assert int(os.environ["AMBI_DRAIN_AFTER_SECONDS"]) > 0
-    segment = os.environ["SLURM_JOB_ID"] + "." + os.environ.get("SLURM_RESTART_COUNT", "0")
+    segment = os.environ["SLURM_JOB_ID"] + "." + restart
     args.output.mkdir(parents=True, exist_ok=True)
-    write_new(args.output / f"launch-{segment}.json", {
+    launch_receipt = args.output / f"launch-{segment}.json"
+    write_new(launch_receipt, {
         "binding": current_binding, "config": name, "run_params": run, "runtime": current_runtime,
         "gate_binding": gate_binding, "source_compatibility": source_compatibility,
         "gate_receipt": str(args.gate), "gate_sha256": digest(args.gate), "lineage_dir": str(lineage),
-        "segment": segment, "resume_mode": "required" if os.environ.get("SLURM_RESTART_COUNT", "0") != "0" else os.environ.get("AMBI_RESUME_MODE", "new"),
+        "segment": segment, "resume_mode": resume_mode,
+        "storage": {"mode": storage, "root": os.environ["AMBI_DURABLE_ROOT"],
+                    "quota_path": os.environ.get("AMBI_DURABLE_QUOTA_PATH", "/oscar/home")},
         "created_utc": datetime.now(timezone.utc).isoformat(),
     })
     os.environ.update(AMBI_RUN_CONFIG=str(resolve_manifest(args.manifest)), AMBI_ALG_DIR=str(ROOT / "configs/dmcontrol/algs"),
                       AMBI_PYTHON=sys.executable, SLURM_SUBMIT_DIR=str(ROOT))
-    os.execv("/bin/bash", ["/bin/bash", str(ROOT / "run_ambi_oscar.sh")])
+    if storage == "scratch-jh-scaling":
+        os.environ["AMBI_JH_LAUNCH_RECEIPT"] = str(launch_receipt.resolve())
+    os.execv("/bin/bash", ["/bin/bash", str(launcher)])
 
 
 def main():
@@ -439,10 +502,12 @@ def main():
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--gate", type=Path)
-    parser.add_argument("--warmup", type=int, default=12)
+    parser.add_argument("--warmup", type=int)
     parser.add_argument("--decisions", type=int, default=120)
     parser.add_argument("--worker-cpus", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.warmup is None:
+        args.warmup = 60 if resolve_manifest(args.manifest) in SCALING_CASES else 12
     assert binding(args.manifest)["commit"] == os.environ["AMBI_EXPECTED_COMMIT"]
     assert not subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=all"], cwd=ROOT, text=True).strip()
     if args.mode == "smoke":

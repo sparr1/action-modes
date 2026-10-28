@@ -201,6 +201,35 @@ Select this manifest with `AMBI_RETURN_MANIFEST` in
 train mode with a fresh lineage. Its gate measures one and two physical CPUs
 and verifies the J10 update counts; a J8 receipt cannot authorize the J10 run.
 
+The three one-cell `ambi_return_only_sac_h3_j12_k3_training.json`,
+`ambi_return_only_sac_h4_j10_k4_training.json`, and
+`ambi_return_only_sac_h5_j10_k5_training.json` manifests extend this screen to
+J12/H3/K3, J10/H4/K4, and J10/H5/K5. They initialize fresh at seed 55 and train
+for one million decisions, matching the extended J10 reference budget. Each
+retains C16/A4/N128/B256, reward-only critics, automatic per-solve temperature,
+sampled training actions, and every 25k checkpoint. Their inner replay capacities
+are 4,608, 5,120, and 6,400 rows respectively, exactly `J*N*H`.
+
+Here H changes only the inner rollout horizon; the recurrent world-model
+training horizon and outer planning horizon remain three. H4/H5 therefore also
+test extrapolation beyond the model's recurrent training window. Increasing J
+increases both imagined data and optimizer work. Increasing H=K changes the
+rollout horizon and held-policy cadence together: imagined transitions per real
+decision remain approximately constant, while optimizer updates per real
+decision decrease. These are single-seed exploratory screens, so differences
+cannot isolate horizon from cadence. Publication uses group
+`ambi-return-jh-scaling-20261028`. The same reward-training launcher validates
+each exact recipe and measures both one and two physical CPUs; these new gates
+default to 60 active warmup decisions and 120 measured decisions, complete
+cycles for K3, K4, and K5.
+
+For unattended Oscar startup, run `slurm/submit_ambi_jh_scaling_production.py`
+in a CPU job depending on successful completion of the three GPU gates. It
+validates their source and artifacts, chooses measured CPU allocations and
+walltimes, checks live reservations, and records each submission before starting
+the three training jobs. A dependent CPU watcher binds their immutable W&B
+identities to the dedicated comparison; neither step requires a client laptop.
+
 For a short CPU-allocation comparison, run
 `python slurm/benchmark_ambi_training_cpu.py --output /absolute/scratch/directory`
 inside one Slurm allocation with a GPU, eight physical CPU cores
@@ -337,6 +366,21 @@ launchers reject that label and any quota selection other than exactly
 shown above, so the checked quota row and the checkpoint filesystem cannot
 diverge. Oscar scratch and job-local storage are not substitutes for the
 durable checkpoint root.
+
+The three J/H scaling runs dated 2026-10-28 have an explicitly approved,
+campaign-specific scratch option because their retained snapshots exceed home
+quota headroom. Set `AMBI_RETURN_STORAGE=scratch-jh-scaling` on
+`slurm/run_ambi_reward_training_oscar.sbatch` for these recipes only. Their
+lineages must be under
+`/oscar/scratch/rgao48/ambi/jh-scaling-training/20261028/lineages`, named
+`h3-j12-k3-seed55`, `h4-j10-k4-seed55`, or `h5-j10-k5-seed55` to match the
+selected manifest. The dedicated launcher checks the `rgao48` `/oscar/scratch`
+quota row, rejects symlinks, validates the bound GPU gate and clean source,
+and preserves episode-boundary exact resume and verified requeue. The first
+launch must create a new lineage; Slurm restarts require its verified handoff.
+All snapshots and resume generations for these three runs stay in scratch;
+scratch remains transient storage and important results should be archived.
+Omitting this option preserves the strict home-storage behavior above.
 
 The compact AMBI branch-count and imagination-horizon suite lives under
 `configs/ambi/`. Each algorithm file has one matching runnable
