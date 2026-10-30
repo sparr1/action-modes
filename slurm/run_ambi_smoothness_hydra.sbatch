@@ -50,6 +50,10 @@ export TORCHINDUCTOR_CACHE_DIR="$AMBI_CACHE_ROOT/inductor" TRITON_CACHE_DIR="$AM
 export XDG_CACHE_HOME="$AMBI_CACHE_ROOT/cache" TMPDIR="$AMBI_CACHE_ROOT/tmp"
 export WANDB_DISABLE_CODE=true WANDB_DIR="$AMBI_CACHE_ROOT/wandb" WANDB_CACHE_DIR="$AMBI_CACHE_ROOT/cache"
 export WANDB_DATA_DIR="$AMBI_CACHE_ROOT/data" WANDB_ARTIFACT_DIR="$AMBI_CACHE_ROOT/artifacts"
+# The pinned SDK's legacy backend fails server-settings introspection here.
+# Match the established Hydra launchers' core backend and bounded startup waits.
+export WANDB__REQUIRE_CORE=true
+export WANDB_INIT_TIMEOUT=90 WANDB_HTTP_TIMEOUT=30 WANDB__SERVICE_WAIT=60
 export WANDB_MODE=disabled
 if [[ "$AMBI_MODE" == train ]]; then
   : "${AMBI_TRAIN_WALLTIME_SECONDS:?Set the measured production allocation in seconds.}"

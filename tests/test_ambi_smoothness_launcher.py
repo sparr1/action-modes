@@ -120,3 +120,11 @@ def test_handoff_is_75_and_never_auto_requeues(tmp_path, monkeypatch):
     for required in ("--no-requeue", "--nodelist=gpu2501", "--constraint=l40s", "--gres=gpu:nvidia_l40s:1"):
         assert required in script
     assert "scontrol requeue" not in script
+
+
+def test_hydra_opts_into_wandb_core_before_starting_the_job():
+    script = (launch.ROOT / "slurm/run_ambi_smoothness_hydra.sbatch").read_text()
+    for setting in ("WANDB__REQUIRE_CORE=true", "WANDB_INIT_TIMEOUT=90",
+                    "WANDB_HTTP_TIMEOUT=30", "WANDB__SERVICE_WAIT=60"):
+        assert setting in script
+        assert script.index(setting) < script.index("exec srun")

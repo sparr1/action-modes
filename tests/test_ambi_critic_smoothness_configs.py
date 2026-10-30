@@ -17,8 +17,8 @@ from utils.resume_identity import (
 
 ROOT = Path(__file__).resolve().parents[1] / "configs/dmcontrol"
 BASELINES = {
-    "return_only": ("de37a4eec8094c67a2a691db04e47a2b", "outer_pave"),
-    "alpha_carry": ("774f452fdda045aaa835dec670cb3584", "aux_return_pave"),
+    "return_only": ("de37a4eec8094c67a2a691db04e47a2b", ("outer_pave",)),
+    "alpha_carry": ("774f452fdda045aaa835dec670cb3584", ("outer_pave", "aux_return_pave")),
 }
 TERMS = ("mpr", "action_smoothness")
 CELLS = tuple(product(BASELINES, TERMS))
@@ -60,14 +60,14 @@ def _without_labels(config):
 def test_only_accepted_scientific_changes_from_frozen_source(baseline, term):
     sources = _read(ROOT / "critic_smoothness_sources.json")
     assert set(sources) == {value[0] for value in BASELINES.values()}
-    source_id, prefix = BASELINES[baseline]
+    source_id, prefixes = BASELINES[baseline]
     source = sources[source_id]
     actual, manifest = _cell(baseline, term)
     expected = deepcopy(source["run_params"])
     expected["total_steps"] = 1_000_000
     expected["alg_params"].update({
         **dict.fromkeys(PAVE_COEFFICIENT_KEYS, 0.),
-        f"{prefix}_{term}_coef": .004,
+        **{f"{prefix}_{term}_coef": .004 for prefix in prefixes},
         "outer_pave_batch_size": None,
         "outer_pave_obs_noise_std": .01,
         "outer_pave_action_noise_std": .02,
@@ -80,21 +80,24 @@ def test_only_accepted_scientific_changes_from_frozen_source(baseline, term):
     assert manifest["source_run_id"] == source_id
     assert manifest["source_commit"] == source["commit"]
     assert manifest["regularizer"] == term
-    assert manifest["target_critic"] == prefix
+    assert manifest["target_critic"] == ("both" if len(prefixes) == 2 else prefixes[0])
 
 
 @pytest.mark.parametrize("baseline,term", CELLS)
-def test_selected_return_critic_full_batch_and_coefficient_convention(baseline, term):
-    source_id, prefix = BASELINES[baseline]
+def test_selected_critics_full_batch_and_coefficient_convention(baseline, term):
+    source_id, prefixes = BASELINES[baseline]
     config, _ = _cell(baseline, term)
     params = config["alg_params"]
-    active = f"{prefix}_{term}_coef"
+    active = {f"{prefix}_{term}_coef" for prefix in prefixes}
     assert {key: params[key] for key in PAVE_COEFFICIENT_KEYS} == {
-        key: .004 if key == active else 0. for key in PAVE_COEFFICIENT_KEYS
+        key: .004 if key in active else 0. for key in PAVE_COEFFICIENT_KEYS
     }
-    td_coefficient = params["critic_coef" if prefix == "outer_pave" else "aux_return_critic_coef"]
     assert params["num_q"] == 5
-    assert params[active] * params["num_q"] / td_coefficient == pytest.approx(.2)
+    # Each selected ensemble gets its own .2 coefficient ratio. Selecting both
+    # does not halve the individual strength or combine their gradients first.
+    for prefix in prefixes:
+        td_coefficient = params["critic_coef" if prefix == "outer_pave" else "aux_return_critic_coef"]
+        assert params[f"{prefix}_{term}_coef"] * params["num_q"] / td_coefficient == pytest.approx(.2)
     assert params["outer_pave_batch_size"] is None
     assert params["batch_size"] * params["train_unroll_horizon"] == 768
     assert params["outer_pave_obs_noise_std"] == .01
@@ -112,12 +115,12 @@ def test_selected_return_critic_full_batch_and_coefficient_convention(baseline, 
 
     # Resolve through the real wrapper without allocating networks or rendering.
     resolved = _build_cfg(**params)
-    assert getattr(resolved, active) == .004
+    assert all(getattr(resolved, key) == .004 for key in active)
     assert resolved.outer_pave_batch_size is None
     assert resolved.num_q == 5
     signature = pave_training_signature(resolved)
     assert signature["version"] == (1 if term == "mpr" else 2)
-    assert signature["controls"][active] == .004
+    assert all(signature["controls"][key] == .004 for key in active)
 
 
 @pytest.mark.parametrize("term", TERMS)
@@ -153,12 +156,13 @@ def test_master_and_single_manifests_cover_exactly_four_independent_lineages():
     assert master["trials"] == 1 and "overrides_alg" not in master
     identities, run_names = set(), set()
     for index, (baseline, term) in enumerate(CELLS):
-        source_id, prefix = BASELINES[baseline]
+        source_id, prefixes = BASELINES[baseline]
         config, manifest = _cell(baseline, term)
         name = names[index]
         assert master["cells"][index] == {
             "index": index, "config": name, "baseline": baseline,
-            "regularizer": term, "target_critic": prefix, "source_run_id": source_id,
+            "regularizer": term, "target_critic": "both" if len(prefixes) == 2 else prefixes[0],
+            "source_run_id": source_id,
         }
         assert manifest["configs"] == [name] and manifest["trials"] == 1
         assert "overrides_alg" not in manifest

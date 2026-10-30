@@ -3,7 +3,7 @@
   "source_run_id": "774f452fdda045aaa835dec670cb3584",
   "source_commit": "7cce39056c886b24cf8a5335299d36d050898b14",
   "regularizer": "mpr",
-  "target_critic": "aux_return_pave",
+  "target_critic": "both",
   "env_params": {
     "task": "humanoid-walk",
     "obs": "state",

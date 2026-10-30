@@ -147,7 +147,7 @@
     "wandb_group": "ambi-critic-smoothness-hydra-20261030",
     "wandb_mode": "online",
     "wandb_project": "ambi",
-    "wandb_run_name": "Alpha carry / aux return | Action smoothness | H3 J10 K3 | seed55",
+    "wandb_run_name": "Alpha carry / aux return | Action smoothness | both critics | H3 J10 K3 | seed55",
     "wandb_step_every": 1000,
     "wandb_tags": [
       "ambi",
@@ -165,12 +165,13 @@
       "coefficient-0p004",
       "alpha_carry",
       "action_smoothness",
-      "source-774f452fdda045aaa835dec670cb3584"
+      "source-774f452fdda045aaa835dec670cb3584",
+      "regularize-both-critics"
     ],
     "outer_pave_mpr_coef": 0.0,
     "outer_pave_vfc_coef": 0.0,
     "outer_pave_curvature_coef": 0.0,
-    "outer_pave_action_smoothness_coef": 0.0,
+    "outer_pave_action_smoothness_coef": 0.004,
     "aux_return_pave_mpr_coef": 0.0,
     "aux_return_pave_vfc_coef": 0.0,
     "aux_return_pave_curvature_coef": 0.0,

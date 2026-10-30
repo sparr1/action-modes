@@ -7,7 +7,7 @@ has an MPR-only cell and an action-gradient-consistency-only cell.
 | Baseline | Reference W&B run | Critic receiving the penalty | Inner temperature lifetime |
 |---|---|---|---|
 | Single return critic | `de37a4eec8094c67a2a691db04e47a2b` | Primary reward-return critic | Reset from outer temperature each solve |
-| Detached auxiliary return critic | `774f452fdda045aaa835dec670cb3584` | Auxiliary reward-return critic | Temperature and Adam state persist across solves |
+| Detached auxiliary return critic | `774f452fdda045aaa835dec670cb3584` | Both primary soft critic and auxiliary reward-return critic | Temperature and Adam state persist across solves |
 
 Both retain H3/J10/K3, C16/A4/N128/B256, five distributional critic heads,
 stochastic training actions, target entropy -10.5, 2,500 warmup decisions,
@@ -35,7 +35,9 @@ the same latent state and two actions: the recorded replay action and that
 action plus Gaussian noise with per-coordinate standard deviation 0.02,
 clamped to [-1,1]. Both action inputs are independent autograd leaves.
 
-Each active term has coefficient 0.004; all other PAVE terms are zero. TD's
+Each active term has coefficient 0.004 per selected critic; all other PAVE terms
+are zero. The auxiliary baseline regularizes both its soft primary critic and
+its auxiliary return critic. TD's
 coefficient is 0.1 and its head reduction is a mean; the regularizer sums its
 five per-head losses. Therefore the coefficient ratio per head is
 `0.004 / (0.1 / 5) = 0.2`. This is a coefficient convention, not a measured
@@ -44,7 +46,8 @@ temporal weighting; regularizer rows are weighted uniformly.
 
 Use every transition in the TD replay sample: 256 sequences times 3 steps,
 or 768 rows (`outer_pave_batch_size=null`). Gradients from these extra losses
-update only the selected outer critic. Observation encodings and replay
+update only the selected outer critic parameters (both ensembles for the
+auxiliary baseline). Observation encodings and replay
 actions are detached. Losses use decoded scalar Q and are not normalized by
 noise variance or Q scale. They run on every outer update, including
 pretraining; inner losses are unchanged.

@@ -40,7 +40,7 @@
       "config": "ambi_smoothness_alpha_carry_mpr",
       "baseline": "alpha_carry",
       "regularizer": "mpr",
-      "target_critic": "aux_return_pave",
+      "target_critic": "both",
       "source_run_id": "774f452fdda045aaa835dec670cb3584"
     },
     {
@@ -48,7 +48,7 @@
       "config": "ambi_smoothness_alpha_carry_action_smoothness",
       "baseline": "alpha_carry",
       "regularizer": "action_smoothness",
-      "target_critic": "aux_return_pave",
+      "target_critic": "both",
       "source_run_id": "774f452fdda045aaa835dec670cb3584"
     }
   ]
