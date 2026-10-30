@@ -1,0 +1,55 @@
+{
+  "study_type": "single_seed_exploratory_critic_smoothness",
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_smoothness_return_only_mpr",
+    "ambi_smoothness_return_only_action_smoothness",
+    "ambi_smoothness_alpha_carry_mpr",
+    "ambi_smoothness_alpha_carry_action_smoothness"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "cells": [
+    {
+      "index": 0,
+      "config": "ambi_smoothness_return_only_mpr",
+      "baseline": "return_only",
+      "regularizer": "mpr",
+      "target_critic": "outer_pave",
+      "source_run_id": "de37a4eec8094c67a2a691db04e47a2b"
+    },
+    {
+      "index": 1,
+      "config": "ambi_smoothness_return_only_action_smoothness",
+      "baseline": "return_only",
+      "regularizer": "action_smoothness",
+      "target_critic": "outer_pave",
+      "source_run_id": "de37a4eec8094c67a2a691db04e47a2b"
+    },
+    {
+      "index": 2,
+      "config": "ambi_smoothness_alpha_carry_mpr",
+      "baseline": "alpha_carry",
+      "regularizer": "mpr",
+      "target_critic": "aux_return_pave",
+      "source_run_id": "774f452fdda045aaa835dec670cb3584"
+    },
+    {
+      "index": 3,
+      "config": "ambi_smoothness_alpha_carry_action_smoothness",
+      "baseline": "alpha_carry",
+      "regularizer": "action_smoothness",
+      "target_critic": "aux_return_pave",
+      "source_run_id": "774f452fdda045aaa835dec670cb3584"
+    }
+  ]
+}

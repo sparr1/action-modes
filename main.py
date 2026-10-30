@@ -95,6 +95,55 @@ def _checkpoint_replay_kwargs(model, checkpoint_config):
     return {"checkpoint_replay": True}
 
 
+def _validate_resume_model_snapshot_root(root, *, lineage_dir, repo_root):
+    """Keep an optional operational artifact bank separate from owned state."""
+    if root is None:
+        return None
+    root = Path(root)
+    if not root.is_absolute():
+        raise ValueError("--resume-model-snapshot-root must be an absolute directory.")
+    root = root.resolve()
+    for label, protected in (("source checkout", repo_root), ("lineage", lineage_dir)):
+        protected = Path(protected).resolve()
+        if root.is_relative_to(protected) or protected.is_relative_to(root):
+            raise ValueError(
+                f"--resume-model-snapshot-root must not overlap the {label}."
+            )
+    if root.exists() and not root.is_dir():
+        raise ValueError("--resume-model-snapshot-root must be a directory.")
+    return root
+
+
+def _prepare_resume_model_snapshot_directory(session, *, external_root=None):
+    """Reserve a fresh segment bank; the exact-resume generation stays local.
+
+    The CLI destination is operational and never enters scientific identity.
+    The lineage pointer makes externally stored periodic models/replay visible
+    without relocating the durable latest/predecessor resume generations.
+    """
+    if external_root is None:
+        snapshot_dir = session.segment_dir / "model_snapshots"
+        snapshot_dir.mkdir()
+        return snapshot_dir
+    root = Path(external_root)
+    root.mkdir(parents=True, exist_ok=True)
+    segment_id = session.segment_dir.name
+    segment_root = root / segment_id
+    # Reserve the whole segment atomically, including against an existing
+    # symlink or a partially populated bank; never reuse or overwrite it.
+    segment_root.mkdir(exist_ok=False)
+    snapshot_dir = segment_root / "model_snapshots"
+    snapshot_dir.mkdir()
+    with (session.segment_dir / "model_snapshots.json").open("x") as stream:
+        json.dump({
+            "schema_version": 1,
+            "segment_id": segment_id,
+            "path": str(snapshot_dir),
+        }, stream, indent=2)
+        stream.write("\n")
+    return snapshot_dir
+
+
 def _remove_saved_checkpoint(checkpoint_path):
     """Remove superseded cross-trial artifacts and their matching sidecars."""
 
@@ -794,6 +843,10 @@ def _run_resumable_experiment(
         raise ValueError(
             "Training resume does not accept nonzero algorithm/trial start indices."
         )
+    snapshot_root = _validate_resume_model_snapshot_root(
+        args.get("resume_model_snapshot_root"),
+        lineage_dir=args["lineage_dir"], repo_root=Path(__file__).resolve().parent,
+    )
     run_params = copy.deepcopy(runtime_params[0])
     requested_wandb_mode = args.get("resume_wandb_mode")
     if requested_wandb_mode is not None:
@@ -900,8 +953,9 @@ def _run_resumable_experiment(
                 raise ValueError(
                     f"Algorithm {model_run_params['alg']!r} lacks composable model snapshots."
                 )
-            snapshot_dir = session.segment_dir / "model_snapshots"
-            snapshot_dir.mkdir()
+            snapshot_dir = _prepare_resume_model_snapshot_directory(
+                session, external_root=snapshot_root,
+            )
             model.set_checkpointing(
                 save_freq=checkpoint_config.every,
                 save_path=str(snapshot_dir),
@@ -983,6 +1037,10 @@ def main():
     parser.add_argument('--resume-mode', choices=('new', 'required'))
     parser.add_argument('--resume-generation', help='explicit committed rollback generation')
     parser.add_argument('--resume-checkpoint-minutes', default=60.0, type=float)
+    parser.add_argument(
+        '--resume-model-snapshot-root',
+        help='absolute external root for per-segment portable model/replay banks; exact resume only',
+    )
     parser.add_argument('--drain-after-seconds', type=float)
     parser.add_argument(
         '--resume-wandb-mode',
@@ -990,6 +1048,13 @@ def main():
         help='explicit W&B mode for exact resume (Oscar requires online)',
     )
     args = vars(parser.parse_args())
+    if args["resume_model_snapshot_root"] is not None:
+        if args["resume_mode"] is None or args["lineage_dir"] is None:
+            raise ValueError("--resume-model-snapshot-root requires exact resume mode and --lineage-dir.")
+        args["resume_model_snapshot_root"] = _validate_resume_model_snapshot_root(
+            args["resume_model_snapshot_root"], lineage_dir=args["lineage_dir"],
+            repo_root=Path(__file__).resolve().parent,
+        )
     print(args)
     config, alg_dir, log_dir, num_runs, alg_ind, trial_ind = args['run'], args['alg_dir'], args['log_dir'], args['num_runs'], args['alg_index'], args['trial_index']
 

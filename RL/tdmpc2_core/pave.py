@@ -3,16 +3,19 @@
 Reference: https://github.com/AIRLABkhu/PAVE (SAC implementation). The
 regularizers sum independent critic heads, use recorded actions in all three
 state views, and leave the ordinary Bellman objective and Q decoder intact.
+AMBI additionally supports action-gradient consistency under action noise.
 """
 
 from contextlib import contextmanager
 
 import torch
 
-from .common.layers import Ensemble
+from .common import ensemble_vmap
+from .common.layers import Ensemble, NormedLinear
+from .common.q_representation import QRepresentation
 
 
-_TERMS = ("mpr", "vfc", "curvature")
+_TERMS = ("mpr", "vfc", "curvature", "action_smoothness")
 _CRITICS = (("outer_pave", "_Qs"), ("aux_return_pave", "_aux_return_Qs"))
 
 
@@ -60,20 +63,98 @@ def _head_predictions(critic, latents, actions):
     ], dim=0)
 
 
+def _view_batch_spec(critic, decode):
+    """Only fuse known row-independent critics and decoders.
+
+    Custom heads, hooks, forwards or decoders can couple rows or observe call
+    boundaries. Preserve their existing per-view execution, including errors.
+    Check this inside geometry mode, after dropout has been disabled.
+    """
+    if (
+        type(critic) is Ensemble
+        and getattr(critic.forward_heads_eager, "__func__", None) is Ensemble.forward_heads_eager
+        and type(getattr(decode, "__self__", None)) is QRepresentation
+        and getattr(decode, "__func__", None) is QRepresentation.decode
+    ):
+        return ensemble_vmap.grouped_vmap_spec((critic,), NormedLinear)
+    return None
+
+
+def _view_gradients(critic, decode, views, action, *, curvature, noisy_action=None):
+    """Share parameter stacks without making curvature traverse unused views.
+
+    When supplied, ``noisy_action`` belongs to the last view only; preceding
+    views keep the recorded action. Each gradient uses its own coordinates.
+    """
+    spec = _view_batch_spec(critic, decode) if len(views) > 1 else None
+    parameters = ensemble_vmap.stack_parameters(critic.modules_list) if spec is not None else None
+
+    def gradient(latents, actions):
+        latents = latents.detach()
+        if spec is None:
+            predictions = _head_predictions(critic, latents, actions)
+        else:
+            expanded = latents.unsqueeze(0).expand(len(critic), *latents.shape)
+            predictions = ensemble_vmap._tensor_mlp_vmap(
+                parameters, torch.cat((expanded, actions), dim=-1), spec, True,
+            )
+        values = decode(predictions)
+        if values.shape != (*actions.shape[:-1], 1):
+            raise ValueError("PAVE requires a single decoded scalar per critic head and row.")
+        return _action_gradient(values, actions)
+
+    if spec is None:
+        # Preserve custom call boundaries and shared action coordinates exactly.
+        actions = action.detach().unsqueeze(0).expand(len(critic), -1, -1).clone()
+        actions.requires_grad_(True)
+        view_actions = [actions] * len(views)
+        if noisy_action is not None:
+            # Differentiate Q at the perturbed point, never through the noise
+            # or clamp operation that produced it (especially at +/-1).
+            perturbed = noisy_action.detach().unsqueeze(0).expand(len(critic), -1, -1).clone()
+            view_actions[-1] = perturbed.requires_grad_(True)
+        return tuple(gradient(view, coordinates) for view, coordinates in zip(views, view_actions)), actions
+
+    # With curvature, keep the current-state graph small. Merely slicing its
+    # gradient out of a fully fused forward still makes higher derivatives
+    # traverse all views (including zero cotangents), wasting compute/memory.
+    view_actions = [action] * len(views)
+    if noisy_action is not None:
+        view_actions[-1] = noisy_action
+    pairs = list(zip(views, view_actions))
+    groups = (pairs[:1], pairs[1:]) if curvature else (pairs,)
+    gradients = []
+    current_actions = None
+    for group in groups:
+        # Every head, view and transition gets independent coordinates. Never
+        # differentiate expanded aliases of the same underlying action leaf.
+        actions = torch.cat([coordinates.detach() for _, coordinates in group], dim=0)
+        actions = actions.unsqueeze(0).repeat(len(critic), 1, 1)
+        actions.requires_grad_(True)
+        if current_actions is None:
+            current_actions = actions
+        latents = torch.cat([view.detach() for view, _ in group], dim=0)
+        gradients.extend(gradient(latents, actions).split(action.shape[0], dim=1))
+    return tuple(gradients), current_actions
+
+
 def critic_pave_loss(
-    critic, decode, z, action, *, noisy_z=None, next_z=None, probe=None,
+    critic, decode, z, action, *, noisy_z=None, next_z=None, probe=None, noisy_action=None,
     mpr_coef=0.0, vfc_coef=0.0, curvature_coef=0.0, curvature_margin=1.0,
-    return_components=False,
+    action_smoothness_coef=0.0, return_components=False,
 ):
     """Return weighted loss and detached metrics for one independent ensemble.
 
     Inputs are flat transition batches. ``decode`` receives every head at once
-    and must return [heads, rows, 1]. Separate action coordinates for each head
-    let a single autograd call compute all head gradients without cancellation.
+    and must return [heads, rows, 1]. Supported dense vmap critics concatenate
+    state/action views along the row axis, stacking parameters only once. Curvature
+    keeps a separate current-state graph; without it, all views share a forward.
+    Independent action coordinates preserve each head/view's action gradient.
     Encoder graphs and replay actions are deliberately detached here as well as
     at the outer call site. Only the selected online critic is differentiated.
     """
-    coefficients = dict(mpr=mpr_coef, vfc=vfc_coef, curvature=curvature_coef)
+    coefficients = dict(mpr=mpr_coef, vfc=vfc_coef, curvature=curvature_coef,
+                        action_smoothness=action_smoothness_coef)
     if not any(coefficient > 0.0 for coefficient in coefficients.values()):
         result = (action.new_zeros(()), {})
         return (*result, {}) if return_components else result
@@ -83,34 +164,39 @@ def critic_pave_loss(
         raise ValueError("PAVE VFC requires successor-observation latents.")
     if curvature_coef > 0.0 and (probe is None or probe.shape != action.shape):
         raise ValueError("PAVE curvature requires one action-shaped probe per transition.")
-
-    actions = action.detach().unsqueeze(0).expand(len(critic), -1, -1).clone()
-    actions.requires_grad_(True)
-
-    def gradient(latents):
-        latents = latents.detach()
-        predictions = _head_predictions(critic, latents, actions)
-        values = decode(predictions)
-        if values.shape != (*actions.shape[:-1], 1):
-            raise ValueError("PAVE requires a single decoded scalar per critic head and row.")
-        return _action_gradient(values, actions)
+    if action_smoothness_coef > 0.0 and (noisy_action is None or noisy_action.shape != action.shape):
+        raise ValueError("Action smoothness requires one perturbed action per transition.")
 
     losses = {}
     metrics = {}
     with _geometry_mode(critic):
-        original = gradient(z)
+        views = [z]
+        if mpr_coef > 0.0:
+            views.append(noisy_z)
+        if vfc_coef > 0.0:
+            views.append(next_z)
+        if action_smoothness_coef > 0.0:
+            views.append(z)
+        gradients, actions = _view_gradients(
+            critic, decode, views, action, curvature=curvature_coef > 0.0,
+            noisy_action=noisy_action if action_smoothness_coef > 0.0 else None,
+        )
+        original, *other_gradients = gradients
+        other_gradients = iter(other_gradients)
         if return_components:
             metrics["action_gradient_rms"] = original.detach().square().mean().sqrt()
         if mpr_coef > 0.0:
-            losses["mpr"] = (original - gradient(noisy_z)).square().mean(dim=(1, 2)).sum()
+            losses["mpr"] = (original - next(other_gradients)).square().mean(dim=(1, 2)).sum()
         if vfc_coef > 0.0:
-            losses["vfc"] = (original - gradient(next_z)).square().mean(dim=(1, 2)).sum()
+            losses["vfc"] = (original - next(other_gradients)).square().mean(dim=(1, 2)).sum()
         if curvature_coef > 0.0:
             vectors = probe.detach().unsqueeze(0)
             hvp = _action_gradient((original * vectors).sum(), actions)
             margin_error = (hvp * vectors).sum(dim=-1) + curvature_margin
             losses["curvature"] = margin_error.relu().mean(dim=1).sum()
             metrics["curvature_violation_fraction"] = (margin_error.detach() > 0).float().mean()
+        if action_smoothness_coef > 0.0:
+            losses["action_smoothness"] = (original - next(other_gradients)).square().mean(dim=(1, 2)).sum()
 
     total = action.new_zeros(())
     for term, loss in losses.items():
@@ -125,6 +211,7 @@ def critic_pave_loss(
 def prepare_pave_inputs(
     model, obs, action, *, seed, update_number, batch_size=64,
     obs_noise_std=0.01, needs_noise=True, needs_next=True, needs_probe=True,
+    action_noise_std=0.02, needs_action_noise=False,
 ):
     """Prepare one shared geometry sample using the training RNG convention.
 
@@ -158,7 +245,16 @@ def prepare_pave_inputs(
             .to(actions.dtype).mul_(2).sub_(1)
             if needs_probe else None
         )
-    return dict(z=z, action=actions, noisy_z=noisy_z, next_z=next_z, probe=probe)
+        noisy_action = None
+        if needs_action_noise:
+            # Draw last so enabling this extension preserves the existing
+            # observation noise and curvature probes on the same sample.
+            noise = torch.randn(
+                actions.shape, dtype=actions.dtype, device=actions.device, generator=generator,
+            ) * float(action_noise_std)
+            noisy_action = (actions + noise).clamp(-1., 1.)
+    return dict(z=z, action=actions, noisy_z=noisy_z, next_z=next_z, probe=probe,
+                noisy_action=noisy_action)
 
 
 def outer_pave_loss(model, obs, action, cfg, update_number):
@@ -184,11 +280,14 @@ def outer_pave_loss(model, obs, action, cfg, update_number):
     needs_noise = any(coefficients["mpr_coef"] > 0.0 for _, _, coefficients in selected)
     needs_next = any(coefficients["vfc_coef"] > 0.0 for _, _, coefficients in selected)
     needs_probe = any(coefficients["curvature_coef"] > 0.0 for _, _, coefficients in selected)
+    needs_action_noise = any(coefficients["action_smoothness_coef"] > 0.0 for _, _, coefficients in selected)
     inputs = prepare_pave_inputs(
         model, obs, action, seed=cfg.seed, update_number=update_number,
         batch_size=getattr(cfg, "outer_pave_batch_size", 64),
         obs_noise_std=getattr(cfg, "outer_pave_obs_noise_std", 0.01),
+        action_noise_std=getattr(cfg, "outer_pave_action_noise_std", 0.02),
         needs_noise=needs_noise, needs_next=needs_next, needs_probe=needs_probe,
+        needs_action_noise=needs_action_noise,
     )
 
     total = action.new_zeros(())
@@ -197,6 +296,7 @@ def outer_pave_loss(model, obs, action, cfg, update_number):
         loss, critic_metrics = critic_pave_loss(
             critic, model.q_backend.decode, inputs["z"], inputs["action"],
             noisy_z=inputs["noisy_z"], next_z=inputs["next_z"], probe=inputs["probe"],
+            noisy_action=inputs["noisy_action"],
             curvature_margin=float(getattr(cfg, "outer_pave_curvature_margin", 1.0)),
             **coefficients,
         )

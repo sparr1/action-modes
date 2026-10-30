@@ -1,0 +1,22 @@
+{
+  "study_type": "single_seed_exploratory_critic_smoothness",
+  "source_run_id": "de37a4eec8094c67a2a691db04e47a2b",
+  "source_commit": "900a9ece85d5b97f7998db05a19a913044c33d93",
+  "regularizer": "mpr",
+  "target_critic": "outer_pave",
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_smoothness_return_only_mpr"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}
