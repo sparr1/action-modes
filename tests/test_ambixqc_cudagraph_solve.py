@@ -1,6 +1,7 @@
 """Verify staged solve RNG, fresh resets and actual one-launch CUDA replay."""
 
-from copy import deepcopy
+from contextlib import contextmanager
+import json
 import importlib.util
 import os
 from pathlib import Path
@@ -94,9 +95,14 @@ def test_capture_rejects_unsupported_semantics():
         model.env.close()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or os.getenv("AMBI_RUN_XQC_SOLVE_CUDA_GATE") != "1",
-                    reason="Production-shape graph gate requires scheduled CUDA")
-def test_production_j8_compiled_capture_matches_and_launches_once():
+cuda_gate = pytest.mark.skipif(
+    not torch.cuda.is_available() or os.getenv("AMBI_RUN_XQC_SOLVE_CUDA_GATE") != "1",
+    reason="Production-shape graph gate requires scheduled CUDA",
+)
+
+
+@contextmanager
+def production_pair(*, capture):
     import gymnasium as gym
     import domains  # noqa: F401
     from RL.AMBIXQC import AMBIXQC
@@ -106,77 +112,120 @@ def test_production_j8_compiled_capture_matches_and_launches_once():
     spec.loader.exec_module(timing)
     run, manifest = timing.recipe("j8", True, 21, 108, 3)
     torch.set_num_threads(1)
-    # CUDA categorical projection/reduction order can diverge even between
-    # identical reference solves. Use deterministic kernels only for this
-    # numerical gate; the separately launched timing process keeps defaults.
-    deterministic = torch.are_deterministic_algorithms_enabled()
+    torch._dynamo.reset()
     models = []
     try:
-        torch.use_deterministic_algorithms(True)
-        for name in ("reference", "captured"):
+        for name in ("reference", "candidate"):
             env = gym.make(run["env"], **manifest["env_params"])
             models.append(AMBIXQC(name, env, run["alg_params"], run, manifest))
-        reference, graphed = models
-        graphed.agent.load_state_dict(reference.agent.state_dict())
-        engine = capture_module.CapturedXQCSolve(graphed.agent)
-        graphed.agent.inner_engine = engine
+        reference, candidate = models
+        candidate.agent.load_state_dict(reference.agent.state_dict())
+        engine = capture_module.CapturedXQCSolve(candidate.agent, capture=capture)
+        candidate.agent.inner_engine = engine
         observation, _ = reference.env.reset(seed=55)
-        obs = reference._obs_to_tensor(observation)
+        yield reference, candidate, engine, reference._obs_to_tensor(observation), timing
+    finally:
+        for model in models:
+            model.flush_checkpoints()
+            model.agent.inner_engine.clear_all()
+            model.env.close()
+
+
+def update_matching_priors(reference, candidate):
+    batch = tuple(t.to(reference.agent.device) for t in _batch(reference.agent))
+    reference.agent._update(*batch)
+    candidate.agent._update(*batch)
+    # Isolate inner-solve parity from nondeterministic outer reductions. Copy
+    # in place, preserving every address already used by the captured graph.
+    candidate.agent.load_state_dict(reference.agent.state_dict())
+
+
+def assert_solve_invariants(reference, candidate, engine, outer, cpu_rng, cuda_rng, timing):
+    assert _tree_equal(outer, candidate.agent.frozen_outer_state())
+    assert _tree_equal(reference.agent.inner_engine.rng.training_state_dict(), engine.rng.training_state_dict())
+    assert torch.equal(cpu_rng, torch.get_rng_state())
+    assert torch.equal(cuda_rng, torch.cuda.get_rng_state())
+    assert [candidate.agent.last_inner_metrics[k] for k in timing.WORK_KEYS] == [128, 32, 32, 3072]
+
+
+@cuda_gate
+def test_production_j8_staging_matches_exactly_with_deterministic_kernels():
+    # PyTorch 2.3's deterministic scatter fallback synchronizes and cannot be
+    # captured. It can still prove exact RNG/input/reset equivalence of the
+    # full staged body, independently of normal-kernel numerical variation.
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        with production_pair(capture=False) as (reference, candidate, engine, obs, timing):
+            for index in range(2):
+                if index:
+                    update_matching_priors(reference, candidate)
+                outer = candidate.agent.frozen_outer_state()
+                cpu_rng, cuda_rng = torch.get_rng_state().clone(), torch.cuda.get_rng_state().clone()
+                expected = reference.agent.act(obs + index * 0.01, collect_diagnostics=False)
+                actual = candidate.agent.act(obs + index * 0.01, collect_diagnostics=False)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                compare_state(reference.agent.inner_engine._workspace_pool.controller.state_dict(),
+                              engine._workspace_pool.controller.state_dict(), atol=0, rtol=0)
+                assert_solve_invariants(reference, candidate, engine, outer, cpu_rng, cuda_rng, timing)
+            print("PRODUCTION_STAGED_EXACT_GATE_PASSED", flush=True)
+    finally:
+        torch.use_deterministic_algorithms(deterministic)
+
+
+def compare_reference_envelope(actual, samples, name):
+    """Bound capture error by measured reference repeat variation, per tensor.
+
+    Keep the original 2e-5/2e-4 floor. For nondeterministic tensors allow three
+    observed reference ranges; do not replace all state tolerances with one
+    permissive bound from a noisy BatchNorm bias. Integer buffers stay exact.
+    """
+    if not actual.is_floating_point():
+        for sample in samples:
+            torch.testing.assert_close(actual.cpu(), sample, atol=0, rtol=0)
+        return {"spread": 0.0, "error": 0.0}
+    stack = torch.stack(samples)
+    center = stack.mean(0)
+    spread = float((stack.max(0).values - stack.min(0).values).abs().max())
+    error = float((actual.cpu() - center).abs().max())
+    torch.testing.assert_close(actual.cpu(), center, atol=2e-5 + 3 * spread, rtol=2e-4,
+                               msg=lambda msg: f"{name}: reference spread={spread}, capture error={error}: {msg}")
+    return {"spread": spread, "error": error}
+
+
+@cuda_gate
+def test_production_j8_compiled_capture_matches_and_launches_once():
+    assert not torch.are_deterministic_algorithms_enabled()
+    with production_pair(capture=True) as (reference, candidate, engine, obs, timing):
         for index in range(2):
             if index:
-                batch = tuple(t.to(reference.agent.device) for t in _batch(reference.agent))
-                reference.agent._update(*batch)
-                graphed.agent._update(*batch)
-            outer = graphed.agent.frozen_outer_state()
+                update_matching_priors(reference, candidate)
+            outer = candidate.agent.frozen_outer_state()
             cpu_rng, cuda_rng = torch.get_rng_state().clone(), torch.cuda.get_rng_state().clone()
-            if index == 0:
-                before_reference_rng = reference.agent.inner_engine.rng.training_state_dict()
-            expected = reference.agent.act(obs, collect_diagnostics=False)
-            if index == 0:
-                expected_state = deepcopy(reference.agent.inner_engine._workspace_pool.controller.state_dict())
-                after_reference_rng = reference.agent.inner_engine.rng.training_state_dict()
-                reference.agent.inner_engine.rng.load_training_state_dict(before_reference_rng)
-                repeat = reference.agent.act(obs, collect_diagnostics=False)
-                print("REFERENCE_REPEAT_ACTION_MAX", float((repeat-expected).abs().max()), flush=True)
-                print("REFERENCE_REPEAT_STATE_MAX", max(float((value-reference.agent.inner_engine._workspace_pool.controller.state_dict()[key]).abs().max())
-                      for key,value in expected_state.items() if value.is_floating_point()), flush=True)
-                torch.testing.assert_close(repeat, expected, rtol=2e-4, atol=2e-5)
-                compare_state(expected_state, reference.agent.inner_engine._workspace_pool.controller.state_dict(),
-                              atol=2e-5, rtol=2e-4)
-                reference.agent.inner_engine.rng.load_training_state_dict(after_reference_rng)
-                staged = capture_module.CapturedXQCSolve(graphed.agent, capture=False)
-                graphed.agent.inner_engine = staged
-                staged_action = graphed.agent.act(obs, collect_diagnostics=False)
-                print("STAGED_ACTION_MAX", float((staged_action-expected).abs().max()), flush=True)
-                print("STAGED_STATE_MAX", max(float((value-staged._workspace_pool.controller.state_dict()[key]).abs().max())
-                      for key,value in expected_state.items() if value.is_floating_point()), flush=True)
-                print("STAGED_RNG_EQUAL", _tree_equal(after_reference_rng, staged.rng.training_state_dict()), flush=True)
-                torch.testing.assert_close(staged_action, expected, rtol=2e-4, atol=2e-5)
-                compare_state(expected_state, staged._workspace_pool.controller.state_dict(), atol=2e-5, rtol=2e-4)
-                assert _tree_equal(after_reference_rng, staged.rng.training_state_dict())
-                graphed.agent.inner_engine = engine
-            actual = graphed.agent.act(obs, collect_diagnostics=False)
-            print("CAPTURE_ACTION_MAX", index, float((actual-expected).abs().max()), flush=True)
-            print("CAPTURE_RNG_EQUAL", _tree_equal(reference.agent.inner_engine.rng.training_state_dict(), engine.rng.training_state_dict()), flush=True)
-            torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
-            compare_state(reference.agent.inner_engine._workspace_pool.controller.state_dict(),
-                          engine._workspace_pool.controller.state_dict(), atol=2e-5, rtol=2e-4)
-            assert _tree_equal(outer, graphed.agent.frozen_outer_state())
-            assert _tree_equal(reference.agent.inner_engine.rng.training_state_dict(), engine.rng.training_state_dict())
-            assert torch.equal(cpu_rng, torch.get_rng_state())
-            assert torch.equal(cuda_rng, torch.cuda.get_rng_state())
-            assert [graphed.agent.last_inner_metrics[k] for k in timing.WORK_KEYS] == [128,32,32,3072]
+            original = reference.agent.inner_engine
+            before_rng, before_index = original.rng.training_state_dict(), original.action_index
+            actions, states = [], []
+            for _ in range(4):
+                original.rng.load_training_state_dict(before_rng)
+                original.action_index = before_index
+                actions.append(reference.agent.act(obs + index * 0.01, collect_diagnostics=False))
+                states.append({k: v.detach().cpu().clone()
+                               for k, v in original._workspace_pool.controller.state_dict().items()})
+            actual = candidate.agent.act(obs + index * 0.01, collect_diagnostics=False)
+            action_error = compare_reference_envelope(actual, actions, "action")
+            # Also cap both reference variation and capture action error to
+            # 0.1% of the normalized action range; wide envelopes must fail.
+            assert action_error["spread"] < 0.002 and action_error["error"] < 0.002
+            state_errors = {key: compare_reference_envelope(value, [s[key] for s in states], key)
+                            for key, value in engine._workspace_pool.controller.state_dict().items()}
+            assert_solve_invariants(reference, candidate, engine, outer, cpu_rng, cuda_rng, timing)
+            print("PRODUCTION_CAPTURE_PARITY " + json.dumps(
+                {"solve": index, "reference_repeats": 4, "action": action_error, "state": state_errors}), flush=True)
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                                                 torch.profiler.ProfilerActivity.CUDA]) as prof:
-            graphed.agent.act(obs, collect_diagnostics=False)
+            candidate.agent.act(obs, collect_diagnostics=False)
             torch.cuda.synchronize()
         launches = sum(e.count for e in prof.key_averages() if e.key == "cudaGraphLaunch")
         assert launches == 1
         assert engine.capture_count == 1 and engine.replay_count == 3
         print("PRODUCTION_GRAPH_GATE_PASSED", engine.capture_status, "cudaGraphLaunch", launches, flush=True)
-    finally:
-        torch.use_deterministic_algorithms(deterministic)
-        for model in models:
-            model.flush_checkpoints()
-            model.agent.inner_engine.clear_all()
-            model.env.close()

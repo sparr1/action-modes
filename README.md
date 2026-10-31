@@ -304,9 +304,13 @@ remain outside the graph. Timing includes these costs. W&B is disabled.
 `slurm/run_ambixqc_solve_cudagraph_oscar.sbatch` first runs small and full-J8
 CUDA parity gates, including a profiler assertion of one `cudaGraphLaunch`
 per solve, then compares compiled K3 with and without capture on the same
-GPU/CPU allocation. The full-shape numerical gate enables deterministic CUDA
-kernels and checks a reference repeat and uncaptured staged execution; the
-separate timing process retains the normal kernel settings. Supply the exact tested `XQC_TIMING_SHA`, locked
+GPU/CPU allocation. Full-shape staged execution must match exactly with
+deterministic kernels. PyTorch 2.3's deterministic scatter fallback cannot be
+captured, so normal graph replay is checked against four reference repeats:
+per-tensor tolerances include three measured reference ranges, with a 0.002
+absolute action-error cap. RNG states, work counts and integer buffers stay
+exact. The separate timing process retains normal kernel settings.
+Supply the exact tested `XQC_TIMING_SHA`, locked
 `XQC_TIMING_PYTHON`, and external `XQC_TIMING_RESULTS`, plus external Slurm
 stdout/stderr paths. Direct timing uses
 `tests/benchmarks/ambixqc_j8_training_throughput.py --graph-comparison
