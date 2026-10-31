@@ -1264,15 +1264,15 @@ class InnerXQCEngine:
                     getattr(self.cfg, "inner_critic_target_bn_mode", "batch_no_update") == "running"
                 ),
                 inner_critic_utd=(
-                    torch.as_tensor(float(update_slots), device=self.device)
+                    torch.full((), float(update_slots), device=self.device)
                     / utd_denominator
                 ),
                 inner_actor_utd=(
-                    torch.as_tensor(float(actor_steps), device=self.device)
+                    torch.full((), float(actor_steps), device=self.device)
                     / utd_denominator
                 ),
                 inner_temperature_utd=(
-                    torch.as_tensor(float(temperature_steps), device=self.device)
+                    torch.full((), float(temperature_steps), device=self.device)
                     / utd_denominator
                 ),
                 inner_target_updates=float(target_steps),
