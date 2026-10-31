@@ -890,7 +890,7 @@ class InnerXQCEngine:
             dim=0,
         )
         reward_support = td_math.categorical_support(root_z, cfg)
-        discount = root_z.new_tensor(float(self.agent.discount))
+        discount = root_z.new_full((), float(self.agent.discount))
         region = self._ensure_rollout_compile_region(
             self.state.workspace.controller
         )
@@ -985,8 +985,8 @@ class InnerXQCEngine:
             rewards=raw["reward"],
             next_latents=raw["next_z"],
             bootstrap_mask=1.0 - raw["terminated"],
-            discount=torch.as_tensor(
-                float(self.agent.discount),
+            discount=torch.full(
+                (), float(self.agent.discount),
                 dtype=raw["reward"].dtype,
                 device=self.device,
             ),
@@ -1052,7 +1052,10 @@ class InnerXQCEngine:
             values = [metrics[key] for metrics in history if key in metrics]
             if not values:
                 continue
-            tensors = [torch.as_tensor(value, device=reference.device) for value in values]
+            tensors = [torch.as_tensor(value, device=reference.device)
+                       if torch.is_tensor(value)
+                       else torch.full((), value, device=reference.device)
+                       for value in values]
             result[f"inner_{key}"] = torch.stack(tensors).float().mean()
         return result
 
