@@ -152,6 +152,9 @@ class InnerImprovementEngine(RetraceInnerMixin):
 
     def __init__(self, agent):
         self.agent = agent
+        self._whole_graph_runner = None
+        self._whole_graph_resume = None
+        self._whole_graph_worker = False
         self.cfg = agent.cfg
         self.model = agent.model
         self.device = agent.device
@@ -593,6 +596,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
         return initial_alpha.clamp_min(_INNER_ALPHA_FLOOR)
 
     def clear_all(self):
+        self._whole_graph_runner = None
+        self._whole_graph_resume = None
         self._clear_held_policy(drop_pool=True)
         self.state = InnerWorkspace()
         self._action_pool = InnerWorkspace()
@@ -1110,6 +1115,9 @@ class InnerImprovementEngine(RetraceInnerMixin):
             payload["critic_transfer_spec"] = self._critic_transfer_spec()
         if self._held_policy_spec() is not None:
             payload["held_policy_spec"] = self._held_policy_spec()
+        if getattr(self.cfg, "inner_cuda_graph", False):
+            from .whole_inner_graph import training_graph_state
+            payload["whole_graph"] = training_graph_state(self)
         return payload
 
     def _load_module_candidate(
@@ -1188,6 +1196,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 "workspace",
                 "mppi_prev_mean",
         }
+        from .whole_inner_graph import preflight_training_graph_state
+        graph_candidate = preflight_training_graph_state(self, state.get("whole_graph"))
+        if getattr(self.cfg, "inner_cuda_graph", False):
+            common_keys.add("whole_graph")
         transfer_spec = self._critic_transfer_spec()
         if state.get("critic_transfer_spec") != transfer_spec:
             raise ValueError("Inner Bernoulli transfer specification is incompatible with exact continuation.")
@@ -1587,6 +1599,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         candidate_rng.load_training_state_dict(state["rng"])
         return {
             "state": candidate,
+            "whole_graph": graph_candidate,
             "rng": candidate_rng,
             "action_index": action_index,
             "episode_index": episode_index,
@@ -1601,6 +1614,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
     def _commit_training_state_candidate(self, candidate):
         """Install a candidate returned by strict preflight."""
         self._clear_held_policy(drop_pool=True)
+        self._whole_graph_runner = None
+        self._whole_graph_resume = candidate["whole_graph"]
         self.state = candidate["state"]
         self._action_pool = InnerWorkspace()
         self.rng = candidate["rng"]
@@ -6735,15 +6750,15 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 else 0.0
             ),
             inner_critic_utd=(
-                torch.as_tensor(float(state.critic_steps), device=self.device)
+                torch.full((), float(state.critic_steps), device=self.device)
                 / utd_denominator
             ),
             inner_actor_utd=(
-                torch.as_tensor(float(state.actor_steps), device=self.device)
+                torch.full((), float(state.actor_steps), device=self.device)
                 / utd_denominator
             ),
             inner_temperature_utd=(
-                torch.as_tensor(float(state.temperature_steps), device=self.device)
+                torch.full((), float(state.temperature_steps), device=self.device)
                 / utd_denominator
             ),
             inner_critic_optimizer_steps=float(state.critic_steps),
@@ -6829,20 +6844,20 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 explorer_alpha_final - explorer_alpha_initial
             ).mean(),
             inner_explorer_actor_utd=(
-                torch.as_tensor(
-                    float(state.explorer_actor_steps), device=self.device
+                torch.full(
+                    (), float(state.explorer_actor_steps), device=self.device
                 )
                 / utd_denominator
             ),
             inner_explorer_critic_utd=(
-                torch.as_tensor(
-                    float(state.explorer_critic_steps), device=self.device
+                torch.full(
+                    (), float(state.explorer_critic_steps), device=self.device
                 )
                 / utd_denominator
             ),
             inner_explorer_temperature_utd=(
-                torch.as_tensor(
-                    float(state.explorer_temperature_steps), device=self.device
+                torch.full(
+                    (), float(state.explorer_temperature_steps), device=self.device
                 )
                 / utd_denominator
             ),
@@ -7196,6 +7211,13 @@ class InnerImprovementEngine(RetraceInnerMixin):
         apply_inner_writeback=False,
         trace=None,
     ):
+        if getattr(self.cfg, "inner_cuda_graph", False) and not self._whole_graph_worker:
+            from .whole_inner_graph import validate_training_graph, training_graph_act
+            validate_training_graph(self)
+            if not eval_mode and not collect_diagnostics and trace is None:
+                if return_behavior_policy:
+                    raise ValueError("Training CUDA graph does not support behavior-policy metadata.")
+                return training_graph_act(self, root_z)
         try:
             self.prepare_control(t0=t0, eval_mode=eval_mode)
             result = self._act_with_trace(
@@ -7208,6 +7230,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
             self.abort_control()
             raise
         self._control_prepared = None
+        if getattr(self.cfg, "inner_cuda_graph", False) and not self._whole_graph_worker:
+            result[1]["inner_cuda_graph_used"] = 0.0
         return result
 
     def _act_with_trace(

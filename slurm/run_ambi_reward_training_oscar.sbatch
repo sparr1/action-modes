@@ -43,6 +43,11 @@ export WANDB_CACHE_DIR="$local_root/cache" WANDB_DATA_DIR="$local_root/data" WAN
 if [[ "$mode" == smoke ]]; then
   [[ "$SLURM_CPUS_PER_TASK" == 2 && "${SLURM_RESTART_COUNT:-0}" == 0 ]]
   export WANDB_MODE=disabled
+  if [[ "${AMBI_GRAPH_PARITY:-0}" == 1 ]]; then
+    srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.benchmark_whole_inner_graph \
+      --config configs/dmcontrol/algs/ambi_full_h3_j10_k1_reward_only_graph.json \
+      --steps 2 --repeats 1 --output "$AMBI_RETURN_OUTPUT/graph-parity.json"
+  fi
   exec srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" slurm/ambi_reward_training.py smoke \
     --manifest "$AMBI_RETURN_MANIFEST" --output "$AMBI_RETURN_OUTPUT/gate"
 else

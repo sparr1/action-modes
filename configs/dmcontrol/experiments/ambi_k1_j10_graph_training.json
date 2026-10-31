@@ -1,0 +1,26 @@
+{
+  "study_type": "single_seed_exploratory_full_training_reward_only_primary",
+  "study_note": "Fresh K1 counterpart of W&B ambi/de37a4eec8094c67a2a691db04e47a2b: H3/J10, seed55, reward-only primary critics, no auxiliary critic, C16/A4/N128/B256, automatic inherited alpha, 1 million decisions, effective 500k replay, 25k portable checkpoints and durable resume. Ordinary training solves use one CUDA graph with an isolated CUDA RNG stream (a distinct experimental lineage); scheduled diagnostics use the native engine and its isolated phase streams. Preserve 2500 seed decisions and 2500 pretraining updates. Native sequence is not reproduced.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_full_h3_j10_k1_reward_only_graph"
+  ],
+  "logs": "timestamp",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

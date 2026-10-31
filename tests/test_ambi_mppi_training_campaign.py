@@ -33,10 +33,10 @@ def test_gpu_gate_only_shortens_collection_and_disables_external_logging(index):
     name, original_manifest, original = campaign.recipe(index, campaign.MANIFEST)
     selected, manifest, run, overrides = campaign.smoke_recipe(index, 20, 128)
     expected = deepcopy(original)
-    expected["alg_params"].update(wandb=False, seed_steps=500, pretrain_steps=2, buffer_size=4096)
+    expected["alg_params"].update(wandb=False, wandb_mode="disabled", seed_steps=500, pretrain_steps=2, buffer_size=4096)
     expected.update(total_steps=649, checkpoint_every=649, save_strat="all")
     assert selected == name and run == expected
-    assert overrides == {"wandb": False, "seed_steps": 500, "pretrain_steps": 2, "buffer_size": 4096}
+    assert overrides == {"wandb": False, "wandb_mode": "disabled", "seed_steps": 500, "pretrain_steps": 2, "buffer_size": 4096}
     expected_manifest = deepcopy(original_manifest)
     expected_manifest.update(checkpoint_every=649, save_strat="all", save_trials="none", logs="none")
     assert manifest == expected_manifest

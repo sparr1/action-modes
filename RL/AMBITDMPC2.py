@@ -131,6 +131,7 @@ _AMBI_DEFAULTS = {
     "tau": 0.005,
     "target_update_interval": 1,
     "compile_strict": False,
+    "inner_cuda_graph": False,
     # Observational outer-policy telemetry; opt-in for the SAC prior study.
     "outer_policy_diagnostics": False,
     "outer_policy_diagnostics_early_every": 100,
@@ -2712,6 +2713,8 @@ class AMBITDMPC2(TDMPC2Baseline):
                         f"inner state; {key} must be 'action'."
                     )
         cfg.compile_strict = bool(cfg.compile_strict)
+        if not isinstance(cfg.inner_cuda_graph, bool):
+            raise ValueError("inner_cuda_graph must be a bool.")
 
         cfg.inner_termination_threshold = _finite_float(
             cfg.inner_termination_threshold, "inner_termination_threshold"
@@ -3748,6 +3751,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         }
         action_gauges = {
             "inner_solve_interval",
+            "inner_cuda_graph_used",
             "inner_solve_index",
             "inner_action_age",
             "inner_episode_decision_index",

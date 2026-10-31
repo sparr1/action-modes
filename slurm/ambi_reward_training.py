@@ -34,10 +34,12 @@ MANIFESTS = {
     "mppi": ROOT / "configs/dmcontrol/experiments/ambi_return_only_mppi_training.json",
 }
 J10_MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_return_only_sac_j10_training.json"
+GRAPH_MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_k1_j10_graph_training.json"
 # Approved identities bind J and the held-policy cadence independently of H.
 CAMPAIGNS = {
     MANIFESTS["sac"]: ("ambi_full_h3_j8_k3_reward_only", "sac", 8, 3),
     J10_MANIFEST: ("ambi_full_h3_j10_k3_reward_only", "sac", 10, 3),
+    GRAPH_MANIFEST: ("ambi_full_h3_j10_k1_reward_only_graph", "sac", 10, 1),
     MANIFESTS["mppi"]: ("ambi_full_h3_mppi_reward_only", "mppi", 0, 1),
 }
 
@@ -57,7 +59,11 @@ def validate_campaign(manifest_path):
     assert len(manifest["configs"]) == 1 and manifest["trials"] == 1
     name, _, run = recipe(0, path)
     assert name == expected_name, "Campaign configuration identity changed"
-    assert (run["seed"], run["total_steps"], run["checkpoint_every"], run["save_strat"]) == (55, 500000, 25000, "all")
+    target = 1000000 if path == GRAPH_MANIFEST else 500000
+    assert (run["seed"], run["total_steps"], run["checkpoint_every"], run["save_strat"]) == (55, target, 25000, "all")
+    if path == GRAPH_MANIFEST:
+        assert run["alg_params"]["inner_cuda_graph"] is True
+        assert run["alg_params"]["buffer_size"] == 500000
     assert manifest["env_params"] == {"task": "humanoid-walk", "obs": "state", "render_mode": None}
     # These unchanged defaults are omitted by the older MPPI/SAC recipes.
     # Validate the explicit resolved meaning without modifying the manifest.
@@ -107,7 +113,7 @@ def smoke_recipe(warmup, decisions, manifest_path):
     return _smoke_recipe(0, warmup, decisions, manifest_path)
 
 
-def validate_learner(cfg, agent, *, rounds=8):
+def validate_learner(cfg, agent, *, rounds=8, interval=3):
     assert cfg.compile and cfg.compile_strict and cfg.critic_ensemble_backend == "vmap"
     assert (cfg.model_size, cfg.enc_dim, cfg.mlp_dim, cfg.latent_dim, cfg.num_q) == (5, 256, 512, 512, 5)
     assert (cfg.action_dim, cfg.batch_size, cfg.train_unroll_horizon) == (21, 256, 3)
@@ -129,7 +135,7 @@ def validate_learner(cfg, agent, *, rounds=8):
     else:
         assert cfg.inner_operator == "sac" and rounds in (8, 10)
         assert (cfg.inner_rollout_horizon, cfg.inner_rounds, cfg.inner_rollouts_per_round) == (3, rounds, 128)
-        assert cfg.inner_solve_interval == 3 and cfg.inner_replay_capacity == 3 * 128 * rounds
+        assert cfg.inner_solve_interval == interval and cfg.inner_replay_capacity == 3 * 128 * rounds
         assert (cfg.inner_critic_updates_per_action, cfg.inner_actor_updates_per_action,
                 cfg.inner_temperature_updates_per_action) == (16 * rounds, 4 * rounds, 4 * rounds)
         assert cfg.inner_model_step_budget == 3 * 128 * rounds
@@ -176,7 +182,7 @@ def worker(args):
         learner = AMBITDMPC2(name + "-gpu-gate", env, run["alg_params"], run, manifest)
         cfg, agent = learner.cfg, learner.agent
         rounds = production["alg_params"].get("inner_rounds", 0)
-        validate_learner(cfg, agent, rounds=rounds)
+        validate_learner(cfg, agent, rounds=rounds, interval=production["alg_params"].get("inner_solve_interval", 1))
         learner.buffer.enable_resumable_storage()
         operator, interval = cfg.inner_operator, cfg.inner_solve_interval
         assert args.warmup % interval == args.decisions % interval == 0
@@ -217,6 +223,8 @@ def worker(args):
             seconds = time.perf_counter() - action_started
             timer.after_action(step, seconds)
             assert action.device.type == "cpu" and torch.isfinite(action).all()
+            if getattr(cfg, "inner_cuda_graph", False):
+                assert agent.last_inner_metrics["inner_cuda_graph_used"] == 1.0
             solve = validate_action(agent.last_inner_metrics, operator=operator, decision=decision,
                                     interval=interval, rounds=rounds)
             if solve and operator == "sac":
@@ -267,6 +275,9 @@ def worker(args):
             assert checkpoint.is_file() and Path(str(checkpoint) + ".metadata.json").is_file()
             saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
             assert "aux_return_state" not in saved
+            if getattr(cfg, "inner_cuda_graph", False):
+                from tests.test_training_inner_graph import assert_graph_resume_continuation
+                assert_graph_resume_continuation(agent)
             agent.load(checkpoint)
             for key, value in agent.model.state_dict().items():
                 torch.testing.assert_close(value.cpu(), saved["model"][key], rtol=0, atol=0)
@@ -303,6 +314,7 @@ def worker(args):
                   "mppi_primary_online_mean_pair_no_entropy_verified": bool(terminal_calls),
                   "checkpoint_roundtrip": True, "checkpoint_sidecars": True,
                   "boundary_training_state_roundtrip": True, "full_replay_resume_roundtrip": False,
+                  "graph_resume_continuation": bool(getattr(cfg, "inner_cuda_graph", False)),
                   "checkpoint_bytes": checkpoint_bytes, "replay_storage_device": "cpu",
                   "replay_bytes_per_row": replay_bytes_per_row,
                   "estimated_production_replay_bytes": replay_bytes_per_row * min(production["total_steps"], production["alg_params"]["buffer_size"]),
@@ -339,6 +351,8 @@ def validate_receipt(receipt, campaign_binding, current_runtime, cpus, *, name, 
         if operator == "sac":
             assert row["inner_rounds"] == rounds
             assert row["inner_work_per_solve"] == sac_work(rounds), "Gate inner update dose mismatch"
+        if name == "ambi_full_h3_j10_k1_reward_only_graph":
+            assert row["graph_resume_continuation"] is True
         assert row["compile_fallback"] is False and row["replay_storage_device"] == "cpu"
         assert row["compile_graph_counts"]["before"] == row["compile_graph_counts"]["after"]
         assert row["auxiliary_critic_present"] is False

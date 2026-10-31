@@ -39,7 +39,7 @@ def campaign_names(manifest_path=MANIFEST):
 def smoke_recipe(index, warmup, decisions, manifest_path=MANIFEST):
     name, manifest, run = recipe(index, manifest_path)
     manifest, run = deepcopy(manifest), deepcopy(run)
-    overrides = {"wandb": False, "seed_steps": SEED_STEPS, "pretrain_steps": 2, "buffer_size": 4096}
+    overrides = {"wandb": False, "wandb_mode": "disabled", "seed_steps": SEED_STEPS, "pretrain_steps": 2, "buffer_size": 4096}
     run["alg_params"].update(overrides)
     run["total_steps"] = SEED_STEPS + 1 + warmup + decisions
     # Checkpoint I/O is exercised after the timer's final complete decision.

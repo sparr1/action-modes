@@ -16,10 +16,10 @@ def test_actual_campaigns_validate_and_smoke_preserves_production_shapes(operato
     name, manifest, original = campaign.validate_campaign(path)
     selected, small_manifest, run, overrides = campaign.smoke_recipe(12, 120, path)
     expected = deepcopy(original)
-    expected["alg_params"].update(wandb=False, seed_steps=500, pretrain_steps=2, buffer_size=4096)
+    expected["alg_params"].update(wandb=False, wandb_mode="disabled", seed_steps=500, pretrain_steps=2, buffer_size=4096)
     expected.update(total_steps=633, checkpoint_every=633, save_strat="all")
     assert selected == name and run == expected
-    assert overrides == {"wandb": False, "seed_steps": 500, "pretrain_steps": 2, "buffer_size": 4096}
+    assert overrides == {"wandb": False, "wandb_mode": "disabled", "seed_steps": 500, "pretrain_steps": 2, "buffer_size": 4096}
     expected_manifest = deepcopy(manifest)
     expected_manifest.update(checkpoint_every=633, save_strat="all", save_trials="none", logs="none")
     assert small_manifest == expected_manifest
