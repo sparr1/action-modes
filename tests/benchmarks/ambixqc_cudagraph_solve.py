@@ -101,6 +101,8 @@ class CapturedXQCSolve(InnerXQCEngine):
             raise ValueError("Whole-solve benchmark requires replay without eviction")
         if capture and self.device.type != "cuda":
             raise ValueError("CUDA Graph capture requires a CUDA device")
+        if capture and cfg.xqc_optimizer_backend not in {"auto", "fused"}:
+            raise ValueError("CUDA solve capture requires the production fused optimizer backend")
         self.capture_enabled = capture
         self._scientific_rng = self.rng
         self.rng = _PreparedRNG(self._scientific_rng)

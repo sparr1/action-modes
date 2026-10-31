@@ -23,14 +23,17 @@ def compare_state(a, b, *, atol=1e-6, rtol=1e-5):
         torch.testing.assert_close(a[key], b[key], atol=atol, rtol=rtol, msg=lambda msg: f"{key}: {msg}")
 
 
-@pytest.mark.parametrize("capture", [False, True])
-def test_whole_solve_matches_reference_through_prior_changes(capture):
-    if capture and (not torch.cuda.is_available() or os.getenv("AMBI_RUN_XQC_SOLVE_CUDA_GATE") != "1"):
+@pytest.mark.parametrize("execution", ["cpu", "cuda-staged", "cuda-graph"])
+def test_whole_solve_matches_reference_through_prior_changes(execution):
+    cuda = execution != "cpu"
+    capture = execution == "cuda-graph"
+    if cuda and (not torch.cuda.is_available() or os.getenv("AMBI_RUN_XQC_SOLVE_CUDA_GATE") != "1"):
         pytest.skip("Opt-in CUDA graph gate requires a scheduled CUDA allocation")
-    device = "cuda:0" if capture else "cpu"
+    device = "cuda:0" if cuda else "cpu"
     threads = torch.get_num_threads()
     torch.set_num_threads(1)
-    options = dict(device=device, inner_rounds=2, inner_rollouts_per_round=3,
+    options = dict(device=device, xqc_optimizer_backend="fused" if cuda else "single_tensor",
+                   inner_rounds=2, inner_rollouts_per_round=3,
                    inner_updates_per_round=4, inner_policy_delay=2,
                    inner_batch_size=4, inner_replay_capacity=12)
     reference, graphed = _wrapper(**options), _wrapper(**options)
@@ -46,13 +49,13 @@ def test_whole_solve_matches_reference_through_prior_changes(capture):
             obs = torch.tensor([0.25 + index, -0.75, 0.5])
             outer = graphed.agent.frozen_outer_state()
             global_cpu = torch.get_rng_state().clone()
-            global_cuda = torch.cuda.get_rng_state().clone() if capture else None
+            global_cuda = torch.cuda.get_rng_state().clone() if cuda else None
             expected = reference.agent.act(obs, collect_diagnostics=False)
             actual = graphed.agent.act(obs, collect_diagnostics=False)
             torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
             assert _tree_equal(outer, graphed.agent.frozen_outer_state())
             assert torch.equal(global_cpu, torch.get_rng_state())
-            if capture:
+            if cuda:
                 assert torch.equal(global_cuda, torch.cuda.get_rng_state())
             assert _tree_equal(reference.agent.inner_engine.rng.training_state_dict(), engine.rng.training_state_dict())
             a = reference.agent.inner_engine._workspace_pool
