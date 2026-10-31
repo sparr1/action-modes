@@ -117,8 +117,10 @@ def benchmark(args):
     generator = torch.Generator(device="cpu").manual_seed(1947)
     # Valid SimNorm latents, fixed across every arm and repeated measurement.
     dim = agents["whole_graph"].cfg.latent_dim
-    roots = torch.softmax(torch.randn(4, 1, dim // 4, 4, generator=generator), -1).reshape(4, 1, dim).cuda()
+    group = agents["whole_graph"].cfg.simnorm_dim
+    roots = torch.softmax(torch.randn(4, 1, dim // group, group, generator=generator), -1).reshape(4, 1, dim).cuda()
     outer_before = {name: deepcopy(agent.model.state_dict()) for name, agent in agents.items()}
+    alpha_before = {name: agent.log_ent_coef.detach().clone() for name, agent in agents.items()}
     engine = agents["native_regions"].inner_engine
     disable_phase_timers(engine)
     operations = {"native_regions": lambda root: engine.act(root, collect_diagnostics=False)}
@@ -149,10 +151,13 @@ def benchmark(args):
         states = {}
         outside = torch.cuda.get_rng_state().clone()
         for name, runner in runners.items():
+            expected_outer = deepcopy(agents[name].model.state_dict())
             output = runner(roots[index])
             captured[name] = deepcopy(materialize(agents[name], output))
             states[name] = snapshot(agents[name].inner_engine)
             torch.testing.assert_close(torch.cuda.get_rng_state(), outside, rtol=0, atol=0)
+            assert_tree_close(agents[name].model.state_dict(), expected_outer, rtol=0, atol=0)
+            assert all(p.grad is None for p in agents[name].model.parameters())
         assert_tree_close(captured["graph_ready_eager"], captured["whole_graph"])
         assert_tree_close(states["graph_ready_eager"], states["whole_graph"])
         checks.append({"root": index, "action_state_optimizer_replay_parity": True})
@@ -161,7 +166,7 @@ def benchmark(args):
         agent.model.load_state_dict(outer_before[name])
         if name in runners:
             with torch.no_grad():
-                agent.log_ent_coef.sub_(0.03)
+                agent.log_ent_coef.copy_(alpha_before[name])
     for name in runners:
         runners[name].reset_rng()
     # Both controls must do the complete configured work, with no fallback.

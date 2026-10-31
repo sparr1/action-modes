@@ -6651,15 +6651,15 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 else 0.0
             ),
             inner_critic_utd=(
-                torch.as_tensor(float(state.critic_steps), device=self.device)
+                torch.full((), float(state.critic_steps), device=self.device)
                 / utd_denominator
             ),
             inner_actor_utd=(
-                torch.as_tensor(float(state.actor_steps), device=self.device)
+                torch.full((), float(state.actor_steps), device=self.device)
                 / utd_denominator
             ),
             inner_temperature_utd=(
-                torch.as_tensor(float(state.temperature_steps), device=self.device)
+                torch.full((), float(state.temperature_steps), device=self.device)
                 / utd_denominator
             ),
             inner_critic_optimizer_steps=float(state.critic_steps),
@@ -6745,20 +6745,20 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 explorer_alpha_final - explorer_alpha_initial
             ).mean(),
             inner_explorer_actor_utd=(
-                torch.as_tensor(
-                    float(state.explorer_actor_steps), device=self.device
+                torch.full(
+                    (), float(state.explorer_actor_steps), device=self.device
                 )
                 / utd_denominator
             ),
             inner_explorer_critic_utd=(
-                torch.as_tensor(
-                    float(state.explorer_critic_steps), device=self.device
+                torch.full(
+                    (), float(state.explorer_critic_steps), device=self.device
                 )
                 / utd_denominator
             ),
             inner_explorer_temperature_utd=(
-                torch.as_tensor(
-                    float(state.explorer_temperature_steps), device=self.device
+                torch.full(
+                    (), float(state.explorer_temperature_steps), device=self.device
                 )
                 / utd_denominator
             ),
