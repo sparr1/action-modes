@@ -29,7 +29,7 @@ export TRITON_CACHE_DIR="${SLURM_TMPDIR:-/tmp}/xqc-solve-${SLURM_JOB_ID}/triton"
 export AMBI_RUN_XQC_SOLVE_CUDA_GATE=1
 git rev-parse HEAD HEAD^{tree}
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
-srun --cpu-bind=cores "$XQC_TIMING_PYTHON" -m pytest -q -x -s \
+srun --cpu-bind=cores env CUBLAS_WORKSPACE_CONFIG=:4096:8 "$XQC_TIMING_PYTHON" -m pytest -q -x -s \
     tests/test_ambixqc_cudagraph_solve.py \
     > "$XQC_TIMING_RESULTS/gate-${SLURM_JOB_ID}.log" 2>&1
 srun --cpu-bind=cores "$XQC_TIMING_PYTHON" \

@@ -292,7 +292,7 @@ actor/temperature and critic updates, projections, target updates, action
 execution, and non-diagnostic metrics. It is a benchmark adapter, without a
 production configuration or checkpoint/resume interface. Its supported case
 is state, non-episodic XQC with round updates, main soft critics, frozen real
-reward scale, and replay large enough for the complete solve.
+reward scale, fused CUDA Adam, and replay large enough for the complete solve.
 
 The pinned PyTorch 2.3 runtime cannot capture user-supplied CUDA generators.
 Fresh noise and replay indices are therefore prepared outside the graph with
@@ -304,7 +304,9 @@ remain outside the graph. Timing includes these costs. W&B is disabled.
 `slurm/run_ambixqc_solve_cudagraph_oscar.sbatch` first runs small and full-J8
 CUDA parity gates, including a profiler assertion of one `cudaGraphLaunch`
 per solve, then compares compiled K3 with and without capture on the same
-GPU/CPU allocation. Supply the exact tested `XQC_TIMING_SHA`, locked
+GPU/CPU allocation. The full-shape numerical gate enables deterministic CUDA
+kernels and checks a reference repeat and uncaptured staged execution; the
+separate timing process retains the normal kernel settings. Supply the exact tested `XQC_TIMING_SHA`, locked
 `XQC_TIMING_PYTHON`, and external `XQC_TIMING_RESULTS`, plus external Slurm
 stdout/stderr paths. Direct timing uses
 `tests/benchmarks/ambixqc_j8_training_throughput.py --graph-comparison

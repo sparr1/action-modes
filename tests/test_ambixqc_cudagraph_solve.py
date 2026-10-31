@@ -106,8 +106,13 @@ def test_production_j8_compiled_capture_matches_and_launches_once():
     spec.loader.exec_module(timing)
     run, manifest = timing.recipe("j8", True, 21, 108, 3)
     torch.set_num_threads(1)
+    # CUDA categorical projection/reduction order can diverge even between
+    # identical reference solves. Use deterministic kernels only for this
+    # numerical gate; the separately launched timing process keeps defaults.
+    deterministic = torch.are_deterministic_algorithms_enabled()
     models = []
     try:
+        torch.use_deterministic_algorithms(True)
         for name in ("reference", "captured"):
             env = gym.make(run["env"], **manifest["env_params"])
             models.append(AMBIXQC(name, env, run["alg_params"], run, manifest))
@@ -135,6 +140,9 @@ def test_production_j8_compiled_capture_matches_and_launches_once():
                 print("REFERENCE_REPEAT_ACTION_MAX", float((repeat-expected).abs().max()), flush=True)
                 print("REFERENCE_REPEAT_STATE_MAX", max(float((value-reference.agent.inner_engine._workspace_pool.controller.state_dict()[key]).abs().max())
                       for key,value in expected_state.items() if value.is_floating_point()), flush=True)
+                torch.testing.assert_close(repeat, expected, rtol=2e-4, atol=2e-5)
+                compare_state(expected_state, reference.agent.inner_engine._workspace_pool.controller.state_dict(),
+                              atol=2e-5, rtol=2e-4)
                 reference.agent.inner_engine.rng.load_training_state_dict(after_reference_rng)
                 staged = capture_module.CapturedXQCSolve(graphed.agent, capture=False)
                 graphed.agent.inner_engine = staged
@@ -143,6 +151,9 @@ def test_production_j8_compiled_capture_matches_and_launches_once():
                 print("STAGED_STATE_MAX", max(float((value-staged._workspace_pool.controller.state_dict()[key]).abs().max())
                       for key,value in expected_state.items() if value.is_floating_point()), flush=True)
                 print("STAGED_RNG_EQUAL", _tree_equal(after_reference_rng, staged.rng.training_state_dict()), flush=True)
+                torch.testing.assert_close(staged_action, expected, rtol=2e-4, atol=2e-5)
+                compare_state(expected_state, staged._workspace_pool.controller.state_dict(), atol=2e-5, rtol=2e-4)
+                assert _tree_equal(after_reference_rng, staged.rng.training_state_dict())
                 graphed.agent.inner_engine = engine
             actual = graphed.agent.act(obs, collect_diagnostics=False)
             print("CAPTURE_ACTION_MAX", index, float((actual-expected).abs().max()), flush=True)
@@ -164,6 +175,7 @@ def test_production_j8_compiled_capture_matches_and_launches_once():
         assert engine.capture_count == 1 and engine.replay_count == 3
         print("PRODUCTION_GRAPH_GATE_PASSED", engine.capture_status, "cudaGraphLaunch", launches, flush=True)
     finally:
+        torch.use_deterministic_algorithms(deterministic)
         for model in models:
             model.flush_checkpoints()
             model.agent.inner_engine.clear_all()
