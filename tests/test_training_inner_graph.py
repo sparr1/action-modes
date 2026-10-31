@@ -11,6 +11,7 @@ import torch
 
 from RL.tdmpc2_core.whole_inner_graph import (
     preflight_training_graph_state, training_graph_state, validate_training_graph,
+    training_graph_act,
 )
 from tests.benchmark_whole_inner_graph import assert_tree_close, make_agent
 from utils.resume_identity import scientific_trial_parameters
@@ -78,6 +79,16 @@ def test_graph_checkpoint_requires_complete_compatible_rng_state(graph_engine):
     with pytest.raises(ValueError, match="native"):
         preflight_training_graph_state(graph_engine, saved)
     assert preflight_training_graph_state(graph_engine, None) is None
+
+
+def test_graph_action_records_prior_version_for_resume_boundary(graph_engine):
+    graph_engine._whole_graph_runner = lambda root: (root, {}, [])
+    graph_engine._timer_start = lambda: None
+    graph_engine._timer_stop = lambda *args: None
+    training_graph_act(graph_engine, torch.zeros(1, 8))
+    assert graph_engine.action_index == 1
+    assert graph_engine.state.outer_version == graph_engine.agent.outer_version
+    graph_engine.prepare_training_resume_boundary()
 
 
 def assert_graph_resume_continuation(agent):

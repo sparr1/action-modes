@@ -264,6 +264,9 @@ def training_graph_act(engine, root):
     action, values, lengths = engine._whole_graph_runner(root)
     engine._timer_stop("inner_action_seconds", started)
     engine.action_index += 1
+    # The live engine records the prior version used by this logical action,
+    # even though its disposable tensor workspace belongs to the graph worker.
+    engine.state.outer_version = int(engine.agent.outer_version)
     # Do not mutate the static result dictionary owned by the capture.
     values = dict(values, inner_cuda_graph_used=1.0)
     return action, values, lengths
