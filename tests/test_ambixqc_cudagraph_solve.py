@@ -124,8 +124,29 @@ def test_production_j8_compiled_capture_matches_and_launches_once():
                 graphed.agent._update(*batch)
             outer = graphed.agent.frozen_outer_state()
             cpu_rng, cuda_rng = torch.get_rng_state().clone(), torch.cuda.get_rng_state().clone()
+            if index == 0:
+                before_reference_rng = reference.agent.inner_engine.rng.training_state_dict()
             expected = reference.agent.act(obs, collect_diagnostics=False)
+            if index == 0:
+                expected_state = deepcopy(reference.agent.inner_engine._workspace_pool.controller.state_dict())
+                after_reference_rng = reference.agent.inner_engine.rng.training_state_dict()
+                reference.agent.inner_engine.rng.load_training_state_dict(before_reference_rng)
+                repeat = reference.agent.act(obs, collect_diagnostics=False)
+                print("REFERENCE_REPEAT_ACTION_MAX", float((repeat-expected).abs().max()), flush=True)
+                print("REFERENCE_REPEAT_STATE_MAX", max(float((value-reference.agent.inner_engine._workspace_pool.controller.state_dict()[key]).abs().max())
+                      for key,value in expected_state.items() if value.is_floating_point()), flush=True)
+                reference.agent.inner_engine.rng.load_training_state_dict(after_reference_rng)
+                staged = capture_module.CapturedXQCSolve(graphed.agent, capture=False)
+                graphed.agent.inner_engine = staged
+                staged_action = graphed.agent.act(obs, collect_diagnostics=False)
+                print("STAGED_ACTION_MAX", float((staged_action-expected).abs().max()), flush=True)
+                print("STAGED_STATE_MAX", max(float((value-staged._workspace_pool.controller.state_dict()[key]).abs().max())
+                      for key,value in expected_state.items() if value.is_floating_point()), flush=True)
+                print("STAGED_RNG_EQUAL", _tree_equal(after_reference_rng, staged.rng.training_state_dict()), flush=True)
+                graphed.agent.inner_engine = engine
             actual = graphed.agent.act(obs, collect_diagnostics=False)
+            print("CAPTURE_ACTION_MAX", index, float((actual-expected).abs().max()), flush=True)
+            print("CAPTURE_RNG_EQUAL", _tree_equal(reference.agent.inner_engine.rng.training_state_dict(), engine.rng.training_state_dict()), flush=True)
             torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
             compare_state(reference.agent.inner_engine._workspace_pool.controller.state_dict(),
                           engine._workspace_pool.controller.state_dict(), atol=2e-5, rtol=2e-4)
