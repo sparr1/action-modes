@@ -283,6 +283,34 @@ one-million-decision budget, evaluation cadence, and checkpoint policy. Only
 strict compilation and the W&B identity differ. It is still a single-seed
 exploratory run, not a learning-quality comparison.
 
+### AMBI-XQC whole-solve CUDA Graph benchmark
+
+The experimental `tests/benchmarks/ambixqc_cudagraph_solve.py` adapter captures
+one complete fixed-shape solve in one CUDA Graph: fresh-prior/target copies,
+optimizer-moment reset, all imagined rounds and replay gathers, delayed
+actor/temperature and critic updates, projections, target updates, action
+execution, and non-diagnostic metrics. It is a benchmark adapter, without a
+production configuration or checkpoint/resume interface. Its supported case
+is state, non-episodic XQC with round updates, main soft critics, frozen real
+reward scale, and replay large enough for the complete solve.
+
+The pinned PyTorch 2.3 runtime cannot capture user-supplied CUDA generators.
+Fresh noise and replay indices are therefore prepared outside the graph with
+the original private streams, draw shapes, per-round bounds, and call order.
+Warmup/capture preserve scientific RNG state. Root encoding, input refresh,
+CPU materialization, K3 actor/encoder snapshots, and real outer learning also
+remain outside the graph. Timing includes these costs. W&B is disabled.
+
+`slurm/run_ambixqc_solve_cudagraph_oscar.sbatch` first runs small and full-J8
+CUDA parity gates, including a profiler assertion of one `cudaGraphLaunch`
+per solve, then compares compiled K3 with and without capture on the same
+GPU/CPU allocation. Supply the exact tested `XQC_TIMING_SHA`, locked
+`XQC_TIMING_PYTHON`, and external `XQC_TIMING_RESULTS`, plus external Slurm
+stdout/stderr paths. Direct timing uses
+`tests/benchmarks/ambixqc_j8_training_throughput.py --graph-comparison
+--solve-interval 3 --warmup 21 --measured 108 --output /external/new-directory`.
+Capture failure is fatal; there is no silent eager fallback.
+
 ### AMBI-XQC heavy inner-loop v1 suite
 
 The `ambixqc_humanoid_walk_heavy_inner_v1` suite is an XQC-native heavy-compute

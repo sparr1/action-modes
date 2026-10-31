@@ -596,15 +596,20 @@ class InnerXQCEngine:
             self._release_action()
 
     @torch.no_grad()
+    def _normal(self, shape, *, dtype, device, stream):
+        """Named noise input seam; preserve each released draw's shape/order."""
+        return torch.randn(shape, dtype=dtype, device=device,
+                           generator=self.rng.generator(stream))
+
+    @torch.no_grad()
     def _sample_actor(self, z, *, stream, deterministic=False):
-        generator = self.rng.generator(stream)
         # Draw explicitly so all inner randomness stays on its named stream and
         # evaluation advances the stream exactly once, as released XQC does.
-        noise = torch.randn(
+        noise = self._normal(
             (*z.shape[:-1], int(self.cfg.action_dim)),
             dtype=z.dtype,
             device=z.device,
-            generator=generator,
+            stream=stream,
         )
         action, _ = self.state.workspace.controller.sample_action(
             z,
@@ -870,16 +875,15 @@ class InnerXQCEngine:
         """Collect and commit one fixed-shape non-episodic rollout round."""
 
         cfg = self.cfg
-        generator = self.rng.generator("collection")
         # Preserve the released scientific RNG contract: one independent draw
         # of shape N x A per horizon step, rather than one H x N x A draw.
         policy_noise = torch.stack(
             [
-                torch.randn(
+                self._normal(
                     (count, int(cfg.action_dim)),
                     dtype=root_z.dtype,
                     device=root_z.device,
-                    generator=generator,
+                    stream="collection",
                 )
                 for _ in range(horizon)
             ],
@@ -963,17 +967,17 @@ class InnerXQCEngine:
     def _update_slot(self):
         raw = self._sample_batch()
         batch_size = int(raw["z"].shape[0])
-        next_noise = torch.randn(
+        next_noise = self._normal(
             (batch_size, int(self.cfg.action_dim)),
             dtype=raw["z"].dtype,
             device=self.device,
-            generator=self.rng.generator("bootstrap"),
+            stream="bootstrap",
         )
-        actor_noise = torch.randn(
+        actor_noise = self._normal(
             (batch_size, int(self.cfg.action_dim)),
             dtype=raw["z"].dtype,
             device=self.device,
-            generator=self.rng.generator("gradient_policy"),
+            stream="gradient_policy",
         )
         batch = LatentXQCBatch(
             latents=raw["z"],

@@ -228,6 +228,9 @@ def worker(args):
     try:
         learner = AMBIXQC("xqc-j8-throughput", env, run["alg_params"], run, manifest)
         cfg, agent = learner.cfg, learner.agent
+        if args.cuda_graph:
+            from ambixqc_cudagraph_solve import CapturedXQCSolve
+            agent.inner_engine = CapturedXQCSolve(agent)
         if args.solve_interval > 1:
             HeldPolicyBenchmark(agent, args.solve_interval)
         expected = (0, 0, 0, 0) if args.mode == "prior" else (128, 32, 32, 3072)
@@ -312,11 +315,15 @@ def worker(args):
                     raise RuntimeError(f"Missing compiled region: {key}")
             if args.mode == "j8" and not statuses["rollout"].get("compiled"):
                 raise RuntimeError("Inner rollout did not compile")
+        graph_status = agent.inner_engine.capture_status if args.cuda_graph else None
+        if args.cuda_graph and (graph_status["captures"] != 1 or graph_status["replays"] != actions // args.solve_interval):
+            raise RuntimeError("Expected exactly one capture and one replay per solve")
         if not all(bool(torch.isfinite(p).all()) for p in agent.parameters()):
             raise RuntimeError("Nonfinite learned parameters")
         result = {
             "passed": True, "mode": args.mode, "compiled": args.compile,
             "inner_solve_interval": args.solve_interval,
+            "cuda_graph": graph_status,
             "held_policy_implementation": "benchmark_adapter_solve_snapshot" if args.solve_interval > 1 else None,
             "physical_cores": len(cpus), "cpu_ids": cpus,
             "host": os.uname().nodename, "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
@@ -348,7 +355,7 @@ def driver(args):
     if not os.environ.get("SLURM_JOB_ID"):
         raise RuntimeError("Submit the driver through Slurm")
     cpus = physical_cpus(os.sched_getaffinity(0))
-    if len(cpus) < (1 if args.single_case else 2):
+    if len(cpus) < (1 if args.single_case or args.graph_comparison else 2):
         raise RuntimeError("Two physical cores required for the CPU comparison")
     output = args.output.resolve()
     if output == ROOT or ROOT in output.parents:
@@ -357,8 +364,11 @@ def driver(args):
     # Eager first also warms shared libraries; compiler startup is excluded.
     cases = [("prior", False, 1), ("j8", False, 1), ("j8", False, 2),
              ("prior", True, 1), ("j8", True, 1), ("j8", True, 2)]
-    if args.single_case:
-        cases = [(args.mode, args.compile, 1)]
+    cases = [(*case, False) for case in cases]
+    if args.graph_comparison:
+        cases = [("j8", True, 1, False), ("j8", True, 1, True)]
+    elif args.single_case:
+        cases = [(args.mode, args.compile, 1, args.cuda_graph)]
     elif args.solve_interval != 1:
         raise ValueError("K3 requires --single-case")
     cache = Path(os.environ.get("SLURM_TMPDIR", "/tmp")) / ("xqc-j8-" + os.environ["SLURM_JOB_ID"])
@@ -366,10 +376,12 @@ def driver(args):
                "measured": args.measured, "j8": J8, "physical_cpu_ids": cpus,
                "inner_solve_interval": args.solve_interval})
     results = []
-    for mode, compiled, count in cases:
+    for mode, compiled, count, captured in cases:
         label = f"{mode}-{'compiled' if compiled else 'eager'}-cpu{count}"
         if args.solve_interval > 1:
             label += f"-k{args.solve_interval}"
+        if captured:
+            label += "-cudagraph"
         environment = dict(os.environ)
         for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
             environment[key] = str(count)
@@ -380,6 +392,8 @@ def driver(args):
                    "--mode", mode, "--compile" if compiled else "--no-compile",
                    "--solve-interval", str(args.solve_interval),
                    "--warmup", str(args.warmup), "--measured", str(args.measured), "--output", str(output / (label + ".json"))]
+        if captured:
+            command.append("--cuda-graph")
         print("XQC_TIMING_START " + label, flush=True)
         with (output / (label + ".log")).open("x") as log:
             subprocess.run(command, cwd=ROOT, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True)
@@ -399,8 +413,12 @@ def main():
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--solve-interval", type=int, choices=(1, 3), default=1)
     parser.add_argument("--single-case", action="store_true")
+    parser.add_argument("--cuda-graph", action="store_true")
+    parser.add_argument("--graph-comparison", action="store_true")
     args = parser.parse_args()
     recipe(args.mode, args.compile, args.warmup, args.measured, args.solve_interval)
+    if args.cuda_graph and (args.mode != "j8" or not args.compile):
+        parser.error("--cuda-graph requires --mode j8 --compile")
     (worker if args.worker_cpus else driver)(args)
 
 
