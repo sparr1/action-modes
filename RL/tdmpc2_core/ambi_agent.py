@@ -12,6 +12,7 @@ from .common.device import resolve_device
 from .common.layers import api_model_conversion
 from .common.scale import percentile_range
 from .common.soft_world_model import SoftWorldModel
+from .auxiliary_return import AuxiliaryReturnLearner
 from .inner_improvement import InnerImprovementEngine, polyak_update
 from .common.training_state import (
     load_optimizer_state_preserving_hyperparameters,
@@ -64,6 +65,9 @@ class AMBITDMPC2Agent(torch.nn.Module):
             strict = bool(getattr(cfg, "compile_strict", False))
             self.model._Qs.enable_compile(strict=strict)
             self.model._target_Qs.enable_compile(strict=strict)
+            if hasattr(self.model, "_aux_return_Qs"):
+                self.model._aux_return_Qs.enable_compile(strict=strict)
+                self.model._target_aux_return_Qs.enable_compile(strict=strict)
         self._outer_update_region = CompileRegion(
             "outer update",
             self._outer_update_kernel,
@@ -159,6 +163,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             + list(self.model._reward.parameters())
             + (list(self.model._termination.parameters()) if cfg.episodic else [])
             + list(self.model._Qs.parameters())
+            + (list(self.model._aux_return_Qs.parameters()) if hasattr(self.model, "_aux_return_Qs") else [])
         )
         optimizer_groups = [
             {
@@ -174,6 +179,11 @@ class AMBITDMPC2Agent(torch.nn.Module):
         ]
         if cfg.episodic:
             optimizer_groups.append({"params": self.model._termination.parameters()})
+        if hasattr(self.model, "_aux_return_Qs"):
+            optimizer_groups.append({
+                "params": self.model._aux_return_Qs.parameters(),
+                "lr": float(cfg.aux_return_critic_lr),
+            })
         self.optim = torch.optim.Adam(
             optimizer_groups,
             lr=float(cfg.lr),
@@ -249,6 +259,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
             )
 
         self.discount = self._get_discount(cfg.episode_length)
+        self.aux_return = (
+            AuxiliaryReturnLearner(self)
+            if str(getattr(cfg, "aux_return_mode", "off")) != "off" else None
+        )
         self.num_updates = 0
         self.outer_version = 0
         self.last_inner_metrics = {}
@@ -721,7 +735,25 @@ class AMBITDMPC2Agent(torch.nn.Module):
         if self.behavior_policy_kl_enabled:
             state["behavior_policy_kl_spec"] = self._behavior_policy_kl_spec()
             state["behavior_policy_kl_state"] = self._behavior_policy_kl_state()
+        if self.aux_return is not None:
+            state["aux_return_spec"] = self.aux_return.specification()
+            state["aux_return_state"] = self.aux_return.checkpoint_state()
         return state
+
+    def _preflight_aux_return(self, state, *, exact=False):
+        keys = {"aux_return_spec", "aux_return_state"}
+        present = keys.intersection(state) if isinstance(state, dict) else set()
+        if self.aux_return is None:
+            if present:
+                raise ValueError("Checkpoint has auxiliary return state but aux_return_mode is off.")
+            return None
+        if present != keys:
+            raise ValueError("Checkpoint is missing auxiliary return specification or state.")
+        if state["aux_return_spec"] != self.aux_return.specification():
+            raise ValueError("Checkpoint auxiliary return specification does not match this learner.")
+        return self.aux_return.preflight_state(
+            state["aux_return_state"], exact=exact, expected_updates=state.get("num_updates"),
+        )
 
     def _critic_target_spec(self):
         """Return Bellman-target semantics recorded for reproducibility."""
@@ -734,6 +766,9 @@ class AMBITDMPC2Agent(torch.nn.Module):
         # their absence itself denotes the legacy single-policy controller.
         if str(getattr(self.cfg, "inner_explorer_mode", "none")) != "none":
             spec["inner_population"] = self._inner_population_spec()
+        if self.aux_return is not None:
+            spec["auxiliary_critic_target"] = "reward_only"
+            spec["auxiliary_continuation_policy"] = "sac"
         return spec
 
     def _inner_population_spec(self):
@@ -948,7 +983,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
             expected_keys.update(
                 {"behavior_policy_kl_spec", "behavior_policy_kl_state"}
             )
+        if self.aux_return is not None:
+            expected_keys.update({"aux_return_spec", "aux_return_state"})
         state = require_exact_keys(state, expected_keys, "AMBI outer training state")
+        self._preflight_aux_return(state, exact=True)
         expected_checkpoint_version = self._checkpoint_version()
         if state["checkpoint_version"] != expected_checkpoint_version:
             raise ValueError(
@@ -1102,6 +1140,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             if isinstance(fp, dict)
             else torch.load(fp, map_location=self.device, weights_only=False)
         )
+        aux_return_candidate = self._preflight_aux_return(state)
         checkpoint_version = state.get("checkpoint_version") if isinstance(state, dict) else None
         if checkpoint_version is not None and int(checkpoint_version) not in {
             1,
@@ -1274,6 +1313,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
             )
         self.num_updates = int(state.get("num_updates", 0))
         self.outer_version = int(state.get("outer_version", self.num_updates))
+        if aux_return_candidate is not None:
+            self.aux_return.load_state(aux_return_candidate)
         if self.log_ent_coef is not None and "log_ent_coef" in state:
             self.log_ent_coef.data.copy_(state["log_ent_coef"].to(self.device))
             self.log_ent_coef.data.clamp_(min=math.log(_ENTROPY_COEF_MIN))
@@ -2673,6 +2714,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
         with torch.no_grad():
             next_z_targets = self.model.encode(obs[1:])
             td_targets = self._soft_td_target(next_z_targets, reward, terminated)
+            aux_targets = (
+                self.aux_return.td_target(next_z_targets, reward, terminated)
+                if self.aux_return is not None else None
+            )
 
         self.model.train()
         (
@@ -2694,6 +2739,30 @@ class AMBITDMPC2Agent(torch.nn.Module):
             next_z_targets,
             td_targets,
         )
+
+        auxiliary_info = {}
+        if self.aux_return is not None:
+            aux_loss, aux_predictions = self.aux_return.critic_loss(
+                latent_states, action, aux_targets,
+            )
+            # Detachment blocks the auxiliary loss's representation gradients.
+            # The existing global gradient clip intentionally still includes
+            # both ensembles, matching the established auxiliary study.
+            total_loss = total_loss + float(self.cfg.aux_return_critic_coef) * aux_loss
+            with torch.no_grad():
+                aux_values = self.model.q_backend.decode(aux_predictions.detach())
+                clipping = aux_loss.new_zeros(())
+                if self.model.q_backend.representation == "distributional":
+                    symlog_target = td_math.symlog(aux_targets)
+                    clipping = ((symlog_target <= self.model.q_backend.vmin)
+                                | (symlog_target >= self.model.q_backend.vmax)).float().mean()
+                auxiliary_info = {
+                    "aux_return_critic_loss": aux_loss.detach(),
+                    "aux_return_q_mean": aux_values.mean(),
+                    "aux_return_q_target_mean": aux_targets.mean(),
+                    "aux_return_td_error_abs_mean": (aux_values - aux_targets.unsqueeze(0)).abs().mean(),
+                    "aux_return_q_target_clip_fraction": clipping,
+                }
 
         value_equivalence_info = {}
         value_equivalence_loss_coef = float(
@@ -2754,6 +2823,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
         if self.num_updates % int(self.cfg.target_update_interval) == 0:
             self.model.soft_update_target_Q()
         self.num_updates += 1
+        if self.aux_return is not None:
+            self.aux_return.num_updates += 1
         self.outer_version += 1
         self.inner_engine.mark_outer_update(self.outer_version)
 
@@ -2819,6 +2890,14 @@ class AMBITDMPC2Agent(torch.nn.Module):
             )
         info.update(actor_info)
         info.update(value_equivalence_info)
+        if self.aux_return is not None:
+            info.update(auxiliary_info)
+            info["compile_aux_return_online_fallback"] = float(self.model._aux_return_Qs.compile_failed)
+            info["compile_aux_return_target_fallback"] = float(self.model._target_aux_return_Qs.compile_failed)
+            info["compile_fallback"] = float(
+                info["compile_fallback"] or info["compile_aux_return_online_fallback"]
+                or info["compile_aux_return_target_fallback"]
+            )
         return info
 
     def update(self, buffer):

@@ -87,6 +87,11 @@ _AMBI_DEFAULTS = {
     "ent_coef": "auto",
     "ent_coef_lr": 3e-4,
     "target_entropy": "auto",
+    # Historical-prior extension: reward-only evaluation of the same SAC actor.
+    "aux_return_mode": "off",
+    "aux_return_detach_representation": True,
+    "aux_return_critic_coef": 0.1,
+    "aux_return_critic_lr": None,
     "tau": 0.005,
     "target_update_interval": 1,
     "compile_strict": False,
@@ -2235,6 +2240,24 @@ class AMBITDMPC2(TDMPC2Baseline):
             if value <= 0.0:
                 raise ValueError(f"{key} must be positive.")
             setattr(cfg, key, value)
+        cfg.aux_return_mode = _normalize_choice(
+            cfg.aux_return_mode, "aux_return_mode", {"off", "sac"}
+        )
+        if cfg.aux_return_mode != "off":
+            if cfg.inner_operator != "none":
+                raise ValueError("This historical auxiliary critic requires inner_operator='none'.")
+            cfg.aux_return_detach_representation = _strict_bool(
+                cfg.aux_return_detach_representation, "aux_return_detach_representation"
+            )
+            cfg.aux_return_critic_coef = _strict_nonnegative_float(
+                cfg.aux_return_critic_coef, "aux_return_critic_coef"
+            )
+            cfg.aux_return_critic_lr = _finite_float(
+                cfg.critic_lr if cfg.aux_return_critic_lr is None else cfg.aux_return_critic_lr,
+                "aux_return_critic_lr",
+            )
+            if cfg.aux_return_critic_lr <= 0:
+                raise ValueError("aux_return_critic_lr must be positive.")
         if isinstance(cfg.target_entropy, str):
             cfg.target_entropy = cfg.target_entropy.lower()
             if cfg.target_entropy != "auto":

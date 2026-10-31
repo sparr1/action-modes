@@ -1,0 +1,28 @@
+{
+  "study_type": "original_prior_detached_auxiliary_return_critic",
+  "study_note": "Original u13m14st 253e89b recipe plus an independent reward-only auxiliary critic under the same SAC actor. Auxiliary inputs are detached from encoder/dynamics; joint gradient clipping is retained. Target entropy is explicitly -21. Historical network initialization is retained. Seed55,1.5M decisions,60 portable checkpoints at25k intervals; no inner optimization, extra actor, or online evaluation.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1500000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_original_prior_aux_detached_target21_1p5m"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": [
+    "all"
+  ],
+  "log_info": false,
+  "log_type": "summary"
+}

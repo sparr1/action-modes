@@ -50,9 +50,15 @@ def test_storage_preflight(tmp_path, monkeypatch):
     assert not (tmp_path / "new").exists()
 
 
-def test_original_scientific_files_unchanged():
+def test_original_launcher_requires_unchanged_scientific_files(monkeypatch):
     result = subprocess.check_output(["git", "diff", "--name-only", repro.ORIGINAL, "--", *repro.PROTECTED], cwd=ROOT, text=True)
-    assert result == ""
+    # A later scientific variant must never silently use the exact-baseline
+    # launcher. Ignore working-tree dirt here to exercise its source guard.
+    if result:
+        real_git = repro.git
+        monkeypatch.setattr(repro, "git", lambda *args: "" if args[0] == "status" else real_git(*args))
+        with pytest.raises(RuntimeError, match="Original scientific source changed"):
+            repro.source_binding()
 
 
 def test_launcher_syntax():

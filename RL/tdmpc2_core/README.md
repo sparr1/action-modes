@@ -1,5 +1,58 @@
 # TD-MPC2 core
 
+## Historical prior with a detached auxiliary return critic
+
+The original-prior reproduction branch adds an opt-in, SAC-only auxiliary
+critic to historical commit `253e89b3896ca3891844d797573b00ade338165d`:
+
+```json
+{
+  "inner_operator": "none",
+  "target_entropy": -21,
+  "aux_return_mode": "sac",
+  "aux_return_detach_representation": true,
+  "aux_return_critic_coef": 0.1,
+  "aux_return_critic_lr": 0.0003
+}
+```
+
+The auxiliary online ensemble and its EMA target have independent parameters.
+They use the primary critic's architecture, distributional regression, temporal
+weights, target reduction, target-update cadence and EMA rate. Each outer update
+reuses the same real-replay minibatch and rollout latents. Its target is
+`reward + discount * (1 - terminated) * Q_aux_target(next_z, next_action)`, where
+`next_action` is sampled from the original stochastic SAC actor. No entropy is
+added to this target, and no auxiliary actor or temperature is created. The
+numeric target entropy governs the primary SAC learner's automatic alpha.
+
+Detachment stops auxiliary-loss gradients at the rollout latents. Its critic
+loss, weighted by `aux_return_critic_coef`, still participates in the established
+joint world-model/critic gradient clip and Adam step. Auxiliary gradients can
+therefore change the clipping scale of primary gradients when clipping activates;
+this is not a claim of identical primary training trajectories. The actor keeps
+its original objective against the primary critic. This backport supports
+`inner_operator="none"` only and does not add auxiliary-based action selection.
+
+All primary initialization and update equations remain historical. New auxiliary
+heads also use the historical truncated-normal initialization (standard deviation
+0.02), zero linear biases and zero final-layer weights. Construction uses an
+isolated CPU seed `seed + 104729`; target-action sampling, head-pair selection and
+dropout use private CPU/CUDA streams seeded `seed + 130363/130364`. Auxiliary
+initialization and operations preserve the primary RNG stream. The loop critic
+backend, original log-standard-deviation limits, replay
+placement and training dose remain unchanged. `aux_return_mode="off"` allocates
+no auxiliary networks and preserves the historical checkpoint payload.
+
+Portable checkpoints contain both online/target ensembles, their shared Adam
+group, auxiliary specification and private RNG/update state. Loading requires
+matching auxiliary semantics and complete weights before mutating the learner.
+The normal adjacent metadata sidecar retains the full algorithm configuration;
+the existing checkpoint renderer reconstructs this configuration and preserves
+auxiliary weights while executing the original policy. These model checkpoints
+are not exact mid-run resumes because they do not contain replay/environment
+state. Auxiliary compilation failures contribute to `compile_fallback` and are
+also exposed separately for the online and target ensembles.
+
 This package vendors the algorithmic core from the official TD-MPC2 implementation
 at upstream commit `8bbc14ebabdb32ea7ada5c801dc525d0dc73bafe`.
 

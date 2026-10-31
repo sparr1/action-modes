@@ -88,6 +88,24 @@ class SoftWorldModel(nn.Module):
             torch.tensor(self._log_std_max_value - self._log_std_min_value),
         )
         self.init()
+        if str(getattr(cfg, "aux_return_mode", "off")) != "off":
+            # Preserve every historical primary parameter and its RNG stream.
+            # Seed only the CPU generator: torch.manual_seed also affects CUDA.
+            with torch.random.fork_rng(devices=[]):
+                torch.random.default_generator.manual_seed(int(cfg.seed) + 104729)
+                self._aux_return_Qs = layers.Ensemble([
+                    layers.mlp(
+                        cfg.latent_dim + cfg.action_dim, 2 * [cfg.mlp_dim],
+                        self.q_backend.output_dim, dropout=cfg.dropout,
+                    ) for _ in range(self.q_backend.num_q)
+                ])
+                # Match the historical primary critic, not the newer default
+                # nn.Linear initialization used by the modern auxiliary study.
+                self._aux_return_Qs.apply(init.weight_init)
+                init.zero_([q[-1].weight for q in self._aux_return_Qs])
+                self._target_aux_return_Qs = deepcopy(self._aux_return_Qs)
+                self._target_aux_return_Qs.requires_grad_(False)
+                self._target_aux_return_Qs.train(False)
 
     def init(self):
         """Create a frozen EMA target critic."""
@@ -152,6 +170,8 @@ class SoftWorldModel(nn.Module):
     def train(self, mode=True):
         super().train(mode)
         self._target_Qs.train(False)
+        if hasattr(self, "_target_aux_return_Qs"):
+            self._target_aux_return_Qs.train(False)
         return self
 
     @torch.no_grad()
@@ -165,6 +185,23 @@ class SoftWorldModel(nn.Module):
             torch._foreach_lerp_(target_parameters, online_parameters, tau)
         for target_buffer, buffer in zip(self._target_Qs.buffers(), self._Qs.buffers()):
             target_buffer.copy_(buffer)
+        if hasattr(self, "_aux_return_Qs"):
+            target_parameters = tuple(self._target_aux_return_Qs.parameters())
+            online_parameters = tuple(self._aux_return_Qs.parameters())
+            if tau == 1.0:
+                torch._foreach_copy_(target_parameters, online_parameters)
+            elif tau != 0.0:
+                torch._foreach_lerp_(target_parameters, online_parameters, tau)
+            for target_buffer, buffer in zip(self._target_aux_return_Qs.buffers(), self._aux_return_Qs.buffers()):
+                target_buffer.copy_(buffer)
+
+    def aux_return_q_predictions(self, z, action, *, target=False):
+        ensemble = self._target_aux_return_Qs if target else self._aux_return_Qs
+        return ensemble(self.joint_input(z, action))
+
+    def aux_return_Q(self, z, action, *, target=False, reduction="min_pair"):
+        predictions = self.aux_return_q_predictions(z, action, target=target)
+        return self.q_backend.reduce(self.q_backend.decode(predictions), reduction)
 
     def encode(self, obs, task=None):
         if task is not None:
