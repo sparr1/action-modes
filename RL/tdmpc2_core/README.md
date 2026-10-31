@@ -3,6 +3,34 @@
 This package vendors the algorithmic core from the official TD-MPC2 implementation
 at upstream commit `8bbc14ebabdb32ea7ada5c801dc525d0dc73bafe`.
 
+### Experimental whole inner-solve CUDA graph
+
+`whole_inner_graph.WholeInnerGraph` captures a fixed, fresh SAC solve in one
+CUDA graph, including tensor resets, collection, replay sampling, backwards,
+Adam, target updates, action selection and ordinary metrics. Existing compiled
+tensor regions remain separate compiler graphs inside that CUDA graph. Root
+input copies, initial-alpha validation, RNG isolation and the action/metric host
+transfer remain outside capture and are included in benchmark latency.
+
+This is an experimental benchmark API, not a production/resume mode. The locked
+PyTorch 2.3.1 cannot capture the native per-phase reseeding and private CUDA
+generators. The experimental path uses one isolated default CUDA RNG stream;
+every replay gets fresh draws, but the native seed sequence changes. An otherwise
+identical uncaptured control separates that change and capturable Adam from graph
+replay. CUDA validation compares actions, actor/critic/target parameters, Adam
+state, replay and alpha across changing roots and outer priors, and checks outer
+RNG isolation. Unsupported dynamic/persistent protocols fail explicitly.
+
+Run `python -m tests.benchmark_whole_inner_graph --output /absolute/result.json`
+inside a scheduled GPU allocation, or submit
+`slurm/run_whole_inner_graph_oscar.sbatch` with its required paths and pinned SHA.
+The frozen benchmark recipe is `configs/research/ambi_whole_graph_benchmark.json`:
+Humanoid dimensions, H3/J8/N128/B256, C16/A4 per round, five distributional heads,
+vmap, finite-horizon auxiliary-return targets, and fresh actor/critic priors.
+W&B and checkpointing are disabled. Timings are complete inner solves from
+resident latent roots, not full environment/outer-learning throughput. Warmup
+and capture are reported separately; timed windows reject recompilation.
+
 Copied/adapted here:
 
 - `agent.py`
