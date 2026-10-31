@@ -111,7 +111,8 @@ def benchmark(args):
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires a scheduled CUDA allocation.")
     torch.set_num_threads(args.threads)
-    torch.set_num_interop_threads(1)
+    if torch.get_num_interop_threads() != 1:
+        torch.set_num_interop_threads(1)
     agents = {name: make_agent(tiny=args.tiny, compile_enabled=not args.eager)
               for name in ("native_regions", "graph_ready_eager", "whole_graph")}
     generator = torch.Generator(device="cpu").manual_seed(1947)
@@ -150,17 +151,22 @@ def benchmark(args):
         captured = {}
         states = {}
         outside = torch.cuda.get_rng_state().clone()
+        outside_cpu = torch.random.get_rng_state().clone()
         for name, runner in runners.items():
             expected_outer = deepcopy(agents[name].model.state_dict())
+            private_before = runner.rng_state.clone()
             output = runner(roots[index])
             captured[name] = deepcopy(materialize(agents[name], output))
             states[name] = snapshot(agents[name].inner_engine)
             torch.testing.assert_close(torch.cuda.get_rng_state(), outside, rtol=0, atol=0)
+            torch.testing.assert_close(torch.random.get_rng_state(), outside_cpu, rtol=0, atol=0)
+            assert not torch.equal(runner.rng_state, private_before), "Inner randomness was frozen."
             assert_tree_close(agents[name].model.state_dict(), expected_outer, rtol=0, atol=0)
             assert all(p.grad is None for p in agents[name].model.parameters())
         assert_tree_close(captured["graph_ready_eager"], captured["whole_graph"])
         assert_tree_close(states["graph_ready_eager"], states["whole_graph"])
-        checks.append({"root": index, "action_state_optimizer_replay_parity": True})
+        checks.append({"root": index, "action_state_optimizer_replay_parity": True,
+                       "private_rng_advances": True, "outer_cpu_cuda_rng_unchanged": True})
     for name, agent in agents.items():
         # Restore exactly the same outer weights for throughput measurement.
         agent.model.load_state_dict(outer_before[name])
