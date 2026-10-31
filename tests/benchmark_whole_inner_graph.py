@@ -26,8 +26,9 @@ from RL.tdmpc2_core.whole_inner_graph import WholeInnerGraph, disable_phase_time
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def make_agent(*, device="cuda", tiny=False, compile_enabled=True):
-    run = json.loads((ROOT / "configs/research/ambi_whole_graph_benchmark.json").read_text())
+def make_agent(*, device="cuda", tiny=False, compile_enabled=True, config=None):
+    config = Path(config) if config is not None else ROOT / "configs/research/ambi_whole_graph_benchmark.json"
+    run = json.loads(config.read_text())
     params = deepcopy(run["alg_params"])
     params.update(device=device, compile=compile_enabled, compile_strict=compile_enabled)
     if tiny:
@@ -113,7 +114,7 @@ def benchmark(args):
     torch.set_num_threads(args.threads)
     if torch.get_num_interop_threads() != 1:
         torch.set_num_interop_threads(1)
-    agents = {name: make_agent(tiny=args.tiny, compile_enabled=not args.eager)
+    agents = {name: make_agent(tiny=args.tiny, compile_enabled=not args.eager, config=getattr(args, "config", None))
               for name in ("native_regions", "graph_ready_eager", "whole_graph")}
     generator = torch.Generator(device="cpu").manual_seed(1947)
     # Valid SimNorm latents, fixed across every arm and repeated measurement.
@@ -203,6 +204,7 @@ def benchmark(args):
         "rng_protocol": "isolated_default_cuda_stream_for_graph_and_matched_control",
         "native_rng_sequence_preserved": False,
         "wandb": False, "compile": not args.eager, "tiny": args.tiny,
+        "config": str(getattr(args, "config", None) or "configs/research/ambi_whole_graph_benchmark.json"),
         "steps_per_repeat": args.steps, "repeats": args.repeats, "threads": args.threads,
         "runtime": {"torch": torch.__version__, "cuda": torch.version.cuda,
                     "gpu": torch.cuda.get_device_name(0), "host": platform.node(),
@@ -227,6 +229,7 @@ def benchmark(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--config", type=Path)
     parser.add_argument("--tiny", action="store_true")
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--steps", type=int, default=32)

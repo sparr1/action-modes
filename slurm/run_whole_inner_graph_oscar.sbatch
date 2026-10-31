@@ -29,6 +29,20 @@ export TORCHINDUCTOR_COMPILE_THREADS=1
 export TORCHINDUCTOR_CACHE_DIR="$graph_cache/inductor" TRITON_CACHE_DIR="$graph_cache/triton"
 export XDG_CACHE_HOME="$graph_cache/cache" WANDB_MODE=disabled MUJOCO_GL=egl
 nvidia-smi --query-gpu=name,uuid,driver_version,memory.total --format=csv > "$AMBI_BENCH_OUTPUT/gpu.csv"
+if [[ "${AMBI_GRAPH_K1_TRAINING:-0}" == "1" ]]; then
+    srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.benchmark_whole_inner_graph \
+        --config configs/research/ambi_whole_graph_k1_reward_benchmark.json \
+        --steps 2 --repeats 1 --output "$AMBI_BENCH_OUTPUT/k1-parity.json" \
+        > "$AMBI_BENCH_OUTPUT/k1-parity.log" 2>&1
+    for training_arm in native_regions whole_graph; do
+        srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.benchmark_k1_training_graph \
+            --arm "$training_arm" --warmup 12 --decisions 64 \
+            --output "$AMBI_BENCH_OUTPUT/$training_arm.json" \
+            > "$AMBI_BENCH_OUTPUT/$training_arm.log" 2>&1
+    done
+    [[ -z "$(git status --porcelain --untracked-files=all)" ]]
+    exit 0
+fi
 if [[ "${AMBI_GRAPH_VALIDATE_ONLY:-0}" == "1" ]]; then
     export AMBI_RUN_INNER_GRAPH_CUDA=1
     srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m pytest -q -p no:cacheprovider \

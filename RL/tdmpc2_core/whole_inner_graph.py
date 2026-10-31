@@ -84,6 +84,9 @@ class WholeInnerGraph:
         if root.ndim != 2 or root.shape[0] != 1:
             raise ValueError("WholeInnerGraph requires one [1, latent_dim] root.")
         self.engine, self.device = engine, engine.device
+        # Keep the native entry point when a benchmark installs this runner
+        # as engine.act after capture.
+        self._engine_act = engine.act
         self.root = root.detach().clone()
         self.capture_enabled = bool(capture)
         self.graph = None
@@ -154,7 +157,7 @@ class WholeInnerGraph:
             self.rng_state = torch.cuda.get_rng_state(self.device)
 
     def _solve(self):
-        return self.engine.act(self.root, collect_diagnostics=False, eval_mode=False)
+        return self._engine_act(self.root, collect_diagnostics=False, eval_mode=False)
 
     def __call__(self, root):
         if root.shape != self.root.shape or root.dtype != self.root.dtype or root.device != self.root.device:

@@ -31,6 +31,16 @@ W&B and checkpointing are disabled. Timings are complete inner solves from
 resident latent roots, not full environment/outer-learning throughput. Warmup
 and capture are reported separately; timed windows reject recompilation.
 
+For a short **K1 real-training** comparison, set `AMBI_GRAPH_K1_TRAINING=1`
+when submitting that launcher. It first validates graph parity with the
+reward-only primary-critic recipe, then measures 64 real Humanoid decisions per
+arm after 12 active warmup decisions. Every decision performs a fresh H3/J8 solve,
+an environment step and one outer update. Replay stays on CPU, matching exact
+resume training. The smoke overrides use 500 random seed decisions, two
+pretraining updates and a small replay; checkpoints and W&B remain disabled.
+These are early-training throughput measurements, excluding mature replay and
+production publication/checkpoint costs. The graph RNG caveat above still applies.
+
 Copied/adapted here:
 
 - `agent.py`
