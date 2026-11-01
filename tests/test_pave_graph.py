@@ -165,6 +165,9 @@ def test_cuda_loss_gradients_ownership_rng_and_changed_inputs(term, target, repr
                 for parameter in critic.parameters():
                     parameter.add_(.003)  # Capture must read current weights.
     assert runner.calls == 3
+    for live, alias in zip(runner.parameters, runner.capture_parameters):
+        assert live is not alias and live.data_ptr() == alias.data_ptr()
+        assert alias.grad is None
     for metrics, snapshot in held_metrics:
         close_tree(metrics, snapshot, rtol=0, atol=0)
 

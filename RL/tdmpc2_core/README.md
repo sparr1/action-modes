@@ -78,7 +78,8 @@ ways:
 - CPU and explicit device selection are supported;
 - arbitrary finite Box action bounds are normalized to `[-1, 1]` by the wrapper;
 - AMBI supports compiled ordinary state-observation losses and ensemble
-  forwards; higher-order PAVE geometry executes eagerly;
+  forwards; PAVE geometry is eager by default, with opt-in CUDA capture for
+  MPR and action smoothness;
 - the environment boundary follows Gymnasium's NumPy/five-value API rather than
   upstream's Torch/four-value wrapper API;
 - RGB is restricted to the upstream-compatible `(9, 64, 64)` `uint8` layout and
@@ -97,8 +98,9 @@ For homogeneous dense Linear/NormedLinear critics, vmap evaluates all heads
 together. This includes scalar, distributional, and split-value critics,
 primary and auxiliary targets, and full inner critic clones. Detached actor
 forwards preserve gradients into actions while freezing critic parameters.
-PAVE uses a separate eager entry point with independent action coordinates per
-head, retaining its higher derivatives and separate observation views.
+PAVE uses a separate entry point with independent action coordinates per head,
+retaining its higher derivatives and separate observation views. Its optional
+CUDA graph captures this same geometry and its parameter gradients.
 
 The implementation differentiably stacks the original parameters on each
 forward. It does not create replacement leaf parameters, cache stale stacked
@@ -2465,6 +2467,22 @@ floating-point gradient accumulation order may differ from eager execution.
 Disabled mode preserves existing identities. `outer_pave_cuda_graph_used=1`
 confirms execution on this path. Enabling this option for an existing eager run
 requires a new weight-transfer lineage rather than an exact continuation.
+
+`tests/test_pave_graph.py` gates losses, parameter gradients, clipping, Adam,
+target updates, RNG isolation, output ownership, and exact continuation. Run it
+on an allocated GPU for CUDA coverage. The bounded production-shape check is:
+
+```bash
+WANDB_MODE=disabled MUJOCO_GL=egl python -m tests.benchmark_pave_graph \
+  --term mpr --graph --geometry --output /scratch/pave-mpr-graph.json
+```
+
+Repeat with `--term action_smoothness`; omit `--graph` for the eager timing
+control. Both training arms retain the existing J10/K1 inner graph. This check
+uses 768 geometry rows and real short training, disables W&B, and tests exact
+inner/outer continuation. Timing excludes startup, production pretraining,
+checkpoint I/O and mature replay, so it must not be presented as a measured
+full-run completion time. Use distinct output files for each invocation.
 
 ### Frozen PAVE gradient probe
 

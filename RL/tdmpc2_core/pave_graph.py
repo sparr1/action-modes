@@ -105,6 +105,8 @@ class PaveGraph:
         self.decoder_signature = deepcopy((self.decoder.signature, self.decoder.codec))
         self.structures = self._structures()
         self.graph = None
+        self.capture_parameters = None
+        self.capture_selected = None
         self.static_inputs = None
         self.outputs = None
         self.calls = 0
@@ -143,8 +145,8 @@ class PaveGraph:
             raise ValueError("PAVE graph critic structure or decoder changed.")
 
     def _loss_and_gradients(self):
-        loss, metrics = prepared_pave_loss(self.model, self.static_inputs, self.cfg, self.selected)
-        gradients = torch.autograd.grad(loss, self.parameters, allow_unused=True)
+        loss, metrics = prepared_pave_loss(self.model, self.static_inputs, self.cfg, self.capture_selected)
+        gradients = torch.autograd.grad(loss, self.capture_parameters, allow_unused=True)
         layout = tuple(gradient is not None for gradient in gradients)
         pieces = [gradient.reshape(-1) for gradient in gradients if gradient is not None]
         packed = torch.cat(pieces) if pieces else loss.new_empty(0)
@@ -161,6 +163,19 @@ class PaveGraph:
         # No optimizer mutation, .grad accumulation, or random sampling occurs
         # in warmup/capture. Existing ordinary-loss autograd graphs remain valid.
         with torch.cuda.stream(stream):
+            # Live leaves may already have AccumulateGrad nodes associated with
+            # the default stream (including the pending ordinary TD backward).
+            # Give capture independent autograd leaves, sharing the SAME weight
+            # storage. Initialize their gradient tape on this capture stream.
+            # deepcopy's memo substitutes aliases without copying any weights;
+            # no live modules, optimizer slots, or .grad buffers are replaced.
+            memo = {id(p): torch.nn.Parameter(p.detach(), requires_grad=True)
+                    for p in self.parameters}
+            self.capture_parameters = tuple(memo[id(p)] for p in self.parameters)
+            self.capture_selected = [
+                (prefix, deepcopy(critic, memo), coefficients)
+                for prefix, critic, coefficients in self.selected
+            ]
             for _ in range(3):
                 self._loss_and_gradients()
         current.wait_stream(stream)
