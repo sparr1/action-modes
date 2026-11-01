@@ -61,6 +61,7 @@ def test_graph_dispatch_failure_discards_held_state(monkeypatch):
 def test_k3_graph_held_actions_updates_diagnostics_and_exact_resume():
     agent = make_agent(tiny=True, config=RECIPE)
     agent.cfg.inner_solve_interval = 3
+    agent.cfg.inner_hold_encoder = "solve_snapshot"
     agent.cfg.inner_cuda_graph = True
     engine = agent.inner_engine
     generator = torch.Generator().manual_seed(902)
