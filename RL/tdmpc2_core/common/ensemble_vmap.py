@@ -66,6 +66,51 @@ def ensemble_vmap_spec(modules, normed_linear_type):
     return specifications
 
 
+def grouped_vmap_spec(ensembles, normed_linear_type):
+    """Check whether independent ensembles can share one dense-head vmap.
+
+    The grouping bypasses the individual ensemble wrappers, so their hooks and
+    overridden forwards must be checked as well as the constituent heads.
+    Selection is entirely structural and consumes no tensor RNG. Run this
+    preflight eagerly and pass its result into compiled tensor regions: Dynamo
+    does not preserve wrapper bound-method identity during inspection.
+    """
+    # Imported lazily because layers imports the ordinary vmap helpers above.
+    from .layers import Ensemble
+
+    if not ensembles:
+        return None
+    for ensemble in ensembles:
+        if (type(ensemble) is not Ensemble or ensemble.backend != "vmap"
+                or len(ensemble) == 0 or ensemble._forward_hooks
+                or ensemble._forward_pre_hooks or ensemble._backward_hooks
+                or ensemble._backward_pre_hooks
+                or getattr(ensemble.forward, "__func__", None) is not Ensemble.forward
+                or getattr(ensemble._forward_eager, "__func__", None) is not Ensemble._forward_eager
+                or any(True for _ in ensemble.buffers())):
+            return None
+    modules = tuple(head for ensemble in ensembles for head in ensemble.modules_list)
+    return ensemble_vmap_spec(modules, normed_linear_type)
+
+
+def stack_parameters(modules, *, detached=False):
+    """Stack original parameters for one forward/loss graph, never across steps.
+
+    Eager geometry may reuse these tensors across several independent forwards
+    in the same loss. All gradients still reach the optimizer-owned leaves.
+    """
+    parameter_maps = tuple(dict(head.named_parameters(remove_duplicate=False)) for head in modules)
+    # stack_module_state would create unrelated leaf Parameters. Stack these
+    # existing tensors instead so gradients reach every original optimizer slot.
+    return {
+        name: torch.stack([
+            mapping[name].detach() if detached else mapping[name]
+            for mapping in parameter_maps
+        ], dim=0)
+        for name in parameter_maps[0]
+    }
+
+
 def vectorized_forward(modules, inputs, specifications, *, head_inputs=False, detached=False):
     """Execute supported heads with shared inputs or independent leading heads.
 

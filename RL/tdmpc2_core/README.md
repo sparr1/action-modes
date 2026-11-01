@@ -2269,8 +2269,10 @@ not modify the checkpoint or its metadata sidecar.
 AMBI can add the three losses from
 [PAVE](https://github.com/AIRLABkhu/PAVE) to its persistent outer critics:
 mixed partial regularization (MPR), vector field consistency (VFC), and the
-action-curvature penalty. Each loss has an independent coefficient for the
-primary critic and independent auxiliary return critic. All six coefficients
+action-curvature penalty. An additional action-gradient consistency loss
+compares the same critic's gradients at nearby normalized actions. Each loss
+has an independent coefficient for the primary critic and independent
+auxiliary return critic. All eight coefficients
 default to zero, preserving existing training, random-number use, and checkpoint
 identity. This option does not add losses to inner SAC or standalone TD-MPC2.
 
@@ -2279,14 +2281,17 @@ identity. This option does not add losses to inner SAC or standalone TD-MPC2.
 | `outer_pave_mpr_coef` | `0.0` | Primary critic MPR weight |
 | `outer_pave_vfc_coef` | `0.0` | Primary critic VFC weight |
 | `outer_pave_curvature_coef` | `0.0` | Primary critic curvature weight |
+| `outer_pave_action_smoothness_coef` | `0.0` | Primary critic action-gradient consistency weight |
 | `aux_return_pave_mpr_coef` | `0.0` | Auxiliary return critic MPR weight |
 | `aux_return_pave_vfc_coef` | `0.0` | Auxiliary return critic VFC weight |
 | `aux_return_pave_curvature_coef` | `0.0` | Auxiliary return critic curvature weight |
+| `aux_return_pave_action_smoothness_coef` | `0.0` | Auxiliary return critic action-gradient consistency weight |
 | `outer_pave_batch_size` | `64` | Maximum sampled real transitions; `null` uses the full sampled sequence batch |
 | `outer_pave_obs_noise_std` | `0.01` | Gaussian observation perturbation standard deviation |
+| `outer_pave_action_noise_std` | `0.02` | Gaussian normalized-action perturbation standard deviation |
 | `outer_pave_curvature_margin` | `1.0` | Margin in the curvature penalty |
 
-Coefficients, noise standard deviation, and margin must be finite and
+Coefficients, noise standard deviations, and margin must be finite and
 nonnegative. A finite batch cap must be a positive integer. Active PAVE requires
 state observations and `critic_value_mode="single"`; scalar and distributional
 Q representations are supported. Nonzero auxiliary coefficients also require
@@ -2308,6 +2313,8 @@ Let `g_i(o, a)` be the action gradient of decoded scalar Q head `i`, with
 MPR       = sum_i mean_transitions,actions (g_i(o, a) - g_i(o + noise, a))²
 VFC       = sum_i mean_transitions,actions (g_i(o, a) - g_i(next_o, a))²
 curvature = sum_i mean_transitions relu(vᵀ Hessian_action(Q_i) v + margin)
+action_smoothness = sum_i mean_transitions,actions (g_i(o, a) - g_i(o, a_noisy))²
+a_noisy   = clamp(a + Gaussian(0, action_noise_std² I), -1, 1)
 ```
 
 The same recorded action is used at all three observations; VFC does not sample
@@ -2317,6 +2324,14 @@ Perturbed observations pass through the encoder and its SimNorm, preserving the
 latent simplex structure. PAVE detaches every encoded latent, so these losses
 update only the selected online critic parameters. Normal backbone losses
 retain their existing representation gradients.
+
+Action-gradient consistency holds the current observation encoding fixed.
+The original and clamped perturbed actions are detached before creating
+independent gradient leaves, so differentiation does not pass through the
+clamp, replay, or actor. Its reduction averages over action coordinates and
+transitions and sums heads, without dividing by noise variance or Q scale.
+It penalizes changes in the gradient rather than the magnitude of the gradient.
+With `outer_pave_batch_size=null`, H=3 and B=256 use all 768 real replay rows.
 
 One Rademacher probe `v` per sampled transition estimates curvature through a
 Hessian-vector product, without constructing an explicit Hessian. Selected
@@ -2335,6 +2350,12 @@ dropout and optional compilation. Only enabled terms are evaluated. A dedicated
 stateless generator derives samples from the training seed and outer update
 number, preserving the global training RNG and reproducing the samples on
 exact continuation.
+
+For supported dense vmap critics, active observation/action views share one
+parameter stack and a batched eager forward. A curvature term keeps its base
+view separate to avoid enlarging the Hessian-vector-product graph. Custom,
+hooked, LoRA, loop, and nonstandard decoder paths preserve separate forwards.
+This optimization does not alter ordinary TD/actor forward execution or RNG.
 
 ### Example settings and diagnostics
 
@@ -2379,7 +2400,16 @@ backbone, Q scale, ensemble size, and observation units. Higher-order autograd
 adds training cost; the independent batch cap controls that cost without
 changing the ordinary TD minibatch.
 
-Each enabled critic logs `{prefix}_{mpr,vfc,curvature}_loss`, the corresponding
+For an action-only primary-critic ablation, set
+`outer_pave_action_smoothness_coef=0.004`,
+`outer_pave_action_noise_std=0.02`, and `outer_pave_batch_size=null`, leaving
+the other coefficients zero. With five heads and `critic_coef=0.1`, the
+coefficient is equivalent to `0.02` on a head-averaged regularizer, or 0.2 of
+the TD coefficient. This coefficient ratio is not a measured gradient-norm
+ratio. Use `aux_return_pave_action_smoothness_coef` to select the auxiliary
+critic instead; the same mapping applies when its TD coefficient is 0.1.
+
+Each enabled critic logs `{prefix}_{mpr,vfc,curvature,action_smoothness}_loss`, the corresponding
 `{prefix}_{term}_weighted_loss`, combined `{prefix}_weighted_loss`,
 `{prefix}_sample_count`, and `{prefix}_curvature_violation_fraction`, with
 `prefix` equal to `outer_pave` or `aux_return_pave`. Individual term metrics
@@ -2399,6 +2429,42 @@ checkpoint provenance and exact-resume identity. Portable weight transfer can
 enable, disable, or retune PAVE without changing critic architecture. Exact
 continuation requires the same PAVE configuration; the saved update counter
 reproduces the next regularization sample without extra persistent RNG state.
+Zero action-smoothness weights retain the exact version-1 PAVE signature even
+when an unused action-noise setting is supplied. Enabling the new loss uses a
+version-2 signature that records its noise, clamping, independent gradient
+leaves, decoder, and reduction semantics. Retuning its active coefficient or
+noise is rejected by exact resume before any training state is changed.
+
+### Optional CUDA graph for MPR and action smoothness
+
+Set `outer_pave_cuda_graph=true` to capture the enabled MPR/action-smoothness
+loss and its critic-parameter derivatives. This defaults to `false`; it is
+independent of `inner_cuda_graph`. Supported configurations use CUDA, standard
+dense `vmap` critics, a scalar or distributional Q decoder, and fixed geometry
+batch shapes. Primary, auxiliary, or both critics may be selected. VFC,
+curvature, autocast, custom heads/decoders, and gradient hooks are rejected.
+
+Transition selection, private stateless noise generation, and detached encoding
+still execute outside capture on every update. The existing geometry code runs
+inside capture, including its higher derivatives. Neither the sample count nor
+the coefficients, reductions, perturbations, or decoder change. A first-order
+autograd bridge snapshots the resulting parameter gradients and adds them to
+the ordinary TD gradients before the existing joint clipping and Adam step.
+It supports scaled losses and multiple outstanding forwards, but not further
+higher-order differentiation through the returned scalar; use the eager
+`outer_pave_loss` for such diagnostics. Capture never steps an optimizer or
+mutates live `.grad` buffers. Unsupported inputs and capture errors propagate
+instead of silently falling back.
+
+The first update warms up and captures the graph. Later updates replay it using
+current critic weights and new prepared inputs. Metrics and gradients own their
+storage so later replays cannot overwrite pending results. Graph buffers are
+not checkpointed and are recaptured after loading. Enabled mode is recorded as
+`cuda_graph_loss_and_parameter_gradients_v1` in exact-resume identity because
+floating-point gradient accumulation order may differ from eager execution.
+Disabled mode preserves existing identities. `outer_pave_cuda_graph_used=1`
+confirms execution on this path. Enabling this option for an existing eager run
+requires a new weight-transfer lineage rather than an exact continuation.
 
 ### Frozen PAVE gradient probe
 

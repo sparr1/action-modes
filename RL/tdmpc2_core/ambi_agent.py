@@ -65,6 +65,9 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self._outer_policy_diagnostics_force = False
         self.device = resolve_device(getattr(cfg, "device", None))
         self.cfg.device = str(self.device)
+        self._pave_graph = None
+        if bool(getattr(cfg, "outer_pave_cuda_graph", False)) and self.device.type != "cuda":
+            raise ValueError("outer_pave_cuda_graph requires CUDA.")
         if self.device.type not in {"cpu", "cuda"}:
             raise NotImplementedError(
                 "AMBI inner-loop RNG isolation currently supports CPU and CUDA devices only."
@@ -1500,6 +1503,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             )
 
         # All compatibility checks finish before any live state is mutated.
+        self._pave_graph = None
         self.model.load_state_dict(incoming)
         if "optim" in state:
             load_optimizer_state_preserving_hyperparameters(
@@ -3223,6 +3227,11 @@ class AMBITDMPC2Agent(torch.nn.Module):
         behavior_policy_valid=None,
     ):
         """One TD-MPC2-style model update with configurable Q regression."""
+        if bool(getattr(self.cfg, "outer_pave_cuda_graph", False)):
+            if self._pave_graph is None:
+                from .pave_graph import PaveGraph
+                self._pave_graph = PaveGraph(self.model, self.cfg)
+            self._pave_graph.validate()
         split_values = self.model.value_spec.is_split
         coefficient_kwargs = {}
         if split_values:
@@ -3283,9 +3292,12 @@ class AMBITDMPC2Agent(torch.nn.Module):
 
         pave_info = {}
         if pave_enabled(self.cfg):
-            pave_loss, pave_info = outer_pave_loss(
-                self.model, obs, action, self.cfg, update_number=self.num_updates + 1,
-            )
+            if bool(getattr(self.cfg, "outer_pave_cuda_graph", False)):
+                pave_loss, pave_info = self._pave_graph(obs, action, self.num_updates + 1)
+            else:
+                pave_loss, pave_info = outer_pave_loss(
+                    self.model, obs, action, self.cfg, update_number=self.num_updates + 1,
+                )
             total_loss = total_loss + pave_loss
 
         value_equivalence_info = {}

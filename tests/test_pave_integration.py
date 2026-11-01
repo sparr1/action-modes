@@ -31,7 +31,7 @@ def _weights(*prefixes):
     return {
         f"{prefix}_{term}_coef": value
         for prefix in prefixes
-        for term, value in (("mpr", .1), ("vfc", .1), ("curvature", .01))
+        for term, value in (("mpr", .1), ("vfc", .1), ("curvature", .01), ("action_smoothness", .2))
     }
 
 
@@ -127,7 +127,8 @@ def test_disabled_full_update_is_bitwise_equivalent_to_legacy_configuration(agen
     assert "outer_pave" not in explicit._critic_target_spec()
 
 
-@pytest.mark.parametrize("term,view_count", [("mpr", 2), ("vfc", 2), ("curvature", 1)])
+@pytest.mark.parametrize("term,view_count", [("mpr", 2), ("vfc", 2), ("curvature", 1),
+                                          ("action_smoothness", 1)])
 def test_only_enabled_terms_encode_observations_and_draw_noise(agents, monkeypatch, term, view_count):
     agent = agents(**{f"outer_pave_{term}_coef": .1})
     obs, action, _, _ = _batch(agent)
@@ -142,13 +143,13 @@ def test_only_enabled_terms_encode_observations_and_draw_noise(agents, monkeypat
         raise AssertionError("Inactive PAVE term consumed random draws")
 
     monkeypatch.setattr(agent.model, "encode", record_encode)
-    if term != "mpr":
+    if term not in ("mpr", "action_smoothness"):
         monkeypatch.setattr(torch, "randn", forbidden)
     if term != "curvature":
         monkeypatch.setattr(torch, "randint", forbidden)
     _, metrics = outer_pave_loss(agent.model, obs, action, agent.cfg, update_number=2)
     assert len(views) == view_count
-    for candidate in ("mpr", "vfc", "curvature"):
+    for candidate in ("mpr", "vfc", "curvature", "action_smoothness"):
         assert (f"outer_pave_{candidate}_loss" in metrics) is (candidate == term)
 
 
@@ -207,7 +208,7 @@ def test_observation_pairing_simnorm_and_shared_random_inputs(agents, monkeypatc
     primary, auxiliary = geometry_inputs
     assert primary[0] is auxiliary[0]
     assert primary[1] is auxiliary[1]
-    for key in ("noisy_z", "next_z", "probe"):
+    for key in ("noisy_z", "next_z", "probe", "noisy_action"):
         assert primary[2][key] is auxiliary[2][key]
     assert set(primary[2]["probe"].flatten().tolist()) <= {-1., 1.}
     assert metrics["outer_pave_sample_count"] == metrics["aux_return_pave_sample_count"] == expected_rows
@@ -227,9 +228,9 @@ def test_update_accounts_for_independent_pave_weights_in_single_optimizer_step(a
     for prefix in ("outer_pave", "aux_return_pave"):
         weighted = sum(getattr(agent.cfg, f"{prefix}_{term}_coef")
                        * info[f"{prefix}_{term}_loss"]
-                       for term in ("mpr", "vfc", "curvature"))
+                       for term in ("mpr", "vfc", "curvature", "action_smoothness"))
         torch.testing.assert_close(info[f"{prefix}_weighted_loss"], weighted)
-        for term in ("mpr", "vfc", "curvature"):
+        for term in ("mpr", "vfc", "curvature", "action_smoothness"):
             torch.testing.assert_close(info[f"{prefix}_{term}_weighted_loss"],
                                        getattr(agent.cfg, f"{prefix}_{term}_coef")
                                        * info[f"{prefix}_{term}_loss"])
@@ -260,6 +261,8 @@ def test_portable_transfer_can_toggle_pave_without_architecture_change(agents, a
     {"aux_return_pave_vfc_coef": 0.}, {"aux_return_pave_curvature_coef": .02},
     {"outer_pave_batch_size": None}, {"outer_pave_obs_noise_std": .02},
     {"outer_pave_curvature_margin": 0.},
+    {"outer_pave_action_smoothness_coef": .3}, {"aux_return_pave_action_smoothness_coef": 0.},
+    {"outer_pave_action_noise_std": .03},
 ])
 def test_exact_resume_rejects_changed_pave_settings_before_mutation(agents, change):
     options = dict(aux_return_mode="sac", **_weights("outer_pave", "aux_return_pave"))

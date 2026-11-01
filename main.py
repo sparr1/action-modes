@@ -279,6 +279,7 @@ _RUNTIME_CONFIG_FIELDS = (
     "compile",
     "compile_strict",
     "inner_cuda_graph",
+    "outer_pave_cuda_graph",
     "critic_ensemble_backend",
     "inner_operator",
     "inner_schedule_mode",
@@ -473,6 +474,8 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
             whole_inner_cuda_graph=True,
             rng_protocol="isolated_cuda_graph_with_native_diagnostics_v1",
         )
+    if resolved.get("outer_pave_cuda_graph", False):
+        compile_metadata["outer_pave_cuda_graph"] = "cuda_graph_loss_and_parameter_gradients_v1"
     actor_loss_scale = {}
     if {
         "sac_actor_loss_scale_mode",
