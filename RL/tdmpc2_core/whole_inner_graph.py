@@ -9,7 +9,7 @@ adapter below checkpoints its own stream in a distinct graph lineage.
 """
 
 from contextlib import contextmanager
-from copy import deepcopy
+from copy import copy, deepcopy
 import time
 
 import torch
@@ -181,10 +181,10 @@ _TRAINING_PROTOCOL = "isolated_cuda_graph_with_native_diagnostics_v1"
 
 
 def validate_training_graph(engine):
-    """Keep the first training mode limited to the validated fresh K1 recipe."""
+    """Validate fresh K1 solves and K3 held-policy training."""
     validate_graph_workload(engine)
     for key, expected in {
-        "obs": "state", "inner_solve_interval": 1,
+        "obs": "state", "inner_hold_encoder": "solve_snapshot",
         "inner_execution_action": "policy_sample",
         "inner_execution_policy_source": "primary",
         "outer_behavior_policy_kl_schedule": "none",
@@ -194,6 +194,8 @@ def validate_training_graph(engine):
     }.items():
         if getattr(engine.cfg, key, expected) != expected:
             raise ValueError(f"Training CUDA graph requires {key}={expected!r}.")
+    if type(engine.cfg.inner_solve_interval) is not int or engine.cfg.inner_solve_interval not in (1, 3):
+        raise ValueError("Training CUDA graph requires inner_solve_interval=1 or 3.")
     if engine.device.type != "cuda":
         raise ValueError("Training CUDA graph requires CUDA.")
 
@@ -250,6 +252,11 @@ def training_graph_act(engine, root):
     if engine._whole_graph_runner is None:
         from .inner_improvement import InnerImprovementEngine
         worker = InnerImprovementEngine(engine.agent)
+        # Capture one fresh solve. The live engine owns the real-decision
+        # cadence, encoder snapshot and held actor; those must never be baked
+        # into capture or advanced by its warmup iterations.
+        worker.cfg = copy(engine.cfg)
+        worker.cfg.inner_solve_interval = 1
         worker._whole_graph_worker = True
         runner = WholeInnerGraph(worker, root, seed=int(engine.cfg.seed) + 8173, warmup=4)
         saved = engine._whole_graph_resume
@@ -259,14 +266,19 @@ def training_graph_act(engine, root):
             runner.calls = saved["calls"]
         engine._whole_graph_runner = runner
         engine._whole_graph_resume = None
-    engine._pending_timers = {}
+    if engine._solve_interval == 1:
+        engine._pending_timers = {}
     started = engine._timer_start()
     action, values, lengths = engine._whole_graph_runner(root)
-    engine._timer_stop("inner_action_seconds", started)
     engine.action_index += 1
     # The live engine records the prior version used by this logical action,
     # even though its disposable tensor workspace belongs to the graph worker.
     engine.state.outer_version = int(engine.agent.outer_version)
     # Do not mutate the static result dictionary owned by the capture.
     values = dict(values, inner_cuda_graph_used=1.0)
+    if engine._solve_interval > 1:
+        actor = engine._whole_graph_runner.engine._action_pool.actor
+        engine._snapshot_held_actor(actor=actor)
+        engine._finish_control_cadence(values, held=False, start=started)
+    engine._timer_stop("inner_action_seconds", started)
     return action, values, lengths

@@ -236,14 +236,27 @@ class InnerImprovementEngine(RetraceInnerMixin):
             self._pending_timers = {}
 
     @torch.no_grad()
-    def _snapshot_held_actor(self):
-        if self.state.actor is None:
+    def _snapshot_held_actor(self, actor=None):
+        actor = self.state.actor if actor is None else actor
+        if actor is None:
             raise RuntimeError("Held-policy cadence requires a live solved inner actor.")
         if self._held_actor is None:
-            self._held_actor = deepcopy(self.state.actor)
+            self._held_actor = deepcopy(actor)
         else:
-            self._held_actor.load_state_dict(self.state.actor.state_dict())
+            self._held_actor.load_state_dict(actor.state_dict())
         self._held_actor.requires_grad_(False).eval()
+
+    def _finish_control_cadence(self, metrics, *, held, start):
+        decision = self._episode_decision_index
+        metrics.update(
+            inner_solve_performed=float(not held), inner_policy_held=float(held),
+            inner_solve_interval=float(self._solve_interval),
+            inner_solve_index=float(decision // self._solve_interval),
+            inner_action_age=float(decision % self._solve_interval),
+            inner_episode_decision_index=float(decision),
+        )
+        self._timer_stop("inner_held_seconds" if held else "inner_solve_seconds", start)
+        self._episode_decision_index += 1
 
     @property
     def _critic_bernoulli_p(self):
@@ -7211,27 +7224,29 @@ class InnerImprovementEngine(RetraceInnerMixin):
         apply_inner_writeback=False,
         trace=None,
     ):
-        if getattr(self.cfg, "inner_cuda_graph", False) and not self._whole_graph_worker:
-            from .whole_inner_graph import validate_training_graph, training_graph_act
-            validate_training_graph(self)
-            if not eval_mode and not collect_diagnostics and trace is None:
+        graph = bool(getattr(self.cfg, "inner_cuda_graph", False)) and not self._whole_graph_worker
+        try:
+            if graph:
+                from .whole_inner_graph import validate_training_graph, training_graph_act
+                validate_training_graph(self)
+            held = self.prepare_control(t0=t0, eval_mode=eval_mode)
+            if graph and not held and not eval_mode and not collect_diagnostics and trace is None:
                 if return_behavior_policy:
                     raise ValueError("Training CUDA graph does not support behavior-policy metadata.")
-                return training_graph_act(self, root_z)
-        try:
-            self.prepare_control(t0=t0, eval_mode=eval_mode)
-            result = self._act_with_trace(
-                root_z, t0=t0, eval_mode=eval_mode,
-                collect_diagnostics=collect_diagnostics,
-                return_behavior_policy=return_behavior_policy,
-                apply_inner_writeback=apply_inner_writeback, trace=trace,
-            )
+                result = training_graph_act(self, root_z)
+            else:
+                result = self._act_with_trace(
+                    root_z, t0=t0, eval_mode=eval_mode,
+                    collect_diagnostics=collect_diagnostics,
+                    return_behavior_policy=return_behavior_policy,
+                    apply_inner_writeback=apply_inner_writeback, trace=trace,
+                )
+                if graph:
+                    result[1]["inner_cuda_graph_used"] = 0.0
         except BaseException:
             self.abort_control()
             raise
         self._control_prepared = None
-        if getattr(self.cfg, "inner_cuda_graph", False) and not self._whole_graph_worker:
-            result[1]["inner_cuda_graph_used"] = 0.0
         return result
 
     def _act_with_trace(
@@ -7419,17 +7434,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
             if cadence_active:
                 if not held:
                     self._snapshot_held_actor()
-                decision = self._episode_decision_index
-                metrics.update(
-                    inner_solve_performed=float(not held),
-                    inner_policy_held=float(held),
-                    inner_solve_interval=float(self._solve_interval),
-                    inner_solve_index=float(decision // self._solve_interval),
-                    inner_action_age=float(decision % self._solve_interval),
-                    inner_episode_decision_index=float(decision),
-                )
-                self._timer_stop("inner_held_seconds" if held else "inner_solve_seconds", start)
-                self._episode_decision_index += 1
+                self._finish_control_cadence(metrics, held=held, start=start)
             self._timer_stop("inner_action_seconds", start)
 
             # Refresh after diagnostics/planning, since those calls may be the

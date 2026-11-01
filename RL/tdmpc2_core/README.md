@@ -3,7 +3,7 @@
 This package vendors the algorithmic core from the official TD-MPC2 implementation
 at upstream commit `8bbc14ebabdb32ea7ada5c801dc525d0dc73bafe`.
 
-### Opt-in K1 whole-solve CUDA graph training
+### Opt-in K1/K3 whole-solve CUDA graph training
 
 `inner_cuda_graph=true` uses `whole_inner_graph.WholeInnerGraph` for ordinary
 training solves. It captures resets, imagination, replay sampling, forward and
@@ -11,9 +11,9 @@ backward passes, capturable Adam, target updates, action selection and ordinary
 metrics in one CUDA execution graph. The existing tensor compile regions remain
 separate compiler graphs. Inputs and inherited alpha are refreshed on every call.
 
-The initial supported training protocol is state-observation fresh K1 SAC with
+The supported training protocol is state-observation fresh K1 or K3 SAC with
 reward-only primary critics, no auxiliary critic, and strict compilation.
-Dynamic/persistent scopes, held policies, transfer, writeback and behavior-policy
+Dynamic/persistent scopes, transfer, writeback and behavior-policy
 metadata are rejected. Sparse diagnostic decisions and evaluation retain the
 native implementation; diagnostic cadence and metrics are preserved. The graph
 uses a separate inner workspace sharing only the current outer priors, so native
@@ -21,16 +21,35 @@ diagnostics, episode resets and checkpoint preparation cannot invalidate capture
 addresses. Graph calls advance the main engine action counter and report
 `inner_cuda_graph_used=1`; scheduled native diagnostics report zero.
 
+With K3, only solve decisions replay the graph. The live engine snapshots the
+solved actor and the solve-time encoder, then executes the two held decisions
+through the native feedback-policy path and its private execution RNG. Capture
+warmup cannot advance the live cadence. Outer updates between held decisions do
+not change either snapshot. Episode boundaries and exact resume retain the
+existing held-policy boundary requirements.
+
 PyTorch 2.3.1 cannot capture the native per-phase/private generator protocol.
 Graph solves instead use an isolated default CUDA stream seeded from the run
 seed; each replay draws fresh randomness. Diagnostic decisions retain native
 private streams. Both are isolated from outer CPU/CUDA RNG. This creates a new
-experimental lineage; it is not the same stochastic trajectory as native K1.
+experimental lineage; it is not the same stochastic trajectory as native SAC.
 The graph flag belongs to scientific identity and cross-mode resume is rejected.
 Exact graph continuation saves its RNG state and call count beside native inner
 state. Captured allocations are disposable caches: a restarted process recaptures
 from current priors, then restores the saved graph stream before its first action.
 Portable model snapshots remain usable by ordinary frozen-checkpoint evaluators.
+
+`configs/research/ambi_mpr_hydra_speed.json` records the scientific settings of
+W&B `ambi/4fdce72d14b644b8874221e9670a13fd` with publication disabled. On a
+scheduled GPU, `python -m tests.benchmark_pave_graph --term mpr --graph
+--source-config configs/research/ambi_mpr_hydra_speed.json --interval 3
+--threads 1 --warmup 12 --decisions 192 --output /path/to/new-result.json`
+checks and times the complete training loop with both graph optimizations.
+Use `--interval 1` for K1 and `--threads 2` for CPU sizing. Each arm checks full
+optimizer dose, held cadence, nonzero MPR, compilation stability, and exact inner
+and outer continuation. Timing excludes compilation, production pretraining,
+large replay, checkpoint I/O and W&B; it is a throughput benchmark, not a
+learning-quality comparison.
 
 The one-cell manifest `configs/dmcontrol/experiments/ambi_k1_j10_graph_training.json`
 launches the K1 counterpart of W&B `ambi/de37a4eec8094c67a2a691db04e47a2b`:

@@ -57,7 +57,8 @@ def graph_engine():
 
 
 @pytest.mark.parametrize("key,value", [
-    ("inner_solve_interval", 3), ("obs", "rgb"), ("aux_return_mode", "sac"),
+    ("inner_solve_interval", 2), ("inner_hold_encoder", "current"),
+    ("obs", "rgb"), ("aux_return_mode", "sac"),
     ("outer_behavior_policy_kl_schedule", "fixed"), ("compile_strict", False),
     ("inner_execution_action", "policy_mean"),
 ])
@@ -113,14 +114,20 @@ def assert_graph_resume_continuation(agent):
         outer_cuda = torch.cuda.get_rng_state().clone()
         sequence = []
         # Scheduled native diagnostics must not invalidate graph storage.
-        for index, diagnostic in enumerate((False, True, False)):
+        interval = agent.cfg.inner_solve_interval
+        diagnostics = (False, True, False) if interval == 1 else (False, False, False, True, False, False, False)
+        for index, diagnostic in enumerate(diagnostics):
             obs = torch.full(agent.cfg.obs_shape["state"], 0.1 * index)
             action = agent.act(obs, t0=index == 0, collect_diagnostics=diagnostic)
             metrics = deepcopy(agent.last_inner_metrics)
             assert all(math.isfinite(float(value)) for value in metrics.values())
-            assert metrics["inner_cuda_graph_used"] == float(not diagnostic)
-            assert metrics["inner_critic_optimizer_steps"] == 160
-            assert metrics["inner_actor_optimizer_steps"] == 40
+            solve = index % interval == 0
+            assert metrics["inner_cuda_graph_used"] == float(solve and not diagnostic)
+            assert metrics["inner_critic_optimizer_steps"] == (160 if solve else 0)
+            assert metrics["inner_actor_optimizer_steps"] == (40 if solve else 0)
+            if interval > 1:
+                assert metrics["inner_action_age"] == index % interval
+                assert metrics["inner_solve_performed"] == float(solve)
             if diagnostic:
                 assert metrics["inner_diagnostics_sampled"] == 1
             sequence.append((action.clone(), {key: value for key, value in metrics.items()

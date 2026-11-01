@@ -1,8 +1,8 @@
-"""Scheduled CUDA correctness gate and bounded J10/K1 regularizer benchmark.
+"""Scheduled CUDA correctness gate and bounded J10/K1 or K3 regularizer benchmark.
 
 Run with ``python -m tests.benchmark_pave_graph --term mpr --graph --output ...``.
 The geometry comparison uses identical weights and inputs. Real-training timing
-uses the production K1 recipe with short replay/pretraining and W&B disabled;
+uses the selected production recipe with short replay/pretraining and W&B disabled;
 it is not a learning-quality comparison or a mature-replay runtime estimate.
 """
 
@@ -21,7 +21,7 @@ import torch
 from RL.tdmpc2_core.pave import outer_pave_loss
 from RL.tdmpc2_core.pave_graph import PaveGraph
 from slurm.ambi_mppi_training import smoke_recipe
-from slurm.ambi_reward_training import GRAPH_MANIFEST, SEED_STEPS, validate_action
+from slurm.ambi_reward_training import GRAPH_MANIFEST, SEED_STEPS, validate_action, validate_learner
 from slurm.benchmark_ambi_training_cpu import TrainingWindow
 from tests.benchmark_whole_inner_graph import make_agent, assert_tree_close
 from tests.test_training_inner_graph import assert_graph_resume_continuation
@@ -104,20 +104,33 @@ def geometry_gate(term):
             "scope": "Preparation, encoding, loss, gradients, graph validation and output ownership; no optimizer."}
 
 
+def training_recipe(args):
+    name, manifest, run, overrides = smoke_recipe(0, args.warmup, args.decisions, GRAPH_MANIFEST)
+    if args.source_config is not None:
+        source = json.loads(args.source_config.read_text())
+        run = {**source, "total_steps": run["total_steps"], "alg_params": deepcopy(source["alg_params"])}
+        run["alg_params"].update(overrides)
+    run["alg_params"].update(inner_cuda_graph=True, inner_solve_interval=args.interval,
+                              compile=True, compile_strict=True, critic_ensemble_backend="vmap")
+    run["alg_params"].update(controls(args.term, args.graph))
+    return name, manifest, run, overrides
+
+
 def training_gate(args):
     import gymnasium as gym
     import domains  # noqa: F401
     from RL.AMBITDMPC2 import AMBITDMPC2
 
-    name, manifest, run, overrides = smoke_recipe(0, args.warmup, args.decisions, GRAPH_MANIFEST)
-    run["alg_params"].update(controls(args.term, args.graph))
+    name, manifest, run, overrides = training_recipe(args)
     env = gym.make(run["env"], **manifest["env_params"])
     learner = None
+    started_training = time.perf_counter()
     try:
         learner = AMBITDMPC2(name + "-pave-correctness", env, run["alg_params"], run, manifest)
         agent, cfg = learner.agent, learner.cfg
         assert not cfg.wandb and cfg.wandb_mode == "disabled"
-        assert cfg.inner_cuda_graph and cfg.inner_solve_interval == 1 and cfg.inner_rounds == 10
+        assert cfg.inner_cuda_graph and cfg.inner_solve_interval == args.interval and cfg.inner_rounds == 10
+        validate_learner(cfg, agent, rounds=10, interval=args.interval)
         assert cfg.compile and cfg.compile_strict and cfg.critic_ensemble_backend == "vmap"
         assert cfg.outer_pave_batch_size is None and cfg.batch_size == 256 and cfg.train_unroll_horizon == 3
         learner.buffer.enable_resumable_storage()
@@ -131,12 +144,15 @@ def training_gate(args):
             step = learner._global_step + 1
             if step == timer.first_step:
                 counts["before"] = int(torch._dynamo.utils.counters["stats"]["unique_graphs"])
+                torch.cuda.synchronize()
+                counts["seconds_through_compilation_and_warmup"] = time.perf_counter() - started_training
             timer.before_action(step, learner._num_updates)
             started = time.perf_counter()
             action = act(*positional, **kwargs)
             timer.after_action(step, time.perf_counter() - started)
-            validate_action(agent.last_inner_metrics, operator="sac", decision=active, interval=1, rounds=10)
-            assert agent.last_inner_metrics["inner_cuda_graph_used"] == 1
+            solve = validate_action(agent.last_inner_metrics, operator="sac", decision=active,
+                                    interval=args.interval, rounds=10)
+            assert agent.last_inner_metrics["inner_cuda_graph_used"] == float(solve)
             assert torch.isfinite(action).all()
             active += 1
             return action
@@ -165,6 +181,9 @@ def training_gate(args):
         assert active == args.warmup + args.decisions
         assert updates == agent.num_updates == 2 + active and positive > 0
         assert timer.result and timer.result["outer_updates"] == args.decisions
+        assert agent.inner_engine._whole_graph_runner.calls == active // args.interval
+        print("TIMING_COMPLETE " + json.dumps({"interval":args.interval, "threads":args.threads,
+              "decisions_per_second":timer.result["decisions_per_second"]}), flush=True)
         # The inner graph must remain correct after regularized outer updates,
         # including native diagnostics, changed priors, and recapture on resume.
         assert_graph_resume_continuation(agent)
@@ -186,7 +205,10 @@ def training_gate(args):
         return {"passed": True, "timing": timer.result, "compile_counts": counts,
                 "nonzero_regularizer_updates": positive, "outer_updates": updates,
                 "inner_and_outer_exact_continuation": True,
-                "overrides": {**overrides, **controls(args.term, args.graph), "total_steps": run["total_steps"]},
+                "overrides": {**overrides, **controls(args.term, args.graph), "total_steps": run["total_steps"],
+                              "inner_cuda_graph":True, "inner_solve_interval":args.interval},
+                "resolved_alg_params":run["alg_params"], "source_config":str(args.source_config),
+                "inner_solves":active // args.interval, "held_decisions":active - active // args.interval,
                 "scope": "Short real training; excludes startup, W&B, checkpoints, mature replay and production pretraining."}
     finally:
         if learner is not None:
@@ -202,15 +224,25 @@ def main():
     parser.add_argument("--warmup", type=int, default=12)
     parser.add_argument("--decisions", type=int, default=96)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--source-config", type=Path)
+    parser.add_argument("--interval", type=int, choices=(1, 3), default=1)
+    parser.add_argument("--threads", type=int, choices=(1, 2), default=1)
     args = parser.parse_args()
     assert args.warmup >= 12 and args.decisions >= 32
+    assert args.warmup % args.interval == args.decisions % args.interval == 0
     assert SEED_STEPS + 1 + args.warmup + args.decisions < 1000
     assert torch.cuda.is_available(), "Requires a scheduled CUDA allocation."
     os.environ["WANDB_MODE"] = "disabled"
-    torch.set_num_threads(1)
+    assert os.environ.get("CUDA_LAUNCH_BLOCKING", "0") in ("0", ""), "Disable CUDA debug synchronization."
+    if hasattr(os, "sched_getaffinity"):
+        cpus = sorted(os.sched_getaffinity(0))
+        assert len(cpus) >= args.threads
+        os.sched_setaffinity(0, cpus[:args.threads])
+    torch.set_num_threads(args.threads)
     torch.set_num_interop_threads(1)
     report = {"commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
               "term": args.term, "graph": args.graph, "gpu": torch.cuda.get_device_name(),
+              "interval":args.interval, "threads":args.threads, "cuda_launch_blocking":False,
               "torch": torch.__version__, "cuda": torch.version.cuda}
     if args.geometry:
         report["geometry"] = geometry_gate(args.term)
