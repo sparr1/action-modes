@@ -58,7 +58,8 @@ def make_model(checkpoint):
 
 def root_for(model, observation):
     with torch.no_grad():
-        return model.agent.model.encode(model._obs_to_tensor(observation).unsqueeze(0)).detach()
+        obs = model._obs_to_tensor(observation).to(model.agent.device).unsqueeze(0)
+        return model.agent.model.encode(obs).detach()
 
 
 def install_adapter(model, runner):
