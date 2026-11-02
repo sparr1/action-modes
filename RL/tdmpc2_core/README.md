@@ -2480,6 +2480,70 @@ version-2 signature that records its noise, clamping, independent gradient
 leaves, decoder, and reduction semantics. Retuning its active coefficient or
 noise is rejected by exact resume before any training state is changed.
 
+### Periodic critic geometry logging, including unregularized baselines
+
+State-observation AMBI with `critic_value_mode="single"` enables lightweight
+geometry diagnostics by default, independently of all regularization weights.
+Every 1,000 outer updates (including pretraining), it selects up to 64 real
+transitions from the current TD minibatch and measures **both MPR and action
+smoothness** for the primary critic and any auxiliary return critic. Baselines,
+MPR-only runs, and action-only runs therefore expose the same diagnostic keys.
+These measurements use the online critics before that update's optimizer step.
+
+| Configuration | Default | Meaning |
+| --- | --- | --- |
+| `critic_geometry_diagnostics` | `null` | Auto-enable for state observations and single-component Q; explicit `false` disables |
+| `critic_geometry_every` | `1000` | Outer-update cadence |
+| `critic_geometry_batch_size` | `64` | Maximum replay rows; `null` uses the full TD sample |
+| `critic_geometry_obs_noise_std` | `0.01` | Diagnostic observation-noise standard deviation |
+| `critic_geometry_action_noise_std` | `0.02` | Diagnostic normalized-action-noise standard deviation |
+| `critic_geometry_seed` | `12345` | Private perturbation/subsampling seed |
+
+Explicit enablement on RGB or split return/entropy critics is rejected; the
+automatic default disables diagnostics for those unsupported cases. Diagnostic
+noise scales and sample counts are separate from the training regularizer's
+controls so coefficient or training-noise ablations keep a common measurement.
+Both perturbations and both critics share the selected replay rows. The seed
+and saved outer-update counter reproduce the draws without advancing training
+RNG. Replay data still change during learning and differ between runs: these
+curves are **not** measurements on a fixed cross-run observation-action bank.
+Use matched saved checkpoints and a shared bank for that stronger comparison.
+
+Metrics appear under `train/critic_geometry_primary_*` and, when present,
+`train/critic_geometry_aux_return_*`:
+
+- `mpr_loss` and `action_smoothness_loss` use the training convention: sum
+  heads, mean replay rows and action coordinates, decoded raw Q, no noise- or
+  Q-scale normalization.
+- `action_gradient_rms` measures the unperturbed action gradient. For each
+  term, `{term}_gradient_change_rms` is `sqrt(raw_loss / num_q)` and
+  `{term}_perturbed_action_gradient_rms` measures the perturbed gradient.
+- `{term}_relative_gradient_change` divides gradient-change RMS by the
+  unperturbed gradient RMS. It is unavailable at or below `1e-8`; the separate
+  `gradient_scale_valid` field reports whether this denominator is usable.
+- `{term}_cosine_similarity` averages direction agreement per head and replay
+  row only when both action-gradient L2 norms exceed `1e-8`.
+  `{term}_cosine_valid_fraction` reports coverage. Zero valid vectors produce
+  an unavailable cosine, never fabricated perfect agreement for a flat critic.
+
+Shared `train/critic_geometry_sample_count`, `critic_geometry_update`,
+`critic_geometry_action_perturbation_rms`, and
+`critic_geometry_action_boundary_fraction` record the sample, update number,
+actual perturbation after clamping, and fraction of perturbed coordinates at
+an action boundary. The existing logger emits finite metrics with per-window
+sample counts; unsampled updates do not insert zeros. Undefined angular or
+relative metrics are omitted, with their validity fields retained.
+
+The probe uses first action derivatives only (`create_graph=False`), eager
+batched critic views, detached encoder outputs, and temporarily disabled
+dropout. It adds no training objective, parameter gradients, optimizer steps,
+or inner-loop computation. Module modes and Torch RNG are restored even on
+failure. Its controls are recorded in the resolved configuration but excluded
+from scientific trial identity; normal source checks for exact continuation
+still apply. `tests/test_critic_geometry.py` checks loss parity, zero-gradient
+handling, sparse logging, and unchanged complete optimizer/target/RNG updates
+with diagnostics enabled versus disabled.
+
 ### Frozen PAVE gradient probe
 
 `probe_pave.py` measures PAVE against the actual weighted outer TD gradients

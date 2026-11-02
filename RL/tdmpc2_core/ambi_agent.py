@@ -21,6 +21,7 @@ from .auxiliary_return import AuxiliaryReturnLearner
 from .inner_improvement import InnerImprovementEngine, polyak_update
 from .outer_policy_diagnostics import diagnostics_due, policy_diagnostics
 from .pave import outer_pave_loss, pave_enabled
+from .critic_geometry import critic_geometry_diagnostics
 from .common.training_state import (
     load_optimizer_state_preserving_hyperparameters,
     preflight_adam_state,
@@ -3288,6 +3289,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
             )
             total_loss = total_loss + pave_loss
 
+        geometry_info = critic_geometry_diagnostics(
+            self.model, obs, action, self.cfg, update_number=self.num_updates + 1,
+        )
+
         value_equivalence_info = {}
         value_equivalence_loss_coef = float(
             self.cfg.value_equivalence_loss_coef
@@ -3454,6 +3459,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         info.update(component_info)
         info.update(value_equivalence_info)
         info.update(pave_info)
+        info.update(geometry_info)
         info.update(auxiliary_info)
         if self._outer_policy_diagnostics_packet is not None:
             diagnostic_started = time.perf_counter()

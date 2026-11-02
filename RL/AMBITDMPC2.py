@@ -25,6 +25,7 @@ from RL.tdmpc2_core.common.auxiliary_config import (
 )
 from utils.utils import setup_logs
 from utils.pave_identity import PAVE_COEFFICIENT_KEYS, PAVE_DEFAULTS, resolve_pave_controls
+from utils.pave_identity import CRITIC_GEOMETRY_DEFAULTS, resolve_critic_geometry_controls
 from utils.ensemble_identity import (
     DEFAULT_CRITIC_ENSEMBLE_BACKEND, normalize_critic_ensemble_backend,
 )
@@ -61,6 +62,7 @@ _INNER_EXECUTION_POLICY_SOURCES = {
 _AMBI_DEFAULTS = {
     # PAVE regularizes action derivatives of independently selected outer critics.
     **PAVE_DEFAULTS,
+    **CRITIC_GEOMETRY_DEFAULTS,
     # Outer latent SAC. Q representation, ensemble reduction, and whether
     # entropy enters policy evaluation are independent controls.
     "mpc": False,
@@ -1638,6 +1640,8 @@ class AMBITDMPC2(TDMPC2Baseline):
         )
         pave_controls = resolve_pave_controls(cfg)
         for key, value in pave_controls.items():
+            setattr(cfg, key, value)
+        for key, value in resolve_critic_geometry_controls(cfg).items():
             setattr(cfg, key, value)
         if any(pave_controls[key] > 0 for key in PAVE_COEFFICIENT_KEYS):
             if cfg.obs != "state":

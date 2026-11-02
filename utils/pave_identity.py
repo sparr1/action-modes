@@ -21,6 +21,50 @@ PAVE_DEFAULTS = {
     "outer_pave_curvature_margin": 1.0,
 }
 
+# Observation-only controls are deliberately outside PAVE's training identity.
+CRITIC_GEOMETRY_DEFAULTS = {
+    "critic_geometry_diagnostics": None,  # Auto-enable for state/single-Q AMBI.
+    "critic_geometry_every": 1_000,
+    "critic_geometry_batch_size": 64,
+    "critic_geometry_obs_noise_std": 0.01,
+    "critic_geometry_action_noise_std": 0.02,
+    "critic_geometry_seed": 12345,
+}
+
+
+def resolve_critic_geometry_controls(config):
+    """Resolve independent telemetry even when every loss weight is zero."""
+    if not isinstance(config, Mapping):
+        config = vars(config)
+    controls = {key: config.get(key, default)
+                for key, default in CRITIC_GEOMETRY_DEFAULTS.items()}
+    supported = (config.get("obs", "state") == "state"
+                 and config.get("critic_value_mode", "single") == "single")
+    enabled = controls["critic_geometry_diagnostics"]
+    if enabled is None:
+        enabled = supported
+    elif not isinstance(enabled, bool):
+        raise ValueError("critic_geometry_diagnostics must be boolean or null.")
+    if enabled and not supported:
+        raise ValueError("critic_geometry_diagnostics requires state observations and critic_value_mode='single'.")
+    controls["critic_geometry_diagnostics"] = enabled
+    for key in ("critic_geometry_every", "critic_geometry_batch_size", "critic_geometry_seed"):
+        value = controls[key]
+        if key == "critic_geometry_batch_size" and value is None:
+            continue
+        minimum = 0 if key == "critic_geometry_seed" else 1
+        if isinstance(value, bool) or not isinstance(value, Integral) or value < minimum:
+            raise ValueError(f"{key} must be an integer >= {minimum}"
+                             + (" or null." if key == "critic_geometry_batch_size" else "."))
+        controls[key] = int(value)
+    for key in ("critic_geometry_obs_noise_std", "critic_geometry_action_noise_std"):
+        value = controls[key]
+        if (isinstance(value, bool) or not isinstance(value, Real)
+                or not math.isfinite(value) or value < 0):
+            raise ValueError(f"{key} must be a finite non-negative number.")
+        controls[key] = float(value)
+    return controls
+
 
 def resolve_pave_controls(config):
     """Validate and canonicalize controls, including inactive numeric values."""
@@ -93,7 +137,7 @@ def normalize_pave_identity(config):
     """Drop disabled controls; hash active resolved settings and semantics."""
     result = dict(config)
     signature = pave_training_signature(result, include_seed=False)
-    for key in PAVE_DEFAULTS:
+    for key in (*PAVE_DEFAULTS, *CRITIC_GEOMETRY_DEFAULTS):
         result.pop(key, None)
     result.pop("outer_pave_training", None)
     if signature is not None:

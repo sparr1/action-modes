@@ -38,16 +38,19 @@ def _geometry_mode(critic):
             module.training = training
 
 
-def _action_gradient(value, action):
+def _action_gradient(value, action, *, create_graph=True):
     # Constant/affine critics legitimately have zero first/second derivatives.
     # Keep the zero connected so a curvature-only loss remains backwardable.
     if not value.requires_grad:
-        return action * 0.0
+        return action * 0.0 if create_graph else torch.zeros_like(action)
     gradient = torch.autograd.grad(
-        value.sum(), action, create_graph=True, allow_unused=True,
+        value.sum(), action, create_graph=create_graph, allow_unused=True,
     )[0]
     if gradient is None:
-        return action * 0.0 + value.sum() * 0.0
+        return (action * 0.0 + value.sum() * 0.0
+                if create_graph else torch.zeros_like(action))
+    if not create_graph:
+        return gradient.detach()
     return gradient + action * 0.0
 
 
@@ -80,7 +83,8 @@ def _view_batch_spec(critic, decode):
     return None
 
 
-def _view_gradients(critic, decode, views, action, *, curvature, noisy_action=None):
+def _view_gradients(critic, decode, views, action, *, curvature, noisy_action=None,
+                    create_graph=True):
     """Share parameter stacks without making curvature traverse unused views.
 
     When supplied, ``noisy_action`` belongs to the last view only; preceding
@@ -101,7 +105,7 @@ def _view_gradients(critic, decode, views, action, *, curvature, noisy_action=No
         values = decode(predictions)
         if values.shape != (*actions.shape[:-1], 1):
             raise ValueError("PAVE requires a single decoded scalar per critic head and row.")
-        return _action_gradient(values, actions)
+        return _action_gradient(values, actions, create_graph=create_graph)
 
     if spec is None:
         # Preserve custom call boundaries and shared action coordinates exactly.
