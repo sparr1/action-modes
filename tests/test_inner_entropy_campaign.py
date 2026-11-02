@@ -144,3 +144,96 @@ def test_pending_resource_changes_are_held_and_all_fields_verified(monkeypatch):
     assert calls[0]==['scontrol','hold','123']
     assert {'NumCPUs=1','CPUsPerTask=1','TresPerTask=cpu:1','MinCPUsNode=1'} <= set(calls[1])
     assert calls[2]==['scontrol','release','123']
+
+
+def test_gpu_parity_junit_rejects_skipped_or_missing_cuda_cases(tmp_path):
+    from slurm.inner_entropy_oscar import parity_cases, GPU_PARITY_TEST
+    node = GPU_PARITY_TEST.rsplit('::', 1)[1]
+    cases = [f'<testcase name="{node}[arm-{i}]"></testcase>' for i in range(6)]
+    path = tmp_path / 'parity.xml'
+    path.write_text('<testsuites><testsuite>' + ''.join(cases) + '</testsuite></testsuites>')
+    assert len(parity_cases(path)) == 6
+    for bad_cases in (cases[:5], cases[:-1] + [cases[-1].replace('</testcase>', '<skipped/></testcase>')],
+                      cases[:-1] + [cases[-1].replace('</testcase>', '<failure/></testcase>')]):
+        path.write_text('<testsuite>' + ''.join(bad_cases) + '</testsuite>')
+        with pytest.raises(AssertionError):
+            parity_cases(path)
+
+
+def test_gpu_parity_receipt_rejects_other_source_runtime_and_skips():
+    from slurm.inner_entropy_oscar import validate_global_parity, GPU_PARITY_TEST
+    receipt = {'passed': True, 'binding': {'commit': 'one'}, 'runtime': {'gpu': 'L40S'},
+               'case_count': 6, 'case_names': [f'case{i}' for i in range(6)],
+               'test_node': GPU_PARITY_TEST, 'failures': 0, 'errors': 0, 'skipped': 0}
+    validate_global_parity(receipt, {'commit': 'one'}, {'gpu': 'L40S'})
+    for mutation in ({'binding': {'commit': 'two'}}, {'runtime': {'gpu': 'A100'}},
+                     {'skipped': 1}, {'case_count': 5}, {'case_names': ['same'] * 6}):
+        with pytest.raises(AssertionError):
+            validate_global_parity({**receipt, **mutation}, {'commit': 'one'}, {'gpu': 'L40S'})
+
+
+def test_parity_mode_needs_no_two_cpu_allocation(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from slurm import inner_entropy_oscar as launch
+    campaign = tmp_path / 'campaign'
+    monkeypatch.setenv('SLURM_JOB_ID', '100')
+    monkeypatch.setenv('WANDB_MODE', 'disabled')
+    monkeypatch.setenv('AMBI_ENTROPY_CAMPAIGN', str(campaign))
+    monkeypatch.setattr(launch, 'CAMPAIGN_ROOT', campaign)
+    monkeypatch.setattr(launch, 'physical_core_cpus', lambda *a: pytest.fail('Parity needs only one CPU'))
+    calls = []
+    monkeypatch.setattr(launch, 'run_gpu_parity', lambda output, root: calls.append((output, root)))
+    output = campaign / 'parity'
+    launch.parity(SimpleNamespace(output=output))
+    assert calls == [(output, campaign)] and output.is_dir()
+
+
+def test_parity_reuse_checks_persisted_junit_hash(monkeypatch, tmp_path):
+    import hashlib
+    from slurm import inner_entropy_oscar as launch
+    node = launch.GPU_PARITY_TEST.rsplit('::', 1)[1]
+    xml = '<testsuite>' + ''.join(f'<testcase name="{node}[arm{i}]"/>' for i in range(6)) + '</testsuite>'
+    junit = tmp_path / 'parity.xml'
+    junit.write_text(xml)
+    receipt = {'passed': True, 'binding': {'commit': 'one'}, 'runtime': {'gpu': 'L40S'},
+               'case_count': 6, 'case_names': launch.parity_cases(junit),
+               'test_node': launch.GPU_PARITY_TEST, 'failures': 0, 'errors': 0, 'skipped': 0,
+               'junit_path': str(junit), 'junit_sha256': hashlib.sha256(junit.read_bytes()).hexdigest()}
+    (tmp_path / 'gpu-parity.json').write_text(json.dumps(receipt))
+    monkeypatch.setattr(launch, 'binding', lambda manifest: {'commit': 'one'})
+    assert launch.load_global_parity(tmp_path, {'gpu': 'L40S'}) == receipt
+    junit.write_text(xml + '\n')
+    with pytest.raises(AssertionError):
+        launch.load_global_parity(tmp_path, {'gpu': 'L40S'})
+
+
+def test_standalone_gate_measures_without_releasing_production(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from slurm import inner_entropy_oscar as launch
+    monkeypatch.setenv('SLURM_JOB_ID', '123')
+    monkeypatch.setenv('WANDB_MODE', 'disabled')
+    monkeypatch.setenv('AMBI_ENTROPY_CAMPAIGN', str(launch.CAMPAIGN_ROOT))
+    monkeypatch.setattr(launch.os, 'sched_getaffinity', lambda pid: {0, 1}, raising=False)
+    monkeypatch.setattr(launch, 'physical_core_cpus', lambda allowed: [0, 1])
+    monkeypatch.setattr(launch, 'binding', lambda manifest: {'commit': 'test'})
+    monkeypatch.setattr(launch, 'checkpoint_space', lambda *a: {'checkpoint_bank_bytes': 40 * 6 * 72_500_000})
+    monkeypatch.setattr(launch, 'resize_pending', lambda *a: pytest.fail('Standalone gate must not mutate production'))
+    commands = []
+    def completed_worker(command, **kwargs):
+        commands.append(command)
+        native = '--native-reference' in command
+        cpus = command[command.index('--worker-cpus') + 1].count(',') + 1
+        path = Path(command[command.index('--output') + 1])
+        path.write_text(json.dumps({
+            'passed': True, 'index': 1, 'physical_cpus': cpus,
+            'runtime': {'gpu': 'L40S'}, 'checkpoint_bytes': 72_500_000,
+            'measured': {'seconds_per_decision': 1.0 if native else .2},
+            'graph_native_graph_continuation': not native,
+        }))
+    monkeypatch.setattr(launch.subprocess, 'run', completed_worker)
+    output = tmp_path / 'gate'
+    launch.gate(SimpleNamespace(index=1, output=output, release_job=None))
+    receipt = json.loads((output / 'receipt.json').read_text())
+    assert len(commands) == 3 and receipt['graph_speedup_vs_native_one_cpu'] == 5
+    assert receipt['plan']['cpus'] == 1
+    assert not (output / 'allocation.json').exists()

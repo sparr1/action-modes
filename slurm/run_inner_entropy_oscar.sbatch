@@ -5,6 +5,7 @@
 #SBATCH --account=default
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --mem=16G
+#SBATCH --hint=nomultithread
 #SBATCH --no-requeue
 set -Eeuo pipefail
 umask 077
@@ -12,10 +13,14 @@ umask 077
 : "${AMBI_EXPECTED_COMMIT:?Pin the source commit}"
 : "${AMBI_ENTROPY_CAMPAIGN:?Set campaign scratch root}"
 : "${AMBI_DMCONTROL_PYTHON:?Set the locked Python interpreter}"
-mode="${1:?gate or train}"
-index="${2:?arm index}"
+mode="${1:?parity, gate, or train}"
+if [[ "$mode" == parity ]]; then
+  index=0
+else
+  index="${2:?arm index}"
+fi
 [[ "$index" =~ ^[0-5]$ ]]
-[[ "$AMBI_ENTROPY_CAMPAIGN" == /oscar/scratch/rgao48/ambi/inner-entropy-20261102 ]]
+[[ "$AMBI_ENTROPY_CAMPAIGN" == /oscar/scratch/rgao48/ambi/inner-entropy-cudagraph-20261102 ]]
 [[ "$(git rev-parse HEAD)" == "$AMBI_EXPECTED_COMMIT" ]]
 [[ -z "$(git status --porcelain --untracked-files=all)" ]]
 [[ "${SLURM_RESTART_COUNT:-0}" == 0 ]]
@@ -32,10 +37,18 @@ export TMPDIR="$scratch_cache/tmp" TORCHINDUCTOR_CACHE_DIR="$scratch_cache/induc
 export XDG_CACHE_HOME="$scratch_cache/cache" WANDB_DIR="$scratch_cache/wandb" WANDB_CACHE_DIR="$scratch_cache/cache"
 export WANDB_DATA_DIR="$scratch_cache/data" WANDB_ARTIFACT_DIR="$scratch_cache/artifacts"
 export WANDB_DISABLE_CODE=true WANDB__REQUIRE_CORE=true
-if [[ "$mode" == gate ]]; then
+if [[ "$mode" == parity ]]; then
   export WANDB_MODE=disabled
+  srun --kill-on-bad-exit=1 "$AMBI_DMCONTROL_PYTHON" slurm/inner_entropy_oscar.py parity \
+    --output "$AMBI_ENTROPY_CAMPAIGN/parity"
+elif [[ "$mode" == gate ]]; then
+  export WANDB_MODE=disabled
+  release_args=()
+  if [[ -n "${AMBI_ENTROPY_RELEASE_JOB:-}" ]]; then
+    release_args=(--release-job "$AMBI_ENTROPY_RELEASE_JOB")
+  fi
   srun --kill-on-bad-exit=1 "$AMBI_DMCONTROL_PYTHON" slurm/inner_entropy_oscar.py gate \
-    --index "$index" --output "$AMBI_ENTROPY_CAMPAIGN/gates/$index"
+    --index "$index" --output "$AMBI_ENTROPY_CAMPAIGN/gates/$index" "${release_args[@]}"
 elif [[ "$mode" == train ]]; then
   : "${AMBI_WORKSPACE_PYTHON:?Set the isolated W&B publisher interpreter}"
   "$AMBI_WORKSPACE_PYTHON" slurm/inner_entropy_workspace.py "$AMBI_ENTROPY_CAMPAIGN/submission.json"

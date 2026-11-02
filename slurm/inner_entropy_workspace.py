@@ -60,6 +60,20 @@ metrics['Inner policy']=[
     ('Inner post-tanh entropy','train/inner_actor_post_tanh_entropy'),
     ('Inner sampled action saturation','train/inner_actor_action_abs_ge_0p99_fraction'),
     ('Inner actor gradient norm','train/inner_actor_grad_norm')]
+metrics['CUDA graph execution']=[
+    ('Whole-inner CUDA graph used','train/inner_cuda_graph_used'),
+    ('Inner solve seconds per decision','time/inner_seconds_per_action'),
+    ('Inner compilation fallback','train/inner_compile_fallback'),
+    ('Outer compilation fallback','train/compile_fallback')]
+for term, label in [('mpr', 'MPR geometry'), ('action_smoothness', 'Action geometry')]:
+    metrics[label]=[
+        ('Unweighted consistency loss',f'train/critic_geometry_primary_{term}_loss'),
+        ('Relative gradient change',f'train/critic_geometry_primary_{term}_relative_gradient_change'),
+        ('Gradient direction agreement',f'train/critic_geometry_primary_{term}_cosine_similarity'),
+        ('Valid direction fraction',f'train/critic_geometry_primary_{term}_cosine_valid_fraction')]
+metrics['Critic gradient magnitude']=[
+    ('Action gradient RMS','train/critic_geometry_primary_action_gradient_rms'),
+    ('Nonzero gradient validity','train/critic_geometry_primary_gradient_scale_valid')]
 timestamp=datetime.now(timezone.utc).isoformat()
 status='\n'.join(f"| {r['label'].replace('|','/')} | {r['job']} | {r['state']} | {r['decisions']} |" for r in rows)
 md=f'''**H3/J8/K1 entropy and Q-normalization comparison — Oscar L40S.**
@@ -73,9 +87,13 @@ joint post-tanh coefficient0.0021=21×0.0001. No temperature tuning.
 Q scale is P95–P5, floor1, EMA0.01 per actor update. Carry survives episodes.
 
 All **40 checkpoints per arm** are retained every25k decisions. Compilation,
-vectorized critics, GPU replay and TF32 are enabled. Each pending production
-job depends on its GPU validation gate; measured CPU/walltime sizing happens
-before release. Diagnostic gates never create W&B runs.
+vectorized critics, GPU replay and TF32 are enabled. Whole-inner CUDA graphs
+execute each supported solve, with sparse native diagnostic solves retained.
+Every arm passes GPU parity and end-to-end throughput validation before launch;
+CPU and walltime requests come from those measurements. Graph-private RNG changes
+the random trajectory relative to uncaptured execution; objectives and update dose
+are unchanged. Critic geometry is observed every 1,000 outer updates on up to64
+replay transitions, using observation/action noise0.01/0.02; no penalties are added. Diagnostic gates never create W&B runs.
 The two prior-only controls run on Hydra L40 hardware; runtime is not a matched
 hardware comparison. Training-return curves use agent decisions and no smoothing.
 
@@ -125,11 +143,12 @@ assert (readback.entity,readback.project)==(entity,project)
 assert readback.settings.max_runs==8 and readback.settings.x_axis=='env_step'
 assert readback.runset_settings.filters == f'Metric("ID") in {ids!r}'
 owned={s.name:s for s in readback.sections if s.name.startswith('Inner entropy / ')}
-assert len(owned)==8 and sum(len(s.panels) for s in owned.values())==29
+expected_panels=1+sum(len(group) for group in metrics.values())
+assert len(owned)==1+len(metrics) and sum(len(s.panels) for s in owned.values())==expected_panels
 for title,items in metrics.items():
     for panel,(_,metric) in zip(owned['Inner entropy / '+title].panels,items):
         assert [getattr(v,'name',v) for v in panel.y]==[metric]
-receipt.update(api_verified=True,panel_count=29)
+receipt.update(api_verified=True,panel_count=expected_panels)
 temporary = HERE / f'workspace.{os.getpid()}.tmp'
 temporary.write_text(json.dumps(receipt,indent=2)+'\n')
 os.replace(temporary, receipt_path)

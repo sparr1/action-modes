@@ -86,7 +86,6 @@
     "wandb_mode": "online",
     "wandb_run_name": "pretanh | outer_frozen | H3 J8 K1 | seed55",
     "wandb_tags": [
-      "inner-entropy-20261102",
       "H3",
       "J8",
       "K1",
@@ -102,7 +101,10 @@
       "vmap",
       "compiled",
       "tf32-high",
-      "oscar-l40s"
+      "oscar-l40s",
+      "inner-entropy-cudagraph-20261102",
+      "whole-inner-cuda-graph",
+      "critic-geometry"
     ],
     "outer_actor_entropy_mode": "tdmpc2_scaled",
     "inner_actor_entropy_mode": "tdmpc2_scaled",
@@ -138,10 +140,10 @@
     "inner_actor_loss_scale_update": "per_action",
     "inner_critic_target_initialization": "online",
     "inner_steps_per_update": null,
-    "wandb_group": "inner-entropy-oscar-20261102",
+    "wandb_group": "inner-entropy-cudagraph-oscar-20261102",
     "critic_ensemble_backend": "vmap",
     "aux_return_mode": "off",
-    "critic_geometry_diagnostics": false,
+    "critic_geometry_diagnostics": true,
     "wandb_event_indexed": true,
     "seed_steps": 2500,
     "pretrain_steps": 2500,
@@ -149,7 +151,12 @@
     "inner_actor_updates_per_round": 4,
     "inner_solve_interval": 1,
     "inner_actor_loss_scale_scope": "action",
-    "inner_root_entropy_samples": 0
+    "inner_root_entropy_samples": 0,
+    "inner_cuda_graph": true,
+    "critic_geometry_every": 1000,
+    "critic_geometry_batch_size": 64,
+    "critic_geometry_obs_noise_std": 0.01,
+    "critic_geometry_action_noise_std": 0.02
   },
   "total_steps": 1000000,
   "episodes": null,

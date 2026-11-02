@@ -85,6 +85,54 @@ Frozen-checkpoint research presets also accept this override. Inner-evaluation
 publication identities distinguish vmap results from loop results; historical
 artifacts without the field retain their loop identity.
 
+### Whole inner SAC CUDA graph
+
+`inner_cuda_graph=true` opts into one captured solve for the fresh K1,
+state-observation SAC training recipe. It requires strict compiled regions,
+fresh prior-initialized actor and reward-only critic clones, action-scoped
+optimizers/replay/temperature, and no auxiliary critic, writeback, explorer,
+or replay transfer. Unsupported configurations fail rather than falling back.
+The six inner-entropy campaign arms use this path with matching inner/outer
+`tdmpc2_scaled` or `squashed` entropy and percentile-range Q normalization.
+
+The normalization input is refreshed before every replay. The validated
+`inner_actor_loss_scale_scope` / `inner_actor_loss_scale_update` pairs are
+`action/per_action` (copy outer and freeze), `action/per_update` (copy outer and
+adapt), and `run/per_update` (continue the previous successful solve and adapt).
+The carried estimator has separate storage, survives ordinary episode resets,
+and passes through intervening native diagnostic solves and checkpoint
+recapture. Inner updates never change the outer estimator. Existing native
+entropy, saturation, optimizer-dose, and initial/final-scale metrics are
+retained; `inner_cuda_graph_used` distinguishes captured solves from periodic
+native diagnostics. Outer critic geometry probes keep their ordinary cadence.
+
+This is an explicit CUDA graph implementation, independent of generic compiler
+mode suggestions. It captures initialization, imagination, replay, losses,
+backward passes, capturable Adam, target updates, action sampling, and ordinary
+tensor metrics. It reads live outer parameters on each replay. Diagnostic
+probes and host metric materialization remain outside capture. Compilation and
+capture warmup are discarded before the first logical solve.
+
+The graph uses an isolated CUDA RNG stream because the locked Torch runtime
+cannot capture native per-phase generators. This preserves the outer learner's
+CPU/CUDA RNG and supplies fresh random draws on each solve, but creates a
+distinct scientific lineage from native inner execution. Exact continuation
+saves the graph stream and counters alongside native diagnostic RNG and the
+carried Q scale; native/graph cross-resume is rejected. The numerical CUDA gate
+compares captured and otherwise identical uncaptured solves for all six arms,
+including inner parameters, targets, Adam state, replay, metrics, live-prior
+refresh, and unchanged outer state. Production validation also checks
+graph → native diagnostic → graph continuity and exact boundary recapture.
+
+Run the six numerical cases inside a scheduled CUDA allocation with:
+
+```bash
+WANDB_MODE=disabled environments/dmcontrol/.venv/bin/python -m pytest -q \
+  tests/test_inner_entropy_graph.py::test_cuda_capture_matches_uncaptured_normalized_solve
+```
+
+### Critic initialization and policy probabilities
+
 Fresh critics always match the initialization in the official checkout at
 `8bbc14ebabdb32ea7ada5c801dc525d0dc73bafe`. Its TensorDict critic parameters
 retain the samples drawn by each `nn.Linear` constructor, so the ordinary

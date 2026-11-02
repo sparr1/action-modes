@@ -230,6 +230,8 @@ def scientific_trial_parameters(
                 algorithm = normalize_lora_rl_identity(algorithm)
                 algorithm = normalize_pave_identity(algorithm)
                 algorithm = normalize_aux_return_identity(algorithm)
+                if algorithm.get("inner_cuda_graph", False) is False:
+                    algorithm.pop("inner_cuda_graph", None)
                 interval = algorithm.get("inner_solve_interval", 1)
                 if interval == 1:
                     algorithm.pop("inner_solve_interval", None)

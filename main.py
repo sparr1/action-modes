@@ -339,6 +339,7 @@ _RUNTIME_CONFIG_FIELDS = (
     "inner_target_entropy",
     "compile",
     "compile_strict",
+    "inner_cuda_graph",
     "critic_ensemble_backend",
     "inner_operator",
     "inner_schedule_mode",
@@ -528,6 +529,11 @@ def _resolved_runtime_metadata(model, *, trial_run_params):
         "enabled": bool(resolved.get("compile", False)),
         "strict": bool(resolved.get("compile_strict", False)),
     }
+    if resolved.get("inner_cuda_graph", False):
+        compile_metadata.update(
+            whole_inner_cuda_graph=True,
+            rng_protocol="isolated_cuda_graph_with_native_diagnostics_v1",
+        )
     actor_loss_scale = {}
     if {
         "sac_actor_loss_scale_mode",

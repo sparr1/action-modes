@@ -1,6 +1,6 @@
 {
   "study_type": "inner_entropy_normalization",
-  "study_note": "Six fixed-entropy H3/J8/K1 training runs: pre/post tanh crossed with outer frozen, outer reset/adapt, run carry/adapt Q normalization. N128 C16 A4 B256; reward-only critic; unchanged outer settings from prior controls. Inner EMA updates once per actor update at tau0.01; no alpha compensation or tuning. All40 portable checkpoints per run every25k.",
+  "study_note": "Six fixed-entropy H3/J8/K1 training runs: pre/post tanh crossed with outer frozen, outer reset/adapt, run carry/adapt Q normalization. N128 C16 A4 B256; reward-only critic; unchanged outer settings from prior controls. Inner EMA updates once per actor update at tau0.01; no alpha compensation or tuning. All40 portable checkpoints per run every25k. Whole-inner CUDA graph replay with private graph RNG; sparse native inner diagnostics and independent outer critic geometry every1000 updates. Graph validation covers all six entropy/normalization combinations.",
   "overrides_alg": {
     "seed": 55,
     "device": "cuda",
