@@ -209,7 +209,9 @@ def worker(args):
             assert inner["inner_critic_optimizer_steps"] == 128
             assert inner["inner_temperature_optimizer_steps"] == 0
             assert inner["inner_compile_fallback"] == 0
-            assert inner["inner_cuda_graph_used"] == float(graph_enabled)
+            # Native-only execution need not emit the graph telemetry key;
+            # graph-enabled measurements still require an explicit one.
+            assert inner.get("inner_cuda_graph_used", 0.0) == float(graph_enabled)
             assert all(math.isfinite(float(v)) for v in inner.values())
             expected = initial if cfg.inner_actor_loss_scale_scope == "run" else before
             assert math.isclose(inner["inner_actor_loss_scale_initial"], expected.item(), rel_tol=1e-6)

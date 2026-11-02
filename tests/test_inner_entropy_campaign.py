@@ -70,6 +70,18 @@ def test_held_actions_do_not_adapt_carried_scale():
     finally:
         m.close(); m.env.close()
 
+
+def test_native_disabled_graph_marker_is_optional():
+    m = model(inner_cuda_graph=False)
+    try:
+        m.agent.act(torch.zeros(3), t0=True, collect_diagnostics=False)
+        metrics = m.agent.last_inner_metrics
+        assert metrics.get('inner_cuda_graph_used', 0.0) == 0.0
+        assert metrics['inner_actor_optimizer_steps'] > 0
+        assert metrics['inner_critic_optimizer_steps'] > 0
+    finally:
+        m.close(); m.env.close()
+
 def test_corrupt_carry_resume_rejected_without_mutation():
     m = model()
     try:

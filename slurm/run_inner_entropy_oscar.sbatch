@@ -40,7 +40,7 @@ export WANDB_DISABLE_CODE=true WANDB__REQUIRE_CORE=true
 if [[ "$mode" == parity ]]; then
   export WANDB_MODE=disabled
   srun --kill-on-bad-exit=1 "$AMBI_DMCONTROL_PYTHON" slurm/inner_entropy_oscar.py parity \
-    --output "$AMBI_ENTROPY_CAMPAIGN/parity"
+    --output "$AMBI_ENTROPY_CAMPAIGN/parity-$AMBI_EXPECTED_COMMIT"
 elif [[ "$mode" == gate ]]; then
   export WANDB_MODE=disabled
   release_args=()
