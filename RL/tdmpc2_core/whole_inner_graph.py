@@ -43,13 +43,16 @@ def validate_graph_workload(engine):
         "inner_explorer_mode": "none", "inner_update_timing": "round",
         "inner_critic_bernoulli_p": 0.0, "inner_outer_replay_fraction": 0.0,
         "inner_actor_writeback_coef": 0.0, "inner_critic_writeback_coef": 0.0,
-        "inner_rebase_persistent": False,
         "critic_value_mode": "single", "inner_horizon_conditioning": "none",
     }
     expected.update({f"inner_{name}_scope": "action" for name in (
         "actor", "critic", "temperature", "replay", "actor_optimizer",
         "critic_optimizer", "temperature_optimizer",
     )})
+    # inner_rebase_persistent is deliberately unrestricted: the action-scoped
+    # actor/critic required above are expired before every solve. Both are then
+    # missing, so _prepare_workspace cannot enter either persistent-rebase arm.
+    # Its default True is dormant for this fresh-state protocol.
     for key, value in expected.items():
         actual = getattr(cfg, key, value)
         if actual != value:

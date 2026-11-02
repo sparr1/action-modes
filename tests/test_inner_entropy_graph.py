@@ -33,7 +33,6 @@ def make_agent(entropy="squashed", scope="action", update="per_action", *, devic
         inner_critic_updates_per_round=2, inner_actor_updates_per_round=2,
         inner_replay_capacity=8, inner_finite_horizon=True, inner_solve_interval=1,
         inner_root_entropy_samples=0, critic_geometry_diagnostics=False,
-        inner_rebase_persistent=False,
     )
     params.pop("inner_updates_per_round", None)
     cfg = _build_cfg(**params)
@@ -95,6 +94,49 @@ def test_graph_validation_accepts_six_normalization_contracts(entropy, scope, up
     agent.cfg.compile = agent.cfg.compile_strict = True
     agent.inner_engine.device = torch.device("cuda")
     validate_training_graph(agent.inner_engine)
+
+
+@pytest.mark.parametrize("name", (
+    "ambi_inner_entropy_pretanh_outer_frozen", "ambi_inner_entropy_pretanh_outer_adapt",
+    "ambi_inner_entropy_pretanh_carry_adapt", "ambi_inner_entropy_posttanh_outer_frozen",
+    "ambi_inner_entropy_posttanh_outer_adapt", "ambi_inner_entropy_posttanh_carry_adapt",
+))
+def test_resolved_production_recipe_passes_graph_validation(name):
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+    path = Path(__file__).resolve().parents[1] / "configs" / "dmcontrol" / "algs" / f"{name}.json"
+    # Resolve every production option and its defaults, without allocating the
+    # large model or requiring a local CUDA device for static validation.
+    cfg = _build_cfg(**json.loads(path.read_text())["alg_params"])
+    assert cfg.inner_rebase_persistent is True
+    engine = SimpleNamespace(cfg=cfg, device=torch.device("cuda"), _active_trace=None, _retrace_enabled=False)
+    validate_training_graph(engine)
+
+
+def test_persistent_rebase_flag_is_dormant_for_fresh_action_scopes():
+    enabled, disabled = make_agent(), make_agent()
+    disabled.load(deepcopy(enabled.checkpoint_state()))
+    disabled.cfg.inner_rebase_persistent = False
+    assert enabled.cfg.inner_rebase_persistent is True
+    enabled.inner_engine._refresh_persistent_component = lambda *args: pytest.fail("Fresh clones must never rebase")
+    for index in range(2):
+        observation = torch.full(enabled.cfg.obs_shape["state"], .1 * index)
+        expected = disabled.act(observation, collect_diagnostics=False)
+        actual = enabled.act(observation, collect_diagnostics=False)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert_tree_close(inner_snapshot(enabled.inner_engine), inner_snapshot(disabled.inner_engine))
+        assert_tree_close(
+            {k: v for k, v in enabled.last_inner_metrics.items() if not k.endswith("seconds")},
+            {k: v for k, v in disabled.last_inner_metrics.items() if not k.endswith("seconds")},
+        )
+        # Force the outer-version condition true on the next solve. The two
+        # action-local missing-state guards must still bypass persistent rebase.
+        for agent in (enabled, disabled):
+            agent.outer_version += 1
+            with torch.no_grad():
+                for parameter in agent.model.parameters():
+                    parameter.add_(.0001)
 
 
 @pytest.mark.parametrize("key,value", [
