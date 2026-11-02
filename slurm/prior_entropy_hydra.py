@@ -4,6 +4,7 @@ from copy import deepcopy
 import json
 import math
 import os
+import runpy
 from pathlib import Path
 import shutil
 import subprocess
@@ -19,6 +20,12 @@ from slurm.benchmark_ambi_training_cpu import TrainingWindow, physical_core_cpus
 MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_prior_entropy.json"
 
 
+def accelerated_runtime():
+    import torch
+    torch.set_float32_matmul_precision("high")
+    return {**runtime(), "float32_matmul_precision": torch.get_float32_matmul_precision()}
+
+
 def worker(args):
     cpus = [int(cpu) for cpu in args.worker_cpus.split(",")]
     assert set(cpus) <= os.sched_getaffinity(0)
@@ -30,6 +37,7 @@ def worker(args):
 
     torch.set_num_threads(len(cpus))
     torch.set_num_interop_threads(1)
+    execution = accelerated_runtime()
     name, manifest, run = recipe(args.index, MANIFEST)
     run, manifest = deepcopy(run), deepcopy(manifest)
     overrides = {"wandb": False, "seed_steps": 500, "pretrain_steps": 2}
@@ -96,7 +104,7 @@ def worker(args):
                 torch.testing.assert_close(value.cpu(), saved["model"][key], rtol=0, atol=0)
             torch.testing.assert_close(agent.actor_loss_scale, scale, rtol=0, atol=0)
         report = {"passed": True, "index": args.index, "name": name,
-                  "physical_cpus": len(cpus), "runtime": runtime(),
+                  "physical_cpus": len(cpus), "runtime": execution,
                   "binding": binding(MANIFEST), "measured": timer.result,
                   "checkpoint_bytes": size, "checkpoint_roundtrip": True,
                   "checkpoint_scale_roundtrip": True, "checkpoint_sidecar": True,
@@ -156,8 +164,8 @@ def gate(args):
 def train(args):
     receipt = json.loads(args.gate.read_text())
     assert receipt["passed"] and receipt["binding"] == binding(MANIFEST)
-    current = runtime()
-    for key in ("python", "torch", "cuda", "gpu", "executable"):
+    current = accelerated_runtime()
+    for key in ("python", "torch", "cuda", "gpu", "executable", "float32_matmul_precision"):
         assert current[key] == receipt["runtime"][key], key
     plan = receipt["plans"][args.index]
     assert int(os.environ["SLURM_CPUS_PER_TASK"]) == plan["cpus"]
@@ -171,7 +179,9 @@ def train(args):
         "job_id": os.environ["SLURM_JOB_ID"], "wandb_run_id": os.environ["WANDB_RUN_ID"]})
     command = [sys.executable, "main.py", "--run", str(MANIFEST), "--alg-dir", "configs/dmcontrol/algs",
                "--log-dir", str(args.output), "--alg-index", str(args.index), "--trial-index", "0", "--num-runs", "1"]
-    os.execv(sys.executable, command)
+    # Keep the validated matmul setting in the same process as the trainer.
+    sys.argv = command[1:]
+    runpy.run_path(str(ROOT / "main.py"), run_name="__main__")
 
 
 def main():

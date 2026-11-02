@@ -100,7 +100,8 @@
       "checkpoints-every25k",
       "vmap",
       "compiled",
-      "hydra-l40"
+      "hydra-l40",
+      "tf32-high"
     ],
     "outer_actor_entropy_mode": "tdmpc2_scaled",
     "inner_actor_entropy_mode": "squashed",
