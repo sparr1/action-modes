@@ -23,6 +23,14 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires schedu
 def make_agent(entropy="squashed", scope="action", update="per_action", *, device="cpu", compiled=False):
     params = _tiny_params(
         compile=compiled, compile_strict=compiled, critic_ensemble_backend="vmap",
+        # Keep production representation and RNG branches. Only widths and
+        # solve dose are reduced: pair sampling must choose 2 of 5 heads, and
+        # vectorized inner-critic dropout must consume fresh random draws.
+        q_representation="distributional", num_q=5, q_num_bins=101,
+        q_vmin=-10, q_vmax=10, q_pair_size=2, num_bins=101,
+        outer_q_target_reduction="min_pair", outer_q_actor_reduction="mean_pair",
+        inner_q_target_reduction="min_pair", inner_q_actor_reduction="mean_pair",
+        dropout=.01, inner_critic_dropout_enabled=True,
         outer_actor_entropy_mode=entropy, inner_actor_entropy_mode=entropy,
         log_std_mapping="tdmpc2_tanh", inner_log_std_mapping="tdmpc2_tanh",
         sac_actor_loss_scale_mode="tdmpc2_percentile_range", sac_actor_loss_scale_tau=.25,
@@ -94,6 +102,26 @@ def test_graph_validation_accepts_six_normalization_contracts(entropy, scope, up
     agent.cfg.compile = agent.cfg.compile_strict = True
     agent.inner_engine.device = torch.device("cuda")
     validate_training_graph(agent.inner_engine)
+
+
+def test_small_graph_agent_preserves_production_critic_rng_branches():
+    import json
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[1] / "configs/dmcontrol/algs/ambi_inner_entropy_pretanh_outer_frozen.json"
+    production = json.loads(path.read_text())["alg_params"]
+    agent = make_agent()
+    for key in ("q_representation", "num_q", "q_num_bins", "q_vmin", "q_vmax",
+                "q_pair_size", "dropout", "inner_critic_dropout_enabled",
+                "outer_q_target_reduction", "outer_q_actor_reduction",
+                "inner_q_target_reduction", "inner_q_actor_reduction",
+                "critic_ensemble_backend"):
+        assert getattr(agent.cfg, key) == production[key], key
+    assert agent.model.q_backend.pair_size < agent.model.q_backend.num_q
+    agent.act(torch.zeros(agent.cfg.obs_shape["state"]), collect_diagnostics=False)
+    critic = agent.inner_engine._action_pool.critic
+    assert critic.training
+    assert any(isinstance(module, torch.nn.Dropout) and module.training and module.p == .01
+               for module in critic.modules())
 
 
 @pytest.mark.parametrize("name", (
