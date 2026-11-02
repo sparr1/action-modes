@@ -289,6 +289,7 @@ def scientific_trial_parameters(
                     ("inner_mppi_eval_action", "mean"),
                     ("inner_critic_loss_coef", 1.0),
                     ("inner_actor_loss_scale_update", "per_action"),
+                    ("inner_actor_loss_scale_scope", "action"),
                     ("inner_critic_target_initialization", "online"),
                 ):
                     value = algorithm.get(field, default)

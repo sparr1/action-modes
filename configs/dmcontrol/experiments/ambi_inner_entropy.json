@@ -1,0 +1,31 @@
+{
+  "study_type": "inner_entropy_normalization",
+  "study_note": "Six fixed-entropy H3/J8/K1 training runs: pre/post tanh crossed with outer frozen, outer reset/adapt, run carry/adapt Q normalization. N128 C16 A4 B256; reward-only critic; unchanged outer settings from prior controls. Inner EMA updates once per actor update at tau0.01; no alpha compensation or tuning. All40 portable checkpoints per run every25k.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_inner_entropy_pretanh_outer_frozen",
+    "ambi_inner_entropy_pretanh_outer_adapt",
+    "ambi_inner_entropy_pretanh_carry_adapt",
+    "ambi_inner_entropy_posttanh_outer_frozen",
+    "ambi_inner_entropy_posttanh_outer_adapt",
+    "ambi_inner_entropy_posttanh_carry_adapt"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

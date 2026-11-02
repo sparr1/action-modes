@@ -167,6 +167,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self.action_index = 0
         self.episode_index = 0
         self._mppi_prev_mean = None
+        self._carried_actor_loss_scale = None
         self._collect_diagnostics = True
         self._active_trace = None
         self._pending_timers = {}
@@ -186,6 +187,17 @@ class InnerImprovementEngine(RetraceInnerMixin):
     @property
     def _solve_interval(self):
         return int(getattr(self.cfg, "inner_solve_interval", 1))
+
+    @property
+    def _carry_actor_loss_scale(self):
+        return getattr(self.cfg, "inner_actor_loss_scale_scope", "action") == "run"
+
+    def _initial_actor_loss_scale(self, outer_scale):
+        """Own a solve-local scalar; neither source is mutated by adaptation."""
+        source = (self._carried_actor_loss_scale
+                  if self._carry_actor_loss_scale and self._carried_actor_loss_scale is not None
+                  else outer_scale)
+        return source.detach().clone()
 
     def _held_policy_spec(self):
         if self._solve_interval == 1:
@@ -689,6 +701,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         if not retain_pool:
             self._action_pool = InnerWorkspace()
         self.rng = self._new_rng(seed)
+        self._carried_actor_loss_scale = None
         self.action_index = 0
         self.episode_index = 0
         self._mppi_prev_mean = None
@@ -1152,6 +1165,11 @@ class InnerImprovementEngine(RetraceInnerMixin):
             payload["critic_transfer_spec"] = self._critic_transfer_spec()
         if self._held_policy_spec() is not None:
             payload["held_policy_spec"] = self._held_policy_spec()
+        if self._carry_actor_loss_scale:
+            payload["actor_loss_scale_carry"] = (
+                None if self._carried_actor_loss_scale is None
+                else self._carried_actor_loss_scale.detach().clone()
+            )
         return payload
 
     def _load_module_candidate(
@@ -1230,6 +1248,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 "workspace",
                 "mppi_prev_mean",
         }
+        if self._carry_actor_loss_scale:
+            common_keys.add("actor_loss_scale_carry")
         transfer_spec = self._critic_transfer_spec()
         if state.get("critic_transfer_spec") != transfer_spec:
             raise ValueError("Inner Bernoulli transfer specification is incompatible with exact continuation.")
@@ -1627,12 +1647,23 @@ class InnerImprovementEngine(RetraceInnerMixin):
 
         candidate_rng = self._new_rng(self.cfg.seed)
         candidate_rng.load_training_state_dict(state["rng"])
+        carried_scale = state.get("actor_loss_scale_carry")
+        if self._carry_actor_loss_scale and action_index > 0 and carried_scale is None:
+            raise ValueError("An initialized carried actor loss scale is required after the first solve.")
+        if carried_scale is not None:
+            reference = self._critic_owner.actor_loss_scale
+            require_tensor(carried_scale, "inner carried actor loss scale",
+                           shape=tuple(reference.shape), dtype=reference.dtype)
+            if not bool(torch.isfinite(carried_scale).all()) or not bool((carried_scale >= 1).all()):
+                raise ValueError("Inner carried actor loss scale must be finite and at least one.")
+            carried_scale = carried_scale.detach().to(self.device).clone()
         return {
             "state": candidate,
             "rng": candidate_rng,
             "action_index": action_index,
             "episode_index": episode_index,
             "mppi_prev_mean": previous_mean,
+            "actor_loss_scale_carry": carried_scale,
         }
 
     def load_training_state_dict(self, state):
@@ -1649,6 +1680,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self.action_index = candidate["action_index"]
         self.episode_index = candidate["episode_index"]
         self._mppi_prev_mean = candidate["mppi_prev_mean"]
+        self._carried_actor_loss_scale = candidate["actor_loss_scale_carry"]
         self._collect_diagnostics = True
         self._pending_timers = {}
         self._parameter_noise_spec = None
@@ -6660,7 +6692,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
             # default freezes this scale for the action; per-update mode commits
             # each successful actor kernel's proposal only to this local copy.
             actor_loss_scale_outer = self._critic_owner.actor_loss_scale.detach().clone()
-            actor_loss_scale = actor_loss_scale_outer.clone()
+            actor_loss_scale = self._initial_actor_loss_scale(actor_loss_scale_outer)
             actor_loss_scale_initial = actor_loss_scale.clone()
         alpha_initial = self.alpha.detach().clone()
         temperature_lifetime_steps_initial = state.temperature_lifetime_steps
@@ -7138,6 +7170,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
             lengths_host = length_values.detach()
         else:
             lengths_host = [int(cfg.inner_rollout_horizon)] * rollout_count
+        if self._carry_actor_loss_scale and actor_loss_scale is not None:
+            # Commit only after a successful solve. Held decisions and ordinary
+            # episode resets do not update or discard this run-scoped estimate.
+            self._carried_actor_loss_scale = actor_loss_scale.detach().clone()
         if return_behavior_policy:
             return action[0], metrics, lengths_host, behavior_policy
         return action[0], metrics, lengths_host

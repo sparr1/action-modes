@@ -946,6 +946,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         for key, default in (
             ("inner_critic_loss_coef", 1.0),
             ("inner_actor_loss_scale_update", "per_action"),
+            ("inner_actor_loss_scale_scope", "action"),
             ("inner_critic_target_initialization", "online"),
             ("inner_actor_initialization", "prior"),
             ("inner_actor_initial_std", None),

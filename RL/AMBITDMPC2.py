@@ -106,6 +106,7 @@ _AMBI_DEFAULTS = {
     # Inner SAC normally freezes the outer scale for one real action. The
     # TD-AMBI recipe updates its local copy from each actor minibatch instead.
     "inner_actor_loss_scale_update": "per_action",
+    "inner_actor_loss_scale_scope": "action",
     # Optional behavior-policy regularizer from the outer actor to the replayed
     # action-generating policy. ``none`` preserves the historical runtime and
     # replay schema; active schedules require stochastic inner SAC execution.
@@ -1307,6 +1308,7 @@ def _validate_split_value_config(cfg):
         "inner_critic_initialization": "prior",
         "inner_bootstrap_source": "inner_target",
         "inner_actor_loss_scale_update": "per_action",
+        "inner_actor_loss_scale_scope": "action",
         "inner_critic_target_initialization": "online",
         "inner_execution_policy_source": "primary",
         "inner_rebase_persistent": False,
@@ -2814,12 +2816,26 @@ class AMBITDMPC2(TDMPC2Baseline):
             raise ValueError("inner_critic_loss_coef must be positive.")
         for key, choices in (
             ("inner_actor_loss_scale_update", {"per_action", "per_update"}),
+            ("inner_actor_loss_scale_scope", {"action", "run"}),
             ("inner_critic_target_initialization", {"online", "outer_target"}),
         ):
             value = str(getattr(cfg, key)).lower()
             if value not in choices:
                 raise ValueError(f"{key} must be one of {sorted(choices)}.")
             setattr(cfg, key, value)
+        if cfg.inner_actor_loss_scale_scope == "run" and not (
+            cfg.inner_operator == "sac"
+            and cfg.inner_explorer_mode == "none"
+            and cfg.aux_return_mode == "off"
+            and cfg.critic_value_mode == "single"
+            and cfg.sac_actor_loss_scale_mode == "tdmpc2_percentile_range"
+            and cfg.inner_actor_loss_scale_update == "per_update"
+            and cfg.inner_rounds > 0
+        ):
+            raise ValueError(
+                "Run-scoped inner_actor_loss_scale_scope requires single-critic "
+                "SAC with percentile normalization and per_update adaptation."
+            )
         if (
             cfg.inner_critic_loss_coef != 1.0
             or cfg.inner_actor_loss_scale_update == "per_update"
