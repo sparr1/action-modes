@@ -109,7 +109,7 @@ if receipt_path.exists() or state.get('workspace_url'):
     work.runset_settings.filters=[expr.Metric('ID').isin(ids)]
     work.runset_settings.run_settings={s['id']:ws.RunSettings(color=s['color'],disabled=False) for s in specs}
 else:
-    work=ws.Workspace(entity=entity,project=project,name='H3 J8 K1: entropy × Q normalization — Oscar',
+    work=ws.Workspace(entity=entity,project=project,name='H3 J8 K1 - entropy and Q normalization - Oscar',
         auto_generate_panels=False,sections=sections,
         settings=ws.WorkspaceSettings(x_axis='env_step',max_runs=8,tooltip_number_of_runs='all_runs',tooltip_color_run_names=True),
         runset_settings=ws.RunsetSettings(filters=[expr.Metric('ID').isin(ids)],groupby=[],
