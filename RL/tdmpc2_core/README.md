@@ -1591,6 +1591,75 @@ TD3 and MPPI do not use this option. The diagnostics
 `actor_effective_ent_coef` and `inner_effective_alpha` report the unchanged
 entropy coefficient appearing in the optimized objective.
 
+#### Training stability diagnostics
+
+The paired prior-only training manifest
+`configs/dmcontrol/experiments/ambi_prior_entropy.json` uses seed 55 and one
+million Humanoid Walk decisions per arm, saving all 40 portable checkpoints
+at 25k intervals, including the learned Q normalization scale. Both actors use
+the TD-MPC2 log-std mapping, reward-only five-head critics, and Q-only percentile
+normalization. Pre-tanh uses the literal native scaled statistic at `1e-4`;
+post-tanh uses the true joint action entropy at `0.0021`, equivalent to `1e-4`
+times dimension-scaled entropy for 21 actions. No temperature adaptation, inner
+updates, auxiliary critics, or planning are enabled. Both use compilation and
+vectorized critics. `slurm/run_prior_entropy_hydra.sbatch gate` checks real GPU
+training, CPU sizing, diagnostic finiteness, and checkpoint/scale reloads with
+W&B disabled. Production requires its successful commit/config-bound receipt.
+Node-local caches avoid consuming durable checkpoint quota. The launch receipt
+records measured walltime sizing and the checkpoint storage margin.
+
+AMBI's outer, ordinary inner SAC, separate-explorer SAC, and native TD-AMBI
+actor updates report lightweight diagnostics from the existing policy sample,
+without another model call or random draw. The shared-mixture and TD3 inner
+operators retain their existing diagnostics. Outer
+keys start with `train/actor_`; inner keys start with `train/inner_actor_`
+(or `train/inner_explorer_actor_` for a separate explorer):
+
+- `pre_tanh_entropy`: analytic **joint** diagonal Gaussian entropy in nats,
+  summed across action dimensions and averaged across minibatch states.
+- `post_tanh_entropy`: joint squashed-action entropy estimated as `-log_prob`
+  on the existing sample, using the stable tanh Jacobian. This can be negative.
+- `action_abs_ge_0p99_fraction`, `mean_action_abs_ge_0p99_fraction`, and
+  `mean_action_exact_saturation_fraction`: coordinate fractions for the sampled
+  action and deterministic `tanh(mean)` action. These are actor minibatch
+  measurements; real execution is measured separately below.
+- `entropy_coefficient_normalized`: the alpha actually used in `Q/S + alpha*H`.
+  `entropy_coefficient_return_units` is `alpha*S` for the selected entropy
+  statistic. `entropy_coefficient_joint_units` is nominally `alpha*S*d` for
+  TD-MPC2 scaled entropy and `alpha*S` for ordinary post-tanh entropy. The former
+  accounts for action dimension `d` but not the native formula's tiny ratio
+  epsilon; it does not make pre- and post-tanh objectives equivalent.
+
+With Q normalization enabled, outer `actor_q_range_instant` and
+`actor_q_range_ema` report the floored P95-P5 and running scale. Inner
+`actor_q_scale_used`, `actor_q_percentile_range`, and
+`actor_q_percentile_range_over_scale` describe the actual divisor and same-batch
+range, including frozen-scale solves. Per-decision
+`inner_actor_loss_scale_outer`, `_initial`, `_final`, `_initial_over_outer`, and
+`_final_over_outer` record the scale lifecycle. The outer reference belongs to
+the selected critic owner (including an auxiliary critic). Current copy-outer
+initialization makes `initial_over_outer` one; persistent scale transfer is a
+separate algorithm change. Inner update statistics use optimizer-step weights;
+scale lifecycle gauges use one observation per decision.
+
+Both AMBI and TD-MPC2 log `train/executed_action_*` from normalized, clipped
+actions sent to the environment: saturation at 0.99 and exactly 1, within-episode
+`delta_rms`, sign flips, and opposite-bound flips. Flip fractions use all finite
+coordinate pairs; zero coordinates do not count as sign flips. RMS is averaged
+over eligible decisions. Sample/coordinate counts expose coverage, and episode
+resets never form action pairs.
+
+At completed training episodes, `episode/return_window20_*` reports count,
+mean, population standard deviation, minimum, and drawdown from the historical
+peak of complete 20-episode rolling means. `episode/return_disjoint20_change`
+compares the latest 20 returns with the preceding 20; relative drop/drawdown
+fractions require a positive reference mean. Readiness flags distinguish partial
+windows. These describe observed training dips, not validated improvement
+signals or evaluation returns. Wrapper training-state version 5 persists this
+history; version 4 resumes start with zero diagnostic coverage. Reading or
+repeating a log snapshot does not advance history. No diagnostic changes the
+actor objective, temperature target, normalization policy, or launch settings.
+
 Q scaling requires fixed temperatures: set a positive numeric `ent_coef` and
 use `inner_temperature_mode="fixed"` or `"inherit_outer"` for active inner SAC.
 Outer `auto`/`auto_<initial>` and inner `auto` remain rejected. Ordinary SAC

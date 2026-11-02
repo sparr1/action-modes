@@ -20,6 +20,10 @@ from .common import math as td_math
 from .common.compile_regions import CompileRegion
 from .common.bernoulli_transfer import reset_critic_with_bernoulli_
 from .common.entropy import policy_entropy
+from .common.policy_diagnostics import (
+    entropy_coefficient_diagnostics,
+    policy_sample_diagnostics,
+)
 from .common.control_sources import (
     actor_module, actor_options, actor_owner, critic_module, critic_owner, source_metadata,
 )
@@ -4189,12 +4193,14 @@ class InnerImprovementEngine(RetraceInnerMixin):
         # remains connected for the actor objective and is detached only by the
         # temperature update; it comes from this same policy sample.
         entropy_payload = (info["scaled_entropy"],) if scaled_entropy_enabled else ()
-        # Surface the exact sample already used by the compiled actor update so
-        # optional diagnostics can run eagerly without another policy forward
-        # or any additional RNG consumption. Lightweight test/downstream policy
-        # stubs that omit pre_tanh_action retain the historical 8-tuple seam.
+        # Surface the exact sample and distribution already used by the compiled
+        # actor update. Eager diagnostics need no extra forward or RNG draws.
+        # Keep a two-item payload; lightweight policy stubs without sample
+        # information retain the historical 8-tuple seam.
         actor_sample = (
-            (info["pre_tanh_action"].detach(), action.detach())
+            ({name: info[name].detach() for name in (
+                "pre_tanh_action", "mean", "log_std", "log_prob"
+            ) if name in info}, action.detach())
             if "pre_tanh_action" in info
             else ()
         )
@@ -4243,6 +4249,13 @@ class InnerImprovementEngine(RetraceInnerMixin):
         # Match TD-MPC2's Q-only normalization. Entropy and the optional
         # outer-policy KL retain their configured coefficients.
         scale_payload = ()
+        if q_scale is not None:
+            with torch.no_grad():
+                robust_range = percentile_range(
+                    q_pi.detach(), q_pi.new_tensor([5.0, 95.0])
+                )
+            if actor_sample:
+                actor_sample[0]["q_percentile_range"] = robust_range
         if q_scale is not None and not self._split_values and (
             getattr(cfg, "inner_actor_loss_scale_update", "per_action") == "per_update"
         ):
@@ -4250,9 +4263,6 @@ class InnerImprovementEngine(RetraceInnerMixin):
             # CompileRegion may retry eagerly after a lazy backend failure; the
             # caller commits only a successful proposal, exactly once.
             with torch.no_grad():
-                robust_range = percentile_range(
-                    q_pi.detach(), q_pi.new_tensor([5.0, 95.0])
-                )
                 proposed_scale = q_scale.detach().lerp(
                     robust_range, float(self._critic_owner.cfg.sac_actor_loss_scale_tau)
                 )
@@ -4452,10 +4462,30 @@ class InnerImprovementEngine(RetraceInnerMixin):
                     ),
                     actor_entropy=entropy.detach().mean(),
                 )
+                # Snapshot the divisor actually used by this update: the local
+                # EMA mutates again in later updates retained in this history.
+                scale_used = (
+                    alpha.new_ones(()) if actor_loss_scale is None
+                    else actor_loss_scale.detach().clone().reshape(())
+                )
+                metrics["actor_q_scale_used"] = scale_used
+                metrics.update(entropy_coefficient_diagnostics(
+                    alpha, scale_used, cfg.inner_actor_entropy_mode,
+                    int(cfg.action_dim),
+                ))
+                if actor_sample:
+                    metrics.update(policy_sample_diagnostics(
+                        actor_sample[1], actor_sample[0],
+                    ))
+                if actor_sample and "q_percentile_range" in actor_sample[0]:
+                    metrics["actor_q_percentile_range"] = actor_sample[0]["q_percentile_range"].reshape(())
+                    metrics["actor_q_percentile_range_over_scale"] = (
+                        metrics["actor_q_percentile_range"] / scale_used
+                    )
                 if self._collect_diagnostics and actor_sample:
                     metrics.update(
                         self._tanh_saturation_metrics(
-                            actor_sample[0],
+                            actor_sample[0]["pre_tanh_action"],
                             actor_sample[1],
                             prefix="actor_",
                         )
@@ -4772,6 +4802,18 @@ class InnerImprovementEngine(RetraceInnerMixin):
                         f"{prefix}actor_entropy": info["entropy"].detach().mean(),
                     }
                 )
+                scale_used = (
+                    alpha.new_ones(()) if actor_loss_scale is None
+                    else actor_loss_scale.detach().clone().reshape(())
+                )
+                metrics[f"{prefix}actor_q_scale_used"] = scale_used
+                metrics.update(policy_sample_diagnostics(
+                    action, info, prefix=f"{prefix}actor_",
+                ))
+                metrics.update(entropy_coefficient_diagnostics(
+                    alpha, scale_used, cfg.inner_actor_entropy_mode,
+                    int(cfg.action_dim), prefix=f"{prefix}actor_",
+                ))
                 if self._collect_diagnostics and "pre_tanh_action" in info:
                     metrics.update(
                         self._tanh_saturation_metrics(
@@ -5010,6 +5052,15 @@ class InnerImprovementEngine(RetraceInnerMixin):
         }
         metrics.update(self._tanh_saturation_metrics(
             info["pre_tanh_action"].detach(), action.detach(), prefix="actor",
+        ))
+        metrics.update(policy_sample_diagnostics(action, info))
+        metrics["actor_q_scale_used"] = state.tdambi_scale.detach().clone().reshape(())
+        metrics["actor_q_percentile_range_over_scale"] = (
+            metrics["actor_q_percentile_range"] / metrics["actor_q_scale_used"]
+        )
+        metrics.update(entropy_coefficient_diagnostics(
+            action.new_tensor(float(cfg.tdambi_entropy_coef)),
+            metrics["actor_q_scale_used"], "tdmpc2_scaled", int(cfg.action_dim),
         ))
         return metrics
 
@@ -6602,11 +6653,15 @@ class InnerImprovementEngine(RetraceInnerMixin):
             )
             self._timer_stop("inner_diagnostic_seconds", diagnostic_start)
         actor_loss_scale = None
+        actor_loss_scale_outer = None
+        actor_loss_scale_initial = None
         if self._sac_actor_loss_scale_enabled:
             # Start from the outer estimator without sharing its storage. The
             # default freezes this scale for the action; per-update mode commits
             # each successful actor kernel's proposal only to this local copy.
-            actor_loss_scale = self._critic_owner.actor_loss_scale.detach().clone()
+            actor_loss_scale_outer = self._critic_owner.actor_loss_scale.detach().clone()
+            actor_loss_scale = actor_loss_scale_outer.clone()
+            actor_loss_scale_initial = actor_loss_scale.clone()
         alpha_initial = self.alpha.detach().clone()
         temperature_lifetime_steps_initial = state.temperature_lifetime_steps
         temperature_optimizer_step_initial = self._temperature_optimizer_step()
@@ -7016,6 +7071,15 @@ class InnerImprovementEngine(RetraceInnerMixin):
         if actor_loss_scale is not None:
             metrics["inner_actor_loss_scale"] = actor_loss_scale.reshape(())
             metrics["inner_effective_alpha"] = alpha_final.mean()
+            metrics["inner_actor_loss_scale_outer"] = actor_loss_scale_outer.reshape(())
+            metrics["inner_actor_loss_scale_initial"] = actor_loss_scale_initial.reshape(())
+            metrics["inner_actor_loss_scale_initial_over_outer"] = (
+                actor_loss_scale_initial / actor_loss_scale_outer
+            ).reshape(())
+            metrics["inner_actor_loss_scale_final"] = actor_loss_scale.detach().clone().reshape(())
+            metrics["inner_actor_loss_scale_final_over_outer"] = (
+                actor_loss_scale / actor_loss_scale_outer
+            ).detach().reshape(())
         if self._collect_diagnostics and state.sampled_ids:
             sampled = torch.cat(state.sampled_ids)
             metrics["inner_replay_unique_fraction"] = (

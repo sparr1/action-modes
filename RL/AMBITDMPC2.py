@@ -3412,6 +3412,7 @@ class AMBITDMPC2(TDMPC2Baseline):
 
     def _episode_payload_extras(self):
         return {
+            **super()._episode_payload_extras(),
             "rollout/outer_policy_episode": int(
                 self._outer_policy_episode_selected
             ),
@@ -3820,6 +3821,23 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_explorer_actor_pre_tanh_abs_ge_7p6_fraction",
             "inner_explorer_actor_action_exact_saturation_fraction",
         }
+        # Update-level statistics must use actor optimizer counts; treating them
+        # as action gauges would underweight decisions with more adaptation.
+        policy_diagnostic_suffixes = {
+            "pre_tanh_entropy", "post_tanh_entropy",
+            "action_abs_ge_0p99_fraction",
+            "mean_action_abs_ge_0p99_fraction",
+            "mean_action_exact_saturation_fraction",
+            "q_scale_used", "q_percentile_range", "q_percentile_range_over_scale",
+            "entropy_coefficient_normalized",
+            "entropy_coefficient_return_units", "entropy_coefficient_joint_units",
+        }
+        actor_metrics.update(
+            f"inner_actor_{suffix}" for suffix in policy_diagnostic_suffixes
+        )
+        explorer_actor_metrics.update(
+            f"inner_explorer_actor_{suffix}" for suffix in policy_diagnostic_suffixes
+        )
         temperature_metrics = {
             "inner_temperature_loss",
             "inner_temperature_grad_norm",
@@ -3844,6 +3862,11 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_alpha",
             "inner_alpha_to_abs_q",
             "inner_actor_loss_scale",
+            "inner_actor_loss_scale_outer",
+            "inner_actor_loss_scale_initial",
+            "inner_actor_loss_scale_final",
+            "inner_actor_loss_scale_initial_over_outer",
+            "inner_actor_loss_scale_final_over_outer",
             "inner_effective_alpha",
             "inner_buffer_size",
             "inner_buffer_capacity",

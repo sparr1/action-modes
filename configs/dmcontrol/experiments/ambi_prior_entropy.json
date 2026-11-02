@@ -1,0 +1,27 @@
+{
+  "study_type": "prior_entropy_comparison",
+  "study_note": "Two Humanoid Walk prior-only runs. Fixed 1e-4 times the dimension-scaled entropy: literal native TD-MPC2 scaled pre-tanh statistic versus 21 times true joint post-tanh entropy (ent_coef=0.0021). Reward-only five-head critic, adaptive Q normalization, matched seed55/1M decisions, no inner or MPC. Retain all 40 portable checkpoints per arm every25k, including learned Q scale.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_prior_entropy_pretanh",
+    "ambi_prior_entropy_posttanh"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

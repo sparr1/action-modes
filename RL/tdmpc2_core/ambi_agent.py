@@ -15,6 +15,10 @@ from .common.checkpoint import save_checkpoint
 from .common.device import resolve_device
 from .common.entropy import critic_entropy_spec, policy_entropy
 from .common.layers import api_model_conversion
+from .common.policy_diagnostics import (
+    entropy_coefficient_diagnostics,
+    policy_sample_diagnostics,
+)
 from .common.scale import percentile_range
 from .common.soft_world_model import SoftWorldModel
 from .auxiliary_return import AuxiliaryReturnLearner
@@ -2940,6 +2944,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 q_policy / self._actor_loss_scale_value
                 if self.actor_loss_scale_enabled else q_policy
             )
+        actor_scale_used = (
+            scale_snapshot if split_values else self.actor_loss_scale
+        )
+        coefficient_metrics = entropy_coefficient_diagnostics(
+            alpha, actor_scale_used, self._actor_entropy_mode,
+            self.cfg.action_dim,
+        )
         if scaled_entropy_enabled:
             actor_objective = -alpha * policy_info["scaled_entropy"] - actor_q
         else:
@@ -2988,6 +2999,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 q_policy_mean_all - q_policy_min_all
             ).mean(),
             **actor_saturation_metrics,
+            **policy_sample_diagnostics(action, policy_info),
+            **coefficient_metrics,
             "ent_coef": alpha.detach(),
             "ent_coef_loss": entropy_coefficient_loss.detach(),
         }
@@ -3015,10 +3028,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 <= math.log(_ENTROPY_COEF_MIN)
             ).to(dtype=torch.float32)
         if self.actor_loss_scale_enabled:
-            metrics["actor_loss_scale"] = self._actor_loss_scale_value.detach()
+            metrics["actor_loss_scale"] = self._actor_loss_scale_value.detach().clone()
             metrics["actor_effective_ent_coef"] = alpha.detach().expand_as(
                 self._actor_loss_scale_value
             )
+        if self._actor_q_range_enabled:
+            metrics["actor_q_range_instant"] = q_range_instant.detach().clone()
+            metrics["actor_q_range_ema"] = self._actor_loss_scale_value.detach().clone()
         if self.behavior_policy_kl_enabled:
             behavior_metric_prefix = (
                 "behavior_policy_kl"
@@ -3040,11 +3056,6 @@ class AMBITDMPC2Agent(torch.nn.Module):
                     ).detach(),
                 }
             )
-            if self._actor_q_range_enabled:
-                metrics["actor_q_range_instant"] = q_range_instant.detach()
-                metrics["actor_q_range_ema"] = (
-                    self._actor_loss_scale_value.detach()
-                )
             if self._behavior_policy_kl_schedule == "smooth":
                 metrics[f"{behavior_metric_prefix}_ramp_progress"] = float(
                     smooth_progress

@@ -28,6 +28,7 @@ from utils.checkpointing import (
     explicit_checkpoint_target,
 )
 from utils.cleanup import add_cleanup_notes, raise_cleanup_errors
+from utils.training_diagnostics import TrainingDiagnostics
 from utils.utils import setup_logs
 from utils.wandb_utils import (
     WandbAccumulator,
@@ -618,6 +619,7 @@ class TDMPC2Baseline(Algorithm):
         self._episode_len = 0
         self._pretrained = False
         self._last_train_metrics = None
+        self._training_diagnostics = TrainingDiagnostics()
         self._wandb_every = max(1, int((custom_params or {}).get("wandb_step_every", 1000)))
         self._wandb_run = None
         self._wandb_train_window = WandbAccumulator()
@@ -1339,7 +1341,8 @@ class TDMPC2Baseline(Algorithm):
 
     def _episode_payload_extras(self):
         """Return subclass metrics that are meaningful only at episode end."""
-        return {}
+        diagnostics = getattr(self, "_training_diagnostics", None)
+        return diagnostics.episode_metrics() if diagnostics is not None else {}
 
     def _validate_episode_payload_extras(self, extras, *, reserved_keys):
         """Validate episode-only metrics without consuming logging windows."""
@@ -1668,7 +1671,7 @@ class TDMPC2Baseline(Algorithm):
         )
         return {
             "schema": "tdmpc2-wrapper-training-state",
-            "version": 4,
+            "version": 5,
             "phase": phase,
             "total_steps": int(self.cfg.steps),
             "global_step": int(self._global_step),
@@ -1678,6 +1681,7 @@ class TDMPC2Baseline(Algorithm):
             "eval_pending": bool(self._eval_pending),
             "step_zero_eval_done": bool(self._step_zero_eval_done),
             "algorithm_state": self._training_resume_algorithm_state(),
+            "training_diagnostics": self._training_diagnostics.state_dict(),
             "agent": self.agent.training_state_dict(),
             "logger": logger_state,
             "checkpoint_tracker": tracker_state,
@@ -1717,9 +1721,11 @@ class TDMPC2Baseline(Algorithm):
             "checkpoint_tracker",
             "wandb",
         }
+        if isinstance(state, Mapping) and state.get("version") == 5:
+            expected.add("training_diagnostics")
         if not isinstance(state, Mapping) or set(state) != expected:
             raise ValueError("Trainer resume fields do not match the supported schema.")
-        if state["schema"] != "tdmpc2-wrapper-training-state" or state["version"] != 4:
+        if state["schema"] != "tdmpc2-wrapper-training-state" or state["version"] not in (4, 5):
             raise ValueError("Unsupported trainer resume schema/version.")
         phase = state["phase"]
         if phase not in {
@@ -1733,6 +1739,14 @@ class TDMPC2Baseline(Algorithm):
         episodes = self._resume_nonnegative_int(
             state["completed_episodes"], "completed_episodes"
         )
+        # Version 4 predates these observational histories. Start explicit
+        # coverage at zero rather than inventing returns from older episodes.
+        diagnostics = (
+            TrainingDiagnostics.from_state_dict(state["training_diagnostics"])
+            if state["version"] == 5 else TrainingDiagnostics()
+        )
+        if diagnostics.state_dict()["episodes"] > episodes:
+            raise ValueError("Training diagnostics exceed completed trainer episodes.")
         updates = self._resume_nonnegative_int(state["num_updates"], "num_updates")
         if global_step > int(self.cfg.steps):
             raise ValueError("Trainer global_step exceeds the immutable target.")
@@ -1849,6 +1863,7 @@ class TDMPC2Baseline(Algorithm):
             "last_step": last_step,
             "algorithm_state": algorithm_state,
             "agent_candidate": agent_candidate,
+            "training_diagnostics": diagnostics,
         }
 
     def load_training_state_dict(self, state):
@@ -1862,6 +1877,7 @@ class TDMPC2Baseline(Algorithm):
         self._episode_idx = candidate["episodes"]
         self._episode_return = 0.0
         self._episode_len = 0
+        self._training_diagnostics = candidate["training_diagnostics"]
         self._pretrained = state["pretrained"]
         self._num_updates = candidate["updates"]
         self._eval_pending = state["eval_pending"]
@@ -2181,6 +2197,10 @@ class TDMPC2Baseline(Algorithm):
             next_obs, reward, terminated, truncated, info = self.env.step(
                 action_env
             )
+            self._training_diagnostics.record_action(
+                np.clip(action_norm, -1., 1.), self._wandb_train_window,
+                episode_start=(episode_step == 0),
+            )
             if recorder is not None:
                 recorder.action(action_norm, prior=planned)
             done = bool(terminated or truncated)
@@ -2221,6 +2241,7 @@ class TDMPC2Baseline(Algorithm):
                         "Set alg_params.episodic=true or disable true terminations in the env."
                     )
                 self.buffer.add(self._episode_staging[:episode_rows])
+                self._training_diagnostics.complete_episode(self._episode_return)
 
             if self._global_step > self.cfg.seed_steps and self.buffer.num_eps > 0:
                 num_updates = (
