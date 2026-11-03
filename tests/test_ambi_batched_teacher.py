@@ -19,7 +19,7 @@ from tests.test_ambi_reanalyze import (
 from tests.test_ambi_inner_decoupling import _clone_tree, _assert_tree_equal
 
 
-def _agent(*, device="cpu", **overrides):
+def _agent(*, device="cpu", action_dim=3, **overrides):
     params = _tiny_params(
         inner_rounds=2, inner_rollouts_per_round=4, inner_rollout_horizon=2,
         inner_updates_per_round=2, inner_replay_capacity=16, num_q=2,
@@ -27,6 +27,8 @@ def _agent(*, device="cpu", **overrides):
         inner_outer_policy_kl_coef=0.2,
     )
     params.update(overrides)
+    if "inner_critic_updates_per_round" in params:
+        params.pop("inner_updates_per_round")
     params.setdefault("target_entropy", -1.)
     params["inner_target_entropy"] = -1.
     if params.get("sac_actor_loss_scale_mode", "none") != "none":
@@ -35,6 +37,8 @@ def _agent(*, device="cpu", **overrides):
         params["num_q"] = 3
     cfg = _build_cfg(**params)
     cfg.device = device
+    cfg.action_dim = action_dim
+    cfg.action_dims = [action_dim]
     agent = AMBITDMPC2Agent(cfg)
     agent.model.eval()
     return agent
@@ -85,6 +89,8 @@ def _assert_root_state(batch, single, root, *, rtol=1e-4, atol=2e-6):
     {"inner_temperature_mode": "inherit_outer", "ent_coef": .03, "inner_bootstrap_source": "outer_online"},
     {"inner_replay_sampling": "without_replacement", "inner_bootstrap_source": "outer_target",
      "inner_behavior_action": "mean_plus_gaussian"},
+    {"inner_critic_updates_per_round": 3, "inner_actor_updates_per_round": 1,
+     "inner_temperature_updates_per_round": 1},
 ])
 def test_batched_solve_matches_independent_parameters_replay_and_adam(options):
     torch.manual_seed(81)

@@ -148,8 +148,9 @@ def replay(agent):
     return buffer
 
 
-def test_refresh_after_nine_invalid_updates_exact_resume():
-    source = model(reanalyze_batch_size=1).agent
+@pytest.mark.parametrize("backend", ["native", "batched"])
+def test_refresh_after_nine_invalid_updates_exact_resume(backend):
+    source = model(reanalyze_batch_size=1, reanalyze_backend=backend).agent
     buffer = replay(source)
     for _ in range(9):
         metrics = source.update(buffer)
@@ -162,7 +163,7 @@ def test_refresh_after_nine_invalid_updates_exact_resume():
     rng = torch.random.get_rng_state().clone()
     expected_metrics = source.update(buffer)
     expected = _clone_tree(source.training_state_dict())
-    restored = model(reanalyze_batch_size=1).agent
+    restored = model(reanalyze_batch_size=1, reanalyze_backend=backend).agent
     restored.load_training_state_dict(saved)
     restored_buffer = Buffer(restored.cfg, resumable=True)
     restored_buffer.load_training_state_shards(manifest, iter(shards))
@@ -249,7 +250,8 @@ def test_distillation_compiled_tensor_learner_matches_eager(monkeypatch):
         torch._dynamo.reset()
 
 
-def test_distillation_full_trainer_resume_matches_continuous(monkeypatch, tmp_path):
+@pytest.mark.parametrize("backend", ["native", "batched"])
+def test_distillation_full_trainer_resume_matches_continuous(monkeypatch, tmp_path, backend):
     """Exercise persisted replay, collection labels, and refresh across segments."""
     import sys
     from RL.AMBITDMPC2 import AMBITDMPC2
@@ -267,7 +269,7 @@ def test_distillation_full_trainer_resume_matches_continuous(monkeypatch, tmp_pa
         return resume_model(
             env, algorithm=AMBITDMPC2, inner_scope="action", total_steps=6,
             outer_actor_objective="distillation", reanalyze_interval=2,
-            reanalyze_batch_size=1,
+            reanalyze_batch_size=1, reanalyze_backend=backend,
         )
     continuous_env = BoundaryEnv()
     continuous = make(continuous_env)

@@ -43,6 +43,7 @@ def _engine(
     )
     engine.device = torch.device("cpu")
     engine.state = InnerWorkspace()
+    engine._teacher_only = False
     return engine
 
 
