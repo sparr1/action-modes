@@ -12,6 +12,7 @@
 # A bounded correctness/timing workload. No checkpoints or W&B publication.
 set -Eeuo pipefail
 umask 077
+ulimit -c 0
 : "${SLURM_JOB_ID:?Submit through Slurm.}"
 : "${AMBI_PROJECT_DIR:?Supply a clean source checkout.}"
 : "${AMBI_PYTHON:?Supply the locked interpreter.}"
@@ -54,11 +55,8 @@ elif [[ "$AMBI_BENCH_MODE" == width ]]; then
   [[ "$AMBI_BATCH_WIDTH" =~ ^[1-9][0-9]*$ ]]
   read -r -a benchmark_widths <<< "${AMBI_BATCH_WIDTHS:-$AMBI_BATCH_WIDTH}"
   for width in "${benchmark_widths[@]}"; do [[ "$width" =~ ^[1-9][0-9]*$ ]]; done
-  # Same GPU and recipe for the existing stream-graph baseline and root batching.
-  srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.benchmark_ambi_reanalyze \
-    --device cuda --profile reference --compile --graph-only --full-refresh --roots 60 \
-    --parallel-roots 4 --warmup 1 --repeats 5 --output "$AMBI_BENCH_OUTPUT/streams-4.json" \
-    > "$AMBI_BENCH_OUTPUT/streams-4.log" 2>&1
+  # Separate processes isolate compilation and CUDA failures. Record the new
+  # solver first; a failing old baseline must not erase completed measurements.
   for width in "${benchmark_widths[@]}"; do
     srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.benchmark_ambi_reanalyze \
       --device cuda --profile reference --compile --full-refresh --roots 60 \
@@ -66,11 +64,17 @@ elif [[ "$AMBI_BENCH_MODE" == width ]]; then
       --warmup 1 --repeats 5 --output "$AMBI_BENCH_OUTPUT/batched-$width.json" \
       > "$AMBI_BENCH_OUTPUT/batched-$width.log" 2>&1
   done
+  srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.benchmark_ambi_reanalyze \
+    --device cuda --profile reference --compile --graph-only --full-refresh --roots 60 \
+    --parallel-roots 1 --warmup 1 --repeats 5 --output "$AMBI_BENCH_OUTPUT/serial-graph.json" \
+    > "$AMBI_BENCH_OUTPUT/serial-graph.log" 2>&1
 else
   : "${AMBI_BATCH_WIDTH:?Supply the measured root batch width.}"
+  collection_backend="${AMBI_COLLECTION_BACKEND:-cuda_graph}"
+  [[ "$collection_backend" == native || "$collection_backend" == cuda_graph ]]
   for interval in 0 10; do
     srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.benchmark_ambi_distillation_training \
-      --collection cuda_graph --refresh-interval "$interval" \
+      --collection "$collection_backend" --refresh-interval "$interval" \
       --reanalyze-backend batched_cuda_graph --parallel-roots "$AMBI_BATCH_WIDTH" \
       --warmup 510 --decisions 100 --output "$AMBI_BENCH_OUTPUT/interval-${interval}.json" \
       > "$AMBI_BENCH_OUTPUT/interval-${interval}.log" 2>&1

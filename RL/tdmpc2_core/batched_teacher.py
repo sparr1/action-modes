@@ -463,7 +463,8 @@ class BatchedTeacherSolver:
                     started = time.perf_counter()
                     torch.random.default_generator.manual_seed(0)
                     if devices:
-                        torch.cuda.manual_seed(0)
+                        with torch.cuda.device(self.device):
+                            torch.cuda.manual_seed(0)
                     self._setup()
                     setup_seconds = time.perf_counter() - started
                 self.core.refresh_inputs()
@@ -472,7 +473,8 @@ class BatchedTeacherSolver:
                     seed = self._seed(seeds[start:start + self.width])
                     torch.random.default_generator.manual_seed(seed)
                     if devices:
-                        torch.cuda.manual_seed(seed)
+                        with torch.cuda.device(self.device):
+                            torch.cuda.manual_seed(seed)
                     # Padding is independent work and never contributes labels,
                     # replay accounting, or the work counters returned below.
                     with torch.no_grad():
