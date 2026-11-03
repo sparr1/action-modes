@@ -20,7 +20,6 @@ MATRIX = ROOT / "configs/research/ambi_checkpoint_graph_eval.json"
 OWNER = "oscar-rgao48"
 ENTITY, PROJECT = "rwgao_b-brown-university", "ambi-inner-bench"
 SELECTORS = ["controller/prior", "controller/graph"]
-LABELS = {SELECTORS[0]: "Frozen prior mean", SELECTORS[1]: "H3 J8 K1 refinement mean · CUDA graph"}
 COLORS = {SELECTORS[0]: "#6B7280", SELECTORS[1]: "#0F766E"}
 
 
@@ -32,8 +31,36 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def controller_details(config):
+    h, j, k, n, c, a, b = (config[key] for key in (
+        "inner_rollout_horizon", "inner_rounds", "inner_solve_interval",
+        "inner_rollouts_per_round", "inner_critic_updates_per_round",
+        "inner_actor_updates_per_round", "inner_batch_size"))
+    scale = {("action", "per_action"): "outer Q scale frozen within each solve",
+             ("action", "per_update"): "outer Q scale adapted within each solve",
+             ("run", "per_update"): "adaptive Q scale carried between decisions, reset to outer at each independent episode"}[
+                 config["inner_actor_loss_scale_scope"], config["inner_actor_loss_scale_update"]]
+    return {
+        "labels": {SELECTORS[0]: "Frozen prior mean", SELECTORS[1]: f"H{h} J{j} K{k} refinement mean · CUDA graph"},
+        "description": (f"Refinement retains H{h}/J{j}/K{k}, N{n}/C{c}/A{a}/B{b}, "
+                        f"{config['inner_actor_entropy_mode']} entropy, "
+                        f"temperature mode {config['inner_temperature_mode']}, and {scale}."),
+        "expected_metrics": {"inner_cuda_graph_used": 1,
+                             "inner_critic_optimizer_steps": config["inner_critic_updates_per_action"],
+                             "inner_actor_optimizer_steps": config["inner_actor_updates_per_action"],
+                             "inner_model_steps": config["inner_model_step_budget"],
+                             "inner_compile_fallback": 0},
+    }
+
+
 def prepare(args):
     from evaluate_ambi_checkpoint import evaluate_matrix
+    from types import SimpleNamespace
+    from utils.ambi_research import resolve_preset
+    from utils.checkpoint_context import load_checkpoint_context
+    from utils.eval_series_data import resolved_checkpoint_config
+    from RL.tdmpc2_core.whole_inner_graph import validate_training_graph
+    import torch
     if git("status", "--porcelain"):
         raise ValueError("Preparation requires a clean committed source checkout")
     if args.campaign.exists():
@@ -53,8 +80,14 @@ def prepare(args):
         rows.append(dict(step=step, path=str(weight.resolve()), sha256=series._file_digest(weight),
                          metadata_path=str(metadata.resolve()), metadata_sha256=series._file_digest(metadata)))
     rows.sort(key=lambda row: row["step"])
-    if [row["step"] for row in rows] != list(range(50000, args.max_step + 1, 50000)):
-        raise ValueError("The requested present-checkpoint grid is incomplete or duplicated")
+    if not rows or len({row["step"] for row in rows}) != len(rows):
+        raise ValueError("The present-checkpoint inventory is empty or duplicated")
+    context = load_checkpoint_context(rows[0]["path"])
+    resolved = resolve_preset(MATRIX, SELECTORS[1], checkpoint_context=context)
+    config = resolved_checkpoint_config({"metadata": series._read(rows[0]["metadata_path"])}, resolved)
+    validate_training_graph(SimpleNamespace(cfg=SimpleNamespace(**config), device=torch.device("cuda"),
+                                            _active_trace=None, _retrace_enabled=False))
+    details = controller_details(config)
     args.campaign.mkdir(parents=True)
     inventory_path = args.campaign / "checkpoint-inventory.json"
     series._atomic_json(inventory_path, {"source_run": args.source_run, "checkpoints": rows,
@@ -67,10 +100,12 @@ def prepare(args):
         registry = series.create_run(args.registry, series._read(path), args.campaign.name,
                                      PROJECT, ENTITY, OWNER)
         runs.append({"selector": selector, "id": registry["run_id"], "run_dir": registry["run_dir"],
-                     "label": LABELS[selector], "color": COLORS[selector]})
+                     "label": details["labels"][selector], "color": COLORS[selector]})
     run_map = {run["selector"]: run["run_dir"] for run in runs}
     series._atomic_json(args.campaign / "run-map.json", run_map)
-    campaign = dict(created_at=now(), source_run=args.source_run, source_commit=git("rev-parse", "HEAD"),
+    campaign = dict(created_at=now(), source_run=args.source_run, source_name=args.source_name,
+                    controller_description=details["description"], expected_metrics=details["expected_metrics"],
+                    source_commit=git("rev-parse", "HEAD"),
                     source_tree=git("rev-parse", "HEAD^{tree}"), matrix_sha256=series._file_digest(MATRIX),
                     cutoff_step=args.max_step, checkpoints=rows, runs=runs,
                     seeds=[101, 102, 103, 104, 105], controller_seed=55, max_steps=500,
@@ -88,7 +123,7 @@ def load_campaign(path):
     return campaign
 
 
-def validate_result(payload, expected_steps, seeds):
+def validate_result(payload, expected_steps, seeds, expected_metrics):
     if len(payload["results"]) != 2:
         raise ValueError("Both prior and graph results are required")
     for result in payload["results"]:
@@ -101,9 +136,7 @@ def validate_result(payload, expected_steps, seeds):
                 raise ValueError("Missing whole-solve graph replay")
             for episode in result["episodes"]:
                 metrics = episode["model_metrics"]
-                for key, value in {"inner_cuda_graph_used": 1, "inner_critic_optimizer_steps": 128,
-                                   "inner_actor_optimizer_steps": 32, "inner_model_steps": 3072,
-                                   "inner_compile_fallback": 0}.items():
+                for key, value in expected_metrics.items():
                     if metrics.get(key) != value:
                         raise ValueError(f"Unexpected graph workload: {key}={metrics.get(key)}")
     return payload
@@ -128,14 +161,14 @@ def worker(args):
     steps = 8 if args.smoke else 500
     if args.smoke:
         subprocess.run([sys.executable, "-m", "pytest", "-q",
-                        "tests/test_frozen_graph_evaluation.py::test_cuda_mean_graph_matches_control_and_resets_episode_rng"], check=True)
+                        "tests/test_frozen_graph_evaluation.py", "-k", "cuda"], check=True)
     started = time.perf_counter()
     payload = evaluate_matrix(MATRIX, row["path"], seeds=seeds, max_steps=steps, device="cuda",
                               bundle_dir=output / "bundle", source_run=campaign["source_run"],
                               checkpoint_inventory=args.campaign / "checkpoint-inventory.json",
                               eval_run_map=None if args.smoke else args.campaign / "run-map.json",
                               stage_results=False)
-    validate_result(payload, steps, seeds)
+    validate_result(payload, steps, seeds, campaign["expected_metrics"])
     series._atomic_json(output / "results.json", payload)
     receipt = dict(passed=True, checkpoint_step=row["step"], seconds=time.perf_counter()-started,
                    source_commit=campaign["source_commit"], gpu=torch.cuda.get_device_name(),
@@ -168,10 +201,10 @@ def layout(args):
     with series._lock(args.campaign / ".layout.lock"):
         rows = progress(campaign)
         table = "\n".join(f"| {r['step']:,} | {r[SELECTORS[0]]} | {r[SELECTORS[1]]} |" for r in rows)
-        markdown = (f"**Post-tanh / outer-adapt checkpoint evaluation.** Source `{campaign['source_run']}`.\n\n"
+        markdown = (f"**{campaign['source_name']} · checkpoint evaluation.** Source `{campaign['source_run']}`.\n\n"
                     "Five paired full Humanoid Walk episodes per checkpoint; environment seeds 101–105, "
-                    "controller seed 55, 500 decisions. Both execute actor means. Refinement retains H3/J8/K1, "
-                    "N128/C16/A4/B256, inherited fixed entropy and action-local adaptive Q scaling. "
+                    "controller seed 55, 500 decisions. Both execute actor means. "
+                    f"{campaign['controller_description']} "
                     "CUDA graph RNG is isolated per episode; outer checkpoint state stays frozen. "
                     "Return-only logging omits inner traces/model probes. Error bars are represented by the separate episode SD panel.\n\n"
                     f"Present-checkpoint cutoff: {campaign['cutoff_step']:,}. Status at {now()}. Missing points remain pending.\n\n"
@@ -196,7 +229,7 @@ def layout(args):
             if not found:
                 work.sections.append(section)
         else:
-            work = ws.Workspace(entity=ENTITY, project=PROJECT, name="Posttanh outer adapt · checkpoint evaluation",
+            work = ws.Workspace(entity=ENTITY, project=PROJECT, name=campaign['source_name'] + " · checkpoint evaluation",
                                 auto_generate_panels=False, sections=[section],
                                 runset_settings=ws.RunsetSettings(filters=[expr.Metric("ID").isin([r["id"] for r in campaign["runs"]])],
                                                                groupby=[], run_settings={r["id"]:ws.RunSettings(color=r["color"],disabled=False) for r in campaign["runs"]}))
@@ -215,7 +248,7 @@ def publish(args):
     subprocess.run(command, check=True)
     expected = len(campaign["checkpoints"])
     with series.Publisher(run["run_dir"], owner=OWNER) as publisher:
-        publisher.run.name = "Posttanh outer-adapt · " + run["label"]
+        publisher.run.name = campaign["source_name"] + " · " + run["label"]
         publisher.run.config.update({"curve_label": run["label"]}, allow_val_change=True)
         last = None
         while True:
@@ -257,6 +290,7 @@ def main():
         if name == "prepare":
             p.add_argument("--training-root", type=Path, required=True)
             p.add_argument("--source-run", required=True)
+            p.add_argument("--source-name", required=True)
             p.add_argument("--config-name", required=True)
             p.add_argument("--max-step", type=int, required=True)
             p.add_argument("--registry", type=Path, required=True)

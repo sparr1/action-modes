@@ -9,6 +9,10 @@ execution. Return-only bundles retain per-episode returns, scalar controller
 metrics, pairing and frozen-state checks, without inner traces or model probes.
 Its isolated graph RNG is a separate evaluation identity from native execution.
 Warmup/capture is reported separately and discarded before the seeded episodes.
+Carried adaptive Q normalization uses the final scale from the preceding real
+decision, starts from the frozen outer scale for each independent episode, and
+never inherits capture/warmup carry. The action-local frozen/adaptive modes
+continue to inherit the outer scale at every decision.
 Unsupported lifetimes, sampled execution, traces and probes fail explicitly.
 `slurm/graph_checkpoint_campaign.py` prepares a pinned checkpoint inventory and
 two new evaluation series, runs checkpoint tasks, and publishes through the

@@ -16,9 +16,10 @@ ROOT = Path(__file__).resolve().parents[1]
 MATRIX = ROOT / "configs/research/ambi_checkpoint_graph_eval.json"
 
 
-def test_matrix_preserves_saved_controller_and_selects_paired_prior():
+@pytest.mark.parametrize("mode", ["outer_frozen", "outer_adapt", "carry_adapt"])
+def test_matrix_preserves_saved_controller_and_selects_paired_prior(mode):
     import json
-    saved = json.loads((ROOT / "configs/dmcontrol/algs/ambi_inner_entropy_posttanh_outer_adapt.json").read_text())
+    saved = json.loads((ROOT / f"configs/dmcontrol/algs/ambi_inner_entropy_posttanh_{mode}.json").read_text())
     context = SimpleNamespace(source=Path("metadata.json"), trial_run_params={**saved, "env": "DMControl-v0"},
                               experiment_params={"env_params": {"task": "humanoid-walk", "obs": "state", "render_mode": None}})
     matrix = load_preset_matrix(MATRIX)
@@ -98,3 +99,45 @@ def test_cuda_mean_graph_matches_control_and_resets_episode_rng():
     torch.testing.assert_close(action, first, rtol=0, atol=0)
     for agent, snapshot in zip(agents, before):
         assert_tree_close(outer_snapshot(agent), snapshot)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires scheduled CUDA GPU")
+def test_cuda_frozen_controller_carries_scale_and_resets_independent_episodes():
+    torch.set_float32_matmul_precision("high")
+    agents = [make_agent("squashed", "run", "per_update", device="cuda", compiled=True)
+              for _ in range(2)]
+    agents[1].load(deepcopy(agents[0].checkpoint_state()))
+    before = [outer_snapshot(agent) for agent in agents]
+    observation = torch.zeros(agents[0].cfg.obs_shape["state"], device="cuda")
+    with torch.no_grad():
+        root = agents[0].model.encode(observation.unsqueeze(0)).detach()
+    control = MeanActionGraph(agents[0].inner_engine, root, capture=False, seed=12345, warmup=4)
+    model = SimpleNamespace(agent=agents[1], cfg=agents[1].cfg, _obs_to_tensor=lambda obs: obs)
+    controller = FrozenGraphController(model, observation, 12345)
+    engine = agents[1].inner_engine
+    engine.reset_for_evaluation(12345)
+    controller.reset_episode(12345)
+    carried = agents[0].actor_loss_scale.detach().clone()
+    first = None
+    for index in range(3):
+        expected, expected_metrics, _ = control(root + index / 10, initial_actor_loss_scale=carried)
+        carried = expected_metrics["inner_actor_loss_scale_final"].detach().reshape_as(carried).clone()
+        outside = torch.cuda.get_rng_state().clone()
+        actual, metrics, _ = controller.act(root + index / 10, eval_mode=True, collect_diagnostics=False)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert_tree_close({k: v for k, v in metrics.items() if k != "inner_cuda_graph_used"}, expected_metrics)
+        assert_tree_close(inner_snapshot(controller.runner.engine), inner_snapshot(control.engine))
+        torch.testing.assert_close(engine._carried_actor_loss_scale, carried, rtol=0, atol=0)
+        assert engine._carried_actor_loss_scale.data_ptr() != metrics["inner_actor_loss_scale_final"].data_ptr()
+        torch.testing.assert_close(outside, torch.cuda.get_rng_state(), rtol=0, atol=0)
+        if index == 0:
+            first = actual.detach().clone()
+    engine.reset_for_evaluation(12345)
+    controller.reset_episode(12345)
+    actual, metrics, _ = controller.act(root, eval_mode=True, collect_diagnostics=False)
+    torch.testing.assert_close(actual, first, rtol=0, atol=0)
+    torch.testing.assert_close(metrics["inner_actor_loss_scale_initial"], agents[1].actor_loss_scale.reshape(()), rtol=0, atol=0)
+    for agent, snapshot in zip(agents, before):
+        assert_tree_close(outer_snapshot(agent), snapshot)
+    controller.close()
+    assert engine.act == controller.original_act

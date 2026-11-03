@@ -28,8 +28,6 @@ class FrozenGraphController:
         self.model = model
         self.engine = model.agent.inner_engine
         validate_training_graph(self.engine)
-        if model.cfg.inner_actor_loss_scale_scope != "action":
-            raise ValueError("Frozen graph evaluation requires action-scoped Q normalization.")
         with torch.no_grad():
             obs = model._obs_to_tensor(observation).to(model.agent.device).unsqueeze(0)
             root = model.agent.model.encode(obs).detach()
@@ -48,7 +46,18 @@ class FrozenGraphController:
         if (not eval_mode or collect_diagnostics or trace is not None
                 or apply_inner_writeback or return_behavior_policy):
             raise ValueError("Frozen graph requires mean execution without traces, probes or writeback.")
-        action, metrics, lengths = self.runner(root)
+        if self.engine._sac_actor_loss_scale_enabled:
+            initial_scale = self.engine._initial_actor_loss_scale(
+                self.engine._critic_owner.actor_loss_scale)
+            action, metrics, lengths = self.runner(root, initial_actor_loss_scale=initial_scale)
+            if self.engine._carry_actor_loss_scale:
+                # The live engine owns carry, just as in native evaluation.
+                # reset_for_evaluation clears it between independent episodes;
+                # captured warmup state must never become a scored initial value.
+                self.engine._carried_actor_loss_scale = metrics["inner_actor_loss_scale_final"].detach().reshape_as(
+                    initial_scale).clone()
+        else:
+            action, metrics, lengths = self.runner(root)
         self.engine.action_index += 1
         return action, dict(metrics, inner_cuda_graph_used=1.0), lengths
 
