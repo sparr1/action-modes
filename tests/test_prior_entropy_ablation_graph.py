@@ -84,6 +84,17 @@ def test_run_carry_only_changes_temperature_lifetimes():
     assert fresh == carry
 
 
+@pytest.mark.parametrize('index', (1, 2))
+def test_auto_snapshots_have_no_q_normalizer(index):
+    agent = make_agent(index)
+    assert agent.actor_loss_scale is None
+    assert outer_snapshot(agent)['scale'] is None
+    before = outer_snapshot(agent)
+    agent.act(torch.zeros(67), collect_diagnostics=False)
+    assert_tree_close(outer_snapshot(agent), before)
+    assert inner_snapshot(agent.inner_engine)['log_alpha'] is not None
+
+
 def test_temperature_bridge_copies_moments_without_aliasing_or_warmup_leak():
     agent = make_agent(2)
     source = agent.inner_engine.state
@@ -117,7 +128,7 @@ def test_cuda_recipe_parity(index):
     root = torch.zeros(1, native.cfg.latent_dim, device='cuda')
     control = WholeInnerGraph(native.inner_engine, root, capture=False)
     captured = WholeInnerGraph(graph.inner_engine, root)
-    scale = native.actor_loss_scale.clone()
+    scale = native.actor_loss_scale.clone() if index == 0 else None
     for i in range(3):
         cpu_rng, gpu_rng = torch.get_rng_state().clone(), torch.cuda.get_rng_state().clone()
         before = [outer_snapshot(a) for a in (native, graph)]

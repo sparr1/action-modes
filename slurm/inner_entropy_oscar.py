@@ -201,7 +201,7 @@ def worker(args):
                 replay_counts["before"] = 0 if runner is None else runner.calls
             timer.before_action(step, learner._num_updates)
             t = time.perf_counter()
-            before = agent.actor_loss_scale.detach().clone()
+            before = agent.actor_loss_scale.detach().clone() if scale_enabled else None
             outer_alpha = agent.alpha.detach().clone()
             carried = agent.inner_engine._carried_actor_loss_scale
             initial = before if carried is None else carried.detach().clone()
@@ -229,7 +229,8 @@ def worker(args):
                 assert inner["inner_temperature_optimizer_step_final"] - inner["inner_temperature_optimizer_step_initial"] == cfg.inner_temperature_updates_per_action
                 assert inner["inner_temperature_lifetime_steps_final"] - inner["inner_temperature_lifetime_steps_initial"] == cfg.inner_temperature_updates_per_action
             torch.testing.assert_close(agent.alpha, outer_alpha, rtol=0, atol=0)
-            torch.testing.assert_close(agent.actor_loss_scale, before, rtol=0, atol=0)
+            if scale_enabled:
+                torch.testing.assert_close(agent.actor_loss_scale, before, rtol=0, atol=0)
             return action
 
         def observed_log(*positional, **kwargs):
@@ -268,7 +269,7 @@ def worker(args):
             learner.flush_checkpoints()
             assert checkpoint.is_file() and Path(str(checkpoint) + ".metadata.json").is_file()
             size = checkpoint.stat().st_size
-            scale = agent.actor_loss_scale.detach().clone()
+            scale = agent.actor_loss_scale.detach().clone() if scale_enabled else None
             engine = agent.inner_engine
             engine.prepare_training_resume_boundary()
             inner_state = deepcopy(engine.training_state_dict())
@@ -281,7 +282,8 @@ def worker(args):
             agent.load(checkpoint)
             for key, value in agent.model.state_dict().items():
                 torch.testing.assert_close(value.cpu(), saved["model"][key], rtol=0, atol=0)
-            torch.testing.assert_close(agent.actor_loss_scale, scale, rtol=0, atol=0)
+            if scale_enabled:
+                torch.testing.assert_close(agent.actor_loss_scale, scale, rtol=0, atol=0)
             torch.testing.assert_close(agent.alpha, alpha, rtol=0, atol=0)
         report = {"passed": True, "index": args.index, "name": name,
                   "physical_cpus": len(cpus), "runtime": execution,

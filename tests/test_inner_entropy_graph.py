@@ -89,7 +89,7 @@ def inner_snapshot(engine):
 def outer_snapshot(agent):
     return {
         "model": deepcopy(agent.model.state_dict()),
-        "scale": agent.actor_loss_scale.detach().clone(),
+        "scale": None if agent.actor_loss_scale is None else agent.actor_loss_scale.detach().clone(),
         "alpha": agent.alpha.detach().clone(),
         "optimizers": {name: None if getattr(agent, name) is None else deepcopy(getattr(agent, name).state_dict())
                        for name in ("optim", "pi_optim", "ent_coef_optim")},
@@ -275,7 +275,8 @@ def assert_graph_resume_continuation(agent):
                     else engine._carried_actor_loss_scale.detach().clone())
         for index, diagnostic in enumerate((False, True, False)):
             # This real outer quantity changes independently between solves.
-            agent.actor_loss_scale.fill_(4. + index)
+            if engine._sac_actor_loss_scale_enabled:
+                agent.actor_loss_scale.fill_(4. + index)
             if index:
                 with torch.no_grad():
                     next(agent.model._pi.parameters()).add_(.0001)
@@ -309,7 +310,8 @@ def assert_graph_resume_continuation(agent):
                 assert metrics["inner_actor_loss_scale_outer"] == pytest.approx(4. + index)
                 if agent.cfg.inner_actor_loss_scale_update == "per_action":
                     assert metrics["inner_actor_loss_scale_final"] == pytest.approx(expected_initial)
-            torch.testing.assert_close(agent.actor_loss_scale, torch.full_like(agent.actor_loss_scale, 4. + index))
+            if engine._sac_actor_loss_scale_enabled:
+                torch.testing.assert_close(agent.actor_loss_scale, torch.full_like(agent.actor_loss_scale, 4. + index))
             if engine._carry_actor_loss_scale:
                 previous = engine._carried_actor_loss_scale.detach().clone()
                 assert previous.item() == pytest.approx(metrics["inner_actor_loss_scale_final"])
