@@ -87,7 +87,7 @@ artifacts without the field retain their loop identity.
 
 ### Whole inner SAC CUDA graph
 
-`inner_cuda_graph=true` opts into one captured solve for the fresh K1,
+`inner_cuda_graph=true` opts into one captured solve for the fresh K1 or K3,
 state-observation SAC training recipe. It requires strict compiled regions,
 fresh prior-initialized actor and reward-only critic clones, action-scoped
 optimizers/replay/temperature, and no auxiliary critic, writeback, explorer,
@@ -147,6 +147,23 @@ solve inherits outer alpha; later solves either re-inherit or carry it according
 to the arm. All arms retain every 25k checkpoint and critic geometry diagnostics.
 `slurm/run_prior_entropy_ablation_oscar.sbatch` uses the corresponding GPU parity,
 production-shape timing, diagnostic-continuation, checkpoint, and workspace gates.
+
+`configs/dmcontrol/experiments/ambi_posttanh_outer_adapt_k3.json` is the K3
+counterpart of `ambi_inner_entropy_posttanh_outer_adapt` (W&B reference
+`fc7c433ab4734a5aa7eb1717e2165969`). Its only scientific configuration change is
+`inner_solve_interval=3`: coefficient 0.0021, post-tanh entropy, the reset/adapt
+Q estimator, H3/J8 update dose, seed 55 and one-million-decision budget remain
+the same. K3 solves on episode decisions 0, 3, 6, etc. and samples feedback
+actions from independently frozen actor and encoder snapshots between solves.
+Outer updates continue every decision. The live engine owns cadence and the
+held snapshots; its private graph worker always performs one full solve.
+Native diagnostics and episode-boundary exact recapture retain their existing
+semantics. Graph-use telemetry is zero on held decisions, so its average is
+approximately one third. The two K1/K3 numerical cases are in
+`tests/test_k3_entropy_graph.py::test_cuda_k3_capture_continuation`.
+`slurm/run_posttanh_outer_adapt_k3_oscar.sbatch` gates launch on those checks,
+production-size K3 timing on one/two CPUs, and native diagnostic/checkpoint
+continuation. Timing windows contain complete three-decision cycles.
 
 ### Critic initialization and policy probabilities
 

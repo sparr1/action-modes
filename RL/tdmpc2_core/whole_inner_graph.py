@@ -139,6 +139,8 @@ class WholeInnerGraph:
 
     def __init__(self, engine, root, *, capture=True, seed=8173, warmup=3):
         validate_graph_workload(engine)
+        if engine._solve_interval != 1:
+            raise ValueError("Capture requires a single-solve worker; the live engine owns held-policy cadence.")
         if engine.device.type != "cuda" or root.device.type != "cuda":
             raise ValueError("WholeInnerGraph requires a CUDA engine and CUDA root.")
         if root.ndim != 2 or root.shape[0] != 1:
@@ -291,10 +293,12 @@ _TRAINING_PROTOCOL = "isolated_cuda_graph_with_native_diagnostics_v1"
 
 
 def validate_training_graph(engine):
-    """Keep the first training mode limited to the validated fresh K1 recipe."""
+    """Allow fresh solves at the validated K1 or K3 control cadence."""
     validate_graph_workload(engine)
+    if int(getattr(engine.cfg, "inner_solve_interval", 1)) not in (1, 3):
+        raise ValueError("Training CUDA graph supports inner_solve_interval=1 or 3.")
     for key, expected in {
-        "obs": "state", "inner_solve_interval": 1,
+        "obs": "state",
         "inner_execution_action": "policy_sample",
         "inner_execution_policy_source": "primary",
         "outer_behavior_policy_kl_schedule": "none",
@@ -369,7 +373,8 @@ def training_graph_act(engine, root):
             runner.calls = saved["calls"]
         engine._whole_graph_runner = runner
         engine._whole_graph_resume = None
-    engine._pending_timers = {}
+    if engine._solve_interval == 1:
+        engine._pending_timers = {}
     started = engine._timer_start()
     temperature_kwargs = {}
     if engine.cfg.inner_temperature_scope == "run":
@@ -396,4 +401,18 @@ def training_graph_act(engine, root):
     engine.state.outer_version = int(engine.agent.outer_version)
     # Do not mutate the static result dictionary owned by the capture.
     values = dict(values, inner_cuda_graph_used=1.0)
+    if engine._solve_interval > 1:
+        # The worker has released action-scoped state into its allocation pool.
+        # Copy the solved actor before any later graph replay can overwrite it.
+        engine._snapshot_held_actor(engine._whole_graph_runner.engine._action_pool.actor)
+        decision = engine._episode_decision_index
+        values.update(
+            inner_solve_performed=1.0, inner_policy_held=0.0,
+            inner_solve_interval=float(engine._solve_interval),
+            inner_solve_index=float(decision // engine._solve_interval),
+            inner_action_age=float(decision % engine._solve_interval),
+            inner_episode_decision_index=float(decision),
+        )
+        engine._timer_stop("inner_solve_seconds", started)
+        engine._episode_decision_index += 1
     return action, values, lengths

@@ -23,6 +23,7 @@ MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_inner_entropy.json"
 CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/inner-entropy-cudagraph-20261102")
 GPU_PARITY_TEST = "tests/test_inner_entropy_graph.py::test_cuda_capture_matches_uncaptured_normalized_solve"
 GPU_PARITY_CASE_COUNT = 6
+INLINE_GPU_PARITY_INDEX = 0
 ENTRYPOINT = Path(__file__).resolve()
 
 
@@ -169,7 +170,9 @@ def worker(args):
     overrides = {"wandb": False, "wandb_mode": "disabled", "seed_steps": 500,
                  "pretrain_steps": 2, "inner_cuda_graph": graph_enabled}
     run["alg_params"].update(overrides)
-    warmup, measured = 8, 32 if args.native_reference else 128
+    interval = int(run["alg_params"].get("inner_solve_interval", 1))
+    warmup, measured = ((9, 42 if args.native_reference else 126) if interval == 3
+                        else (8, 32 if args.native_reference else 128))
     total = 501 + warmup + measured
     run.update(total_steps=total, checkpoint_every=None, save_strat="none")
     manifest.update(logs="none", save_trials="none", checkpoint_every=None, save_strat="none")
@@ -180,7 +183,8 @@ def worker(args):
         learner = AMBITDMPC2(name + "-disabled-benchmark", env, run["alg_params"], run, manifest)
         agent, cfg = learner.agent, learner.cfg
         assert cfg.action_dim == 21 and cfg.inner_operator == "sac" and not cfg.mpc
-        assert (cfg.inner_rollout_horizon, cfg.inner_rounds, cfg.inner_solve_interval) == (3, 8, 1)
+        assert (cfg.inner_rollout_horizon, cfg.inner_rounds) == (3, 8)
+        assert cfg.inner_solve_interval == interval and interval in (1, 3)
         assert cfg.inner_finite_horizon
         assert cfg.outer_actor_entropy_mode == cfg.inner_actor_entropy_mode
         assert cfg.compile and cfg.compile_strict and cfg.critic_ensemble_backend == "vmap"
@@ -192,8 +196,10 @@ def worker(args):
         act, log = learner._act_agent, learner._log_wandb_step
         graph_counts = {}
         replay_counts = {}
+        measured_solves = 0
 
         def observed_act(*positional, **kwargs):
+            nonlocal measured_solves
             step = learner._global_step + 1
             if step == timer.first_step:
                 graph_counts["before"] = int(torch._dynamo.utils.counters["stats"]["unique_graphs"])
@@ -209,20 +215,26 @@ def worker(args):
             timer.after_action(step, time.perf_counter() - t)
             assert torch.isfinite(action).all()
             inner = agent.last_inner_metrics
-            assert inner["inner_actor_optimizer_steps"] == 32
-            assert inner["inner_critic_optimizer_steps"] == 128
-            assert inner["inner_temperature_optimizer_steps"] == cfg.inner_temperature_updates_per_action
+            solved = int(inner.get("inner_solve_performed", 1))
+            if timer.first_step <= step <= timer.last_step:
+                measured_solves += solved
+            if interval > 1:
+                assert solved == int(inner["inner_episode_decision_index"] % interval == 0)
+                assert inner["inner_policy_held"] == 1 - solved
+            assert inner["inner_actor_optimizer_steps"] == 32 * solved
+            assert inner["inner_critic_optimizer_steps"] == 128 * solved
+            assert inner["inner_temperature_optimizer_steps"] == cfg.inner_temperature_updates_per_action * solved
             assert inner["inner_compile_fallback"] == 0
             # Native-only execution need not emit the graph telemetry key;
             # graph-enabled measurements still require an explicit one.
-            assert inner.get("inner_cuda_graph_used", 0.0) == float(graph_enabled)
+            assert inner.get("inner_cuda_graph_used", 0.0) == float(graph_enabled and solved)
             assert all(math.isfinite(float(v)) for v in inner.values())
-            if scale_enabled:
+            if scale_enabled and solved:
                 expected = initial if cfg.inner_actor_loss_scale_scope == "run" else before
                 assert math.isclose(inner["inner_actor_loss_scale_initial"], expected.item(), rel_tol=1e-6)
                 if cfg.inner_actor_loss_scale_update == "per_action":
                     assert inner["inner_actor_loss_scale_final"] == inner["inner_actor_loss_scale_initial"]
-            if cfg.inner_temperature_mode == "auto":
+            if cfg.inner_temperature_mode == "auto" and solved:
                 if cfg.inner_temperature_scope == "action":
                     assert math.isclose(inner["inner_alpha_initial"], outer_alpha.item(), rel_tol=1e-6)
                     assert inner["inner_temperature_optimizer_step_initial"] == 0
@@ -246,7 +258,8 @@ def worker(args):
         runner = agent.inner_engine._whole_graph_runner
         replay_counts["after"] = 0 if runner is None else runner.calls
         replay_counts["timed"] = replay_counts["after"] - replay_counts["before"]
-        assert replay_counts["timed"] == (measured if graph_enabled else 0), replay_counts
+        assert measured_solves == measured // interval
+        assert replay_counts["timed"] == (measured_solves if graph_enabled else 0), replay_counts
         metrics = learner._last_train_metrics
         assert metrics["compile_fallback"] == 0
         assert all(math.isfinite(float(v)) for v in metrics.values())
@@ -262,8 +275,12 @@ def worker(args):
         # outside the steady-state timing window.
         geometry = check_geometry(agent, learner.buffer)
         if graph_enabled:
-            from tests.test_inner_entropy_graph import assert_graph_resume_continuation
-            assert_graph_resume_continuation(agent)
+            if interval == 3:
+                from tests.test_k3_entropy_graph import assert_k3_graph_resume_continuation
+                assert_k3_graph_resume_continuation(agent)
+            else:
+                from tests.test_inner_entropy_graph import assert_graph_resume_continuation
+                assert_graph_resume_continuation(agent)
         with tempfile.TemporaryDirectory(prefix="prior-entropy-checkpoint-") as temp:
             checkpoint = Path(learner.save(temp, "checkpoint"))
             learner.flush_checkpoints()
@@ -292,6 +309,7 @@ def worker(args):
                   "checkpoint_scale_roundtrip": True, "checkpoint_sidecar": True,
                   "compile_counts": graph_counts, "compile_fallback": False,
                   "inner_cuda_graph": graph_enabled, "graph_replays": replay_counts,
+                  "solve_interval": interval, "measured_solves": measured_solves,
                   "graph_native_graph_continuation": graph_enabled,
                   "critic_geometry": geometry,
                   "gpu_replay": True, "metrics": {k: float(v) for k, v in metrics.items()},
@@ -366,7 +384,7 @@ def gate(args):
     assert campaign == CAMPAIGN_ROOT
     if (campaign / "gpu-parity.json").exists():
         load_global_parity(campaign, accelerated_runtime())
-    elif args.index == 0:
+    elif args.index == INLINE_GPU_PARITY_INDEX:
         run_gpu_parity(args.output, campaign)
     rows = []
     for count in (1, 2):
@@ -399,7 +417,7 @@ def gate(args):
                "graph_speedup_vs_native_one_cpu": native["measured"]["seconds_per_decision"] / rows[0]["measured"]["seconds_per_decision"],
                "graph_native_graph_continuation": all(r["graph_native_graph_continuation"] for r in rows),
                "global_gpu_parity_receipt": str(campaign / "gpu-parity.json"),
-               "scope": "Real H3/J8/K1 Humanoid training, production model/batch; 128 graph decisions on 1/2 CPUs and 32 native reference decisions; sparse inner/geometry diagnostics and recapture outside timing; no W&B."}
+               "scope": "Real H3/J8 Humanoid training at the configured K cadence, production model/batch; graph timing on 1/2 CPUs and a native reference; sparse inner/geometry diagnostics and recapture outside timing; no W&B."}
     write_new(args.output / "receipt.json", receipt)
     # Measuring a gate never implicitly submits/resizes/releases production.
     # An explicit release target is useful only for a previously held job whose

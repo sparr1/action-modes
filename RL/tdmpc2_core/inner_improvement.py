@@ -189,6 +189,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
 
     @property
     def _solve_interval(self):
+        # The captured worker always performs one complete solve. Cadence and
+        # frozen feedback-policy snapshots belong to the live control engine.
+        if self._whole_graph_worker:
+            return 1
         return int(getattr(self.cfg, "inner_solve_interval", 1))
 
     @property
@@ -252,13 +256,14 @@ class InnerImprovementEngine(RetraceInnerMixin):
             self._pending_timers = {}
 
     @torch.no_grad()
-    def _snapshot_held_actor(self):
-        if self.state.actor is None:
+    def _snapshot_held_actor(self, actor=None):
+        actor = self.state.actor if actor is None else actor
+        if actor is None:
             raise RuntimeError("Held-policy cadence requires a live solved inner actor.")
         if self._held_actor is None:
-            self._held_actor = deepcopy(self.state.actor)
+            self._held_actor = deepcopy(actor)
         else:
-            self._held_actor.load_state_dict(self.state.actor.state_dict())
+            self._held_actor.load_state_dict(actor.state_dict())
         self._held_actor.requires_grad_(False).eval()
 
     @property
@@ -7446,12 +7451,14 @@ class InnerImprovementEngine(RetraceInnerMixin):
         if graph:
             from .whole_inner_graph import validate_training_graph, training_graph_act
             validate_training_graph(self)
-            if not eval_mode and not collect_diagnostics and trace is None:
+        try:
+            held = self.prepare_control(t0=t0, eval_mode=eval_mode)
+            if graph and not held and not eval_mode and not collect_diagnostics and trace is None:
                 if return_behavior_policy:
                     raise ValueError("Training CUDA graph does not support behavior-policy metadata.")
-                return training_graph_act(self, root_z)
-        try:
-            self.prepare_control(t0=t0, eval_mode=eval_mode)
+                result = training_graph_act(self, root_z)
+                self._control_prepared = None
+                return result
             result = self._act_with_trace(
                 root_z, t0=t0, eval_mode=eval_mode,
                 collect_diagnostics=collect_diagnostics,

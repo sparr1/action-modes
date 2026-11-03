@@ -169,7 +169,7 @@ def test_persistent_rebase_flag_is_dormant_for_fresh_action_scopes():
 
 
 @pytest.mark.parametrize("key,value", [
-    ("inner_solve_interval", 3), ("aux_return_mode", "sac"),
+    ("inner_solve_interval", 2), ("aux_return_mode", "sac"),
     ("inner_temperature_scope", "run"), ("compile_strict", False),
     ("inner_actor_loss_scale_scope", "episode"), ("inner_actor_loss_scale_update", "unknown"),
 ])

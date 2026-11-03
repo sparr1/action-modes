@@ -1,0 +1,26 @@
+{
+  "study_type": "posttanh_outer_adapt_k3",
+  "study_note": "K3 variant of W&B fc7c433ab4734a5aa7eb1717e2165969: same Humanoid H3/J8 seed55, fixed post-tanh coefficient0.0021 and outer-reset/adapt Q scale. Solve every third decision, retain frozen solved actor and encoder between solves. One million decisions, all40 checkpoints every25k. Whole-inner CUDA graph on solves, native held feedback and sparse diagnostics, independent critic geometry.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_inner_entropy_posttanh_outer_adapt_k3"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}
