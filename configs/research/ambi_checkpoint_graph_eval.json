@@ -13,12 +13,21 @@
     "critic_ensemble_backend": "vmap"
   },
   "evaluation": {
-    "seeds": [101, 102, 103, 104, 105],
+    "seeds": [
+      101,
+      102,
+      103,
+      104,
+      105
+    ],
     "controller_seed": 55,
     "max_steps": 500,
     "execution_action": "mean",
     "recording": "returns",
-    "default_presets": ["controller/prior", "controller/graph"]
+    "default_presets": [
+      "controller/prior",
+      "controller/graph"
+    ]
   },
   "comparisons": {
     "controller": {
@@ -27,13 +36,74 @@
       "variants": {
         "prior": {
           "description": "Frozen prior mean without inner improvement.",
-          "alg_params": {"inner_operator": "none", "inner_cuda_graph": false,
-                         "inner_critic_updates_per_round": null,
-                         "inner_actor_updates_per_round": null}
+          "alg_params": {
+            "inner_rollout_horizon": null,
+            "inner_q_target_reduction": null,
+            "inner_q_actor_reduction": null,
+            "inner_sac_critic_target": null,
+            "inner_operator": "none",
+            "inner_rounds": null,
+            "inner_rollouts_per_round": null,
+            "inner_batch_size": null,
+            "inner_replay_capacity": null,
+            "inner_replay_sampling": null,
+            "inner_diagnostic_rollouts": null,
+            "inner_diagnostics_every": null,
+            "inner_actor_adaptation": null,
+            "inner_critic_adaptation": null,
+            "inner_temperature_mode": null,
+            "inner_temperature_initialization": null,
+            "inner_target_entropy": null,
+            "inner_bootstrap_source": null,
+            "inner_actor_lr": null,
+            "inner_critic_lr": null,
+            "inner_temperature_lr": null,
+            "inner_adam_eps": null,
+            "inner_critic_target_tau": null,
+            "inner_critic_target_update_interval": null,
+            "inner_behavior_action": null,
+            "inner_execution_action": null,
+            "inner_actor_scope": null,
+            "inner_critic_scope": null,
+            "inner_temperature_scope": null,
+            "inner_replay_scope": null,
+            "inner_actor_optimizer_scope": null,
+            "inner_critic_optimizer_scope": null,
+            "inner_temperature_optimizer_scope": null,
+            "inner_actor_entropy_mode": null,
+            "inner_log_std_mapping": null,
+            "inner_log_std_min": null,
+            "inner_log_std_max": null,
+            "inner_temperature": null,
+            "inner_critic_dropout_enabled": null,
+            "inner_actor_grad_clip_norm": null,
+            "inner_critic_grad_clip_norm": null,
+            "inner_outer_policy_kl_coef": null,
+            "inner_outer_action_l2_coef": null,
+            "inner_actor_writeback_coef": null,
+            "inner_critic_writeback_coef": null,
+            "inner_explorer_mode": null,
+            "inner_update_timing": null,
+            "inner_finite_horizon": null,
+            "inner_outer_replay_fraction": null,
+            "inner_critic_loss_coef": null,
+            "inner_actor_adam_eps": null,
+            "inner_actor_loss_scale_update": null,
+            "inner_critic_target_initialization": null,
+            "inner_steps_per_update": null,
+            "inner_critic_updates_per_round": null,
+            "inner_actor_updates_per_round": null,
+            "inner_solve_interval": null,
+            "inner_actor_loss_scale_scope": null,
+            "inner_root_entropy_samples": null,
+            "inner_cuda_graph": false
+          }
         },
         "graph": {
           "description": "Fresh inherited SAC solve at each real decision, final actor mean, isolated CUDA graph RNG.",
-          "evaluation": {"execution_backend": "frozen_mean_cuda_graph_v1"}
+          "evaluation": {
+            "execution_backend": "frozen_mean_cuda_graph_v1"
+          }
         }
       }
     }
