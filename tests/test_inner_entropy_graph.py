@@ -264,7 +264,10 @@ def assert_graph_resume_continuation(agent):
     results = []
     for attempt in range(2):
         if attempt:
-            agent.load_training_state_dict(saved)
+            # Adam may retain input tensors (notably its CPU step). Each
+            # replay needs an independent load, just as rereading a checkpoint
+            # file would provide, so later updates cannot mutate our baseline.
+            agent.load_training_state_dict(deepcopy(saved))
             assert agent.inner_engine._whole_graph_runner is None
         engine = agent.inner_engine
         agent.reset()
@@ -324,7 +327,7 @@ def assert_graph_resume_continuation(agent):
         results.append((sequence, deepcopy(agent.training_state_dict())))
     assert agent.inner_engine._whole_graph_runner is not original_runner
     assert_tree_close(results[0], results[1])
-    agent.load_training_state_dict(saved)
+    agent.load_training_state_dict(deepcopy(saved))
 
 
 @CUDA
