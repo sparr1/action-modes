@@ -41,6 +41,13 @@ comparison operators. In particular, MPPI is the TD-MPC-style planning
 comparator; it is not AMBI's core action-selection
 algorithm.
 
+The prior objective is selectable with `outer_actor_objective`:
+`"q_maximization"` preserves the existing default, while `"distillation"`
+learns from cached adapted inner-SAC policies and periodically refreshes them
+on replay states. Both retain TD learning for the Q critic. See
+[distillation and lazy reanalysis](RL/tdmpc2_core/README.md#selectable-prior-objective-and-lazy-reanalysis)
+for the loss, refresh controls, and compatibility requirements.
+
 The [TD-AMBI training preset](RL/tdmpc2_core/README.md#td-ambi-training-preset)
 uses TD-MPC2's actor and critic loss formulas in both the outer and inner
 learners, with fixed entropy coefficients and Q percentile scaling. It keeps
@@ -87,9 +94,20 @@ slots retain their existing ownership and checkpoint names. Set the option to
 `"loop"` to select the historical head loop. LoRA and custom heads retain their
 compatible loop execution; the standalone TD-MPC2 comparator is unchanged.
 
+With auxiliary return learning enabled, `alg_params.aux_return_joint_vmap=true`
+(the default) also batches the primary and return-only critics together for
+their online losses and target evaluations. It requires the vmap backend, a
+positive auxiliary critic loss coefficient, and compatible dense ensembles.
+Set it to `false` to evaluate the two ensembles separately; inactive or
+unsupported cases retain separate execution. Targets, loss weights, gradient
+clipping, and optimizer ownership are preserved.
+
 Portable checkpoints load across either backend. Vmap preserves independent
-dropout across heads but changes RNG ordering and floating-point arithmetic,
-so exact continuation requires the same backend. See the
+dropout across heads and critic types but changes RNG ordering and
+floating-point arithmetic. Next actions and sampled head subsets remain
+independent between critic types. Exact continuation requires the same backend
+and effective joint-execution policy; portable weight transfer supports either.
+See the
 [execution and compatibility details](RL/tdmpc2_core/README.md#critic-ensemble-execution).
 
 ### Optional Bernoulli critic transfer
@@ -213,42 +231,6 @@ for `latest`; `none` must be used alone. If `save_strat` is omitted, a positive
 `save_trials` remains a separate policy for final models across trials.
 Checkpoint files are model snapshots and do not universally contain replay or
 environment state for full training resume.
-
-For state-observation TD-MPC2/AMBI, opt in with top-level
-`"checkpoint_replay": true` beside `checkpoint_every` (algorithm settings take
-precedence over the experiment manifest). Each saved model then retains a
-`<model>.replay/` companion containing every resident replay row, episode IDs,
-writer/sampler state, and any collected current-episode rows not yet inserted
-into replay. CPU replay placement is fixed before collection. Capture streams
-owned 32,768-row shards while training is paused, bounding additional memory;
-model serialization remains asynchronous. The companion manifest binds the
-model step and SHA-256 and checksums every replay payload. The model metadata
-sidecar is published only after both are complete. Load and verify a pair with
-`utils.checkpoint_replay.load_checkpoint_replay(model_path, buffer)`; pending
-episode rows are returned separately to preserve the original replay sampling
-population. This option preserves retained replay for later experiments; exact
-training continuation still uses the native resume lineage, which additionally
-stores environment, learner, optimizer, carried inner state, and RNG state.
-
-Exact-resume W&B verification accepts API-added null padding only for metric
-keys present elsewhere in the saved event history. Event indices, environment
-steps and logged values still match exactly; missing logged fields, unknown
-fields and extra non-null values remain errors.
-
-Resuming a pre-fix lineage from a telemetry repair commit requires an explicit
-reviewed-source proof. Set `AMBI_RESUME_TELEMETRY_BASE_COMMIT` to the lineage's
-original full commit and `AMBI_RESUME_TELEMETRY_PATCH_SHA256` to the SHA-256 of
-`git diff --binary --full-index --no-ext-diff --no-textconv BASE HEAD --`
-after reviewing that patch. Full object IDs keep the digest independent of
-repository size and Git abbreviation settings. Both checkouts must
-be clean, the execution commit must descend from the base, and the change must
-stay within the enumerated W&B repair, compatibility, tests and documentation
-files. All training configuration, dependencies, model code and gate artifact
-hashes must still match. Use `AMBI_RESUME_MODE=required` and the original lineage.
-The original lineage and checkpoint files are preserved; the new `SEGMENT.json`
-and campaign launch receipt record the actual execution commit, original
-source, patch digest and compatibility rule. Without this explicit proof, the
-strict source-identity requirement is unchanged.
 
 Native TD-MPC2 periodic and final checkpoints also save the learned Q percentile
 scale `S`, frozen at the same step as the networks. Frozen TDAMBI evaluation

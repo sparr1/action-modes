@@ -15,6 +15,13 @@ _BEHAVIOR_POLICY_FIELDS = (
 	"behavior_policy_valid",
 )
 _BEHAVIOR_POLICY_REPLAY_SIGNATURE = "pre-tanh-diagonal-gaussian-v1"
+_TEACHER_POLICY_FIELDS = (
+	"teacher_pre_tanh_mean",
+	"teacher_log_std",
+	"teacher_valid",
+	"teacher_outer_version",
+)
+_TEACHER_POLICY_REPLAY_SIGNATURE = "successor-row-unscaled-pre-tanh-gaussian-v1"
 
 
 class Buffer():
@@ -195,6 +202,7 @@ class Buffer():
 		Load a batch of episodes into the buffer. This is useful for loading data from disk,
 		and is more efficient than adding episodes one by one.
 		"""
+		self._prepare_teacher_fields(td)
 		num_new_eps = len(td)
 		rows_per_episode = int(td.shape[1])
 		episode_idx = torch.arange(self._num_eps, self._num_eps+num_new_eps, dtype=torch.int64)
@@ -210,6 +218,7 @@ class Buffer():
 
 	def add(self, td):
 		"""Add an episode to the buffer."""
+		self._prepare_teacher_fields(td)
 		td['episode'] = torch.full_like(td['reward'], self._num_eps, dtype=torch.int64)
 		if self._num_eps == 0:
 			self._buffer = self._init(td)
@@ -271,6 +280,141 @@ class Buffer():
 		# Keep the historical one-argument seam used by tests and downstream
 		# instrumentation when behavior-policy replay is disabled.
 		return self._prepare_batch(td)
+
+	def _teacher_policy_enabled(self):
+		return bool(getattr(self.cfg, "store_teacher_policy", False))
+
+	def _validate_teacher_fields(self, fields, batch_shape):
+		"""Validate labels without requiring invalid placeholders to be finite."""
+		batch_shape = tuple(batch_shape)
+		specs = (
+			("teacher_pre_tanh_mean", (*batch_shape, self.cfg.action_dim), torch.float32),
+			("teacher_log_std", (*batch_shape, self.cfg.action_dim), torch.float32),
+			("teacher_valid", batch_shape, torch.bool),
+			("teacher_outer_version", batch_shape, torch.int64),
+		)
+		for name, shape, dtype in specs:
+			value = fields[name]
+			if not torch.is_tensor(value) or tuple(value.shape) != shape or value.dtype != dtype:
+				raise ValueError(f"Replay teacher field {name!r} has the wrong shape or dtype.")
+		valid = fields["teacher_valid"]
+		version = fields["teacher_outer_version"]
+		if bool(((version[valid] < 0).any() | (version[~valid] != -1).any()).item()):
+			raise ValueError("Replay teacher versions must be non-negative when valid and -1 otherwise.")
+		for name in _TEACHER_POLICY_FIELDS[:2]:
+			if not bool(torch.isfinite(fields[name][valid]).all().item()):
+				raise ValueError("Valid replay teacher parameters must be finite.")
+
+	def _prepare_teacher_fields(self, td):
+		"""Initialize absent labels; row t+1 labels the actor at observation t."""
+		if not self._teacher_policy_enabled():
+			return
+		present = set(_TEACHER_POLICY_FIELDS).intersection(td.keys())
+		if present and len(present) != len(_TEACHER_POLICY_FIELDS):
+			raise ValueError("Replay teacher fields must be supplied together.")
+		if not present:
+			td["teacher_pre_tanh_mean"] = torch.zeros_like(td["action"])
+			td["teacher_log_std"] = torch.zeros_like(td["action"])
+			td["teacher_valid"] = torch.zeros_like(td["reward"], dtype=torch.bool)
+			td["teacher_outer_version"] = torch.full_like(td["reward"], -1, dtype=torch.int64)
+		self._validate_teacher_fields(td, td.batch_size)
+		if bool(td["teacher_valid"][..., 0].any().item()):
+			raise ValueError("An episode's initial replay row cannot have a teacher label.")
+
+	def _teacher_sample(self, td, index, episode):
+		# Inserts, writeback, and shard restore validate the stored labels. Avoid
+		# extra host/device synchronization on every learner minibatch.
+		labels = td.select(*_TEACHER_POLICY_FIELDS).to(self._device, non_blocking=True)
+		return {
+			"mean": labels["teacher_pre_tanh_mean"].contiguous(),
+			"log_std": labels["teacher_log_std"].contiguous(),
+			"valid": labels["teacher_valid"].unsqueeze(-1).contiguous(),
+			"version": labels["teacher_outer_version"].unsqueeze(-1).contiguous(),
+			"index": index.to(self._storage_device).contiguous(),
+			"episode": episode.to(self._storage_device).contiguous(),
+		}
+
+	def sample_distillation(self, *, include_behavior_policy=False):
+		"""Return the legacy batch plus mutable teacher labels and row identities.
+
+		Teacher tensors have H rows, aligned with obs[:-1]. Their physical indices
+		identify the successor rows holding the corresponding real actions.
+		"""
+		if not self._teacher_policy_enabled():
+			raise RuntimeError("Teacher-policy replay is not enabled for this buffer.")
+		td, info = self._buffer.sample(return_info=True)
+		length = self.cfg.train_unroll_horizon + 1
+		td = td.view(-1, length).permute(1, 0)
+		index = info["index"]
+		# SliceSampler returns a one-item coordinate tuple for flat storage.
+		if isinstance(index, tuple):
+			if len(index) != 1:
+				raise ValueError("Teacher replay requires one-dimensional physical storage.")
+			index = index[0]
+		index = index.reshape(-1, length).transpose(0, 1)[1:]
+		teacher = self._teacher_sample(td[1:], index, td["episode"][1:])
+		return self._prepare_batch(td, include_behavior_policy=include_behavior_policy), teacher
+
+	def _validate_teacher_sample_identity(self, teacher):
+		require_exact_keys(
+			teacher, {"mean", "log_std", "valid", "version", "index", "episode"},
+			"Replay teacher sample",
+		)
+		shape = (int(self.cfg.train_unroll_horizon), int(self.cfg.batch_size))
+		for name in ("index", "episode"):
+			value = teacher[name]
+			if not torch.is_tensor(value) or tuple(value.shape) != shape or value.dtype != torch.int64:
+				raise ValueError(f"Replay teacher sample {name} has the wrong shape or dtype.")
+		index = teacher["index"].to(self._storage_device)
+		episode = teacher["episode"].to(self._storage_device)
+		if bool(((index < 0) | (index >= self.size)).any().item()):
+			raise ValueError("Replay teacher sample contains a nonresident index.")
+		previous = (index - 1).remainder(self.capacity)
+		oldest = int(self._buffer._writer._cursor) if self.size == self.capacity else 0
+		storage_episode = self._buffer._storage._storage["episode"]
+		if bool((
+			(index == oldest)
+			| (storage_episode[index] != episode)
+			| (storage_episode[previous] != episode)
+		).any().item()):
+			raise ValueError("Replay teacher sample has stale or invalid predecessor/destination identities.")
+		return index, episode
+
+	def write_teacher_targets(self, teacher, positions, mean, log_std, outer_version):
+		"""Transactionally update distinct sampled roots and refresh every duplicate.
+
+		The caller deduplicates physical roots before solving. Re-reading the same
+		sample's labels also updates duplicates outside the reanalysis subset,
+		without consuming sampler/RNG state or advancing the replay writer.
+		"""
+		if not self._teacher_policy_enabled():
+			raise RuntimeError("Teacher-policy replay is not enabled for this buffer.")
+		if isinstance(outer_version, bool) or not isinstance(outer_version, int) or not 0 <= outer_version <= torch.iinfo(torch.int64).max:
+			raise ValueError("Teacher outer_version must be a non-negative int64 integer.")
+		index, episode = self._validate_teacher_sample_identity(teacher)
+		if not torch.is_tensor(positions) or positions.dtype != torch.int64 or positions.ndim != 2 or positions.shape[1] != 2:
+			raise ValueError("Teacher positions must be an int64 tensor with shape [N, 2].")
+		positions = positions.to(self._storage_device)
+		if bool(((positions < 0) | (positions >= positions.new_tensor(index.shape))).any().item()):
+			raise ValueError("Teacher positions are outside the sampled batch.")
+		destination = index[positions[:, 0], positions[:, 1]]
+		if destination.unique().numel() != destination.numel():
+			raise ValueError("Teacher writeback requires distinct physical roots; deduplicate positions first.")
+		values = []
+		for name, value in (("mean", mean), ("log_std", log_std)):
+			if not torch.is_tensor(value) or not value.is_floating_point() or tuple(value.shape) != (len(positions), self.cfg.action_dim):
+				raise ValueError(f"Teacher {name} must be a floating tensor with shape [N, action_dim].")
+			value = value.detach().to(device=self._storage_device, dtype=torch.float32)
+			if not bool(torch.isfinite(value).all().item()):
+				raise ValueError("Teacher writeback parameters must be finite.")
+			values.append(value)
+		storage = self._buffer._storage._storage
+		with torch.no_grad():
+			storage["teacher_pre_tanh_mean"][destination] = values[0]
+			storage["teacher_log_std"][destination] = values[1]
+			storage["teacher_valid"][destination] = True
+			storage["teacher_outer_version"][destination] = outer_version
+		return self._teacher_sample(self._buffer._storage[index], index, episode)
 
 	@property
 	def num_sampleable_transitions(self):
@@ -355,6 +499,8 @@ class Buffer():
 		return bool(getattr(self.cfg, "store_behavior_policy", False))
 
 	def _training_state_version(self):
+		if self._teacher_policy_enabled():
+			return 3
 		return 2 if self._behavior_policy_enabled() else 1
 
 	def _training_signature(self):
@@ -383,6 +529,8 @@ class Buffer():
 			signature["behavior_policy_replay"] = (
 				_BEHAVIOR_POLICY_REPLAY_SIGNATURE
 			)
+		if self._teacher_policy_enabled():
+			signature["teacher_policy_replay"] = _TEACHER_POLICY_REPLAY_SIGNATURE
 		return signature
 
 	def _configured_field_specs(self):
@@ -442,6 +590,11 @@ class Buffer():
 					},
 				}
 			)
+		if self._teacher_policy_enabled():
+			for name in _TEACHER_POLICY_FIELDS[:2]:
+				specs[name] = {"name": name, "shape": [action_dim], "dtype": "torch.float32"}
+			for name, dtype in (("teacher_valid", "torch.bool"), ("teacher_outer_version", "torch.int64")):
+				specs[name] = {"name": name, "shape": [], "dtype": dtype}
 		return specs
 
 	def _accounting_state(self):
@@ -497,6 +650,8 @@ class Buffer():
 			expected_fields.add("task")
 		if self._behavior_policy_enabled():
 			expected_fields.update(_BEHAVIOR_POLICY_FIELDS)
+		if self._teacher_policy_enabled():
+			expected_fields.update(_TEACHER_POLICY_FIELDS)
 		if set(fields) != expected_fields:
 			raise ValueError(
 				"Replay storage fields are incompatible with the state-observation "
@@ -583,16 +738,16 @@ class Buffer():
 				f"Replay shard index {index} is outside {rows} resident rows."
 			)
 		stop = min(rows, start + max_rows)
+		shard_fields = {name: value[start:stop].clone() for name, value in fields.items()}
+		if self._teacher_policy_enabled():
+			self._validate_teacher_fields(shard_fields, (stop - start,))
 		return {
 			"schema": "tdmpc2-replay-shard",
 			"version": self._training_state_version(),
 			"index": index,
 			"start": start,
 			"stop": stop,
-			"fields": {
-				name: value[start:stop].clone()
-				for name, value in fields.items()
-			},
+			"fields": shard_fields,
 		}
 
 	def _preflight_sharded_metadata(self, metadata):
@@ -740,6 +895,8 @@ class Buffer():
 				if str(value.dtype) != spec["dtype"]:
 					raise ValueError(f"Replay shard field {name!r} has the wrong dtype.")
 				td_fields[name] = value
+			if self._teacher_policy_enabled():
+				self._validate_teacher_fields(td_fields, (row_count,))
 			candidate.extend(TensorDict(td_fields, batch_size=[row_count]))
 			expected_start = stop
 			expected_index += 1

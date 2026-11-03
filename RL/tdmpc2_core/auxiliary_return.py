@@ -204,16 +204,24 @@ class AuxiliaryReturnLearner(torch.nn.Module):
     @torch.no_grad()
     def td_target(self, next_z, reward, terminated):
         with self.isolated_rng():
-            if self.has_actor:
-                action, _ = self.model.pi(next_z)
-            else:
-                action = self.model._model.pi_action(next_z)
+            action = self.sample_target_action(next_z)
             value = self.model.Q(
                 next_z, action, target=True,
                 reduction=self.cfg.outer_q_target_reduction,
             )
-            value = torch.where(terminated == 1, 0.0, value)
-            return reward + self.discount * (1.0 - terminated) * value
+            return self.target_from_value(value, reward, terminated)
+
+    def sample_target_action(self, next_z):
+        """Sample the configured continuation policy inside the caller's RNG scope."""
+        if self.has_actor:
+            action, _ = self.model.pi(next_z)
+            return action
+        return self.model._model.pi_action(next_z)
+
+    def target_from_value(self, value, reward, terminated):
+        """Keep terminal NaNs out of the reward-only bootstrap."""
+        value = torch.where(terminated == 1, 0.0, value)
+        return reward + self.discount * (1.0 - terminated) * value
 
     def critic_loss(self, latent_states, action, targets):
         latents = latent_states[:-1]
@@ -221,12 +229,16 @@ class AuxiliaryReturnLearner(torch.nn.Module):
             latents = latents.detach()
         with self.isolated_rng():
             predictions = self.model._model.aux_return_q_predictions(latents, action)
+        return self.critic_loss_from_predictions(predictions, targets), predictions
+
+    def critic_loss_from_predictions(self, predictions, targets):
+        """The same per-ensemble objective for separate and joint execution."""
         per_sample = self.model.q_backend.loss(predictions, targets, reduction="none")
         per_time = per_sample.mean(dim=(0,) + tuple(range(2, per_sample.ndim)))
         loss = td_math.reduce_temporal_loss(
             per_time, self.cfg.rho, legacy_order="vector_sum_divide",
         )
-        return loss, predictions
+        return loss
 
     def update_actor(self, latent_states, **behavior):
         with self.isolated_rng():

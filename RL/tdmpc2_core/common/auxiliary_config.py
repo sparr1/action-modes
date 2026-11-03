@@ -45,6 +45,10 @@ def _number(value, name, *, minimum=None, positive=False):
 def normalize_auxiliary_params(params):
     """Early structural checks; called before split and scheduling resolution."""
     params = dict(params)
+    joint_vmap = params.get("aux_return_joint_vmap", True)
+    if not isinstance(joint_vmap, bool):
+        raise ValueError("aux_return_joint_vmap must be bool.")
+    params["aux_return_joint_vmap"] = joint_vmap
     mode = _choice(params.get("aux_return_mode", "off"), "aux_return_mode",
                    {"off", "sac", "return_actor"})
     params["aux_return_mode"] = mode
@@ -173,17 +177,8 @@ def validate_auxiliary_config(cfg):
         "inner_execution_policy_source": "primary", "inner_actor_writeback_coef": 0.,
         "inner_critic_writeback_coef": 0., "value_equivalence_loss_coef": 0.,
     }
-    for component in ("actor", "critic", "replay", "actor_optimizer", "critic_optimizer"):
+    for component in ("actor", "critic", "temperature", "replay", "actor_optimizer", "critic_optimizer", "temperature_optimizer"):
         requirements[f"inner_{component}_scope"] = "action"
-    temperature_scopes = (cfg.inner_temperature_scope, cfg.inner_temperature_optimizer_scope)
-    if temperature_scopes != ("action", "action"):
-        if not (temperature_scopes in {("episode", "episode"), ("run", "run")}
-                and cfg.inner_operator == "sac" and cfg.inner_temperature_mode == "auto"
-                and cfg.inner_entropy_enabled):
-            raise ValueError(
-                "aux_return_mode requires action-scoped temperature and optimizer, "
-                "or matched episode/run scopes with automatic inner SAC entropy tuning."
-            )
     for key, value in requirements.items():
         if getattr(cfg, key) != value:
             raise ValueError(f"aux_return_mode requires {key}={value!r}.")

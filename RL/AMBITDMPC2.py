@@ -70,6 +70,7 @@ _AMBI_DEFAULTS = {
     "critic_ensemble_backend": DEFAULT_CRITIC_ENSEMBLE_BACKEND,
     "critic_value_mode": "single",
     "aux_return_mode": "off",
+    "aux_return_joint_vmap": True,
     "aux_return_critic_coef": 0.1,
     "aux_return_detach_representation": False,
     "aux_return_critic_lr": None,
@@ -100,6 +101,13 @@ _AMBI_DEFAULTS = {
     # Actor, temperature, and entropy-augmented critic objectives share a statistic.
     "outer_actor_entropy_mode": "squashed",
     "inner_actor_entropy_mode": "squashed",
+    # Distillation replaces the primary prior's Q term with imitation of the
+    # final adapted inner actor. Ordinary SAC remains the default.
+    "outer_actor_objective": "q_maximization",
+    "reanalyze_interval": 10,
+    "reanalyze_batch_size": 20,
+    "reanalyze_backend": "native",
+    "reanalyze_parallel_roots": 4,
     # Optional TD-MPC2 Q-only normalization in the SAC actor objective.
     "sac_actor_loss_scale_mode": "none",
     "sac_actor_loss_scale_tau": 0.01,
@@ -153,8 +161,6 @@ _AMBI_DEFAULTS = {
     # were actually generated in that round.
     "inner_operator": "sac",
     "inner_rounds": 4,
-    # Real decisions per inner solve; independent of imagined rollout horizon.
-    "inner_solve_interval": 1,
     "inner_rollouts_per_round": 64,
     "inner_rollout_horizon": 3,
     "inner_updates_per_round": "auto",
@@ -217,8 +223,6 @@ _AMBI_DEFAULTS = {
     # for operators without an entropy objective.
     "inner_temperature_mode": None,
     "inner_temperature_initialization": "inherit_outer",
-    # Scalar Adam steps on each actor sample's detached entropy residual.
-    "inner_temperature_updates_per_actor": 1,
     "inner_temperature": 1.0,
     "inner_target_entropy": "inherit_outer",
     "inner_bootstrap_source": "inner_target",
@@ -296,9 +300,6 @@ _AMBI_DEFAULTS = {
     # model-step budget. Zero preserves legacy runtime.
     "inner_diagnostic_rollouts": 0,
     "inner_diagnostics_every": 1,
-    # Paired root-policy entropy observations at the diagnostic cadence.
-    # Zero disables them; samples only require Gaussian/tanh arithmetic.
-    "inner_root_entropy_samples": 128,
 
     # Sparse, observational value-equivalence monitoring on outer replay
     # updates. Disabled by default so it cannot change the reference runtime.
@@ -1346,6 +1347,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         if self.cfg.inner_outer_replay_fraction > 0.0:
             self.agent.set_outer_replay_buffer(self.buffer)
         self._pending_behavior_policy = None
+        self._pending_teacher_policy = None
         self._value_calibration_evaluator = None
         self._paired_controller_evaluator = None
         self._outer_policy_episode_eligible = False
@@ -1353,7 +1355,6 @@ class AMBITDMPC2(TDMPC2Baseline):
         self._outer_policy_action_generator = None
         self._inner_steps_total = 0
         self._inner_updates_total = 0
-        self._held_diagnostics_bucket = 0
         self._wandb_inner_seconds = 0.0
         self._wandb_inner_actions = 0
         self._wandb_inner_steps = 0
@@ -1364,33 +1365,43 @@ class AMBITDMPC2(TDMPC2Baseline):
     def _stores_behavior_policy(self):
         return bool(getattr(self.cfg, "store_behavior_policy", False))
 
+    @property
+    def _stores_teacher_policy(self):
+        return bool(getattr(self.cfg, "store_teacher_policy", False))
+
     def _allocate_episode_staging(self, capacity):
         staging = super()._allocate_episode_staging(capacity)
-        if not self._stores_behavior_policy:
+        if not (self._stores_behavior_policy or self._stores_teacher_policy):
             return staging
         tensor_kwargs = {
             "device": "cpu",
             "pin_memory": self._pin_episode_staging,
         }
-        staging["behavior_pre_tanh_mean"] = torch.empty(
-            (capacity, self.cfg.action_dim),
-            dtype=torch.float32,
-            **tensor_kwargs,
-        )
-        staging["behavior_log_std"] = torch.empty(
-            (capacity, self.cfg.action_dim),
-            dtype=torch.float32,
-            **tensor_kwargs,
-        )
-        staging["behavior_policy_valid"] = torch.empty(
-            (capacity,),
-            dtype=torch.bool,
-            **tensor_kwargs,
-        )
+        if self._stores_behavior_policy:
+            staging["behavior_pre_tanh_mean"] = torch.empty(
+                (capacity, self.cfg.action_dim), dtype=torch.float32, **tensor_kwargs,
+            )
+            staging["behavior_log_std"] = torch.empty(
+                (capacity, self.cfg.action_dim), dtype=torch.float32, **tensor_kwargs,
+            )
+            staging["behavior_policy_valid"] = torch.empty(
+                (capacity,), dtype=torch.bool, **tensor_kwargs,
+            )
+        if self._stores_teacher_policy:
+            for key in ("teacher_pre_tanh_mean", "teacher_log_std"):
+                staging[key] = torch.empty(
+                    (capacity, self.cfg.action_dim), dtype=torch.float32, **tensor_kwargs,
+                )
+            staging["teacher_valid"] = torch.empty(
+                (capacity,), dtype=torch.bool, **tensor_kwargs,
+            )
+            staging["teacher_outer_version"] = torch.empty(
+                (capacity,), dtype=torch.int64, **tensor_kwargs,
+            )
         return staging
 
     def _ensure_episode_staging_capacity(self, required):
-        if not self._stores_behavior_policy:
+        if not (self._stores_behavior_policy or self._stores_teacher_policy):
             return super()._ensure_episode_staging_capacity(required)
         if required <= len(self._episode_staging):
             return
@@ -1405,18 +1416,51 @@ class AMBITDMPC2(TDMPC2Baseline):
     def _start_episode_staging(self, obs_t):
         rows = super()._start_episode_staging(obs_t)
         self._pending_behavior_policy = None
+        self._pending_teacher_policy = None
         if self._stores_behavior_policy:
             self._episode_staging["behavior_pre_tanh_mean"][0].zero_()
             self._episode_staging["behavior_log_std"][0].zero_()
             self._episode_staging["behavior_policy_valid"][0] = False
+        if self._stores_teacher_policy:
+            self._stage_teacher_policy(0, None)
         return rows
 
     def _random_action_norm(self):
         self._pending_behavior_policy = None
+        self._pending_teacher_policy = None
         return super()._random_action_norm()
+
+    def _stage_teacher_policy(self, row, teacher):
+        """The successor row stores the adapted policy at its predecessor."""
+        staging = self._episode_staging
+        if teacher is None:
+            staging["teacher_pre_tanh_mean"][row].zero_()
+            staging["teacher_log_std"][row].zero_()
+            staging["teacher_valid"][row] = False
+            staging["teacher_outer_version"][row] = -1
+            return
+        mean = torch.as_tensor(teacher["pre_tanh_mean"], dtype=torch.float32).reshape(
+            self.cfg.action_dim
+        )
+        log_std = torch.as_tensor(teacher["log_std"], dtype=torch.float32).reshape(
+            self.cfg.action_dim
+        )
+        version = teacher["outer_version"]
+        if not bool(torch.isfinite(mean).all()) or not bool(torch.isfinite(log_std).all()):
+            raise ValueError("Captured teacher-policy parameters must be finite.")
+        if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            raise ValueError("Captured teacher outer_version must be a non-negative integer.")
+        staging["teacher_pre_tanh_mean"][row].copy_(mean)
+        staging["teacher_log_std"][row].copy_(log_std)
+        staging["teacher_valid"][row] = True
+        staging["teacher_outer_version"][row] = version
 
     def _stage_transition(self, row, obs_t, action, reward, terminated):
         super()._stage_transition(row, obs_t, action, reward, terminated)
+        if self._stores_teacher_policy:
+            teacher = self._pending_teacher_policy
+            self._pending_teacher_policy = None
+            self._stage_teacher_policy(row, teacher)
         if not self._stores_behavior_policy:
             return
         behavior_policy = self._pending_behavior_policy
@@ -1452,6 +1496,11 @@ class AMBITDMPC2(TDMPC2Baseline):
                 (1, self.cfg.action_dim), dtype=torch.float32
             )
             td["behavior_policy_valid"] = torch.zeros((1,), dtype=torch.bool)
+        if self._stores_teacher_policy:
+            for key in ("teacher_pre_tanh_mean", "teacher_log_std"):
+                td[key] = torch.zeros((1, self.cfg.action_dim), dtype=torch.float32)
+            td["teacher_valid"] = torch.zeros((1,), dtype=torch.bool)
+            td["teacher_outer_version"] = torch.full((1,), -1, dtype=torch.int64)
         return td
 
     def _validate_paired_controller_config(self, cfg, observation_type):
@@ -1522,6 +1571,22 @@ class AMBITDMPC2(TDMPC2Baseline):
         if schedule_mode == "legacy" and requested_operator in {"sac", "td3"}:
             merged.update(_LEGACY_SCHEDULE_DEFAULTS)
         merged.update(params)
+        merged["outer_actor_objective"] = _normalize_choice(
+            merged["outer_actor_objective"], "outer_actor_objective",
+            {"q_maximization", "distillation"},
+        )
+        merged["reanalyze_interval"] = _strict_nonnegative_int(
+            merged["reanalyze_interval"], "reanalyze_interval",
+        )
+        merged["reanalyze_batch_size"] = _strict_positive_int(
+            merged["reanalyze_batch_size"], "reanalyze_batch_size",
+        )
+        merged["reanalyze_backend"] = _normalize_choice(
+            merged["reanalyze_backend"], "reanalyze_backend", {"native", "cuda_graph"},
+        )
+        merged["reanalyze_parallel_roots"] = _strict_positive_int(
+            merged["reanalyze_parallel_roots"], "reanalyze_parallel_roots",
+        )
         merged["inner_sac_return_estimator"] = _normalize_choice(
             merged["inner_sac_return_estimator"],
             "inner_sac_return_estimator", {"one_step", "retrace"},
@@ -1824,35 +1889,6 @@ class AMBITDMPC2(TDMPC2Baseline):
         if cfg.inner_mppi_iterations < 0:
             raise ValueError("inner_mppi_iterations must be non-negative.")
 
-        cfg.inner_temperature_updates_per_actor = _strict_positive_int(
-            cfg.inner_temperature_updates_per_actor,
-            "inner_temperature_updates_per_actor",
-        )
-        if cfg.inner_temperature_updates_per_actor != 1:
-            for key, required in {
-                "inner_operator": "sac",
-                "inner_schedule_mode": "canonical",
-                "inner_temperature_mode": "auto",
-                "inner_explorer_mode": "none",
-                "inner_update_timing": "round",
-            }.items():
-                if str(getattr(cfg, key)).lower() != required:
-                    raise ValueError(
-                        "inner_temperature_updates_per_actor>1 requires "
-                        f"{key}={required!r}."
-                    )
-            if not cfg.inner_component_update_schedule:
-                raise ValueError(
-                    "inner_temperature_updates_per_actor>1 requires explicit "
-                    "inner_critic_updates_per_round and inner_actor_updates_per_round."
-                )
-            if (not cfg.inner_entropy_enabled
-                    or str(cfg.inner_actor_adaptation).lower() == "frozen"):
-                raise ValueError(
-                    "inner_temperature_updates_per_actor>1 requires enabled "
-                    "inner entropy and an adaptable actor."
-                )
-
         if cfg.inner_operator in {"sac", "td3"}:
             cfg.inner_rounds = int(cfg.inner_rounds)
             if cfg.inner_rounds < 0:
@@ -2063,16 +2099,6 @@ class AMBITDMPC2(TDMPC2Baseline):
             if cfg.inner_model_step_budget > 0
             else 0.0
         )
-        # Repeated scalar updates share an existing actor-phase sample, so
-        # they change the optimizer budget but never add replay/update slots.
-        cfg.inner_temperature_updates_per_action *= (
-            cfg.inner_temperature_updates_per_actor
-        )
-        if (cfg.inner_temperature_updates_per_actor > 1
-                and cfg.inner_actor_updates_per_action <= 0):
-            raise ValueError(
-                "inner_temperature_updates_per_actor>1 requires actor updates."
-            )
 
         if (
             cfg.inner_operator in {"sac", "td3"}
@@ -2641,11 +2667,6 @@ class AMBITDMPC2(TDMPC2Baseline):
         cfg.inner_diagnostics_every = int(cfg.inner_diagnostics_every)
         if cfg.inner_diagnostics_every <= 0:
             raise ValueError("inner_diagnostics_every must be positive.")
-        cfg.inner_root_entropy_samples = _strict_nonnegative_int(
-            cfg.inner_root_entropy_samples, "inner_root_entropy_samples"
-        )
-        if cfg.inner_root_entropy_samples == 1:
-            raise ValueError("inner_root_entropy_samples must be zero or at least two.")
         cfg.value_equivalence_diagnostics = _strict_bool(
             cfg.value_equivalence_diagnostics,
             "value_equivalence_diagnostics",
@@ -3001,43 +3022,6 @@ class AMBITDMPC2(TDMPC2Baseline):
         _validate_split_value_config(cfg)
         validate_auxiliary_config(cfg)
 
-        cfg.inner_solve_interval = _strict_positive_int(
-            cfg.inner_solve_interval, "inner_solve_interval"
-        )
-        # This is a derived scientific contract, not a selectable live-encoder
-        # variant. Keeping it absent at K=1 preserves historical identities.
-        vars(cfg).pop("inner_hold_encoder", None)
-        if cfg.inner_solve_interval > 1:
-            requirements = {
-                "obs": "state", "inner_operator": "sac",
-                "inner_schedule_mode": "canonical", "critic_value_mode": "single",
-                "inner_actor_adaptation": "clone", "inner_critic_adaptation": "clone",
-                "inner_actor_initialization": "prior", "inner_critic_initialization": "prior",
-                "inner_sac_return_estimator": "one_step", "inner_update_timing": "round",
-                "inner_horizon_conditioning": "none", "inner_explorer_mode": "none",
-                "inner_execution_policy_source": "primary",
-                "inner_actor_writeback_coef": 0.0, "inner_critic_writeback_coef": 0.0,
-                "inner_outer_replay_fraction": 0.0, "outer_policy_episode_probability": 0.0,
-                "value_equivalence_loss_coef": 0.0, "value_equivalence_diagnostics": False,
-            }
-            for component in ("actor", "critic", "replay",
-                              "actor_optimizer", "critic_optimizer"):
-                requirements[f"inner_{component}_scope"] = "action"
-            for key, required in requirements.items():
-                if getattr(cfg, key) != required:
-                    raise ValueError(f"inner_solve_interval>1 requires {key}={required!r}.")
-            temperature_scopes = (cfg.inner_temperature_scope,
-                                  cfg.inner_temperature_optimizer_scope)
-            if temperature_scopes not in {("action", "action"), ("run", "run")}:
-                raise ValueError("inner_solve_interval>1 requires paired action- or run-scoped temperature and optimizer.")
-            if temperature_scopes == ("run", "run") and (
-                cfg.inner_temperature_mode != "auto" or not cfg.inner_entropy_enabled
-            ):
-                raise ValueError("inner_solve_interval>1 with run-scoped temperature requires automatic entropy tuning.")
-            if cfg.inner_rounds <= 0:
-                raise ValueError("inner_solve_interval>1 requires an active SAC solve.")
-            cfg.inner_hold_encoder = "solve_snapshot"
-
         cfg.inner_critic_bernoulli_p = _strict_probability(
             cfg.inner_critic_bernoulli_p, "inner_critic_bernoulli_p"
         )
@@ -3063,6 +3047,45 @@ class AMBITDMPC2(TDMPC2Baseline):
                     raise ValueError(f"inner_critic_bernoulli_p>0 requires {key}={required!r}.")
             if cfg.inner_rounds <= 0 or cfg.inner_critic_updates_per_action <= 0:
                 raise ValueError("inner_critic_bernoulli_p>0 requires an active SAC solve with critic updates.")
+
+        cfg.store_teacher_policy = cfg.outer_actor_objective == "distillation"
+        if cfg.store_teacher_policy:
+            if cfg.rho < 0:
+                raise ValueError(
+                    "outer_actor_objective='distillation' requires rho >= 0 "
+                    "for valid temporal weights."
+                )
+            requirements = {
+                "inner_operator": "sac",
+                "inner_actor_source": "sac",
+                "inner_actor_adaptation": "clone",
+                "inner_actor_initialization": "prior",
+                "inner_explorer_mode": "none",
+                "inner_execution_policy_source": "primary",
+                "inner_critic_bernoulli_p": 0.0,
+                "inner_actor_writeback_coef": 0.0,
+                "inner_critic_writeback_coef": 0.0,
+                "outer_behavior_policy_kl_schedule": "none",
+            }
+            for component in (
+                "actor", "critic", "temperature", "replay", "actor_optimizer",
+                "critic_optimizer", "temperature_optimizer",
+            ):
+                requirements[f"inner_{component}_scope"] = "action"
+            for key, required in requirements.items():
+                if getattr(cfg, key) != required:
+                    raise ValueError(
+                        "outer_actor_objective='distillation' requires "
+                        f"{key}={required!r}."
+                    )
+            if cfg.inner_rounds <= 0 or cfg.inner_actor_updates_per_action <= 0:
+                raise ValueError(
+                    "outer_actor_objective='distillation' requires an active "
+                    "inner SAC solve with positive actor updates."
+                )
+            if cfg.reanalyze_backend == "cuda_graph":
+                from RL.tdmpc2_core.teacher_graph import validate_teacher_graph_config
+                validate_teacher_graph_config(cfg)
 
         # Read-only aliases keep legacy integrations working for one release.
         # Canonical agent code must not use these for scheduling mixed updates.
@@ -3291,6 +3314,7 @@ class AMBITDMPC2(TDMPC2Baseline):
             )
         finally:
             self._pending_behavior_policy = None
+            self._pending_teacher_policy = None
             self._outer_policy_action_generator = None
             self._outer_policy_episode_selected = False
             self._outer_policy_episode_eligible = False
@@ -3298,7 +3322,13 @@ class AMBITDMPC2(TDMPC2Baseline):
     def _act_agent(self, obs_t, *, t0, eval_mode):
         if getattr(self.cfg, "inner_outer_replay_fraction", 0.0) > 0.0:
             self.agent.set_outer_replay_buffer(self.buffer)
+        capture_teacher = self._stores_teacher_policy and not eval_mode
+        if capture_teacher and self._pending_teacher_policy is not None:
+            raise RuntimeError(
+                "Teacher-policy metadata from the previous action was not consumed."
+            )
         if self._outer_policy_episode_selected and not eval_mode:
+            self._pending_teacher_policy = None
             generator = self._outer_policy_action_generator
             if generator is None:
                 raise RuntimeError(
@@ -3325,17 +3355,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         collect_diagnostics = (
             sampling_step % int(self.cfg.inner_diagnostics_every) == 0
         )
-        held_diagnostics_bucket = None
-        if self.cfg.inner_solve_interval > 1 and not eval_mode:
-            # A cadence boundary can be a held decision (for example the last
-            # decision of each 500-step episode at K3/every1000). Defer that
-            # observation to the next solve; persist the consumed bucket so an
-            # episode boundary or exact continuation cannot lose or repeat it.
-            held_diagnostics_bucket = sampling_step // int(self.cfg.inner_diagnostics_every)
-            held = self.agent.inner_engine.prepare_control(t0=t0, eval_mode=eval_mode)
-            collect_diagnostics = (
-                not held and held_diagnostics_bucket > self._held_diagnostics_bucket
-            )
+        teacher_kwargs = {"capture_teacher_policy": True} if capture_teacher else {}
         if self._stores_behavior_policy and not eval_mode:
             if self._pending_behavior_policy is not None:
                 raise RuntimeError(
@@ -3349,6 +3369,7 @@ class AMBITDMPC2(TDMPC2Baseline):
                 collect_diagnostics=collect_diagnostics,
                 return_behavior_policy=True,
                 apply_inner_writeback=not eval_mode,
+                **teacher_kwargs,
             )
             self._pending_behavior_policy = behavior_policy
         else:
@@ -3358,7 +3379,16 @@ class AMBITDMPC2(TDMPC2Baseline):
                 eval_mode=eval_mode,
                 collect_diagnostics=collect_diagnostics,
                 apply_inner_writeback=not eval_mode,
+                **teacher_kwargs,
             )
+        if capture_teacher:
+            teacher = self.agent.last_teacher_policy
+            if teacher is None:
+                raise RuntimeError("The adapted inner actor did not return a teacher policy.")
+            self._pending_teacher_policy = {
+                **teacher,
+                "outer_version": int(self.agent.outer_version),
+            }
         # The engine's action index is useful to direct callers, but training
         # telemetry must use the real environment step (including seed/random
         # actions) that researchers see on the W&B x-axis.
@@ -3366,8 +3396,6 @@ class AMBITDMPC2(TDMPC2Baseline):
             self.agent.last_inner_metrics["inner_diagnostics_step"] = float(
                 sampling_step
             )
-        if collect_diagnostics and held_diagnostics_bucket is not None:
-            self._held_diagnostics_bucket = held_diagnostics_bucket
         return action
 
     def predict(
@@ -3412,6 +3440,7 @@ class AMBITDMPC2(TDMPC2Baseline):
 
     def _episode_payload_extras(self):
         return {
+            **super()._episode_payload_extras(),
             "rollout/outer_policy_episode": int(
                 self._outer_policy_episode_selected
             ),
@@ -3482,14 +3511,16 @@ class AMBITDMPC2(TDMPC2Baseline):
             raise RuntimeError(
                 "AMBI training state requires consumed behavior-policy metadata."
             )
+        if self._pending_teacher_policy is not None:
+            raise RuntimeError(
+                "AMBI training state requires consumed teacher-policy metadata."
+            )
         state = {
             "schema": "ambi-wrapper-training-state",
             "version": 2,
             "inner_steps_total": int(self._inner_steps_total),
             "inner_updates_total": int(self._inner_updates_total),
         }
-        if self.cfg.inner_solve_interval > 1:
-            state["held_diagnostics_bucket"] = int(self._held_diagnostics_bucket)
         if self.cfg.outer_policy_diagnostics:
             recorder = self._outer_policy_recorder
             state["outer_policy_diagnostics"] = (
@@ -3504,8 +3535,6 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_steps_total",
             "inner_updates_total",
         }
-        if self.cfg.inner_solve_interval > 1:
-            expected.add("held_diagnostics_bucket")
         if self.cfg.outer_policy_diagnostics:
             expected.add("outer_policy_diagnostics")
         if not isinstance(state, Mapping) or set(state) != expected:
@@ -3518,9 +3547,7 @@ class AMBITDMPC2(TDMPC2Baseline):
             normalized["outer_policy_diagnostics"] = OuterPolicyDiagnostics.validate_state(
                 state["outer_policy_diagnostics"], self.cfg
             )
-        for key in ("inner_steps_total", "inner_updates_total", "held_diagnostics_bucket"):
-            if key not in normalized:
-                continue
+        for key in ("inner_steps_total", "inner_updates_total"):
             value = normalized[key]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"AMBI wrapper {key} must be a non-negative integer.")
@@ -3530,7 +3557,6 @@ class AMBITDMPC2(TDMPC2Baseline):
         state = self._preflight_training_resume_algorithm_state(state)
         self._inner_steps_total = state["inner_steps_total"]
         self._inner_updates_total = state["inner_updates_total"]
-        self._held_diagnostics_bucket = state.get("held_diagnostics_bucket", 0)
         if self.cfg.outer_policy_diagnostics:
             self._outer_policy_recorder_state = state["outer_policy_diagnostics"]
         self._wandb_inner_seconds = 0.0
@@ -3542,6 +3568,7 @@ class AMBITDMPC2(TDMPC2Baseline):
         self._outer_policy_episode_selected = False
         self._outer_policy_action_generator = None
         self._pending_behavior_policy = None
+        self._pending_teacher_policy = None
 
     def _record_action_metrics(self, *, planned, action_seconds):
         outer_policy_action = bool(
@@ -3655,8 +3682,6 @@ class AMBITDMPC2(TDMPC2Baseline):
         # weighted by their own optimizer, and action-level gauges are averaged
         # by planned actions. New metrics must be deliberately classified here.
         counter_metrics = {
-            "inner_solve_performed",
-            "inner_policy_held",
             "inner_model_steps_budget",
             "inner_nominal_model_steps",
             "inner_realized_model_steps",
@@ -3717,9 +3742,6 @@ class AMBITDMPC2(TDMPC2Baseline):
                 self._wandb_train_window.add_sum(f"train/{key}", metrics[key])
 
         timing_metrics = {
-            "inner_solve_seconds",
-            "inner_held_seconds",
-            "inner_encoder_snapshot_seconds",
             "inner_setup_seconds",
             "inner_rollout_seconds",
             "inner_update_seconds",
@@ -3820,20 +3842,32 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_explorer_actor_pre_tanh_abs_ge_7p6_fraction",
             "inner_explorer_actor_action_exact_saturation_fraction",
         }
+        # Update-level statistics must use actor optimizer counts; treating them
+        # as action gauges would underweight decisions with more adaptation.
+        policy_diagnostic_suffixes = {
+            "pre_tanh_entropy", "post_tanh_entropy",
+            "action_abs_ge_0p99_fraction",
+            "mean_action_abs_ge_0p99_fraction",
+            "mean_action_exact_saturation_fraction",
+            "q_scale_used", "q_percentile_range", "q_percentile_range_over_scale",
+            "entropy_coefficient_normalized",
+            "entropy_coefficient_return_units", "entropy_coefficient_joint_units",
+        }
+        actor_metrics.update(
+            f"inner_actor_{suffix}" for suffix in policy_diagnostic_suffixes
+        )
+        explorer_actor_metrics.update(
+            f"inner_explorer_actor_{suffix}" for suffix in policy_diagnostic_suffixes
+        )
         temperature_metrics = {
             "inner_temperature_loss",
             "inner_temperature_grad_norm",
-            "inner_temperature_entropy_residual",
         }
         explorer_temperature_metrics = {
             "inner_explorer_temperature_loss",
             "inner_explorer_temperature_grad_norm",
         }
         action_gauges = {
-            "inner_solve_interval",
-            "inner_solve_index",
-            "inner_action_age",
-            "inner_episode_decision_index",
             "inner_critic_bernoulli_p",
             "inner_critic_bernoulli_applied",
             "inner_critic_bernoulli_retained_fraction",
@@ -3844,6 +3878,11 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_alpha",
             "inner_alpha_to_abs_q",
             "inner_actor_loss_scale",
+            "inner_actor_loss_scale_outer",
+            "inner_actor_loss_scale_initial",
+            "inner_actor_loss_scale_final",
+            "inner_actor_loss_scale_initial_over_outer",
+            "inner_actor_loss_scale_final_over_outer",
             "inner_effective_alpha",
             "inner_buffer_size",
             "inner_buffer_capacity",
@@ -3900,25 +3939,11 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_alpha_initial",
             "inner_alpha_final",
             "inner_alpha_delta",
-            "inner_temperature_updates_per_actor",
-            "inner_temperature_optimizer_step_initial",
-            "inner_temperature_optimizer_step_final",
-            "inner_temperature_lifetime_steps_initial",
-            "inner_temperature_lifetime_steps_final",
-            "inner_temperature_episode_reset",
-            "inner_temperature_chain_reset",
             "inner_target_entropy",
             "inner_actor_writeback_coef",
             "inner_critic_writeback_coef",
             "inner_policy_mean_delta_l2",
             "inner_final_outer_policy_kl",
-            "inner_root_entropy_initial",
-            "inner_root_entropy_final",
-            "inner_root_entropy_delta",
-            "inner_root_entropy_initial_mc_se",
-            "inner_root_entropy_final_mc_se",
-            "inner_root_entropy_delta_mc_se",
-            "inner_root_entropy_samples",
             "inner_proposal_mean_delta_l2",
             "inner_fixed_target_q_action_gain",
             "inner_outer_q_gain",

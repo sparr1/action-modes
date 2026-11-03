@@ -85,6 +85,45 @@ Frozen-checkpoint research presets also accept this override. Inner-evaluation
 publication identities distinguish vmap results from loop results; historical
 artifacts without the field retain their loop identity.
 
+#### Joint primary and auxiliary execution
+
+`alg_params.aux_return_joint_vmap` is a strictly boolean option defaulting to
+`true`. With `aux_return_mode="sac"` or `"return_actor"`, a positive
+`aux_return_critic_coef`, and `critic_ensemble_backend="vmap"`, compatible
+dense primary and auxiliary ensembles share one vmap over critic type and head.
+The online forward stays inside the ordinary outer-loss compilation region;
+target forwards use a separate tensor-only compilation region. Predictions are
+split back into their critic types before decoding, head selection, or loss
+reduction. Each critic retains its own target, learning rate, parameters, and
+Adam state. Representation detachment affects only the auxiliary latent input;
+the weighted loss sum, temporal normalization, joint gradient clipping, actor
+update order, and target EMA cadence remain unchanged.
+
+Set `aux_return_joint_vmap=false` to retain separate critic execution. An
+inactive auxiliary learner, a zero auxiliary critic coefficient, the loop
+backend, or incompatible layouts select separate execution before sampling or
+computation. Actor training, inner adaptation, and PAVE retain their existing
+paths. Supported joint execution errors propagate through the existing
+compilation failure handling rather than silently retrying separate critics.
+
+Dropout is independent across every critic type and head. Target next actions
+and sampled head subsets remain independent between critic types, with
+auxiliary action sampling retaining its isolated RNG stream. Joint online
+dropout consumes a different random sequence; direct auxiliary helper calls
+retain their isolated RNG behavior. The stochastic training procedure is
+preserved, but identical seeds need not yield bitwise identical updates or
+trajectories. Floating-point operation ordering can differ as well.
+
+Training provenance and exact-resume target specifications record the effective
+joint-execution policy. Missing historical metadata means separate execution.
+Exact continuation rejects a policy change; portable checkpoint loading,
+architecture signatures, and the portable auxiliary specification are unchanged.
+Automatic and explicit enablement have the same training identity. Disabled or
+inactive joint execution retains the historical separate-execution identity,
+including an explicit loop backend. Per-update `aux_return_joint_vmap_online`
+and `aux_return_joint_vmap_target` metrics report the paths actually used;
+target compilation failures appear with the other compilation diagnostics.
+
 Fresh critics always match the initialization in the official checkout at
 `8bbc14ebabdb32ea7ada5c801dc525d0dc73bafe`. Its TensorDict critic parameters
 retain the samples drawn by each `nn.Linear` constructor, so the ordinary
@@ -276,96 +315,6 @@ and `inner_critic_transfer_outer_updates` (outer updates since the donor solve).
 Diagnostic decisions additionally report the actual sampled
 `inner_critic_bernoulli_retained_fraction`; measuring it consumes no extra RNG.
 Timing includes mask application in the ordinary inner setup/action timings.
-
-### Held-policy execution in full training
-
-`inner_solve_interval=K` controls the number of real decisions per inner solve
-and defaults to 1. It is independent of `inner_rollout_horizon=H`, the length
-of imagined rollouts. K=H executes H feedback actions per solve: solve at
-episode decisions 0, K, 2K, etc., and evaluate the same adapted actor on each
-new real observation until the next solve. The first policy-controlled
-decision after random seeding starts a new block. A termination, timeout, or
-training-budget boundary can end a partial block.
-
-For K>1, the complete held observation-to-action policy consists of the
-adapted actor and an independent, evaluation-mode encoder snapshot from its
-solve. The derived configuration field `inner_hold_encoder="solve_snapshot"`
-records this contract. The live outer encoder, actor, critics, dynamics, and
-replay keep learning normally. Each new solve uses the latest outer encoder
-and priors. Snapshot allocations are reused; they do not share mutable outer
-parameters, change the outer optimizer, or become outer model checkpoint keys.
-
-To enable this in an existing H3/J8 algorithm's `alg_params`, add:
-
-```json
-{
-  "inner_solve_interval": 3
-}
-```
-
-Add the key to the complete algorithm configuration. A partial
-`overrides_alg.alg_params` in an experiment manifest replaces the entire
-parameter mapping rather than merging it. No shipped training recipe enables
-holding implicitly.
-
-The initial implementation supports state observations, active canonical
-single-policy SAC, dense prior-initialized actor/critic clones, one-step
-targets, round updates, and action-scoped actor, critic, replay and optimizers. Primary soft
-and auxiliary-return critics and both loop/vmap execution are supported.
-Automatic temperature and its Adam optimizer may both use `run` scope: they
-update only during solves and remain unchanged during held decisions. Their
-values persist across episode resets and exact continuation. Both may instead
-use `action` scope to initialize fresh at every solve; mixed lifetimes and
-episode temperature scope are not enabled for K>1.
-RGB, other persistent inner components, random initialization, LoRA, split values,
-Retrace, horizon conditioning, explorer populations, outer-replay mixing,
-prior writeback, and outer-policy episode interventions are rejected with
-K>1. K=1 retains the historical behavior and supported combinations.
-
-Held training decisions honor `inner_execution_action`; sampled actions use
-only the private execution RNG stream. Requested behavior-policy metadata
-describes the actual held distribution at the new observation. Deterministic
-evaluation uses the held mean without sampling. Held decisions skip workspace
-initialization, imagination, replay draws, optimizers, and model/critic
-diagnostics. With Bernoulli transfer, the previous successful solve's critic
-survives every held decision unchanged. The next solve draws its mask against
-the then-current outer critic and resets targets, optimizer moments, replay,
-and action-scoped temperature as usual. The run-scoped temperature variant
-requires Bernoulli transfer to remain disabled.
-
-Episode resets, mode switches, checkpoint loads, and failed actions invalidate
-the held policy, cadence, and transfer donor. Isolated evaluation does not
-alter the training cache. Portable model snapshots can initialize a different
-cadence; exact training resume binds K and encoder semantics and remains
-episode-boundary-only. Boundary capture clears transient caches in both the
-continuing and restored process. There is no mid-block resume payload. Missing
-or explicit K=1 preserves historical checkpoint and scientific identities.
-
-Every K>1 controlled decision reports `inner_solve_performed`,
-`inner_policy_held`, `inner_solve_interval`, zero-based `inner_solve_index`,
-`inner_episode_decision_index`, and `inner_action_age` (0 through K-1).
-W&B sums solve/held counts under `train/`, averages the cadence gauges, and
-sums `inner_solve_seconds`, `inner_held_seconds`, and
-`inner_encoder_snapshot_seconds` under `time/`. These are component timings;
-ordinary controller wall time still includes encoding and action
-materialization. Held decisions report zero imagined work and optimizer
-updates, and omit stale loss/temperature measurements. Existing default-run
-metrics remain unchanged.
-
-For K>1 training, a diagnostic cadence boundary that lands on a held decision
-is observed at the first subsequent solve. The diagnostic x-axis records that
-actual decision. The completed diagnostic bucket is retained in exact-resume
-wrapper state, so episode-boundary continuation neither drops a pending sample
-nor repeats an already collected one. K=1 keeps its original exact-modulo cadence.
-
-Paired controller evaluation aggregates Q-gain probes over solve decisions
-only, with explicit solve/held counts. Episode returns and average control
-cost still include every real decision, and no held decision repeats an old
-Q diagnostic.
-
-The focused suite is `tests/test_ambi_held_policy_*.py` together with
-`tests/test_ambi_held_alpha_run.py`. A strict CUDA smoke and a measured training
-throughput check must run on a compute allocation before a production launch.
 
 ### Inner-network initialization
 
@@ -796,7 +745,11 @@ to W&B as `train/inner_final_outer_policy_kl`), the
 closed-form `KL(final adapted actor || current outer policy prior)` at the
 encoded real-decision root after all root-local updates. It uses the actors'
 diagonal pre-tanh Gaussian parameters and the same numerically stabilized
-closed-form helper as the KL regularizer. It is evaluated under `no_grad` and
+closed-form helper as the KL regularizer. The helper computes variance ratios
+from log-standard-deviation differences without flooring the prior variance,
+so identical policies retain zero KL and zero inner-policy gradients even at
+`log_std=-20`. The outer prior is a detached target.
+The diagnostic is evaluated under `no_grad` and
 never contributes to the actor loss. It follows `inner_diagnostics_every` and
 is absent on unsampled actions; maintained AMBI presets sample it every 1,000
 real environment steps.
@@ -805,42 +758,135 @@ intermediate actor-update statistic associated with a positive
 `inner_outer_policy_kl_coef`; when that regularizer is disabled, its update-time
 metric is omitted rather than reported as a false zero.
 
-Single-policy inner SAC also records joint post-tanh policy entropy at the
-encoded real-decision root, with the root's full remaining horizon:
+### Selectable prior objective and lazy reanalysis
 
-- `train/inner_root_entropy_initial`: the actual initialized inner actor before
-  any collection or optimizer update (including random or transferred actors).
-- `train/inner_root_entropy_final`: the adapted actor after all inner updates.
-- `train/inner_root_entropy_delta`: final minus initial; negative means adaptation
-  reduced entropy at that same root.
+`outer_actor_objective="q_maximization"` is the default and preserves the
+existing AMBI SAC prior update, Q scaling, and optional replay behavior
+regularizer. Set `outer_actor_objective="distillation"` to replace the primary
+actor's Q term with imitation of the final adapted inner-SAC actor. The Q
+critic continues its configured TD updates in both modes. Entropy statistics,
+temperature tuning, critic targets, ensemble reductions, and the inner-SAC
+budget retain their configured meanings.
 
-These are differential entropies in nats in normalized action coordinates,
-summed over action dimensions. They describe the underlying stochastic actor,
-even when evaluation executes its mean; execution-only standard-deviation
-scaling or added action noise is not included. They are distinct from
-`inner_actor_entropy`, which averages pre-update minibatches across intermediate
-actors and imagined states. Neither root entropy nor its target is expected to
-decrease monotonically as the visited states change.
+For action dimension `d`, cached teacher `mu`, selected entropy `H`, and a
+separate running KL scale `S_KL`, distillation uses
 
-`inner_root_entropy_samples` defaults to 128; zero disables the observation,
-and positive values must be at least two. It follows `inner_diagnostics_every`
-and is absent on unsampled decisions, bypassed solves, and multi-policy
-explorer configurations. Each boundary needs one policy-statistics forward;
-sampling afterward is only Gaussian/tanh arithmetic, with no extra model or Q
-rollouts. The estimate combines analytic Gaussian entropy with a Monte Carlo
-stable tanh-Jacobian correction. Initial and final estimates share the same
-Gaussian noise, drawn from a clone of the diagnostic generator, so all existing
-RNG streams, action samples, updates, and diagnostics remain unchanged. Module
-training modes are restored. Work is counted in policy evaluations and
-`inner_diagnostic_seconds`.
+```text
+loss[t,b] = KL(pi(z[t,b]) || stop_gradient(mu[t,b])) / (d * S_KL)
+            - alpha * H(pi(z[t,b]))
+w[t] = rho**t
+C_H = sum(w) / train_unroll_horizon
+actor_loss = C_H * sum(w * valid * loss) / sum(w * valid)
+```
 
-The corresponding `*_mc_se` metrics report Monte Carlo standard errors, including
-the paired difference's error; they are not dispersion across decisions. W&B
-aggregates root metrics with one observation per sampled decision, rather than
-weighting by actor-update count, and reports its usual mean/std/min/max/count.
-`inner_root_entropy_samples` records the estimator sample count. Frozen-checkpoint
-evaluation retains the same metrics in its ordinary model-metric summaries and
-decision traces. Existing running jobs and historical logs are not modified.
+KL is analytic between the diagonal pre-tanh Gaussians, whose common tanh
+transform preserves KL. Actor latents and teacher labels are detached.
+`S_KL` starts at one and uses an EMA rate of `0.01` toward the valid depth-zero
+KL-per-dimension P95-minus-P5 range, floored at one. If depth zero has no valid
+labels, its previous scale is retained. This estimator is independent of the
+Q-range scale needed by configured critics and inner SAC. The reduction agrees
+with BMPC's actor reduction when every label is valid. Temperature updates use
+the same valid rows with normalized temporal weights. The final, unlabeled
+observation is excluded; batches without any valid teacher skip both actor and
+temperature optimizer steps while model/Q updates continue.
+
+Training collection captures the final adapted actor's **unscaled** Gaussian
+using deterministic `policy_stats(std_scale=1.0)`. It consumes no random draw
+and does not change the executed action. Mutable teacher mean, log standard
+deviation, validity, and outer-version fields are separate from immutable
+execution behavior metadata. Like replay actions, the teacher stored on row
+`t+1` belongs to observation `t`. Random seed actions, direct-prior actions,
+and dummy initial rows have invalid labels until reanalyzed.
+
+`reanalyze_interval=10` and `reanalyze_batch_size=20` refresh all action-bearing
+states from the first 20 sampled replay sequences before every tenth outer
+update. Physical transitions are deduplicated in sequence-first, depth-second
+order. Each distinct real observation is encoded with the current model and
+receives a fresh independent inner-SAC solve from current priors. The refreshed
+teacher is written back and used by every duplicate occurrence in that same
+training batch. At training horizon 3, this is at most 60 full inner solves per
+refresh, averaging six additional solves per outer update before deduplication.
+Set the interval to zero for cached-only distillation; the batch size is a
+positive sequence count, not a count of individual states.
+
+Reanalysis is synchronous and runs outside compiled learner regions with a
+private engine and checkpointed random stream. It preserves live-controller
+state, global randomness, model modes, and replay accounting. Supported inner
+real-replay mixing retains its isolated sampler. Replay identities are checked
+before writeback to reject overwritten transitions.
+
+The default `reanalyze_backend="native"` uses a teacher-only solve: adaptation
+is unchanged, but execution-action evaluation, phase timers, and ordinary
+action-report aggregation are omitted. Its teacher outputs and phase RNG
+state match the original serial collection-style solve, including real-replay
+mixing. Existing native distillation checkpoints retain their schema.
+
+For CUDA, select `reanalyze_backend="cuda_graph"` to capture each complete
+teacher solve, including resets, backwards, Adam, and target updates. Set
+`reanalyze_parallel_roots=4` (the default pool width) to overlap independent
+solves on four CUDA streams; `1` selects sequential graph solves. Each slot
+owns its parameters, gradients, optimizer moments, targets, replay, and
+temperature. Slots share the frozen model and current priors. A final partial
+chunk only solves actual roots. This is stream concurrency, not a reduction
+over root losses or a change to the adaptation budget. Increasing the pool
+uses more GPU memory and is not guaranteed to improve throughput.
+
+Graph capture currently requires state observations, fresh cloned actor and
+critic initialized from priors, a single primary critic, ordinary SAC replay,
+and round-based updates. Episodic termination, auxiliary critics, horizon
+conditioning, and real-replay mixing use the native backend. Unsupported graph
+recipes fail explicitly. Compiled regions require `compile_strict=true`;
+uncompiled CUDA graph capture is also supported. Graphs are built lazily and
+reused across refreshes, with current prior weights, alpha, and Q scale read
+on each solve. Collection continues using its normal controller.
+
+PyTorch 2.3 graph capture uses a separate CUDA RNG protocol. Each deduplicated
+root gets a seed from the checkpointed private reanalysis generator and an
+independent graph RNG sequence. This preserves root order, isolation, and
+resume across refresh boundaries; it does not reproduce native phase-specific
+draws. The backend, protocol, and pool width are part of the exact-resume
+specification. Switching them requires a new lineage. Graph workspaces need
+no persistent checkpoint payload because every solve resets its state.
+
+Additional `train/distillation_reanalyze_*` metrics record the selected backend,
+pool width, graph setup time, and refresh seconds per root. Setup time is
+included in total refresh latency. For bounded timing without W&B or
+environment interaction, run:
+
+```bash
+WANDB_MODE=disabled environments/dmcontrol/.venv/bin/python \
+  -m tests.benchmark_ambi_reanalyze --device cpu --output /tmp/reanalyze-cpu.json
+
+# Inside an allocated GPU job: compare graph pool widths on a J8/H3 workload.
+WANDB_MODE=disabled environments/dmcontrol/.venv/bin/python \
+  -m tests.benchmark_ambi_reanalyze --device cuda --profile reference --compile \
+  --roots 60 --parallel-roots 1 4 8 --output /tmp/reanalyze-gpu.json
+```
+
+The harness separates first-call allocation/compilation/capture from warmed
+refresh timing, reports GPU peak allocated memory, and verifies native teacher
+parity and graph parity across pool widths. It measures encoded roots through
+teacher extraction; use training refresh metrics for encoder/cache overhead
+and full training timing to assess amortized end-to-end cost. Local CPU tests
+do not establish CUDA capture correctness or GPU speedup.
+
+Distillation v1 requires action-local inner SAC, a cloned primary actor
+initialized from the prior, positive actor adaptation, and primary execution.
+Explorer/selector modes, persistent inner components, Bernoulli critic carryover,
+prior writeback, and the old outer behavior regularizer are rejected in this
+mode. Existing Q-maximization configurations retain their compatibility.
+
+Exact resume records the objective, teacher cache, KL scale, refresh randomness,
+and actual actor-update count, including skipped invalid-label batches. A
+changed objective or refresh recipe requires a new training lineage; disabled
+defaults preserve historical identity and checkpoint contracts. Ordinary
+`train/distillation_*` metrics report teacher validity/age, KL/scale, skipped
+updates, refreshed roots, elapsed refresh time, and imagined work separately
+from collection. Critic geometry diagnostics remain enabled as configured.
+
+This is an AMBI adaptation of BMPC's Q-critic variant: the teacher is AMBI's
+adapted inner-SAC actor, and AMBI's configured entropy and Q-target recipe is
+preserved. It does not reproduce BMPC's MPPI teacher or fixed entropy recipe.
 
 ### Optional replay behavior-policy regularizer
 
@@ -1386,8 +1432,8 @@ eight rounds, then performs three critic updates followed by one actor update:
 
 Each critic or actor update draws its own minibatch through the existing
 cumulative action-local replay sampler. Automatic SAC temperature optimization
-follows the actor and defaults to one step per actor update; TD3 and
-fixed-temperature SAC add no temperature step. The resolved runtime metadata records both per-round
+follows the actor and runs once per actor update; TD3 and fixed-temperature SAC
+add no temperature step. The resolved runtime metadata records both per-round
 counts, their derived per-action critic, actor, and temperature totals, and the
 summed critic-plus-actor replay rows drawn. A component count may be zero.
 
@@ -1397,46 +1443,6 @@ budget controls. Existing configurations that use a shared integer or
 `"auto"` retain their joint update-slot behavior, batch sharing, and random
 number ordering. These controls do not change replay capacity, retention, or
 sampling semantics.
-
-`inner_temperature_updates_per_actor` is a positive integer, default `1`.
-Values above one require canonical single-policy SAC with explicit critic/actor
-per-round counts and round update timing, automatic temperature, enabled
-entropy, and actor updates. Each actor phase first updates the actor,
-then takes this many scalar Adam steps using the same detached, pre-update
-entropy residual. It does not resample actions, rerun the actor, add replay
-draws, or change critic/actor budgets or RNG consumption. The next actor phase
-uses the adjusted temperature; alpha-only steps cannot change a frozen actor's
-entropy. The derived `inner_temperature_updates_per_action` and actual optimizer
-counters include every scalar step, while update-slot counts remain unchanged.
-The reported temperature loss averages the repeated scalar losses; the entropy
-residual and gradient norm refer to the shared actor sample.
-
-For a temperature-only carryover ablation, set both
-`inner_temperature_scope` and `inner_temperature_optimizer_scope` to `"episode"`,
-leaving actor, critic, replay, and their optimizers action-local. The inner
-log-alpha parameter and its Adam moments then survive successive real decisions;
-both reset from the selected outer actor's temperature on `t0=True`. They never
-write back to the outer learner. This also works with the auxiliary return
-critic under automatic, enabled inner entropy. The normal action-local default
-still resets temperature at every decision. The metrics
-`inner_temperature_optimizer_step_initial/final` and
-`inner_temperature_lifetime_steps_initial/final` expose continuity and reset,
-while `inner_temperature_episode_reset` marks an episode-boundary reset.
-
-Setting both temperature scopes to `"run"` instead retains log-alpha and Adam
-across online-training episode boundaries as well. Actor, critic, replay and
-their optimizers must still be action-local for auxiliary-return SAC. Frozen
-checkpoint evaluation requires the explicit `--temperature-chain` flag for
-these scopes: one invocation is one independent temperature stream over the
-ordered `--seeds`. Every episode resets its environment, action caches and
-private RNG using the normal per-seed derivation; only log-alpha, Adam and the
-temperature lifetime count survive. The first episode initializes alpha from
-the selected outer actor. The outer checkpoint remains frozen.
-`inner_temperature_chain_reset` marks the first solve in a new stream, while
-the optimizer and lifetime start/end counters verify continuity across episodes.
-Chain bundles retain seed order and the `run-temperature-chain-v1` protocol.
-Their episodes are dependent: across-episode standard deviation is descriptive,
-and they cannot be imported as ordinary independent-seed evaluation series.
 
 For an actor-only inner-SAC ablation, set
 `inner_actor_adaptation="clone"`, `inner_critic_adaptation="frozen"`, and
@@ -1590,6 +1596,60 @@ unscaled, as are rewards and reward-only Bellman targets.
 TD3 and MPPI do not use this option. The diagnostics
 `actor_effective_ent_coef` and `inner_effective_alpha` report the unchanged
 entropy coefficient appearing in the optimized objective.
+
+#### Training stability diagnostics
+
+AMBI's outer, ordinary inner SAC, separate-explorer SAC, and native TD-AMBI
+actor updates report lightweight diagnostics from the existing policy sample,
+without another model call or random draw. The shared-mixture and TD3 inner
+operators retain their existing diagnostics. Outer
+keys start with `train/actor_`; inner keys start with `train/inner_actor_`
+(or `train/inner_explorer_actor_` for a separate explorer):
+
+- `pre_tanh_entropy`: analytic **joint** diagonal Gaussian entropy in nats,
+  summed across action dimensions and averaged across minibatch states.
+- `post_tanh_entropy`: joint squashed-action entropy estimated as `-log_prob`
+  on the existing sample, using the stable tanh Jacobian. This can be negative.
+- `action_abs_ge_0p99_fraction`, `mean_action_abs_ge_0p99_fraction`, and
+  `mean_action_exact_saturation_fraction`: coordinate fractions for the sampled
+  action and deterministic `tanh(mean)` action. These are actor minibatch
+  measurements; real execution is measured separately below.
+- `entropy_coefficient_normalized`: the alpha actually used in `Q/S + alpha*H`.
+  `entropy_coefficient_return_units` is `alpha*S` for the selected entropy
+  statistic. `entropy_coefficient_joint_units` is nominally `alpha*S*d` for
+  TD-MPC2 scaled entropy and `alpha*S` for ordinary post-tanh entropy. The former
+  accounts for action dimension `d` but not the native formula's tiny ratio
+  epsilon; it does not make pre- and post-tanh objectives equivalent.
+
+With Q normalization enabled, outer `actor_q_range_instant` and
+`actor_q_range_ema` report the floored P95-P5 and running scale. Inner
+`actor_q_scale_used`, `actor_q_percentile_range`, and
+`actor_q_percentile_range_over_scale` describe the actual divisor and same-batch
+range, including frozen-scale solves. Per-decision
+`inner_actor_loss_scale_outer`, `_initial`, `_final`, `_initial_over_outer`, and
+`_final_over_outer` record the scale lifecycle. The outer reference belongs to
+the selected critic owner (including an auxiliary critic). Current copy-outer
+initialization makes `initial_over_outer` one; persistent scale transfer is a
+separate algorithm change. Inner update statistics use optimizer-step weights;
+scale lifecycle gauges use one observation per decision.
+
+Both AMBI and TD-MPC2 log `train/executed_action_*` from normalized, clipped
+actions sent to the environment: saturation at 0.99 and exactly 1, within-episode
+`delta_rms`, sign flips, and opposite-bound flips. Flip fractions use all finite
+coordinate pairs; zero coordinates do not count as sign flips. RMS is averaged
+over eligible decisions. Sample/coordinate counts expose coverage, and episode
+resets never form action pairs.
+
+At completed training episodes, `episode/return_window20_*` reports count,
+mean, population standard deviation, minimum, and drawdown from the historical
+peak of complete 20-episode rolling means. `episode/return_disjoint20_change`
+compares the latest 20 returns with the preceding 20; relative drop/drawdown
+fractions require a positive reference mean. Readiness flags distinguish partial
+windows. These describe observed training dips, not validated improvement
+signals or evaluation returns. Wrapper training-state version 5 persists this
+history; version 4 resumes start with zero diagnostic coverage. Reading or
+repeating a log snapshot does not advance history. No diagnostic changes the
+actor objective, temperature target, normalization policy, or launch settings.
 
 Q scaling requires fixed temperatures: set a positive numeric `ent_coef` and
 use `inner_temperature_mode="fixed"` or `"inherit_outer"` for active inner SAC.
@@ -2247,11 +2307,7 @@ auxiliary critic fails validation.
 
 Supported operators are prior-only operation, canonical action-local
 finite-horizon SAC, and MPPI. SAC requires prior initialization and the normal
-inner-target bootstrap. The automatic-temperature ablation may retain only
-log-alpha and its Adam state within an episode or across a run, with both
-temperature scopes set to `"episode"` or both to `"run"` and inner entropy enabled;
-all other inner scopes remain
-action-local. Explorer populations, other persistent inner state, prior
+inner-target bootstrap. Explorer populations, persistent inner state, prior
 writeback, TD3, native TDAMBI, and auxiliary value-equivalence training are
 rejected for this variant. The existing restrictions on each adaptation method
 still apply. Prior-only operation trains the selected auxiliary mode while
@@ -2314,12 +2370,14 @@ not modify the checkpoint or its metadata sidecar.
 AMBI can add the three losses from
 [PAVE](https://github.com/AIRLABkhu/PAVE) to its persistent outer critics:
 mixed partial regularization (MPR), vector field consistency (VFC), and the
-action-curvature penalty. An additional action-gradient consistency loss
-compares the same critic's gradients at nearby normalized actions. Each loss
-has an independent coefficient for the primary critic and independent
-auxiliary return critic. All eight coefficients
-default to zero, preserving existing training, random-number use, and checkpoint
-identity. This option does not add losses to inner SAC or standalone TD-MPC2.
+action-curvature penalty. Each loss has an independent coefficient for the
+primary critic and independent auxiliary return critic. A separate AMBI extension
+optionally penalizes action-gradient changes between nearby actions at the same
+observation. This action-space consistency term is distinct from PAVE's
+curvature-preservation penalty and can run alone or alongside MPR. All eight
+coefficients default to zero, preserving existing training, random-number use,
+and checkpoint identity. These options do not add losses to inner SAC or
+standalone TD-MPC2.
 
 | Configuration | Default | Meaning |
 | --- | --- | --- |
@@ -2333,7 +2391,7 @@ identity. This option does not add losses to inner SAC or standalone TD-MPC2.
 | `aux_return_pave_action_smoothness_coef` | `0.0` | Auxiliary return critic action-gradient consistency weight |
 | `outer_pave_batch_size` | `64` | Maximum sampled real transitions; `null` uses the full sampled sequence batch |
 | `outer_pave_obs_noise_std` | `0.01` | Gaussian observation perturbation standard deviation |
-| `outer_pave_action_noise_std` | `0.02` | Gaussian normalized-action perturbation standard deviation |
+| `outer_pave_action_noise_std` | `0.02` | Gaussian perturbation standard deviation per normalized action coordinate |
 | `outer_pave_curvature_margin` | `1.0` | Margin in the curvature penalty |
 
 Coefficients, noise standard deviations, and margin must be finite and
@@ -2352,31 +2410,42 @@ observation tuples, including valid terminal transitions. Its transition mean
 is independent of the ordinary backbone's horizon weighting.
 
 Let `g_i(o, a)` be the action gradient of decoded scalar Q head `i`, with
-`z = encode(o)`. PAVE computes:
+`z = encode(o)`. The geometry losses are:
 
 ```text
 MPR       = sum_i mean_transitions,actions (g_i(o, a) - g_i(o + noise, a))²
 VFC       = sum_i mean_transitions,actions (g_i(o, a) - g_i(next_o, a))²
 curvature = sum_i mean_transitions relu(vᵀ Hessian_action(Q_i) v + margin)
-action_smoothness = sum_i mean_transitions,actions (g_i(o, a) - g_i(o, a_noisy))²
-a_noisy   = clamp(a + Gaussian(0, action_noise_std² I), -1, 1)
+action_smoothness = sum_i mean_transitions,actions (g_i(o, a) - g_i(o, a_perturbed))²
+a_perturbed = clamp(a + Normal(0, action_noise_std² I), -1, 1)
 ```
 
-The same recorded action is used at all three observations; VFC does not sample
-a next-policy action. Observation noise is isotropic Gaussian in the existing
-observation coordinates, without additional normalization or clipping.
+PAVE's three original state views use the same recorded action; VFC does not
+sample a next-policy action. Observation noise is isotropic Gaussian in the
+existing observation coordinates, without additional normalization or clipping.
 Perturbed observations pass through the encoder and its SimNorm, preserving the
 latent simplex structure. PAVE detaches every encoded latent, so these losses
 update only the selected online critic parameters. Normal backbone losses
 retain their existing representation gradients.
 
-Action-gradient consistency holds the current observation encoding fixed.
-The original and clamped perturbed actions are detached before creating
-independent gradient leaves, so differentiation does not pass through the
-clamp, replay, or actor. Its reduction averages over action coordinates and
-transitions and sums heads, without dividing by noise variance or Q scale.
-It penalizes changes in the gradient rather than the magnitude of the gradient.
-With `outer_pave_batch_size=null`, H=3 and B=256 use all 768 real replay rows.
+Action smoothness keeps the encoded observation fixed and differentiates the
+decoded raw scalar Q at two independently detached action leaves. In particular,
+the perturbed-action gradient is taken with respect to the perturbed coordinate,
+without differentiating through its construction or clamp. Both gradient
+branches retain their critic-parameter graphs. The term penalizes changes in
+the action-gradient vector, including magnitude and direction; it neither
+normalizes that vector nor penalizes its norm directly. The independent action
+noise scale does not change MPR's observation noise.
+
+For small, unclipped isotropic action perturbations with standard deviation
+`sigma`, its per-head mean approximates
+`sigma² * ||Hessian_action(Q_i)||_F² / action_dim`. The implemented loss has no
+division by `sigma²` or by Q scale. Thus changing the perturbation scale changes
+both the neighborhood and effective regularization strength; rescaling decoded
+Q multiplies the loss quadratically. Clipping keeps evaluated actions in bounds
+and changes this local approximation near action limits. Unlike PAVE's curvature
+term, action smoothness does not preserve a negative-curvature margin. These
+coefficients need calibration against the actual weighted critic TD gradients.
 
 One Rademacher probe `v` per sampled transition estimates curvature through a
 Hessian-vector product, without constructing an explicit Hessian. Selected
@@ -2394,13 +2463,37 @@ with critic dropout temporarily disabled. Ordinary TD losses keep their
 dropout and optional compilation. Only enabled terms are evaluated. A dedicated
 stateless generator derives samples from the training seed and outer update
 number, preserving the global training RNG and reproducing the samples on
-exact continuation.
+exact continuation. Action noise is drawn after the existing transition,
+observation-noise and curvature-probe draws, so enabling it preserves those
+draws. At zero action-smoothness coefficients no action-noise draw or extra
+critic view is evaluated, and the existing PAVE terms retain their behavior.
 
-For supported dense vmap critics, active observation/action views share one
-parameter stack and a batched eager forward. A curvature term keeps its base
-view separate to avoid enlarging the Hessian-vector-product graph. Custom,
-hooked, LoRA, loop, and nonstandard decoder paths preserve separate forwards.
-This optimization does not alter ordinary TD/actor forward execution or RNG.
+For supported dense `vmap` critics, PAVE stacks the existing critic parameters
+once per calculation and reuses those tensors across its views; nothing is
+cached across optimizer steps. With curvature enabled, the current-state view
+retains its own forward/action-gradient graph and the enabled perturbed-state,
+successor-state and perturbed-action views share a second forward. This prevents
+higher derivatives from traversing unused view blocks, which can make full
+fusion slower and more memory-hungry on large batches. Without curvature, all
+enabled views share one forward.
+Every head, view and transition has independent action coordinates, and all
+losses retain their original per-view normalization and sum over heads.
+Ordinary critic training and encoder calls are unchanged. Custom critics,
+hooks, overridden forwards, custom decoders and the `loop` backend retain
+separate view execution.
+
+View batching preserves the objective and RNG stream, with normal floating-point
+roundoff from different matrix shapes and reduction order. It does not promise
+bitwise continuation across source versions; the existing exact-resume source
+checks still apply. Correctness coverage compares each loss and its parameter
+gradient with a frozen separate-view oracle, including two complete eager and
+compiled learner updates with clipping, Adam state and target updates. Run
+`tests/test_pave_view_batching.py` and `tests/test_pave_view_batching_update.py`
+with the locked interpreter; CUDA cases require an allocated GPU. The bounded
+`tests.benchmark_pave_views` command compares disabled, separate-view and batched
+PAVE on paired resident synthetic batches, including the full learner update.
+`tests/test_pave_action_smoothness.py` adds analytic quadratic and decoded-Q
+checks, boundary-action gradient ownership, and action-noise RNG coverage.
 
 ### Example settings and diagnostics
 
@@ -2445,16 +2538,16 @@ backbone, Q scale, ensemble size, and observation units. Higher-order autograd
 adds training cost; the independent batch cap controls that cost without
 changing the ordinary TD minibatch.
 
-For an action-only primary-critic ablation, set
-`outer_pave_action_smoothness_coef=0.004`,
-`outer_pave_action_noise_std=0.02`, and `outer_pave_batch_size=null`, leaving
-the other coefficients zero. With five heads and `critic_coef=0.1`, the
-coefficient is equivalent to `0.02` on a head-averaged regularizer, or 0.2 of
-the TD coefficient. This coefficient ratio is not a measured gradient-norm
-ratio. Use `aux_return_pave_action_smoothness_coef` to select the auxiliary
-critic instead; the same mapping applies when its TD coefficient is 0.1.
+To add the AMBI action-space extension, set
+`outer_pave_action_smoothness_coef` and/or
+`aux_return_pave_action_smoothness_coef` to a positive value and optionally
+override `outer_pave_action_noise_std`. Keep the MPR coefficients at zero for
+an action-only ablation, or enable them independently for joint state/action
+consistency. The default noise scale `0.02` is a configurable starting point,
+not a validated coefficient or perturbation recipe from the PAVE paper.
 
-Each enabled critic logs `{prefix}_{mpr,vfc,curvature,action_smoothness}_loss`, the corresponding
+Each enabled critic logs `{prefix}_{mpr,vfc,curvature,action_smoothness}_loss`,
+the corresponding
 `{prefix}_{term}_weighted_loss`, combined `{prefix}_weighted_loss`,
 `{prefix}_sample_count`, and `{prefix}_curvature_violation_fraction`, with
 `prefix` equal to `outer_pave` or `aux_return_pave`. Individual term metrics
@@ -2474,11 +2567,6 @@ checkpoint provenance and exact-resume identity. Portable weight transfer can
 enable, disable, or retune PAVE without changing critic architecture. Exact
 continuation requires the same PAVE configuration; the saved update counter
 reproduces the next regularization sample without extra persistent RNG state.
-Zero action-smoothness weights retain the exact version-1 PAVE signature even
-when an unused action-noise setting is supplied. Enabling the new loss uses a
-version-2 signature that records its noise, clamping, independent gradient
-leaves, decoder, and reduction semantics. Retuning its active coefficient or
-noise is rejected by exact resume before any training state is changed.
 
 ### Periodic critic geometry logging, including unregularized baselines
 
@@ -2629,8 +2717,9 @@ and disabled critic dropout. The complete world/critic baseline gradient is
 used for the shared clipping calculation. Existing saved PAVE coefficients are
 replaced by the probe candidates, not added to them.
 
-Each batch differentiates all three PAVE terms once per critic. A gradient Gram
-matrix then evaluates the default `k` grid `.01 .03 .1 .3 1 3 10` for both
+By default each batch differentiates the three original PAVE terms once per
+critic. A gradient Gram matrix then evaluates the default `k` grid
+`.01 .03 .1 .3 1 3 10` for both
 `k*(.1,.1,.01)` and `k*(.1,.1,.1)` without more differentiation. Override it
 with `--scales`. Results include raw losses, weighted per-term gradient norms
 and TD ratios, gradient cosines and cancellation, full gradient norms,
@@ -2638,6 +2727,24 @@ baseline/candidate clipping multipliers, action-gradient RMS, curvature
 violation fraction, timing, and CUDA allocated-memory peaks. Nonfinite values
 and ratios with unreliable TD denominators become JSON nulls with finite
 gradient fractions retained. No minimum or combined ensemble Q is differentiated.
+
+To compare the action-space extension on the same frozen data, add
+`--action-smoothness-coefs 0 .01 .1` and optionally
+`--action-noise-std .01 .02 .05`. The first flag specifies absolute
+action-smoothness coefficients, independently of the original PAVE `k` grid;
+the second specifies one or more per-coordinate action-noise standard
+deviations. Their defaults are `0` and `0.02`. A positive coefficient enables
+the additional gradient measurement, action-only candidates, and candidates
+combining PAVE with action smoothness. Each noise scale is reported separately;
+changing it changes the loss being measured, not just its weight. The optional
+measurement extends the Gram order to
+`td, mpr, vfc, curvature, action_smoothness` and uses the version-2 report.
+Default invocations retain the original three-term version-1 protocol without
+action-noise draws or an extra critic view. The raw action-term diagnostic uses
+coefficient one; candidate diagnostics use each requested coefficient. The
+existing common-scale recommendation remains limited to the original PAVE
+families. Action-only and combined candidates provide gradient and clipping
+diagnostics without an automatic coefficient recommendation.
 
 `results.json` contains per-batch measurements, checkpoint/bank/source hashes,
 resolved settings, and state hashes confirming that learned state is unchanged.

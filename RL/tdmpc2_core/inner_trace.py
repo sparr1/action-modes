@@ -197,10 +197,8 @@ _DEFINITIONS = {
         "Fraction of sampled action coordinates rounded exactly to a tanh bound."
     ),
     "outer_action_l2": "Pre-update sampled-action L2 anchor penalty for the TD3 actor.",
-    "temperature_loss": "Mean automatic-temperature objective before each scalar Adam step on this actor sample.",
+    "temperature_loss": "Automatic-temperature objective evaluated before its update.",
     "temperature_grad_norm": "Temperature gradient norm before clipping.",
-    "temperature_entropy_residual": "Selected entropy minus target on the shared actor-update sample; positive lowers alpha.",
-    "temperature_updates": "Actual scalar Adam steps sharing this update event's detached entropy residual.",
     "alpha_used": "Temperature used by this update's losses, before temperature adaptation.",
     "alpha": "Inner temperature at this event boundary.",
     "outer_policy_kl": "Pre-update analytic Gaussian KL used by an enabled actor regularizer.",
@@ -241,6 +239,21 @@ _DEFINITIONS = {
 def metric_definitions():
     """Return portable descriptions; callers may retain unlisted raw metrics."""
     result = dict(_DEFINITIONS)
+    policy_diagnostics = {
+        "pre_tanh_entropy": "Analytic joint diagonal Gaussian entropy before tanh, averaged over actor minibatch states.",
+        "post_tanh_entropy": "Joint post-tanh entropy estimated from the same sampled actions and stable log probability used by the actor.",
+        "action_abs_ge_0p99_fraction": "Fraction of sampled action coordinates with absolute value at least 0.99.",
+        "mean_action_abs_ge_0p99_fraction": "Fraction of deterministic tanh(mean) action coordinates with absolute value at least 0.99.",
+        "mean_action_exact_saturation_fraction": "Fraction of deterministic tanh(mean) coordinates rounded exactly to a bound.",
+        "q_scale_used": "Snapshot of the Q divisor actually used by this actor update; one when normalization is disabled.",
+        "q_percentile_range": "Floored P95-P5 of the selected Q values on this actor minibatch, including when its scale is frozen.",
+        "q_percentile_range_over_scale": "This minibatch's floored P95-P5 divided by the actor's actual Q divisor.",
+        "entropy_coefficient_normalized": "Entropy coefficient in the optimized Q/S + alpha*H_selected objective.",
+        "entropy_coefficient_return_units": "alpha*S for the selected entropy statistic, using this update's actual Q divisor.",
+        "entropy_coefficient_joint_units": "Nominal coefficient per joint entropy nat in return units: alpha*S*d for TD-MPC2 scaled entropy and alpha*S otherwise.",
+    }
+    for prefix in ("actor_", "explorer_actor_"):
+        result.update({prefix + key: value for key, value in policy_diagnostics.items()})
     for component in ("reward", "bootstrap"):
         for reference in ("initial", "outer"):
             result[f"togo_{component}_{reference}_mean"] = (
@@ -317,6 +330,16 @@ def metric_catalog(metric_names=()):
             unit = "scaled_entropy_statistic"
         elif name in {"actor_entropy_bonus", "explorer_actor_entropy_bonus"}:
             unit = "objective"
+        elif name.endswith("entropy_coefficient_joint_units"):
+            unit = "value_per_nat"
+        elif name.endswith("entropy_coefficient_return_units"):
+            unit = "value_per_selected_entropy_unit"
+        elif name.endswith("entropy_coefficient_normalized"):
+            unit = "normalized_value_per_selected_entropy_unit"
+        elif name.endswith("q_percentile_range_over_scale"):
+            unit = "ratio"
+        elif name.endswith(("pre_tanh_entropy", "post_tanh_entropy")):
+            unit = "nats"
         elif "kl" in name or name in {"actor_entropy", "explorer_actor_entropy"}:
             unit = "nats"
         elif "alpha" in name and "entropy_bonus" not in name and "soft_score" not in name:

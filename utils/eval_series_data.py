@@ -190,8 +190,7 @@ class _WithoutControlTiming(ast.NodeTransformer):
 
 
 @lru_cache(maxsize=128)
-def scientific_identity(algorithm, controller, commit, dirty=False, source_sha256=None, *,
-                        return_estimator="one_step"):
+def scientific_identity(algorithm, controller, commit, dirty=False, source_sha256=None):
     """Conservative scientific-source identity, excluding publisher/report code.
 
     Hash executable ASTs of the controller stack and environment. Evaluator
@@ -199,10 +198,6 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
     require an explicit compatibility audit; they are never silently accepted.
     Dirty legacy trees remain pinned to their saved complete source digest.
     """
-    _require(return_estimator in {"one_step", "retrace"}, "Unknown scientific return estimator")
-    if return_estimator == "retrace":
-        _require("AMBI" in algorithm and controller == "sac",
-                 "Retrace scientific identity requires the AMBI SAC controller")
     if dirty:
         _require(bool(source_sha256), "Dirty results lack saved source fingerprint")
         return {"version": 1, "algorithm": algorithm, "dirty_source_sha256": source_sha256}
@@ -226,8 +221,6 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
     else:
         paths = ["RL/TDMPC2.py", "RL/tdmpc2_core/agent.py", "RL/tdmpc2_core/mppi.py"]
     paths += ["RL/tdmpc2_core/common", "domains", "environments/dmcontrol/uv.lock"]
-    if return_estimator == "retrace":
-        paths.append("RL/tdmpc2_core/inner_retrace.py")
     evaluator = ("evaluate_tdmpc2_mppi_checkpoint.py" if algorithm == "TDMPC2/TDMPC2Baseline"
                  else "evaluate_ambi_checkpoint.py")
     # Main/CLI orchestrate publication; these functions implement scientific
@@ -237,20 +230,10 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
                  "evaluate_tdmpc2_mppi_checkpoint"}
                 if evaluator.startswith("evaluate_tdmpc2") else
                 {"_make_env", "_seed_spaces", "_initialize_frozen_model", "evaluate_preset"})
-    if "AMBI" in algorithm and controller == "mppi":
-        selected = selected | {"evaluate_mppi_preset"}
     try:
         entries = _git_output(root, "ls-tree", "-rz", commit, "--", *paths)
         names = sorted(entry.split(b"\t", 1)[1].decode() for entry in entries.split(b"\0") if entry)
         _require(paths[0] in names, "Pinned algorithm source is incomplete")
-        if return_estimator == "retrace":
-            _require("RL/tdmpc2_core/inner_retrace.py" in names,
-                     "Pinned Retrace implementation is unavailable")
-        if ("AMBI" in algorithm and controller == "mppi"
-                and b"def evaluate_mppi_preset(" in _git_output(root, "show", f"{commit}:{evaluator}")):
-            # New native-MPPI bundles pin the planner itself. Keep historical
-            # identities intact for commits predating this evaluation path.
-            names = sorted({*names, "RL/tdmpc2_core/mppi.py"})
         hashes = {}
         helper_selections = ({"utils/ambi_benchmark.py": {"canonical_hash", "solver_seed", "protocol_for"}}
                              if evaluator == "evaluate_ambi_checkpoint.py" else {})
@@ -390,16 +373,6 @@ def planner_identity(config, result, algorithm, action_rule):
               if key.startswith("inner_")}
     if active.get("inner_critic_bernoulli_p", 0.0) == 0.0:
         active.pop("inner_critic_bernoulli_p", None)
-    if config.get("inner_solve_interval", 1) == 1:
-        active.pop("inner_solve_interval", None)
-        active.pop("inner_hold_encoder", None)
-    else:
-        active["inner_solve_interval"] = config["inner_solve_interval"]
-        active["inner_hold_encoder"] = config.get("inner_hold_encoder", "solve_snapshot")
-    # One temperature step per actor update is the historical behavior.
-    # Preserve that identity while keeping an actual repeat intervention distinct.
-    if active.get("inner_temperature_updates_per_actor", 1) == 1:
-        active.pop("inner_temperature_updates_per_actor", None)
     estimator = config.get("inner_sac_return_estimator", "one_step")
     if isinstance(estimator, str):
         estimator = estimator.lower()
@@ -519,10 +492,6 @@ def planner_identity(config, result, algorithm, action_rule):
 
 
 def _episode_protocol(protocol, seeds, config=None, action_rule=None):
-    if "temperature_chain" in protocol:
-        raise ValueError(
-            "Temperature-chain episodes are dependent and cannot be imported as an independent-seed eval series."
-        )
     keys = {"environment", "env_wrapper", "env_wrappers", "observation", "action_rule",
             "controller_seed", "seed_scheme", "max_steps", "prior_reference"}
     normalized = {key: copy.deepcopy(value) for key, value in protocol.items() if key in keys}
@@ -605,10 +574,7 @@ def identity_for_ambi_checkpoint(checkpoint, resolved, protocol, seeds, code, *,
     return {"backbone": source, "planner": planner,
             "protocol": _episode_protocol(protocol, seeds, config, action),
             "science": scientific_identity(algorithm, controller, code.get("commit"),
-                                             code.get("dirty"), code.get("source_sha256"),
-                                             **({"return_estimator": "retrace"}
-                                                if controller == "sac" and config.get("inner_sac_return_estimator") == "retrace"
-                                                else {}))}
+                                             code.get("dirty"), code.get("source_sha256"))}
 
 
 def _native_planner(settings, planner_result, controller):
@@ -771,9 +737,7 @@ def _metrics(episodes):
                 metrics[f"work/{component}_updates"] = sum(value * length for value, length in values)
     for metric, candidates in {"model_steps": ("inner_realized_model_steps", "inner_model_steps"),
                                "policy_evaluations": ("inner_policy_evaluations",),
-                               "q_evaluations": ("inner_q_evaluations",),
-                               "retrace_trajectory_draws": ("inner_retrace_trajectory_draws",),
-                               "retrace_critic_rows": ("inner_retrace_critic_rows",)}.items():
+                               "q_evaluations": ("inner_q_evaluations",)}.items():
         for key in candidates:
             values = [(ep.get("model_metrics", {}).get(key), ep["length"]) for ep in episodes]
             if all(value is not None for value, _ in values):
@@ -825,26 +789,6 @@ def validate_tdmpc2_prior_pairing(prior, protocol, seeds=None):
 def _bundle_prior_reference(manifest, path, checkpoint, source):
     """Revalidate a portable native-prior reference before publication."""
     reference = manifest.get("reference", {})
-    if reference.get("format") == "ambi_sampled_prior-v1":
-        from utils.ambi_benchmark import reference_returns
-
-        name = "reference/manifest.json"
-        _require(name in reference.get("files", {}), "Missing exact sampled prior reference file")
-        artifacts = {}
-        for relative, digest in reference["files"].items():
-            file = (path.parent / relative).resolve()
-            _require(file.is_relative_to(path.parent) and relative.startswith("reference/"),
-                     "Reference artifact path escapes bundle")
-            _require(file.is_file() and _file_hash(file) == digest, "Reference artifact hash mismatch")
-            artifacts[relative] = str(file)
-        _require(reference.get("checkpoint_step") == checkpoint["step"], "Reference checkpoint mismatch")
-        inventory = next((file for relative, file in artifacts.items()
-                          if relative.startswith("reference/provenance/checkpoint-inventory-")), None)
-        validated = reference_returns(artifacts[name], checkpoint["sha256"], manifest.get("protocol", {}),
-                                      checkpoint_inventory=inventory, source_run=source)
-        portable = {key: value for key, value in reference.items() if key != "path"}
-        _require(validated.provenance == portable, "Sampled prior provenance differs from saved source")
-        return dict(validated), artifacts
     if reference.get("format") != "tdmpc2-paired-prior":
         return {}, {}
     _require(reference.get("checkpoint_sha256") == checkpoint["sha256"] and
@@ -924,9 +868,6 @@ def normalize_bundle(path, *, checkpoint_inventory=None, source_run=None):
         elif config.get("inner_operator") == "tdambi":
             _require(not any("paired_return_delta" in episode for episode in episodes),
                      "TDAMBI paired gains require a validated native prior reference")
-        elif protocol.get("prior_reference") == "ambi_sampled_prior-v1":
-            _require(not any("paired_return_delta" in episode for episode in episodes),
-                     "MPPI paired gains require a validated sampled prior reference")
         if result.get("episodes"):
             returned = {ep["seed"]: ep for ep in result["episodes"]}
             _require(set(returned) == set(seeds), "Returned episode seeds differ from bundle")
@@ -939,10 +880,7 @@ def normalize_bundle(path, *, checkpoint_inventory=None, source_run=None):
             "inner_xqc" if planner["type"] == "xqc" else planner["type"])
         identity = {"backbone": source, "planner": planner, "protocol": protocol,
                     "science": scientific_identity(algorithm, controller, code.get("commit"),
-                                                     code.get("dirty"), code.get("source_sha256"),
-                                                     **({"return_estimator": "retrace"}
-                                                        if controller == "sac" and config.get("inner_sac_return_estimator") == "retrace"
-                                                        else {}))}
+                                                     code.get("dirty"), code.get("source_sha256"))}
         artifacts = {"manifest.json": str(path), **extra_files, **reference_files}
         missing = []
         for name in run.get("trace_files", []):
@@ -958,8 +896,6 @@ def normalize_bundle(path, *, checkpoint_inventory=None, source_run=None):
                       "legacy_run_status": run.get("status"), "missing_artifact_files": missing,
                       "resolved_config": config, "checkpoint_metadata": cp.get("metadata"),
                       "reference": manifest.get("reference"), "source_result_sha256": _file_hash(path)}
-        if run.get("timing_convention") is not None:
-            provenance["timing_convention"] = copy.deepcopy(run["timing_convention"])
         label = descriptive_label(identity, run.get("selector"))
         record = _record(identity, checkpoint, episodes, artifacts, provenance, path, label,
                          run.get("selector", controller), controller)

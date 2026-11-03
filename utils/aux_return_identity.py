@@ -6,6 +6,8 @@ can describe a checkpoint without constructing networks or consuming RNG.
 
 from collections.abc import Mapping
 
+from utils.ensemble_identity import DEFAULT_CRITIC_ENSEMBLE_BACKEND
+
 
 AUX_RETURN_SOURCE_DEFAULTS = {
     "inner_actor_source": "sac",
@@ -19,10 +21,34 @@ def auxiliary_return_mode(config):
     return str(config.get("aux_return_mode", "off")).lower()
 
 
+def aux_return_joint_vmap_enabled(config):
+    """Resolve joint execution policy without constructing or sampling networks.
+
+    The learner additionally checks that both dense ensembles support joint
+    execution. This helper accepts raw settings and resolved config namespaces;
+    configuration validation remains the responsibility of the config builder.
+    """
+    if not isinstance(config, Mapping):
+        config = vars(config)
+    backend = config.get("critic_ensemble_backend", DEFAULT_CRITIC_ENSEMBLE_BACKEND)
+    return (
+        config.get("aux_return_joint_vmap", True) is True
+        and auxiliary_return_mode(config) in {"sac", "return_actor"}
+        and str(backend).lower() == "vmap"
+        and float(config.get("aux_return_critic_coef", 0.1)) > 0.0
+    )
+
+
 def normalize_aux_return_identity(config):
     """Keep old identities unchanged when the feature and routes are unused."""
     result = dict(config)
     mode = auxiliary_return_mode(result)
+    # Resolve before the ensemble normalizer drops an explicit historical loop
+    # backend. Only active joint execution adds a key to historical identities.
+    if aux_return_joint_vmap_enabled(result):
+        result["aux_return_joint_vmap"] = True
+    else:
+        result.pop("aux_return_joint_vmap", None)
     # The resolved actor view duplicates the flat scientific configuration.
     result.pop("aux_return_actor_cfg", None)
     if mode == "off":
@@ -44,7 +70,8 @@ def normalize_aux_return_identity(config):
                     result.get("outer_actor_entropy_mode", "squashed") if value is None else value
                 )
         for key, value in tuple(result.items()):
-            if not key.startswith("aux_return_") or key == "aux_return_mode":
+            if (not key.startswith("aux_return_")
+                    or key in {"aux_return_mode", "aux_return_joint_vmap"}):
                 continue
             inherited_key = key.removeprefix("aux_return_")
             if isinstance(value, str):

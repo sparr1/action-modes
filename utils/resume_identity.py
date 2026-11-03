@@ -226,17 +226,35 @@ def scientific_trial_parameters(
                         value = 0.0
                 algorithm[field] = value
             if projected.get("alg") == _AMBI_ALGORITHM:
-                algorithm = normalize_ensemble_backend_identity(algorithm)
+                objective = algorithm.get("outer_actor_objective", "q_maximization")
+                if isinstance(objective, str):
+                    objective = objective.lower()
+                # Derived storage flags carry no independent scientific choice.
+                # Omitted and disabled controls preserve historical fingerprints.
+                algorithm.pop("store_teacher_policy", None)
+                if objective == "q_maximization":
+                    for field in (
+                        "outer_actor_objective", "reanalyze_interval", "reanalyze_batch_size",
+                        "reanalyze_backend", "reanalyze_parallel_roots",
+                    ):
+                        algorithm.pop(field, None)
+                elif objective == "distillation":
+                    algorithm["outer_actor_objective"] = objective
+                    algorithm["reanalyze_interval"] = algorithm.get("reanalyze_interval", 10)
+                    algorithm["reanalyze_batch_size"] = algorithm.get("reanalyze_batch_size", 20)
+                    backend = str(algorithm.get("reanalyze_backend", "native")).lower()
+                    if backend == "native":
+                        algorithm.pop("reanalyze_backend", None)
+                        algorithm.pop("reanalyze_parallel_roots", None)
+                    else:
+                        algorithm["reanalyze_backend"] = backend
+                        algorithm["reanalyze_parallel_roots"] = algorithm.get("reanalyze_parallel_roots", 4)
                 algorithm = normalize_lora_rl_identity(algorithm)
                 algorithm = normalize_pave_identity(algorithm)
+                # Auxiliary eligibility needs the explicit backend before the
+                # historical loop value is removed from the identity.
                 algorithm = normalize_aux_return_identity(algorithm)
-                interval = algorithm.get("inner_solve_interval", 1)
-                if interval == 1:
-                    algorithm.pop("inner_solve_interval", None)
-                    algorithm.pop("inner_hold_encoder", None)
-                else:
-                    algorithm["inner_solve_interval"] = interval
-                    algorithm.setdefault("inner_hold_encoder", "solve_snapshot")
+                algorithm = normalize_ensemble_backend_identity(algorithm)
                 estimator = algorithm.get("inner_sac_return_estimator", "one_step")
                 if isinstance(estimator, str):
                     estimator = estimator.lower()
@@ -285,7 +303,6 @@ def scientific_trial_parameters(
                     ("inner_actor_initial_std", None),
                     ("inner_critic_initialization", "prior"),
                     ("inner_critic_bernoulli_p", 0.0),
-                    ("inner_temperature_updates_per_actor", 1),
                     ("inner_mppi_eval_action", "mean"),
                     ("inner_critic_loss_coef", 1.0),
                     ("inner_actor_loss_scale_update", "per_action"),

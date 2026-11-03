@@ -22,7 +22,6 @@ import torch
 from RL.tdmpc2_core.common.buffer import Buffer
 from utils.checkpointing import CheckpointTracker, metadata_path
 from utils.resume_lineage import GenerationFile, LineageStore
-from utils.resume_telemetry_compat import compatible_scientific_identity
 from utils.resume_runtime import (
     capture_environment_state,
     capture_global_rng_state,
@@ -205,11 +204,9 @@ class TrainingResumeSession:
         drain_after_seconds: float | None,
         segment_started_monotonic: float,
         replay_shard_rows: int = DEFAULT_REPLAY_SHARD_ROWS,
-        source_compatibility: Mapping[str, Any] | None = None,
     ) -> None:
         self.store = store
         self.mode = mode
-        self.source_compatibility = copy.deepcopy(source_compatibility)
         self.selected_generation = selected_generation
         self._branch_source_generation_id = source_generation_id
         self.segment_id = str(segment_id)
@@ -259,8 +256,6 @@ class TrainingResumeSession:
                 "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
                 "slurm_restart_count": os.environ.get("SLURM_RESTART_COUNT"),
                 "host": socket.gethostname(),
-                **({"source_compatibility": self.source_compatibility}
-                   if self.source_compatibility is not None else {}),
             },
         )
         # SEGMENT.json's atomic write syncs ``segment_dir``, thereby
@@ -288,7 +283,6 @@ class TrainingResumeSession:
         if isinstance(total_steps, bool) or not isinstance(total_steps, int) or total_steps < 0:
             raise ResumeIncompatibilityError("Total steps must be a non-negative integer.")
         mode = str(mode)
-        source_compatibility = None
         if mode == "new":
             if resume_generation is not None:
                 raise ResumeIncompatibilityError("A new lineage cannot select a generation.")
@@ -312,21 +306,12 @@ class TrainingResumeSession:
                 metadata = store.lineage_metadata
                 if (
                     metadata.get("schema_version") != 1
+                    or metadata.get("scientific_identity") != dict(scientific_identity)
                     or metadata.get("total_steps") != total_steps
                 ):
                     raise ResumeIncompatibilityError(
                         "Code, configuration, environment, or target differs from the lineage."
                     )
-                if metadata.get("scientific_identity") != dict(scientific_identity):
-                    source_compatibility = compatible_scientific_identity(
-                        Path(__file__).resolve().parents[1],
-                        metadata.get("scientific_identity"),
-                        dict(scientific_identity),
-                    )
-                    if source_compatibility is None:
-                        raise ResumeIncompatibilityError(
-                            "Code, configuration, environment, or target differs from the lineage."
-                        )
                 if not isinstance(metadata.get("initial_wandb_run_id"), str):
                     raise ResumeStateCorruptionError("Lineage has no initial W&B run ID.")
                 latest = store.load()
@@ -362,7 +347,6 @@ class TrainingResumeSession:
                 checkpoint_minutes=checkpoint_minutes,
                 drain_after_seconds=drain_after_seconds,
                 segment_started_monotonic=started,
-                source_compatibility=source_compatibility,
             )
         except BaseException:
             store.close()
@@ -602,24 +586,6 @@ class TrainingResumeSession:
                 source = parents[0]
                 metadata = _load_json(parent_metadata[0], "best model metadata")
         if source is not None:
-            # A retained portable best model may have a hash-bound replay
-            # companion. Keep that relative reference valid when carrying the
-            # model into a new exact-resume generation.
-            if "replay" in metadata:
-                replay_name = metadata["replay"].get("path")
-                expected_name = f"{Path(source).name}.replay"
-                if replay_name != expected_name:
-                    raise ResumeIncompatibilityError("Invalid best-model replay companion reference.")
-                replay_source = Path(source).parent / replay_name
-                manifest_path = replay_source / "manifest.json"
-                manifest = _load_json(manifest_path, "best model replay manifest")
-                for name in ["manifest.json"] + [item["path"] for item in manifest["files"]]:
-                    if not isinstance(name, str) or Path(name).name != name:
-                        raise ResumeIncompatibilityError("Invalid best-model replay payload path.")
-                    files.append(GenerationFile(
-                        f"{relative}.replay/{name}", "model_best_replay",
-                        _copy_writer(replay_source / name),
-                    ))
             files.extend(
                 [
                     GenerationFile(relative, "model_best", _copy_writer(source)),

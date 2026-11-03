@@ -20,6 +20,10 @@ from .common import math as td_math
 from .common.compile_regions import CompileRegion
 from .common.bernoulli_transfer import reset_critic_with_bernoulli_
 from .common.entropy import policy_entropy
+from .common.policy_diagnostics import (
+    entropy_coefficient_diagnostics,
+    policy_sample_diagnostics,
+)
 from .common.control_sources import (
     actor_module, actor_options, actor_owner, critic_module, critic_owner, source_metadata,
 )
@@ -165,9 +169,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self._mppi_prev_mean = None
         self._collect_diagnostics = True
         self._active_trace = None
+        self.last_teacher_policy = None
+        self._teacher_only = False
         self._pending_timers = {}
         self._parameter_noise_spec = None
-        self._clear_held_policy(drop_pool=True)
         self._clear_critic_transfer()
         self._clear_parameter_noise_action_state()
         self._initialize_compile_regions()
@@ -178,69 +183,6 @@ class InnerImprovementEngine(RetraceInnerMixin):
         if self._critic_bernoulli_p > 0:
             extra += ("critic_bernoulli",)
         return InnerRNG(seed, self.device, extra_streams=extra)
-
-    @property
-    def _solve_interval(self):
-        return int(getattr(self.cfg, "inner_solve_interval", 1))
-
-    def _held_policy_spec(self):
-        if self._solve_interval == 1:
-            return None
-        return {"version": 1, "solve_interval": self._solve_interval,
-                "encoder": "solve_snapshot", "actor": "fixed_last_solve",
-                "schedule": "episode_decisions", "first_solve": 0,
-                "resume": "empty_episode_boundary"}
-
-    def _clear_held_policy(self, *, drop_pool=False):
-        self._held_actor = None
-        self._held_encoder = None
-        if drop_pool:
-            self._encoder_pool = None
-        self._episode_decision_index = 0
-        self._control_eval_mode = None
-        self._control_prepared = None
-
-    def prepare_control(self, *, t0=False, eval_mode=False):
-        """Prepare cadence before encoding; return whether this action is held.
-
-        The agent snapshots the encoder on solve decisions. Preparation is
-        idempotent until act consumes it, so its encoder timing survives the
-        subsequent engine call. K=1 does not participate in this lifecycle.
-        """
-        if self._solve_interval == 1:
-            return False
-        request = (bool(t0), bool(eval_mode))
-        if self._control_prepared is not None:
-            if self._control_prepared[:2] != request:
-                raise RuntimeError("Held-policy control preparation changed before execution.")
-            return self._control_prepared[2]
-        if t0 or self._control_eval_mode != bool(eval_mode):
-            self._clear_held_policy()
-            self._clear_critic_transfer()
-        self._control_eval_mode = bool(eval_mode)
-        held = self._episode_decision_index % self._solve_interval != 0
-        if held and self._held_actor is None:
-            raise RuntimeError("Held-policy action requires a successful preceding solve.")
-        self._pending_timers = {}
-        self._control_prepared = (*request, held)
-        return held
-
-    def abort_control(self):
-        """Invalidate all cross-decision state after an unsuccessful action."""
-        if self._solve_interval > 1:
-            self._clear_held_policy(drop_pool=True)
-            self._clear_critic_transfer()
-            self._pending_timers = {}
-
-    @torch.no_grad()
-    def _snapshot_held_actor(self):
-        if self.state.actor is None:
-            raise RuntimeError("Held-policy cadence requires a live solved inner actor.")
-        if self._held_actor is None:
-            self._held_actor = deepcopy(self.state.actor)
-        else:
-            self._held_actor.load_state_dict(self.state.actor.state_dict())
-        self._held_actor.requires_grad_(False).eval()
 
     @property
     def _critic_bernoulli_p(self):
@@ -432,14 +374,6 @@ class InnerImprovementEngine(RetraceInnerMixin):
     def _explorer_mode(self):
         return str(getattr(self.cfg, "inner_explorer_mode", "none"))
 
-    def _temperature_optimizer_step(self):
-        """Snapshot Adam's scalar step without transferring a CUDA value."""
-        state = self.state
-        if state.temperature_optim is None or state.log_alpha is None:
-            return torch.zeros((), device=self.device)
-        step = state.temperature_optim.state.get(state.log_alpha, {}).get("step", 0)
-        return torch.as_tensor(step, device=self.device).detach().clone()
-
     @property
     def _explorer_active(self):
         """Whether replay contains a labelled auxiliary population."""
@@ -601,7 +535,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         return initial_alpha.clamp_min(_INNER_ALPHA_FLOOR)
 
     def clear_all(self):
-        self._clear_held_policy(drop_pool=True)
+        self.last_teacher_policy = None
         self.state = InnerWorkspace()
         self._action_pool = InnerWorkspace()
         self.rng = self._new_rng(self.cfg.seed)
@@ -617,8 +551,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         # untouched and ordinary action/episode resets retain their cache.
         self._initialize_compile_regions()
 
-    def reset_for_evaluation(self, seed, *, reuse_action_pool=False,
-                             preserve_run_temperature=False):
+    def reset_for_evaluation(self, seed, *, reuse_action_pool=False):
         """Reset evaluation state and RNG, optionally retaining safe allocations.
 
         Paired controller evaluation reuses one engine that is never the live
@@ -630,42 +563,16 @@ class InnerImprovementEngine(RetraceInnerMixin):
         moments, replay and alpha
         before use. Keeping module identities also avoids recompiling Dynamo
         guards after every root. Other lifecycles still discard their pools.
-        Explicit temperature-chain evaluation may preserve only run-scoped
-        log-alpha and its Adam state across episode resets. It still resets
-        every other workspace field and the episode-private RNG streams.
         """
 
         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise ValueError("Evaluation inner-engine seed must be non-negative.")
         if not isinstance(reuse_action_pool, bool):
             raise TypeError("reuse_action_pool must be bool.")
-        if not isinstance(preserve_run_temperature, bool):
-            raise TypeError("preserve_run_temperature must be bool.")
         if self.rng._action_fork_depth != 0:
             raise RuntimeError(
                 "Cannot reset the evaluation inner engine during an active action."
             )
-        temperature_state = None
-        if preserve_run_temperature:
-            cfg, state = self.cfg, self.state
-            if not (
-                cfg.inner_operator == "sac"
-                and cfg.inner_temperature_mode == "auto"
-                and self._inner_entropy_enabled
-                and cfg.inner_temperature_scope == cfg.inner_temperature_optimizer_scope == "run"
-                and not self._explorer_active
-                and all(getattr(cfg, f"inner_{component}_scope") == "action"
-                        for component in ("actor", "critic", "replay", "actor_optimizer", "critic_optimizer"))
-                and cfg.inner_actor_writeback_coef == cfg.inner_critic_writeback_coef == 0
-            ):
-                raise ValueError("Temperature-chain reset requires only paired run-scoped automatic SAC temperature.")
-            if state.log_alpha is None or state.temperature_optim is None:
-                raise ValueError("Temperature-chain continuation requires an initialized alpha and Adam state.")
-            owned = [p for group in state.temperature_optim.param_groups for p in group["params"]]
-            if len(owned) != 1 or owned[0] is not state.log_alpha:
-                raise RuntimeError("Temperature optimizer does not own the retained log-alpha parameter.")
-            temperature_state = (state.log_alpha, state.temperature_optim,
-                                 state.temperature_lifetime_steps)
         retain_pool = (
             reuse_action_pool
             and str(self.cfg.inner_operator) in {"sac", "td3", "tdambi"}
@@ -679,9 +586,6 @@ class InnerImprovementEngine(RetraceInnerMixin):
             )
         )
         self.state = InnerWorkspace()
-        if temperature_state is not None:
-            (self.state.log_alpha, self.state.temperature_optim,
-             self.state.temperature_lifetime_steps) = temperature_state
         if not retain_pool:
             self._action_pool = InnerWorkspace()
         self.rng = self._new_rng(seed)
@@ -689,8 +593,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self.episode_index = 0
         self._mppi_prev_mean = None
         self._collect_diagnostics = True
+        self.last_teacher_policy = None
         self._pending_timers = {}
-        self._clear_held_policy(drop_pool=True)
         self._clear_critic_transfer()
         self._clear_parameter_noise_action_state()
         return self
@@ -715,6 +619,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
             self._parameter_noise_stddev = initial
 
     def _timer_start(self):
+        if self._teacher_only:
+            return None
         if self.device.type == "cuda":
             event = torch.cuda.Event(enable_timing=True)
             event.record()
@@ -722,6 +628,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
         return time.perf_counter()
 
     def _timer_stop(self, key, start):
+        if start is None:
+            return
         if self.device.type == "cuda":
             end = torch.cuda.Event(enable_timing=True)
             end.record()
@@ -746,7 +654,6 @@ class InnerImprovementEngine(RetraceInnerMixin):
     def reset_episode(self):
         """Clear action/episode state while preserving explicitly run-scoped state."""
         self.episode_index += 1
-        self._clear_held_policy()
         self._clear_critic_transfer()
         self._clear_expired(t0=True, include_action=True)
         if str(self.cfg.inner_mppi_warm_start_scope) != "run":
@@ -767,7 +674,6 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 "AMBI inner timing must be finalized before preparing a resume boundary."
             )
         self.reset_episode()
-        self._clear_held_policy(drop_pool=True)
         self._action_pool = InnerWorkspace()
         self._clear_action_transients()
         self._require_resume_boundary()
@@ -923,10 +829,6 @@ class InnerImprovementEngine(RetraceInnerMixin):
 
     def _require_resume_boundary(self):
         """Reject snapshots that would silently discard transient inner state."""
-        if (self._held_actor is not None or self._held_encoder is not None
-                or self._encoder_pool is not None or self._control_prepared is not None
-                or self._control_eval_mode is not None or self._episode_decision_index != 0):
-            raise RuntimeError("Held-policy state must be cleared at the episode resume boundary.")
         if self._critic_transfer_ready or self._critic_transfer_eval_mode is not None or self._critic_transfer_metrics:
             raise RuntimeError("Bernoulli transfer state must be cleared at the episode resume boundary.")
         if self._pending_timers:
@@ -1146,8 +1048,6 @@ class InnerImprovementEngine(RetraceInnerMixin):
             payload["retrace_spec"] = self._retrace_spec()
         if self._critic_transfer_spec() is not None:
             payload["critic_transfer_spec"] = self._critic_transfer_spec()
-        if self._held_policy_spec() is not None:
-            payload["held_policy_spec"] = self._held_policy_spec()
         return payload
 
     def _load_module_candidate(
@@ -1235,15 +1135,6 @@ class InnerImprovementEngine(RetraceInnerMixin):
             if any(type(saved_transfer[key]) is not type(value) for key, value in transfer_spec.items()):
                 raise ValueError("Inner Bernoulli transfer specification is incompatible.")
             common_keys.add("critic_transfer_spec")
-        held_spec = self._held_policy_spec()
-        if state.get("held_policy_spec") != held_spec:
-            raise ValueError("Inner held-policy specification is incompatible with exact continuation.")
-        if held_spec is not None:
-            saved_held = require_exact_keys(state["held_policy_spec"], set(held_spec),
-                                            "Inner held-policy specification")
-            if any(type(saved_held[key]) is not type(value) for key, value in held_spec.items()):
-                raise ValueError("Inner held-policy specification is incompatible.")
-            common_keys.add("held_policy_spec")
         lora_rl_spec = self._lora_rl_spec()
         initialization_spec = self._random_initialization_spec()
         horizon_spec = self._horizon_conditioning_spec()
@@ -1638,7 +1529,6 @@ class InnerImprovementEngine(RetraceInnerMixin):
 
     def _commit_training_state_candidate(self, candidate):
         """Install a candidate returned by strict preflight."""
-        self._clear_held_policy(drop_pool=True)
         self.state = candidate["state"]
         self._action_pool = InnerWorkspace()
         self.rng = candidate["rng"]
@@ -3764,6 +3654,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
         state.critic_steps += 1
         state.critic_lifetime_steps += 1
 
+        if self._teacher_only:
+            return {}
         metrics = {
             "critic_loss": critic_loss.detach(),
             "critic_grad_norm": torch.as_tensor(grad_norm).detach(),
@@ -4130,14 +4022,13 @@ class InnerImprovementEngine(RetraceInnerMixin):
 
     @staticmethod
     def _gaussian_kl(inner_info, outer_info):
-        inner_log_std = inner_info["log_std"]
-        outer_log_std = outer_info["log_std"]
-        mean_delta = inner_info["pre_tanh_mean"] - outer_info["pre_tanh_mean"]
-        ratio = (
-            inner_log_std.mul(2).exp() + mean_delta.square()
-        ) / outer_log_std.mul(2).exp().clamp_min(1e-12)
-        return (outer_log_std - inner_log_std + 0.5 * ratio - 0.5).sum(
-            dim=-1, keepdim=True
+        # Log-space variance ratios preserve the KL and its gradients even
+        # for narrow priors; flooring the prior variance changes the objective.
+        return td_math.diagonal_gaussian_reverse_kl(
+            inner_info["pre_tanh_mean"],
+            inner_info["log_std"],
+            outer_info["pre_tanh_mean"],
+            outer_info["log_std"],
         )
 
     @staticmethod
@@ -4189,12 +4080,14 @@ class InnerImprovementEngine(RetraceInnerMixin):
         # remains connected for the actor objective and is detached only by the
         # temperature update; it comes from this same policy sample.
         entropy_payload = (info["scaled_entropy"],) if scaled_entropy_enabled else ()
-        # Surface the exact sample already used by the compiled actor update so
-        # optional diagnostics can run eagerly without another policy forward
-        # or any additional RNG consumption. Lightweight test/downstream policy
-        # stubs that omit pre_tanh_action retain the historical 8-tuple seam.
+        # Surface the exact sample and distribution already used by the compiled
+        # actor update. Eager diagnostics need no extra forward or RNG draws.
+        # Keep a two-item payload; lightweight policy stubs without sample
+        # information retain the historical 8-tuple seam.
         actor_sample = (
-            (info["pre_tanh_action"].detach(), action.detach())
+            ({name: info[name].detach() for name in (
+                "pre_tanh_action", "mean", "log_std", "log_prob"
+            ) if name in info}, action.detach())
             if "pre_tanh_action" in info
             else ()
         )
@@ -4243,6 +4136,13 @@ class InnerImprovementEngine(RetraceInnerMixin):
         # Match TD-MPC2's Q-only normalization. Entropy and the optional
         # outer-policy KL retain their configured coefficients.
         scale_payload = ()
+        if q_scale is not None:
+            with torch.no_grad():
+                robust_range = percentile_range(
+                    q_pi.detach(), q_pi.new_tensor([5.0, 95.0])
+                )
+            if actor_sample:
+                actor_sample[0]["q_percentile_range"] = robust_range
         if q_scale is not None and not self._split_values and (
             getattr(cfg, "inner_actor_loss_scale_update", "per_action") == "per_update"
         ):
@@ -4250,9 +4150,6 @@ class InnerImprovementEngine(RetraceInnerMixin):
             # CompileRegion may retry eagerly after a lazy backend failure; the
             # caller commits only a successful proposal, exactly once.
             with torch.no_grad():
-                robust_range = percentile_range(
-                    q_pi.detach(), q_pi.new_tensor([5.0, 95.0])
-                )
                 proposed_scale = q_scale.detach().lerp(
                     robust_range, float(self._critic_owner.cfg.sac_actor_loss_scale_tau)
                 )
@@ -4412,7 +4309,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
             state.policy_evaluations += batch_size
 
             metrics = {}
-            if self._split_values:
+            if not self._teacher_only and self._split_values:
                 metrics.update(
                     actor_alpha_used=alpha.detach().reshape(()),
                     actor_effective_entropy_coefficient=(
@@ -4421,7 +4318,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                     ).reshape(()),
                     actor_value_composition_coefficient=state.value_composition[1].detach(),
                 )
-            if self._scaled_actor_entropy_enabled:
+            if not self._teacher_only and self._scaled_actor_entropy_enabled:
                 metrics.update(
                     actor_scaled_entropy=selected_entropy.detach().mean(),
                     actor_entropy_bonus=(
@@ -4441,70 +4338,79 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 state.actor_optim.step()
                 state.actor_steps += 1
                 state.actor_lifetime_steps += 1
-                metrics.update(
-                    actor_loss=actor_loss.detach(),
-                    actor_grad_norm=torch.as_tensor(actor_grad_norm).detach(),
-                    actor_q_mean=q_mean.detach(),
-                    actor_q_mean_all=q_mean_all.detach(),
-                    actor_q_min_all=q_min_all.detach(),
-                    actor_q_mean_all_minus_min_all=(
-                        q_mean_all_minus_min_all.detach()
-                    ),
-                    actor_entropy=entropy.detach().mean(),
-                )
-                if self._collect_diagnostics and actor_sample:
+                if not self._teacher_only:
                     metrics.update(
-                        self._tanh_saturation_metrics(
-                            actor_sample[0],
-                            actor_sample[1],
-                            prefix="actor_",
-                        )
+                        actor_loss=actor_loss.detach(),
+                        actor_grad_norm=torch.as_tensor(actor_grad_norm).detach(),
+                        actor_q_mean=q_mean.detach(),
+                        actor_q_mean_all=q_mean_all.detach(),
+                        actor_q_min_all=q_min_all.detach(),
+                        actor_q_mean_all_minus_min_all=(
+                            q_mean_all_minus_min_all.detach()
+                        ),
+                        actor_entropy=entropy.detach().mean(),
                     )
-                if float(cfg.inner_outer_policy_kl_coef) > 0.0:
-                    # This is the update-time regularizer statistic. When the
-                    # regularizer is disabled, omit it instead of publishing a
-                    # zero that could be mistaken for an evaluated KL.
-                    metrics["outer_policy_kl"] = kl_mean.detach()
+                    # Snapshot the divisor actually used by this update: the local
+                    # EMA mutates again in later updates retained in this history.
+                    scale_used = (
+                        alpha.new_ones(()) if actor_loss_scale is None
+                        else actor_loss_scale.detach().clone().reshape(())
+                    )
+                    metrics["actor_q_scale_used"] = scale_used
+                    metrics.update(entropy_coefficient_diagnostics(
+                        alpha, scale_used, cfg.inner_actor_entropy_mode,
+                        int(cfg.action_dim),
+                    ))
+                    if actor_sample:
+                        metrics.update(policy_sample_diagnostics(
+                            actor_sample[1], actor_sample[0],
+                        ))
+                    if actor_sample and "q_percentile_range" in actor_sample[0]:
+                        metrics["actor_q_percentile_range"] = actor_sample[0]["q_percentile_range"].reshape(())
+                        metrics["actor_q_percentile_range_over_scale"] = (
+                            metrics["actor_q_percentile_range"] / scale_used
+                        )
+                    if self._collect_diagnostics and actor_sample:
+                        metrics.update(
+                            self._tanh_saturation_metrics(
+                                actor_sample[0]["pre_tanh_action"],
+                                actor_sample[1],
+                                prefix="actor_",
+                            )
+                        )
+                    if float(cfg.inner_outer_policy_kl_coef) > 0.0:
+                        # This is the update-time regularizer statistic. When the
+                        # regularizer is disabled, omit it instead of publishing a
+                        # zero that could be mistaken for an evaluated KL.
+                        metrics["outer_policy_kl"] = kl_mean.detach()
             if update_temperature:
                 target_entropy = self._resolved_inner_target_entropy()
-                repeats = int(getattr(cfg, "inner_temperature_updates_per_actor", 1))
-                # Keep the original sample and loss reduction order. No new
-                # actor forward, replay draw, or RNG draw occurs in this loop.
-                # The next actor update observes the newly adapted alpha.
-                residual = (
-                    (selected_entropy - target_entropy).detach()
-                    if self._scaled_actor_entropy_enabled
-                    else -(log_prob + target_entropy).detach()
+                if self._scaled_actor_entropy_enabled:
+                    temperature_loss = (
+                        state.log_alpha
+                        * (selected_entropy - target_entropy).detach()
+                    ).mean()
+                else:
+                    temperature_loss = -(
+                        state.log_alpha * (log_prob + target_entropy).detach()
+                    ).mean()
+                state.temperature_optim.zero_grad(set_to_none=True)
+                temperature_loss.backward()
+                temperature_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    [state.log_alpha], self._temperature_grad_clip_maximum
                 )
-                temperature_losses = []
-                for _ in range(repeats):
-                    if self._scaled_actor_entropy_enabled:
-                        temperature_loss = (
-                            state.log_alpha * residual
-                        ).mean()
-                    else:
-                        temperature_loss = -(
-                            state.log_alpha * (-residual)
-                        ).mean()
-                    state.temperature_optim.zero_grad(set_to_none=True)
-                    temperature_loss.backward()
-                    temperature_grad_norm = torch.nn.utils.clip_grad_norm_(
-                        [state.log_alpha], self._temperature_grad_clip_maximum
+                state.temperature_optim.step()
+                with torch.no_grad():
+                    state.log_alpha.clamp_(min=_INNER_LOG_ALPHA_FLOOR)
+                state.temperature_steps += 1
+                state.temperature_lifetime_steps += 1
+                if not self._teacher_only:
+                    metrics.update(
+                        temperature_loss=temperature_loss.detach(),
+                        temperature_grad_norm=torch.as_tensor(
+                            temperature_grad_norm
+                        ).detach(),
                     )
-                    state.temperature_optim.step()
-                    with torch.no_grad():
-                        state.log_alpha.clamp_(min=_INNER_LOG_ALPHA_FLOOR)
-                    state.temperature_steps += 1
-                    state.temperature_lifetime_steps += 1
-                    temperature_losses.append(temperature_loss.detach())
-                metrics.update(
-                    temperature_loss=torch.stack(temperature_losses).mean(),
-                    temperature_grad_norm=torch.as_tensor(
-                        temperature_grad_norm
-                    ).detach(),
-                    temperature_entropy_residual=residual.mean(),
-                    temperature_updates=float(repeats),
-                )
             return metrics
 
     def _shared_mixture_policy_step(
@@ -4772,6 +4678,18 @@ class InnerImprovementEngine(RetraceInnerMixin):
                         f"{prefix}actor_entropy": info["entropy"].detach().mean(),
                     }
                 )
+                scale_used = (
+                    alpha.new_ones(()) if actor_loss_scale is None
+                    else actor_loss_scale.detach().clone().reshape(())
+                )
+                metrics[f"{prefix}actor_q_scale_used"] = scale_used
+                metrics.update(policy_sample_diagnostics(
+                    action, info, prefix=f"{prefix}actor_",
+                ))
+                metrics.update(entropy_coefficient_diagnostics(
+                    alpha, scale_used, cfg.inner_actor_entropy_mode,
+                    int(cfg.action_dim), prefix=f"{prefix}actor_",
+                ))
                 if self._collect_diagnostics and "pre_tanh_action" in info:
                     metrics.update(
                         self._tanh_saturation_metrics(
@@ -5010,6 +4928,15 @@ class InnerImprovementEngine(RetraceInnerMixin):
         }
         metrics.update(self._tanh_saturation_metrics(
             info["pre_tanh_action"].detach(), action.detach(), prefix="actor",
+        ))
+        metrics.update(policy_sample_diagnostics(action, info))
+        metrics["actor_q_scale_used"] = state.tdambi_scale.detach().clone().reshape(())
+        metrics["actor_q_percentile_range_over_scale"] = (
+            metrics["actor_q_percentile_range"] / metrics["actor_q_scale_used"]
+        )
+        metrics.update(entropy_coefficient_diagnostics(
+            action.new_tensor(float(cfg.tdambi_entropy_coef)),
+            metrics["actor_q_scale_used"], "tdmpc2_scaled", int(cfg.action_dim),
         ))
         return metrics
 
@@ -5652,6 +5579,31 @@ class InnerImprovementEngine(RetraceInnerMixin):
         return history
 
     @torch.no_grad()
+    def _capture_teacher_policy(self, root_z, policy, *, inner_bounds=True):
+        """Read the unscaled primary Gaussian without consuming action RNG."""
+        modes = tuple((module, bool(module.training)) for module in policy.modules())
+        options = (
+            {
+                "log_std_mapping": self.cfg.inner_log_std_mapping,
+                "log_std_min": self.cfg.inner_log_std_min,
+                "log_std_max": self.cfg.inner_log_std_max,
+            }
+            if inner_bounds else dict(self._actor_options)
+        )
+        if getattr(policy, "horizon_conditioning_horizon", None) is not None:
+            options["remaining_horizon"] = self._remaining_horizon(root_z)
+        try:
+            policy.eval()
+            stats = self.model.policy_stats(root_z, policy=policy, std_scale=1.0, **options)
+            self.last_teacher_policy = {
+                key: stats[key][0].detach().clone()
+                for key in ("pre_tanh_mean", "log_std")
+            }
+        finally:
+            for module, was_training in modes:
+                module.training = was_training
+
+    @torch.no_grad()
     def _execute_policy(
         self,
         root_z,
@@ -6027,51 +5979,6 @@ class InnerImprovementEngine(RetraceInnerMixin):
             "soft_score": soft_score.mean(),
             "model_steps": count * int(self.cfg.inner_rollout_horizon),
         }
-
-    @torch.no_grad()
-    def _root_entropy_samples(self, root_z, policy, noise=None):
-        """Estimate joint post-tanh entropy at this root, not update states.
-
-        Use the analytic Gaussian entropy plus a sampled stable tanh Jacobian.
-        One policy forward supplies all sample parameters. Cloning the existing
-        diagnostic generator preserves every learner and diagnostic RNG stream;
-        callers reuse the noise for the initial/final paired difference.
-        """
-        modes = tuple((module, module.training) for module in policy.modules())
-        try:
-            policy.eval()
-            info = self.model.policy_stats(
-                root_z, policy=policy, **self._inner_policy_kwargs(),
-                **self._horizon_kwargs(self._remaining_horizon(root_z)),
-            )
-        finally:
-            for module, training in modes:
-                module.training = training
-        mean, log_std = info["pre_tanh_mean"], info["log_std"]
-        if noise is None:
-            source = self.rng.generator("diagnostics")
-            generator = torch.Generator(device=source.device)
-            generator.set_state(source.get_state())
-            noise = torch.randn(
-                (int(self.cfg.inner_root_entropy_samples), *mean.shape),
-                device=mean.device, dtype=mean.dtype, generator=generator,
-            )
-        pre_tanh = mean.unsqueeze(0) + log_std.exp().unsqueeze(0) * noise
-        gaussian = (log_std + 0.5 * math.log(2 * math.pi * math.e)).sum(-1)
-        correction = td_math.tanh_log_abs_det_jacobian(pre_tanh).squeeze(-1)
-        samples = (gaussian.unsqueeze(0) + correction).flatten(1).mean(-1)
-        self.state.policy_evaluations += int(root_z.shape[0])
-        return samples, noise
-
-    @staticmethod
-    def _root_entropy_metrics(initial, final):
-        metrics = {"inner_root_entropy_samples": float(initial.numel())}
-        for label, samples in (("initial", initial), ("final", final),
-                               ("delta", final - initial)):
-            key = f"inner_root_entropy_{label}"
-            metrics[key] = samples.mean()
-            metrics[key + "_mc_se"] = samples.std(unbiased=True) / math.sqrt(samples.numel())
-        return metrics
 
     @torch.no_grad()
     def _diagnostics(self, root_z, improved_policy):
@@ -6551,6 +6458,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
         start,
         return_behavior_policy=False,
     ):
+        if self._teacher_only:
+            return self._teacher_result(root_z, model_steps=0)
         capture_behavior = bool(return_behavior_policy and not eval_mode)
         executed = self._execute_policy(
             root_z,
@@ -6582,34 +6491,27 @@ class InnerImprovementEngine(RetraceInnerMixin):
         eval_mode,
         start,
         return_behavior_policy=False,
+        capture_teacher_policy=False,
     ):
         cfg, state = self.cfg, self.state
         setup_start = self._timer_start()
         # LoRA adapter initialization uses ordinary PyTorch initializers; fork
         # it onto the private optimization stream so act() cannot advance the
         # outer learner's global RNG.
-        temperature_uninitialized = state.log_alpha is None
         with self.rng.fork("initialization"):
             self._prepare_workspace(t0=t0)
         self._timer_stop("inner_setup_seconds", setup_start)
-        root_entropy_initial = root_entropy_noise = None
-        if (self._collect_diagnostics and cfg.inner_operator == "sac"
-                and not self._materialized_explorer_active
-                and int(getattr(cfg, "inner_root_entropy_samples", 0)) > 0):
-            diagnostic_start = self._timer_start()
-            root_entropy_initial, root_entropy_noise = self._root_entropy_samples(
-                root_z, state.actor
-            )
-            self._timer_stop("inner_diagnostic_seconds", diagnostic_start)
         actor_loss_scale = None
+        actor_loss_scale_outer = None
+        actor_loss_scale_initial = None
         if self._sac_actor_loss_scale_enabled:
             # Start from the outer estimator without sharing its storage. The
             # default freezes this scale for the action; per-update mode commits
             # each successful actor kernel's proposal only to this local copy.
-            actor_loss_scale = self._critic_owner.actor_loss_scale.detach().clone()
+            actor_loss_scale_outer = self._critic_owner.actor_loss_scale.detach().clone()
+            actor_loss_scale = actor_loss_scale_outer.clone()
+            actor_loss_scale_initial = actor_loss_scale.clone()
         alpha_initial = self.alpha.detach().clone()
-        temperature_lifetime_steps_initial = state.temperature_lifetime_steps
-        temperature_optimizer_step_initial = self._temperature_optimizer_step()
         trace = self._active_trace
         if trace is not None:
             trace.record("initial", state, (
@@ -6645,11 +6547,14 @@ class InnerImprovementEngine(RetraceInnerMixin):
         update_slots = 0
         requested_update_slots = 0
         collected_transition_count = 0
+        teacher_model_steps = 0
         interval_updates_requested = 0
         for round_index in range(int(cfg.inner_rounds)):
             if trace is not None:
                 trace.round_index = round_index + 1
             for rollout in self._collection_chunks(root_z):
+                if self._teacher_only:
+                    teacher_model_steps += int(rollout["transition_count"])
                 if trace is not None:
                     trace.record("collection", state, {
                         "collection_transitions": rollout["transition_count"],
@@ -6730,7 +6635,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
                         allocations["temperature"][round_index],
                     )
                 self._timer_stop("inner_update_seconds", update_start)
-                update_history.extend(round_metrics)
+                if not self._teacher_only:
+                    update_history.extend(round_metrics)
                 update_slots += len(round_metrics)
             all_lengths.append(rollout["lengths"])
             reward_sums.append(rollout["reward_sums"])
@@ -6748,6 +6654,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 if trace.probes:
                     trace.probe(self, root_z, state.actor)
 
+        if capture_teacher_policy:
+            self._capture_teacher_policy(root_z, state.actor)
+        if self._teacher_only:
+            return self._teacher_result(root_z, model_steps=teacher_model_steps)
         execution_start = self._timer_start()
         capture_behavior = bool(return_behavior_policy and not eval_mode)
         selector_metrics = {}
@@ -6780,13 +6690,6 @@ class InnerImprovementEngine(RetraceInnerMixin):
         if self._collect_diagnostics:
             diagnostic_start = self._timer_start()
             diagnostic_metrics = self._diagnostics(root_z, selected_policy)
-            if root_entropy_initial is not None:
-                root_entropy_final, _ = self._root_entropy_samples(
-                    root_z, selected_policy, root_entropy_noise
-                )
-                diagnostic_metrics.update(self._root_entropy_metrics(
-                    root_entropy_initial, root_entropy_final
-                ))
             self._timer_stop("inner_diagnostic_seconds", diagnostic_start)
         else:
             diagnostic_metrics = {}
@@ -6864,19 +6767,6 @@ class InnerImprovementEngine(RetraceInnerMixin):
             inner_critic_optimizer_steps=float(state.critic_steps),
             inner_actor_optimizer_steps=float(state.actor_steps),
             inner_temperature_optimizer_steps=float(state.temperature_steps),
-            inner_temperature_updates_per_actor=float(
-                getattr(cfg, "inner_temperature_updates_per_actor", 1)
-            ),
-            inner_temperature_optimizer_step_initial=temperature_optimizer_step_initial,
-            inner_temperature_optimizer_step_final=self._temperature_optimizer_step(),
-            inner_temperature_lifetime_steps_initial=float(temperature_lifetime_steps_initial),
-            inner_temperature_lifetime_steps_final=float(state.temperature_lifetime_steps),
-            inner_temperature_episode_reset=float(
-                t0 and str(cfg.inner_temperature_scope) in {"action", "episode"}
-            ),
-            inner_temperature_chain_reset=float(
-                temperature_uninitialized and str(cfg.inner_temperature_scope) == "run"
-            ),
             inner_target_updates=float(state.target_steps),
             inner_critic_target_updates=float(state.critic_target_steps),
             inner_actor_target_updates=float(state.actor_target_steps),
@@ -7016,6 +6906,15 @@ class InnerImprovementEngine(RetraceInnerMixin):
         if actor_loss_scale is not None:
             metrics["inner_actor_loss_scale"] = actor_loss_scale.reshape(())
             metrics["inner_effective_alpha"] = alpha_final.mean()
+            metrics["inner_actor_loss_scale_outer"] = actor_loss_scale_outer.reshape(())
+            metrics["inner_actor_loss_scale_initial"] = actor_loss_scale_initial.reshape(())
+            metrics["inner_actor_loss_scale_initial_over_outer"] = (
+                actor_loss_scale_initial / actor_loss_scale_outer
+            ).reshape(())
+            metrics["inner_actor_loss_scale_final"] = actor_loss_scale.detach().clone().reshape(())
+            metrics["inner_actor_loss_scale_final_over_outer"] = (
+                actor_loss_scale / actor_loss_scale_outer
+            ).detach().reshape(())
         if self._collect_diagnostics and state.sampled_ids:
             sampled = torch.cat(state.sampled_ids)
             metrics["inner_replay_unique_fraction"] = (
@@ -7263,55 +7162,47 @@ class InnerImprovementEngine(RetraceInnerMixin):
             applied["inner_critic_writeback_applied"] = 1.0
         return applied
 
-    def _act_held(self, root_z, *, eval_mode, return_behavior_policy=False):
-        """Evaluate the retained actor once, without touching learner state."""
-        capture_behavior = bool(return_behavior_policy and not eval_mode)
-        policy_evaluations = self.state.policy_evaluations
-        try:
-            executed = self._execute_policy(
-                root_z, self._held_actor, eval_mode=eval_mode,
-                inner_bounds=True, return_info=capture_behavior,
-            )
-        finally:
-            self.state.policy_evaluations = policy_evaluations
-        if capture_behavior:
-            action, execution_info = executed
-            behavior_policy = {
-                "pre_tanh_mean": execution_info["pre_tanh_mean"][0].detach(),
-                "log_std": execution_info["log_std"][0].detach(),
-            }
-        else:
-            action, behavior_policy = executed, None
-        # Only measured work counters belong to a held action. In particular,
-        # absent losses, alpha updates and value probes are not zero samples.
-        work_keys = {
-            "inner_active", "inner_actions", "inner_model_steps_budget",
-            "inner_steps", "inner_model_steps", "inner_total_model_steps",
-            "inner_nominal_model_steps", "inner_realized_model_steps",
-            "inner_rounds", "inner_iterations", "inner_mppi_iterations",
-            "inner_requested_rollouts", "inner_rollouts", "inner_updates",
-            "inner_update_slots", "inner_requested_update_slots",
-            "inner_critic_optimizer_steps", "inner_actor_optimizer_steps",
-            "inner_temperature_optimizer_steps", "inner_target_updates",
-            "inner_critic_target_updates", "inner_actor_target_updates",
-            "inner_policy_evaluations", "inner_q_evaluations", "inner_replay_draws",
-            "inner_buffer_size", "inner_outer_replay_samples",
-            "inner_diagnostics_sampled", "inner_diagnostics_sample_count",
-            "inner_primary_rollouts", "inner_explorer_rollouts",
-            "inner_primary_transitions", "inner_explorer_transitions",
-            "inner_primary_replay_samples", "inner_explorer_replay_samples",
-            "inner_optimization_model_steps", "inner_selector_model_steps",
+    def _teacher_result(self, root_z, *, model_steps):
+        # Native eval execution draws no action noise, but does advance this
+        # CPU phase stream once. Preserve that protocol for exact continuation
+        # while omitting the unused deterministic action forward.
+        with self.rng.fork("execution"):
+            pass
+        self.state.policy_evaluations += int(root_z.shape[0])
+        counters = {
+            "inner_total_model_steps": float(model_steps),
+            "inner_actor_optimizer_steps": float(self.state.actor_steps),
+            "inner_critic_optimizer_steps": float(self.state.critic_steps),
+            "inner_temperature_optimizer_steps": float(self.state.temperature_steps),
         }
-        metrics = dict.fromkeys(work_keys, 0.0)
-        metrics.update(inner_actions=1.0, inner_policy_evaluations=float(root_z.shape[0]))
-        if self._critic_bernoulli_p > 0:
-            metrics.update(inner_critic_bernoulli_p=self._critic_bernoulli_p,
-                           inner_critic_bernoulli_applied=0.0)
-        if self._active_trace is not None:
-            self._active_trace.record("held", InnerWorkspace(), {})
-        if return_behavior_policy:
-            return action[0], metrics, [], behavior_policy
-        return action[0], metrics, []
+        return None, counters, []
+
+    def solve_teacher(self, root_z, *, t0=True):
+        """Run native SAC adaptation and return only its Gaussian and work counts.
+
+        The caller owns observation encoding and shared-model mode isolation,
+        exactly as for ``act``. Adaptation, private RNG advancement, and pooled
+        learner state match native evaluation with teacher capture; timers,
+        execution forward, and reporting reductions are omitted.
+        """
+        if self._teacher_only or getattr(self.rng, "_action_fork_depth", 0) or self._active_trace is not None:
+            raise RuntimeError("Teacher solves are not reentrant.")
+        if str(self.cfg.inner_operator) != "sac" or self._explorer_active:
+            raise ValueError("Teacher-only solves require single-policy inner SAC.")
+        if not torch.is_tensor(root_z) or root_z.ndim != 2 or root_z.shape[0] != 1:
+            raise ValueError("Teacher-only solves require root_z with shape [1, latent].")
+        self._teacher_only = True
+        try:
+            with torch.enable_grad():
+                _, counters, _ = self.act(
+                    root_z, t0=t0, eval_mode=True, collect_diagnostics=False,
+                    capture_teacher_policy=True, apply_inner_writeback=False,
+                )
+            if self.last_teacher_policy is None:
+                raise RuntimeError("Inner SAC did not produce a teacher distribution.")
+            return self.last_teacher_policy, counters
+        finally:
+            self._teacher_only = False
 
     def act(
         self,
@@ -7321,35 +7212,16 @@ class InnerImprovementEngine(RetraceInnerMixin):
         eval_mode=False,
         collect_diagnostics=True,
         return_behavior_policy=False,
-        apply_inner_writeback=False,
-        trace=None,
-    ):
-        try:
-            self.prepare_control(t0=t0, eval_mode=eval_mode)
-            result = self._act_with_trace(
-                root_z, t0=t0, eval_mode=eval_mode,
-                collect_diagnostics=collect_diagnostics,
-                return_behavior_policy=return_behavior_policy,
-                apply_inner_writeback=apply_inner_writeback, trace=trace,
-            )
-        except BaseException:
-            self.abort_control()
-            raise
-        self._control_prepared = None
-        return result
-
-    def _act_with_trace(
-        self,
-        root_z,
-        *,
-        t0=False,
-        eval_mode=False,
-        collect_diagnostics=True,
-        return_behavior_policy=False,
+        capture_teacher_policy=False,
         apply_inner_writeback=False,
         trace=None,
     ):
         """Run an action with an optional single-use observational recorder."""
+        self.last_teacher_policy = None
+        if not isinstance(capture_teacher_policy, bool):
+            raise TypeError("capture_teacher_policy must be bool.")
+        if capture_teacher_policy and str(self.cfg.inner_operator) != "sac":
+            raise ValueError("Teacher-policy capture requires inner SAC.")
         if trace is not None:
             from .inner_trace import InnerActionTrace
 
@@ -7390,9 +7262,11 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 root_z, t0=t0, eval_mode=eval_mode,
                 collect_diagnostics=collect_diagnostics,
                 return_behavior_policy=return_behavior_policy,
+                **({"capture_teacher_policy": True} if capture_teacher_policy else {}),
                 apply_inner_writeback=apply_inner_writeback,
             )
         except BaseException:
+            self.last_teacher_policy = None
             self._clear_critic_transfer()
             if trace is not None:
                 trace.abort()
@@ -7408,12 +7282,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
         eval_mode=False,
         collect_diagnostics=True,
         return_behavior_policy=False,
+        capture_teacher_policy=False,
         apply_inner_writeback=False,
     ):
-        cadence_active = self._solve_interval > 1
-        held = cadence_active and self._control_prepared[2]
-        if not cadence_active:
-            self._pending_timers = {}
+        self._pending_timers = {}
         start = self._timer_start()
         self.action_index += 1
         self._collect_diagnostics = bool(collect_diagnostics)
@@ -7430,16 +7302,9 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 operator in {"sac", "td3", "tdambi"}
                 and int(self.cfg.inner_rounds) == 0
             )
-            if held:
-                result = self._act_held(
-                    root_z, eval_mode=eval_mode,
-                    return_behavior_policy=return_behavior_policy,
-                )
-                if return_behavior_policy:
-                    action, metrics, lengths, behavior_policy = result
-                else:
-                    action, metrics, lengths = result
-            elif inactive:
+            if inactive:
+                if capture_teacher_policy:
+                    self._capture_teacher_policy(root_z, self._actor_base, inner_bounds=False)
                 if self._active_trace is not None:
                     self._active_trace.record(
                         "initial", self.state,
@@ -7472,6 +7337,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                     eval_mode=eval_mode,
                     start=start,
                     return_behavior_policy=return_behavior_policy,
+                    **({"capture_teacher_policy": True} if capture_teacher_policy else {}),
                 )
                 if return_behavior_policy:
                     action, metrics, lengths, behavior_policy = result
@@ -7482,7 +7348,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                     self.cfg.inner_actor_writeback_coef > 0.0
                     or self.cfg.inner_critic_writeback_coef > 0.0
                 )
-                if writeback_active:
+                if writeback_active and not self._teacher_only:
                     metrics.update(
                         {
                             "inner_actor_writeback_coef": float(
@@ -7520,31 +7386,17 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 if self.state.tdambi_scale_initialized:
                     metrics["inner_tdambi_q_scale_final"] = self.state.tdambi_scale.detach().clone().reshape(())
 
-            if cadence_active:
-                if not held:
-                    self._snapshot_held_actor()
-                decision = self._episode_decision_index
-                metrics.update(
-                    inner_solve_performed=float(not held),
-                    inner_policy_held=float(held),
-                    inner_solve_interval=float(self._solve_interval),
-                    inner_solve_index=float(decision // self._solve_interval),
-                    inner_action_age=float(decision % self._solve_interval),
-                    inner_episode_decision_index=float(decision),
-                )
-                self._timer_stop("inner_held_seconds" if held else "inner_solve_seconds", start)
-                self._episode_decision_index += 1
             self._timer_stop("inner_action_seconds", start)
 
             # Refresh after diagnostics/planning, since those calls may be the
             # first invocation that discovers an unsupported compiled critic.
-            metrics.update(self._compile_fallback_metrics())
+            if not self._teacher_only:
+                metrics.update(self._compile_fallback_metrics())
 
             # Action-scoped tensors are explicitly released after producing
             # the action; episode/run scopes survive by configuration.
-            if not held:
-                self._clear_expired(t0=False, include_action=True)
-            if self._critic_bernoulli_p > 0 and not held:
+            self._clear_expired(t0=False, include_action=True)
+            if self._critic_bernoulli_p > 0:
                 self._critic_transfer_ready = bool(not inactive and operator == "sac")
                 metrics.update(self._critic_transfer_metrics)
         if return_behavior_policy:

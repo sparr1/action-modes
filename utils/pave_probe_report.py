@@ -25,12 +25,19 @@ def summarize_batches(batches):
     """Keep each checkpoint and critic separate; never average their ratios away."""
     if not batches:
         raise ValueError("At least one probe batch is required.")
+    order = tuple(batches[0].get("settings", {}).get("gram_order", ("td", "mpr", "vfc", "curvature")))
+    noise = batches[0].get("settings", {}).get("action_noise_std")
+    if any(tuple(batch.get("settings", {}).get("gram_order", order)) != order
+           or batch.get("settings", {}).get("action_noise_std") != noise for batch in batches):
+        raise ValueError("Summarize one Gram basis and action-noise scale at a time.")
+    terms = order[1:]
     candidates = defaultdict(list)
     for batch in batches:
         for row in batch["candidates"]:
-            candidates[(row["variant"], row["scope"], row["scale"])].append(row)
+            candidates[(row["variant"], row["scope"], row["scale"],
+                        row.get("action_smoothness_coef", 0.))].append(row)
     summaries = []
-    for (variant, scope, scale), rows in sorted(candidates.items()):
+    for (variant, scope, scale, action_coef), rows in sorted(candidates.items()):
         summaries.append({
             "variant": variant, "scope": scope, "scale": scale,
             "weights": rows[0]["weights"],
@@ -44,13 +51,14 @@ def summarize_batches(batches):
                for metric in ("full_gradient_norm", "clip_multiplier",
                               "clip_multiplier_relative_to_baseline")},
         })
+        if "action_smoothness" in terms:
+            summaries[-1].update(action_smoothness_coef=action_coef, action_noise_std=noise)
     critics = {}
     for name in batches[0]["critics"]:
         rows = [batch["critics"][name] for batch in batches]
-        order = ("td", "mpr", "vfc", "curvature")
         cosines = defaultdict(list)
         for row in rows:
-            for i, j in combinations(range(4), 2):
+            for i, j in combinations(range(len(order)), 2):
                 gram = row["gradient_gram"]
                 a, b, dot = gram[i][i], gram[j][j], gram[i][j]
                 value = (dot / math.sqrt(a * b)
@@ -62,13 +70,13 @@ def summarize_batches(batches):
                for metric in ("td_gradient_norm", "action_gradient_rms",
                               "curvature_violation_fraction")},
             **{group: {term: distribution(row[group][term] for row in rows)
-                       for term in ("mpr", "vfc", "curvature")}
+                       for term in terms}
                for group in ("raw_losses", "weighted_term_gradient_norms")},
             "term_gradient_ratios_to_td": {
                 term: distribution(row["weighted_term_gradient_norms"][term] / row["td_gradient_norm"]
                                    if row["td_norm_reliable"] and row["weighted_term_gradient_norms"][term] is not None
                                    else None for row in rows)
-                for term in ("mpr", "vfc", "curvature")
+                for term in terms
             },
             "gradient_cosines": {pair: distribution(values) for pair, values in cosines.items()},
         }
@@ -98,7 +106,7 @@ def recommend_scales(checkpoints):
     groups = defaultdict(list)
     for index, checkpoint in enumerate(checkpoints):
         for row in checkpoint["summary"]["candidates"]:
-            if row["variant"] == "reference":
+            if row["variant"] == "reference" and row.get("action_smoothness_coef", 0.) == 0.:
                 groups[(row["scope"], row["scale"])].append((index, row))
     screened = defaultdict(list)
     for (scope, scale), rows in sorted(groups.items()):
@@ -139,6 +147,7 @@ def recommend_scales(checkpoints):
             for index, checkpoint in enumerate(checkpoints):
                 match = next((row for row in checkpoint["summary"]["candidates"]
                               if row["variant"] == "stronger_curvature"
+                              and row.get("action_smoothness_coef", 0.) == 0.
                               and row["scope"] == scope and row["scale"] == scale), None)
                 if match is not None:
                     stronger.append({"checkpoint_index": index, **match})
@@ -167,29 +176,46 @@ def _number(value):
 
 
 def render_report(result):
+    if result.get("version", 1) >= 2:
+        sections = []
+        for i, recommendations in enumerate(result["recommendations_by_action_noise_std"]):
+            noise = recommendations["action_noise_std"]
+            view = {
+                "checkpoints": [dict(checkpoint, **checkpoint["action_noise_results"][i])
+                                for checkpoint in result["checkpoints"]],
+                "recommendations": recommendations,
+            }
+            sections.append(f"# Action noise standard deviation {noise:g}\n\n" + render_report(view))
+        return "\n".join(sections)
     lines = ["# Frozen PAVE gradient probe", "",
              "No optimizer or target updates were performed. Ratios compare PAVE with the saved, weighted TD objective.",
              "Timing covers diagnostic forwards and separate gradient measurements; it is not full-update training overhead.", ""]
     for index, checkpoint in enumerate(result["checkpoints"]):
         summary = checkpoint["summary"]
+        terms = tuple(next(iter(summary["critics"].values()))["term_gradient_ratios_to_td"])
+        include_action = "action_smoothness" in terms
         lines.extend([f"## Checkpoint {index}: {checkpoint['checkpoint']['path']}", "",
                       f"Source: `{checkpoint['bank']['provenance']['source_kind']}`. "
                       f"Batches: {summary['batch_count']}. SHA256: `{checkpoint['checkpoint']['sha256']}`.", "",
-                      "| Critic | TD norm median | MPR/TD norm | VFC/TD norm | Curvature/TD norm | Curvature violations |",
-                      "|---|---:|---:|---:|---:|---:|"])
+                      "| Critic | TD norm median | " + " | ".join(f"{term}/TD norm" for term in terms) + " | Curvature violations |",
+                      "|---|---:|" + "---:|" * (len(terms) + 1)])
         for name, row in summary["critics"].items():
             values = [row["td_gradient_norm"]["median"],
-                      *[row["term_gradient_ratios_to_td"][t]["median"] for t in ("mpr", "vfc", "curvature")],
+                      *[row["term_gradient_ratios_to_td"][t]["median"] for t in terms],
                       row["curvature_violation_fraction"]["median"]]
             lines.append(f"| {name} | " + " | ".join(map(_number, values)) + " |")
         lines.extend(["", "Term ratios above use the reference coefficients (0.1, 0.1, 0.01) at k=1.", "",
-                      "| Variant | Scope | k | Critic | PAVE/TD median | P90 | Cosine median | Relative clip min |",
-                      "|---|---|---:|---|---:|---:|---:|---:|"])
+                      *( ["The action-smoothness term ratio uses coefficient 1 (raw). Candidate action coefficients are absolute, independent of k.",
+                           "Action candidates are diagnostics only; common-scale screening below applies to PAVE with action coefficient zero.", ""]
+                         if include_action else []),
+                      "| Variant | Scope | k | " + ("Action coefficient | " if include_action else "") + "Critic | PAVE/TD median | P90 | Cosine median | Relative clip min |",
+                      "|---|---|---:|" + ("---:|" if include_action else "") + "---|---:|---:|---:|---:|"])
         for row in summary["candidates"]:
             for name, metrics in row["critics"].items():
                 values = [metrics["ratio_to_td"]["median"], metrics["ratio_to_td"]["p90"],
                           metrics["cosine_with_td"]["median"], row["clip_multiplier_relative_to_baseline"]["min"]]
-                lines.append(f"| {row['variant']} | {row['scope']} | {row['scale']:g} | {name} | "
+                lines.append(f"| {row['variant']} | {row['scope']} | {row['scale']:g} | "
+                             + (f"{row['action_smoothness_coef']:g} | " if include_action else "") + f"{name} | "
                              + " | ".join(map(_number, values)) + " |")
         timing = summary["timing"]
         lines.extend(["", f"Median diagnostic time: ordinary losses {_number(timing['baseline_seconds']['median'])} s; "

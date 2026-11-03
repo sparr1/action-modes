@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 
 from . import init, layers, math
+from .ensemble_vmap import grouped_vmap_spec, grouped_vectorized_forward
 from .horizon_conditioning import pack_horizon_input
 from .q_representation import QRepresentation, SymexpTwoHotCodec
 from .value_semantics import ValueSpecification, reduce_components
@@ -217,6 +218,53 @@ class SoftWorldModel(nn.Module):
                 self._target_aux_return_Qs.buffers(), self._aux_return_Qs.buffers()
             ):
                 target_buffer.copy_(buffer)
+
+    def _joint_q_ensembles(self, target):
+        if target:
+            return self._target_Qs, self._target_aux_return_Qs
+        return self._Qs, self._aux_return_Qs
+
+    def joint_q_compatible(self, *, target=False):
+        """Preflight both dense ensembles without tensor work or random draws."""
+        return self.joint_q_spec(target=target) is not None
+
+    def joint_q_spec(self, *, target=False):
+        """Return the eager-validated layout to pass into compiled tensor regions."""
+        if self.value_spec.is_split or not hasattr(self, "_aux_return_Qs"):
+            return None
+        return grouped_vmap_spec(
+            self._joint_q_ensembles(target), layers.NormedLinear,
+        )
+
+    def joint_q_predictions(
+        self, z, action, aux_z, aux_action, *, target=False, specifications=None,
+    ):
+        """Batch independent primary/return heads, keeping their outputs separate.
+
+        The caller selects this path before sampling. Unsupported layouts are
+        never retried here, and all parameters remain in their original modules.
+        """
+        primary_input = self.joint_input(z, action)
+        auxiliary_input = (
+            primary_input if aux_z is z and aux_action is action
+            else self.joint_input(aux_z, aux_action)
+        )
+        return self.joint_q_predictions_from_joint(
+            primary_input, auxiliary_input, target=target, specifications=specifications,
+        )
+
+    def joint_q_predictions_from_joint(
+        self, primary_input, auxiliary_input, *, target=False, specifications=None,
+    ):
+        """Use already packed inputs, shared with the reward model when possible."""
+        ensembles = self._joint_q_ensembles(target)
+        if specifications is None:
+            specifications = grouped_vmap_spec(ensembles, layers.NormedLinear)
+        if specifications is None:
+            raise ValueError("Joint critic vmap requires compatible dense ensembles.")
+        return grouped_vectorized_forward(
+            ensembles, (primary_input, auxiliary_input), specifications,
+        )
 
     def aux_return_q_predictions(self, z, action, *, target=False, detach=False):
         """Evaluate the independent, reward-only ensemble without split layout."""

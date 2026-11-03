@@ -18,6 +18,7 @@ from .pave import critic_pave_loss, prepare_pave_inputs
 
 
 _TERMS = ("mpr", "vfc", "curvature")
+_ACTION_TERM = "action_smoothness"
 _VARIANTS = {
     "reference": (.1, .1, .01),
     "stronger_curvature": (.1, .1, .1),
@@ -56,20 +57,30 @@ def _norm_from_squared(value):
     return math.sqrt(max(value, 0.0)) if math.isfinite(value) else float("nan")
 
 
+def _weighted_geometry(gram, weights):
+    """Exclude disabled terms before arithmetic, including nonfinite rows."""
+    active = weights != 0.
+    selected = weights[active]
+    pave = gram[1:, 1:][active][:, active]
+    squared = float(selected @ pave @ selected)
+    dot = float(gram[0, 1:][active] @ selected)
+    sum_norms = sum(abs(float(weight)) * _norm_from_squared(norm_squared)
+                    for weight, norm_squared in zip(selected, pave.diagonal()))
+    return squared, dot, sum_norms
+
+
 def _candidate_statistics(gram, weights, td_norm_floor):
     """Evaluate a PAVE combination in weighted-TD/raw-PAVE Gram coordinates."""
     gram = torch.as_tensor(gram, dtype=torch.float64, device="cpu")
     if isinstance(weights, dict):
-        weights = [weights[term] for term in _TERMS]
+        terms = (*_TERMS, _ACTION_TERM) if gram.shape[0] == 5 else _TERMS
+        weights = [weights[term] for term in terms]
     weights = torch.as_tensor(weights, dtype=torch.float64, device="cpu")
     td_norm = _norm_from_squared(gram[0, 0])
-    pave_squared = float(weights @ gram[1:, 1:] @ weights)
-    dot = float(gram[0, 1:] @ weights)
+    pave_squared, dot, sum_term_norms = _weighted_geometry(gram, weights)
     pave_norm = _norm_from_squared(pave_squared)
     reliable = math.isfinite(td_norm) and td_norm > td_norm_floor
     finite = math.isfinite(pave_norm) and math.isfinite(dot)
-    sum_term_norms = sum(abs(float(weight)) * _norm_from_squared(gram[index + 1, index + 1])
-                         for index, weight in enumerate(weights))
     return {
         "pave_gradient_norm": pave_norm,
         "ratio_to_td": pave_norm / td_norm if reliable and finite else None,
@@ -205,11 +216,13 @@ def _validate(agent, obs, action, reward, terminated, critics, seed, update_numb
 def probe_batch(agent, obs, action, reward, terminated, *, seed, update_number,
                 critics=None, batch_size=64, obs_noise_std=.01,
                 curvature_margin=1., scales=(.01, .03, .1, .3, 1., 3., 10.),
-                td_norm_floor=1e-10):
+                td_norm_floor=1e-10, action_noise_std=.02, action_smoothness_coefs=(0.,)):
     """Return strict-JSONable diagnostics without changing learned agent state.
 
-    ``gradient_gram`` uses [weighted TD, raw MPR, raw VFC, raw curvature].
+    ``gradient_gram`` uses [weighted TD, raw MPR, raw VFC, raw curvature],
+    appending raw action smoothness when a positive action coefficient is tested.
     Candidate ``weights`` are the actual coefficients after multiplying by k.
+    Action coefficients are absolute and are not multiplied by k.
     Ratios/cosines are null when their TD denominator is unreliable. Existing
     PAVE settings are replaced by the candidate grid, not added a second time.
     With ``critics=None``, all available critics are selected; explicit missing
@@ -221,6 +234,17 @@ def probe_batch(agent, obs, action, reward, terminated, *, seed, update_number,
         critics = tuple(name for name, attribute in _CRITIC_ATTRS.items() if hasattr(agent.model, attribute))
     selected = _validate(agent, obs, action, reward, terminated, critics, seed, update_number,
                          batch_size, obs_noise_std, curvature_margin, scales, td_norm_floor)
+    if (isinstance(action_noise_std, bool) or not isinstance(action_noise_std, numbers.Real)
+            or not math.isfinite(action_noise_std) or action_noise_std < 0.):
+        raise ValueError("action_noise_std must be finite and nonnegative.")
+    if not action_smoothness_coefs or any(
+        isinstance(value, bool) or not isinstance(value, numbers.Real)
+        or not math.isfinite(value) or value < 0. for value in action_smoothness_coefs
+    ) or len(set(action_smoothness_coefs)) != len(action_smoothness_coefs):
+        raise ValueError("action_smoothness_coefs must contain unique finite nonnegative numbers.")
+    include_action = any(value > 0. for value in action_smoothness_coefs)
+    terms = (*_TERMS, _ACTION_TERM) if include_action else _TERMS
+    reference_weights = (*_VARIANTS["reference"], 1.) if include_action else _VARIANTS["reference"]
     device = torch.device(agent.device)
     parameter_dtype = next(agent.model.parameters()).dtype
     obs, action, reward, terminated = (
@@ -280,6 +304,7 @@ def probe_batch(agent, obs, action, reward, terminated, *, seed, update_number,
         inputs = prepare_pave_inputs(
             agent.model, obs, action, seed=agent.cfg.seed, update_number=update_number,
             batch_size=batch_size, obs_noise_std=obs_noise_std,
+            action_noise_std=action_noise_std, needs_action_noise=include_action,
         )
         critic_results, grams = {}, {}
         for name, owned in critic_parameters.items():
@@ -288,10 +313,11 @@ def probe_batch(agent, obs, action, reward, terminated, *, seed, update_number,
                 inputs["z"], inputs["action"], noisy_z=inputs["noisy_z"],
                 next_z=inputs["next_z"], probe=inputs["probe"],
                 mpr_coef=1., vfc_coef=1., curvature_coef=1.,
+                noisy_action=inputs["noisy_action"], action_smoothness_coef=float(include_action),
                 curvature_margin=curvature_margin, return_components=True,
             )
-            gradients = [_gradient(components[term], owned, retain_graph=index < len(_TERMS) - 1)
-                         for index, term in enumerate(_TERMS)]
+            gradients = [_gradient(components[term], owned, retain_graph=index < len(terms) - 1)
+                         for index, term in enumerate(terms)]
             vectors = [td_gradients[name], *gradients]
             gram = _gram(vectors).cpu()
             grams[name] = gram
@@ -301,14 +327,14 @@ def probe_batch(agent, obs, action, reward, terminated, *, seed, update_number,
                                         else agent.cfg.aux_return_critic_coef),
                 "td_gradient_norm": td_norm,
                 "td_norm_reliable": math.isfinite(td_norm) and td_norm > td_norm_floor,
-                "raw_losses": {term: components[term].detach() for term in _TERMS},
+                "raw_losses": {term: components[term].detach() for term in terms},
                 "weighted_term_gradient_norms": {
                     term: weight * _norm_from_squared(gram[index + 1, index + 1])
-                    for index, (term, weight) in enumerate(zip(_TERMS, _VARIANTS["reference"]))
+                    for index, (term, weight) in enumerate(zip(terms, reference_weights))
                 },
                 "gradient_gram": gram,
                 "finite_gradient_fractions": {term: _finite_fraction(vector)
-                                              for term, vector in zip(("td", *_TERMS), vectors)},
+                                              for term, vector in zip(("td", *terms), vectors)},
                 "action_gradient_rms": diagnostics["action_gradient_rms"],
                 "curvature_violation_fraction": diagnostics["curvature_violation_fraction"],
             }
@@ -322,38 +348,52 @@ def probe_batch(agent, obs, action, reward, terminated, *, seed, update_number,
         if len(selected) > 1:
             scopes.append(("combined", selected))
         candidates = []
+        combinations = []
         for variant, base_weights in _VARIANTS.items():
             for scale in scales:
-                weights = torch.tensor(base_weights, dtype=torch.float64) * float(scale)
-                for scope, names in scopes:
-                    squared = baseline_squared
-                    for name in names:
-                        gram = grams[name]
-                        # Critic parameter sets are disjoint, so there is no
-                        # primary/auxiliary PAVE cross term. TD/PAVE cross
-                        # terms within each critic are retained explicitly.
-                        squared += float(2. * gram[0, 1:] @ weights
-                                         + weights @ gram[1:, 1:] @ weights)
-                    norm = _norm_from_squared(squared)
-                    clip = _clip_multiplier(norm, clip_limit)
-                    candidates.append({
-                        "variant": variant, "scope": scope, "scale": float(scale),
-                        "weights": dict(zip(_TERMS, weights.tolist())),
-                        "critics": {name: _candidate_statistics(grams[name], weights, td_norm_floor)
-                                    for name in names},
-                        "full_gradient_norm": norm, "clip_multiplier": clip,
-                        "clip_multiplier_relative_to_baseline": clip / baseline_clip
-                        if clip is not None and baseline_clip is not None and baseline_clip > 0. else None,
-                    })
+                action_coefs = sorted({0., *action_smoothness_coefs}) if include_action else (0.,)
+                for action_coef in action_coefs:
+                    weights = [float(scale) * weight for weight in base_weights]
+                    if include_action:
+                        weights.append(float(action_coef))
+                    combinations.append((variant, float(scale), weights))
+        if include_action:
+            combinations.extend(("action_smoothness", 1., [0., 0., 0., float(coef)])
+                                for coef in action_smoothness_coefs if coef > 0.)
+        for variant, scale, candidate_weights in combinations:
+            weights = torch.tensor(candidate_weights, dtype=torch.float64)
+            for scope, names in scopes:
+                squared = baseline_squared
+                for name in names:
+                    gram = grams[name]
+                    # Critic parameter sets are disjoint, so there is no
+                    # primary/auxiliary PAVE cross term. TD/PAVE cross
+                    # terms within each critic are retained explicitly.
+                    contribution, dot, _ = _weighted_geometry(gram, weights)
+                    squared += 2. * dot + contribution
+                norm = _norm_from_squared(squared)
+                clip = _clip_multiplier(norm, clip_limit)
+                candidates.append({
+                    "variant": variant, "scope": scope, "scale": float(scale),
+                    "weights": dict(zip(terms, weights.tolist())),
+                    "critics": {name: _candidate_statistics(grams[name], weights, td_norm_floor)
+                                for name in names},
+                    "full_gradient_norm": norm, "clip_multiplier": clip,
+                    "clip_multiplier_relative_to_baseline": clip / baseline_clip
+                    if clip is not None and baseline_clip is not None and baseline_clip > 0. else None,
+                })
+                if include_action:
+                    candidates[-1].update(action_smoothness_coef=candidate_weights[-1],
+                                          action_noise_std=float(action_noise_std))
         report = {
-            "schema": "ambi-pave-gradient-probe-batch", "version": 1,
+            "schema": "ambi-pave-gradient-probe-batch", "version": 2 if include_action else 1,
             "seed": int(seed), "update_number": int(update_number),
             "sample_count": inputs["action"].shape[0],
             "settings": {
                 "critics": selected, "batch_size": int(batch_size) if batch_size is not None else None,
                 "obs_noise_std": float(obs_noise_std), "curvature_margin": float(curvature_margin),
                 "td_norm_floor": float(td_norm_floor),
-                "gram_order": ["td", *_TERMS], "gram_basis": "weighted_td_and_raw_pave",
+                "gram_order": ["td", *terms], "gram_basis": "weighted_td_and_raw_pave",
                 "td_seed": int(seed), "pave_training_seed": int(agent.cfg.seed),
                 "train_unroll_horizon": int(agent.cfg.train_unroll_horizon),
                 "td_batch_size": int(agent.cfg.batch_size), "action_dim": int(agent.cfg.action_dim),
@@ -365,4 +405,10 @@ def probe_batch(agent, obs, action, reward, terminated, *, seed, update_number,
                        "kind": "diagnostic_forward_and_gradients"},
             "cuda_memory": peak_memory,
         }
+        if include_action:
+            report["settings"].update(
+                action_noise_std=float(action_noise_std),
+                action_smoothness_coefs=list(action_smoothness_coefs),
+                term_diagnostic_weights=dict(zip(terms, reference_weights)),
+            )
     return _jsonable(report)
