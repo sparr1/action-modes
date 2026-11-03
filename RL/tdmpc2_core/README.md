@@ -92,6 +92,12 @@ state-observation SAC training recipe. It requires strict compiled regions,
 fresh prior-initialized actor and reward-only critic clones, action-scoped
 optimizers/replay/temperature, and no auxiliary critic, writeback, explorer,
 or replay transfer. Unsupported configurations fail rather than falling back.
+Automatic temperature may instead use paired `run` scopes for alpha and its
+Adam optimizer, with Q normalization disabled. The live engine owns this state;
+the captured worker imports alpha and all Adam buffers before each solve and
+exports them afterward. Actor, critic, and replay still reset every decision.
+Capture warmup is discarded, episode resets retain alpha, and native diagnostic
+solves and exact checkpoint recapture continue the same temperature trajectory.
 The six inner-entropy campaign arms use this path with matching inner/outer
 `tdmpc2_scaled` or `squashed` entropy and percentile-range Q normalization.
 
@@ -130,6 +136,17 @@ Run the six numerical cases inside a scheduled CUDA allocation with:
 WANDB_MODE=disabled environments/dmcontrol/.venv/bin/python -m pytest -q \
   tests/test_inner_entropy_graph.py::test_cuda_capture_matches_uncaptured_normalized_solve
 ```
+
+`configs/dmcontrol/experiments/ambi_prior_entropy_ablation.json` defines three
+Humanoid H3/J8/K1, seed55, one-million-decision runs: post-tanh coefficient
+0.0001 with carried/adapted Q scale; automatic post-tanh entropy with fresh inner
+alpha; and the same automatic recipe with run-scoped alpha and Adam. Both auto
+arms start outer alpha at 1.0, target joint entropy -10.5, disable Q scaling,
+and keep reward-only critics and TD-MPC2 policy architecture. The first inner
+solve inherits outer alpha; later solves either re-inherit or carry it according
+to the arm. All arms retain every 25k checkpoint and critic geometry diagnostics.
+`slurm/run_prior_entropy_ablation_oscar.sbatch` uses the corresponding GPU parity,
+production-shape timing, diagnostic-continuation, checkpoint, and workspace gates.
 
 ### Critic initialization and policy probabilities
 

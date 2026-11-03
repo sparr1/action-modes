@@ -74,12 +74,13 @@ def inner_snapshot(engine):
     for name in ("actor", "critic", "critic_target", "actor_target"):
         module = getattr(pool, name)
         result[name] = None if module is None else deepcopy(module.state_dict())
-    result["alpha_fixed"] = deepcopy(pool.alpha_fixed)
-    result["log_alpha"] = deepcopy(pool.log_alpha)
+    temperature = engine.state if engine.cfg.inner_temperature_scope == "run" else pool
+    result["alpha_fixed"] = deepcopy(temperature.alpha_fixed)
+    result["log_alpha"] = deepcopy(temperature.log_alpha)
     result["replay"] = pool.replay._storage[:pool.replay.size].detach().clone()
     result["replay_metadata"] = (pool.replay.size, pool.replay.pos, pool.replay.full, pool.replay.next_sample_id)
     result["optimizers"] = {
-        name: None if getattr(pool, name) is None else deepcopy(getattr(pool, name).state_dict())
+        name: None if getattr(temperature if name == "temperature_optim" else pool, name) is None else deepcopy(getattr(temperature if name == "temperature_optim" else pool, name).state_dict())
         for name in ("actor_optim", "critic_optim", "temperature_optim")
     }
     return result
@@ -278,6 +279,10 @@ def assert_graph_resume_continuation(agent):
             if index:
                 with torch.no_grad():
                     next(agent.model._pi.parameters()).add_(.0001)
+                    if agent.log_ent_coef is not None:
+                        agent.log_ent_coef.add_(.03)
+            alpha_before = engine.alpha.detach().clone()
+            lifetime_before = engine.state.temperature_lifetime_steps
             observation = torch.full(agent.cfg.obs_shape["state"], .1 * index)
             action = agent.act(observation, t0=index == 0, collect_diagnostics=diagnostic)
             metrics = deepcopy(agent.last_inner_metrics)
@@ -285,13 +290,25 @@ def assert_graph_resume_continuation(agent):
             assert metrics["inner_cuda_graph_used"] == float(not diagnostic)
             assert metrics["inner_critic_optimizer_steps"] == agent.cfg.inner_critic_updates_per_action
             assert metrics["inner_actor_optimizer_steps"] == agent.cfg.inner_actor_updates_per_action
-            assert metrics["inner_temperature_optimizer_steps"] == 0
+            assert metrics["inner_temperature_optimizer_steps"] == agent.cfg.inner_temperature_updates_per_action
+            if agent.cfg.inner_temperature_mode == "auto":
+                if agent.cfg.inner_temperature_scope == "run":
+                    assert metrics["inner_alpha_initial"] == pytest.approx(alpha_before.item())
+                    assert metrics["inner_temperature_lifetime_steps_initial"] == lifetime_before
+                    assert metrics["inner_temperature_lifetime_steps_final"] == lifetime_before + agent.cfg.inner_temperature_updates_per_action
+                    assert metrics["inner_temperature_optimizer_step_initial"] == lifetime_before
+                    assert metrics["inner_temperature_optimizer_step_final"] == engine.state.temperature_lifetime_steps
+                    assert metrics["inner_temperature_episode_reset"] == 0
+                else:
+                    assert metrics["inner_alpha_initial"] == pytest.approx(agent.alpha.item())
+                    assert metrics["inner_temperature_optimizer_step_initial"] == 0
             expected_initial = (float(previous.item()) if engine._carry_actor_loss_scale and previous is not None
                                 else 4. + index)
-            assert metrics["inner_actor_loss_scale_initial"] == pytest.approx(expected_initial)
-            assert metrics["inner_actor_loss_scale_outer"] == pytest.approx(4. + index)
-            if agent.cfg.inner_actor_loss_scale_update == "per_action":
-                assert metrics["inner_actor_loss_scale_final"] == pytest.approx(expected_initial)
+            if engine._sac_actor_loss_scale_enabled:
+                assert metrics["inner_actor_loss_scale_initial"] == pytest.approx(expected_initial)
+                assert metrics["inner_actor_loss_scale_outer"] == pytest.approx(4. + index)
+                if agent.cfg.inner_actor_loss_scale_update == "per_action":
+                    assert metrics["inner_actor_loss_scale_final"] == pytest.approx(expected_initial)
             torch.testing.assert_close(agent.actor_loss_scale, torch.full_like(agent.actor_loss_scale, 4. + index))
             if engine._carry_actor_loss_scale:
                 previous = engine._carried_actor_loss_scale.detach().clone()

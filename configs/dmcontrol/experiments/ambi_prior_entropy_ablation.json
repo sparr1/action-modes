@@ -1,0 +1,28 @@
+{
+  "study_type": "prior_entropy_nod_and_auto",
+  "study_note": "H3/J8/K1 Humanoid seed55, one million decisions. Reference post-tanh carry-Q recipe without dimension multiplication; automatic post-tanh entropy with reward-only critics and TD-MPC2 architecture, with fresh or run-carried inner alpha and Adam. Auto target -10.5, initial alpha1. All accelerations and observational critic geometry retained. Every25k checkpoint retained.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_prior_entropy_nod_carry_q",
+    "ambi_prior_entropy_auto_action",
+    "ambi_prior_entropy_auto_run"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

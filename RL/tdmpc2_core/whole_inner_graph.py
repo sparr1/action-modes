@@ -10,6 +10,7 @@ adapter below checkpoints its own stream in a distinct graph lineage.
 
 from contextlib import contextmanager
 from copy import deepcopy
+from types import SimpleNamespace
 import time
 
 import torch
@@ -46,8 +47,7 @@ def validate_graph_workload(engine):
         "critic_value_mode": "single", "inner_horizon_conditioning": "none",
     }
     expected.update({f"inner_{name}_scope": "action" for name in (
-        "actor", "critic", "temperature", "replay", "actor_optimizer",
-        "critic_optimizer", "temperature_optimizer",
+        "actor", "critic", "replay", "actor_optimizer", "critic_optimizer",
     )})
     # inner_rebase_persistent is deliberately unrestricted: the action-scoped
     # actor/critic required above are expired before every solve. Both are then
@@ -57,6 +57,14 @@ def validate_graph_workload(engine):
         actual = getattr(cfg, key, value)
         if actual != value:
             raise ValueError(f"Whole inner graph requires {key}={value!r}; got {actual!r}.")
+    temperature_scopes = (cfg.inner_temperature_scope, cfg.inner_temperature_optimizer_scope)
+    if temperature_scopes != ("action", "action"):
+        if not (temperature_scopes == ("run", "run")
+                and cfg.inner_temperature_mode == "auto"
+                and getattr(cfg, "inner_entropy_enabled", True)
+                and int(cfg.inner_temperature_updates_per_action) > 0
+                and getattr(cfg, "sac_actor_loss_scale_mode", "none") == "none"):
+            raise ValueError("Whole inner graph supports action-scoped temperature or paired run-scoped automatic temperature without Q scaling.")
     scale_mode = getattr(cfg, "sac_actor_loss_scale_mode", "none")
     scale_scope = getattr(cfg, "inner_actor_loss_scale_scope", "action")
     scale_update = getattr(cfg, "inner_actor_loss_scale_update", "per_action")
@@ -78,6 +86,44 @@ def disable_phase_timers(engine):
     """Apply equally to all benchmark arms; external synchronized timers remain."""
     engine._timer_start = lambda: None
     engine._timer_stop = lambda key, start: None
+
+
+def _initialize_run_temperature(engine, state):
+    """Initialize only persistent alpha; do not allocate actors or consume RNG."""
+    if state.log_alpha is None:
+        state.log_alpha = torch.nn.Parameter(engine._initial_inner_alpha().log().clone())
+        state.temperature_optim = torch.optim.Adam(
+            [state.log_alpha], lr=float(engine.cfg.inner_temperature_lr),
+            eps=float(engine.cfg.inner_adam_eps), capturable=False,
+            foreach=engine.device.type == "cuda",
+        )
+        state.temperature_lifetime_steps = 0
+    if state.temperature_optim is None:
+        raise ValueError("Run-scoped alpha requires its persistent Adam optimizer.")
+
+
+def _copy_temperature(source, destination):
+    """Copy alpha and Adam buffers without replacing captured tensor addresses.
+
+    Native Adam keeps its scalar step on CPU; captured Adam keeps it on CUDA.
+    The live native workspace owns checkpoint state and diagnostic continuation.
+    """
+    with torch.no_grad():
+        destination.log_alpha.copy_(source.log_alpha)
+        source_buffers = source.temperature_optim.state.get(source.log_alpha, {})
+        target_buffers = destination.temperature_optim.state[destination.log_alpha]
+        capturable = destination.temperature_optim.param_groups[0]["capturable"]
+        for name in ("step", "exp_avg", "exp_avg_sq"):
+            if name not in target_buffers:
+                target_buffers[name] = (
+                    torch.zeros((), device=destination.log_alpha.device if capturable else "cpu")
+                    if name == "step" else torch.zeros_like(destination.log_alpha)
+                )
+            if name in source_buffers:
+                target_buffers[name].copy_(source_buffers[name])
+            else:
+                target_buffers[name].zero_()
+    destination.temperature_lifetime_steps = source.temperature_lifetime_steps
 
 
 class WholeInnerGraph:
@@ -109,6 +155,12 @@ class WholeInnerGraph:
         self._initial_alpha = engine._initial_inner_alpha
         self.alpha_input = self._initial_alpha().detach().clone()
         engine._initial_inner_alpha = lambda: self.alpha_input
+        self._run_temperature = engine.cfg.inner_temperature_scope == "run"
+        self._temperature_state = None
+        if self._run_temperature:
+            self._temperature_state = SimpleNamespace(log_alpha=None, temperature_optim=None,
+                                                      temperature_lifetime_steps=0)
+            _initialize_run_temperature(engine, self._temperature_state)
         self.actor_loss_scale_input = None
         if engine._sac_actor_loss_scale_enabled:
             self.actor_loss_scale_input = engine._critic_owner.actor_loss_scale.detach().clone()
@@ -179,7 +231,7 @@ class WholeInnerGraph:
     def _solve(self):
         return self._engine_act(self.root, collect_diagnostics=False, eval_mode=False)
 
-    def __call__(self, root, *, initial_actor_loss_scale=None):
+    def __call__(self, root, *, initial_actor_loss_scale=None, temperature_state=None):
         if root.shape != self.root.shape or root.dtype != self.root.dtype or root.device != self.root.device:
             raise ValueError("Whole inner graph root shape, dtype and device must remain fixed.")
         # Preflight every input before changing captured buffers or RNG state.
@@ -195,6 +247,14 @@ class WholeInnerGraph:
                 raise ValueError("Whole inner graph Q scale must be finite and at least one.")
         elif initial_actor_loss_scale is not None:
             raise ValueError("An unnormalized whole inner graph does not accept a Q scale.")
+        if temperature_state is not None and not self._run_temperature:
+            raise ValueError("Action-scoped temperature cannot accept persistent state.")
+        if self._run_temperature:
+            temperature_state = self._temperature_state if temperature_state is None else temperature_state
+            if temperature_state.log_alpha is None or temperature_state.temperature_optim is None:
+                raise ValueError("Run-scoped graph input must include initialized alpha and Adam.")
+            if not bool(torch.isfinite(temperature_state.log_alpha).all()):
+                raise ValueError("Run-scoped graph alpha must be finite.")
         # Preserve the native finite/nonnegative alpha contract and refresh
         # inherited alpha after any outer update.
         alpha = self._initial_alpha()
@@ -202,12 +262,28 @@ class WholeInnerGraph:
         if self.actor_loss_scale_input is not None:
             self.actor_loss_scale_input.copy_(initial_actor_loss_scale.detach())
         self.root.copy_(root)
+        if self._run_temperature:
+            # Warmup/capture state is disposable. Every logical solve starts
+            # from the live carried state, including after native diagnostics.
+            initial_steps = temperature_state.temperature_lifetime_steps
+            _copy_temperature(temperature_state, self.engine.state)
         with self._rng_fork():
             if self.graph is None:
                 self.output = self._solve()
             else:
                 self.graph.replay()
         self.calls += 1
+        if self._run_temperature:
+            steps = int(self.engine.cfg.inner_temperature_updates_per_action)
+            self.engine.state.temperature_lifetime_steps = initial_steps + steps
+            _copy_temperature(self.engine.state, temperature_state)
+            action, values, lengths = self.output
+            # Python counters execute during capture only; expose the logical
+            # lifetime while tensor alpha/Adam-step diagnostics replay on GPU.
+            return action, dict(values,
+                inner_temperature_lifetime_steps_initial=float(initial_steps),
+                inner_temperature_lifetime_steps_final=float(initial_steps + steps),
+                inner_temperature_chain_reset=float(initial_steps == 0)), lengths
         return self.output
 
 
@@ -295,6 +371,10 @@ def training_graph_act(engine, root):
         engine._whole_graph_resume = None
     engine._pending_timers = {}
     started = engine._timer_start()
+    temperature_kwargs = {}
+    if engine.cfg.inner_temperature_scope == "run":
+        _initialize_run_temperature(engine, engine.state)
+        temperature_kwargs["temperature_state"] = engine.state
     if engine._sac_actor_loss_scale_enabled:
         initial_scale = engine._initial_actor_loss_scale(engine._critic_owner.actor_loss_scale)
         action, values, lengths = engine._whole_graph_runner(
@@ -308,7 +388,7 @@ def training_graph_act(engine, root):
                 initial_scale
             ).clone()
     else:
-        action, values, lengths = engine._whole_graph_runner(root)
+        action, values, lengths = engine._whole_graph_runner(root, **temperature_kwargs)
     engine._timer_stop("inner_action_seconds", started)
     engine.action_index += 1
     # The live engine records the prior version used by this logical action,

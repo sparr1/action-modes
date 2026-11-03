@@ -22,13 +22,15 @@ from slurm.benchmark_ambi_training_cpu import TrainingWindow, physical_core_cpus
 MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_inner_entropy.json"
 CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/inner-entropy-cudagraph-20261102")
 GPU_PARITY_TEST = "tests/test_inner_entropy_graph.py::test_cuda_capture_matches_uncaptured_normalized_solve"
+GPU_PARITY_CASE_COUNT = 6
+ENTRYPOINT = Path(__file__).resolve()
 
 
 def parity_cases(junit_path):
     """Reject a successful pytest exit that merely skipped unavailable CUDA."""
     cases = list(ET.parse(junit_path).getroot().iter("testcase"))
     names = [case.attrib["name"] for case in cases]
-    assert len(cases) == 6 and len(set(names)) == 6, names
+    assert len(cases) == GPU_PARITY_CASE_COUNT and len(set(names)) == GPU_PARITY_CASE_COUNT, names
     expected = GPU_PARITY_TEST.rsplit("::", 1)[1]
     assert all(name.startswith(expected + "[") for name in names), names
     assert not any(case.find(tag) is not None for case in cases
@@ -40,7 +42,7 @@ def validate_global_parity(receipt, expected_binding, expected_runtime):
     assert receipt["passed"] is True
     assert receipt["binding"] == expected_binding
     assert receipt["runtime"] == expected_runtime
-    assert receipt["case_count"] == 6 and len(set(receipt["case_names"])) == 6
+    assert receipt["case_count"] == GPU_PARITY_CASE_COUNT and len(set(receipt["case_names"])) == GPU_PARITY_CASE_COUNT
     assert receipt["test_node"] == GPU_PARITY_TEST
     assert receipt["failures"] == receipt["errors"] == receipt["skipped"] == 0
 
@@ -184,7 +186,8 @@ def worker(args):
         assert cfg.compile and cfg.compile_strict and cfg.critic_ensemble_backend == "vmap"
         assert cfg.inner_cuda_graph is graph_enabled
         assert cfg.outer_critic_target == "reward_only" and cfg.aux_return_mode == "off"
-        assert cfg.sac_actor_loss_scale_mode == "tdmpc2_percentile_range"
+        scale_enabled = cfg.sac_actor_loss_scale_mode == "tdmpc2_percentile_range"
+        assert scale_enabled or cfg.sac_actor_loss_scale_mode == "none"
         timer = TrainingWindow(502 + warmup, measured, torch.cuda.synchronize)
         act, log = learner._act_agent, learner._log_wandb_step
         graph_counts = {}
@@ -199,6 +202,7 @@ def worker(args):
             timer.before_action(step, learner._num_updates)
             t = time.perf_counter()
             before = agent.actor_loss_scale.detach().clone()
+            outer_alpha = agent.alpha.detach().clone()
             carried = agent.inner_engine._carried_actor_loss_scale
             initial = before if carried is None else carried.detach().clone()
             action = act(*positional, **kwargs)
@@ -207,16 +211,24 @@ def worker(args):
             inner = agent.last_inner_metrics
             assert inner["inner_actor_optimizer_steps"] == 32
             assert inner["inner_critic_optimizer_steps"] == 128
-            assert inner["inner_temperature_optimizer_steps"] == 0
+            assert inner["inner_temperature_optimizer_steps"] == cfg.inner_temperature_updates_per_action
             assert inner["inner_compile_fallback"] == 0
             # Native-only execution need not emit the graph telemetry key;
             # graph-enabled measurements still require an explicit one.
             assert inner.get("inner_cuda_graph_used", 0.0) == float(graph_enabled)
             assert all(math.isfinite(float(v)) for v in inner.values())
-            expected = initial if cfg.inner_actor_loss_scale_scope == "run" else before
-            assert math.isclose(inner["inner_actor_loss_scale_initial"], expected.item(), rel_tol=1e-6)
-            if cfg.inner_actor_loss_scale_update == "per_action":
-                assert inner["inner_actor_loss_scale_final"] == inner["inner_actor_loss_scale_initial"]
+            if scale_enabled:
+                expected = initial if cfg.inner_actor_loss_scale_scope == "run" else before
+                assert math.isclose(inner["inner_actor_loss_scale_initial"], expected.item(), rel_tol=1e-6)
+                if cfg.inner_actor_loss_scale_update == "per_action":
+                    assert inner["inner_actor_loss_scale_final"] == inner["inner_actor_loss_scale_initial"]
+            if cfg.inner_temperature_mode == "auto":
+                if cfg.inner_temperature_scope == "action":
+                    assert math.isclose(inner["inner_alpha_initial"], outer_alpha.item(), rel_tol=1e-6)
+                    assert inner["inner_temperature_optimizer_step_initial"] == 0
+                assert inner["inner_temperature_optimizer_step_final"] - inner["inner_temperature_optimizer_step_initial"] == cfg.inner_temperature_updates_per_action
+                assert inner["inner_temperature_lifetime_steps_final"] - inner["inner_temperature_lifetime_steps_initial"] == cfg.inner_temperature_updates_per_action
+            torch.testing.assert_close(agent.alpha, outer_alpha, rtol=0, atol=0)
             torch.testing.assert_close(agent.actor_loss_scale, before, rtol=0, atol=0)
             return action
 
@@ -239,8 +251,10 @@ def worker(args):
         assert all(math.isfinite(float(v)) for v in metrics.values())
         for key in ("actor_pre_tanh_entropy", "actor_post_tanh_entropy",
                     "actor_mean_action_abs_ge_0p99_fraction",
-                    "actor_entropy_coefficient_joint_units", "actor_q_range_instant"):
+                    "actor_entropy_coefficient_joint_units"):
             assert key in metrics, key
+        if scale_enabled:
+            assert "actor_q_range_instant" in metrics
         assert all(torch.isfinite(p).all() for p in agent.model.parameters())
         assert learner.buffer._storage_device.type == "cuda"
         # Expensive sparse observations and recapture checks are deliberately
@@ -263,10 +277,12 @@ def worker(args):
                 torch.testing.assert_close(engine._carried_actor_loss_scale,
                                            inner_state["actor_loss_scale_carry"], rtol=0, atol=0)
             saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            alpha = agent.alpha.detach().clone()
             agent.load(checkpoint)
             for key, value in agent.model.state_dict().items():
                 torch.testing.assert_close(value.cpu(), saved["model"][key], rtol=0, atol=0)
             torch.testing.assert_close(agent.actor_loss_scale, scale, rtol=0, atol=0)
+            torch.testing.assert_close(agent.alpha, alpha, rtol=0, atol=0)
         report = {"passed": True, "index": args.index, "name": name,
                   "physical_cpus": len(cpus), "runtime": execution,
                   "binding": binding(MANIFEST), "measured": timer.result,
@@ -356,7 +372,7 @@ def gate(args):
         env = dict(os.environ)
         for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
             env[key] = str(count)
-        command = [sys.executable, str(Path(__file__).resolve()), "worker", "--index", str(args.index),
+        command = [sys.executable, str(ENTRYPOINT), "worker", "--index", str(args.index),
                    "--worker-cpus", ",".join(map(str, cores[:count])), "--output", str(output)]
         with output.with_suffix(".log").open("x") as log:
             subprocess.run(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
@@ -367,13 +383,13 @@ def gate(args):
         native_env[key] = "1"
     with native_output.with_suffix(".log").open("x") as log:
         subprocess.run(
-            [sys.executable, str(Path(__file__).resolve()), "worker", "--index", str(args.index),
+            [sys.executable, str(ENTRYPOINT), "worker", "--index", str(args.index),
              "--worker-cpus", str(cores[0]), "--native-reference", "--output", str(native_output)],
             cwd=ROOT, env=native_env, stdout=log, stderr=subprocess.STDOUT, check=True,
         )
     native = json.loads(native_output.read_text())
     plan = select_plan(rows)
-    bank_bytes = 6 * 40 * max(r["checkpoint_bytes"] for r in rows)
+    bank_bytes = len(json.loads(MANIFEST.read_text())["configs"]) * 40 * max(r["checkpoint_bytes"] for r in rows)
     space = checkpoint_space(args.output, bank_bytes)
     receipt = {"passed": True, "binding": binding(MANIFEST), "runtime": rows[0]["runtime"],
                "plan": plan, "space": space, "cases": [str(args.output/f"cpu-{n}.json") for n in (1,2)],
@@ -437,7 +453,7 @@ def main():
     parser.add_argument("mode", choices=("parity", "gate", "worker", "train"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--gate", type=Path)
-    parser.add_argument("--index", type=int, choices=range(6))
+    parser.add_argument("--index", type=int, choices=range(len(json.loads(MANIFEST.read_text())["configs"])))
     parser.add_argument("--worker-cpus")
     parser.add_argument("--native-reference", action="store_true")
     parser.add_argument("--release-job", type=int)
