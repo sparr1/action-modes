@@ -78,6 +78,14 @@ def benchmark(args):
         raise ValueError("CUDA is unavailable on this host.")
     torch.set_num_threads(args.threads)
     torch.set_float32_matmul_precision(getattr(args, "matmul_precision", "high"))
+    cache_limit = getattr(args, "compile_cache_limit", None)
+    if cache_limit is not None:
+        # Private actors induce separate identity guards in the pinned PyTorch
+        # runtime. Widen only this standalone process's bounded benchmark cache.
+        torch._dynamo.config.cache_size_limit = cache_limit
+        torch._dynamo.config.accumulated_cache_size_limit = max(
+            torch._dynamo.config.accumulated_cache_size_limit, 8 * cache_limit,
+        )
     torch.manual_seed(193)
     params = _tiny_params(
         outer_actor_objective="distillation", inner_rounds=2,
@@ -132,6 +140,7 @@ def benchmark(args):
         "device": str(device), "torch": torch.__version__, "platform": platform.platform(),
         "profile": args.profile, "roots": args.roots, "threads": args.threads,
         "compile": args.compile, "warmup": args.warmup, "repeats": args.repeats,
+        "compile_cache_limit": torch._dynamo.config.cache_size_limit,
         "matmul_precision": torch.get_float32_matmul_precision(),
         "configuration": vars(cfg).copy(), "arms": {},
         "scope": "encoded roots through teacher extraction; excludes encoder/cache/outer learner",
@@ -230,6 +239,7 @@ def benchmark_refresh(args, agent):
         "profile": args.profile, "roots": args.roots, "sequences": sequences,
         "threads": args.threads, "compile": args.compile,
         "warmup": args.warmup, "repeats": args.repeats,
+        "compile_cache_limit": torch._dynamo.config.cache_size_limit,
         "matmul_precision": torch.get_float32_matmul_precision(),
         "replay_device": str(replay._buffer._storage._storage.device),
         "configuration": vars(cfg).copy(), "arms": {},
@@ -241,10 +251,15 @@ def benchmark_refresh(args, agent):
     if device.type == "cuda":
         arms += [(f"cuda_graph_roots_{width}", "cuda_graph", width) for width in args.parallel_roots]
     native_control = graph_control = None
+    saved_solver = None
     for name, backend, width in arms:
         print(json.dumps({"starting_arm": name}), flush=True)
         cfg.reanalyze_backend, cfg.reanalyze_parallel_roots = backend, width
         reanalyzer = LazyReanalyzer(agent)
+        if backend == "cuda_graph" and saved_solver is not None:
+            saved_solver.parallel_roots = width
+            reanalyzer.parallel_solver = saved_solver
+        reused_slots = len(saved_solver.runners) if saved_solver is not None else 0
         if name == "legacy_native":
             engine = reanalyzer.engine
             def legacy_teacher(root, *, t0=True):
@@ -273,6 +288,9 @@ def benchmark_refresh(args, agent):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             result["graph_pool_width_bitwise_parity"] = True
         measured["last_refresh_metrics"] = metrics
+        measured["reused_graph_slots"] = reused_slots
+        if backend == "cuda_graph" and getattr(args, "reuse_graph_pool", False):
+            saved_solver = reanalyzer.parallel_solver
         result["arms"][name] = measured
         _save_progress(result, getattr(args, "output", None))
         print(json.dumps({"completed_arm": name, **measured}), flush=True)
@@ -296,6 +314,8 @@ def main():
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--full-refresh", action="store_true")
     parser.add_argument("--graph-only", action="store_true")
+    parser.add_argument("--compile-cache-limit", type=int)
+    parser.add_argument("--reuse-graph-pool", action="store_true")
     parser.add_argument("--matmul-precision", choices=("highest", "high"), default="high")
     parser.add_argument("--roots", type=int, default=6)
     parser.add_argument("--parallel-roots", type=int, nargs="+", default=[1, 4, 8])
@@ -306,6 +326,10 @@ def main():
     args = parser.parse_args()
     if min(args.roots, args.threads, args.repeats, *args.parallel_roots) <= 0 or args.warmup < 1:
         parser.error("Counts must be positive, including at least one warmup.")
+    if args.compile_cache_limit is not None and args.compile_cache_limit < 1:
+        parser.error("--compile-cache-limit must be positive.")
+    if args.reuse_graph_pool and not (args.full_refresh and args.graph_only):
+        parser.error("--reuse-graph-pool requires --full-refresh --graph-only.")
     if args.graph_only:
         if args.device != "cuda":
             parser.error("--graph-only requires CUDA.")

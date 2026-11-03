@@ -891,6 +891,11 @@ Each stream has separate adapted parameters and optimizer state; this is not a
 fused batched-root implementation. The synthetic refresh harness also supports
 `--graph-only` to omit already-measured native baselines. No timing mode publishes
 to W&B or writes training checkpoints.
+The pinned PyTorch compiler defaults to eight cached variants per function;
+separate worker actor identities reach that limit above eight workers. The
+standalone wider-pool benchmark sets `--compile-cache-limit 128` and still
+requires strict compilation and no new graphs in the measured window. This
+benchmark override does not change production compiler limits.
 
 Distillation v1 requires action-local inner SAC, a cloned primary actor
 initialized from the prior, positive actor adaptation, and primary execution.

@@ -18,9 +18,9 @@ umask 077
 : "${AMBI_PYTHON:?Supply the locked DMControl interpreter.}"
 : "${EXPECTED_ACTION_MODES_SHA:?Supply the tested full SHA.}"
 : "${AMBI_BENCH_OUTPUT:?Supply a fresh output directory outside source.}"
-: "${AMBI_BENCH_MODE:?Choose native, cuda_graph, or parallel.}"
+: "${AMBI_BENCH_MODE:?Choose native, cuda_graph, parallel, or parallel_wide.}"
 [[ "$AMBI_PROJECT_DIR" == /* && "$AMBI_PYTHON" == /* && "$AMBI_BENCH_OUTPUT" == /* ]]
-[[ "$AMBI_BENCH_MODE" == native || "$AMBI_BENCH_MODE" == cuda_graph || "$AMBI_BENCH_MODE" == parallel ]]
+[[ "$AMBI_BENCH_MODE" == native || "$AMBI_BENCH_MODE" == cuda_graph || "$AMBI_BENCH_MODE" == parallel || "$AMBI_BENCH_MODE" == parallel_wide ]]
 cd "$AMBI_PROJECT_DIR"
 [[ "$(git rev-parse HEAD)" == "$EXPECTED_ACTION_MODES_SHA" ]]
 [[ -z "$(git status --porcelain --untracked-files=all)" ]]
@@ -45,14 +45,19 @@ print(json.dumps(dict(host=platform.node(), torch=torch.__version__, cuda=torch.
     sha=subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),
     tree=subprocess.check_output(["git","rev-parse","HEAD^{tree}"],text=True).strip()),indent=2))
 PY
-if [[ "$AMBI_BENCH_MODE" == parallel ]]; then
-  srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.benchmark_ambi_reanalyze \
-    --device cuda --profile reference --compile --graph-only --roots 1 --parallel-roots 1 \
-    --warmup 2 --repeats 20 --output "$AMBI_BENCH_OUTPUT/one-root.json" \
-    > "$AMBI_BENCH_OUTPUT/one-root.log" 2>&1
+if [[ "$AMBI_BENCH_MODE" == parallel || "$AMBI_BENCH_MODE" == parallel_wide ]]; then
+  if [[ "$AMBI_BENCH_MODE" == parallel ]]; then
+    srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.benchmark_ambi_reanalyze \
+      --device cuda --profile reference --compile --graph-only --roots 1 --parallel-roots 1 \
+      --warmup 2 --repeats 20 --output "$AMBI_BENCH_OUTPUT/one-root.json" \
+      > "$AMBI_BENCH_OUTPUT/one-root.log" 2>&1
+    widths=(1 4 16 60)
+  else
+    widths=(16 60)
+  fi
   srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.benchmark_ambi_reanalyze \
     --device cuda --profile reference --compile --graph-only --full-refresh --roots 60 \
-    --parallel-roots 1 4 16 60 --warmup 1 --repeats 3 \
+    --parallel-roots "${widths[@]}" --compile-cache-limit 128 --reuse-graph-pool --warmup 1 --repeats 3 \
     --output "$AMBI_BENCH_OUTPUT/parallel.json" > "$AMBI_BENCH_OUTPUT/parallel.log" 2>&1
 else
   if [[ "$AMBI_BENCH_MODE" == cuda_graph ]]; then
