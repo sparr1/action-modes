@@ -23,6 +23,7 @@ from .teacher_graph import validate_teacher_graph_config
 
 
 BATCHED_TEACHER_PROTOCOL = "root_batched_sac_chunk_seed_v1"
+BATCHED_TEACHER_OPTIMIZER = "adam_fused_cuda_eager_cpu_v1"
 
 
 def validate_batched_teacher_config(cfg):
@@ -104,7 +105,7 @@ class BatchedTeacherCore:
         for optimizer in self.optimizers:
             for parameter in optimizer.param_groups[0]["params"]:
                 optimizer.state[parameter] = {
-                    "step": torch.zeros((), device=self.device if capturable else "cpu"),
+                    "step": torch.zeros((), device=self.device if capturable or self.device.type == "cuda" else "cpu"),
                     "exp_avg": torch.zeros_like(parameter),
                     "exp_avg_sq": torch.zeros_like(parameter),
                 }
@@ -136,7 +137,8 @@ class BatchedTeacherCore:
         if epsilon is None:
             epsilon = self.cfg.inner_adam_eps
         return torch.optim.Adam(list(params), lr=float(getattr(self.cfg, f"inner_{component}_lr")),
-                                eps=float(epsilon), foreach=self.device.type == "cuda", capturable=capturable)
+                                eps=float(epsilon), foreach=False, fused=self.device.type == "cuda",
+                                capturable=capturable)
 
     def _schedule(self):
         cfg, helper = self.cfg, self.helper
@@ -503,6 +505,7 @@ class BatchedTeacherSolver:
                 return mean, log_std, counts, {
                     "distillation_reanalyze_batched": 1.,
                     "distillation_reanalyze_cuda_graph": float(self.capture),
+                    "distillation_reanalyze_fused_adam": float(self.device.type == "cuda"),
                     "distillation_reanalyze_parallel_roots": float(self.width),
                     "distillation_reanalyze_chunks": float(math.ceil(len(roots) / self.width)),
                     "distillation_reanalyze_padding_roots": float((-len(roots)) % self.width),

@@ -45,12 +45,13 @@ print(json.dumps(dict(host=platform.node(), torch=torch.__version__, cuda=torch.
     sha=subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),
     tree=subprocess.check_output(["git","rev-parse","HEAD^{tree}"],text=True).strip()),indent=2))
 PY
-if [[ "$AMBI_BENCH_MODE" == gate ]]; then
+if [[ "$AMBI_BENCH_MODE" == gate || "${AMBI_VALIDATE_FIRST:-0}" == 1 ]]; then
   srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m pytest -q --tb=short -p no:cacheprovider \
     tests/test_ambi_batched_teacher.py tests/test_ambi_reanalyze_backends.py \
     --basetemp="$benchmark_cache/pytest" --junitxml="$AMBI_BENCH_OUTPUT/gate.xml" \
     > "$AMBI_BENCH_OUTPUT/gate.log" 2>&1
-elif [[ "$AMBI_BENCH_MODE" == width ]]; then
+fi
+if [[ "$AMBI_BENCH_MODE" == width ]]; then
   : "${AMBI_BATCH_WIDTH:?Supply a positive root batch width.}"
   [[ "$AMBI_BATCH_WIDTH" =~ ^[1-9][0-9]*$ ]]
   read -r -a benchmark_widths <<< "${AMBI_BATCH_WIDTHS:-$AMBI_BATCH_WIDTH}"
@@ -68,7 +69,7 @@ elif [[ "$AMBI_BENCH_MODE" == width ]]; then
     --device cuda --profile reference --compile --graph-only --full-refresh --roots 60 \
     --parallel-roots 1 --warmup 1 --repeats 5 --output "$AMBI_BENCH_OUTPUT/serial-graph.json" \
     > "$AMBI_BENCH_OUTPUT/serial-graph.log" 2>&1
-else
+elif [[ "$AMBI_BENCH_MODE" == training ]]; then
   : "${AMBI_BATCH_WIDTH:?Supply the measured root batch width.}"
   collection_backend="${AMBI_COLLECTION_BACKEND:-cuda_graph}"
   [[ "$collection_backend" == native || "$collection_backend" == cuda_graph ]]

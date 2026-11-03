@@ -56,12 +56,15 @@ class LazyReanalyzer:
 
     def backend_specification(self):
         from .teacher_graph import TEACHER_GRAPH_PROTOCOL
-        from .batched_teacher import BATCHED_TEACHER_PROTOCOL
-        return {
+        from .batched_teacher import BATCHED_TEACHER_PROTOCOL, BATCHED_TEACHER_OPTIMIZER
+        specification = {
             "reanalyze_backend": self.backend,
             "reanalyze_rng_protocol": BATCHED_TEACHER_PROTOCOL if self.backend.startswith("batched") else TEACHER_GRAPH_PROTOCOL,
             "reanalyze_parallel_roots": int(self.cfg.reanalyze_parallel_roots),
         }
+        if self.backend.startswith("batched"):
+            specification["reanalyze_optimizer"] = BATCHED_TEACHER_OPTIMIZER
+        return specification
 
     def preflight_state_dict(self, state):
         expected = {"schema", "version", "rng_state", "refreshes", "roots"}

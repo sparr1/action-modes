@@ -856,7 +856,9 @@ work. Losses average within each root and sum across roots, and gradient
 clipping computes a separate norm for each root. This preserves the adaptation
 budget and independent optimizers; it does not fit one shared actor to many
 roots. Dynamics and reward evaluation batch the imagined states through the
-shared frozen model. `reanalyze_backend="batched"` runs the same solver
+shared frozen model. CUDA uses fused Adam, retaining independent moment tensors
+and the same update equations; its implementation identifier is checkpointed.
+`reanalyze_backend="batched"` runs the same solver
 without CUDA graph capture and also supports CPU arithmetic checks.
 
 Both batched backends require the static fresh-SAC subset described above

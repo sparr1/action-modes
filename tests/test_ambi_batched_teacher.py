@@ -160,14 +160,15 @@ def test_batched_losses_and_gradients_match_native_sac(representation, scaled):
         torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
 
 
-def test_root_clipping_and_adam_do_not_share_norm_or_moments():
-    parameters = [torch.nn.Parameter(torch.randn(3, 2, 4)), torch.nn.Parameter(torch.randn(3, 4))]
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA."))])
+def test_root_clipping_and_adam_do_not_share_norm_or_moments(device):
+    parameters = [torch.nn.Parameter(torch.randn(3, 2, 4, device=device)), torch.nn.Parameter(torch.randn(3, 4, device=device))]
     reference = [[torch.nn.Parameter(p[r].detach().clone()) for p in parameters] for r in range(3)]
-    optimizer = torch.optim.Adam(parameters, lr=.1, eps=1e-5)
+    optimizer = torch.optim.Adam(parameters, lr=.1, eps=1e-5, fused=device == "cuda")
     separate = [torch.optim.Adam(p, lr=.1, eps=1e-5) for p in reference]
     for step in range(3):
         for p in parameters:
-            p.grad = torch.randn_like(p) * torch.tensor([1e-3, 1., 1e3]).reshape(3, *([1] * (p.ndim - 1)))
+            p.grad = torch.randn_like(p) * p.new_tensor([1e-3, 1., 1e3]).reshape(3, *([1] * (p.ndim - 1)))
         for r, params in enumerate(reference):
             for p, original in zip(params, parameters):
                 p.grad = original.grad[r].clone()
@@ -178,6 +179,8 @@ def test_root_clipping_and_adam_do_not_share_norm_or_moments():
         for r, params in enumerate(reference):
             for p, original in zip(params, parameters):
                 torch.testing.assert_close(original[r], p)
+                for key in ("exp_avg", "exp_avg_sq"):
+                    torch.testing.assert_close(optimizer.state[original][key][r], separate[r].state[p][key])
 
 
 def test_ring_wrap_and_oversized_appends_match_native_replay():
@@ -238,7 +241,7 @@ def test_batched_refresh_resume_and_protocol_validation(models):
     actual = restored.refresh(_ReplayProbe(), obs, teacher, 20)[0]
     _assert_tree_equal(actual, expected)
     assert saved["version"] == 3 and actual["valid"].sum() == 4
-    for key, invalid in (("reanalyze_parallel_roots", 3), ("reanalyze_backend", "native"), ("reanalyze_rng_protocol", "other")):
+    for key, invalid in (("reanalyze_parallel_roots", 3), ("reanalyze_backend", "native"), ("reanalyze_rng_protocol", "other"), ("reanalyze_optimizer", "other")):
         state = _clone_tree(saved)
         state[key] = invalid
         before = _clone_tree(restored.state_dict())
@@ -301,7 +304,14 @@ def test_cuda_graph_matches_uncaptured_batch_and_is_exactly_repeatable(compiled,
     cpu_rng, cuda_rng = torch.get_rng_state().clone(), torch.cuda.get_rng_state().clone()
     for iteration in range(2):
         with torch.no_grad():
-            agent.model._pi[-1].bias.add_(.01)
+            for parameter in agent.model.parameters():
+                parameter.add_(.001)
+            if agent.log_ent_coef is not None:
+                agent.log_ent_coef.add_(.1)
+            else:
+                agent.fixed_ent_coef.mul_(1.1)
+            if scaled:
+                agent.actor_loss_scale.fill_(2. + iteration)
         expected = eager.solve(roots, seeds)
         actual = graph.solve(roots, seeds)
         for a, e in zip(actual[:3], expected[:3]):
