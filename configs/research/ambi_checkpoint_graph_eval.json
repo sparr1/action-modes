@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "base_alg_config": "checkpoint",
+  "description": "Frozen saved-controller mean-action CUDA graph evaluation and its paired policy prior. Inherit the checkpoint's scientific settings.",
+  "shared_alg_params": {
+    "wandb": false,
+    "wandb_mode": "disabled",
+    "inner_diagnostic_rollouts": 0,
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "compile": true,
+    "compile_strict": true,
+    "critic_ensemble_backend": "vmap"
+  },
+  "evaluation": {
+    "seeds": [101, 102, 103, 104, 105],
+    "controller_seed": 55,
+    "max_steps": 500,
+    "execution_action": "mean",
+    "recording": "returns",
+    "default_presets": ["controller/prior", "controller/graph"]
+  },
+  "comparisons": {
+    "controller": {
+      "description": "Paired prior versus fresh checkpoint-matched inner adaptation.",
+      "reference": "prior",
+      "variants": {
+        "prior": {
+          "description": "Frozen prior mean without inner improvement.",
+          "alg_params": {"inner_operator": "none", "inner_cuda_graph": false}
+        },
+        "graph": {
+          "description": "Fresh inherited SAC solve at each real decision, final actor mean, isolated CUDA graph RNG.",
+          "evaluation": {"execution_backend": "frozen_mean_cuda_graph_v1"}
+        }
+      }
+    }
+  }
+}

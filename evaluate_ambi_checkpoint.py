@@ -739,6 +739,17 @@ def evaluate_preset(
     from utils.ambi_benchmark import frozen_execution_action
     execution_action = frozen_execution_action(resolved)
     deterministic = execution_action == "mean"
+    evaluation_options = resolved.get("evaluation", {})
+    execution_backend = evaluation_options.get("execution_backend", "native")
+    return_only = evaluation_options.get("recording", "full") == "returns"
+    if execution_backend not in {"native", "frozen_mean_cuda_graph_v1"}:
+        raise ValueError("Unsupported frozen evaluation execution_backend.")
+    graph_evaluation = execution_backend == "frozen_mean_cuda_graph_v1"
+    if return_only and (root_bank is not None or bank_only or captured_roots is not None or togo_return_rollouts):
+        raise ValueError("Return-only evaluation cannot request banks or model-return probes.")
+    if graph_evaluation and (not deterministic or not return_only or temperature_chain
+                             or params.get("inner_operator") != "sac"):
+        raise ValueError("Frozen mean CUDA graphs require return-only deterministic fresh SAC episodes.")
     _validate_horizon_probe_selection(
         [resolved], root_bank_requested=root_bank is not None,
         togo_return_rollouts=togo_return_rollouts,
@@ -746,6 +757,8 @@ def evaluate_preset(
 
     env = _make_env(resolved)
     model = None
+    graph_controller = None
+    graph_setup_seconds = 0.0
     primary_error = None
     pending_events = []
     phase_id = "initialization"
@@ -857,6 +870,15 @@ def evaluate_preset(
                 )
             _seed_spaces(env, seed)
             observation, _ = env.reset(seed=seed)
+            if graph_evaluation:
+                from RL.tdmpc2_core.frozen_graph import FrozenGraphController
+                if graph_controller is None:
+                    setup_started = time.perf_counter()
+                    graph_controller = FrozenGraphController(model, observation, episode_seed)
+                    graph_setup_seconds = time.perf_counter() - setup_started
+                    if bundle_run is not None:
+                        bundle_run["warmup_including_compile_seconds"] = graph_setup_seconds
+                graph_controller.reset_episode(episode_seed)
             terminated = truncated = False
             episode_return = 0.0
             episode_steps = 0
@@ -881,8 +903,10 @@ def evaluate_preset(
                     probe_rollouts=togo_return_rollouts,
                     probe_horizon=int(model.cfg.inner_rollout_horizon),
                     probe_seed=solver_seed(controller_seed, "togo_probe", seed, episode_steps),
-                ) if probe_this_decision else InnerActionTrace()) if bundle is not None else None
+                ) if probe_this_decision else InnerActionTrace()) if bundle is not None and not return_only else None
                 predict_options = {"trace": trace} if trace is not None else {}
+                if return_only:
+                    predict_options["collect_diagnostics"] = False
                 started = time.perf_counter()
                 action, _ = model.predict(
                     observation,
@@ -1015,6 +1039,10 @@ def evaluate_preset(
                if temperature_chain else {}),
             "seed_scheme": "sha256-v1",
             "execution_action": execution_action,
+            **({"execution_backend": execution_backend,
+                "graph_setup_seconds": graph_setup_seconds,
+                "graph_replays": graph_controller.runner.calls}
+               if graph_evaluation else {}),
             "outer_updates_before": updates_before,
             "outer_updates_after": updates_after,
             "outer_state_unchanged": True,
@@ -1059,6 +1087,8 @@ def evaluate_preset(
                     _close_resources(model, env, primary_error=exc)
                     raise
                 add_cleanup_notes(primary_error, [exc])
+        if graph_controller is not None:
+            graph_controller.close()
         _close_resources(model, env, primary_error=primary_error)
 
 

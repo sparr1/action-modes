@@ -1,5 +1,20 @@
 # Frozen-checkpoint AMBI research
 
+`ambi_checkpoint_graph_eval.json` compares the saved controller with its frozen
+mean-action prior using five paired full episodes (seeds 101–105, controller
+seed 55). It inherits the checkpoint's inner dose, entropy and normalization.
+The SAC arm explicitly selects `frozen_mean_cuda_graph_v1`: one complete captured
+fresh solve per decision, strict compilation, vectorized critics and mean-action
+execution. Return-only bundles retain per-episode returns, scalar controller
+metrics, pairing and frozen-state checks, without inner traces or model probes.
+Its isolated graph RNG is a separate evaluation identity from native execution.
+Warmup/capture is reported separately and discarded before the seeded episodes.
+Unsupported lifetimes, sampled execution, traces and probes fail explicitly.
+`slurm/graph_checkpoint_campaign.py` prepares a pinned checkpoint inventory and
+two new evaluation series, runs checkpoint tasks, and publishes through the
+single-owner registry. Its CPU publisher installs and verifies a dedicated W&B
+workspace before uploading results, and reports missing/failed cells.
+
 The [joint entropy and prior-KL evaluation](ENTROPY_KL_EVAL.md) keeps automatic
 temperature learning enabled while testing two fixed prior-KL penalties on
 the same saved roots and sampled full episodes.

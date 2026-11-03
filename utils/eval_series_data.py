@@ -191,7 +191,7 @@ class _WithoutControlTiming(ast.NodeTransformer):
 
 @lru_cache(maxsize=128)
 def scientific_identity(algorithm, controller, commit, dirty=False, source_sha256=None, *,
-                        return_estimator="one_step"):
+                        return_estimator="one_step", execution_backend="native"):
     """Conservative scientific-source identity, excluding publisher/report code.
 
     Hash executable ASTs of the controller stack and environment. Evaluator
@@ -226,6 +226,9 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
     else:
         paths = ["RL/TDMPC2.py", "RL/tdmpc2_core/agent.py", "RL/tdmpc2_core/mppi.py"]
     paths += ["RL/tdmpc2_core/common", "domains", "environments/dmcontrol/uv.lock"]
+    if execution_backend != "native":
+        _require(execution_backend == "frozen_mean_cuda_graph_v1", "Unknown frozen execution backend")
+        paths += ["RL/tdmpc2_core/whole_inner_graph.py", "RL/tdmpc2_core/frozen_graph.py"]
     if return_estimator == "retrace":
         paths.append("RL/tdmpc2_core/inner_retrace.py")
     evaluator = ("evaluate_tdmpc2_mppi_checkpoint.py" if algorithm == "TDMPC2/TDMPC2Baseline"
@@ -514,6 +517,9 @@ def planner_identity(config, result, algorithm, action_rule):
                 shared[key] = value
     if shared.get("sac_actor_loss_scale_mode") == "none":
         shared.pop("sac_actor_loss_scale_tau", None)
+    if result.get("execution_backend", "native") != "native":
+        _require(result["execution_backend"] == "frozen_mean_cuda_graph_v1", "Unknown frozen execution backend")
+        active["evaluation_execution_backend"] = result["execution_backend"]
     return {"type": operator, "backend": algorithm, "action_rule": action_rule,
             "settings": {**shared, **active}}
 
@@ -598,6 +604,7 @@ def identity_for_ambi_checkpoint(checkpoint, resolved, protocol, seeds, code, *,
                                                                    action_dim=config["action_dim"])}
         action_rule = description.protocol["action_rule"]
     result = {"evaluation_controller": evaluation_controller} if evaluation_controller else {}
+    result["execution_backend"] = resolved.get("evaluation", {}).get("execution_backend", "native")
     action = action_rule or protocol["action_rule"]
     planner = planner_identity(config, result, algorithm, action)
     controller = "prior" if planner["type"] == "prior" else (
@@ -606,6 +613,7 @@ def identity_for_ambi_checkpoint(checkpoint, resolved, protocol, seeds, code, *,
             "protocol": _episode_protocol(protocol, seeds, config, action),
             "science": scientific_identity(algorithm, controller, code.get("commit"),
                                              code.get("dirty"), code.get("source_sha256"),
+                                             execution_backend=result["execution_backend"],
                                              **({"return_estimator": "retrace"}
                                                 if controller == "sac" and config.get("inner_sac_return_estimator") == "retrace"
                                                 else {}))}
@@ -940,6 +948,7 @@ def normalize_bundle(path, *, checkpoint_inventory=None, source_run=None):
         identity = {"backbone": source, "planner": planner, "protocol": protocol,
                     "science": scientific_identity(algorithm, controller, code.get("commit"),
                                                      code.get("dirty"), code.get("source_sha256"),
+                                                     execution_backend=result.get("execution_backend", "native"),
                                                      **({"return_estimator": "retrace"}
                                                         if controller == "sac" and config.get("inner_sac_return_estimator") == "retrace"
                                                         else {}))}
