@@ -31,6 +31,12 @@ def test_matrix_preserves_saved_controller_and_selects_paired_prior():
     assert prior["algorithm_config"]["alg_params"]["inner_operator"] == "none"
     assert prior["algorithm_config"]["alg_params"]["inner_cuda_graph"] is False
     assert graph["evaluation"]["seeds"] == prior["evaluation"]["seeds"] == [101, 102, 103, 104, 105]
+    from tests.test_ambi_research_presets import _build_cfg
+    prior_cfg = _build_cfg(prior)
+    graph_cfg = _build_cfg(graph)
+    assert prior_cfg.inner_operator == "none"
+    assert graph_cfg.inner_critic_updates_per_action == 128
+    assert graph_cfg.inner_actor_updates_per_action == 32
 
 
 def test_graph_controller_rejects_any_protocol_fallback():

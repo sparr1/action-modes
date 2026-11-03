@@ -27,7 +27,9 @@
       "variants": {
         "prior": {
           "description": "Frozen prior mean without inner improvement.",
-          "alg_params": {"inner_operator": "none", "inner_cuda_graph": false}
+          "alg_params": {"inner_operator": "none", "inner_cuda_graph": false,
+                         "inner_critic_updates_per_round": null,
+                         "inner_actor_updates_per_round": null}
         },
         "graph": {
           "description": "Fresh inherited SAC solve at each real decision, final actor mean, isolated CUDA graph RNG.",
