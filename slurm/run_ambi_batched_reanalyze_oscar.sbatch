@@ -52,16 +52,20 @@ if [[ "$AMBI_BENCH_MODE" == gate ]]; then
 elif [[ "$AMBI_BENCH_MODE" == width ]]; then
   : "${AMBI_BATCH_WIDTH:?Supply a positive root batch width.}"
   [[ "$AMBI_BATCH_WIDTH" =~ ^[1-9][0-9]*$ ]]
+  read -r -a benchmark_widths <<< "${AMBI_BATCH_WIDTHS:-$AMBI_BATCH_WIDTH}"
+  for width in "${benchmark_widths[@]}"; do [[ "$width" =~ ^[1-9][0-9]*$ ]]; done
   # Same GPU and recipe for the existing stream-graph baseline and root batching.
   srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.benchmark_ambi_reanalyze \
     --device cuda --profile reference --compile --graph-only --full-refresh --roots 60 \
     --parallel-roots 4 --warmup 1 --repeats 5 --output "$AMBI_BENCH_OUTPUT/streams-4.json" \
     > "$AMBI_BENCH_OUTPUT/streams-4.log" 2>&1
-  srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.benchmark_ambi_reanalyze \
-    --device cuda --profile reference --compile --full-refresh --roots 60 \
-    --batched-backend batched_cuda_graph --parallel-roots "$AMBI_BATCH_WIDTH" \
-    --warmup 1 --repeats 5 --output "$AMBI_BENCH_OUTPUT/batched.json" \
-    > "$AMBI_BENCH_OUTPUT/batched.log" 2>&1
+  for width in "${benchmark_widths[@]}"; do
+    srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.benchmark_ambi_reanalyze \
+      --device cuda --profile reference --compile --full-refresh --roots 60 \
+      --batched-backend batched_cuda_graph --parallel-roots "$width" \
+      --warmup 1 --repeats 5 --output "$AMBI_BENCH_OUTPUT/batched-$width.json" \
+      > "$AMBI_BENCH_OUTPUT/batched-$width.log" 2>&1
+  done
 else
   : "${AMBI_BATCH_WIDTH:?Supply the measured root batch width.}"
   for interval in 0 10; do
