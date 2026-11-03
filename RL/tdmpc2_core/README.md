@@ -870,6 +870,28 @@ teacher extraction; use training refresh metrics for encoder/cache overhead
 and full training timing to assess amortized end-to-end cost. Local CPU tests
 do not establish CUDA capture correctness or GPU speedup.
 
+Add `--full-refresh` to measure the production `LazyReanalyzer.refresh` call,
+including deduplication, encoding, and real replay-cache writeback. This mode
+samples a fixed batch containing exactly `--roots` distinct transitions and
+excludes batch sampling and the outer update. The root count must be divisible
+by the training horizon. Both modes default to `--matmul-precision high` and
+record the selected precision. Results are saved after each completed arm.
+`slurm/run_ambi_reanalyze_benchmark_oscar.sbatch` runs CUDA parity gates followed
+by the complete 60-root refresh comparison on one L40S, with W&B disabled.
+
+`tests/benchmark_ambi_distillation_training.py` measures real humanoid-walk
+collection and outer training with refresh enabled or cached-only distillation.
+It warms through a complete adapted episode before timing, then requires every
+measured decision to include an actor update. Its optional CUDA collection
+adapter is benchmark-only and does not add production checkpoint support.
+`slurm/run_ambi_distillation_timing_oscar.sbatch` accepts `AMBI_BENCH_MODE=native`
+or `cuda_graph` for paired training arms on one GPU, or `parallel` for a one-root
+comparison and 60-root sweeps with pools of 1, 4, 16, and 60 independent streams.
+Each stream has separate adapted parameters and optimizer state; this is not a
+fused batched-root implementation. The synthetic refresh harness also supports
+`--graph-only` to omit already-measured native baselines. No timing mode publishes
+to W&B or writes training checkpoints.
+
 Distillation v1 requires action-local inner SAC, a cloned primary actor
 initialized from the prior, positive actor adaptation, and primary execution.
 Explorer/selector modes, persistent inner components, Bernoulli critic carryover,

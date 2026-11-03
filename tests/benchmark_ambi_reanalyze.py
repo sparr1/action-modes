@@ -139,7 +139,8 @@ def benchmark(args):
     if device.type == "cuda":
         result["gpu"] = torch.cuda.get_device_name(device)
     controls = {}
-    for name, fast in (("legacy_native", False), ("teacher_native", True)):
+    native_arms = [] if getattr(args, "graph_only", False) else [("legacy_native", False), ("teacher_native", True)]
+    for name, fast in native_arms:
         print(json.dumps({"starting_arm": name}), flush=True)
         engine = InnerImprovementEngine(agent)
         outputs, measured = _measure(
@@ -154,9 +155,10 @@ def benchmark(args):
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
-    for actual, expected in zip(controls["teacher_native"], controls["legacy_native"]):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    result["native_teacher_bitwise_parity"] = True
+    if controls:
+        for actual, expected in zip(controls["teacher_native"], controls["legacy_native"]):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        result["native_teacher_bitwise_parity"] = True
     if device.type == "cuda":
         from RL.tdmpc2_core.parallel_teacher import ParallelTeacherSolver
         from RL.tdmpc2_core.teacher_graph import TEACHER_GRAPH_PROTOCOL
@@ -184,9 +186,10 @@ def benchmark(args):
             gc.collect()
             torch.cuda.empty_cache()
         result["graph_pool_width_bitwise_parity"] = True
-    baseline = result["arms"]["legacy_native"]["median_refresh_seconds"]
-    for measured in result["arms"].values():
-        measured["speedup_over_legacy_native"] = baseline / measured["median_refresh_seconds"]
+    if "legacy_native" in result["arms"]:
+        baseline = result["arms"]["legacy_native"]["median_refresh_seconds"]
+        for measured in result["arms"].values():
+            measured["speedup_over_legacy_native"] = baseline / measured["median_refresh_seconds"]
     return result
 
 
@@ -234,7 +237,7 @@ def benchmark_refresh(args, agent):
     }
     if device.type == "cuda":
         result["gpu"] = torch.cuda.get_device_name(device)
-    arms = [("legacy_native", "native", 1), ("teacher_native", "native", 1)]
+    arms = [] if getattr(args, "graph_only", False) else [("legacy_native", "native", 1), ("teacher_native", "native", 1)]
     if device.type == "cuda":
         arms += [(f"cuda_graph_roots_{width}", "cuda_graph", width) for width in args.parallel_roots]
     native_control = graph_control = None
@@ -279,9 +282,10 @@ def benchmark_refresh(args, agent):
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
-    baseline = result["arms"]["legacy_native"]["median_refresh_seconds"]
-    for measured in result["arms"].values():
-        measured["speedup_over_legacy_native"] = baseline / measured["median_refresh_seconds"]
+    if "legacy_native" in result["arms"]:
+        baseline = result["arms"]["legacy_native"]["median_refresh_seconds"]
+        for measured in result["arms"].values():
+            measured["speedup_over_legacy_native"] = baseline / measured["median_refresh_seconds"]
     return result
 
 
@@ -291,6 +295,7 @@ def main():
     parser.add_argument("--profile", choices=("tiny", "reference"), default="tiny")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--full-refresh", action="store_true")
+    parser.add_argument("--graph-only", action="store_true")
     parser.add_argument("--matmul-precision", choices=("highest", "high"), default="high")
     parser.add_argument("--roots", type=int, default=6)
     parser.add_argument("--parallel-roots", type=int, nargs="+", default=[1, 4, 8])
@@ -301,6 +306,21 @@ def main():
     args = parser.parse_args()
     if min(args.roots, args.threads, args.repeats, *args.parallel_roots) <= 0 or args.warmup < 1:
         parser.error("Counts must be positive, including at least one warmup.")
+    if args.graph_only:
+        if args.device != "cuda":
+            parser.error("--graph-only requires CUDA.")
+        from RL.tdmpc2_core.parallel_teacher import ParallelTeacherSolver
+        make_runner = ParallelTeacherSolver._make_runner
+
+        def observed_runner(self, root):
+            started = time.perf_counter()
+            runner = make_runner(self, root)
+            print(json.dumps({"captured_slot": len(self.runners) + 1,
+                              "pool_width": self.parallel_roots,
+                              "setup_seconds": time.perf_counter() - started}), flush=True)
+            return runner
+
+        ParallelTeacherSolver._make_runner = observed_runner
     result = benchmark(args)
     rendered = json.dumps(result, indent=2, default=str)
     if args.output:
