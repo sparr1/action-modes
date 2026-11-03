@@ -848,6 +848,45 @@ draws. The backend, protocol, and pool width are part of the exact-resume
 specification. Switching them requires a new lineage. Graph workspaces need
 no persistent checkpoint payload because every solve resets its state.
 
+`reanalyze_backend="batched_cuda_graph"` instead captures one root-batched
+SAC solve. `reanalyze_parallel_roots` is its fixed chunk width: actor and critic
+parameters, target networks, replay, temperature and Adam moments all have an
+independent leading root axis. Functional MLP `vmap` combines their tensor
+work. Losses average within each root and sum across roots, and gradient
+clipping computes a separate norm for each root. This preserves the adaptation
+budget and independent optimizers; it does not fit one shared actor to many
+roots. Dynamics and reward evaluation batch the imagined states through the
+shared frozen model. `reanalyze_backend="batched"` runs the same solver
+without CUDA graph capture and also supports CPU arithmetic checks.
+
+Both batched backends require the static fresh-SAC subset described above
+and action-local Q scaling. The root-batched RNG protocol is
+`root_batched_sac_chunk_seed_v1`: the ordered root seeds determine each chunk's
+private random stream. Every root receives separate policy noise, replay
+indices, dropout masks and Q-head selections. Chunk width/order changes those
+draws and is part of exact-resume identity, together with the backend and
+protocol. Native and stream-graph checkpoint formats remain unchanged; batched
+reanalysis uses version 3. A partial final chunk is padded with independent
+dummy roots. Padding never produces labels or changes useful-work counters;
+`distillation_reanalyze_padding_roots` and
+`distillation_reanalyze_executed_model_steps` expose its actual extra work.
+All backends leave normal action collection unchanged.
+
+For a complete batched refresh benchmark inside an allocated GPU job:
+
+```bash
+WANDB_MODE=disabled environments/dmcontrol/.venv/bin/python \
+  -m tests.benchmark_ambi_reanalyze --device cuda --profile reference --compile \
+  --full-refresh --batched-backend batched_cuda_graph --roots 60 \
+  --parallel-roots 4 16 60 --output /tmp/reanalyze-batched.json
+```
+
+This includes deduplication, observation encoding and cache writeback. The
+benchmark records first-call setup separately and rejects compilation during
+the steady-state timing window. Root-batched arithmetic is checked against
+independent solves using identical explicit random tensors; its outputs are
+not expected to equal the other RNG protocols or another chunk width.
+
 Additional `train/distillation_reanalyze_*` metrics record the selected backend,
 pool width, graph setup time, and refresh seconds per root. Setup time is
 included in total refresh latency. For bounded timing without W&B or

@@ -247,8 +247,11 @@ def benchmark_refresh(args, agent):
     }
     if device.type == "cuda":
         result["gpu"] = torch.cuda.get_device_name(device)
-    arms = [] if getattr(args, "graph_only", False) else [("legacy_native", "native", 1), ("teacher_native", "native", 1)]
-    if device.type == "cuda":
+    batched_backend = getattr(args, "batched_backend", None)
+    arms = [] if getattr(args, "graph_only", False) or batched_backend else [("legacy_native", "native", 1), ("teacher_native", "native", 1)]
+    if batched_backend:
+        arms += [(f"{batched_backend}_roots_{width}", batched_backend, width) for width in args.parallel_roots]
+    elif device.type == "cuda":
         arms += [(f"cuda_graph_roots_{width}", "cuda_graph", width) for width in args.parallel_roots]
     native_control = graph_control = None
     saved_solver = None
@@ -281,6 +284,10 @@ def benchmark_refresh(args, agent):
             for actual, expected in zip(current, native_control):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             result["native_teacher_bitwise_parity"] = True
+        elif backend != "cuda_graph":
+            # Root-batched draws have their own protocol; width is an identity
+            # field. Arithmetic parity is tested using explicit random tapes.
+            assert all(torch.isfinite(value).all() for value in current)
         elif graph_control is None:
             graph_control = current
         else:
@@ -313,6 +320,7 @@ def main():
     parser.add_argument("--profile", choices=("tiny", "reference"), default="tiny")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--full-refresh", action="store_true")
+    parser.add_argument("--batched-backend", choices=("batched", "batched_cuda_graph"))
     parser.add_argument("--graph-only", action="store_true")
     parser.add_argument("--compile-cache-limit", type=int)
     parser.add_argument("--reuse-graph-pool", action="store_true")
@@ -330,7 +338,9 @@ def main():
         parser.error("--compile-cache-limit must be positive.")
     if args.reuse_graph_pool and not (args.full_refresh and args.graph_only):
         parser.error("--reuse-graph-pool requires --full-refresh --graph-only.")
-    if args.graph_only:
+    if args.batched_backend and (not args.full_refresh or args.reuse_graph_pool):
+        parser.error("--batched-backend requires --full-refresh and cannot reuse stream slots.")
+    if args.graph_only and not args.batched_backend:
         if args.device != "cuda":
             parser.error("--graph-only requires CUDA.")
         from RL.tdmpc2_core.parallel_teacher import ParallelTeacherSolver

@@ -79,8 +79,8 @@ def recipe(args):
         inner_critic_updates_per_round=16, inner_actor_updates_per_round=4,
         inner_temperature_updates_per_round=0, inner_temperature_mode="inherit_outer",
         outer_actor_objective="distillation", reanalyze_interval=args.refresh_interval,
-        reanalyze_batch_size=20, reanalyze_backend="cuda_graph" if args.refresh_interval else "native",
-        reanalyze_parallel_roots=4, batch_size=256, buffer_size=4096,
+        reanalyze_batch_size=20, reanalyze_backend=getattr(args, "reanalyze_backend", "cuda_graph") if args.refresh_interval else "native",
+        reanalyze_parallel_roots=getattr(args, "parallel_roots", 4), batch_size=256, buffer_size=4096,
         seed_steps=500, pretrain_steps=2, compile=True, compile_strict=True,
         inner_diagnostics_every=1_000_000_000, inner_diagnostic_rollouts=0,
         wandb=False, utd=1,
@@ -234,6 +234,8 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--collection",choices=("native","cuda_graph"),default="native")
     parser.add_argument("--refresh-interval",type=int,choices=(0,10),default=10)
+    parser.add_argument("--reanalyze-backend", choices=("native", "cuda_graph", "batched", "batched_cuda_graph"), default="cuda_graph")
+    parser.add_argument("--parallel-roots", type=int, default=4)
     parser.add_argument("--warmup",type=int,default=510)
     parser.add_argument("--decisions",type=int,default=100)
     parser.add_argument("--device",choices=("cpu","cuda"),default="cuda")

@@ -29,10 +29,10 @@ class LazyReanalyzer:
         self.agent = agent
         self.cfg = agent.cfg
         self.backend = getattr(self.cfg, "reanalyze_backend", "native")
-        if self.backend not in {"native", "cuda_graph"}:
+        if self.backend not in {"native", "cuda_graph", "batched", "batched_cuda_graph"}:
             raise ValueError("Unknown reanalyze_backend.")
-        if self.backend == "cuda_graph" and torch.device(agent.device).type != "cuda":
-            raise ValueError("reanalyze_backend='cuda_graph' requires a CUDA agent.")
+        if self.backend in {"cuda_graph", "batched_cuda_graph"} and torch.device(agent.device).type != "cuda":
+            raise ValueError(f"reanalyze_backend={self.backend!r} requires a CUDA agent.")
         self.parallel_solver = None
         self.generator = torch.Generator(device="cpu")
         self.generator.manual_seed((int(self.cfg.seed) + 982451653) % (2**63 - 1))
@@ -49,26 +49,28 @@ class LazyReanalyzer:
             "refreshes": self.refreshes,
             "roots": self.roots,
         }
-        if self.backend == "cuda_graph":
-            state.update(version=2, **self.backend_specification())
+        if self.backend != "native":
+            state.update(version=3 if self.backend.startswith("batched") else 2,
+                         **self.backend_specification())
         return state
 
     def backend_specification(self):
         from .teacher_graph import TEACHER_GRAPH_PROTOCOL
+        from .batched_teacher import BATCHED_TEACHER_PROTOCOL
         return {
             "reanalyze_backend": self.backend,
-            "reanalyze_rng_protocol": TEACHER_GRAPH_PROTOCOL,
+            "reanalyze_rng_protocol": BATCHED_TEACHER_PROTOCOL if self.backend.startswith("batched") else TEACHER_GRAPH_PROTOCOL,
             "reanalyze_parallel_roots": int(self.cfg.reanalyze_parallel_roots),
         }
 
     def preflight_state_dict(self, state):
         expected = {"schema", "version", "rng_state", "refreshes", "roots"}
-        graph_spec = self.backend_specification() if self.backend == "cuda_graph" else {}
+        graph_spec = self.backend_specification() if self.backend != "native" else {}
         state = require_exact_keys(
             state, expected | graph_spec.keys(),
             "lazy reanalyze state",
         )
-        version = 2 if graph_spec else 1
+        version = 3 if self.backend.startswith("batched") else 2 if graph_spec else 1
         if state["schema"] != "ambi-lazy-reanalyze" or state["version"] != version:
             raise ValueError("Unsupported lazy reanalyze state version.")
         if any(state[key] != value for key, value in graph_spec.items()):
@@ -177,6 +179,11 @@ class LazyReanalyzer:
         return refreshed, metrics
 
     def _solve(self, roots, seeds):
+        if self.backend in {"batched", "batched_cuda_graph"}:
+            if self.parallel_solver is None:
+                from .batched_teacher import BatchedTeacherSolver
+                self.parallel_solver = BatchedTeacherSolver(self.agent)
+            return self.parallel_solver.solve(roots, seeds)
         if self.backend == "cuda_graph":
             if self.parallel_solver is None:
                 from .parallel_teacher import ParallelTeacherSolver

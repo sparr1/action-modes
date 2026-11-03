@@ -33,7 +33,7 @@ class PriorDistillation:
             "reanalyze_interval": int(self.agent.cfg.reanalyze_interval),
             "reanalyze_batch_size": int(self.agent.cfg.reanalyze_batch_size),
         }
-        if self.reanalyzer.backend == "cuda_graph":
+        if self.reanalyzer.backend != "native":
             specification.update(self.reanalyzer.backend_specification())
         return specification
 

@@ -1582,7 +1582,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             merged["reanalyze_batch_size"], "reanalyze_batch_size",
         )
         merged["reanalyze_backend"] = _normalize_choice(
-            merged["reanalyze_backend"], "reanalyze_backend", {"native", "cuda_graph"},
+            merged["reanalyze_backend"], "reanalyze_backend",
+            {"native", "cuda_graph", "batched", "batched_cuda_graph"},
         )
         merged["reanalyze_parallel_roots"] = _strict_positive_int(
             merged["reanalyze_parallel_roots"], "reanalyze_parallel_roots",
@@ -3086,6 +3087,9 @@ class AMBITDMPC2(TDMPC2Baseline):
             if cfg.reanalyze_backend == "cuda_graph":
                 from RL.tdmpc2_core.teacher_graph import validate_teacher_graph_config
                 validate_teacher_graph_config(cfg)
+            elif cfg.reanalyze_backend in {"batched", "batched_cuda_graph"}:
+                from RL.tdmpc2_core.batched_teacher import validate_batched_teacher_config
+                validate_batched_teacher_config(cfg)
 
         # Read-only aliases keep legacy integrations working for one release.
         # Canonical agent code must not use these for scheduling mixed updates.
