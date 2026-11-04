@@ -97,7 +97,7 @@ def test_cuda_graph_captures_correct_behavior_labels_without_changing_solve(upda
         assert_tree_close(actual,expected,rtol=5e-5,atol=5e-7)
         assert_tree_close(inner_snapshot(captured.inner_engine),inner_snapshot(native.inner_engine),rtol=5e-5,atol=5e-7)
         with torch.no_grad():
-            _,info=captured.model.pi(root+.1*index,policy=captured.inner_engine.state.actor,
+            _,info=captured.model.pi(root+.1*index,policy=captured.inner_engine._action_pool.actor,
                 deterministic=True,**captured.inner_engine._inner_policy_kwargs())
         torch.testing.assert_close(actual[3]['pre_tanh_mean'],info['pre_tanh_mean'][0],rtol=5e-5,atol=5e-7)
         torch.testing.assert_close(actual[3]['log_std'],info['log_std'][0],rtol=5e-5,atol=5e-7)
