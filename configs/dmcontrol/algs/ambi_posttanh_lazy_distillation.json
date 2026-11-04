@@ -103,7 +103,7 @@
       "oscar-l40s",
       "whole-inner-cuda-graph",
       "critic-geometry",
-      "750k-decisions",
+      "600k-decisions",
       "lazy-reanalyze",
       "reverse-kl-distillation",
       "refresh-I200-B20",
@@ -169,7 +169,7 @@
     "reanalyze_batched_optimizations": true,
     "reanalyze_batched_first_layer_fusion": false
   },
-  "total_steps": 750000,
+  "total_steps": 600000,
   "episodes": null,
   "checkpoint_every": 25000,
   "save_strat": "all",

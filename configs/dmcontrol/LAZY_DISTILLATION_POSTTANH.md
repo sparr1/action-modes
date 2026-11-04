@@ -15,13 +15,16 @@ starts from fresh prior-initialized actor/critic/optimizer state. Its private Q
 scale starts from the current outer scale and adapts per actor update. The KL
 scale is separate. Critic geometry remains enabled every 1,000 outer updates.
 
-The intended initial budget is 750,000 decisions, with all portable checkpoints
-retained every 25,000 decisions. This shorter budget is deliberate: the original
-million-decision K1 run already takes roughly 50 hours at its observed throughput.
-A fresh end-to-end gate, including environment interaction, collection, outer
-updates, refreshes, checkpoint cost and startup, must fit the supplied absolute
-48-hour deadline before production is launched. No existing run is resumed or
-modified. Compare returns at matching decision counts.
+The budget is 600,000 decisions, with all portable checkpoints retained every
+25,000 decisions. The L40S end-to-end gate at commit `8943eaf` measured 0.19902
+seconds per decision after removing its extra checkpoint and geometry observers.
+Including production pretraining, startup, checkpoint and geometry costs, plus
+a 10% margin, it projected 45.57 hours for 750,000 decisions and 36.45 hours for
+600,000. The shorter budget leaves room for validation and queueing before the
+original absolute 48-hour deadline; completion still depends on the actual
+start time. A fresh gate bound to this budget must pass, and training rechecks
+the time remaining before launch. No existing run is resumed or modified.
+Compare returns at matching decision counts.
 
 Lazy refresh initially uses 20 sequences every 200 outer updates. The interval is
 larger than the default 10 to control runtime. All collection actions still
