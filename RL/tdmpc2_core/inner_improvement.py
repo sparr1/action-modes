@@ -156,6 +156,9 @@ class InnerImprovementEngine(RetraceInnerMixin):
 
     def __init__(self, agent):
         self.agent = agent
+        self._whole_graph_runner = None
+        self._whole_graph_resume = None
+        self._whole_graph_worker = False
         self.cfg = agent.cfg
         self.model = agent.model
         self.device = agent.device
@@ -535,6 +538,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
         return initial_alpha.clamp_min(_INNER_ALPHA_FLOOR)
 
     def clear_all(self):
+        self._whole_graph_runner = None
+        self._whole_graph_resume = None
         self.last_teacher_policy = None
         self.state = InnerWorkspace()
         self._action_pool = InnerWorkspace()
@@ -589,6 +594,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
         if not retain_pool:
             self._action_pool = InnerWorkspace()
         self.rng = self._new_rng(seed)
+        self._whole_graph_runner = None
+        self._whole_graph_resume = None
         self.action_index = 0
         self.episode_index = 0
         self._mppi_prev_mean = None
@@ -1048,6 +1055,9 @@ class InnerImprovementEngine(RetraceInnerMixin):
             payload["retrace_spec"] = self._retrace_spec()
         if self._critic_transfer_spec() is not None:
             payload["critic_transfer_spec"] = self._critic_transfer_spec()
+        if getattr(self.cfg, "inner_cuda_graph", False):
+            from .whole_inner_graph import training_graph_state
+            payload["whole_graph"] = training_graph_state(self)
         return payload
 
     def _load_module_candidate(
@@ -1126,6 +1136,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 "workspace",
                 "mppi_prev_mean",
         }
+        from .whole_inner_graph import preflight_training_graph_state
+        graph_candidate = preflight_training_graph_state(self, state.get("whole_graph"))
+        if getattr(self.cfg, "inner_cuda_graph", False):
+            common_keys.add("whole_graph")
         transfer_spec = self._critic_transfer_spec()
         if state.get("critic_transfer_spec") != transfer_spec:
             raise ValueError("Inner Bernoulli transfer specification is incompatible with exact continuation.")
@@ -1516,6 +1530,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         candidate_rng.load_training_state_dict(state["rng"])
         return {
             "state": candidate,
+            "whole_graph": graph_candidate,
             "rng": candidate_rng,
             "action_index": action_index,
             "episode_index": episode_index,
@@ -1529,6 +1544,9 @@ class InnerImprovementEngine(RetraceInnerMixin):
 
     def _commit_training_state_candidate(self, candidate):
         """Install a candidate returned by strict preflight."""
+        self._whole_graph_runner = None
+        self._whole_graph_resume = candidate["whole_graph"]
+        self.last_teacher_policy = None
         self.state = candidate["state"]
         self._action_pool = InnerWorkspace()
         self.rng = candidate["rng"]
@@ -7222,6 +7240,19 @@ class InnerImprovementEngine(RetraceInnerMixin):
             raise TypeError("capture_teacher_policy must be bool.")
         if capture_teacher_policy and str(self.cfg.inner_operator) != "sac":
             raise ValueError("Teacher-policy capture requires inner SAC.")
+        graph = (bool(getattr(self.cfg, "inner_cuda_graph", False))
+                 and not self._whole_graph_worker and not self._teacher_only)
+        if graph:
+            from .whole_inner_graph import validate_training_graph, training_graph_act
+            validate_training_graph(self)
+            if not eval_mode and not collect_diagnostics and trace is None:
+                if return_behavior_policy:
+                    raise ValueError("Collection CUDA graph does not support behavior-policy metadata.")
+                try:
+                    return training_graph_act(self, root_z, capture_teacher_policy=capture_teacher_policy)
+                except BaseException:
+                    self.last_teacher_policy = None
+                    raise
         if trace is not None:
             from .inner_trace import InnerActionTrace
 
@@ -7258,13 +7289,16 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 trace.begin()
         self._active_trace = trace
         try:
-            return self._act(
+            result = self._act(
                 root_z, t0=t0, eval_mode=eval_mode,
                 collect_diagnostics=collect_diagnostics,
                 return_behavior_policy=return_behavior_policy,
                 **({"capture_teacher_policy": True} if capture_teacher_policy else {}),
                 apply_inner_writeback=apply_inner_writeback,
             )
+            if graph:
+                result[1]["inner_cuda_graph_used"] = 0.0
+            return result
         except BaseException:
             self.last_teacher_policy = None
             self._clear_critic_transfer()

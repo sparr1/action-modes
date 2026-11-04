@@ -987,6 +987,25 @@ resume. It is independent of `reanalyze_batched_optimizations`. Benchmark the
 optional `--trace-dir` collects one additional warmed refresh after timing;
 profiled execution is excluded from latency samples.
 
+The first-layer experiment at commit
+`11f7b41beee2f58926f92de8b602f2437a2d6639` passed all 129 CUDA checks on an
+L40S, but did not improve full-refresh latency meaningfully. Five synchronized
+samples per arm gave the following paired 60-root medians:
+
+| Root width / workers | Existing optimizations | + First-layer fusion |
+|---|---:|---:|
+| 4 / 2 | **3.774 s** | 3.811 s |
+| 8 / 1 | 4.511 s | 4.505 s |
+| 16 / 1 | 4.668 s | 4.658 s |
+| 60 / 1 | 4.803 s | 4.796 s |
+
+Widths 8/16 execute 64 lanes including 4 padding roots; widths 4/60 execute 60.
+The larger-width differences are below 0.3%, while width 4 regresses about 1%.
+Keep fusion disabled for this recipe and use width 4/workers 2. The optional
+kernel trace showed redistributed GEMM/Triton work, with unchanged listed
+GEMM and fused-Adam launch counts; overlapping device-event sums are not
+wall-clock latency. This experiment does not establish a performance ceiling.
+
 Additional `train/distillation_reanalyze_*` metrics record the selected backend,
 pool width, graph setup time, and refresh seconds per root. Setup time is
 included in total refresh latency. For bounded timing without W&B or

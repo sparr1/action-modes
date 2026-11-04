@@ -1836,6 +1836,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
             raise ValueError("AMBI-TD-MPC2 currently supports single-task training only.")
         obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
         was_training = self.model.training
+        collection_modes = (tuple((module, module.training) for module in self.model.modules())
+                            if getattr(self.cfg, "inner_cuda_graph", False) else None)
         self.model.eval()
         try:
             if self.cfg.obs == "rgb":
@@ -1880,7 +1882,11 @@ class AMBITDMPC2Agent(torch.nn.Module):
                         **({"trace": trace} if trace is not None else {}),
                     )
         finally:
-            self.model.train(was_training)
+            if collection_modes is None:
+                self.model.train(was_training)
+            else:
+                for module, training in collection_modes:
+                    module.training = training
         if return_behavior_policy:
             action, metrics, lengths, behavior_policy = result
             if behavior_policy is None:

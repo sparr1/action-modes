@@ -144,6 +144,7 @@ _AMBI_DEFAULTS = {
     "tau": 0.005,
     "target_update_interval": 1,
     "compile_strict": False,
+    "inner_cuda_graph": False,
     # Observational outer-policy telemetry; opt-in for the SAC prior study.
     "outer_policy_diagnostics": False,
     "outer_policy_diagnostics_early_every": 100,
@@ -1599,6 +1600,9 @@ class AMBITDMPC2(TDMPC2Baseline):
         )
         merged["reanalyze_batched_workers"] = _strict_positive_int(
             merged["reanalyze_batched_workers"], "reanalyze_batched_workers",
+        )
+        merged["inner_cuda_graph"] = _strict_bool(
+            merged["inner_cuda_graph"], "inner_cuda_graph",
         )
         merged["inner_sac_return_estimator"] = _normalize_choice(
             merged["inner_sac_return_estimator"],
@@ -3108,6 +3112,10 @@ class AMBITDMPC2(TDMPC2Baseline):
                         "reanalyze_backend='batched_cuda_graph'."
                     )
 
+        if cfg.inner_cuda_graph:
+            from .tdmpc2_core.whole_inner_graph import validate_collection_graph_config
+            validate_collection_graph_config(cfg)
+
         # Read-only aliases keep legacy integrations working for one release.
         # Canonical agent code must not use these for scheduling mixed updates.
         cfg.inner_iterations = (
@@ -3889,6 +3897,7 @@ class AMBITDMPC2(TDMPC2Baseline):
             "inner_explorer_temperature_grad_norm",
         }
         action_gauges = {
+            "inner_cuda_graph_used",
             "inner_critic_bernoulli_p",
             "inner_critic_bernoulli_applied",
             "inner_critic_bernoulli_retained_fraction",

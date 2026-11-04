@@ -226,6 +226,10 @@ def scientific_trial_parameters(
                         value = 0.0
                 algorithm[field] = value
             if projected.get("alg") == _AMBI_ALGORITHM:
+                # Disabled collection capture preserves historical identities;
+                # enabling it changes the collection RNG/checkpoint protocol.
+                if algorithm.get("inner_cuda_graph", False) is False:
+                    algorithm.pop("inner_cuda_graph", None)
                 objective = algorithm.get("outer_actor_objective", "q_maximization")
                 if isinstance(objective, str):
                     objective = objective.lower()

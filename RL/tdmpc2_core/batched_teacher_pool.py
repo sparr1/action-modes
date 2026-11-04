@@ -118,6 +118,7 @@ class ConcurrentBatchedTeacherSolver:
             "distillation_reanalyze_selective_q": float("selective_q" in features),
             "distillation_reanalyze_actor_cache": float("actor_cache" in features),
             "distillation_reanalyze_fused_updates": float("fused_updates" in features),
+            "distillation_reanalyze_first_layer_fusion": float("first_layer_fusion" in features),
             "distillation_reanalyze_chunks": float(chunks),
             "distillation_reanalyze_padding_roots": float((-roots) % self.width),
             "distillation_reanalyze_executed_model_steps": float(chunks * self.width * model_steps),
