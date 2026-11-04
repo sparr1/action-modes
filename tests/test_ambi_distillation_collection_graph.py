@@ -157,6 +157,37 @@ def test_collection_graph_failure_restores_mixed_model_modes():
     assert agent.inner_engine.last_teacher_policy is None
 
 
+def test_prepared_boundary_is_consumed_by_direct_action_like_explicit_reset():
+    torch.manual_seed(519)
+    agent = make_agent()
+    observation = torch.zeros(agent.cfg.obs_shape["state"])
+    agent.act(observation, collect_diagnostics=True, capture_teacher_policy=True)
+    agent.prepare_training_resume_boundary()
+    saved = deepcopy(agent.training_state_dict())
+    episode = agent.inner_engine.episode_index
+    attempts = []
+    for explicit_reset in (False, True):
+        agent.load_training_state_dict(saved)
+        assert agent._resume_boundary_prepared
+        if explicit_reset:
+            agent.reset()
+        host = _globals()
+        action = agent.act(observation + .1, t0=True, collect_diagnostics=True,
+                           capture_teacher_policy=True)
+        _assert_globals(host)
+        assert not agent._resume_boundary_prepared
+        assert agent.inner_engine.episode_index == episode
+        assert agent.inner_engine._nondefault_workspace_fields(agent.inner_engine._action_pool)
+        teacher = _clone_tree(agent.last_teacher_policy)
+        metrics = {key: value for key, value in agent.last_inner_metrics.items()
+                   if not key.endswith("seconds")}
+        agent.prepare_training_resume_boundary()
+        assert agent.inner_engine.episode_index == episode + 1
+        assert not agent.inner_engine._nondefault_workspace_fields(agent.inner_engine._action_pool)
+        attempts.append((action.clone(), teacher, metrics, deepcopy(agent.training_state_dict())))
+    _assert_close(attempts[0], attempts[1], exact=True)
+
+
 @CUDA
 @pytest.mark.parametrize("full,precision", [
     pytest.param(False, "highest", id="small"),

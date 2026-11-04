@@ -1835,6 +1835,11 @@ class AMBITDMPC2Agent(torch.nn.Module):
         if task is not None:
             raise ValueError("AMBI-TD-MPC2 currently supports single-task training only.")
         obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
+        if self._resume_boundary_prepared:
+            # The boundary already advanced the episode lifecycle. Beginning
+            # another action consumes its deferred reset just as reset()->act()
+            # does, so a later checkpoint must clear newly allocated inner state.
+            self.reset()
         was_training = self.model.training
         collection_modes = (tuple((module, module.training) for module in self.model.modules())
                             if getattr(self.cfg, "inner_cuda_graph", False) else None)
