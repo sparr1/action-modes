@@ -29,6 +29,8 @@ def test_matrix_preserves_saved_controller_and_selects_paired_prior(mode):
         if key not in matrix["shared_alg_params"]:
             assert graph["algorithm_config"]["alg_params"][key] == value
     assert graph["evaluation"]["execution_backend"] == PROTOCOL
+    evaluator._validate_benchmark_scopes(graph["algorithm_config"]["alg_params"],
+                                         episode_evaluation=True, execution_backend=PROTOCOL)
     assert prior["algorithm_config"]["alg_params"]["inner_operator"] == "none"
     assert prior["algorithm_config"]["alg_params"]["inner_cuda_graph"] is False
     assert graph["evaluation"]["seeds"] == prior["evaluation"]["seeds"] == [101, 102, 103, 104, 105]
@@ -38,6 +40,17 @@ def test_matrix_preserves_saved_controller_and_selects_paired_prior(mode):
     assert prior_cfg.inner_operator == "none"
     assert graph_cfg.inner_critic_updates_per_action == 128
     assert graph_cfg.inner_actor_updates_per_action == 32
+
+
+def test_q_scale_carry_is_only_permitted_in_full_graph_episodes():
+    params = {"inner_operator": "sac", "sac_actor_loss_scale_mode": "tdmpc2_percentile_range",
+              "inner_actor_loss_scale_scope": "run", "inner_actor_loss_scale_update": "per_update"}
+    for options, override in [({"episode_evaluation": False, "execution_backend": PROTOCOL}, {}),
+                              ({"episode_evaluation": True}, {}),
+                              ({"episode_evaluation": True, "execution_backend": PROTOCOL}, {"inner_actor_scope": "run"}),
+                              ({"episode_evaluation": True, "execution_backend": PROTOCOL}, {"inner_actor_loss_scale_update": "per_action"})]:
+        with pytest.raises(ValueError, match="Benchmark presets require"):
+            evaluator._validate_benchmark_scopes({**params, **override}, **options)
 
 
 def test_graph_controller_rejects_any_protocol_fallback():

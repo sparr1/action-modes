@@ -644,7 +644,8 @@ def _validate_horizon_probe_selection(resolved_presets, *, root_bank_requested,
         )
 
 
-def _validate_benchmark_scopes(params, *, episode_evaluation, temperature_chain=False):
+def _validate_benchmark_scopes(params, *, episode_evaluation, temperature_chain=False,
+                               execution_backend="native"):
     """Permit temperature-only episode memory in explicitly matched full episodes."""
     temperature_keys = ("inner_temperature_scope", "inner_temperature_optimizer_scope")
     if not isinstance(temperature_chain, bool):
@@ -667,14 +668,23 @@ def _validate_benchmark_scopes(params, *, episode_evaluation, temperature_chain=
         and all(params.get(key, "action") == ("run" if temperature_chain else "episode")
                 for key in temperature_keys)
     )
+    graph_scale_carry = (
+        episode_evaluation and execution_backend == "frozen_mean_cuda_graph_v1"
+        and params.get("inner_operator", "sac") == "sac"
+        and params.get("sac_actor_loss_scale_mode") == "tdmpc2_percentile_range"
+        and params.get("inner_actor_loss_scale_scope") == "run"
+        and params.get("inner_actor_loss_scale_update") == "per_update"
+    )
     scopes = [key for key in params if key.startswith("inner_") and key.endswith("_scope")
               and key != "inner_mppi_warm_start_scope"]
     if any(params[key] != "action" and not (temperature_carry and key in temperature_keys)
+           and not (graph_scale_carry and key == "inner_actor_loss_scale_scope")
            for key in scopes):
         raise ValueError(
             "Benchmark presets require fresh action-local inner state, except "
             "paired episode-scoped temperature and optimizer in full-episode SAC evaluation, "
-            "or matched run scopes with explicit --temperature-chain."
+            "matched run scopes with explicit --temperature-chain, or adaptive Q-scale "
+            "carry in the independent-episode CUDA graph protocol."
         )
 
 
@@ -1254,7 +1264,8 @@ def evaluate_matrix(
             if params.get("inner_operator", "sac") not in {"none", "sac", "tdambi", "mppi"}:
                 raise ValueError("Benchmark bundles support prior-only, SAC, TDAMBI, and MPPI presets.")
             _validate_benchmark_scopes(params, episode_evaluation=not (root_bank_path or bank_only),
-                                       temperature_chain=temperature_chain)
+                                       temperature_chain=temperature_chain,
+                                       execution_backend=resolved.get("evaluation", {}).get("execution_backend", "native"))
             if any(params.get(key, 0) for key in ("inner_actor_writeback_coef", "inner_critic_writeback_coef")):
                 raise ValueError("Benchmark presets must disable prior writeback.")
             if int(params.get("inner_diagnostic_rollouts", 0)) != 0:
