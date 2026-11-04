@@ -41,6 +41,12 @@ print(json.dumps(dict(host=platform.node(), torch=torch.__version__, cuda=torch.
     sha=subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),
     tree=subprocess.check_output(["git","rev-parse","HEAD^{tree}"],text=True).strip()),indent=2))
 PY
+if [[ "${AMBI_PRECISION_DIAGNOSTIC:-0}" == 1 ]]; then
+  srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.diagnose_ambi_teacher_precision \
+    --output "$AMBI_BENCH_OUTPUT/precision.json" > "$AMBI_BENCH_OUTPUT/precision.log" 2>&1
+  [[ -z "$(git status --porcelain --untracked-files=all)" ]]
+  exit 0
+fi
 srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m pytest -q --tb=short -p no:cacheprovider \
   tests/test_ambi_batched_teacher.py tests/test_ambi_batched_optimizations.py \
   tests/test_ambi_batched_pool.py tests/test_ambi_reanalyze_backends.py \

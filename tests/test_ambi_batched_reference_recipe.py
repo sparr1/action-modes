@@ -177,3 +177,70 @@ def test_full_reference_recipe_matches_previous_arithmetic(precision, record_pro
         torch.set_float32_matmul_precision(previous_precision)
         gc.collect()
         torch.cuda.empty_cache()
+
+
+def test_full_reference_recipe_concurrent_workers_are_bitwise_identical_at_production_precision(record_property):
+    """Concurrency preserves identical fixed-width kernels, seeds and budgets."""
+    from RL.tdmpc2_core.batched_teacher_pool import ConcurrentBatchedTeacherSolver
+
+    previous_precision = torch.get_float32_matmul_precision()
+    previous_cache_size = torch._dynamo.config.cache_size_limit
+    previous_accumulated = torch._dynamo.config.accumulated_cache_size_limit
+    torch._dynamo.reset()
+    try:
+        torch.set_float32_matmul_precision("high")
+        # Do not enlarge either compiler cache limit: the full eight-round
+        # recipe must compile for every independent worker under normal limits.
+        with _preserve_global_rng():
+            torch.manual_seed(297)
+            agent = _reference_agent(True)
+            with torch.no_grad():
+                observations = torch.randn(10, 67, device="cuda")
+                roots = agent.model.encode(observations).detach()
+            seeds = list(range(377, 387))
+            snapshot = _snapshot_outer(agent)
+            host_rng, cuda_rng = _globals(), torch.cuda.get_rng_state().clone()
+            serial = BatchedTeacherSolver(agent)
+            expected = serial.solve(roots, seeds)
+            _assert_globals(host_rng)
+            torch.testing.assert_close(torch.cuda.get_rng_state(), cuda_rng, rtol=0, atol=0)
+            _assert_outer_unchanged(agent, snapshot)
+            torch.testing.assert_close(
+                expected[2], roots.new_tensor([10 * 3072, 10 * 32, 10 * 128]), rtol=0, atol=0,
+            )
+            # Release graph-private pools between configurations, retaining the
+            # compiler cache so repeated worker shapes still exercise its limit.
+            del serial
+            gc.collect()
+            torch.cuda.empty_cache()
+            for workers in (2, 4):
+                agent.cfg.reanalyze_batched_workers = workers
+                snapshot = _snapshot_outer(agent)
+                pool = ConcurrentBatchedTeacherSolver(agent)
+                for repetition in range(2):
+                    actual = pool.solve(roots, seeds)
+                    for name, value, target in zip(("mean", "log_std", "counts"), actual[:3], expected[:3]):
+                        torch.testing.assert_close(
+                            value, target, rtol=0, atol=0,
+                            msg=lambda message, name=name: f"workers={workers}, {name}: {message}",
+                        )
+                    assert actual[3]["distillation_reanalyze_chunks"] == 3
+                    assert actual[3]["distillation_reanalyze_padding_roots"] == 2
+                    # Ten roots have three width-four chunks: a two-worker
+                    # pool reuses its first workspace; a four-worker setting
+                    # needs only three workers for this particular batch.
+                    assert actual[3]["distillation_reanalyze_batched_workers"] == min(workers, 3)
+                    _assert_outer_unchanged(agent, snapshot)
+                    _assert_globals(host_rng)
+                    torch.testing.assert_close(torch.cuda.get_rng_state(), cuda_rng, rtol=0, atol=0)
+                    record_property(f"high_workers_{workers}_repetition_{repetition}_bitwise_identical", True)
+                del pool
+                gc.collect()
+                torch.cuda.empty_cache()
+    finally:
+        torch._dynamo.reset()
+        torch._dynamo.config.cache_size_limit = previous_cache_size
+        torch._dynamo.config.accumulated_cache_size_limit = previous_accumulated
+        torch.set_float32_matmul_precision(previous_precision)
+        gc.collect()
+        torch.cuda.empty_cache()
