@@ -867,12 +867,57 @@ and action-local Q scaling. The root-batched RNG protocol is
 private random stream. Every root receives separate policy noise, replay
 indices, dropout masks and Q-head selections. Chunk width/order changes those
 draws and is part of exact-resume identity, together with the backend and
-protocol. Native and stream-graph checkpoint formats remain unchanged; batched
-reanalysis uses version 3. A partial final chunk is padded with independent
+protocol. Native and stream-graph checkpoint formats remain unchanged. The
+reference batched implementation uses version 3; optimized or concurrent
+execution uses version 4 as described below. A partial final chunk is padded with independent
 dummy roots. Padding never produces labels or changes useful-work counters;
 `distillation_reanalyze_padding_roots` and
 `distillation_reanalyze_executed_model_steps` expose its actual extra work.
 All backends leave normal action collection unchanged.
+
+For batched backends, `reanalyze_batched_optimizations=true` enables sampled-head
+Q evaluation, actor-output caching during eligible critic-only blocks, and
+compiled gradient clipping/target EMA. Target and actor Q reductions evaluate
+only the selected pair, while critic training still updates the entire ensemble.
+The original pair and dropout draws are retained. Cached actor network outputs
+are rebuilt after replay changes and actor updates; action noise, log probability,
+and entropy are computed afresh for every critic update. Interleaved schedules
+use the uncached path, and caching is skipped when it would evaluate more rows.
+These changes preserve the full rollout and optimization budgets and independent
+root losses. Different matrix shapes and compiled reductions can change floating
+point rounding; parity is numerical rather than a cross-implementation bitwise
+guarantee.
+
+`reanalyze_batched_workers=1` is the default. With `batched_cuda_graph`, larger
+values enqueue independent fixed-width chunks on separate CUDA streams. Each
+worker owns its graphs, optimizer state and replay; all captures finish before
+launches, outputs are copied before worker reuse, and every worker joins before
+the outer learner proceeds. Chunk order and seeds do not change with worker
+count. Concurrency remains synchronous with respect to the outer update; it
+does not introduce stale teachers. More workers use more memory and require
+measurement rather than assuming higher throughput.
+
+Optimized/concurrent checkpoints record execution revision, optimization flag
+and worker count, and reject incompatible exact resumes before mutation. Set
+`reanalyze_batched_optimizations=false` and `reanalyze_batched_workers=1` to use
+the previous version-3 reference arithmetic and checkpoint specification. These
+controls are dormant for native reanalysis, the previous stream backend, and
+the default Q-maximization objective.
+
+The bounded optimization benchmark below runs the actual refresh path with
+unchanged budgets and no W&B/checkpoints. `--features` supports `reference`,
+`heads`, `heads-cache`, and `all`; partial feature sets are benchmark-only.
+
+```bash
+WANDB_MODE=disabled environments/dmcontrol/.venv/bin/python \
+  -m tests.benchmark_ambi_teacher_optimizations --features all --workers 1 \
+  --width 4 --roots 60 --output /tmp/reanalyze-optimized.json
+```
+
+`slurm/run_ambi_teacher_optimizations_oscar.sbatch` first runs CUDA correctness
+gates, including the full reference recipe, then measures each feature set and
+one/two/four workers on the same L40S in separate processes. It preserves the
+previous reference implementation as an explicit paired baseline.
 
 For a complete batched refresh benchmark inside an allocated GPU job:
 
@@ -888,6 +933,34 @@ benchmark records first-call setup separately and rejects compilation during
 the steady-state timing window. Root-batched arithmetic is checked against
 independent solves using identical explicit random tensors; its outputs are
 not expected to equal the other RNG protocols or another chunk width.
+
+On an L40S with the locked PyTorch 2.3.1+cu121 runtime and float32 matmul
+precision `high`, the reference J8/N128/H3 recipe (128 critic and 32 actor
+updates per root) gave these complete 60-root refresh medians. Each arm uses
+five synchronized measurements after warmup; setup is excluded from medians.
+The measured runtime is commit `a9ef5d72bfd6918292a81b8fe096ef8c1ae0749b`,
+before the sampled-head, actor-cache and concurrent-worker optimizations.
+On newer source, reproduce that reference path with
+`reanalyze_batched_optimizations=false` and `reanalyze_batched_workers=1`.
+
+| Backend | Root chunk width | Refresh median | Peak allocated GPU memory |
+|---|---:|---:|---:|
+| Original sequential CUDA graphs | 1 | 7.282 s | 135.6 MiB |
+| Batched CUDA graph + fused Adam | 1 | 6.634 s | 148.5 MiB |
+| Batched CUDA graph + fused Adam | 4 | **4.197 s** | 420.5 MiB |
+| Batched CUDA graph + fused Adam | 16 | 5.102 s | 1,507.7 MiB |
+| Batched CUDA graph + fused Adam | 60 | 5.184 s | 5,477.5 MiB |
+
+Use `reanalyze_backend="batched_cuda_graph"` and
+`reanalyze_parallel_roots=4` for this recipe. The four-root first call took
+35.12 seconds including allocation, compilation, capture and execution. Its
+steady refresh was 1.74 times faster than the same-GPU sequential graph
+baseline. Larger root batches were slower; the measurements do not identify
+the limiting kernels. At interval 10, a 60-root refresh adds about 0.420 seconds
+per outer update. Reanalysis remains
+synchronous. This is a refresh benchmark, not a new full-training measurement.
+Fresh four-stream baseline attempts failed in compiled CUDA execution, so
+the older 5.31-second four-stream result is only a historical comparison.
 
 Additional `train/distillation_reanalyze_*` metrics record the selected backend,
 pool width, graph setup time, and refresh seconds per root. Setup time is

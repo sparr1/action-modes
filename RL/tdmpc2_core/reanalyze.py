@@ -50,9 +50,29 @@ class LazyReanalyzer:
             "roots": self.roots,
         }
         if self.backend != "native":
-            state.update(version=3 if self.backend.startswith("batched") else 2,
+            state.update(version=self._schema_version(),
                          **self.backend_specification())
         return state
+
+    def _batched_execution_specification(self):
+        if not self.backend.startswith("batched"):
+            return {}
+        optimized = bool(getattr(self.cfg, "reanalyze_batched_optimizations", True))
+        workers = int(getattr(self.cfg, "reanalyze_batched_workers", 1))
+        # The explicit reference path retains the previous v3 payload and
+        # arithmetic, so previously saved batched teachers can still resume.
+        if not optimized and workers == 1:
+            return {}
+        return {
+            "reanalyze_execution": "root_batched_optimized_v2",
+            "reanalyze_batched_optimizations": optimized,
+            "reanalyze_batched_workers": workers,
+        }
+
+    def _schema_version(self):
+        if self.backend.startswith("batched"):
+            return 4 if self._batched_execution_specification() else 3
+        return 2 if self.backend != "native" else 1
 
     def backend_specification(self):
         from .teacher_graph import TEACHER_GRAPH_PROTOCOL
@@ -64,6 +84,7 @@ class LazyReanalyzer:
         }
         if self.backend.startswith("batched"):
             specification["reanalyze_optimizer"] = BATCHED_TEACHER_OPTIMIZER
+            specification.update(self._batched_execution_specification())
         return specification
 
     def preflight_state_dict(self, state):
@@ -73,9 +94,15 @@ class LazyReanalyzer:
             state, expected | graph_spec.keys(),
             "lazy reanalyze state",
         )
-        version = 3 if self.backend.startswith("batched") else 2 if graph_spec else 1
+        version = self._schema_version()
         if state["schema"] != "ambi-lazy-reanalyze" or state["version"] != version:
             raise ValueError("Unsupported lazy reanalyze state version.")
+        if "reanalyze_batched_optimizations" in graph_spec:
+            if type(state["reanalyze_batched_optimizations"]) is not bool:
+                raise ValueError("Lazy reanalyze optimization flag must be a boolean.")
+            workers = state["reanalyze_batched_workers"]
+            if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
+                raise ValueError("Lazy reanalyze worker count must be a positive integer.")
         if any(state[key] != value for key, value in graph_spec.items()):
             raise ValueError("Incompatible reanalysis backend or RNG protocol.")
         for name in ("refreshes", "roots"):
@@ -184,8 +211,12 @@ class LazyReanalyzer:
     def _solve(self, roots, seeds):
         if self.backend in {"batched", "batched_cuda_graph"}:
             if self.parallel_solver is None:
-                from .batched_teacher import BatchedTeacherSolver
-                self.parallel_solver = BatchedTeacherSolver(self.agent)
+                if int(getattr(self.cfg, "reanalyze_batched_workers", 1)) > 1:
+                    from .batched_teacher_pool import ConcurrentBatchedTeacherSolver
+                    self.parallel_solver = ConcurrentBatchedTeacherSolver(self.agent)
+                else:
+                    from .batched_teacher import BatchedTeacherSolver
+                    self.parallel_solver = BatchedTeacherSolver(self.agent)
             return self.parallel_solver.solve(roots, seeds)
         if self.backend == "cuda_graph":
             if self.parallel_solver is None:

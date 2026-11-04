@@ -236,6 +236,7 @@ def scientific_trial_parameters(
                     for field in (
                         "outer_actor_objective", "reanalyze_interval", "reanalyze_batch_size",
                         "reanalyze_backend", "reanalyze_parallel_roots",
+                        "reanalyze_batched_optimizations", "reanalyze_batched_workers",
                     ):
                         algorithm.pop(field, None)
                 elif objective == "distillation":
@@ -249,6 +250,20 @@ def scientific_trial_parameters(
                     else:
                         algorithm["reanalyze_backend"] = backend
                         algorithm["reanalyze_parallel_roots"] = algorithm.get("reanalyze_parallel_roots", 4)
+                    if backend in {"batched", "batched_cuda_graph"}:
+                        optimized = algorithm.get("reanalyze_batched_optimizations", True)
+                        workers = algorithm.get("reanalyze_batched_workers", 1)
+                        if optimized is False and workers == 1:
+                            # Explicit reference execution preserves old v3
+                            # fingerprints; the checkpoint validates its schema.
+                            algorithm.pop("reanalyze_batched_optimizations", None)
+                            algorithm.pop("reanalyze_batched_workers", None)
+                        else:
+                            algorithm["reanalyze_batched_optimizations"] = optimized
+                            algorithm["reanalyze_batched_workers"] = workers
+                    else:
+                        algorithm.pop("reanalyze_batched_optimizations", None)
+                        algorithm.pop("reanalyze_batched_workers", None)
                 algorithm = normalize_lora_rl_identity(algorithm)
                 algorithm = normalize_pave_identity(algorithm)
                 # Auxiliary eligibility needs the explicit backend before the

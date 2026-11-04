@@ -240,7 +240,7 @@ def test_batched_refresh_resume_and_protocol_validation(models):
     restored.load_state_dict(saved)
     actual = restored.refresh(_ReplayProbe(), obs, teacher, 20)[0]
     _assert_tree_equal(actual, expected)
-    assert saved["version"] == 3 and actual["valid"].sum() == 4
+    assert saved["version"] == 4 and actual["valid"].sum() == 4
     for key, invalid in (("reanalyze_parallel_roots", 3), ("reanalyze_backend", "native"), ("reanalyze_rng_protocol", "other"), ("reanalyze_optimizer", "other")):
         state = _clone_tree(saved)
         state[key] = invalid

@@ -108,6 +108,8 @@ _AMBI_DEFAULTS = {
     "reanalyze_batch_size": 20,
     "reanalyze_backend": "native",
     "reanalyze_parallel_roots": 4,
+    "reanalyze_batched_optimizations": True,
+    "reanalyze_batched_workers": 1,
     # Optional TD-MPC2 Q-only normalization in the SAC actor objective.
     "sac_actor_loss_scale_mode": "none",
     "sac_actor_loss_scale_tau": 0.01,
@@ -1587,6 +1589,12 @@ class AMBITDMPC2(TDMPC2Baseline):
         )
         merged["reanalyze_parallel_roots"] = _strict_positive_int(
             merged["reanalyze_parallel_roots"], "reanalyze_parallel_roots",
+        )
+        merged["reanalyze_batched_optimizations"] = _strict_bool(
+            merged["reanalyze_batched_optimizations"], "reanalyze_batched_optimizations",
+        )
+        merged["reanalyze_batched_workers"] = _strict_positive_int(
+            merged["reanalyze_batched_workers"], "reanalyze_batched_workers",
         )
         merged["inner_sac_return_estimator"] = _normalize_choice(
             merged["inner_sac_return_estimator"],
@@ -3090,6 +3098,11 @@ class AMBITDMPC2(TDMPC2Baseline):
             elif cfg.reanalyze_backend in {"batched", "batched_cuda_graph"}:
                 from RL.tdmpc2_core.batched_teacher import validate_batched_teacher_config
                 validate_batched_teacher_config(cfg)
+                if cfg.reanalyze_batched_workers > 1 and cfg.reanalyze_backend != "batched_cuda_graph":
+                    raise ValueError(
+                        "reanalyze_batched_workers > 1 requires "
+                        "reanalyze_backend='batched_cuda_graph'."
+                    )
 
         # Read-only aliases keep legacy integrations working for one release.
         # Canonical agent code must not use these for scheduling mixed updates.

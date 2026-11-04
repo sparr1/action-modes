@@ -92,6 +92,8 @@ def benchmark(args):
         inner_updates_per_round=1, inner_replay_capacity=8,
         compile=args.compile, compile_strict=args.compile,
         inner_temperature_mode="inherit_outer", wandb=False,
+        reanalyze_batched_optimizations=not getattr(args, "reference_batched", False),
+        reanalyze_batched_workers=getattr(args, "batched_workers", 1),
     )
     if args.profile == "reference":
         params.pop("inner_updates_per_round")
@@ -321,6 +323,8 @@ def main():
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--full-refresh", action="store_true")
     parser.add_argument("--batched-backend", choices=("batched", "batched_cuda_graph"))
+    parser.add_argument("--reference-batched", action="store_true")
+    parser.add_argument("--batched-workers", type=int, default=1)
     parser.add_argument("--graph-only", action="store_true")
     parser.add_argument("--compile-cache-limit", type=int)
     parser.add_argument("--reuse-graph-pool", action="store_true")
@@ -332,7 +336,7 @@ def main():
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    if min(args.roots, args.threads, args.repeats, *args.parallel_roots) <= 0 or args.warmup < 1:
+    if min(args.roots, args.threads, args.repeats, args.batched_workers, *args.parallel_roots) <= 0 or args.warmup < 1:
         parser.error("Counts must be positive, including at least one warmup.")
     if args.compile_cache_limit is not None and args.compile_cache_limit < 1:
         parser.error("--compile-cache-limit must be positive.")
