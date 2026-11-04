@@ -18,6 +18,10 @@ Unsupported lifetimes, sampled execution, traces and probes fail explicitly.
 two new evaluation series, runs checkpoint tasks, and publishes through the
 single-owner registry. Its CPU publisher installs and verifies a dedicated W&B
 workspace before uploading results, and reports missing/failed cells.
+Preparation defaults to the 50,000-decision checkpoint grid; pass
+`--checkpoint-every 25000` to include every saved 25,000-decision checkpoint up
+to the explicit `--max-step` cutoff. The selected grid and checkpoint hashes
+are pinned in the campaign before evaluation.
 
 The [joint entropy and prior-KL evaluation](ENTROPY_KL_EVAL.md) keeps automatic
 temperature learning enabled while testing two fixed prior-KL penalties on

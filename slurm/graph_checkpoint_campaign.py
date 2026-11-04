@@ -65,6 +65,8 @@ def prepare(args):
         raise ValueError("Preparation requires a clean committed source checkout")
     if args.campaign.exists():
         raise FileExistsError("Campaign exists; select its existing registry instead of creating duplicate runs")
+    if args.checkpoint_every <= 0 or args.max_step < args.checkpoint_every:
+        raise ValueError("Checkpoint spacing must be positive and no greater than the cutoff")
     rows = []
     for metadata in sorted(args.training_root.glob("*/*/*.metadata.json")):
         weight = Path(str(metadata).removesuffix(".metadata.json"))
@@ -72,7 +74,7 @@ def prepare(args):
             continue
         data = series._read(metadata)
         step = data["checkpoint"]["step"]
-        if step < 50000 or step > args.max_step or step % 50000:
+        if step < args.checkpoint_every or step > args.max_step or step % args.checkpoint_every:
             continue
         trial = data["trial_run_params"]
         if trial["name"] != args.config_name:
@@ -107,7 +109,8 @@ def prepare(args):
                     controller_description=details["description"], expected_metrics=details["expected_metrics"],
                     source_commit=git("rev-parse", "HEAD"),
                     source_tree=git("rev-parse", "HEAD^{tree}"), matrix_sha256=series._file_digest(MATRIX),
-                    cutoff_step=args.max_step, checkpoints=rows, runs=runs,
+                    cutoff_step=args.max_step, checkpoint_every=args.checkpoint_every,
+                    checkpoints=rows, runs=runs,
                     seeds=[101, 102, 103, 104, 105], controller_seed=55, max_steps=500,
                     execution_action="mean", recording="returns", root=str(args.campaign.resolve()))
     series._atomic_json(args.campaign / "campaign.json", campaign)
@@ -293,6 +296,8 @@ def main():
             p.add_argument("--source-name", required=True)
             p.add_argument("--config-name", required=True)
             p.add_argument("--max-step", type=int, required=True)
+            p.add_argument("--checkpoint-every", type=int, default=50000,
+                           help="Select available checkpoints on this decision grid (default: 50000).")
             p.add_argument("--registry", type=Path, required=True)
         if name == "worker":
             p.add_argument("--index", type=int, required=True)
