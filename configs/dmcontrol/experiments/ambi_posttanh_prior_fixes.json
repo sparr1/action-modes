@@ -1,0 +1,31 @@
+{
+  "study_type": "posttanh_prior_fixes",
+  "study_note": "Six H3/J8/K1 post-tanh fixed-alpha (0.0021) runs: outer_adapt and outer_frozen crossed with baseline, corrected TD-M(PC)^2 beta1, and corrected BOOM lambda0.42. Seed55; one million decisions; every25k portable checkpoints. Whole-inner CUDA graphs, strict compilation, vmap critics, and sparse observational critic geometry in every arm. No BOOM lambda0 control.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_posttanh_prior_outer_adapt_baseline",
+    "ambi_posttanh_prior_outer_adapt_tdmpc_square",
+    "ambi_posttanh_prior_outer_adapt_boom",
+    "ambi_posttanh_prior_outer_frozen_baseline",
+    "ambi_posttanh_prior_outer_frozen_tdmpc_square",
+    "ambi_posttanh_prior_outer_frozen_boom"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}

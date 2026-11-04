@@ -22,6 +22,8 @@ from .common.policy_diagnostics import (
 from .common.scale import percentile_range
 from .common.soft_world_model import SoftWorldModel
 from .auxiliary_return import AuxiliaryReturnLearner
+from .behavior_policy import squashed_behavior_cross_entropy
+from .boom import boom_alignment_loss
 from .inner_improvement import InnerImprovementEngine, polyak_update
 from .outer_policy_diagnostics import diagnostics_due, policy_diagnostics
 from .pave import outer_pave_loss, pave_enabled
@@ -66,6 +68,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        self._boom_enabled = str(getattr(cfg, "outer_actor_objective", "q_maximization")) == "boom"
         self._outer_policy_diagnostics_packet = None
         self._outer_policy_diagnostics_force = False
         self.device = resolve_device(getattr(cfg, "device", None))
@@ -87,6 +90,19 @@ class AMBITDMPC2Agent(torch.nn.Module):
             self._outer_update_kernel,
             enabled=bool(getattr(cfg, "compile", False)),
             strict=bool(getattr(cfg, "compile_strict", False)),
+        )
+        # CUDA graph optimization is opt-in. CPU checkpoints/configs remain
+        # portable and use ordinary compilation even when it was requested.
+        self._boom_actor_compile_mode = (
+            str(getattr(cfg, "outer_boom_compile_mode", "default"))
+            if self.device.type == "cuda" else "default"
+        )
+        self._boom_actor_region = CompileRegion(
+            "BOOM outer actor",
+            self._boom_actor_kernel,
+            enabled=self._boom_enabled and bool(getattr(cfg, "compile", False)),
+            strict=bool(getattr(cfg, "compile_strict", False)),
+            mode=self._boom_actor_compile_mode,
         )
         self.register_buffer(
             "_transition_temporal_weights",
@@ -110,12 +126,48 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self._actor_loss_scale_mode = str(
             getattr(cfg, "sac_actor_loss_scale_mode", "none")
         ).lower()
+        if self._boom_enabled and self._actor_loss_scale_mode != _ACTOR_LOSS_SCALE_MODE:
+            raise ValueError("BOOM requires sac_actor_loss_scale_mode='tdmpc2_percentile_range'.")
         self._behavior_policy_kl_schedule = str(
             getattr(cfg, "outer_behavior_policy_kl_schedule", "none")
         ).lower()
         self._behavior_policy_objective = str(
             getattr(cfg, "outer_behavior_policy_objective", "reverse_kl")
         ).lower()
+        self._behavior_policy_weighting = str(
+            getattr(cfg, "outer_behavior_policy_weighting", "constant")
+        ).lower()
+        if self._behavior_policy_weighting not in {"constant", "tdmpc_square"}:
+            raise ValueError(
+                "outer_behavior_policy_weighting must be 'constant' or 'tdmpc_square'."
+            )
+        requested_behavior_compile_mode = str(
+            getattr(cfg, "outer_behavior_policy_compile_mode", "default")
+        ).lower()
+        if requested_behavior_compile_mode not in {"default", "reduce-overhead"}:
+            raise ValueError("outer_behavior_policy_compile_mode must be 'default' or 'reduce-overhead'.")
+        self._behavior_ce_compile_mode = (
+            requested_behavior_compile_mode if self.device.type == "cuda" else "default"
+        )
+        self._behavior_ce_region = CompileRegion(
+            "TD-M(PC)^2 behavior CE", squashed_behavior_cross_entropy,
+            enabled=(self._behavior_policy_weighting == "tdmpc_square"
+                     and bool(getattr(cfg, "compile", False))),
+            strict=bool(getattr(cfg, "compile_strict", False)),
+            mode=self._behavior_ce_compile_mode,
+        )
+        if self._behavior_policy_weighting == "tdmpc_square" and (
+            self._behavior_policy_objective != "action_space_cross_entropy"
+            or self._behavior_policy_kl_schedule != "quantile_gate"
+            or self._actor_loss_scale_mode != _ACTOR_LOSS_SCALE_MODE
+            or str(getattr(cfg, "outer_actor_objective", "q_maximization")) != "q_maximization"
+            or self.model.value_spec.is_split
+            or float(cfg.rho) < 0.0
+        ):
+            raise ValueError(
+                "TD-M(PC)^2 weighting requires action-space CE, quantile_gate, "
+                "TD-MPC2 Q scaling, q_maximization, a single-component critic, and rho >= 0."
+            )
         if self._behavior_policy_kl_schedule not in _BEHAVIOR_POLICY_KL_SCHEDULES:
             raise ValueError(
                 "outer_behavior_policy_kl_schedule must be one of "
@@ -387,6 +439,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
         return self._actor_loss_scale_value
 
     def _checkpoint_version(self):
+        if self.boom_enabled:
+            return 9
         if self.behavior_policy_kl_enabled:
             return 6 if self.actor_loss_scale_enabled else 5
         return 4 if self.actor_loss_scale_enabled else 3
@@ -394,9 +448,16 @@ class AMBITDMPC2Agent(torch.nn.Module):
     def _actor_loss_scale_spec(self):
         if not self.actor_loss_scale_enabled:
             return None
+        application = "q_only"
+        # Auxiliary actors borrow this method but do not opt into the primary
+        # actor's BOOM/TD-M(PC)^2 objective settings.
+        if getattr(self, "_boom_enabled", False):
+            application = "q_and_boom_alignment"
+        elif getattr(self, "_behavior_policy_weighting", "constant") == "tdmpc_square":
+            application = "q_and_behavior_cross_entropy"
         spec = {
             "mode": _ACTOR_LOSS_SCALE_MODE,
-            "application": "q_only",
+            "application": application,
             "source": "decoded_outer_actor_q_depth0",
             "reduction": str(self.cfg.outer_q_actor_reduction),
             "percentiles": list(_ACTOR_LOSS_SCALE_PERCENTILES),
@@ -520,6 +581,14 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 "q_only" if self.actor_loss_scale_enabled else "none"
             ),
         }
+        if getattr(self, "_behavior_policy_weighting", "constant") == "tdmpc_square":
+            spec.update({
+                "weighting": "tdmpc_square",
+                "action_dim": int(self.cfg.action_dim),
+                "joint_density_coefficient": "coef_times_action_dim_over_61_over_q_scale",
+                "extra_logprob_action_dim_multiplier": False,
+                "actor_loss_scaling": "q_and_behavior_cross_entropy",
+            })
         if self._behavior_policy_objective == "reverse_kl":
             # The scaling application above distinguishes historical full-loss
             # scaling from Q-only scaling without changing the state schema.
@@ -865,6 +934,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
         if self.behavior_policy_kl_enabled:
             state["behavior_policy_kl_spec"] = self._behavior_policy_kl_spec()
             state["behavior_policy_kl_state"] = self._behavior_policy_kl_state()
+        if self.boom_enabled:
+            state["boom_spec"] = self._boom_spec()
         if getattr(self, "aux_return", None) is not None:
             state["aux_return_spec"] = self.aux_return.specification()
             state["aux_return_state"] = self.aux_return.checkpoint_state()
@@ -1190,7 +1261,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
             )
         if getattr(self, "aux_return", None) is not None:
             expected_keys.update({"aux_return_spec", "aux_return_state"})
+        if self.boom_enabled:
+            expected_keys.add("boom_spec")
         state = require_exact_keys(state, expected_keys, "AMBI outer training state")
+        self._preflight_boom_spec(state)
         self._preflight_aux_return(state, exact=True)
         if state["critic_spec"] != self.model.critic_signature:
             raise ValueError("AMBI exact training-state critic specification does not match this agent.")
@@ -1356,12 +1430,15 @@ class AMBITDMPC2Agent(torch.nn.Module):
             4,
             5,
             6,
+            9,
         }:
             raise ValueError(
                 f"Unsupported AMBI checkpoint_version={checkpoint_version!r}; "
-                "supported versions are 1 through 6."
+                "supported versions are 1 through 6 and 9."
             )
         structured_checkpoint = isinstance(state, dict) and "model" in state
+        if structured_checkpoint:
+            self._preflight_boom_spec(state)
         aux_return_candidate = self._preflight_aux_return(state)
         actor_loss_scale_candidate = None
         behavior_policy_kl_candidate = None
@@ -1388,7 +1465,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
                     "configured schedule is 'none'."
                 )
             if self.actor_loss_scale_enabled:
-                expected_scale_version = 6 if self.behavior_policy_kl_enabled else 4
+                expected_scale_version = self._checkpoint_version()
                 if checkpoint_version != expected_scale_version:
                     raise ValueError(
                         "An enabled actor-loss scaler requires a "
@@ -2613,66 +2690,28 @@ class AMBITDMPC2Agent(torch.nn.Module):
         behavior_log_std,
         behavior_policy_valid,
     ):
-        """Return exact normalized-action CE with a sampled tanh correction."""
-        (
-            current_mean,
-            current_log_std,
-            current_pre_tanh_action,
-            valid,
-        ) = self._behavior_policy_inputs(
-            policy_info,
-            behavior_pre_tanh_mean,
-            behavior_log_std,
-            behavior_policy_valid,
+        """Use the fixed-shape CE kernel for corrected TD-M(PC)^2 weighting."""
+        if getattr(self, "_behavior_policy_weighting", "constant") != "tdmpc_square":
+            return self._behavior_policy_action_ce_loss_reference(
+                policy_info, behavior_pre_tanh_mean, behavior_log_std, behavior_policy_valid,
+            )
+        current_mean, current_log_std, pre_tanh_action, valid = self._behavior_policy_inputs(
+            policy_info, behavior_pre_tanh_mean, behavior_log_std, behavior_policy_valid,
             require_pre_tanh_action=True,
         )
-        action_dim = float(self.cfg.action_dim)
-        gaussian_per_row = td_math.diagonal_gaussian_cross_entropy(
-            current_mean,
-            current_log_std,
-            behavior_pre_tanh_mean,
-            behavior_log_std,
-        ).squeeze(-1) / action_dim
-        log_jacobian_per_row = td_math.tanh_log_abs_det_jacobian(
-            current_pre_tanh_action,
-        ).squeeze(-1) / action_dim
-        ce_per_row = gaussian_per_row + log_jacobian_per_row
-        stats = self._behavior_policy_row_statistics(
-            ce_per_row,
-            valid,
-            (
-                current_mean.sum()
-                + current_log_std.sum()
-                + current_pre_tanh_action.sum()
-            ),
+        loss, ready, metrics = self._behavior_ce_region(
+            current_mean, current_log_std, pre_tanh_action,
+            behavior_pre_tanh_mean, behavior_log_std, valid,
+            self._transition_temporal_weights,
+            int(self.cfg.outer_behavior_policy_kl_min_valid_count),
         )
-        if stats["has_weighted_support"]:
-            weighted_valid = stats["weighted_valid"]
-            denominator = stats["denominator"]
-            gaussian_component = (
-                gaussian_per_row[valid] * weighted_valid[valid]
-            ).sum() / denominator
-            jacobian_component = (
-                log_jacobian_per_row[valid] * weighted_valid[valid]
-            ).sum() / denominator
-        else:
-            gaussian_component = stats["loss"]
-            jacobian_component = stats["loss"]
-        metrics = {
-            "behavior_policy_action_ce": stats["loss"].detach(),
-            "behavior_policy_action_ce_gaussian": gaussian_component.detach(),
-            "behavior_policy_action_ce_log_abs_det_jacobian": (
-                jacobian_component.detach()
-            ),
-            "behavior_policy_action_ce_p50": stats["p50"],
-            "behavior_policy_action_ce_p95": stats["p95"],
-            "behavior_policy_action_ce_valid_count": float(
-                stats["valid_count"]
-            ),
-            "behavior_policy_action_ce_valid_fraction": stats["valid_fraction"],
-            "behavior_policy_action_ce_ready": float(stats["ready"]),
-        }
-        return stats["loss"], stats["ready"], metrics
+        if self._behavior_ce_region.enabled and self._behavior_ce_compile_mode == "reduce-overhead":
+            # Scalar diagnostics may outlive this update. Own their storage
+            # outside the compiled region before its next CUDA graph replay.
+            names = tuple(metrics)
+            owned = torch.stack([metrics[name] for name in names])
+            metrics = {name: owned[index] for index, name in enumerate(names)}
+        return loss, ready, metrics
 
     def _behavior_policy_regularizer_loss(
         self,
@@ -2700,7 +2739,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
         """Keep ordinary L2 clipping safe for large finite behavior gradients."""
         parameters = tuple(self.model._pi.parameters())
         maximum = float(self.cfg.grad_clip_norm)
-        if not self.behavior_policy_kl_enabled:
+        if (not self.behavior_policy_kl_enabled
+                and not getattr(self, "_boom_enabled", False)):
             return torch.nn.utils.clip_grad_norm_(parameters, maximum)
 
         gradients = [p.grad for p in parameters if p.grad is not None]
@@ -2734,6 +2774,22 @@ class AMBITDMPC2Agent(torch.nn.Module):
         alpha_snapshot=None,
         scale_snapshot=None,
     ):
+        boom_enabled = getattr(self, "_boom_enabled", False)
+        actor_temporal_weights = self._actor_temporal_weights
+        if boom_enabled:
+            # Replay has labels for H executed decisions, not the terminal
+            # latent. Released BOOM uses those same H states for every actor
+            # term, including Q and entropy, with no extra policy/Q sample.
+            zs = zs[:-1]
+            actor_temporal_weights = self._transition_temporal_weights
+            if behavior_pre_tanh_mean is None or behavior_policy_valid is None:
+                raise ValueError("BOOM actor updates require replay behavior means and validity.")
+            expected_mean_shape = (*zs.shape[:-1], self.cfg.action_dim)
+            if behavior_pre_tanh_mean.shape != expected_mean_shape:
+                raise ValueError("BOOM replay means must align with H nonterminal actor states.")
+            if (behavior_policy_valid.shape not in {zs.shape[:-1], (*zs.shape[:-1], 1)}
+                    or behavior_policy_valid.dtype != torch.bool):
+                raise ValueError("BOOM replay validity must be boolean [H,B] or [H,B,1].")
         split_values = self.model.value_spec.is_split
         if split_values:
             # Critic parameters are detached by the forward below. Only the
@@ -2753,7 +2809,15 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self._outer_policy_diagnostics_force = False
         self._outer_policy_diagnostics_packet = None
         scaled_entropy_enabled = self._actor_entropy_mode == "tdmpc2_scaled"
-        if scaled_entropy_enabled:
+        if boom_enabled:
+            boom_outputs = self._boom_actor_region(
+                zs, behavior_pre_tanh_mean, behavior_policy_valid,
+                self.alpha.detach(), self._actor_loss_scale_value,
+            )
+            action, policy_info = boom_outputs["action"], boom_outputs["policy_info"]
+            with torch.no_grad():
+                self._actor_loss_scale_value.copy_(boom_outputs["proposed_scale"])
+        elif scaled_entropy_enabled:
             action, policy_info = self.model.pi(zs, include_scaled_entropy=True)
         else:
             action, policy_info = self.model.pi(zs)
@@ -2814,7 +2878,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             ).detach().mean(dim=(1, 2))
             # Match the actor's relative depth mixture without making the
             # temperature step size depend on horizon-level loss scaling.
-            entropy_temporal_weights = self._actor_temporal_weights.to(
+            entropy_temporal_weights = actor_temporal_weights.to(
                 dtype=entropy_residual_per_time.dtype
             )
             entropy_temporal_weights = (
@@ -2877,7 +2941,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
         # reduction and the observational head-gap diagnostics see exactly the
         # same critic/dropout sample. The configured reduction below remains
         # the only Q signal used by the actor objective.
-        if split_values:
+        if boom_enabled:
+            q_policy_all = boom_outputs["q_policy_all"]
+            q_policy = boom_outputs["q_policy"]
+        elif split_values:
             beta = alpha * scale_snapshot
             q_components_all = self.model.q_values(zs, action, detach=True)
             q_components = self.model.reduce_components(
@@ -2903,7 +2970,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
             q_policy_all_detached,
             "min_all",
         )
-        q_range_instant = None if split_values else self._update_actor_loss_scale(q_policy[0])
+        q_range_instant = (
+            boom_outputs["q_range_instant"] if boom_enabled else
+            None if split_values else self._update_actor_loss_scale(q_policy[0])
+        )
 
         smooth_progress = 0.0
         quantile_gate_active = False
@@ -2926,25 +2996,29 @@ class AMBITDMPC2Agent(torch.nn.Module):
                     float(completed) / float(ramp_updates), 1.0
                 )
         elif self._behavior_policy_kl_schedule == "quantile_gate":
-            quantile_gate_active = bool(
-                self._actor_loss_scale_value.item()
+            quantile_gate_active = (
+                self._actor_loss_scale_value.detach().reshape(())
                 > float(self.cfg.outer_behavior_policy_kl_q_threshold)
             )
-            if behavior_regularizer_ready and quantile_gate_active:
-                behavior_regularizer_coefficient = behavior_regularizer.new_tensor(
-                    float(self.cfg.outer_behavior_policy_kl_coef)
+            behavior_regularizer_coefficient = torch.where(
+                quantile_gate_active & behavior_regularizer_ready,
+                behavior_regularizer.new_tensor(float(self.cfg.outer_behavior_policy_kl_coef)),
+                torch.zeros_like(behavior_regularizer_coefficient),
+            )
+            if getattr(self, "_behavior_policy_weighting", "constant") == "tdmpc_square":
+                # Released TD-M(PC)^2: beta*d/61 times the joint behavior NLL,
+                # divided by the same just-updated Q scale. Our CE helper
+                # reports NLL/d, so the final d below only undoes that mean;
+                # it is NOT the extra d from the legacy Gaussian helper.
+                dimension = float(self.cfg.action_dim)
+                behavior_regularizer_coefficient = (
+                    behavior_regularizer_coefficient * (dimension / 61.0)
+                    * dimension / self._actor_loss_scale_value.detach().reshape(())
                 )
 
-        # TD-MPC2 normalizes the actor's Q term with the just-updated,
-        # detached depth-zero scale. Entropy and policy regularizers retain
-        # their coefficients in the optimized objective.
-        if split_values:
-            actor_q = q_policy / scale_snapshot
-        else:
-            actor_q = (
-                q_policy / self._actor_loss_scale_value
-                if self.actor_loss_scale_enabled else q_policy
-            )
+        # TD-MPC2 normalizes Q with the just-updated detached depth-zero scale.
+        # Constant behavior weighting preserves the historical coefficient;
+        # TD-M(PC)^2 weighting and BOOM also divide their penalty by this scale.
         actor_scale_used = (
             scale_snapshot if split_values else self.actor_loss_scale
         )
@@ -2952,29 +3026,53 @@ class AMBITDMPC2Agent(torch.nn.Module):
             alpha, actor_scale_used, self._actor_entropy_mode,
             self.cfg.action_dim,
         )
-        if scaled_entropy_enabled:
-            actor_objective = -alpha * policy_info["scaled_entropy"] - actor_q
+        boom_metrics = {}
+        if boom_enabled:
+            actor_loss = boom_outputs["actor_loss"]
+            boom_metrics = boom_outputs["boom_metrics"]
         else:
-            actor_objective = alpha * policy_info["log_prob"] - actor_q
-        actor_per_time = actor_objective.mean(dim=(1, 2))
-        sac_actor_loss = td_math.reduce_temporal_loss(
-            actor_per_time,
-            self.cfg.rho,
-            include_terminal=True,
-            legacy_order="vector_mean",
-        )
-        if self.behavior_policy_kl_enabled:
-            actor_loss = (
-                sac_actor_loss
-                + behavior_regularizer_coefficient * behavior_regularizer
+            if split_values:
+                actor_q = q_policy / scale_snapshot
+            else:
+                actor_q = (
+                    q_policy / self._actor_loss_scale_value
+                    if self.actor_loss_scale_enabled else q_policy
+                )
+            if scaled_entropy_enabled:
+                actor_objective = -alpha * policy_info["scaled_entropy"] - actor_q
+            else:
+                actor_objective = alpha * policy_info["log_prob"] - actor_q
+            sac_actor_loss = td_math.reduce_temporal_loss(
+                actor_objective.mean(dim=(1, 2)), self.cfg.rho,
+                include_terminal=True, legacy_order="vector_mean",
             )
-        else:
             actor_loss = sac_actor_loss
+            if self.behavior_policy_kl_enabled:
+                actor_loss = actor_loss + behavior_regularizer_coefficient * behavior_regularizer
 
         self.pi_optim.zero_grad(set_to_none=True)
         actor_loss.backward()
         actor_grad_norm = self._clip_actor_grad_norm_()
         self.pi_optim.step()
+        actor_loss_metric = actor_loss.detach()
+        if boom_enabled:
+            if (self._boom_actor_region.enabled
+                    and self._boom_actor_compile_mode == "reduce-overhead"):
+                # Transient policy/Q samples stay live through this backward
+                # and diagnostics. Only these scalar outputs escape the
+                # update while aliasing graph-owned storage. One eager stack
+                # owns them across future replays without copying every HxB
+                # sample or launching a clone for every individual metric.
+                metric_names = tuple(boom_metrics)
+                owned_metrics = torch.stack([
+                    actor_loss_metric, *(boom_metrics[key] for key in metric_names),
+                ])
+                actor_loss_metric = owned_metrics[0]
+                boom_metrics = {
+                    key: owned_metrics[index + 1]
+                    for index, key in enumerate(metric_names)
+                }
+            boom_metrics["compile_outer_actor_fallback"] = float(self._boom_actor_region.failed)
         if split_values:
             if self.ent_coef_optim is not None:
                 self.ent_coef_optim.zero_grad(set_to_none=True)
@@ -2990,7 +3088,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         ):
             self.behavior_policy_kl_eligible_updates += 1
         metrics = {
-            "actor_loss": actor_loss.detach(),
+            "actor_loss": actor_loss_metric,
             "actor_grad_norm": torch.as_tensor(actor_grad_norm).detach(),
             "actor_entropy": policy_info["entropy"].detach().mean(),
             "actor_q_mean": q_policy.detach().mean(),
@@ -3002,6 +3100,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             **actor_saturation_metrics,
             **policy_sample_diagnostics(action, policy_info),
             **coefficient_metrics,
+            **boom_metrics,
             "ent_coef": alpha.detach(),
             "ent_coef_loss": entropy_coefficient_loss.detach(),
         }
@@ -3065,12 +3164,20 @@ class AMBITDMPC2Agent(torch.nn.Module):
                     self.behavior_policy_kl_eligible_updates
                 )
             elif self._behavior_policy_kl_schedule == "quantile_gate":
-                metrics[f"{behavior_metric_prefix}_gate_active"] = float(
-                    quantile_gate_active
+                metrics[f"{behavior_metric_prefix}_gate_active"] = (
+                    quantile_gate_active.to(dtype=behavior_regularizer.dtype)
                 )
                 metrics[f"{behavior_metric_prefix}_q_threshold"] = float(
                     self.cfg.outer_behavior_policy_kl_q_threshold
                 )
+                if getattr(self, "_behavior_policy_weighting", "constant") == "tdmpc_square":
+                    metrics["compile_behavior_ce_fallback"] = float(self._behavior_ce_region.failed)
+                    metrics[f"{behavior_metric_prefix}_base_coefficient"] = float(
+                        self.cfg.outer_behavior_policy_kl_coef
+                    )
+                    metrics[f"{behavior_metric_prefix}_joint_coefficient"] = (
+                        behavior_regularizer_coefficient.detach() / float(self.cfg.action_dim)
+                    )
             elif self._behavior_policy_kl_schedule == "dual":
                 metrics.update(
                     {
@@ -3107,7 +3214,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
             diagnostic_metrics = packet["metrics"]
             selected_entropy = policy_entropy(policy_info, self._actor_entropy_mode).detach()
             selected_per_depth = selected_entropy.mean(dim=(1, 2))
-            normalized_weights = self._actor_temporal_weights / self._actor_temporal_weights.sum()
+            normalized_weights = actor_temporal_weights / actor_temporal_weights.sum()
             selected_entropy_rho = (selected_per_depth * normalized_weights).sum()
             diagnostic_metrics.update({
                 "alpha_before": alpha.detach().clone().reshape(()),
@@ -3122,7 +3229,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 "temperature_loss": entropy_coefficient_loss.detach().clone(),
                 "entropy_bonus_rho_mean": alpha.reshape(()) * selected_entropy_rho,
                 "entropy_actor_loss_contribution": -alpha.reshape(()) * (
-                    selected_per_depth * self._actor_temporal_weights
+                    selected_per_depth * actor_temporal_weights
                 ).sum(),
                 **{key: torch.as_tensor(metrics[key]).detach().clone().reshape(()) for key in (
                     "actor_loss", "actor_grad_norm", "actor_q_mean", "actor_q_mean_all",
@@ -3433,6 +3540,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 self.model._Qs.compile_failed
                 or self.model._target_Qs.compile_failed
                 or self._outer_update_region.failed
+                or self._boom_actor_region.failed
+                or self._behavior_ce_region.failed
             ),
             "compile_outer_update_fallback": float(
                 self._outer_update_region.failed
@@ -3535,3 +3644,187 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 behavior_log_std=behavior_log_std,
                 behavior_policy_valid=behavior_policy_valid,
             )
+
+
+    @property
+    def boom_enabled(self):
+        return getattr(self, "_boom_enabled", False)
+
+
+
+    def _boom_spec(self):
+        if not self.boom_enabled:
+            return None
+        return {
+            "objective": "boom",
+            "version": 1,
+            "target": "tanh_immutable_behavior_pre_tanh_mean",
+            "estimator": "sampled_action_corrected_diagonal_gaussian_nll",
+            "extra_action_dimension_multiplier": False,
+            "coefficient": float(self.cfg.outer_boom_coef),
+            "min_std": float(self.cfg.outer_boom_min_std),
+            "std_source": "detached_current_actor_pre_tanh_std",
+            "q_weights": "detached_softmax_current_actor_q_over_shared_scale",
+            "batch_reduction": "valid_softmax_per_depth",
+            "temporal_reduction": "sum_rho_t_over_H_nonterminal_states",
+            "rho": float(self.cfg.rho),
+            "gate": "shared_scale_strictly_greater_than_2",
+            "alignment_scaling": "divide_by_shared_scale",
+            "q_range": self._actor_q_range_spec(),
+        }
+
+
+
+    def _preflight_boom_spec(self, state):
+        if not self.boom_enabled:
+            if "boom_spec" in state or state.get("checkpoint_version") == 9:
+                raise ValueError(
+                    "Checkpoint uses BOOM but this agent does not; load raw model "
+                    "weights for intentional weight transfer."
+                )
+            return
+        if state.get("checkpoint_version") != 9:
+            raise ValueError(
+                "BOOM requires a matching objective checkpoint; load raw model "
+                "weights for intentional weight transfer."
+            )
+        expected = self._boom_spec()
+        saved = require_exact_keys(
+            state.get("boom_spec"), expected.keys(), "BOOM specification"
+        )
+        if dict(saved) != expected:
+            raise ValueError("Checkpoint BOOM specification does not match this agent.")
+
+
+
+    def _behavior_policy_action_ce_loss_reference(
+        self,
+        policy_info,
+        behavior_pre_tanh_mean,
+        behavior_log_std,
+        behavior_policy_valid,
+    ):
+        """Return exact normalized-action CE with a sampled tanh correction."""
+        (
+            current_mean,
+            current_log_std,
+            current_pre_tanh_action,
+            valid,
+        ) = self._behavior_policy_inputs(
+            policy_info,
+            behavior_pre_tanh_mean,
+            behavior_log_std,
+            behavior_policy_valid,
+            require_pre_tanh_action=True,
+        )
+        # Missing replay labels can be NaN. Mask before Gaussian arithmetic so
+        # invalid rows cannot leave 0*NaN in otherwise valid actor gradients.
+        mask = valid.unsqueeze(-1)
+        current_mean = torch.where(mask, current_mean, 0.0)
+        current_log_std = torch.where(mask, current_log_std, 0.0)
+        current_pre_tanh_action = torch.where(mask, current_pre_tanh_action, 0.0)
+        behavior_pre_tanh_mean = torch.where(mask, behavior_pre_tanh_mean, 0.0)
+        behavior_log_std = torch.where(mask, behavior_log_std, 0.0)
+        action_dim = float(self.cfg.action_dim)
+        gaussian_per_row = td_math.diagonal_gaussian_cross_entropy(
+            current_mean,
+            current_log_std,
+            behavior_pre_tanh_mean,
+            behavior_log_std,
+        ).squeeze(-1) / action_dim
+        log_jacobian_per_row = td_math.tanh_log_abs_det_jacobian(
+            current_pre_tanh_action,
+        ).squeeze(-1) / action_dim
+        ce_per_row = gaussian_per_row + log_jacobian_per_row
+        stats = self._behavior_policy_row_statistics(
+            ce_per_row,
+            valid,
+            (
+                current_mean.sum()
+                + current_log_std.sum()
+                + current_pre_tanh_action.sum()
+            ),
+        )
+        if stats["has_weighted_support"]:
+            weighted_valid = stats["weighted_valid"]
+            denominator = stats["denominator"]
+            gaussian_component = (
+                gaussian_per_row[valid] * weighted_valid[valid]
+            ).sum() / denominator
+            jacobian_component = (
+                log_jacobian_per_row[valid] * weighted_valid[valid]
+            ).sum() / denominator
+        else:
+            gaussian_component = stats["loss"]
+            jacobian_component = stats["loss"]
+        metrics = {
+            "behavior_policy_action_ce": stats["loss"].detach(),
+            "behavior_policy_action_ce_gaussian": gaussian_component.detach(),
+            "behavior_policy_action_ce_log_abs_det_jacobian": (
+                jacobian_component.detach()
+            ),
+            "behavior_policy_action_ce_p50": stats["p50"],
+            "behavior_policy_action_ce_p95": stats["p95"],
+            "behavior_policy_action_ce_valid_count": float(
+                stats["valid_count"]
+            ),
+            "behavior_policy_action_ce_valid_fraction": stats["valid_fraction"],
+            "behavior_policy_action_ce_ready": float(stats["ready"]),
+        }
+        return stats["loss"], stats["ready"], metrics
+
+
+
+    def _boom_actor_kernel(
+        self, zs, behavior_pre_tanh_mean, behavior_policy_valid, alpha,
+        actor_loss_scale,
+    ):
+        """Pure H-by-B policy/Q/loss region; the caller commits the proposed S.
+
+        Keep policy noise, critic dropout, and pair selection in their original
+        order. A lazy compilation failure can retry this region without a
+        second EMA update or optimizer step. Only the loss retains autograd
+        ownership; the other outputs describe this same pre-update sample.
+        """
+        scaled_entropy = self._actor_entropy_mode == "tdmpc2_scaled"
+        if scaled_entropy:
+            action, info = self.model.pi(zs, include_scaled_entropy=True)
+        else:
+            action, info = self.model.pi(zs)
+        q_all = self.model.Q(zs, action, reduction="all", detach=True)
+        q = self.model.q_backend.reduce(q_all, self.cfg.outer_q_actor_reduction)
+        with torch.no_grad():
+            q_range = percentile_range(
+                q[0].detach(), self._actor_loss_scale_percentiles,
+                minimum=_ACTOR_LOSS_SCALE_FLOOR,
+            )
+            proposed_scale = actor_loss_scale.detach().lerp(
+                q_range, self._actor_loss_scale_tau,
+            )
+        objective = (
+            -alpha * info["scaled_entropy"] if scaled_entropy
+            else alpha * info["log_prob"]
+        ) - q / proposed_scale
+        sac_loss = td_math.reduce_temporal_loss(
+            objective.mean(dim=(1, 2)), self.cfg.rho,
+            include_terminal=False, legacy_order="vector_mean",
+        )
+        alignment, metrics = boom_alignment_loss(
+            action, info["log_std"], behavior_pre_tanh_mean.detach().tanh(),
+            behavior_policy_valid, q, proposed_scale,
+            rho=float(self.cfg.rho), coefficient=float(self.cfg.outer_boom_coef),
+            min_std=float(self.cfg.outer_boom_min_std),
+        )
+        metrics["boom_coefficient"] = action.new_tensor(float(self.cfg.outer_boom_coef))
+        metrics["boom_rl_loss"] = sac_loss.detach()
+        return {
+            "action": action.detach(),
+            "policy_info": {key: value.detach() for key, value in info.items()},
+            "q_policy_all": q_all.detach(),
+            "q_policy": q.detach(),
+            "q_range_instant": q_range,
+            "proposed_scale": proposed_scale,
+            "sac_actor_loss": sac_loss.detach(),
+            "actor_loss": sac_loss + alignment,
+            "boom_metrics": metrics,
+        }

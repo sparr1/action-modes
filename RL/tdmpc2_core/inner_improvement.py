@@ -7447,9 +7447,9 @@ class InnerImprovementEngine(RetraceInnerMixin):
             from .whole_inner_graph import validate_training_graph, training_graph_act
             validate_training_graph(self)
             if not eval_mode and not collect_diagnostics and trace is None:
-                if return_behavior_policy:
-                    raise ValueError("Training CUDA graph does not support behavior-policy metadata.")
-                return training_graph_act(self, root_z)
+                return training_graph_act(
+                    self, root_z, return_behavior_policy=return_behavior_policy,
+                )
         try:
             self.prepare_control(t0=t0, eval_mode=eval_mode)
             result = self._act_with_trace(

@@ -91,7 +91,7 @@ class WholeInnerGraph:
     The returned tensors are overwritten by the next invocation.
     """
 
-    def __init__(self, engine, root, *, capture=True, seed=8173, warmup=3):
+    def __init__(self, engine, root, *, capture=True, seed=8173, warmup=3, return_behavior_policy=False):
         validate_graph_workload(engine)
         if engine.device.type != "cuda" or root.device.type != "cuda":
             raise ValueError("WholeInnerGraph requires a CUDA engine and CUDA root.")
@@ -102,6 +102,7 @@ class WholeInnerGraph:
         # as engine.act after capture.
         self._engine_act = engine.act
         self.root = root.detach().clone()
+        self.return_behavior_policy = bool(return_behavior_policy)
         self.capture_enabled = bool(capture)
         self.graph = None
         self.calls = 0
@@ -177,7 +178,10 @@ class WholeInnerGraph:
             self.rng_state = torch.cuda.get_rng_state(self.device)
 
     def _solve(self):
-        return self._engine_act(self.root, collect_diagnostics=False, eval_mode=False)
+        return self._engine_act(
+            self.root, collect_diagnostics=False, eval_mode=False,
+            return_behavior_policy=self.return_behavior_policy,
+        )
 
     def __call__(self, root, *, initial_actor_loss_scale=None):
         if root.shape != self.root.shape or root.dtype != self.root.dtype or root.device != self.root.device:
@@ -221,13 +225,19 @@ def validate_training_graph(engine):
         "obs": "state", "inner_solve_interval": 1,
         "inner_execution_action": "policy_sample",
         "inner_execution_policy_source": "primary",
-        "outer_behavior_policy_kl_schedule": "none",
         "aux_return_mode": "off", "outer_critic_target": "reward_only",
         "inner_sac_critic_target": "reward_only",
         "compile": True, "compile_strict": True,
     }.items():
         if getattr(engine.cfg, key, expected) != expected:
             raise ValueError(f"Training CUDA graph requires {key}={expected!r}.")
+    schedule = getattr(engine.cfg, "outer_behavior_policy_kl_schedule", "none")
+    if schedule != "none" and not (
+        schedule == "quantile_gate"
+        and getattr(engine.cfg, "outer_behavior_policy_weighting", "constant") == "tdmpc_square"
+        and getattr(engine.cfg, "outer_behavior_policy_objective", "reverse_kl") == "action_space_cross_entropy"
+    ):
+        raise ValueError("Training CUDA graph supports no behavior regularizer or corrected TD-M(PC)^2.")
     if engine.device.type != "cuda":
         raise ValueError("Training CUDA graph requires CUDA.")
 
@@ -274,7 +284,7 @@ def preflight_training_graph_state(engine, saved):
     return deepcopy(saved)
 
 
-def training_graph_act(engine, root):
+def training_graph_act(engine, root, *, return_behavior_policy=False):
     """Replay in a private workspace, retaining native diagnostics and reset logic.
 
     The native engine handles the configured diagnostic decisions and keeps its
@@ -285,7 +295,10 @@ def training_graph_act(engine, root):
         from .inner_improvement import InnerImprovementEngine
         worker = InnerImprovementEngine(engine.agent)
         worker._whole_graph_worker = True
-        runner = WholeInnerGraph(worker, root, seed=int(engine.cfg.seed) + 8173, warmup=4)
+        runner = WholeInnerGraph(
+            worker, root, seed=int(engine.cfg.seed) + 8173, warmup=4,
+            return_behavior_policy=bool(getattr(engine.cfg, "store_behavior_policy", False)),
+        )
         saved = engine._whole_graph_resume
         if saved is not None:
             if saved["rng_state"] is not None:
@@ -297,9 +310,10 @@ def training_graph_act(engine, root):
     started = engine._timer_start()
     if engine._sac_actor_loss_scale_enabled:
         initial_scale = engine._initial_actor_loss_scale(engine._critic_owner.actor_loss_scale)
-        action, values, lengths = engine._whole_graph_runner(
+        result = engine._whole_graph_runner(
             root, initial_actor_loss_scale=initial_scale,
         )
+        action, values, lengths = result[:3]
         if engine._carry_actor_loss_scale:
             # Preserve native [1] shape and own storage independently of the
             # captured outputs. A following native diagnostic uses this value,
@@ -308,7 +322,8 @@ def training_graph_act(engine, root):
                 initial_scale
             ).clone()
     else:
-        action, values, lengths = engine._whole_graph_runner(root)
+        result = engine._whole_graph_runner(root)
+        action, values, lengths = result[:3]
     engine._timer_stop("inner_action_seconds", started)
     engine.action_index += 1
     # The live engine records the prior version used by this logical action,
@@ -316,4 +331,8 @@ def training_graph_act(engine, root):
     engine.state.outer_version = int(engine.agent.outer_version)
     # Do not mutate the static result dictionary owned by the capture.
     values = dict(values, inner_cuda_graph_used=1.0)
+    if return_behavior_policy:
+        if len(result) != 4:
+            raise ValueError("Behavior-policy metadata requires configured replay label storage.")
+        return action, values, lengths, result[3]
     return action, values, lengths
