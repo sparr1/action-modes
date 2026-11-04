@@ -22,7 +22,9 @@ rows=[]
 for spec in specs:
     r=existing.get(spec['id'])
     summary={} if r is None else dict(r.summary)
-    rows.append({**spec,'state':f"pending GPU validation / gate {spec.get('gate_job', 'not submitted')}" if r is None else r.state,
+    pending_state = ("submitted / awaiting training start" if spec.get('job') else
+                     f"pending GPU validation / gate {spec.get('gate_job', 'not submitted')}")
+    rows.append({**spec,'state':pending_state if r is None else r.state,
                  'decisions':summary.get('env_step','pending'), 'job':spec.get('job','pending submission')})
 metrics={
     'Returns and progress':[
