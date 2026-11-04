@@ -29,6 +29,10 @@ export TORCHINDUCTOR_COMPILE_THREADS=1
 export TORCHINDUCTOR_CACHE_DIR="$benchmark_cache/inductor" TRITON_CACHE_DIR="$benchmark_cache/triton"
 export XDG_CACHE_HOME="$benchmark_cache/cache" WANDB_MODE=disabled MUJOCO_GL=egl
 nvidia-smi --query-gpu=name,uuid,driver_version,memory.total --format=csv > "$AMBI_BENCH_OUTPUT/gpu.csv"
+nvidia-smi --query-gpu=timestamp,uuid,clocks.sm,clocks.mem,utilization.gpu,power.draw,temperature.gpu --format=csv -l 1 \
+  > "$AMBI_BENCH_OUTPUT/telemetry.csv" &
+telemetry_pid=$!
+trap 'kill "$telemetry_pid" 2>/dev/null || true' EXIT
 "$AMBI_PYTHON" - <<'PY' > "$AMBI_BENCH_OUTPUT/runtime.json"
 import json, os, platform, subprocess
 import torch
@@ -42,27 +46,44 @@ print(json.dumps(dict(host=platform.node(), torch=torch.__version__, cuda=torch.
     tree=subprocess.check_output(["git","rev-parse","HEAD^{tree}"],text=True).strip()),indent=2))
 PY
 if [[ "${AMBI_PRECISION_DIAGNOSTIC:-0}" == 1 ]]; then
-  srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.diagnose_ambi_teacher_precision \
+  srun --input=/dev/null --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.diagnose_ambi_teacher_precision \
     --output "$AMBI_BENCH_OUTPUT/precision.json" > "$AMBI_BENCH_OUTPUT/precision.log" 2>&1
   [[ -z "$(git status --porcelain --untracked-files=all)" ]]
   exit 0
 fi
-srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m pytest -q --tb=short -p no:cacheprovider \
+srun --input=/dev/null --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m pytest -q --tb=short -p no:cacheprovider \
   tests/test_ambi_batched_teacher.py tests/test_ambi_batched_optimizations.py \
+  tests/test_ambi_batched_first_layer.py \
   tests/test_ambi_batched_pool.py tests/test_ambi_reanalyze_backends.py \
   tests/test_ambi_teacher_precision_budget.py \
   tests/test_ambi_batched_reference_recipe.py tests/test_ambi_batched_cuda_semantics.py \
   --basetemp="$benchmark_cache/pytest" --junitxml="$AMBI_BENCH_OUTPUT/gate.xml" \
   > "$AMBI_BENCH_OUTPUT/gate.log" 2>&1
 if [[ "${AMBI_GATE_ONLY:-0}" != 1 ]]; then
+  if [[ "${AMBI_FIRST_LAYER_BENCHMARK:-0}" == 1 ]]; then
+    # Paired configurations on the same allocated GPU; all use CUDA graphs.
+    for arm in all:4:2 all-first-layer:4:2 all:8:1 all-first-layer:8:1 all:16:1 all-first-layer:16:1 all:60:1 all-first-layer:60:1; do
+      IFS=: read -r features width workers <<< "$arm"
+      label="${features}-width${width}-workers${workers}"
+      trace_args=()
+      if [[ "$width" == 4 ]]; then
+        trace_args=(--trace-dir "$AMBI_BENCH_OUTPUT/${label}-profile")
+      fi
+      srun --input=/dev/null --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.benchmark_ambi_teacher_optimizations \
+        --features "$features" --workers "$workers" --width "$width" --roots 60 --warmup 1 --repeats 5 \
+        "${trace_args[@]}" --output "$AMBI_BENCH_OUTPUT/${label}.json" \
+        > "$AMBI_BENCH_OUTPUT/${label}.log" 2>&1
+    done
+  else
   for arm in reference:1 heads:1 heads-cache:1 all:1 all:2 all:4; do
     features="${arm%:*}"
     workers="${arm#*:}"
-    srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.benchmark_ambi_teacher_optimizations \
+    srun --input=/dev/null --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m tests.benchmark_ambi_teacher_optimizations \
       --features "$features" --workers "$workers" --width 4 --roots 60 --warmup 1 --repeats 5 \
       --output "$AMBI_BENCH_OUTPUT/${features}-workers${workers}.json" \
       > "$AMBI_BENCH_OUTPUT/${features}-workers${workers}.log" 2>&1
   done
+  fi
 fi
 [[ -z "$(git status --porcelain --untracked-files=all)" ]]
 printf 'Benchmark complete: %s\n' "$AMBI_BENCH_OUTPUT"

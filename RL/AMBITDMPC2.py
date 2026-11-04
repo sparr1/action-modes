@@ -109,6 +109,7 @@ _AMBI_DEFAULTS = {
     "reanalyze_backend": "native",
     "reanalyze_parallel_roots": 4,
     "reanalyze_batched_optimizations": True,
+    "reanalyze_batched_first_layer_fusion": False,
     "reanalyze_batched_workers": 1,
     # Optional TD-MPC2 Q-only normalization in the SAC actor objective.
     "sac_actor_loss_scale_mode": "none",
@@ -1592,6 +1593,9 @@ class AMBITDMPC2(TDMPC2Baseline):
         )
         merged["reanalyze_batched_optimizations"] = _strict_bool(
             merged["reanalyze_batched_optimizations"], "reanalyze_batched_optimizations",
+        )
+        merged["reanalyze_batched_first_layer_fusion"] = _strict_bool(
+            merged["reanalyze_batched_first_layer_fusion"], "reanalyze_batched_first_layer_fusion",
         )
         merged["reanalyze_batched_workers"] = _strict_positive_int(
             merged["reanalyze_batched_workers"], "reanalyze_batched_workers",

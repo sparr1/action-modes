@@ -94,6 +94,7 @@ def benchmark(args):
         inner_temperature_mode="inherit_outer", wandb=False,
         reanalyze_batched_optimizations=not getattr(args, "reference_batched", False),
         reanalyze_batched_workers=getattr(args, "batched_workers", 1),
+        reanalyze_batched_first_layer_fusion=getattr(args, "batched_first_layer_fusion", False),
     )
     if args.profile == "reference":
         params.pop("inner_updates_per_round")

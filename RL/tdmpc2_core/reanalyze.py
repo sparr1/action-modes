@@ -58,16 +58,23 @@ class LazyReanalyzer:
         if not self.backend.startswith("batched"):
             return {}
         optimized = bool(getattr(self.cfg, "reanalyze_batched_optimizations", True))
+        first_layer_fusion = bool(getattr(self.cfg, "reanalyze_batched_first_layer_fusion", False))
         workers = int(getattr(self.cfg, "reanalyze_batched_workers", 1))
         # The explicit reference path retains the previous v3 payload and
         # arithmetic, so previously saved batched teachers can still resume.
-        if not optimized and workers == 1:
+        if not optimized and workers == 1 and not first_layer_fusion:
             return {}
-        return {
+        specification = {
             "reanalyze_execution": "root_batched_optimized_v3",
             "reanalyze_batched_optimizations": optimized,
             "reanalyze_batched_workers": workers,
         }
+        if first_layer_fusion:
+            specification.update(
+                reanalyze_execution="root_batched_first_layer_v1",
+                reanalyze_batched_first_layer_fusion=True,
+            )
+        return specification
 
     def _schema_version(self):
         if self.backend.startswith("batched"):
@@ -103,6 +110,9 @@ class LazyReanalyzer:
             workers = state["reanalyze_batched_workers"]
             if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
                 raise ValueError("Lazy reanalyze worker count must be a positive integer.")
+        if "reanalyze_batched_first_layer_fusion" in graph_spec:
+            if type(state["reanalyze_batched_first_layer_fusion"]) is not bool:
+                raise ValueError("Lazy reanalyze first-layer fusion flag must be a boolean.")
         if any(state[key] != value for key, value in graph_spec.items()):
             raise ValueError("Incompatible reanalysis backend or RNG protocol.")
         for name in ("refreshes", "roots"):

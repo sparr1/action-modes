@@ -25,11 +25,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _reference_agent(optimized):
+def _reference_agent(optimized, first_layer_fusion=False):
     params = _tiny_params(
         outer_actor_objective="distillation", inner_temperature_mode="inherit_outer",
         reanalyze_backend="batched_cuda_graph", reanalyze_parallel_roots=4,
         reanalyze_batched_workers=1, reanalyze_batched_optimizations=optimized,
+        reanalyze_batched_first_layer_fusion=first_layer_fusion,
         compile=True, compile_strict=True, wandb=False,
         enc_dim=256, mlp_dim=512, latent_dim=512, simnorm_dim=8,
         num_q=5, num_bins=101, q_num_bins=101,
@@ -57,6 +58,9 @@ def _reference_agent(optimized):
     assert cfg.inner_critic_dropout_enabled is True
     assert cfg.inner_q_actor_reduction == cfg.inner_q_target_reduction == "min_pair"
     assert cfg.q_pair_size == 2
+    assert cfg.reanalyze_batched_first_layer_fusion is first_layer_fusion
+    if not first_layer_fusion:
+        assert "reanalyze_batched_first_layer_fusion" not in agent.distillation.specification()
     return agent
 
 
@@ -202,10 +206,10 @@ def _assert_precision_state_budget(actual, reference, highest, record_property):
             _assert_precision_budget(family, expected, baseline, name=name, record_property=record_property)
 
 
-def _exercise_reference_recipe(precision, record_property):
+def _exercise_reference_recipe(precision, record_property, first_layer_fusion=False):
     torch.manual_seed(193)
     reference_agent = _reference_agent(False)
-    optimized_agent = _reference_agent(True)
+    optimized_agent = _reference_agent(True, first_layer_fusion=first_layer_fusion)
     optimized_agent.load_state_dict(reference_agent.state_dict())
     with torch.no_grad():
         observations = torch.randn(4, 67, device="cuda")
@@ -303,8 +307,10 @@ def _exercise_reference_recipe(precision, record_property):
         assert (drift <= budget).all(), f"{direction}: KL={drift.tolist()}, budget={budget.tolist()}"
 
 
+@pytest.mark.parametrize("first_layer_fusion", [False, True], ids=["existing", "first_layer_fused"])
 @pytest.mark.parametrize("precision", ["highest", "high"])
-def test_full_reference_recipe_matches_previous_arithmetic(precision, record_property):
+def test_full_reference_recipe_matches_previous_arithmetic(precision, first_layer_fusion, record_property):
+    record_property("first_layer_fusion", first_layer_fusion)
     previous_precision = torch.get_float32_matmul_precision()
     previous_cache_size = torch._dynamo.config.cache_size_limit
     previous_accumulated = torch._dynamo.config.accumulated_cache_size_limit
@@ -314,7 +320,7 @@ def test_full_reference_recipe_matches_previous_arithmetic(precision, record_pro
         # Retain production compiler cache limits: this correctness gate must
         # expose exhausted compilation budgets rather than widen them.
         with _preserve_global_rng():
-            _exercise_reference_recipe(precision, record_property)
+            _exercise_reference_recipe(precision, record_property, first_layer_fusion=first_layer_fusion)
     finally:
         torch._dynamo.reset()
         torch._dynamo.config.cache_size_limit = previous_cache_size
@@ -324,10 +330,12 @@ def test_full_reference_recipe_matches_previous_arithmetic(precision, record_pro
         torch.cuda.empty_cache()
 
 
-def test_full_reference_recipe_concurrent_workers_are_bitwise_identical_at_production_precision(record_property):
+@pytest.mark.parametrize("first_layer_fusion", [False, True], ids=["existing", "first_layer_fused"])
+def test_full_reference_recipe_concurrent_workers_are_bitwise_identical_at_production_precision(first_layer_fusion, record_property):
     """Concurrency preserves identical fixed-width kernels, seeds and budgets."""
     from RL.tdmpc2_core.batched_teacher_pool import ConcurrentBatchedTeacherSolver
 
+    record_property("first_layer_fusion", first_layer_fusion)
     previous_precision = torch.get_float32_matmul_precision()
     previous_cache_size = torch._dynamo.config.cache_size_limit
     previous_accumulated = torch._dynamo.config.accumulated_cache_size_limit
@@ -338,7 +346,7 @@ def test_full_reference_recipe_concurrent_workers_are_bitwise_identical_at_produ
         # recipe must compile for every independent worker under normal limits.
         with _preserve_global_rng():
             torch.manual_seed(297)
-            agent = _reference_agent(True)
+            agent = _reference_agent(True, first_layer_fusion=first_layer_fusion)
             with torch.no_grad():
                 observations = torch.randn(14, 67, device="cuda")
                 roots = agent.model.encode(observations).detach()

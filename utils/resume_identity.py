@@ -237,6 +237,7 @@ def scientific_trial_parameters(
                         "outer_actor_objective", "reanalyze_interval", "reanalyze_batch_size",
                         "reanalyze_backend", "reanalyze_parallel_roots",
                         "reanalyze_batched_optimizations", "reanalyze_batched_workers",
+                        "reanalyze_batched_first_layer_fusion",
                     ):
                         algorithm.pop(field, None)
                 elif objective == "distillation":
@@ -253,7 +254,12 @@ def scientific_trial_parameters(
                     if backend in {"batched", "batched_cuda_graph"}:
                         optimized = algorithm.get("reanalyze_batched_optimizations", True)
                         workers = algorithm.get("reanalyze_batched_workers", 1)
-                        if optimized is False and workers == 1:
+                        first_layer_fusion = algorithm.get("reanalyze_batched_first_layer_fusion", False)
+                        if first_layer_fusion is False:
+                            algorithm.pop("reanalyze_batched_first_layer_fusion", None)
+                        else:
+                            algorithm["reanalyze_batched_first_layer_fusion"] = first_layer_fusion
+                        if optimized is False and workers == 1 and first_layer_fusion is False:
                             # Explicit reference execution preserves old v3
                             # fingerprints; the checkpoint validates its schema.
                             algorithm.pop("reanalyze_batched_optimizations", None)
@@ -264,6 +270,7 @@ def scientific_trial_parameters(
                     else:
                         algorithm.pop("reanalyze_batched_optimizations", None)
                         algorithm.pop("reanalyze_batched_workers", None)
+                        algorithm.pop("reanalyze_batched_first_layer_fusion", None)
                 algorithm = normalize_lora_rl_identity(algorithm)
                 algorithm = normalize_pave_identity(algorithm)
                 # Auxiliary eligibility needs the explicit backend before the

@@ -14,6 +14,7 @@ def test_native_defaults_preserve_scientific_identity_and_checkpoint(models):
     cfg = _build_cfg()
     assert cfg.reanalyze_backend == "native" and cfg.reanalyze_parallel_roots == 4
     assert cfg.reanalyze_batched_optimizations is True
+    assert cfg.reanalyze_batched_first_layer_fusion is False
     assert cfg.reanalyze_batched_workers == 1
     assert _identity({}) == _identity({
         "reanalyze_backend": "cuda_graph", "reanalyze_parallel_roots": 8,
@@ -35,6 +36,9 @@ def test_native_defaults_preserve_scientific_identity_and_checkpoint(models):
     ("reanalyze_parallel_roots", 1.5),
     ("reanalyze_batched_optimizations", 1), ("reanalyze_batched_optimizations", "true"),
     ("reanalyze_batched_optimizations", None),
+    ("reanalyze_batched_first_layer_fusion", 1),
+    ("reanalyze_batched_first_layer_fusion", "true"),
+    ("reanalyze_batched_first_layer_fusion", None),
     ("reanalyze_batched_workers", 0), ("reanalyze_batched_workers", True),
     ("reanalyze_batched_workers", 1.5),
 ])
@@ -54,7 +58,8 @@ def test_graph_restrictions_do_not_leak_into_native_or_q_objectives():
 @pytest.mark.parametrize("backend", ["native", "cuda_graph", "batched", "batched_cuda_graph"])
 def test_batched_controls_are_dormant_for_q_maximization(backend):
     explicit = dict(reanalyze_backend=backend, reanalyze_batched_workers=3,
-                    reanalyze_batched_optimizations=False)
+                    reanalyze_batched_optimizations=False,
+                    reanalyze_batched_first_layer_fusion=True)
     cfg = _build_cfg(**explicit)
     assert cfg.outer_actor_objective == "q_maximization"
     assert _identity(explicit) == _identity({})
@@ -64,7 +69,8 @@ def test_batched_controls_are_dormant_for_q_maximization(backend):
 def test_batched_controls_leave_other_distillation_backends_unchanged(backend, models):
     base = dict(outer_actor_objective="distillation", reanalyze_backend=backend)
     explicit = dict(**base, reanalyze_batched_workers=3,
-                    reanalyze_batched_optimizations=False)
+                    reanalyze_batched_optimizations=False,
+                    reanalyze_batched_first_layer_fusion=True)
     assert _build_cfg(**explicit).reanalyze_batched_workers == 3
     assert _identity(base) == _identity(explicit)
     model = models()
@@ -73,6 +79,7 @@ def test_batched_controls_leave_other_distillation_backends_unchanged(backend, m
     original = reference.state_dict()
     model.cfg.reanalyze_batched_workers = 3
     model.cfg.reanalyze_batched_optimizations = False
+    model.cfg.reanalyze_batched_first_layer_fusion = True
     _assert_tree_equal(reference.state_dict(), original)
 
 
@@ -97,6 +104,25 @@ def test_batched_execution_identity_and_reference_projection():
     assert _identity(cuda) != _identity(dict(cuda, reanalyze_batched_workers=2))
 
 
+@pytest.mark.parametrize("backend", ["batched", "batched_cuda_graph"])
+@pytest.mark.parametrize("optimized", [False, True])
+def test_first_layer_fusion_is_independent_and_preserves_disabled_identity(backend, optimized):
+    base = dict(outer_actor_objective="distillation", reanalyze_backend=backend,
+                reanalyze_batched_optimizations=optimized)
+    disabled = dict(base, reanalyze_batched_first_layer_fusion=False)
+    enabled = dict(base, reanalyze_batched_first_layer_fusion=True)
+    assert _identity(base) == _identity(disabled)
+    assert "reanalyze_batched_first_layer_fusion" not in _identity(disabled)["alg_params"]
+    assert _identity(base) != _identity(enabled)
+    cfg = _build_cfg(**enabled)
+    assert cfg.reanalyze_batched_first_layer_fusion is True
+    assert cfg.reanalyze_batched_optimizations is optimized
+    identity = _identity(enabled)["alg_params"]
+    assert identity["reanalyze_batched_first_layer_fusion"] is True
+    assert identity["reanalyze_batched_optimizations"] is optimized
+    assert identity["reanalyze_batched_workers"] == 1
+
+
 @pytest.mark.parametrize("optimized,version", [(False, 3), (True, 4)])
 def test_batched_checkpoint_execution_specification_and_roundtrip(models, optimized, version):
     options = dict(outer_actor_objective="distillation", reanalyze_backend="batched",
@@ -106,6 +132,11 @@ def test_batched_checkpoint_execution_specification_and_roundtrip(models, optimi
     torch.randint(0, 100, (7,), generator=first.generator)
     saved = _clone_tree(first.state_dict())
     assert saved["version"] == version
+    assert "reanalyze_batched_first_layer_fusion" not in saved
+    # A pre-feature config and an explicitly disabled config serialize exactly
+    # the same checkpoint payload, including their unchanged RNG stream.
+    del first.cfg.reanalyze_batched_first_layer_fusion
+    _assert_tree_equal(first.state_dict(), saved)
     if optimized:
         assert saved["reanalyze_execution"] == "root_batched_optimized_v3"
         assert saved["reanalyze_batched_optimizations"] is True
@@ -136,6 +167,49 @@ def test_changed_batched_execution_rejects_full_resume_before_mutation(models, s
     source = models(**options, reanalyze_batched_optimizations=source_optimized).agent
     saved = _clone_tree(source.training_state_dict())
     target = models(**options, reanalyze_batched_optimizations=not source_optimized).agent
+    before = _clone_tree(target.training_state_dict())
+    with pytest.raises(ValueError, match="distillation specification"):
+        target.load_training_state_dict(saved)
+    _assert_tree_equal(target.training_state_dict(), before)
+
+
+@pytest.mark.parametrize("optimized", [False, True])
+def test_first_layer_fusion_checkpoint_roundtrip_and_strict_flag(models, optimized):
+    options = dict(outer_actor_objective="distillation", reanalyze_backend="batched",
+                   reanalyze_batched_optimizations=optimized,
+                   reanalyze_batched_first_layer_fusion=True)
+    source = models(**options).agent.distillation.reanalyzer
+    source.refreshes, source.roots = 2, 7
+    torch.randint(0, 100, (3,), generator=source.generator)
+    saved = _clone_tree(source.state_dict())
+    assert saved["version"] == 4
+    assert saved["reanalyze_execution"] == "root_batched_first_layer_v1"
+    assert saved["reanalyze_batched_first_layer_fusion"] is True
+    assert saved["reanalyze_batched_optimizations"] is optimized
+    restored = models(**options).agent.distillation.reanalyzer
+    restored.load_state_dict(saved)
+    _assert_tree_equal(restored.state_dict(), saved)
+    for invalid in (1, "true", None, False):
+        corrupted = _clone_tree(saved)
+        corrupted["reanalyze_batched_first_layer_fusion"] = invalid
+        with pytest.raises(ValueError):
+            restored.load_state_dict(corrupted)
+        _assert_tree_equal(restored.state_dict(), saved)
+    corrupted = _clone_tree(saved)
+    corrupted["reanalyze_execution"] = "root_batched_optimized_v3"
+    with pytest.raises(ValueError):
+        restored.load_state_dict(corrupted)
+    _assert_tree_equal(restored.state_dict(), saved)
+
+
+@pytest.mark.parametrize("optimized", [False, True])
+@pytest.mark.parametrize("source_fused", [False, True])
+def test_changed_first_layer_fusion_rejects_full_resume_before_mutation(models, optimized, source_fused):
+    options = dict(outer_actor_objective="distillation", reanalyze_backend="batched",
+                   reanalyze_batched_optimizations=optimized)
+    source = models(**options, reanalyze_batched_first_layer_fusion=source_fused).agent
+    saved = _clone_tree(source.training_state_dict())
+    target = models(**options, reanalyze_batched_first_layer_fusion=not source_fused).agent
     before = _clone_tree(target.training_state_dict())
     with pytest.raises(ValueError, match="distillation specification"):
         target.load_training_state_dict(saved)

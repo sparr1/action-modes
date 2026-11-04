@@ -12,6 +12,7 @@ import math
 import time
 
 import torch
+from torch.nn import functional as F
 
 from .common import math as td_math
 from .common.compile_regions import CompileRegion, _preserve_host_rng_state
@@ -65,6 +66,54 @@ def _lerp_targets_(targets, online, tau):
     torch._foreach_lerp_(targets, online, tau)
 
 
+@torch._dynamo.allow_in_graph
+def _first_layer_fused_mlp(parameters, inputs, specifications, dropout_masks=None):
+    """Share the first-layer input while retaining independent root/head MLPs.
+
+    Concatenate head output channels only for the first linear GEMM. The
+    following normalization still operates on one head's features at a time;
+    neither losses nor learned parameters are shared across heads or roots.
+    Nested vmap lets the first activation consume the strided head view before
+    later per-head linear layers need a flattened root/head matrix batch.
+    """
+    weight = parameters["0.weight"]
+    roots, heads, hidden = weight.shape[:3]
+    first = torch.bmm(inputs, weight.flatten(1, 2).transpose(1, 2))
+    if specifications[0][2]:
+        first = first + parameters["0.bias"].flatten(1)[:, None]
+    first = first.reshape(roots, inputs.shape[1], heads, hidden).movedim(2, 1)
+    if dropout_masks is not None:
+        dropout_masks = {
+            key: value.reshape(roots, heads, *value.shape[1:])
+            for key, value in dropout_masks.items()
+        }
+
+    def head_tail(params, x, masks):
+        for index, (_, _, bias, norm) in enumerate(specifications):
+            prefix = str(index) + "."
+            if index:
+                x = F.linear(x, params[prefix + "weight"],
+                             params[prefix + "bias"] if bias else None)
+            if norm is not None:
+                shape, eps, ln_weight, ln_bias, mish, dropout, training = norm
+                if dropout and training:
+                    x = (F.dropout(x, p=dropout, training=True, inplace=False)
+                         if masks is None else x * masks[index])
+                x = F.layer_norm(
+                    x, shape, params[prefix + "ln.weight"] if ln_weight else None,
+                    params[prefix + "ln.bias"] if ln_bias else None, eps,
+                )
+                if mish:
+                    x = F.mish(x, inplace=False)
+        return x
+
+    in_dims = (0, 0, 0 if dropout_masks is not None else None)
+    per_root = torch.vmap(head_tail, in_dims=in_dims, randomness="different")
+    return torch.vmap(per_root, in_dims=in_dims, randomness="different")(
+        parameters, first, dropout_masks,
+    )
+
+
 class BatchedTeacherCore:
     """One reusable root-batched workspace; orchestration never loops over roots.
 
@@ -77,9 +126,14 @@ class BatchedTeacherCore:
         validate_batched_teacher_config(agent.cfg)
         self.agent, self.model, self.cfg = agent, agent.model, agent.cfg
         self.device, self.width = torch.device(agent.device), int(width)
-        available = frozenset({"selective_q", "actor_cache", "fused_updates"})
-        self.optimization_features = (available if getattr(self.cfg, "reanalyze_batched_optimizations", True)
-                                      else frozenset()) if optimization_features is None else frozenset(optimization_features)
+        standard_features = frozenset({"selective_q", "actor_cache", "fused_updates"})
+        available = standard_features | {"first_layer_fusion"}
+        configured_features = (standard_features if getattr(self.cfg, "reanalyze_batched_optimizations", True)
+                               else frozenset())
+        if getattr(self.cfg, "reanalyze_batched_first_layer_fusion", False):
+            configured_features = configured_features | {"first_layer_fusion"}
+        self.optimization_features = (configured_features if optimization_features is None
+                                      else frozenset(optimization_features))
         if not self.optimization_features <= available:
             raise ValueError("Unknown batched teacher optimization feature.")
         if self.width < 1:
@@ -265,9 +319,12 @@ class BatchedTeacherCore:
                     for key, value in masks.items()
                 }
         joined = torch.cat((z, action), dim=-1)
+        spec = self.critic_train_spec if training else self.critic_eval_spec
+        if "first_layer_fusion" in self.optimization_features:
+            predictions = _first_layer_fused_mlp(parameters, joined, spec, masks)
+            return predictions.movedim(1, 0)
         inputs = joined[:, None].expand(-1, heads, -1, -1).reshape(self.width * heads, joined.shape[1], -1)
         parameters = {k: v.flatten(0, 1) for k, v in parameters.items()}
-        spec = self.critic_train_spec if training else self.critic_eval_spec
         predictions = _tensor_mlp_vmap(parameters, inputs, spec, True, masks)
         return predictions.reshape(self.width, heads, z.shape[1], -1).movedim(1, 0)
 
@@ -624,6 +681,7 @@ class BatchedTeacherSolver:
                     "distillation_reanalyze_selective_q": float("selective_q" in self.core.optimization_features),
                     "distillation_reanalyze_actor_cache": float("actor_cache" in self.core.optimization_features),
                     "distillation_reanalyze_fused_updates": float("fused_updates" in self.core.optimization_features),
+                    "distillation_reanalyze_first_layer_fusion": float("first_layer_fusion" in self.core.optimization_features),
                     "distillation_reanalyze_chunks": float(math.ceil(len(roots) / self.width)),
                     "distillation_reanalyze_padding_roots": float((-len(roots)) % self.width),
                     "distillation_reanalyze_executed_model_steps": float(math.ceil(len(roots) / self.width) * self.width * self.core.counts["inner_total_model_steps"]),

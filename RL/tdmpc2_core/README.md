@@ -974,6 +974,19 @@ synchronous. This is a refresh benchmark, not a new full-training measurement.
 Fresh four-stream baseline attempts failed in compiled CUDA execution, so
 the older 5.31-second four-stream result is only a historical comparison.
 
+An additional opt-in `reanalyze_batched_first_layer_fusion=true` concatenates
+the critic heads' first-layer output channels into one wider multiplication
+per root. Head parameters, dropout, LayerNorm, Mish, remaining layers, and
+Adam state remain independent. This applies to all-head critic training and
+selected-head target/actor evaluation without changing the SAC budget. The
+default is false; enabling it records `root_batched_first_layer_v1` in exact
+resume state, and switching it requires a fresh run rather than an exact
+resume. It is independent of `reanalyze_batched_optimizations`. Benchmark the
+`all` and `all-first-layer` feature sets in
+`tests/benchmark_ambi_teacher_optimizations.py` for a paired comparison. The
+optional `--trace-dir` collects one additional warmed refresh after timing;
+profiled execution is excluded from latency samples.
+
 Additional `train/distillation_reanalyze_*` metrics record the selected backend,
 pool width, graph setup time, and refresh seconds per root. Setup time is
 included in total refresh latency. For bounded timing without W&B or
