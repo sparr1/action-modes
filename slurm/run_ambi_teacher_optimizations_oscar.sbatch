@@ -50,6 +50,7 @@ fi
 srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -m pytest -q --tb=short -p no:cacheprovider \
   tests/test_ambi_batched_teacher.py tests/test_ambi_batched_optimizations.py \
   tests/test_ambi_batched_pool.py tests/test_ambi_reanalyze_backends.py \
+  tests/test_ambi_teacher_precision_budget.py \
   tests/test_ambi_batched_reference_recipe.py tests/test_ambi_batched_cuda_semantics.py \
   --basetemp="$benchmark_cache/pytest" --junitxml="$AMBI_BENCH_OUTPUT/gate.xml" \
   > "$AMBI_BENCH_OUTPUT/gate.log" 2>&1

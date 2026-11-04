@@ -107,7 +107,7 @@ def test_batched_checkpoint_execution_specification_and_roundtrip(models, optimi
     saved = _clone_tree(first.state_dict())
     assert saved["version"] == version
     if optimized:
-        assert saved["reanalyze_execution"] == "root_batched_optimized_v2"
+        assert saved["reanalyze_execution"] == "root_batched_optimized_v3"
         assert saved["reanalyze_batched_optimizations"] is True
         assert saved["reanalyze_batched_workers"] == 1
     else:
@@ -120,7 +120,8 @@ def test_batched_checkpoint_execution_specification_and_roundtrip(models, optimi
     _assert_tree_equal(restored.state_dict(), saved)
     for key, bad_value in (("reanalyze_batched_optimizations", not optimized),
                            ("reanalyze_batched_workers", 2),
-                           ("reanalyze_execution", "unknown_execution")):
+                           ("reanalyze_execution", "unknown_execution"),
+                           ("reanalyze_execution", "root_batched_optimized_v2")):
         incompatible = _clone_tree(saved)
         incompatible[key] = bad_value
         before = _clone_tree(restored.state_dict())

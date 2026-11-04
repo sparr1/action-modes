@@ -881,7 +881,9 @@ compiled gradient clipping/target EMA. Target and actor Q reductions evaluate
 only the selected pair, while critic training still updates the entire ensemble.
 The original pair and dropout draws are retained. Cached actor network outputs
 are rebuilt after replay changes and actor updates; action noise, log probability,
-and entropy are computed afresh for every critic update. Interleaved schedules
+and entropy are computed afresh for every critic update. Cache construction
+uses padded batches with the original critic minibatch size and packed layout
+to preserve the policy matrix-multiplication shapes in TF32 mode. Interleaved schedules
 use the uncached path, and caching is skipped when it would evaluate more rows.
 These changes preserve the full rollout and optimization budgets and independent
 root losses. Different matrix shapes and compiled reductions can change floating
@@ -897,7 +899,7 @@ count. Concurrency remains synchronous with respect to the outer update; it
 does not introduce stale teachers. More workers use more memory and require
 measurement rather than assuming higher throughput.
 
-Optimized/concurrent checkpoints record execution revision, optimization flag
+Optimized/concurrent checkpoints record execution revision (`root_batched_optimized_v3`), optimization flag
 and worker count, and reject incompatible exact resumes before mutation. Set
 `reanalyze_batched_optimizations=false` and `reanalyze_batched_workers=1` to use
 the previous version-3 reference arithmetic and checkpoint specification. These
@@ -918,6 +920,16 @@ WANDB_MODE=disabled environments/dmcontrol/.venv/bin/python \
 gates, including the full reference recipe, then measures each feature set and
 one/two/four workers on the same L40S in separate processes. It preserves the
 previous reference implementation as an explicit paired baseline.
+
+The full-budget FP32 gate checks teacher outputs, adapted parameters, replay,
+targets and Adam state against the reference with strict tensor tolerances.
+For TF32, the gate measures the reference's own TF32-to-FP32 variation using
+identical priors, roots and seeds. Optimized-to-reference drift must stay within
+that budget for each root and state family; Adam first and second moments are
+checked separately. Teacher KL in both directions must also stay below both
+the measured reference precision variation and the absolute `1e-6` per-action
+dimension limit. Counts, prior state, RNG isolation and optimizer steps remain
+exact; concurrent workers must produce bitwise-identical teacher outputs.
 
 For a complete batched refresh benchmark inside an allocated GPU job:
 

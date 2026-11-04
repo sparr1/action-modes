@@ -83,7 +83,7 @@ def _assert_outer_unchanged(agent, snapshot):
 
 def _assert_adapted_state_close(actual, expected):
     # Absolute tolerance protects small/near-zero Adam moments; relative
-    # tolerance applies uniformly to both highest and production high precision.
+    # tolerance applies to the strict, highest-precision arithmetic gate.
     tolerance = dict(rtol=5e-4, atol=1e-5)
     for name in ("actor", "critic", "target", "prior_actor", "prior_critic"):
         for key, value in getattr(actual, name).items():
@@ -108,6 +108,98 @@ def _assert_adapted_state_close(actual, expected):
                     **(dict(rtol=0, atol=0) if key == "step" else tolerance),
                     msg=lambda message, key=key: f"Adam {key}: {message}",
                 )
+
+
+def _precision_state(core):
+    """Retain CPU tensors so three full graph workspaces need not coexist."""
+    clone = lambda value: value.detach().cpu().clone()
+    families = {
+        name: {key: clone(value) for key, value in getattr(core, name).items()}
+        for name in ("actor", "critic", "target", "prior_actor", "prior_critic")
+    }
+    families["replay"] = {"rows": clone(core.replay[:, :core.size])}
+    families["scalars"] = {
+        name: clone(getattr(core, name)) for name in ("scale", "log_alpha", "alpha_fixed")
+    }
+    steps = {}
+    for name, optimizer in (
+        ("actor", core.actor_optim), ("critic", core.critic_optim),
+        ("temperature", core.temperature_optim),
+    ):
+        if optimizer is None:
+            continue
+        for index, state in enumerate(optimizer.state.values()):
+            assert state.keys() == {"step", "exp_avg", "exp_avg_sq"}
+            steps[f"{name}_{index}"] = clone(state["step"])
+            # First and second moments have different units and magnitudes;
+            # neither can supply the numerical budget for the other.
+            for moment in ("exp_avg", "exp_avg_sq"):
+                families.setdefault(f"{name}_{moment}", {})[str(index)] = clone(state[moment])
+    return {
+        "families": families, "steps": steps,
+        "structure": (core.width, core.size, core.position, core.critic_steps),
+    }
+
+
+def _assert_precision_budget(actual, reference, highest, *, name="state", record_property=None):
+    """Bound each root's RMS drift by the reference's measured precision drift.
+
+    Sixteen FP32 epsilons of reference RMS allow a small arithmetic-roundoff
+    floor even when the reference high/highest paths happen to agree exactly.
+    There is no absolute/data-dependent floor: an entirely zero reference family
+    must stay zero. Double accumulation keeps the comparison itself precise.
+    """
+    assert actual.keys() == reference.keys() == highest.keys(), name
+    assert actual, name
+    roots = next(iter(reference.values())).shape[0]
+    sums = torch.zeros(3, roots, dtype=torch.float64)
+    elements = 0
+    for key, value in actual.items():
+        expected, baseline = reference[key], highest[key]
+        assert value.shape == expected.shape == baseline.shape, f"{name}.{key} shape"
+        assert value.dtype == expected.dtype == baseline.dtype == torch.float32, f"{name}.{key} dtype"
+        assert value.shape[0] == roots, f"{name}.{key} roots"
+        assert all(torch.isfinite(tensor).all() for tensor in (value, expected, baseline)), f"{name}.{key} nonfinite"
+        value, expected, baseline = (tensor.detach().double().cpu().reshape(roots, -1)
+                                     for tensor in (value, expected, baseline))
+        sums[0] += (value - expected).square().sum(dim=1)
+        sums[1] += (expected - baseline).square().sum(dim=1)
+        sums[2] += baseline.square().sum(dim=1)
+        elements += value.shape[1]
+    assert elements > 0, name
+    drift, precision_drift, magnitude = (sums / elements).sqrt()
+    floor = 16 * torch.finfo(torch.float32).eps * magnitude
+    budget = precision_drift + floor
+    metrics = {
+        "drift_rms_per_root": drift.tolist(),
+        "reference_precision_drift_rms_per_root": precision_drift.tolist(),
+        "roundoff_floor_per_root": floor.tolist(),
+        "budget_rms_per_root": budget.tolist(),
+    }
+    if record_property is not None:
+        for key, value in metrics.items():
+            record_property(f"high_{name}_{key}", value)
+    assert (drift <= budget).all(), f"{name} exceeds reference precision budget: {metrics}"
+    return metrics
+
+
+def _assert_precision_state_budget(actual, reference, highest, record_property):
+    assert actual["structure"] == reference["structure"] == highest["structure"]
+    assert actual["families"].keys() == reference["families"].keys() == highest["families"].keys()
+    assert actual["steps"].keys() == reference["steps"].keys() == highest["steps"].keys()
+    for key in actual["steps"]:
+        torch.testing.assert_close(actual["steps"][key], reference["steps"][key], rtol=0, atol=0)
+        torch.testing.assert_close(reference["steps"][key], highest["steps"][key], rtol=0, atol=0)
+    for name, family in actual["families"].items():
+        expected, baseline = reference["families"][name], highest["families"][name]
+        assert family.keys() == expected.keys() == baseline.keys(), name
+        if name in ("prior_actor", "prior_critic", "scalars"):
+            for key, value in family.items():
+                assert all(torch.isfinite(tensor).all() for tensor in (value, expected[key], baseline[key]))
+                torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
+                torch.testing.assert_close(expected[key], baseline[key], rtol=0, atol=0)
+        else:
+            _assert_precision_budget(family, expected, baseline, name=name, record_property=record_property)
 
 
 def _exercise_reference_recipe(precision, record_property):
@@ -138,7 +230,8 @@ def _exercise_reference_recipe(precision, record_property):
         assert torch.isfinite(value).all()
         error = (value - expected_value).abs().max().item()
         record_property(f"{precision}_teacher_{name}_max_abs_error", error)
-        torch.testing.assert_close(value, expected_value, rtol=5e-4, atol=1e-5)
+        if precision == "highest":
+            torch.testing.assert_close(value, expected_value, rtol=5e-4, atol=1e-5)
     torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
     torch.testing.assert_close(actual[2], roots.new_tensor([4 * 3072, 4 * 32, 4 * 128]), rtol=0, atol=0)
 
@@ -155,7 +248,59 @@ def _exercise_reference_recipe(precision, record_property):
         record_property(f"{precision}_{direction}_max_kl_per_dimension", maximum)
         assert torch.isfinite(per_dimension_kl).all()
         assert maximum <= 1e-6, f"{direction} KL/action dimension={maximum}"
-    _assert_adapted_state_close(optimized.core, reference.core)
+    if precision == "highest":
+        _assert_adapted_state_close(optimized.core, reference.core)
+        return
+
+    # TF32 kernels may change rounding when optimization changes operation
+    # shapes. Measure its budget using the unoptimized reference itself, with
+    # precisely the same starting priors, encoded roots and per-root seeds.
+    actual_state = _precision_state(optimized.core)
+    expected_state = _precision_state(reference.core)
+    initial_state = {key: value.detach().cpu().clone() for key, value in reference_agent.state_dict().items()}
+    actual = tuple(value.detach().cpu().clone() for value in actual[:3])
+    expected = tuple(value.detach().cpu().clone() for value in expected[:3])
+    del reference, optimized, reference_agent, optimized_agent, reference_outer, optimized_outer
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch._dynamo.reset()
+    try:
+        torch.set_float32_matmul_precision("highest")
+        with _preserve_global_rng():
+            baseline_agent = _reference_agent(False)
+            baseline_agent.load_state_dict(initial_state)
+            baseline_outer = _snapshot_outer(baseline_agent)
+            baseline_solver = BatchedTeacherSolver(baseline_agent)
+            baseline_host_rng, baseline_cuda_rng = _globals(), torch.cuda.get_rng_state().clone()
+            baseline = baseline_solver.solve(roots, seeds)
+            _assert_globals(baseline_host_rng)
+            torch.testing.assert_close(torch.cuda.get_rng_state(), baseline_cuda_rng, rtol=0, atol=0)
+            _assert_outer_unchanged(baseline_agent, baseline_outer)
+            baseline_state = _precision_state(baseline_solver.core)
+            baseline = tuple(value.detach().cpu().clone() for value in baseline[:3])
+    finally:
+        torch.set_float32_matmul_precision(precision)
+    _assert_globals(host_rng)
+    torch.testing.assert_close(torch.cuda.get_rng_state(), cuda_rng, rtol=0, atol=0)
+    torch.testing.assert_close(expected[2], baseline[2], rtol=0, atol=0)
+    _assert_precision_state_budget(actual_state, expected_state, baseline_state, record_property)
+    actual_policy, expected_policy, baseline_policy = (
+        tuple(value.double() for value in result[:2]) for result in (actual, expected, baseline)
+    )
+    for direction, current, teacher, reference_current, reference_teacher in (
+        ("optimized_to_reference", actual_policy, expected_policy, expected_policy, baseline_policy),
+        ("reference_to_optimized", expected_policy, actual_policy, baseline_policy, expected_policy),
+    ):
+        drift = diagonal_gaussian_reverse_kl(*current, *teacher) / 21
+        precision_drift = diagonal_gaussian_reverse_kl(*reference_current, *reference_teacher) / 21
+        assert torch.isfinite(drift).all() and torch.isfinite(precision_drift).all()
+        # Clamp mathematically nonnegative KL at zero to remove double-precision
+        # cancellation; the 1e-12 floor is additional to the unchanged 1e-6 cap.
+        budget = precision_drift.clamp_min(0) + 1e-12
+        record_property(f"high_{direction}_kl_per_dimension_per_root", drift.flatten().tolist())
+        record_property(f"high_{direction}_reference_precision_kl_per_root", precision_drift.flatten().tolist())
+        assert (drift <= 1e-6).all()
+        assert (drift <= budget).all(), f"{direction}: KL={drift.tolist()}, budget={budget.tolist()}"
 
 
 @pytest.mark.parametrize("precision", ["highest", "high"])
@@ -195,9 +340,9 @@ def test_full_reference_recipe_concurrent_workers_are_bitwise_identical_at_produ
             torch.manual_seed(297)
             agent = _reference_agent(True)
             with torch.no_grad():
-                observations = torch.randn(10, 67, device="cuda")
+                observations = torch.randn(14, 67, device="cuda")
                 roots = agent.model.encode(observations).detach()
-            seeds = list(range(377, 387))
+            seeds = list(range(377, 391))
             snapshot = _snapshot_outer(agent)
             host_rng, cuda_rng = _globals(), torch.cuda.get_rng_state().clone()
             serial = BatchedTeacherSolver(agent)
@@ -206,7 +351,7 @@ def test_full_reference_recipe_concurrent_workers_are_bitwise_identical_at_produ
             torch.testing.assert_close(torch.cuda.get_rng_state(), cuda_rng, rtol=0, atol=0)
             _assert_outer_unchanged(agent, snapshot)
             torch.testing.assert_close(
-                expected[2], roots.new_tensor([10 * 3072, 10 * 32, 10 * 128]), rtol=0, atol=0,
+                expected[2], roots.new_tensor([14 * 3072, 14 * 32, 14 * 128]), rtol=0, atol=0,
             )
             # Release graph-private pools between configurations, retaining the
             # compiler cache so repeated worker shapes still exercise its limit.
@@ -224,12 +369,12 @@ def test_full_reference_recipe_concurrent_workers_are_bitwise_identical_at_produ
                             value, target, rtol=0, atol=0,
                             msg=lambda message, name=name: f"workers={workers}, {name}: {message}",
                         )
-                    assert actual[3]["distillation_reanalyze_chunks"] == 3
+                    assert actual[3]["distillation_reanalyze_chunks"] == 4
                     assert actual[3]["distillation_reanalyze_padding_roots"] == 2
-                    # Ten roots have three width-four chunks: a two-worker
-                    # pool reuses its first workspace; a four-worker setting
-                    # needs only three workers for this particular batch.
-                    assert actual[3]["distillation_reanalyze_batched_workers"] == min(workers, 3)
+                    # Fourteen roots have four width-four chunks: two workers
+                    # reuse their workspaces, while all four workers are active
+                    # in the larger pool. The last chunk retains two pad rows.
+                    assert actual[3]["distillation_reanalyze_batched_workers"] == min(workers, 4)
                     _assert_outer_unchanged(agent, snapshot)
                     _assert_globals(host_rng)
                     torch.testing.assert_close(torch.cuda.get_rng_state(), cuda_rng, rtol=0, atol=0)

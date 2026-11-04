@@ -115,7 +115,7 @@ def test_selected_heads_match_full_ensemble_action_gradients_with_explicit_dropo
     assert agent.model.q_backend.num_q == 3
 
 
-def test_cache_evaluates_each_resident_next_state_once_per_critic_block(monkeypatch):
+def test_cache_visits_resident_next_states_in_minibatch_tiles_per_critic_block(monkeypatch):
     agent = _agent(inner_rounds=3, inner_critic_updates_per_round=4,
                    inner_actor_updates_per_round=1, inner_replay_capacity=24)
     # Exercise the low-level ring contract even though production action-local
@@ -130,10 +130,79 @@ def test_cache_evaluates_each_resident_next_state_once_per_critic_block(monkeypa
     monkeypatch.setattr(core.regions["actor_cache"], "eager", observe)
     core.root.normal_()
     core.run()
-    assert rows == [8, 11, 11]  # ring wrap keeps every retained physical row valid
+    # The 8/11/11 resident rows need 2/3/3 tiles; the last row of the
+    # nondivisible rounds is padded without adding a replay label.
+    assert rows == [4] * 8
     rows.clear()
     core.run()
-    assert rows == [8, 11, 11]
+    assert rows == [4] * 8
+
+
+@pytest.mark.parametrize("size", [1, 4, 5, 11])
+def test_cache_tiles_preserve_minibatch_layout_padding_indices_and_rng(monkeypatch, size):
+    torch.manual_seed(613)
+    agent = _agent(inner_critic_updates_per_round=4, inner_actor_updates_per_round=1,
+                   inner_batch_size=4, inner_finite_horizon=True)
+    core = BatchedTeacherCore(agent, 2, optimization_features={"actor_cache"})
+    core.reset()
+    core.replay.normal_()
+    core.size = size
+    offset = sum(core.field_widths[:3])
+    indices = torch.tensor([[size - 1, 0, size // 2, size - 1],
+                            [0, size - 1, 0, size // 2]])
+    batch = core.replay.gather(1, indices[..., None].expand(-1, -1, core.replay.shape[-1]))
+    reference_next_z = batch[..., offset:offset + agent.cfg.latent_dim]
+    observed = []
+    cache = core.regions["actor_cache"].eager
+
+    def observe(next_z):
+        assert next_z.shape == reference_next_z.shape
+        assert next_z.stride() == reference_next_z.stride()
+        assert next_z.storage_offset() == reference_next_z.storage_offset()
+        observed.append(next_z.clone())
+        return cache(next_z)
+
+    monkeypatch.setattr(core.regions["actor_cache"], "eager", observe)
+    before = torch.get_rng_state().clone()
+    with torch.no_grad():
+        raw = core._cache_replay_actor_outputs()
+        expected = cache(reference_next_z)
+    torch.testing.assert_close(torch.get_rng_state(), before, rtol=0, atol=0)
+    assert raw.shape == (2, size, 2 * agent.cfg.action_dim)
+    assert len(observed) == (size + 3) // 4
+    for tile, value in enumerate(observed):
+        start, valid = tile * 4, min(4, size - tile * 4)
+        torch.testing.assert_close(value[:, :valid],
+                                   core.replay[:, start:start + valid, offset:offset + agent.cfg.latent_dim],
+                                   rtol=0, atol=0)
+        assert torch.count_nonzero(value[:, valid:]).item() == 0
+    actual = raw.gather(1, indices[..., None].expand(-1, -1, raw.shape[-1]))
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_cache_padded_cost_allows_equal_work_and_skips_more_expensive_round(monkeypatch):
+    agent = _agent(inner_critic_updates_per_round=2, inner_actor_updates_per_round=1,
+                   inner_batch_size=5)
+    core = BatchedTeacherCore(agent, 2, optimization_features={"actor_cache"})
+    sizes, rows = [], []
+    cache_replay = core._cache_replay_actor_outputs
+    cache_tile = core.regions["actor_cache"].eager
+
+    def observe_replay():
+        sizes.append(core.size)
+        return cache_replay()
+
+    def observe_tile(next_z):
+        rows.append(next_z.shape[1])
+        return cache_tile(next_z)
+
+    monkeypatch.setattr(core, "_cache_replay_actor_outputs", observe_replay)
+    monkeypatch.setattr(core.regions["actor_cache"], "eager", observe_tile)
+    core.run()
+    # First round: ceil(8/5)*5 == 2 critic updates * 5 rows, so cache.
+    # Second round: ceil(16/5)*5 > 10, so ordinary minibatch forwards win.
+    assert sizes == [8]
+    assert rows == [5, 5]
 
 
 def test_cache_is_not_used_for_interleaved_actor_updates(monkeypatch):

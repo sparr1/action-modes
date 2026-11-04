@@ -332,6 +332,24 @@ class BatchedTeacherCore:
         # applies bounds, fresh noise, tanh and the configured entropy per update.
         return self._actor(self.actor, next_z)
 
+    def _cache_replay_actor_outputs(self):
+        # Match the critic minibatch's matrix shapes AND packed-field layout.
+        # Evaluating the whole replay at once can select different TF32 kernels
+        # from the ordinary B-row actor forward. The scratch batch also keeps
+        # input strides/offsets identical for full and padded final tiles.
+        batch_size = int(self.cfg.inner_batch_size)
+        packed = self.replay.new_empty(self.width, batch_size, self.replay.shape[-1])
+        offset = sum(self.field_widths[:3])
+        next_z = packed[..., offset:offset + self.cfg.latent_dim]
+        outputs = []
+        for start in range(0, self.size, batch_size):
+            valid = min(batch_size, self.size - start)
+            packed[:, :valid].copy_(self.replay[:, start:start + valid])
+            if valid < batch_size:
+                packed[:, valid:].zero_()
+            outputs.append(self.regions["actor_cache"](next_z)[:, :valid])
+        return torch.cat(outputs, dim=1)
+
     def _clip(self, parameters, maximum):
         parameters = tuple(p for p in parameters if p.grad is not None)
         if "fused_updates" not in self.optimization_features:
@@ -425,17 +443,16 @@ class BatchedTeacherCore:
             with torch.no_grad():
                 self.append(self.regions["rollout"](noise))
             next_policy_outputs = None
+            batch_size = int(cfg.inner_batch_size)
+            padded_cache_rows = ((self.size + batch_size - 1) // batch_size) * batch_size
             if ("actor_cache" in self.optimization_features and self.helper._uses_component_update_schedule
                     and sum(c for c, a, t in slots) > 1
-                    and self.size <= cfg.inner_batch_size * sum(c for c, a, t in slots)):
+                    and padded_cache_rows <= batch_size * sum(c for c, a, t in slots)):
                 # Component schedules place all critic-only updates before any
                 # actor update. Rebuild after every append/actor block; never
                 # retain these values across rounds, roots, or solve resets.
-                offset = sum(self.field_widths[:3])
                 with torch.no_grad():
-                    next_policy_outputs = self.regions["actor_cache"](
-                        self.replay[:, :self.size, offset:offset + cfg.latent_dim],
-                    )
+                    next_policy_outputs = self._cache_replay_actor_outputs()
             for do_critic, do_actor, do_temperature in slots:
                 if cfg.inner_replay_sampling == "with_replacement":
                     indices = draw("integer", (self.width, cfg.inner_batch_size), self.size)

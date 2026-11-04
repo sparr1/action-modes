@@ -64,7 +64,7 @@ class LazyReanalyzer:
         if not optimized and workers == 1:
             return {}
         return {
-            "reanalyze_execution": "root_batched_optimized_v2",
+            "reanalyze_execution": "root_batched_optimized_v3",
             "reanalyze_batched_optimizations": optimized,
             "reanalyze_batched_workers": workers,
         }
