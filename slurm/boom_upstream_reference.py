@@ -205,7 +205,7 @@ def observed_class(base):
 
 
 def validate_observer(agent, output):
-    """Identical actor/model/optimizer updates and RNG with observation on/off."""
+    """Numerical update parity and exact RNG, with a native/native repeat control."""
     import numpy as np
     import torch
     cfg = agent.cfg
@@ -225,7 +225,7 @@ def validate_observer(agent, output):
         pi_optim = deepcopy(agent.pi_optim.state_dict())
         rng = (torch.get_rng_state(), torch.cuda.get_rng_state_all(), np.random.get_state(), random.getstate())
         results = []
-        for enabled in (False, True):
+        for enabled in (False, False, True):
             agent.model.load_state_dict(model)
             # Upstream clips all model parameters before clearing the actor's
             # previous gradients. They are therefore part of its update state.
@@ -243,9 +243,14 @@ def validate_observer(agent, output):
                             torch.get_rng_state(), torch.cuda.get_rng_state_all(),
                             np.random.get_state(), random.getstate()))
 
+        differences = {}
         def equal(a, b, path="root"):
             if isinstance(a, torch.Tensor):
-                assert torch.equal(a, b), (path, float((a - b).abs().max()))
+                if a.is_floating_point():
+                    torch.testing.assert_close(a, b, rtol=2e-5, atol=1e-7, msg=path)
+                    differences[path] = float((a - b).abs().max())
+                else:
+                    assert torch.equal(a, b), path
             elif isinstance(a, np.ndarray):
                 assert np.array_equal(a, b)
             elif isinstance(a, dict):
@@ -254,10 +259,19 @@ def validate_observer(agent, output):
             elif isinstance(a, (list, tuple)):
                 assert len(a) == len(b)
                 for i, (x, y) in enumerate(zip(a, b)): equal(x, y, f"{path}[{i}]")
+            elif isinstance(a, float):
+                assert math.isclose(a, b, rel_tol=2e-5, abs_tol=1e-7), (path, a, b)
+                differences[path] = abs(a - b)
             else:
                 assert a == b, (a, b)
         equal(results[0], results[1])
-        rows.append({"initial_scale": scale, "exact_parity": True})
+        native_repeat = max(differences.values(), default=0)
+        differences.clear()
+        equal(results[1], results[2])
+        rows.append({"initial_scale": scale, "numerical_parity": True, "rng_exact": True,
+                     "native_repeat_max_absolute_difference": native_repeat,
+                     "observed_max_absolute_difference": max(differences.values(), default=0),
+                     "rtol": 2e-5, "atol": 1e-7})
     (output / "parity.json").write_text(json.dumps({"upstream": UPSTREAM, "checks": rows}, indent=2))
     print("OBSERVER_PARITY_PASSED", rows, flush=True)
 

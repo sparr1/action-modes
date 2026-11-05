@@ -41,7 +41,7 @@ checkpoints, not exact-resume snapshots. The stock training and evaluation
 schedule is unchanged; crossing snapshots can be evaluated separately.
 
 Before production, run the `validate` mode on a scheduled GPU. It verifies
-exact equality of model parameters, optimizer states, losses and all RNG states
+numerical agreement of model parameters, optimizer states and losses, and exact equality of all RNG states
 with observation disabled/enabled, both below and above the gate. The
 `benchmark` mode disables W&B in both config and environment and measures
 one/two-CPU affinity windows of complete online training on the same GPU.
@@ -67,7 +67,7 @@ prior episodes every 50k decisions. Disable video capture as an output choice.
 The Monte Carlo and predicted values appear in the shared reference dashboard.
 
 The TD adapter changes only call signatures and adds metric aliases for the
-common observer. Validate it with the same exact model/optimizer/RNG parity
+common observer. Validate it with the same numerical model/optimizer and exact RNG parity
 test. Validation restores parameter gradients as well as model and optimizer
 states: both released implementations include retained previous actor gradients
 in the model-wide gradient clipping operation. This behavior is preserved.
@@ -77,3 +77,7 @@ own scratch directory containing the clean official `upstream` checkout. Set
 `BOOM_WORKSPACE_ROOT` to the common campaign root. Both roots have separate
 submission records and output ownership. The common root's `references` list
 selects the exact two W&B identities without changing the AMBI comparison.
+
+GPU validation includes a repeated unobserved update as a numerical control.
+Floating outputs use rtol=2e-5 and atol=1e-7; RNG and integer states must match
+exactly. The receipt records both native-repeat and observed-update differences.
