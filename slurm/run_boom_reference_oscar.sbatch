@@ -14,7 +14,7 @@ umask 077
 : "${BOOM_OBSERVER_COMMIT:?Pin observer source}"
 : "${BOOM_REFERENCE_ROOT:?Set scratch root}"
 : "${BOOM_REFERENCE_PYTHON:?Set isolated upstream interpreter}"
-mode="${1:?validate, benchmark, or train}"
+mode="${1:?validate, benchmark, gate, or train}"
 [[ "$(git rev-parse HEAD)" == "$BOOM_OBSERVER_COMMIT" ]]
 [[ -z "$(git status --porcelain --untracked-files=all)" ]]
 [[ "${SLURM_RESTART_COUNT:-0}" == 0 ]]
@@ -31,13 +31,20 @@ if [[ "$mode" == train ]]; then
   : "${BOOM_WORKSPACE_PYTHON:?Set publisher interpreter}"
   "$BOOM_WORKSPACE_PYTHON" slurm/boom_reference_workspace.py "$BOOM_REFERENCE_ROOT"
   export WANDB_MODE=online
-elif [[ "$mode" == validate || "$mode" == benchmark ]]; then
+elif [[ "$mode" == validate || "$mode" == benchmark || "$mode" == gate ]]; then
   export WANDB_MODE=disabled
 else
   exit 2
 fi
-srun --kill-on-bad-exit=1 "$BOOM_REFERENCE_PYTHON" slurm/boom_upstream_reference.py "$mode" \
-  --upstream "$BOOM_REFERENCE_ROOT/upstream" --output "$BOOM_REFERENCE_ROOT/$mode-$SLURM_JOB_ID"
+if [[ "$mode" == gate ]]; then
+  phases=(validate benchmark)
+else
+  phases=("$mode")
+fi
+for phase in "${phases[@]}"; do
+  srun --kill-on-bad-exit=1 "$BOOM_REFERENCE_PYTHON" slurm/boom_upstream_reference.py "$phase" \
+    --upstream "$BOOM_REFERENCE_ROOT/upstream" --output "$BOOM_REFERENCE_ROOT/$phase-$SLURM_JOB_ID"
+done
 if [[ "$mode" == train ]]; then
   "$BOOM_WORKSPACE_PYTHON" slurm/boom_reference_workspace.py "$BOOM_REFERENCE_ROOT"
 fi
