@@ -20,6 +20,8 @@ def main():
     parser.add_argument("--upstream", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=55)
+    parser.add_argument("--steps", type=int, default=200000)
+    parser.add_argument("--acceleration", choices=("native", "planner-graph", "compiled-planner"), default="native")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     assert subprocess.check_output(["git", "-C", str(args.upstream), "rev-parse", "HEAD"], text=True).strip() == UPSTREAM
@@ -53,6 +55,8 @@ def main():
     with patch("hydra.utils.get_original_cwd", return_value=str(Path.cwd())):
         cfg = parse_cfg(cfg)
     cfg.work_dir = args.output
+    cfg.steps = args.steps
+    cfg.acceleration = args.acceleration
     assert cfg.actor_mode == "residual" and cfg.scale_threshold == 2.0 and cfg.prior_coef == 1.0
     if args.mode == "benchmark":
         cfg.steps = 4100
@@ -84,10 +88,15 @@ def main():
     agent = observed_class(InterfaceAdapter)(cfg)
     if args.mode == "validate":
         validate_observer(agent, args.output)
+        if args.acceleration != "native":
+            from upstream_reference_acceleration import validate_planner
+            validate_planner(agent, "tdmpc_square", args.output, args.acceleration)
         p = args.output / "parity.json"
         receipt = json.loads(p.read_text()); receipt["upstream"] = UPSTREAM
         p.write_text(json.dumps(receipt, indent=2))
         return
+    from upstream_reference_acceleration import install_planner
+    install_planner(agent, "tdmpc_square", args.acceleration)
     recorder = Recorder(args.output, cfg, args.mode == "train",
                         method="TD-M(PC)^2", upstream_commit=UPSTREAM)
     recorder.agent = agent

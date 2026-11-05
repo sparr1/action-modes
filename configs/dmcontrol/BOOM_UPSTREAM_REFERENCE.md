@@ -8,12 +8,13 @@ The upstream source is a separate clean checkout of
 `https://github.com/molumitu/BOOM_MBRL` at
 `b3b2f09c03533c15b804ced9abc6767e73ff8e1e`. No upstream source is modified.
 `slurm/boom_upstream_reference.py` invokes its environment, agent, replay, and
-online trainer. Runtime wrappers only observe policy outputs and the existing
-gradient-clipping result. The original Gaussian/entropy arithmetic, seed-data
+online trainer. Runtime wrappers observe policy outputs and the existing
+gradient-clipping result. Optional CUDA graph execution captures the planner
+iterations while retaining its original sampling and final action selection. The original Gaussian/entropy arithmetic, seed-data
 pretraining and replay prefetch behavior are preserved, including their quirks.
 
 Use the upstream default config, changing task to `humanoid-walk` and seed to
-55. Keep the released 2,001,000-decision budget, action repeat two, summed
+55. Use the requested 200,000-decision initial diagnostic budget, action repeat two, summed
 rewards, ten evaluation episodes for both planner and prior every 50k decisions,
 and original S > 2 gate. The released action-dimension heuristic gives lambda
 0.42 for the 21-dimensional Humanoid. This differs from the BOOM paper's written
@@ -37,8 +38,7 @@ activation. Entropy diagnostics remove the upstream extra Gaussian multiplier
 while retaining its floored tanh Jacobian; they do not change the objective.
 The observer saves model/scale snapshots before and after the first active
 actor update, every 25k decisions and at completion. These are diagnostic
-checkpoints, not exact-resume snapshots. The stock training and evaluation
-schedule is unchanged; crossing snapshots can be evaluated separately.
+checkpoints, not exact-resume snapshots. The stock update and evaluation cadence is retained; crossing snapshots can be evaluated separately.
 
 Before production, run the `validate` mode on a scheduled GPU. It verifies
 numerical agreement of model parameters, optimizer states and losses, and exact equality of all RNG states
@@ -59,7 +59,7 @@ returns, threshold, objective, gradient and entropy panels.
 `DarthUtopian/tdmpc_square_public` commit
 `d1c2632c36effd2f7b661bfe5f822a3db8054d40`. Use the same DMC dependencies and
 seed 55, with the native `residual` actor objective, beta=1 and scale threshold
-2. Preserve its 2,000,000-decision budget, eager module execution, vectorized
+2. Use the requested 200,000-decision initial diagnostic budget, vectorized
 critic heads, native TF32 defaults and complete replay/trainer behavior. The
 launcher restricts Torch threads for measured CPU sizing. Its original
 evaluations use one planner episode, one prior episode and 100 Monte Carlo
@@ -81,3 +81,22 @@ selects the exact two W&B identities without changing the AMBI comparison.
 GPU validation includes a repeated unobserved update as a numerical control.
 Floating outputs use rtol=2e-5 and atol=1e-7; RNG and integer states must match
 exactly. The receipt records both native-repeat and observed-update differences.
+
+`REFERENCE_AUTOLAUNCH=1` makes a successful gate submit its scientific job with
+an `afterok` dependency on the gate itself. It requires both parity receipts
+and a completed timing checkpoint, selects one CPU unless two improve speed by
+more than 5%, and reserves measured training plus evaluation time with a 25%
+margin and half an hour for startup. TD sizing retains its full native Monte
+Carlo evaluation. Submission failures propagate; failed gates never launch
+training. The scientific job ID and measured resource plan are written to the
+campaign submission record before the shared dashboard is updated.
+
+`REFERENCE_STEPS=200000` selects the agreed diagnostic budget.
+`REFERENCE_ACCELERATION=planner-graph` captures the complete MPPI iteration
+region, reusing the original neural modules. BOOM retains native module
+compilation; TD retains native module arithmetic. A GPU test compares native,
+translated eager and captured planners for both episode reset modes and
+training/evaluation actions, including exact Python, NumPy and Torch RNG state.
+Graph construction restores RNG and planner state after warmup. Sampling of
+critic head pairs retains the original NumPy stream, and final categorical
+action selection remains outside the graph with each method's original API.

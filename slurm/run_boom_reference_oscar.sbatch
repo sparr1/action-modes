@@ -46,8 +46,12 @@ else
 fi
 for phase in "${phases[@]}"; do
   srun --kill-on-bad-exit=1 "$BOOM_REFERENCE_PYTHON" "slurm/${method}_upstream_reference.py" "$phase" \
-    --upstream "$BOOM_REFERENCE_ROOT/upstream" --output "$BOOM_REFERENCE_ROOT/$phase-$SLURM_JOB_ID"
+    --upstream "$BOOM_REFERENCE_ROOT/upstream" --output "$BOOM_REFERENCE_ROOT/$phase-$SLURM_JOB_ID" \
+    --steps "${REFERENCE_STEPS:-200000}" --acceleration "${REFERENCE_ACCELERATION:-planner-graph}"
 done
+if [[ "$mode" == gate && "${REFERENCE_AUTOLAUNCH:-0}" == 1 ]]; then
+  "$BOOM_REFERENCE_PYTHON" slurm/release_upstream_reference.py
+fi
 if [[ "$mode" == train ]]; then
   "$BOOM_WORKSPACE_PYTHON" slurm/boom_reference_workspace.py "$workspace_root"
 fi

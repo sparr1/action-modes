@@ -51,10 +51,11 @@ md = f"""**Released BOOM and TD-M(PC)² — DMC Humanoid Walk — threshold refe
 
 One seed (55) each and original S > 2 gates. BOOM uses released lambda=0.42;
 TD-M(PC)² uses beta=1. Original entropy, Gaussian penalties, replay, planners,
-and training equations. Budgets are 2,001,000 / 2,000,000 decisions respectively
+and training equations. Budgets are 200,000 decisions each
 (two raw control steps per decision). State observations, summed rewards,
-500-decision episodes. BOOM retains native compilation and TF32; TD-M(PC)²
-retains its released eager implementation. Both vectorize critic heads.
+500-decision episodes. Both capture the MPPI planner iterations with CUDA graphs. BOOM also retains
+native module compilation and TF32. Both vectorize critic heads and preserve
+their native training equations and precision settings.
 Original evaluations every 50k: BOOM ten planner/prior episodes; TD one of each
 plus 100 Monte Carlo prior episodes for value estimation. Videos are disabled.
 

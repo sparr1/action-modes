@@ -282,6 +282,8 @@ def main():
     parser.add_argument("--upstream", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--seed", type=int, default=55)
+    parser.add_argument("--steps", type=int, default=200000)
+    parser.add_argument("--acceleration", choices=("native", "planner-graph", "compiled-planner"), default="native")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     assert subprocess.check_output(["git", "-C", str(args.upstream), "rev-parse", "HEAD"], text=True).strip() == UPSTREAM
@@ -315,6 +317,8 @@ def main():
     with patch("hydra.utils.get_original_cwd", return_value=str(Path.cwd())):
         cfg = parse_cfg(cfg)
     cfg.work_dir = args.output
+    cfg.steps = args.steps
+    cfg.acceleration = args.acceleration
     if args.mode == "benchmark":
         cfg.steps = 4100
         cfg.eval_episodes = 1
@@ -323,7 +327,12 @@ def main():
     agent = observed_class(BOOM)(cfg)
     if args.mode == "validate":
         validate_observer(agent, args.output)
+        if args.acceleration != "native":
+            from upstream_reference_acceleration import validate_planner
+            validate_planner(agent, "boom", args.output, args.acceleration)
         return
+    from upstream_reference_acceleration import install_planner
+    install_planner(agent, "boom", args.acceleration)
     recorder = Recorder(args.output, cfg, args.mode == "train")
     agent.recorder = recorder
     recorder.agent = agent
