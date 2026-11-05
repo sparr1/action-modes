@@ -156,11 +156,16 @@ def worker(args):
     import torch
     import domains  # noqa: F401
     from RL.AMBITDMPC2 import AMBITDMPC2
+    from main import _checkpoint_replay_kwargs
+    from utils.checkpointing import resolve_checkpoint_config
 
     torch.set_num_threads(len(cpus))
     torch.set_num_interop_threads(1)
     execution = accelerated_runtime()
     name, manifest, run = recipe(args.index, MANIFEST)
+    checkpoint_config = resolve_checkpoint_config(run, manifest)
+    assert checkpoint_config.enabled and checkpoint_config.every == 25000
+    assert _checkpoint_replay_kwargs(AMBITDMPC2, checkpoint_config) == {}
     run, manifest = deepcopy(run), deepcopy(manifest)
     graph_enabled = not args.native_reference
     overrides = {"wandb": False, "wandb_mode": "disabled", "seed_steps": 500,

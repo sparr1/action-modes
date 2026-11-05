@@ -75,6 +75,7 @@ class CheckpointConfig:
     every: int | None
     strategies: tuple[str, ...]
     best_window: int
+    replay: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -105,6 +106,9 @@ def resolve_checkpoint_config(
     every = resolved("checkpoint_every", None)
     strategies = normalize_save_strat(resolved("save_strat", None))
     best_window = resolved("checkpoint_best_window", 100)
+    replay = resolved("checkpoint_replay", False)
+    if not isinstance(replay, bool):
+        raise ValueError("checkpoint_replay must be a boolean.")
 
     if every is not None:
         if isinstance(every, bool):
@@ -127,7 +131,9 @@ def resolve_checkpoint_config(
     if not math.isfinite(numeric_window) or best_window <= 0 or numeric_window != best_window:
         raise ValueError("checkpoint_best_window must be a positive integer.")
 
-    return CheckpointConfig(every=every, strategies=strategies, best_window=best_window)
+    if replay and (every is None or strategies == ("none",)):
+        raise ValueError("checkpoint_replay=true requires enabled checkpoint_every/save_strat.")
+    return CheckpointConfig(every=every, strategies=strategies, best_window=best_window, replay=replay)
 
 
 @dataclass(frozen=True)
