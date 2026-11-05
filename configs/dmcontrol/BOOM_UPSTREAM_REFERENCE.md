@@ -52,3 +52,28 @@ The Slurm launcher requires pinned clean observer and upstream source, unique
 output paths, and a scientific W&B run ID. `boom_reference_workspace.py`
 idempotently installs and reads back a separate workspace with progress,
 returns, threshold, objective, gradient and entropy panels.
+
+## Paired TD-M(PC)² reference
+
+`slurm/tdmpc_square_upstream_reference.py` also supports the official
+`DarthUtopian/tdmpc_square_public` commit
+`d1c2632c36effd2f7b661bfe5f822a3db8054d40`. Use the same DMC dependencies and
+seed 55, with the native `residual` actor objective, beta=1 and scale threshold
+2. Preserve its 2,000,000-decision budget, eager module execution, vectorized
+critic heads, native TF32 defaults and complete replay/trainer behavior. The
+launcher restricts Torch threads for measured CPU sizing. Its original
+evaluations use one planner episode, one prior episode and 100 Monte Carlo
+prior episodes every 50k decisions. Disable video capture as an output choice.
+The Monte Carlo and predicted values appear in the shared reference dashboard.
+
+The TD adapter changes only call signatures and adds metric aliases for the
+common observer. Validate it with the same exact model/optimizer/RNG parity
+test. Validation restores parameter gradients as well as model and optimizer
+states: both released implementations include retained previous actor gradients
+in the model-wide gradient clipping operation. This behavior is preserved.
+
+Set `BOOM_REFERENCE_METHOD=tdmpc_square` and point `BOOM_REFERENCE_ROOT` to its
+own scratch directory containing the clean official `upstream` checkout. Set
+`BOOM_WORKSPACE_ROOT` to the common campaign root. Both roots have separate
+submission records and output ownership. The common root's `references` list
+selects the exact two W&B identities without changing the AMBI comparison.

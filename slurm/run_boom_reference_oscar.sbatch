@@ -15,6 +15,9 @@ umask 077
 : "${BOOM_REFERENCE_ROOT:?Set scratch root}"
 : "${BOOM_REFERENCE_PYTHON:?Set isolated upstream interpreter}"
 mode="${1:?validate, benchmark, gate, or train}"
+method="${BOOM_REFERENCE_METHOD:-boom}"
+[[ "$method" == boom || "$method" == tdmpc_square ]]
+workspace_root="${BOOM_WORKSPACE_ROOT:-$BOOM_REFERENCE_ROOT}"
 [[ "$(git rev-parse HEAD)" == "$BOOM_OBSERVER_COMMIT" ]]
 [[ -z "$(git status --porcelain --untracked-files=all)" ]]
 [[ "${SLURM_RESTART_COUNT:-0}" == 0 ]]
@@ -29,7 +32,7 @@ export TMPDIR="$cache/tmp" XDG_CACHE_HOME="$cache/xdg"
 if [[ "$mode" == train ]]; then
   : "${WANDB_RUN_ID:?Set unique scientific run ID}"
   : "${BOOM_WORKSPACE_PYTHON:?Set publisher interpreter}"
-  "$BOOM_WORKSPACE_PYTHON" slurm/boom_reference_workspace.py "$BOOM_REFERENCE_ROOT"
+  "$BOOM_WORKSPACE_PYTHON" slurm/boom_reference_workspace.py "$workspace_root"
   export WANDB_MODE=online
 elif [[ "$mode" == validate || "$mode" == benchmark || "$mode" == gate ]]; then
   export WANDB_MODE=disabled
@@ -42,10 +45,10 @@ else
   phases=("$mode")
 fi
 for phase in "${phases[@]}"; do
-  srun --kill-on-bad-exit=1 "$BOOM_REFERENCE_PYTHON" slurm/boom_upstream_reference.py "$phase" \
+  srun --kill-on-bad-exit=1 "$BOOM_REFERENCE_PYTHON" "slurm/${method}_upstream_reference.py" "$phase" \
     --upstream "$BOOM_REFERENCE_ROOT/upstream" --output "$BOOM_REFERENCE_ROOT/$phase-$SLURM_JOB_ID"
 done
 if [[ "$mode" == train ]]; then
-  "$BOOM_WORKSPACE_PYTHON" slurm/boom_reference_workspace.py "$BOOM_REFERENCE_ROOT"
+  "$BOOM_WORKSPACE_PYTHON" slurm/boom_reference_workspace.py "$workspace_root"
 fi
 

@@ -31,13 +31,14 @@ def jsonable(value):
 
 
 class Recorder:
-    def __init__(self, output, cfg, online):
+    def __init__(self, output, cfg, online, method="BOOM", upstream_commit=UPSTREAM):
         self.output = output
         self.start = time.perf_counter()
         self.updates = 0
         self.window = defaultdict(list)
         self.crossed = False
         self.agent = None
+        self.upstream_commit = upstream_commit
         self.wandb = None
         self.video = None
         self.last_checkpoint = -1
@@ -46,8 +47,8 @@ class Recorder:
         self.raw = (output / "updates.jsonl").open("x", buffering=1024 * 1024)
         from omegaconf import OmegaConf
         config = OmegaConf.to_container(cfg, resolve=True)
-        config.update(upstream_commit=UPSTREAM, threshold=2.0,
-                      effective_alignment_lambda=0.42, reference_method="released BOOM",
+        config.update(upstream_commit=upstream_commit, threshold=2.0,
+                      reference_method=f"released {method}",
                       action_repeat=2, reward_aggregation="sum",
                       observer_commit=subprocess.check_output(
                           ["git", "rev-parse", "HEAD"], text=True).strip())
@@ -57,9 +58,9 @@ class Recorder:
             self.wandb = wandb.init(
                 entity=cfg.wandb_entity, project=cfg.wandb_project,
                 id=os.environ["WANDB_RUN_ID"], resume="never",
-                name=f"BOOM released | humanoid-walk | S>2 | seed{cfg.seed}",
+                name=f"{method} released | humanoid-walk | S>2 | seed{cfg.seed}",
                 group="boom-upstream-threshold-reference-20261104",
-                tags=["upstream-reference", "boom", "threshold-diagnostics"],
+                tags=["upstream-reference", method, "threshold-diagnostics"],
                 config=jsonable(config), dir=str(output))
             self.wandb.define_metric("env_step")
             self.wandb.define_metric("*", step_metric="env_step")
@@ -77,7 +78,7 @@ class Recorder:
         path.parent.mkdir(exist_ok=True)
         torch.save({"model": self.agent.model.state_dict(),
                     "scale": self.agent.scale.state_dict(),
-                    "env_step": step, "upstream_commit": UPSTREAM}, path)
+                    "env_step": step, "upstream_commit": self.upstream_commit}, path)
 
     def update(self, step, metrics):
         self.updates += 1
@@ -154,7 +155,9 @@ def observed_class(base):
 
             self.model.pi = pi
 
-        def update_pi(self, zs, action, mu, std, task, step):
+        def update_pi(self, zs, action, mu, std, task, step=None):
+            if step is None:
+                step = getattr(self, "reference_step", 0)
             if not self.observe:
                 return super().update_pi(zs, action, mu, std, task, step)
             self.actor_metrics = {}

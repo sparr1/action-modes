@@ -10,6 +10,8 @@ from wandb_workspaces import expr
 root = Path(sys.argv[1])
 state = json.loads((root / "submission.json").read_text())
 run_id = state["run_id"]
+references = state.get("references", [{"method": "BOOM", "run_id": run_id, "root": str(root)}])
+run_ids = [r["run_id"] for r in references]
 api = wandb.Api()
 try:
     run = api.run(f"rwgao_b-brown-university/ambi/{run_id}")
@@ -34,19 +36,31 @@ groups = {
                ("Action saturation", "diagnostic/action_saturation", "diagnostic/mean_saturation"),
                ("Actor standard deviation", "diagnostic/actor_std_mean", "diagnostic/actor_std_min")],
     "Learning and progress": [("Model and critic fitting", "diagnostic/consistency_loss", "diagnostic/value_loss"),
+                              ("TD-M(PC)^2 Monte Carlo versus predicted value", "eval/mc_value", "eval/q_value"),
                               ("Completed updates", "progress/updates"),
                               ("Update duration", "diagnostic/update_seconds")],
 }
-md = f"""**Released BOOM — DMC Humanoid Walk — threshold reference.**
+reference_status = []
+for ref in references:
+    sub = json.loads((Path(ref["root"]) / "submission.json").read_text())
+    reference_status.append(f"| {ref['method']} | {sub.get('job', 'pending validation')} | {sub['commit']} |")
+table = "\n".join(reference_status)
+md = f"""**Released BOOM and TD-M(PC)² — DMC Humanoid Walk — threshold references.**
 
 {status} Slurm job `{state.get('job', 'pending submission')}`.
 
-One seed (55), original S > 2 gate and released lambda=0.42; original entropy,
-Gaussian penalty, replay, planner, and training equations. Original budget:
-2,001,000 decisions (two raw control steps per decision). State observations,
-reward summation, 500-decision episodes. Native compilation, vectorized critic
-ensemble and TF32 are enabled. Upstream default evaluation: ten planner and
-ten prior-only episodes every 50,000 decisions. This is a diagnostic seed.
+One seed (55) each and original S > 2 gates. BOOM uses released lambda=0.42;
+TD-M(PC)² uses beta=1. Original entropy, Gaussian penalties, replay, planners,
+and training equations. Budgets are 2,001,000 / 2,000,000 decisions respectively
+(two raw control steps per decision). State observations, summed rewards,
+500-decision episodes. BOOM retains native compilation and TF32; TD-M(PC)²
+retains its released eager implementation. Both vectorize critic heads.
+Original evaluations every 50k: BOOM ten planner/prior episodes; TD one of each
+plus 100 Monte Carlo prior episodes for value estimation. Videos are disabled.
+
+| Reference | Slurm job | Observer commit |
+|---|---|---|
+{table}
 
 Every update is retained locally; displayed diagnostics summarize 100 updates
 with minima and maxima. Checkpoints immediately before/after the first active
@@ -54,7 +68,8 @@ actor update and every 25k decisions support follow-up inspection. The entropy
 diagnostic removes the extra upstream Gaussian factor, but retains the
 upstream Jacobian floor; the learning objective is unchanged.
 
-Upstream `b3b2f09c03533c15b804ced9abc6767e73ff8e1e`.
+BOOM upstream `b3b2f09c03533c15b804ced9abc6767e73ff8e1e`.
+TD-M(PC)² upstream `d1c2632c36effd2f7b661bfe5f822a3db8054d40`.
 Observer `{state['commit']}`. Outputs: `{root}`.
 """
 sections = [ws.Section(name="BOOM reference / Protocol and progress", is_open=True,
@@ -69,14 +84,17 @@ if receipt_path.exists():
     work = ws.Workspace.from_url(json.loads(receipt_path.read_text())["url"])
     replacement = {s.name: s for s in sections}
     work.sections = [replacement.pop(s.name, s) for s in work.sections] + list(replacement.values())
+    work.name = "Released BOOM and TD-M(PC)2 Humanoid Walk - threshold references"
+    work.settings.max_runs = len(run_ids)
+    work.runset_settings.filters = [expr.Metric("ID").isin(run_ids)]
 else:
     work = ws.Workspace(entity="rwgao_b-brown-university", project="ambi",
-        name="Released BOOM Humanoid Walk - S threshold reference", auto_generate_panels=False,
-        sections=sections, settings=ws.WorkspaceSettings(x_axis="env_step", max_runs=1),
-        runset_settings=ws.RunsetSettings(filters=[expr.Metric("ID").isin([run_id])]))
+        name="Released BOOM and TD-M(PC)2 Humanoid Walk - threshold references", auto_generate_panels=False,
+        sections=sections, settings=ws.WorkspaceSettings(x_axis="env_step", max_runs=len(run_ids)),
+        runset_settings=ws.RunsetSettings(filters=[expr.Metric("ID").isin(run_ids)]))
 work.save()
 check = ws.Workspace.from_url(work.url)
-assert check.runset_settings.filters == f'Metric("ID") in {[run_id]!r}'
+assert check.runset_settings.filters == f'Metric("ID") in {run_ids!r}'
 count = sum(len(s.panels) for s in check.sections if s.name.startswith("BOOM reference / "))
 assert count == 1 + sum(len(rows) for rows in groups.values())
 receipt_path.write_text(json.dumps({"url": work.url, "run_id": run_id,
