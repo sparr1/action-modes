@@ -57,7 +57,6 @@ def main():
     if args.mode == "benchmark":
         cfg.steps = 4100
         cfg.eval_episodes = 1
-        cfg.eval_value = False
     set_seed(cfg.seed)
     env = make_env(cfg)
 
