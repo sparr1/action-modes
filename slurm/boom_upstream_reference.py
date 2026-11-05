@@ -216,12 +216,18 @@ def validate_observer(agent, output):
     rows = []
     for scale in (1., 3.):
         model = deepcopy(agent.model.state_dict())
+        grads = {name: None if p.grad is None else p.grad.detach().clone()
+                 for name, p in agent.model.named_parameters()}
         optim = deepcopy(agent.optim.state_dict())
         pi_optim = deepcopy(agent.pi_optim.state_dict())
         rng = (torch.get_rng_state(), torch.cuda.get_rng_state_all(), np.random.get_state(), random.getstate())
         results = []
         for enabled in (False, True):
             agent.model.load_state_dict(model)
+            # Upstream clips all model parameters before clearing the actor's
+            # previous gradients. They are therefore part of its update state.
+            for name, p in agent.model.named_parameters():
+                p.grad = None if grads[name] is None else grads[name].clone()
             agent.optim.load_state_dict(deepcopy(optim))
             agent.pi_optim.load_state_dict(deepcopy(pi_optim))
             agent.scale._value.fill_(scale)
@@ -234,17 +240,17 @@ def validate_observer(agent, output):
                             torch.get_rng_state(), torch.cuda.get_rng_state_all(),
                             np.random.get_state(), random.getstate()))
 
-        def equal(a, b):
+        def equal(a, b, path="root"):
             if isinstance(a, torch.Tensor):
-                assert torch.equal(a, b)
+                assert torch.equal(a, b), (path, float((a - b).abs().max()))
             elif isinstance(a, np.ndarray):
                 assert np.array_equal(a, b)
             elif isinstance(a, dict):
                 assert a.keys() == b.keys()
-                for k in a: equal(a[k], b[k])
+                for k in a: equal(a[k], b[k], f"{path}.{k}")
             elif isinstance(a, (list, tuple)):
                 assert len(a) == len(b)
-                for x, y in zip(a, b): equal(x, y)
+                for i, (x, y) in enumerate(zip(a, b)): equal(x, y, f"{path}[{i}]")
             else:
                 assert a == b, (a, b)
         equal(results[0], results[1])
