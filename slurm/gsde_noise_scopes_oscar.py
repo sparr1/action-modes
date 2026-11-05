@@ -187,6 +187,7 @@ def worker(args):
         assert cfg.inner_cuda_graph is graph_enabled
         assert cfg.outer_critic_target == "reward_only" and cfg.aux_return_mode == "off"
         assert cfg.sac_actor_loss_scale_mode == "tdmpc2_percentile_range"
+        assert cfg.inner_actor_loss_scale_scope == "action"
         timer = TrainingWindow(502 + warmup, measured, torch.cuda.synchronize)
         act, log = learner._act_agent, learner._log_wandb_step
         graph_counts = {}
@@ -201,8 +202,6 @@ def worker(args):
             timer.before_action(step, learner._num_updates)
             t = time.perf_counter()
             before = agent.actor_loss_scale.detach().clone()
-            carried = agent.inner_engine._carried_actor_loss_scale
-            initial = before if carried is None else carried.detach().clone()
             action = act(*positional, **kwargs)
             timer.after_action(step, time.perf_counter() - t)
             assert torch.isfinite(action).all()
@@ -215,8 +214,7 @@ def worker(args):
             # graph-enabled measurements still require an explicit one.
             assert inner.get("inner_cuda_graph_used", 0.0) == float(graph_enabled)
             assert all(math.isfinite(float(v)) for v in inner.values())
-            expected = initial if cfg.inner_actor_loss_scale_scope == "run" else before
-            assert math.isclose(inner["inner_actor_loss_scale_initial"], expected.item(), rel_tol=1e-6)
+            assert math.isclose(inner["inner_actor_loss_scale_initial"], before.item(), rel_tol=1e-6)
             if cfg.inner_actor_loss_scale_update == "per_action":
                 assert inner["inner_actor_loss_scale_final"] == inner["inner_actor_loss_scale_initial"]
             torch.testing.assert_close(agent.actor_loss_scale, before, rtol=0, atol=0)
@@ -260,9 +258,6 @@ def worker(args):
             engine.prepare_training_resume_boundary()
             inner_state = deepcopy(engine.training_state_dict())
             engine.load_training_state_dict(inner_state)
-            if cfg.inner_actor_loss_scale_scope == "run":
-                torch.testing.assert_close(engine._carried_actor_loss_scale,
-                                           inner_state["actor_loss_scale_carry"], rtol=0, atol=0)
             saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
             agent.load(checkpoint)
             for key, value in agent.model.state_dict().items():
