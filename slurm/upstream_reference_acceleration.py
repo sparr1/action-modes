@@ -274,7 +274,7 @@ class ModelUpdateGraph:
     def __call__(self, batch, step):
         start = time.perf_counter()
         agent = self.agent
-        if not isinstance(batch, tuple): batch = batch.sample()
+        if not isinstance(batch, tuple): batch = tuple(batch.sample())
         if self.graph is None: self.build(batch)
         for dst, src in zip(self.batch, batch):
             if dst is not None: dst.copy_(src)

@@ -36,12 +36,15 @@ def main():
     assert not subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
     checks = json.loads((root / f"validate-{gate}/parity.json").read_text())["checks"]
     assert len(checks) == 2 and all(x["numerical_parity"] and x["rng_exact"] for x in checks)
+    if os.environ.get("REFERENCE_ACCELERATION") == "model-planner-graph":
+        model = json.loads((root / f"validate-{gate}/model_parity.json").read_text())
+        assert len(model["checks"]) == 2 and all(x["numerical_parity"] and x["rng_exact"] for x in model["checks"])
     bench = root / f"benchmark-{gate}"
     assert (bench / "checkpoints/final.pt").exists(), "Timing run must complete"
     rows = json.loads((bench / "benchmark.json").read_text())
     assert len(rows) == 4 and all(x["seconds"] > 0 and x["decisions"] == 300 for x in rows)
     cfg = json.loads((bench / "resolved_config.json").read_text())
-    cfg["steps"] = int(os.environ.get("REFERENCE_STEPS", "200000"))
+    cfg["steps"] = int(os.environ.get("REFERENCE_STEPS", "400000"))
     assert cfg["steps"] == state["requested_steps"]
     planner = json.loads((root / f"validate-{gate}/planner_parity.json").read_text())
     assert len(planner["checks"]) == 3 and all(x["rng_exact"] for x in planner["checks"])

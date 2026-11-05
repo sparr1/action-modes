@@ -20,7 +20,7 @@ def main():
     parser.add_argument("--upstream", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=55)
-    parser.add_argument("--steps", type=int, default=200000)
+    parser.add_argument("--steps", type=int, default=400000)
     parser.add_argument("--acceleration", choices=("native", "planner-graph", "compiled-planner", "model-planner-graph"), default="native")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)

@@ -14,7 +14,7 @@ iterations while retaining its original sampling and final action selection. The
 pretraining and replay prefetch behavior are preserved, including their quirks.
 
 Use the upstream default config, changing task to `humanoid-walk` and seed to
-55. Use the requested 200,000-decision initial diagnostic budget, action repeat two, summed
+55. Use the requested 400,000-decision initial diagnostic budget, action repeat two, summed
 rewards, ten evaluation episodes for both planner and prior every 50k decisions,
 and original S > 2 gate. The released action-dimension heuristic gives lambda
 0.42 for the 21-dimensional Humanoid. This differs from the BOOM paper's written
@@ -59,7 +59,7 @@ returns, threshold, objective, gradient and entropy panels.
 `DarthUtopian/tdmpc_square_public` commit
 `d1c2632c36effd2f7b661bfe5f822a3db8054d40`. Use the same DMC dependencies and
 seed 55, with the native `residual` actor objective, beta=1 and scale threshold
-2. Use the requested 200,000-decision initial diagnostic budget, vectorized
+2. Use the requested 400,000-decision initial diagnostic budget, vectorized
 critic heads, native TF32 defaults and complete replay/trainer behavior. The
 launcher restricts Torch threads for measured CPU sizing. Its original
 evaluations use one planner episode, one prior episode and 100 Monte Carlo
@@ -91,7 +91,7 @@ Carlo evaluation. Submission failures propagate; failed gates never launch
 training. The scientific job ID and measured resource plan are written to the
 campaign submission record before the shared dashboard is updated.
 
-`REFERENCE_STEPS=200000` selects the agreed diagnostic budget.
+`REFERENCE_STEPS=400000` selects the agreed diagnostic budget.
 `REFERENCE_ACCELERATION=planner-graph` captures the complete MPPI iteration
 region, reusing the original neural modules. BOOM retains native module
 compilation; TD retains native module arithmetic. A GPU test compares native,
@@ -100,3 +100,17 @@ training/evaluation actions, including exact Python, NumPy and Torch RNG state.
 Graph construction restores RNG and planner state after warmup. Sampling of
 critic head pairs retains the original NumPy stream, and final categorical
 action selection remains outside the graph with each method's original API.
+
+`REFERENCE_ACCELERATION=model-planner-graph` additionally captures the model
+loss and backward pass. The original Adam optimizers, model-wide clipping
+(including retained actor gradients), actor loss/threshold branch and target
+updates still execute through the released implementation. The model graph
+validation compares complete model/optimizer/gradient states, losses and RNG
+below and above S=2, with a repeated-native numerical control. Its warmup
+restores gradients and RNG and does not apply optimizer steps.
+
+On Oscar L40S, the first complete online BOOM sizing measured 18.24 decisions/s
+natively, 27.10 with planner capture, and 52.64 with model plus planner capture.
+One CPU matched or exceeded two. Planner outputs/RNG and complete update states
+matched exactly in the recorded captured/native validation cases at S=1 and S=3.
+These are timing results, not evidence of learning performance.

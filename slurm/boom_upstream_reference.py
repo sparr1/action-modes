@@ -58,7 +58,7 @@ class Recorder:
             self.wandb = wandb.init(
                 entity=cfg.wandb_entity, project=cfg.wandb_project,
                 id=os.environ["WANDB_RUN_ID"], resume="never",
-                name=f"{method} released | humanoid-walk | S>2 | seed{cfg.seed}",
+                name=f"{method} released | humanoid-walk | S>2 | {cfg.steps // 1000}k | {cfg.acceleration} | seed{cfg.seed}",
                 group="boom-upstream-threshold-reference-20261104",
                 tags=["upstream-reference", method, "threshold-diagnostics"],
                 config=jsonable(config), dir=str(output))
@@ -282,7 +282,7 @@ def main():
     parser.add_argument("--upstream", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--seed", type=int, default=55)
-    parser.add_argument("--steps", type=int, default=200000)
+    parser.add_argument("--steps", type=int, default=400000)
     parser.add_argument("--acceleration", choices=("native", "planner-graph", "compiled-planner", "model-planner-graph"), default="native")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
