@@ -1,0 +1,43 @@
+{
+  "study_type": "gsde_noise_persistence",
+  "study_note": "Six exploratory seed55 Humanoid Walk runs: two exact reference AMBI recipes crossed with round, solve, real_steps gSDE collection persistence. Actor features, log scale -3, mean clip2, both real-decision resampling intervals8. First reference uses literal tdmpc2_scaled, not analytic pre_tanh; second uses squashed. Fresh action-local adaptation; reward-only critics; original H3/J8/N128/C16/A4/B256 budget and 1M real decisions. Forty checkpoints per run every25k. Strict compilation, vmap, whole-inner CUDA graphs; observational critic geometry unchanged.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_gsde_tdmpc2_scaled_round",
+    "ambi_gsde_tdmpc2_scaled_solve",
+    "ambi_gsde_tdmpc2_scaled_real_steps",
+    "ambi_gsde_squashed_round",
+    "ambi_gsde_squashed_solve",
+    "ambi_gsde_squashed_real_steps"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "reference_runs": {
+    "tdmpc2_scaled": {
+      "id": "d9c2c24cfd00449ca0efd75252f2fc59",
+      "url": "https://forge.coreweave.com/wandb/rwgao_b-brown-university/ambi/runs/d9c2c24cfd00449ca0efd75252f2fc59",
+      "config_sha256": "65d189f4aeb343480ae51a1d1539c547ee35d71188e4f00b13ad4ce4e28e96e9"
+    },
+    "squashed": {
+      "id": "c7315843d48e49c58364dbc5686a4bd2",
+      "url": "https://forge.coreweave.com/wandb/rwgao_b-brown-university/ambi/runs/c7315843d48e49c58364dbc5686a4bd2",
+      "config_sha256": "b4302abf7c3ac2f59f461729b07f086f6e85e2793ab1f10d33bed34771c7aec2"
+    }
+  }
+}

@@ -7,6 +7,7 @@ AMBI configures whether their Bellman bootstrap includes policy entropy.
 """
 
 from copy import deepcopy
+from math import log as scalar_log
 from numbers import Real
 
 import torch
@@ -14,6 +15,7 @@ import torch.nn as nn
 
 from . import init, layers, math
 from .ensemble_vmap import grouped_vmap_spec, grouped_vectorized_forward
+from .gsde import GsdeActor
 from .horizon_conditioning import pack_horizon_input
 from .q_representation import QRepresentation, SymexpTwoHotCodec
 from .value_semantics import ValueSpecification, reduce_components
@@ -69,7 +71,18 @@ class SoftWorldModel(nn.Module):
             if cfg.episodic
             else None
         )
-        self._pi = layers.mlp(cfg.latent_dim, 2 * [cfg.mlp_dim], 2 * cfg.action_dim)
+        actor_distribution = getattr(cfg, "actor_distribution", "gaussian")
+        if actor_distribution == "gsde":
+            self._pi = GsdeActor(
+                cfg.latent_dim, cfg.mlp_dim, cfg.action_dim,
+                feature_source=getattr(cfg, "gsde_feature_source", "actor"),
+                log_std_init=getattr(cfg, "gsde_log_std_init", -3.0),
+                mean_clip=getattr(cfg, "gsde_mean_clip", 2.0),
+            )
+        elif actor_distribution == "gaussian":
+            self._pi = layers.mlp(cfg.latent_dim, 2 * [cfg.mlp_dim], 2 * cfg.action_dim)
+        else:
+            raise ValueError("actor_distribution must be 'gaussian' or 'gsde'.")
         self._Qs = layers.Ensemble(
             [
                 layers.mlp(
@@ -365,6 +378,7 @@ class SoftWorldModel(nn.Module):
         deterministic=False,
         generator=None,
         noise=None,
+        sde_noise=None,
         std_scale=1.0,
         log_std_min=None,
         log_std_max=None,
@@ -372,6 +386,20 @@ class SoftWorldModel(nn.Module):
         remaining_horizon=None,
     ):
         """Return policy parameters and one isolated standard-normal sample."""
+        if sde_noise is not None:
+            if noise is not None or generator is not None:
+                raise ValueError("Specify gSDE matrix noise, action noise, or a generator, not multiple sources.")
+            if task is not None:
+                raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
+            selected_policy = self._pi if policy is None else policy
+            if not isinstance(selected_policy, GsdeActor):
+                raise ValueError("sde_noise requires a gSDE actor.")
+            mean_raw, log_std, eps = self._gsde_policy_output(
+                z, selected_policy, detach_policy=detach_policy,
+                std_scale=std_scale, sde_noise=sde_noise,
+                remaining_horizon=remaining_horizon,
+            )
+            return mean_raw, log_std, torch.zeros_like(mean_raw) if deterministic else eps
         mean_raw, log_std = self._policy_parameters(
             z,
             task,
@@ -405,6 +433,33 @@ class SoftWorldModel(nn.Module):
             )
         return mean_raw, log_std, eps
 
+    def gsde_noise_shape(self, policy=None, batch_shape=()):
+        """Shape of caller-owned standard matrices, without a policy forward."""
+        policy = self._pi if policy is None else policy
+        if not isinstance(policy, GsdeActor):
+            raise ValueError("gSDE noise shapes require a gSDE actor.")
+        return (*batch_shape, policy.sde_feature_dim, policy.sde_action_dim)
+
+    @staticmethod
+    def _gsde_policy_output(z, policy, *, detach_policy=False, std_scale=1.0,
+                            sde_noise=None, remaining_horizon=None):
+        """Evaluate current gSDE parameters, preserving detached-input gradients."""
+        std_scale = float(std_scale)
+        if not 0.0 < std_scale < float("inf"):
+            raise ValueError(f"std_scale must be positive, got {std_scale}.")
+        policy_input = pack_horizon_input(policy, z, remaining_horizon)
+        mean_raw, log_std, eps = policy(
+            policy_input, sde_noise=sde_noise, detach_parameters=detach_policy,
+        )
+        if std_scale != 1.0:
+            log_std = log_std + scalar_log(std_scale)
+            scaled_std = log_std.exp()
+            torch._assert_async(
+                torch.isfinite(scaled_std).all() & (scaled_std > 0).all(),
+                "Scaled gSDE marginal standard deviations must be finite and positive.",
+            )
+        return mean_raw, log_std, eps
+
     def _policy_parameters(
         self,
         z,
@@ -422,6 +477,12 @@ class SoftWorldModel(nn.Module):
         if task is not None:
             raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
         policy = self._pi if policy is None else policy
+        if isinstance(policy, GsdeActor):
+            mean_raw, log_std, _ = self._gsde_policy_output(
+                z, policy, detach_policy=detach_policy, std_scale=std_scale,
+                remaining_horizon=remaining_horizon,
+            )
+            return mean_raw, log_std
         policy_input = pack_horizon_input(policy, z, remaining_horizon)
 
         std_scale = float(std_scale)
@@ -605,6 +666,7 @@ class SoftWorldModel(nn.Module):
         deterministic=False,
         generator=None,
         noise=None,
+        sde_noise=None,
         std_scale=1.0,
         log_std_min=None,
         log_std_max=None,
@@ -612,6 +674,24 @@ class SoftWorldModel(nn.Module):
         remaining_horizon=None,
     ):
         """Sample only an action, omitting policy statistics and log-probability."""
+        selected_policy = self._pi if policy is None else policy
+        if isinstance(selected_policy, GsdeActor) and (deterministic or sde_noise is not None):
+            if task is not None:
+                raise ValueError("Task IDs are not used in single-task AMBI-TD-MPC2.")
+            if sde_noise is not None and (noise is not None or generator is not None):
+                raise ValueError("Specify gSDE matrix noise, action noise, or a generator, not multiple sources.")
+            if noise is not None and generator is not None:
+                raise ValueError("Specify either policy noise or a generator, not both.")
+            if noise is not None and noise.shape != (*z.shape[:-1], selected_policy.sde_action_dim):
+                raise ValueError("Policy noise must match the action-parameter shape.")
+            # Collection already owns the base matrix. Project it directly,
+            # avoiding the density path's standardize/unstandardize round trip.
+            # The actor retains the same finite/singular distribution checks.
+            policy_input = pack_horizon_input(selected_policy, z, remaining_horizon)
+            return selected_policy.action(
+                policy_input, sde_noise=sde_noise, deterministic=deterministic,
+                detach_parameters=detach_policy, std_scale=std_scale,
+            )
         mean_raw, log_std, eps = self._policy_sample(
             z,
             task,
@@ -620,6 +700,7 @@ class SoftWorldModel(nn.Module):
             deterministic=deterministic,
             generator=generator,
             noise=noise,
+            sde_noise=sde_noise,
             std_scale=std_scale,
             log_std_min=log_std_min,
             log_std_max=log_std_max,
@@ -638,6 +719,7 @@ class SoftWorldModel(nn.Module):
         deterministic=False,
         generator=None,
         noise=None,
+        sde_noise=None,
         std_scale=1.0,
         log_std_min=None,
         log_std_max=None,
@@ -654,6 +736,7 @@ class SoftWorldModel(nn.Module):
             deterministic=deterministic,
             generator=generator,
             noise=noise,
+            sde_noise=sde_noise,
             std_scale=std_scale,
             log_std_min=log_std_min,
             log_std_max=log_std_max,
@@ -679,7 +762,8 @@ class SoftWorldModel(nn.Module):
             )
         return action, info
 
-    def pi_tdmpc2(self, z, *, policy=None, generator=None, noise=None, remaining_horizon=None):
+    def pi_tdmpc2(self, z, *, policy=None, generator=None, noise=None, sde_noise=None,
+                  remaining_horizon=None):
         """Native TD-MPC2 actor information, without changing SAC's policy API.
 
         In particular, ``scaled_entropy`` uses the native pre-squash Gaussian
@@ -687,7 +771,7 @@ class SoftWorldModel(nn.Module):
         not SAC's entropy and must not be replaced with ``-log_prob``.
         """
         mean_raw, log_std, eps = self._policy_sample(
-            z, policy=policy, generator=generator, noise=noise,
+            z, policy=policy, generator=generator, noise=noise, sde_noise=sde_noise,
             remaining_horizon=remaining_horizon,
         )
         log_prob = math.gaussian_logprob(eps, log_std)

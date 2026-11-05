@@ -20,8 +20,13 @@ _RNG_LOCK = threading.RLock()
 _ALPHA_FLOOR = 1e-8
 
 
-def validate_teacher_graph_config(cfg):
+def validate_teacher_graph_config(cfg, *, allow_gsde_collection=False):
     """Check the supported static protocol without allocating CUDA state."""
+    gsde_collection = (
+        allow_gsde_collection and getattr(cfg, "actor_distribution", "gaussian") == "gsde"
+    )
+    if getattr(cfg, "actor_distribution", "gaussian") == "gsde" and not gsde_collection:
+        raise ValueError("gSDE graph sampling requires the live collection noise controller.")
     required = {
         "obs": "state",
         "inner_operator": "sac",
@@ -45,6 +50,14 @@ def validate_teacher_graph_config(cfg):
         "aux_return_mode": "off",
         "inner_horizon_conditioning": "none",
     }
+    if gsde_collection:
+        # A collection graph unrolls a fixed number of non-episodic steps.
+        # Interleaved updates are static too; the live controller supplies one
+        # matrix per trajectory and round across every captured optimizer step.
+        required.pop("inner_update_timing")
+        required.pop("inner_steps_per_update")
+        if getattr(cfg, "inner_update_timing", "round") not in {"round", "step"}:
+            raise ValueError("gSDE collection graphs require round or step update timing.")
     for component in (
         "actor", "critic", "temperature", "replay", "actor_optimizer",
         "critic_optimizer", "temperature_optimizer",

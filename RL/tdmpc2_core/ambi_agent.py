@@ -749,6 +749,14 @@ class AMBITDMPC2Agent(torch.nn.Module):
         }
 
     def _policy_spec(self):
+        if getattr(self.cfg, "actor_distribution", "gaussian") == "gsde":
+            return {
+                "actor_distribution": "gsde",
+                "gsde_feature_source": self.cfg.gsde_feature_source,
+                "gsde_mean_clip": self.cfg.gsde_mean_clip,
+                "feature_dim": int(self.model._pi.sde_feature_dim),
+                "action_dim": int(self.cfg.action_dim),
+            }
         return {
             "log_std_mapping": str(self.cfg.log_std_mapping),
             "log_std_min": float(self.cfg.log_std_min),
@@ -778,6 +786,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
 
     @staticmethod
     def _entropy_target_semantics(mode):
+        if mode == "pre_tanh":
+            return "pre_tanh_gaussian_entropy"
         return (
             "tdmpc2_scaled_entropy"
             if mode == "tdmpc2_scaled"
@@ -914,6 +924,18 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "entropy_semantics": critic_entropy_spec(vars(self.cfg)),
             "critic_ensemble_backend": getattr(self.cfg, "critic_ensemble_backend", "loop"),
         }
+        if getattr(self.cfg, "actor_distribution", "gaussian") == "gsde":
+            spec["gsde"] = {
+                **self._policy_spec(),
+                "gsde_log_std_init": float(self.cfg.gsde_log_std_init),
+                "inner_gsde_noise_scope": self.cfg.inner_gsde_noise_scope,
+                "inner_gsde_resample_steps": int(self.cfg.inner_gsde_resample_steps),
+                "gsde_execution_resample_steps": int(self.cfg.gsde_execution_resample_steps),
+                "persistence": "base_standard_normal",
+            }
+            if getattr(self.cfg, "inner_cuda_graph", False):
+                from .whole_inner_graph import training_graph_protocol
+                spec["gsde"]["graph_protocol"] = training_graph_protocol(self.cfg)
         if pave_enabled(self.cfg):
             from utils.pave_identity import pave_training_signature
             spec["outer_pave"] = pave_training_signature(vars(self.cfg))
@@ -1477,6 +1499,12 @@ class AMBITDMPC2Agent(torch.nn.Module):
         saved_policy_spec = state.get("policy_spec") if isinstance(state, dict) else None
         saved_policy_spec = self._normalize_saved_policy_spec(saved_policy_spec)
         configured_policy_spec = self._policy_spec()
+        if (saved_policy_spec is None
+                and getattr(self.cfg, "actor_distribution", "gaussian") == "gsde"):
+            raise ValueError(
+                "gSDE checkpoints require a policy specification identifying "
+                "the feature source and mean clipping before load."
+            )
         if saved_policy_spec is not None and saved_policy_spec != configured_policy_spec:
             raise ValueError(
                 "Checkpoint policy specification does not match this agent: "
@@ -1529,7 +1557,11 @@ class AMBITDMPC2Agent(torch.nn.Module):
         incoming = api_model_conversion(self.model.state_dict(), incoming)
         expected = self.model.state_dict()
         preflight_module_state(self.model, incoming, "Checkpoint model architecture")
-        for key in ("log_std_min", "log_std_dif"):
+        gaussian_bound_keys = (
+            () if getattr(self.cfg, "actor_distribution", "gaussian") == "gsde"
+            else ("log_std_min", "log_std_dif")
+        )
+        for key in gaussian_bound_keys:
             if key in incoming and key in expected and not torch.equal(
                 incoming[key].to(device=expected[key].device, dtype=expected[key].dtype),
                 expected[key],
@@ -2878,8 +2910,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
         weighted_entropy_residual = None
         if self.ent_coef_optim is not None:
             temperature_log_prob = (
-                -policy_info["scaled_entropy"]
-                if scaled_entropy_enabled
+                -policy_entropy(policy_info, self._actor_entropy_mode)
+                if self._actor_entropy_mode != "squashed"
                 else policy_info["log_prob"]
             )
             entropy_residual_per_time = (
@@ -3025,8 +3057,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
             alpha, actor_scale_used, self._actor_entropy_mode,
             self.cfg.action_dim,
         )
-        if scaled_entropy_enabled:
-            actor_objective = -alpha * policy_info["scaled_entropy"] - actor_q
+        if self._actor_entropy_mode != "squashed":
+            actor_objective = -alpha * policy_entropy(policy_info, self._actor_entropy_mode) - actor_q
         else:
             actor_objective = alpha * policy_info["log_prob"] - actor_q
         actor_per_time = actor_objective.mean(dim=(1, 2))
@@ -3096,6 +3128,10 @@ class AMBITDMPC2Agent(torch.nn.Module):
             metrics["actor_entropy_bonus"] = (
                 alpha * policy_info["scaled_entropy"].detach()
             ).mean()
+        elif self._actor_entropy_mode == "pre_tanh":
+            selected_entropy = policy_entropy(policy_info, "pre_tanh").detach()
+            metrics["actor_selected_entropy"] = selected_entropy.mean()
+            metrics["actor_entropy_bonus"] = (alpha * selected_entropy).mean()
         if self.log_ent_coef is not None:
             metrics["ent_coef_floor_hit"] = (
                 self.log_ent_coef.detach().reshape(())

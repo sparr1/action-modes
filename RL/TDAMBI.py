@@ -207,6 +207,14 @@ class TDAMBI(AMBITDMPC2):
         super().__init__(name, env, custom_params, run_params, experiment_params)
 
     def _build_cfg(self, params):
+        # Validate native policy semantics before temporarily routing through
+        # AMBI's SAC config resolver below. The native kernel/checkpoints do
+        # not implement either of these opt-in AMBI policy changes.
+        if str(params.get("actor_distribution", "gaussian")).lower() != "gaussian":
+            raise ValueError("Native TDAMBI requires actor_distribution='gaussian'.")
+        for key in ("outer_actor_entropy_mode", "inner_actor_entropy_mode"):
+            if str(params.get(key, "squashed")).lower() == "pre_tanh":
+                raise ValueError(f"Native TDAMBI does not support {key}='pre_tanh'.")
         if str(params.get("inner_sac_return_estimator", "one_step")).lower() != "one_step":
             raise ValueError("Native TDAMBI requires inner_sac_return_estimator='one_step'.")
         if str(params.get("inner_horizon_conditioning", "none")).lower() != "none":

@@ -178,7 +178,91 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self._parameter_noise_spec = None
         self._clear_critic_transfer()
         self._clear_parameter_noise_action_state()
+        self._clear_gsde_state()
         self._initialize_compile_regions()
+
+    @property
+    def _gsde_active(self):
+        return bool(getattr(self._actor_base, "is_gsde", False))
+
+    def _clear_gsde_state(self):
+        # These standard-normal draws belong to the behavior controller, not
+        # to the actor or the action-local optimizer/allocation pool.
+        self._gsde_collection_noise = None
+        self._gsde_collection_decision = None
+        self._gsde_execution_noise = None
+        self._gsde_execution_uses = 0
+        self._gsde_decision_index = 0
+        self._gsde_eval_mode = None
+
+    def _begin_gsde_action(self, *, t0, eval_mode):
+        if not self._gsde_active:
+            return
+        if t0 or self._gsde_eval_mode != bool(eval_mode):
+            self._clear_gsde_state()
+        self._gsde_eval_mode = bool(eval_mode)
+        self._gsde_decision_index += 1
+        if self.cfg.inner_gsde_noise_scope != "real_steps":
+            self._gsde_collection_noise = None
+            self._gsde_collection_decision = None
+
+    def _draw_gsde_noise(self, reference, policy, count, generator):
+        return torch.randn(
+            (count, policy.sde_feature_dim, policy.sde_action_dim),
+            device=reference.device, dtype=reference.dtype, generator=generator,
+        )
+
+    def _gsde_noise_for_round(self, root_z, count, generator):
+        """One independent draw per original trajectory, stable through H."""
+        if (not self._gsde_active
+                or self.cfg.inner_behavior_action != "policy_sample"
+                or float(self.cfg.inner_behavior_std_scale) == 0.0):
+            return None
+        scope = self.cfg.inner_gsde_noise_scope
+        expired = (
+            scope == "real_steps"
+            and self._gsde_collection_decision is not None
+            and self._gsde_decision_index - self._gsde_collection_decision
+            >= int(self.cfg.inner_gsde_resample_steps)
+        )
+        if scope == "round" or self._gsde_collection_noise is None or expired:
+            self._gsde_collection_noise = self._draw_gsde_noise(
+                root_z, self.state.actor if self.state.actor is not None else self._actor_base,
+                count, generator,
+            )
+            self._gsde_collection_decision = self._gsde_decision_index
+        return self._gsde_collection_noise
+
+    def _gsde_noise_for_execution(self, root_z, policy, generator):
+        if (self._gsde_execution_noise is None
+                or self._gsde_execution_uses >= int(self.cfg.gsde_execution_resample_steps)):
+            self._gsde_execution_noise = self._draw_gsde_noise(
+                root_z, policy, int(root_z.shape[0]), generator,
+            )
+            self._gsde_execution_uses = 0
+        return self._gsde_execution_noise
+
+    def _finish_gsde_action(self):
+        if self._gsde_active and self.cfg.inner_gsde_noise_scope != "real_steps":
+            self._gsde_collection_noise = None
+            self._gsde_collection_decision = None
+
+    def _gsde_spec(self):
+        if not self._gsde_active:
+            return None
+        return {
+            "version": 1,
+            "features": self.cfg.gsde_feature_source,
+            "mean_clip": self.cfg.gsde_mean_clip,
+            "log_std_init": float(self.cfg.gsde_log_std_init),
+            "feature_dim": int(self._actor_base.sde_feature_dim),
+            "action_dim": int(self._actor_base.sde_action_dim),
+            "collection_scope": self.cfg.inner_gsde_noise_scope,
+            "collection_resample_steps": int(self.cfg.inner_gsde_resample_steps),
+            "execution_resample_steps": int(self.cfg.gsde_execution_resample_steps),
+            "noise": "standard_normal_current_scales",
+            "reset": "episode",
+        }
 
     def _new_rng(self, seed):
         # Keep legacy stream identities and exact-resume schemas unchanged.
@@ -426,6 +510,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
         )
 
     @property
+    def _selected_actor_entropy_enabled(self):
+        return getattr(self.cfg, "inner_actor_entropy_mode", "squashed") != "squashed"
+
+    @property
     def _uses_canonical_schedule(self):
         return (
             str(getattr(self.cfg, "inner_schedule_mode", "legacy"))
@@ -529,7 +617,11 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 f"'fixed', got {initialization!r}."
             )
         valid = torch.isfinite(initial_alpha) & (initial_alpha >= 0)
-        if not bool(valid.item()):
+        if self.device.type == "cuda" and self._gsde_active:
+            torch._assert_async(
+                valid, "The initial inner entropy coefficient must be finite and non-negative.",
+            )
+        elif not bool(valid.item()):
             raise ValueError(
                 "The initial inner entropy coefficient must be finite and "
                 "non-negative before flooring, "
@@ -551,6 +643,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self._parameter_noise_spec = None
         self._clear_critic_transfer()
         self._clear_parameter_noise_action_state()
+        self._clear_gsde_state()
         # A checkpoint load invalidates action-local module identities. Rebuild
         # only the non-serialized compile callables; model/checkpoint keys stay
         # untouched and ordinary action/episode resets retain their cache.
@@ -604,6 +697,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self._pending_timers = {}
         self._clear_critic_transfer()
         self._clear_parameter_noise_action_state()
+        self._clear_gsde_state()
         return self
 
     def _clear_parameter_noise_action_state(self):
@@ -662,6 +756,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         """Clear action/episode state while preserving explicitly run-scoped state."""
         self.episode_index += 1
         self._clear_critic_transfer()
+        self._clear_gsde_state()
         self._clear_expired(t0=True, include_action=True)
         if str(self.cfg.inner_mppi_warm_start_scope) != "run":
             self._mppi_prev_mean = None
@@ -836,6 +931,13 @@ class InnerImprovementEngine(RetraceInnerMixin):
 
     def _require_resume_boundary(self):
         """Reject snapshots that would silently discard transient inner state."""
+        if (self._gsde_collection_noise is not None
+                or self._gsde_collection_decision is not None
+                or self._gsde_execution_noise is not None
+                or self._gsde_execution_uses != 0
+                or self._gsde_decision_index != 0
+                or self._gsde_eval_mode is not None):
+            raise RuntimeError("gSDE behavior noise must be cleared at the episode resume boundary.")
         if self._critic_transfer_ready or self._critic_transfer_eval_mode is not None or self._critic_transfer_metrics:
             raise RuntimeError("Bernoulli transfer state must be cleared at the episode resume boundary.")
         if self._pending_timers:
@@ -1055,6 +1157,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
             payload["retrace_spec"] = self._retrace_spec()
         if self._critic_transfer_spec() is not None:
             payload["critic_transfer_spec"] = self._critic_transfer_spec()
+        if self._gsde_spec() is not None:
+            payload["gsde_spec"] = self._gsde_spec()
         if getattr(self.cfg, "inner_cuda_graph", False):
             from .whole_inner_graph import training_graph_state
             payload["whole_graph"] = training_graph_state(self)
@@ -1149,6 +1253,15 @@ class InnerImprovementEngine(RetraceInnerMixin):
             if any(type(saved_transfer[key]) is not type(value) for key, value in transfer_spec.items()):
                 raise ValueError("Inner Bernoulli transfer specification is incompatible.")
             common_keys.add("critic_transfer_spec")
+        gsde_spec = self._gsde_spec()
+        if state.get("gsde_spec") != gsde_spec:
+            raise ValueError("Inner gSDE specification is incompatible with exact continuation.")
+        if gsde_spec is not None:
+            saved_gsde = require_exact_keys(state["gsde_spec"], set(gsde_spec),
+                                            "Inner gSDE specification")
+            if any(type(saved_gsde[key]) is not type(value) for key, value in gsde_spec.items()):
+                raise ValueError("Inner gSDE specification is incompatible.")
+            common_keys.add("gsde_spec")
         lora_rl_spec = self._lora_rl_spec()
         initialization_spec = self._random_initialization_spec()
         horizon_spec = self._horizon_conditioning_spec()
@@ -1558,6 +1671,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self._parameter_noise_spec = None
         self._clear_critic_transfer()
         self._clear_parameter_noise_action_state()
+        self._clear_gsde_state()
         self._initialize_compile_regions()
         return self
 
@@ -2357,6 +2471,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         mode,
         generator,
         noise=None,
+        sde_noise=None,
         std_scale=1.0,
         noise_std=0.0,
         inner_bounds=True,
@@ -2372,6 +2487,9 @@ class InnerImprovementEngine(RetraceInnerMixin):
             }
         if remaining_horizon is not None:
             kwargs["remaining_horizon"] = remaining_horizon
+        if sde_noise is not None:
+            kwargs["sde_noise"] = sde_noise
+            generator = None
         if mode == "policy_sample":
             if hasattr(self.model, "pi_action") and not return_info:
                 return self.model.pi_action(
@@ -2978,7 +3096,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
             self._timer_stop("inner_rollout_seconds", start)
             yield rollout
 
-    def _rollout_step_kernel(self, z, policy_noise, reward_support, remaining_horizon=None):
+    def _rollout_step_kernel(self, z, policy_noise, reward_support, remaining_horizon=None,
+                             *, sde_noise=None):
         """One pure parallel model step; replay and optimization stay outside."""
         cfg = self.cfg
         std_scale = float(cfg.inner_behavior_std_scale)
@@ -2988,6 +3107,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         action, _ = self._policy_action(
             z, self.state.actor, mode=behavior_mode, generator=None,
             noise=policy_noise if policy_noise.numel() else None,
+            sde_noise=sde_noise,
             std_scale=max(std_scale, 1e-12),
             noise_std=cfg.inner_behavior_noise_std,
             remaining_horizon=remaining_horizon,
@@ -3020,6 +3140,13 @@ class InnerImprovementEngine(RetraceInnerMixin):
         if behavior_mode == "policy_sample" and float(cfg.inner_behavior_std_scale) == 0.0:
             behavior_mode = "mean"
         needs_noise = behavior_mode in {"policy_sample", "mean_plus_gaussian"}
+        # Draw before any optimizer yield. Original row IDs remain the matrix
+        # identity even when terminated trajectories are compacted below.
+        if self._gsde_active and behavior_mode == "policy_sample":
+            with self.rng.fork("collection") as generator:
+                sde_noise = self._gsde_noise_for_round(root_z, count, generator)
+        else:
+            sde_noise = None
         for step in range(horizon):
             if step:
                 start = self._timer_start()
@@ -3041,7 +3168,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                     torch.randn(
                         (active_count, int(cfg.action_dim)), device=self.device,
                         dtype=root_z.dtype, generator=generator,
-                    ) if needs_noise else root_z.new_empty(0)
+                    ) if needs_noise and sde_noise is None else root_z.new_empty(0)
                 )
                 # Episodic populations compact as trajectories terminate, as
                 # in the existing eager episodic collector.
@@ -3053,6 +3180,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 action, reward, next_z = kernel(
                     active_z, noise, reward_support,
                     **self._horizon_kwargs(remaining_horizon),
+                    **({"sde_noise": sde_noise[active] if active is not None else sde_noise}
+                       if sde_noise is not None else {}),
                 )
                 done = (
                     (self.model.termination(next_z) > float(cfg.inner_termination_threshold)).float()
@@ -3122,6 +3251,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         remaining_horizons = []
         transition_count = 0
         with self.rng.fork("collection") as generator:
+            sde_noise = self._gsde_noise_for_round(root_z, count, generator)
             for step in range(horizon):
                 active = torch.nonzero(alive, as_tuple=False).squeeze(-1)
                 if active.numel() == 0:
@@ -3137,6 +3267,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                     state.actor,
                     mode=behavior_mode,
                     generator=generator,
+                    sde_noise=sde_noise[active] if sde_noise is not None else None,
                     std_scale=max(std_scale, 1e-12),
                     noise_std=cfg.inner_behavior_noise_std,
                     remaining_horizon=self._remaining_horizon(active_z, step),
@@ -3187,7 +3318,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
             "transition_count": transition_count,
         }
 
-    def _dense_rollout_kernel(self, root_z, policy_noise, reward_support):
+    def _dense_rollout_kernel(self, root_z, policy_noise, reward_support, *, sde_noise=None):
         """Pure rollout; the collector owns no_grad, replay and counters.
 
         Keep this compile entrypoint undecorated: the locked PyTorch version
@@ -3212,6 +3343,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 mode=behavior_mode,
                 generator=None,
                 noise=(policy_noise[step] if policy_noise.numel() else None),
+                sde_noise=sde_noise,
                 std_scale=max(std_scale, 1e-12),
                 noise_std=cfg.inner_behavior_noise_std,
                 remaining_horizon=self._remaining_horizon(z, step),
@@ -3256,7 +3388,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
         self.model.eval()
         needs_noise = behavior_mode in {"policy_sample", "mean_plus_gaussian"}
         with self.rng.fork("collection") as generator:
-            if needs_noise:
+            sde_noise = self._gsde_noise_for_round(root_z, count, generator)
+            if needs_noise and sde_noise is None:
                 # Draw once per horizon step, exactly matching eager RNG
                 # progression, then pass tensors (not Generators) into Dynamo.
                 policy_noise = torch.stack(
@@ -3278,6 +3411,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 root_z,
                 policy_noise,
                 reward_support,
+                **({"sde_noise": sde_noise} if sde_noise is not None else {}),
             )
 
         state.replay.add_packed(
@@ -4084,6 +4218,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         if not self._inner_entropy_enabled:
             alpha = alpha.new_zeros(())
         scaled_entropy_enabled = self._scaled_actor_entropy_enabled
+        selected_entropy_enabled = self._selected_actor_entropy_enabled
         action, info = self.model.pi(
             z,
             policy=state.actor,
@@ -4097,7 +4232,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
         # Keep the feature-off tuple contract unchanged. The optional statistic
         # remains connected for the actor objective and is detached only by the
         # temperature update; it comes from this same policy sample.
-        entropy_payload = (info["scaled_entropy"],) if scaled_entropy_enabled else ()
+        entropy_payload = (
+            (policy_entropy(info, cfg.inner_actor_entropy_mode),)
+            if selected_entropy_enabled else ()
+        )
         # Surface the exact sample and distribution already used by the compiled
         # actor update. Eager diagnostics need no extra forward or RNG draws.
         # Keep a two-item payload; lightweight policy stubs without sample
@@ -4180,8 +4318,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
             actor_loss_values = -actor_q
         else:
             actor_loss_values = (
-                -actor_q - alpha * info["scaled_entropy"]
-                if scaled_entropy_enabled
+                -actor_q - alpha * policy_entropy(info, cfg.inner_actor_entropy_mode)
+                if selected_entropy_enabled
                 else alpha * info["log_prob"] - actor_q
             )
         kl = torch.zeros_like(actor_loss_values)
@@ -4310,7 +4448,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 q_min_all,
                 q_mean_all_minus_min_all,
             ) = actor_outputs[:8]
-            if self._scaled_actor_entropy_enabled:
+            if self._selected_actor_entropy_enabled:
                 selected_entropy = actor_outputs[8]
                 actor_sample = actor_outputs[9:]
             else:
@@ -4336,13 +4474,15 @@ class InnerImprovementEngine(RetraceInnerMixin):
                     ).reshape(()),
                     actor_value_composition_coefficient=state.value_composition[1].detach(),
                 )
-            if not self._teacher_only and self._scaled_actor_entropy_enabled:
-                metrics.update(
-                    actor_scaled_entropy=selected_entropy.detach().mean(),
-                    actor_entropy_bonus=(
-                        alpha.detach() * selected_entropy.detach()
-                    ).mean(),
+            if not self._teacher_only and self._selected_actor_entropy_enabled:
+                entropy_key = (
+                    "actor_scaled_entropy" if self._scaled_actor_entropy_enabled
+                    else "actor_pre_tanh_entropy"
                 )
+                metrics[entropy_key] = selected_entropy.detach().mean()
+                metrics["actor_entropy_bonus"] = (
+                    alpha.detach() * selected_entropy.detach()
+                ).mean()
             if update_actor:
                 state.q_evaluations += batch_size
                 if float(cfg.inner_outer_policy_kl_coef) > 0.0:
@@ -4403,7 +4543,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                         metrics["outer_policy_kl"] = kl_mean.detach()
             if update_temperature:
                 target_entropy = self._resolved_inner_target_entropy()
-                if self._scaled_actor_entropy_enabled:
+                if self._selected_actor_entropy_enabled:
                     temperature_loss = (
                         state.log_alpha
                         * (selected_entropy - target_entropy).detach()
@@ -5641,11 +5781,16 @@ class InnerImprovementEngine(RetraceInnerMixin):
         try:
             policy.eval()
             with self.rng.fork("execution") as generator:
+                sde_noise = (
+                    self._gsde_noise_for_execution(root_z, policy, generator)
+                    if self._gsde_active and mode == "policy_sample" else None
+                )
                 action, info = self._policy_action(
                     root_z,
                     policy,
                     mode=mode,
                     generator=generator,
+                    sde_noise=sde_noise,
                     std_scale=max(std_scale, 1e-12),
                     noise_std=self.cfg.inner_execution_noise_std,
                     inner_bounds=inner_bounds,
@@ -5656,6 +5801,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
                         else None
                     ),
                 )
+                if sde_noise is not None:
+                    self._gsde_execution_uses += 1
         finally:
             for module, was_training in training_modes:
                 module.training = was_training
@@ -7249,7 +7396,9 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 if return_behavior_policy:
                     raise ValueError("Collection CUDA graph does not support behavior-policy metadata.")
                 try:
-                    return training_graph_act(self, root_z, capture_teacher_policy=capture_teacher_policy)
+                    return training_graph_act(
+                        self, root_z, t0=t0, capture_teacher_policy=capture_teacher_policy,
+                    )
                 except BaseException:
                     self.last_teacher_policy = None
                     raise
@@ -7321,6 +7470,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
     ):
         self._pending_timers = {}
         start = self._timer_start()
+        self._begin_gsde_action(t0=t0, eval_mode=eval_mode)
         self.action_index += 1
         self._collect_diagnostics = bool(collect_diagnostics)
         if self._critic_bernoulli_p > 0:
@@ -7430,6 +7580,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
             # Action-scoped tensors are explicitly released after producing
             # the action; episode/run scopes survive by configuration.
             self._clear_expired(t0=False, include_action=True)
+            self._finish_gsde_action()
             if self._critic_bernoulli_p > 0:
                 self._critic_transfer_ready = bool(not inactive and operator == "sac")
                 metrics.update(self._critic_transfer_metrics)

@@ -33,7 +33,7 @@ from utils.ensemble_identity import (
 
 _Q_REDUCTIONS = {"min_pair", "mean_pair", "min_all", "mean_all"}
 _CRITIC_TARGETS = {"entropy_augmented", "reward_only"}
-_ACTOR_ENTROPY_MODES = {"squashed", "tdmpc2_scaled"}
+_ACTOR_ENTROPY_MODES = {"squashed", "tdmpc2_scaled", "pre_tanh"}
 _SAC_ACTOR_LOSS_SCALE_MODES = {"none", "tdmpc2_percentile_range"}
 _BEHAVIOR_POLICY_OBJECTIVES = {"reverse_kl", "action_space_cross_entropy"}
 _BEHAVIOR_POLICY_KL_SCHEDULES = {"none", "smooth", "quantile_gate", "dual"}
@@ -138,6 +138,15 @@ _AMBI_DEFAULTS = {
     "log_std_mapping": "direct_clamp",
     "log_std_min": -20,
     "log_std_max": 2,
+    # gSDE replaces the std head with learned feature/action matrix scales.
+    # Gaussian defaults and their existing std-head controls remain unchanged.
+    "actor_distribution": "gaussian",
+    "gsde_feature_source": "actor",
+    "gsde_log_std_init": -3.0,
+    "gsde_mean_clip": 2.0,
+    "inner_gsde_noise_scope": "round",
+    "inner_gsde_resample_steps": 8,
+    "gsde_execution_resample_steps": 8,
     "ent_coef": "auto",
     "ent_coef_lr": 3e-4,
     "target_entropy": "auto",
@@ -478,6 +487,64 @@ def _normalize_choice(value, key, choices):
     if value not in choices:
         raise ValueError(f"{key} must be one of {sorted(choices)}, got {value!r}.")
     return value
+
+
+def _validate_gsde_config(cfg):
+    """Keep matrix-noise persistence within the supported single-policy path."""
+    if cfg.actor_distribution != "gsde":
+        return
+    if cfg.inner_operator not in {"none", "sac"}:
+        raise ValueError("actor_distribution='gsde' supports inner_operator='none' or 'sac'.")
+    if cfg.inner_operator == "sac" and cfg.inner_schedule_mode != "canonical":
+        raise ValueError("actor_distribution='gsde' requires the canonical inner SAC schedule.")
+    requirements = {
+        "inner_sac_return_estimator": "one_step",
+        "inner_explorer_mode": "none",
+        "inner_actor_initialization": "prior",
+        "inner_critic_initialization": "prior",
+        "inner_actor_adaptation": "clone",
+        "inner_critic_adaptation": "clone",
+        "inner_horizon_conditioning": "none",
+        "inner_execution_policy_source": "primary",
+        "inner_actor_source": "sac",
+        "inner_horizon_actor_source": "sac",
+        "critic_value_mode": "single",
+        "outer_actor_objective": "q_maximization",
+        "reanalyze_backend": "native",
+        "outer_policy_episode_probability": 0.0,
+    }
+    for component in (
+        "actor", "critic", "temperature", "replay", "actor_optimizer",
+        "critic_optimizer", "temperature_optimizer",
+    ):
+        requirements[f"inner_{component}_scope"] = "action"
+    for key, expected in requirements.items():
+        if getattr(cfg, key) != expected:
+            raise ValueError(f"actor_distribution='gsde' requires {key}={expected!r}.")
+    if cfg.aux_return_mode not in {"off", "sac"}:
+        raise ValueError("actor_distribution='gsde' supports aux_return_mode='off' or 'sac'.")
+
+
+def _validate_pre_tanh_config(cfg):
+    """Do not silently route the new objective through a specialized backend."""
+    auxiliary_pre_tanh = (
+        cfg.aux_return_mode == "return_actor"
+        and cfg.aux_return_actor_cfg["outer_actor_entropy_mode"] == "pre_tanh"
+    )
+    if not (
+        cfg.outer_actor_entropy_mode == "pre_tanh"
+        or cfg.inner_actor_entropy_mode == "pre_tanh"
+        or auxiliary_pre_tanh
+    ):
+        return
+    for key, expected in (
+        ("outer_actor_objective", "q_maximization"),
+        ("reanalyze_backend", "native"),
+    ):
+        if getattr(cfg, key) != expected:
+            raise ValueError(f"pre_tanh entropy requires {key}={expected!r}.")
+    if cfg.inner_actor_entropy_mode == "pre_tanh" and cfg.inner_explorer_mode != "none":
+        raise ValueError("inner_actor_entropy_mode='pre_tanh' requires inner_explorer_mode='none'.")
 
 
 def _validate_horizon_conditioning_config(cfg):
@@ -1575,6 +1642,25 @@ class AMBITDMPC2(TDMPC2Baseline):
         if schedule_mode == "legacy" and requested_operator in {"sac", "td3"}:
             merged.update(_LEGACY_SCHEDULE_DEFAULTS)
         merged.update(params)
+        for key, choices in (
+            ("actor_distribution", {"gaussian", "gsde"}),
+            ("gsde_feature_source", {"actor", "latent"}),
+            ("inner_gsde_noise_scope", {"round", "solve", "real_steps"}),
+        ):
+            merged[key] = _normalize_choice(merged[key], key, choices)
+        init = merged["gsde_log_std_init"]
+        if isinstance(init, (bool, np.bool_)) or not isinstance(
+            init, (int, float, np.integer, np.floating)
+        ):
+            raise ValueError("gsde_log_std_init must be a finite number.")
+        merged["gsde_log_std_init"] = _finite_float(init, "gsde_log_std_init")
+        if merged["gsde_mean_clip"] is not None:
+            clip = _strict_nonnegative_float(merged["gsde_mean_clip"], "gsde_mean_clip")
+            if clip == 0.0:
+                raise ValueError("gsde_mean_clip must be positive or null to disable clipping.")
+            merged["gsde_mean_clip"] = clip
+        for key in ("inner_gsde_resample_steps", "gsde_execution_resample_steps"):
+            merged[key] = _strict_positive_int(merged[key], key)
         merged["outer_actor_objective"] = _normalize_choice(
             merged["outer_actor_objective"], "outer_actor_objective",
             {"q_maximization", "distillation"},
@@ -2928,14 +3014,14 @@ class AMBITDMPC2(TDMPC2Baseline):
                 raise ValueError(f"{key} must be positive.")
             setattr(cfg, key, value)
         if (
-            cfg.outer_actor_entropy_mode == "tdmpc2_scaled"
+            cfg.outer_actor_entropy_mode in {"tdmpc2_scaled", "pre_tanh"}
             and isinstance(cfg.ent_coef, str)
             and cfg.ent_coef.startswith("auto")
             and isinstance(cfg.target_entropy, str)
             and cfg.target_entropy.lower() in {"auto", "inherit_outer"}
         ):
             raise ValueError(
-                "outer_actor_entropy_mode='tdmpc2_scaled' with automatic ent_coef "
+                f"outer_actor_entropy_mode={cfg.outer_actor_entropy_mode!r} with automatic ent_coef "
                 "requires an explicit numeric target_entropy."
             )
         if isinstance(cfg.target_entropy, str):
@@ -2960,14 +3046,15 @@ class AMBITDMPC2(TDMPC2Baseline):
             if cfg.ent_coef <= 0.0:
                 raise ValueError("ent_coef must be positive.")
 
-        if cfg.inner_actor_entropy_mode == "tdmpc2_scaled":
+        if cfg.inner_actor_entropy_mode in {"tdmpc2_scaled", "pre_tanh"}:
             if cfg.inner_operator != "sac":
                 raise ValueError(
-                    "inner_actor_entropy_mode='tdmpc2_scaled' requires inner_operator='sac'."
+                    f"inner_actor_entropy_mode={cfg.inner_actor_entropy_mode!r} "
+                    "requires inner_operator='sac'."
                 )
             if cfg.inner_explorer_mode == "shared_mixture":
                 raise ValueError(
-                    "inner_actor_entropy_mode='tdmpc2_scaled' does not support "
+                    f"inner_actor_entropy_mode={cfg.inner_actor_entropy_mode!r} does not support "
                     "inner_explorer_mode='shared_mixture'."
                 )
             if (
@@ -2980,16 +3067,16 @@ class AMBITDMPC2(TDMPC2Baseline):
                     else vars(cfg)
                 )
                 numeric_inheritance = (
-                    cfg.aux_return_mode != "off"
+                    (cfg.aux_return_mode != "off" or cfg.inner_actor_entropy_mode == "pre_tanh")
                     and cfg.inner_target_entropy == "inherit_outer"
-                    and selected_actor["outer_actor_entropy_mode"] == "tdmpc2_scaled"
+                    and selected_actor["outer_actor_entropy_mode"] == cfg.inner_actor_entropy_mode
                     and selected_actor["target_entropy"] != "auto"
                 )
                 if not numeric_inheritance:
                     raise ValueError(
-                        "inner_actor_entropy_mode='tdmpc2_scaled' with automatic "
+                        f"inner_actor_entropy_mode={cfg.inner_actor_entropy_mode!r} with automatic "
                         "temperature requires an explicit numeric inner_target_entropy "
-                        "or a numeric target inherited from the selected scaled-entropy actor."
+                        "or a numeric target inherited from the selected same-mode actor."
                     )
         elif (
             cfg.inner_temperature_mode == "auto"
@@ -3034,6 +3121,8 @@ class AMBITDMPC2(TDMPC2Baseline):
                     + ". Alternatively, set sac_actor_loss_scale_mode='none'."
                 )
 
+        _validate_pre_tanh_config(cfg)
+        _validate_gsde_config(cfg)
         _validate_retrace_config(cfg)
         _validate_horizon_conditioning_config(cfg)
         _validate_split_value_config(cfg)

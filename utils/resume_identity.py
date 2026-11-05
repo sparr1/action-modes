@@ -391,6 +391,36 @@ def scientific_trial_parameters(
                         value, (int, float, np.integer, np.floating)
                     ) and not isinstance(value, (bool, np.bool_)):
                         algorithm[field] = float(value)
+                # Inactive gSDE options must not change historical Gaussian
+                # lineages. Active defaults are canonical scientific settings.
+                distribution = str(algorithm.get("actor_distribution", "gaussian")).lower()
+                gsde_defaults = {
+                    "gsde_feature_source": "actor",
+                    "gsde_log_std_init": -3.0,
+                    "gsde_mean_clip": 2.0,
+                    "inner_gsde_noise_scope": "round",
+                    "inner_gsde_resample_steps": 8,
+                    "gsde_execution_resample_steps": 8,
+                }
+                if distribution == "gaussian":
+                    algorithm.pop("actor_distribution", None)
+                    for field in gsde_defaults:
+                        algorithm.pop(field, None)
+                elif distribution == "gsde":
+                    algorithm["actor_distribution"] = distribution
+                    for field, default in gsde_defaults.items():
+                        value = algorithm.get(field, default)
+                        if isinstance(default, str):
+                            value = str(value).lower()
+                        elif value is not None:
+                            value = type(default)(value)
+                        algorithm[field] = value
+                    # These describe the removed Gaussian std head, not S or
+                    # its induced marginal. They have no gSDE effect.
+                    for field in ("log_std_mapping", "log_std_min", "log_std_max",
+                                  "inner_log_std_mapping", "inner_log_std_min",
+                                  "inner_log_std_max"):
+                        algorithm.pop(field, None)
         projected["alg_params"] = algorithm
     return _json_safe(projected)
 

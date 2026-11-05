@@ -97,7 +97,7 @@ def resolve_auxiliary_actor_config(cfg):
         raise ValueError("aux_return_log_std_min must be less than aux_return_log_std_max.")
     for key in ("outer_q_actor_reduction", "outer_q_target_reduction"):
         values[key] = _choice(values[key], f"aux_return_{key}", {"min_pair", "mean_pair", "min_all", "mean_all"})
-    values["outer_actor_entropy_mode"] = _choice(values["outer_actor_entropy_mode"], "aux_return_outer_actor_entropy_mode", {"squashed", "tdmpc2_scaled"})
+    values["outer_actor_entropy_mode"] = _choice(values["outer_actor_entropy_mode"], "aux_return_outer_actor_entropy_mode", {"squashed", "tdmpc2_scaled", "pre_tanh"})
     values["sac_actor_loss_scale_mode"] = _choice(values["sac_actor_loss_scale_mode"], "aux_return_sac_actor_loss_scale_mode", {"none", "tdmpc2_percentile_range"})
     tau = _number(values["sac_actor_loss_scale_tau"], "aux_return_sac_actor_loss_scale_tau", positive=True)
     if tau > 1:
@@ -128,8 +128,8 @@ def resolve_auxiliary_actor_config(cfg):
         target = _number(target, "aux_return_target_entropy")
     values["target_entropy"] = target
     if cfg.aux_return_mode == "return_actor" and isinstance(alpha, str):
-        if values["outer_actor_entropy_mode"] == "tdmpc2_scaled" and target == "auto":
-            raise ValueError("Automatic scaled auxiliary entropy requires numeric aux_return_target_entropy.")
+        if values["outer_actor_entropy_mode"] in {"tdmpc2_scaled", "pre_tanh"} and target == "auto":
+            raise ValueError("Automatic scaled/pre-tanh auxiliary entropy requires numeric aux_return_target_entropy.")
         if values["sac_actor_loss_scale_mode"] != "none":
             raise ValueError("Auxiliary Q normalization requires a fixed aux_return_ent_coef.")
     objective = _choice(values["outer_behavior_policy_objective"], "aux_return_outer_behavior_policy_objective", {"reverse_kl", "action_space_cross_entropy"})

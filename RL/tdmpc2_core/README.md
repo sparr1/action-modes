@@ -1875,10 +1875,170 @@ For intentional weight transfer, load the raw model state into a fresh agent,
 which resets the running scale. The existing mode name and default `"none"`
 are retained; enabling normalization is still an explicit configuration choice.
 
+### Generalized state-dependent exploration (gSDE)
+
+Set `actor_distribution="gsde"` to replace the outer actor's standard-deviation
+head with a full learned feature/action scale matrix. The inner SAC actor is a
+fresh full clone of this same architecture, including its scales. The default
+`"gaussian"` retains the existing architecture, sampling, and checkpoint format.
+
+The actor keeps its two hidden layers and a linear mean head. For noise features
+`x`, learned `S = exp(log_scale)`, and independent standard-normal matrix entries
+`Z`, its action is:
+
+```text
+u_j = clip(mu_j, -c, c) + sum_i x_i * S_ij * Z_ij
+a = tanh(u)
+variance_j = sum_i x_i**2 * S_ij**2
+```
+
+`gsde_feature_source="actor"` uses the final actor hidden representation;
+`"latent"` uses the world-model latent `z` through a parallel noise branch. The
+mean always uses the actor trunk. With actor features, entropy gradients train
+both that trunk and the scales; with latent features they train the scales.
+The outer actor still receives detached model latents. These are different
+feature geometries and do not generally have equal initial action variance.
+
+`gsde_log_std_init=-3.0` initializes every matrix log scale. The pre-noise mean
+clip `gsde_mean_clip=2.0` can be changed to another positive value or disabled
+with `null`. These defaults follow the
+[SB3 SAC implementation](https://stable-baselines3.readthedocs.io/en/master/_modules/stable_baselines3/sac/policies.html).
+The old Gaussian `log_std_mapping`/bounds and their inner overrides do not apply
+to gSDE scales or to its induced marginal variance.
+
+Sampling, density, and entropy use the same variance. CPU float32 policies use
+a float64 matrix multiplication for variance accumulation, avoiding the large
+batch/feature/action broadcast while covering the float32 exponent range.
+CUDA and native float64 policies retain log-domain reductions. Distribution
+outputs remain at least float32. Exactly zero feature vectors and nonfinite/unrepresentable
+scales or standard deviations are rejected explicitly; the implementation
+does not add a variance floor or another independent noise source.
+
+#### Behavior-noise lifetime
+
+Each imagined trajectory gets its own independent matrix. A matrix stays with
+that trajectory throughout its imagined horizon, including across step-timed
+optimizer updates and when other trajectories terminate. `inner_gsde_noise_scope`
+selects when the collection of matrices refreshes:
+
+| Value | Refresh boundary |
+| --- | --- |
+| `"round"` (default) | Every imagined rollout round |
+| `"solve"` | Every complete inner solve at a real decision |
+| `"real_steps"` | Every `inner_gsde_resample_steps` real decisions (default 8) |
+
+Real sampled execution uses a separate independent matrix, refreshed every
+`gsde_execution_resample_steps` sampled decisions (default 8). This applies to
+both the adapted actor and prior-only execution. Mean actions consume no
+execution draw or execution lifetime count. Episode boundaries, controller
+resets, and evaluation-mode changes clear the controller's noise.
+
+Persistence always retains **base standard-normal draws**, applying the current
+learned scales and features on every forward. An actor update can therefore
+change the effect of a retained draw. Keeping collection noise across solves
+does not keep the inner actor, optimizer, or replay across solves.
+
+SAC actor updates and critic targets use fresh independent action-shaped
+Gaussian draws from the equivalent fixed-input marginal. They never reuse a
+collection/execution matrix. The explicit `sde_noise` policy argument accepts
+matrices shaped `[..., feature_dim, action_dim]`; it is mutually exclusive with
+the existing action-shaped `noise` argument and a sampling generator.
+
+#### Entropy and compatibility
+
+gSDE supports `squashed`, `tdmpc2_scaled`, and the analytic `pre_tanh` objective
+described below. For example, these settings select gSDE with an illustrative
+fixed entropy coefficient, leaving the existing rollout/update budget intact:
+
+```json
+{
+  "actor_distribution": "gsde",
+  "gsde_feature_source": "actor",
+  "inner_gsde_noise_scope": "round",
+  "gsde_execution_resample_steps": 8,
+  "outer_actor_entropy_mode": "pre_tanh",
+  "inner_actor_entropy_mode": "pre_tanh",
+  "ent_coef": 0.0001,
+  "inner_temperature_mode": "inherit_outer"
+}
+```
+
+The supported gSDE path is canonical action-local, prior-initialized, full-clone
+one-step SAC, or prior-only execution. Round/step collection, episodic branch
+compaction, ordinary strict compilation, scalar/distributional critics, loop/vmap
+ensembles, and an auxiliary SAC return critic are supported. Retrace, explorer
+populations, random/specialized actor adaptation, horizon-conditioned actors,
+separate return actors, split-value critics, cached-teacher objectives,
+specialized planner/teacher backends, and direct
+outer-policy episode interventions are rejected during configuration resolution.
+In particular, a fixed-input gSDE marginal density is not a conditional behavior
+likelihood given a history of actions sharing the same matrix.
+
+Portable gSDE checkpoints require feature-source and mean-clipping metadata;
+there is no implicit Gaussian-std-head conversion. Portable weight loading can
+change collection/execution lifetimes, while exact continuation requires the
+same noise protocol and entropy semantics. Persistent draws are episode-local:
+episode-boundary snapshots contain no live matrices, and attempts to snapshot
+live noise fail rather than silently losing it. Gaussian checkpoints and
+scientific identities retain their historical behavior when gSDE is disabled.
+
+#### Acceleration
+
+Ordinary `compile=true` compiles the existing rollout, actor, critic, and
+optimizer tensor regions. Set `compile_strict=true` to reject compiler fallback.
+Matrix and deterministic action-only calls avoid the statistics path's
+standardize/unstandardize round trip, while retaining finite and singular
+distribution checks. The CPU variance GEMM and action path preserve the
+distribution, gradients, and random draws; floating-point reduction order can
+change, so source versions are not bitwise continuation equivalents.
+
+For fixed-shape CUDA execution, `inner_cuda_graph=true` now also supports gSDE.
+It requires strict compilation, state observations, non-episodic fresh inner
+SAC, and no auxiliary critic. Both round and step update timing, all three noise
+lifetimes, and reward-only or entropy-augmented targets are supported. The
+remaining collection-graph restrictions are checked at configuration time.
+For an otherwise eligible gSDE recipe, enable:
+
+```json
+{
+  "compile": true,
+  "compile_strict": true,
+  "inner_cuda_graph": true
+}
+```
+
+The live engine refreshes collection and execution matrices using their
+independent phase generators, then copies them into stable graph inputs.
+Python resampling counters are not captured. Solve/real-step scopes share one
+matrix buffer across rounds; round scope has one per round. Diagnostic and
+evaluation actions use the native path, preserving the same behavior-noise
+lifetimes. Captured optimization uses the graph's private RNG protocol,
+`isolated_cuda_graph_with_live_gsde_inputs_v1`, recorded in checkpoints; this is
+distinct from ordinary phase-separated optimization. The existing Gaussian
+graph protocol is unchanged.
+
+The bounded benchmark measures actor forward/backward and complete inner
+solves, separates first-call/compile cost from warmed timing, synchronizes CUDA,
+and disables W&B. It runs without stepping an environment or training outer
+priors. For example:
+
+```bash
+WANDB_MODE=disabled TORCHINDUCTOR_COMPILE_THREADS=1 \
+  environments/dmcontrol/.venv/bin/python -m tests.benchmark_ambi_gsde \
+  --device cpu --threads 1 --output /absolute/scratch/gsde-timing.json
+```
+
+Use `--device cuda --compile-backends eager inductor` on an allocated GPU for
+device-specific measurements. An optional `--reference-root` points to a local
+source snapshot for before/after comparisons; no benchmark results are uploaded.
+The CPU optimization is measured locally. Real CUDA graph replay, device
+memory savings, and GPU speedups require the CUDA-gated tests and profiling on
+GPU hardware; CPU graph-protocol tests do not establish those results.
+
 ### Selectable actor and critic entropy
 
 `outer_actor_entropy_mode` and `inner_actor_entropy_mode` independently select
-`"squashed"` (the default) or `"tdmpc2_scaled"` for actor and temperature
+`"squashed"` (the default), `"tdmpc2_scaled"`, or `"pre_tanh"` for actor and temperature
 optimization and the corresponding entropy-augmented critic. The default uses
 the existing stable squashed-action entropy sample, `H_selected = -log_pi`.
 With Q scaling off, each learner's entropy-augmented Bellman target is:
@@ -1895,6 +2055,24 @@ Reward-only targets have no entropy bonus. With Q scaling enabled, the supported
 fixed-temperature entropy-augmented case uses the `alpha * S` coefficient
 described above. Action-entropy metrics, the finite-horizon prior handoff, and
 the native TDAMBI operator retain their existing definitions.
+
+`pre_tanh` uses the exact joint Gaussian entropy
+`H_selected = sum(log_std + 0.5 * log(2*pi*e))`, where gSDE supplies the induced
+marginal log standard deviations. It is measured in joint nats, has no extra
+action-dimension multiplier, and requires no entropy sampling. Its gradients
+remain connected to the variance parameters. Actor, temperature, and soft
+critic objectives all select this same statistic; actual squashed-action
+log-probabilities remain available for diagnostics and regularizers. This is
+the fixed-input marginal entropy, not trajectory entropy or entropy conditioned
+on a retained exploration matrix. It does not depend on the resampling interval.
+
+Automatic temperature tuning with `pre_tanh` requires an explicit numeric
+target. An inner learner can use `inherit_outer` when its selected source actor
+has a numeric target in the same entropy mode. There is no automatic conversion
+from an action-entropy target. Fixed coefficients do not require target changes.
+The initial pre-tanh implementation supports the ordinary Q-maximizing actor
+and single-policy inner SAC; specialized teacher objectives/backends and inner
+explorer populations must use their existing supported entropy modes.
 
 In scaled mode the critic estimates returns augmented by the selected surrogate
 statistic. The manuscript's standard maximum-entropy SAC equations describe
@@ -1981,7 +2159,7 @@ experiment presets are unchanged.
 
 Checkpoint `critic_target_spec.entropy_semantics` and resolved run metadata
 `critic_entropy` record each critic's bonus as `none`, `squashed_action_entropy`,
-`squashed_mixture_entropy`, or `tdmpc2_scaled_entropy`. Historical checkpoints
+`squashed_mixture_entropy`, `tdmpc2_scaled_entropy`, or `pre_tanh_gaussian_entropy`. Historical checkpoints
 missing these fields used squashed entropy for entropy-augmented targets, even
 when their actors selected scaled entropy. Exact resumes reject a changed critic
 entropy statistic before mutating state; portable target metadata remains

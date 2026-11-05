@@ -1,5 +1,7 @@
 """AMBI's selected policy entropy and Bellman-target provenance."""
 
+import math
+
 
 def policy_entropy(info, mode):
     """Select an existing statistic without resampling or detaching its graph."""
@@ -7,6 +9,12 @@ def policy_entropy(info, mode):
         return info["scaled_entropy"]
     if mode == "squashed":
         return -info["log_prob"]
+    if mode == "pre_tanh":
+        # Joint Gaussian entropy in nats, including for gSDE's induced
+        # state-dependent marginal. Keep the variance graph differentiable.
+        return (info["log_std"] + 0.5 * math.log(2.0 * math.pi * math.e)).sum(
+            dim=-1, keepdim=True,
+        )
     raise ValueError(f"Unknown policy entropy mode: {mode!r}")
 
 
@@ -39,6 +47,11 @@ def critic_entropy_spec(config, *, historical=False):
             and config.get(f"{learner}_actor_entropy_mode") == "tdmpc2_scaled"
         ):
             semantics = "tdmpc2_scaled_entropy"
+        elif (
+            not historical
+            and config.get(f"{learner}_actor_entropy_mode") == "pre_tanh"
+        ):
+            semantics = "pre_tanh_gaussian_entropy"
         else:
             semantics = "squashed_action_entropy"
         spec[learner] = semantics

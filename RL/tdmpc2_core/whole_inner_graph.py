@@ -16,10 +16,19 @@ from .teacher_graph import validate_teacher_graph_config
 
 
 _TRAINING_PROTOCOL = "isolated_cuda_graph_with_native_diagnostics_v1"
+_GSDE_TRAINING_PROTOCOL = "isolated_cuda_graph_with_live_gsde_inputs_v1"
+
+
+def training_graph_protocol(cfg):
+    """Name the graph RNG contract without altering historical identities."""
+    return (_GSDE_TRAINING_PROTOCOL
+            if getattr(cfg, "actor_distribution", "gaussian") == "gsde"
+            else _TRAINING_PROTOCOL)
 
 
 def _validate_fresh_config(cfg, *, require_compile):
-    validate_teacher_graph_config(cfg)
+    gsde = getattr(cfg, "actor_distribution", "gaussian") == "gsde"
+    validate_teacher_graph_config(cfg, allow_gsde_collection=gsde)
     expected = {
         "inner_solve_interval": 1,
         "inner_actor_loss_scale_scope": "action",
@@ -29,6 +38,14 @@ def _validate_fresh_config(cfg, *, require_compile):
         "inner_sac_critic_target": "reward_only",
         "inner_root_entropy_samples": 0,
     }
+    if gsde:
+        # Both targets are fixed-shape tensor equations. The legacy Gaussian
+        # graph recipe retains its original reward-only contract.
+        expected.pop("outer_critic_target")
+        expected.pop("inner_sac_critic_target")
+        for name in ("outer_critic_target", "inner_sac_critic_target"):
+            if getattr(cfg, name) not in {"reward_only", "entropy_augmented"}:
+                raise ValueError(f"gSDE collection graph has unsupported {name}.")
     if require_compile:
         expected.update(compile=True, compile_strict=True)
     for key, value in expected.items():
@@ -67,6 +84,101 @@ class _GraphRNG:
         raise RuntimeError("Checkpoint collection graph RNG through its live engine, not its disposable worker.")
 
 
+class _GsdeGraphInputs:
+    """Stable graph buffers; the live controller owns all matrix lifetimes.
+
+    Round scopes need one buffer per round. Solve and real-step scopes share
+    one buffer across every round, avoiding J redundant matrix copies. The
+    cursor is only used while tracing/capturing a solve, never for replay.
+    """
+
+    def __init__(self, engine, root):
+        cfg, actor = engine.cfg, engine._actor_base
+        self.rounds = int(cfg.inner_rounds)
+        self.per_round = cfg.inner_gsde_noise_scope == "round"
+        self.collection_enabled = (
+            cfg.inner_behavior_action == "policy_sample"
+            and float(cfg.inner_behavior_std_scale) > 0.0
+        )
+        self.execution_enabled = (
+            cfg.inner_execution_action == "policy_sample"
+            and float(cfg.inner_execution_std_scale) > 0.0
+        )
+        shape = (int(cfg.inner_rollouts_per_round), actor.sde_feature_dim, actor.sde_action_dim)
+        self.collection = tuple(
+            root.new_zeros(shape)
+            for _ in range((self.rounds if self.per_round else 1) if self.collection_enabled else 0)
+        )
+        self.execution = (
+            root.new_zeros((int(root.shape[0]), actor.sde_feature_dim, actor.sde_action_dim))
+            if self.execution_enabled else None
+        )
+        self._cursor = 0
+
+    def install(self, engine):
+        # Replaying a CUDA graph skips Python. Bind explicit buffers here so
+        # neither a captured t0=True nor captured interval branches decide when
+        # to resample behavior noise.
+        engine._begin_gsde_action = self.begin
+        engine._gsde_noise_for_round = self.next_round
+        engine._gsde_noise_for_execution = self.for_execution
+
+    def begin(self, *, t0, eval_mode):
+        del t0, eval_mode
+        self._cursor = 0
+
+    def next_round(self, root, count, generator):
+        del root, count, generator
+        if not self.collection_enabled:
+            return None
+        if self._cursor >= self.rounds:
+            raise RuntimeError("gSDE graph requested more rollout rounds than captured.")
+        index = self._cursor if self.per_round else 0
+        self._cursor += 1
+        return self.collection[index]
+
+    def for_execution(self, root, policy, generator):
+        del root, policy, generator
+        return self.execution
+
+    def copy_(self, collection, execution):
+        if not isinstance(collection, (tuple, list)) or len(collection) != len(self.collection):
+            raise ValueError("gSDE graph requires its complete collection matrix inputs.")
+        pairs = list(zip(self.collection, collection))
+        if self.execution is None:
+            if execution is not None:
+                raise ValueError("This gSDE graph does not sample execution noise.")
+        else:
+            pairs.append((self.execution, execution))
+        # Validate every tensor before copying any, without reading device data.
+        for destination, source in pairs:
+            if (not torch.is_tensor(source) or source.shape != destination.shape
+                    or source.dtype != destination.dtype or source.device != destination.device):
+                raise ValueError("gSDE graph matrix shape, dtype and device must remain fixed.")
+        for destination, source in pairs:
+            destination.copy_(source)
+
+
+def _gsde_inputs_for_action(engine, root):
+    """Draw on the live behavior streams, independently of captured gradients."""
+    collection = []
+    generator = engine.rng.generator("collection")
+    for round_index in range(int(engine.cfg.inner_rounds)):
+        # Explicit generators need no default-RNG fork. Collection/execution
+        # contain no implicit draws here; captured optimizer randomness stays
+        # on the graph's private stream.
+        matrix = engine._gsde_noise_for_round(
+            root, int(engine.cfg.inner_rollouts_per_round), generator,
+        )
+        if matrix is not None and (round_index == 0 or engine.cfg.inner_gsde_noise_scope == "round"):
+            collection.append(matrix)
+    execution = (
+        engine._gsde_noise_for_execution(root, engine._actor_base, engine.rng.generator("execution"))
+        if float(engine.cfg.inner_execution_std_scale) > 0.0 else None
+    )
+    return collection, execution
+
+
 class WholeInnerGraph:
     """Capture a private fresh solve, including sampled execution and teachers.
 
@@ -100,6 +212,9 @@ class WholeInnerGraph:
         self.calls, self.seed = 0, int(seed)
         self.graph = None
         self.root = root.detach().clone()
+        self.gsde_inputs = _GsdeGraphInputs(engine, root) if engine._gsde_active else None
+        if self.gsde_inputs is not None:
+            self.gsde_inputs.install(engine)
         self._initial_alpha = engine._initial_inner_alpha
         self.alpha_input = self._initial_alpha().detach().clone()
         engine._initial_inner_alpha = lambda: self.alpha_input
@@ -174,7 +289,7 @@ class WholeInnerGraph:
             return (*result, self.engine.last_teacher_policy)
         return result
 
-    def __call__(self, root):
+    def __call__(self, root, *, gsde_collection=None, gsde_execution=None):
         if root.shape != self.root.shape or root.dtype != self.root.dtype or root.device != self.root.device:
             raise ValueError("Collection graph root shape, dtype and device must remain fixed.")
         # Canonical fresh-SAC clones this live outer scalar inside every solve.
@@ -182,8 +297,15 @@ class WholeInnerGraph:
         # inner per-update normalization never writes into the outer estimator.
         if self.engine._sac_actor_loss_scale_enabled:
             scale = self.engine._critic_owner.actor_loss_scale
-            if not bool((torch.isfinite(scale) & (scale >= 1)).all()):
+            valid_scale = (torch.isfinite(scale) & (scale >= 1)).all()
+            if self.gsde_inputs is not None:
+                torch._assert_async(valid_scale, "Collection graph Q scale must be finite and at least one.")
+            elif not bool(valid_scale):
                 raise ValueError("Collection graph Q scale must be finite and at least one.")
+        if self.gsde_inputs is not None:
+            self.gsde_inputs.copy_(gsde_collection, gsde_execution)
+        elif gsde_collection is not None or gsde_execution is not None:
+            raise ValueError("Gaussian collection graphs do not accept gSDE matrix inputs.")
         alpha = self._initial_alpha()
         self.alpha_input.copy_(alpha)
         self.root.copy_(root)
@@ -201,7 +323,7 @@ def training_graph_state(engine):
         return deepcopy(engine._whole_graph_resume)
     runner = engine._whole_graph_runner
     return {
-        "schema": "ambi-training-whole-inner-graph-v1", "protocol": _TRAINING_PROTOCOL,
+        "schema": "ambi-training-whole-inner-graph-v1", "protocol": training_graph_protocol(engine.cfg),
         "seed": int(engine.cfg.seed) + 8173,
         "calls": 0 if runner is None else runner.calls,
         "rng_state": None if runner is None else runner.rng_state.detach().cpu().clone(),
@@ -218,7 +340,7 @@ def preflight_training_graph_state(engine, saved):
     if not isinstance(saved, dict) or saved.keys() != expected:
         raise ValueError("Collection CUDA graph resume requires its complete RNG state.")
     if (saved["schema"] != "ambi-training-whole-inner-graph-v1"
-            or saved["protocol"] != _TRAINING_PROTOCOL
+            or saved["protocol"] != training_graph_protocol(engine.cfg)
             or type(saved["seed"]) is not int or saved["seed"] != int(engine.cfg.seed) + 8173
             or type(saved["calls"]) is not int or saved["calls"] < 0):
         raise ValueError("Incompatible collection CUDA graph RNG protocol or counters.")
@@ -233,7 +355,7 @@ def preflight_training_graph_state(engine, saved):
     return deepcopy(saved)
 
 
-def training_graph_act(engine, root, *, capture_teacher_policy=False):
+def training_graph_act(engine, root, *, t0=False, capture_teacher_policy=False):
     """Collect with the production private stream, keeping teachers owned."""
     runner = engine._whole_graph_runner
     if runner is None or runner.capture_teacher_policy != capture_teacher_policy:
@@ -252,7 +374,15 @@ def training_graph_act(engine, root, *, capture_teacher_policy=False):
         engine._whole_graph_resume = None
     engine._pending_timers = {}
     started = engine._timer_start()
-    result = runner(root)
+    if engine._gsde_active:
+        engine._begin_gsde_action(t0=t0, eval_mode=False)
+        collection, execution = _gsde_inputs_for_action(engine, root)
+        result = runner(root, gsde_collection=collection, gsde_execution=execution)
+        if execution is not None:
+            engine._gsde_execution_uses += 1
+        engine._finish_gsde_action()
+    else:
+        result = runner(root)
     action, values, lengths = result[:3]
     if capture_teacher_policy:
         # Captured outputs are overwritten at the next action. Replay staging
