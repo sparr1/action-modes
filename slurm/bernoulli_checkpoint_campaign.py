@@ -47,7 +47,7 @@ def prepare(args):
         cell.mkdir()
         inventory = cell / 'inventory.json'
         series._atomic_json(inventory, {'source_run': row['source_run'], 'checkpoints': [row]})
-        specs = evaluate_matrix(MATRIX, row['path'], source_run=row['source_run'],
+        specs = evaluate_matrix(MATRIX, row['path'], source_run=row['source_run'], bundle_dir=cell / 'preflight',
                                 checkpoint_inventory=inventory, reference_bundle=reference,
                                 eval_series_spec_dir=cell / 'specs')
         registry = series.create_run(args.registry, series._read(specs['specs'][SELECTOR]),
