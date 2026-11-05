@@ -45,9 +45,15 @@ else
   phases=("$mode")
 fi
 for phase in "${phases[@]}"; do
+  entropy_args=()
+  if [[ "$method" == boom ]]; then
+    entropy_args=(--entropy "${REFERENCE_ENTROPY:-released}")
+  else
+    [[ "${REFERENCE_ENTROPY:-released}" == released ]]
+  fi
   srun --kill-on-bad-exit=1 "$BOOM_REFERENCE_PYTHON" "slurm/${method}_upstream_reference.py" "$phase" \
-    --upstream "$BOOM_REFERENCE_ROOT/upstream" --output "$BOOM_REFERENCE_ROOT/$phase-$SLURM_JOB_ID" \
-    --steps "${REFERENCE_STEPS:-400000}" --acceleration "${REFERENCE_ACCELERATION:-planner-graph}"
+    --upstream "${BOOM_REFERENCE_UPSTREAM:-$BOOM_REFERENCE_ROOT/upstream}" --output "$BOOM_REFERENCE_ROOT/$phase-$SLURM_JOB_ID" \
+    --steps "${REFERENCE_STEPS:-400000}" --acceleration "${REFERENCE_ACCELERATION:-planner-graph}" "${entropy_args[@]}"
 done
 if [[ "$mode" == gate && "${REFERENCE_AUTOLAUNCH:-0}" == 1 ]]; then
   "$BOOM_REFERENCE_PYTHON" slurm/release_upstream_reference.py

@@ -1,4 +1,4 @@
-"""Observe the pinned, released BOOM trainer without changing its updates."""
+"""Observe released BOOM, with an explicitly selected actor-entropy ablation."""
 from __future__ import annotations
 
 import argparse
@@ -47,8 +47,9 @@ class Recorder:
         self.raw = (output / "updates.jsonl").open("x", buffering=1024 * 1024)
         from omegaconf import OmegaConf
         config = OmegaConf.to_container(cfg, resolve=True)
+        entropy_ablation = config.get("reference_entropy") == "ambi-posttanh"
         config.update(upstream_commit=upstream_commit, threshold=2.0,
-                      reference_method=f"released {method}",
+                      reference_method=("released BOOM with AMBI post-tanh actor entropy" if entropy_ablation else f"released {method}"),
                       action_repeat=2, reward_aggregation="sum",
                       observer_commit=subprocess.check_output(
                           ["git", "rev-parse", "HEAD"], text=True).strip())
@@ -58,9 +59,9 @@ class Recorder:
             self.wandb = wandb.init(
                 entity=cfg.wandb_entity, project=cfg.wandb_project,
                 id=os.environ["WANDB_RUN_ID"], resume="never",
-                name=f"{method} released | humanoid-walk | S>2 | {cfg.steps // 1000}k | {cfg.acceleration} | seed{cfg.seed}",
-                group="boom-upstream-threshold-reference-20261104",
-                tags=["upstream-reference", method, "threshold-diagnostics"],
+                name=f"{method} {'AMBI post-tanh entropy' if entropy_ablation else 'released'} | humanoid-walk | S>2 | {cfg.steps // 1000}k | {cfg.acceleration} | seed{cfg.seed}",
+                group="boom-entropy-ablation-20261105" if entropy_ablation else "boom-upstream-threshold-reference-20261104",
+                tags=["upstream-ablation" if entropy_ablation else "upstream-reference", method, "threshold-diagnostics"] + (["ambi-posttanh-entropy"] if entropy_ablation else []),
                 config=jsonable(config), dir=str(output))
             self.wandb.define_metric("env_step")
             self.wandb.define_metric("*", step_metric="env_step")
@@ -135,7 +136,12 @@ def observed_class(base):
             original_pi = self.model.pi
 
             def pi(*a, **kw):
-                out = original_pi(*a, **kw)
+                corrected = self.in_actor and self.cfg.get("reference_entropy", "released") == "ambi-posttanh"
+                if corrected:
+                    from boom_entropy_ablation import corrected_actor_pi
+                    out, entropy_metrics = corrected_actor_pi(self.model, *a, **kw)
+                else:
+                    out = original_pi(*a, **kw)
                 if self.observe and self.in_actor:
                     with torch.no_grad():
                         mean, sample, legacy_log_pi, log_std = (x.detach() for x in out)
@@ -151,6 +157,9 @@ def observed_class(base):
                             mean_saturation=float((mean.abs() >= .99).float().mean()),
                             actor_std_mean=float(log_std.exp().mean()),
                             actor_std_min=float(log_std.exp().min()))
+                        if corrected:
+                            self.actor_metrics.update({k: float(v) for k, v in entropy_metrics.items()})
+                            self.actor_metrics["alignment_std_floor_fraction"] = float((log_std.exp() < self.cfg.min_std).float().mean())
                 return out
 
             self.model.pi = pi
@@ -159,7 +168,11 @@ def observed_class(base):
             if step is None:
                 step = getattr(self, "reference_step", 0)
             if not self.observe:
-                return super().update_pi(zs, action, mu, std, task, step)
+                self.in_actor = True
+                try:
+                    return super().update_pi(zs, action, mu, std, task, step)
+                finally:
+                    self.in_actor = False
             self.actor_metrics = {}
             self.in_actor = True
             clip = torch.nn.utils.clip_grad_norm_
@@ -283,6 +296,7 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--seed", type=int, default=55)
     parser.add_argument("--steps", type=int, default=400000)
+    parser.add_argument("--entropy", choices=("released", "ambi-posttanh"), default="released")
     parser.add_argument("--acceleration", choices=("native", "planner-graph", "compiled-planner", "model-planner-graph"), default="native")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
@@ -319,13 +333,24 @@ def main():
     cfg.work_dir = args.output
     cfg.steps = args.steps
     cfg.acceleration = args.acceleration
+    cfg.reference_entropy = args.entropy
     if args.mode == "benchmark":
         cfg.steps = 4100
         cfg.eval_episodes = 1
     set_seed(cfg.seed)
     env = make_env(cfg)
+    cfg.reference_original_entropy_coef = float(cfg.entropy_coef)
+    if args.entropy == "ambi-posttanh":
+        # Match AMBI's joint entropy coefficient: 21 * 1e-4 for Humanoid.
+        # This changes only the actor entropy; native alignment retains its
+        # original Gaussian helper, dimension multiplier, lambda, and S gate.
+        cfg.entropy_coef = cfg.action_dim * cfg.reference_original_entropy_coef
+        cfg.exp_name = "ambi-posttanh-entropy-ablation"
     agent = observed_class(BOOM)(cfg)
     if args.mode == "validate":
+        if args.entropy == "ambi-posttanh":
+            from boom_entropy_ablation import validate_entropy_ablation
+            validate_entropy_ablation(agent, args.output)
         validate_observer(agent, args.output)
         if args.acceleration != "native":
             from upstream_reference_acceleration import validate_planner
