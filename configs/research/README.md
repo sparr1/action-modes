@@ -1,5 +1,14 @@
 # Frozen-checkpoint AMBI research
 
+`ambi_checkpoint_bernoulli50.json` evaluates saved controllers with 50% scalar
+critic retention between real decisions. The actor and other action-local state
+remain fresh, with the first critic solve also fresh. It uses the existing
+compiled native path because whole-solve CUDA graphs reject Bernoulli transfer.
+`slurm/bernoulli_checkpoint_campaign.py` selects explicit checkpoints from prior
+campaigns, verifies and reuses their prior reference bundles, and creates new
+evaluation curves plus a verified progress/results workspace. Historical graph
+refinement remains a separately labeled RNG/backend reference.
+
 `ambi_checkpoint_graph_eval.json` compares the saved controller with its frozen
 mean-action prior using five paired full episodes (seeds 101–105, controller
 seed 55). It inherits the checkpoint's inner dose, entropy and normalization.
