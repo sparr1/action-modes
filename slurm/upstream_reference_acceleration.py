@@ -1,6 +1,7 @@
 """CUDA execution regions around the released single-task reference models."""
 from __future__ import annotations
 
+from copy import deepcopy
 import importlib
 import json
 import random
@@ -8,6 +9,7 @@ import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 def rng_state():
@@ -148,6 +150,8 @@ class PlannerGraph:
 def install_planner(agent, method, acceleration):
     if acceleration == "native": return
     agent.plan = PlannerGraph(agent, method, compile_region=acceleration == "compiled-planner")
+    if acceleration == "model-planner-graph":
+        agent.update = ModelUpdateGraph(agent, method)
 
 
 @torch.no_grad()
@@ -188,3 +192,168 @@ def validate_planner(agent, method, output, acceleration):
                "capture_seconds": captured.capture_seconds}
     (output / "planner_parity.json").write_text(json.dumps(receipt, indent=2))
     print("PLANNER_PARITY_PASSED", json.dumps(receipt), flush=True)
+
+
+class ModelUpdateGraph:
+    """Capture native world-model forward/backward; keep both optimizers native.
+
+    The actor update (including its original threshold branch), model-wide
+    clipping with retained actor gradients, and target update remain upstream.
+    """
+    def __init__(self, agent, method):
+        self.agent, self.model, self.cfg = agent, agent.model, agent.cfg
+        self.math = importlib.import_module(("boom" if method == "boom" else "tdmpc_square") + ".common.math")
+        self.method = method
+        self.heads = torch.zeros(2, device=agent.device, dtype=torch.long)
+        self.parameters = [p for group in agent.optim.param_groups for p in group["params"]]
+        self.graph = None
+
+    def kernel(self):
+        obs, action, _, _, reward, _ = self.batch
+        cfg, model = self.cfg, self.model
+        with torch.no_grad():
+            next_z = model.encode(obs[1:], None)
+            pi = model.pi(next_z, None)[1]
+            out = model._target_Qs(torch.cat((next_z, pi), dim=-1)).index_select(0, self.heads)
+            q1, q2 = (self.math.two_hot_inv(out[i], cfg) for i in (0, 1))
+            targets = reward + self.agent.discount * torch.min(q1, q2)
+        self.agent.optim.zero_grad(set_to_none=False)
+        model.train()
+        zs = torch.empty(cfg.horizon + 1, cfg.batch_size, cfg.latent_dim, device=self.agent.device)
+        z = model.encode(obs[0], None)
+        zs[0] = z
+        consistency = 0
+        for t in range(cfg.horizon):
+            z = model.next(z, action[t], None)
+            consistency += F.mse_loss(z, next_z[t]) * cfg.rho**t
+            zs[t + 1] = z
+        latent = zs[:-1]
+        qs = model.Q(latent, action, None, return_type="all")
+        rewards = model.reward(latent, action, None)
+        reward_loss, value_loss = 0, 0
+        for t in range(cfg.horizon):
+            reward_loss += self.math.soft_ce(rewards[t], reward[t], cfg).mean() * cfg.rho**t
+            for q in range(cfg.num_q):
+                value_loss += self.math.soft_ce(qs[q][t], targets[t], cfg).mean() * cfg.rho**t
+        consistency *= 1 / cfg.horizon
+        reward_loss *= 1 / cfg.horizon
+        value_loss *= 1 / (cfg.horizon * cfg.num_q)
+        loss = cfg.consistency_coef * consistency + cfg.reward_coef * reward_loss + cfg.value_coef * value_loss
+        loss.backward()
+        return latent.detach(), torch.stack((consistency.detach(), reward_loss.detach(), value_loss.detach(), loss.detach()))
+
+    def build(self, batch):
+        self.batch = tuple(x.detach().clone() if x is not None else None for x in batch)
+        assert self.batch[-1] is None and not self.cfg.multitask
+        state = rng_state()
+        grads = [None if p.grad is None else p.grad.clone() for p in self.parameters]
+        for p in self.parameters:
+            if p.grad is None: p.grad = torch.zeros_like(p)
+        # Stable buffers are also used for restoration in the parity check.
+        self.grad_buffers = [p.grad for p in self.parameters]
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        start = time.perf_counter()
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                self.model.eval()
+                self.outputs = self.kernel()
+        torch.cuda.current_stream().wait_stream(stream)
+        self.model.eval()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, stream=stream):
+            self.outputs = self.kernel()
+        torch.cuda.synchronize()
+        for p, original in zip(self.parameters, grads):
+            if original is None: p.grad.zero_()
+            else: p.grad.copy_(original)
+        self.model.eval()
+        restore_rng(state)
+        print("MODEL_GRAPH_CAPTURE_SECONDS", time.perf_counter() - start, flush=True)
+
+    def __call__(self, batch, step):
+        start = time.perf_counter()
+        agent = self.agent
+        if not isinstance(batch, tuple): batch = batch.sample()
+        if self.graph is None: self.build(batch)
+        for dst, src in zip(self.batch, batch):
+            if dst is not None: dst.copy_(src)
+        # Native target-Q selection is the first NumPy draw in an update.
+        self.heads.copy_(torch.as_tensor(np.random.choice(self.cfg.num_q, 2, replace=False), device=agent.device))
+        for p, grad in zip(self.parameters, self.grad_buffers): p.grad = grad
+        self.graph.replay()
+        latent, losses = self.outputs
+        norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
+        agent.optim.step()
+        self.model.train()
+        pi_loss, q_loss, prior_loss = agent.update_pi(latent, batch[1].detach(), batch[2].detach(),
+                                                     batch[3].detach(), None, step)
+        self.model.soft_update_target_Q()
+        self.model.eval()
+        consistency, reward, value, loss = losses.tolist()
+        metrics = dict(consistency_loss=consistency, reward_loss=reward, value_loss=value,
+                       pi_loss=pi_loss, pi_q_loss=q_loss, pi_fkl_loss=prior_loss,
+                       total_loss=loss, grad_norm=float(norm), pi_scale=agent.scale.value)
+        if self.method == "tdmpc_square":
+            metrics.update(pi_loss_q=q_loss, pi_loss_prior=prior_loss)
+        if agent.observe and agent.recorder is not None:
+            agent.recorder.update(step, {**metrics, **agent.actor_metrics,
+                "gate_active": float(agent.scale.value > 2),
+                "weighted_alignment_loss": self.cfg.action_dim * agent.lamda * prior_loss,
+                "update_seconds": time.perf_counter() - start})
+        return metrics
+
+
+def validate_model_update(agent, method, output):
+    batch = (torch.randn(4, 256, 67, device=agent.device),
+             torch.rand(3, 256, 21, device=agent.device) * 2 - 1,
+             torch.rand(3, 256, 21, device=agent.device) * 2 - 1,
+             torch.ones(3, 256, 21, device=agent.device),
+             torch.rand(3, 256, 1, device=agent.device), None)
+    native = agent.update
+    native(batch, 0)
+    captured = ModelUpdateGraph(agent, method)
+    captured.build(batch)
+    rows = []
+    for scale in (1., 3.):
+        model = deepcopy(agent.model.state_dict())
+        grads = {n: None if p.grad is None else p.grad.clone() for n, p in agent.model.named_parameters()}
+        optim, pi_optim = deepcopy(agent.optim.state_dict()), deepcopy(agent.pi_optim.state_dict())
+        state = rng_state()
+        outputs = []
+        for fn in (native, native, captured):
+            agent.model.load_state_dict(model)
+            for name, p in agent.model.named_parameters():
+                p.grad = None if grads[name] is None else grads[name].clone()
+            agent.optim.load_state_dict(deepcopy(optim)); agent.pi_optim.load_state_dict(deepcopy(pi_optim))
+            agent.scale._value.fill_(scale)
+            restore_rng(state)
+            metrics = fn(batch, 0)
+            outputs.append((deepcopy(agent.model.state_dict()), deepcopy(agent.optim.state_dict()),
+                            deepcopy(agent.pi_optim.state_dict()), metrics, rng_state(),
+                            {n: None if p.grad is None else p.grad.clone() for n, p in agent.model.named_parameters()}))
+        differences = []
+        def equal(a, b):
+            if isinstance(a, torch.Tensor):
+                torch.testing.assert_close(a, b, rtol=2e-5, atol=1e-7)
+                differences.append(float((a.double() - b.double()).abs().max()))
+            elif isinstance(a, np.ndarray): assert np.array_equal(a, b)
+            elif isinstance(a, dict):
+                assert a.keys() == b.keys()
+                for k in a: equal(a[k], b[k])
+            elif isinstance(a, (tuple, list)):
+                assert len(a) == len(b)
+                for x, y in zip(a, b): equal(x, y)
+            elif isinstance(a, float):
+                assert abs(a-b) <= 1e-7 + 2e-5 * abs(a), (a, b)
+                differences.append(abs(a-b))
+            else: assert a == b, (a, b)
+        equal(outputs[0], outputs[1])
+        repeat = max(differences)
+        differences.clear()
+        equal(outputs[1], outputs[2])
+        rows.append(dict(initial_scale=scale, numerical_parity=True, rng_exact=True,
+                         native_repeat_max_absolute_difference=repeat,
+                         captured_max_absolute_difference=max(differences)))
+    (output / "model_parity.json").write_text(json.dumps({"checks": rows}, indent=2))
+    print("MODEL_UPDATE_PARITY_PASSED", json.dumps(rows), flush=True)

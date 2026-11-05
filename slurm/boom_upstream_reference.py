@@ -283,7 +283,7 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--seed", type=int, default=55)
     parser.add_argument("--steps", type=int, default=200000)
-    parser.add_argument("--acceleration", choices=("native", "planner-graph", "compiled-planner"), default="native")
+    parser.add_argument("--acceleration", choices=("native", "planner-graph", "compiled-planner", "model-planner-graph"), default="native")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     assert subprocess.check_output(["git", "-C", str(args.upstream), "rev-parse", "HEAD"], text=True).strip() == UPSTREAM
@@ -330,6 +330,9 @@ def main():
         if args.acceleration != "native":
             from upstream_reference_acceleration import validate_planner
             validate_planner(agent, "boom", args.output, args.acceleration)
+        if args.acceleration == "model-planner-graph":
+            from upstream_reference_acceleration import validate_model_update
+            validate_model_update(agent, "boom", args.output)
         return
     from upstream_reference_acceleration import install_planner
     install_planner(agent, "boom", args.acceleration)

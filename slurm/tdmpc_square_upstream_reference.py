@@ -21,7 +21,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=55)
     parser.add_argument("--steps", type=int, default=200000)
-    parser.add_argument("--acceleration", choices=("native", "planner-graph", "compiled-planner"), default="native")
+    parser.add_argument("--acceleration", choices=("native", "planner-graph", "compiled-planner", "model-planner-graph"), default="native")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     assert subprocess.check_output(["git", "-C", str(args.upstream), "rev-parse", "HEAD"], text=True).strip() == UPSTREAM
@@ -91,6 +91,9 @@ def main():
         if args.acceleration != "native":
             from upstream_reference_acceleration import validate_planner
             validate_planner(agent, "tdmpc_square", args.output, args.acceleration)
+        if args.acceleration == "model-planner-graph":
+            from upstream_reference_acceleration import validate_model_update
+            validate_model_update(agent, "tdmpc_square", args.output)
         p = args.output / "parity.json"
         receipt = json.loads(p.read_text()); receipt["upstream"] = UPSTREAM
         p.write_text(json.dumps(receipt, indent=2))
