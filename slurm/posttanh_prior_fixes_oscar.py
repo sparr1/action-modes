@@ -19,8 +19,13 @@ sys.path.insert(0, str(ROOT))
 from slurm.ambi_transfer_training import binding, recipe, runtime, write_new
 from slurm.benchmark_ambi_training_cpu import TrainingWindow, physical_core_cpus
 
-MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_posttanh_prior_fixes.json"
-CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/posttanh-prior-fixes-20261104")
+CAMPAIGNS = {
+    "original": ("ambi_posttanh_prior_fixes.json", "posttanh-prior-fixes-20261104"),
+    "strength": ("ambi_posttanh_prior_strength.json", "posttanh-prior-strength-20261105"),
+}
+_manifest_name, _campaign_name = CAMPAIGNS[os.environ.get("AMBI_PRIOR_VARIANT", "original")]
+MANIFEST = ROOT / "configs/dmcontrol/experiments" / _manifest_name
+CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi") / _campaign_name
 GPU_PARITY_TESTS = [
     "tests/test_posttanh_prior_campaign.py::test_cuda_graph_captures_correct_behavior_labels_without_changing_solve",
     "tests/test_inner_entropy_graph.py::test_cuda_capture_matches_uncaptured_normalized_solve",
@@ -248,12 +253,12 @@ def worker(args):
             batch = learner.buffer.sample(include_behavior_policy=True)
             assert batch[-1].any(), "Training must exercise collected behavior labels"
         if cfg.outer_actor_objective == "boom":
-            assert cfg.outer_boom_coef == .42 and agent._boom_actor_region.enabled
+            assert cfg.outer_boom_coef == run["alg_params"]["outer_boom_coef"] and agent._boom_actor_region.enabled
             assert agent._boom_actor_compile_mode == "reduce-overhead"
             assert metrics["boom_valid_fraction"] > 0
             assert metrics["compile_outer_actor_fallback"] == 0
         elif cfg.outer_behavior_policy_weighting == "tdmpc_square":
-            assert cfg.outer_behavior_policy_kl_coef == 1.0 and agent._behavior_ce_region.enabled
+            assert cfg.outer_behavior_policy_kl_coef == run["alg_params"]["outer_behavior_policy_kl_coef"] and agent._behavior_ce_region.enabled
             assert agent._behavior_ce_compile_mode == "reduce-overhead"
             assert metrics["compile_behavior_ce_fallback"] == 0
         assert all(math.isfinite(float(v)) for v in metrics.values())
@@ -393,7 +398,7 @@ def gate(args):
         )
     native = json.loads(native_output.read_text())
     plan = select_plan(rows)
-    bank_bytes = 6 * 40 * max(r["checkpoint_bytes"] for r in rows)
+    bank_bytes = len(json.loads(MANIFEST.read_text())["configs"]) * 40 * max(r["checkpoint_bytes"] for r in rows)
     space = checkpoint_space(args.output, bank_bytes)
     receipt = {"passed": True, "binding": binding(MANIFEST), "runtime": rows[0]["runtime"],
                "plan": plan, "space": space, "cases": [str(args.output/f"cpu-{n}.json") for n in (1,2)],
@@ -457,7 +462,7 @@ def main():
     parser.add_argument("mode", choices=("parity", "gate", "worker", "train"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--gate", type=Path)
-    parser.add_argument("--index", type=int, choices=range(6))
+    parser.add_argument("--index", type=int, choices=range(len(json.loads(MANIFEST.read_text())["configs"])))
     parser.add_argument("--worker-cpus")
     parser.add_argument("--native-reference", action="store_true")
     parser.add_argument("--release-job", type=int)

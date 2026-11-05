@@ -40,3 +40,29 @@ observation. Separate 1/2-CPU measurements choose the smallest allocation within
 with 25% margin plus half an hour, rounded up. Source/config/runtime receipts
 must match before training. All scientific training runs publish into a dedicated
 six-run workspace through the idempotent, serialized workspace publisher.
+
+## Outer-adapt regularization strength
+
+`experiments/ambi_posttanh_prior_strength.json` selects four fresh outer-adapt
+runs with regularization multipliers 0.1 and 0.01 relative to the original
+campaign. BOOM uses `outer_boom_coef=0.042` or `0.0042`; TD-M(PC)² uses
+`outer_behavior_policy_kl_coef=0.1` or `0.01`. All other scientific parameters,
+including the S>2 gate, sampled-action objectives, entropy, seed, one-million
+decision budget, and checkpoint/diagnostic cadences match the original
+outer-adapt arms. There are no new baseline or outer-frozen runs.
+
+`slurm/run_posttanh_prior_strength_oscar.sbatch` executes one arm per GPU with
+`AMBI_PRIOR_VARIANT=strength`. Prepare the campaign using
+`slurm/posttanh_prior_strength_oscar.py prepare`. Preparation verifies that the
+learner, environment, dependencies, and CUDA parity tests are byte-identical to
+validated commit `342c7f1ec4d55fe18257499431eed335226e335a`, checks the original
+receipt and JUnit hashes, and records the provenance of reused GPU parity and
+1/2-CPU sizing evidence. It never represents reused checks as newly executed.
+
+Every job first performs a fresh, disabled-W&B check at its exact coefficient:
+production-size Humanoid training, 128 timed graph decisions, behavior labels,
+checkpoint roundtrip, critic geometry and graph/native/graph continuation.
+Only success permits scientific training in the same allocation. The measured
+runtime must fit the allocated walltime. All four jobs can execute concurrently;
+one CPU per L40S follows the measured sizing evidence. The dedicated workspace
+contains all four run IDs with explicit progress and method-specific panels.
