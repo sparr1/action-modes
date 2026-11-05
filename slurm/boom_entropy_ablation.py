@@ -56,7 +56,9 @@ def validate_entropy_ablation(agent, output):
     agent.observe = False
     results = []
     try:
-        for active in (False, True):
+        # The released TorchScript Gaussian helper profiles/fuses on its first
+        # calls. Warm it before comparing, retaining a native/native control.
+        for active in (False, False, False, False, False, True):
             restore_rng(state)
             agent.in_actor = active
             mean, action, log_prob, log_std = agent.model.pi(z, None)
@@ -70,6 +72,13 @@ def validate_entropy_ablation(agent, output):
     finally:
         agent.in_actor = False
         agent.observe = observed
+    native_repeat = max(float((a - b).abs().max()) for a, b in zip(results[-3][1], results[-2][1]))
+    intervention = max(float((a - b).abs().max()) for a, b in zip(results[-2][1], results[-1][1]))
+    print("ALIGNMENT_GRADIENT_COMPARISON", json.dumps({"native_repeat_max_abs": native_repeat,
+                                                      "intervention_max_abs": intervention}), flush=True)
+    for a, b in zip(results[-3][1], results[-2][1]):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+    results = results[-2:]
     for a, b in zip(results[0][0], results[1][0]):
         torch.testing.assert_close(a, b, rtol=0, atol=0)
     for a, b in zip(results[0][1], results[1][1]):
@@ -78,6 +87,7 @@ def validate_entropy_ablation(agent, output):
     assert all(torch.equal(a, b) for a, b in zip(results[0][2][3], results[1][2][3]))
     receipt = {
         "actions_exact": True, "alignment_gradients_exact": True, "torch_rng_exact": True,
+        "native_repeat_max_abs": native_repeat, "intervention_max_abs": intervention,
         "entropy_coefficient": float(agent.cfg.entropy_coef),
         "released_log_prob_mean": results[0][3], "corrected_log_prob_mean": results[1][3],
         "alignment_gaussian": "unchanged released helper, including extra action-dimension factor",
