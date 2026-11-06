@@ -229,7 +229,7 @@ def install(state_path):
         work.sections.extend(replacements.values())
     else:
         work = ws.Workspace(entity=ENTITY, project=PROJECT,
-            name="BOOM x0.01 + gSDE — Oscar", auto_generate_panels=False, sections=sections,
+            name="BOOM x0.01 with gSDE - Oscar", auto_generate_panels=False, sections=sections,
             settings=ws.WorkspaceSettings(x_axis="env_step", max_runs=len(ids),
                 tooltip_number_of_runs="all_runs", tooltip_color_run_names=True),
             runset_settings=ws.RunsetSettings(filters=[expr.Metric("ID").isin(ids)], groupby=[],
