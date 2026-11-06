@@ -1,0 +1,36 @@
+{
+  "study_type": "gsde_resampling_intervals",
+  "study_note": "Four single-axis interval changes around the existing real_steps (8,8) gSDE reference. Squashed entropy, fixed alpha 0.0021, seed55, actor features, log scale -3, mean clip2. Imagined/execution intervals: (4,8), (16,8), (8,4), (8,16). All other scientific settings match the reference; 1M real decisions and all40 checkpoints every25k. No BOOM.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_gsde_real_steps_i4_e8",
+    "ambi_gsde_real_steps_i16_e8",
+    "ambi_gsde_real_steps_i8_e4",
+    "ambi_gsde_real_steps_i8_e16"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "reference_runs": {
+    "gsde_real_steps_8_8": {
+      "id": "590be7c27a9b40eaa9a68218cdb74d0a",
+      "config": "ambi_gsde_squashed_real_steps",
+      "commit": "edec58cf7ec2b51bd54834aa4d6f806715075502"
+    }
+  }
+}

@@ -183,8 +183,9 @@ def worker(args):
         agent, cfg = learner.agent, learner.cfg
         assert cfg.action_dim == 21 and cfg.inner_operator == "sac" and not cfg.mpc
         assert cfg.actor_distribution == "gsde" and cfg.gsde_feature_source == "actor"
-        assert cfg.inner_gsde_noise_scope == ("round", "solve", "real_steps")[args.index % 3]
-        assert cfg.inner_gsde_resample_steps == cfg.gsde_execution_resample_steps == 8
+        for key in ("inner_gsde_noise_scope", "inner_gsde_resample_steps",
+                    "gsde_execution_resample_steps"):
+            assert getattr(cfg, key) == run["alg_params"][key], key
         assert (cfg.inner_rollout_horizon, cfg.inner_rounds, cfg.inner_solve_interval) == (3, 8, 1)
         assert cfg.inner_finite_horizon
         assert cfg.outer_actor_entropy_mode == cfg.inner_actor_entropy_mode
@@ -197,6 +198,8 @@ def worker(args):
         act, log = learner._act_agent, learner._log_wandb_step
         graph_counts = {}
         replay_counts = {}
+        noise_counts = {key: 0 for key in (
+            "collection_refresh", "collection_retained", "execution_refresh", "execution_retained")}
 
         def observed_act(*positional, **kwargs):
             step = learner._global_step + 1
@@ -205,10 +208,35 @@ def worker(args):
                 runner = agent.inner_engine._whole_graph_runner
                 replay_counts["before"] = 0 if runner is None else runner.calls
             timer.before_action(step, learner._num_updates)
+            engine = agent.inner_engine
+            audit_noise = bool(getattr(args, "audit_gsde_persistence", False))
+            if audit_noise:
+                assert cfg.inner_gsde_noise_scope == "real_steps"
+                old_collection = (None if engine._gsde_collection_noise is None
+                                  else engine._gsde_collection_noise.clone())
+                old_execution = (None if engine._gsde_execution_noise is None
+                                 else engine._gsde_execution_noise.clone())
+                old_collection_decision = engine._gsde_collection_decision
+                old_execution_uses = engine._gsde_execution_uses
             t = time.perf_counter()
             before = agent.actor_loss_scale.detach().clone()
             action = act(*positional, **kwargs)
             timer.after_action(step, time.perf_counter() - t)
+            if audit_noise:
+                episode_start = engine._gsde_decision_index == 1
+                refresh_collection = (episode_start or old_collection is None or
+                    engine._gsde_decision_index - old_collection_decision >= cfg.inner_gsde_resample_steps)
+                refresh_execution = (episode_start or old_execution is None or
+                                     old_execution_uses >= cfg.gsde_execution_resample_steps)
+                for label, old, new, refresh in (
+                    ("collection", old_collection, engine._gsde_collection_noise, refresh_collection),
+                    ("execution", old_execution, engine._gsde_execution_noise, refresh_execution),
+                ):
+                    assert new is not None
+                    if old is not None:
+                        assert torch.equal(old, new) is not refresh, (label, step)
+                    noise_counts[label + ("_refresh" if refresh else "_retained")] += 1
+                assert engine._gsde_execution_uses == (1 if refresh_execution else old_execution_uses + 1)
             assert torch.isfinite(action).all()
             inner = agent.last_inner_metrics
             assert inner["inner_actor_optimizer_steps"] == 32
@@ -283,6 +311,11 @@ def worker(args):
                   "diagnostic_episodes": learner._training_diagnostics.episode_metrics(),
                   "seconds": time.perf_counter() - started,
                   "benchmark_overrides": {**overrides, "total_steps": total}, "wandb": False}
+        if getattr(args, "audit_gsde_persistence", False):
+            assert all(value >= 2 for value in noise_counts.values()), noise_counts
+            report["noise_lifetimes"] = {"passed": True, "counts": noise_counts,
+                "imagined_interval": cfg.inner_gsde_resample_steps,
+                "execution_interval": cfg.gsde_execution_resample_steps}
         write_new(args.output, report)
     finally:
         if learner is not None:
