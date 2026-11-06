@@ -18,13 +18,23 @@ umask 077
 : "${AMBI_DMCONTROL_PYTHON:?Set locked interpreter}"
 : "${AMBI_WORKSPACE_PYTHON:?Set W&B publisher interpreter}"
 index="${1:?arm index}"
-[[ "$index" =~ ^[0-3]$ ]]
-[[ "$AMBI_PRIOR_CAMPAIGN" == /oscar/scratch/rgao48/ambi/posttanh-prior-strength-20261105 ]]
+export AMBI_PRIOR_VARIANT="${AMBI_PRIOR_VARIANT:-strength}"
+case "$AMBI_PRIOR_VARIANT" in
+  strength)
+    [[ "$index" =~ ^[0-3]$ ]]
+    [[ "$AMBI_PRIOR_CAMPAIGN" == /oscar/scratch/rgao48/ambi/posttanh-prior-strength-20261105 ]]
+    ;;
+  strength_x003)
+    [[ "$index" == 0 ]]
+    [[ "$AMBI_PRIOR_CAMPAIGN" == /oscar/scratch/rgao48/ambi/posttanh-prior-strength-x003-20261106 ]]
+    ;;
+  *) exit 2 ;;
+esac
 [[ "$(git rev-parse HEAD)" == "$AMBI_EXPECTED_COMMIT" ]]
 [[ -z "$(git status --porcelain --untracked-files=all)" ]]
 [[ "${SLURM_RESTART_COUNT:-0}" == 0 ]]
 unset CUDA_LAUNCH_BLOCKING WANDB_RESUME WANDB_RUN_ID
-export AMBI_PRIOR_VARIANT=strength WANDB_MODE=disabled
+export WANDB_MODE=disabled
 export MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0
 export PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1

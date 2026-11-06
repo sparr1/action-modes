@@ -1,0 +1,28 @@
+{
+  "study_type": "posttanh_prior_fixes",
+  "study_note": "One outer-adapt H3/J8/K1 Humanoid Walk run, seed 55, one million decisions: existing BOOM sampled-action alignment with lambda 0.0126 (0.03 times 0.42). Matches W&B run 03bc3869a52b4a69a64d180fc28f4d1e scientifically except lambda 0.0042 becomes 0.0126. Retains S > 2 gating, post-tanh entropy alpha 0.0021, strict compilation, whole-inner CUDA graphs, GPU replay, vmap critics, TF32-high, and periodic critic geometry. This is a coefficient ablation of the existing BOOM implementation.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_posttanh_prior_outer_adapt_boom_x0p03"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "name": "AMBI post-tanh outer-adapt BOOM strength x0.03",
+  "description": "One outer-adapt H3/J8/K1 Humanoid Walk run, seed 55, one million decisions: existing BOOM sampled-action alignment with lambda 0.0126 (0.03 times 0.42). Matches W&B run 03bc3869a52b4a69a64d180fc28f4d1e scientifically except lambda 0.0042 becomes 0.0126. Retains S > 2 gating, post-tanh entropy alpha 0.0021, strict compilation, whole-inner CUDA graphs, GPU replay, vmap critics, TF32-high, and periodic critic geometry. This is a coefficient ablation of the existing BOOM implementation."
+}

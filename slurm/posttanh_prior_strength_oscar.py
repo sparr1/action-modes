@@ -1,4 +1,4 @@
-"""Four coefficient-only AMBI runs, reusing verified unchanged-learner evidence."""
+"""Coefficient-only AMBI runs, reusing verified unchanged-learner evidence."""
 import argparse
 from copy import deepcopy
 import hashlib
@@ -12,13 +12,16 @@ from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-os.environ["AMBI_PRIOR_VARIANT"] = "strength"
+VARIANT = os.environ.setdefault("AMBI_PRIOR_VARIANT", "strength")
 from slurm import posttanh_prior_fixes_oscar as base
 
 ORIGINAL_COMMIT = "342c7f1ec4d55fe18257499431eed335226e335a"
 ORIGINAL_ROOT = Path("/oscar/scratch/rgao48/ambi/posttanh-prior-fixes-20261104")
-ARMS = (("boom", .1, 2), ("boom", .01, 2),
-        ("tdmpc_square", .1, 1), ("tdmpc_square", .01, 1))
+ARMS = {
+    "strength": (("boom", .1, 2), ("boom", .01, 2),
+                 ("tdmpc_square", .1, 1), ("tdmpc_square", .01, 1)),
+    "strength_x003": (("boom", .03, 2),),
+}[VARIANT]
 
 
 def read(path):
@@ -27,7 +30,7 @@ def read(path):
 
 def verify_variants():
     manifest = read(base.MANIFEST)
-    assert len(manifest["configs"]) == 4 and manifest["trials"] == 1
+    assert len(manifest["configs"]) == len(ARMS) and manifest["trials"] == 1
     assert manifest["overrides_alg"]["total_steps"] == 1000000
     assert manifest["checkpoint_every"] == 25000
     for index, (method, multiplier, _) in enumerate(ARMS):
@@ -91,7 +94,7 @@ def prepare():
                       "cpu_comparison": [{"cpus": r["physical_cpus"],
                                           "seconds_per_decision": r["measured"]["seconds_per_decision"],
                                           "average_cpu_cores_used": r["measured"]["average_cpu_cores_used"]} for r in rows]})
-    space = base.checkpoint_space(campaign, 4 * 40 * max(p["checkpoint_bytes"] for p in plans))
+    space = base.checkpoint_space(campaign, len(ARMS) * 40 * max(p["checkpoint_bytes"] for p in plans))
     base.write_new(campaign / "preflight.json", {"binding": base.binding(base.MANIFEST),
                    "source_evidence": evidence, "plans": plans, "space": space})
     print(json.dumps({"prepared": True, "plans": plans, "space": space}), flush=True)
@@ -122,7 +125,7 @@ def start(index):
     plan = base.select_plan([report])
     # Keep the already-budgeted measured reservation; refuse an unexpectedly slow node.
     assert plan["wall_hours"] <= arm["allocated_hours"], (plan, arm["allocated_hours"])
-    space = base.checkpoint_space(gate, 4 * 40 * report["checkpoint_bytes"])
+    space = base.checkpoint_space(gate, len(ARMS) * 40 * report["checkpoint_bytes"])
     receipt = {"passed": True, "binding": report["binding"], "runtime": report["runtime"],
                "plan": plan, "space": space, "cases": [str(report_path)],
                "graph_native_graph_continuation": True,
@@ -141,7 +144,7 @@ def start(index):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("mode", choices=("prepare", "start"))
-    parser.add_argument("--index", type=int, choices=range(4))
+    parser.add_argument("--index", type=int, choices=range(len(ARMS)))
     args = parser.parse_args()
     if args.mode == "prepare":
         prepare()

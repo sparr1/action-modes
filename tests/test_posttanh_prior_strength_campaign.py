@@ -10,11 +10,12 @@ ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / 'configs/dmcontrol/experiments/ambi_posttanh_prior_strength.json'
 
 
-@pytest.mark.parametrize('method,key,original', [
-    ('boom', 'outer_boom_coef', .42),
-    ('tdmpc_square', 'outer_behavior_policy_kl_coef', 1.),
-])
-@pytest.mark.parametrize('suffix,multiplier', [('0p1', .1), ('0p01', .01)])
+@pytest.mark.parametrize('method,key,original,suffix,multiplier', [
+    (method, key, original, suffix, multiplier)
+    for method, key, original in [('boom', 'outer_boom_coef', .42),
+                                 ('tdmpc_square', 'outer_behavior_policy_kl_coef', 1.)]
+    for suffix, multiplier in [('0p1', .1), ('0p01', .01)]
+] + [('boom', 'outer_boom_coef', .42, '0p03', .03)])
 def test_coefficient_is_the_only_scientific_change(method, key, original, suffix, multiplier):
     source_name = f'ambi_posttanh_prior_outer_adapt_{method}'
     source = json.loads((ROOT/'configs/dmcontrol/algs'/f'{source_name}.json').read_text())
@@ -40,3 +41,13 @@ def test_exact_four_cells_and_original_budget():
                            for method in ('boom', 'tdmpc_square') for suffix in ('0p1', '0p01')]
     assert m['trials'] == 1 and m['overrides_alg']['seed'] == 55
     assert m['overrides_alg']['total_steps'] == 1000000 and m['checkpoint_every'] == 25000
+
+
+def test_boom_x003_is_one_matched_cell():
+    source = json.loads(MANIFEST.read_text())
+    target = json.loads(MANIFEST.with_name('ambi_posttanh_prior_strength_x0p03.json').read_text())
+    assert target['configs'] == ['ambi_posttanh_prior_outer_adapt_boom_x0p03']
+    for key in ('study_note', 'name', 'description', 'configs'):
+        source.pop(key)
+        target.pop(key)
+    assert target == source
