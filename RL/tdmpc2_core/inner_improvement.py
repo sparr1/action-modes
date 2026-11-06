@@ -7393,11 +7393,10 @@ class InnerImprovementEngine(RetraceInnerMixin):
             from .whole_inner_graph import validate_training_graph, training_graph_act
             validate_training_graph(self)
             if not eval_mode and not collect_diagnostics and trace is None:
-                if return_behavior_policy:
-                    raise ValueError("Collection CUDA graph does not support behavior-policy metadata.")
                 try:
                     return training_graph_act(
                         self, root_z, t0=t0, capture_teacher_policy=capture_teacher_policy,
+                        return_behavior_policy=return_behavior_policy,
                     )
                 except BaseException:
                     self.last_teacher_policy = None

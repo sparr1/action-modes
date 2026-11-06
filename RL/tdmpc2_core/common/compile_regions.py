@@ -88,13 +88,20 @@ def _restore_rng_state(state):
 
 
 class CompileRegion:
-    """Lazily compile one tensor region with a warning/eager fallback."""
+    """Lazily compile one tensor region with a warning/eager fallback.
 
-    def __init__(self, name, eager, *, enabled=False, strict=False):
+    ``mode`` is an optional PyTorch compile mode for this region alone. The
+    default preserves the historical compiler arguments. A caller requesting
+    CUDA graphs can choose ``"reduce-overhead"`` for a compatible tensor region
+    without changing other regions or their fallback policy.
+    """
+
+    def __init__(self, name, eager, *, enabled=False, strict=False, mode="default"):
         self.name = str(name)
         self.eager = eager
         self.strict = bool(strict)
         self.enabled = bool(enabled)
+        self.mode = mode
         self.failed = False
         self._compiled = None
         self._warned = False
@@ -143,6 +150,7 @@ class CompileRegion:
                     self.eager,
                     fullgraph=self.strict,
                     dynamic=False,
+                    **({"mode": self.mode} if self.mode != "default" else {}),
                 )
             except Exception as error:
                 _restore_rng_state(construction_rng_state)

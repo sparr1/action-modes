@@ -104,6 +104,10 @@ _AMBI_DEFAULTS = {
     # Distillation replaces the primary prior's Q term with imitation of the
     # final adapted inner actor. Ordinary SAC remains the default.
     "outer_actor_objective": "q_maximization",
+    # BOOM aligns sampled actions with the saved adapted-policy mean.
+    "outer_boom_coef": "auto",
+    "outer_boom_min_std": 0.05,
+    "outer_boom_compile_mode": "default",
     "reanalyze_interval": 10,
     "reanalyze_batch_size": 20,
     "reanalyze_backend": "native",
@@ -121,6 +125,8 @@ _AMBI_DEFAULTS = {
     # action-generating policy. ``none`` preserves the historical runtime and
     # replay schema; active schedules require stochastic inner SAC execution.
     "outer_behavior_policy_objective": "reverse_kl",
+    "outer_behavior_policy_weighting": "constant",
+    "outer_behavior_policy_compile_mode": "default",
     "outer_behavior_policy_kl_schedule": "none",
     "outer_behavior_policy_kl_coef": 1.0,
     "outer_behavior_policy_kl_min_valid_count": "auto",
@@ -497,6 +503,13 @@ def _validate_gsde_config(cfg):
         raise ValueError("actor_distribution='gsde' supports inner_operator='none' or 'sac'.")
     if cfg.inner_operator == "sac" and cfg.inner_schedule_mode != "canonical":
         raise ValueError("actor_distribution='gsde' requires the canonical inner SAC schedule.")
+    # BOOM uses the saved behavior mean and the current marginal variance;
+    # neither depends on an independent collection-time action-noise sample.
+    if cfg.outer_actor_objective not in {"q_maximization", "boom"}:
+        raise ValueError(
+            "actor_distribution='gsde' supports outer_actor_objective="
+            "'q_maximization' or 'boom'."
+        )
     requirements = {
         "inner_sac_return_estimator": "one_step",
         "inner_explorer_mode": "none",
@@ -509,7 +522,6 @@ def _validate_gsde_config(cfg):
         "inner_actor_source": "sac",
         "inner_horizon_actor_source": "sac",
         "critic_value_mode": "single",
-        "outer_actor_objective": "q_maximization",
         "reanalyze_backend": "native",
         "outer_policy_episode_probability": 0.0,
     }
@@ -1663,8 +1675,36 @@ class AMBITDMPC2(TDMPC2Baseline):
             merged[key] = _strict_positive_int(merged[key], key)
         merged["outer_actor_objective"] = _normalize_choice(
             merged["outer_actor_objective"], "outer_actor_objective",
-            {"q_maximization", "distillation"},
+            {"q_maximization", "distillation", "boom"},
         )
+        merged["outer_boom_compile_mode"] = _normalize_choice(
+            merged["outer_boom_compile_mode"], "outer_boom_compile_mode",
+            {"default", "reduce-overhead"},
+        )
+        if isinstance(merged["outer_boom_coef"], str):
+            merged["outer_boom_coef"] = _normalize_choice(
+                merged["outer_boom_coef"], "outer_boom_coef", {"auto"},
+            )
+        else:
+            merged["outer_boom_coef"] = _strict_nonnegative_float(
+                merged["outer_boom_coef"], "outer_boom_coef",
+            )
+        merged["outer_boom_min_std"] = _strict_nonnegative_float(
+            merged["outer_boom_min_std"], "outer_boom_min_std",
+        )
+        if merged["outer_boom_min_std"] <= 0.0:
+            raise ValueError("outer_boom_min_std must be positive.")
+        if (
+            merged["outer_actor_objective"] == "boom"
+            and str(merged["sac_actor_loss_scale_mode"]).lower()
+            != "tdmpc2_percentile_range"
+        ):
+            raise ValueError(
+                "outer_actor_objective='boom' requires explicit "
+                "sac_actor_loss_scale_mode='tdmpc2_percentile_range'; "
+                "BOOM uses the same running Q scale for Q maximization, "
+                "alignment weights, and alignment loss."
+            )
         merged["reanalyze_interval"] = _strict_nonnegative_int(
             merged["reanalyze_interval"], "reanalyze_interval",
         )
@@ -1803,6 +1843,11 @@ class AMBITDMPC2(TDMPC2Baseline):
                 inner_temperature_mode="inherit_outer",
             )
         cfg = super()._build_cfg(merged)
+        if cfg.outer_boom_coef == "auto":
+            dimension = int(cfg.action_dim)
+            cfg.outer_boom_coef = dimension / (
+                1000.0 if 24 <= dimension <= 48 else 50.0
+            )
         cfg.critic_ensemble_backend = normalize_critic_ensemble_backend(
             cfg.critic_ensemble_backend
         )
@@ -2492,6 +2537,30 @@ class AMBITDMPC2(TDMPC2Baseline):
                 f"{sorted(_BEHAVIOR_POLICY_KL_SCHEDULES)}, got {schedule!r}."
             )
         cfg.outer_behavior_policy_kl_schedule = schedule
+        cfg.outer_behavior_policy_weighting = _normalize_choice(
+            cfg.outer_behavior_policy_weighting, "outer_behavior_policy_weighting",
+            {"constant", "tdmpc_square"},
+        )
+        cfg.outer_behavior_policy_compile_mode = _normalize_choice(
+            cfg.outer_behavior_policy_compile_mode, "outer_behavior_policy_compile_mode",
+            {"default", "reduce-overhead"},
+        )
+        if cfg.outer_behavior_policy_weighting == "tdmpc_square":
+            requirements = {
+                "outer_behavior_policy_objective": "action_space_cross_entropy",
+                "outer_behavior_policy_kl_schedule": "quantile_gate",
+                "sac_actor_loss_scale_mode": "tdmpc2_percentile_range",
+                "outer_actor_objective": "q_maximization",
+                "critic_value_mode": "single",
+            }
+            for key, required in requirements.items():
+                if getattr(cfg, key) != required:
+                    raise ValueError(
+                        "outer_behavior_policy_weighting='tdmpc_square' requires "
+                        f"{key}={required!r}."
+                    )
+            if cfg.rho < 0.0:
+                raise ValueError("TD-M(PC)^2 behavior weighting requires rho >= 0.")
         if objective == "action_space_cross_entropy" and schedule == "dual":
             raise ValueError(
                 "outer_behavior_policy_objective='action_space_cross_entropy' "
@@ -2571,7 +2640,8 @@ class AMBITDMPC2(TDMPC2Baseline):
                     "inner_execution_action='policy_sample' and "
                     "inner_execution_std_scale > 0."
                 )
-        cfg.store_behavior_policy = schedule != "none"
+        cfg.store_behavior_policy = schedule != "none" or cfg.outer_actor_objective == "boom"
+        cfg.store_teacher_policy = False
         cfg.log_std_mapping = normalize_log_std_mapping(
             cfg.log_std_mapping, "log_std_mapping"
         )
@@ -3125,6 +3195,34 @@ class AMBITDMPC2(TDMPC2Baseline):
         _validate_gsde_config(cfg)
         _validate_retrace_config(cfg)
         _validate_horizon_conditioning_config(cfg)
+        if cfg.outer_actor_objective == "boom":
+            if cfg.rho < 0:
+                raise ValueError(
+                    "outer_actor_objective='boom' requires rho >= 0 "
+                    "for valid temporal weights."
+                )
+            # Frozen checkpoint evaluation may execute the learned prior
+            # directly. Training still needs SAC's saved behavior-policy mean.
+            frozen_prior_evaluation = (
+                getattr(self, "experiment_params", {}).get("frozen_checkpoint_evaluation") is True
+                and cfg.inner_operator == "none"
+            )
+            requirements = {
+                "inner_operator": "none" if frozen_prior_evaluation else "sac",
+                "inner_actor_source": "sac",
+                "inner_execution_policy_source": "primary",
+                "inner_explorer_mode": "none",
+                "outer_behavior_policy_kl_schedule": "none",
+                "critic_value_mode": "single",
+                "aux_return_mode": "off",
+            }
+            for key, required in requirements.items():
+                if getattr(cfg, key) != required:
+                    raise ValueError(
+                        "outer_actor_objective='boom' requires "
+                        f"{key}={required!r}."
+                    )
+
         _validate_split_value_config(cfg)
         validate_auxiliary_config(cfg)
 

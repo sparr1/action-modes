@@ -1875,6 +1875,165 @@ For intentional weight transfer, load the raw model state into a fresh agent,
 which resets the running scale. The existing mode name and default `"none"`
 are retained; enabling normalization is still an explicit configuration choice.
 
+### BOOM actor alignment
+
+Set `outer_actor_objective="boom"` to add the released BOOM sampled-action
+alignment objective to the outer actor's Q and entropy loss. This is an AMBI
+adaptation of [BOOM's official implementation](https://github.com/molumitu/BOOM_MBRL/blob/b3b2f09c03533c15b804ced9abc6767e73ff8e1e/boom/boom_alg.py#L235-L280),
+with the Gaussian helper's extra action-dimension multiplier removed. It is
+not the replay-action negative log-likelihood in
+[the paper's Eq. 3](https://arxiv.org/html/2511.00423#S3.SS2).
+
+For each of the `H` action-bearing latent states, sample the current actor once:
+
+```text
+a[t,b] = tanh(mean_theta[t,b] + std_theta[t,b] * eps[t,b])
+b[t,b] = tanh(stop_gradient(replayed_behavior_pre_tanh_mean[t,b]))
+c[t,b] = stop_gradient(max(std_theta[t,b], outer_boom_min_std))
+q[t,b] = configured_reduction(Q(z[t,b], a[t,b]))
+S <- EMA(max(P95(q[0]) - P5(q[0]), 1))
+w[t,:] = stop_gradient(masked_softmax(q[t,:] / S, valid[t,:]))
+nll[t,b] = sum_j(0.5 * ((a[t,b,j] - b[t,b,j]) / c[t,b,j])**2
+                  + log(c[t,b,j]) + 0.5 * log(2*pi))
+alignment[t] = sum_b(w[t,b] * nll[t,b])
+loss = mean_t(rho**t * (mean_b(alpha * selected_log_prob[t,b] - q[t,b]/S)
+             + outer_boom_coef * indicator(S > 2) * alignment[t]/S))
+```
+
+`selected_log_prob` denotes minus the configured entropy statistic; standard
+`"squashed"` entropy remains the default. The Q reduction and critic-target
+recipe are also unchanged. The same current actor-action Q sample supplies
+both Q maximization and detached alignment weights, with no additional critic
+forward. Standard deviations and targets are detached, but actor mean and
+standard-deviation gradients still flow through the sampled, squashed action.
+There is no tanh density correction in the alignment score and no extra
+dimension multiplier or division by action dimension.
+
+The target is the immutable action-space mean of the policy used for
+collection. In AMBI this is the adapted inner actor, rather than BOOM's
+selected MPPI elite action before exploration. Existing replay behavior fields
+are captured automatically. Stored behavior variance is not used. Random seed
+actions have invalid labels; weights normalize over valid batch rows at each
+depth, and a depth with no valid labels contributes zero alignment. Q and
+entropy learning continue even when all labels are invalid. No teacher cache
+or reanalysis is required. Unlike ordinary AMBI's `H+1` actor states, BOOM uses
+only the `H` nonterminal states for all three actor terms, matching its source
+implementation. Temporal weights are divided by `H`, not renormalized after
+masking.
+
+BOOM also supports the canonical full-clone gSDE inner-SAC path, including all
+three collection-noise lifetimes and collection CUDA graphs. Its saved target
+is still `tanh(pre_tanh_mean)` of the adapted execution policy; the current
+actor's induced marginal standard deviation supplies the detached denominator.
+The target does not include the particular persistent exploration-matrix draw.
+This remains an action-attraction surrogate, not a conditional likelihood of
+the temporally correlated behavior process. The same BOOM coefficient, Q
+weighting, standard-deviation floor, and gate apply.
+
+BOOM explicitly requires the existing percentile Q-scaling option, including
+its fixed-temperature compatibility requirements. The scale starts at one;
+`sac_actor_loss_scale_tau` defaults to `0.01`. Its just-updated value is shared
+by Q normalization, softmax temperature, alignment normalization, and the
+strict `S > 2` gate. Selecting BOOM does not silently enable the global scaling
+option or change its existing inner-learner/critic-target semantics.
+
+Add these settings to a supported ordinary inner-SAC configuration:
+
+```json
+{
+  "outer_actor_objective": "boom",
+  "outer_boom_coef": "auto",
+  "outer_boom_min_std": 0.05,
+  "sac_actor_loss_scale_mode": "tdmpc2_percentile_range",
+  "sac_actor_loss_scale_tau": 0.01,
+  "ent_coef": 0.0001,
+  "inner_temperature_mode": "inherit_outer"
+}
+```
+
+`outer_boom_coef="auto"` resolves to the released implementation's explicit
+coefficient: `d/1000` for `24 <= d <= 48`, otherwise `d/50`. A finite nonnegative
+numeric value overrides it. This preserves that explicit coefficient, **not**
+the accidental additional `d` hidden in the original Gaussian helper; at the
+same coefficient our alignment gradient is consequently `d` times smaller.
+Zero is a no-alignment ablation within BOOM's H-state/scaling convention.
+`outer_boom_min_std` is finite and positive, defaulting to `0.05`.
+
+The first implementation supports primary inner SAC without explorers,
+auxiliary return learners, split-value critics, or another outer behavior
+regularizer. Mean and stochastic execution are both supported. It preserves
+the configured inner adaptation budget and lifecycle. The existing frozen
+checkpoint evaluator may use `inner_operator="none"` for prior-only evaluation;
+ordinary training still requires SAC to capture the behavior-policy target.
+Inactive BOOM settings do not alter existing scientific identities or default
+losses.
+
+Checkpoint version 9 records the BOOM objective, coefficient, target, std
+floor, weighting, temporal convention, and existing shared Q-scale state.
+Structured checkpoints reject cross-objective or changed BOOM specifications
+before mutation; raw model-only loading remains an explicit weight-transfer
+path. Exact resume also retains the immutable replay metadata.
+
+`train/boom_*` diagnostics report weighted NLL, gated/scaled and final alignment
+loss, the RL component, coefficient, gate, valid fraction, weight entropy, and
+effective batch sample count. Existing actor Q-scale diagnostics expose `S`.
+The alignment helper uses fixed-shape tensor masking and no `.item()` or host
+gate. With `compile=true`, the full BOOM actor policy, critic evaluation, scale
+proposal, and loss run in one compiled tensor region. The default
+`outer_boom_compile_mode="default"` uses ordinary compilation. On CUDA, opt into
+PyTorch's CUDA graph optimization for this region and its compiled backward:
+
+```json
+{
+  "compile": true,
+  "outer_boom_compile_mode": "reduce-overhead"
+}
+```
+
+The mode is inactive without `compile=true` or for another actor objective;
+CPU execution uses ordinary compilation even when `"reduce-overhead"` is
+requested. CUDA graph replay depends on the installed PyTorch backend and
+capture eligibility. Adam, gradient clipping, and the persistent scale update
+remain outside the compiled region. The region returns a proposed scale,
+which the caller commits once after successful execution, so an eager retry
+cannot advance the scale twice. Persistent scalar metrics are packed into one
+owned tensor outside capture to protect them from subsequent graph replay;
+transient policy/Q samples need no extra copies. Non-strict compilation warns and
+falls back to eager on a forward compilation failure; `compile_strict=true`
+surfaces that failure. A backward failure is not silently retried.
+
+Replay time and batch axes are already processed together, and the default
+`critic_ensemble_backend="vmap"` evaluates dense Q heads in parallel. BOOM adds
+no extra Q forward or teacher reanalysis. The world-model/critic update and
+actor update remain sequential because the actor uses the updated critic.
+The compilation mode leaves the objective and portable checkpoint format
+unchanged; an active nondefault mode is recorded in strict resume identity
+because compiled arithmetic and RNG draws can differ from eager execution.
+CPU full-graph checks do not establish CUDA capture or GPU latency; measure
+warm steady-state GPU throughput before attributing a speedup to this option.
+
+The synthetic actor benchmark compares eager, ordinary compiled, and
+`reduce-overhead` execution from the same initial model and fresh Adam state.
+It reports the first update separately from warmup and steady-state wall/CUDA
+event timing, plus available compiler counters and the alignment gate fraction.
+It cycles through different latent minibatches, samples fresh policy actions
+and Q-head pairs, and keeps training dropout enabled. Run on an allocated GPU:
+
+```bash
+WANDB_MODE=disabled environments/dmcontrol/.venv/bin/python \
+  -m tests.benchmark_ambi_boom_actor --device cuda \
+  --batch 256 --horizon 3 --action-dim 21 --hidden-width 256 \
+  --warmup 10 --steps 100 --output /path/to/boom-actor-benchmark.json
+```
+
+For a bounded CPU smoke, use `--device cpu --modes eager --batch 8 --horizon 2
+--action-dim 3 --hidden-width 32 --warmup 1 --steps 3`. The benchmark disables
+W&B in both the environment and learner configuration, rejects CUDA graph
+timing on CPU, and fails a compiled mode if compilation fails instead of
+timing an unnoticed eager fallback. This measures the actor step only; it
+excludes replay sampling, world-model/critic training, and environment work.
+
+
 ### Generalized state-dependent exploration (gSDE)
 
 Set `actor_distribution="gsde"` to replace the outer actor's standard-deviation
@@ -1973,6 +2132,9 @@ specialized planner/teacher backends, and direct
 outer-policy episode interventions are rejected during configuration resolution.
 In particular, a fixed-input gSDE marginal density is not a conditional behavior
 likelihood given a history of actions sharing the same matrix.
+The outer actor objective can be ordinary Q maximization or BOOM alignment.
+BOOM additionally requires its fixed-temperature percentile Q scaling,
+primary-SAC execution, and no auxiliary critic or other behavior-KL penalty.
 
 Portable gSDE checkpoints require feature-source and mean-clipping metadata;
 there is no implicit Gaussian-std-head conversion. Portable weight loading can
@@ -2016,6 +2178,12 @@ lifetimes. Captured optimization uses the graph's private RNG protocol,
 `isolated_cuda_graph_with_live_gsde_inputs_v1`, recorded in checkpoints; this is
 distinct from ordinary phase-separated optimization. The existing Gaussian
 graph protocol is unchanged.
+
+Collection graphs also capture BOOM's behavior-policy metadata without drawing
+additional noise or advancing the live refresh counters again. The live
+adapter copies these outputs before graph storage is reused. Behavior records
+describe the executed policy, including execution standard-deviation scaling;
+optional teacher records remain separate and unscaled.
 
 The bounded benchmark measures actor forward/backward and complete inner
 solves, separates first-call/compile cost from warmed timing, synchronizes CUDA,

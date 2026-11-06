@@ -230,12 +230,42 @@ def scientific_trial_parameters(
                 # enabling it changes the collection RNG/checkpoint protocol.
                 if algorithm.get("inner_cuda_graph", False) is False:
                     algorithm.pop("inner_cuda_graph", None)
+                behavior_weighting = algorithm.get("outer_behavior_policy_weighting", "constant")
+                if isinstance(behavior_weighting, str):
+                    behavior_weighting = behavior_weighting.lower()
+                if behavior_weighting == "constant":
+                    # The new opt-in recipe must not change historical identities.
+                    algorithm.pop("outer_behavior_policy_weighting", None)
+                else:
+                    algorithm["outer_behavior_policy_weighting"] = behavior_weighting
+                behavior_compile_mode = str(
+                    algorithm.get("outer_behavior_policy_compile_mode", "default")
+                ).lower()
+                if (behavior_weighting != "tdmpc_square" or not algorithm.get("compile", False)
+                        or behavior_compile_mode == "default"):
+                    algorithm.pop("outer_behavior_policy_compile_mode", None)
+                else:
+                    algorithm["outer_behavior_policy_compile_mode"] = behavior_compile_mode
                 objective = algorithm.get("outer_actor_objective", "q_maximization")
                 if isinstance(objective, str):
                     objective = objective.lower()
+                boom_compile_mode = str(
+                    algorithm.get("outer_boom_compile_mode", "default")
+                ).lower()
+                if (objective != "boom" or not algorithm.get("compile", False)
+                        or boom_compile_mode == "default"):
+                    algorithm.pop("outer_boom_compile_mode", None)
+                else:
+                    # Like the existing compile flag, an active execution
+                    # change belongs to exact-resume identity even though the
+                    # mathematical objective and portable weights are unchanged.
+                    algorithm["outer_boom_compile_mode"] = boom_compile_mode
                 # Derived storage flags carry no independent scientific choice.
                 # Omitted and disabled controls preserve historical fingerprints.
                 algorithm.pop("store_teacher_policy", None)
+                if objective != "boom":
+                    algorithm.pop("outer_boom_coef", None)
+                    algorithm.pop("outer_boom_min_std", None)
                 if objective == "q_maximization":
                     for field in (
                         "outer_actor_objective", "reanalyze_interval", "reanalyze_batch_size",
@@ -275,6 +305,26 @@ def scientific_trial_parameters(
                         algorithm.pop("reanalyze_batched_optimizations", None)
                         algorithm.pop("reanalyze_batched_workers", None)
                         algorithm.pop("reanalyze_batched_first_layer_fusion", None)
+                elif objective == "boom":
+                    algorithm["outer_actor_objective"] = objective
+                    coefficient = algorithm.get("outer_boom_coef", "auto")
+                    algorithm["outer_boom_coef"] = (
+                        coefficient.lower() if isinstance(coefficient, str)
+                        else float(coefficient)
+                    )
+                    algorithm["outer_boom_min_std"] = float(
+                        algorithm.get("outer_boom_min_std", 0.05)
+                    )
+                    # BOOM reads immutable collection labels, without reanalysis.
+                    # Its replay storage flag is derived from the objective.
+                    for field in (
+                        "store_behavior_policy", "reanalyze_interval",
+                        "reanalyze_batch_size", "reanalyze_backend",
+                        "reanalyze_parallel_roots", "reanalyze_batched_optimizations",
+                        "reanalyze_batched_workers",
+                        "reanalyze_batched_first_layer_fusion",
+                    ):
+                        algorithm.pop(field, None)
                 algorithm = normalize_lora_rl_identity(algorithm)
                 algorithm = normalize_pave_identity(algorithm)
                 # Auxiliary eligibility needs the explicit backend before the

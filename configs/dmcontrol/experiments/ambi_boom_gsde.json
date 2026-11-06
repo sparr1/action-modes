@@ -1,0 +1,52 @@
+{
+  "study_type": "boom_gsde_noise_persistence",
+  "study_note": "Three exploratory seed55 Humanoid Walk runs combining the selected BOOM x0.01 outer-adapt recipe with real_steps, solve, and round gSDE collection noise. One million real decisions, H3/J8/K1/N128/C16/A4/B256, squashed entropy, lambda0.0042, fixed alpha0.0021, standard S>2 gate, strict compilation, vmap and collection CUDA graphs. Checkpoints every25k and observational critic geometry every1k. No scientific change beyond the requested gSDE distribution/noise scope.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_boom_x0p01_gsde_real_steps",
+    "ambi_boom_x0p01_gsde_solve",
+    "ambi_boom_x0p01_gsde_round"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "reference_runs": {
+    "boom": {
+      "id": "03bc3869a52b4a69a64d180fc28f4d1e",
+      "url": "https://forge.coreweave.com/wandb/rwgao_b-brown-university/ambi/runs/03bc3869a52b4a69a64d180fc28f4d1e",
+      "config_sha256": "40a9bcde08b3b67fcdc952341a10ce55ae638722bc434cb3bd15f1e08f54aaa4"
+    },
+    "gsde": {
+      "real_steps": {
+        "id": "590be7c27a9b40eaa9a68218cdb74d0a",
+        "url": "https://forge.coreweave.com/wandb/rwgao_b-brown-university/ambi/runs/590be7c27a9b40eaa9a68218cdb74d0a",
+        "config_sha256": "c3976af6ca9bba842e198bd5e620a64b8dff2ed1d361b16c85160aa997652010"
+      },
+      "solve": {
+        "id": "8e9fa1727be040be8cfc6f49a95a98f2",
+        "url": "https://forge.coreweave.com/wandb/rwgao_b-brown-university/ambi/runs/8e9fa1727be040be8cfc6f49a95a98f2",
+        "config_sha256": "655544505985b2313b2e0196d78b82df5edccf008dd266110585500abef90f3b"
+      },
+      "round": {
+        "id": "b945d2adcf66493a89c06dc05ded2237",
+        "url": "https://forge.coreweave.com/wandb/rwgao_b-brown-university/ambi/runs/b945d2adcf66493a89c06dc05ded2237",
+        "config_sha256": "d7dcca5ccf119276fc39885409441ab81f2e842485a3812203a3db42b388ba08"
+      }
+    }
+  }
+}

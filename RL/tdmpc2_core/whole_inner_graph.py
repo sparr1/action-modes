@@ -184,18 +184,19 @@ class WholeInnerGraph:
 
     ``capture=False`` uses exactly the same RNG protocol and provides the
     uncaptured arithmetic reference. Outputs own captured storage and must be
-    copied before another call. The live adapter below owns those teacher copies.
+    copied before another call. The live adapter below owns those policy copies.
     """
 
     def __init__(self, engine, root, *, capture=True, seed=8173, warmup=4,
-                 capture_teacher_policy=False):
+                 capture_teacher_policy=False, return_behavior_policy=False):
         _validate_fresh_config(engine.cfg, require_compile=False)
         if engine.device.type != "cuda" or root.device.type != "cuda":
             raise ValueError("WholeInnerGraph requires a CUDA engine and root.")
         if (root.ndim != 2 or root.shape != (1, int(engine.cfg.latent_dim))
                 or root.dtype != torch.float32):
             raise ValueError("WholeInnerGraph requires one float32 [1, latent_dim] root.")
-        if not isinstance(capture, bool) or not isinstance(capture_teacher_policy, bool):
+        if not all(isinstance(flag, bool) for flag in
+                   (capture, capture_teacher_policy, return_behavior_policy)):
             raise TypeError("Collection graph capture controls must be bool.")
         if isinstance(warmup, bool) or not isinstance(warmup, int) or warmup < 3:
             raise ValueError("Collection graph warmup must be an integer of at least three.")
@@ -209,6 +210,7 @@ class WholeInnerGraph:
         self._engine_act = engine.act
         self.capture_enabled = capture
         self.capture_teacher_policy = capture_teacher_policy
+        self.return_behavior_policy = return_behavior_policy
         self.calls, self.seed = 0, int(seed)
         self.graph = None
         self.root = root.detach().clone()
@@ -284,6 +286,7 @@ class WholeInnerGraph:
         result = self._engine_act(
             self.root, t0=True, collect_diagnostics=False, eval_mode=False,
             capture_teacher_policy=self.capture_teacher_policy,
+            return_behavior_policy=self.return_behavior_policy,
         )
         if self.capture_teacher_policy:
             return (*result, self.engine.last_teacher_policy)
@@ -355,17 +358,21 @@ def preflight_training_graph_state(engine, saved):
     return deepcopy(saved)
 
 
-def training_graph_act(engine, root, *, t0=False, capture_teacher_policy=False):
-    """Collect with the production private stream, keeping teachers owned."""
+def training_graph_act(engine, root, *, t0=False, capture_teacher_policy=False,
+                       return_behavior_policy=False):
+    """Collect with the production private stream and owned policy metadata."""
+    capture_behavior = bool(getattr(engine.cfg, "store_behavior_policy", False)) or return_behavior_policy
     runner = engine._whole_graph_runner
-    if runner is None or runner.capture_teacher_policy != capture_teacher_policy:
+    if (runner is None or runner.capture_teacher_policy != capture_teacher_policy
+            or getattr(runner, "return_behavior_policy", False) != capture_behavior):
         from .inner_improvement import InnerImprovementEngine
         saved = training_graph_state(engine) if runner is not None else engine._whole_graph_resume
         worker = InnerImprovementEngine(engine.agent)
         worker._whole_graph_worker = True
         with _preserve_host_rng_state():
             runner = WholeInnerGraph(worker, root, seed=int(engine.cfg.seed) + 8173,
-                                     capture_teacher_policy=capture_teacher_policy)
+                                     capture_teacher_policy=capture_teacher_policy,
+                                     return_behavior_policy=capture_behavior)
         if saved is not None:
             if saved["rng_state"] is not None:
                 runner.rng_state = saved["rng_state"].detach().cpu().clone()
@@ -387,8 +394,17 @@ def training_graph_act(engine, root, *, t0=False, capture_teacher_policy=False):
     if capture_teacher_policy:
         # Captured outputs are overwritten at the next action. Replay staging
         # and live callers must instead retain their own unscaled statistics.
-        engine.last_teacher_policy = {key: value.detach().clone() for key, value in result[3].items()}
+        teacher_index = 4 if capture_behavior else 3
+        engine.last_teacher_policy = {
+            key: value.detach().clone() for key, value in result[teacher_index].items()
+        }
     engine._timer_stop("inner_action_seconds", started)
     engine.action_index += 1
     engine.state.outer_version = int(engine.agent.outer_version)
-    return action, dict(values, inner_cuda_graph_used=1.0), lengths
+    output = action, dict(values, inner_cuda_graph_used=1.0), lengths
+    if return_behavior_policy:
+        # Behavior statistics describe the executed adapted actor (including
+        # execution std scaling), independently of unscaled teacher targets.
+        behavior = {key: value.detach().clone() for key, value in result[3].items()}
+        return (*output, behavior)
+    return output
