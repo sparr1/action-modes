@@ -95,6 +95,15 @@ or replay transfer. Unsupported configurations fail rather than falling back.
 The six inner-entropy campaign arms use this path with matching inner/outer
 `tdmpc2_scaled` or `squashed` entropy and percentile-range Q normalization.
 
+Training execution supports `inner_execution_action="policy_sample"` (the
+default) and `"mean"`. Mean execution returns `tanh(mu)` from the final adapted
+actor, without execution noise. This leaves stochastic imagined collection,
+SAC updates, and BOOM's saved adapted-policy mean/log-std labels unchanged.
+The mean is the deterministic policy action, not an estimate of the expectation
+of a tanh-transformed Gaussian. The single-cell manifest
+`configs/dmcontrol/experiments/ambi_boom_mean_execution.json` repeats the BOOM
+x0.01 Humanoid Walk recipe with only this scientific setting changed.
+
 The normalization input is refreshed before every replay. The validated
 `inner_actor_loss_scale_scope` / `inner_actor_loss_scale_update` pairs are
 `action/per_action` (copy outer and freeze), `action/per_update` (copy outer and

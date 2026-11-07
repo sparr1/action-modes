@@ -22,6 +22,7 @@ from slurm.benchmark_ambi_training_cpu import TrainingWindow, physical_core_cpus
 CAMPAIGNS = {
     "original": ("ambi_posttanh_prior_fixes.json", "posttanh-prior-fixes-20261104"),
     "strength": ("ambi_posttanh_prior_strength.json", "posttanh-prior-strength-20261105"),
+    "mean_execution": ("ambi_boom_mean_execution.json", "boom-mean-execution-20261107"),
 }
 _manifest_name, _campaign_name = CAMPAIGNS[os.environ.get("AMBI_PRIOR_VARIANT", "original")]
 MANIFEST = ROOT / "configs/dmcontrol/experiments" / _manifest_name
@@ -32,15 +33,24 @@ GPU_PARITY_TESTS = [
     "tests/test_ambi_boom_acceleration.py::test_boom_reduce_overhead_cuda_uses_fresh_samples_and_survives_restore",
     "tests/test_ambi_tdmpc_square_acceleration.py::test_cuda_compiled_ce_backward_changes_masks_and_retains_metrics",
 ]
+GPU_PARITY_COUNTS = [4, 6, 2, 1]
+if os.environ.get("AMBI_PRIOR_VARIANT") == "mean_execution":
+    GPU_PARITY_TESTS = [
+        "tests/test_ambi_mean_execution.py::test_cuda_mean_capture_preserves_labels_and_inner_state",
+        "tests/test_ambi_mean_execution.py::test_cuda_mean_graph_native_graph_and_checkpoint_continuation",
+        "tests/test_ambi_boom_acceleration.py::test_boom_reduce_overhead_cuda_uses_fresh_samples_and_survives_restore",
+    ]
+    GPU_PARITY_COUNTS = [1, 1, 2]
 
 
 def parity_cases(junit_path):
     """Reject a successful pytest exit that merely skipped unavailable CUDA."""
     cases = list(ET.parse(junit_path).getroot().iter("testcase"))
     names = [case.attrib["name"] for case in cases]
-    assert len(cases) == 13 and len(set(names)) == 13, names
+    count = sum(GPU_PARITY_COUNTS)
+    assert len(cases) == count and len(set(names)) == count, names
     expected = [node.rsplit("::", 1)[1] for node in GPU_PARITY_TESTS]
-    assert [sum(name == prefix or name.startswith(prefix + "[") for name in names) for prefix in expected] == [4, 6, 2, 1], names
+    assert [sum(name == prefix or name.startswith(prefix + "[") for name in names) for prefix in expected] == GPU_PARITY_COUNTS, names
     assert not any(case.find(tag) is not None for case in cases
                    for tag in ("skipped", "error", "failure")), names
     return names
@@ -50,7 +60,8 @@ def validate_global_parity(receipt, expected_binding, expected_runtime):
     assert receipt["passed"] is True
     assert receipt["binding"] == expected_binding
     assert receipt["runtime"] == expected_runtime
-    assert receipt["case_count"] == 13 and len(set(receipt["case_names"])) == 13
+    count = sum(GPU_PARITY_COUNTS)
+    assert receipt["case_count"] == count and len(set(receipt["case_names"])) == count
     assert receipt["test_nodes"] == GPU_PARITY_TESTS
     assert receipt["failures"] == receipt["errors"] == receipt["skipped"] == 0
 
@@ -330,9 +341,10 @@ def select_plan(rows):
     one = next(r for r in rows if r["physical_cpus"] == 1)
     selected = one if one["measured"]["seconds_per_decision"] <= 1.05 * fastest["measured"]["seconds_per_decision"] else fastest
     seconds = selected["measured"]["seconds_per_decision"]
+    margin = 1.15 if os.environ.get("AMBI_PRIOR_VARIANT") == "mean_execution" else 1.25
     return {"index": selected["index"], "cpus": selected["physical_cpus"],
             "seconds_per_decision": seconds,
-            "wall_hours": math.ceil(seconds * 1000000 * 1.25 / 3600 + .5),
+            "wall_hours": math.ceil(seconds * 1000000 * margin / 3600 + .5),
             "checkpoint_bytes": selected["checkpoint_bytes"]}
 
 
