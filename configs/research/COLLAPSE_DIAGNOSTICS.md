@@ -15,7 +15,7 @@ critic dropout during adaptation, and gSDE imagined-noise scopes. There are no
 entropy or scale interventions and no outer updates or checkpoint writes.
 
 The shared bank contains 32 upright states selected deterministically from a
-specified frozen prior's mean-action episodes with environment seeds 201–210.
+specified frozen prior's mean-action episodes with environment seeds 201–240.
 Candidates occur every 25 decisions from 25 onward and must have head height
 at least 1.2 and torso upright at least 0.8. Selection spans all eligible
 candidates. The bank records its source checkpoint, environment, and content

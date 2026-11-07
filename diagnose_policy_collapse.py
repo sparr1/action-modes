@@ -76,7 +76,7 @@ def make_bank(args):
         before = _outer_state_digest(model)
         controller = FrozenPriorController(model,'mean')
         candidates, episodes = [], []
-        for seed in range(201,211):
+        for seed in range(201,241):
             obs,_ = env.reset(seed=seed)
             total = 0.
             for step in range(500):
@@ -89,12 +89,14 @@ def make_bank(args):
                 total += float(reward)
                 if done or truncated: break
             episodes.append(dict(seed=seed,return_value=total,steps=step+1))
+        atomic_json(args.output/'collection.json',dict(eligible_candidates=len(candidates),
+            episodes=episodes,source=identity(args.checkpoint,context)))
         if len(candidates)<args.roots:
             raise ValueError(f'Only {len(candidates)} eligible upright states; need {args.roots}.')
         indices = np.linspace(0,len(candidates)-1,args.roots,dtype=int)
         data = dict(kind='collapse_upright_bank_v1',requested_roots=args.roots,
             source=identity(args.checkpoint,context), environment=config['environment'],
-            selection='Evenly spaced over all eligible states from fixed prior-mean seeds 201..210, steps 25..475.',
+            selection='Evenly spaced over all eligible states from fixed prior-mean seeds 201..240, steps 25..475.',
             roots=[candidates[i] for i in indices], eligible_candidates=len(candidates),collection_episodes=episodes)
         if before != _outer_state_digest(model): raise AssertionError('Bank collection mutated outer state.')
         data['id'] = canonical_hash(data)
