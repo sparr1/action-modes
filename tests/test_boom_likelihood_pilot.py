@@ -5,6 +5,7 @@ import xml.etree.ElementTree as ET
 import pytest
 
 from slurm.boom_likelihood_pilot_oscar import GPU_TESTS, MANIFEST, parity_cases, select_plan
+from slurm import boom_likelihood_pilot_oscar as pilot
 from tests.test_ambi_root_local_sac import _build_cfg
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,3 +56,26 @@ def test_resource_plan_uses_400k_budget_and_measured_cpu_tradeoff():
     plan = select_plan([row(1, .2), row(2, .196)])
     assert plan["cpus"] == 1 and plan["wall_hours"] == 29
     assert select_plan([row(1, .2), row(2, .17)])["cpus"] == 2
+
+
+@pytest.mark.parametrize("mismatch", [None, "commit", "gate", "dependency"])
+def test_release_only_resizes_the_bound_dependent_production_job(tmp_path, monkeypatch, mismatch):
+    state = {"commit": "abc", "runs": [{"index": 0, "gate_job": "41", "job": "42"}]}
+    if mismatch == "commit":
+        state["commit"] = "other"
+    if mismatch == "gate":
+        state["runs"][0]["gate_job"] = "40"
+    (tmp_path / "submission.json").write_text(json.dumps(state))
+    monkeypatch.setenv("SLURM_JOB_ID", "41")
+    calls = []
+    monkeypatch.setattr(pilot.base, "slurm_fields", lambda job: {"Dependency": "afterok:99(unfulfilled)" if mismatch == "dependency" else "afterok:41(unfulfilled)"})
+    monkeypatch.setattr(pilot.base, "resize_pending", lambda job, plan: calls.append((job, plan)) or {"CPUs/Task": "1"})
+    receipt = {"passed": True, "binding": {"commit": "abc"}, "plan": {"cpus": 1}}
+    if mismatch:
+        with pytest.raises(AssertionError):
+            pilot.release_production(receipt, tmp_path)
+        assert not calls
+    else:
+        pilot.release_production(receipt, tmp_path)
+        assert calls == [(42, {"cpus": 1})]
+        assert json.loads((tmp_path / "allocation.json").read_text())["production_job"] == 42

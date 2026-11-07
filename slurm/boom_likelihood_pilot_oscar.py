@@ -39,6 +39,21 @@ def select_plan(rows):
     return plan
 
 
+def release_production(receipt, campaign=CAMPAIGN):
+    """Release only this campaign's held dependent job, after fresh evidence."""
+    state = json.loads((campaign / "submission.json").read_text())
+    arm = state["runs"][0]
+    assert receipt["passed"] and state["commit"] == receipt["binding"]["commit"]
+    assert len(state["runs"]) == 1 and arm["index"] == 0
+    assert str(arm["gate_job"]) == os.environ["SLURM_JOB_ID"]
+    job = int(arm["job"])
+    fields = base.slurm_fields(job)
+    assert fields["Dependency"] == f"afterok:{arm['gate_job']}(unfulfilled)", fields
+    applied = base.resize_pending(job, receipt["plan"])
+    base.write_new(campaign / "allocation.json", {"production_job": job, "plan": receipt["plan"], "verified": applied})
+    print("PRODUCTION_RELEASED", job, flush=True)
+
+
 def gate(args):
     assert os.environ.get("WANDB_MODE") == "disabled"
     cores = base.physical_core_cpus(os.sched_getaffinity(0))
@@ -76,6 +91,8 @@ def gate(args):
     }
     base.write_new(args.output / "receipt.json", receipt)
     print("GATE_PASSED", json.dumps(receipt["plan"]), flush=True)
+    if args.release_production:
+        release_production(receipt)
 
 
 def train(args):
@@ -112,6 +129,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--gate", type=Path)
     parser.add_argument("--worker-cpus")
+    parser.add_argument("--release-production", action="store_true")
     args = parser.parse_args()
     args.index, args.native_reference = 0, False
     assert Path(os.environ["AMBI_PRIOR_CAMPAIGN"]) == CAMPAIGN

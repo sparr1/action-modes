@@ -43,3 +43,6 @@ export XDG_CACHE_HOME="$scratch_cache/cache" WANDB_DIR="$scratch_cache/wandb" WA
 export WANDB_DATA_DIR="$scratch_cache/data" WANDB_ARTIFACT_DIR="$scratch_cache/artifacts"
 export WANDB_DISABLE_CODE=true WANDB__REQUIRE_CORE=true
 srun --kill-on-bad-exit=1 "$AMBI_DMCONTROL_PYTHON" slurm/boom_likelihood_pilot_oscar.py "$mode" "$@"
+if [[ -n "${AMBI_WORKSPACE_PYTHON:-}" ]]; then
+    flock "$AMBI_PRIOR_CAMPAIGN/workspace.lock" "$AMBI_WORKSPACE_PYTHON" slurm/posttanh_prior_fixes_workspace.py "$AMBI_PRIOR_CAMPAIGN/submission.json"
+fi
