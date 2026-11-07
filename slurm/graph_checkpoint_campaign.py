@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
@@ -38,7 +39,8 @@ def checkpoint_steps(max_step, every=50000, descending=False):
     return sorted(range(every, max_step + 1, every), reverse=descending)
 
 
-def inventory(training_root, config_name, steps):
+def inventory(training_root, config_name, steps, *, allow_missing=False, known=()):
+    pinned = {row["step"]: row for row in known if "path" in row}
     rows = {}
     for metadata in sorted(training_root.glob("*/*/*.metadata.json")):
         weight = Path(str(metadata).removesuffix(".metadata.json"))
@@ -52,11 +54,48 @@ def inventory(training_root, config_name, steps):
             raise ValueError("Checkpoint inventory includes a different training configuration")
         if step in rows:
             raise ValueError("The requested checkpoint grid contains duplicates")
-        rows[step] = dict(step=step, path=str(weight.resolve()), sha256=series._file_digest(weight),
-                          metadata_path=str(metadata.resolve()), metadata_sha256=series._file_digest(metadata))
-    if set(rows) != set(steps):
+        metadata_sha256 = series._file_digest(metadata)
+        previous = pinned.get(step)
+        if previous is not None:
+            if (previous["path"] != str(weight.resolve()) or
+                    previous["metadata_path"] != str(metadata.resolve()) or
+                    previous["metadata_sha256"] != metadata_sha256):
+                raise ValueError("An inventoried checkpoint changed")
+            # Workers verify the full weight hash again immediately before use.
+            # Do not reread all existing weights on every discovery poll.
+            rows[step] = previous
+        else:
+            rows[step] = dict(step=step, path=str(weight.resolve()), sha256=series._file_digest(weight),
+                              metadata_path=str(metadata.resolve()), metadata_sha256=metadata_sha256)
+    if not set(pinned).issubset(rows):
+        raise ValueError("An inventoried checkpoint disappeared")
+    if not allow_missing and set(rows) != set(steps):
         raise ValueError("The requested checkpoint grid is incomplete")
-    return [rows[step] for step in steps]
+    return [rows[step] for step in steps if step in rows]
+
+
+def complete_grid(steps, rows):
+    available = {row["step"]: row for row in rows}
+    return [available.get(step, {"step": step}) for step in steps]
+
+
+def write_inventory(path, campaign, rows):
+    series._atomic_json(path, {"source_run": campaign["source_run"], "checkpoints": rows,
+                              "training_root": campaign.get("training_root"), "inventoried_at": now()})
+
+
+def refresh_inventory(path):
+    with series._lock(path / ".inventory.lock"):
+        campaign = load_campaign(path)
+        steps = [row["step"] for row in campaign["checkpoints"]]
+        rows = inventory(Path(campaign["training_root"]), campaign["config_name"], steps,
+                         allow_missing=True, known=campaign["checkpoints"])
+        grid = complete_grid(steps, rows)
+        if grid != campaign["checkpoints"]:
+            write_inventory(path / "checkpoint-inventory.json", campaign, rows)
+            campaign["checkpoints"] = grid
+            series._atomic_json(path / "campaign.json", campaign)
+        return campaign
 
 
 def plan(args):
@@ -88,7 +127,9 @@ def prepare(args):
                 or previous["config_name"] != args.config_name
                 or [row["step"] for row in previous["checkpoints"]] != steps):
             raise ValueError("Preparation differs from the queued evaluation plan")
-    rows = inventory(args.training_root, args.config_name, steps)
+    rows = inventory(args.training_root, args.config_name, steps, allow_missing=args.available_only)
+    if not rows:
+        raise ValueError("At least one saved checkpoint is required to prepare evaluation")
     args.campaign.mkdir(parents=True, exist_ok=True)
     inventory_path = args.campaign / "checkpoint-inventory.json"
     series._atomic_json(inventory_path, {"source_run": args.source_run, "checkpoints": rows,
@@ -106,7 +147,9 @@ def prepare(args):
     series._atomic_json(args.campaign / "run-map.json", run_map)
     campaign = dict(planned=False, created_at=now(), source_run=args.source_run, source_commit=git("rev-parse", "HEAD"),
                     source_tree=git("rev-parse", "HEAD^{tree}"), matrix_sha256=series._file_digest(MATRIX),
-                    cutoff_step=args.max_step, checkpoints=rows, runs=runs,
+                    cutoff_step=args.max_step, checkpoints=complete_grid(steps, rows), runs=runs,
+                    training_root=str(args.training_root), config_name=args.config_name,
+                    streaming=args.available_only,
                     seeds=[101, 102, 103, 104, 105], controller_seed=55, max_steps=500,
                     execution_action="mean", recording="returns", root=str(args.campaign.resolve()))
     series._atomic_json(args.campaign / "campaign.json", campaign)
@@ -120,6 +163,76 @@ def load_campaign(path):
     if series._file_digest(MATRIX) != campaign["matrix_sha256"]:
         raise ValueError("Evaluation matrix changed")
     return campaign
+
+
+def release_available(campaign, compute_job, released, save):
+    """Release ready tasks newest first; future tasks retain their user hold."""
+    for index, row in enumerate(campaign["checkpoints"]):
+        if "path" not in row or index in released:
+            continue
+        job = f"{compute_job}_{index}"
+        state = subprocess.check_output(["scontrol", "show", "job", job, "-o"], text=True)
+        if "Reason=JobHeldUser " in state:
+            subprocess.run(["scontrol", "release", job], check=True)
+        elif not any(f"JobState={value} " in state for value in ("RUNNING", "COMPLETING", "COMPLETED")):
+            if "JobState=PENDING " not in state or "Priority=0 " in state or "Dependency=(null) " not in state:
+                raise RuntimeError(f"Evaluation task {job} is not releasable: {state.strip()}")
+        released.add(index)
+        save()
+        print(json.dumps({"released": job, "checkpoint_step": row["step"]}), flush=True)
+
+
+def release(args):
+    """Finite CPU controller; no GPU allocation waits for an unwritten checkpoint."""
+    if args.timeout_seconds <= 0:
+        raise ValueError("Release controller requires a positive finite deadline")
+    receipt = args.campaign / "release-state.json"
+    started = time.monotonic()
+    released = set()
+    def save(**extra):
+        series._atomic_json(receipt, dict(compute_job=args.compute_job, training_job=args.training_job,
+                                         released=sorted(released), updated_at=now(), **extra))
+    def terminated(signum, frame):
+        raise RuntimeError(f"Checkpoint release controller received signal {signum}")
+    signal.signal(signal.SIGTERM, terminated)
+    with series._lock(args.campaign / ".release.lock", blocking=False):
+        if receipt.exists():
+            previous = series._read(receipt)
+            if previous["compute_job"] != args.compute_job or previous["training_job"] != args.training_job:
+                raise ValueError("Release receipt belongs to different Slurm jobs")
+            released.update(previous["released"])
+        try:
+            while True:
+                campaign = refresh_inventory(args.campaign)
+                release_available(campaign, args.compute_job, released, save)
+                if len(released) == len(campaign["checkpoints"]):
+                    save(complete=True)
+                    return
+                active = subprocess.check_output(
+                    ["squeue", "-h", "-j", args.training_job, "-o", "%i"], text=True).strip()
+                if not active:
+                    # The final save can land between the inventory and queue reads.
+                    campaign = refresh_inventory(args.campaign)
+                    release_available(campaign, args.compute_job, released, save)
+                    if len(released) == len(campaign["checkpoints"]):
+                        save(complete=True)
+                        return
+                    raise RuntimeError("Training ended before every requested checkpoint was inventoried")
+                if time.monotonic() - started >= args.timeout_seconds:
+                    raise TimeoutError("Checkpoint release controller reached its finite deadline")
+                time.sleep(60)
+        except BaseException as exc:
+            # Preserve every running/finished evaluation. Cancel only future
+            # tasks still on our original user hold, so publishers can finish.
+            for index in range(len(load_campaign(args.campaign)["checkpoints"])):
+                if index in released:
+                    continue
+                job = f"{args.compute_job}_{index}"
+                result = subprocess.run(["scontrol", "show", "job", job, "-o"], text=True, capture_output=True)
+                if result.returncode == 0 and "Reason=JobHeldUser " in result.stdout:
+                    subprocess.run(["scancel", job], check=True)
+            save(complete=False, error=str(exc))
+            raise
 
 
 def validate_result(payload, expected_steps, seeds):
@@ -158,6 +271,10 @@ def worker(args):
         raise ValueError("Checkpoint or metadata changed after inventory")
     output = args.campaign / ("smoke" if args.smoke else "production") / str(row["step"])
     output.mkdir(parents=True, exist_ok=False)
+    # Publication fingerprints include this file; later discovery must never
+    # mutate the provenance of a completed checkpoint result.
+    inventory_path = output / "checkpoint-inventory.json"
+    write_inventory(inventory_path, campaign, [row])
     seeds = [101, 102] if args.smoke else campaign["seeds"]
     steps = 8 if args.smoke else 500
     if args.smoke:
@@ -166,7 +283,7 @@ def worker(args):
     started = time.perf_counter()
     payload = evaluate_matrix(MATRIX, row["path"], seeds=seeds, max_steps=steps, device="cuda",
                               bundle_dir=output / "bundle", source_run=campaign["source_run"],
-                              checkpoint_inventory=args.campaign / "checkpoint-inventory.json",
+                              checkpoint_inventory=inventory_path,
                               eval_run_map=None if args.smoke else args.campaign / "run-map.json",
                               stage_results=False)
     validate_result(payload, steps, seeds)
@@ -180,7 +297,7 @@ def worker(args):
     if not args.smoke:
         for run in campaign["runs"]:
             series.stage_result(run["run_dir"], output / "bundle/manifest.json", selector=run["selector"],
-                                source_run=campaign["source_run"], inventory_path=args.campaign / "checkpoint-inventory.json")
+                                source_run=campaign["source_run"], inventory_path=inventory_path)
     print(json.dumps(receipt), flush=True)
 
 
@@ -190,7 +307,8 @@ def progress(campaign):
         path = Path(campaign["root"]) / "production" / str(cp["step"]) / "bundle/manifest.json"
         manifest = series._read(path) if path.exists() else {}
         states = {run["selector"]: run["status"] for run in manifest.get("runs", [])}
-        rows.append({"step": cp["step"], **{selector: states.get(selector, "pending") for selector in SELECTORS}})
+        pending = "queued" if "path" in cp else "awaiting checkpoint"
+        rows.append({"step": cp["step"], **{selector: states.get(selector, pending) for selector in SELECTORS}})
     return rows
 
 
@@ -210,7 +328,8 @@ def layout(args):
                     "Return-only logging omits inner traces/model probes. Error bars are represented by the separate episode SD panel.\n\n"
                     f"Checkpoint order: {', '.join(str(cp['step']) for cp in campaign['checkpoints'])}. "
                     f"Status at {now()}. Missing points remain pending. "
-                    "Evaluation begins after training and checkpoint inventory finish.\n\n"
+                    "Available checkpoints are evaluated newest first while training continues. "
+                    "Future checkpoints are released as their weights and metadata become available.\n\n"
                     "| Training decisions | Prior | Refinement |\n|---:|---|---|\n" + table)
         panels = [wr.MarkdownPanel(markdown=markdown, layout=wr.Layout(w=24, h=14))]
         for title, metric in (("Full-episode return · five-seed mean", "eval/return_mean"),
@@ -266,7 +385,7 @@ def publish(args):
             publisher.run.summary.update({"evaluation/checkpoints_expected": expected,
                                           "evaluation/checkpoints_accepted": count,
                                           "evaluation/status": "complete" if count == expected else "pending"})
-            state = progress(campaign)
+            state = progress(load_campaign(args.campaign))
             signature = json.dumps(state)
             if signature != last:
                 subprocess.run(command, check=True)
@@ -293,7 +412,7 @@ def publish(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("plan", "prepare", "worker", "layout", "publish"):
+    for name in ("plan", "prepare", "worker", "layout", "publish", "release"):
         p = sub.add_parser(name)
         p.add_argument("--campaign", type=Path, required=True)
         if name in {"plan", "prepare"}:
@@ -304,6 +423,8 @@ def main():
             p.add_argument("--checkpoint-every", type=int, default=50000)
             p.add_argument("--descending", action="store_true")
             p.add_argument("--registry", type=Path, required=True)
+        if name == "prepare":
+            p.add_argument("--available-only", action="store_true")
         if name == "worker":
             p.add_argument("--index", type=int, required=True)
             p.add_argument("--smoke", action="store_true")
@@ -311,6 +432,10 @@ def main():
             p.add_argument("--selector", choices=SELECTORS, required=True)
             p.add_argument("--compute-job", required=True)
             p.add_argument("--workspace-python", required=True)
+        if name == "release":
+            p.add_argument("--compute-job", required=True)
+            p.add_argument("--training-job", required=True)
+            p.add_argument("--timeout-seconds", type=int, required=True)
     args = parser.parse_args()
     globals()[args.command](args)
 

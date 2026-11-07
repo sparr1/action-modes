@@ -243,11 +243,27 @@ checkpoint identity. Training retains all acceleration and critic geometry.
 For every 25k checkpoint in reverse order, invoke
 `slurm/graph_checkpoint_campaign.py plan` with `--max-step 400000
 --checkpoint-every 25000 --descending`. This creates a pending workload and
-workspace without fabricating weights, metrics, or W&B result runs. After
-successful training, `prepare` with the same arguments verifies all 16
-checkpoint/metadata pairs and allocates two new evaluation series. Array index
-0 is 400k and index 15 is 25k; independent checkpoints can run concurrently.
+workspace without fabricating weights, metrics, or W&B result runs. Run
+`prepare --available-only` with the same arguments once at least one checkpoint
+exists; it verifies available checkpoint/metadata pairs and allocates two
+evaluation series for the full grid. Array index 0 remains 400k and index 15
+remains 25k, including while later checkpoints are missing. Without
+`--available-only`, preparation still requires the complete grid.
+
+Submit the GPU array with `--hold`, then run the finite CPU `release` command
+with `--compute-job ARRAY_ID --training-job TRAINING_ID --timeout-seconds N`.
+It inventories new checkpoints and releases only available tasks, newest first,
+once a minute. Set its deadline and CPU walltime from remaining training time
+plus a measured margin. Missing checkpoints hold no GPU resources. On training
+failure or its deadline it cancels only unreleased held tasks, leaving completed
+and running evaluations intact. Independent checkpoints can run concurrently;
+choose the array cap from live QOS headroom.
+
 Each evaluates five paired full episodes (101–105; controller seed55), prior
 versus saved H3/J8 inner SAC, with mean real actions and a frozen outer model.
-GPU workers stage results; finite CPU publishers run after the array and
-verify publication and visible result panels. No recurring agent is required.
+GPU workers pin a separate immutable checkpoint inventory per result, so later
+checkpoint discovery cannot change publication fingerprints. Start one finite
+CPU `publish` process per selector alongside the release controller, passing the
+same array ID. Results and progress panels update after each checkpoint rather
+than waiting for training or the whole array to finish. Publishers verify all
+16 points before exiting. No recurring agent is required.
