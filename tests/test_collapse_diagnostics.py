@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 import torch
 
-from utils.collapse_diagnostics import gradient_geometry, gradient_probe, FrozenPriorController
+from utils.collapse_diagnostics import (gradient_geometry, gradient_probe, FrozenPriorController,
+                                       adapted_workspace)
 from tests.test_ambi_root_local_sac import _tiny_model
 from evaluate_ambi_checkpoint import _outer_state_digest
 from diagnose_policy_collapse import load_bank
@@ -84,3 +85,28 @@ def test_shared_bank_rejects_tampering_and_non_upright_states(tmp_path):
     bank.pop('id');bank['roots'][0]['head_height']=.2;bank['id']=canonical_hash(bank)
     path.write_text(json.dumps(bank))
     with pytest.raises(ValueError,match='upright'):load_bank(path)
+
+
+def test_adapted_probe_reads_finished_action_pool_not_outer_networks():
+    model=_tiny_model(sac_actor_loss_scale_mode='tdmpc2_percentile_range',
+        inner_temperature_mode='fixed',inner_temperature_initialization='fixed',
+        inner_temperature=.0021,ent_coef=.0021)
+    try:
+        engine=model.agent.inner_engine
+        with pytest.raises(RuntimeError,match='retained'):adapted_workspace(engine)
+        before=_outer_state_digest(model)
+        engine.reset_for_evaluation(123,reuse_action_pool=True)
+        model.predict(np.zeros(3,np.float32),deterministic=True,episode_start=True,
+                      collect_diagnostics=False)
+        assert engine.state.actor is None
+        state=adapted_workspace(engine)
+        assert state.actor is not model.agent.model._pi
+        assert state.critic is not model.agent.model._Qs
+        assert any(not torch.equal(a,b) for a,b in
+                   zip(state.actor.parameters(),model.agent.model._pi.parameters()))
+        result=gradient_probe(model,np.zeros(3,np.float32),policy=state.actor,critic=state.critic,
+            scale=model.agent.last_inner_metrics['inner_actor_loss_scale_final'],
+            alpha=model.agent.last_inner_metrics['inner_effective_alpha'],samples=8)
+        assert np.isfinite(result['total_gradient_norm'])
+        assert _outer_state_digest(model)==before
+    finally:model.env.close()

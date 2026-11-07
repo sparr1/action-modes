@@ -15,7 +15,7 @@ from evaluate_ambi_checkpoint import (_make_env, _initialize_frozen_model, _oute
 from utils.ambi_benchmark import atomic_json, canonical_hash, solver_seed
 from utils.checkpoint_context import load_checkpoint_context
 from utils.collapse_diagnostics import (FrozenPriorController, PairedInnerController,
-                                       gradient_probe, episode)
+                                       gradient_probe, episode, adapted_workspace)
 
 
 def resolved(checkpoint, device, *, compiled=False):
@@ -126,11 +126,11 @@ def gradients(args):
                 solve_seed = solver_seed(55,'fixed-solve',root['root_id'],repeat)
                 engine.reset_for_evaluation(solve_seed,reuse_action_pool=True)
                 model.predict(obs,deterministic=True,episode_start=True,collect_diagnostics=False)
-                state = engine.state
+                state = adapted_workspace(engine)
                 metrics = model.agent.last_inner_metrics
                 scale = metrics['inner_actor_loss_scale_final']
                 final = gradient_probe(model,obs,policy=state.actor,critic=state.critic,scale=scale,
-                    alpha=engine.alpha,samples=args.samples,seed=seed,pair=pair)
+                    alpha=metrics['inner_effective_alpha'],samples=args.samples,seed=seed,pair=pair)
                 rows.append(dict(**base,phase='adapted',solve_seed=solve_seed,**final))
             atomic_json(args.output/'progress.json',dict(completed_roots=len(rows)//(2*args.repeats),
                 requested_roots=min(args.roots,len(bank['roots'])),elapsed_seconds=time.perf_counter()-started))
@@ -209,14 +209,14 @@ def parity(args):
                 a,b=graph.action(obs,t0=step==0),native.action(obs,t0=step==0)
                 np.testing.assert_allclose(a,b,rtol=2e-4,atol=3e-5)
                 for component in ['actor','critic']:
-                    left=getattr(graph.runner.engine.state,component).state_dict()
-                    right=getattr(native.runner.engine.state,component).state_dict()
+                    left=getattr(adapted_workspace(graph.runner.engine),component).state_dict()
+                    right=getattr(adapted_workspace(native.runner.engine),component).state_dict()
                     for key in left: torch.testing.assert_close(left[key],right[key],rtol=2e-4,atol=3e-5)
                 comparisons.append(dict(mode=mode,step=step,max_action_difference=float(np.max(np.abs(a-b)))))
         graph.reset(991,'mean');graph.action(obs,t0=True)
-        mean_actor=copy.deepcopy(graph.runner.engine.state.actor.state_dict())
+        mean_actor=copy.deepcopy(adapted_workspace(graph.runner.engine).actor.state_dict())
         graph.reset(991,'sample');graph.action(obs,t0=True)
-        for key,value in graph.runner.engine.state.actor.state_dict().items():
+        for key,value in adapted_workspace(graph.runner.engine).actor.state_dict().items():
             torch.testing.assert_close(mean_actor[key],value,rtol=0,atol=0)
         # Use actual full inner solves + environment steps for CPU sizing.
         # Keep torch threads at one: the graph is GPU work, with serial physics.

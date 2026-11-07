@@ -28,7 +28,7 @@ def main():
     bank=root/'bank'/'bank.json'
     task=(dict(key='shared-bank',checkpoint=manifest['bank_checkpoint']) if args.stage=='bank'
           else (manifest['smoke_tasks'] if args.stage=='smoke' else manifest['checkpoints'])[index])
-    output=root/args.stage/task['key']
+    output=root/'bank-status' if args.stage=='bank' else root/args.stage/task['key']
     output.mkdir(parents=True,exist_ok=True)
     def run(mode,checkpoint,destination,*extra):
         command=[sys.executable,str(source/'diagnose_policy_collapse.py'),mode,

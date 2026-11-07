@@ -93,6 +93,19 @@ def gradient_probe(wrapper, observations, *, policy=None, critic=None, scale=Non
         return result
 
 
+def adapted_workspace(engine):
+    """Read the finished action-scoped solve, retained in the allocation pool.
+
+    act() expires public workspace fields before returning. Their modules and
+    final weights live in the action pool until the next solve initializes it.
+    Never silently substitute the outer networks when measuring adaptation.
+    """
+    state = engine._action_pool
+    if state.actor is None or state.critic is None:
+        raise RuntimeError('No retained adapted actor/critic after the fresh inner solve.')
+    return state
+
+
 class FrozenPriorController:
     """Fixed network parameters; gSDE matrices are held or independently drawn."""
     def __init__(self, wrapper, mode, interval=None):
