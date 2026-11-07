@@ -1,5 +1,20 @@
 # Frozen-checkpoint AMBI research
 
+`ambi_checkpoint_graph_eval.json` compares the saved controller with its frozen
+mean-action prior using five paired full episodes (seeds 101–105, controller
+seed 55). It inherits the checkpoint's inner dose, entropy and normalization.
+The SAC arm explicitly selects `frozen_mean_cuda_graph_v1`: one complete captured
+fresh solve per decision, strict compilation, vectorized critics and mean-action
+execution. Return-only bundles retain per-episode returns, scalar controller
+metrics, pairing and frozen-state checks, without inner traces or model probes.
+Its isolated graph RNG is a separate evaluation identity from native execution.
+Warmup/capture is reported separately and discarded before the seeded episodes.
+Unsupported lifetimes, sampled execution, traces and probes fail explicitly.
+`slurm/graph_checkpoint_campaign.py` prepares a pinned checkpoint inventory and
+two new evaluation series, runs checkpoint tasks, and publishes through the
+single-owner registry. Its CPU publisher installs and verifies a dedicated W&B
+workspace before uploading results, and reports missing/failed cells.
+
 The [joint entropy and prior-KL evaluation](ENTROPY_KL_EVAL.md) keeps automatic
 temperature learning enabled while testing two fixed prior-KL penalties on
 the same saved roots and sampled full episodes.
@@ -198,3 +213,31 @@ then measures exact inner-solver entropy dynamics and paired fixed-replay actor
 updates at roots 0, 10, 50, 100 and 250. See
 [ENTROPY_PROBE.md](ENTROPY_PROBE.md) for checkpoint hashes, source/probe RNG
 separation, frozen-state checks, output ownership and the per-seed worker CLI.
+
+## Calibrated BOOM likelihood checkpoint campaign
+
+`ambi_boom_likelihood_calibrated.json` trains the same 400k-decision, seed55
+outer-adapt H3/J8/K1 recipe as the likelihood pilot, changing only the fixed
+BOOM coefficient and publication labels. The gate remains S>2, the detached
+weights use Q/S, and alignment is divided by S. Choose the coefficient from
+valid diagnostic batches and retain the supporting history and selection
+receipt beside the launch manifest; gradient balance is not a return optimum.
+
+`slurm/boom_likelihood_calibrated_oscar.py gate` runs fresh CUDA correctness
+checks and pairs a prior with the graph controller after checkpoint reload.
+The evaluator sizing benchmark uses 1 and 2 physical CPUs with W&B disabled;
+its untrained snapshot never enters scientific result series. The prior
+selector removes inactive SAC compute controls while retaining BOOM's outer
+checkpoint identity. Training retains all acceleration and critic geometry.
+
+For every 25k checkpoint in reverse order, invoke
+`slurm/graph_checkpoint_campaign.py plan` with `--max-step 400000
+--checkpoint-every 25000 --descending`. This creates a pending workload and
+workspace without fabricating weights, metrics, or W&B result runs. After
+successful training, `prepare` with the same arguments verifies all 16
+checkpoint/metadata pairs and allocates two new evaluation series. Array index
+0 is 400k and index 15 is 25k; independent checkpoints can run concurrently.
+Each evaluates five paired full episodes (101–105; controller seed55), prior
+versus saved H3/J8 inner SAC, with mean real actions and a frozen outer model.
+GPU workers stage results; finite CPU publishers run after the array and
+verify publication and visible result panels. No recurring agent is required.

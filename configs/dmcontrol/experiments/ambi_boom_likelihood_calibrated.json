@@ -1,0 +1,28 @@
+{
+  "study_type": "posttanh_prior_fixes",
+  "study_note": "One seed55 H3/J8/K1 Humanoid Walk run, 400k decisions, BOOM replay-action likelihood at fixed lambda=0.00001. Gradient-calibrated from the pilot, not return-optimized. Preserve S>2, Q/S weights, division by S, post-tanh alpha=0.0021, all acceleration and critic geometry. Retain every25k checkpoint for descending paired prior/inner-SAC evaluation.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 400000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_boom_likelihood_outer_adapt_calibrated"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "name": "BOOM replay-likelihood outer-adapt calibrated scale",
+  "description": "One seed55 H3/J8/K1 Humanoid Walk run, 400k decisions, BOOM replay-action likelihood at fixed lambda=0.00001. Gradient-calibrated from the pilot, not return-optimized. Preserve S>2, Q/S weights, division by S, post-tanh alpha=0.0021, all acceleration and critic geometry. Retain every25k checkpoint for descending paired prior/inner-SAC evaluation."
+}
