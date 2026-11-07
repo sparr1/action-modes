@@ -22,6 +22,7 @@ from slurm.benchmark_ambi_training_cpu import TrainingWindow, physical_core_cpus
 CAMPAIGNS = {
     "original": ("ambi_posttanh_prior_fixes.json", "posttanh-prior-fixes-20261104"),
     "strength": ("ambi_posttanh_prior_strength.json", "posttanh-prior-strength-20261105"),
+    "likelihood": ("ambi_boom_likelihood_pilot.json", "boom-likelihood-pilot-20261107"),
 }
 _manifest_name, _campaign_name = CAMPAIGNS[os.environ.get("AMBI_PRIOR_VARIANT", "original")]
 MANIFEST = ROOT / "configs/dmcontrol/experiments" / _manifest_name
@@ -38,9 +39,9 @@ def parity_cases(junit_path):
     """Reject a successful pytest exit that merely skipped unavailable CUDA."""
     cases = list(ET.parse(junit_path).getroot().iter("testcase"))
     names = [case.attrib["name"] for case in cases]
-    assert len(cases) == 13 and len(set(names)) == 13, names
+    assert len(cases) == 15 and len(set(names)) == 15, names
     expected = [node.rsplit("::", 1)[1] for node in GPU_PARITY_TESTS]
-    assert [sum(name == prefix or name.startswith(prefix + "[") for name in names) for prefix in expected] == [4, 6, 2, 1], names
+    assert [sum(name == prefix or name.startswith(prefix + "[") for name in names) for prefix in expected] == [4, 6, 4, 1], names
     assert not any(case.find(tag) is not None for case in cases
                    for tag in ("skipped", "error", "failure")), names
     return names
@@ -50,7 +51,7 @@ def validate_global_parity(receipt, expected_binding, expected_runtime):
     assert receipt["passed"] is True
     assert receipt["binding"] == expected_binding
     assert receipt["runtime"] == expected_runtime
-    assert receipt["case_count"] == 13 and len(set(receipt["case_names"])) == 13
+    assert receipt["case_count"] == 15 and len(set(receipt["case_names"])) == 15
     assert receipt["test_nodes"] == GPU_PARITY_TESTS
     assert receipt["failures"] == receipt["errors"] == receipt["skipped"] == 0
 
@@ -199,6 +200,15 @@ def worker(args):
         act, log = learner._act_agent, learner._log_wandb_step
         graph_counts = {}
         replay_counts = {}
+        diagnostic_samples = []
+        if getattr(cfg, "outer_boom_diagnostics", False):
+            original_update = agent.update
+            def observed_update(buffer):
+                values = original_update(buffer)
+                if "boom_diag_update" in values:
+                    diagnostic_samples.append({k: float(v) for k, v in values.items() if k.startswith("boom_diag_")})
+                return values
+            agent.update = observed_update
 
         def observed_act(*positional, **kwargs):
             step = learner._global_step + 1
@@ -267,6 +277,8 @@ def worker(args):
                     "actor_entropy_coefficient_joint_units", "actor_q_range_instant"):
             assert key in metrics, key
         assert all(torch.isfinite(p).all() for p in agent.model.parameters())
+        if getattr(cfg, "outer_boom_diagnostics", False):
+            assert diagnostic_samples and all(math.isfinite(v) for sample in diagnostic_samples for v in sample.values())
         assert learner.buffer._storage_device.type == "cuda"
         # Expensive sparse observations and recapture checks are deliberately
         # outside the steady-state timing window.
@@ -303,6 +315,7 @@ def worker(args):
                   "critic_geometry": geometry,
                   "gpu_replay": True, "metrics": {k: float(v) for k, v in metrics.items()},
                   "diagnostic_episodes": learner._training_diagnostics.episode_metrics(),
+                  "boom_gradient_probes": diagnostic_samples,
                   "seconds": time.perf_counter() - started,
                   "benchmark_overrides": {**overrides, "total_steps": total}, "wandb": False}
         write_new(args.output, report)

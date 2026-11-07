@@ -67,6 +67,8 @@ def _actor_step(agent, inputs):
     return agent._update_actor(
         zs, behavior_pre_tanh_mean=mean, behavior_log_std=log_std,
         behavior_policy_valid=valid,
+        **({"replay_action": (mean * 1.2).tanh(), "behavior_pre_tanh_action": mean * 1.2}
+           if agent._boom_replay_likelihood else {}),
     )
 
 
@@ -96,13 +98,15 @@ def _assert_actor_state_equal(actual, expected, *, compiled=False):
 
 @pytest.mark.parametrize("entropy_mode", ["squashed", "tdmpc2_scaled"])
 @pytest.mark.parametrize("all_invalid", [False, True])
+@pytest.mark.parametrize("alignment", ["sampled_action", "replay_likelihood"])
 def test_boom_fullgraph_kernel_matches_eager_and_proposes_scale_without_mutation(
-    entropy_mode, all_invalid,
+    entropy_mode, all_invalid, alignment,
 ):
     eager = _agent(
         q_representation="distributional", num_q=5, q_pair_size=2,
         outer_q_actor_reduction="min_pair", dropout=0.2,
         outer_actor_entropy_mode=entropy_mode,
+        outer_boom_alignment=alignment,
     )
     _nonzero_critic(eager)
     compiled = AMBITDMPC2Agent(deepcopy(eager.cfg))
@@ -116,14 +120,20 @@ def test_boom_fullgraph_kernel_matches_eager_and_proposes_scale_without_mutation
     graphs = _trace_actor_region(compiled)
     before = eager.actor_loss_scale.clone()
     rng = torch.get_rng_state().clone()
+    replay_kwargs = (
+        {"replay_action": (mean * 1.2).tanh(), "behavior_pre_tanh_action": mean * 1.2}
+        if alignment == "replay_likelihood" else {}
+    )
     expected = eager._boom_actor_kernel(
         zs[:-1], mean, valid, eager.alpha.detach(), eager.actor_loss_scale,
+        **replay_kwargs,
     )
     expected["actor_loss"].backward()
     expected_rng = torch.get_rng_state().clone()
     torch.set_rng_state(rng)
     actual = compiled._boom_actor_region(
         zs[:-1], mean, valid, compiled.alpha.detach(), compiled.actor_loss_scale,
+        **replay_kwargs,
     )
     actual["actor_loss"].backward()
 
@@ -151,10 +161,12 @@ def test_boom_fullgraph_kernel_matches_eager_and_proposes_scale_without_mutation
         assert actual["boom_metrics"]["boom_alignment_loss"] == 0
 
 
-def test_boom_compiled_actor_first_and_next_adam_steps_match_eager():
+@pytest.mark.parametrize("alignment", ["sampled_action", "replay_likelihood"])
+def test_boom_compiled_actor_first_and_next_adam_steps_match_eager(alignment):
     eager = _agent(
         q_representation="distributional", num_q=5, q_pair_size=2,
         outer_q_actor_reduction="min_pair", dropout=0.2,
+        outer_boom_alignment=alignment,
     )
     _nonzero_critic(eager)
     compiled = AMBITDMPC2Agent(deepcopy(eager.cfg))
@@ -194,10 +206,12 @@ def test_boom_compiled_actor_first_and_next_adam_steps_match_eager():
     assert gates[0] == 1 and gates[-1] == 0
 
 
-def test_boom_lazy_forward_failure_retries_same_sample_and_commits_scale_once():
+@pytest.mark.parametrize("alignment", ["sampled_action", "replay_likelihood"])
+def test_boom_lazy_forward_failure_retries_same_sample_and_commits_scale_once(alignment):
     eager = _agent(
         q_representation="distributional", num_q=5, q_pair_size=2,
         outer_q_actor_reduction="min_pair", dropout=0.2,
+        outer_boom_alignment=alignment,
     )
     _nonzero_critic(eager)
     fallback = AMBITDMPC2Agent(deepcopy(eager.cfg))
@@ -211,9 +225,9 @@ def test_boom_lazy_forward_failure_retries_same_sample_and_commits_scale_once():
     region.strict = False
     calls = []
 
-    def lazy_failure(*args):
+    def lazy_failure(*args, **kwargs):
         calls.append(1)
-        region.eager(*args)
+        region.eager(*args, **kwargs)
         torch.rand(7)
         raise RuntimeError("injected BOOM backend failure after sampling")
 
@@ -252,8 +266,9 @@ def test_boom_actor_region_activation_and_cpu_mode_are_portable(objective, enabl
     assert agent._boom_actor_region.enabled is (enabled and objective == "boom")
 
 
-def test_boom_packed_metrics_outlive_reused_graph_output_storage():
-    agent = _agent()
+@pytest.mark.parametrize("alignment", ["sampled_action", "replay_likelihood"])
+def test_boom_packed_metrics_outlive_reused_graph_output_storage(alignment):
+    agent = _agent(outer_boom_alignment=alignment)
     agent.actor_loss_scale.fill_(4)
     region = agent._boom_actor_region
     # Exercise the CUDA output-ownership branch on CPU with simulated reusable
@@ -262,8 +277,8 @@ def test_boom_packed_metrics_outlive_reused_graph_output_storage():
     region.enabled = True
     graph_outputs = []
 
-    def simulate_graph(*args):
-        outputs = region.eager(*args)
+    def simulate_graph(*args, **kwargs):
+        outputs = region.eager(*args, **kwargs)
         graph_outputs.append(outputs)
         return outputs
 
@@ -290,11 +305,13 @@ def test_boom_packed_metrics_outlive_reused_graph_output_storage():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 @pytest.mark.parametrize("representation", ["scalar", "distributional"])
-def test_boom_reduce_overhead_cuda_uses_fresh_samples_and_survives_restore(representation):
+@pytest.mark.parametrize("alignment", ["sampled_action", "replay_likelihood"])
+def test_boom_reduce_overhead_cuda_uses_fresh_samples_and_survives_restore(representation, alignment):
     base = _agent(
         q_representation=representation,
         num_q=5 if representation == "distributional" else 2,
         q_pair_size=2, outer_q_actor_reduction="min_pair", dropout=0.2,
+        outer_boom_alignment=alignment,
     )
     cfg = deepcopy(base.cfg)
     cfg.device = "cuda"

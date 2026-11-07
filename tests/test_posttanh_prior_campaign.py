@@ -58,7 +58,7 @@ def test_exact_six_cells():
 @pytest.mark.parametrize('bad', [None, 'skipped', 'failure', 'error', 'missing'])
 def test_gpu_receipt_rejects_missing_or_skipped_coverage(tmp_path,bad):
     root=ET.Element('testsuite')
-    for node,count in zip(GPU_PARITY_TESTS,[4,6,2,1]):
+    for node,count in zip(GPU_PARITY_TESTS,[4,6,4,1]):
         for i in range(count):
             c=ET.SubElement(root,'testcase',name=node.split('::')[-1]+(f'[{i}]' if count>1 else ''))
     if bad=='missing': root.remove(list(root)[0])
@@ -66,7 +66,7 @@ def test_gpu_receipt_rejects_missing_or_skipped_coverage(tmp_path,bad):
     path=tmp_path/'parity.xml';ET.ElementTree(root).write(path)
     if bad:
         with pytest.raises(AssertionError): parity_cases(path)
-    else: assert len(parity_cases(path))==13
+    else: assert len(parity_cases(path))==15
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='Requires scheduled CUDA GPU')
 @pytest.mark.parametrize('update', ['per_action', 'per_update'])

@@ -259,9 +259,15 @@ def scientific_trial_parameters(
                 # Derived storage flags carry no independent scientific choice.
                 # Omitted and disabled controls preserve historical fingerprints.
                 algorithm.pop("store_teacher_policy", None)
+                algorithm.pop("store_behavior_pre_tanh_action", None)
+                for key in list(algorithm):
+                    if key.startswith("outer_boom_diagnostics"):
+                        algorithm.pop(key)
                 if objective != "boom":
                     algorithm.pop("outer_boom_coef", None)
                     algorithm.pop("outer_boom_min_std", None)
+                    algorithm.pop("outer_boom_alignment", None)
+                    algorithm.pop("outer_boom_q_temperature", None)
                 if objective == "q_maximization":
                     for field in (
                         "outer_actor_objective", "reanalyze_interval", "reanalyze_batch_size",
@@ -280,6 +286,18 @@ def scientific_trial_parameters(
                     algorithm["outer_boom_min_std"] = float(
                         algorithm.get("outer_boom_min_std", 0.05)
                     )
+                    alignment = str(algorithm.get("outer_boom_alignment", "sampled_action")).lower()
+                    if alignment == "sampled_action":
+                        algorithm.pop("outer_boom_alignment", None)
+                        algorithm.pop("outer_boom_q_temperature", None)
+                    else:
+                        algorithm["outer_boom_alignment"] = alignment
+                        temperature = algorithm.get("outer_boom_q_temperature", "scale")
+                        algorithm["outer_boom_q_temperature"] = (
+                            temperature.lower() if isinstance(temperature, str) else float(temperature)
+                        )
+                        # The exact density has no surrogate variance floor.
+                        algorithm.pop("outer_boom_min_std", None)
                     # BOOM reads immutable collection labels, without reanalysis.
                     # Its replay storage flag is derived from the objective.
                     for field in (

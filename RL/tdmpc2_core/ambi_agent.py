@@ -23,7 +23,8 @@ from .common.scale import percentile_range
 from .common.soft_world_model import SoftWorldModel
 from .auxiliary_return import AuxiliaryReturnLearner
 from .behavior_policy import squashed_behavior_cross_entropy
-from .boom import boom_alignment_loss
+from .boom import boom_alignment_loss, boom_replay_likelihood_loss
+from . import boom_diagnostics
 from .inner_improvement import InnerImprovementEngine, polyak_update
 from .outer_policy_diagnostics import diagnostics_due, policy_diagnostics
 from .pave import outer_pave_loss, pave_enabled
@@ -69,6 +70,9 @@ class AMBITDMPC2Agent(torch.nn.Module):
         super().__init__()
         self.cfg = cfg
         self._boom_enabled = str(getattr(cfg, "outer_actor_objective", "q_maximization")) == "boom"
+        self._boom_replay_likelihood = self._boom_enabled and (
+            getattr(cfg, "outer_boom_alignment", "sampled_action") == "replay_likelihood"
+        )
         self._outer_policy_diagnostics_packet = None
         self._outer_policy_diagnostics_force = False
         self.device = resolve_device(getattr(cfg, "device", None))
@@ -1695,14 +1699,14 @@ class AMBITDMPC2Agent(torch.nn.Module):
             )
         behavior_shapes = None
         if behavior_policy is not None:
-            behavior_mean = behavior_policy["pre_tanh_mean"].detach().to(
-                device=action.device, dtype=action.dtype
-            )
-            behavior_log_std = behavior_policy["log_std"].detach().to(
-                device=action.device, dtype=action.dtype
-            )
-            behavior_shapes = (behavior_mean.shape, behavior_log_std.shape)
-            pieces.extend((behavior_mean.reshape(-1), behavior_log_std.reshape(-1)))
+            behavior_keys = ["pre_tanh_mean", "log_std"]
+            if "pre_tanh_action" in behavior_policy:
+                behavior_keys.append("pre_tanh_action")
+            behavior_shapes = {}
+            for key in behavior_keys:
+                value = behavior_policy[key].detach().to(device=action.device, dtype=action.dtype)
+                behavior_shapes[key] = value.shape
+                pieces.append(value.reshape(-1))
         trace_start = sum(piece.numel() for piece in pieces) if trace is not None else 0
         trace_items = trace.tensor_items() if trace is not None else []
         pieces.extend(
@@ -1730,17 +1734,11 @@ class AMBITDMPC2Agent(torch.nn.Module):
         behavior_start = action_size + len(tensor_items)
         if tensor_lengths is not None:
             behavior_start += int(tensor_lengths.numel())
-        mean_shape, log_std_shape = behavior_shapes
-        mean_size = math.prod(mean_shape)
-        log_std_size = math.prod(log_std_shape)
-        materialized_behavior = {
-            "pre_tanh_mean": packed[
-                behavior_start : behavior_start + mean_size
-            ].reshape(mean_shape),
-            "log_std": packed[
-                behavior_start + mean_size : behavior_start + mean_size + log_std_size
-            ].reshape(log_std_shape),
-        }
+        materialized_behavior = {}
+        for key, shape in behavior_shapes.items():
+            size = math.prod(shape)
+            materialized_behavior[key] = packed[behavior_start : behavior_start + size].reshape(shape)
+            behavior_start += size
         return cpu_action, materialized, rollout_lengths, materialized_behavior
 
     @torch.no_grad()
@@ -1830,22 +1828,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
             raise ValueError("The outer policy returned a non-finite action.")
         if not return_behavior_policy:
             return action[0].detach().cpu()
-        packed = torch.cat(
-            (
-                action[0].reshape(-1),
-                policy_info["pre_tanh_mean"][0].reshape(-1),
-                policy_info["log_std"][0].reshape(-1),
-            )
-        ).detach().cpu()
-        action_size = int(action[0].numel())
-        return packed[:action_size].reshape(action[0].shape), {
-            "pre_tanh_mean": packed[action_size : 2 * action_size].reshape(
-                action[0].shape
-            ),
-            "log_std": packed[2 * action_size : 3 * action_size].reshape(
-                action[0].shape
-            ),
-        }
+        keys = ["pre_tanh_mean", "log_std"]
+        if getattr(self.cfg, "store_behavior_pre_tanh_action", False):
+            keys.append("pre_tanh_action")
+        action, _, _, behavior = self._materialize_action_metrics(
+            action[0], {}, [], behavior_policy={key: policy_info[key][0] for key in keys},
+        )
+        return action, behavior
 
     def act(
         self,
@@ -2771,6 +2760,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
         behavior_log_std=None,
         behavior_policy_valid=None,
         *,
+        replay_action=None,
+        behavior_pre_tanh_action=None,
         alpha_snapshot=None,
         scale_snapshot=None,
     ):
@@ -2790,6 +2781,12 @@ class AMBITDMPC2Agent(torch.nn.Module):
             if (behavior_policy_valid.shape not in {zs.shape[:-1], (*zs.shape[:-1], 1)}
                     or behavior_policy_valid.dtype != torch.bool):
                 raise ValueError("BOOM replay validity must be boolean [H,B] or [H,B,1].")
+            if self._boom_replay_likelihood and (
+                replay_action is None or behavior_pre_tanh_action is None
+                or replay_action.shape != expected_mean_shape
+                or behavior_pre_tanh_action.shape != expected_mean_shape
+            ):
+                raise ValueError("BOOM replay likelihood requires aligned executed actions and pre-tanh samples.")
         split_values = self.model.value_spec.is_split
         if split_values:
             # Critic parameters are detached by the forward below. Only the
@@ -2810,9 +2807,14 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self._outer_policy_diagnostics_packet = None
         scaled_entropy_enabled = self._actor_entropy_mode == "tdmpc2_scaled"
         if boom_enabled:
+            replay_kwargs = (
+                {"replay_action": replay_action, "behavior_pre_tanh_action": behavior_pre_tanh_action}
+                if self._boom_replay_likelihood else {}
+            )
             boom_outputs = self._boom_actor_region(
                 zs, behavior_pre_tanh_mean, behavior_policy_valid,
                 self.alpha.detach(), self._actor_loss_scale_value,
+                **replay_kwargs,
             )
             action, policy_info = boom_outputs["action"], boom_outputs["policy_info"]
             with torch.no_grad():
@@ -3053,7 +3055,14 @@ class AMBITDMPC2Agent(torch.nn.Module):
         self.pi_optim.zero_grad(set_to_none=True)
         actor_loss.backward()
         actor_grad_norm = self._clip_actor_grad_norm_()
+        boom_diagnostic_metrics, boom_step_snapshot = {}, None
+        if boom_diagnostics.diagnostics_due(self.cfg, self.num_updates + 1):
+            boom_diagnostic_metrics, boom_step_snapshot = boom_diagnostics.before_step(
+                self, zs, replay_action, behavior_pre_tanh_action, behavior_policy_valid,
+            )
         self.pi_optim.step()
+        if boom_step_snapshot is not None:
+            boom_diagnostic_metrics.update(boom_diagnostics.after_step(self, boom_step_snapshot))
         actor_loss_metric = actor_loss.detach()
         if boom_enabled:
             if (self._boom_actor_region.enabled
@@ -3101,9 +3110,13 @@ class AMBITDMPC2Agent(torch.nn.Module):
             **policy_sample_diagnostics(action, policy_info),
             **coefficient_metrics,
             **boom_metrics,
+            **boom_diagnostic_metrics,
             "ent_coef": alpha.detach(),
             "ent_coef_loss": entropy_coefficient_loss.detach(),
         }
+        if getattr(self.cfg, "outer_boom_diagnostics", False):
+            metrics["boom_actor_clip_fraction"] = (actor_grad_norm > float(self.cfg.grad_clip_norm)).double().detach()
+            metrics["boom_actor_clip_multiplier"] = (float(self.cfg.grad_clip_norm) / (actor_grad_norm + 1e-6)).clamp(max=1).detach()
         if split_values:
             metrics.update({
                 "actor_q_return": q_return.detach().mean(),
@@ -3341,6 +3354,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
         behavior_pre_tanh_mean=None,
         behavior_log_std=None,
         behavior_policy_valid=None,
+        behavior_pre_tanh_action=None,
     ):
         """One TD-MPC2-style model update with configurable Q regression."""
         split_values = self.model.value_spec.is_split
@@ -3467,6 +3481,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
             behavior_pre_tanh_mean=behavior_pre_tanh_mean,
             behavior_log_std=behavior_log_std,
             behavior_policy_valid=behavior_policy_valid,
+            **({"replay_action": action, "behavior_pre_tanh_action": behavior_pre_tanh_action}
+               if self._boom_replay_likelihood else {}),
             **coefficient_kwargs,
         )
         if self.aux_return is not None:
@@ -3602,7 +3618,14 @@ class AMBITDMPC2Agent(torch.nn.Module):
         return info
 
     def update(self, buffer):
+        behavior_pre_tanh_action = None
         if bool(getattr(self.cfg, "store_behavior_policy", self.behavior_policy_kl_enabled)):
+            if self._boom_replay_likelihood:
+                *batch, behavior_pre_tanh_action = buffer.sample(
+                    include_behavior_policy=True, include_behavior_action=True,
+                )
+            else:
+                batch = buffer.sample(include_behavior_policy=True)
             (
                 obs,
                 action,
@@ -3612,7 +3635,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 behavior_pre_tanh_mean,
                 behavior_log_std,
                 behavior_policy_valid,
-            ) = buffer.sample(include_behavior_policy=True)
+            ) = batch
         else:
             obs, action, reward, terminated, task = buffer.sample()
             behavior_pre_tanh_mean = None
@@ -3643,6 +3666,8 @@ class AMBITDMPC2Agent(torch.nn.Module):
                 behavior_pre_tanh_mean=behavior_pre_tanh_mean,
                 behavior_log_std=behavior_log_std,
                 behavior_policy_valid=behavior_policy_valid,
+                **({"behavior_pre_tanh_action": behavior_pre_tanh_action}
+                   if self._boom_replay_likelihood else {}),
             )
 
 
@@ -3655,7 +3680,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
     def _boom_spec(self):
         if not self.boom_enabled:
             return None
-        return {
+        spec = {
             "objective": "boom",
             "version": 1,
             "target": "tanh_immutable_behavior_pre_tanh_mean",
@@ -3672,6 +3697,17 @@ class AMBITDMPC2Agent(torch.nn.Module):
             "alignment_scaling": "divide_by_shared_scale",
             "q_range": self._actor_q_range_spec(),
         }
+        if self._boom_replay_likelihood:
+            spec.pop("min_std")
+            spec.update({
+                "version": 2,
+                "target": "immutable_executed_pre_tanh_sample",
+                "estimator": "squashed_gaussian_replay_negative_log_likelihood",
+                "std_source": "differentiable_current_actor_pre_tanh_std_no_floor",
+                "q_weights": "detached_softmax_current_replay_action_q_over_temperature",
+                "q_temperature": getattr(self.cfg, "outer_boom_q_temperature", "scale"),
+            })
+        return spec
 
 
 
@@ -3778,6 +3814,7 @@ class AMBITDMPC2Agent(torch.nn.Module):
     def _boom_actor_kernel(
         self, zs, behavior_pre_tanh_mean, behavior_policy_valid, alpha,
         actor_loss_scale,
+        replay_action=None, behavior_pre_tanh_action=None,
     ):
         """Pure H-by-B policy/Q/loss region; the caller commits the proposed S.
 
@@ -3809,12 +3846,27 @@ class AMBITDMPC2Agent(torch.nn.Module):
             objective.mean(dim=(1, 2)), self.cfg.rho,
             include_terminal=False, legacy_order="vector_mean",
         )
-        alignment, metrics = boom_alignment_loss(
-            action, info["log_std"], behavior_pre_tanh_mean.detach().tanh(),
-            behavior_policy_valid, q, proposed_scale,
-            rho=float(self.cfg.rho), coefficient=float(self.cfg.outer_boom_coef),
-            min_std=float(self.cfg.outer_boom_min_std),
-        )
+        if self._boom_replay_likelihood:
+            # Replay targets and their weights are fixed for actor autograd.
+            # Keep the ordinary policy sample / Q / S update above unchanged.
+            mask = behavior_policy_valid.reshape(*action.shape[:2], 1)
+            with torch.no_grad():
+                target_action = torch.where(mask, replay_action.detach(), 0.0)
+                replay_q_all = self.model.Q(zs, target_action, reduction="all", detach=True)
+                replay_q = self.model.q_backend.reduce(replay_q_all, self.cfg.outer_q_actor_reduction)
+            alignment, metrics = boom_replay_likelihood_loss(
+                info["pre_tanh_mean"], info["log_std"], behavior_pre_tanh_action,
+                behavior_policy_valid, replay_q, proposed_scale,
+                rho=float(self.cfg.rho), coefficient=float(self.cfg.outer_boom_coef),
+                q_temperature=getattr(self.cfg, "outer_boom_q_temperature", "scale"),
+            )
+        else:
+            alignment, metrics = boom_alignment_loss(
+                action, info["log_std"], behavior_pre_tanh_mean.detach().tanh(),
+                behavior_policy_valid, q, proposed_scale,
+                rho=float(self.cfg.rho), coefficient=float(self.cfg.outer_boom_coef),
+                min_std=float(self.cfg.outer_boom_min_std),
+            )
         metrics["boom_coefficient"] = action.new_tensor(float(self.cfg.outer_boom_coef))
         metrics["boom_rl_loss"] = sac_loss.detach()
         return {

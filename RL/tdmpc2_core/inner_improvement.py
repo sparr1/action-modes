@@ -6666,6 +6666,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 "pre_tanh_mean": execution_info["pre_tanh_mean"][0].detach(),
                 "log_std": execution_info["log_std"][0].detach(),
             }
+            if getattr(self.cfg, "store_behavior_pre_tanh_action", False):
+                behavior_policy["pre_tanh_action"] = execution_info["pre_tanh_action"][0].detach()
         else:
             action = executed
             behavior_policy = None
@@ -6878,6 +6880,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 "pre_tanh_mean": execution_info["pre_tanh_mean"][0].detach(),
                 "log_std": execution_info["log_std"][0].detach(),
             }
+            if getattr(self.cfg, "store_behavior_pre_tanh_action", False):
+                behavior_policy["pre_tanh_action"] = execution_info["pre_tanh_action"][0].detach()
         else:
             action = executed
             behavior_policy = None
@@ -7398,6 +7402,8 @@ class InnerImprovementEngine(RetraceInnerMixin):
                 "pre_tanh_mean": execution_info["pre_tanh_mean"][0].detach(),
                 "log_std": execution_info["log_std"][0].detach(),
             }
+            if getattr(self.cfg, "store_behavior_pre_tanh_action", False):
+                behavior_policy["pre_tanh_action"] = execution_info["pre_tanh_action"][0].detach()
         else:
             action, behavior_policy = executed, None
         # Only measured work counters belong to a held action. In particular,

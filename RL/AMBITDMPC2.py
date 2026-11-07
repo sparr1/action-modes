@@ -100,6 +100,13 @@ _AMBI_DEFAULTS = {
     # Actor, temperature, and entropy-augmented critic objectives share a statistic.
     "outer_actor_objective": "q_maximization",
     "outer_boom_coef": "auto",
+    "outer_boom_alignment": "sampled_action",
+    "outer_boom_q_temperature": "scale",
+    "outer_boom_diagnostics": False,
+    "outer_boom_diagnostics_early_every": 100,
+    "outer_boom_diagnostics_early_until": 20000,
+    "outer_boom_diagnostics_every": 1000,
+    "outer_boom_diagnostics_seed": 1729,
     "outer_boom_min_std": 0.05,
     "outer_boom_compile_mode": "default",
     "outer_behavior_policy_weighting": "constant",
@@ -1373,6 +1380,10 @@ class AMBITDMPC2(TDMPC2Baseline):
     def _stores_behavior_policy(self):
         return bool(getattr(self.cfg, "store_behavior_policy", False))
 
+    @property
+    def _stores_behavior_pre_tanh_action(self):
+        return bool(getattr(self.cfg, "store_behavior_pre_tanh_action", False))
+
     def _allocate_episode_staging(self, capacity):
         staging = super()._allocate_episode_staging(capacity)
         if not self._stores_behavior_policy:
@@ -1396,6 +1407,10 @@ class AMBITDMPC2(TDMPC2Baseline):
             dtype=torch.bool,
             **tensor_kwargs,
         )
+        if self._stores_behavior_pre_tanh_action:
+            staging["behavior_pre_tanh_action"] = torch.empty(
+                (capacity, self.cfg.action_dim), dtype=torch.float32, **tensor_kwargs,
+            )
         return staging
 
     def _ensure_episode_staging_capacity(self, required):
@@ -1418,6 +1433,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             self._episode_staging["behavior_pre_tanh_mean"][0].zero_()
             self._episode_staging["behavior_log_std"][0].zero_()
             self._episode_staging["behavior_policy_valid"][0] = False
+            if self._stores_behavior_pre_tanh_action:
+                self._episode_staging["behavior_pre_tanh_action"][0].zero_()
         return rows
 
     def _random_action_norm(self):
@@ -1434,6 +1451,8 @@ class AMBITDMPC2(TDMPC2Baseline):
             self._episode_staging["behavior_pre_tanh_mean"][row].zero_()
             self._episode_staging["behavior_log_std"][row].zero_()
             self._episode_staging["behavior_policy_valid"][row] = False
+            if self._stores_behavior_pre_tanh_action:
+                self._episode_staging["behavior_pre_tanh_action"][row].zero_()
             return
         mean = torch.as_tensor(
             behavior_policy["pre_tanh_mean"], dtype=torch.float32
@@ -1447,6 +1466,20 @@ class AMBITDMPC2(TDMPC2Baseline):
             raise ValueError(
                 "Captured behavior-policy parameters must be finite."
             )
+        if self._stores_behavior_pre_tanh_action:
+            if "pre_tanh_action" not in behavior_policy:
+                raise ValueError("Replay likelihood requires the executed pre-tanh action.")
+            pre_tanh_action = torch.as_tensor(
+                behavior_policy["pre_tanh_action"], dtype=torch.float32,
+            ).reshape(self.cfg.action_dim)
+            if not bool(torch.isfinite(pre_tanh_action).all()):
+                raise ValueError("Captured behavior pre-tanh action must be finite.")
+            # Compare on CPU: this also catches accidentally captured policy
+            # means, post-squash exploration, and stale graph output buffers.
+            executed_action = self._episode_staging["action"][row]
+            if not torch.allclose(pre_tanh_action.cpu().tanh(), executed_action, atol=1e-6, rtol=1e-6):
+                raise ValueError("Captured pre-tanh action does not match the executed action.")
+            self._episode_staging["behavior_pre_tanh_action"][row].copy_(pre_tanh_action)
         self._episode_staging["behavior_pre_tanh_mean"][row].copy_(mean)
         self._episode_staging["behavior_log_std"][row].copy_(log_std)
         self._episode_staging["behavior_policy_valid"][row] = True
@@ -1461,6 +1494,10 @@ class AMBITDMPC2(TDMPC2Baseline):
                 (1, self.cfg.action_dim), dtype=torch.float32
             )
             td["behavior_policy_valid"] = torch.zeros((1,), dtype=torch.bool)
+            if self._stores_behavior_pre_tanh_action:
+                td["behavior_pre_tanh_action"] = torch.zeros(
+                    (1, self.cfg.action_dim), dtype=torch.float32,
+                )
         return td
 
     def _validate_paired_controller_config(self, cfg, observation_type):
@@ -1539,6 +1576,24 @@ class AMBITDMPC2(TDMPC2Baseline):
             merged["outer_boom_compile_mode"], "outer_boom_compile_mode",
             {"default", "reduce-overhead"},
         )
+        merged["outer_boom_alignment"] = _normalize_choice(
+            merged["outer_boom_alignment"], "outer_boom_alignment",
+            {"sampled_action", "replay_likelihood"},
+        )
+        if isinstance(merged["outer_boom_q_temperature"], str):
+            merged["outer_boom_q_temperature"] = _normalize_choice(
+                merged["outer_boom_q_temperature"], "outer_boom_q_temperature", {"scale"},
+            )
+        else:
+            merged["outer_boom_q_temperature"] = _strict_nonnegative_float(
+                merged["outer_boom_q_temperature"], "outer_boom_q_temperature",
+            )
+            if merged["outer_boom_q_temperature"] <= 0:
+                raise ValueError("outer_boom_q_temperature must be positive.")
+        if (merged["outer_actor_objective"] == "boom"
+                and merged["outer_boom_alignment"] == "sampled_action"
+                and merged["outer_boom_q_temperature"] != "scale"):
+            raise ValueError("Fixed outer_boom_q_temperature requires outer_boom_alignment='replay_likelihood'.")
         if isinstance(merged["outer_boom_coef"], str):
             merged["outer_boom_coef"] = _normalize_choice(
                 merged["outer_boom_coef"], "outer_boom_coef", {"auto"},
@@ -2513,7 +2568,22 @@ class AMBITDMPC2(TDMPC2Baseline):
                     "inner_execution_std_scale > 0."
                 )
         cfg.store_behavior_policy = schedule != "none" or cfg.outer_actor_objective == "boom"
+        cfg.store_behavior_pre_tanh_action = (
+            cfg.outer_actor_objective == "boom" and cfg.outer_boom_alignment == "replay_likelihood"
+        )
+        if cfg.store_behavior_pre_tanh_action and cfg.inner_execution_action == "mean_plus_gaussian":
+            raise ValueError(
+                "outer_boom_alignment='replay_likelihood' requires 'policy_sample' or 'mean' "
+                "execution; clipped action-space noise has no exact pre-tanh sample."
+            )
         cfg.store_teacher_policy = False
+        cfg.outer_boom_diagnostics = _strict_bool(cfg.outer_boom_diagnostics, "outer_boom_diagnostics")
+        for key in ("outer_boom_diagnostics_early_every", "outer_boom_diagnostics_every"):
+            setattr(cfg, key, _strict_positive_int(getattr(cfg, key), key))
+        for key in ("outer_boom_diagnostics_early_until", "outer_boom_diagnostics_seed"):
+            setattr(cfg, key, _strict_nonnegative_int(getattr(cfg, key), key))
+        if cfg.outer_boom_diagnostics and not cfg.store_behavior_pre_tanh_action:
+            raise ValueError("outer_boom_diagnostics requires BOOM replay_likelihood.")
         cfg.log_std_mapping = normalize_log_std_mapping(
             cfg.log_std_mapping, "log_std_mapping"
         )

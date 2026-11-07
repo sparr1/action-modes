@@ -890,6 +890,126 @@ weighting by actor-update count, and reports its usual mean/std/min/max/count.
 evaluation retains the same metrics in its ordinary model-metric summaries and
 decision traces. Existing running jobs and historical logs are not modified.
 
+### BOOM replay likelihood alignment
+
+AMBI supports two distinct BOOM alignment objectives under
+`outer_actor_objective="boom"`. The default
+`outer_boom_alignment="sampled_action"` preserves the released-code surrogate:
+it attracts a fresh actor action toward the stored behavior mean using a
+detached, floored current standard deviation, with actor-action Q weights.
+The port sums over action dimensions once, removing the upstream helper's
+additional dimension multiplier. This normalization correction does **not**
+make the surrogate the paper's forward-KL likelihood objective.
+
+Select the empirical replay likelihood from
+[BOOM Eqs. 2–4](https://arxiv.org/html/2511.00423v3#S3.SS2) with these additions
+to an existing BOOM algorithm configuration:
+
+```json
+{
+  "outer_boom_alignment": "replay_likelihood",
+  "outer_boom_q_temperature": "scale"
+}
+```
+
+For each nonterminal model-unrolled replay latent `z[t,b]`, this option scores
+the **executed** replay action under the current outer squashed Gaussian.
+Its loss is `outer_boom_coef * 1[S>2] / S * mean_t(rho**t * sum_b(w[t,b] * NLL[t,b]))`,
+where `w` is a softmax of **replay-action** Q over valid rows at each depth.
+Mean and log standard deviation both receive exact density gradients. Replay
+targets, Q weights, and the shared Q range `S` are detached. There is no extra
+action-dimension factor or variance floor; `outer_boom_min_std` applies only
+to the original surrogate and is excluded from likelihood objective identity.
+The actor's configured log-standard-deviation bounds still apply.
+
+`outer_boom_q_temperature="scale"` preserves the existing `Q/S` weighting.
+Set a finite positive numeric value, e.g. `1.0`, to use a fixed temperature
+as in the paper. Fixed temperatures require the replay-likelihood option.
+Both choices retain AMBI's strict `S>2` gate, division by `S`, temporal
+reduction, entropy setting, and the configured alignment coefficient. This
+is an alignment ablation within AMBI, not a complete reproduction of the
+paper's training algorithm. Existing strength presets are unchanged.
+
+The ordinary actor sample still supplies the SAC objective and updates `S`
+once. A separate critic forward and the configured `outer_q_actor_reduction`
+evaluate replay-action Q without gradients. This forward retains the critic's
+current dropout mode and pair-selection convention. Its additional random
+draws can change subsequent training samples even while the alignment gate
+is off; cross-objective runs are not expected to remain bit-identical early
+in training. The existing compiled actor region also covers this computation.
+
+Collection records the original executed **pre-tanh sample** alongside the
+normalized action. It passes through ordinary, held-policy, outer-prior and
+whole-inner-graph collection and is copied out of reusable graph storage with
+the action. This avoids clamped `atanh` approximations when actions round to
+±1. Staging verifies that the saved sample squashes to the executed action.
+Stochastic `policy_sample` and deterministic `mean` execution are supported;
+`mean_plus_gaussian` is rejected because post-squash clipping has no exact
+Gaussian preimage. Seed/random actions have invalid alignment labels.
+
+The tanh Jacobian is included in the reported density. Because targets are
+fixed, it is constant with respect to actor parameters; density gradients are
+those of Gaussian likelihood fitting at the saved preimage. Reported NLL may
+be negative, as is normal for continuous densities. Small predicted variance
+can still create large likelihood gradients; this objective does not guarantee
+stable learning, and the existing actor gradient clipping remains active.
+
+Existing `boom_*` diagnostics retain their reductions; likelihood mode also
+logs `boom_q_temperature`. Its version-2 BOOM specification records target,
+density, Q weighting, temperature, gate, and normalization semantics. Exact
+resume rejects switches between objectives or temperatures before mutation.
+Replay with pre-tanh samples uses schema version 3; legacy replay and BOOM
+checkpoint identities retain their existing formats. Old checkpoints can be
+used for explicit raw-weight transfer, but missing executed preimages are
+never reconstructed from stored means or silently synthesized.
+
+`tests/test_boom_replay_likelihood.py` checks independent transformed-density
+values and gradients, variance expansion, replay-action Q weighting,
+saturation, invalid rows, collection, replay serialization, and exact learner
+continuation. `tests/test_ambi_boom_acceleration.py` covers eager/fullgraph
+gradient and Adam parity, fallback RNG restoration, and graph-output ownership
+for both objectives; CUDA-specific tests require CUDA hardware.
+
+#### Gradient and optimizer diagnostics
+
+Enable `outer_boom_diagnostics=true` for replay-likelihood alignment to log
+`boom_diag_*` measurements at update 1, every 100 updates through update
+20,000, and every 1,000 thereafter. The `outer_boom_diagnostics_early_every`,
+`outer_boom_diagnostics_early_until`, and `outer_boom_diagnostics_every`
+settings control this cadence. These observational settings do not change
+the scientific resume identity.
+
+The component-gradient probe uses the current training minibatch and committed
+S, with independent reproducible policy, dropout and Q-pair draws in an isolated
+RNG context. It reports Q, entropy, their SAC sum, and unit-coefficient alignment
+gradient norms, alignment/SAC ratios, and gradient cosine. This is a stochastic
+estimate of component balance, not a decomposition of the compiled update's
+exact random realization. The probe preserves training RNG, parameters, `.grad`,
+optimizer state and module modes; CPU and CUDA continuation tests check this.
+
+Both gated and prospective (gate ignored) alignment strengths are logged.
+Candidate ratios for lambda in {0.000042, 0.00042, 0.0042, 0.042, 0.42} reuse
+the same probe. `lambda_for_ratio_0p1` and `lambda_for_ratio_0p3` estimate the
+coefficient giving a norm 10% or 30% of SAC on this minibatch; neither is an
+established optimum or a prediction of an alternative training trajectory.
+Validity flags accompany ratios whose denominator can vanish.
+
+At the same cadence, snapshots immediately before and after the actual Adam
+step measure its parameter delta and relative norm, policy KL(old || new),
+mean-action change and log-standard-deviation change. The KL is analytic in
+pre-tanh Gaussian space, equal to squashed-policy KL under the shared invertible
+transform. Each pair uses the same up-to-64 replay latents; the state sample
+changes between measurements. Clip incidence and multiplier are recorded on
+every update. These measurements expose clipping and Adam preconditioning,
+which component gradient norms alone cannot describe.
+
+The versioned `ambi_boom_likelihood_pilot` manifest specifies one outer-adapt
+seed55 Humanoid Walk run at lambda=0.0042 for 400k decisions, retaining S>2,
+Q/S weights and post-tanh alpha=0.0021. The Oscar launcher requires fresh CUDA
+parity, real-production-shape one/two-CPU sizing, checkpoint/geometry checks
+and a clean pinned source. Validation disables W&B. Production retains all
+16 checkpoints and logs diagnostics without adapting lambda during the run.
+
 ### Optional replay behavior-policy regularizer
 
 `outer_behavior_policy_kl_schedule` optionally enables a replayed

@@ -218,7 +218,7 @@ class Buffer():
 		self._track_episode_rows(len(td))
 		return self._num_eps
 
-	def _prepare_batch(self, td, *, include_behavior_policy=False):
+	def _prepare_batch(self, td, *, include_behavior_policy=False, include_behavior_action=False):
 		"""
 		Prepare a sampled batch for training (post-processing).
 		Expects `td` to be a TensorDict with batch size TxB.
@@ -227,14 +227,21 @@ class Buffer():
 			raise RuntimeError(
 				"Behavior-policy replay is not enabled for this buffer."
 			)
+		if include_behavior_action and (
+			not include_behavior_policy or not self._behavior_action_enabled()
+		):
+			raise RuntimeError("Executed pre-tanh action replay is not enabled or policy labels were not requested.")
 		selected = ("obs", "action", "reward", "terminated", "task")
+		behavior_fields = _BEHAVIOR_POLICY_FIELDS
+		if include_behavior_action:
+			behavior_fields += ("behavior_pre_tanh_action",)
 		if include_behavior_policy:
-			selected += _BEHAVIOR_POLICY_FIELDS
+			selected += behavior_fields
 		td = td.select(*selected, strict=False).to(
 			self._device, non_blocking=True
 		)
 		if include_behavior_policy:
-			missing = set(_BEHAVIOR_POLICY_FIELDS).difference(td.keys())
+			missing = set(behavior_fields).difference(td.keys())
 			if missing:
 				raise RuntimeError(
 					"Replay sample lacks behavior-policy fields: "
@@ -259,13 +266,20 @@ class Buffer():
 		behavior_valid = (
 			td.get("behavior_policy_valid")[1:].unsqueeze(-1).contiguous()
 		)
-		return batch + (behavior_mean, behavior_log_std, behavior_valid)
+		batch += (behavior_mean, behavior_log_std, behavior_valid)
+		if include_behavior_action:
+			batch += (td.get("behavior_pre_tanh_action")[1:].contiguous(),)
+		return batch
 
-	def sample(self, *, include_behavior_policy=False):
+	def sample(self, *, include_behavior_policy=False, include_behavior_action=False):
 		"""Sample a batch of subsequences from the buffer."""
 		td = self._buffer.sample().view(
 			-1, self.cfg.train_unroll_horizon+1
 		).permute(1, 0)
+		if include_behavior_action:
+			return self._prepare_batch(
+				td, include_behavior_policy=include_behavior_policy, include_behavior_action=True,
+			)
 		if include_behavior_policy:
 			return self._prepare_batch(td, include_behavior_policy=True)
 		# Keep the historical one-argument seam used by tests and downstream
@@ -354,7 +368,12 @@ class Buffer():
 	def _behavior_policy_enabled(self):
 		return bool(getattr(self.cfg, "store_behavior_policy", False))
 
+	def _behavior_action_enabled(self):
+		return bool(getattr(self.cfg, "store_behavior_pre_tanh_action", False))
+
 	def _training_state_version(self):
+		if self._behavior_action_enabled():
+			return 3
 		return 2 if self._behavior_policy_enabled() else 1
 
 	def _training_signature(self):
@@ -383,6 +402,8 @@ class Buffer():
 			signature["behavior_policy_replay"] = (
 				_BEHAVIOR_POLICY_REPLAY_SIGNATURE
 			)
+		if self._behavior_action_enabled():
+			signature["behavior_action_replay"] = "executed-pre-tanh-sample-v1"
 		return signature
 
 	def _configured_field_specs(self):
@@ -442,6 +463,10 @@ class Buffer():
 					},
 				}
 			)
+		if self._behavior_action_enabled():
+			specs["behavior_pre_tanh_action"] = {
+				"name": "behavior_pre_tanh_action", "shape": [action_dim], "dtype": "torch.float32",
+			}
 		return specs
 
 	def _accounting_state(self):
@@ -497,6 +522,8 @@ class Buffer():
 			expected_fields.add("task")
 		if self._behavior_policy_enabled():
 			expected_fields.update(_BEHAVIOR_POLICY_FIELDS)
+		if self._behavior_action_enabled():
+			expected_fields.add("behavior_pre_tanh_action")
 		if set(fields) != expected_fields:
 			raise ValueError(
 				"Replay storage fields are incompatible with the state-observation "

@@ -87,6 +87,39 @@ metrics['TD-M(PC)² behavior penalty']=[
     ('Behavior regularizer contribution','train/behavior_policy_action_ce_weighted_loss'),
     ('Behavior coefficient','train/behavior_policy_action_ce_joint_coefficient'),
     ('Compiled CE fallback','train/compile_behavior_ce_fallback')]
+if state.get('boom_likelihood_diagnostics'):
+    metrics.pop('TD-M(PC)² behavior penalty')
+    diagnostic_groups = {
+        'BOOM gradient balance': [
+            ('SAC gradient norm (isolated probe)', 'sac_grad_norm'),
+            ('Q gradient norm (isolated probe)', 'q_grad_norm'),
+            ('Entropy gradient norm (isolated probe)', 'entropy_grad_norm'),
+            ('Gated weighted alignment gradient norm', 'alignment_weighted_grad_norm'),
+            ('Gated alignment / SAC gradient norm', 'alignment_over_sac'),
+            ('Prospective alignment / SAC, ignoring gate', 'prospective_alignment_over_sac'),
+            ('Alignment vs SAC gradient cosine', 'alignment_sac_cosine'),
+            ('Gradient-ratio validity', 'ratio_valid')],
+        'BOOM candidate scales': [
+            (f'Prospective ratio at lambda={value}', 'prospective_ratio_lambda_' + label)
+            for value, label in [('0.000042','0p000042'), ('0.00042','0p00042'), ('0.0042','0p0042'), ('0.042','0p042'), ('0.42','0p42')]
+        ] + [('Lambda for 10% SAC gradient norm', 'lambda_for_ratio_0p1'),
+             ('Lambda for 30% SAC gradient norm', 'lambda_for_ratio_0p3'),
+             ('Coefficient-estimate validity', 'coefficient_estimate_valid')],
+        'BOOM actual Adam and policy change': [
+            ('Actual Adam parameter step norm', 'adam_step_norm'),
+            ('Actual Adam relative step norm', 'adam_step_relative_norm'),
+            ('Policy KL before vs after actual step', 'policy_kl_before_after'),
+            ('95th percentile policy KL', 'policy_kl_p95'),
+            ('Mean-action change RMS', 'mean_action_change_rms'),
+            ('Log-standard-deviation change RMS', 'log_std_change_rms'),
+            ('Standard deviation before step', 'std_before'),
+            ('Standard deviation after step', 'std_after')],
+    }
+    metrics = {**{name: [(title, 'train/boom_diag_' + key) for title, key in group]
+                  for name, group in diagnostic_groups.items()}, **metrics}
+    metrics['BOOM clipping'] = [
+        ('Fraction of actual actor updates clipped', 'train/boom_actor_clip_fraction'),
+        ('Actual actor clipping multiplier', 'train/boom_actor_clip_multiplier')]
 timestamp=datetime.now(timezone.utc).isoformat()
 status='\n'.join(f"| {r['label'].replace('|','/')} | {r['job']} | {r['state']} | {r['decisions']} |" for r in rows)
 md=f'''**Post-tanh policy-prior fixes — H3/J8/K1, Oscar L40S.**
