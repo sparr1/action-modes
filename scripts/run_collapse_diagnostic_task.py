@@ -10,10 +10,10 @@ import sys
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--manifest',type=Path,required=True)
-    parser.add_argument('--stage',choices=['smoke','checkpoint'],required=True)
+    parser.add_argument('--stage',choices=['bank','smoke','checkpoint'],required=True)
     parser.add_argument('--index',type=int)
     args=parser.parse_args()
-    index=args.index if args.index is not None else int(os.environ['SLURM_ARRAY_TASK_ID'])
+    index=args.index if args.index is not None else int(os.environ.get('SLURM_ARRAY_TASK_ID','0'))
     manifest=json.loads(args.manifest.read_text())
     source=Path(__file__).resolve().parents[1]
     os.chdir(source)
@@ -26,7 +26,8 @@ def main():
         TORCHINDUCTOR_COMPILE_THREADS='1')
     root=Path(manifest['output_root'])
     bank=root/'bank'/'bank.json'
-    task=(manifest['smoke_tasks'] if args.stage=='smoke' else manifest['checkpoints'])[index]
+    task=(dict(key='shared-bank',checkpoint=manifest['bank_checkpoint']) if args.stage=='bank'
+          else (manifest['smoke_tasks'] if args.stage=='smoke' else manifest['checkpoints'])[index])
     output=root/args.stage/task['key']
     output.mkdir(parents=True,exist_ok=True)
     def run(mode,checkpoint,destination,*extra):
@@ -37,9 +38,9 @@ def main():
         name='bank.json' if mode=='bank' else 'result.json'
         result=json.loads((destination/name).read_text())
         if mode!='bank' and not result.get('complete'):raise RuntimeError('Incomplete result.')
-    if args.stage=='smoke':
-        if index==0:
-            run('bank',manifest['bank_checkpoint'],root/'bank')
+    if args.stage=='bank':
+        run('bank',manifest['bank_checkpoint'],root/'bank','--device','cpu')
+    elif args.stage=='smoke':
         run('parity',task['checkpoint'],output/'parity')
         run('episodes',task['checkpoint'],output/'episodes','--seeds',101,'--steps',50,
             '--arms','prior_mean','prior_sample')
