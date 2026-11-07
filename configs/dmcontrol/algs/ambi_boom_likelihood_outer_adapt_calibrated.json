@@ -84,7 +84,7 @@
     "wandb_step_every": 100,
     "wandb_entity": "rwgao_b-brown-university",
     "wandb_mode": "online",
-    "wandb_run_name": "outer adapt K1 | BOOM replay likelihood | lambda0.00001 | seed55",
+    "wandb_run_name": "outer adapt K1 | BOOM replay likelihood | lambda0.000042 | seed55",
     "wandb_tags": [
       "H3",
       "J8",
@@ -161,7 +161,7 @@
     "critic_geometry_obs_noise_std": 0.01,
     "critic_geometry_action_noise_std": 0.02,
     "outer_actor_objective": "boom",
-    "outer_boom_coef": 1e-05,
+    "outer_boom_coef": 4.2e-05,
     "outer_boom_min_std": 0.05,
     "outer_boom_compile_mode": "reduce-overhead",
     "outer_boom_alignment": "replay_likelihood",

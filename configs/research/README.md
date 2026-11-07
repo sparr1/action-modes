@@ -223,6 +223,16 @@ weights use Q/S, and alignment is divided by S. Choose the coefficient from
 valid diagnostic batches and retain the supporting history and selection
 receipt beside the launch manifest; gradient balance is not a return optimum.
 
+The November 7 pilot (`ambi/8b8130452c1741e580fd69487eb7f7c2`, lambda0.0042)
+supplied 71 valid probes from decisions 3,100–10,100. Thirteen had S>=1.5,
+including three with S>2. The selected fixed lambda0.000042 is the largest
+logged candidate that keeps every observed near-threshold prospective
+alignment/SAC gradient ratio below one: median0.240, maximum0.735. The three
+active probes alone project to ratios0.0097–0.0122. Including batches within
+25% below the gate protects against its sharp activation transients; this
+analysis window does not change the S>2 training gate. These are fixed-state
+counterfactual gradient ratios, not predictions of Adam steps or later returns.
+
 `slurm/boom_likelihood_calibrated_oscar.py gate` runs fresh CUDA correctness
 checks and pairs a prior with the graph controller after checkpoint reload.
 The evaluator sizing benchmark uses 1 and 2 physical CPUs with W&B disabled;

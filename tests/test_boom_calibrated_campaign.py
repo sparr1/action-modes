@@ -51,7 +51,7 @@ def test_boom_prior_preflight_uses_same_frozen_context_as_model_load():
         cfg = resolved_checkpoint_config(checkpoint, resolved)
         assert cfg["outer_actor_objective"] == "boom"
         assert cfg["outer_boom_alignment"] == "replay_likelihood"
-        assert cfg["outer_boom_coef"] == 1e-5
+        assert cfg["outer_boom_coef"] == 0.000042
         assert cfg["inner_operator"] == ("none" if selector.endswith("prior") else "sac")
 
 
