@@ -133,7 +133,8 @@ def gradients(args):
                     alpha=metrics['inner_effective_alpha'],samples=args.samples,seed=seed,pair=pair)
                 rows.append(dict(**base,phase='adapted',solve_seed=solve_seed,**final))
             atomic_json(args.output/'progress.json',dict(completed_roots=len(rows)//(2*args.repeats),
-                requested_roots=min(args.roots,len(bank['roots'])),elapsed_seconds=time.perf_counter()-started))
+                requested_roots=min(args.roots,len(bank['roots'])),elapsed_seconds=time.perf_counter()-started),
+                overwrite=True)
         after = _outer_state_digest(model)
         if before != after: raise AssertionError('Gradient diagnostics mutated outer state.')
         result = dict(complete=True,kind='collapse_gradients_v1',source=identity(args.checkpoint,context),
@@ -178,7 +179,8 @@ def episodes(args):
                 row = episode(env,controller,env_seed=seed,noise_seed=noise_seed,max_steps=args.steps)
                 rows.append(dict(arm=arm,**row))
                 atomic_json(args.output/'progress.json',dict(completed_episodes=len(rows),
-                    total_episodes=len(arms)*len(args.seeds),rows=rows,elapsed_seconds=time.perf_counter()-started))
+                    total_episodes=len(arms)*len(args.seeds),rows=rows,elapsed_seconds=time.perf_counter()-started),
+                    overwrite=True)
         if before != _outer_state_digest(model): raise AssertionError('Episode evaluation mutated outer state.')
         result = dict(complete=True,kind='collapse_episodes_v1',source=identity(args.checkpoint,context),
             rows=rows,outer_state_unchanged=True,outer_digest=before,resolved_config=config,

@@ -25,7 +25,7 @@ def main():
         OMP_NUM_THREADS='1',MKL_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1',
         TORCHINDUCTOR_COMPILE_THREADS='1')
     root=Path(manifest['output_root'])
-    bank=root/'bank'/'bank.json'
+    bank=Path(manifest.get('bank_path',root/'bank'/'bank.json'))
     task=(dict(key='shared-bank',checkpoint=manifest['bank_checkpoint']) if args.stage=='bank'
           else (manifest['smoke_tasks'] if args.stage=='smoke' else manifest['checkpoints'])[index])
     output=root/'bank-status' if args.stage=='bank' else root/args.stage/task['key']
