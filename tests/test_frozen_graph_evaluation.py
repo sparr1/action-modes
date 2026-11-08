@@ -7,6 +7,7 @@ import torch
 
 import evaluate_ambi_checkpoint as evaluator
 from RL.tdmpc2_core.frozen_graph import FrozenGraphController, MeanActionGraph, PROTOCOL
+from RL.tdmpc2_core.whole_inner_graph import validate_training_graph
 from tests.test_inner_entropy_graph import make_agent, inner_snapshot, outer_snapshot, assert_tree_close
 from utils.ambi_research import load_preset_matrix, resolve_preset
 from utils.eval_series_data import planner_identity
@@ -50,6 +51,29 @@ def test_graph_rng_has_distinct_curve_identity():
     assert graph["settings"]["evaluation_execution_backend"] == PROTOCOL
 
 
+@pytest.mark.parametrize("saved_execution", ["policy_sample", "mean"])
+def test_frozen_graph_accepts_saved_execution_without_changing_training_gate(saved_execution):
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(inner_rounds=8, compile=True, compile_strict=True,
+                            inner_execution_action=saved_execution),
+        device=torch.device("cuda"), _retrace_enabled=False, _active_trace=None,
+    )
+    validate_training_graph(engine, frozen_mean_evaluation=True)
+    assert engine.cfg.inner_execution_action == saved_execution
+    if saved_execution == "mean":
+        with pytest.raises(ValueError, match="inner_execution_action"):
+            validate_training_graph(engine)
+    else:
+        validate_training_graph(engine)
+    engine.cfg.inner_execution_action = "mean_plus_gaussian"
+    with pytest.raises(ValueError, match="inner_execution_action"):
+        validate_training_graph(engine, frozen_mean_evaluation=True)
+    engine.cfg.inner_execution_action = saved_execution
+    engine.cfg.inner_actor_scope = "run"
+    with pytest.raises(ValueError, match="inner_actor_scope"):
+        validate_training_graph(engine, frozen_mean_evaluation=True)
+
+
 @pytest.mark.parametrize("bad_options", [
     {"execution_action": "sample", "recording": "returns"},
     {"execution_action": "mean", "recording": "full"},
@@ -64,10 +88,14 @@ def test_evaluator_rejects_graph_protocol_changes_before_model_load(tmp_path, ba
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires scheduled CUDA GPU")
-def test_cuda_mean_graph_matches_control_and_resets_episode_rng():
+@pytest.mark.parametrize("saved_execution", ["policy_sample", "mean"])
+def test_cuda_mean_graph_matches_control_and_resets_episode_rng(saved_execution):
     torch.set_float32_matmul_precision("high")
     agents = [make_agent("squashed", "action", "per_update", device="cuda", compiled=True) for _ in range(2)]
     agents[1].load(deepcopy(agents[0].checkpoint_state()))
+    for agent in agents:
+        agent.cfg.inner_execution_action = saved_execution
+        validate_training_graph(agent.inner_engine, frozen_mean_evaluation=True)
     before = [outer_snapshot(agent) for agent in agents]
     root = torch.randn(1, agents[0].cfg.latent_dim, device="cuda")
     runners = [MeanActionGraph(agent.inner_engine, root, capture=capture, seed=12345, warmup=4)

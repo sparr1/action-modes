@@ -218,12 +218,11 @@ class WholeInnerGraph:
 _TRAINING_PROTOCOL = "isolated_cuda_graph_with_native_diagnostics_v1"
 
 
-def validate_training_graph(engine):
-    """Keep the first training mode limited to the validated fresh K1 recipe."""
+def validate_training_graph(engine, *, frozen_mean_evaluation=False):
+    """Validate fresh K1 graphs, with saved mean execution allowed for evaluation."""
     validate_graph_workload(engine)
     for key, expected in {
         "obs": "state", "inner_solve_interval": 1,
-        "inner_execution_action": "policy_sample",
         "inner_execution_policy_source": "primary",
         "aux_return_mode": "off", "outer_critic_target": "reward_only",
         "inner_sac_critic_target": "reward_only",
@@ -231,6 +230,9 @@ def validate_training_graph(engine):
     }.items():
         if getattr(engine.cfg, key, expected) != expected:
             raise ValueError(f"Training CUDA graph requires {key}={expected!r}.")
+    allowed_execution = {"policy_sample", "mean"} if frozen_mean_evaluation else {"policy_sample"}
+    if getattr(engine.cfg, "inner_execution_action", "policy_sample") not in allowed_execution:
+        raise ValueError(f"CUDA graph requires inner_execution_action in {sorted(allowed_execution)!r}.")
     schedule = getattr(engine.cfg, "outer_behavior_policy_kl_schedule", "none")
     if schedule != "none" and not (
         schedule == "quantile_gate"

@@ -24,6 +24,10 @@ trainer, which shares its environment with training. Our prior and H3/J8 SAC
 continue to execute actor means; this change does not replace them with the
 TD-MPC2 planner.
 
+The frozen graph accepts checkpoints trained with either sampled or mean final
+action execution. It retains that saved configuration and explicitly executes
+means during evaluation; the training graph's execution restrictions are unchanged.
+
 Select the new matrix for direct evaluation:
 
 ```bash

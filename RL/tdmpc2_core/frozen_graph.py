@@ -28,7 +28,7 @@ class FrozenGraphController:
     def __init__(self, model, observation, seed):
         self.model = model
         self.engine = model.agent.inner_engine
-        validate_training_graph(self.engine)
+        validate_training_graph(self.engine, frozen_mean_evaluation=True)
         if model.cfg.inner_actor_loss_scale_scope != "action":
             raise ValueError("Frozen graph evaluation requires action-scoped Q normalization.")
         with torch.no_grad():
