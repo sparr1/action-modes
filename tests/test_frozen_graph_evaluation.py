@@ -74,6 +74,21 @@ def test_frozen_graph_accepts_saved_execution_without_changing_training_gate(sav
         validate_training_graph(engine, frozen_mean_evaluation=True)
 
 
+def test_mean_checkpoint_native_evaluation_warmup_uses_evaluation_validation():
+    from RL.tdmpc2_core.inner_improvement import InnerImprovementEngine
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(inner_rounds=8, compile=True, compile_strict=True,
+                            inner_execution_action="mean", inner_cuda_graph=True),
+        device=torch.device("cuda"), _retrace_enabled=False, _active_trace=None,
+        _whole_graph_worker=False, prepare_control=lambda **kwargs: None,
+        _act_with_trace=lambda *args, **kwargs: (None, {}, []),
+    )
+    result = InnerImprovementEngine.act(engine, None, eval_mode=True)
+    assert result[1]["inner_cuda_graph_used"] == 0.0
+    with pytest.raises(ValueError, match="inner_execution_action"):
+        InnerImprovementEngine.act(engine, None, eval_mode=False)
+
+
 @pytest.mark.parametrize("bad_options", [
     {"execution_action": "sample", "recording": "returns"},
     {"execution_action": "mean", "recording": "full"},

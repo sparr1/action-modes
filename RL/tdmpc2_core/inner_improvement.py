@@ -7451,7 +7451,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
         graph = bool(getattr(self.cfg, "inner_cuda_graph", False)) and not self._whole_graph_worker
         if graph:
             from .whole_inner_graph import validate_training_graph, training_graph_act
-            validate_training_graph(self)
+            validate_training_graph(self, frozen_mean_evaluation=eval_mode)
             if not eval_mode and not collect_diagnostics and trace is None:
                 return training_graph_act(
                     self, root_z, return_behavior_policy=return_behavior_policy,
