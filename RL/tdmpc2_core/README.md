@@ -95,6 +95,14 @@ or replay transfer. Unsupported configurations fail rather than falling back.
 The six inner-entropy campaign arms use this path with matching inner/outer
 `tdmpc2_scaled` or `squashed` entropy and percentile-range Q normalization.
 
+Training CUDA graphs also support `inner_execution_action="mean"`, which
+executes `tanh(mu)` from the final adapted actor without execution noise.
+Imagined actions remain sampled. This is the deterministic policy action,
+not the expectation of a tanh-transformed Gaussian. The paired Humanoid Run
+manifest is `configs/dmcontrol/experiments/ambi_boom_x0p01_humanoid_run_mean.json`.
+Its Oscar launcher validates mean-action GPU parity and checkpoint
+continuation with W&B disabled before starting fresh training.
+
 The normalization input is refreshed before every replay. The validated
 `inner_actor_loss_scale_scope` / `inner_actor_loss_scale_update` pairs are
 `action/per_action` (copy outer and freeze), `action/per_update` (copy outer and

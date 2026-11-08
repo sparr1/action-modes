@@ -223,7 +223,6 @@ def validate_training_graph(engine):
     validate_graph_workload(engine)
     for key, expected in {
         "obs": "state", "inner_solve_interval": 1,
-        "inner_execution_action": "policy_sample",
         "inner_execution_policy_source": "primary",
         "aux_return_mode": "off", "outer_critic_target": "reward_only",
         "inner_sac_critic_target": "reward_only",
@@ -238,6 +237,8 @@ def validate_training_graph(engine):
         and getattr(engine.cfg, "outer_behavior_policy_objective", "reverse_kl") == "action_space_cross_entropy"
     ):
         raise ValueError("Training CUDA graph supports no behavior regularizer or corrected TD-M(PC)^2.")
+    if getattr(engine.cfg, "inner_execution_action", "policy_sample") not in {"policy_sample", "mean"}:
+        raise ValueError("Training CUDA graph requires sampled or mean policy execution.")
     if engine.device.type != "cuda":
         raise ValueError("Training CUDA graph requires CUDA.")
 
