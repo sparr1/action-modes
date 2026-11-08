@@ -22,6 +22,8 @@ from slurm.benchmark_ambi_training_cpu import TrainingWindow, physical_core_cpus
 CAMPAIGNS = {
     "original": ("ambi_posttanh_prior_fixes.json", "posttanh-prior-fixes-20261104"),
     "strength": ("ambi_posttanh_prior_strength.json", "posttanh-prior-strength-20261105"),
+    "humanoid_stand": ("ambi_boom_x0p01_humanoid_stand.json", "boom-humanoid-stand-run-20261108/stand"),
+    "humanoid_run": ("ambi_boom_x0p01_humanoid_run.json", "boom-humanoid-stand-run-20261108/run"),
 }
 _manifest_name, _campaign_name = CAMPAIGNS[os.environ.get("AMBI_PRIOR_VARIANT", "original")]
 MANIFEST = ROOT / "configs/dmcontrol/experiments" / _manifest_name

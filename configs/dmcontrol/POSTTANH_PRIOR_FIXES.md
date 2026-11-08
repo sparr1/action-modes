@@ -66,3 +66,30 @@ Only success permits scientific training in the same allocation. The measured
 runtime must fit the allocated walltime. All four jobs can execute concurrently;
 one CPU per L40S follows the measured sizing evidence. The dedicated workspace
 contains all four run IDs with explicit progress and method-specific panels.
+
+## BOOM x0.01 Humanoid Stand and Run
+
+`experiments/ambi_boom_x0p01_humanoid_stand.json` and
+`experiments/ambi_boom_x0p01_humanoid_run.json` retain the complete learning
+recipe of Humanoid Walk run `03bc3869a52b4a69a64d180fc28f4d1e` at
+`bcaa1f59b8e513d7095b1276d6cd2f34144ab18a`. Only the task and publication
+identity change: seed 55, one million decisions, BOOM coefficient 0.0042,
+sampled final actions, H3/J8/K1, fixed squashed entropy coefficient 0.0021,
+all 25k checkpoints, and critic geometry every 1,000 updates remain intact.
+
+`slurm/boom_humanoid_oscar.py prepare --task stand` (or `run`) uses
+`AMBI_PRIOR_VARIANT=humanoid_stand` (or `humanoid_run`). It verifies unchanged
+learner/environment/lock/parity-test sources against the linked run, checks the
+saved CUDA evidence and 1/2-CPU scaling results, and records their reuse.
+`slurm/run_boom_humanoid_oscar.sbatch stand` (or `run`) then performs a fresh
+task-specific production-shape GPU smoke check with W&B disabled, including
+128 timed decisions, checkpoint roundtrip, geometry observation and
+graph/native/graph continuation, before starting fresh scientific training.
+Each task owns a separate output directory and W&B run. Workspace publication
+is idempotent and a publication failure stops the launcher visibly.
+
+One CPU per L40S follows the 1/2-core benchmark (0.1732 versus 0.1735 seconds
+per decision, approximately one core actually used). The 59-hour reservation
+comes from the completed reference's 50.29 hours plus 15% and half an hour for
+startup. A fresh smoke measurement must fit that reservation. Both jobs may
+run concurrently, subject to the live account limits and GPU availability.

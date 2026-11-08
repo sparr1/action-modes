@@ -22,7 +22,8 @@ rows=[]
 for spec in specs:
     r=existing.get(spec['id'])
     summary={} if r is None else dict(r.summary)
-    pending = ("validated; awaiting training logs" if (HERE/'gates'/str(spec.get('index'))/'receipt.json').exists()
+    gate_path = Path(spec['gate_receipt']) if spec.get('gate_receipt') else HERE/'gates'/str(spec.get('index'))/'receipt.json'
+    pending = ("validated; awaiting training logs" if gate_path.exists()
                else f"pending startup validation / job {spec.get('job', 'not submitted')}")
     rows.append({**spec,'state':pending if r is None else r.state,
                  'decisions':summary.get('env_step','pending'), 'job':spec.get('job','pending submission')})
@@ -87,6 +88,8 @@ metrics['TD-M(PC)² behavior penalty']=[
     ('Behavior regularizer contribution','train/behavior_policy_action_ce_weighted_loss'),
     ('Behavior coefficient','train/behavior_policy_action_ce_joint_coefficient'),
     ('Compiled CE fallback','train/compile_behavior_ce_fallback')]
+if state.get('methods') == ['boom']:
+    metrics.pop('TD-M(PC)² behavior penalty')
 timestamp=datetime.now(timezone.utc).isoformat()
 status='\n'.join(f"| {r['label'].replace('|','/')} | {r['job']} | {r['state']} | {r['decisions']} |" for r in rows)
 md=f'''**Post-tanh policy-prior fixes — H3/J8/K1, Oscar L40S.**

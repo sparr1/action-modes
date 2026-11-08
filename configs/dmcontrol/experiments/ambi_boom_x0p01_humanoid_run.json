@@ -1,0 +1,29 @@
+{
+  "study_type": "posttanh_prior_fixes",
+  "study_note": "One seed-55 Humanoid Run training run, one million decisions. Matches W&B run 03bc3869a52b4a69a64d180fc28f4d1e and learner commit bcaa1f59b8e513d7095b1276d6cd2f34144ab18a except for the requested environment task. BOOM coefficient 0.0042, H3/J8/K1, N128/C16/A4/B256, fixed squashed entropy 0.0021, sampled execution, reward-only critics, strict compilation, whole-inner CUDA graphs, vmap, GPU replay and TF32-high. Keep all 40 checkpoints every 25k decisions and critic geometry every 1000 updates.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-run",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_boom_x0p01_humanoid_run"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "name": "BOOM x0.01 Humanoid Run",
+  "description": "One seed-55 Humanoid Run training run, one million decisions. Matches W&B run 03bc3869a52b4a69a64d180fc28f4d1e and learner commit bcaa1f59b8e513d7095b1276d6cd2f34144ab18a except for the requested environment task. BOOM coefficient 0.0042, H3/J8/K1, N128/C16/A4/B256, fixed squashed entropy 0.0021, sampled execution, reward-only critics, strict compilation, whole-inner CUDA graphs, vmap, GPU replay and TF32-high. Keep all 40 checkpoints every 25k decisions and critic geometry every 1000 updates.",
+  "source_run_url": "https://forge.coreweave.com/wandb/rwgao_b-brown-university/ambi/runs/03bc3869a52b4a69a64d180fc28f4d1e"
+}
