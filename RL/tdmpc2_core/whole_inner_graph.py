@@ -219,7 +219,6 @@ def validate_training_graph(engine):
     validate_graph_workload(engine)
     for key, expected in {
         "obs": "state", "inner_solve_interval": 1,
-        "inner_execution_action": "policy_sample",
         "inner_execution_policy_source": "primary",
         "outer_behavior_policy_kl_schedule": "none",
         "aux_return_mode": "off", "outer_critic_target": "reward_only",
@@ -228,6 +227,8 @@ def validate_training_graph(engine):
     }.items():
         if getattr(engine.cfg, key, expected) != expected:
             raise ValueError(f"Training CUDA graph requires {key}={expected!r}.")
+    if getattr(engine.cfg, "inner_execution_action", "policy_sample") not in {"policy_sample", "mean"}:
+        raise ValueError("Training CUDA graph requires sampled or mean policy execution.")
     if engine.device.type != "cuda":
         raise ValueError("Training CUDA graph requires CUDA.")
 

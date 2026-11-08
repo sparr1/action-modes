@@ -1,0 +1,28 @@
+{
+  "study_type": "posttanh-humanoid-run-mean-20261108",
+  "study_note": "Mean-execution counterpart of ambi_posttanh_outer_adapt_humanoid_run: only inner_execution_action changes from policy_sample to mean (tanh(mu)). Fresh Humanoid Run, state observations, seed55, one million decisions, H3/J8/K1, N128/C16/A4/B256, sampled imagined actions, fixed post-tanh entropy 0.0021, reward-only critics, all 25k checkpoints and periodic critic geometry.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-run",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_posttanh_outer_adapt_humanoid_run_mean"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "name": "Humanoid Run - Post-tanh outer adapt - mean execution",
+  "description": "Mean-execution counterpart of ambi_posttanh_outer_adapt_humanoid_run: only inner_execution_action changes from policy_sample to mean (tanh(mu)). Fresh Humanoid Run, state observations, seed55, one million decisions, H3/J8/K1, N128/C16/A4/B256, sampled imagined actions, fixed post-tanh entropy 0.0021, reward-only critics, all 25k checkpoints and periodic critic geometry."
+}

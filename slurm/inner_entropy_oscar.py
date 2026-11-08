@@ -24,6 +24,9 @@ CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/inner-entropy-cudagraph-2026110
 if os.environ.get("AMBI_ENTROPY_VARIANT") == "humanoid_run":
     MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_posttanh_outer_adapt_humanoid_run.json"
     CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/posttanh-humanoid-run-20261108")
+if os.environ.get("AMBI_ENTROPY_VARIANT") == "humanoid_run_mean":
+    MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_posttanh_outer_adapt_humanoid_run_mean.json"
+    CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/posttanh-humanoid-run-mean-20261108")
 GPU_PARITY_TEST = "tests/test_inner_entropy_graph.py::test_cuda_capture_matches_uncaptured_normalized_solve"
 
 
