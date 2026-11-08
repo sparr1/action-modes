@@ -16,12 +16,13 @@ api = wandb.Api()
 specs = state['runs'] + state.get('controls', [])
 entity, project = 'rwgao_b-brown-university', 'ambi'
 ids = [r['id'] for r in specs]
+max_runs = max(8, len(specs))
 existing = {r.id:r for r in api.runs(entity+'/'+project, filters={'name':{'$in':ids}}, per_page=8)}
 rows=[]
 for spec in specs:
     r=existing.get(spec['id'])
     summary={} if r is None else dict(r.summary)
-    rows.append({**spec,'state':f"pending GPU validation / gate {spec.get('gate_job', 'not submitted')}" if r is None else r.state,
+    rows.append({**spec,'state':f"pending startup validation / job {spec.get('job', 'not submitted')}" if r is None else r.state,
                  'decisions':summary.get('env_step','pending'), 'job':spec.get('job','pending submission')})
 metrics={
     'Returns and progress':[
@@ -107,11 +108,23 @@ This table is a timestamped snapshot. Charts update with training; missing
 inner metrics on prior-only controls are intentional. Pending arms have no
 fabricated data. Return drawdowns require 20 complete episodes.
 '''
+if state.get('protocol'):
+    md = f"""{state['protocol']}
+
+Source `{state['commit']}`. Checkpoint root `{state['output']}`.
+
+| Arm | Job | State at {timestamp} | Uploaded decisions |
+|---|---|---|---|
+{status}
+
+The table is a timestamped snapshot; charts update with training. Startup
+validation has W&B disabled. Missing results remain explicitly pending.
+"""
 sections=[ws.Section(name='Inner entropy / Protocol and progress',is_open=True,
                     panels=[wr.MarkdownPanel(markdown=md,layout=wr.Layout(w=24,h=15))])]
 for name,group in metrics.items():
     panels=[wr.LinePlot(title=title,x='env_step',y=[metric],title_x='Agent decisions',aggregate=False,
-                       smoothing_type='none',legend_template='${run:displayName}',max_runs_to_show=8,
+                       smoothing_type='none',legend_template='${run:displayName}',max_runs_to_show=max_runs,
                        layout=wr.Layout(w=12,h=8),
                        line_colors={s['id']+':'+metric:s['color'] for s in specs},
                        line_titles={s['id']+':'+metric:s['label'] for s in specs}) for title,metric in group]
@@ -127,9 +140,9 @@ if receipt_path.exists() or state.get('workspace_url'):
     work.runset_settings.filters=[expr.Metric('ID').isin(ids)]
     work.runset_settings.run_settings={s['id']:ws.RunSettings(color=s['color'],disabled=False) for s in specs}
 else:
-    work=ws.Workspace(entity=entity,project=project,name='H3 J8 K1 - entropy and Q normalization - Oscar',
+    work=ws.Workspace(entity=entity,project=project,name=state.get('workspace_name','H3 J8 K1 - entropy and Q normalization - Oscar'),
         auto_generate_panels=False,sections=sections,
-        settings=ws.WorkspaceSettings(x_axis='env_step',max_runs=8,tooltip_number_of_runs='all_runs',tooltip_color_run_names=True),
+        settings=ws.WorkspaceSettings(x_axis='env_step',max_runs=max_runs,tooltip_number_of_runs='all_runs',tooltip_color_run_names=True),
         runset_settings=ws.RunsetSettings(filters=[expr.Metric('ID').isin(ids)],groupby=[],
             run_settings={s['id']:ws.RunSettings(color=s['color'],disabled=False) for s in specs},
             pinned_columns=['run:displayName','summary:env_step','summary:episode/return']))
@@ -140,7 +153,7 @@ temporary.write_text(json.dumps(receipt,indent=2)+'\n')
 os.replace(temporary, receipt_path)
 readback=ws.Workspace.from_url(work.url)
 assert (readback.entity,readback.project)==(entity,project)
-assert readback.settings.max_runs==8 and readback.settings.x_axis=='env_step'
+assert readback.settings.max_runs==max_runs and readback.settings.x_axis=='env_step'
 assert readback.runset_settings.filters == f'Metric("ID") in {ids!r}'
 owned={s.name:s for s in readback.sections if s.name.startswith('Inner entropy / ')}
 expected_panels=1+sum(len(group) for group in metrics.values())

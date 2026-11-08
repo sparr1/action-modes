@@ -21,6 +21,9 @@ from slurm.benchmark_ambi_training_cpu import TrainingWindow, physical_core_cpus
 
 MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_inner_entropy.json"
 CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/inner-entropy-cudagraph-20261102")
+if os.environ.get("AMBI_ENTROPY_VARIANT") == "humanoid_run":
+    MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_posttanh_outer_adapt_humanoid_run.json"
+    CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/posttanh-humanoid-run-20261108")
 GPU_PARITY_TEST = "tests/test_inner_entropy_graph.py::test_cuda_capture_matches_uncaptured_normalized_solve"
 
 
