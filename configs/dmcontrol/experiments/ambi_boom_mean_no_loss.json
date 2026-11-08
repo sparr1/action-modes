@@ -1,0 +1,28 @@
+{
+  "study_type": "boom_mean_no_loss",
+  "study_note": "Single-axis ablation of W&B ambi/a23ba4087b6b4847995e9998fa4936c6 at source 450aa82ed65eeb887c8e8072a0bf9402a2ae8ef0: outer_boom_coef changes from 0.0042 to 0.0. Retains the BOOM H-state actor horizon and Q-scaling convention so only its alignment loss is removed. Fresh seed55 Humanoid Walk training, mean real actions, sampled inner rollouts, H3/J8/K1, N128/C16/A4/B256, one million decisions, alpha0.0021, all 25k checkpoints, strict compilation, whole-inner CUDA graphs, vmap, TF32-high and critic geometry.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_boom_mean_no_loss"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "name": "AMBI mean execution without BOOM alignment loss",
+  "description": "Single-axis ablation of W&B ambi/a23ba4087b6b4847995e9998fa4936c6 at source 450aa82ed65eeb887c8e8072a0bf9402a2ae8ef0: outer_boom_coef changes from 0.0042 to 0.0. Retains the BOOM H-state actor horizon and Q-scaling convention so only its alignment loss is removed. Fresh seed55 Humanoid Walk training, mean real actions, sampled inner rollouts, H3/J8/K1, N128/C16/A4/B256, one million decisions, alpha0.0021, all 25k checkpoints, strict compilation, whole-inner CUDA graphs, vmap, TF32-high and critic geometry."
+}

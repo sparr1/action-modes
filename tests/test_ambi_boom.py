@@ -54,12 +54,13 @@ def _batch(agent):
     )
 
 
+@pytest.mark.parametrize("coefficient", [0.0, 0.17])
 @pytest.mark.parametrize("horizon,rho", [(1, 0.0), (2, 0.5)])
 @pytest.mark.parametrize("valid_labels", [True, False])
 def test_boom_actor_step_matches_corrected_reference_and_reuses_sampled_q(
-    monkeypatch, horizon, rho, valid_labels,
+    monkeypatch, horizon, rho, valid_labels, coefficient,
 ):
-    base = _agent(train_unroll_horizon=horizon, rho=rho)
+    base = _agent(train_unroll_horizon=horizon, rho=rho, outer_boom_coef=coefficient)
     cfg = deepcopy(base.cfg)
     cfg.action_dim = 3
     agent = AMBITDMPC2Agent(cfg)

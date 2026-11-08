@@ -23,6 +23,7 @@ CAMPAIGNS = {
     "original": ("ambi_posttanh_prior_fixes.json", "posttanh-prior-fixes-20261104"),
     "strength": ("ambi_posttanh_prior_strength.json", "posttanh-prior-strength-20261105"),
     "mean_execution": ("ambi_boom_mean_execution.json", "boom-mean-execution-20261107"),
+    "mean_no_loss": ("ambi_boom_mean_no_loss.json", "boom-mean-no-loss-20261108"),
 }
 _manifest_name, _campaign_name = CAMPAIGNS[os.environ.get("AMBI_PRIOR_VARIANT", "original")]
 MANIFEST = ROOT / "configs/dmcontrol/experiments" / _manifest_name
@@ -34,7 +35,7 @@ GPU_PARITY_TESTS = [
     "tests/test_ambi_tdmpc_square_acceleration.py::test_cuda_compiled_ce_backward_changes_masks_and_retains_metrics",
 ]
 GPU_PARITY_COUNTS = [4, 6, 2, 1]
-if os.environ.get("AMBI_PRIOR_VARIANT") == "mean_execution":
+if os.environ.get("AMBI_PRIOR_VARIANT") in {"mean_execution", "mean_no_loss"}:
     GPU_PARITY_TESTS = [
         "tests/test_ambi_mean_execution.py::test_cuda_mean_capture_preserves_labels_and_inner_state",
         "tests/test_ambi_mean_execution.py::test_cuda_mean_graph_native_graph_and_checkpoint_continuation",
@@ -341,7 +342,7 @@ def select_plan(rows):
     one = next(r for r in rows if r["physical_cpus"] == 1)
     selected = one if one["measured"]["seconds_per_decision"] <= 1.05 * fastest["measured"]["seconds_per_decision"] else fastest
     seconds = selected["measured"]["seconds_per_decision"]
-    margin = 1.15 if os.environ.get("AMBI_PRIOR_VARIANT") == "mean_execution" else 1.25
+    margin = 1.15 if os.environ.get("AMBI_PRIOR_VARIANT") in {"mean_execution", "mean_no_loss"} else 1.25
     return {"index": selected["index"], "cpus": selected["physical_cpus"],
             "seconds_per_decision": seconds,
             "wall_hours": math.ceil(seconds * 1000000 * margin / 3600 + .5),
