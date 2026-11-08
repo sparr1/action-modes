@@ -20,7 +20,8 @@ class FrozenGraphController:
     """Use a private captured workspace through the ordinary prediction API.
 
     Episode resets affect the native engine, never the captured allocations.
-    Each episode explicitly resets the graph-private stream to its solver seed.
+    Independent-seed evaluation resets the graph-private stream per episode;
+    consecutive evaluation resets it once and advances it across all episodes.
     Native phase RNG and this graph protocol are distinct publication identities.
     """
 

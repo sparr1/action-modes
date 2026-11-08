@@ -163,7 +163,7 @@ def test_publication_validates_paired_deltas_against_portable_prior(tmp_path, mo
     from utils.eval_series_data import normalize_bundle
 
     monkeypatch.setattr("utils.ambi_benchmark.code_identity", lambda: {})
-    monkeypatch.setattr("utils.eval_series_data.scientific_identity", lambda *args: {"version": 1})
+    monkeypatch.setattr("utils.eval_series_data.scientific_identity", lambda *args, **kwargs: {"version": 1})
     path, manifest = _prior(tmp_path)
     resolved = {**_resolved(), "selector": "mppi/aux"}
     protocol = reference_protocol_for(resolved, 55, 500)

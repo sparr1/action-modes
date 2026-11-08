@@ -1,5 +1,53 @@
 # Frozen-checkpoint AMBI research
 
+`ambi_checkpoint_graph_eval_consecutive.json` selects ten consecutive full
+episodes per checkpoint, matching TD-MPC2's episode sampling and return
+averaging convention. The environment starts with `reset(seed=55)` exactly
+once, followed by nine ordinary `reset()` calls. The controller stream is also
+seeded once with 55 and advances across episode boundaries, including the
+private CUDA graph stream. Episode-local controller state still resets, and
+each real decision uses fresh prior-initialized inner adaptation. Compilation
+and warmup use the initial observation without stepping the environment; their
+controller draws are discarded before scoring.
+
+The prior and inner SAC each receive their own environment initialized with
+the same seed. Episode indices (0–9 in artifacts, 1–10 in plots) identify the
+paired observations; hashes of the initial observations must agree before
+paired gains can be published. The report averages all ten returns, records
+sample SD and retains every episode point. Each Humanoid Walk episode has 500
+decisions, preserving the action repeat and bounded 0–1000 return convention.
+
+Each checkpoint restarts these streams, so independent checkpoint tasks remain
+parallel and repeatable. This matches the standalone evaluation convention;
+it does not reconstruct the historical RNG position of the official online
+trainer, which shares its environment with training. Our prior and H3/J8 SAC
+continue to execute actor means; this change does not replace them with the
+TD-MPC2 planner.
+
+Select the new matrix for direct evaluation:
+
+```bash
+python evaluate_ambi_checkpoint.py \
+  --matrix configs/research/ambi_checkpoint_graph_eval_consecutive.json \
+  --checkpoint /path/to/model --device cuda \
+  --bundle-dir /path/to/new-evaluation --output /path/to/new-evaluation.json
+```
+
+For `slurm/graph_checkpoint_campaign.py plan` and `prepare`, add
+`--episode-sampling consecutive` to the usual campaign arguments. The chosen
+matrix and its hash are pinned in the campaign; workers and publishers recover
+that choice automatically. Smoke checks shorten it to two consecutive episodes
+without W&B. Direct `--num-episodes` and `--environment-seed` overrides apply
+only to a consecutive matrix and change the scientific protocol identity.
+`--seeds` is rejected for this mode. It supports return-only prior/SAC mean
+execution, including the graph backend; banks and temperature chains are
+separate protocols. An external prior reference must match the entire stream
+protocol and all starting-observation hashes.
+
+The ten-episode protocol requires new evaluation series. It cannot append to
+or reuse the old five-seed results. The legacy matrix and existing campaigns
+retain their settings:
+
 `ambi_checkpoint_graph_eval.json` compares the saved controller with its frozen
 mean-action prior using five paired full episodes (seeds 101–105, controller
 seed 55). It inherits the checkpoint's inner dose, entropy and normalization.
@@ -14,6 +62,11 @@ Unsupported lifetimes, sampled execution, traces and probes fail explicitly.
 two new evaluation series, runs checkpoint tasks, and publishes through the
 single-owner registry. Its CPU publisher installs and verifies a dedicated W&B
 workspace before uploading results, and reports missing/failed cells.
+The return chart shows all measured episode returns at each checkpoint
+with a mean line for each controller. Dots have small horizontal offsets so
+overlapping episodes remain visible; their returns are unchanged. The private
+custom-chart preset queries an episode table maintained in each run summary.
+Updating that table adds no scalar history rows and preserves result identity.
 
 The [joint entropy and prior-KL evaluation](ENTROPY_KL_EVAL.md) keeps automatic
 temperature learning enabled while testing two fixed prior-KL penalties on

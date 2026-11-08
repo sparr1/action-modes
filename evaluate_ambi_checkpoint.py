@@ -26,6 +26,9 @@ import torch
 from RL.tdmpc2_core import MODEL_SIZE
 from utils.cleanup import add_cleanup_notes, raise_cleanup_errors
 from utils.aux_return_identity import auxiliary_return_architecture, auxiliary_return_routing
+from utils.evaluation_episodes import (
+    consecutive_protocol, episode_id, episode_key, validate_paired_starts,
+)
 from utils.ambi_research import (
     PresetMatrixError,
     load_preset_matrix,
@@ -92,6 +95,10 @@ def build_parser():
         type=int,
         help="Override the common inner-controller RNG seed from the matrix.",
     )
+    parser.add_argument("--environment-seed", type=int,
+                        help="Initial environment seed for a consecutive-episode matrix.")
+    parser.add_argument("--num-episodes", type=int,
+                        help="Number of consecutive episodes; requires a consecutive-episode matrix.")
     parser.add_argument(
         "--temperature-chain", action="store_true",
         help="Treat ordered episode seeds as one alpha/Adam stream; requires paired run temperature scopes and a local bundle.",
@@ -448,7 +455,7 @@ def _validate_checkpoint_contract(matrix, checkpoint, context, resolved_presets)
 
 
 def _attach_paired_return_deltas(results):
-    """Attach seed-paired return deltas whenever a reference was selected."""
+    """Pair by independent seed or by index within the same consecutive stream."""
     grouped = {}
     for result in results:
         grouped.setdefault(result["comparison"], []).append(result)
@@ -461,11 +468,15 @@ def _attach_paired_return_deltas(results):
         if reference is None:
             continue
         reference_returns = {
-            episode["seed"]: episode["return"] for episode in reference["episodes"]
+            episode_key(episode): episode["return"] for episode in reference["episodes"]
         }
         for result in group:
+            if reference.get("episode_sampling") != result.get("episode_sampling"):
+                raise ValueError("Paired results have different episode sampling protocols.")
+            if result.get("episode_sampling") is not None:
+                validate_paired_starts(reference["episodes"], result["episodes"])
             candidate_returns = {
-                episode["seed"]: episode["return"] for episode in result["episodes"]
+                episode_key(episode): episode["return"] for episode in result["episodes"]
             }
             common_seeds = sorted(set(reference_returns) & set(candidate_returns))
             result["paired_return_delta_vs_reference"] = _summary(
@@ -704,7 +715,11 @@ def evaluate_preset(
     checkpoint = Path(checkpoint).resolve()
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint}")
-    if not seeds:
+    sampling = consecutive_protocol(resolved.get("evaluation", {}))
+    seeds = [] if seeds is None else list(seeds)
+    if sampling is not None and seeds:
+        raise ValueError("Consecutive evaluation cannot use per-episode seeds.")
+    if sampling is None and not seeds:
         raise ValueError("At least one evaluation seed is required.")
     if any(
         isinstance(seed, bool)
@@ -750,6 +765,12 @@ def evaluate_preset(
     if graph_evaluation and (not deterministic or not return_only or temperature_chain
                              or params.get("inner_operator") != "sac"):
         raise ValueError("Frozen mean CUDA graphs require return-only deterministic fresh SAC episodes.")
+    if sampling is not None and (
+        not deterministic or not return_only or temperature_chain or root_bank is not None
+        or bank_only or captured_roots is not None or togo_return_rollouts
+        or params.get("inner_operator", "sac") not in {"sac", "none"}
+    ):
+        raise ValueError("Consecutive evaluation requires return-only mean-action prior/SAC episodes without banks or temperature chains.")
     _validate_horizon_probe_selection(
         [resolved], root_bank_requested=root_bank is not None,
         togo_return_rollouts=togo_return_rollouts,
@@ -777,6 +798,12 @@ def evaluate_preset(
         episodes = []
         bank_metric_values = {}
         togo_rows = []
+        first_observation = None
+        if sampling is not None:
+            # Warmup uses this observation without stepping the environment.
+            # Only scored episodes advance the seeded environment stream.
+            _seed_spaces(env, sampling["environment_seed"])
+            first_observation, _ = env.reset(seed=sampling["environment_seed"])
 
         if bundle is not None:
             from RL.tdmpc2_core.inner_trace import InnerActionTrace
@@ -804,8 +831,12 @@ def evaluate_preset(
                         raise ValueError("Bank observation shape does not match checkpoint environment.")
             # One unscored action pays lazy compilation before the measured
             # solves. Reset RNG afterwards; warmup never enters return statistics.
-            warm_observation = (np.asarray(root_bank["roots"][0]["observation"], dtype=np.float32)
-                                if root_bank is not None else env.reset(seed=int(seeds[0]))[0])
+            if sampling is not None:
+                warm_observation = first_observation
+            elif root_bank is not None:
+                warm_observation = np.asarray(root_bank["roots"][0]["observation"], dtype=np.float32)
+            else:
+                warm_observation = env.reset(seed=int(seeds[0]))[0]
             started = time.perf_counter()
             model.predict(warm_observation, deterministic=deterministic, episode_start=True)
             bundle_run["warmup_including_compile_seconds"] = time.perf_counter() - started
@@ -858,18 +889,33 @@ def evaluate_preset(
                     for key in nonfinite:
                         nonfinite_metric_counts[key] = nonfinite_metric_counts.get(key, 0) + 1
 
-        for chain_episode_index, seed in enumerate([] if bank_only else seeds):
-            seed = int(seed)
-            episode_seed = solver_seed(controller_seed, "episode", seed)
+        if sampling is not None:
+            episode_specs = [{"episode_index": index, "environment_seed": sampling["environment_seed"],
+                              "controller_stream_seed": int(controller_seed)}
+                             for index in range(sampling["num_episodes"])]
+            # Discard initialization/warmup draws, then advance continuously.
+            model._set_seed(int(controller_seed))
+        else:
+            episode_specs = [{"seed": int(seed), "solver_seed": solver_seed(controller_seed, "episode", seed)}
+                             for seed in seeds]
+        for chain_episode_index, episode_spec in enumerate([] if bank_only else episode_specs):
+            seed = episode_key(episode_spec)
+            episode_seed = (int(controller_seed) if sampling is not None else episode_spec["solver_seed"])
             engine = getattr(model.agent, "inner_engine", None)
-            if engine is not None:
+            if engine is not None and (sampling is None or chain_episode_index == 0):
                 engine.reset_for_evaluation(
                     episode_seed, reuse_action_pool=bundle is not None,
                     **({"preserve_run_temperature": True}
                        if temperature_chain and chain_episode_index > 0 else {}),
                 )
-            _seed_spaces(env, seed)
-            observation, _ = env.reset(seed=seed)
+            if sampling is not None:
+                observation = first_observation if chain_episode_index == 0 else env.reset()[0]
+                array = np.ascontiguousarray(observation)
+                header = json.dumps({"shape": array.shape, "dtype": str(array.dtype)}, sort_keys=True).encode()
+                episode_spec["initial_observation_sha256"] = hashlib.sha256(header + array.tobytes()).hexdigest()
+            else:
+                _seed_spaces(env, seed)
+                observation, _ = env.reset(seed=seed)
             if graph_evaluation:
                 from RL.tdmpc2_core.frozen_graph import FrozenGraphController
                 if graph_controller is None:
@@ -878,7 +924,8 @@ def evaluate_preset(
                     graph_setup_seconds = time.perf_counter() - setup_started
                     if bundle_run is not None:
                         bundle_run["warmup_including_compile_seconds"] = graph_setup_seconds
-                graph_controller.reset_episode(episode_seed)
+                if sampling is None or chain_episode_index == 0:
+                    graph_controller.reset_episode(episode_seed)
             terminated = truncated = False
             episode_return = 0.0
             episode_steps = 0
@@ -889,7 +936,7 @@ def evaluate_preset(
             episode_probe_seconds = 0.0
             episode_probe_model_steps = 0
             episode_togo_rows = []
-            phase_id = f"seed-{seed}"
+            phase_id = episode_id(episode_spec)
             active_episode = True
 
             while not (terminated or truncated):
@@ -972,12 +1019,11 @@ def evaluate_preset(
 
             if not math.isfinite(episode_return):
                 raise RuntimeError(
-                    f"Non-finite return for preset {resolved['selector']} at seed {seed}."
+                    f"Non-finite return for preset {resolved['selector']} at {phase_id}."
                 )
             episodes.append(
                 {
-                    "seed": seed,
-                    "solver_seed": episode_seed,
+                    **episode_spec,
                     **({"temperature_chain_episode_index": chain_episode_index} if temperature_chain else {}),
                     "return": episode_return,
                     "length": episode_steps,
@@ -1031,13 +1077,14 @@ def evaluate_preset(
                 "value_routing": auxiliary_return_routing(vars(model.cfg))}
                if getattr(model.agent, "aux_return", None) is not None else {}),
             "controller_seed": int(controller_seed),
-            "environment_seeds": [int(seed) for seed in seeds],
+            **({"episode_sampling": sampling} if sampling is not None else
+               {"environment_seeds": [int(seed) for seed in seeds]}),
             **({"temperature_chain": True,
                 "temperature_chain_seeds": [int(seed) for seed in seeds],
                 "temperature_chain_kind": "run-temperature-chain-v1",
                 "episode_variation_semantics": "dependent episodes within one temperature stream; descriptive only"}
                if temperature_chain else {}),
-            "seed_scheme": "sha256-v1",
+            "seed_scheme": "consecutive-v1" if sampling is not None else "sha256-v1",
             "execution_action": execution_action,
             **({"execution_backend": execution_backend,
                 "graph_setup_seconds": graph_setup_seconds,
@@ -1070,7 +1117,7 @@ def evaluate_preset(
         if primary_error is not None and bundle is not None and active_episode:
             if not any(item["episode_id"] == phase_id for item in bundle_run["episodes"]):
                 bundle_run["episodes"].append({
-                    "episode_id": phase_id, "seed": seed, "solver_seed": episode_seed,
+                    "episode_id": phase_id, **episode_spec,
                     "return": episode_return if math.isfinite(episode_return) else None,
                     "length": episode_steps, "status": "failed",
                     "terminated": bool(terminated), "truncated": bool(truncated),
@@ -1125,6 +1172,8 @@ def evaluate_matrix(
     comparisons=None,
     *,
     seeds=None,
+    environment_seed=None,
+    num_episodes=None,
     controller_seed=None,
     max_steps=None,
     device=None,
@@ -1145,7 +1194,7 @@ def evaluate_matrix(
     eval_series_spec_dir=None,
     temperature_chain=False,
 ):
-    """Evaluate selected presets from a matrix with paired seeds."""
+    """Evaluate selected presets with paired independent seeds or consecutive streams."""
     evaluation_started = time.perf_counter()
     if not isinstance(temperature_chain, bool):
         raise TypeError("temperature_chain must be bool.")
@@ -1156,6 +1205,15 @@ def evaluate_matrix(
         raise ValueError("Temperature chains require their own protocol: banks, reference bundles and independent-episode publication are not supported.")
     matrix_path = Path(matrix_path).resolve()
     matrix = load_preset_matrix(matrix_path)
+    evaluation = matrix.setdefault("evaluation", {})
+    for key, value in (("environment_seed", environment_seed), ("num_episodes", num_episodes)):
+        if value is not None:
+            evaluation[key] = value
+    sampling = consecutive_protocol(evaluation)
+    if sampling is not None and seeds is not None:
+        raise ValueError("--seeds is incompatible with consecutive episodes; use --environment-seed.")
+    if sampling is not None and (save_root_bank or root_bank_path or bank_only or temperature_chain):
+        raise ValueError("Consecutive evaluation does not support banks or temperature chains.")
     selectors = normalize_selectors(matrix, selectors, comparisons)
     from utils.ambi_benchmark import resolve_eval_run_map
     assigned_runs = resolve_eval_run_map(selectors, run_dir=eval_run_dir, run_map=eval_run_map, wandb=wandb_options)
@@ -1185,7 +1243,7 @@ def evaluate_matrix(
            for value in (probe_rollouts, probe_horizon)):
         raise ValueError("Bank diagnostic_rollouts and diagnostic_horizon must be positive integers.")
     seeds = list(evaluation.get("seeds", [])) if seeds is None else list(seeds)
-    if not seeds:
+    if not seeds and sampling is None:
         raise PresetMatrixError("No evaluation seeds were supplied by CLI or matrix.")
     if controller_seed is None:
         controller_seed = int(evaluation.get("controller_seed", 0))
@@ -1271,10 +1329,11 @@ def evaluate_matrix(
     root_bank = load_bank(root_bank_path, checkpoint_sha256, protocol) if root_bank_path else None
     reference_options = ({"checkpoint_inventory": checkpoint_inventory,
                           "source_run": source_run or matrix.get("source_run"), "seeds": seeds}
-                         if tdambi or protocol.get("prior_reference") == "ambi_sampled_prior-v1" else {})
+                         if tdambi or sampling is not None or protocol.get("prior_reference") == "ambi_sampled_prior-v1" else {})
     reference = (reference_returns(reference_bundle, checkpoint_sha256, protocol, **reference_options)
                  if reference_bundle else None)
-    if reference is not None and not bank_only and any(int(seed) not in reference for seed in seeds):
+    expected_keys = list(range(sampling["num_episodes"])) if sampling is not None else seeds
+    if reference is not None and not bank_only and any(int(seed) not in reference for seed in expected_keys):
         raise ValueError("Prior reference is missing requested episode seeds.")
     if root_bank is not None:
         protocol["root_bank_id"] = root_bank["id"]
@@ -1315,7 +1374,7 @@ def evaluate_matrix(
                                    else "paired.json")
             reference_metadata = bundle.manifest.setdefault("reference", {})
             reference_metadata["path"] = str(reference_path.resolve())
-            if reference_metadata.get("format") not in {"tdmpc2-paired-prior", "ambi_sampled_prior-v1"}:
+            if reference_metadata.get("format") not in {"tdmpc2-paired-prior", "ambi_sampled_prior-v1", "ambi_consecutive_prior-v1"}:
                 reference_metadata["manifest_sha256"] = _file_sha256(reference_path)
         for resolved in resolved_presets:
             kind = "bank" if bank_only else "both" if root_bank is not None else "episodes"
@@ -1337,8 +1396,14 @@ def evaluate_matrix(
                     **({"temperature_chain": True} if temperature_chain else {}),
                 )
                 results.append(result)
+                if sampling is not None:
+                    # Fail before staging a complete paired result if a task's
+                    # transition RNG caused its reset sequence to diverge.
+                    _attach_paired_return_deltas(results)
+                    if reference is not None:
+                        validate_paired_starts(reference.provenance["episodes"], result["episodes"])
                 if bundle is not None and resolved["algorithm_config"]["alg_params"].get("inner_operator") == "none":
-                    bundle.reference = {episode["seed"]: episode["return"] for episode in result["episodes"]}
+                    bundle.reference = {episode_key(episode): episode["return"] for episode in result["episodes"]}
                 if save_root_bank:
                     bank = make_bank(checkpoint_sha256, protocol, captured_roots, complete=True)
                     atomic_json(save_root_bank, bank)
@@ -1434,6 +1499,8 @@ def main(argv=None):
             args.checkpoint,
             selectors=selectors,
             seeds=args.seeds,
+            environment_seed=args.environment_seed,
+            num_episodes=args.num_episodes,
             controller_seed=args.controller_seed,
             max_steps=args.max_steps,
             device=args.device,

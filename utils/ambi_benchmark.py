@@ -22,6 +22,10 @@ from pathlib import Path
 
 import numpy as np
 
+from utils.evaluation_episodes import (
+    consecutive_protocol, episode_id, episode_key, validate_consecutive_episodes,
+)
+
 
 SCHEMA_VERSION = 1
 SEED_SCHEME = "sha256-v1"
@@ -77,6 +81,9 @@ def protocol_for(resolved, controller_seed, max_steps):
         "controller_seed": int(controller_seed),
         "seed_scheme": SEED_SCHEME,
     }
+    sampling = consecutive_protocol(resolved.get("evaluation", {}))
+    if sampling is not None:
+        protocol.update(episode_sampling=sampling, seed_scheme="consecutive-v1")
     if config.get("alg") == "TDAMBI/TDAMBI":
         # The adapted controller keeps the existing isolated solver streams.
         # Its deterministic native prior reference has its own recorded RNG
@@ -278,10 +285,12 @@ def reference_returns(path, checkpoint_sha256, protocol, *, checkpoint_inventory
     if len(runs) != 1:
         raise ValueError("Prior reference must contain exactly one completed prior-only episode run.")
     episodes = runs[0]["episodes"]
-    values = {episode["seed"]: episode["return"] for episode in episodes}
+    if "episode_sampling" in protocol:
+        validate_consecutive_episodes(episodes, protocol["episode_sampling"], protocol["controller_seed"])
+    values = {episode_key(episode): episode["return"] for episode in episodes}
     if len(values) != len(episodes) or not all(math.isfinite(value) for value in values.values()):
         raise ValueError("Prior reference has duplicate seeds or non-finite returns.")
-    if sampled_reference:
+    if sampled_reference or "episode_sampling" in protocol:
         from utils.eval_series_data import _source
 
         checkpoint = manifest["checkpoint"]
@@ -297,13 +306,14 @@ def reference_returns(path, checkpoint_sha256, protocol, *, checkpoint_inventory
                 or not isinstance(result.get("outer_updates_before"), int)
                 or result.get("outer_updates_before") != result.get("outer_updates_after")):
             raise ValueError("Sampled prior reference lacks frozen-state validation.")
-        if seeds is not None and sorted(values) != sorted(seeds):
+        if sampled_reference and seeds is not None and sorted(values) != sorted(seeds):
             raise ValueError("Sampled prior reference episode seeds do not match.")
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         files = {"reference/manifest.json": str(path.resolve()),
                  **{f"reference/{name}": source for name, source in source_files.items()}}
         provenance = {
-            "format": AMBI_SAMPLED_PRIOR_REFERENCE, "source_run": reference_source,
+            "format": (AMBI_SAMPLED_PRIOR_REFERENCE if sampled_reference else "ambi_consecutive_prior-v1"),
+            "source_run": reference_source,
             "checkpoint_sha256": checkpoint_sha256,
             "checkpoint_step": checkpoint_step, "source_provenance": source_evidence,
             "source_result_sha256": digest, "source_protocol": expected_protocol,
@@ -519,11 +529,11 @@ class BenchmarkBundle:
 
     def episode(self, run, result, events):
         result = copy.deepcopy(result)
-        result["episode_id"] = f"seed-{result['seed']}"
+        result["episode_id"] = episode_id(result)
         result["capped"] = result["truncated_by_evaluator"]
         result["inner_metrics_mean"] = result["model_metrics"]
-        if result["seed"] in self.reference:
-            result["paired_return_delta"] = result["return"] - self.reference[result["seed"]]
+        if episode_key(result) in self.reference:
+            result["paired_return_delta"] = result["return"] - self.reference[episode_key(result)]
         run["episodes"].append(result)
         self.write_trace(run, result["episode_id"], events)
         self.save()

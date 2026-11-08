@@ -105,6 +105,11 @@ def validate_preset_matrix(matrix):
     _require_mapping(environment.get("params", {}), "environment.params")
 
     evaluation = _require_mapping(matrix.get("evaluation", {}), "evaluation")
+    from utils.evaluation_episodes import consecutive_protocol
+    try:
+        consecutive_protocol(evaluation)
+    except ValueError as exc:
+        raise PresetMatrixError(str(exc)) from exc
     if evaluation.get("execution_action", "mean") not in {"mean", "sample"}:
         raise PresetMatrixError("evaluation.execution_action must be 'mean' or 'sample'.")
     if "seeds" in evaluation:
