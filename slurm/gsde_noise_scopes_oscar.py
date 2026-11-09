@@ -21,6 +21,9 @@ from slurm.benchmark_ambi_training_cpu import TrainingWindow, physical_core_cpus
 
 MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_gsde_noise_scopes.json"
 CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/gsde-noise-scopes-20261105")
+if os.environ.get("AMBI_GSDE_VARIANT") == "humanoid_run":
+    MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_gsde_squashed_real_steps_humanoid_run.json"
+    CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/gsde-humanoid-run-20261108")
 GPU_PARITY_TEST = "tests/test_ambi_gsde_graph.py"
 
 
@@ -183,7 +186,8 @@ def worker(args):
         agent, cfg = learner.agent, learner.cfg
         assert cfg.action_dim == 21 and cfg.inner_operator == "sac" and not cfg.mpc
         assert cfg.actor_distribution == "gsde" and cfg.gsde_feature_source == "actor"
-        assert cfg.inner_gsde_noise_scope == ("round", "solve", "real_steps")[args.index % 3]
+        expected_scope = "real_steps" if os.environ.get("AMBI_GSDE_VARIANT") == "humanoid_run" else ("round", "solve", "real_steps")[args.index % 3]
+        assert cfg.inner_gsde_noise_scope == expected_scope
         assert cfg.inner_gsde_resample_steps == cfg.gsde_execution_resample_steps == 8
         assert (cfg.inner_rollout_horizon, cfg.inner_rounds, cfg.inner_solve_interval) == (3, 8, 1)
         assert cfg.inner_finite_horizon

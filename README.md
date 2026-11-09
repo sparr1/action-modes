@@ -403,3 +403,17 @@ environment, wrapper, and algorithm settings. Existing checkpoints in their
 original `logs/<run>/models` directory are supported through the run's
 `settings.json` and per-trial `alg_settings.json`. For copied legacy files, pass
 `--trial-settings` and `--experiment-settings` explicitly.
+
+### gSDE Humanoid Run counterpart
+
+`configs/dmcontrol/experiments/ambi_gsde_squashed_real_steps_humanoid_run.json`
+changes only the task and publication identity of the squashed `real_steps`
+gSDE Humanoid Walk recipe (run `590be7c27a9b40eaa9a68218cdb74d0a`, source
+`edec58cf7ec2b51bd54834aa4d6f806715075502`). It retains sampled execution,
+noise resampling every eight decisions, seed 55, one million decisions and
+all forty 25k checkpoints. `slurm/run_gsde_humanoid_run_oscar.sbatch` pins a
+clean checkout, verifies the original CUDA parity and CPU scaling receipts
+against unchanged learner sources, then runs a fresh full-size Humanoid Run
+startup check before online training. The startup check keeps W&B disabled
+and checks checkpoint roundtrips, geometry diagnostics, graph replay and
+throughput. The publisher installs and verifies a dedicated progress workspace.

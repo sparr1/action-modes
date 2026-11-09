@@ -114,6 +114,9 @@ This table is a timestamped snapshot; charts update with training. Pending runs 
 metrics. Compilation and timing checks must pass before production. Curves have no smoothing.
 '''
 
+if state.get('protocol'):
+    md = state['protocol'] + f"\n\nSource `{state['commit']}`. Outputs `{state['output']}`.\n\n| Arm | Job | State at {timestamp} | Uploaded decisions |\n|---|---|---|---|\n{status}\n\nThis table is a timestamped snapshot; charts update with training. Missing metrics remain pending."
+
 sections=[ws.Section(name='gSDE / Protocol and progress',is_open=True,
                     panels=[wr.MarkdownPanel(markdown=md,layout=wr.Layout(w=24,h=15))])]
 for name,group in metrics.items():
@@ -134,7 +137,7 @@ if receipt_path.exists() or state.get('workspace_url'):
     work.runset_settings.filters=[expr.Metric('ID').isin(ids)]
     work.runset_settings.run_settings={s['id']:ws.RunSettings(color=s['color'],disabled=False) for s in specs}
 else:
-    work=ws.Workspace(entity=entity,project=project,name='gSDE - noise persistence - Oscar',
+    work=ws.Workspace(entity=entity,project=project,name=state.get('workspace_name', 'gSDE - noise persistence - Oscar'),
         auto_generate_panels=False,sections=sections,
         settings=ws.WorkspaceSettings(x_axis='env_step',max_runs=8,tooltip_number_of_runs='all_runs',tooltip_color_run_names=True),
         runset_settings=ws.RunsetSettings(filters=[expr.Metric('ID').isin(ids)],groupby=[],

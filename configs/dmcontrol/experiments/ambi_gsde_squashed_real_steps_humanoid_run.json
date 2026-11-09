@@ -1,0 +1,32 @@
+{
+  "study_type": "gsde_humanoid_run",
+  "study_note": "Humanoid Run counterpart of W&B run 590be7c27a9b40eaa9a68218cdb74d0a, pinned at edec58cf7ec2b51bd54834aa4d6f806715075502. Only the task and publication identity change: gSDE actor features, sampled execution, real_steps persistence with both resampling intervals8, joint squashed entropy alpha0.0021, seed55, 1M decisions, H3/J8/K1/N128/C16/A4/B256. Forty checkpoints every25k; critic geometry every1000 updates. Existing CUDA parity and CPU scaling evidence are verified against unchanged learner sources; fresh full-size Humanoid Run startup validation precedes training with W&B disabled.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-run",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_gsde_squashed_real_steps_humanoid_run"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "reference_runs": {
+    "humanoid_walk": {
+      "id": "590be7c27a9b40eaa9a68218cdb74d0a",
+      "commit": "edec58cf7ec2b51bd54834aa4d6f806715075502"
+    }
+  }
+}
