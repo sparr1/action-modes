@@ -1,0 +1,24 @@
+{
+  "study_type": "tdmpc2_humanoid_run_state_checkpoint_bank",
+  "study_note": "Humanoid Run TD-MPC2 baseline using the exact native learner and H3 MPC settings of completed Humanoid Walk run 7oweo9jg (9002963d20880d8ed354f663040c52daadb3136f). User-selected one million decisions and seed55 match the concurrent AMBI runs. State observations, model size5, native TD-MPC2 learning, H3 train and planning horizons; runtime MPPI iterations8,512 samples,64 elites,24 prior trajectories. Separate online evaluation remains disabled. Retain forty portable model checkpoints every25k decisions. CPU scaling and full-size smoke run on a Slurm GPU with W&B disabled before production.",
+  "overrides_alg": {
+    "env": "DMControl-v0"
+  },
+  "env_params": {
+    "task": "humanoid-run",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "tdmpc2_humanoid_run_state_checkpoint_bank_1m"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": [
+    "all"
+  ],
+  "log_info": false,
+  "log_type": "summary"
+}

@@ -245,3 +245,20 @@ environment, wrapper, and algorithm settings. Existing checkpoints in their
 original `logs/<run>/models` directory are supported through the run's
 `settings.json` and per-trial `alg_settings.json`. For copied legacy files, pass
 `--trial-settings` and `--experiment-settings` explicitly.
+
+### Humanoid Run native TD-MPC2 baseline on Oscar
+
+`configs/dmcontrol/experiments/tdmpc2_humanoid_run_state_checkpoint_bank_1m.json`
+uses the exact H3 native learner/MPC recipe from Humanoid Walk run `7oweo9jg`
+(source `9002963d20880d8ed354f663040c52daadb3136f`), with task Humanoid Run,
+seed 55 and one million decisions. All forty portable checkpoints are retained
+every 25k decisions; separate online evaluation remains disabled.
+
+`slurm/tdmpc2_humanoid_run_oscar.py prepare` verifies unchanged learner sources.
+Run `gate` through `slurm/run_tdmpc2_humanoid_run_oscar.sbatch` on two physical
+CPU cores and one L40S GPU with `AMBI_TDMPC2_MODE=gate`. Its full-size native
+smoke, checkpoint roundtrip and 1/2-core timing keep W&B disabled. Production
+uses the smallest core count within 5% of best throughput, measured memory
+and measured end-to-end throughput plus 15% and 30 minutes for startup/I/O.
+The `train` mode requires that receipt, the exact source/runtime, and verified
+W&B progress panels before beginning online training.
