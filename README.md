@@ -417,3 +417,10 @@ against unchanged learner sources, then runs a fresh full-size Humanoid Run
 startup check before online training. The startup check keeps W&B disabled
 and checks checkpoint roundtrips, geometry diagnostics, graph replay and
 throughput. The publisher installs and verifies a dedicated progress workspace.
+
+`slurm/run_gsde_humanoid_run_validated_oscar.sbatch` launches this same
+pinned learner after its full-size gate has passed. It consumes the verified
+receipt with the measured 59-hour allocation, checks both the launcher and
+training-source commits, and preserves the fresh production output and W&B
+identity. It is useful when the original combined startup job passed all
+science checks but its measured walltime exceeded the requested allocation.
