@@ -198,3 +198,28 @@ then measures exact inner-solver entropy dynamics and paired fixed-replay actor
 updates at roots 0, 10, 50, 100 and 250. See
 [ENTROPY_PROBE.md](ENTROPY_PROBE.md) for checkpoint hashes, source/probe RNG
 separation, frozen-state checks, output ownership and the per-seed worker CLI.
+
+## Consecutive checkpoint evaluation with gSDE
+
+`ambi_checkpoint_graph_eval_consecutive.json` evaluates the saved prior and
+checkpoint-matched H3/J8 inner SAC controller using mean real actions. Each
+controller runs ten full episodes: seed the environment and controller once
+with 55, use ordinary unseeded environment resets thereafter, and restart the
+streams at every checkpoint. Checkpoint state is frozen and paired initial
+observations are verified. Result plots show each episode and the mean.
+
+The frozen graph retains the checkpoint's actor distribution and adaptation
+settings. For gSDE, the live controller supplies collection matrices to stable
+CUDA buffers, preserving `round`, `solve`, or `real_steps` lifetimes and episode
+boundaries. Mean execution draws no execution noise. Collection noise streams
+and the isolated optimization stream advance across consecutive episodes;
+the adapted actor, critics, optimizer and replay are fresh at every decision.
+Training graph behavior and its sampled-execution guard remain unchanged.
+
+Use `slurm/graph_checkpoint_campaign.py prepare` with
+`--episode-sampling consecutive --checkpoint-every 50000 --descending` and the
+explicit source run, training directory, config name, cutoff, output and
+registry. Source must be clean and pinned. The scheduled `smoke` worker runs
+Gaussian/gSDE CUDA parity tests and two 16-decision episodes per controller,
+covering the eight-decision resampling boundary without publishing to W&B.
+Production workers stage results; one finite CPU publisher owns each curve.

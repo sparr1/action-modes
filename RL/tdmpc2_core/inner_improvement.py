@@ -7391,7 +7391,7 @@ class InnerImprovementEngine(RetraceInnerMixin):
                  and not self._whole_graph_worker and not self._teacher_only)
         if graph:
             from .whole_inner_graph import validate_training_graph, training_graph_act
-            validate_training_graph(self)
+            validate_training_graph(self, frozen_mean_evaluation=eval_mode)
             if not eval_mode and not collect_diagnostics and trace is None:
                 if return_behavior_policy:
                     raise ValueError("Collection CUDA graph does not support behavior-policy metadata.")

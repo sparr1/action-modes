@@ -22,10 +22,15 @@ from pathlib import Path
 
 import numpy as np
 
+from utils.evaluation_episodes import (
+    consecutive_protocol, episode_id, episode_key, validate_consecutive_episodes,
+)
+
 
 SCHEMA_VERSION = 1
 SEED_SCHEME = "sha256-v1"
 TDAMBI_PRIOR_REFERENCE = "native_tdmpc2_prior_mean-v1"
+AMBI_SAMPLED_PRIOR_REFERENCE = "ambi_sampled_prior-v1"
 ROOT_DECISIONS = (0, 100, 200, 300, 400)
 
 
@@ -37,6 +42,25 @@ def canonical_hash(value):
 
 def solver_seed(base, *identity):
     return int(canonical_hash([SEED_SCHEME, int(base), *identity])[:8], 16)
+
+
+def frozen_execution_action(resolved):
+    """Explicit frozen SAC/prior execution mode; old matrices retain means."""
+    mode = resolved.get("evaluation", {}).get("execution_action", "mean")
+    if mode not in {"mean", "sample"}:
+        raise ValueError("evaluation.execution_action must be 'mean' or 'sample'.")
+    if mode == "sample":
+        config = resolved.get("algorithm_config", {})
+        params = config.get("alg_params", {})
+        if (config.get("alg") != "AMBITDMPC2/AMBITDMPC2"
+                or params.get("inner_operator", "sac") not in {"sac", "none"}
+                or params.get("inner_execution_action", "policy_sample") != "policy_sample"
+                or float(params.get("inner_execution_std_scale", 1.0)) <= 0.0):
+            raise ValueError(
+                "Sampled frozen evaluation requires AMBI inner SAC or its prior and "
+                "inner_execution_action='policy_sample'."
+            )
+    return mode
 
 
 def protocol_for(resolved, controller_seed, max_steps):
@@ -51,11 +75,15 @@ def protocol_for(resolved, controller_seed, max_steps):
         "env_wrappers": copy.deepcopy(config.get("env_wrappers", [])),
         "env_wrapper": copy.deepcopy(config.get("env_wrapper")),
         "observation": config.get("alg_params", {}).get("obs", "state"),
-        "action_rule": "mppi_weighted_elite" if weighted_mppi else "tanh_mean",
+        "action_rule": ("tanh_sample" if frozen_execution_action(resolved) == "sample"
+                        else "mppi_weighted_elite" if weighted_mppi else "tanh_mean"),
         "max_steps": max_steps,
         "controller_seed": int(controller_seed),
         "seed_scheme": SEED_SCHEME,
     }
+    sampling = consecutive_protocol(resolved.get("evaluation", {}))
+    if sampling is not None:
+        protocol.update(episode_sampling=sampling, seed_scheme="consecutive-v1")
     if config.get("alg") == "TDAMBI/TDAMBI":
         # The adapted controller keeps the existing isolated solver streams.
         # Its deterministic native prior reference has its own recorded RNG
@@ -64,8 +92,36 @@ def protocol_for(resolved, controller_seed, max_steps):
     return protocol
 
 
+def reference_protocol_for(resolved, controller_seed, max_steps):
+    """Add an opt-in reference comparison without changing legacy identities."""
+    protocol = protocol_for(resolved, controller_seed, max_steps)
+    reference = resolved.get("evaluation", {}).get("prior_reference")
+    if reference is not None:
+        config = resolved["algorithm_config"]
+        if (reference != AMBI_SAMPLED_PRIOR_REFERENCE
+                or protocol["action_rule"] != "mppi_weighted_elite"
+                or config.get("alg") != "AMBITDMPC2/AMBITDMPC2"):
+            raise ValueError("Sampled-prior pairing requires weighted-elite AMBI MPPI evaluation.")
+        protocol["prior_reference"] = reference
+    return protocol
+
+
 def episode_protocol(protocol):
     return {key: value for key, value in protocol.items() if key != "root_bank_id"}
+
+
+def sampled_prior_protocol(protocol):
+    """Explicitly pair MPPI evaluation with its sampled frozen actor baseline.
+
+    Action rules remain distinct in identities; only this named comparison
+    permits the difference, while all environment and RNG fields must match.
+    """
+    expected = episode_protocol(protocol)
+    if (expected.pop("prior_reference", None) != AMBI_SAMPLED_PRIOR_REFERENCE
+            or expected.get("action_rule") != "mppi_weighted_elite"):
+        raise ValueError("Invalid MPPI/sample-prior pairing protocol.")
+    expected["action_rule"] = "tanh_sample"
+    return expected
 
 
 def atomic_json(path, value, *, overwrite=False):
@@ -218,7 +274,9 @@ def reference_returns(path, checkpoint_sha256, protocol, *, checkpoint_inventory
         raise ValueError("Prior reference must be a completed benchmark bundle.")
     if manifest.get("checkpoint", {}).get("sha256") != checkpoint_sha256:
         raise ValueError("Prior reference checkpoint does not match.")
-    if episode_protocol(manifest.get("protocol", {})) != episode_protocol(protocol):
+    sampled_reference = protocol.get("prior_reference") == AMBI_SAMPLED_PRIOR_REFERENCE
+    expected_protocol = sampled_prior_protocol(protocol) if sampled_reference else episode_protocol(protocol)
+    if episode_protocol(manifest.get("protocol", {})) != expected_protocol:
         raise ValueError("Prior reference environment/action/seed protocol does not match.")
     runs = [run for run in manifest["runs"] if
             run.get("config", {}).get("alg_params", {}).get("inner_operator") == "none"
@@ -227,9 +285,43 @@ def reference_returns(path, checkpoint_sha256, protocol, *, checkpoint_inventory
     if len(runs) != 1:
         raise ValueError("Prior reference must contain exactly one completed prior-only episode run.")
     episodes = runs[0]["episodes"]
-    values = {episode["seed"]: episode["return"] for episode in episodes}
+    if "episode_sampling" in protocol:
+        validate_consecutive_episodes(episodes, protocol["episode_sampling"], protocol["controller_seed"])
+    values = {episode_key(episode): episode["return"] for episode in episodes}
     if len(values) != len(episodes) or not all(math.isfinite(value) for value in values.values()):
         raise ValueError("Prior reference has duplicate seeds or non-finite returns.")
+    if sampled_reference or "episode_sampling" in protocol:
+        from utils.eval_series_data import _source
+
+        checkpoint = manifest["checkpoint"]
+        reference_source = checkpoint.get("source_run")
+        if reference_source and source_run is not None and reference_source != source_run:
+            raise ValueError("Sampled prior reference backbone does not match.")
+        checkpoint_step = checkpoint.get("metadata", {}).get("checkpoint", {}).get("step")
+        reference_source, source_evidence, source_files = _source(
+            {**checkpoint, "step": checkpoint_step}, path,
+            checkpoint_inventory=checkpoint_inventory, source_run=source_run)
+        result = runs[0].get("result", {})
+        if (result.get("outer_state_unchanged") is not True
+                or not isinstance(result.get("outer_updates_before"), int)
+                or result.get("outer_updates_before") != result.get("outer_updates_after")):
+            raise ValueError("Sampled prior reference lacks frozen-state validation.")
+        if sampled_reference and seeds is not None and sorted(values) != sorted(seeds):
+            raise ValueError("Sampled prior reference episode seeds do not match.")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        files = {"reference/manifest.json": str(path.resolve()),
+                 **{f"reference/{name}": source for name, source in source_files.items()}}
+        provenance = {
+            "format": (AMBI_SAMPLED_PRIOR_REFERENCE if sampled_reference else "ambi_consecutive_prior-v1"),
+            "source_run": reference_source,
+            "checkpoint_sha256": checkpoint_sha256,
+            "checkpoint_step": checkpoint_step, "source_provenance": source_evidence,
+            "source_result_sha256": digest, "source_protocol": expected_protocol,
+            "evaluation_protocol": episode_protocol(protocol), "episodes": episodes,
+            "files": {name: hashlib.sha256(Path(source).read_bytes()).hexdigest()
+                      for name, source in files.items()},
+        }
+        return PriorReference(values, provenance, files)
     return values
 
 
@@ -437,11 +529,11 @@ class BenchmarkBundle:
 
     def episode(self, run, result, events):
         result = copy.deepcopy(result)
-        result["episode_id"] = f"seed-{result['seed']}"
+        result["episode_id"] = episode_id(result)
         result["capped"] = result["truncated_by_evaluator"]
         result["inner_metrics_mean"] = result["model_metrics"]
-        if result["seed"] in self.reference:
-            result["paired_return_delta"] = result["return"] - self.reference[result["seed"]]
+        if episode_key(result) in self.reference:
+            result["paired_return_delta"] = result["return"] - self.reference[episode_key(result)]
         run["episodes"].append(result)
         self.write_trace(run, result["episode_id"], events)
         self.save()

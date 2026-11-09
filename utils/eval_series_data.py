@@ -23,6 +23,9 @@ import subprocess
 from utils.lora_identity import publication_lora_identity
 from utils.aux_return_identity import normalize_aux_return_identity
 from utils.ensemble_identity import normalize_critic_ensemble_backend
+from utils.evaluation_episodes import (
+    episode_key, validate_consecutive_protocol, validate_consecutive_episodes, validate_paired_starts,
+)
 
 
 def _require(condition, message):
@@ -190,7 +193,8 @@ class _WithoutControlTiming(ast.NodeTransformer):
 
 
 @lru_cache(maxsize=128)
-def scientific_identity(algorithm, controller, commit, dirty=False, source_sha256=None):
+def scientific_identity(algorithm, controller, commit, dirty=False, source_sha256=None, *,
+                        return_estimator="one_step", execution_backend="native"):
     """Conservative scientific-source identity, excluding publisher/report code.
 
     Hash executable ASTs of the controller stack and environment. Evaluator
@@ -198,6 +202,10 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
     require an explicit compatibility audit; they are never silently accepted.
     Dirty legacy trees remain pinned to their saved complete source digest.
     """
+    _require(return_estimator in {"one_step", "retrace"}, "Unknown scientific return estimator")
+    if return_estimator == "retrace":
+        _require("AMBI" in algorithm and controller == "sac",
+                 "Retrace scientific identity requires the AMBI SAC controller")
     if dirty:
         _require(bool(source_sha256), "Dirty results lack saved source fingerprint")
         return {"version": 1, "algorithm": algorithm, "dirty_source_sha256": source_sha256}
@@ -221,8 +229,16 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
     else:
         paths = ["RL/TDMPC2.py", "RL/tdmpc2_core/agent.py", "RL/tdmpc2_core/mppi.py"]
     paths += ["RL/tdmpc2_core/common", "domains", "environments/dmcontrol/uv.lock"]
+    if execution_backend != "native":
+        _require(execution_backend == "frozen_mean_cuda_graph_v1", "Unknown frozen execution backend")
+        paths += ["RL/tdmpc2_core/whole_inner_graph.py", "RL/tdmpc2_core/frozen_graph.py"]
+    if return_estimator == "retrace":
+        paths.append("RL/tdmpc2_core/inner_retrace.py")
     evaluator = ("evaluate_tdmpc2_mppi_checkpoint.py" if algorithm == "TDMPC2/TDMPC2Baseline"
                  else "evaluate_ambi_checkpoint.py")
+    if evaluator == "evaluate_ambi_checkpoint.py":
+        # ls-tree omits this file for historical commits predating the protocol.
+        paths.append("utils/evaluation_episodes.py")
     # Main/CLI orchestrate publication; these functions implement scientific
     # initialization, randomness, action execution, and frozen-state checks.
     selected = ({"_namespaced_seed", "_set_controller", "_run_arm", "_reset_paired_environments",
@@ -230,10 +246,20 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
                  "evaluate_tdmpc2_mppi_checkpoint"}
                 if evaluator.startswith("evaluate_tdmpc2") else
                 {"_make_env", "_seed_spaces", "_initialize_frozen_model", "evaluate_preset"})
+    if "AMBI" in algorithm and controller == "mppi":
+        selected = selected | {"evaluate_mppi_preset"}
     try:
         entries = _git_output(root, "ls-tree", "-rz", commit, "--", *paths)
         names = sorted(entry.split(b"\t", 1)[1].decode() for entry in entries.split(b"\0") if entry)
         _require(paths[0] in names, "Pinned algorithm source is incomplete")
+        if return_estimator == "retrace":
+            _require("RL/tdmpc2_core/inner_retrace.py" in names,
+                     "Pinned Retrace implementation is unavailable")
+        if ("AMBI" in algorithm and controller == "mppi"
+                and b"def evaluate_mppi_preset(" in _git_output(root, "show", f"{commit}:{evaluator}")):
+            # New native-MPPI bundles pin the planner itself. Keep historical
+            # identities intact for commits predating this evaluation path.
+            names = sorted({*names, "RL/tdmpc2_core/mppi.py"})
         hashes = {}
         helper_selections = ({"utils/ambi_benchmark.py": {"canonical_hash", "solver_seed", "protocol_for"}}
                              if evaluator == "evaluate_ambi_checkpoint.py" else {})
@@ -361,10 +387,16 @@ def planner_identity(config, result, algorithm, action_rule):
         return {"type": "mppi", "backend": semantics.pop("algorithm"),
                 "settings": settings, "semantics": semantics, "action_rule": action_rule}
     operator = config.get("inner_operator")
+    distribution = ({key: copy.deepcopy(config[key]) for key in (
+        "actor_distribution", "gsde_feature_source", "gsde_mean_clip", "gsde_log_std_init",
+        "gsde_execution_resample_steps") if key in config}
+        if config.get("actor_distribution", "gaussian") == "gsde" else {})
     if result.get("controller") in {"prior", "policy_prior"} or operator == "none":
         identity = {"type": "prior", "action_rule": action_rule}
+        if distribution:
+            identity["settings"] = distribution
         if config.get("inner_actor_source", "sac") != "sac":
-            identity["settings"] = {"inner_actor_source": config["inner_actor_source"]}
+            identity.setdefault("settings", {})["inner_actor_source"] = config["inner_actor_source"]
         return identity
     if operator == "tdambi":
         return _tdambi_planner(config, algorithm, action_rule)
@@ -373,6 +405,16 @@ def planner_identity(config, result, algorithm, action_rule):
               if key.startswith("inner_")}
     if active.get("inner_critic_bernoulli_p", 0.0) == 0.0:
         active.pop("inner_critic_bernoulli_p", None)
+    if config.get("inner_solve_interval", 1) == 1:
+        active.pop("inner_solve_interval", None)
+        active.pop("inner_hold_encoder", None)
+    else:
+        active["inner_solve_interval"] = config["inner_solve_interval"]
+        active["inner_hold_encoder"] = config.get("inner_hold_encoder", "solve_snapshot")
+    # One temperature step per actor update is the historical behavior.
+    # Preserve that identity while keeping an actual repeat intervention distinct.
+    if active.get("inner_temperature_updates_per_actor", 1) == 1:
+        active.pop("inner_temperature_updates_per_actor", None)
     estimator = config.get("inner_sac_return_estimator", "one_step")
     if isinstance(estimator, str):
         estimator = estimator.lower()
@@ -487,16 +529,28 @@ def planner_identity(config, result, algorithm, action_rule):
                 shared[key] = value
     if shared.get("sac_actor_loss_scale_mode") == "none":
         shared.pop("sac_actor_loss_scale_tau", None)
+    if result.get("execution_backend", "native") != "native":
+        _require(result["execution_backend"] == "frozen_mean_cuda_graph_v1", "Unknown frozen execution backend")
+        active["evaluation_execution_backend"] = result["execution_backend"]
     return {"type": operator, "backend": algorithm, "action_rule": action_rule,
-            "settings": {**shared, **active}}
+            "settings": {**shared, **active, **distribution}}
 
 
 def _episode_protocol(protocol, seeds, config=None, action_rule=None):
+    if "temperature_chain" in protocol:
+        raise ValueError(
+            "Temperature-chain episodes are dependent and cannot be imported as an independent-seed eval series."
+        )
     keys = {"environment", "env_wrapper", "env_wrappers", "observation", "action_rule",
-            "controller_seed", "seed_scheme", "max_steps", "prior_reference"}
+            "controller_seed", "seed_scheme", "max_steps", "prior_reference", "episode_sampling"}
     normalized = {key: copy.deepcopy(value) for key, value in protocol.items() if key in keys}
     normalized["action_rule"] = action_rule or normalized.get("action_rule")
-    normalized["environment_seeds"] = sorted(seeds)
+    if "episode_sampling" in normalized:
+        validate_consecutive_protocol(normalized["episode_sampling"])
+        _require(not seeds and normalized.get("seed_scheme") == "consecutive-v1",
+                 "Consecutive protocol cannot contain independent episode seeds")
+    else:
+        normalized["environment_seeds"] = sorted(seeds)
     normalized["max_steps"] = normalized.get("max_steps") or (config or {}).get("episode_length")
     normalized["mode"] = "episodes"
     return normalized
@@ -532,6 +586,7 @@ def resolved_checkpoint_config(checkpoint, resolved, *, env=None):
             spec=SimpleNamespace(max_episode_steps=observation["episode_length"]))
     model = cls.__new__(cls)
     model.env = env
+    model.experiment_params = {"frozen_checkpoint_evaluation": True}
     model.run_params = {**algorithm_config, "device": "cpu"}
     model.custom_params = {**algorithm_config.get("alg_params", {}), "device": "cpu"}
     config = vars(model._build_cfg(model.custom_params))
@@ -567,6 +622,7 @@ def identity_for_ambi_checkpoint(checkpoint, resolved, protocol, seeds, code, *,
                                                                    action_dim=config["action_dim"])}
         action_rule = description.protocol["action_rule"]
     result = {"evaluation_controller": evaluation_controller} if evaluation_controller else {}
+    result["execution_backend"] = resolved.get("evaluation", {}).get("execution_backend", "native")
     action = action_rule or protocol["action_rule"]
     planner = planner_identity(config, result, algorithm, action)
     controller = "prior" if planner["type"] == "prior" else (
@@ -574,7 +630,11 @@ def identity_for_ambi_checkpoint(checkpoint, resolved, protocol, seeds, code, *,
     return {"backbone": source, "planner": planner,
             "protocol": _episode_protocol(protocol, seeds, config, action),
             "science": scientific_identity(algorithm, controller, code.get("commit"),
-                                             code.get("dirty"), code.get("source_sha256"))}
+                                             code.get("dirty"), code.get("source_sha256"),
+                                             execution_backend=result["execution_backend"],
+                                             **({"return_estimator": "retrace"}
+                                                if controller == "sac" and config.get("inner_sac_return_estimator") == "retrace"
+                                                else {}))}
 
 
 def _native_planner(settings, planner_result, controller):
@@ -671,11 +731,14 @@ def identity_for_tdmpc2_checkpoint(checkpoint, metadata, controller, protocol, c
                                             code.get("commit", code.get("code_sha")))}
 
 
-def _episodes(episodes, seeds, max_steps):
+def _episodes(episodes, seeds, max_steps, protocol=None):
     _require(bool(episodes), "No completed episode measurements")
-    _require(len(set(seeds)) == len(seeds), "Duplicate environment seeds")
-    _require(sorted(ep.get("seed") for ep in episodes) == sorted(seeds),
-             "Missing, duplicate, or unexpected episode seeds")
+    if protocol is not None and "episode_sampling" in protocol:
+        validate_consecutive_episodes(episodes, protocol["episode_sampling"], protocol["controller_seed"])
+    else:
+        _require(len(set(seeds)) == len(seeds), "Duplicate environment seeds")
+        _require(sorted(ep.get("seed") for ep in episodes) == sorted(seeds),
+                 "Missing, duplicate, or unexpected episode seeds")
     normalized = []
     for episode in episodes:
         _require(episode.get("status", "complete") == "complete", "Incomplete episode")
@@ -687,7 +750,7 @@ def _episodes(episodes, seeds, max_steps):
         value = copy.deepcopy(episode)
         value["return"] = _number(value.get("return"), "episode return")
         normalized.append(value)
-    return sorted(normalized, key=lambda ep: ep["seed"])
+    return sorted(normalized, key=episode_key)
 
 
 def _metrics(episodes):
@@ -737,7 +800,9 @@ def _metrics(episodes):
                 metrics[f"work/{component}_updates"] = sum(value * length for value, length in values)
     for metric, candidates in {"model_steps": ("inner_realized_model_steps", "inner_model_steps"),
                                "policy_evaluations": ("inner_policy_evaluations",),
-                               "q_evaluations": ("inner_q_evaluations",)}.items():
+                               "q_evaluations": ("inner_q_evaluations",),
+                               "retrace_trajectory_draws": ("inner_retrace_trajectory_draws",),
+                               "retrace_critic_rows": ("inner_retrace_critic_rows",)}.items():
         for key in candidates:
             values = [(ep.get("model_metrics", {}).get(key), ep["length"]) for ep in episodes]
             if all(value is not None for value, _ in values):
@@ -748,6 +813,7 @@ def _metrics(episodes):
 
 def _record(identity, checkpoint, episodes, artifacts, provenance, path, label, selector, controller):
     science_episodes = [{key: ep[key] for key in ("seed", "solver_seed", "return", "length",
+                        "episode_index", "environment_seed", "controller_stream_seed", "initial_observation_sha256",
                         "terminated", "truncated", "truncated_by_evaluator", "capped",
                         "paired_return_delta") if key in ep} for ep in episodes]
     return _safe({"identity": identity, "checkpoint": checkpoint, "metrics": _metrics(episodes),
@@ -789,6 +855,26 @@ def validate_tdmpc2_prior_pairing(prior, protocol, seeds=None):
 def _bundle_prior_reference(manifest, path, checkpoint, source):
     """Revalidate a portable native-prior reference before publication."""
     reference = manifest.get("reference", {})
+    if reference.get("format") in {"ambi_sampled_prior-v1", "ambi_consecutive_prior-v1"}:
+        from utils.ambi_benchmark import reference_returns
+
+        name = "reference/manifest.json"
+        _require(name in reference.get("files", {}), "Missing exact sampled prior reference file")
+        artifacts = {}
+        for relative, digest in reference["files"].items():
+            file = (path.parent / relative).resolve()
+            _require(file.is_relative_to(path.parent) and relative.startswith("reference/"),
+                     "Reference artifact path escapes bundle")
+            _require(file.is_file() and _file_hash(file) == digest, "Reference artifact hash mismatch")
+            artifacts[relative] = str(file)
+        _require(reference.get("checkpoint_step") == checkpoint["step"], "Reference checkpoint mismatch")
+        inventory = next((file for relative, file in artifacts.items()
+                          if relative.startswith("reference/provenance/checkpoint-inventory-")), None)
+        validated = reference_returns(artifacts[name], checkpoint["sha256"], manifest.get("protocol", {}),
+                                      checkpoint_inventory=inventory, source_run=source)
+        portable = {key: value for key, value in reference.items() if key != "path"}
+        _require(validated.provenance == portable, "Sampled prior provenance differs from saved source")
+        return dict(validated), artifacts
     if reference.get("format") != "tdmpc2-paired-prior":
         return {}, {}
     _require(reference.get("checkpoint_sha256") == checkpoint["sha256"] and
@@ -853,26 +939,57 @@ def normalize_bundle(path, *, checkpoint_inventory=None, source_run=None):
         protocol = copy.deepcopy(manifest.get("protocol", {}))
         action = result.get("action_rule", protocol.get("action_rule"))
         _require(bool(action), "Missing executed action rule")
-        seeds = result.get("environment_seeds")
-        _require(isinstance(seeds, list) and seeds, "Missing requested environment seeds")
+        seeds = result.get("environment_seeds", [])
+        if "episode_sampling" in protocol:
+            _require(result.get("episode_sampling") == protocol["episode_sampling"]
+                     and "environment_seeds" not in result,
+                     "Result episode sampling differs from the bundle protocol")
+        else:
+            _require(isinstance(seeds, list) and seeds, "Missing requested environment seeds")
         protocol = _episode_protocol(protocol, seeds, config, action)
         maximum = protocol["max_steps"]
         _require(isinstance(maximum, int) and maximum > 0, "Missing episode decision limit")
-        episodes = _episodes(run.get("episodes") or result.get("episodes", []), seeds, maximum)
+        episodes = _episodes(run.get("episodes") or result.get("episodes", []), seeds, maximum, protocol)
+        expected_keys = {episode_key(ep) for ep in episodes}
+        if "episode_sampling" in protocol:
+            prior_episodes = manifest.get("reference", {}).get("episodes")
+            if prior_episodes is None:
+                priors = [r for r in manifest["runs"]
+                          if r.get("config", {}).get("alg_params", {}).get("inner_operator") == "none"
+                          and r.get("status") == "complete"]
+                _require(len(priors) <= 1, "Ambiguous consecutive prior reference")
+                prior_episodes = priors[0].get("episodes") if priors else None
+            if prior_episodes is not None:
+                validate_consecutive_episodes(prior_episodes, protocol["episode_sampling"], protocol["controller_seed"])
+                validate_paired_starts(prior_episodes, episodes)
+                paired_returns = {episode_key(ep): ep["return"] for ep in prior_episodes}
+                for episode in episodes:
+                    if config.get("inner_operator") != "none" or "paired_return_delta" in episode:
+                        _require(episode.get("paired_return_delta") == episode["return"] - paired_returns[episode_key(episode)],
+                                 "Paired return delta differs from the consecutive prior")
+            else:
+                _require(not any("paired_return_delta" in ep for ep in episodes),
+                         "Consecutive paired gains require a complete prior reference")
         if reference_returns:
-            _require(set(reference_returns) == set(seeds), "Reference episode seeds differ from evaluation")
+            _require(set(reference_returns) == expected_keys, "Reference episodes differ from evaluation")
             for episode in episodes:
-                expected = episode["return"] - reference_returns[episode["seed"]]
+                expected = episode["return"] - reference_returns[episode_key(episode)]
                 _require(episode.get("paired_return_delta") == expected,
                          "Paired return delta differs from exact prior reference")
         elif config.get("inner_operator") == "tdambi":
             _require(not any("paired_return_delta" in episode for episode in episodes),
                      "TDAMBI paired gains require a validated native prior reference")
+        elif protocol.get("prior_reference") == "ambi_sampled_prior-v1":
+            _require(not any("paired_return_delta" in episode for episode in episodes),
+                     "MPPI paired gains require a validated sampled prior reference")
         if result.get("episodes"):
-            returned = {ep["seed"]: ep for ep in result["episodes"]}
-            _require(set(returned) == set(seeds), "Returned episode seeds differ from bundle")
+            if "episode_sampling" in protocol:
+                validate_consecutive_episodes(result["episodes"], protocol["episode_sampling"], protocol["controller_seed"])
+                validate_paired_starts(episodes, result["episodes"])
+            returned = {episode_key(ep): ep for ep in result["episodes"]}
+            _require(set(returned) == expected_keys, "Returned episodes differ from bundle")
             for episode in episodes:
-                _require(all(episode.get(key) == returned[episode["seed"]].get(key)
+                _require(all(episode.get(key) == returned[episode_key(episode)].get(key)
                              for key in ("return", "length", "terminated", "truncated")),
                          "Returned scientific episodes differ from bundle")
         planner = planner_identity(config, result, algorithm, action)
@@ -880,7 +997,11 @@ def normalize_bundle(path, *, checkpoint_inventory=None, source_run=None):
             "inner_xqc" if planner["type"] == "xqc" else planner["type"])
         identity = {"backbone": source, "planner": planner, "protocol": protocol,
                     "science": scientific_identity(algorithm, controller, code.get("commit"),
-                                                     code.get("dirty"), code.get("source_sha256"))}
+                                                     code.get("dirty"), code.get("source_sha256"),
+                                                     execution_backend=result.get("execution_backend", "native"),
+                                                     **({"return_estimator": "retrace"}
+                                                        if controller == "sac" and config.get("inner_sac_return_estimator") == "retrace"
+                                                        else {}))}
         artifacts = {"manifest.json": str(path), **extra_files, **reference_files}
         missing = []
         for name in run.get("trace_files", []):
@@ -896,6 +1017,8 @@ def normalize_bundle(path, *, checkpoint_inventory=None, source_run=None):
                       "legacy_run_status": run.get("status"), "missing_artifact_files": missing,
                       "resolved_config": config, "checkpoint_metadata": cp.get("metadata"),
                       "reference": manifest.get("reference"), "source_result_sha256": _file_hash(path)}
+        if run.get("timing_convention") is not None:
+            provenance["timing_convention"] = copy.deepcopy(run["timing_convention"])
         label = descriptive_label(identity, run.get("selector"))
         record = _record(identity, checkpoint, episodes, artifacts, provenance, path, label,
                          run.get("selector", controller), controller)

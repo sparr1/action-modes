@@ -26,7 +26,7 @@ def training_graph_protocol(cfg):
             else _TRAINING_PROTOCOL)
 
 
-def _validate_fresh_config(cfg, *, require_compile):
+def _validate_fresh_config(cfg, *, require_compile, frozen_mean_evaluation=False):
     gsde = getattr(cfg, "actor_distribution", "gaussian") == "gsde"
     validate_teacher_graph_config(cfg, allow_gsde_collection=gsde)
     expected = {
@@ -38,6 +38,10 @@ def _validate_fresh_config(cfg, *, require_compile):
         "inner_sac_critic_target": "reward_only",
         "inner_root_entropy_samples": 0,
     }
+    if frozen_mean_evaluation:
+        expected.pop("inner_execution_action")
+        if cfg.inner_execution_action not in {"policy_sample", "mean"}:
+            raise ValueError("Frozen graph requires mean or policy_sample saved inner_execution_action.")
     if gsde:
         # Both targets are fixed-shape tensor equations. The legacy Gaussian
         # graph recipe retains its original reward-only contract.
@@ -60,8 +64,9 @@ def validate_collection_graph_config(cfg):
     _validate_fresh_config(cfg, require_compile=True)
 
 
-def validate_training_graph(engine):
-    validate_collection_graph_config(engine.cfg)
+def validate_training_graph(engine, *, frozen_mean_evaluation=False):
+    _validate_fresh_config(engine.cfg, require_compile=True,
+                           frozen_mean_evaluation=frozen_mean_evaluation)
     if engine.device.type != "cuda":
         raise ValueError("Collection CUDA graph requires CUDA.")
 
@@ -92,7 +97,7 @@ class _GsdeGraphInputs:
     cursor is only used while tracing/capturing a solve, never for replay.
     """
 
-    def __init__(self, engine, root):
+    def __init__(self, engine, root, *, eval_mode=False):
         cfg, actor = engine.cfg, engine._actor_base
         self.rounds = int(cfg.inner_rounds)
         self.per_round = cfg.inner_gsde_noise_scope == "round"
@@ -101,7 +106,7 @@ class _GsdeGraphInputs:
             and float(cfg.inner_behavior_std_scale) > 0.0
         )
         self.execution_enabled = (
-            cfg.inner_execution_action == "policy_sample"
+            not eval_mode and cfg.inner_execution_action == "policy_sample"
             and float(cfg.inner_execution_std_scale) > 0.0
         )
         shape = (int(cfg.inner_rollouts_per_round), actor.sde_feature_dim, actor.sde_action_dim)
@@ -159,7 +164,7 @@ class _GsdeGraphInputs:
             destination.copy_(source)
 
 
-def _gsde_inputs_for_action(engine, root):
+def _gsde_inputs_for_action(engine, root, *, eval_mode=False):
     """Draw on the live behavior streams, independently of captured gradients."""
     collection = []
     generator = engine.rng.generator("collection")
@@ -174,7 +179,7 @@ def _gsde_inputs_for_action(engine, root):
             collection.append(matrix)
     execution = (
         engine._gsde_noise_for_execution(root, engine._actor_base, engine.rng.generator("execution"))
-        if float(engine.cfg.inner_execution_std_scale) > 0.0 else None
+        if not eval_mode and float(engine.cfg.inner_execution_std_scale) > 0.0 else None
     )
     return collection, execution
 
@@ -188,8 +193,11 @@ class WholeInnerGraph:
     """
 
     def __init__(self, engine, root, *, capture=True, seed=8173, warmup=4,
-                 capture_teacher_policy=False):
-        _validate_fresh_config(engine.cfg, require_compile=False)
+                 capture_teacher_policy=False, eval_mode=False):
+        if not isinstance(eval_mode, bool) or (eval_mode and capture_teacher_policy):
+            raise ValueError("Mean evaluation cannot capture a training teacher policy.")
+        _validate_fresh_config(engine.cfg, require_compile=False,
+                              frozen_mean_evaluation=eval_mode)
         if engine.device.type != "cuda" or root.device.type != "cuda":
             raise ValueError("WholeInnerGraph requires a CUDA engine and root.")
         if (root.ndim != 2 or root.shape != (1, int(engine.cfg.latent_dim))
@@ -209,10 +217,12 @@ class WholeInnerGraph:
         self._engine_act = engine.act
         self.capture_enabled = capture
         self.capture_teacher_policy = capture_teacher_policy
+        self.eval_mode = eval_mode
         self.calls, self.seed = 0, int(seed)
         self.graph = None
         self.root = root.detach().clone()
-        self.gsde_inputs = _GsdeGraphInputs(engine, root) if engine._gsde_active else None
+        self.gsde_inputs = (_GsdeGraphInputs(engine, root, eval_mode=eval_mode)
+                            if engine._gsde_active else None)
         if self.gsde_inputs is not None:
             self.gsde_inputs.install(engine)
         self._initial_alpha = engine._initial_inner_alpha
@@ -282,7 +292,7 @@ class WholeInnerGraph:
 
     def _solve(self):
         result = self._engine_act(
-            self.root, t0=True, collect_diagnostics=False, eval_mode=False,
+            self.root, t0=True, collect_diagnostics=False, eval_mode=self.eval_mode,
             capture_teacher_policy=self.capture_teacher_policy,
         )
         if self.capture_teacher_policy:
