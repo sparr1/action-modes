@@ -5,7 +5,7 @@
 #SBATCH --account=default
 #SBATCH --partition=gpu
 #SBATCH --qos=pri-gpu+
-#SBATCH --gres=gpu:l40s:1
+#SBATCH --gres=gpu:a5500:1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=8G
 #SBATCH --time=28:00:00

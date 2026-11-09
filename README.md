@@ -256,7 +256,7 @@ every 25k decisions; separate online evaluation remains disabled.
 
 `slurm/tdmpc2_humanoid_run_oscar.py prepare` verifies unchanged learner sources.
 Run `gate` through `slurm/run_tdmpc2_humanoid_run_oscar.sbatch` on two physical
-CPU cores and one L40S GPU with `AMBI_TDMPC2_MODE=gate`. Its full-size native
+CPU cores and one A5500 GPU with `AMBI_TDMPC2_MODE=gate`. Its full-size native
 smoke, checkpoint roundtrip and 1/2-core timing keep W&B disabled. Production
 uses the smallest core count within 5% of best throughput, measured memory
 and measured end-to-end throughput plus 15% and 30 minutes for startup/I/O.
