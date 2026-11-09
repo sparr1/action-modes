@@ -19,7 +19,7 @@ umask 077
 : "${AMBI_DMCONTROL_PYTHON:?Set the locked Python interpreter}"
 : "${AMBI_WORKSPACE_PYTHON:?Set the W&B publisher interpreter}"
 : "${AMBI_EXPECTED_LAUNCHER_COMMIT:?Pin the launcher commit}"
-launcher_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+launcher_root="${AMBI_LAUNCHER_ROOT:?Set the pinned launcher checkout}"
 [[ "$(git -C "$launcher_root" rev-parse HEAD)" == "$AMBI_EXPECTED_LAUNCHER_COMMIT" ]]
 [[ -z "$(git -C "$launcher_root" status --porcelain --untracked-files=all)" ]]
 [[ "$AMBI_GSDE_CAMPAIGN" == /oscar/scratch/rgao48/ambi/gsde-humanoid-run-20261108 ]]
