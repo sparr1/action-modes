@@ -330,8 +330,9 @@ def test_j10_reuses_paired_prior_and_keeps_all_other_settings(fake_runtime, tmp_
     changed_config = vars(fake_runtime.models[-1].cfg).copy()
     assert changed_config.pop("inner_rounds") == 10
     assert baseline_config.pop("inner_rounds") == 8
+    assert changed_config.pop("inner_replay_capacity") == 3840
+    assert baseline_config.pop("inner_replay_capacity") == 3072
     assert changed_config == baseline_config
-    assert changed_config["inner_replay_capacity"] == 3072
     sampling = consecutive_protocol(load_preset_matrix(campaign.J10_MATRIX)["evaluation"])
     campaign.validate_result(payload, 2, sampling=sampling, inner_rounds=10,
                              selectors=["controller/graph"])
@@ -356,6 +357,25 @@ def test_return_plot_keeps_j8_and_j10_separate():
     scale = return_episode_spec(runs)["encoding"]["color"]["scale"]
     assert scale["domain"] == ["Prior", "H3/J8 inner SAC", "H3/J10 inner SAC"]
     assert scale["range"] == ["gray", "teal", "orange"]
+
+
+def test_j10_real_config_retains_all_rounds(fake_runtime):
+    import gymnasium as gym
+
+    context = checkpoint_context.load_checkpoint_context(fake_runtime.checkpoint)
+    resolved = evaluator.resolve_preset(campaign.J10_MATRIX, "controller/graph", checkpoint_context=context)
+    env = gym.make("Pendulum-v1", max_episode_steps=500)
+    try:
+        cfg = data.resolved_checkpoint_config({}, resolved, env=env)
+    finally:
+        env.close()
+    assert cfg["inner_rounds"] == 10
+    assert cfg["inner_model_step_budget"] == cfg["inner_replay_capacity"] == 3840
+    assert cfg["inner_critic_updates_per_action"] == 160
+    assert cfg["inner_actor_updates_per_action"] == 40
+    assert cfg["inner_gsde_noise_scope"] == "real_steps"
+    assert cfg["inner_gsde_resample_steps"] == 8
+    assert cfg["actor_distribution"] == "gsde"
 
 
 def test_reference_campaign_pins_completed_matching_checkpoints(fake_runtime, tmp_path):

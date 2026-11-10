@@ -226,9 +226,11 @@ Production workers stage results; one finite CPU publisher owns each curve.
 
 To compare ten inner rounds on the same checkpoints, add `--inner-rounds 10`
 and `--reference-campaign /path/to/completed-j8-campaign` to preparation.
-`ambi_checkpoint_graph_eval_consecutive_j10.json` changes only `inner_rounds`;
-H3/N128/C16/A4/B256, replay capacity (3072), noise lifetimes, learning rates and
-entropy settings remain inherited. This gives 160 critic updates, 40 actor
+`ambi_checkpoint_graph_eval_consecutive_j10.json` changes `inner_rounds` and
+increases replay capacity from 3072 to 3840, retaining all ten rounds' generated
+transitions as required by the action-local replay contract. H3/N128/C16/A4/B256,
+noise lifetimes, learning rates and entropy settings remain inherited.
+This gives 160 critic updates, 40 actor
 updates and 3840 model transitions per real decision. The ten-round worker
 evaluates only inner SAC, validates and reuses the matched prior bundle, and
 publishes into a separate curve. Its comparison workspace includes the existing

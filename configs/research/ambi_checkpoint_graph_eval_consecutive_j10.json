@@ -56,7 +56,8 @@
             "execution_backend": "frozen_mean_cuda_graph_v1"
           },
           "alg_params": {
-            "inner_rounds": 10
+            "inner_rounds": 10,
+            "inner_replay_capacity": 3840
           }
         }
       }
