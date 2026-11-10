@@ -20,6 +20,7 @@ from slurm.ambi_transfer_training import binding, recipe, runtime, write_new
 from slurm.benchmark_ambi_training_cpu import TrainingWindow, physical_core_cpus
 
 CAMPAIGNS = {
+    "humanoid_stand_mean": ("ambi_boom_x0p01_humanoid_stand_mean.json", "humanoid-stand-20261109/boom"),
     "humanoid_run_mean": ("ambi_boom_x0p01_humanoid_run_mean.json", "boom-humanoid-run-mean-20261108"),
     "original": ("ambi_posttanh_prior_fixes.json", "posttanh-prior-fixes-20261104"),
     "strength": ("ambi_posttanh_prior_strength.json", "posttanh-prior-strength-20261105"),

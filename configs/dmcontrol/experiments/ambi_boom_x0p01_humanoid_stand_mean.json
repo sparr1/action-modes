@@ -1,0 +1,30 @@
+{
+  "study_type": "humanoid-stand-20261109",
+  "study_note": "Fresh Humanoid Stand counterpart of 99b2e2808d2742b9a548a5f58bad062c. Only the task and publication metadata change; all learner settings, seed55, 1M decisions and all 40 checkpoints every25k are retained.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-stand",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_boom_x0p01_humanoid_stand_mean"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "name": "Humanoid Stand - BOOM coefficient 0.0042 | mean execution",
+  "description": "Fresh Humanoid Stand counterpart of 99b2e2808d2742b9a548a5f58bad062c. Only the task and publication metadata change; all learner settings, seed55, 1M decisions and all 40 checkpoints every25k are retained.",
+  "source_run_url": "https://forge.coreweave.com/wandb/rwgao_b-brown-university/ambi/runs/99b2e2808d2742b9a548a5f58bad062c",
+  "source_commit": "7427e1c681cbc3f2b2fbc3109855afc7d720e57b"
+}
