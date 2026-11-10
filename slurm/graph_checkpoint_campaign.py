@@ -153,6 +153,8 @@ def prepare(args):
     rows = inventory(args.training_root, args.config_name, steps, allow_missing=args.available_only)
     if not rows:
         raise ValueError("At least one saved checkpoint is required to prepare evaluation")
+    metadata = series._read(rows[0]["metadata_path"])
+    task = metadata["trial_run_params"]["resolved_runtime"]["observation"]["task"]
     args.campaign.mkdir(parents=True, exist_ok=True)
     inventory_path = args.campaign / "checkpoint-inventory.json"
     series._atomic_json(inventory_path, {"source_run": args.source_run, "checkpoints": rows,
@@ -172,7 +174,7 @@ def prepare(args):
                     source_tree=git("rev-parse", "HEAD^{tree}"), **settings,
                     cutoff_step=args.max_step, checkpoints=complete_grid(steps, rows), runs=runs,
                     training_root=str(args.training_root), config_name=args.config_name,
-                    streaming=args.available_only,
+                    streaming=args.available_only, task=task,
                     root=str(args.campaign.resolve()))
     series._atomic_json(args.campaign / "campaign.json", campaign)
     print(json.dumps(campaign), flush=True)
@@ -361,18 +363,24 @@ def layout(args):
     from utils.checkpoint_return_plot import return_episode_panel
     campaign = load_campaign(args.campaign)
     with series._lock(args.campaign / ".layout.lock"):
+        title = campaign.get("label", "Posttanh outer adapt · checkpoint evaluation")
+        task = campaign.get("task", "humanoid-walk").replace("-", " ").title()
         rows = progress(campaign)
         table = "\n".join(f"| {r['step']:,} | {r[SELECTORS[0]]} | {r[SELECTORS[1]]} |" for r in rows)
         sampling = campaign.get("episode_sampling")
         episode_description = (
-            f"{sampling['num_episodes']} paired consecutive full Humanoid Walk episodes per checkpoint; "
+            f"{sampling['num_episodes']} paired consecutive full {task} episodes per checkpoint; "
             f"environment stream seeded once with {sampling['environment_seed']}, then ordinary resets. "
             "Controller and CUDA graph RNG advance across episodes; both streams restart at each checkpoint. "
             if sampling else
-            f"{len(campaign['seeds'])} paired full Humanoid Walk episodes per checkpoint; "
+            f"{len(campaign['seeds'])} paired full {task} episodes per checkpoint; "
             f"environment seeds {campaign['seeds']}. CUDA graph RNG is isolated per episode. "
         )
-        markdown = (f"**Post-tanh / outer-adapt checkpoint evaluation.** Source `{campaign['source_run']}`.\n\n"
+        scope = ("Available checkpoints are evaluated newest first while training continues. "
+                 "Future checkpoints are released as their weights and metadata become available."
+                 if campaign.get("streaming") else
+                 "Only the pinned checkpoints already present at submission are evaluated, newest first.")
+        markdown = (f"**{title}.** Source `{campaign['source_run']}`.\n\n"
                     + episode_description +
                     f"Controller seed {campaign['controller_seed']}, {campaign['max_steps']} decisions per episode. "
                     "Both execute actor means. Refinement retains H3/J8/K1, "
@@ -382,8 +390,7 @@ def layout(args):
                     "at each checkpoint; lines show their means. Small horizontal offsets separate overlapping dots.\n\n"
                     f"Checkpoint order: {', '.join(str(cp['step']) for cp in campaign['checkpoints'])}. "
                     f"Status at {now()}. Missing points remain pending. "
-                    "Available checkpoints are evaluated newest first while training continues. "
-                    "Future checkpoints are released as their weights and metadata become available.\n\n"
+                    f"{scope}\n\n"
                     "| Training decisions | Prior | Refinement |\n|---:|---|---|\n" + table)
         panels = [wr.MarkdownPanel(markdown=markdown, layout=wr.Layout(w=24, h=14))]
         preset_path = args.campaign / "return-episodes-preset.json"
@@ -408,7 +415,7 @@ def layout(args):
             if not found:
                 work.sections.append(section)
         else:
-            work = ws.Workspace(entity=ENTITY, project=PROJECT, name="Posttanh outer adapt · checkpoint evaluation",
+            work = ws.Workspace(entity=ENTITY, project=PROJECT, name=title,
                                 auto_generate_panels=False, sections=[section],
                                 runset_settings=ws.RunsetSettings(filters=[expr.Metric("ID").isin([r["id"] for r in campaign["runs"]])],
                                                                groupby=[], run_settings={r["id"]:ws.RunSettings(color=r["color"],disabled=False) for r in campaign["runs"]}))
