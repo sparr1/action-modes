@@ -203,6 +203,8 @@ def prepare(args):
     rows = inventory(args.training_root, args.config_name, steps, allow_missing=args.available_only)
     if not rows:
         raise ValueError("At least one saved checkpoint is required to prepare evaluation")
+    metadata = series._read(rows[0]["metadata_path"])
+    task = metadata["trial_run_params"]["resolved_runtime"]["observation"]["task"]
     comparison_runs = (pin_reference_campaign(reference_campaign, args.source_run, settings, rows)
                        if reference_campaign is not None else [])
     args.campaign.mkdir(parents=True, exist_ok=True)
@@ -228,7 +230,7 @@ def prepare(args):
                     source_tree=git("rev-parse", "HEAD^{tree}"), **settings,
                     cutoff_step=args.max_step, checkpoints=complete_grid(steps, rows), runs=runs,
                     training_root=str(args.training_root), config_name=args.config_name,
-                    streaming=args.available_only,
+                    streaming=args.available_only, task=task,
                     comparison_runs=comparison_runs,
                     root=str(args.campaign.resolve()))
     series._atomic_json(args.campaign / "campaign.json", campaign)
@@ -432,20 +434,24 @@ def layout(args):
     from utils.checkpoint_return_plot import return_episode_panel
     campaign = load_campaign(args.campaign)
     with series._lock(args.campaign / ".layout.lock"):
+        task = campaign.get("task", "humanoid-walk").replace("-", " ").title()
         runs = display_runs(campaign)
         rows = progress(campaign)
         table = "\n".join(f"| {row['step']:,} | " + " | ".join(row[r['selector']] for r in runs) + " |"
                           for row in rows)
         sampling = campaign.get("episode_sampling")
         episode_description = (
-            f"{sampling['num_episodes']} paired consecutive full Humanoid Walk episodes per checkpoint; "
+            f"{sampling['num_episodes']} paired consecutive full {task} episodes per checkpoint; "
             f"environment stream seeded once with {sampling['environment_seed']}, then ordinary resets. "
             "Controller and CUDA graph RNG advance across episodes; both streams restart at each checkpoint. "
             if sampling else
-            f"{len(campaign['seeds'])} paired full Humanoid Walk episodes per checkpoint; "
+            f"{len(campaign['seeds'])} paired full {task} episodes per checkpoint; "
             f"environment seeds {campaign['seeds']}. CUDA graph RNG is isolated per episode. "
         )
-        markdown = (f"**Frozen checkpoint evaluation.** Source `{campaign['source_run']}`.\n\n"
+        scope = ("Available checkpoints are evaluated in the requested order."
+                 if campaign.get("streaming") else
+                 "Only the pinned checkpoints already present at submission are evaluated, newest first.")
+        markdown = (f"**{campaign.get('label', 'Frozen checkpoint evaluation')}.** Source `{campaign['source_run']}`.\n\n"
                     + episode_description +
                     f"Controller seed {campaign['controller_seed']}, {campaign['max_steps']} decisions per episode. "
                     f"All execute actor means. New refinement uses H3/J{campaign.get('inner_rounds', 8)}/K1, "
@@ -455,7 +461,7 @@ def layout(args):
                     "at each checkpoint; lines show their means. Small horizontal offsets separate overlapping dots.\n\n"
                     f"Checkpoint order: {', '.join(str(cp['step']) for cp in campaign['checkpoints'])}. "
                     f"Status at {now()}. Missing points remain pending. "
-                    "Available checkpoints are evaluated in the requested order.\n\n"
+                    f"{scope}\n\n"
                     + ("The completed prior and J8 results are reused in this comparison. "
                        if campaign.get("comparison_runs") else "") + "\n\n"
                     + "| Training decisions | " + " | ".join(r.get("plot_label", r["label"]) for r in runs)
