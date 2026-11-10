@@ -1,0 +1,42 @@
+{
+  "study_type": "humanoid-stand-20261109",
+  "study_note": "Fresh Humanoid Stand counterpart of 590be7c27a9b40eaa9a68218cdb74d0a. Only the task and publication metadata change; all learner settings, seed55, 1M decisions and all 40 checkpoints every25k are retained.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-stand",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_gsde_squashed_real_steps_humanoid_stand"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "reference_runs": {
+    "tdmpc2_scaled": {
+      "id": "d9c2c24cfd00449ca0efd75252f2fc59",
+      "url": "https://forge.coreweave.com/wandb/rwgao_b-brown-university/ambi/runs/d9c2c24cfd00449ca0efd75252f2fc59",
+      "config_sha256": "65d189f4aeb343480ae51a1d1539c547ee35d71188e4f00b13ad4ce4e28e96e9"
+    },
+    "squashed": {
+      "id": "c7315843d48e49c58364dbc5686a4bd2",
+      "url": "https://forge.coreweave.com/wandb/rwgao_b-brown-university/ambi/runs/c7315843d48e49c58364dbc5686a4bd2",
+      "config_sha256": "b4302abf7c3ac2f59f461729b07f086f6e85e2793ab1f10d33bed34771c7aec2"
+    }
+  },
+  "name": "Humanoid Stand - gSDE real_steps8 | sampled execution",
+  "source_run_url": "https://forge.coreweave.com/wandb/rwgao_b-brown-university/ambi/runs/590be7c27a9b40eaa9a68218cdb74d0a",
+  "description": "Fresh Humanoid Stand counterpart of 590be7c27a9b40eaa9a68218cdb74d0a. Only the task and publication metadata change; all learner settings, seed55, 1M decisions and all 40 checkpoints every25k are retained.",
+  "source_commit": "edec58cf7ec2b51bd54834aa4d6f806715075502"
+}
