@@ -20,6 +20,7 @@ from utils.evaluation_episodes import consecutive_protocol, validate_consecutive
 
 MATRIX = ROOT / "configs/research/ambi_checkpoint_graph_eval.json"
 CONSECUTIVE_MATRIX = ROOT / "configs/research/ambi_checkpoint_graph_eval_consecutive.json"
+J10_MATRIX = ROOT / "configs/research/ambi_checkpoint_graph_eval_consecutive_j10.json"
 OWNER = "oscar-rgao48"
 ENTITY, PROJECT = "rwgao_b-brown-university", "ambi-inner-bench"
 SELECTORS = ["controller/prior", "controller/graph"]
@@ -27,23 +28,67 @@ LABELS = {SELECTORS[0]: "Frozen prior mean", SELECTORS[1]: "H3 J8 K1 refinement 
 COLORS = {SELECTORS[0]: "#6B7280", SELECTORS[1]: "#0F766E"}
 
 
-def evaluation_settings(mode):
+def evaluation_settings(mode, inner_rounds=8):
     if mode not in {"independent_seeds", "consecutive"}:
         raise ValueError("Unknown episode sampling mode")
     matrix = CONSECUTIVE_MATRIX if mode == "consecutive" else MATRIX
+    if inner_rounds != 8:
+        if inner_rounds != 10 or mode != "consecutive":
+            raise ValueError("J10 requires the consecutive episode protocol")
+        matrix = J10_MATRIX
     evaluation = series._read(matrix)["evaluation"]
     sampling = consecutive_protocol(evaluation)
     return dict(matrix=str(matrix.relative_to(ROOT)), matrix_sha256=series._file_digest(matrix),
                 controller_seed=evaluation["controller_seed"], max_steps=evaluation["max_steps"],
                 execution_action=evaluation["execution_action"], recording=evaluation["recording"],
+                inner_rounds=inner_rounds,
                 **({"episode_sampling": sampling} if sampling else {"seeds": evaluation["seeds"]}))
 
 
 def campaign_matrix(campaign):
     matrix = ROOT / campaign.get("matrix", str(MATRIX.relative_to(ROOT)))
-    if matrix not in {MATRIX, CONSECUTIVE_MATRIX}:
+    if matrix not in {MATRIX, CONSECUTIVE_MATRIX, J10_MATRIX}:
         raise ValueError("Unknown checkpoint campaign matrix")
     return matrix
+
+
+def display_runs(campaign):
+    return campaign.get("comparison_runs", []) + campaign["runs"]
+
+
+def pin_reference_campaign(path, source_run, settings, rows):
+    """Reuse completed paired priors without creating another prior curve."""
+    reference = series._read(path / "campaign.json")
+    if reference["source_run"] != source_run:
+        raise ValueError("Reference campaign uses another training run")
+    for key in ("episode_sampling", "controller_seed", "max_steps", "execution_action"):
+        if reference.get(key) != settings.get(key):
+            raise ValueError("Reference campaign episode protocol differs")
+    previous = {row["step"]: row for row in reference["checkpoints"]}
+    for row in rows:
+        old = previous.get(row["step"], {})
+        if any(old.get(key) != row.get(key) for key in ("sha256", "metadata_sha256")):
+            raise ValueError("Reference campaign checkpoint identity differs")
+        for phase in ("production", "smoke"):
+            manifest_path = path / phase / str(row["step"]) / "bundle/manifest.json"
+            if phase == "smoke" and not manifest_path.exists():
+                continue
+            manifest = series._read(manifest_path)
+            priors = [run for run in manifest["runs"] if run["selector"] == "controller/prior"]
+            if (manifest["status"] != "complete" or len(priors) != 1
+                    or priors[0]["status"] != "complete"
+                    or manifest["checkpoint"]["sha256"] != row["sha256"]):
+                raise ValueError("Reference requires a complete paired prior at each checkpoint")
+            row["reference_" + phase] = {"path": str(manifest_path.resolve()),
+                                         "sha256": series._file_digest(manifest_path)}
+    comparison_runs = []
+    for run in reference["runs"]:
+        prior = run["selector"] == "controller/prior"
+        comparison_runs.append({**run, "reference_root": str(path.resolve()),
+                                "result_selector": run["selector"],
+                                "selector": "controller/prior" if prior else "controller/j8",
+                                "plot_label": "Prior" if prior else "H3/J8 inner SAC"})
+    return comparison_runs
 
 
 def git(*args):
@@ -125,7 +170,8 @@ def plan(args):
         raise ValueError("Planning requires a clean committed source checkout")
     args.campaign.mkdir(parents=True, exist_ok=False)
     steps = checkpoint_steps(args.max_step, args.checkpoint_every, args.descending)
-    settings = evaluation_settings(getattr(args, "episode_sampling", "independent_seeds"))
+    settings = evaluation_settings(getattr(args, "episode_sampling", "independent_seeds"),
+                                   getattr(args, "inner_rounds", 8))
     series._atomic_json(args.campaign / "campaign.json", dict(
         planned=True, created_at=now(), source_run=args.source_run,
         source_commit=git("rev-parse", "HEAD"), source_tree=git("rev-parse", "HEAD^{tree}"),
@@ -143,7 +189,11 @@ def prepare(args):
     if previous is not None and not previous.get("planned"):
         raise FileExistsError("Campaign exists; select its existing registry instead of creating duplicate runs")
     steps = checkpoint_steps(args.max_step, args.checkpoint_every, args.descending)
-    settings = evaluation_settings(getattr(args, "episode_sampling", "independent_seeds"))
+    settings = evaluation_settings(getattr(args, "episode_sampling", "independent_seeds"),
+                                   getattr(args, "inner_rounds", 8))
+    reference_campaign = getattr(args, "reference_campaign", None)
+    if (settings["inner_rounds"] == 10) != (reference_campaign is not None):
+        raise ValueError("J10 must reuse its completed J8 campaign's paired prior")
     if previous is not None:
         if (previous["source_run"] != args.source_run or previous["training_root"] != str(args.training_root)
                 or previous["config_name"] != args.config_name
@@ -153,6 +203,8 @@ def prepare(args):
     rows = inventory(args.training_root, args.config_name, steps, allow_missing=args.available_only)
     if not rows:
         raise ValueError("At least one saved checkpoint is required to prepare evaluation")
+    comparison_runs = (pin_reference_campaign(reference_campaign, args.source_run, settings, rows)
+                       if reference_campaign is not None else [])
     args.campaign.mkdir(parents=True, exist_ok=True)
     inventory_path = args.campaign / "checkpoint-inventory.json"
     series._atomic_json(inventory_path, {"source_run": args.source_run, "checkpoints": rows,
@@ -164,8 +216,12 @@ def prepare(args):
     for selector, path in specs["specs"].items():
         registry = series.create_run(args.registry, series._read(path), args.campaign.name,
                                      PROJECT, ENTITY, OWNER)
+        j10 = settings["inner_rounds"] == 10 and selector == "controller/graph"
         runs.append({"selector": selector, "id": registry["run_id"], "run_dir": registry["run_dir"],
-                     "label": LABELS[selector], "color": COLORS[selector]})
+                     "label": "H3 J10 K1 refinement mean · CUDA graph" if j10 else LABELS[selector],
+                     "plot_label": "H3/J10 inner SAC" if j10 else
+                                   ("Prior" if selector == "controller/prior" else "H3/J8 inner SAC"),
+                     "color": "#D97706" if j10 else COLORS[selector]})
     run_map = {run["selector"]: run["run_dir"] for run in runs}
     series._atomic_json(args.campaign / "run-map.json", run_map)
     campaign = dict(planned=False, created_at=now(), source_run=args.source_run, source_commit=git("rev-parse", "HEAD"),
@@ -173,6 +229,7 @@ def prepare(args):
                     cutoff_step=args.max_step, checkpoints=complete_grid(steps, rows), runs=runs,
                     training_root=str(args.training_root), config_name=args.config_name,
                     streaming=args.available_only,
+                    comparison_runs=comparison_runs,
                     root=str(args.campaign.resolve()))
     series._atomic_json(args.campaign / "campaign.json", campaign)
     print(json.dumps(campaign), flush=True)
@@ -257,12 +314,14 @@ def release(args):
             raise
 
 
-def validate_result(payload, expected_steps, seeds=None, *, sampling=None, controller_seed=55):
-    if len(payload["results"]) != 2:
-        raise ValueError("Both prior and graph results are required")
+def validate_result(payload, expected_steps, seeds=None, *, sampling=None, controller_seed=55,
+                    inner_rounds=8, selectors=None):
+    selectors = SELECTORS if selectors is None else selectors
+    if len(payload["results"]) != len(selectors):
+        raise ValueError("All selected results are required")
     expected_count = sampling["num_episodes"] if sampling else len(seeds)
-    if {r["selector"] for r in payload["results"]} != set(SELECTORS):
-        raise ValueError("Both prior and graph selectors are required")
+    if {r["selector"] for r in payload["results"]} != set(selectors):
+        raise ValueError("Result selectors differ from the requested controllers")
     for result in payload["results"]:
         if not result["outer_state_unchanged"] or result["outer_updates_before"] != result["outer_updates_after"]:
             raise ValueError("Outer checkpoint state changed")
@@ -280,12 +339,13 @@ def validate_result(payload, expected_steps, seeds=None, *, sampling=None, contr
                 raise ValueError("Missing whole-solve graph replay")
             for episode in result["episodes"]:
                 metrics = episode["model_metrics"]
-                for key, value in {"inner_cuda_graph_used": 1, "inner_critic_optimizer_steps": 128,
-                                   "inner_actor_optimizer_steps": 32, "inner_model_steps": 3072,
+                for key, value in {"inner_cuda_graph_used": 1, "inner_critic_optimizer_steps": 16 * inner_rounds,
+                                   "inner_actor_optimizer_steps": 4 * inner_rounds,
+                                   "inner_model_steps": 384 * inner_rounds,
                                    "inner_compile_fallback": 0}.items():
                     if metrics.get(key) != value:
                         raise ValueError(f"Unexpected graph workload: {key}={metrics.get(key)}")
-    if sampling is not None:
+    if sampling is not None and len(payload["results"]) == 2:
         validate_paired_starts(payload["results"][0]["episodes"], payload["results"][1]["episodes"])
     return payload
 
@@ -318,6 +378,11 @@ def worker(args):
         seeds = campaign["seeds"][:2] if args.smoke else campaign["seeds"]
         episode_options = {"seeds": seeds}
     steps = 16 if args.smoke else campaign["max_steps"]
+    reference = row.get("reference_smoke" if args.smoke else "reference_production")
+    if campaign.get("comparison_runs") and reference is None:
+        raise ValueError("Missing pinned prior reference for this evaluation")
+    if reference is not None and series._file_digest(reference["path"]) != reference["sha256"]:
+        raise ValueError("Pinned prior reference changed")
     if args.smoke:
         subprocess.run([sys.executable, "-m", "pytest", "-q",
                         "tests/test_frozen_graph_evaluation.py::test_cuda_mean_graph_matches_control_and_resets_episode_rng"], check=True)
@@ -326,8 +391,11 @@ def worker(args):
                               bundle_dir=output / "bundle", source_run=campaign["source_run"],
                               checkpoint_inventory=inventory_path,
                               eval_run_map=None if args.smoke else args.campaign / "run-map.json",
+                              reference_bundle=reference["path"] if reference else None,
                               stage_results=False)
-    validate_result(payload, steps, seeds, sampling=sampling, controller_seed=campaign["controller_seed"])
+    validate_result(payload, steps, seeds, sampling=sampling, controller_seed=campaign["controller_seed"],
+                    inner_rounds=campaign.get("inner_rounds", 8),
+                    selectors=[run["selector"] for run in campaign["runs"]])
     series._atomic_json(output / "results.json", payload)
     receipt = dict(passed=True, checkpoint_step=row["step"], seconds=time.perf_counter()-started,
                    source_commit=campaign["source_commit"], gpu=torch.cuda.get_device_name(),
@@ -346,11 +414,14 @@ def worker(args):
 def progress(campaign):
     rows = []
     for cp in campaign["checkpoints"]:
-        path = Path(campaign["root"]) / "production" / str(cp["step"]) / "bundle/manifest.json"
-        manifest = series._read(path) if path.exists() else {}
-        states = {run["selector"]: run["status"] for run in manifest.get("runs", [])}
         pending = "queued" if "path" in cp else "awaiting checkpoint"
-        rows.append({"step": cp["step"], **{selector: states.get(selector, pending) for selector in SELECTORS}})
+        row = {"step": cp["step"]}
+        for run in display_runs(campaign):
+            path = Path(run.get("reference_root", campaign["root"])) / "production" / str(cp["step"]) / "bundle/manifest.json"
+            manifest = series._read(path) if path.exists() else {}
+            states = {result["selector"]: result["status"] for result in manifest.get("runs", [])}
+            row[run["selector"]] = states.get(run.get("result_selector", run["selector"]), pending)
+        rows.append(row)
     return rows
 
 
@@ -361,8 +432,10 @@ def layout(args):
     from utils.checkpoint_return_plot import return_episode_panel
     campaign = load_campaign(args.campaign)
     with series._lock(args.campaign / ".layout.lock"):
+        runs = display_runs(campaign)
         rows = progress(campaign)
-        table = "\n".join(f"| {r['step']:,} | {r[SELECTORS[0]]} | {r[SELECTORS[1]]} |" for r in rows)
+        table = "\n".join(f"| {row['step']:,} | " + " | ".join(row[r['selector']] for r in runs) + " |"
+                          for row in rows)
         sampling = campaign.get("episode_sampling")
         episode_description = (
             f"{sampling['num_episodes']} paired consecutive full Humanoid Walk episodes per checkpoint; "
@@ -375,7 +448,7 @@ def layout(args):
         markdown = (f"**Frozen checkpoint evaluation.** Source `{campaign['source_run']}`.\n\n"
                     + episode_description +
                     f"Controller seed {campaign['controller_seed']}, {campaign['max_steps']} decisions per episode. "
-                    "Both execute actor means. Refinement retains H3/J8/K1, "
+                    f"All execute actor means. New refinement uses H3/J{campaign.get('inner_rounds', 8)}/K1, "
                     "N128/C16/A4/B256, inherited fixed entropy and action-local adaptive Q scaling. "
                     "Outer checkpoint state stays frozen. "
                     "Return-only logging omits inner traces/model probes. Dots show all episode returns "
@@ -383,10 +456,13 @@ def layout(args):
                     f"Checkpoint order: {', '.join(str(cp['step']) for cp in campaign['checkpoints'])}. "
                     f"Status at {now()}. Missing points remain pending. "
                     "Available checkpoints are evaluated in the requested order.\n\n"
-                    "| Training decisions | Prior | Refinement |\n|---:|---|---|\n" + table)
+                    + ("The completed prior and J8 results are reused in this comparison. "
+                       if campaign.get("comparison_runs") else "") + "\n\n"
+                    + "| Training decisions | " + " | ".join(r.get("plot_label", r["label"]) for r in runs)
+                    + " |\n|---:|" + "---|" * len(runs) + "\n" + table)
         panels = [wr.MarkdownPanel(markdown=markdown, layout=wr.Layout(w=24, h=14))]
         preset_path = args.campaign / "return-episodes-preset.json"
-        return_panel, preset = return_episode_panel(campaign["runs"], ENTITY,
+        return_panel, preset = return_episode_panel(runs, ENTITY,
             series._read(preset_path) if preset_path.exists() else None)
         series._atomic_json(preset_path, preset)
         panels.append(return_panel)
@@ -394,9 +470,9 @@ def layout(args):
                               ("Controller seconds per decision", "runtime/control_seconds_per_decision")):
             panels.append(wr.LinePlot(title=title, x=series.X_AXIS, y=[metric], aggregate=False,
                                      smoothing_type="none", title_x="Training decisions at checkpoint",
-                                     legend_template="${run:displayName}", max_runs_to_show=2,
-                                     line_titles={r["id"]+":"+metric:r["label"] for r in campaign["runs"]},
-                                     line_colors={r["id"]+":"+metric:r["color"] for r in campaign["runs"]},
+                                     legend_template="${run:displayName}", max_runs_to_show=len(runs),
+                                     line_titles={r["id"]+":"+metric:r["label"] for r in runs},
+                                     line_colors={r["id"]+":"+metric:r["color"] for r in runs},
                                      layout=wr.Layout(w=12, h=8)))
         section = ws.Section(name="Checkpoint evaluation / Results and progress", is_open=True, panels=panels)
         receipt_path = args.campaign / "workspace.json"
@@ -409,14 +485,14 @@ def layout(args):
         else:
             work = ws.Workspace(entity=ENTITY, project=PROJECT, name=campaign.get("label", "Frozen checkpoint evaluation"),
                                 auto_generate_panels=False, sections=[section],
-                                runset_settings=ws.RunsetSettings(filters=[expr.Metric("ID").isin([r["id"] for r in campaign["runs"]])],
-                                                               groupby=[], run_settings={r["id"]:ws.RunSettings(color=r["color"],disabled=False) for r in campaign["runs"]}))
+                                runset_settings=ws.RunsetSettings(filters=[expr.Metric("ID").isin([r["id"] for r in runs])],
+                                                               groupby=[], run_settings={r["id"]:ws.RunSettings(color=r["color"],disabled=False) for r in runs}))
         # A planned campaign has no result IDs yet. Keep unrelated runs hidden;
         # preparation replaces this empty selection with the two real series.
         work.runset_settings.filters = [expr.Metric("ID").isin(
-            [r["id"] for r in campaign["runs"]] or ["pending-" + args.campaign.name])]
+            [r["id"] for r in runs] or ["pending-" + args.campaign.name])]
         work.runset_settings.run_settings = {r["id"]: ws.RunSettings(color=r["color"], disabled=False)
-                                             for r in campaign["runs"]}
+                                             for r in runs}
         work.save()
         verified = ws.Workspace.from_url(work.url)
         if not any(s.name == section.name and len(s.panels) == 4 and
@@ -489,9 +565,11 @@ def main():
             p.add_argument("--descending", action="store_true")
             p.add_argument("--episode-sampling", choices=("independent_seeds", "consecutive"),
                            default="independent_seeds", help="Consecutive selects ten episodes from seed 55.")
+            p.add_argument("--inner-rounds", type=int, choices=(8, 10), default=8)
             p.add_argument("--registry", type=Path, required=True)
         if name == "prepare":
             p.add_argument("--available-only", action="store_true")
+            p.add_argument("--reference-campaign", type=Path)
         if name == "worker":
             p.add_argument("--index", type=int, required=True)
             p.add_argument("--smoke", action="store_true")

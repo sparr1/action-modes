@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "base_alg_config": "checkpoint",
+  "description": "J10 refinement of frozen checkpoints, ten consecutive mean-action episodes; reuse the matched completed prior bundle.",
+  "shared_alg_params": {
+    "wandb": false,
+    "wandb_mode": "disabled",
+    "inner_diagnostic_rollouts": 0,
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "compile": true,
+    "compile_strict": true,
+    "critic_ensemble_backend": "vmap"
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "max_steps": 500,
+    "execution_action": "mean",
+    "recording": "returns",
+    "default_presets": [
+      "controller/graph"
+    ],
+    "episode_sampling": "consecutive",
+    "environment_seed": 55,
+    "num_episodes": 10
+  },
+  "comparisons": {
+    "controller": {
+      "description": "Paired prior versus fresh checkpoint-matched inner adaptation.",
+      "reference": "prior",
+      "variants": {
+        "prior": {
+          "description": "Frozen prior mean without inner improvement.",
+          "alg_params": {
+            "inner_operator": "none",
+            "inner_cuda_graph": false,
+            "inner_finite_horizon": false,
+            "inner_actor_loss_scale_update": null,
+            "inner_actor_loss_scale_scope": null,
+            "inner_critic_target_initialization": null,
+            "inner_rounds": null,
+            "inner_rollouts_per_round": null,
+            "inner_updates_per_round": null,
+            "inner_model_step_budget": null,
+            "inner_mppi_iterations": null,
+            "inner_critic_updates_per_action": null,
+            "inner_actor_updates_per_action": null,
+            "inner_temperature_updates_per_action": null,
+            "inner_critic_updates_per_round": null,
+            "inner_actor_updates_per_round": null
+          }
+        },
+        "graph": {
+          "description": "Fresh inherited SAC solve at each real decision, final actor mean, isolated CUDA graph RNG.",
+          "evaluation": {
+            "execution_backend": "frozen_mean_cuda_graph_v1"
+          },
+          "alg_params": {
+            "inner_rounds": 10
+          }
+        }
+      }
+    }
+  }
+}

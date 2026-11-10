@@ -44,6 +44,9 @@ def episode_return_rows(records):
             step = record["checkpoint"]["step"]
             seed = episode["environment_seed"] if sampling is not None else episode["seed"]
             label = LABELS[record["selector"]]
+            if record["selector"] == "controller/graph":
+                settings = record["identity"]["planner"]["settings"]
+                label = f"H{settings['inner_rollout_horizon']}/J{settings['inner_rounds']} inner SAC"
             key = (step, label, index)
             if key in seen:
                 raise ValueError("Duplicate checkpoint episode")
@@ -65,7 +68,7 @@ def publish_episode_returns(run, run_dir):
 
 
 def return_episode_spec(runs):
-    colors = {r["selector"]: r["color"] for r in runs}
+    colors = {r.get("plot_label", LABELS.get(r["selector"], r["selector"])): r["color"] for r in runs}
     return {
         "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
         "title": TITLE,
@@ -76,9 +79,7 @@ def return_episode_spec(runs):
             "x": {"field": "${field:x}", "type": "quantitative",
                   "title": "Training decisions at checkpoint", "axis": {"format": "~s"}},
             "color": {"field": "${field:controller}", "type": "nominal", "title": None,
-                      "scale": {"domain": list(LABELS.values()),
-                                "range": [colors.get("controller/prior", "#6B7280"),
-                                          colors.get("controller/graph", "#0F766E")]},
+                      "scale": {"domain": list(colors), "range": list(colors.values())},
                       "legend": {"orient": "bottom"}},
         },
         "layer": [

@@ -87,8 +87,9 @@ class StreamModel:
         if self.cfg.inner_operator == "none":
             action = 0.
         self.agent.last_inner_metrics = {
-            "inner_cuda_graph_used": 1, "inner_critic_optimizer_steps": 128,
-            "inner_actor_optimizer_steps": 32, "inner_model_steps": 3072, "inner_compile_fallback": 0,
+            "inner_cuda_graph_used": 1, "inner_critic_optimizer_steps": 16 * (getattr(self.cfg, "inner_rounds", 8) or 8),
+            "inner_actor_optimizer_steps": 4 * (getattr(self.cfg, "inner_rounds", 8) or 8),
+            "inner_model_steps": 384 * (getattr(self.cfg, "inner_rounds", 8) or 8), "inner_compile_fallback": 0,
         }
         return action, None
 
@@ -318,6 +319,70 @@ def test_campaign_pins_new_matrix_without_relabeling_old_campaigns():
     assert settings["max_steps"] == 500
     assert campaign.campaign_matrix({}) == campaign.MATRIX
     assert "episode_sampling" not in campaign.evaluation_settings("independent_seeds")
+
+
+def test_j10_reuses_paired_prior_and_keeps_all_other_settings(fake_runtime, tmp_path):
+    _, original = run_matrix(fake_runtime, tmp_path, name="j8")
+    baseline_config = vars(fake_runtime.models[1].cfg).copy()
+    payload, directory = run_matrix(fake_runtime, tmp_path, matrix=campaign.J10_MATRIX,
+                                   name="j10", reference_bundle=original)
+    assert len(payload["results"]) == 1
+    changed_config = vars(fake_runtime.models[-1].cfg).copy()
+    assert changed_config.pop("inner_rounds") == 10
+    assert baseline_config.pop("inner_rounds") == 8
+    assert changed_config == baseline_config
+    assert changed_config["inner_replay_capacity"] == 3072
+    sampling = consecutive_protocol(load_preset_matrix(campaign.J10_MATRIX)["evaluation"])
+    campaign.validate_result(payload, 2, sampling=sampling, inner_rounds=10,
+                             selectors=["controller/graph"])
+    record, = data.normalize_bundle(directory, checkpoint_inventory=fake_runtime.inventory)
+    assert record["identity"]["planner"]["settings"]["inner_rounds"] == 10
+    assert record["metrics"]["eval/paired_episodes"] == 10
+    assert {row[1] for row in episode_return_rows([record])} == {"H3/J10 inner SAC"}
+    with pytest.raises(ValueError, match="Unexpected graph workload"):
+        campaign.validate_result(payload, 2, sampling=sampling, inner_rounds=8,
+                                 selectors=["controller/graph"])
+    settings = campaign.evaluation_settings("consecutive", 10)
+    assert campaign.campaign_matrix(settings) == campaign.J10_MATRIX
+    with pytest.raises(ValueError, match="consecutive"):
+        campaign.evaluation_settings("independent_seeds", 10)
+
+
+def test_return_plot_keeps_j8_and_j10_separate():
+    from utils.checkpoint_return_plot import return_episode_spec
+    runs = [{"selector": selector, "plot_label": label, "color": color} for selector, label, color in
+            [("controller/prior", "Prior", "gray"), ("controller/j8", "H3/J8 inner SAC", "teal"),
+             ("controller/graph", "H3/J10 inner SAC", "orange")]]
+    scale = return_episode_spec(runs)["encoding"]["color"]["scale"]
+    assert scale["domain"] == ["Prior", "H3/J8 inner SAC", "H3/J10 inner SAC"]
+    assert scale["range"] == ["gray", "teal", "orange"]
+
+
+def test_reference_campaign_pins_completed_matching_checkpoints(fake_runtime, tmp_path):
+    reference = tmp_path / "previous"
+    _, bundle = run_matrix(fake_runtime, tmp_path, name="previous/production/25000/bundle")
+    digest = hashlib.sha256(fake_runtime.checkpoint.read_bytes()).hexdigest()
+    rows = [{"step": 25000, "sha256": digest, "metadata_sha256": "metadata"}]
+    settings = campaign.evaluation_settings("consecutive")
+    settings["max_steps"] = 2
+    saved = {**settings, "source_run": "entity/project/source", "checkpoints": rows,
+             "runs": [{"selector": "controller/prior", "id": "prior"},
+                      {"selector": "controller/graph", "id": "j8"}]}
+    (reference / "campaign.json").write_text(json.dumps(saved))
+    comparisons = campaign.pin_reference_campaign(reference, saved["source_run"], settings, rows)
+    assert [r["selector"] for r in comparisons] == ["controller/prior", "controller/j8"]
+    assert rows[0]["reference_production"]["sha256"] == hashlib.sha256((bundle / "manifest.json").read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="another training run"):
+        campaign.pin_reference_campaign(reference, "entity/project/other", settings, rows)
+    with pytest.raises(ValueError, match="protocol differs"):
+        campaign.pin_reference_campaign(reference, saved["source_run"], {**settings, "controller_seed": 56}, rows)
+    with pytest.raises(ValueError, match="identity differs"):
+        campaign.pin_reference_campaign(reference, saved["source_run"], settings, [{**rows[0], "sha256": "wrong"}])
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    manifest["status"] = "running"
+    (bundle / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="complete paired prior"):
+        campaign.pin_reference_campaign(reference, saved["source_run"], settings, rows)
 
 
 def test_actual_inner_engine_episode_boundary_preserves_random_stream():
