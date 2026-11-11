@@ -138,6 +138,17 @@ timings; W&B and checkpoints are disabled. This early-replay screen excludes
 long-run logging, periodic diagnostics and checkpoint costs. It does not change
 the training recipes or establish a production walltime guarantee.
 
+The `ambi_posttanh_outer_adapt_humanoid_stand.json` algorithm and experiment
+manifest reproduce the Humanoid Walk run `fc7c433ab4734a5aa7eb1717e2165969`
+on Humanoid Stand. The learner remains pinned to source `5f6089fe`: seed 55,
+one million decisions, sampled execution, H3/J8/K1, N128/C16/A4/B256, fixed
+post-tanh entropy 0.0021, and action-local adaptive Q scaling. All checkpoints
+are retained every 25k decisions and critic geometry is observed every 1k
+updates. `slurm/posttanh_humanoid_stand_oscar.py prepare` verifies source parity
+and existing CPU-scaling evidence; `slurm/run_posttanh_humanoid_stand_oscar.sbatch`
+requires a clean pinned checkout and runs fresh GPU startup, timing, geometry,
+and checkpoint checks with W&B disabled before starting online training.
+
 ### Optional random inner initialization
 
 Set `inner_actor_initialization="random"` and/or
