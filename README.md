@@ -149,6 +149,21 @@ and existing CPU-scaling evidence; `slurm/run_posttanh_humanoid_stand_oscar.sbat
 requires a clean pinned checkout and runs fresh GPU startup, timing, geometry,
 and checkpoint checks with W&B disabled before starting online training.
 
+The three `ambi_posttanh_outer_adapt_dog_{run,walk,trot}.json` algorithm and
+experiment pairs transfer that same recipe to Dog's 223 state observations and
+38 actions. The fixed **joint** entropy coefficient remains 0.0021. Like the
+official TD-MPC2 wrapper at `8bbc14eb`, each action is held for two DMControl
+steps, their rewards are summed, and an episode contains 500 policy decisions.
+The one-million-decision budget therefore covers two million control steps.
+`slurm/run_posttanh_dog_oscar.sbatch gate`, with `AMBI_DOG_TASK` selecting the
+task, checks 38-action CUDA parity and benchmarks the actual task on one and
+two physical CPU cores with W&B disabled. On success it submits that task's
+training job with the smallest competitive CPU allocation and measured
+runtime plus 15% and 30 minutes for startup. It checks combined live QOS limits,
+verifies the source and checkpoint capacity, installs W&B progress panels,
+and releases the training job only after those checks succeed. The three tasks
+can run concurrently; failures are shown in the workspace and Slurm logs.
+
 ### Optional random inner initialization
 
 Set `inner_actor_initialization="random"` and/or

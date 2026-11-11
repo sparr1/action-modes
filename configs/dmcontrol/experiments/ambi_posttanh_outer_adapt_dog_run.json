@@ -1,0 +1,28 @@
+{
+  "study_type": "posttanh_outer_adapt_dog_run",
+  "study_note": "Fresh Dog Run version of W&B ambi/fc7c433ab4734a5aa7eb1717e2165969. Preserve all learner hyperparameters, including fixed joint post-tanh entropy 0.0021 despite the 38-dimensional Dog action space. State observations, seed55, one million agent decisions, H3/J8/K1, N128/C16/A4/B256, sampled execution, reward-only critics, action-local adaptive Q scaling, strict compilation, whole-inner CUDA graphs, vmap, TF32-high, critic geometry every1k updates and all25k checkpoints. Match official TD-MPC2 action repeat2 with summed rewards and500 decisions per episode: 1M decisions equal2M raw control steps.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "dog-run",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_posttanh_outer_adapt_dog_run"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "name": "Dog Run - posttanh outer-adapt H3 J8 K1",
+  "description": "Fresh Dog Run version of W&B ambi/fc7c433ab4734a5aa7eb1717e2165969. Preserve all learner hyperparameters, including fixed joint post-tanh entropy 0.0021 despite the 38-dimensional Dog action space. State observations, seed55, one million agent decisions, H3/J8/K1, N128/C16/A4/B256, sampled execution, reward-only critics, action-local adaptive Q scaling, strict compilation, whole-inner CUDA graphs, vmap, TF32-high, critic geometry every1k updates and all25k checkpoints. Match official TD-MPC2 action repeat2 with summed rewards and500 decisions per episode: 1M decisions equal2M raw control steps."
+}

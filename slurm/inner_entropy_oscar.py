@@ -27,6 +27,12 @@ if os.environ.get("AMBI_ENTROPY_VARIANT") == "humanoid_run":
 elif os.environ.get("AMBI_ENTROPY_VARIANT") == "humanoid_stand":
     MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_posttanh_outer_adapt_humanoid_stand.json"
     CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/posttanh-humanoid-stand-20261111")
+elif os.environ.get("AMBI_ENTROPY_VARIANT") == "dog":
+    dog_task = os.environ["AMBI_DOG_TASK"]
+    if dog_task not in ("run", "walk", "trot"):
+        raise ValueError("AMBI_DOG_TASK must be run, walk, or trot")
+    MANIFEST = ROOT / f"configs/dmcontrol/experiments/ambi_posttanh_outer_adapt_dog_{dog_task}.json"
+    CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/posttanh-dog-20261111") / dog_task
 GPU_PARITY_TEST = "tests/test_inner_entropy_graph.py::test_cuda_capture_matches_uncaptured_normalized_solve"
 
 
@@ -156,6 +162,7 @@ def accelerated_runtime():
 
 
 def worker(args):
+    import resource
     cpus = [int(cpu) for cpu in args.worker_cpus.split(",")]
     assert set(cpus) <= os.sched_getaffinity(0)
     os.sched_setaffinity(0, cpus)
@@ -183,7 +190,10 @@ def worker(args):
     try:
         learner = AMBITDMPC2(name + "-disabled-benchmark", env, run["alg_params"], run, manifest)
         agent, cfg = learner.agent, learner.cfg
-        assert cfg.action_dim == 21 and cfg.inner_operator == "sac" and not cfg.mpc
+        expected_shape = (223, 38) if manifest["env_params"]["task"].startswith("dog-") else (67, 21)
+        assert (env.observation_space.shape[0], env.action_space.shape[0]) == expected_shape
+        assert cfg.action_dim == expected_shape[1] and cfg.inner_operator == "sac" and not cfg.mpc
+        assert env.unwrapped.action_repeat == 2 and env.spec.max_episode_steps == 500
         assert (cfg.inner_rollout_horizon, cfg.inner_rounds, cfg.inner_solve_interval) == (3, 8, 1)
         assert cfg.inner_finite_horizon
         assert cfg.outer_actor_entropy_mode == cfg.inner_actor_entropy_mode
@@ -285,6 +295,8 @@ def worker(args):
                   "gpu_replay": True, "metrics": {k: float(v) for k, v in metrics.items()},
                   "diagnostic_episodes": learner._training_diagnostics.episode_metrics(),
                   "seconds": time.perf_counter() - started,
+                  "peak_host_memory_bytes": int((resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                      + resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss) * (1 if sys.platform == "darwin" else 1024)),
                   "benchmark_overrides": {**overrides, "total_steps": total}, "wandb": False}
         write_new(args.output, report)
     finally:
