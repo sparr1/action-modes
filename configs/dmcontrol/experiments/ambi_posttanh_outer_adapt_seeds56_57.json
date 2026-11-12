@@ -1,0 +1,26 @@
+{
+  "study_type": "posttanh_outer_adapt_seed_replication",
+  "study_note": "Seeds 56 and 57 reproduce Humanoid Walk reference run fc7c433ab4734a5aa7eb1717e2165969 at 5f6089fe70441b968ed814d1b1e73ddbd3f08a71. Only seed and W&B labels change; one million decisions, sampled execution, H3/J8/K1, critic geometry and 25k checkpoint cadence are retained.",
+  "overrides_alg": {
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-walk",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_inner_entropy_posttanh_outer_adapt_seed56",
+    "ambi_inner_entropy_posttanh_outer_adapt_seed57"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary"
+}
