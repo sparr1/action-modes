@@ -25,7 +25,7 @@ for spec in specs:
     gate_path = Path(spec['gate_receipt']) if spec.get('gate_receipt') else HERE/'gates'/str(spec.get('index'))/'receipt.json'
     pending = ("validated; awaiting training logs" if gate_path.exists()
                else f"pending startup validation / job {spec.get('job', 'not submitted')}")
-    rows.append({**spec,'state':pending if r is None else r.state,
+    rows.append({**spec,'state':spec.get('phase',pending) if r is None else r.state,
                  'decisions':summary.get('env_step','pending'), 'job':spec.get('job','pending submission')})
 metrics={
     'Returns and progress':[

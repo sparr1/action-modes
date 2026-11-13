@@ -1,0 +1,28 @@
+{
+  "study_type": "boom_x0p01_dog_trot",
+  "study_note": "Fresh seed-55 Dog Trot BOOM run. Add corrected BOOM sampled-action alignment with coefficient 0.00038 = 0.01 * (38/1000), std floor 0.05 and compiled outer loss. Preserve the existing dog post-tanh baseline: fixed joint entropy 0.0021, H3/J8/K1, N128/C16/A4/B256, sampled execution, 1M decisions, action repeat 2 with summed rewards, 500-decision episodes, all checkpoints every 25k and critic geometry every 1k outer updates. Evaluation campaigns are separate.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "dog-trot",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_boom_x0p01_dog_trot"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "name": "Dog Trot - BOOM x0.01 sampled outer adapt",
+  "description": "Fresh seed-55 Dog Trot BOOM run. Add corrected BOOM sampled-action alignment with coefficient 0.00038 = 0.01 * (38/1000), std floor 0.05 and compiled outer loss. Preserve the existing dog post-tanh baseline: fixed joint entropy 0.0021, H3/J8/K1, N128/C16/A4/B256, sampled execution, 1M decisions, action repeat 2 with summed rewards, 500-decision episodes, all checkpoints every 25k and critic geometry every 1k outer updates. Evaluation campaigns are separate."
+}

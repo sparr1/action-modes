@@ -6,6 +6,7 @@ import json
 import math
 import os
 import runpy
+import resource
 from pathlib import Path
 import shutil
 import subprocess
@@ -24,6 +25,8 @@ CAMPAIGNS = {
     "strength": ("ambi_posttanh_prior_strength.json", "posttanh-prior-strength-20261105"),
     "humanoid_stand": ("ambi_boom_x0p01_humanoid_stand.json", "boom-humanoid-stand-run-20261108/stand"),
     "humanoid_run": ("ambi_boom_x0p01_humanoid_run.json", "boom-humanoid-stand-run-20261108/run"),
+    **{f"dog_{task}": (f"ambi_boom_x0p01_dog_{task}.json", f"boom-dog-x001-20261113/{task}")
+       for task in ("walk", "trot", "run")},
 }
 _manifest_name, _campaign_name = CAMPAIGNS[os.environ.get("AMBI_PRIOR_VARIANT", "original")]
 MANIFEST = ROOT / "configs/dmcontrol/experiments" / _manifest_name
@@ -189,7 +192,11 @@ def worker(args):
     try:
         learner = AMBITDMPC2(name + "-disabled-benchmark", env, run["alg_params"], run, manifest)
         agent, cfg = learner.agent, learner.cfg
-        assert cfg.action_dim == 21 and cfg.inner_operator == "sac" and not cfg.mpc
+        dog = manifest["env_params"]["task"].startswith("dog-")
+        assert cfg.action_dim == (38 if dog else 21) and cfg.inner_operator == "sac" and not cfg.mpc
+        if dog:
+            assert env.observation_space.shape == (223,) and env.action_space.shape == (38,)
+            assert env.unwrapped.action_repeat == 2 and env.spec.max_episode_steps == 500
         assert (cfg.inner_rollout_horizon, cfg.inner_rounds, cfg.inner_solve_interval) == (3, 8, 1)
         assert cfg.inner_finite_horizon
         assert cfg.outer_actor_entropy_mode == cfg.inner_actor_entropy_mode
@@ -306,6 +313,7 @@ def worker(args):
                   "gpu_replay": True, "metrics": {k: float(v) for k, v in metrics.items()},
                   "diagnostic_episodes": learner._training_diagnostics.episode_metrics(),
                   "seconds": time.perf_counter() - started,
+                  "peak_host_memory_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024),
                   "benchmark_overrides": {**overrides, "total_steps": total}, "wandb": False}
         write_new(args.output, report)
     finally:

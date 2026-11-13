@@ -187,6 +187,25 @@ never written back. When either coefficient is active, the lightweight
 `inner_actor_writeback_applied`, and `inner_critic_writeback_applied` metrics
 report the configured strengths and whether each writeback occurred.
 
+## Sampled BOOM on Dog tasks
+
+The `ambi_boom_x0p01_dog_{walk,trot,run}` algorithm and experiment files
+add corrected BOOM alignment to the matching post-tanh outer-adapt recipe.
+The explicit coefficient is `0.00038 = 0.01 * (38 / 1000)`, following the
+released BOOM Dog default. The Humanoid coefficient `0.0042` must not be
+copied unchanged to these presets. Fixed joint entropy remains `0.0021`,
+matching the existing Dog baselines, with sampled execution, seed 55,
+H3/J8/K1 and N128/C16/A4/B256. Each run retains all 25k checkpoints through
+one million decisions and logs critic geometry every 1,000 outer updates.
+
+`slurm/boom_dog_oscar.py` validates the exact task, Dog-shape CUDA parity,
+checkpoint restoration, diagnostics, and one-versus-two-CPU throughput.
+Validation disables W&B. Production walltime includes measured training
+overhead plus a 15% margin and 30 minutes for startup. The separate `gate`
+and `train` modes never submit production as a benchmark side effect.
+W&B publication installs and verifies return, progress, BOOM, and critic
+geometry panels before training; panel setup failures are surfaced.
+
 ## Training checkpoints
 
 Within-run checkpoint retention is configured independently from end-of-trial
