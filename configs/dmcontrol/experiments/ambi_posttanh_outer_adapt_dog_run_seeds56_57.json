@@ -1,0 +1,28 @@
+{
+  "study_type": "posttanh_outer_adapt_dog_run_seeds56_57",
+  "study_note": "Seeds 56 and 57 replicate the existing Dog Run seed-55 sampled post-tanh recipe; only seeds and publication labels change. Each starts fresh for 1M decisions, retains every 25k checkpoint, and logs critic geometry every 1k updates.",
+  "overrides_alg": {
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "dog-run",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_posttanh_outer_adapt_dog_run_seed56",
+    "ambi_posttanh_outer_adapt_dog_run_seed57"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "name": "Dog Run - posttanh outer-adapt H3 J8 K1 - seeds 56 and 57",
+  "description": "Seeds 56 and 57 replicate the existing Dog Run seed-55 sampled post-tanh recipe; only seeds and publication labels change. Each starts fresh for 1M decisions, retains every 25k checkpoint, and logs critic geometry every 1k updates."
+}

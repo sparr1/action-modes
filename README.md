@@ -164,6 +164,15 @@ verifies the source and checkpoint capacity, installs W&B progress panels,
 and releases the training job only after those checks succeed. The three tasks
 can run concurrently; failures are shown in the workspace and Slurm logs.
 
+The `ambi_posttanh_outer_adapt_dog_{walk,trot,run}_seeds56_57.json` manifests
+add independent seeds 56 and 57 to each sampled baseline. Only the seed and
+publication labels change. `slurm/run_posttanh_dog_seed_replicates_oscar.sbatch`
+takes the task and seed index (`0` for 56, `1` for 57), with a separate campaign
+directory for each task. The launcher verifies unchanged training code, exact
+reference recipe hashes, task-specific CUDA parity, CPU-scaling evidence,
+checkpoint checks and the L40S runtime before enabling W&B training. Use the
+measured one-CPU allocation and derive walltime from completed reference runs.
+
 ### Optional random inner initialization
 
 Set `inner_actor_initialization="random"` and/or
