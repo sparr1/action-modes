@@ -1,0 +1,29 @@
+{
+  "study_type": "posttanh_outer_adapt_dog_stand_seeds55_56_57",
+  "study_note": "Fresh Dog Stand training on seeds 55, 56 and 57. Preserve the sampled Dog Walk/Trot/Run learner: 1M decisions, H3/J8/K1, N128/C16/A4/B256, fixed joint post-tanh entropy 0.0021, reward-only critics, action-local adaptive Q scaling and critic geometry every 1k updates. Retain every 25k checkpoint. State observations, two raw control steps per decision, 500 decisions per episode.",
+  "overrides_alg": {
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "dog-stand",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_posttanh_outer_adapt_dog_stand_seed55",
+    "ambi_posttanh_outer_adapt_dog_stand_seed56",
+    "ambi_posttanh_outer_adapt_dog_stand_seed57"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "name": "Dog Stand - posttanh outer-adapt H3 J8 K1 - seeds 55, 56 and 57",
+  "description": "Fresh Dog Stand training on seeds 55, 56 and 57. Preserve the sampled Dog Walk/Trot/Run learner: 1M decisions, H3/J8/K1, N128/C16/A4/B256, fixed joint post-tanh entropy 0.0021, reward-only critics, action-local adaptive Q scaling and critic geometry every 1k updates. Retain every 25k checkpoint. State observations, two raw control steps per decision, 500 decisions per episode."
+}

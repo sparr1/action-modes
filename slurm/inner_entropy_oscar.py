@@ -21,7 +21,10 @@ from slurm.benchmark_ambi_training_cpu import TrainingWindow, physical_core_cpus
 
 MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_inner_entropy.json"
 CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/inner-entropy-cudagraph-20261102")
-if os.environ.get("AMBI_ENTROPY_VARIANT") == "humanoid_run":
+if os.environ.get("AMBI_ENTROPY_VARIANT") == "dog_stand_seeds":
+    MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_posttanh_outer_adapt_dog_stand_seeds55_56_57.json"
+    CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/posttanh-dog-stand-20261115")
+elif os.environ.get("AMBI_ENTROPY_VARIANT") == "humanoid_run":
     MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_posttanh_outer_adapt_humanoid_run.json"
     CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/posttanh-humanoid-run-20261108")
 elif os.environ.get("AMBI_ENTROPY_VARIANT") == "humanoid_stand":
@@ -391,7 +394,8 @@ def gate(args):
         )
     native = json.loads(native_output.read_text())
     plan = select_plan(rows)
-    bank_bytes = 6 * 40 * max(r["checkpoint_bytes"] for r in rows)
+    cells = len(json.loads(MANIFEST.read_text())["configs"])
+    bank_bytes = cells * 40 * max(r["checkpoint_bytes"] for r in rows)
     space = checkpoint_space(args.output, bank_bytes)
     receipt = {"passed": True, "binding": binding(MANIFEST), "runtime": rows[0]["runtime"],
                "plan": plan, "space": space, "cases": [str(args.output/f"cpu-{n}.json") for n in (1,2)],
@@ -399,7 +403,7 @@ def gate(args):
                "graph_speedup_vs_native_one_cpu": native["measured"]["seconds_per_decision"] / rows[0]["measured"]["seconds_per_decision"],
                "graph_native_graph_continuation": all(r["graph_native_graph_continuation"] for r in rows),
                "global_gpu_parity_receipt": str(campaign / "gpu-parity.json"),
-               "scope": "Real H3/J8/K1 Humanoid training, production model/batch; 128 graph decisions on 1/2 CPUs and 32 native reference decisions; sparse inner/geometry diagnostics and recapture outside timing; no W&B."}
+               "scope": "Real H3/J8/K1 training on " + recipe(args.index, MANIFEST)[1]["env_params"]["task"] + "; production model/batch; 128 graph decisions on 1/2 CPUs and 32 native reference decisions; sparse inner/geometry diagnostics and recapture outside timing; no W&B."}
     write_new(args.output / "receipt.json", receipt)
     # Measuring a gate never implicitly submits/resizes/releases production.
     # An explicit release target is useful only for a previously held job whose

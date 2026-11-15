@@ -173,6 +173,18 @@ reference recipe hashes, task-specific CUDA parity, CPU-scaling evidence,
 checkpoint checks and the L40S runtime before enabling W&B training. Use the
 measured one-CPU allocation and derive walltime from completed reference runs.
 
+The `ambi_posttanh_outer_adapt_dog_stand_seeds55_56_57.json` manifest adds
+Dog Stand with fresh seeds 55, 56 and 57 and the same sampled learner. Run
+`slurm/posttanh_dog_stand.py prepare` from a clean pinned checkout, then submit
+`slurm/run_posttanh_dog_stand_oscar.sbatch gate` with two physical CPUs and an
+L40S. The gate checks the actual Dog Stand environment and benchmarks one versus
+two CPUs with W&B disabled, including geometry, checkpoint and graph/native
+continuation checks. Production takes `train INDEX`, with indices 0–2 mapping
+to seeds 55–57. All three share the verified gate because their resolved
+learner settings differ only by seed and publication labels. Size production
+from `gate.json`; its walltime uses the larger of the fresh measured estimate
+and completed Dog reference runtimes, plus 15% and 30 minutes for startup.
+
 ### Optional random inner initialization
 
 Set `inner_actor_initialization="random"` and/or
