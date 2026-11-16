@@ -31,3 +31,45 @@ def test_invalid_seed_index_rejected(index):
 def test_real_dog_stand_two_control_steps():
     from tests.test_posttanh_dog import test_real_dog_matches_tdmpc2_two_control_steps
     test_real_dog_matches_tdmpc2_two_control_steps('stand')
+
+
+def test_matching_memory_does_not_mutate_held_job(monkeypatch):
+    from slurm import posttanh_dog_stand as launcher
+    fields = {'JobState': 'PENDING', 'Reason': 'JobHeldUser', 'MinMemoryNode': '8G'}
+    monkeypatch.setattr(launcher.base, 'slurm_fields', lambda job: fields)
+    def unexpected(*args, **kwargs):
+        pytest.fail('An allocation already matching the gate should not be changed')
+    monkeypatch.setattr(launcher.subprocess, 'run', unexpected)
+    launcher.set_pending_memory(123, 8)
+
+
+def test_memory_resize_uses_integer_megabytes(monkeypatch):
+    from slurm import posttanh_dog_stand as launcher
+    fields = {'JobState': 'PENDING', 'Reason': 'JobHeldUser', 'MinMemoryNode': '8G'}
+    monkeypatch.setattr(launcher.base, 'slurm_fields', lambda job: dict(fields))
+    commands = []
+    def slurm_update(command, *, check):
+        # Oscar rejects a G suffix for this scontrol parameter, unlike sbatch --mem.
+        assert command == ['scontrol', 'update', 'JobId=123', 'MinMemoryNode=12288']
+        assert check
+        commands.append(command)
+        fields['MinMemoryNode'] = '12G'
+    monkeypatch.setattr(launcher.subprocess, 'run', slurm_update)
+    launcher.set_pending_memory(123, 12)
+    assert len(commands) == 1
+
+
+def test_memory_resize_verifies_scheduler_readback(monkeypatch):
+    from slurm import posttanh_dog_stand as launcher
+    fields = {'JobState': 'PENDING', 'Reason': 'JobHeldUser', 'MinMemoryNode': '8G'}
+    monkeypatch.setattr(launcher.base, 'slurm_fields', lambda job: dict(fields))
+    monkeypatch.setattr(launcher.subprocess, 'run', lambda *args, **kwargs: None)
+    with pytest.raises(AssertionError):
+        launcher.set_pending_memory(123, 12)
+
+
+def test_memory_resize_rejects_running_job(monkeypatch):
+    from slurm import posttanh_dog_stand as launcher
+    monkeypatch.setattr(launcher.base, 'slurm_fields', lambda job: {'JobState': 'RUNNING'})
+    with pytest.raises(AssertionError):
+        launcher.set_pending_memory(123, 8)

@@ -115,6 +115,23 @@ def gate():
     print('DOG_STAND_GATE_PASSED', json.dumps(plan), flush=True)
 
 
+def set_pending_memory(job, memory_gib):
+    """scontrol accepts integer MB here; its readback may include a unit suffix."""
+    megabytes = int(memory_gib * 1024)
+    assert megabytes > 0 and megabytes == memory_gib * 1024
+    def allocated_mb(fields):
+        match = re.fullmatch(r'([0-9.]+)([KMGT]?)', fields['MinMemoryNode'])
+        assert match, fields
+        return float(match.group(1)) * {'': 1, 'K': 1/1024, 'M': 1, 'G': 1024, 'T': 1024**2}[match.group(2)]
+    fields = base.slurm_fields(job)
+    assert fields['JobState'] == 'PENDING' and fields['Reason'] == 'JobHeldUser'
+    if allocated_mb(fields) != megabytes:
+        subprocess.run(['scontrol', 'update', f'JobId={job}', f'MinMemoryNode={megabytes}'], check=True)
+    verified = base.slurm_fields(job)
+    assert verified['JobState'] == 'PENDING' and verified['Reason'] == 'JobHeldUser'
+    assert allocated_mb(verified) == megabytes, verified
+
+
 def release():
     """Apply the measured allocation to the three held, pre-submitted jobs."""
     state = read(CAMPAIGN / 'submission.json')
@@ -153,7 +170,7 @@ def release():
         fields = base.slurm_fields(row['job'])
         assert fields['JobState'] == 'PENDING' and fields['Reason'] == 'JobHeldUser'
         assert fields['WorkDir'] == str(ROOT) and fields['UserId'].startswith('rgao48(')
-        subprocess.run(['scontrol', 'update', f"JobId={row['job']}", f"MinMemoryNode={plan['memory_gib']}G"], check=True)
+        set_pending_memory(row['job'], plan['memory_gib'])
         row.update(cpus=plan['cpus'], memory_gib=plan['memory_gib'], allocated_hours=plan['wall_hours'])
     temporary = CAMPAIGN / 'submission.tmp'
     temporary.write_text(json.dumps(state, indent=2) + '\n'); temporary.replace(CAMPAIGN / 'submission.json')

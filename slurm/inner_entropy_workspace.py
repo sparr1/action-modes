@@ -22,7 +22,7 @@ rows=[]
 for spec in specs:
     r=existing.get(spec['id'])
     summary={} if r is None else dict(r.summary)
-    rows.append({**spec,'state':f"pending startup validation / job {spec.get('job', 'not submitted')}" if r is None else r.state,
+    rows.append({**spec,'state':spec.get('pending_status',f"pending startup validation / job {spec.get('job', 'not submitted')}") if r is None else r.state,
                  'decisions':summary.get('env_step','pending'), 'job':spec.get('job','pending submission')})
 metrics={
     'Returns and progress':[
