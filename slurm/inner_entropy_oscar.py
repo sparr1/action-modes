@@ -176,6 +176,11 @@ def worker(args):
     started = time.perf_counter()
     try:
         learner = AMBITDMPC2(name + "-disabled-benchmark", env, run["alg_params"], run, manifest)
+        cpu_replay = bool(getattr(args, "cpu_replay", False))
+        if cpu_replay:
+            from RL.tdmpc2_core.common.buffer import Buffer
+            learner.buffer = Buffer(learner.cfg, resumable=True)
+            learner.agent.set_outer_replay_buffer(learner.buffer)
         agent, cfg = learner.agent, learner.cfg
         assert cfg.action_dim == 21 and cfg.inner_operator == "sac" and not cfg.mpc
         assert (cfg.inner_rollout_horizon, cfg.inner_rounds, cfg.inner_solve_interval) == (3, 8, 1)
@@ -242,7 +247,7 @@ def worker(args):
                     "actor_entropy_coefficient_joint_units", "actor_q_range_instant"):
             assert key in metrics, key
         assert all(torch.isfinite(p).all() for p in agent.model.parameters())
-        assert learner.buffer._storage_device.type == "cuda"
+        assert learner.buffer._storage_device.type == ("cpu" if cpu_replay else "cuda")
         # Expensive sparse observations and recapture checks are deliberately
         # outside the steady-state timing window.
         geometry = check_geometry(agent, learner.buffer)
@@ -276,7 +281,7 @@ def worker(args):
                   "inner_cuda_graph": graph_enabled, "graph_replays": replay_counts,
                   "graph_native_graph_continuation": graph_enabled,
                   "critic_geometry": geometry,
-                  "gpu_replay": True, "metrics": {k: float(v) for k, v in metrics.items()},
+                  "gpu_replay": not cpu_replay, "metrics": {k: float(v) for k, v in metrics.items()},
                   "diagnostic_episodes": learner._training_diagnostics.episode_metrics(),
                   "seconds": time.perf_counter() - started,
                   "benchmark_overrides": {**overrides, "total_steps": total}, "wandb": False}

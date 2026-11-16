@@ -259,6 +259,21 @@ without `S` retain the documented local-calibration fallback; see the
 
 ### Oscar durable checkpoint storage
 
+The Humanoid Run seed57 restart uses the single-cell manifest
+`configs/dmcontrol/experiments/ambi_posttanh_outer_adapt_humanoid_run_seed57_resume.json`
+and `slurm/run_posttanh_humanoid_run_resume_oscar.sbatch`. It retains the original
+one-million-decision recipe, all 25k model snapshots, and critic geometry logging.
+Native resume commits trainer, replay, optimizer, environment and RNG state every
+15 minutes at episode boundaries, retaining the latest and predecessor generations
+in the approved home lineage. Portable model banks remain in campaign scratch.
+Resume requires CPU replay, so this fresh restart need not reproduce the original
+GPU-replay random trajectory. The first real training segment drains after ten
+minutes and resumes in the same allocation; later time-limit handoffs are verified
+before automatic requeue. Failures never silently start a new training lineage.
+The launcher also installs and verifies a dedicated comparison workspace without
+replacing the original run or workspace. Its `benchmark` mode disables W&B and
+checks one- and two-core throughput with CPU replay before production sizing.
+
 AMBI jobs submitted by `rgao48` on Oscar store resumable state under
 `/oscar/home/rgao48/ambi-durable`. The quota preflight must select the user home
 row that owns that path:

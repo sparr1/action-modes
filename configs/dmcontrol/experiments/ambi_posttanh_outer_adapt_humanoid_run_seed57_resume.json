@@ -1,0 +1,27 @@
+{
+  "study_type": "posttanh_outer_adapt_seed_replication",
+  "study_note": "Fresh seed57 restart of the 7e2eb91 training recipe, using native full-state resume. CPU replay is required by the resume implementation. Retain every 25k portable model snapshot and the latest two full trainer/replay generations.",
+  "overrides_alg": {
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-run",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_posttanh_outer_adapt_humanoid_run_seed57_resume"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "name": "Humanoid Run - posttanh outer-adapt seed57 resumable restart",
+  "description": "Fresh Humanoid Run version of W&B ambi/fc7c433ab4734a5aa7eb1717e2165969 at source 5f6089fe70441b968ed814d1b1e73ddbd3f08a71. Only scientific change is humanoid-walk to humanoid-run. Keeps sampled execution, seed55, one million decisions, H3/J8/K1, N128/C16/A4/B256, alpha0.0021, reward-only critics, action-local adaptive Q scaling, strict compilation, whole-inner CUDA graphs, vmap, TF32-high, periodic critic geometry and all 25k checkpoints."
+}
