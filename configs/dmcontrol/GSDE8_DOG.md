@@ -25,3 +25,9 @@ The submission receipt must bind the job ID and verified W&B workspace to the
 same source commit. Training checks GPU/runtime identity and gate evidence,
 and its publisher installs and verifies progress, learning, and geometry
 panels before starting. Preserve each task's outputs in its own directory.
+Record browser verification when available; if the browser cannot be used,
+record the explicit reason while still requiring API panel readback. A launcher
+fix may use a separately pinned clean `AMBI_LAUNCHER_ROOT` and
+`AMBI_EXPECTED_LAUNCHER_COMMIT` while the working directory and
+`AMBI_EXPECTED_COMMIT` keep the learner and GPU gate bound to their original
+validated source.

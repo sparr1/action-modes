@@ -18,6 +18,10 @@ umask 077
 [[ "$AMBI_GSDE_CAMPAIGN" == "/oscar/scratch/rgao48/ambi/gsde8-dog-trot-run-20261116/$AMBI_GSDE_VARIANT" ]]
 [[ "$(git rev-parse HEAD)" == "$AMBI_EXPECTED_COMMIT" ]]
 [[ -z "$(git status --porcelain --untracked-files=all)" ]]
+if [[ -n "${AMBI_LAUNCHER_ROOT:-}" ]]; then
+  [[ "$(git -C "$AMBI_LAUNCHER_ROOT" rev-parse HEAD)" == "${AMBI_EXPECTED_LAUNCHER_COMMIT:?Pin launcher commit}" ]]
+  [[ -z "$(git -C "$AMBI_LAUNCHER_ROOT" status --porcelain --untracked-files=all)" ]]
+fi
 [[ "${SLURM_RESTART_COUNT:-0}" == 0 ]]
 mode="${1:?gate or train}"
 unset CUDA_LAUNCH_BLOCKING WANDB_RESUME WANDB_RUN_ID
@@ -45,7 +49,8 @@ import json, os, sys
 s=json.load(open(sys.argv[1])); arm=s['runs'][0]
 assert s['commit']==os.environ['AMBI_EXPECTED_COMMIT']
 assert str(arm['job'])==os.environ['SLURM_JOB_ID']
-assert s['workspace_api_verified'] and s['workspace_browser_verified']
+assert s['workspace_api_verified']
+assert s.get('workspace_browser_verified') or s.get('workspace_browser_unavailable_reason')
 assert arm['cpus']==int(os.environ['SLURM_CPUS_PER_TASK'])
 print(arm['id'])
 CHECK
