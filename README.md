@@ -207,6 +207,24 @@ report the configured strengths and whether each writeback occurred.
 
 ## Training checkpoints
 
+### Sampled gSDE8 Dog Walk on Hydra
+
+`configs/dmcontrol/experiments/ambi_gsde8_dog_walk.json` replicates the completed
+sampled gSDE8 recipe on Dog Walk: seed 55, one million decisions, H3/J8/K1,
+real-step noise resampling every eight decisions, joint squashed entropy with
+fixed coefficient 0.0021, critic geometry every 1,000 updates, and all 40
+checkpoints every 25,000 decisions. The learner is unchanged from the reference.
+
+Use `slurm/run_gsde8_dog_hydra.sbatch` with an exact
+`AMBI_EXPECTED_COMMIT`, `AMBI_DMCONTROL_PYTHON`, and `AMBI_GSDE_CAMPAIGN`
+beneath `/ltmp/rgao48` on `gpu2501`. Gate mode uses two physical CPUs and 16 GiB
+to verify CUDA parity, full-size Dog training, checkpoint I/O, critic geometry,
+and one-versus-two-core throughput with W&B disabled. Then submit train mode
+(`AMBI_GSDE_MODE=train`, unique `WANDB_RUN_ID`) using the receipt's CPU, memory,
+and walltime requests. Walltime uses measured throughput with a completed-run
+floor, 25% margin, and one hour for startup/I/O. Node-local scratch is not
+durable storage; retain the node and campaign path when retrieving checkpoints.
+
 Within-run checkpoint retention is configured independently from end-of-trial
 model saving:
 

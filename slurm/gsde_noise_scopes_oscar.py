@@ -184,9 +184,9 @@ def worker(args):
     try:
         learner = AMBITDMPC2(name + "-disabled-benchmark", env, run["alg_params"], run, manifest)
         agent, cfg = learner.agent, learner.cfg
-        assert cfg.action_dim == 21 and cfg.inner_operator == "sac" and not cfg.mpc
+        assert cfg.action_dim == env.action_space.shape[0] and cfg.inner_operator == "sac" and not cfg.mpc
         assert cfg.actor_distribution == "gsde" and cfg.gsde_feature_source == "actor"
-        expected_scope = "real_steps" if os.environ.get("AMBI_GSDE_VARIANT") == "humanoid_run" else ("round", "solve", "real_steps")[args.index % 3]
+        expected_scope = run["alg_params"]["inner_gsde_noise_scope"]
         assert cfg.inner_gsde_noise_scope == expected_scope
         assert cfg.inner_gsde_resample_steps == cfg.gsde_execution_resample_steps == 8
         assert (cfg.inner_rollout_horizon, cfg.inner_rounds, cfg.inner_solve_interval) == (3, 8, 1)
