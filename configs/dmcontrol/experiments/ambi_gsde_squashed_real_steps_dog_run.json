@@ -1,0 +1,32 @@
+{
+  "study_type": "gsde8_dog_trot_run",
+  "study_note": "Dog task transfer of the completed gSDE8 sampled reference. Only the task and W&B identity change: seed55, 1M decisions, joint squashed entropy alpha0.0021, H3/J8/K1/N128/C16/A4/B256, real_steps noise persistence and execution resampling every8 decisions. Forty checkpoints every25k; critic geometry every1000 updates. Fresh production-size Dog GPU validation and CPU sizing precede training with W&B disabled.",
+  "overrides_alg": {
+    "seed": 55,
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "dog-run",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_gsde_squashed_real_steps_dog_run"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "reference_runs": {
+    "humanoid_walk": {
+      "id": "590be7c27a9b40eaa9a68218cdb74d0a",
+      "commit": "edec58cf7ec2b51bd54834aa4d6f806715075502"
+    }
+  }
+}

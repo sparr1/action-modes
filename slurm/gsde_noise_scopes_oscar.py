@@ -24,6 +24,10 @@ CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/gsde-noise-scopes-20261105")
 if os.environ.get("AMBI_GSDE_VARIANT") == "humanoid_run":
     MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_gsde_squashed_real_steps_humanoid_run.json"
     CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/gsde-humanoid-run-20261108")
+elif os.environ.get("AMBI_GSDE_VARIANT") in {"dog_trot", "dog_run"}:
+    variant = os.environ["AMBI_GSDE_VARIANT"]
+    MANIFEST = ROOT / f"configs/dmcontrol/experiments/ambi_gsde_squashed_real_steps_{variant}.json"
+    CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/gsde8-dog-trot-run-20261116") / variant
 GPU_PARITY_TEST = "tests/test_ambi_gsde_graph.py"
 
 
@@ -184,9 +188,11 @@ def worker(args):
     try:
         learner = AMBITDMPC2(name + "-disabled-benchmark", env, run["alg_params"], run, manifest)
         agent, cfg = learner.agent, learner.cfg
-        assert cfg.action_dim == 21 and cfg.inner_operator == "sac" and not cfg.mpc
+        dog = manifest["env_params"]["task"] in {"dog-trot", "dog-run"}
+        assert cfg.action_dim == (38 if dog else 21)
+        assert cfg.inner_operator == "sac" and not cfg.mpc
         assert cfg.actor_distribution == "gsde" and cfg.gsde_feature_source == "actor"
-        expected_scope = "real_steps" if os.environ.get("AMBI_GSDE_VARIANT") == "humanoid_run" else ("round", "solve", "real_steps")[args.index % 3]
+        expected_scope = "real_steps" if os.environ.get("AMBI_GSDE_VARIANT") in {"humanoid_run", "dog_trot", "dog_run"} else ("round", "solve", "real_steps")[args.index % 3]
         assert cfg.inner_gsde_noise_scope == expected_scope
         assert cfg.inner_gsde_resample_steps == cfg.gsde_execution_resample_steps == 8
         assert (cfg.inner_rollout_horizon, cfg.inner_rounds, cfg.inner_solve_interval) == (3, 8, 1)
@@ -381,7 +387,13 @@ def gate(args):
         )
     native = json.loads(native_output.read_text())
     plan = select_plan(rows)
-    bank_bytes = 6 * 40 * max(r["checkpoint_bytes"] for r in rows)
+    dog = os.environ.get("AMBI_GSDE_VARIANT") in {"dog_trot", "dog_run"}
+    if dog:
+        # Include the completed gSDE reference's end-to-end overhead floor.
+        plan["wall_hours"] = math.ceil(max(plan["seconds_per_decision"] * 1000000,
+                                          179838.70855) * 1.15 / 3600 + .5)
+    banks = 2 if dog else len(json.loads(MANIFEST.read_text())["configs"])
+    bank_bytes = banks * 40 * max(r["checkpoint_bytes"] for r in rows)
     space = checkpoint_space(args.output, bank_bytes)
     receipt = {"passed": True, "binding": binding(MANIFEST), "runtime": rows[0]["runtime"],
                "plan": plan, "space": space, "cases": [str(args.output/f"cpu-{n}.json") for n in (1,2)],
@@ -389,7 +401,7 @@ def gate(args):
                "graph_speedup_vs_native_one_cpu": native["measured"]["seconds_per_decision"] / rows[0]["measured"]["seconds_per_decision"],
                "global_gpu_parity_required": all(r["global_gpu_parity_required"] for r in rows),
                "global_gpu_parity_receipt": str(campaign / "gpu-parity.json"),
-               "scope": "Real H3/J8/K1 Humanoid training, production model/batch; 96 graph decisions on 1/2 CPUs and 32 native reference decisions; geometry and boundary/checkpoint checks outside timing; no W&B."}
+               "scope": "Real H3/J8/K1 training on the manifest task, production model/batch; 96 graph decisions on 1/2 CPUs and 32 native reference decisions; geometry and boundary/checkpoint checks outside timing; no W&B."}
     write_new(args.output / "receipt.json", receipt)
     # Measuring a gate never implicitly submits/resizes/releases production.
     # An explicit release target is useful only for a previously held job whose
