@@ -74,6 +74,14 @@ def gate(args):
                'scope': 'Seven CUDA gSDE tests; Dog 223-observation/38-action graph parity; full-size Dog Walk 1/2-core training, GPU replay, checkpoint roundtrip and critic geometry; W&B disabled.'}
     base.write_new(args.output / 'receipt.json', receipt)
     print('GATE_PASSED', json.dumps(plan), flush=True)
+    if args.release_job is not None:
+        assert plan['memory_gib'] <= 16, plan
+        fields = base.slurm_fields(args.release_job)
+        assert fields['JobName'] == 'gsde8-dog-walk' and fields['ReqNodeList'] == 'gpu2501'
+        base.resize_pending(args.release_job, plan)
+        base.write_new(args.output / 'production-release.json',
+                       {'job': args.release_job, 'plan': plan, 'verified': base.slurm_fields(args.release_job)})
+        print('TRAINING_RELEASED', args.release_job, flush=True)
 
 
 def train(args):
@@ -95,5 +103,6 @@ if __name__ == '__main__':
     parser.add_argument('--index', type=int, default=0, choices=(0,))
     parser.add_argument('--worker-cpus')
     parser.add_argument('--native-reference', action='store_true')
+    parser.add_argument('--release-job', type=int)
     args = parser.parse_args()
     {'gate': gate, 'worker': base.worker, 'train': train}[args.mode](args)

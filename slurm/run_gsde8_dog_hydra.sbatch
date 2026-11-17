@@ -37,7 +37,9 @@ export WANDB_DATA_DIR="$scratch_cache/data" WANDB_ARTIFACT_DIR="$scratch_cache/a
 export WANDB_DISABLE_CODE=true WANDB__REQUIRE_CORE=true
 if [[ "$mode" == gate ]]; then
   export WANDB_MODE=disabled
-  exec "$AMBI_DMCONTROL_PYTHON" slurm/gsde8_dog_hydra.py gate --output "$AMBI_GSDE_CAMPAIGN/gate"
+  release_args=()
+  if [[ -n "${AMBI_TRAIN_JOB_ID:-}" ]]; then release_args=(--release-job "$AMBI_TRAIN_JOB_ID"); fi
+  exec "$AMBI_DMCONTROL_PYTHON" slurm/gsde8_dog_hydra.py gate --output "$AMBI_GSDE_CAMPAIGN/gate" "${release_args[@]}"
 else
   : "${WANDB_RUN_ID:?Set the unique training identity}"
   export WANDB_MODE=online

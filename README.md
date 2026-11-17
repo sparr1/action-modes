@@ -224,6 +224,11 @@ and one-versus-two-core throughput with W&B disabled. Then submit train mode
 and walltime requests. Walltime uses measured throughput with a completed-run
 floor, 25% margin, and one hour for startup/I/O. Node-local scratch is not
 durable storage; retain the node and campaign path when retrieving checkpoints.
+When home storage is full, the bootstrap launcher fetches the pinned Git commit
+into the selected node's scratch directory. Supply `AMBI_TRAIN_JOB_ID` for a
+held training job to resize and release it automatically after validation; the
+CPU count, per-task CPU request, node minimum, and walltime are verified before
+release. A failed gate leaves training held and publishes no benchmark run.
 
 Within-run checkpoint retention is configured independently from end-of-trial
 model saving:
