@@ -50,6 +50,16 @@ def verify_allocation(actual, plan):
     assert wall_minutes(actual['TimeLimit']) == plan['wall_hours'] * 60, actual
 
 
+def allocation_updates(job, plan):
+    count = str(plan['cpus'])
+    # scontrol's MinMemoryNode update accepts integer MiB, unlike sbatch --mem.
+    return ['scontrol', 'update', 'JobId=' + str(job),
+            'NumCPUs=' + count, 'CPUsPerTask=' + count,
+            'TresPerTask=cpu:' + count, 'MinCPUsNode=' + count,
+            'MinMemoryNode=' + str(plan['memory_gib'] * 1024),
+            'TimeLimit=' + str(plan['wall_hours']) + ':00:00']
+
+
 def reservation_check(job, plan):
     line = command(['sacctmgr', '-nP', 'show', 'qos', 'pri-gpu+', 'format=Name,MaxTRESRunMinsPU'])
     limits = dict(x.split('=', 1) for x in line.split('|')[1].split(','))
@@ -95,7 +105,7 @@ def release(task, publisher):
                   for name, digest in binding['config_sha256'].items()]
         for relative, digest in files:
             path = (source / relative).resolve()
-            assert path.is_relative_to(source)
+            assert path.is_relative_to(source.resolve())
             assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
         parity = Path(gate['cuda_parity_junit'])
         assert parity.is_relative_to(root)
@@ -112,12 +122,7 @@ def release(task, publisher):
         assert current['JobState'] == 'PENDING' and current['Reason'] == 'JobHeldUser'
         budget = reservation_check(job, plan)
         subprocess.run(['scontrol', 'hold', str(job)], check=True)
-        count = str(plan['cpus'])
-        subprocess.run(['scontrol', 'update', 'JobId=' + str(job),
-                        'NumCPUs=' + count, 'CPUsPerTask=' + count,
-                        'TresPerTask=cpu:' + count, 'MinCPUsNode=' + count,
-                        'MinMemoryNode=' + str(plan['memory_gib']) + 'G',
-                        'TimeLimit=' + str(plan['wall_hours']) + ':00:00'], check=True)
+        subprocess.run(allocation_updates(job, plan), check=True)
         actual = fields(job)
         assert actual['JobState'] == 'PENDING' and actual['Reason'] == 'JobHeldUser'
         verify_allocation(actual, plan)

@@ -1,7 +1,7 @@
 """Guard against inconsistent Slurm CPU fields and incorrect release budgets."""
 from copy import deepcopy
 import pytest
-from slurm.release_mrsq_q5_suite import verify_allocation, wall_minutes, reservation_check
+from slurm.release_mrsq_q5_suite import allocation_updates, verify_allocation, wall_minutes, reservation_check
 
 
 PLAN = {'cpus': 1, 'memory_gib': 10, 'wall_hours': 58}
@@ -12,6 +12,12 @@ FIELDS = {'NumCPUs': '1', 'CPUs/Task': '1', 'MinCPUsNode': '1',
 def test_verified_allocation_accepts_slurm_day_format():
     verify_allocation(FIELDS, PLAN)
     assert wall_minutes('35:00') == 35
+
+
+def test_memory_update_uses_slurm_integer_mib_units():
+    updates = allocation_updates(42, {'cpus': 2, 'memory_gib': 12, 'wall_hours': 60})
+    assert 'MinMemoryNode=12288' in updates
+    assert all(value in updates for value in ('NumCPUs=2', 'CPUsPerTask=2', 'TresPerTask=cpu:2', 'MinCPUsNode=2'))
 
 
 @pytest.mark.parametrize('key,value', [('NumCPUs', '2'), ('CPUs/Task', '2'),
