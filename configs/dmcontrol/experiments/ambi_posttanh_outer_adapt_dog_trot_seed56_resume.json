@@ -1,0 +1,27 @@
+{
+  "study_type": "posttanh_outer_adapt_dog_trot_seeds56_57",
+  "study_note": "Fresh seed56 restart of interrupted W&B 005d672e237748b68ca77ba721e36876. Identical scientific recipe, with native CPU replay and full-state resume every 15 minutes. Retain all 25k portable model snapshots and the latest two full trainer/replay generations.",
+  "overrides_alg": {
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "dog-trot",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_posttanh_outer_adapt_dog_trot_seed56_resume"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "name": "Dog Trot - posttanh sampled seed56 resumable restart",
+  "description": "Dog Trot seed56 Post-tanh sampled: one million decisions, full-state checkpointing, verified real-training restart and measured CPU sizing. The old model-only run cannot be exactly resumed."
+}
