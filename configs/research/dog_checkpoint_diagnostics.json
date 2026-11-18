@@ -11,6 +11,9 @@
   "tail_steps": 1000,
   "gradient_rollouts": 32,
   "gradient_pretanh_step": 0.1,
+  "probe_device": "cpu",
+  "probe_threads": 2,
+  "roots_per_shard": 2,
   "arms": [
     {"seed": 55, "step": 675000, "partner_step": 700000},
     {"seed": 55, "step": 700000, "partner_step": 675000},

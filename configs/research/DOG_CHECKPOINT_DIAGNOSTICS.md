@@ -11,8 +11,9 @@ This campaign cannot reconstruct the replay batch or update that initiated a col
    inner recipe, using the same CUDA graph implementation as training. Private
    controller noise is reset per episode and paired across checkpoints. Prior
    and inner controllers have distinct noise streams. There are no outer updates.
-2. **Action preferences:** six identical physical roots, two each from successful
-   inner behavior and the two collapsed inner behaviors at decision 200. Test
+2. **Action preferences:** six identical physical roots, two each from seed-55
+   pre-spike inner behavior and seed-55/56 post-spike inner behavior at decision
+   200. A post-spike checkpoint can already have recovered. Test
    positive and negative pre-tanh steps of length 0.1 along inherited Q,
    differentiated one/three-step model objectives, and a random control. Also
    evaluate both before/after prior mean actions under each checkpoint. Each
@@ -42,6 +43,12 @@ and minimum-pair TD targets. Per-head values are recorded. Round traces run the
 native implementation with observational probes and independent RNG; full
 episodes retain the training CUDA graph. These use different random sequences
 but the same optimization objectives and budget.
+
+The reference diagnostic panel uses two CPU threads per independent two-root
+probe shard; full episodes use CUDA. Each shard records its runtime and source
+identity. A matched CPU/CUDA check on inherited values and action gradients is
+required before changing diagnostic device; this does not equate their solver
+random streams or imply identical adapted policies.
 
 Dog snapshots preserve full MuJoCo integration state, task and wrapper RNG/clocks,
 reward constants, and acceleration/contact sensor readings. Restoration requires
