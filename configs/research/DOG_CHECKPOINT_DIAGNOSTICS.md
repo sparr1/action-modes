@@ -54,3 +54,8 @@ stdout. The `bank` command combines complete episode shards; all probes use its
 content hash. Slurm checks a clean pinned Git commit. Smoke/sizing runs use the
 same commands with short budgets and separate output directories. W&B is disabled;
 these diagnostic bundles are not episode training curves.
+
+Independent root shards use `--root-start` and `--root-limit`. The `merge`
+command requires identical checkpoint/config/noise protocol identities and every
+bank root exactly once. It refuses partial or overlapping coverage. This allows
+short queue slots and parallel work without treating partial results as complete.

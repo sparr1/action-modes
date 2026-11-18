@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from diagnose_dog_checkpoints import same_actions, load_bank
+from diagnose_dog_checkpoints import same_actions, load_bank, merge_probes
 from tests.test_ambi_real_calibration import AnalyticEnv
 from utils.ambi_benchmark import atomic_json, canonical_hash
 from utils.ambi_real_calibration import capture_simulator_snapshot
@@ -77,3 +77,32 @@ def test_shared_bank_refuses_corruption_and_environment_mismatch(tmp_path):
     atomic_json(path, bank, overwrite=True)
     with pytest.raises(ValueError, match='identity'):
         load_bank(path, environment)
+
+
+def test_shards_require_identical_science_unique_roots_and_complete_coverage(tmp_path):
+    env = AnalyticEnv()
+    env.reset()
+    environment = {'id': 'DMControl-v0', 'params': {'task': 'dog-stand'}}
+    bank = dict(schema=1, kind='dog_checkpoint_common_roots_v1', environment=environment,
+                roots=[dict(root_id=str(i), snapshot=capture_simulator_snapshot(env).to_dict(),
+                            observation=[0.], anchor_pretanh_action=[0.]) for i in range(2)])
+    bank['id'] = canonical_hash(bank)
+    atomic_json(tmp_path/'bank.json', bank)
+    common = dict(schema=1, label='s55', complete=True, checkpoint_sha256='cp',
+                  implementation_sha256='code',
+                  partner_sha256='partner', bank_id=bank['id'], resolved=dict(environment=environment),
+                  diagnostic_q_reduction='mean_all', continuation='prior', tail_steps=1000,
+                  rollouts=2, outer_state_before='frozen', outer_state_after='frozen', total_seconds=3.)
+    paths = [tmp_path/f'part{i}.json' for i in range(2)]
+    for i, path in enumerate(paths):
+        atomic_json(path, dict(common, roots=[dict(root_id=str(i))]))
+    with pytest.raises(ValueError, match='coverage'):
+        merge_probes(paths[:1], tmp_path/'bank.json', tmp_path/'bad.json')
+    with pytest.raises(ValueError, match='Duplicate'):
+        merge_probes([paths[0],paths[0]], tmp_path/'bank.json', tmp_path/'bad.json')
+    merged = merge_probes(paths[::-1], tmp_path/'bank.json', tmp_path/'complete.json')
+    assert [r['root_id'] for r in merged['roots']] == ['0','1']
+    assert merged['total_seconds'] == 6.
+    atomic_json(paths[1], dict(common, tail_steps=50, roots=[dict(root_id='1')]), overwrite=True)
+    with pytest.raises(ValueError, match='Incompatible'):
+        merge_probes(paths, tmp_path/'bank.json', tmp_path/'bad.json')

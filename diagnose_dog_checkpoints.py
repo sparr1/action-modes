@@ -19,7 +19,7 @@ from evaluate_ambi_checkpoint import (
     _close_resources, _file_sha256, _initialize_frozen_model, _make_env,
     _outer_state_digest, _seed_spaces,
 )
-from probe_ambi_gradients import _resolved
+from probe_ambi_gradients import _resolved, _science_identity
 from RL.tdmpc2_core.inner_trace import InnerActionTrace
 from utils.ambi_benchmark import atomic_json, canonical_hash, read_json, solver_seed
 from utils.ambi_gradient_probe import PriorRewardObjective, frozen_parameters, probe_root
@@ -186,6 +186,38 @@ def load_bank(path, environment):
     return bank
 
 
+def merge_probes(parts, bank_path, output):
+    """Publish one complete checkpoint result only after exact root coverage."""
+    records = [read_json(path) for path in parts]
+    if not records:
+        raise ValueError('No probe shards.')
+    first = records[0]
+    bank = load_bank(bank_path, first['resolved']['environment'])
+    keys = ('schema', 'label', 'checkpoint_sha256', 'partner_sha256', 'bank_id', 'implementation_sha256',
+            'resolved', 'diagnostic_q_reduction', 'continuation', 'tail_steps', 'rollouts',
+            'outer_state_before', 'outer_state_after')
+    roots = {}
+    for record in records:
+        if (record.get('complete') is not True
+                or record['outer_state_before'] != record['outer_state_after']
+                or any(record[key] != first[key] for key in keys)):
+            raise ValueError('Incompatible or incomplete probe shards.')
+        for root in record['roots']:
+            if root['root_id'] in roots:
+                raise ValueError('Duplicate root across probe shards.')
+            roots[root['root_id']] = root
+    expected = [root['root_id'] for root in bank['roots']]
+    if first['bank_id'] != bank['id'] or set(roots) != set(expected):
+        raise ValueError('Incomplete common-root coverage.')
+    result = dict(first, roots=[roots[key] for key in expected],
+                  total_seconds=sum(r['total_seconds'] for r in records),
+                  timing_scope='sum of independent shard compute times',
+                  shard_runtimes=[r.get('runtime') for r in records],
+                  shards=[dict(path=str(p), sha256=_file_sha256(p)) for p in parts])
+    atomic_json(output, result)
+    return result
+
+
 @torch.no_grad()
 def same_actions(objective, envs, snapshot, observation, actions, noise, remaining):
     """Replay one identical open-loop action sequence in model and simulator.
@@ -276,7 +308,10 @@ def run_probes(args, checkpoint, output):
     started = time.perf_counter()
     results = []
     try:
-        roots = bank['roots'][:args.root_limit] if args.root_limit else bank['roots']
+        roots = bank['roots'][args.root_start:]
+        roots = roots[:args.root_limit] if args.root_limit else roots
+        if not roots:
+            raise ValueError('Empty root shard.')
         for root in roots:
             root_start = time.perf_counter()
             obs = np.asarray(root['observation'], np.float32)
@@ -332,6 +367,10 @@ def run_probes(args, checkpoint, output):
             raise RuntimeError('Frozen outer model/optimizer/scale changed during probes.')
         result = dict(schema=1, complete=True, label=args.label, checkpoint=str(checkpoint),
             checkpoint_sha256=_file_sha256(checkpoint), partner=str(args.partner),
+            implementation_sha256=canonical_hash([_science_identity(), _file_sha256(Path(__file__))]),
+            runtime=dict(torch=torch.__version__, cuda=torch.version.cuda,
+                         device=torch.cuda.get_device_name() if args.device=='cuda' else 'cpu',
+                         threads=torch.get_num_threads()),
             partner_sha256=_file_sha256(args.partner), bank_id=bank['id'], resolved=resolved,
             outer_state_before=before, outer_state_after=_outer_state_digest(model),
             diagnostic_q_reduction='mean_all (expectation of actor mean_pair)',
@@ -349,7 +388,7 @@ def run_probes(args, checkpoint, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['episodes', 'probes', 'bank'])
+    parser.add_argument('mode', choices=['episodes', 'probes', 'bank', 'merge'])
     parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--label')
@@ -362,11 +401,16 @@ def main():
     parser.add_argument('--rollouts', type=int, default=2)
     parser.add_argument('--tail-steps', type=int, default=1000)
     parser.add_argument('--root-limit', type=int)
+    parser.add_argument('--root-start', type=int, default=0)
+    parser.add_argument('--parts', type=Path, nargs='+')
     parser.add_argument('--threads', type=int, default=1)
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda')
     args = parser.parse_args()
     if args.mode == 'bank':
         make_bank(args.episodes_dir, args.output)
+        return
+    if args.mode == 'merge':
+        merge_probes(args.parts or [], args.bank, args.output)
         return
     if not args.checkpoint or not args.label:
         parser.error('checkpoint and label are required')
@@ -374,6 +418,8 @@ def main():
         parser.error('invalid work budget')
     if args.mode == 'probes' and (args.bank is None or args.partner is None):
         parser.error('probes require bank and partner')
+    if args.root_start < 0 or (args.root_limit is not None and args.root_limit < 1):
+        parser.error('invalid root shard')
     args.output.mkdir(parents=True, exist_ok=False)
     torch.set_num_threads(args.threads)
     torch.set_num_interop_threads(1)
