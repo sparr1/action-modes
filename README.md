@@ -218,6 +218,12 @@ pinned checkout. Every task passes environment action-repeat/reward parity,
 Q5 family CUDA parity, one/two-core throughput, checkpoint and geometry checks
 before production. Keep benchmark W&B disabled; derive production allocations
 from each task's validated receipt and schedule against live QOS limits.
+Training jobs may be queued held while these gates wait for GPUs. An `afterok`
+CPU job running `slurm/release_mrsq_q5_suite.py` verifies each gate's pinned
+source/configuration, updates every Slurm CPU field plus memory and walltime,
+verifies the W&B workspace, and releases only that task's training job. The
+controller records its own commit separately from the unchanged training
+checkout; failed gates leave their production jobs held.
 
 ### Optional random inner initialization
 
