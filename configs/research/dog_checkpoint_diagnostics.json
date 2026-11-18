@@ -5,7 +5,7 @@
   "episode_steps": 500,
   "execution": "sampled",
   "root_decision": 200,
-  "root_sources": [[55, 675000, "prior"], [55, 700000, "inner"], [56, 575000, "inner"]],
+  "root_sources": [[55, 675000, "inner"], [55, 700000, "inner"], [56, 575000, "inner"]],
   "root_seeds": [101, 102],
   "rollouts": 2,
   "tail_steps": 1000,

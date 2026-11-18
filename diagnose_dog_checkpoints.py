@@ -143,7 +143,7 @@ def run_episodes(args, checkpoint, output):
 def make_bank(episodes_dir, output):
     # Balanced successful and collapsed behavior; selection is fixed before
     # looking at checkpoint-probe outcomes. Reuse the exact roots in every arm.
-    selection = [('s55-675000', 'prior'), ('s55-700000', 'inner'), ('s56-575000', 'inner')]
+    selection = [('s55-675000', 'inner'), ('s55-700000', 'inner'), ('s56-575000', 'inner')]
     roots, sources = [], []
     environment = None
     for label, controller in selection:

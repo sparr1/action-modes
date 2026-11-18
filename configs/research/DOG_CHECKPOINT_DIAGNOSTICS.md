@@ -12,7 +12,7 @@ This campaign cannot reconstruct the replay batch or update that initiated a col
    controller noise is reset per episode and paired across checkpoints. Prior
    and inner controllers have distinct noise streams. There are no outer updates.
 2. **Action preferences:** six identical physical roots, two each from successful
-   prior behavior and the two collapsed inner behaviors at decision 200. Test
+   inner behavior and the two collapsed inner behaviors at decision 200. Test
    positive and negative pre-tanh steps of length 0.1 along inherited Q,
    differentiated one/three-step model objectives, and a random control. Also
    evaluate both before/after prior mean actions under each checkpoint. Each
