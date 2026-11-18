@@ -208,6 +208,17 @@ checkout. The task-specific gate checks real Dog Walk action-repeat/reward parit
 full-ensemble CUDA parity, one/two-CPU throughput, checkpointing and geometry
 before production is enabled.
 
+The matching seed-55 Q5 suite adds Dog Trot, Dog Run, Humanoid Stand,
+Humanoid Walk and Humanoid Run through `ambi_<task>_mrsq_q5_seed55.json`
+manifests. Only the environment task and publication labels differ from Dog
+Walk Q5. Each task uses its own manifest, output directory and W&B identity.
+Set `AMBI_MRSQ_TASK=<task>` for `slurm/mrsq_q5_suite.py prepare`, then use
+`slurm/run_mrsq_q5_suite_oscar.sbatch gate <task>` and `train <task>` from the
+pinned checkout. Every task passes environment action-repeat/reward parity,
+Q5 family CUDA parity, one/two-core throughput, checkpoint and geometry checks
+before production. Keep benchmark W&B disabled; derive production allocations
+from each task's validated receipt and schedule against live QOS limits.
+
 ### Optional random inner initialization
 
 Set `inner_actor_initialization="random"` and/or

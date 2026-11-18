@@ -21,7 +21,13 @@ from slurm.benchmark_ambi_training_cpu import TrainingWindow, physical_core_cpus
 
 MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_inner_entropy.json"
 CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/inner-entropy-cudagraph-20261102")
-if os.environ.get("AMBI_ENTROPY_VARIANT") == "dog_walk_mrsq":
+if os.environ.get("AMBI_ENTROPY_VARIANT") == "mrsq_q5_suite":
+    suite_task = os.environ["AMBI_MRSQ_TASK"]
+    if suite_task not in ("dog-trot", "dog-run", "humanoid-stand", "humanoid-walk", "humanoid-run"):
+        raise ValueError("Unsupported MRS.Q suite task: " + suite_task)
+    MANIFEST = ROOT / ("configs/dmcontrol/experiments/ambi_" + suite_task.replace("-", "_") + "_mrsq_q5_seed55.json")
+    CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/mrsq-q5-suite-20261118") / suite_task
+elif os.environ.get("AMBI_ENTROPY_VARIANT") == "dog_walk_mrsq":
     MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_dog_walk_mrsq_q5_seed55.json"
     CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/dog-walk-mrsq-q5-20261118")
 elif os.environ.get("AMBI_ENTROPY_VARIANT") == "dog_stand_mrsq":
