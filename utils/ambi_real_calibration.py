@@ -111,7 +111,7 @@ def _wrapper_chain(env):
 
 
 def capture_simulator_snapshot(env) -> SimulatorSnapshot:
-    """Capture an initialized Humanoid state environment and reviewed wrappers."""
+    """Capture an initialized reviewed state environment and its Gym wrappers."""
     wrappers, base = _wrapper_chain(env)
     state = base.calibration_state()
     bookkeeping = []

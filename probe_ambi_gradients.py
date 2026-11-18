@@ -86,8 +86,8 @@ def _resolved(context):
     # No inner act()/predict() call is made. Retain saved learning settings for provenance.
     params.update(compile=False, compile_strict=False, wandb=False)
     environment = dict(id=config['env'], params=copy.deepcopy(context.experiment_params.get('env_params', {})))
-    if environment['id'] != 'DMControl-v0' or environment['params'].get('task') != 'humanoid-walk':
-        raise ValueError('Simulator restoration is reviewed only for DMControl humanoid-walk state.')
+    if environment['id'] != 'DMControl-v0' or environment['params'].get('task') not in {'humanoid-walk', 'dog-stand'}:
+        raise ValueError('Simulator restoration is reviewed only for DMControl humanoid-walk and dog-stand state.')
     if environment['params'].get('obs', 'state') != 'state':
         raise ValueError('Simulator restoration requires state observations.')
     return dict(algorithm_config=config, environment=environment, selector='inherited_gradient_probe')

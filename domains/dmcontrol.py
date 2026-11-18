@@ -404,8 +404,8 @@ class DMControlEnv(gym.Env):
         self._continuing_calibration = True
 
     def _require_calibration_task(self) -> None:
-        if self.task_name != "humanoid-walk" or self.observation_type != "state":
-            raise ValueError("Simulator calibration supports only Humanoid Walk state observations.")
+        if self.task_name not in {"humanoid-walk", "dog-stand"} or self.observation_type != "state":
+            raise ValueError("Simulator calibration supports only Humanoid Walk and Dog Stand state observations.")
 
     def _calibration_runtime(self) -> dict[str, Any]:
         import mujoco
@@ -431,8 +431,8 @@ class DMControlEnv(gym.Env):
 
         The enclosing snapshot codec makes this mutable transport mapping
         immutable and includes Gym wrapper bookkeeping. It is intentionally
-        limited to the pinned Humanoid task, whose task state outside Physics
-        consists only of its random generator and fixed construction options.
+        limited to reviewed tasks. Dog Stand additionally saves the reward
+        constants initialized at reset and its acceleration-dependent sensors.
         """
         self._require_calibration_task()
         import mujoco
@@ -457,6 +457,11 @@ class DMControlEnv(gym.Env):
             "adapter_random_state": _generator_state(self),
             "action_random_state": _generator_state(self.action_space),
             "observation_random_state": _generator_state(self.observation_space),
+            **({"dog_task_state": {
+                "stand_height": raw.task._stand_height.copy(),
+                "body_weight": float(raw.task._body_weight),
+                "sensordata": physics.data.sensordata.copy(),
+            }} if self.task_name == "dog-stand" else {}),
         }
 
     def load_calibration_state(self, state: Mapping[str, Any]) -> np.ndarray:
@@ -487,11 +492,25 @@ class DMControlEnv(gym.Env):
         task_random_probe.set_state(copy.deepcopy(state["task_random_state"]))
         for name in ("adapter_random_state", "action_random_state", "observation_random_state"):
             _validate_generator_state(state[name])
+        if self.task_name == "dog-stand":
+            dog = state["dog_task_state"]
+            for key, shape in (("stand_height", (2,)),
+                               ("sensordata", physics.data.sensordata.shape),
+                               ("body_weight", ())):
+                value = np.asarray(dog[key])
+                if value.shape != shape or not np.isfinite(value).all():
+                    raise ValueError(f"Invalid Dog Stand snapshot {key}.")
         raw = self._env._env
         mujoco.mj_setState(physics.model.ptr, physics.data.ptr, integration, state_spec)
         # Match dm_control's legacy step boundary. mj_forward would additionally
         # overwrite acceleration-dependent fields and warm-start data.
         mujoco.mj_step1(physics.model.ptr, physics.data.ptr)
+        if self.task_name == "dog-stand":
+            raw.task._stand_height = np.asarray(dog["stand_height"]).copy()
+            raw.task._body_weight = float(dog["body_weight"])
+            # mj_step1 updates position/velocity sensors, but not the saved
+            # acceleration/contact sensors from the preceding mj_step2.
+            physics.data.sensordata[:] = dog["sensordata"]
         raw.task.random.set_state(copy.deepcopy(state["task_random_state"]))
         raw._step_count = int(state["step_count"])
         raw._reset_next_step = bool(state["reset_next_step"])

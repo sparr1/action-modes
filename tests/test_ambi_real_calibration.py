@@ -209,11 +209,12 @@ def test_no_hidden_mc_bootstrap_and_reference_tail_bound():
 @pytest.mark.skipif(os.environ.get("AMBI_RUN_REAL_DMCONTROL_TESTS") != "1",
                     reason="Real MuJoCo integration is opt-in and host-dependent.")
 @pytest.mark.parametrize("decision", [0, 499])
-def test_real_humanoid_serialized_snapshot_roundtrip_and_continuing_cutoff(decision):
+@pytest.mark.parametrize("task", ["humanoid-walk", "dog-stand"])
+def test_real_serialized_snapshot_roundtrip_and_continuing_cutoff(decision, task):
     import domains  # noqa: F401
 
-    source = gym.make("DMControl-v0", task="humanoid-walk", obs="state")
-    branch = gym.make("DMControl-v0", task="humanoid-walk", obs="state")
+    source = gym.make("DMControl-v0", task=task, obs="state")
+    branch = gym.make("DMControl-v0", task=task, obs="state")
     try:
         source.reset(seed=101)
         rng = np.random.default_rng(7)

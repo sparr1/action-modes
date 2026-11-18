@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "checkpoint_root": "/oscar/scratch/rgao48/ambi/posttanh-dog-stand-20261115/production",
+  "episode_seeds": [101, 102, 103],
+  "episode_steps": 500,
+  "execution": "sampled",
+  "root_decision": 200,
+  "root_sources": [[55, 675000, "prior"], [55, 700000, "inner"], [56, 575000, "inner"]],
+  "root_seeds": [101, 102],
+  "rollouts": 2,
+  "tail_steps": 1000,
+  "gradient_rollouts": 32,
+  "gradient_pretanh_step": 0.1,
+  "arms": [
+    {"seed": 55, "step": 675000, "partner_step": 700000},
+    {"seed": 55, "step": 700000, "partner_step": 675000},
+    {"seed": 56, "step": 550000, "partner_step": 575000},
+    {"seed": 56, "step": 575000, "partner_step": 550000},
+    {"seed": 57, "step": 550000, "partner_step": 575000},
+    {"seed": 57, "step": 575000, "partner_step": 550000},
+    {"seed": 57, "step": 675000, "partner_step": 700000},
+    {"seed": 57, "step": 700000, "partner_step": 675000}
+  ]
+}
