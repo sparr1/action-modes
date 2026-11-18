@@ -199,6 +199,15 @@ one/two-CPU timing, geometry, checkpoint and graph/native continuation checks.
 Production allocations use measured throughput, observed full-run overhead,
 15% margin and 30 minutes for startup. Gates keep W&B disabled.
 
+`ambi_dog_walk_mrsq_q5_seed55.json` applies that five-critic recipe to Dog Walk,
+changing only the task and publication labels. It retains the one-million-decision
+budget, 25k checkpoint bank and critic geometry logging. Use
+`slurm/dog_walk_mrsq.py prepare`, followed by
+`slurm/run_dog_walk_mrsq_oscar.sbatch gate 0` and `train 0` from the pinned clean
+checkout. The task-specific gate checks real Dog Walk action-repeat/reward parity,
+full-ensemble CUDA parity, one/two-CPU throughput, checkpointing and geometry
+before production is enabled.
+
 ### Optional random inner initialization
 
 Set `inner_actor_initialization="random"` and/or
