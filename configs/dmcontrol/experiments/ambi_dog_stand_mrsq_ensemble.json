@@ -1,0 +1,28 @@
+{
+  "study_type": "dog_stand_mrsq_ensemble",
+  "study_note": "Two fresh seed-55 AMBI Dog Stand runs with MRS.Q-style critic aggregation: min over all critics for inner/outer TD targets and inner terminal bootstrap, mean over all critics for inner/outer actors. Compare five versus ten distributional critics; no pair sampling. Preserve the sampled post-tanh baseline, 1M decisions, H3/J8/K1, N128/C16/A4/B256, fixed joint entropy 0.0021, action-local adaptive scaling, all 25k checkpoints and critic geometry every 1k updates. This transfers the aggregation rules, not the entire MRS.Q algorithm.",
+  "overrides_alg": {
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "dog-stand",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_dog_stand_mrsq_q5_seed55",
+    "ambi_dog_stand_mrsq_q10_seed55"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "name": "Dog Stand - MRS.Q reductions - Q5 and Q10 - seed 55",
+  "description": "Two fresh seed-55 AMBI Dog Stand runs with MRS.Q-style critic aggregation: min over all critics for inner/outer TD targets and inner terminal bootstrap, mean over all critics for inner/outer actors. Compare five versus ten distributional critics; no pair sampling. Preserve the sampled post-tanh baseline, 1M decisions, H3/J8/K1, N128/C16/A4/B256, fixed joint entropy 0.0021, action-local adaptive scaling, all 25k checkpoints and critic geometry every 1k updates. This transfers the aggregation rules, not the entire MRS.Q algorithm."
+}

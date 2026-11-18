@@ -21,7 +21,10 @@ from slurm.benchmark_ambi_training_cpu import TrainingWindow, physical_core_cpus
 
 MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_inner_entropy.json"
 CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/inner-entropy-cudagraph-20261102")
-if os.environ.get("AMBI_ENTROPY_VARIANT") == "dog_stand_seeds":
+if os.environ.get("AMBI_ENTROPY_VARIANT") == "dog_stand_mrsq":
+    MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_dog_stand_mrsq_ensemble.json"
+    CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/dog-stand-mrsq-ensemble-20261117")
+elif os.environ.get("AMBI_ENTROPY_VARIANT") == "dog_stand_seeds":
     MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_posttanh_outer_adapt_dog_stand_seeds55_56_57.json"
     CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/posttanh-dog-stand-20261115")
 elif os.environ.get("AMBI_ENTROPY_VARIANT") == "humanoid_run":

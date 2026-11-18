@@ -75,6 +75,7 @@ for term, label in [('mpr', 'MPR geometry'), ('action_smoothness', 'Action geome
 metrics['Critic gradient magnitude']=[
     ('Action gradient RMS','train/critic_geometry_primary_action_gradient_rms'),
     ('Nonzero gradient validity','train/critic_geometry_primary_gradient_scale_valid')]
+metrics.update(state.get('additional_metrics', {}))
 timestamp=datetime.now(timezone.utc).isoformat()
 status='\n'.join(f"| {r['label'].replace('|','/')} | {r['job']} | {r['state']} | {r['decisions']} |" for r in rows)
 md=f'''**H3/J8/K1 entropy and Q-normalization comparison — Oscar L40S.**

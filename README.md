@@ -185,6 +185,20 @@ learner settings differ only by seed and publication labels. Size production
 from `gate.json`; its walltime uses the larger of the fresh measured estimate
 and completed Dog reference runtimes, plus 15% and 30 minutes for startup.
 
+The `ambi_dog_stand_mrsq_ensemble.json` manifest compares five and ten critics
+on fresh seed-55 Dog Stand runs. It transfers MRS.Q's aggregation rules:
+`min_all` for both TD targets and the inner terminal bootstrap, `mean_all` for
+both actor objectives, and no critic-pair sampling. All remaining sampled
+post-tanh Dog Stand settings are preserved. This is an AMBI aggregation study,
+not a reproduction of the full MRS.Q method; its released actor uses the
+ensemble mean ([official implementation](https://github.com/facebookresearch/MRSQ/blob/b12abaf309833f28619dfd87f4251074abed3ae3/MRSQ/MRSQ.py#L446-L469)).
+`slurm/dog_stand_mrsq.py prepare` checks unchanged learner source and prior CUDA
+evidence. The Oscar launcher takes `gate INDEX` or `train INDEX` (0 for five,
+1 for ten critics). Each arm requires its own fresh CUDA aggregation parity,
+one/two-CPU timing, geometry, checkpoint and graph/native continuation checks.
+Production allocations use measured throughput, observed full-run overhead,
+15% margin and 30 minutes for startup. Gates keep W&B disabled.
+
 ### Optional random inner initialization
 
 Set `inner_actor_initialization="random"` and/or
