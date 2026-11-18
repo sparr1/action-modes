@@ -11,7 +11,8 @@
 #SBATCH --time=01:00:00
 #SBATCH --exclude=gpu2708
 #SBATCH --requeue
-#SBATCH --signal=USR1@1800
+# Pass --signal=USR1@1800 for production only. A short benchmark must not
+# inherit a warning offset longer than its allocation.
 set -Eeuo pipefail
 umask 077
 batch_started=$SECONDS

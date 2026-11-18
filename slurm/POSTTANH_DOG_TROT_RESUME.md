@@ -28,6 +28,9 @@ The launcher requires `AMBI_EXPECTED_COMMIT`, `AMBI_PYTHON`,
 `AMBI_TRAIN_WALLTIME_SECONDS`. Use the locked DMControl interpreter and the
 existing workspace-publisher interpreter. Submit from the clean pinned checkout;
 pass the selected CPU count and measured walltime explicitly to `sbatch`.
+For production, also pass `--signal=USR1@1800`; omit this warning for the short
+benchmark allocation. The trainer's internal deadline independently starts a
+walltime handoff 30 minutes before allocation expiry.
 
 First run `benchmark` with two physical CPUs, one L40S and W&B disabled. Its
 `benchmark/plan.json` chooses the smallest CPU count within 5% of the fastest
