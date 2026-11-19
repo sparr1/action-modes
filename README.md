@@ -216,6 +216,11 @@ and W&B identity are separate from Q5. Q10 requires fresh ten-head CUDA parity
 and Dog Walk one/two-CPU timing; size its allocation from
 `gates/q10/validated.json`, including the measured memory, observed full-run
 overhead, 15% timing margin and 30-minute startup allowance.
+Production can be queued held behind the gate. A dependent CPU job running
+`slurm/release_dog_walk_mrsq.py --publisher-python <python>` checks the pinned
+Q10 evidence, applies and verifies all CPU fields, memory and walltime, checks
+the Q5/Q10 workspace, then releases that existing job. Its controller commit
+is recorded separately from the training commit.
 
 The matching seed-55 Q5 suite adds Dog Trot, Dog Run, Humanoid Stand,
 Humanoid Walk and Humanoid Run through `ambi_<task>_mrsq_q5_seed55.json`
