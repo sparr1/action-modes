@@ -17,15 +17,17 @@ umask 077
 : "${AMBI_WORKSPACE_PYTHON:?Set publisher Python}"
 : "${SLURM_CPUS_PER_TASK:?Use measured CPUs}"
 mode="${1:?gate or train}"
-index="${2:?Q5 index 0}"
+index="${2:?single-run index 0}"
+q="${AMBI_MRSQ_NUM_Q:-5}"
 [[ "$mode" == gate || "$mode" == train ]]
 [[ "$index" =~ ^0$ ]]
-[[ "$AMBI_ENTROPY_CAMPAIGN" == /oscar/scratch/rgao48/ambi/dog-walk-mrsq-q5-20261118 ]]
+[[ "$q" == 5 || "$q" == 10 ]]
+[[ "$AMBI_ENTROPY_CAMPAIGN" == /oscar/scratch/rgao48/ambi/dog-walk-mrsq-q${q}-20261118 ]]
 [[ "$(git rev-parse HEAD)" == "$AMBI_EXPECTED_COMMIT" ]]
 [[ -z "$(git status --porcelain --untracked-files=all)" ]]
 [[ "${SLURM_RESTART_COUNT:-0}" == 0 ]]
 unset CUDA_LAUNCH_BLOCKING WANDB_RESUME WANDB_RUN_ID AMBI_DOG_TASK
-export AMBI_ENTROPY_VARIANT=dog_walk_mrsq WANDB_MODE=disabled
+export AMBI_ENTROPY_VARIANT=dog_walk_mrsq AMBI_MRSQ_NUM_Q="$q" WANDB_MODE=disabled
 export MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0
 export PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1
 export OMP_NUM_THREADS="$SLURM_CPUS_PER_TASK" MKL_NUM_THREADS="$SLURM_CPUS_PER_TASK"

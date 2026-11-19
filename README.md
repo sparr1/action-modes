@@ -208,6 +208,15 @@ checkout. The task-specific gate checks real Dog Walk action-repeat/reward parit
 full-ensemble CUDA parity, one/two-CPU throughput, checkpointing and geometry
 before production is enabled.
 
+`ambi_dog_walk_mrsq_q10_seed55.json` changes only that Dog Walk run's critic
+count to ten, with all-head aggregation and the same seed and training budget.
+Set `AMBI_MRSQ_NUM_Q=10` for both `prepare` and the gate/training submissions;
+the default remains five. The Q10 manifest, campaign, gate receipts, checkpoints
+and W&B identity are separate from Q5. Q10 requires fresh ten-head CUDA parity
+and Dog Walk one/two-CPU timing; size its allocation from
+`gates/q10/validated.json`, including the measured memory, observed full-run
+overhead, 15% timing margin and 30-minute startup allowance.
+
 The matching seed-55 Q5 suite adds Dog Trot, Dog Run, Humanoid Stand,
 Humanoid Walk and Humanoid Run through `ambi_<task>_mrsq_q5_seed55.json`
 manifests. Only the environment task and publication labels differ from Dog

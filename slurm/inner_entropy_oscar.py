@@ -28,8 +28,11 @@ if os.environ.get("AMBI_ENTROPY_VARIANT") == "mrsq_q5_suite":
     MANIFEST = ROOT / ("configs/dmcontrol/experiments/ambi_" + suite_task.replace("-", "_") + "_mrsq_q5_seed55.json")
     CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/mrsq-q5-suite-20261118") / suite_task
 elif os.environ.get("AMBI_ENTROPY_VARIANT") == "dog_walk_mrsq":
-    MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_dog_walk_mrsq_q5_seed55.json"
-    CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/dog-walk-mrsq-q5-20261118")
+    dog_walk_q = int(os.environ.get("AMBI_MRSQ_NUM_Q", "5"))
+    if dog_walk_q not in (5, 10):
+        raise ValueError("Dog Walk MRS.Q supports five or ten critics")
+    MANIFEST = ROOT / f"configs/dmcontrol/experiments/ambi_dog_walk_mrsq_q{dog_walk_q}_seed55.json"
+    CAMPAIGN_ROOT = Path(f"/oscar/scratch/rgao48/ambi/dog-walk-mrsq-q{dog_walk_q}-20261118")
 elif os.environ.get("AMBI_ENTROPY_VARIANT") == "dog_stand_mrsq":
     MANIFEST = ROOT / "configs/dmcontrol/experiments/ambi_dog_stand_mrsq_ensemble.json"
     CAMPAIGN_ROOT = Path("/oscar/scratch/rgao48/ambi/dog-stand-mrsq-ensemble-20261117")
