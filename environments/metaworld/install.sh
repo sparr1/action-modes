@@ -36,4 +36,5 @@ uv sync --project "$runtime" --locked --python 3.10 --link-mode copy --no-instal
 # Compile the binding and compare one full episode per task with the raw backend.
 cd "$runtime/../.."
 WANDB_MODE=disabled AMBI_RUN_REAL_METAWORLD_TESTS=1 "$runtime/python" -m pytest -q \
-    tests/test_metaworld_env.py::test_real_task_matches_tdmpc2_raw_trajectory
+    tests/test_metaworld_env.py::test_real_task_matches_tdmpc2_raw_trajectory \
+    tests/test_metaworld_resume.py

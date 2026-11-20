@@ -35,6 +35,7 @@ locked packages with uv, then installs the checksummed original Gym sdist with
 the pinned versions of pip, setuptools, and wheel. It finishes by compiling
 and loading `mujoco-py`, verifying the environment pins, and comparing a
 100-decision episode on each task against the raw simulator with W&B disabled.
+It also checks that restoring each task reproduces two subsequent episodes.
 Re-run the installer after a failed
 build once the missing prerequisites are available.
 
