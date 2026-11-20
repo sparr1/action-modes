@@ -77,6 +77,36 @@ def test_exact_wandb_initialization_receives_production_identity(tmp_path):
     run.abort()
 
 
+@pytest.mark.parametrize("seed", [0, 56, 57])
+def test_production_seed_override_changes_only_seed_and_publication_labels(tmp_path, seed):
+    path = tmp_path / "ambi_state.json"
+    main(["production-config", "--task", "assembly", "--seed", str(seed), "--output", str(path)])
+    actual = read_json(path)
+    expected = production_algorithm("assembly")
+    expected["seed"] = seed
+    expected["alg_params"].update(
+        wandb_group=f"metaworld-tdmpc2-4task-s{seed}",
+        wandb_run_name=f"Meta-World Assembly | AMBI post-tanh | seed{seed}",
+        wandb_tags=[f"metaworld-tdmpc2-4task-s{seed}", "metaworld", "tdmpc2-04be337",
+                    "post-tanh", "sampled", "assembly", f"seed{seed}"],
+    )
+    assert actual == expected
+    assert read_json(CONFIG_ROOT / "algs/ambi_state.json")["seed"] == 55
+
+
+@pytest.mark.parametrize("seed", [-1, True, 56.0, "56", None])
+def test_production_seed_override_rejects_invalid_seed(seed):
+    with pytest.raises(ValueError, match="non-negative integer"):
+        production_algorithm("assembly", seed=seed)
+
+
+def test_invalid_cli_seed_does_not_create_production_config(tmp_path):
+    path = tmp_path / "ambi_state.json"
+    with pytest.raises(ValueError, match="non-negative integer"):
+        main(["production-config", "--task", "assembly", "--seed", "-1", "--output", str(path)])
+    assert not path.exists()
+
+
 def test_reference_config_retains_shared_tdmpc2_settings():
     baseline = read_json(CONFIG_ROOT / "algs/tdmpc2_state.json")
     dmc = read_json(CONFIG_ROOT.parent / "dmcontrol/algs/tdmpc2_state_benchmark.json")

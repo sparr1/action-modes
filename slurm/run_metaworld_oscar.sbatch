@@ -21,6 +21,11 @@ umask 077
 tasks=(assembly hand-insert push stick-pull)
 [[ "$SLURM_ARRAY_TASK_ID" =~ ^[0-3]$ ]]
 task=${tasks[SLURM_ARRAY_TASK_ID]}
+seed=${AMBI_METAWORLD_SEED-55}
+[[ "$seed" =~ ^(0|[1-9][0-9]*)$ ]] || {
+    echo "AMBI_METAWORLD_SEED must be a non-negative integer without leading zeros" >&2
+    exit 1
+}
 
 cd "$AMBI_PROJECT_DIR"
 [[ "$(git rev-parse HEAD)" == "$AMBI_EXPECTED_COMMIT" ]]
@@ -28,7 +33,7 @@ cd "$AMBI_PROJECT_DIR"
 [[ "$AMBI_METAWORLD_ROOT" == /* ]]
 root=$(realpath -m "$AMBI_METAWORLD_ROOT")
 [[ "$root" != "$PWD" && "$root" != "$PWD/"* ]]
-cell="$root/$task/ambi_state/seed_55"
+cell="$root/$task/ambi_state/seed_$seed"
 lineage="$cell/lineage"
 mkdir -p "$cell"
 exec 9>"$cell/launcher.lock"
@@ -82,7 +87,7 @@ export WANDB_DIR="$cache_root/wandb" WANDB_CACHE_DIR="$cache_root/wandb-cache"
 export WANDB_DATA_DIR="$cache_root/wandb-data" WANDB_ARTIFACT_DIR="$cache_root/wandb-artifacts"
 mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$WANDB_DATA_DIR" "$WANDB_ARTIFACT_DIR"
 "$py" slurm/metaworld_campaign.py production-config \
-    --task "$task" --output "$step_log/ambi_state.json"
+    --task "$task" --seed "$seed" --output "$step_log/ambi_state.json"
 status=0
 srun --unbuffered --output="$step_log/stdout.log" --error="$step_log/stderr.log" \
     "$py" -c '

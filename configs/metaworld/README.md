@@ -67,9 +67,17 @@ the GPU, CPU, memory, and walltime requests for the measured workload.
 launcher, and `AMBI_METAWORLD_NATIVE_ENV` can point to the site's native
 library environment script.
 
+Set `AMBI_METAWORLD_SEED=56` or `57` to launch another independent seed;
+the default remains 55. For Assembly alone, submit `--array=0` separately
+for each seed with its measured resource requests. This changes the top-level
+training seed and publication labels only. Each invocation remains one
+algorithm/trial cell at trial index zero; do not use `--trial-index` for
+resumable seed selection. The equivalent config command is
+`python3 slurm/metaworld_campaign.py production-config --task assembly --seed 56 --output /absolute/path/to/ambi_state.json`.
+
 The Oscar launcher materializes a complete production recipe in each segment's
 console directory before launching. W&B reports to
-`rwgao_b-brown-university/ambi`, group `metaworld-tdmpc2-4task-s55`,
+`rwgao_b-brown-university/ambi`, group `metaworld-tdmpc2-4task-s<seed>`,
 with a separate run identity per task. Event-indexed metrics are collected
 every 1,000 decisions and published as generations commit. Training uses PyTorch
 float32 matmul precision `high`, one interop thread, and one intraop thread
@@ -78,7 +86,8 @@ uses the checkpointed W&B run ID. An explicit rollback branches with a fresh
 ID. The base algorithm and preparation commands keep W&B disabled for smoke
 checks and timing.
 
-All allocations for a task use the same `<campaign>/<task>/ambi_state/seed_55/lineage`.
+All allocations for a task and seed use the same
+`<campaign>/<task>/ambi_state/seed_<seed>/lineage`.
 The trainer commits full training state (including replay) every 25,000
 decisions, on its 30-minute timer, and when draining at an episode boundary.
 It keeps the latest recovery generations separately from the historical
@@ -87,6 +96,10 @@ checkpoint directory under `lineage/segments/`. The launcher verifies the
 handoff before requeuing that array element and verifies the durable `DONE`
 record on completion. Resubmitting a single element under the same root
 opens its latest committed generation. Concurrent writers are rejected.
+Unexpected nonzero exits remain fail-closed rather than automatically requeued;
+after resolving the cause, resubmit the same task and seed under the same root
+to restore its durable `LATEST` generation. A different seed uses a separate
+lineage and W&B identity, without modifying the seed-55 run.
 
 ## Runtime and compatibility
 

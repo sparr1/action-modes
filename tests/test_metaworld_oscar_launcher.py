@@ -44,6 +44,7 @@ def launch(tmp_path):
                    SLURM_ARRAY_JOB_ID="741", SLURM_ARRAY_TASK_ID="3", SLURM_JOB_ID="749",
                    SLURM_TMPDIR=str(tmp_path), SLURM_JOB_END_TIME=str(int(time.time()) + 7200),
                    TRAIN_STATUS="75")
+        env.pop("AMBI_METAWORLD_SEED", None)
         env.update(changes)
         result = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
         return result.returncode, invocations.read_text() if invocations.exists() else ""
@@ -85,3 +86,37 @@ def test_missing_genesis_refuses_to_restart_in_place(launch):
     lineage.mkdir(parents=True)
     status, calls = run()
     assert status != 0 and "train " not in calls
+
+
+@pytest.mark.parametrize("seed", [56, 57])
+def test_assembly_seed_override_uses_own_lineage_and_resumes_without_touching_seed55(launch, seed):
+    run, default_lineage = launch
+    campaign = default_lineage.parents[3]
+    seed55 = campaign / "assembly/ambi_state/seed_55/lineage"
+    seed55.mkdir(parents=True)
+    (seed55 / "LATEST").write_text("original-seed55-generation")
+    lineage = campaign / f"assembly/ambi_state/seed_{seed}/lineage"
+    status, calls = run(AMBI_METAWORLD_SEED=str(seed), SLURM_ARRAY_TASK_ID="0")
+    assert status == 0
+    assert f"production-config --task assembly --seed {seed} --output" in calls
+    assert f"--lineage-dir {lineage} --resume-mode new" in calls
+    assert "--run configs/metaworld/experiments/assembly.json" in calls
+    assert "--trial-index" not in calls
+    assert calls.endswith("scheduler requeue 741_0\n")
+    assert str(seed55) not in calls
+    lineage.mkdir()
+    (lineage / "LATEST").write_text(f"committed-seed{seed}")
+    status, calls = run(AMBI_METAWORLD_SEED=str(seed), SLURM_ARRAY_TASK_ID="0",
+                        SLURM_RESTART_COUNT="1", TRAIN_STATUS="0")
+    assert status == 0
+    assert f"--lineage-dir {lineage} --resume-mode required" in calls
+    assert "scheduler requeue" not in calls
+    assert (seed55 / "LATEST").read_text() == "original-seed55-generation"
+
+
+@pytest.mark.parametrize("seed", ["", "-1", "55.0", "055", "../55", "invalid"])
+def test_invalid_seed_override_fails_before_any_launch_or_lineage_write(launch, seed):
+    run, default_lineage = launch
+    status, calls = run(AMBI_METAWORLD_SEED=seed)
+    assert status != 0 and calls == ""
+    assert not default_lineage.parents[3].exists()
