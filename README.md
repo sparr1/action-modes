@@ -387,6 +387,23 @@ after explicitly freezing and profiling an inner-loop compute schedule; the
 sparse historical Walker AMBI template inherits a substantially larger default
 inner workload and is not a confirmatory benchmark configuration.
 
+## Single-task Meta-World
+
+The four-task state setup covers Assembly, Hand-Insert, Push, and Stick-Pull,
+with one independent learner per task and seed. It uses TD-MPC2's Meta-World
+revision `04be337` with MuJoCo 2.1.0 and Gym 0.21. See the
+[runtime guide](environments/metaworld/README.md) for installation and simulator checks.
+
+The [run setup](configs/metaworld/README.md) prepares four independent AMBI
+runs with post-tanh entropy and sampled training actions at seed 55.
+TD-MPC2 is excluded from the prepared manifests; its comparison results come
+from the upstream repository.
+Each run has one million agent decisions (two million raw training steps).
+The preparation-only tool prints commands or creates configuration files.
+Each episode has 100 agent decisions, action repeat two, and summed rewards.
+Online evaluations report final-step `success_rate` alongside episode reward.
+Configuration steps and command previews do not start training or submit jobs.
+
 ## Rendering a checkpoint
 
 Use the dedicated renderer instead of `init.py`:

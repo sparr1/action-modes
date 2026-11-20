@@ -1,13 +1,26 @@
-from gymnasium.envs.registration import register
-from .ant_variable_legs import AntVariableLegsEnv
-from .ant_3leg_deadstump_env import Ant3LegDeadStumpEnv
+from importlib import import_module
+from importlib.util import find_spec
 
-try:
-    from .ant_leg_adaptation import AntLegAdaptationEnv
-except ModuleNotFoundError as e:
-    if e.name != f"{__name__}.ant_leg_adaptation":
-        raise
+from gymnasium.envs.registration import register
+
+_ANT_MODULES = {
+    "AntVariableLegsEnv": ".ant_variable_legs",
+    "Ant3LegDeadStumpEnv": ".ant_3leg_deadstump_env",
+    "AntLegAdaptationEnv": ".ant_leg_adaptation",
+}
+__all__ = ["register", *_ANT_MODULES]
+_has_adaptation = find_spec(f"{__name__}.ant_leg_adaptation") is not None
+if not _has_adaptation:
     AntLegAdaptationEnv = None
+
+
+def __getattr__(name):
+    # Keep the public Ant imports and Gym entry points available without
+    # loading their native MuJoCo bindings in the legacy Meta-World process.
+    if name not in _ANT_MODULES:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(import_module(_ANT_MODULES[name], __name__), name)
+
 
 register(id="VarLegsAnt-v0",
     entry_point="domains:AntVariableLegsEnv",
@@ -16,7 +29,7 @@ register(id="VarLegsAnt-v0",
     kwargs={"exclude_current_positions_from_observation":False,"num_legs":8, "contact_cost_weight":.0, "render_mode":None}
     )
 
-if AntLegAdaptationEnv is not None:
+if _has_adaptation:
     # Adaptation env: 4 legs -> 3 legs at switch_fraction of total_timesteps.
     # total_timesteps should match the value passed to model.learn().
     register(id="LegAdaptAnt-v0",
@@ -42,5 +55,13 @@ register(
     id="DMControl-v0",
     entry_point="domains.dmcontrol:DMControlEnv",
     max_episode_steps=500,
+    order_enforce=True,
+)
+
+# Meta-World has its own pinned MuJoCo runtime; keep the optional import lazy.
+register(
+    id="MetaWorld-v0",
+    entry_point="domains.metaworld:MetaWorldEnv",
+    max_episode_steps=100,
     order_enforce=True,
 )

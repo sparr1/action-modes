@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Use the same mujoco-py extension for headless state runs on CPU and GPU hosts.
+set -eu
+runtime=$(cd -- "$(dirname -- "$0")" && pwd)
+export MUJOCO_PY_MUJOCO_PATH="$runtime/.mujoco/mujoco210"
+export MUJOCO_PY_FORCE_CPU=1
+export LD_LIBRARY_PATH="$MUJOCO_PY_MUJOCO_PATH/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$runtime/.venv-tdmpc2/bin/python" "$@"

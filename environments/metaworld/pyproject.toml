@@ -1,0 +1,50 @@
+[project]
+name = "ambi-metaworld-runtime"
+version = "0.2.0"
+description = "TD-MPC2's legacy Meta-World v2 simulator for single-task AMBI"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "metaworld @ git+https://github.com/Farama-Foundation/Metaworld.git@04be337a12305e393c0caf0cbf5ec7755c7c8feb",
+    "gym==0.21.0",
+    "mujoco-py==2.1.2.14",
+    # mujoco-py compiles a Cython extension on its first import.
+    "cython==0.29.37",
+    # Install Gym 0.21's original sdist with this compatible Python toolchain.
+    "pip==24.0",
+    "setuptools==65.5.0",
+    "wheel==0.38.4",
+    "glfw==2.7.0",
+    "gymnasium==0.29.1",
+    "numpy==1.24.4",
+    # The v2 registry eagerly imports tasks that use scipy.spatial.
+    "scipy==1.13.1",
+    "opencv-python-headless==4.10.0.82",
+    "tensordict==0.4.0",
+    "torch==2.3.1",
+    "torchrl==0.4.0",
+    "typing-extensions>=4.14.1",
+    "wandb==0.17.4",
+]
+
+[dependency-groups]
+dev = ["pytest==8.2.2"]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+required-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+# Upstream's optional OpenCV extra uses the invalid specifier >=3.; we use
+# only the unmodified base Gym package. Supply its CPython 3.10 requirements.
+[[tool.uv.dependency-metadata]]
+name = "gym"
+version = "0.21.0"
+requires-dist = ["numpy>=1.18.0", "cloudpickle>=1.2.0"]

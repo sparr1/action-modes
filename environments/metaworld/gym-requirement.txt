@@ -1,0 +1,2 @@
+# Original PyPI sdist. Its optional extras contain metadata rejected by uv.
+gym==0.21.0 --hash=sha256:0fd1ce165c754b4017e37a617b097c032b8c3feb8a0394ccc8777c7c50dddff3

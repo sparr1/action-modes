@@ -582,6 +582,19 @@ class TDMPC2Baseline(Algorithm):
         super().__init__(name, env, custom_params)
         self.run_params = run_params or {}
         self.experiment_params = experiment_params or {}
+        # Environment opt-in keeps reward-only tasks and their CSV schemas
+        # unchanged. Success is measured at the final raw transition, as in
+        # the official TD-MPC2 Meta-World protocol.
+        self._evaluation_success_key = getattr(
+            self.env.unwrapped, "evaluation_success_key", None
+        )
+        if self._evaluation_success_key is not None and (
+            not isinstance(self._evaluation_success_key, str)
+            or not self._evaluation_success_key.strip()
+        ):
+            raise ValueError(
+                "Environment evaluation_success_key must be a non-empty string or None."
+            )
         self.cfg = self._build_cfg(custom_params or {})
         print(
             "Resolved horizons:",
@@ -1936,6 +1949,8 @@ class TDMPC2Baseline(Algorithm):
                 if getattr(self, "_resume_enabled", False)
                 else ("step", "reward", "seed")
             )
+            if getattr(self, "_evaluation_success_key", None) is not None:
+                header += ("success_rate",)
             csv.writer(stream).writerow(header)
             stream.flush()
             os.fsync(stream.fileno())
@@ -1989,36 +2004,27 @@ class TDMPC2Baseline(Algorithm):
         if evaluator is not None:
             evaluator.close()
 
-    def _record_evaluation(self, step, reward, *, extras=None):
+    def _record_evaluation(self, step, reward, *, extras=None, success_rate=None):
         reward = float(reward)
-        print(
-            "TD-MPC2 evaluation:",
-            f"step={int(step)},",
-            f"reward={reward:.1f},",
-            f"episodes={self._eval_episodes},",
-            f"seed={self.cfg.seed}",
-            flush=True,
-        )
-        if self._eval_csv_path:
-            self._prepare_eval_csv()
-            with open(self._eval_csv_path, "a", newline="") as stream:
-                row = (
-                    (
-                        int(step),
-                        int(self._episode_idx),
-                        f"{reward:.1f}",
-                        int(self.cfg.seed),
-                    )
-                    if getattr(self, "_resume_enabled", False)
-                    else (int(step), f"{reward:.1f}", int(self.cfg.seed))
-                )
-                csv.writer(stream).writerow(row)
-                stream.flush()
-                os.fsync(stream.fileno())
+        if not math.isfinite(reward):
+            raise ValueError("Evaluation reward must be finite.")
+        has_success = getattr(self, "_evaluation_success_key", None) is not None
+        if has_success:
+            if isinstance(success_rate, (bool, np.bool_)) or not isinstance(
+                success_rate, (int, float, np.integer, np.floating)
+            ):
+                raise TypeError("Evaluation success_rate must be a finite number in [0, 1].")
+            success_rate = float(success_rate)
+            if not math.isfinite(success_rate) or not 0.0 <= success_rate <= 1.0:
+                raise ValueError("Evaluation success_rate must be a finite number in [0, 1].")
+        elif success_rate is not None:
+            raise ValueError("Evaluation success_rate requires environment opt-in.")
         payload = {
             "eval/episode_reward": reward,
             "eval/episodes": int(self._eval_episodes),
         }
+        if has_success:
+            payload["eval/success_rate"] = success_rate
         if getattr(self, "_resume_enabled", False):
             payload["episode/index"] = int(self._episode_idx)
         if extras is not None:
@@ -2027,6 +2033,7 @@ class TDMPC2Baseline(Algorithm):
             reserved = {
                 "eval/episode_reward",
                 "eval/episodes",
+                "eval/success_rate",
                 "episode/index",
                 "env_step",
             }
@@ -2053,12 +2060,42 @@ class TDMPC2Baseline(Algorithm):
                         f"Evaluation payload extra {key!r} must be finite."
                     )
                 payload[key] = numeric
+        # Validate the entire event before writing any CSV row or W&B metric.
+        print(
+            "TD-MPC2 evaluation:",
+            f"step={int(step)},",
+            f"reward={reward:.1f},",
+            *((f"success_rate={success_rate:.4f},",) if has_success else ()),
+            f"episodes={self._eval_episodes},",
+            f"seed={self.cfg.seed}",
+            flush=True,
+        )
+        if self._eval_csv_path:
+            self._prepare_eval_csv()
+            with open(self._eval_csv_path, "a", newline="") as stream:
+                row = (
+                    (
+                        int(step),
+                        int(self._episode_idx),
+                        f"{reward:.1f}",
+                        int(self.cfg.seed),
+                    )
+                    if getattr(self, "_resume_enabled", False)
+                    else (int(step), f"{reward:.1f}", int(self.cfg.seed))
+                )
+                if has_success:
+                    row += (success_rate,)
+                csv.writer(stream).writerow(row)
+                stream.flush()
+                os.fsync(stream.fileno())
         log_wandb(self._wandb_run, payload, step=int(step))
 
     @torch.no_grad()
     def _evaluate_policy(self, step, *, initial_obs=None):
         """Run the official ten-episode deterministic-policy evaluation."""
         episode_returns = []
+        episode_successes = []
+        success_key = getattr(self, "_evaluation_success_key", None)
         for episode in range(self._eval_episodes):
             if episode == 0 and initial_obs is not None:
                 obs = initial_obs
@@ -2071,21 +2108,71 @@ class TDMPC2Baseline(Algorithm):
             done = False
             while not done:
                 obs_t = self._reuse_observation_tensor(obs)
+                if not bool(torch.isfinite(obs_t).all()):
+                    raise FloatingPointError(
+                        f"Non-finite online evaluation observation at training step {step}, "
+                        f"episode {episode + 1}, decision {episode_step + 1}."
+                    )
                 action_norm = self._act_agent(
                     obs_t,
                     t0=(episode_step == 0),
                     eval_mode=True,
                 ).numpy()
+                # Check before unscaling: clipping could hide an infinite action.
+                if not np.isfinite(action_norm).all():
+                    raise FloatingPointError(
+                        f"Non-finite online evaluation action at training step {step}, "
+                        f"episode {episode + 1}, decision {episode_step + 1}."
+                    )
                 action_env = self._unscale_action(action_norm)
-                obs, reward, terminated, truncated, _ = self.env.step(action_env)
+                obs, reward, terminated, truncated, info = self.env.step(action_env)
+                # A terminal observation never reaches the next loop iteration.
+                if (terminated or truncated) and not np.isfinite(self._obs_to_numpy(obs)).all():
+                    raise FloatingPointError(
+                        f"Non-finite online evaluation observation at training step {step}, "
+                        f"episode {episode + 1}, decision {episode_step + 1}."
+                    )
                 episode_return += float(reward)
+                if not math.isfinite(episode_return):
+                    raise FloatingPointError(
+                        f"Non-finite online evaluation return at training step {step}, "
+                        f"episode {episode + 1}, decision {episode_step + 1}."
+                    )
                 episode_step += 1
                 done = bool(terminated or truncated)
+                if done and success_key is not None:
+                    if not isinstance(info, Mapping) or success_key not in info:
+                        raise ValueError(
+                            f"Missing final-step evaluation success field {success_key!r} "
+                            f"at step {step}, episode {episode + 1}."
+                        )
+                    success = info[success_key]
+                    if not isinstance(
+                        success, (bool, np.bool_, int, float, np.integer, np.floating)
+                    ):
+                        raise TypeError(
+                            f"Final-step evaluation success {success_key!r} must be a binary scalar."
+                        )
+                    success = float(success)
+                    if not math.isfinite(success) or success not in (0.0, 1.0):
+                        raise ValueError(
+                            f"Final-step evaluation success {success_key!r} must be finite and binary."
+                        )
+                    episode_successes.append(success)
             episode_returns.append(episode_return)
 
-        mean_return = float(np.nanmean(episode_returns))
+        mean_return = float(np.mean(episode_returns))
+        if not math.isfinite(mean_return):
+            raise FloatingPointError(
+                f"Non-finite online evaluation mean return at training step {step}."
+            )
         extras = self._evaluation_payload_extras(int(step))
-        if extras:
+        if success_key is not None:
+            self._record_evaluation(
+                step, mean_return, extras=extras,
+                success_rate=float(np.mean(episode_successes)),
+            )
+        elif extras:
             self._record_evaluation(step, mean_return, extras=extras)
         else:
             # Preserve the historical two-argument seam used by downstream
