@@ -1,6 +1,8 @@
 """Gymnasium adapter for the legacy Meta-World revision used by TD-MPC2."""
 
+import copy
 import json
+from collections.abc import Mapping
 from contextlib import contextmanager
 from importlib import metadata
 
@@ -140,6 +142,7 @@ class MetaWorldEnv(gym.Env):
         if options:
             raise ValueError("MetaWorld-v0 does not support reset options")
         self._needs_reset = True
+        self._elapsed_steps = 0
         if seed is not None:
             self._random = np.random.RandomState(seed)
             self.action_space.seed(seed)
@@ -159,7 +162,6 @@ class MetaWorldEnv(gym.Env):
                     f"MuJoCo 2.1.0 produced no stable state while resetting {self.task_name} "
                     f"on Meta-World {METAWORLD_REVISION}. Check the simulator warning."
                 )
-        self._elapsed_steps = 0
         self._needs_reset = False
         return observation, {}
 
@@ -184,6 +186,84 @@ class MetaWorldEnv(gym.Env):
         truncated = self._elapsed_steps >= self.episode_length
         self._needs_reset = truncated
         return self._observation(observation), reward, False, truncated, dict(info)
+
+    def training_resume_state(self):
+        """Capture only at timeout. The next reset calls sim.reset() itself."""
+        if self._env is None or not self._needs_reset or self._elapsed_steps != self.episode_length:
+            raise ValueError("Meta-World resume requires a completed episode before reset.")
+        raw = self._env
+        return {
+            "schema_version": 1,
+            "task": self.task_name,
+            "protocol": self.protocol,
+            "revision": self.backend_revision,
+            "reset_rng": self._random.get_state(),
+            "raw_rng": raw.np_random.get_state(),
+            "adapter_rng": copy.deepcopy(self.np_random.bit_generator.state),
+            # The previous frame appears in the *next* reset observation. The
+            # failure branch of raw.step also retains the last stable observation.
+            "previous_frame": raw._prev_obs.copy(),
+            "last_stable_obs": raw._last_stable_obs.copy(),
+            "object_init": raw.obj_init_pos.copy(),
+            # sim.reset resets mjData, not mjModel. Assembly moves a peg body
+            # and its site in the model before the next hand reset.
+            "body_pos": raw.model.body_pos.copy(),
+            "site_pos": raw.model.site_pos.copy(),
+            "num_resets": raw.num_resets if self.task_name == "push" else None,
+        }
+
+    def validate_training_resume_state(self, state):
+        fields = {
+            "schema_version", "task", "protocol", "revision", "reset_rng", "raw_rng",
+            "adapter_rng", "previous_frame", "last_stable_obs", "object_init",
+            "body_pos", "site_pos", "num_resets",
+        }
+        if (not isinstance(state, Mapping) or set(state) != fields
+                or state["schema_version"] != 1 or state["task"] != self.task_name
+                or state["protocol"] != self.protocol or state["revision"] != self.backend_revision):
+            raise ValueError("Incompatible Meta-World boundary checkpoint.")
+        raw = self._env
+        if raw is None:
+            raise ValueError("Cannot restore a closed Meta-World environment.")
+        for key, shape in (
+            ("previous_frame", (18,)), ("last_stable_obs", (39,)), ("object_init", (3,)),
+            ("body_pos", raw.model.body_pos.shape), ("site_pos", raw.model.site_pos.shape),
+        ):
+            array = state[key]
+            if (not isinstance(array, np.ndarray) or array.dtype != np.float64
+                    or array.shape != shape or not np.isfinite(array).all()):
+                raise ValueError(f"Invalid Meta-World {key}.")
+        count = state["num_resets"]
+        if self.task_name == "push":
+            if type(count) is not int or count < 1:
+                raise ValueError("Invalid Push reset count.")
+        elif count is not None:
+            raise ValueError("Unexpected task-specific reset count.")
+        for key in ("reset_rng", "raw_rng"):
+            rng = state[key]
+            if (not isinstance(rng, tuple) or len(rng) != 5 or rng[0] != "MT19937"
+                    or not isinstance(rng[1], np.ndarray) or rng[1].dtype != np.uint32
+                    or rng[1].shape != (624,) or not 0 <= rng[2] <= 624
+                    or rng[3] not in (0, 1) or not np.isfinite(rng[4])):
+                raise ValueError(f"Invalid Meta-World {key}.")
+            np.random.RandomState(0).set_state(rng)
+        np.random.default_rng(0).bit_generator.state = copy.deepcopy(state["adapter_rng"])
+
+    def load_training_resume_state(self, state):
+        self.validate_training_resume_state(state)
+        raw = self._env
+        self._random.set_state(state["reset_rng"])
+        raw.np_random.set_state(state["raw_rng"])
+        self.np_random.bit_generator.state = copy.deepcopy(state["adapter_rng"])
+        raw._prev_obs = state["previous_frame"].copy()
+        raw._last_stable_obs = state["last_stable_obs"].copy()
+        raw.obj_init_pos = state["object_init"].copy()
+        raw.model.body_pos[:] = state["body_pos"]
+        raw.model.site_pos[:] = state["site_pos"]
+        if self.task_name == "push":
+            raw.num_resets = state["num_resets"]
+        self._elapsed_steps = self.episode_length
+        self._needs_reset = True
 
     def render(self):
         if self.render_mode != "rgb_array":

@@ -174,6 +174,8 @@ def test_main_resume_acquires_session_before_model_and_passes_explicit_context(
             "new",
             "--resume-checkpoint-minutes",
             "60",
+            "--resume-checkpoint-steps",
+            "2",
             "--drain-after-seconds",
             "300",
         ],
@@ -189,6 +191,7 @@ def test_main_resume_acquires_session_before_model_and_passes_explicit_context(
     assert path == lineage
     assert call["mode"] == "new"
     assert call["checkpoint_minutes"] == 60
+    assert call["checkpoint_steps"] == 2
     assert call["drain_after_seconds"] == 300
     assert "drain_timing" not in call
     assert env.closed

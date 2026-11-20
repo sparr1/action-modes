@@ -913,6 +913,11 @@ def _run_resumable_experiment(
         seed_env_spaces(domain, trial_seed)
         run_params["resume_environment"] = environment_contract(domain)
         episode_steps = int(run_params["resume_environment"]["episode_steps"])
+        checkpoint_steps = args.get("resume_checkpoint_steps")
+        if checkpoint_steps is not None and (
+            checkpoint_steps <= 0 or checkpoint_steps % episode_steps
+        ):
+            raise ValueError("--resume-checkpoint-steps must be a positive multiple of the episode length.")
         if total_steps % episode_steps:
             raise ValueError(
                 "Resumable total_steps must end at an episode boundary: "
@@ -935,6 +940,7 @@ def _run_resumable_experiment(
             scientific_identity=identity,
             total_steps=total_steps,
             checkpoint_minutes=args["resume_checkpoint_minutes"],
+            checkpoint_steps=checkpoint_steps,
             drain_after_seconds=drain_after_seconds,
             resume_generation=args["resume_generation"],
         )
@@ -1043,6 +1049,8 @@ def main():
     parser.add_argument('--resume-mode', choices=('new', 'required'))
     parser.add_argument('--resume-generation', help='explicit committed rollback generation')
     parser.add_argument('--resume-checkpoint-minutes', default=60.0, type=float)
+    parser.add_argument('--resume-checkpoint-steps', type=int,
+                        help='also publish a full resume generation every N training decisions')
     parser.add_argument(
         '--resume-model-snapshot-root',
         help='absolute external root for per-segment portable model/replay banks; exact resume only',
@@ -1054,6 +1062,8 @@ def main():
         help='explicit W&B mode for exact resume (Oscar requires online)',
     )
     args = vars(parser.parse_args())
+    if args["resume_checkpoint_steps"] is not None and args["resume_mode"] is None:
+        raise ValueError("--resume-checkpoint-steps requires exact resume mode.")
     if args["resume_model_snapshot_root"] is not None:
         if args["resume_mode"] is None or args["lineage_dir"] is None:
             raise ValueError("--resume-model-snapshot-root requires exact resume mode and --lineage-dir.")

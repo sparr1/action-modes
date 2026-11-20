@@ -374,6 +374,28 @@ def test_repeated_signals_wait_for_the_completed_episode_boundary(monkeypatch, t
         _close(model, session)
 
 
+@pytest.mark.parametrize("timer_due", [False, True])
+def test_step_checkpoint_coalesces_with_timer_and_target(monkeypatch, tmp_path, timer_due):
+    monkeypatch.setitem(sys.modules, "wandb", _FakeWandb())
+    model = _model(BoundaryEnv())
+    session = _session(tmp_path / "steps", mode="new", segment="part-1")
+    session.checkpoint_steps = 2
+    monkeypatch.setattr(session, "checkpoint_due", lambda: timer_due)
+    events = []
+    original = session.publish
+
+    def publish(learner, *, reason):
+        events.append((learner._global_step, reason))
+        return original(learner, reason=reason)
+
+    monkeypatch.setattr(session, "publish", publish)
+    try:
+        model.learn(total_timesteps=4, resume_session=session)
+        assert [row for row in events if row[0] > 0] == [(2, "step-cadence"), (4, "target")]
+    finally:
+        _close(model, session)
+
+
 def test_signal_during_hourly_publish_forces_one_newer_drain_generation(
     monkeypatch, tmp_path
 ):

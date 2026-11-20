@@ -65,6 +65,9 @@ before it. The settling step is outside the interaction budget. The adapter
 isolates each environment's reset randomness from the learner's NumPy stream.
 
 The four configurations use 1,000,000 training decisions, or 2,000,000 raw
-training steps per task. Model snapshots support evaluation. Exact training
-resume with simulator and replay state is unsupported for MetaWorld-v0.
+training steps per task. The four tasks support exact training continuation
+at episode boundaries. The resume generation saves the goal sampler, stacked
+observation history, mutable simulator model positions, and learner/replay state.
+Run the full two-episode continuation test on the target simulator:
+`AMBI_RUN_REAL_METAWORLD_TESTS=1 environments/metaworld/python -m pytest -q tests/test_metaworld_resume.py`.
 See the [experiment configurations](../../configs/metaworld/README.md).

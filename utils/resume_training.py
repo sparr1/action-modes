@@ -202,6 +202,7 @@ class TrainingResumeSession:
         source_generation_id: str | None,
         segment_id: str,
         checkpoint_minutes: float,
+        checkpoint_steps: int | None = None,
         drain_after_seconds: float | None,
         segment_started_monotonic: float,
         replay_shard_rows: int = DEFAULT_REPLAY_SHARD_ROWS,
@@ -218,6 +219,9 @@ class TrainingResumeSession:
         self.segment_dir = store.root / "segments" / self.segment_id
         self.segment_log_dir = self.segment_dir / "logs"
         self.eval_csv_path = self.segment_dir / "evaluation.csv"
+        if checkpoint_steps is not None and (type(checkpoint_steps) is not int or checkpoint_steps < 1):
+            raise ResumeIncompatibilityError("Checkpoint step cadence must be a positive integer.")
+        self.checkpoint_steps = checkpoint_steps
         self.checkpoint_interval_seconds = float(checkpoint_minutes) * 60.0
         self.drain_after_seconds = (
             None if drain_after_seconds is None else float(drain_after_seconds)
@@ -280,6 +284,7 @@ class TrainingResumeSession:
         scientific_identity: Mapping[str, Any],
         total_steps: int,
         checkpoint_minutes: float,
+        checkpoint_steps: int | None = None,
         drain_after_seconds: float | None,
         resume_generation: str | None = None,
         segment_id: str | None = None,
@@ -360,6 +365,7 @@ class TrainingResumeSession:
                 source_generation_id=source,
                 segment_id=resolved_segment,
                 checkpoint_minutes=checkpoint_minutes,
+                checkpoint_steps=checkpoint_steps,
                 drain_after_seconds=drain_after_seconds,
                 segment_started_monotonic=started,
                 source_compatibility=source_compatibility,

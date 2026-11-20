@@ -30,6 +30,7 @@ class _Capability:
     protocol: str
     fixed_horizon: int | None = None
     state_only: bool = False
+    reviewed_tasks: tuple[str, ...] = ()
 
 
 _CAPABILITIES = {
@@ -38,6 +39,10 @@ _CAPABILITIES = {
     "domains.ant_variable_legs.AntVariableLegsEnv": _Capability("explicit"),
     "domains.ant_leg_adaptation.AntLegAdaptationEnv": _Capability("explicit"),
     "domains.ant_3leg_deadstump_env.Ant3LegDeadStumpEnv": _Capability("explicit"),
+    "domains.metaworld.MetaWorldEnv": _Capability(
+        "explicit", fixed_horizon=100, state_only=True,
+        reviewed_tasks=("assembly", "hand-insert", "push", "stick-pull"),
+    ),
     "domains.dmcontrol.DMControlEnv": _Capability(
         "explicit", fixed_horizon=500, state_only=True
     ),
@@ -142,8 +147,10 @@ def _review(env):
             )
     elif capability.protocol != "ant":
         raise UnsupportedResumeEnvironment("Unknown environment resume protocol.")
+    if capability.reviewed_tasks and getattr(base, "task_name", None) not in capability.reviewed_tasks:
+        raise UnsupportedResumeEnvironment("Task has no reviewed boundary-resume protocol.")
     if capability.state_only and getattr(base, "observation_type", None) != "state":
-        raise UnsupportedResumeEnvironment("Exact DMControl resume is state-only.")
+        raise UnsupportedResumeEnvironment("Exact environment resume is state-only.")
     unhealthy = getattr(base, "_terminate_when_unhealthy", False)
     if not isinstance(unhealthy, bool) or unhealthy:
         raise UnsupportedResumeEnvironment(

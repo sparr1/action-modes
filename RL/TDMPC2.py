@@ -2496,10 +2496,11 @@ class TDMPC2Baseline(Algorithm):
         drain = resume_session.drain_requested()
         due = resume_session.checkpoint_due()
         generation = None
-        if due or drain:
-            generation = resume_session.publish(
-                self, reason="drain" if drain else "hourly"
-            )
+        checkpoint_steps = getattr(resume_session, "checkpoint_steps", None)
+        step_due = checkpoint_steps is not None and self._global_step % checkpoint_steps == 0
+        if due or drain or step_due:
+            reason = "drain" if drain else ("step-cadence" if step_due else "hourly")
+            generation = resume_session.publish(self, reason=reason)
 
         # One newer generation covers a signal delivered during an ordinary
         # hourly publication; repeated signals during that drain publication
