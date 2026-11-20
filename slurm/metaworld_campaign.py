@@ -28,6 +28,25 @@ def read_json(path):
     return json.loads(Path(path).read_text(), object_pairs_hook=_unique_object)
 
 
+def production_algorithm(task):
+    """Resolve the W&B identity for one authorized, resumable training cell."""
+    if task not in TASKS:
+        raise ValueError(f"Unknown campaign task: {task!r}")
+    run = read_json(CONFIG_ROOT / "algs/ambi_state.json")
+    validate_algorithm(run)
+    if run["seed"] != 55:
+        raise ValueError("The s55 production campaign requires seed 55.")
+    title = " ".join(word.capitalize() for word in task.split("-"))
+    run["alg_params"].update(
+        wandb=True, wandb_mode="online", wandb_event_indexed=True, wandb_step_every=1000,
+        wandb_entity="rwgao_b-brown-university", wandb_project="ambi",
+        wandb_group="metaworld-tdmpc2-4task-s55",
+        wandb_run_name=f"Meta-World {title} | AMBI post-tanh | seed55",
+        wandb_tags=["metaworld-tdmpc2-4task-s55", "metaworld", "tdmpc2-04be337", "post-tanh", "sampled", task, "seed55"],
+    )
+    return run
+
+
 def manifest(task, names, trials):
     return {
         "study_type": "metaworld_four_task_state",
@@ -148,6 +167,9 @@ def main(argv=None):
     inspect = commands.add_parser("plan", help="Print commands for existing configs; never run them")
     inspect.add_argument("--config-dir", type=Path, default=CONFIG_ROOT)
     inspect.add_argument("--results-dir", type=Path, required=True)
+    production = commands.add_parser("production-config", help="Materialize one online training recipe")
+    production.add_argument("--task", choices=TASKS, required=True)
+    production.add_argument("--output", type=Path, required=True)
     create = commands.add_parser("prepare", help="Write a fresh config directory; never execute jobs")
     create.add_argument("--algorithm-config", type=Path, action="append", required=True)
     create.add_argument("--output-dir", type=Path, required=True)
@@ -157,6 +179,12 @@ def main(argv=None):
     create.add_argument("--base-seed", type=int, default=55)
     create.add_argument("--dry-run", action="store_true", help="Print the plan without writing files")
     args = parser.parse_args(argv)
+    if args.command == "production-config":
+        run = production_algorithm(args.task)
+        with args.output.open("x") as stream:
+            json.dump(run, stream, indent=2, allow_nan=False)
+            stream.write("\n")
+        return
     if args.command == "plan":
         result = plan(args.config_dir, args.results_dir)
     else:

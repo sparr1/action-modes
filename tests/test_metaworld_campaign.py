@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from slurm.metaworld_campaign import CONFIG_ROOT, ROOT, TASKS, main, plan, prepare, read_json
+from slurm.metaworld_campaign import CONFIG_ROOT, ROOT, TASKS, main, plan, prepare, production_algorithm, read_json
 
 
 def test_prepared_campaign_has_four_ambi_single_task_seed_cells(tmp_path):
@@ -34,6 +34,47 @@ def test_prepared_campaign_has_four_ambi_single_task_seed_cells(tmp_path):
             assert "WANDB_MODE=disabled" in command
             assert "--resume-mode" not in command
     assert not (tmp_path / "results").exists()
+
+
+def test_production_wandb_config_preserves_scientific_recipe(tmp_path):
+    base = read_json(CONFIG_ROOT / "algs/ambi_state.json")
+    names = set()
+    for task in TASKS:
+        path = tmp_path / f"{task}.json"
+        main(["production-config", "--task", task, "--output", str(path)])
+        run = read_json(path)
+        assert run == production_algorithm(task)
+        expected = base["alg_params"]
+        params = run["alg_params"]
+        assert {k: v for k, v in run.items() if k != "alg_params"} == {
+            k: v for k, v in base.items() if k != "alg_params"}
+        assert {k: v for k, v in params.items() if not k.startswith("wandb")} == {
+            k: v for k, v in expected.items() if not k.startswith("wandb")}
+        names.add(params["wandb_run_name"])
+        assert task in params["wandb_tags"] and "seed55" in params["wandb_tags"]
+        assert params["wandb_event_indexed"] and params["wandb_step_every"] == 1000
+        assert (params["wandb"], params["wandb_mode"]) == (True, "online")
+        assert (params["wandb_entity"], params["wandb_project"], params["wandb_group"]) == (
+            "rwgao_b-brown-university", "ambi", "metaworld-tdmpc2-4task-s55")
+    assert len(names) == len(TASKS)
+    assert base["alg_params"]["wandb"] is False
+
+
+def test_exact_wandb_initialization_receives_production_identity(tmp_path):
+    from tests.test_wandb_resume import _FakeWandb
+    from utils.wandb_resume import WandbResumeContext
+    from utils.wandb_utils import init_wandb
+
+    params = production_algorithm("stick-pull")["alg_params"]
+    fake = _FakeWandb()
+    run = init_wandb(params, default_project="unset", run_name="unset", wandb_module=fake,
+                     resume_context=WandbResumeContext.new(run_id="test-cell", directory=tmp_path))
+    call, = fake.init_calls
+    assert call["entity"] == "rwgao_b-brown-university" and call["project"] == "ambi"
+    assert call["group"] == "metaworld-tdmpc2-4task-s55"
+    assert call["name"] == "Meta-World Stick Pull | AMBI post-tanh | seed55"
+    assert call["id"] == "test-cell" and call["resume"] == "never"
+    run.abort()
 
 
 def test_reference_config_retains_shared_tdmpc2_settings():

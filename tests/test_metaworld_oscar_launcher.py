@@ -57,6 +57,9 @@ def test_verified_handoff_requeues_only_the_correct_array_element(launch):
     assert f"--lineage-dir {lineage} --resume-mode new" in calls
     assert "--run configs/metaworld/experiments/stick-pull.json" in calls
     assert "--resume-checkpoint-steps 25000" in calls
+    assert "--resume-wandb-mode online" in calls
+    assert 'torch.set_float32_matmul_precision("high")' in calls
+    assert "torch.set_num_interop_threads(1)" in calls
     assert "handoff" in calls and "--segment-id slurm-749-0" in calls
     assert calls.endswith("scheduler requeue 741_3\n")
     lineage.mkdir()

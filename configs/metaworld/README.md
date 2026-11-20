@@ -67,6 +67,17 @@ the GPU, CPU, memory, and walltime requests for the measured workload.
 launcher, and `AMBI_METAWORLD_NATIVE_ENV` can point to the site's native
 library environment script.
 
+The Oscar launcher materializes a complete production recipe in each segment's
+console directory before launching. W&B reports to
+`rwgao_b-brown-university/ambi`, group `metaworld-tdmpc2-4task-s55`,
+with a separate run identity per task. Event-indexed metrics are collected
+every 1,000 decisions and published as generations commit. Training uses PyTorch
+float32 matmul precision `high`, one interop thread, and one intraop thread
+per allocated CPU. A continuation
+uses the checkpointed W&B run ID. An explicit rollback branches with a fresh
+ID. The base algorithm and preparation commands keep W&B disabled for smoke
+checks and timing.
+
 All allocations for a task use the same `<campaign>/<task>/ambi_state/seed_55/lineage`.
 The trainer commits full training state (including replay) every 25,000
 decisions, on its 30-minute timer, and when draining at an episode boundary.

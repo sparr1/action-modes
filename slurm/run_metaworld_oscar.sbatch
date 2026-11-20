@@ -42,7 +42,7 @@ if [[ -n "${AMBI_METAWORLD_NATIVE_ENV:-}" ]]; then
 fi
 py=${AMBI_METAWORLD_PYTHON:-$PWD/environments/metaworld/python}
 export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-export WANDB_MODE=disabled
+export WANDB_MODE=online WANDB_DISABLE_CODE=true
 unset WANDB_RUN_ID WANDB_RESUME TDMPC2_EVAL_CSV
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
 export OPENBLAS_NUM_THREADS=$OMP_NUM_THREADS MKL_NUM_THREADS=$OMP_NUM_THREADS NUMEXPR_NUM_THREADS=$OMP_NUM_THREADS
@@ -78,10 +78,21 @@ drain=$((end_time - $(date +%s) - 900))
 
 mkdir -p "$cell/console"
 mkdir "$step_log"
+export WANDB_DIR="$cache_root/wandb" WANDB_CACHE_DIR="$cache_root/wandb-cache"
+export WANDB_DATA_DIR="$cache_root/wandb-data" WANDB_ARTIFACT_DIR="$cache_root/wandb-artifacts"
+mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$WANDB_DATA_DIR" "$WANDB_ARTIFACT_DIR"
+"$py" slurm/metaworld_campaign.py production-config \
+    --task "$task" --output "$step_log/ambi_state.json"
 status=0
 srun --unbuffered --output="$step_log/stdout.log" --error="$step_log/stderr.log" \
-    "$py" main.py --run "configs/metaworld/experiments/$task.json" \
-    --alg-dir configs/metaworld/algs --num-runs 1 \
+    "$py" -c '
+import os, runpy, torch
+torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
+torch.set_num_interop_threads(1)
+torch.set_float32_matmul_precision("high")
+runpy.run_path("main.py", run_name="__main__")
+' --run "configs/metaworld/experiments/$task.json" \
+    --alg-dir "$step_log" --num-runs 1 --resume-wandb-mode online \
     --lineage-dir "$lineage" --resume-mode "$mode" \
     --resume-checkpoint-minutes 30 --resume-checkpoint-steps 25000 --drain-after-seconds "$drain" || status=$?
 case "$status" in
