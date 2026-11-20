@@ -79,7 +79,9 @@ The Oscar launcher materializes a complete production recipe in each segment's
 console directory before launching. W&B reports to
 `rwgao_b-brown-university/ambi`, group `metaworld-tdmpc2-4task-s<seed>`,
 with a separate run identity per task. Event-indexed metrics are collected
-every 1,000 decisions and published as generations commit. Training uses PyTorch
+every 1,000 decisions and published as generations commit. The launcher selects
+W&B's core backend (`WANDB__REQUIRE_CORE=true`) with the pinned SDK, matching
+the working seed-55 deployment. Training uses PyTorch
 float32 matmul precision `high`, one interop thread, and one intraop thread
 per allocated CPU. A continuation
 uses the checkpointed W&B run ID. An explicit rollback branches with a fresh
