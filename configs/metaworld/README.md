@@ -50,11 +50,32 @@ at any earlier point. Evaluation returns and successes go into a separate CSV
 for each task/algorithm/seed. The ten-episode cadence and one-seed selection are
 setup choices, not claims that this four-task subset is an official benchmark.
 
-The manifests save `best` and `latest` model snapshots every 100,000 decisions;
-`best` uses rolling training return, not evaluation success. `latest` is also
-updated on clean completion. These are portable model snapshots, not an exact
-training-resume facility. Full replay/environment continuation and the
-DMC-specific paired-controller snapshot evaluator are not enabled.
+Each manifest keeps a numbered, portable model checkpoint every 25,000 agent
+decisions, aligned with evaluation. A completed run has 40 numbered
+checkpoints through decision 1,000,000. The matching metadata sidecar
+records the task and model configuration. The `latest` and `best` aliases
+are also retained; `best` uses rolling training return.
+
+For resumable training on Oscar, use
+[`slurm/run_metaworld_oscar.sbatch`](../../slurm/run_metaworld_oscar.sbatch).
+Array indices 0–3 correspond to Assembly, Hand-Insert, Push, and Stick-Pull.
+Submit from a clean checkout with `AMBI_PROJECT_DIR`, `AMBI_EXPECTED_COMMIT`,
+and `AMBI_METAWORLD_ROOT` exported. Place the campaign root and Slurm
+`--output` / `--error` files on shared storage outside the checkout. Supply
+the GPU, CPU, memory, and walltime requests for the measured workload.
+`AMBI_METAWORLD_PYTHON` can point to a separate install of the pinned runtime's
+launcher, and `AMBI_METAWORLD_NATIVE_ENV` can point to the site's native
+library environment script.
+
+All allocations for a task use the same `<campaign>/<task>/ambi_state/seed_55/lineage`.
+The trainer commits full training state (including replay) every 25,000
+decisions, on its 30-minute timer, and when draining at an episode boundary.
+It keeps the latest recovery generations separately from the historical
+evaluation checkpoints. Each segment has its own `evaluation.csv` and
+checkpoint directory under `lineage/segments/`. The launcher verifies the
+handoff before requeuing that array element and verifies the durable `DONE`
+record on completion. Resubmitting a single element under the same root
+opens its latest committed generation. Concurrent writers are rejected.
 
 ## Runtime and compatibility
 

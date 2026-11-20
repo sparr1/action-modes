@@ -13,8 +13,9 @@
   ],
   "logs": "none",
   "save_trials": "none",
-  "checkpoint_every": 100000,
+  "checkpoint_every": 25000,
   "save_strat": [
+    "all",
     "best",
     "latest"
   ],

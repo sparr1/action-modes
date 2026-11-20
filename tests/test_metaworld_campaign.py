@@ -190,6 +190,6 @@ def test_main_resolves_a_single_cell_without_mutating_the_base_recipe(
     assert captured["env_params"]["protocol"] == "metaworld-tdmpc2-04be337-state-final-success-v1"
     assert captured["params"] == json.loads(original)["alg_params"]
     assert captured["budget"] == {"total_timesteps": 1_000_000}
-    assert captured["checkpointing"]["save_freq"] == 100_000
-    assert set(captured["checkpointing"]["save_strat"]) == {"best", "latest"}
+    assert captured["checkpointing"]["save_freq"] == 25_000
+    assert set(captured["checkpointing"]["save_strat"]) == {"all", "best", "latest"}
     assert algorithm_path.read_bytes() == original
