@@ -1,5 +1,34 @@
 # Frozen-checkpoint AMBI research
 
+## Consecutive saved-controller evaluation
+
+`ambi_checkpoint_graph_eval_consecutive.json` evaluates the frozen prior mean
+and the saved fresh SAC controller's final mean for ten consecutive 500-decision
+episodes. Each checkpoint starts environment and controller streams at seed 55;
+ordinary episode resets advance those streams without reseeding. The saved
+controller's architecture and reductions are inherited, including five-head
+`mean_all` actor and `min_all` target reductions. Return-only logging omits
+diagnostic probes; compiled graph execution retains stochastic imagined
+learning, and outer checkpoint state must remain unchanged.
+
+`slurm/graph_checkpoint_campaign.py prepare --episode-sampling consecutive`
+creates the pinned checkpoint inventory and two publication registries. Use
+`--checkpoint-every 50000 --max-step 1000000` for the full 50k grid. Each GPU
+worker evaluates one paired checkpoint with W&B disabled. A separate CPU
+publisher owns each registry. `--owner hydra-rgao48` selects Hydra for newly
+created IDs; the default and historical campaigns remain `oscar-rgao48`.
+The owner is saved in the campaign and cannot change between planning and
+preparation. Do not relocate existing registries or resume an ID from another
+cluster.
+
+Consecutive sampling is the campaign CLI default; historical independent-seed
+evaluation requires explicit `--episode-sampling independent_seeds`.
+`slurm/run_q5_checkpoint_eval_hydra.sbatch` requests one GPU, one CPU and 8 GiB;
+set the measured walltime at submission and override the partition if needed.
+Its `smoke` mode runs the Q5 frozen-mean CUDA parity test and the campaign's
+W&B-disabled checkpoint smoke. The latter checks saved architecture loading,
+the exact inner update workload, paired starts, and unchanged outer state.
+
 The [joint entropy and prior-KL evaluation](ENTROPY_KL_EVAL.md) keeps automatic
 temperature learning enabled while testing two fixed prior-KL penalties on
 the same saved roots and sampled full episodes.

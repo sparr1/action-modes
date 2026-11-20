@@ -105,6 +105,11 @@ def validate_preset_matrix(matrix):
     _require_mapping(environment.get("params", {}), "environment.params")
 
     evaluation = _require_mapping(matrix.get("evaluation", {}), "evaluation")
+    from utils.evaluation_episodes import consecutive_protocol
+    try:
+        consecutive_protocol(evaluation)
+    except ValueError as exc:
+        raise PresetMatrixError(str(exc)) from exc
     if evaluation.get("execution_action", "mean") not in {"mean", "sample"}:
         raise PresetMatrixError("evaluation.execution_action must be 'mean' or 'sample'.")
     if "seeds" in evaluation:
@@ -186,13 +191,15 @@ def validate_preset_matrix(matrix):
                 variant.get("evaluation", {}),
                 f"comparisons.{comparison_name}.variants.{variant_name}.evaluation",
             )
-            if set(variant_evaluation) - {"execution_action"}:
+            if set(variant_evaluation) - {"execution_action", "execution_backend"}:
                 raise PresetMatrixError(
-                    "Variant evaluation overrides support only execution_action; "
+                    "Variant evaluation overrides support only execution_action and execution_backend; "
                     "episode seeds and budgets must remain paired."
                 )
             if variant_evaluation.get("execution_action", "mean") not in {"mean", "sample"}:
                 raise PresetMatrixError("Variant evaluation.execution_action must be 'mean' or 'sample'.")
+            if variant_evaluation.get("execution_backend", "native") not in {"native", "frozen_mean_cuda_graph_v1"}:
+                raise PresetMatrixError("Unsupported frozen evaluation execution_backend.")
             if "alg_params" in variant.get("run_params", {}):
                 raise PresetMatrixError(
                     f"{comparison_name}/{variant_name}.run_params cannot replace alg_params; "
