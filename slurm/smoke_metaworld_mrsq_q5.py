@@ -84,6 +84,25 @@ def finite_metrics(metrics, torch):
             assert bool(torch.isfinite(torch.as_tensor(value)).all()), f"Non-finite metric: {key}"
 
 
+def validate_graph_usage(rows, diagnostic_every, first_measured, last_measured):
+    """Match the engine's intentional native evaluation/diagnostic paths."""
+    assert diagnostic_every > 0
+    counts = {"training_graph": 0, "training_native_diagnostic": 0,
+              "evaluation_native": 0, "measured_training_graph": 0}
+    for row in rows:
+        diagnostic = row["step"] % diagnostic_every == 0
+        scope = ("evaluation_native" if row["evaluation"] else
+                 "training_native_diagnostic" if diagnostic else "training_graph")
+        used = float(row["metrics"]["inner_cuda_graph_used"])
+        expected = float(scope == "training_graph")
+        assert used == expected, f"Unexpected graph usage for {scope} at step {row['step']}: {used}"
+        counts[scope] += 1
+        if not row["evaluation"] and first_measured <= row["step"] <= last_measured:
+            assert used == 1, "Timed training must use the whole-inner CUDA graph"
+            counts["measured_training_graph"] += 1
+    return counts
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path, help="New directory outside source")
@@ -205,6 +224,17 @@ def main(argv=None):
         learner._evaluate_policy, learner._record_evaluation = observed_evaluate, observed_record
         learner.learn(run["total_steps"])
         compile_counts["after"] = int(torch._dynamo.utils.counters["stats"]["unique_graphs"])
+        # Preserve completed timing even if a later gate fails. This file is
+        # explicitly unvalidated and cannot authorize production; only the
+        # final results.json below carries passed=true.
+        with (output / "measurements.json").open("x") as stream:
+            json.dump({"passed": False, "validation": "pending", "source": binding,
+                       "measured": timer.result, "startup": startup,
+                       "compile_graph_counts": compile_counts,
+                       "evaluations_before_final_gate": evaluations,
+                       "created_utc": datetime.now(timezone.utc).isoformat()},
+                      stream, indent=2, allow_nan=False)
+            stream.write("\n")
         assert compile_counts["before"] == compile_counts["after"], "Compilation occurred in timed window"
         assert timer.result is not None
         assert len([r for r in inner_rows if not r["evaluation"]]) == WARMUP + MEASURED
@@ -215,6 +245,10 @@ def main(argv=None):
         # This is outside the throughput window and uses no extra training.
         learner._evaluate_policy(learner._global_step)
         assert [r["step"] for r in evaluations] == [0, 1000, 1201]
+        graph_usage = validate_graph_usage(inner_rows, cfg.inner_diagnostics_every,
+                                          timer.first_step, timer.last_step)
+        assert graph_usage == {"training_graph": 200, "training_native_diagnostic": 0,
+                               "evaluation_native": 300, "measured_training_graph": 100}
         for row in inner_rows:
             metrics = row["metrics"]
             finite_metrics(metrics, torch)
@@ -222,7 +256,6 @@ def main(argv=None):
             assert float(metrics["inner_actor_optimizer_steps"]) == 32
             assert float(metrics["inner_temperature_optimizer_steps"]) == 0
             assert float(metrics["inner_compile_fallback"]) == 0
-            assert float(metrics["inner_cuda_graph_used"]) == 1
         for row in outer_rows:
             finite_metrics(row["metrics"], torch)
             assert float(row["metrics"]["compile_fallback"]) == 0
@@ -244,6 +277,7 @@ def main(argv=None):
             "peak_gpu_allocated_bytes": torch.cuda.max_memory_allocated(),
             "peak_gpu_reserved_bytes": torch.cuda.max_memory_reserved(), "compile_graph_counts": compile_counts,
             "compile_fallback": False, "inner_cuda_graph_used": True, "finite_actions_model_metrics": True,
+            "graph_usage_counts": graph_usage,
             "critic_updates_per_action": 128, "actor_updates_per_action": 32,
             "q5_reductions": REDUCTIONS, "num_q": 5, "q_pair_size": 5,
             "critic_geometry_diagnostics": True, "production_overrides": overrides,
