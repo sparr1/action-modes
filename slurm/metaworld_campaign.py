@@ -28,13 +28,18 @@ def read_json(path):
     return json.loads(Path(path).read_text(), object_pairs_hook=_unique_object)
 
 
-def production_algorithm(task, seed=55):
+def production_algorithm(task, seed=55, variant="baseline"):
     """Resolve the W&B identity for one authorized, resumable training cell."""
     if task not in TASKS:
         raise ValueError(f"Unknown campaign task: {task!r}")
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         raise ValueError("seed must be a non-negative integer.")
-    run = read_json(CONFIG_ROOT / "algs/ambi_state.json")
+    if variant not in ("baseline", "mrsq_q5"):
+        raise ValueError(f"Unknown campaign variant: {variant!r}")
+    if variant == "mrsq_q5" and task != "assembly":
+        raise ValueError("The mrsq_q5 variant is prepared for assembly only.")
+    name = "ambi_state" if variant == "baseline" else "ambi_state_mrsq_q5"
+    run = read_json(CONFIG_ROOT / "algs" / f"{name}.json")
     validate_algorithm(run)
     if run["seed"] != 55:
         raise ValueError("The s55 production campaign requires seed 55.")
@@ -47,6 +52,14 @@ def production_algorithm(task, seed=55):
         wandb_run_name=f"Meta-World {title} | AMBI post-tanh | seed{seed}",
         wandb_tags=[f"metaworld-tdmpc2-4task-s{seed}", "metaworld", "tdmpc2-04be337", "post-tanh", "sampled", task, f"seed{seed}"],
     )
+    if variant == "mrsq_q5":
+        group = f"metaworld-assembly-mrsq-q5-s{seed}"
+        run["alg_params"].update(
+            wandb_group=group,
+            wandb_run_name=f"Meta-World {title} | Q5 actor mean / target min | seed{seed}",
+            wandb_tags=[group, "metaworld", "tdmpc2-04be337", "post-tanh", "sampled",
+                        task, f"seed{seed}", "mrsq-q5", "mean_all", "min_all"],
+        )
     return run
 
 
@@ -173,6 +186,7 @@ def main(argv=None):
     production = commands.add_parser("production-config", help="Materialize one online training recipe")
     production.add_argument("--task", choices=TASKS, required=True)
     production.add_argument("--seed", type=int, default=55)
+    production.add_argument("--variant", choices=("baseline", "mrsq_q5"), default="baseline")
     production.add_argument("--output", type=Path, required=True)
     create = commands.add_parser("prepare", help="Write a fresh config directory; never execute jobs")
     create.add_argument("--algorithm-config", type=Path, action="append", required=True)
@@ -184,7 +198,7 @@ def main(argv=None):
     create.add_argument("--dry-run", action="store_true", help="Print the plan without writing files")
     args = parser.parse_args(argv)
     if args.command == "production-config":
-        run = production_algorithm(args.task, seed=args.seed)
+        run = production_algorithm(args.task, seed=args.seed, variant=args.variant)
         with args.output.open("x") as stream:
             json.dump(run, stream, indent=2, allow_nan=False)
             stream.write("\n")

@@ -103,6 +103,37 @@ after resolving the cause, resubmit the same task and seed under the same root
 to restore its durable `LATEST` generation. A different seed uses a separate
 lineage and W&B identity, without modifying the seed-55 run.
 
+## Assembly with Q5 actor mean and target minimum
+
+The explicit [Q5 Assembly recipe](algs/ambi_state_mrsq_q5.json) changes the
+baseline's random-pair reductions to use all five critics: `q_pair_size=5`,
+inner and outer actors use `mean_all`, and inner/outer targets and terminal
+Q use `min_all`. All other scientific settings remain the Assembly baseline,
+including sampled training actions, entropy coefficient 0.0004, discount
+0.95, the H3/J8 planner, 1M decisions, critic geometry diagnostics, and ten
+online evaluation episodes every 25k decisions.
+
+Submit only Assembly (`--array=0`) with `AMBI_METAWORLD_VARIANT=mrsq_q5`
+and an explicit seed (55 for the initial comparison), using the existing Oscar
+launcher and a new campaign root. The launcher selects
+[`assembly_mrsq_q5.json`](experiments/assembly_mrsq_q5.json) and saves the full
+recovery lineage under `<campaign>/assembly/ambi_state_mrsq_q5/seed_<seed>/lineage`.
+This is a fresh training variant, not a mutation or continuation of the original
+Assembly policy. It uses the same full-state recovery and verified walltime
+handoff behavior described above. The default `baseline` variant retains the
+existing configuration, output layout, and W&B identities.
+
+Preview the exact production recipe without creating a run:
+
+```bash
+python3 slurm/metaworld_campaign.py production-config \
+  --task assembly --seed 55 --variant mrsq_q5 \
+  --output /absolute/new/path/ambi_state_mrsq_q5.json
+```
+
+The Q5 variant is currently prepared only for Assembly. The launcher rejects
+other task indices or unknown variant names before creating a lineage.
+
 ## Runtime and compatibility
 
 The [isolated runtime](../../environments/metaworld/README.md) uses the

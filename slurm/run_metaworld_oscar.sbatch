@@ -26,6 +26,16 @@ seed=${AMBI_METAWORLD_SEED-55}
     echo "AMBI_METAWORLD_SEED must be a non-negative integer without leading zeros" >&2
     exit 1
 }
+variant=${AMBI_METAWORLD_VARIANT-baseline}
+case "$variant" in
+    baseline) config_name=ambi_state; manifest="configs/metaworld/experiments/$task.json" ;;
+    mrsq_q5)
+        [[ "$task" == assembly ]] || { echo "mrsq_q5 is prepared for assembly only" >&2; exit 1; }
+        config_name=ambi_state_mrsq_q5
+        manifest=configs/metaworld/experiments/assembly_mrsq_q5.json
+        ;;
+    *) echo "Unknown AMBI_METAWORLD_VARIANT: $variant" >&2; exit 1 ;;
+esac
 
 cd "$AMBI_PROJECT_DIR"
 [[ "$(git rev-parse HEAD)" == "$AMBI_EXPECTED_COMMIT" ]]
@@ -33,7 +43,7 @@ cd "$AMBI_PROJECT_DIR"
 [[ "$AMBI_METAWORLD_ROOT" == /* ]]
 root=$(realpath -m "$AMBI_METAWORLD_ROOT")
 [[ "$root" != "$PWD" && "$root" != "$PWD/"* ]]
-cell="$root/$task/ambi_state/seed_$seed"
+cell="$root/$task/$config_name/seed_$seed"
 lineage="$cell/lineage"
 mkdir -p "$cell"
 exec 9>"$cell/launcher.lock"
@@ -87,7 +97,7 @@ export WANDB_DIR="$cache_root/wandb" WANDB_CACHE_DIR="$cache_root/wandb-cache"
 export WANDB_DATA_DIR="$cache_root/wandb-data" WANDB_ARTIFACT_DIR="$cache_root/wandb-artifacts"
 mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$WANDB_DATA_DIR" "$WANDB_ARTIFACT_DIR"
 "$py" slurm/metaworld_campaign.py production-config \
-    --task "$task" --seed "$seed" --output "$step_log/ambi_state.json"
+    --task "$task" --seed "$seed" --output "$step_log/$config_name.json" --variant "$variant"
 status=0
 srun --unbuffered --output="$step_log/stdout.log" --error="$step_log/stderr.log" \
     "$py" -c '
@@ -96,7 +106,7 @@ torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
 torch.set_num_interop_threads(1)
 torch.set_float32_matmul_precision("high")
 runpy.run_path("main.py", run_name="__main__")
-' --run "configs/metaworld/experiments/$task.json" \
+' --run "$manifest" \
     --alg-dir "$step_log" --num-runs 1 --resume-wandb-mode online \
     --lineage-dir "$lineage" --resume-mode "$mode" \
     --resume-checkpoint-minutes 30 --resume-checkpoint-steps 25000 --drain-after-seconds "$drain" || status=$?
