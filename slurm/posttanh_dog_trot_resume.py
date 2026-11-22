@@ -75,7 +75,7 @@ def train(args):
     runpy.run_path(str(ROOT / "main.py"), run_name="__main__")
 
 
-def benchmark_worker(args):
+def benchmark_worker(args, *, manifest_path=MANIFEST, measure_resume_storage=False):
     import resource
     from slurm.ambi_transfer_training import binding, recipe, write_new
     from slurm.benchmark_ambi_training_cpu import TrainingWindow
@@ -91,8 +91,9 @@ def benchmark_worker(args):
     torch.set_num_threads(len(cpus))
     torch.set_num_interop_threads(1)
     execution = accelerated_runtime()
-    name, manifest, run = recipe(args.index, MANIFEST)
+    name, manifest, run = recipe(args.index, manifest_path)
     run, manifest = deepcopy(run), deepcopy(manifest)
+    full_steps = run["total_steps"]
     graph_enabled = not args.native_reference
     overrides = {"wandb": False, "wandb_mode": "disabled", "seed_steps": 500,
                  "pretrain_steps": 2, "inner_cuda_graph": graph_enabled}
@@ -185,6 +186,7 @@ def benchmark_worker(args):
         if graph_enabled:
             from tests.test_inner_entropy_graph import assert_graph_resume_continuation
             assert_graph_resume_continuation(agent)
+        resume_storage = {}
         with tempfile.TemporaryDirectory(prefix="prior-entropy-checkpoint-") as temp:
             checkpoint = Path(learner.save(temp, "checkpoint"))
             learner.flush_checkpoints()
@@ -198,6 +200,28 @@ def benchmark_worker(args):
             if cfg.inner_actor_loss_scale_scope == "run":
                 torch.testing.assert_close(engine._carried_actor_loss_scale,
                                            inner_state["actor_loss_scale_carry"], rtol=0, atol=0)
+            if measure_resume_storage:
+                from utils.resume_training import DEFAULT_REPLAY_SHARD_ROWS
+
+                trainer_file, metadata_file, shard_file = (Path(temp) / filename for filename in
+                                                           ("trainer.pt", "metadata.pt", "shard.pt"))
+                buffer = learner.buffer
+                replay_metadata = buffer.training_state_metadata()
+                shard = buffer.training_state_shard(0, max_rows=DEFAULT_REPLAY_SHARD_ROWS)
+                torch.save(agent.training_state_dict(), trainer_file)
+                torch.save(replay_metadata, metadata_file)
+                torch.save(shard, shard_file)
+                bytes_per_row = sum(value[0].numel() * value.element_size() for value in shard["fields"].values())
+                archive_overhead = shard_file.stat().st_size - (shard["stop"] - shard["start"]) * bytes_per_row
+                capacity = min(run["alg_params"]["buffer_size"], full_steps)
+                max_shards = math.ceil(capacity / DEFAULT_REPLAY_SHARD_ROWS)
+                resume_storage = {"trainer_agent_bytes": trainer_file.stat().st_size,
+                                  "replay_metadata_measured_bytes": metadata_file.stat().st_size,
+                                  "replay_tensor_bytes_per_row": bytes_per_row,
+                                  "replay_archive_overhead_measured_bytes": archive_overhead,
+                                  "replay_full_capacity": capacity,
+                                  "replay_max_shards": max_shards,
+                                  "replay_full_estimated_bytes": capacity * bytes_per_row + max_shards * archive_overhead}
             saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
             agent.load(checkpoint)
             for key, value in agent.model.state_dict().items():
@@ -205,7 +229,7 @@ def benchmark_worker(args):
             torch.testing.assert_close(agent.actor_loss_scale, scale, rtol=0, atol=0)
         report = {"passed": True, "index": args.index, "name": name,
                   "physical_cpus": len(cpus), "runtime": execution,
-                  "binding": binding(MANIFEST), "measured": timer.result,
+                  "binding": binding(manifest_path), "measured": timer.result,
                   "checkpoint_bytes": size, "checkpoint_roundtrip": True,
                   "checkpoint_scale_roundtrip": True, "checkpoint_sidecar": True,
                   "compile_counts": graph_counts, "compile_fallback": False,
@@ -217,7 +241,8 @@ def benchmark_worker(args):
                   "seconds": time.perf_counter() - started,
                   "peak_host_memory_bytes": int((resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
                       + resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss) * (1 if sys.platform == "darwin" else 1024)),
-                  "benchmark_overrides": {**overrides, "total_steps": total}, "wandb": False}
+                  "benchmark_overrides": {**overrides, "total_steps": total}, "wandb": False,
+                  **({"resume_storage": resume_storage} if measure_resume_storage else {})}
         write_new(args.output, report)
     finally:
         if learner is not None:

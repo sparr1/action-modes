@@ -1,0 +1,27 @@
+{
+  "study_type": "mrsq_q10_suite",
+  "study_note": "One seed-55 AMBI Humanoid Run run matching the task-specific Q5 learner with ten critics. Use min over all critics for inner/outer targets and terminal bootstrap, mean over all critics for both actors, and no critic subset sampling. Preserve 1M decisions, sampled H3/J8/K1, N128/C16/A4/B256, fixed joint post-tanh entropy 0.0021, all 25k checkpoints and critic geometry every 1k outer updates.",
+  "overrides_alg": {
+    "device": "cuda",
+    "env": "DMControl-v0",
+    "total_steps": 1000000,
+    "episodes": null
+  },
+  "env_params": {
+    "task": "humanoid-run",
+    "obs": "state",
+    "render_mode": null
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_humanoid_run_mrsq_q10_seed55"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": "all",
+  "log_info": false,
+  "log_type": "summary",
+  "name": "Humanoid Run - MRS.Q reductions - Q10 - seed 55",
+  "description": "One seed-55 AMBI Humanoid Run run matching the task-specific Q5 learner with ten critics. Use min over all critics for inner/outer targets and terminal bootstrap, mean over all critics for both actors, and no critic subset sampling. Preserve 1M decisions, sampled H3/J8/K1, N128/C16/A4/B256, fixed joint post-tanh entropy 0.0021, all 25k checkpoints and critic geometry every 1k outer updates."
+}
