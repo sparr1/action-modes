@@ -92,7 +92,7 @@ def test_real_wandb_adapter_receives_new_variant_identity_without_network(tmp_pa
         run.abort()
 
 
-@pytest.mark.parametrize("variant", ["", "mrsq-q5", "mrsq_q10", "../baseline"])
+@pytest.mark.parametrize("variant", ["", "mrsq-q5", "mrsq_q15", "../baseline"])
 def test_unknown_variant_is_rejected_before_config_output(tmp_path, variant):
     with pytest.raises(ValueError):
         production_algorithm("assembly", variant=variant)
@@ -103,30 +103,33 @@ def test_unknown_variant_is_rejected_before_config_output(tmp_path, variant):
     assert not output.parent.exists()
 
 
+@pytest.mark.parametrize("variant", [VARIANT, "mrsq_q10"])
 @pytest.mark.parametrize("task", ["hand-insert", "push", "stick-pull"])
-def test_q5_other_tasks_are_rejected_before_config_output(tmp_path, task):
+def test_ensemble_variants_reject_other_tasks_before_config_output(tmp_path, task, variant):
     with pytest.raises(ValueError):
-        production_algorithm(task, variant=VARIANT)
+        production_algorithm(task, variant=variant)
     output = tmp_path / "not-created" / "config.json"
     with pytest.raises(ValueError):
-        main(["production-config", "--task", task, "--variant", VARIANT,
+        main(["production-config", "--task", task, "--variant", variant,
               "--output", str(output)])
     assert not output.parent.exists()
 
 
-def test_q5_launcher_uses_new_lineage_then_resumes_it_without_touching_baseline(launch):
+@pytest.mark.parametrize("variant", [VARIANT, "mrsq_q10"])
+def test_ensemble_launcher_uses_new_lineage_then_resumes_it_without_touching_baseline(launch, variant):
     run, default_lineage = launch
     campaign = default_lineage.parents[3]
     baseline = campaign / "assembly/ambi_state/seed_55/lineage"
     baseline.mkdir(parents=True)
     (baseline / "LATEST").write_text("existing-baseline-generation")
-    lineage = campaign / f"assembly/{ALGORITHM}/seed_55/lineage"
-    overrides = dict(AMBI_METAWORLD_VARIANT=VARIANT, SLURM_ARRAY_TASK_ID="0")
+    algorithm = f"ambi_state_{variant}"
+    lineage = campaign / f"assembly/{algorithm}/seed_55/lineage"
+    overrides = dict(AMBI_METAWORLD_VARIANT=variant, SLURM_ARRAY_TASK_ID="0")
     status, calls = run(**overrides)
     assert status == 0
-    assert "--variant mrsq_q5" in calls
-    assert f"/{ALGORITHM}.json" in calls
-    assert "--run configs/metaworld/experiments/assembly_mrsq_q5.json" in calls
+    assert f"--variant {variant}" in calls
+    assert f"/{algorithm}.json" in calls
+    assert f"--run configs/metaworld/experiments/assembly_{variant}.json" in calls
     assert f"--lineage-dir {lineage} --resume-mode new" in calls
     assert "--resume-checkpoint-steps 25000" in calls and "--resume-checkpoint-minutes 30" in calls
     assert "--num-runs 1" in calls and "--trial-index" not in calls
@@ -143,7 +146,8 @@ def test_q5_launcher_uses_new_lineage_then_resumes_it_without_touching_baseline(
 
 
 @pytest.mark.parametrize("variant,index", [("invalid", "0"), ("../baseline", "0"),
-                                           (VARIANT, "1"), (VARIANT, "2"), (VARIANT, "3")])
+                                           (VARIANT, "1"), (VARIANT, "2"), (VARIANT, "3"),
+                                           ("mrsq_q10", "1")])
 def test_invalid_launcher_variant_or_task_fails_before_any_write(launch, variant, index):
     run, default_lineage = launch
     status, calls = run(AMBI_METAWORLD_VARIANT=variant, SLURM_ARRAY_TASK_ID=index)
@@ -191,8 +195,26 @@ def test_resolved_metaworld_ensemble_uses_all_heads_without_subset_sampling(monk
         env.close()
 
 
+def test_q10_recipe_changes_only_ensemble_size_and_uses_its_own_wandb_group():
+    q5 = production_algorithm("assembly", variant=VARIANT)
+    q10 = production_algorithm("assembly", variant="mrsq_q10")
+    expected = {k: v for k, v in q5["alg_params"].items() if not k.startswith("wandb")}
+    expected.update(num_q=10, q_pair_size=10)
+    assert {k: v for k, v in q10["alg_params"].items() if not k.startswith("wandb")} == expected
+    assert q10["alg_params"]["wandb_group"] == "metaworld-assembly-mrsq-q10-s55"
+    q5_manifest = read_json(CONFIG_ROOT / "experiments/assembly_mrsq_q5.json")
+    q10_manifest = read_json(CONFIG_ROOT / "experiments/assembly_mrsq_q10.json")
+    for name in ("study_type", "study_note", "configs"):
+        q5_manifest.pop(name)
+    assert q10_manifest.pop("configs") == ["ambi_state_mrsq_q10"]
+    for name in ("study_type", "study_note"):
+        q10_manifest.pop(name)
+    assert q10_manifest == q5_manifest
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires scheduled CUDA GPU")
-def test_cuda_full_ensemble_metaworld_capture_matches_native_solve(monkeypatch):
+@pytest.mark.parametrize("heads", [5, 10])
+def test_cuda_full_ensemble_metaworld_capture_matches_native_solve(monkeypatch, heads):
     from RL.tdmpc2_core.ambi_agent import AMBITDMPC2Agent
     from tests import test_inner_entropy_graph as checks
 
@@ -206,9 +228,10 @@ def test_cuda_full_ensemble_metaworld_capture_matches_native_solve(monkeypatch):
         cfg.obs_shapes = [{"state": (39,)}]
         cfg.ent_coef = cfg.inner_temperature = 0.0004
         cfg.target_entropy = cfg.inner_target_entropy = -4.
-        cfg.num_q = 5
+        cfg.num_q = heads
         for key, value in CHANGES.items():
             setattr(cfg, key, value)
+        cfg.q_pair_size = heads
         cfg.device = device
         cfg.compile = cfg.compile_strict = compiled
         agent = AMBITDMPC2Agent(cfg)

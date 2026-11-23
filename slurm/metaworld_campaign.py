@@ -13,6 +13,7 @@ TASKS = ("assembly", "hand-insert", "push", "stick-pull")
 ACTION_REPEAT = 2
 EPISODE_DECISIONS = 100
 PROTOCOL = "metaworld-tdmpc2-04be337-state-final-success-v1"
+ENSEMBLE_VARIANTS = {"mrsq_q5": 5, "mrsq_q10": 10}
 
 
 def _unique_object(pairs):
@@ -34,11 +35,11 @@ def production_algorithm(task, seed=55, variant="baseline"):
         raise ValueError(f"Unknown campaign task: {task!r}")
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         raise ValueError("seed must be a non-negative integer.")
-    if variant not in ("baseline", "mrsq_q5"):
+    if variant != "baseline" and variant not in ENSEMBLE_VARIANTS:
         raise ValueError(f"Unknown campaign variant: {variant!r}")
-    if variant == "mrsq_q5" and task != "assembly":
-        raise ValueError("The mrsq_q5 variant is prepared for assembly only.")
-    name = "ambi_state" if variant == "baseline" else "ambi_state_mrsq_q5"
+    if variant in ENSEMBLE_VARIANTS and task != "assembly":
+        raise ValueError(f"The {variant} variant is prepared for assembly only.")
+    name = "ambi_state" if variant == "baseline" else f"ambi_state_{variant}"
     run = read_json(CONFIG_ROOT / "algs" / f"{name}.json")
     validate_algorithm(run)
     if run["seed"] != 55:
@@ -52,13 +53,15 @@ def production_algorithm(task, seed=55, variant="baseline"):
         wandb_run_name=f"Meta-World {title} | AMBI post-tanh | seed{seed}",
         wandb_tags=[f"metaworld-tdmpc2-4task-s{seed}", "metaworld", "tdmpc2-04be337", "post-tanh", "sampled", task, f"seed{seed}"],
     )
-    if variant == "mrsq_q5":
-        group = f"metaworld-assembly-mrsq-q5-s{seed}"
+    if variant in ENSEMBLE_VARIANTS:
+        heads = ENSEMBLE_VARIANTS[variant]
+        variant_tag = f"mrsq-q{heads}"
+        group = f"metaworld-assembly-{variant_tag}-s{seed}"
         run["alg_params"].update(
             wandb_group=group,
-            wandb_run_name=f"Meta-World {title} | Q5 actor mean / target min | seed{seed}",
+            wandb_run_name=f"Meta-World {title} | Q{heads} actor mean / target min | seed{seed}",
             wandb_tags=[group, "metaworld", "tdmpc2-04be337", "post-tanh", "sampled",
-                        task, f"seed{seed}", "mrsq-q5", "mean_all", "min_all"],
+                        task, f"seed{seed}", variant_tag, "mean_all", "min_all"],
         )
     return run
 
@@ -186,7 +189,7 @@ def main(argv=None):
     production = commands.add_parser("production-config", help="Materialize one online training recipe")
     production.add_argument("--task", choices=TASKS, required=True)
     production.add_argument("--seed", type=int, default=55)
-    production.add_argument("--variant", choices=("baseline", "mrsq_q5"), default="baseline")
+    production.add_argument("--variant", choices=("baseline", *ENSEMBLE_VARIANTS), default="baseline")
     production.add_argument("--output", type=Path, required=True)
     create = commands.add_parser("prepare", help="Write a fresh config directory; never execute jobs")
     create.add_argument("--algorithm-config", type=Path, action="append", required=True)

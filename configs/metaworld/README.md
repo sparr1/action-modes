@@ -134,6 +134,19 @@ python3 slurm/metaworld_campaign.py production-config \
 The Q5 variant is currently prepared only for Assembly. The launcher rejects
 other task indices or unknown variant names before creating a lineage.
 
+## Assembly with Q10 actor mean and target minimum
+
+The [Q10 Assembly recipe](algs/ambi_state_mrsq_q10.json) increases both the
+ensemble and the full-ensemble reduction size to ten. It uses the same
+Assembly training settings and ten-episode online evaluation at 25k decisions.
+Submit Assembly (`--array=0`) with `AMBI_METAWORLD_VARIANT=mrsq_q10` and a new
+shared-scratch campaign root. Its full-state lineage is
+`<campaign>/assembly/ambi_state_mrsq_q10/seed_<seed>/lineage`.
+
+Before production, run the scheduled L40S check in
+`slurm/smoke_metaworld_mrsq_q5.py` with `--variant mrsq_q10`.
+Use its compiled training and native evaluation timings to size the allocation.
+
 ## Runtime and compatibility
 
 The [isolated runtime](../../environments/metaworld/README.md) uses the

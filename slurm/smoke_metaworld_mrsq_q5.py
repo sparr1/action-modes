@@ -1,4 +1,4 @@
-"""W&B-disabled Assembly Q5 training, evaluation, and throughput gate.
+"""W&B-disabled Assembly full-ensemble training, evaluation, and throughput gate.
 
 Run on one scheduled GPU/CPU from a clean, pinned checkout. The production
 seed/pretraining budget and scientific settings are retained. Only the smoke
@@ -27,6 +27,7 @@ from slurm.metaworld_campaign import PROTOCOL, read_json, validate_algorithm
 
 ALGORITHM = ROOT / "configs/metaworld/algs/ambi_state_mrsq_q5.json"
 MANIFEST = ROOT / "configs/metaworld/experiments/assembly_mrsq_q5.json"
+ENSEMBLE_SIZES = {"mrsq_q5": 5, "mrsq_q10": 10}
 WARMUP = MEASURED = 100
 REDUCTIONS = {
     "outer_q_actor_reduction": "mean_all",
@@ -37,24 +38,36 @@ REDUCTIONS = {
 }
 
 
-def source_binding():
+def recipe_paths(variant):
+    num_q = ENSEMBLE_SIZES[variant]
+    if num_q == 5:
+        return ALGORITHM, MANIFEST
+    return (ALGORITHM.with_name(f"ambi_state_mrsq_q{num_q}.json"),
+            MANIFEST.with_name(f"assembly_mrsq_q{num_q}.json"))
+
+
+def source_binding(variant="mrsq_q5"):
     def git(*args):
         return subprocess.check_output(["git", *args], cwd=ROOT, text=True).strip()
 
     assert not git("status", "--porcelain", "--untracked-files=all"), "Dirty source checkout"
     commit = git("rev-parse", "HEAD")
     expected = os.environ.get("AMBI_EXPECTED_COMMIT")
+    if variant == "mrsq_q10":
+        assert expected, "Pin AMBI_EXPECTED_COMMIT for the Q10 gate"
     assert expected is None or commit == expected, "Unexpected source commit"
+    paths = (*recipe_paths(variant), Path(__file__).resolve())
     return {"commit": commit, "tree": git("rev-parse", "HEAD^{tree}"), "clean": True,
             "files": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
-                      for p in (ALGORITHM, MANIFEST, Path(__file__).resolve())}}
+                      for p in paths}}
 
 
-def recipe(output):
+def recipe(output, variant="mrsq_q5"):
     """Derive an explicitly bounded smoke from the versioned production recipe."""
-    run, manifest = deepcopy(read_json(ALGORITHM)), deepcopy(read_json(MANIFEST))
+    algorithm_path, manifest_path = recipe_paths(variant)
+    run, manifest = deepcopy(read_json(algorithm_path)), deepcopy(read_json(manifest_path))
     validate_algorithm(run)
-    assert manifest["configs"] == ["ambi_state_mrsq_q5"]
+    assert manifest["configs"] == [algorithm_path.stem]
     assert not manifest.get("overrides_alg"), "Unexpected shallow manifest override"
     assert manifest["env_params"] == {
         "task": "assembly", "obs": "state", "render_mode": None, "protocol": PROTOCOL,
@@ -62,7 +75,7 @@ def recipe(output):
     params = run["alg_params"]
     assert run["seed"] == 55 and run["total_steps"] == 1_000_000
     assert params["seed_steps"] == params["pretrain_steps"] == 1000
-    assert params["num_q"] == params["q_pair_size"] == 5
+    assert params["num_q"] == params["q_pair_size"] == ENSEMBLE_SIZES[variant]
     assert all(params[key] == value for key, value in REDUCTIONS.items())
     assert params["critic_geometry_diagnostics"] is True
     assert params["wandb"] is False and params["wandb_mode"] == "disabled"
@@ -106,13 +119,15 @@ def validate_graph_usage(rows, diagnostic_every, first_measured, last_measured):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path, help="New directory outside source")
+    parser.add_argument("--variant", choices=ENSEMBLE_SIZES, default="mrsq_q5")
     args = parser.parse_args(argv)
+    num_q = ENSEMBLE_SIZES[args.variant]
     assert os.environ.get("SLURM_JOB_ID"), "Use a scheduled GPU allocation"
     assert int(os.environ.get("SLURM_CPUS_PER_TASK", "0")) == 1, "Gate requires one CPU"
     assert os.environ.get("WANDB_MODE") == "disabled", "Smoke must never create a W&B run"
     output = args.output.resolve()
     assert output != ROOT and ROOT not in output.parents, "Keep smoke output outside source"
-    binding = source_binding()
+    binding = source_binding(args.variant)
     cpus = physical_core_cpus(os.sched_getaffinity(0))
     assert cpus, "No allocated physical CPU"
     cpu = cpus[0]
@@ -121,7 +136,7 @@ def main(argv=None):
         os.environ[key] = "1"
     os.environ.update(OMP_DYNAMIC="FALSE", MKL_DYNAMIC="FALSE", TORCHINDUCTOR_COMPILE_THREADS="1")
     output.mkdir(parents=True, exist_ok=False)
-    run, manifest, overrides = recipe(output)
+    run, manifest, overrides = recipe(output, args.variant)
 
     import torch
     import gymnasium as gym
@@ -132,20 +147,24 @@ def main(argv=None):
     torch.set_num_interop_threads(1)
     torch.set_float32_matmul_precision("high")
     assert torch.cuda.is_available(), "CUDA GPU required"
+    gpu = torch.cuda.get_device_name()
+    if num_q == 10:
+        assert gpu == "NVIDIA L40S", f"Q10 Assembly production sizing requires L40S, received {gpu}"
     env = gym.make(run["env"], **manifest["env_params"])
     learner = None
     started = time.perf_counter()
     try:
         assert env.observation_space.shape == (39,) and env.action_space.shape == (4,)
-        learner = AMBITDMPC2("assembly-mrsq-q5-smoke", env, run["alg_params"], run, manifest)
+        assert env.unwrapped.action_repeat == 2 and env.spec.max_episode_steps == 100
+        learner = AMBITDMPC2(f"assembly-mrsq-q{num_q}-smoke", env, run["alg_params"], run, manifest)
         # Match full-state-resume production replay placement, while the
         # tracker has no save strategy and therefore writes no checkpoints.
         learner.set_checkpointing(25_000, str(output / "checkpointing-disabled"),
-                                  "assembly-q5-smoke", save_strat="none", checkpoint_replay=True)
+                                  f"assembly-q{num_q}-smoke", save_strat="none", checkpoint_replay=True)
         cfg, agent = learner.cfg, learner.agent
         assert cfg.compile and cfg.compile_strict and cfg.inner_cuda_graph
         assert cfg.critic_ensemble_backend == "vmap" and cfg.utd == 1
-        assert cfg.num_q == cfg.q_pair_size == 5
+        assert cfg.num_q == cfg.q_pair_size == num_q
         assert all(getattr(cfg, key) == value for key, value in REDUCTIONS.items())
         assert cfg.seed_steps == cfg.pretrain_steps == 1000
         assert (cfg.inner_rounds, cfg.inner_rollout_horizon, cfg.inner_solve_interval) == (8, 3, 1)
@@ -232,6 +251,7 @@ def main(argv=None):
                        "measured": timer.result, "startup": startup,
                        "compile_graph_counts": compile_counts,
                        "evaluations_before_final_gate": evaluations,
+                       "num_q": num_q,
                        "created_utc": datetime.now(timezone.utc).isoformat()},
                       stream, indent=2, allow_nan=False)
             stream.write("\n")
@@ -264,12 +284,20 @@ def main(argv=None):
         assert learner._wandb_run is None and not list(output.rglob("*.pt"))
         assert torch.get_num_threads() == torch.get_num_interop_threads() == 1
         assert os.sched_getaffinity(0) == {cpu}
+        extra_checks = {}
+        if num_q == 10:
+            from slurm.inner_entropy_oscar import check_geometry
+            from tests.test_inner_entropy_graph import assert_graph_resume_continuation
+
+            extra_checks["critic_geometry"] = check_geometry(agent, learner.buffer)
+            assert_graph_resume_continuation(agent)
+            extra_checks["graph_native_graph_continuation"] = True
         measured = dict(timer.result)
         measured["projected_1m_training_hours"] = measured["seconds_per_decision"] * 1e6 / 3600
         report = {
             "passed": True, "source": binding, "runtime": {"python": sys.version.split()[0],
                 "executable": sys.executable, "torch": torch.__version__, "cuda": torch.version.cuda,
-                "gpu": torch.cuda.get_device_name(), "float32_matmul_precision": torch.get_float32_matmul_precision()},
+                "gpu": gpu, "float32_matmul_precision": torch.get_float32_matmul_precision()},
             "slurm_job_id": os.environ["SLURM_JOB_ID"], "host": os.uname().nodename,
             "physical_cores": 1, "logical_cpu_ids": [cpu], "warmup_active_decisions": WARMUP,
             "measured": measured, "startup": startup, "evaluations": evaluations,
@@ -279,17 +307,18 @@ def main(argv=None):
             "compile_fallback": False, "inner_cuda_graph_used": True, "finite_actions_model_metrics": True,
             "graph_usage_counts": graph_usage,
             "critic_updates_per_action": 128, "actor_updates_per_action": 32,
-            "q5_reductions": REDUCTIONS, "num_q": 5, "q_pair_size": 5,
+            f"q{num_q}_reductions": REDUCTIONS, "num_q": num_q, "q_pair_size": num_q,
             "critic_geometry_diagnostics": True, "production_overrides": overrides,
             "total_steps": run["total_steps"], "seed_steps": 1000, "pretrain_steps": 1000,
             "replay_storage_device": "cpu", "replay_transitions": learner.buffer.num_transitions,
             "checkpointing": False, "wandb": False, "created_utc": datetime.now(timezone.utc).isoformat(),
             "scope": "Early-replay steady training only; add production evaluation, diagnostics, checkpoint I/O and startup overhead when sizing a full run.",
+            **extra_checks,
         }
         with (output / "results.json").open("x") as stream:
             json.dump(report, stream, indent=2, allow_nan=False)
             stream.write("\n")
-        print("ASSEMBLY_Q5_SMOKE " + json.dumps({"passed": True, "output": str(output),
+        print(f"ASSEMBLY_Q{num_q}_SMOKE " + json.dumps({"passed": True, "output": str(output),
               "seconds_per_decision": measured["seconds_per_decision"], "evaluations": evaluations}), flush=True)
     finally:
         if learner is not None:

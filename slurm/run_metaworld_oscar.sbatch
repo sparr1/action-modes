@@ -29,10 +29,10 @@ seed=${AMBI_METAWORLD_SEED-55}
 variant=${AMBI_METAWORLD_VARIANT-baseline}
 case "$variant" in
     baseline) config_name=ambi_state; manifest="configs/metaworld/experiments/$task.json" ;;
-    mrsq_q5)
-        [[ "$task" == assembly ]] || { echo "mrsq_q5 is prepared for assembly only" >&2; exit 1; }
-        config_name=ambi_state_mrsq_q5
-        manifest=configs/metaworld/experiments/assembly_mrsq_q5.json
+    mrsq_q5|mrsq_q10)
+        [[ "$task" == assembly ]] || { echo "$variant is prepared for assembly only" >&2; exit 1; }
+        config_name="ambi_state_$variant"
+        manifest="configs/metaworld/experiments/assembly_$variant.json"
         ;;
     *) echo "Unknown AMBI_METAWORLD_VARIANT: $variant" >&2; exit 1 ;;
 esac
