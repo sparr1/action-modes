@@ -374,13 +374,18 @@ launchers reject that label and any quota selection other than exactly
 shown above, so the checked quota row and the checkpoint filesystem cannot
 diverge.
 
-The four-task Q10 launcher stores active-run state on the shared Oscar scratch
+The Q10 launcher stores active-run state on the shared Oscar scratch
 filesystem, under the campaign's `<task>/lineage` directory. Its quota check
 uses the `rgao48` row for `/oscar/scratch` and accounts for staged generations
 and the separate `<task>/models` checkpoint bank. The same lineage is used
 after a requeue or restart on another node. Oscar may purge individual scratch
 files after 30 days without access, so archive checkpoints that need longer
 retention. Job-local storage is used only for temporary work and caches.
+
+Humanoid Stand keeps its existing task recipe with ten critics and the
+full-ensemble Q10 reductions. The resumable Dog Walk job starts a fresh
+seed-55 attempt. The earlier interrupted run saved model checkpoints without
+enough training state to restore its replay and random streams.
 
 The compact AMBI branch-count and imagination-horizon suite lives under
 `configs/ambi/`. Each algorithm file has one matching runnable

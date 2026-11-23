@@ -18,7 +18,7 @@ from slurm.mrsq_q10_suite import CAMPAIGN, lineage_path, load_plan
 
 PYTHON = '/oscar/home/rgao48/action-modes/environments/dmcontrol/.venv/bin/python'
 LAUNCHER = SOURCE / 'slurm/run_mrsq_q10_suite_oscar.sbatch'
-TASKS = ('humanoid-walk', 'humanoid-run', 'dog-trot', 'dog-run')
+TASKS = ('humanoid-walk', 'humanoid-run', 'dog-trot', 'dog-run', 'humanoid-stand', 'dog-walk')
 PROVISIONAL = {'cpus': 1, 'memory_gib': 14, 'wall_hours': 102}
 
 
@@ -84,7 +84,7 @@ def queue_task(task, commit, tree):
                       '--cpus-per-task=2', '--mem=16G', '--time=00:30:00', '--no-requeue',
                       str(LAUNCHER), 'benchmark', task], row, receipt, exports)
     if 'train' not in row:
-        reservation_check(-1, PROVISIONAL)
+        reservation_check(-1, PROVISIONAL, concurrent=True)
     train = submit_one(task, 'train', ['--partition=gpu', '--qos=pri-gpu+', *hardware,
                        '--cpus-per-task=1', '--mem=14G', '--time=102:00:00', '--requeue',
                        '--signal=USR1@1800', '--hold', '--dependency=afterok:' + gate,
@@ -182,7 +182,7 @@ def release_task(task, commit, tree):
         atomic(release, pending)
         return pending
     verify_held(current, plan if intent.is_file() else PROVISIONAL, gate)
-    budget = reservation_check(train, plan)
+    budget = reservation_check(train, plan, concurrent=True)
     needed, free = booked_scratch_gib(task, plan), scratch_free_gib()
     assert free >= needed, f'Scratch has {free:.2f} GiB free, needs {needed:.2f} GiB for resume and snapshots'
     command(*allocation_updates(train, plan))

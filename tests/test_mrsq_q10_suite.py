@@ -7,11 +7,12 @@ import pytest
 import torch
 
 from slurm.dog_stand_mrsq import REDUCTIONS
+from slurm import mrsq_q10_suite
 from tests.test_ambi_root_local_sac import _build_cfg
 
 
 CONFIG_ROOT = Path(__file__).resolve().parents[1] / 'configs/dmcontrol'
-TASKS = ('humanoid-walk', 'humanoid-run', 'dog-trot', 'dog-run')
+TASKS = ('humanoid-walk', 'humanoid-run', 'dog-trot', 'dog-run', 'humanoid-stand', 'dog-walk')
 CAMPAIGN = 'mrsq-q10-suite-20261122'
 
 
@@ -33,13 +34,19 @@ def test_q10_matches_task_q5_except_critic_count_and_publication_labels(task):
     q10 = read_config('algs', q10_name)
     expected = deepcopy(q5)
     q5_params = q5['alg_params']
+    run_name = q5_params['wandb_run_name'].replace('Q5', 'Q10')
+    tag_changes = {'q5': 'q10', 'mrsq-q5-suite-20261118': CAMPAIGN, 'oscar-l40s': 'oscar',
+                   'dog-walk-mrsq-q5-20261118': CAMPAIGN}
+    tags = [tag_changes.get(tag, tag) for tag in q5_params['wandb_tags']]
+    if task == 'dog-walk':
+        run_name += ' | fresh 1M attempt'
+        tags.append('fresh-1m-attempt')
     expected['alg_params'].update(
         num_q=10,
         q_pair_size=10,
-        wandb_run_name=q5_params['wandb_run_name'].replace('Q5', 'Q10'),
+        wandb_run_name=run_name,
         wandb_group=f'{CAMPAIGN}-{task}',
-        wandb_tags=[{'q5': 'q10', 'mrsq-q5-suite-20261118': CAMPAIGN, 'oscar-l40s': 'oscar'}.get(tag, tag)
-                    for tag in q5_params['wandb_tags']],
+        wandb_tags=tags,
     )
     assert q10 == expected
 
@@ -64,6 +71,24 @@ def test_q10_matches_task_q5_except_critic_count_and_publication_labels(task):
     assert cfg.critic_geometry_diagnostics and cfg.critic_geometry_every == 1000
     assert cfg.critic_geometry_batch_size == 64
     assert (cfg.critic_geometry_obs_noise_std, cfg.critic_geometry_action_noise_std) == (0.01, 0.02)
+
+
+@pytest.mark.parametrize('task,environment_test', [
+    ('dog-walk', 'tests/test_dog_walk_mrsq.py::test_real_dog_walk_two_control_steps'),
+    ('humanoid-stand', 'tests/test_mrsq_q5_suite.py::test_real_task_action_repeat[humanoid-stand]'),
+])
+def test_new_tasks_route_real_environment_gate(task, environment_test, tmp_path, monkeypatch):
+    report = tmp_path / 'parity.xml'
+
+    def planned_test_run(command, *, cwd, env, check):
+        family = task.split('-')[0]
+        assert command[-3:] == [f'tests/test_mrsq_q10_suite.py::test_cuda_q10_family_parity[{family}]',
+                               environment_test, f'--junitxml={report}']
+        assert env['AMBI_RUN_REAL_DMCONTROL_TESTS'] == '1' and check
+        report.write_text('<testsuite><testcase/><testcase/></testsuite>')
+
+    monkeypatch.setattr(mrsq_q10_suite.subprocess, 'run', planned_test_run)
+    mrsq_q10_suite.verify_parity(task, report)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='Requires scheduled CUDA GPU')

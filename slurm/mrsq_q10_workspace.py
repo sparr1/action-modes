@@ -12,7 +12,7 @@ from slurm.ambi_alpha_carry_workspace import ENTITY, PROJECT, WorkspaceError, _f
 NAME = 'AMBI Q10 actor mean / target min — Oscar training'
 PREFIX = 'AMBI Q10 training / '
 CAMPAIGN = 'mrsq-q10-suite-20261122'
-TASKS = ('humanoid-walk', 'humanoid-run', 'dog-trot', 'dog-run')
+TASKS = ('humanoid-walk', 'humanoid-run', 'dog-trot', 'dog-run', 'humanoid-stand', 'dog-walk')
 STEP = 'env_step'
 METRICS = {
     'Learning': {
@@ -60,6 +60,7 @@ def markdown(rows):
 Each task trains for 1,000,000 decisions. The actors average all ten critics.
 The targets and terminal bootstrap use their minimum. All 25k model checkpoints
 are retained. Full training state is saved separately for exact resume.
+Dog Walk is a fresh seed-55 attempt with its own training history.
 
 The return curves show sampled training episodes. Preliminary GPU tests keep
 W&B disabled. Panels populate as production uploads durable training metrics.
@@ -88,7 +89,7 @@ def verify(work, rows, url, wanted, wr, expr):
         raise WorkspaceError('Saved Q10 workspace identity differs from the receipt')
     settings = work.runset_settings
     if settings.groupby or settings.query or _filter_wire(settings.filters, expr) != _filter_wire(wanted, expr):
-        raise WorkspaceError('Saved Q10 workspace lost the four training groups')
+        raise WorkspaceError('Saved Q10 workspace lost its exact training-group filter')
     owned = [section for section in work.sections if section.name.startswith(PREFIX)]
     expected = {title: metric for metrics in METRICS.values() for title, metric in metrics.items()}
     if len(owned) != len(METRICS) + 1 or not all(section.is_open for section in owned):

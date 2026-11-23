@@ -19,7 +19,7 @@ batch_started=$SECONDS
 mode="${1:?Use benchmark or train}"
 task="${2:?Set task}"
 [[ "$mode" == benchmark || "$mode" == train ]]
-case "$task" in humanoid-walk|humanoid-run|dog-trot|dog-run) ;; *) exit 2 ;; esac
+case "$task" in humanoid-walk|humanoid-run|dog-trot|dog-run|humanoid-stand|dog-walk) ;; *) exit 2 ;; esac
 [[ "$AMBI_Q10_CAMPAIGN" == /oscar/scratch/rgao48/ambi/mrsq-q10-suite-20261122 ]]
 cd "${SLURM_SUBMIT_DIR:?}"
 [[ "$(git rev-parse --show-toplevel)" == "$PWD" ]]

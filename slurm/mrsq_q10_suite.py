@@ -1,4 +1,4 @@
-"""Size and run exact-resume Oscar allocations for four Q10 tasks."""
+"""Size and run exact-resume Oscar allocations for the Q10 tasks."""
 
 import argparse
 import hashlib
@@ -21,7 +21,8 @@ from slurm.inner_entropy_oscar import accelerated_runtime, slurm_fields
 
 CAMPAIGN = Path("/oscar/scratch/rgao48/ambi/mrsq-q10-suite-20261122")
 # Completed matching Q5 times scaled by the measured Dog Stand/Walk Q10 ratios.
-PREDICTED_COMPUTE_HOURS = {"humanoid-walk": 84, "humanoid-run": 84, "dog-trot": 85, "dog-run": 86}
+PREDICTED_COMPUTE_HOURS = {"humanoid-walk": 84, "humanoid-run": 84, "dog-trot": 85, "dog-run": 86,
+                           "humanoid-stand": 85, "dog-walk": 86}
 MAX_SECONDS_PER_DECISION = 0.38
 TIMING_MARGIN = 0.15
 STARTUP_ALLOWANCE_HOURS = 0.5
@@ -75,12 +76,14 @@ def measurement(task, cpus, path, *, measure_resume_storage=False):
 
 def verify_parity(task, path):
     family = task.split("-", 1)[0]
+    environment_test = ("tests/test_dog_walk_mrsq.py::test_real_dog_walk_two_control_steps"
+                        if task == "dog-walk" else f"tests/test_mrsq_q5_suite.py::test_real_task_action_repeat[{task}]")
     program = ("import sys,torch,pytest; torch.set_num_threads(1); "
                "torch.set_num_interop_threads(1); torch.set_float32_matmul_precision('high'); "
                "raise SystemExit(pytest.main(sys.argv[1:]))")
     subprocess.run([sys.executable, "-c", program, "-q",
                     f"tests/test_mrsq_q10_suite.py::test_cuda_q10_family_parity[{family}]",
-                    f"tests/test_mrsq_q5_suite.py::test_real_task_action_repeat[{task}]",
+                    environment_test,
                     f"--junitxml={path}"], cwd=ROOT,
                    env=dict(os.environ, AMBI_RUN_REAL_DMCONTROL_TESTS="1"), check=True)
     cases = list(ET.parse(path).getroot().iter("testcase"))

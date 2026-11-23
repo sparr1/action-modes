@@ -84,7 +84,7 @@
     "wandb_step_every": 1000,
     "wandb_entity": "rwgao_b-brown-university",
     "wandb_mode": "online",
-    "wandb_run_name": "Dog Walk | MRS.Q reductions Q10 | H3 J8 K1 | seed55",
+    "wandb_run_name": "Dog Walk | MRS.Q reductions Q10 | H3 J8 K1 | seed55 | fresh 1M attempt",
     "wandb_tags": [
       "H3",
       "J8",
@@ -100,7 +100,7 @@
       "vmap",
       "compiled",
       "tf32-high",
-      "oscar-l40s",
+      "oscar",
       "whole-inner-cuda-graph",
       "critic-geometry",
       "dog-walk",
@@ -111,7 +111,8 @@
       "mean-all-actors",
       "min-all-terminal",
       "no-pair-sampling",
-      "dog-walk-mrsq-q10-20261118"
+      "mrsq-q10-suite-20261122",
+      "fresh-1m-attempt"
     ],
     "outer_actor_entropy_mode": "squashed",
     "inner_actor_entropy_mode": "squashed",
@@ -147,7 +148,7 @@
     "inner_actor_loss_scale_update": "per_update",
     "inner_critic_target_initialization": "online",
     "inner_steps_per_update": null,
-    "wandb_group": "dog-walk-mrsq-q10-20261118",
+    "wandb_group": "mrsq-q10-suite-20261122-dog-walk",
     "critic_ensemble_backend": "vmap",
     "aux_return_mode": "off",
     "critic_geometry_diagnostics": true,

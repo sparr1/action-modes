@@ -60,11 +60,13 @@ def allocation_updates(job, plan):
             'TimeLimit=' + str(plan['wall_hours']) + ':00:00']
 
 
-def reservation_check(job, plan):
-    line = command(['sacctmgr', '-nP', 'show', 'qos', 'pri-gpu+', 'format=Name,MaxTRESRunMinsPU'])
-    limits = dict(x.split('=', 1) for x in line.split('|')[1].split(','))
-    totals = {'cpu': plan['cpus'] * plan['wall_hours'] * 60,
-              'gres/gpu': plan['wall_hours'] * 60}
+def reservation_check(job, plan, *, concurrent=False):
+    line = command(['sacctmgr', '-nP', 'show', 'qos', 'pri-gpu+',
+                    'format=Name,MaxTRESRunMinsPU,MaxTRESPerUser'])
+    _, run_minutes, allocated = line.split('|')[:3]
+    limits = dict(x.split('=', 1) for x in run_minutes.split(','))
+    wall = plan['wall_hours'] * 60
+    durations = {'cpu': [wall] * plan['cpus'], 'gres/gpu': [wall]}
     queue = command(['squeue', '-h', '-r', '-u', 'rgao48', '-o', '%i|%q|%C|%l|%b'])
     for row in queue.splitlines():
         ident, qos, cpus, time, gres = row.split('|')
@@ -72,10 +74,18 @@ def reservation_check(job, plan):
             continue
         minutes = wall_minutes(time)
         match = re.search(r'gpu:(?:[^:,]+:)?([0-9]+)', gres)
-        totals['cpu'] += int(cpus) * minutes
-        totals['gres/gpu'] += (int(match[1]) if match else 0) * minutes
+        durations['cpu'].extend([minutes] * int(cpus))
+        durations['gres/gpu'].extend([minutes] * (int(match[1]) if match else 0))
+    # Full requested durations are conservative. At most the user allocation
+    # limit can run simultaneously, even when there are more queued jobs.
+    caps = (dict(pair.split('=', 1) for pair in allocated.split(',')) if concurrent else {})
+    totals = {key: sum(sorted(times, reverse=True)[:int(caps.get(key, len(times)))])
+              for key, times in durations.items()}
     assert all(value <= float(limits[key]) for key, value in totals.items()), (totals, limits)
-    return {'full_reservation_upper_bound_minutes': totals, 'limits': limits}
+    result = {'full_reservation_upper_bound_minutes': totals, 'limits': limits}
+    if concurrent:
+        result['allocation_limits'] = {key: int(caps[key]) for key in durations}
+    return result
 
 
 def release(task, publisher):
