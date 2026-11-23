@@ -1,4 +1,4 @@
-"""W&B-disabled Assembly full-ensemble training, evaluation, and throughput gate.
+"""W&B-disabled MetaWorld full-ensemble training, evaluation, and throughput gate.
 
 Run on one scheduled GPU/CPU from a clean, pinned checkout. The production
 seed/pretraining budget and scientific settings are retained. Only the smoke
@@ -25,9 +25,9 @@ sys.path.insert(0, str(ROOT))
 from slurm.benchmark_ambi_training_cpu import TrainingWindow, physical_core_cpus
 from slurm.metaworld_campaign import PROTOCOL, read_json, validate_algorithm
 
-ALGORITHM = ROOT / "configs/metaworld/algs/ambi_state_mrsq_q5.json"
-MANIFEST = ROOT / "configs/metaworld/experiments/assembly_mrsq_q5.json"
+CONFIG_ROOT = ROOT / "configs/metaworld"
 ENSEMBLE_SIZES = {"mrsq_q5": 5, "mrsq_q10": 10}
+TASKS = ("assembly", "push", "stick-pull")
 WARMUP = MEASURED = 100
 REDUCTIONS = {
     "outer_q_actor_reduction": "mean_all",
@@ -38,15 +38,14 @@ REDUCTIONS = {
 }
 
 
-def recipe_paths(variant):
-    num_q = ENSEMBLE_SIZES[variant]
-    if num_q == 5:
-        return ALGORITHM, MANIFEST
-    return (ALGORITHM.with_name(f"ambi_state_mrsq_q{num_q}.json"),
-            MANIFEST.with_name(f"assembly_mrsq_q{num_q}.json"))
+def recipe_paths(variant, task="assembly"):
+    if variant not in ENSEMBLE_SIZES or task not in TASKS or (variant == "mrsq_q5" and task != "assembly"):
+        raise ValueError(f"Unsupported MetaWorld smoke recipe: {task} {variant}")
+    return (CONFIG_ROOT / "algs" / f"ambi_state_{variant}.json",
+            CONFIG_ROOT / "experiments" / f"{task}_{variant}.json")
 
 
-def source_binding(variant="mrsq_q5"):
+def source_binding(variant="mrsq_q5", task="assembly"):
     def git(*args):
         return subprocess.check_output(["git", *args], cwd=ROOT, text=True).strip()
 
@@ -56,21 +55,21 @@ def source_binding(variant="mrsq_q5"):
     if variant == "mrsq_q10":
         assert expected, "Pin AMBI_EXPECTED_COMMIT for the Q10 gate"
     assert expected is None or commit == expected, "Unexpected source commit"
-    paths = (*recipe_paths(variant), Path(__file__).resolve())
+    paths = (*recipe_paths(variant, task), Path(__file__).resolve())
     return {"commit": commit, "tree": git("rev-parse", "HEAD^{tree}"), "clean": True,
             "files": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
                       for p in paths}}
 
 
-def recipe(output, variant="mrsq_q5"):
+def recipe(output, variant="mrsq_q5", task="assembly"):
     """Derive an explicitly bounded smoke from the versioned production recipe."""
-    algorithm_path, manifest_path = recipe_paths(variant)
+    algorithm_path, manifest_path = recipe_paths(variant, task)
     run, manifest = deepcopy(read_json(algorithm_path)), deepcopy(read_json(manifest_path))
     validate_algorithm(run)
     assert manifest["configs"] == [algorithm_path.stem]
     assert not manifest.get("overrides_alg"), "Unexpected shallow manifest override"
     assert manifest["env_params"] == {
-        "task": "assembly", "obs": "state", "render_mode": None, "protocol": PROTOCOL,
+        "task": task, "obs": "state", "render_mode": None, "protocol": PROTOCOL,
     }
     params = run["alg_params"]
     assert run["seed"] == 55 and run["total_steps"] == 1_000_000
@@ -136,14 +135,19 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path, help="New directory outside source")
     parser.add_argument("--variant", choices=ENSEMBLE_SIZES, default="mrsq_q5")
+    parser.add_argument("--task", choices=TASKS, default="assembly")
+    parser.add_argument("--gpu-name", help="Required CUDA device name, default NVIDIA L40S for Q10")
     args = parser.parse_args(argv)
+    if args.variant == "mrsq_q5" and args.task != "assembly":
+        parser.error("Push and Stick Pull require --variant mrsq_q10")
     num_q = ENSEMBLE_SIZES[args.variant]
+    smoke_name = f"{args.task}-mrsq-q{num_q}-smoke"
     assert os.environ.get("SLURM_JOB_ID"), "Use a scheduled GPU allocation"
     assert int(os.environ.get("SLURM_CPUS_PER_TASK", "0")) == 1, "Gate requires one CPU"
     assert os.environ.get("WANDB_MODE") == "disabled", "Smoke must never create a W&B run"
     output = args.output.resolve()
     assert output != ROOT and ROOT not in output.parents, "Keep smoke output outside source"
-    binding = source_binding(args.variant)
+    binding = source_binding(args.variant, args.task)
     cpus = physical_core_cpus(os.sched_getaffinity(0))
     assert cpus, "No allocated physical CPU"
     cpu = cpus[0]
@@ -152,7 +156,7 @@ def main(argv=None):
         os.environ[key] = "1"
     os.environ.update(OMP_DYNAMIC="FALSE", MKL_DYNAMIC="FALSE", TORCHINDUCTOR_COMPILE_THREADS="1")
     output.mkdir(parents=True, exist_ok=False)
-    run, manifest, overrides = recipe(output, args.variant)
+    run, manifest, overrides = recipe(output, args.variant, args.task)
 
     import torch
     import gymnasium as gym
@@ -164,19 +168,20 @@ def main(argv=None):
     torch.set_float32_matmul_precision("high")
     assert torch.cuda.is_available(), "CUDA GPU required"
     gpu = torch.cuda.get_device_name()
-    if num_q == 10:
-        assert gpu == "NVIDIA L40S", f"Q10 Assembly production sizing requires L40S, received {gpu}"
+    expected_gpu = args.gpu_name or ("NVIDIA L40S" if num_q == 10 else None)
+    if expected_gpu is not None:
+        assert gpu == expected_gpu, f"Production sizing requires {expected_gpu}, received {gpu}"
     env = gym.make(run["env"], **manifest["env_params"])
     learner = None
     started = time.perf_counter()
     try:
         assert env.observation_space.shape == (39,) and env.action_space.shape == (4,)
         assert env.unwrapped.action_repeat == 2 and env.spec.max_episode_steps == 100
-        learner = AMBITDMPC2(f"assembly-mrsq-q{num_q}-smoke", env, run["alg_params"], run, manifest)
+        learner = AMBITDMPC2(smoke_name, env, run["alg_params"], run, manifest)
         # Match full-state-resume production replay placement, while the
         # tracker has no save strategy and therefore writes no checkpoints.
         learner.set_checkpointing(25_000, str(output / "checkpointing-disabled"),
-                                  f"assembly-q{num_q}-smoke", save_strat="none", checkpoint_replay=True)
+                                  f"{args.task}-q{num_q}-smoke", save_strat="none", checkpoint_replay=True)
         cfg, agent = learner.cfg, learner.agent
         assert cfg.compile and cfg.compile_strict and cfg.inner_cuda_graph
         assert cfg.critic_ensemble_backend == "vmap" and cfg.utd == 1
@@ -267,7 +272,7 @@ def main(argv=None):
                        "measured": timer.result, "startup": startup,
                        "compile_graph_counts": compile_counts,
                        "evaluations_before_final_gate": evaluations,
-                       "num_q": num_q,
+                       "task": args.task, "gpu": gpu, "num_q": num_q,
                        "created_utc": datetime.now(timezone.utc).isoformat()},
                       stream, indent=2, allow_nan=False)
             stream.write("\n")
@@ -301,7 +306,7 @@ def main(argv=None):
         measured = dict(timer.result)
         measured["projected_1m_training_hours"] = measured["seconds_per_decision"] * 1e6 / 3600
         report = {
-            "passed": True, "source": binding, "runtime": {"python": sys.version.split()[0],
+            "passed": True, "source": binding, "task": args.task, "runtime": {"python": sys.version.split()[0],
                 "executable": sys.executable, "torch": torch.__version__, "cuda": torch.version.cuda,
                 "gpu": gpu, "float32_matmul_precision": torch.get_float32_matmul_precision()},
             "slurm_job_id": os.environ["SLURM_JOB_ID"], "host": os.uname().nodename,
@@ -324,7 +329,8 @@ def main(argv=None):
         with (output / "results.json").open("x") as stream:
             json.dump(report, stream, indent=2, allow_nan=False)
             stream.write("\n")
-        print(f"ASSEMBLY_Q{num_q}_SMOKE " + json.dumps({"passed": True, "output": str(output),
+        label = args.task.replace("-", "_").upper()
+        print(f"{label}_Q{num_q}_SMOKE " + json.dumps({"passed": True, "output": str(output),
               "seconds_per_decision": measured["seconds_per_decision"], "evaluations": evaluations}), flush=True)
     finally:
         if learner is not None:

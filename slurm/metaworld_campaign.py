@@ -14,6 +14,7 @@ ACTION_REPEAT = 2
 EPISODE_DECISIONS = 100
 PROTOCOL = "metaworld-tdmpc2-04be337-state-final-success-v1"
 ENSEMBLE_VARIANTS = {"mrsq_q5": 5, "mrsq_q10": 10}
+ENSEMBLE_TASKS = {"mrsq_q5": ("assembly",), "mrsq_q10": ("assembly", "push", "stick-pull")}
 
 
 def _unique_object(pairs):
@@ -37,8 +38,8 @@ def production_algorithm(task, seed=55, variant="baseline"):
         raise ValueError("seed must be a non-negative integer.")
     if variant != "baseline" and variant not in ENSEMBLE_VARIANTS:
         raise ValueError(f"Unknown campaign variant: {variant!r}")
-    if variant in ENSEMBLE_VARIANTS and task != "assembly":
-        raise ValueError(f"The {variant} variant is prepared for assembly only.")
+    if variant in ENSEMBLE_TASKS and task not in ENSEMBLE_TASKS[variant]:
+        raise ValueError(f"The {variant} variant is not prepared for {task}.")
     name = "ambi_state" if variant == "baseline" else f"ambi_state_{variant}"
     run = read_json(CONFIG_ROOT / "algs" / f"{name}.json")
     validate_algorithm(run)
@@ -56,7 +57,7 @@ def production_algorithm(task, seed=55, variant="baseline"):
     if variant in ENSEMBLE_VARIANTS:
         heads = ENSEMBLE_VARIANTS[variant]
         variant_tag = f"mrsq-q{heads}"
-        group = f"metaworld-assembly-{variant_tag}-s{seed}"
+        group = f"metaworld-{task}-{variant_tag}-s{seed}"
         run["alg_params"].update(
             wandb_group=group,
             wandb_run_name=f"Meta-World {title} | Q{heads} actor mean / target min | seed{seed}",

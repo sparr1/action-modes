@@ -68,15 +68,26 @@ def test_trained_resume_check_checks_graph_before_native_evaluation(monkeypatch,
         assert checked == ["evaluation"] and checks == {}
 
 
-@pytest.mark.parametrize("variant,num_q", [("mrsq_q5", 5), ("mrsq_q10", 10)])
-def test_smoke_loads_the_matching_pinned_recipe_without_enabling_wandb(tmp_path, variant, num_q):
-    path, manifest_path = recipe_paths(variant)
-    run, manifest, overrides = recipe(tmp_path, variant)
+@pytest.mark.parametrize("variant,num_q,task", [
+    ("mrsq_q5", 5, "assembly"),
+    ("mrsq_q10", 10, "assembly"),
+    ("mrsq_q10", 10, "push"),
+    ("mrsq_q10", 10, "stick-pull"),
+])
+def test_smoke_loads_the_matching_pinned_recipe_without_enabling_wandb(tmp_path, variant, num_q, task):
+    path, manifest_path = recipe_paths(variant, task)
+    run, manifest, overrides = recipe(tmp_path, variant, task)
     expected = read_json(path)
     assert run["alg_params"] == {**expected["alg_params"], **overrides["alg_params"]}
     assert run["alg_params"]["num_q"] == run["alg_params"]["q_pair_size"] == num_q
     assert not run["alg_params"]["wandb"] and run["alg_params"]["wandb_mode"] == "disabled"
     assert run["alg_params"]["seed_steps"] == run["alg_params"]["pretrain_steps"] == 1000
     assert manifest["env_params"] == read_json(manifest_path)["env_params"]
+    assert manifest["env_params"]["task"] == task
     assert manifest["configs"] == [f"ambi_state_mrsq_q{num_q}"]
     assert run["total_steps"] == 1201
+
+
+def test_smoke_rejects_unversioned_q5_task():
+    with pytest.raises(ValueError, match="Unsupported MetaWorld smoke recipe"):
+        recipe_paths("mrsq_q5", "push")

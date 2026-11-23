@@ -29,10 +29,15 @@ seed=${AMBI_METAWORLD_SEED-55}
 variant=${AMBI_METAWORLD_VARIANT-baseline}
 case "$variant" in
     baseline) config_name=ambi_state; manifest="configs/metaworld/experiments/$task.json" ;;
-    mrsq_q5|mrsq_q10)
+    mrsq_q5)
         [[ "$task" == assembly ]] || { echo "$variant is prepared for assembly only" >&2; exit 1; }
         config_name="ambi_state_$variant"
         manifest="configs/metaworld/experiments/assembly_$variant.json"
+        ;;
+    mrsq_q10)
+        [[ "$task" == assembly || "$task" == push || "$task" == stick-pull ]] || exit 1
+        config_name=ambi_state_mrsq_q10
+        manifest="configs/metaworld/experiments/${task}_mrsq_q10.json"
         ;;
     *) echo "Unknown AMBI_METAWORLD_VARIANT: $variant" >&2; exit 1 ;;
 esac
@@ -109,7 +114,8 @@ runpy.run_path("main.py", run_name="__main__")
 ' --run "$manifest" \
     --alg-dir "$step_log" --num-runs 1 --resume-wandb-mode online \
     --lineage-dir "$lineage" --resume-mode "$mode" \
-    --resume-checkpoint-minutes 30 --resume-checkpoint-steps 25000 --drain-after-seconds "$drain" || status=$?
+    --resume-checkpoint-minutes "${AMBI_METAWORLD_RESUME_MINUTES:-30}" \
+    --resume-checkpoint-steps 25000 --drain-after-seconds "$drain" || status=$?
 case "$status" in
     0) "${check_resume[@]}" done --lineage-dir "$lineage" ;;
     75)

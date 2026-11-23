@@ -103,8 +103,8 @@ def test_unknown_variant_is_rejected_before_config_output(tmp_path, variant):
     assert not output.parent.exists()
 
 
-@pytest.mark.parametrize("variant", [VARIANT, "mrsq_q10"])
-@pytest.mark.parametrize("task", ["hand-insert", "push", "stick-pull"])
+@pytest.mark.parametrize("task,variant", [("hand-insert", VARIANT), ("push", VARIANT),
+                                           ("stick-pull", VARIANT), ("hand-insert", "mrsq_q10")])
 def test_ensemble_variants_reject_other_tasks_before_config_output(tmp_path, task, variant):
     with pytest.raises(ValueError):
         production_algorithm(task, variant=variant)
@@ -210,6 +210,33 @@ def test_q10_recipe_changes_only_ensemble_size_and_uses_its_own_wandb_group():
     for name in ("study_type", "study_note"):
         q10_manifest.pop(name)
     assert q10_manifest == q5_manifest
+
+
+@pytest.mark.parametrize("task,index", [("push", "2"), ("stick-pull", "3")])
+def test_q10_hydra_cells_preserve_task_and_shared_resume_lineage(launch, task, index):
+    run, default_lineage = launch
+    root = default_lineage.parents[3]
+    q10 = production_algorithm(task, variant="mrsq_q10")
+    params = q10["alg_params"]
+    assert q10["seed"] == 55 and q10["total_steps"] == 1_000_000
+    assert params["num_q"] == params["q_pair_size"] == 10
+    assert params["wandb_group"] == f"metaworld-{task}-mrsq-q10-s55"
+    baseline = read_json(CONFIG_ROOT / f"experiments/{task}.json")
+    manifest = read_json(CONFIG_ROOT / f"experiments/{task}_mrsq_q10.json")
+    assert manifest["configs"] == ["ambi_state_mrsq_q10"]
+    for key in baseline.keys() - {"configs", "study_type", "study_note"}:
+        assert baseline[key] == manifest[key]
+    lineage = root / task / "ambi_state_mrsq_q10/seed_55/lineage"
+    overrides = dict(AMBI_METAWORLD_VARIANT="mrsq_q10", SLURM_ARRAY_TASK_ID=index,
+                     AMBI_METAWORLD_RESUME_MINUTES="15")
+    status, calls = run(**overrides)
+    assert status == 0 and f"--lineage-dir {lineage} --resume-mode new" in calls
+    assert f"--run configs/metaworld/experiments/{task}_mrsq_q10.json" in calls
+    assert "--resume-checkpoint-minutes 15" in calls
+    lineage.mkdir()
+    (lineage / "LATEST").write_text("committed")
+    status, calls = run(**overrides, SLURM_RESTART_COUNT="1", TRAIN_STATUS="0")
+    assert status == 0 and f"--lineage-dir {lineage} --resume-mode required" in calls
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires scheduled CUDA GPU")

@@ -147,6 +147,13 @@ Before production, run the scheduled L40S check in
 `slurm/smoke_metaworld_mrsq_q5.py` with `--variant mrsq_q10`.
 Use its compiled training and native evaluation timings to size the allocation.
 
+Push and Stick Pull also support `mrsq_q10`. For the Hydra pair, submit
+`slurm/run_metaworld_q10_hydra.sbatch` with its two task indices, a pinned
+checkout, the locked native MetaWorld interpreter, and shared project
+storage. Each allocation validates its actual L40 before training in place.
+The shared launcher saves full state every 15 minutes at an episode boundary
+or every 25k decisions, and verifies the handoff before a walltime requeue.
+
 ## Runtime and compatibility
 
 The [isolated runtime](../../environments/metaworld/README.md) uses the
