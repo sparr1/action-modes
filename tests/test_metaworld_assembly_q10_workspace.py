@@ -8,16 +8,16 @@ import pytest
 from slurm import metaworld_assembly_q10_workspace as layout
 
 
-def public_api(rows):
+def public_api(rows, task='assembly'):
     def runs(project, *, filters, per_page):
         assert project == f'{layout.ENTITY}/{layout.PROJECT}'
-        assert filters == {'group': layout.GROUP} and per_page == 2
+        assert filters == {'group': f'metaworld-{task}-mrsq-q10-s55'} and per_page == 2
         return iter(rows)
 
     return SimpleNamespace(runs=runs)
 
 
-def native_run(tmp_path):
+def native_run(tmp_path, task='assembly'):
     run_id = 'a' * 32
     lineage = tmp_path / 'LINEAGE.json'
     lineage.write_text(json.dumps({'metadata': {'total_steps': 1_000_000, 'initial_wandb_run_id': run_id}}))
@@ -26,9 +26,11 @@ def native_run(tmp_path):
                            compile=True, compile_strict=True, inner_cuda_graph=True,
                            critic_geometry_diagnostics=True),
         'run_params': dict(seed=55, total_steps=1_000_000, env='MetaWorld-v0', resolved_runtime={
-            'observation': dict(task='assembly', episode_length=100, action_repeat=2)}),
+            'observation': dict(task=task, episode_length=100, action_repeat=2)}),
     }
-    run = SimpleNamespace(group=layout.GROUP, name=layout.RUN_NAME, id=run_id, config=config,
+    title = task.replace('-', ' ').title()
+    run = SimpleNamespace(group=f'metaworld-{task}-mrsq-q10-s55',
+                          name=f'Meta-World {title} | Q10 actor mean / target min | seed55', id=run_id, config=config,
                           state='running', summary={'env_step': 31_000})
     return run, lineage
 
@@ -45,10 +47,11 @@ def test_discovery_rejects_duplicate_and_wrong_lineage(tmp_path):
         layout.discover(public_api([run]), None, lineage)
 
 
-def test_sdk_reuses_pending_view_and_preserves_user_sections(tmp_path, monkeypatch):
+@pytest.mark.parametrize('task', ['assembly', 'hand-insert'])
+def test_sdk_reuses_pending_view_and_preserves_user_sections(tmp_path, monkeypatch, task):
     ws = pytest.importorskip('wandb_workspaces.workspaces')
     pytest.importorskip('wandb_workspaces.reports.v2')
-    run, lineage = native_run(tmp_path)
+    run, lineage = native_run(tmp_path, task)
     store = {}
     url = f'https://wandb.ai/{layout.ENTITY}/{layout.PROJECT}?nw=mockview'
     monkeypatch.setattr(ws.Workspace, 'url', property(lambda self: url))
@@ -56,13 +59,13 @@ def test_sdk_reuses_pending_view_and_preserves_user_sections(tmp_path, monkeypat
     monkeypatch.setattr(ws.Workspace, 'from_url', classmethod(lambda cls, _: cls._from_model(deepcopy(store['model']))))
 
     receipt = tmp_path / 'workspace.json'
-    pending = layout.install(receipt, api=public_api([]), lineage=lineage)
+    pending = layout.install(receipt, api=public_api([], task), lineage=lineage, task=task)
     assert pending['api_verified'] and pending['panel_count'] == 4 and pending['run']['run_id'] is None
-    assert layout.GROUP in store['model'].model_dump_json()
+    assert run.group in store['model'].model_dump_json()
     workspace = ws.Workspace.from_url(url)
     workspace.sections.append(ws.Section(name='User notes', is_open=True))
     workspace.save()
-    bound = layout.install(receipt, api=public_api([run]), lineage=lineage)
+    bound = layout.install(receipt, api=public_api([run], task), lineage=lineage, task=task)
     assert bound['api_verified'] and bound['url'] == pending['url'] and bound['run']['run_id'] == run.id
     assert 'User notes' in store['model'].model_dump_json()
     assert run.id in store['model'].model_dump_json()
