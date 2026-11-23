@@ -1,9 +1,11 @@
 """The training throughput gate must distinguish intentional native actions."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from slurm.metaworld_campaign import read_json
-from slurm.smoke_metaworld_mrsq_q5 import recipe, recipe_paths, validate_graph_usage
+from slurm.smoke_metaworld_mrsq_q5 import recipe, recipe_paths, validate_graph_usage, validate_trained_controller
 
 
 def row(step, used, *, evaluation=False):
@@ -30,6 +32,40 @@ def test_graph_gate_rejects_unexpected_execution_path(record):
 def test_native_diagnostic_is_not_a_valid_timing_sample():
     with pytest.raises(AssertionError, match="Timed training must use"):
         validate_graph_usage([row(2000, 0)], 1000, 1901, 2000)
+
+
+@pytest.mark.parametrize("num_q", [5, 10])
+def test_trained_resume_check_checks_graph_before_native_evaluation(monkeypatch, num_q):
+    from slurm import inner_entropy_oscar
+    from tests import test_inner_entropy_graph
+
+    checked = []
+    agent = SimpleNamespace(captured=True)
+    buffer = object()
+
+    def continuation(selected_agent):
+        assert selected_agent is agent and agent.captured
+        checked.append("continuation")
+
+    def geometry(selected_agent, selected_buffer):
+        assert selected_agent is agent and selected_buffer is buffer
+        checked.append("geometry")
+        return {"passed": True}
+
+    def evaluation(step):
+        assert step == 1201
+        checked.append("evaluation")
+        agent.captured = False
+
+    monkeypatch.setattr(test_inner_entropy_graph, "assert_graph_resume_continuation", continuation)
+    monkeypatch.setattr(inner_entropy_oscar, "check_geometry", geometry)
+    learner = SimpleNamespace(agent=agent, buffer=buffer, _global_step=1201, _evaluate_policy=evaluation)
+    checks = validate_trained_controller(learner, num_q)
+    if num_q == 10:
+        assert checked == ["continuation", "geometry", "evaluation"]
+        assert checks == {"graph_native_graph_continuation": True, "critic_geometry": {"passed": True}}
+    else:
+        assert checked == ["evaluation"] and checks == {}
 
 
 @pytest.mark.parametrize("variant,num_q", [("mrsq_q5", 5), ("mrsq_q10", 10)])

@@ -116,6 +116,22 @@ def validate_graph_usage(rows, diagnostic_every, first_measured, last_measured):
     return counts
 
 
+def validate_trained_controller(learner, num_q):
+    extra_checks = {}
+    if num_q == 10:
+        from slurm.inner_entropy_oscar import check_geometry
+        from tests.test_inner_entropy_graph import assert_graph_resume_continuation
+
+        # Native evaluation restores the training state and drops the captured
+        # runner. Test continuation from the actual sampled training graph first.
+        assert_graph_resume_continuation(learner.agent)
+        extra_checks["graph_native_graph_continuation"] = True
+        extra_checks["critic_geometry"] = check_geometry(learner.agent, learner.buffer)
+    # Exercise the trained model's real online success/return path outside timing.
+    learner._evaluate_policy(learner._global_step)
+    return extra_checks
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path, help="New directory outside source")
@@ -261,9 +277,7 @@ def main(argv=None):
         assert len([r for r in outer_rows if timer.first_step <= r["step"] <= timer.last_step]) == MEASURED
         assert learner._global_step == 1201 and learner._num_updates == 1200
         assert learner.buffer.resumable_storage and learner.buffer._storage_device.type == "cpu"
-        # Also exercise the trained model's real online success/return path.
-        # This is outside the throughput window and uses no extra training.
-        learner._evaluate_policy(learner._global_step)
+        extra_checks = validate_trained_controller(learner, num_q)
         assert [r["step"] for r in evaluations] == [0, 1000, 1201]
         graph_usage = validate_graph_usage(inner_rows, cfg.inner_diagnostics_every,
                                           timer.first_step, timer.last_step)
@@ -284,14 +298,6 @@ def main(argv=None):
         assert learner._wandb_run is None and not list(output.rglob("*.pt"))
         assert torch.get_num_threads() == torch.get_num_interop_threads() == 1
         assert os.sched_getaffinity(0) == {cpu}
-        extra_checks = {}
-        if num_q == 10:
-            from slurm.inner_entropy_oscar import check_geometry
-            from tests.test_inner_entropy_graph import assert_graph_resume_continuation
-
-            extra_checks["critic_geometry"] = check_geometry(agent, learner.buffer)
-            assert_graph_resume_continuation(agent)
-            extra_checks["graph_native_graph_continuation"] = True
         measured = dict(timer.result)
         measured["projected_1m_training_hours"] = measured["seconds_per_decision"] * 1e6 / 3600
         report = {
