@@ -2,18 +2,21 @@
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 
 SOURCE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SOURCE))
 
 from slurm.release_mrsq_q5_suite import allocation_updates, atomic, fields, reservation_check, wall_minutes
-from slurm.mrsq_q10_suite import CAMPAIGN, lineage_path, load_plan
+from slurm.ambi_transfer_training import binding, recipe, write_new
+from slurm.mrsq_q10_suite import CAMPAIGN, SEED56_TASKS, lineage_path, load_plan, manifest_path, task_path
 
 
 PYTHON = '/oscar/home/rgao48/action-modes/environments/dmcontrol/.venv/bin/python'
@@ -37,26 +40,26 @@ def validate_pin(commit):
     return command('git', 'rev-parse', 'HEAD^{tree}')
 
 
-def job_name(task, role):
-    return f'mrsq-q10-{task}-s55-{role}'
+def job_name(task, role, seed=55):
+    return f'mrsq-q10-{task}-s{seed}-{role}'
 
 
-def job_for(task, role, job):
+def job_for(task, role, job, *, seed=55):
     current = fields(job)
     assert current['UserId'].startswith('rgao48('), current
-    assert current['JobName'] == job_name(task, role), current
+    assert current['JobName'] == job_name(task, role, seed), current
     assert current['WorkDir'] == str(SOURCE), current
     return current
 
 
-def submit_one(task, role, command_args, row, receipt, exports):
+def submit_one(task, role, command_args, row, receipt, exports, *, seed=55):
     if role in row:
         return row[role]
-    name = job_name(task, role)
+    name = job_name(task, role, seed)
     assert not command('squeue', '-h', '-u', 'rgao48', '-n', name, '-o', '%i'), name
     args = ['sbatch', '--parsable', '--account=default', '--nodes=1', '--ntasks=1',
             '--chdir=' + str(SOURCE), '--job-name=' + name,
-            '--output=' + str(CAMPAIGN / 'slurm' / f'{task}-{role}-%j.log'),
+            '--output=' + str(CAMPAIGN / 'slurm' / f'{task_path(task, seed=seed).name}-{role}-%j.log'),
             '--export=' + exports, *command_args]
     job = command(*args).split(';')[0]
     assert job.isdecimal(), job
@@ -65,11 +68,58 @@ def submit_one(task, role, command_args, row, receipt, exports):
     return job
 
 
-def queue_task(task, commit, tree):
-    root = CAMPAIGN / task
+def reuse_timing_plan(task, root):
+    """Reuse a verified seed-55 plan for the identical workload's next seed."""
+    gate = root / 'benchmark'
+    if gate.is_dir():
+        return load_plan(task, root, seed=56)
+    reference_root = task_path(task, CAMPAIGN)
+    reference_gate = reference_root / 'benchmark'
+    reference = read(reference_gate / 'plan.json')
+    release = read(reference_root / 'release.json')
+    schedule = read(reference_root / 'scheduling.json')
+    assert release['allocation_verified'] and release['plan'] == reference
+    assert reference['passed'] and reference['task'] == task and reference['cpus'] == 1
+    assert reference['runtime']['gpu'] == 'NVIDIA L40S'
+    assert str(reference['gate_job']) == release['gate_job'] == schedule['gate']
+    reference_commit = schedule['commit']
+    assert reference['binding'] == {**binding(manifest_path(task)), 'commit': reference_commit}
+    assert command('git', 'rev-parse', f'{reference_commit}^{{tree}}') == schedule['tree']
+    command('git', 'diff', '--quiet', reference_commit, 'HEAD', '--',
+            'main.py', 'RL', 'domains', 'utils', 'environments',
+            'slurm/ambi_transfer_training.py', 'slurm/benchmark_ambi_training_cpu.py',
+            'slurm/inner_entropy_oscar.py', 'slurm/posttanh_dog_trot_resume.py')
+
+    identity_fields = {'wandb_run_name', 'wandb_group', 'wandb_tags'}
+    manifest_labels = {'configs', 'name', 'description', 'study_note'}
+    _, original_manifest, original = recipe(0, manifest_path(task))
+    _, next_manifest, next_seed = recipe(0, manifest_path(task, 56))
+    assert {k: v for k, v in original_manifest.items() if k not in manifest_labels} == {
+        k: v for k, v in next_manifest.items() if k not in manifest_labels}
+    for run in (original, next_seed):
+        run['alg_params'] = {k: v for k, v in run['alg_params'].items() if k not in identity_fields}
+    assert original['seed'] == 55 and next_seed['seed'] == 56
+    assert {k: v for k, v in original.items() if k not in {'name', 'seed'}} == {
+        k: v for k, v in next_seed.items() if k not in {'name', 'seed'}}
+
+    parity = (reference_gate / 'parity.xml').read_bytes()
+    assert hashlib.sha256(parity).hexdigest() == reference['parity_sha256']
+    plan = {**reference, 'binding': binding(manifest_path(task, 56)),
+            'sizing_reference': {'seed': 55, 'binding': reference['binding'],
+                                 'training_job': release['training_job']}}
+    with TemporaryDirectory(prefix='.timing-', dir=root) as temporary:
+        staging = Path(temporary)
+        (staging / 'parity.xml').write_bytes(parity)
+        write_new(staging / 'plan.json', plan)
+        staging.rename(gate)
+    return load_plan(task, root, seed=56)
+
+
+def queue_task(task, commit, tree, *, seed=55):
+    root = task_path(task, CAMPAIGN, seed=seed)
     root.mkdir(mode=0o700, exist_ok=True)
     receipt = root / 'scheduling.json'
-    lineage = lineage_path(task, CAMPAIGN)
+    lineage = lineage_path(task, CAMPAIGN, seed=seed)
     row = read(receipt) if receipt.exists() else {'task': task, 'commit': commit, 'tree': tree,
                                                   'source': str(SOURCE), 'lineage': str(lineage)}
     assert (row['commit'], row['tree'], row['source'], row['lineage']) == (
@@ -77,18 +127,30 @@ def queue_task(task, commit, tree):
     if 'train' not in row:
         assert not lineage.exists(), 'A new job cannot replace a lineage'
     exports = ','.join(['ALL', 'AMBI_EXPECTED_COMMIT=' + commit, 'AMBI_PYTHON=' + PYTHON,
-                        'AMBI_Q10_CAMPAIGN=' + str(CAMPAIGN), 'WANDB_MODE=disabled',
+                        'AMBI_Q10_CAMPAIGN=' + str(CAMPAIGN), f'AMBI_Q10_SEED={seed}', 'WANDB_MODE=disabled',
                         'PYTHONDONTWRITEBYTECODE=1'])
     hardware = ['--gres=gpu:l40s:1', '--exclude=gpu2708', '--hint=nomultithread']
-    gate = submit_one(task, 'gate', ['--partition=gpu-debug', '--qos=gpu-debug', *hardware,
-                      '--cpus-per-task=2', '--mem=16G', '--time=00:30:00', '--no-requeue',
-                      str(LAUNCHER), 'benchmark', task], row, receipt, exports)
+    if seed == 56:
+        plan = reuse_timing_plan(task, root)
+        gate = str(plan['gate_job'])
+        dependency = []
+        row.update(seed=seed, gate=gate)
+    else:
+        plan = PROVISIONAL
+        gate = submit_one(task, 'gate', ['--partition=gpu-debug', '--qos=gpu-debug', *hardware,
+                          '--cpus-per-task=2', '--mem=16G', '--time=00:30:00', '--no-requeue',
+                          str(LAUNCHER), 'benchmark', task], row, receipt, exports)
+        dependency = ['--dependency=afterok:' + gate]
     if 'train' not in row:
-        reservation_check(-1, PROVISIONAL, concurrent=True)
+        reservation_check(-1, plan, concurrent=True)
     train = submit_one(task, 'train', ['--partition=gpu', '--qos=pri-gpu+', *hardware,
-                       '--cpus-per-task=1', '--mem=14G', '--time=102:00:00', '--requeue',
-                       '--signal=USR1@1800', '--hold', '--dependency=afterok:' + gate,
-                       str(LAUNCHER), 'train', task], row, receipt, exports)
+                       f"--cpus-per-task={plan['cpus']}", f"--mem={plan['memory_gib']}G",
+                       f"--time={plan['wall_hours']}:00:00", '--requeue',
+                       '--signal=USR1@1800', '--hold', *dependency,
+                       str(LAUNCHER), 'train', task], row, receipt, exports, seed=seed)
+    if seed == 56:
+        release_task(task, commit, tree, seed=seed)
+        return row
     if not (root / 'release.json').is_file():
         verify_held(job_for(task, 'train', train), PROVISIONAL, gate)
     controller = shlex.join([PYTHON, '-B', str(Path(__file__).resolve()), 'release', '--task', task])
@@ -131,14 +193,16 @@ def bytes_on_disk(paths):
     return total
 
 
-def booked_scratch_gib(task, new_plan):
-    plans = {task: new_plan}
-    for other in TASKS:
-        if other != task and (CAMPAIGN / other / 'release.json').is_file():
-            plans[other] = read(CAMPAIGN / other / 'release.json')['plan']
+def booked_scratch_gib(task, new_plan, *, seed=55):
+    plans = {task_path(task, CAMPAIGN, seed=seed): new_plan}
+    cells = [(name, 55) for name in TASKS] + [(name, 56) for name in SEED56_TASKS]
+    for other, other_seed in cells:
+        root = task_path(other, CAMPAIGN, seed=other_seed)
+        if root not in plans and (root / 'release.json').is_file():
+            plans[root] = read(root / 'release.json')['plan']
     remaining = 0
-    for name, plan in plans.items():
-        lineage = lineage_path(name, CAMPAIGN)
+    for root, plan in plans.items():
+        lineage = root / 'lineage'
         if (lineage / 'DONE').is_file():
             continue
         # Keep two completed generations and space for the atomically staged third.
@@ -151,8 +215,8 @@ def booked_scratch_gib(task, new_plan):
     return remaining / 2**30
 
 
-def release_task(task, commit, tree):
-    root = CAMPAIGN / task
+def release_task(task, commit, tree, *, seed=55):
+    root = task_path(task, CAMPAIGN, seed=seed)
     row = read(root / 'scheduling.json')
     assert row['commit'] == commit and row['tree'] == tree and row['source'] == str(SOURCE)
     controller = os.environ.get('SLURM_JOB_ID')
@@ -162,32 +226,34 @@ def release_task(task, commit, tree):
     if release.exists():
         return read(release)
     gate, train = row['gate'], row['train']
-    try:
-        completed = job_for(task, 'gate', gate)
-        assert completed['JobState'] == 'COMPLETED' and completed['ExitCode'] == '0:0', completed
-    except subprocess.CalledProcessError:
-        attested = command('sacct', '-nPX', '-j', gate, '-o', 'JobIDRaw,State,ExitCode').splitlines()
-        assert f'{gate}|COMPLETED|0:0' in attested, attested
-    plan = load_plan(task, root)
+    if seed == 55:
+        try:
+            completed = job_for(task, 'gate', gate)
+            assert completed['JobState'] == 'COMPLETED' and completed['ExitCode'] == '0:0', completed
+        except subprocess.CalledProcessError:
+            attested = command('sacct', '-nPX', '-j', gate, '-o', 'JobIDRaw,State,ExitCode').splitlines()
+            assert f'{gate}|COMPLETED|0:0' in attested, attested
+    plan = load_plan(task, root, seed=seed)
     assert plan['binding']['commit'] == commit and str(plan['gate_job']) == gate
     assert plan['cpu_replay'] is True and plan['wandb'] is False
     assert plan['cpus'] in (1, 2) and plan['memory_gib'] > 0 and plan['wall_hours'] > 0
     assert plan['full_generation_bytes'] > 0 and plan['checkpoint_bytes'] > 0
     assert plan['seconds_per_decision'] > 0
-    current = job_for(task, 'train', train)
+    current = job_for(task, 'train', train, seed=seed)
     intent = root / 'release-intent.json'
     if current['Reason'] != 'JobHeldUser' and intent.is_file():
         pending = read(intent)
         assert pending['training_job'] == train and pending['plan'] == plan
         atomic(release, pending)
         return pending
-    verify_held(current, plan if intent.is_file() else PROVISIONAL, gate)
+    verify_held(current, plan if seed == 56 or intent.is_file() else PROVISIONAL, gate)
     budget = reservation_check(train, plan, concurrent=True)
-    needed, free = booked_scratch_gib(task, plan), scratch_free_gib()
+    needed, free = booked_scratch_gib(task, plan, seed=seed), scratch_free_gib()
     assert free >= needed, f'Scratch has {free:.2f} GiB free, needs {needed:.2f} GiB for resume and snapshots'
-    command(*allocation_updates(train, plan))
-    current = job_for(task, 'train', train)
-    verify_held(current, plan, gate)
+    if seed == 55:
+        command(*allocation_updates(train, plan))
+        current = job_for(task, 'train', train)
+        verify_held(current, plan, gate)
     pending = {'training_job': train, 'gate_job': gate, 'controller_job': controller,
                'plan': plan, 'scratch_quota': {'free_gib': free, 'reserved_gib': needed},
                'reservations': budget, 'allocation_verified': True}
@@ -201,7 +267,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('queue', 'release'))
     parser.add_argument('--task', choices=TASKS)
+    parser.add_argument('--seed', type=int, choices=(55, 56), default=55)
     args = parser.parse_args()
+    if args.seed == 56 and args.task not in SEED56_TASKS:
+        parser.error('Seed 56 requires an explicit --task dog-run or humanoid-run')
     commit = os.environ['AMBI_EXPECTED_COMMIT']
     tree = validate_pin(commit)
     CAMPAIGN.mkdir(mode=0o700, exist_ok=True)
@@ -209,11 +278,12 @@ def main():
     with (CAMPAIGN / 'scheduler.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if args.command == 'queue':
-            result = [queue_task(task, commit, tree) for task in (TASKS if args.task is None else (args.task,))]
+            result = [queue_task(task, commit, tree, seed=args.seed)
+                      for task in (TASKS if args.task is None else (args.task,))]
         else:
             if args.task is None:
                 parser.error('release requires --task')
-            result = release_task(args.task, commit, tree)
+            result = release_task(args.task, commit, tree, seed=args.seed)
     print(json.dumps(result), flush=True)
 
 

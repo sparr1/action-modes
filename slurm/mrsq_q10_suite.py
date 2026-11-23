@@ -23,20 +23,22 @@ CAMPAIGN = Path("/oscar/scratch/rgao48/ambi/mrsq-q10-suite-20261122")
 # Completed matching Q5 times scaled by the measured Dog Stand/Walk Q10 ratios.
 PREDICTED_COMPUTE_HOURS = {"humanoid-walk": 84, "humanoid-run": 84, "dog-trot": 85, "dog-run": 86,
                            "humanoid-stand": 85, "dog-walk": 86}
+SEED56_TASKS = ("dog-run", "humanoid-run")
 MAX_SECONDS_PER_DECISION = 0.38
 TIMING_MARGIN = 0.15
 STARTUP_ALLOWANCE_HOURS = 0.5
 
 
-def manifest_path(task):
-    return ROOT / "configs/dmcontrol/experiments" / f"ambi_{task.replace('-', '_')}_mrsq_q10_seed55.json"
+def manifest_path(task, seed=55):
+    assert seed == 55 or (seed == 56 and task in SEED56_TASKS)
+    return ROOT / "configs/dmcontrol/experiments" / f"ambi_{task.replace('-', '_')}_mrsq_q10_seed{seed}.json"
 
 
-def validate_recipe(task):
-    name, manifest, run = recipe(0, manifest_path(task))
+def validate_recipe(task, seed=55):
+    name, manifest, run = recipe(0, manifest_path(task, seed))
     assert manifest["configs"] == [name] and manifest["trials"] == 1
     assert manifest["env_params"] == {"task": task, "obs": "state", "render_mode": None}
-    assert run["seed"] == 55 and run["total_steps"] == 1_000_000
+    assert run["seed"] == seed and run["total_steps"] == 1_000_000
     assert run["checkpoint_every"] == 25_000 and run["save_strat"] == "all"
     cfg = run["alg_params"]
     required = {"num_q": 10, "q_pair_size": 10, "outer_q_actor_reduction": "mean_all",
@@ -49,8 +51,8 @@ def validate_recipe(task):
     return name, run
 
 
-def check_speed(report, task, *, limit=MAX_SECONDS_PER_DECISION):
-    assert report["passed"] and report["binding"] == binding(manifest_path(task))
+def check_speed(report, task, *, seed=55, limit=MAX_SECONDS_PER_DECISION):
+    assert report["passed"] and report["binding"] == binding(manifest_path(task, seed))
     assert report["runtime"]["gpu"] == "NVIDIA L40S"
     assert report["runtime"]["float32_matmul_precision"] == "high"
     assert report["cpu_replay"] and not report["gpu_replay"]
@@ -63,9 +65,9 @@ def check_speed(report, task, *, limit=MAX_SECONDS_PER_DECISION):
         raise RuntimeError(f"{task} measured {elapsed:.4f} s/decision above the {limit:.4f} limit")
 
 
-def measurement(task, cpus, path, *, measure_resume_storage=False):
+def measurement(task, cpus, path, *, seed=55, measure_resume_storage=False):
     command = [sys.executable, str(Path(__file__).resolve()), "benchmark-worker", task,
-               "--output", str(path), "--worker-cpus", ",".join(map(str, cpus))]
+               "--seed", str(seed), "--output", str(path), "--worker-cpus", ",".join(map(str, cpus))]
     if measure_resume_storage:
         command.append("--measure-resume-storage")
     subprocess.run(command, cwd=ROOT, check=True)
@@ -150,17 +152,19 @@ def benchmark(task, task_root):
     print("Q10_BENCHMARK_PASSED", json.dumps(plan), flush=True)
 
 
-def load_plan(task, output):
+def load_plan(task, output, *, seed=55):
     gate = output / "benchmark"
     plan = read(gate / "plan.json")
-    assert plan["passed"] and plan["task"] == task and plan["binding"] == binding(manifest_path(task))
+    assert plan["passed"] and plan["task"] == task and plan["binding"] == binding(manifest_path(task, seed))
+    if seed == 56:
+        assert plan["sizing_reference"]["seed"] == 55 and plan["cpus"] == 1, plan
     assert plan["cpu_replay"] and plan["wandb"] is False
     assert hashlib.sha256((gate / "parity.xml").read_bytes()).hexdigest() == plan["parity_sha256"]
     return plan
 
 
-def allocation(task, output):
-    plan = load_plan(task, output)
+def allocation(task, output, *, seed=55):
+    plan = load_plan(task, output, seed=seed)
     fields = slurm_fields(os.environ["SLURM_JOB_ID"])
     count = str(plan["cpus"])
     assert count == os.environ["SLURM_CPUS_PER_TASK"]
@@ -177,45 +181,49 @@ def allocation(task, output):
     print(hours * 3600)
 
 
-def node_check(task, output, receipt):
+def node_check(task, output, receipt, *, seed=55):
     from slurm.benchmark_ambi_training_cpu import physical_core_cpus
 
     assert os.environ["WANDB_MODE"] == "disabled"
-    plan = load_plan(task, output)
+    plan = load_plan(task, output, seed=seed)
     cpus = physical_core_cpus(os.sched_getaffinity(0))
     count = int(os.environ["SLURM_CPUS_PER_TASK"])
     assert plan["cpus"] == count and len(cpus) >= count
     receipt.parent.mkdir(parents=True, exist_ok=True)
-    report = measurement(task, cpus[:count], receipt)
+    report = measurement(task, cpus[:count], receipt, seed=seed)
     assert report["runtime"] == plan["runtime"]
-    check_speed(report, task, limit=plan["max_seconds_per_decision"])
+    check_speed(report, task, seed=seed, limit=plan["max_seconds_per_decision"])
     print(f"Q10_NODE_THROUGHPUT_PASSED {task} {report['measured']['seconds_per_decision']:.6f}", flush=True)
 
 
-def lineage_path(task, campaign=CAMPAIGN):
-    return campaign / task / "lineage"
+def task_path(task, campaign=CAMPAIGN, *, seed=55):
+    return campaign / (task if seed == 55 else f"{task}-s{seed}")
+
+
+def lineage_path(task, campaign=CAMPAIGN, *, seed=55):
+    return task_path(task, campaign, seed=seed) / "lineage"
 
 
 def train(args, task_root):
     import torch
 
     assert os.environ.get("SLURM_JOB_ID") and os.environ.get("WANDB_MODE") == "online"
-    name, run = validate_recipe(args.task)
+    name, run = validate_recipe(args.task, args.seed)
     torch.set_num_threads(int(os.environ["SLURM_CPUS_PER_TASK"]))
     torch.set_num_interop_threads(1)
     runtime = accelerated_runtime()
-    assert runtime == load_plan(args.task, task_root)["runtime"]
-    lineage = lineage_path(args.task)
+    assert runtime == load_plan(args.task, task_root, seed=args.seed)["runtime"]
+    lineage = lineage_path(args.task, seed=args.seed)
     snapshot_root = task_root / "models"
     args.output.mkdir(parents=True, exist_ok=False)
     write_new(args.output / "launch.json", {
-        "binding": binding(manifest_path(args.task)), "task": args.task, "config": name,
+        "binding": binding(manifest_path(args.task, args.seed)), "task": args.task, "config": name,
         "seed": run["seed"], "runtime": runtime, "resume_mode": args.resume_mode,
         "lineage_dir": str(lineage), "snapshot_root": str(snapshot_root),
         "resume_checkpoint_minutes": 15, "drain_after_seconds": args.drain_seconds,
         "slurm_job_id": os.environ["SLURM_JOB_ID"], "segment_id": os.environ["AMBI_SEGMENT_ID"],
     })
-    sys.argv = ["main.py", "--run", str(manifest_path(args.task)), "--alg-dir", "configs/dmcontrol/algs",
+    sys.argv = ["main.py", "--run", str(manifest_path(args.task, args.seed)), "--alg-dir", "configs/dmcontrol/algs",
                 "--num-runs", "1", "--log-dir", str(args.output), "--lineage-dir", str(lineage),
                 "--resume-mode", args.resume_mode, "--resume-wandb-mode", "online",
                 "--resume-model-snapshot-root", str(snapshot_root), "--resume-checkpoint-minutes", "15",
@@ -223,8 +231,8 @@ def train(args, task_root):
     runpy.run_path(str(ROOT / "main.py"), run_name="__main__")
 
 
-def record_handoff(task, output):
-    lineage = lineage_path(task)
+def record_handoff(task, output, *, seed=55):
+    lineage = lineage_path(task, seed=seed)
     generation = (lineage / "LATEST").read_text().strip()
     generation_file = lineage / "generations" / generation / "manifest.json"
     metadata = read(generation_file)["metadata"]
@@ -243,6 +251,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("benchmark", "benchmark-worker", "allocation", "node-check", "record-handoff", "train"))
     parser.add_argument("task", choices=PREDICTED_COMPUTE_HOURS)
+    parser.add_argument("--seed", type=int, choices=(55, 56), default=55)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--worker-cpus")
     parser.add_argument("--measure-resume-storage", action="store_true")
@@ -250,24 +259,25 @@ def main():
     parser.add_argument("--drain-seconds", type=int)
     args = parser.parse_args()
     assert Path(os.environ["AMBI_Q10_CAMPAIGN"]) == CAMPAIGN
-    task_root = CAMPAIGN / args.task
-    validate_recipe(args.task)
+    task_root = task_path(args.task, seed=args.seed)
+    validate_recipe(args.task, args.seed)
     if args.mode == "benchmark-worker":
         from slurm.posttanh_dog_trot_resume import benchmark_worker
 
         assert os.environ["WANDB_MODE"] == "disabled" and args.worker_cpus and args.output
         args.index, args.native_reference = 0, False
-        benchmark_worker(args, manifest_path=manifest_path(args.task),
+        benchmark_worker(args, manifest_path=manifest_path(args.task, args.seed),
                          measure_resume_storage=args.measure_resume_storage)
     elif args.mode == "benchmark":
+        assert args.seed == 55, "Seed 56 uses the measured seed-55 timing and an assigned-GPU check"
         benchmark(args.task, task_root)
     elif args.mode == "allocation":
-        allocation(args.task, task_root)
+        allocation(args.task, task_root, seed=args.seed)
     elif args.mode == "node-check":
         assert args.output is not None and args.output.parent == task_root / "node-checks"
-        node_check(args.task, task_root, args.output)
+        node_check(args.task, task_root, args.output, seed=args.seed)
     elif args.mode == "record-handoff":
-        record_handoff(args.task, task_root)
+        record_handoff(args.task, task_root, seed=args.seed)
     else:
         assert args.resume_mode and args.output and args.output.parent == task_root / "launches"
         assert args.drain_seconds and args.drain_seconds > 0

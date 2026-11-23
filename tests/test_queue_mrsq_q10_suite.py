@@ -1,9 +1,11 @@
+import hashlib
 import json
 
 import pytest
 
 from slurm import queue_mrsq_q10_suite as suite
 from slurm import release_mrsq_q5_suite as resources
+from slurm.mrsq_q10_workspace import discover_rows, markdown
 
 
 def test_hold_validation_checks_all_cpu_fields_and_node_exclusion():
@@ -61,3 +63,49 @@ def test_reservation_bound_uses_live_concurrency_and_excludes_replaced_job(monke
     assert result['allocation_limits'] == {'cpu': 4, 'gres/gpu': 2}
     with pytest.raises(AssertionError):
         resources.reservation_check('12', plan)
+
+
+def test_seed56_reuses_only_matching_seed55_recipe_and_measurements(monkeypatch, tmp_path):
+    monkeypatch.setattr(suite, 'CAMPAIGN', tmp_path)
+    task = 'dog-run'
+    old_root = suite.task_path(task, tmp_path)
+    new_root = suite.task_path(task, tmp_path, seed=56)
+    gate = old_root / 'benchmark'
+    gate.mkdir(parents=True)
+    new_root.mkdir()
+    parity = b'<testsuite><testcase/><testcase/></testsuite>'
+    (gate / 'parity.xml').write_bytes(parity)
+    reference = {'passed': True, 'task': task, 'cpus': 1, 'cpu_replay': True, 'wandb': False,
+                 'binding': {**suite.binding(suite.manifest_path(task)), 'commit': 'old'},
+                 'runtime': {'gpu': 'NVIDIA L40S'}, 'gate_job': '10',
+                 'parity_sha256': hashlib.sha256(parity).hexdigest()}
+    (gate / 'plan.json').write_text(json.dumps(reference))
+    (old_root / 'release.json').write_text(json.dumps({'allocation_verified': True, 'plan': reference,
+                                                       'gate_job': '10', 'training_job': '11'}))
+    (old_root / 'scheduling.json').write_text(json.dumps({'gate': '10', 'commit': 'old', 'tree': 'old-tree'}))
+
+    def git(*args):
+        if args == ('git', 'rev-parse', 'old^{tree}'):
+            return 'old-tree'
+        assert args[:5] == ('git', 'diff', '--quiet', 'old', 'HEAD')
+
+    monkeypatch.setattr(suite, 'command', git)
+    assert suite.lineage_path(task, tmp_path, seed=56).parent == new_root != old_root
+    plan = suite.reuse_timing_plan(task, new_root)
+    assert plan['binding'] == suite.binding(suite.manifest_path(task, 56))
+    assert plan['sizing_reference'] == {'seed': 55, 'binding': reference['binding'], 'training_job': '11'}
+    assert suite.reuse_timing_plan(task, new_root) == plan
+    assert json.loads((gate / 'plan.json').read_text()) == reference
+
+
+def test_workspace_matches_old_seedless_receipts_and_keeps_seed56_independent():
+    class API:
+        def runs(self, *args, **kwargs):
+            return []
+
+    rows = discover_rows(API(), [{'task': 'dog-run', 'run_id': 'old'}])
+    assert len(rows) == len({row['group'] for row in rows}) == 8
+    dog = {row['seed']: row for row in rows if row['task'] == 'dog-run'}
+    assert dog[55]['run_id'] == 'old'
+    assert dog[56]['run_id'] is None
+    assert '| dog-run | 56 | pending |' in markdown(rows)

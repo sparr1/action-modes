@@ -18,8 +18,10 @@ batch_started=$SECONDS
 : "${AMBI_Q10_CAMPAIGN:?Set campaign scratch storage}"
 mode="${1:?Use benchmark or train}"
 task="${2:?Set task}"
+seed="${AMBI_Q10_SEED:-55}"
 [[ "$mode" == benchmark || "$mode" == train ]]
 case "$task" in humanoid-walk|humanoid-run|dog-trot|dog-run|humanoid-stand|dog-walk) ;; *) exit 2 ;; esac
+case "$seed:$task" in 55:*|56:dog-run|56:humanoid-run) ;; *) exit 2 ;; esac
 [[ "$AMBI_Q10_CAMPAIGN" == /oscar/scratch/rgao48/ambi/mrsq-q10-suite-20261122 ]]
 cd "${SLURM_SUBMIT_DIR:?}"
 [[ "$(git rev-parse --show-toplevel)" == "$PWD" ]]
@@ -28,6 +30,9 @@ cd "${SLURM_SUBMIT_DIR:?}"
 restart="${SLURM_RESTART_COUNT:-0}"
 [[ "$restart" =~ ^[0-9]+$ ]]
 task_root="$AMBI_Q10_CAMPAIGN/$task"
+if [[ "$seed" == 56 ]]; then
+    task_root="$task_root-s56"
+fi
 cache="$task_root/cache/$SLURM_JOB_ID.$restart"
 mkdir -p -- "$(dirname "$cache")"
 mkdir -- "$cache"
@@ -47,11 +52,11 @@ export WANDB_MODE=disabled
 helper=slurm/mrsq_q10_suite.py
 if [[ "$mode" == benchmark ]]; then
     (( SLURM_CPUS_PER_TASK >= 2 ))
-    srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" "$helper" benchmark "$task"
+    srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" "$helper" benchmark "$task" --seed "$seed"
     exit 0
 fi
 
-walltime="$("$AMBI_PYTHON" "$helper" allocation "$task")"
+walltime="$("$AMBI_PYTHON" "$helper" allocation "$task" --seed "$seed")"
 (( walltime > 3600 ))
 lineage="$task_root/lineage"
 checkquota | "$AMBI_PYTHON" -m utils.oscar_resume_launcher quota \
@@ -76,7 +81,7 @@ else
     [[ -s "$lineage/LINEAGE.json" && -s "$lineage/LATEST" ]]
 fi
 srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" "$helper" node-check "$task" \
-    --output "$task_root/node-checks/$SLURM_JOB_ID.$restart.json"
+    --seed "$seed" --output "$task_root/node-checks/$SLURM_JOB_ID.$restart.json"
 export WANDB_MODE=online
 
 run_segment() {
@@ -87,7 +92,7 @@ run_segment() {
     segment_status=0
     srun --unbuffered --kill-on-bad-exit=1 \
         --output="$AMBI_SEGMENT_CONSOLE_DIR/stdout.log" --error="$AMBI_SEGMENT_CONSOLE_DIR/stderr.log" \
-        "$AMBI_PYTHON" "$helper" train "$task" --output "$task_root/launches/$AMBI_SEGMENT_ID" \
+        "$AMBI_PYTHON" "$helper" train "$task" --seed "$seed" --output "$task_root/launches/$AMBI_SEGMENT_ID" \
         --resume-mode "$resume_mode" --drain-seconds "$2" || segment_status=$?
 }
 
@@ -104,7 +109,7 @@ if [[ "$resume_mode" == new ]]; then
         exit 2
     fi
     verify_handoff
-    "$AMBI_PYTHON" "$helper" record-handoff "$task"
+    "$AMBI_PYTHON" "$helper" record-handoff "$task" --seed "$seed"
     resume_mode=required
 fi
 
