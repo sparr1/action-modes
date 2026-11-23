@@ -355,7 +355,7 @@ without `S` retain the documented local-calibration fallback; see the
 
 ### Oscar durable checkpoint storage
 
-AMBI jobs submitted by `rgao48` on Oscar store resumable state under
+The general Oscar resume launchers for `rgao48` store resumable state under
 `/oscar/home/rgao48/ambi-durable`. The quota preflight must select the user home
 row that owns that path:
 
@@ -372,8 +372,15 @@ separate allocation and is not an approved AMBI durable target; both Oscar
 launchers reject that label and any quota selection other than exactly
 `rgao48` plus `/oscar/home`. On Oscar they also require the exact durable root
 shown above, so the checked quota row and the checkpoint filesystem cannot
-diverge. Oscar scratch and job-local storage are not substitutes for the
-durable checkpoint root.
+diverge.
+
+The four-task Q10 launcher stores active-run state on the shared Oscar scratch
+filesystem, under the campaign's `<task>/lineage` directory. Its quota check
+uses the `rgao48` row for `/oscar/scratch` and accounts for staged generations
+and the separate `<task>/models` checkpoint bank. The same lineage is used
+after a requeue or restart on another node. Oscar may purge individual scratch
+files after 30 days without access, so archive checkpoints that need longer
+retention. Job-local storage is used only for temporary work and caches.
 
 The compact AMBI branch-count and imagination-horizon suite lives under
 `configs/ambi/`. Each algorithm file has one matching runnable

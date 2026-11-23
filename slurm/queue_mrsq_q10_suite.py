@@ -13,10 +13,9 @@ SOURCE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SOURCE))
 
 from slurm.release_mrsq_q5_suite import allocation_updates, atomic, fields, reservation_check, wall_minutes
+from slurm.mrsq_q10_suite import CAMPAIGN, lineage_path, load_plan
 
 
-CAMPAIGN = Path('/oscar/scratch/rgao48/ambi/mrsq-q10-suite-20261122')
-DURABLE = Path('/oscar/home/rgao48/ambi-durable/lineages/mrsq-q10-suite-20261122')
 PYTHON = '/oscar/home/rgao48/action-modes/environments/dmcontrol/.venv/bin/python'
 LAUNCHER = SOURCE / 'slurm/run_mrsq_q10_suite_oscar.sbatch'
 TASKS = ('humanoid-walk', 'humanoid-run', 'dog-trot', 'dog-run')
@@ -70,12 +69,13 @@ def queue_task(task, commit, tree):
     root = CAMPAIGN / task
     root.mkdir(mode=0o700, exist_ok=True)
     receipt = root / 'scheduling.json'
+    lineage = lineage_path(task, CAMPAIGN)
     row = read(receipt) if receipt.exists() else {'task': task, 'commit': commit, 'tree': tree,
-                                                  'source': str(SOURCE), 'lineage': str(DURABLE / task)}
+                                                  'source': str(SOURCE), 'lineage': str(lineage)}
     assert (row['commit'], row['tree'], row['source'], row['lineage']) == (
-        commit, tree, str(SOURCE), str(DURABLE / task))
+        commit, tree, str(SOURCE), str(lineage))
     if 'train' not in row:
-        assert not (DURABLE / task).exists(), 'A new job cannot replace a lineage'
+        assert not lineage.exists(), 'A new job cannot replace a lineage'
     exports = ','.join(['ALL', 'AMBI_EXPECTED_COMMIT=' + commit, 'AMBI_PYTHON=' + PYTHON,
                         'AMBI_Q10_CAMPAIGN=' + str(CAMPAIGN), 'WANDB_MODE=disabled',
                         'PYTHONDONTWRITEBYTECODE=1'])
@@ -112,34 +112,42 @@ def verify_held(current, plan, gate):
     assert wall_minutes(current['TimeLimit']) == plan['wall_hours'] * 60, current
 
 
-def home_free_gib():
+def scratch_free_gib():
     rows = [line.split() for line in command('checkquota').splitlines()]
-    selected = [row for row in rows if row[:2] == ['rgao48', '/oscar/home']]
+    selected = [row for row in rows if row[:2] == ['rgao48', '/oscar/scratch']]
     assert len(selected) == 1 and selected[0][-2:] == ['OK', 'None'], selected
     return float(selected[0][4]) - float(selected[0][2])
 
 
-def booked_home_gib(task, new_plan):
+def bytes_on_disk(paths):
+    total = 0
+    for file in paths:
+        try:
+            if file.is_file() and not file.is_symlink():
+                total += file.stat().st_size
+        except FileNotFoundError:
+            # A concurrent commit can retire its predecessor between those reads.
+            continue
+    return total
+
+
+def booked_scratch_gib(task, new_plan):
     plans = {task: new_plan}
     for other in TASKS:
         if other != task and (CAMPAIGN / other / 'release.json').is_file():
             plans[other] = read(CAMPAIGN / other / 'release.json')['plan']
     remaining = 0
     for name, plan in plans.items():
-        lineage = DURABLE / name
+        lineage = lineage_path(name, CAMPAIGN)
         if (lineage / 'DONE').is_file():
             continue
         # Keep two completed generations and space for the atomically staged third.
-        bytes_required = 3 * plan['full_generation_bytes']
-        committed = 0
-        for file in (lineage / 'generations').glob('*/**/*'):
-            try:
-                if file.is_file():
-                    committed += file.stat().st_size
-            except FileNotFoundError:
-                # A concurrent commit can retire its predecessor between those reads.
-                continue
-        remaining += max(0, bytes_required - committed)
+        generations = bytes_on_disk((lineage / 'generations').glob('*/**/*'))
+        remaining += max(0, 3 * plan['full_generation_bytes'] - generations)
+        # Portable 25k weights are siblings of the lineage on the same quota.
+        models = (lineage.parent / 'models').rglob('model:*')
+        snapshots = bytes_on_disk(path for path in models if path.name.rsplit('_', 1)[-1].isdigit())
+        remaining += max(0, 40 * plan['checkpoint_bytes'] - snapshots)
     return remaining / 2**30
 
 
@@ -160,13 +168,12 @@ def release_task(task, commit, tree):
     except subprocess.CalledProcessError:
         attested = command('sacct', '-nPX', '-j', gate, '-o', 'JobIDRaw,State,ExitCode').splitlines()
         assert f'{gate}|COMPLETED|0:0' in attested, attested
-    from slurm.mrsq_q10_suite import load_plan
-
     plan = load_plan(task, root)
     assert plan['binding']['commit'] == commit and str(plan['gate_job']) == gate
     assert plan['cpu_replay'] is True and plan['wandb'] is False
     assert plan['cpus'] in (1, 2) and plan['memory_gib'] > 0 and plan['wall_hours'] > 0
-    assert plan['full_generation_bytes'] > 0 and plan['seconds_per_decision'] > 0
+    assert plan['full_generation_bytes'] > 0 and plan['checkpoint_bytes'] > 0
+    assert plan['seconds_per_decision'] > 0
     current = job_for(task, 'train', train)
     intent = root / 'release-intent.json'
     if current['Reason'] != 'JobHeldUser' and intent.is_file():
@@ -176,13 +183,13 @@ def release_task(task, commit, tree):
         return pending
     verify_held(current, plan if intent.is_file() else PROVISIONAL, gate)
     budget = reservation_check(train, plan)
-    needed, free = booked_home_gib(task, plan), home_free_gib()
-    assert free >= needed, f'Home storage can reserve {free:.2f} GiB, needs {needed:.2f} GiB for exact resume'
+    needed, free = booked_scratch_gib(task, plan), scratch_free_gib()
+    assert free >= needed, f'Scratch has {free:.2f} GiB free, needs {needed:.2f} GiB for resume and snapshots'
     command(*allocation_updates(train, plan))
     current = job_for(task, 'train', train)
     verify_held(current, plan, gate)
     pending = {'training_job': train, 'gate_job': gate, 'controller_job': controller,
-               'plan': plan, 'home_quota': {'free_gib': free, 'reserved_gib': needed},
+               'plan': plan, 'scratch_quota': {'free_gib': free, 'reserved_gib': needed},
                'reservations': budget, 'allocation_verified': True}
     atomic(intent, pending)
     command('scontrol', 'release', train)

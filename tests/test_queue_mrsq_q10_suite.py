@@ -18,18 +18,31 @@ def test_hold_validation_checks_all_cpu_fields_and_node_exclusion():
             suite.verify_held({**fields, key: '1'}, plan, '123')
 
 
-def test_storage_reservation_counts_staging_and_existing_lineages(monkeypatch, tmp_path):
-    campaign, durable = tmp_path / 'campaign', tmp_path / 'durable'
+def test_scratch_reservation_counts_staging_and_portable_checkpoints(monkeypatch, tmp_path):
+    campaign = tmp_path / 'campaign'
     monkeypatch.setattr(suite, 'CAMPAIGN', campaign)
-    monkeypatch.setattr(suite, 'DURABLE', durable)
-    plan = {'full_generation_bytes': 2**30}
+    plan = {'full_generation_bytes': 2**30, 'checkpoint_bytes': 2**25}
     prior = campaign / 'dog-trot' / 'release.json'
     prior.parent.mkdir(parents=True)
     prior.write_text(json.dumps({'plan': plan}))
-    generation = durable / 'dog-trot' / 'generations' / 'step-500' / 'replay.pt'
+    lineage = suite.lineage_path('dog-trot', campaign)
+    assert lineage == campaign / 'dog-trot' / 'lineage'
+    generation = lineage / 'generations' / 'step-500' / 'replay.pt'
     generation.parent.mkdir(parents=True)
     with generation.open('wb') as file:
         file.truncate(2**30)
-    assert suite.booked_home_gib('humanoid-run', plan) == 5
-    (durable / 'dog-trot' / 'DONE').touch()
-    assert suite.booked_home_gib('humanoid-run', plan) == 3
+    weight = lineage.parent / 'models' / 'run' / 'models' / 'model:dog_trot_25000'
+    weight.parent.mkdir(parents=True)
+    with weight.open('wb') as file:
+        file.truncate(2**25)
+    weight.with_suffix('.metadata.json').write_bytes(b'{}')
+    assert suite.booked_scratch_gib('humanoid-run', plan) == 7.5 - 1/32
+    (lineage / 'DONE').touch()
+    assert suite.booked_scratch_gib('humanoid-run', plan) == 4.25
+
+
+def test_quota_uses_scratch_row(monkeypatch):
+    output = 'rgao48 /oscar/home 95.57 95.57 100 125 0 0 0 OK None\n' \
+             'rgao48 /oscar/scratch 407.68 79.63 512 10240 0 0 0 OK None\n'
+    monkeypatch.setattr(suite, 'command', lambda *args: output)
+    assert suite.scratch_free_gib() == pytest.approx(104.32)

@@ -53,12 +53,11 @@ fi
 
 walltime="$("$AMBI_PYTHON" "$helper" allocation "$task")"
 (( walltime > 3600 ))
-durable=/oscar/home/rgao48/ambi-durable
-lineage="$durable/lineages/mrsq-q10-suite-20261122/$task"
+lineage="$task_root/lineage"
 checkquota | "$AMBI_PYTHON" -m utils.oscar_resume_launcher quota \
-    --allocation rgao48 --filesystem-path /oscar/home
+    --allocation rgao48 --filesystem-path /oscar/scratch
 "$AMBI_PYTHON" -m utils.oscar_resume_launcher storage \
-    --durable-root "$durable" --lineage-dir "$lineage"
+    --durable-root "$task_root" --lineage-dir "$lineage"
 if [[ -e "$lineage/DONE" ]]; then
     "$AMBI_PYTHON" -m utils.oscar_resume_launcher done --lineage-dir "$lineage"
     exit 0

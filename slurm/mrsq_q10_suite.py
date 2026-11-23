@@ -20,7 +20,6 @@ from slurm.inner_entropy_oscar import accelerated_runtime, slurm_fields
 
 
 CAMPAIGN = Path("/oscar/scratch/rgao48/ambi/mrsq-q10-suite-20261122")
-DURABLE_ROOT = Path("/oscar/home/rgao48/ambi-durable")
 # Completed matching Q5 times scaled by the measured Dog Stand/Walk Q10 ratios.
 PREDICTED_COMPUTE_HOURS = {"humanoid-walk": 84, "humanoid-run": 84, "dog-trot": 85, "dog-run": 86}
 MAX_SECONDS_PER_DECISION = 0.38
@@ -190,8 +189,8 @@ def node_check(task, output, receipt):
     print(f"Q10_NODE_THROUGHPUT_PASSED {task} {report['measured']['seconds_per_decision']:.6f}", flush=True)
 
 
-def lineage_path(task):
-    return DURABLE_ROOT / "lineages" / CAMPAIGN.name / task
+def lineage_path(task, campaign=CAMPAIGN):
+    return campaign / task / "lineage"
 
 
 def train(args, task_root):
