@@ -53,13 +53,19 @@ def test_quota_uses_scratch_row(monkeypatch):
 
 def test_reservation_bound_uses_live_concurrency_and_excludes_replaced_job(monkeypatch):
     qos = 'pri-gpu+|cpu=800,gres/gpu=240|cpu=4,gres/gpu=2,mem=64G|'
-    jobs = '10|pri-gpu+|2|02:00:00|gres/gpu:l40s:1\n' \
-           '11|pri-gpu+|1|01:50:00|gres/gpu:l40s:1\n' \
-           '12|pri-gpu+|1|02:15:00|gres/gpu:l40s:1'
-    monkeypatch.setattr(resources, 'command', lambda args: qos if args[0] == 'sacctmgr' else jobs)
+    def command(args):
+        if args[0] == 'sacctmgr':
+            return qos
+        # Job 10 is running. Job 11 is pending and retains its full request.
+        active = '01:15:00' if '%L' in args[-1] else '04:00:00'
+        return (f'10|pri-gpu+|2|{active}|gres/gpu:l40s:1\n'
+                '11|pri-gpu+|1|01:50:00|gres/gpu:l40s:1\n'
+                '12|pri-gpu+|1|02:15:00|gres/gpu:l40s:1')
+
+    monkeypatch.setattr(resources, 'command', command)
     plan = {'cpus': 1, 'wall_hours': 2}
     result = resources.reservation_check('12', plan, concurrent=True)
-    assert result['full_reservation_upper_bound_minutes'] == {'cpu': 470, 'gres/gpu': 240}
+    assert result['remaining_reservation_upper_bound_minutes'] == {'cpu': 380, 'gres/gpu': 230}
     assert result['allocation_limits'] == {'cpu': 4, 'gres/gpu': 2}
     with pytest.raises(AssertionError):
         resources.reservation_check('12', plan)

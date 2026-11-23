@@ -67,7 +67,10 @@ def reservation_check(job, plan, *, concurrent=False):
     limits = dict(x.split('=', 1) for x in run_minutes.split(','))
     wall = plan['wall_hours'] * 60
     durations = {'cpu': [wall] * plan['cpus'], 'gres/gpu': [wall]}
-    queue = command(['squeue', '-h', '-r', '-u', 'rgao48', '-o', '%i|%q|%C|%l|%b'])
+    # Slurm reports the full limit as time left for pending jobs. For running
+    # jobs, count the remaining reservation in the concurrent budget.
+    time_format = '%L' if concurrent else '%l'
+    queue = command(['squeue', '-h', '-r', '-u', 'rgao48', '-o', f'%i|%q|%C|{time_format}|%b'])
     for row in queue.splitlines():
         ident, qos, cpus, time, gres = row.split('|')
         if qos != 'pri-gpu+' or ident == str(job):
@@ -76,13 +79,14 @@ def reservation_check(job, plan, *, concurrent=False):
         match = re.search(r'gpu:(?:[^:,]+:)?([0-9]+)', gres)
         durations['cpu'].extend([minutes] * int(cpus))
         durations['gres/gpu'].extend([minutes] * (int(match[1]) if match else 0))
-    # Full requested durations are conservative. At most the user allocation
-    # limit can run simultaneously, even when there are more queued jobs.
+    # At most the user allocation limit can run simultaneously, even when
+    # there are more queued jobs.
     caps = (dict(pair.split('=', 1) for pair in allocated.split(',')) if concurrent else {})
     totals = {key: sum(sorted(times, reverse=True)[:int(caps.get(key, len(times)))])
               for key, times in durations.items()}
     assert all(value <= float(limits[key]) for key, value in totals.items()), (totals, limits)
-    result = {'full_reservation_upper_bound_minutes': totals, 'limits': limits}
+    budget_name = 'remaining_reservation_upper_bound_minutes' if concurrent else 'full_reservation_upper_bound_minutes'
+    result = {budget_name: totals, 'limits': limits}
     if concurrent:
         result['allocation_limits'] = {key: int(caps[key]) for key in durations}
     return result
