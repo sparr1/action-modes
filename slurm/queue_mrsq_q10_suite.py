@@ -270,7 +270,7 @@ def main():
     parser.add_argument('--seed', type=int, choices=(55, 56), default=55)
     args = parser.parse_args()
     if args.seed == 56 and args.task not in SEED56_TASKS:
-        parser.error('Seed 56 requires an explicit --task dog-run or humanoid-run')
+        parser.error('Seed 56 requires an explicit --task from ' + ', '.join(SEED56_TASKS))
     commit = os.environ['AMBI_EXPECTED_COMMIT']
     tree = validate_pin(commit)
     CAMPAIGN.mkdir(mode=0o700, exist_ok=True)

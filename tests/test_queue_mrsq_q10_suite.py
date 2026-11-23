@@ -65,9 +65,9 @@ def test_reservation_bound_uses_live_concurrency_and_excludes_replaced_job(monke
         resources.reservation_check('12', plan)
 
 
-def test_seed56_reuses_only_matching_seed55_recipe_and_measurements(monkeypatch, tmp_path):
+@pytest.mark.parametrize('task', suite.SEED56_TASKS)
+def test_seed56_reuses_only_matching_seed55_recipe_and_measurements(monkeypatch, tmp_path, task):
     monkeypatch.setattr(suite, 'CAMPAIGN', tmp_path)
-    task = 'dog-run'
     old_root = suite.task_path(task, tmp_path)
     new_root = suite.task_path(task, tmp_path, seed=56)
     gate = old_root / 'benchmark'
@@ -104,8 +104,9 @@ def test_workspace_matches_old_seedless_receipts_and_keeps_seed56_independent():
             return []
 
     rows = discover_rows(API(), [{'task': 'dog-run', 'run_id': 'old'}])
-    assert len(rows) == len({row['group'] for row in rows}) == 8
+    assert len(rows) == len({row['group'] for row in rows}) == 9
     dog = {row['seed']: row for row in rows if row['task'] == 'dog-run'}
     assert dog[55]['run_id'] == 'old'
     assert dog[56]['run_id'] is None
     assert '| dog-run | 56 | pending |' in markdown(rows)
+    assert '| humanoid-stand | 56 | pending |' in markdown(rows)
