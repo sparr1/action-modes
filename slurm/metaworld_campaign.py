@@ -14,7 +14,7 @@ ACTION_REPEAT = 2
 EPISODE_DECISIONS = 100
 PROTOCOL = "metaworld-tdmpc2-04be337-state-final-success-v1"
 ENSEMBLE_VARIANTS = {"mrsq_q5": 5, "mrsq_q10": 10}
-ENSEMBLE_TASKS = {"mrsq_q5": ("assembly",), "mrsq_q10": ("assembly", "push", "stick-pull")}
+ENSEMBLE_TASKS = {"mrsq_q5": ("assembly",), "mrsq_q10": TASKS}
 
 
 def _unique_object(pairs):

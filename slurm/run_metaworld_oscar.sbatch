@@ -35,7 +35,6 @@ case "$variant" in
         manifest="configs/metaworld/experiments/assembly_$variant.json"
         ;;
     mrsq_q10)
-        [[ "$task" == assembly || "$task" == push || "$task" == stick-pull ]] || exit 1
         config_name=ambi_state_mrsq_q10
         manifest="configs/metaworld/experiments/${task}_mrsq_q10.json"
         ;;

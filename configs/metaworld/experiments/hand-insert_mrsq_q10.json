@@ -1,0 +1,25 @@
+{
+  "study_type": "metaworld_hand_insert_mrsq_q10",
+  "study_note": "Single-task TD-MPC2 Meta-World v2 protocol (04be337). Final-timestep success, action repeat 2, 100 decisions per episode. Q10 uses all ten critics for actor mean, target and terminal minimum.",
+  "env_params": {
+    "task": "hand-insert",
+    "obs": "state",
+    "render_mode": null,
+    "protocol": "metaworld-tdmpc2-04be337-state-final-success-v1"
+  },
+  "trials": 1,
+  "configs": [
+    "ambi_state_mrsq_q10"
+  ],
+  "logs": "none",
+  "save_trials": "none",
+  "checkpoint_every": 25000,
+  "save_strat": [
+    "all",
+    "best",
+    "latest"
+  ],
+  "checkpoint_best_window": 100,
+  "log_info": false,
+  "log_type": "summary"
+}

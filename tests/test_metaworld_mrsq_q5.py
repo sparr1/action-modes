@@ -104,7 +104,7 @@ def test_unknown_variant_is_rejected_before_config_output(tmp_path, variant):
 
 
 @pytest.mark.parametrize("task,variant", [("hand-insert", VARIANT), ("push", VARIANT),
-                                           ("stick-pull", VARIANT), ("hand-insert", "mrsq_q10")])
+                                           ("stick-pull", VARIANT)])
 def test_ensemble_variants_reject_other_tasks_before_config_output(tmp_path, task, variant):
     with pytest.raises(ValueError):
         production_algorithm(task, variant=variant)
@@ -147,7 +147,7 @@ def test_ensemble_launcher_uses_new_lineage_then_resumes_it_without_touching_bas
 
 @pytest.mark.parametrize("variant,index", [("invalid", "0"), ("../baseline", "0"),
                                            (VARIANT, "1"), (VARIANT, "2"), (VARIANT, "3"),
-                                           ("mrsq_q10", "1")])
+                                           ("mrsq_q10", "4")])
 def test_invalid_launcher_variant_or_task_fails_before_any_write(launch, variant, index):
     run, default_lineage = launch
     status, calls = run(AMBI_METAWORLD_VARIANT=variant, SLURM_ARRAY_TASK_ID=index)
@@ -212,14 +212,16 @@ def test_q10_recipe_changes_only_ensemble_size_and_uses_its_own_wandb_group():
     assert q10_manifest == q5_manifest
 
 
-@pytest.mark.parametrize("task,index", [("push", "2"), ("stick-pull", "3")])
-def test_q10_hydra_cells_preserve_task_and_shared_resume_lineage(launch, task, index):
+@pytest.mark.parametrize("task,index", [("hand-insert", "1"), ("push", "2"), ("stick-pull", "3")])
+def test_q10_cells_preserve_task_and_shared_resume_lineage(launch, task, index):
     run, default_lineage = launch
     root = default_lineage.parents[3]
     q10 = production_algorithm(task, variant="mrsq_q10")
     params = q10["alg_params"]
     assert q10["seed"] == 55 and q10["total_steps"] == 1_000_000
     assert params["num_q"] == params["q_pair_size"] == 10
+    assert params["eval_freq"] == 25_000 and params["eval_episodes"] == 10
+    assert params["critic_geometry_diagnostics"]
     assert params["wandb_group"] == f"metaworld-{task}-mrsq-q10-s55"
     baseline = read_json(CONFIG_ROOT / f"experiments/{task}.json")
     manifest = read_json(CONFIG_ROOT / f"experiments/{task}_mrsq_q10.json")

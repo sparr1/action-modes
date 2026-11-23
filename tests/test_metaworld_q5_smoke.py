@@ -71,6 +71,7 @@ def test_trained_resume_check_checks_graph_before_native_evaluation(monkeypatch,
 @pytest.mark.parametrize("variant,num_q,task", [
     ("mrsq_q5", 5, "assembly"),
     ("mrsq_q10", 10, "assembly"),
+    ("mrsq_q10", 10, "hand-insert"),
     ("mrsq_q10", 10, "push"),
     ("mrsq_q10", 10, "stick-pull"),
 ])

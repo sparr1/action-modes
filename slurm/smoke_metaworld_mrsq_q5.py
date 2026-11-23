@@ -23,11 +23,9 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from slurm.benchmark_ambi_training_cpu import TrainingWindow, physical_core_cpus
-from slurm.metaworld_campaign import PROTOCOL, read_json, validate_algorithm
+from slurm.metaworld_campaign import ENSEMBLE_TASKS, ENSEMBLE_VARIANTS, PROTOCOL, read_json, validate_algorithm
 
 CONFIG_ROOT = ROOT / "configs/metaworld"
-ENSEMBLE_SIZES = {"mrsq_q5": 5, "mrsq_q10": 10}
-TASKS = ("assembly", "push", "stick-pull")
 WARMUP = MEASURED = 100
 REDUCTIONS = {
     "outer_q_actor_reduction": "mean_all",
@@ -39,7 +37,7 @@ REDUCTIONS = {
 
 
 def recipe_paths(variant, task="assembly"):
-    if variant not in ENSEMBLE_SIZES or task not in TASKS or (variant == "mrsq_q5" and task != "assembly"):
+    if task not in ENSEMBLE_TASKS.get(variant, ()):
         raise ValueError(f"Unsupported MetaWorld smoke recipe: {task} {variant}")
     return (CONFIG_ROOT / "algs" / f"ambi_state_{variant}.json",
             CONFIG_ROOT / "experiments" / f"{task}_{variant}.json")
@@ -74,7 +72,7 @@ def recipe(output, variant="mrsq_q5", task="assembly"):
     params = run["alg_params"]
     assert run["seed"] == 55 and run["total_steps"] == 1_000_000
     assert params["seed_steps"] == params["pretrain_steps"] == 1000
-    assert params["num_q"] == params["q_pair_size"] == ENSEMBLE_SIZES[variant]
+    assert params["num_q"] == params["q_pair_size"] == ENSEMBLE_VARIANTS[variant]
     assert all(params[key] == value for key, value in REDUCTIONS.items())
     assert params["critic_geometry_diagnostics"] is True
     assert params["wandb"] is False and params["wandb_mode"] == "disabled"
@@ -134,13 +132,13 @@ def validate_trained_controller(learner, num_q):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path, help="New directory outside source")
-    parser.add_argument("--variant", choices=ENSEMBLE_SIZES, default="mrsq_q5")
-    parser.add_argument("--task", choices=TASKS, default="assembly")
+    parser.add_argument("--variant", choices=ENSEMBLE_VARIANTS, default="mrsq_q5")
+    parser.add_argument("--task", choices=ENSEMBLE_TASKS["mrsq_q10"], default="assembly")
     parser.add_argument("--gpu-name", help="Required CUDA device name, default NVIDIA L40S for Q10")
     args = parser.parse_args(argv)
-    if args.variant == "mrsq_q5" and args.task != "assembly":
-        parser.error("Push and Stick Pull require --variant mrsq_q10")
-    num_q = ENSEMBLE_SIZES[args.variant]
+    if args.task not in ENSEMBLE_TASKS[args.variant]:
+        parser.error(f"{args.task} requires --variant mrsq_q10")
+    num_q = ENSEMBLE_VARIANTS[args.variant]
     smoke_name = f"{args.task}-mrsq-q{num_q}-smoke"
     assert os.environ.get("SLURM_JOB_ID"), "Use a scheduled GPU allocation"
     assert int(os.environ.get("SLURM_CPUS_PER_TASK", "0")) == 1, "Gate requires one CPU"

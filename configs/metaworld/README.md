@@ -147,7 +147,13 @@ Before production, run the scheduled L40S check in
 `slurm/smoke_metaworld_mrsq_q5.py` with `--variant mrsq_q10`.
 Use its compiled training and native evaluation timings to size the allocation.
 
-Push and Stick Pull also support `mrsq_q10`. For the Hydra pair, submit
+Hand Insert, Push, and Stick Pull also support `mrsq_q10`. For Hand Insert
+on Oscar, use `--task hand-insert` for the L40S check, then submit the shared
+launcher with `--array=1`, `AMBI_METAWORLD_VARIANT=mrsq_q10`, and
+`AMBI_METAWORLD_RESUME_MINUTES=15`. Its lineage is
+`<campaign>/hand-insert/ambi_state_mrsq_q10/seed_<seed>/lineage`.
+
+For the Hydra pair, submit
 `slurm/run_metaworld_q10_hydra.sbatch` with its two task indices, a pinned
 checkout, the locked native MetaWorld interpreter, and shared project
 storage. Each allocation validates its actual L40 before training in place.
