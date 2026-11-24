@@ -109,10 +109,15 @@ def test_workspace_matches_old_seedless_receipts_and_keeps_seed56_independent():
         def runs(self, *args, **kwargs):
             return []
 
-    rows = discover_rows(API(), [{'task': 'dog-run', 'run_id': 'old'}])
-    assert len(rows) == len({row['group'] for row in rows}) == 9
+    rows = discover_rows(API(), [{'task': 'dog-run', 'run_id': 'old'},
+                                {'task': 'humanoid-walk', 'run_id': 'old-walk'}])
+    assert len(rows) == len({row['group'] for row in rows}) == 10
     dog = {row['seed']: row for row in rows if row['task'] == 'dog-run'}
     assert dog[55]['run_id'] == 'old'
     assert dog[56]['run_id'] is None
     assert '| dog-run | 56 | pending |' in markdown(rows)
     assert '| humanoid-stand | 56 | pending |' in markdown(rows)
+    walk = {row['seed']: row for row in rows if row['task'] == 'humanoid-walk'}
+    assert walk[55]['run_id'] == 'old-walk'
+    assert walk[56]['run_id'] is None
+    assert '| humanoid-walk | 56 | pending |' in markdown(rows)

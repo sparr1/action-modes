@@ -23,7 +23,7 @@ CAMPAIGN = Path("/oscar/scratch/rgao48/ambi/mrsq-q10-suite-20261122")
 # Completed matching Q5 times scaled by the measured Dog Stand/Walk Q10 ratios.
 PREDICTED_COMPUTE_HOURS = {"humanoid-walk": 84, "humanoid-run": 84, "dog-trot": 85, "dog-run": 86,
                            "humanoid-stand": 85, "dog-walk": 86}
-SEED56_TASKS = ("dog-run", "humanoid-run", "humanoid-stand")
+SEED56_TASKS = ("dog-run", "humanoid-run", "humanoid-stand", "humanoid-walk")
 MAX_SECONDS_PER_DECISION = 0.38
 TIMING_MARGIN = 0.15
 STARTUP_ALLOWANCE_HOURS = 0.5

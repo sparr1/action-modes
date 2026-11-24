@@ -387,12 +387,12 @@ full-ensemble Q10 reductions. The resumable Dog Walk job starts a fresh
 seed-55 attempt. The earlier interrupted run saved model checkpoints without
 enough training state to restore its replay and random streams.
 
-For the matched Dog Run, Humanoid Run, and Humanoid Stand seed-56 jobs, pass
-`--seed 56` and the task to `slurm/queue_mrsq_q10_suite.py queue`. The dispatcher
-reuses the validated seed-55 resource measurements after checking the recipe
-and source, then checks the assigned GPU at startup. Each seed-56 job uses its
-own `<task>-s56/lineage` and tests save-and-resume on its first trained
-checkpoint before continuing.
+For the matched Dog Run, Humanoid Run, Humanoid Stand, and Humanoid Walk
+seed-56 jobs, pass `--seed 56` and the task to
+`slurm/queue_mrsq_q10_suite.py queue`. The dispatcher reuses the validated
+seed-55 resource measurements after checking the recipe and source, then checks
+the assigned GPU at startup. Each seed-56 job uses its own `<task>-s56/lineage`
+and tests save-and-resume on its first trained checkpoint before continuing.
 
 The compact AMBI branch-count and imagination-horizon suite lives under
 `configs/ambi/`. Each algorithm file has one matching runnable
