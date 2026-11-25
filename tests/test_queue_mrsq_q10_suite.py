@@ -1,5 +1,6 @@
 import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -104,14 +105,21 @@ def test_seed56_reuses_only_matching_seed55_recipe_and_measurements(monkeypatch,
     assert json.loads((gate / 'plan.json').read_text()) == reference
 
 
-def test_workspace_matches_old_seedless_receipts_and_keeps_seed56_independent():
+def test_workspace_matches_old_seedless_receipts_and_keeps_seeds_independent():
     class API:
-        def runs(self, *args, **kwargs):
+        def runs(self, project, *, filters, per_page):
+            assert project == f'{ENTITY}/{PROJECT}' and per_page == 2
+            group = filters['group']
+            if group == 'mrsq-q10-seed57-hydra-20261125-dog-trot':
+                return [SimpleNamespace(group=group, id='s57-trot', state='running',
+                                        name='Dog Trot | MRS.Q reductions Q10 | H3 J8 K1 | seed57',
+                                        summary={'env_step': 1000})]
             return []
 
     rows = discover_rows(API(), [{'task': 'dog-run', 'run_id': 'old'},
-                                {'task': 'humanoid-walk', 'run_id': 'old-walk'}])
-    assert len(rows) == len({row['group'] for row in rows}) == 13
+                                {'task': 'humanoid-walk', 'run_id': 'old-walk'},
+                                {'task': 'dog-trot', 'seed': 56, 'run_id': 's56-trot'}])
+    assert len(rows) == len({row['group'] for row in rows}) == 16
     dog = {row['seed']: row for row in rows if row['task'] == 'dog-run'}
     assert dog[55]['run_id'] == 'old'
     assert dog[56]['run_id'] is None
@@ -121,14 +129,19 @@ def test_workspace_matches_old_seedless_receipts_and_keeps_seed56_independent():
     assert walk[55]['run_id'] == 'old-walk'
     assert walk[56]['run_id'] is None
     assert '| humanoid-walk | 56 | pending |' in markdown(rows)
-    hydra = {row['task']: row for row in rows if row['cluster'] == 'Hydra'}
-    assert set(hydra) == {'dog-stand', 'dog-trot', 'dog-walk'}
-    assert all(
-        row['seed'] == 56 and row['group'] == f'mrsq-q10-dogs-s56-hydra-20261124-{task}'
-        for task, row in hydra.items()
-    )
+    hydra = {(row['task'], row['seed']): row for row in rows if row['cluster'] == 'Hydra'}
+    assert {task for task, seed in hydra if seed == 56} == {'dog-stand', 'dog-trot', 'dog-walk'}
+    assert {task for task, seed in hydra if seed == 57} == {'dog-trot', 'dog-walk', 'humanoid-stand'}
+    for (task, seed), row in hydra.items():
+        group = ('mrsq-q10-dogs-s56-hydra-20261124' if seed == 56 else
+                 'mrsq-q10-seed57-hydra-20261125')
+        assert row['group'] == f'{group}-{task}'
+    assert hydra['dog-trot', 56]['run_id'] == 's56-trot'
+    assert hydra['dog-trot', 57]['run_id'] == 's57-trot'
     assert 'Oscar + Hydra' in markdown(rows)
     assert '| dog-stand | 56 | pending | pending | Hydra |' in markdown(rows)
+    assert '| dog-trot | 57 | running | 1000 | Hydra |' in markdown(rows)
+    assert '| humanoid-stand | 57 | pending | pending | Hydra |' in markdown(rows)
 
 
 def test_workspace_keeps_existing_receipt_when_explicit_view_differs(tmp_path):

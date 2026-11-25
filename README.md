@@ -394,6 +394,12 @@ seed-55 resource measurements after checking the recipe and source, then checks
 the assigned GPU at startup. Each seed-56 job uses its own `<task>-s56/lineage`
 and tests save-and-resume on its first trained checkpoint before continuing.
 
+Hydra accepts Dog Trot, Dog Walk, and Humanoid Stand seed 57 through
+`slurm/run_mrsq_q10_dogs_hydra.sbatch <task> 57`. Request one L40S or L40 with
+the corresponding Slurm GPU type. The startup check permits at most 0.38
+seconds per decision on L40S or 0.46 on L40. Each run has a separate
+`<task>-s57/lineage` and `<task>-s57/models` under the Hydra campaign.
+
 The compact AMBI branch-count and imagination-horizon suite lives under
 `configs/ambi/`. Each algorithm file has one matching runnable
 manifest under `configs/ambi/experiments/`; the anchor entry point is

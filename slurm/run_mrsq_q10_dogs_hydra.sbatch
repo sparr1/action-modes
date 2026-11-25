@@ -12,8 +12,13 @@
 #SBATCH --open-mode=append
 set -Eeuo pipefail
 umask 077
-task="${1:?Set a Dog Q10 task}"
-case "$task" in dog-stand|dog-trot|dog-walk) ;; *) exit 2 ;; esac
+task="${1:?Set a Q10 task}"
+seed="${2:-56}"
+case "$seed:$task" in
+    56:dog-stand|56:dog-trot|56:dog-walk) campaign=mrsq-q10-dogs-s56-hydra-20261124 ;;
+    57:dog-trot|57:dog-walk|57:humanoid-stand) campaign=mrsq-q10-seed57-hydra-20261125 ;;
+    *) exit 2 ;;
+esac
 : "${AMBI_EXPECTED_COMMIT:?Pin the tested checkout}"
 : "${AMBI_PYTHON:?Use the locked DMControl interpreter}"
 cd "${SLURM_SUBMIT_DIR:?}"
@@ -21,8 +26,7 @@ cd "${SLURM_SUBMIT_DIR:?}"
 [[ "$(git rev-parse HEAD)" == "$AMBI_EXPECTED_COMMIT" ]]
 [[ -z "$(git status --porcelain --untracked-files=all)" ]]
 
-campaign=/data/public/rgao48/ambi/mrsq-q10-dogs-s56-hydra-20261124
-root="$campaign/$task-s56"
+root="/data/public/rgao48/ambi/$campaign/$task-s$seed"
 mkdir -p "$root"
 exec 9>"$root/launcher.lock"
 flock -n 9
@@ -63,7 +67,7 @@ if [[ ! "$end_time" =~ ^[0-9]+$ ]]; then
     end_time=$(date -d "$iso_end" +%s)
 fi
 helper=slurm/mrsq_q10_hydra.py
-srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -B "$helper" node-check "$task"
+srun --unbuffered --kill-on-bad-exit=1 "$AMBI_PYTHON" -B "$helper" node-check "$task" --seed "$seed"
 export WANDB_MODE=online
 
 run_segment() {
@@ -73,7 +77,7 @@ run_segment() {
     mkdir "$console"
     segment_status=0
     srun --unbuffered --kill-on-bad-exit=1 --output="$console/stdout.log" --error="$console/stderr.log" \
-        "$AMBI_PYTHON" -B "$helper" train "$task" --resume-mode "$resume_mode" --drain-seconds "$2" \
+        "$AMBI_PYTHON" -B "$helper" train "$task" --seed "$seed" --resume-mode "$resume_mode" --drain-seconds "$2" \
         || segment_status=$?
 }
 
@@ -89,7 +93,7 @@ if [[ "$resume_mode" == new ]]; then
         exit 2
     fi
     verify_handoff
-    "$AMBI_PYTHON" -B "$helper" record-handoff "$task"
+    "$AMBI_PYTHON" -B "$helper" record-handoff "$task" --seed "$seed"
     resume_mode=required
 fi
 

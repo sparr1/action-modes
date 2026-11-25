@@ -8,17 +8,21 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from slurm.ambi_alpha_carry_workspace import ENTITY, PROJECT, WorkspaceError, _filter_wire, _view_id, _write
-from slurm.mrsq_q10_suite import HYDRA_SEED56_TASKS, SEED56_TASKS
+from slurm.mrsq_q10_suite import HYDRA_SEED56_TASKS, HYDRA_SEED57_TASKS, SEED56_TASKS
 
 NAME = 'AMBI Q10 actor mean / target min — Oscar training'
 PREFIX = 'AMBI Q10 training / '
 CAMPAIGN = 'mrsq-q10-suite-20261122'
-HYDRA_CAMPAIGN = 'mrsq-q10-dogs-s56-hydra-20261124'
+HYDRA_CAMPAIGNS = {
+    56: 'mrsq-q10-dogs-s56-hydra-20261124',
+    57: 'mrsq-q10-seed57-hydra-20261125',
+}
 TASKS = ('humanoid-walk', 'humanoid-run', 'dog-trot', 'dog-run', 'humanoid-stand', 'dog-walk')
 CELLS = (
     tuple((task, 55, 'Oscar') for task in TASKS)
     + tuple((task, 56, 'Oscar') for task in SEED56_TASKS)
     + tuple((task, 56, 'Hydra') for task in HYDRA_SEED56_TASKS)
+    + tuple((task, 57, 'Hydra') for task in HYDRA_SEED57_TASKS)
 )
 STEP = 'env_step'
 METRICS = {
@@ -43,7 +47,7 @@ def discover_rows(api, previous_rows):
         path = ROOT / 'configs/dmcontrol/algs' / f'{name}.json'
         params = json.loads(path.read_text())['alg_params']
         if cluster == 'Hydra':
-            group = f'{HYDRA_CAMPAIGN}-{task}'
+            group = f'{HYDRA_CAMPAIGNS[seed]}-{task}'
         else:
             group = f'{CAMPAIGN}-{task}' + ('' if seed == 55 else f'-s{seed}')
         if (params['wandb_group'], params['wandb_entity'], params['wandb_project']) != (group, ENTITY, PROJECT):
@@ -83,7 +87,8 @@ W&B disabled. Panels populate as production uploads durable training metrics.
 
 def sections(rows, ws, wr):
     result = [ws.Section(name=PREFIX + 'Protocol and status', is_open=True,
-                         panels=[wr.MarkdownPanel(markdown=markdown(rows), layout=wr.Layout(w=24, h=14))])]
+                         panels=[wr.MarkdownPanel(markdown=markdown(rows),
+                                                  layout=wr.Layout(w=24, h=len(CELLS) + 1))])]
     for section, metrics in METRICS.items():
         result.append(ws.Section(name=PREFIX + section, is_open=True, panels=[
             wr.LinePlot(title=title, x=STEP, y=[metric], title_x='Training decisions',

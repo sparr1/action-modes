@@ -1,4 +1,4 @@
-"""Gate and launch the Hydra Dog Q10 jobs with the shared training recipe."""
+"""Gate and launch Hydra Q10 jobs with the shared training recipe."""
 
 import argparse
 import os
@@ -11,24 +11,44 @@ sys.path.insert(0, str(ROOT))
 
 from slurm.ambi_transfer_training import read
 from slurm.benchmark_ambi_training_cpu import physical_core_cpus
-from slurm.mrsq_q10_suite import check_speed, manifest_path, record_handoff, train, validate_recipe
+from slurm.mrsq_q10_suite import (
+    HYDRA_SEED56_TASKS, HYDRA_SEED57_TASKS, MAX_SECONDS_PER_DECISION, check_speed,
+    manifest_path, record_handoff, task_path, train, validate_recipe,
+)
 from slurm.posttanh_dog_trot_resume import benchmark_worker
 
 
-CAMPAIGN = Path('/data/public/rgao48/ambi/mrsq-q10-dogs-s56-hydra-20261124')
-TASKS = ('dog-stand', 'dog-trot', 'dog-walk')
+CAMPAIGNS = {
+    56: 'mrsq-q10-dogs-s56-hydra-20261124',
+    57: 'mrsq-q10-seed57-hydra-20261125',
+}
+TASKS = {56: HYDRA_SEED56_TASKS, 57: HYDRA_SEED57_TASKS}
+L40_MAX_SECONDS_PER_DECISION = 0.46
+
+
+def check_hydra_speed(report, task, *, seed):
+    gpu = report['runtime']['gpu']
+    limits = {'NVIDIA L40S': MAX_SECONDS_PER_DECISION}
+    if seed == 57:
+        limits['NVIDIA L40'] = L40_MAX_SECONDS_PER_DECISION
+    if gpu not in limits:
+        raise RuntimeError(f'{gpu} is unsupported for Hydra Q10 seed {seed}')
+    check_speed(report, task, seed=seed, gpu=gpu, limit=limits[gpu])
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=('node-check', 'train', 'record-handoff'))
-    parser.add_argument('task', choices=TASKS)
+    parser.add_argument('task', choices=sorted(set(HYDRA_SEED56_TASKS + HYDRA_SEED57_TASKS)))
+    parser.add_argument('--seed', type=int, choices=CAMPAIGNS, default=56)
     parser.add_argument('--resume-mode', choices=('new', 'required'))
     parser.add_argument('--drain-seconds', type=int)
     args = parser.parse_args()
-    args.seed = 56
+    if args.task not in TASKS[args.seed]:
+        parser.error(f'{args.task} is unsupported for Hydra Q10 seed {args.seed}')
     validate_recipe(args.task, args.seed)
-    root = CAMPAIGN / f'{args.task}-s56'
+    campaign = Path('/data/public/rgao48/ambi') / CAMPAIGNS[args.seed]
+    root = task_path(args.task, campaign, seed=args.seed)
     allocation = f"{os.environ['SLURM_JOB_ID']}.{os.environ.get('SLURM_RESTART_COUNT', '0')}"
     gate = root / 'node-checks' / f'{allocation}.json'
 
@@ -40,8 +60,9 @@ def main():
         benchmark_worker(SimpleNamespace(index=0, native_reference=False, worker_cpus=str(cpus[0]), output=gate),
                          manifest_path=manifest_path(args.task, args.seed))
         report = read(gate)
-        check_speed(report, args.task, seed=args.seed)
-        print('Hydra Q10 L40S gate passed', args.task, report['measured']['seconds_per_decision'], flush=True)
+        check_hydra_speed(report, args.task, seed=args.seed)
+        print('Hydra Q10 GPU gate passed', args.task, report['runtime']['gpu'],
+              report['measured']['seconds_per_decision'], flush=True)
     elif args.mode == 'record-handoff':
         record_handoff(args.task, root, seed=args.seed)
     else:
@@ -50,7 +71,7 @@ def main():
         assert segment in (allocation + '.verify', allocation + '.train')
         args.output = root / 'launches' / segment
         report = read(gate)
-        check_speed(report, args.task, seed=args.seed)
+        check_hydra_speed(report, args.task, seed=args.seed)
         train(args, root, expected_runtime=report['runtime'])
 
 

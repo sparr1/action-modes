@@ -2,12 +2,13 @@
 from copy import deepcopy
 import json
 from pathlib import Path
+import sys
 
 import pytest
 import torch
 
 from slurm.dog_stand_mrsq import REDUCTIONS
-from slurm import mrsq_q10_suite
+from slurm import mrsq_q10_hydra, mrsq_q10_suite
 from tests.test_ambi_root_local_sac import _build_cfg
 
 
@@ -73,10 +74,13 @@ def test_q10_matches_task_q5_except_critic_count_and_publication_labels(task):
     assert (cfg.critic_geometry_obs_noise_std, cfg.critic_geometry_action_noise_std) == (0.01, 0.02)
 
 
-@pytest.mark.parametrize('task', mrsq_q10_suite.HYDRA_SEED56_TASKS)
-def test_hydra_seed56_preserves_its_task_specific_q10_recipe(task):
-    name, run = mrsq_q10_suite.validate_recipe(task, 56)
-    old_name = name.replace('seed56', 'seed55')
+@pytest.mark.parametrize('task,seed', [
+    *((task, 56) for task in mrsq_q10_suite.HYDRA_SEED56_TASKS),
+    *((task, 57) for task in mrsq_q10_suite.HYDRA_SEED57_TASKS),
+])
+def test_hydra_replication_preserves_its_task_specific_q10_recipe(task, seed):
+    name, run = mrsq_q10_suite.validate_recipe(task, seed)
+    old_name = name.replace(f'seed{seed}', f'seed{seed - 1}')
     old_config = read_config('algs', old_name)
     new_config = read_config('algs', name)
     old_manifest_name = 'ambi_dog_stand_mrsq_ensemble' if task == 'dog-stand' else old_name
@@ -86,17 +90,55 @@ def test_hydra_seed56_preserves_its_task_specific_q10_recipe(task):
     assert new_manifest['configs'] == [name]
     publication_keys = ('wandb_run_name', 'wandb_group', 'wandb_tags')
     params = new_config['alg_params']
-    assert params['wandb_group'] == f'mrsq-q10-dogs-s56-hydra-20261124-{task}'
-    assert params['wandb_run_name'].endswith('seed56')
-    assert 'hydra' in params['wandb_tags'] and 'seed56' in params['wandb_tags']
-    assert run['seed'] == new_config['seed'] == 56 and old_config['seed'] == 55
-    old_config.update(seed=56)
+    assert params['wandb_group'] == f'{mrsq_q10_hydra.CAMPAIGNS[seed]}-{task}'
+    assert params['wandb_run_name'].endswith(f'seed{seed}')
+    assert 'hydra' in params['wandb_tags'] and f'seed{seed}' in params['wandb_tags']
+    assert run['seed'] == new_config['seed'] == seed and old_config['seed'] == seed - 1
+    old_config.update(seed=seed)
     for key in publication_keys:
         old_config['alg_params'][key] = params[key]
     assert new_config == old_config
     for key in ('configs', 'name', 'study_type', 'study_note', 'description'):
         old_manifest[key] = new_manifest[key]
     assert new_manifest == old_manifest
+
+
+@pytest.mark.parametrize('seed,gpu,rate,passes', [
+    (56, 'NVIDIA L40S', 0.38, True),
+    (56, 'NVIDIA L40', 0.37, False),
+    (57, 'NVIDIA L40S', 0.39, False),
+    (57, 'NVIDIA L40', 0.46, True),
+    (57, 'NVIDIA L40', 0.47, False),
+    (57, 'NVIDIA A40', 0.31, False),
+])
+def test_hydra_gpu_models_and_throughput(seed, gpu, rate, passes, monkeypatch):
+    monkeypatch.setattr(mrsq_q10_suite, 'binding', lambda path: path.name)
+    report = dict(passed=True, binding=f'ambi_dog_trot_mrsq_q10_seed{seed}.json',
+                  runtime=dict(gpu=gpu, float32_matmul_precision='high'),
+                  cpu_replay=True, gpu_replay=False, wandb=False, compile_fallback=False,
+                  graph_replays=dict(timed=128), measured=dict(decisions=128, seconds_per_decision=rate),
+                  compile_counts=dict(before=4, after=4), checkpoint_roundtrip=True,
+                  critic_geometry=dict(passed=True))
+    if passes:
+        mrsq_q10_hydra.check_hydra_speed(report, 'dog-trot', seed=seed)
+    else:
+        with pytest.raises(RuntimeError):
+            mrsq_q10_hydra.check_hydra_speed(report, 'dog-trot', seed=seed)
+
+
+@pytest.mark.parametrize('task,seed_arg,expected_seed', [
+    ('dog-trot', [], 56), ('dog-trot', ['--seed', '57'], 57),
+    ('humanoid-stand', ['--seed', '57'], 57),
+])
+def test_hydra_handoffs_use_isolated_task_lineage(task, seed_arg, expected_seed, monkeypatch):
+    calls = []
+    monkeypatch.setenv('SLURM_JOB_ID', '123')
+    monkeypatch.setattr(sys, 'argv', ['mrsq_q10_hydra.py', 'record-handoff', task, *seed_arg])
+    monkeypatch.setattr(mrsq_q10_hydra, 'record_handoff', lambda *args, **kwargs: calls.append((args, kwargs)))
+    mrsq_q10_hydra.main()
+    campaign = mrsq_q10_hydra.CAMPAIGNS[expected_seed]
+    expected_root = Path(f'/data/public/rgao48/ambi/{campaign}/{task}-s{expected_seed}')
+    assert calls == [((task, expected_root), {'seed': expected_seed})]
 
 
 @pytest.mark.parametrize('task,environment_test', [

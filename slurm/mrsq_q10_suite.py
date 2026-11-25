@@ -25,13 +25,15 @@ PREDICTED_COMPUTE_HOURS = {"humanoid-walk": 84, "humanoid-run": 84, "dog-trot": 
                            "humanoid-stand": 85, "dog-walk": 86}
 SEED56_TASKS = ("dog-run", "humanoid-run", "humanoid-stand", "humanoid-walk")
 HYDRA_SEED56_TASKS = ("dog-stand", "dog-trot", "dog-walk")
+HYDRA_SEED57_TASKS = ("dog-trot", "dog-walk", "humanoid-stand")
 MAX_SECONDS_PER_DECISION = 0.38
 TIMING_MARGIN = 0.15
 STARTUP_ALLOWANCE_HOURS = 0.5
 
 
 def manifest_path(task, seed=55):
-    assert seed == 55 or (seed == 56 and task in SEED56_TASKS + HYDRA_SEED56_TASKS)
+    supported = {56: SEED56_TASKS + HYDRA_SEED56_TASKS, 57: HYDRA_SEED57_TASKS}
+    assert seed == 55 or task in supported.get(seed, ())
     return ROOT / "configs/dmcontrol/experiments" / f"ambi_{task.replace('-', '_')}_mrsq_q10_seed{seed}.json"
 
 
@@ -52,9 +54,9 @@ def validate_recipe(task, seed=55):
     return name, run
 
 
-def check_speed(report, task, *, seed=55, limit=MAX_SECONDS_PER_DECISION):
+def check_speed(report, task, *, seed=55, limit=MAX_SECONDS_PER_DECISION, gpu="NVIDIA L40S"):
     assert report["passed"] and report["binding"] == binding(manifest_path(task, seed))
-    assert report["runtime"]["gpu"] == "NVIDIA L40S"
+    assert report["runtime"]["gpu"] == gpu
     assert report["runtime"]["float32_matmul_precision"] == "high"
     assert report["cpu_replay"] and not report["gpu_replay"]
     assert report["wandb"] is False and report["compile_fallback"] is False
