@@ -42,6 +42,13 @@ export WANDB_DISABLE_CODE=true WANDB__REQUIRE_CORE=true WANDB_MODE=disabled
 export WANDB_INIT_TIMEOUT=90 WANDB_HTTP_TIMEOUT=30 WANDB__SERVICE_WAIT=60
 unset CUDA_LAUNCH_BLOCKING WANDB_RUN_ID WANDB_RESUME
 
+"$AMBI_PYTHON" -B -c '
+import os
+import tempfile
+
+if tempfile.gettempdir() != os.environ["TMPDIR"]:
+    raise SystemExit("Python did not select the job-local Hydra temp directory")
+'
 check_resume=("$AMBI_PYTHON" -B -m utils.oscar_resume_launcher)
 "${check_resume[@]}" storage --durable-root "$root" --lineage-dir "$lineage" --print-metrics
 if [[ -e "$lineage/DONE" ]]; then

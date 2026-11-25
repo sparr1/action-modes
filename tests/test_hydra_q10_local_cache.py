@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -33,7 +34,7 @@ rm() {
 
 def invoke(mount, statements, **overrides):
     env = {**os.environ, "MOCK_MOUNT": "/dev/nvme0n1p1 rw,nodev,nosuid,relatime",
-           "MOCK_DEVICE": "2", "MOCK_FREE": "4194304", **overrides}
+           "MOCK_DEVICE": "2", "MOCK_FREE": "4194304", "CHECK_PYTHON": sys.executable, **overrides}
     return subprocess.run(["bash", "-c", SHELL_SETUP + statements, "cache-test", str(HELPER), str(mount)],
                           env=env, text=True, capture_output=True, check=False)
 
@@ -49,6 +50,7 @@ def test_cache_routes_all_temporary_paths_and_removes_its_unique_directory(tmp_p
         WANDB_DATA_DIR WANDB_ARTIFACT_DIR; do
         [[ "${!var}" == "$hydra_q10_cache"* && -d "${!var}" ]]
     done
+    "$CHECK_PYTHON" -B -c 'import os, tempfile; assert tempfile.gettempdir() == os.environ["TMPDIR"]'
     printf '%s\\n' "$hydra_q10_cache"
     """
     first = invoke(tmp_path, statements)
