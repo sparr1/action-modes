@@ -205,7 +205,7 @@ def lineage_path(task, campaign=CAMPAIGN, *, seed=55):
     return task_path(task, campaign, seed=seed) / "lineage"
 
 
-def train(args, task_root):
+def train(args, task_root, *, expected_runtime=None):
     import torch
 
     assert os.environ.get("SLURM_JOB_ID") and os.environ.get("WANDB_MODE") == "online"
@@ -213,8 +213,10 @@ def train(args, task_root):
     torch.set_num_threads(int(os.environ["SLURM_CPUS_PER_TASK"]))
     torch.set_num_interop_threads(1)
     runtime = accelerated_runtime()
-    assert runtime == load_plan(args.task, task_root, seed=args.seed)["runtime"]
-    lineage = lineage_path(args.task, seed=args.seed)
+    if expected_runtime is None:
+        expected_runtime = load_plan(args.task, task_root, seed=args.seed)["runtime"]
+    assert runtime == expected_runtime
+    lineage = task_root / "lineage"
     snapshot_root = task_root / "models"
     args.output.mkdir(parents=True, exist_ok=False)
     write_new(args.output / "launch.json", {
@@ -233,7 +235,7 @@ def train(args, task_root):
 
 
 def record_handoff(task, output, *, seed=55):
-    lineage = lineage_path(task, seed=seed)
+    lineage = output / "lineage"
     generation = (lineage / "LATEST").read_text().strip()
     generation_file = lineage / "generations" / generation / "manifest.json"
     metadata = read(generation_file)["metadata"]
