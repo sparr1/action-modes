@@ -5,7 +5,7 @@ import pytest
 
 from slurm import queue_mrsq_q10_suite as suite
 from slurm import release_mrsq_q5_suite as resources
-from slurm.mrsq_q10_workspace import discover_rows, markdown
+from slurm.mrsq_q10_workspace import CAMPAIGN, ENTITY, NAME, PROJECT, WorkspaceError, discover_rows, install, markdown
 
 
 def test_hold_validation_checks_all_cpu_fields_and_node_exclusion():
@@ -111,7 +111,7 @@ def test_workspace_matches_old_seedless_receipts_and_keeps_seed56_independent():
 
     rows = discover_rows(API(), [{'task': 'dog-run', 'run_id': 'old'},
                                 {'task': 'humanoid-walk', 'run_id': 'old-walk'}])
-    assert len(rows) == len({row['group'] for row in rows}) == 10
+    assert len(rows) == len({row['group'] for row in rows}) == 13
     dog = {row['seed']: row for row in rows if row['task'] == 'dog-run'}
     assert dog[55]['run_id'] == 'old'
     assert dog[56]['run_id'] is None
@@ -121,3 +121,21 @@ def test_workspace_matches_old_seedless_receipts_and_keeps_seed56_independent():
     assert walk[55]['run_id'] == 'old-walk'
     assert walk[56]['run_id'] is None
     assert '| humanoid-walk | 56 | pending |' in markdown(rows)
+    hydra = {row['task']: row for row in rows if row['cluster'] == 'Hydra'}
+    assert set(hydra) == {'dog-stand', 'dog-trot', 'dog-walk'}
+    assert all(
+        row['seed'] == 56 and row['group'] == f'mrsq-q10-dogs-s56-hydra-20261124-{task}'
+        for task, row in hydra.items()
+    )
+    assert 'Oscar + Hydra' in markdown(rows)
+    assert '| dog-stand | 56 | pending | pending | Hydra |' in markdown(rows)
+
+
+def test_workspace_keeps_existing_receipt_when_explicit_view_differs(tmp_path):
+    receipt = tmp_path / 'workspace.json'
+    url = f'https://wandb.ai/{ENTITY}/{PROJECT}?nw=wcqgbdphdpb'
+    previous = dict(entity=ENTITY, project=PROJECT, campaign=CAMPAIGN, name=NAME, url=url)
+    receipt.write_text(json.dumps(previous))
+    with pytest.raises(WorkspaceError, match='different view than requested'):
+        install(receipt, existing_url=f'https://wandb.ai/{ENTITY}/{PROJECT}?nw=other')
+    assert json.loads(receipt.read_text()) == previous
