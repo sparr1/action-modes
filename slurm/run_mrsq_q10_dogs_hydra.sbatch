@@ -32,17 +32,12 @@ exec 9>"$root/launcher.lock"
 flock -n 9
 lineage="$root/lineage"
 prefix="$SLURM_JOB_ID.${SLURM_RESTART_COUNT:-0}"
-cache="${SLURM_TMPDIR:-/tmp}/ambi-q10-dogs-$UID-$prefix"
-mkdir "$cache"
-mkdir "$cache/"{inductor,triton,tmp,xdg,xdg-config,wandb,data,artifacts,cuda}
+source slurm/hydra_q10_local_cache.sh
+setup_hydra_q10_local_cache /ltmp "$prefix"
 export MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0
 export PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 export OMP_DYNAMIC=FALSE MKL_DYNAMIC=FALSE TORCHINDUCTOR_COMPILE_THREADS=1
-export TORCHINDUCTOR_CACHE_DIR="$cache/inductor" TRITON_CACHE_DIR="$cache/triton" TMPDIR="$cache/tmp"
-export CUDA_CACHE_PATH="$cache/cuda" XDG_CACHE_HOME="$cache/xdg" XDG_CONFIG_HOME="$cache/xdg-config"
-export WANDB_DIR="$cache/wandb" WANDB_CACHE_DIR="$cache/xdg" WANDB_CONFIG_DIR="$cache/xdg-config"
-export WANDB_DATA_DIR="$cache/data" WANDB_ARTIFACT_DIR="$cache/artifacts"
 export WANDB_DISABLE_CODE=true WANDB__REQUIRE_CORE=true WANDB_MODE=disabled
 export WANDB_INIT_TIMEOUT=90 WANDB_HTTP_TIMEOUT=30 WANDB__SERVICE_WAIT=60
 unset CUDA_LAUNCH_BLOCKING WANDB_RUN_ID WANDB_RESUME
@@ -102,7 +97,7 @@ remaining=$((end_time - $(date +%s) - 1800))
 run_segment train "$remaining"
 case "$segment_status" in
     0) "${check_resume[@]}" done --lineage-dir "$lineage" ;;
-    75) verify_handoff; scontrol requeue "$SLURM_JOB_ID" ;;
+    75) verify_handoff; cleanup_hydra_q10_local_cache; scontrol requeue "$SLURM_JOB_ID" ;;
     *) echo "Training failed with status $segment_status. Full checkpoints are in $lineage." >&2
        exit "$segment_status" ;;
 esac

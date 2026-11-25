@@ -399,6 +399,9 @@ Hydra accepts Dog Trot, Dog Walk, and Humanoid Stand seed 57 through
 the corresponding Slurm GPU type. The startup check permits at most 0.38
 seconds per decision on L40S or 0.46 on L40. Each run has a separate
 `<task>-s57/lineage` and `<task>-s57/models` under the Hydra campaign.
+Each allocation creates a private cache on the compute node's executable
+`/ltmp` mount after checking for 4 GiB of free space. The launcher removes that
+cache when it exits or requeues.
 
 The compact AMBI branch-count and imagination-horizon suite lives under
 `configs/ambi/`. Each algorithm file has one matching runnable
