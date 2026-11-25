@@ -24,13 +24,14 @@ CAMPAIGN = Path("/oscar/scratch/rgao48/ambi/mrsq-q10-suite-20261122")
 PREDICTED_COMPUTE_HOURS = {"humanoid-walk": 84, "humanoid-run": 84, "dog-trot": 85, "dog-run": 86,
                            "humanoid-stand": 85, "dog-walk": 86}
 SEED56_TASKS = ("dog-run", "humanoid-run", "humanoid-stand", "humanoid-walk")
+HYDRA_SEED56_TASKS = ("dog-stand", "dog-trot", "dog-walk")
 MAX_SECONDS_PER_DECISION = 0.38
 TIMING_MARGIN = 0.15
 STARTUP_ALLOWANCE_HOURS = 0.5
 
 
 def manifest_path(task, seed=55):
-    assert seed == 55 or (seed == 56 and task in SEED56_TASKS)
+    assert seed == 55 or (seed == 56 and task in SEED56_TASKS + HYDRA_SEED56_TASKS)
     return ROOT / "configs/dmcontrol/experiments" / f"ambi_{task.replace('-', '_')}_mrsq_q10_seed{seed}.json"
 
 

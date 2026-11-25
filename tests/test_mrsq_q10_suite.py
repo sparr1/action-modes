@@ -73,6 +73,32 @@ def test_q10_matches_task_q5_except_critic_count_and_publication_labels(task):
     assert (cfg.critic_geometry_obs_noise_std, cfg.critic_geometry_action_noise_std) == (0.01, 0.02)
 
 
+@pytest.mark.parametrize('task', mrsq_q10_suite.HYDRA_SEED56_TASKS)
+def test_hydra_seed56_preserves_its_task_specific_q10_recipe(task):
+    name, run = mrsq_q10_suite.validate_recipe(task, 56)
+    old_name = name.replace('seed56', 'seed55')
+    old_config = read_config('algs', old_name)
+    new_config = read_config('algs', name)
+    old_manifest_name = 'ambi_dog_stand_mrsq_ensemble' if task == 'dog-stand' else old_name
+    old_manifest = read_config('experiments', old_manifest_name)
+    new_manifest = read_config('experiments', name)
+    assert old_name in old_manifest['configs']
+    assert new_manifest['configs'] == [name]
+    publication_keys = ('wandb_run_name', 'wandb_group', 'wandb_tags')
+    params = new_config['alg_params']
+    assert params['wandb_group'] == f'mrsq-q10-dogs-s56-hydra-20261124-{task}'
+    assert params['wandb_run_name'].endswith('seed56')
+    assert 'hydra' in params['wandb_tags'] and 'seed56' in params['wandb_tags']
+    assert run['seed'] == new_config['seed'] == 56 and old_config['seed'] == 55
+    old_config.update(seed=56)
+    for key in publication_keys:
+        old_config['alg_params'][key] = params[key]
+    assert new_config == old_config
+    for key in ('configs', 'name', 'study_type', 'study_note', 'description'):
+        old_manifest[key] = new_manifest[key]
+    assert new_manifest == old_manifest
+
+
 @pytest.mark.parametrize('task,environment_test', [
     ('dog-walk', 'tests/test_dog_walk_mrsq.py::test_real_dog_walk_two_control_steps'),
     ('humanoid-stand', 'tests/test_mrsq_q5_suite.py::test_real_task_action_repeat[humanoid-stand]'),
