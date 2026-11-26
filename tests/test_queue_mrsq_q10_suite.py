@@ -44,6 +44,64 @@ def test_scratch_reservation_counts_staging_and_portable_checkpoints(monkeypatch
     assert suite.booked_scratch_gib('humanoid-run', plan) == 4.25
 
 
+def test_prepared_seed57_plans_are_booked_for_every_seed(monkeypatch, tmp_path):
+    monkeypatch.setattr(suite, 'CAMPAIGN', tmp_path)
+    plan = {'full_generation_bytes': 2**30, 'checkpoint_bytes': 2**25}
+    for task in suite.SEED57_TASKS:
+        prepared = suite.task_path(task, tmp_path, seed=57) / 'benchmark/plan.json'
+        prepared.parent.mkdir(parents=True)
+        prepared.write_text(json.dumps(plan))
+    released = suite.task_path('humanoid-stand', tmp_path, seed=56) / 'release-intent.json'
+    released.parent.mkdir()
+    released.write_text(json.dumps({'plan': plan}))
+
+    assert suite.booked_scratch_gib('humanoid-run', plan, seed=55) == 6 * 4.25
+    assert suite.booked_scratch_gib('humanoid-walk', plan, seed=56) == 6 * 4.25
+    assert suite.booked_scratch_gib('dog-trot', plan, seed=57) == 5 * 4.25
+
+
+def test_seed57_campaign_stages_every_job_with_verified_held_resources(monkeypatch, tmp_path):
+    monkeypatch.setattr(suite, 'CAMPAIGN', tmp_path)
+    monkeypatch.setattr(suite, 'scratch_free_gib', lambda: 80)
+    jobs = []
+    wall_hours = {'dog-walk': 100, 'dog-trot': 99, 'humanoid-stand': 99, 'dog-run': 100}
+
+    def timing_plan(task, root, *, seed):
+        assert seed == 57
+        plan = {'cpus': 1, 'memory_gib': 11, 'wall_hours': wall_hours[task], 'gate_job': '11',
+                'full_generation_bytes': 2**30, 'checkpoint_bytes': 2**25}
+        (root / 'benchmark').mkdir()
+        (root / 'benchmark/plan.json').write_text(json.dumps(plan))
+        return plan
+
+    def submit(task, role, arguments, row, receipt, exports, *, seed):
+        assert role == 'train' and seed == 57 and 'AMBI_Q10_SEED=57' in exports
+        assert set(('--gres=gpu:l40s:1', '--exclude=gpu2708', '--hold', '--requeue', '--signal=USR1@1800',
+                    '--cpus-per-task=1', '--mem=11G', f'--time={wall_hours[task]}:00:00')) <= set(arguments)
+        jobs.append(task)
+        row['train'] = str(100 + len(jobs))
+        return row['train']
+
+    def held_job(task, role, job, *, seed):
+        assert role == 'train' and seed == 57 and job == str(100 + len(jobs))
+        days, hours = divmod(wall_hours[task], 24)
+        return {'JobState': 'PENDING', 'Reason': 'JobHeldUser', 'Partition': 'gpu', 'QOS': 'pri-gpu+',
+                'Dependency': '(null)', 'ExcNodeList': 'gpu2708', 'TresPerNode': 'gres/gpu:l40s:1',
+                'NumCPUs': '1', 'CPUs/Task': '1', 'MinCPUsNode': '1', 'TresPerTask': 'cpu:1',
+                'MinMemoryNode': '11G', 'TimeLimit': f'{days}-{hours:02}:00:00'}
+
+    monkeypatch.setattr(suite, 'reuse_timing_plan', timing_plan)
+    monkeypatch.setattr(suite, 'submit_one', submit)
+    monkeypatch.setattr(suite, 'job_for', held_job)
+    monkeypatch.setattr(suite, 'reservation_check', lambda *args, **kwargs: None)
+    monkeypatch.setattr(suite, 'release_task', lambda *args, **kwargs: pytest.fail('Held job was released'))
+    for index, task in enumerate(suite.SEED57_TASKS, start=1):
+        job = suite.queue_task(task, 'expected-commit', 'expected-tree', seed=57, hold=True)
+        assert job['lineage'] == str(tmp_path / f'{task}-s57/lineage')
+        assert job['held_verification']['scratch_quota']['reserved_gib'] == index * 4.25
+    assert jobs == list(suite.SEED57_TASKS)
+
+
 def test_quota_uses_scratch_row(monkeypatch):
     output = 'rgao48 /oscar/home 95.57 95.57 100 125 0 0 0 OK None\n' \
              'rgao48 /oscar/scratch 407.68 79.63 512 10240 0 0 0 OK None\n'
@@ -71,11 +129,14 @@ def test_reservation_bound_uses_live_concurrency_and_excludes_replaced_job(monke
         resources.reservation_check('12', plan)
 
 
-@pytest.mark.parametrize('task', suite.SEED56_TASKS)
-def test_seed56_reuses_only_matching_seed55_recipe_and_measurements(monkeypatch, tmp_path, task):
+@pytest.mark.parametrize('task,seed', [
+    *((task, 56) for task in suite.SEED56_TASKS),
+    *((task, 57) for task in suite.SEED57_TASKS),
+])
+def test_replicates_reuse_only_matching_seed55_recipe_and_measurements(monkeypatch, tmp_path, task, seed):
     monkeypatch.setattr(suite, 'CAMPAIGN', tmp_path)
     old_root = suite.task_path(task, tmp_path)
-    new_root = suite.task_path(task, tmp_path, seed=56)
+    new_root = suite.task_path(task, tmp_path, seed=seed)
     gate = old_root / 'benchmark'
     gate.mkdir(parents=True)
     new_root.mkdir()
@@ -96,11 +157,11 @@ def test_seed56_reuses_only_matching_seed55_recipe_and_measurements(monkeypatch,
         assert args[:5] == ('git', 'diff', '--quiet', 'old', 'HEAD')
 
     monkeypatch.setattr(suite, 'command', git)
-    assert suite.lineage_path(task, tmp_path, seed=56).parent == new_root != old_root
-    plan = suite.reuse_timing_plan(task, new_root)
-    assert plan['binding'] == suite.binding(suite.manifest_path(task, 56))
+    assert suite.lineage_path(task, tmp_path, seed=seed).parent == new_root != old_root
+    plan = suite.reuse_timing_plan(task, new_root, seed=seed)
+    assert plan['binding'] == suite.binding(suite.manifest_path(task, seed))
     assert plan['sizing_reference'] == {'seed': 55, 'binding': reference['binding'], 'training_job': '11'}
-    assert suite.reuse_timing_plan(task, new_root) == plan
+    assert suite.reuse_timing_plan(task, new_root, seed=seed) == plan
     assert json.loads((gate / 'plan.json').read_text()) == reference
 
 

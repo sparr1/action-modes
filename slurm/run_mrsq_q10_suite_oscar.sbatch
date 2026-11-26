@@ -21,7 +21,11 @@ task="${2:?Set task}"
 seed="${AMBI_Q10_SEED:-55}"
 [[ "$mode" == benchmark || "$mode" == train ]]
 case "$task" in humanoid-walk|humanoid-run|dog-trot|dog-run|humanoid-stand|dog-walk) ;; *) exit 2 ;; esac
-case "$seed:$task" in 55:*|56:dog-run|56:humanoid-run|56:humanoid-stand|56:humanoid-walk) ;; *) exit 2 ;; esac
+case "$seed:$task" in
+    55:*|56:dog-run|56:humanoid-run|56:humanoid-stand|56:humanoid-walk) ;;
+    57:dog-walk|57:dog-trot|57:humanoid-stand|57:dog-run) ;;
+    *) exit 2 ;;
+esac
 [[ "$AMBI_Q10_CAMPAIGN" == /oscar/scratch/rgao48/ambi/mrsq-q10-suite-20261122 ]]
 cd "${SLURM_SUBMIT_DIR:?}"
 [[ "$(git rev-parse --show-toplevel)" == "$PWD" ]]
@@ -30,8 +34,8 @@ cd "${SLURM_SUBMIT_DIR:?}"
 restart="${SLURM_RESTART_COUNT:-0}"
 [[ "$restart" =~ ^[0-9]+$ ]]
 task_root="$AMBI_Q10_CAMPAIGN/$task"
-if [[ "$seed" == 56 ]]; then
-    task_root="$task_root-s56"
+if [[ "$seed" != 55 ]]; then
+    task_root="$task_root-s$seed"
 fi
 cache="$task_root/cache/$SLURM_JOB_ID.$restart"
 mkdir -p -- "$(dirname "$cache")"

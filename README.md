@@ -394,6 +394,13 @@ seed-55 resource measurements after checking the recipe and source, then checks
 the assigned GPU at startup. Each seed-56 job uses its own `<task>-s56/lineage`
 and tests save-and-resume on its first trained checkpoint before continuing.
 
+Oscar seed 57 supports Dog Walk, Dog Trot, Humanoid Stand, and Dog Run.
+The dispatcher uses each task's verified seed-55 timing and checks storage
+capacity across the prepared and released runs. To stage a job, use
+`queue --task <task> --seed 57 --hold`. Use `release --task <task> --seed 57`
+to verify and release that same job. Each replicate gets its own
+`<task>-s57/lineage` and `<task>-s57/models` in shared Oscar scratch.
+
 The compact AMBI branch-count and imagination-horizon suite lives under
 `configs/ambi/`. Each algorithm file has one matching runnable
 manifest under `configs/ambi/experiments/`; the anchor entry point is

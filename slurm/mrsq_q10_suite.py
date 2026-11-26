@@ -24,13 +24,15 @@ CAMPAIGN = Path("/oscar/scratch/rgao48/ambi/mrsq-q10-suite-20261122")
 PREDICTED_COMPUTE_HOURS = {"humanoid-walk": 84, "humanoid-run": 84, "dog-trot": 85, "dog-run": 86,
                            "humanoid-stand": 85, "dog-walk": 86}
 SEED56_TASKS = ("dog-run", "humanoid-run", "humanoid-stand", "humanoid-walk")
+SEED57_TASKS = ("dog-walk", "dog-trot", "humanoid-stand", "dog-run")
 MAX_SECONDS_PER_DECISION = 0.38
 TIMING_MARGIN = 0.15
 STARTUP_ALLOWANCE_HOURS = 0.5
 
 
 def manifest_path(task, seed=55):
-    assert seed == 55 or (seed == 56 and task in SEED56_TASKS)
+    eligible = {56: SEED56_TASKS, 57: SEED57_TASKS}
+    assert seed == 55 or task in eligible.get(seed, ())
     return ROOT / "configs/dmcontrol/experiments" / f"ambi_{task.replace('-', '_')}_mrsq_q10_seed{seed}.json"
 
 
@@ -156,7 +158,7 @@ def load_plan(task, output, *, seed=55):
     gate = output / "benchmark"
     plan = read(gate / "plan.json")
     assert plan["passed"] and plan["task"] == task and plan["binding"] == binding(manifest_path(task, seed))
-    if seed == 56:
+    if seed != 55:
         assert plan["sizing_reference"]["seed"] == 55 and plan["cpus"] == 1, plan
     assert plan["cpu_replay"] and plan["wandb"] is False
     assert hashlib.sha256((gate / "parity.xml").read_bytes()).hexdigest() == plan["parity_sha256"]
@@ -251,7 +253,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("benchmark", "benchmark-worker", "allocation", "node-check", "record-handoff", "train"))
     parser.add_argument("task", choices=PREDICTED_COMPUTE_HOURS)
-    parser.add_argument("--seed", type=int, choices=(55, 56), default=55)
+    parser.add_argument("--seed", type=int, choices=(55, 56, 57), default=55)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--worker-cpus")
     parser.add_argument("--measure-resume-storage", action="store_true")
@@ -269,7 +271,7 @@ def main():
         benchmark_worker(args, manifest_path=manifest_path(args.task, args.seed),
                          measure_resume_storage=args.measure_resume_storage)
     elif args.mode == "benchmark":
-        assert args.seed == 55, "Seed 56 uses the measured seed-55 timing and an assigned-GPU check"
+        assert args.seed == 55, "Replicates use the measured seed-55 timing and an assigned-GPU check"
         benchmark(args.task, task_root)
     elif args.mode == "allocation":
         allocation(args.task, task_root, seed=args.seed)

@@ -16,7 +16,7 @@ sys.path.insert(0, str(SOURCE))
 
 from slurm.release_mrsq_q5_suite import allocation_updates, atomic, fields, reservation_check, wall_minutes
 from slurm.ambi_transfer_training import binding, recipe, write_new
-from slurm.mrsq_q10_suite import CAMPAIGN, SEED56_TASKS, lineage_path, load_plan, manifest_path, task_path
+from slurm.mrsq_q10_suite import CAMPAIGN, SEED56_TASKS, SEED57_TASKS, lineage_path, load_plan, manifest_path, task_path
 
 
 PYTHON = '/oscar/home/rgao48/action-modes/environments/dmcontrol/.venv/bin/python'
@@ -68,11 +68,11 @@ def submit_one(task, role, command_args, row, receipt, exports, *, seed=55):
     return job
 
 
-def reuse_timing_plan(task, root):
+def reuse_timing_plan(task, root, *, seed=56):
     """Reuse a verified seed-55 plan for the identical workload's next seed."""
     gate = root / 'benchmark'
     if gate.is_dir():
-        return load_plan(task, root, seed=56)
+        return load_plan(task, root, seed=seed)
     reference_root = task_path(task, CAMPAIGN)
     reference_gate = reference_root / 'benchmark'
     reference = read(reference_gate / 'plan.json')
@@ -93,18 +93,18 @@ def reuse_timing_plan(task, root):
     identity_fields = {'wandb_run_name', 'wandb_group', 'wandb_tags'}
     manifest_labels = {'configs', 'name', 'description', 'study_note'}
     _, original_manifest, original = recipe(0, manifest_path(task))
-    _, next_manifest, next_seed = recipe(0, manifest_path(task, 56))
+    _, next_manifest, next_seed = recipe(0, manifest_path(task, seed))
     assert {k: v for k, v in original_manifest.items() if k not in manifest_labels} == {
         k: v for k, v in next_manifest.items() if k not in manifest_labels}
     for run in (original, next_seed):
         run['alg_params'] = {k: v for k, v in run['alg_params'].items() if k not in identity_fields}
-    assert original['seed'] == 55 and next_seed['seed'] == 56
+    assert original['seed'] == 55 and next_seed['seed'] == seed
     assert {k: v for k, v in original.items() if k not in {'name', 'seed'}} == {
         k: v for k, v in next_seed.items() if k not in {'name', 'seed'}}
 
     parity = (reference_gate / 'parity.xml').read_bytes()
     assert hashlib.sha256(parity).hexdigest() == reference['parity_sha256']
-    plan = {**reference, 'binding': binding(manifest_path(task, 56)),
+    plan = {**reference, 'binding': binding(manifest_path(task, seed)),
             'sizing_reference': {'seed': 55, 'binding': reference['binding'],
                                  'training_job': release['training_job']}}
     with TemporaryDirectory(prefix='.timing-', dir=root) as temporary:
@@ -112,10 +112,10 @@ def reuse_timing_plan(task, root):
         (staging / 'parity.xml').write_bytes(parity)
         write_new(staging / 'plan.json', plan)
         staging.rename(gate)
-    return load_plan(task, root, seed=56)
+    return load_plan(task, root, seed=seed)
 
 
-def queue_task(task, commit, tree, *, seed=55):
+def queue_task(task, commit, tree, *, seed=55, hold=False):
     root = task_path(task, CAMPAIGN, seed=seed)
     root.mkdir(mode=0o700, exist_ok=True)
     receipt = root / 'scheduling.json'
@@ -130,8 +130,8 @@ def queue_task(task, commit, tree, *, seed=55):
                         'AMBI_Q10_CAMPAIGN=' + str(CAMPAIGN), f'AMBI_Q10_SEED={seed}', 'WANDB_MODE=disabled',
                         'PYTHONDONTWRITEBYTECODE=1'])
     hardware = ['--gres=gpu:l40s:1', '--exclude=gpu2708', '--hint=nomultithread']
-    if seed == 56:
-        plan = reuse_timing_plan(task, root)
+    if seed != 55:
+        plan = reuse_timing_plan(task, root, seed=seed)
         gate = str(plan['gate_job'])
         dependency = []
         row.update(seed=seed, gate=gate)
@@ -143,13 +143,21 @@ def queue_task(task, commit, tree, *, seed=55):
         dependency = ['--dependency=afterok:' + gate]
     if 'train' not in row:
         reservation_check(-1, plan, concurrent=True)
+    if hold:
+        scratch = verified_scratch_quota(task, plan, seed=seed)
     train = submit_one(task, 'train', ['--partition=gpu', '--qos=pri-gpu+', *hardware,
                        f"--cpus-per-task={plan['cpus']}", f"--mem={plan['memory_gib']}G",
                        f"--time={plan['wall_hours']}:00:00", '--requeue',
                        '--signal=USR1@1800', '--hold', *dependency,
                        str(LAUNCHER), 'train', task], row, receipt, exports, seed=seed)
-    if seed == 56:
-        release_task(task, commit, tree, seed=seed)
+    if seed != 55:
+        if hold:
+            verify_held(job_for(task, 'train', train, seed=seed), plan, gate)
+            row['held_verification'] = {'cpus': plan['cpus'], 'memory_gib': plan['memory_gib'],
+                                        'wall_hours': plan['wall_hours'], 'scratch_quota': scratch}
+            atomic(receipt, row)
+        else:
+            release_task(task, commit, tree, seed=seed)
         return row
     if not (root / 'release.json').is_file():
         verify_held(job_for(task, 'train', train), PROVISIONAL, gate)
@@ -195,11 +203,18 @@ def bytes_on_disk(paths):
 
 def booked_scratch_gib(task, new_plan, *, seed=55):
     plans = {task_path(task, CAMPAIGN, seed=seed): new_plan}
-    cells = [(name, 55) for name in TASKS] + [(name, 56) for name in SEED56_TASKS]
-    for other, other_seed in cells:
-        root = task_path(other, CAMPAIGN, seed=other_seed)
-        if root not in plans and (root / 'release.json').is_file():
-            plans[root] = read(root / 'release.json')['plan']
+    for other_seed, tasks in ((55, TASKS), (56, SEED56_TASKS), (57, SEED57_TASKS)):
+        for other in tasks:
+            root = task_path(other, CAMPAIGN, seed=other_seed)
+            if root in plans:
+                continue
+            for receipt in (root / 'release.json', root / 'release-intent.json'):
+                if receipt.is_file():
+                    plans[root] = read(receipt)['plan']
+                    break
+            else:
+                if other_seed == 57 and (root / 'benchmark/plan.json').is_file():
+                    plans[root] = read(root / 'benchmark/plan.json')
     remaining = 0
     for root, plan in plans.items():
         lineage = root / 'lineage'
@@ -213,6 +228,12 @@ def booked_scratch_gib(task, new_plan, *, seed=55):
         snapshots = bytes_on_disk(path for path in models if path.name.rsplit('_', 1)[-1].isdigit())
         remaining += max(0, 40 * plan['checkpoint_bytes'] - snapshots)
     return remaining / 2**30
+
+
+def verified_scratch_quota(task, plan, *, seed):
+    needed, free = booked_scratch_gib(task, plan, seed=seed), scratch_free_gib()
+    assert free >= needed, f'Scratch has {free:.2f} GiB free, needs {needed:.2f} GiB for resume and snapshots'
+    return {'free_gib': free, 'reserved_gib': needed}
 
 
 def release_task(task, commit, tree, *, seed=55):
@@ -246,16 +267,15 @@ def release_task(task, commit, tree, *, seed=55):
         assert pending['training_job'] == train and pending['plan'] == plan
         atomic(release, pending)
         return pending
-    verify_held(current, plan if seed == 56 or intent.is_file() else PROVISIONAL, gate)
+    verify_held(current, plan if seed != 55 or intent.is_file() else PROVISIONAL, gate)
     budget = reservation_check(train, plan, concurrent=True)
-    needed, free = booked_scratch_gib(task, plan, seed=seed), scratch_free_gib()
-    assert free >= needed, f'Scratch has {free:.2f} GiB free, needs {needed:.2f} GiB for resume and snapshots'
+    scratch = verified_scratch_quota(task, plan, seed=seed)
     if seed == 55:
         command(*allocation_updates(train, plan))
         current = job_for(task, 'train', train)
         verify_held(current, plan, gate)
     pending = {'training_job': train, 'gate_job': gate, 'controller_job': controller,
-               'plan': plan, 'scratch_quota': {'free_gib': free, 'reserved_gib': needed},
+               'plan': plan, 'scratch_quota': scratch,
                'reservations': budget, 'allocation_verified': True}
     atomic(intent, pending)
     command('scontrol', 'release', train)
@@ -267,10 +287,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('queue', 'release'))
     parser.add_argument('--task', choices=TASKS)
-    parser.add_argument('--seed', type=int, choices=(55, 56), default=55)
+    parser.add_argument('--seed', type=int, choices=(55, 56, 57), default=55)
+    parser.add_argument('--hold', action='store_true', help='Stage a matched replicate without releasing the job')
     args = parser.parse_args()
-    if args.seed == 56 and args.task not in SEED56_TASKS:
-        parser.error('Seed 56 requires an explicit --task from ' + ', '.join(SEED56_TASKS))
+    replicates = {56: SEED56_TASKS, 57: SEED57_TASKS}
+    if args.seed in replicates and args.task not in replicates[args.seed]:
+        parser.error(f'Seed {args.seed} requires an explicit --task from ' + ', '.join(replicates[args.seed]))
+    if args.hold and (args.command != 'queue' or args.seed == 55):
+        parser.error('--hold applies to queue for measured seed-56 and seed-57 replicates')
     commit = os.environ['AMBI_EXPECTED_COMMIT']
     tree = validate_pin(commit)
     CAMPAIGN.mkdir(mode=0o700, exist_ok=True)
@@ -278,7 +302,7 @@ def main():
     with (CAMPAIGN / 'scheduler.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if args.command == 'queue':
-            result = [queue_task(task, commit, tree, seed=args.seed)
+            result = [queue_task(task, commit, tree, seed=args.seed, hold=args.hold)
                       for task in (TASKS if args.task is None else (args.task,))]
         else:
             if args.task is None:
