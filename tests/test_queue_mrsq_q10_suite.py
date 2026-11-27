@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 
@@ -55,16 +56,18 @@ def test_prepared_seed57_plans_are_booked_for_every_seed(monkeypatch, tmp_path):
     released.parent.mkdir()
     released.write_text(json.dumps({'plan': plan}))
 
-    assert suite.booked_scratch_gib('humanoid-run', plan, seed=55) == 6 * 4.25
-    assert suite.booked_scratch_gib('humanoid-walk', plan, seed=56) == 6 * 4.25
-    assert suite.booked_scratch_gib('dog-trot', plan, seed=57) == 5 * 4.25
+    count = len(suite.SEED57_TASKS)
+    assert suite.booked_scratch_gib('humanoid-run', plan, seed=55) == (count + 2) * 4.25
+    assert suite.booked_scratch_gib('humanoid-walk', plan, seed=56) == (count + 2) * 4.25
+    assert suite.booked_scratch_gib('dog-trot', plan, seed=57) == (count + 1) * 4.25
 
 
 def test_seed57_campaign_stages_every_job_with_verified_held_resources(monkeypatch, tmp_path):
     monkeypatch.setattr(suite, 'CAMPAIGN', tmp_path)
     monkeypatch.setattr(suite, 'scratch_free_gib', lambda: 80)
     jobs = []
-    wall_hours = {'dog-walk': 100, 'dog-trot': 99, 'humanoid-stand': 99, 'dog-run': 100}
+    wall_hours = {'dog-walk': 100, 'dog-trot': 99, 'humanoid-stand': 99, 'dog-run': 100,
+                  'dog-stand': 100, 'humanoid-walk': 98, 'humanoid-run': 98}
 
     def timing_plan(task, root, *, seed):
         assert seed == 57
@@ -109,6 +112,38 @@ def test_quota_uses_scratch_row(monkeypatch):
     assert suite.scratch_free_gib() == pytest.approx(104.32)
 
 
+def test_explicit_scratch_grace_requires_a_fresh_observation_and_covers_startup(monkeypatch):
+    monkeypatch.setattr(suite, 'booked_scratch_gib', lambda *args, **kwargs: 80)
+    plan = {'wall_hours': 100}
+    scratch = 'rgao48 /oscar/scratch {} 92.15 512 10240 1695815 4000000 16000000 {}'
+    monkeypatch.setattr(suite, 'command', lambda *args: scratch.format(471.79, 'OK None'))
+
+    with pytest.raises(AssertionError):
+        suite.scratch_status('dog-stand', plan, seed=57)
+    approved = suite.scratch_status('dog-stand', plan, seed=57, allow_grace=True)
+    deadline = approved['grace_deadline_utc']
+    assert approved['usage_state'] == 'OK'
+    assert approved['reserved_gib'] == 80
+    assert datetime.fromisoformat(deadline) - datetime.fromisoformat(approved['observed_at_utc']) == timedelta(days=20)
+
+    monkeypatch.setattr(suite, 'command', lambda *args: scratch.format(525, 'SOFT_EXCEEDED 19days'))
+    assert suite.verified_scratch_grace('dog-stand', plan, seed=57, deadline=deadline)['usage_state'] == 'SOFT_EXCEEDED'
+    with pytest.raises(AssertionError):
+        suite.verified_scratch_grace('dog-stand', plan, seed=57)
+    with pytest.raises(AssertionError):
+        suite.verified_scratch_grace(
+            'dog-stand', plan, seed=57,
+            deadline=(datetime.now(timezone.utc) + timedelta(hours=110)).isoformat())
+    with pytest.raises(AssertionError):
+        suite.verified_scratch_grace('dog-trot', plan, seed=57, deadline=deadline)
+
+    for state, usage in [('GRACE_EXPIRED expired', 530), ('SOFT_EXCEEDED 19days', 10_100),
+                         ('UNKNOWN None', 530)]:
+        monkeypatch.setattr(suite, 'command', lambda *args: scratch.format(usage, state))
+        with pytest.raises(AssertionError):
+            suite.verified_scratch_grace('dog-stand', plan, seed=57, deadline=deadline)
+
+
 def test_reservation_bound_uses_live_concurrency_and_excludes_replaced_job(monkeypatch):
     qos = 'pri-gpu+|cpu=800,gres/gpu=240|cpu=4,gres/gpu=2,mem=64G|'
     def command(args):
@@ -131,7 +166,7 @@ def test_reservation_bound_uses_live_concurrency_and_excludes_replaced_job(monke
 
 @pytest.mark.parametrize('task,seed', [
     *((task, 56) for task in suite.SEED56_TASKS),
-    *((task, 57) for task in suite.SEED57_TASKS),
+    *((task, 57) for task in suite.SEED57_TASKS if task != 'dog-stand'),
 ])
 def test_replicates_reuse_only_matching_seed55_recipe_and_measurements(monkeypatch, tmp_path, task, seed):
     monkeypatch.setattr(suite, 'CAMPAIGN', tmp_path)
@@ -163,6 +198,36 @@ def test_replicates_reuse_only_matching_seed55_recipe_and_measurements(monkeypat
     assert plan['sizing_reference'] == {'seed': 55, 'binding': reference['binding'], 'training_job': '11'}
     assert suite.reuse_timing_plan(task, new_root, seed=seed) == plan
     assert json.loads((gate / 'plan.json').read_text()) == reference
+
+
+def test_dog_stand_reuses_the_largest_verified_dog_sizing(monkeypatch, tmp_path):
+    root = suite.task_path('dog-stand', tmp_path, seed=57)
+    root.mkdir()
+    parity = b'<testsuite><testcase/><testcase/></testsuite>'
+    related = {
+        'dog-walk': (100, 11, 120_000_000, 1_200_000_000),
+        'dog-trot': (99, 11, 122_000_000, 1_300_000_000),
+        'dog-run': (100, 12, 121_000_000, 1_200_000_000),
+    }
+
+    def verified(task):
+        wall, memory, snapshot, generation = related[task]
+        plan = {'passed': True, 'task': task, 'cpus': 1, 'cpu_replay': True, 'wandb': False,
+                'binding': suite.binding(suite.manifest_path(task)), 'runtime': {'gpu': 'NVIDIA L40S'},
+                'gate_job': '10', 'parity_sha256': hashlib.sha256(parity).hexdigest(),
+                'wall_hours': wall, 'memory_gib': memory, 'checkpoint_bytes': snapshot,
+                'full_generation_bytes': generation}
+        return plan, {'training_job': '11'}, parity
+
+    monkeypatch.setattr(suite, 'verified_seed55_plan', verified)
+    plan = suite.reuse_timing_plan('dog-stand', root, seed=57)
+    assert plan['binding'] == suite.binding(suite.manifest_path('dog-stand', 57))
+    assert plan['task'] == 'dog-stand'
+    assert (plan['wall_hours'], plan['memory_gib'], plan['checkpoint_bytes'],
+            plan['full_generation_bytes']) == (100, 12, 122_000_000, 1_301_000_000)
+    assert plan['sizing_reference']['same_class_tasks'] == list(related)
+    assert plan['sizing_reference']['observed_dog_stand'][0]['job'] == '9256526'
+    assert suite.reuse_timing_plan('dog-stand', root, seed=57) == plan
 
 
 def test_workspace_matches_old_seedless_receipts_and_keeps_seed56_independent():

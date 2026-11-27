@@ -22,9 +22,10 @@ from slurm.inner_entropy_oscar import accelerated_runtime, slurm_fields
 CAMPAIGN = Path("/oscar/scratch/rgao48/ambi/mrsq-q10-suite-20261122")
 # Completed matching Q5 times scaled by the measured Dog Stand/Walk Q10 ratios.
 PREDICTED_COMPUTE_HOURS = {"humanoid-walk": 84, "humanoid-run": 84, "dog-trot": 85, "dog-run": 86,
-                           "humanoid-stand": 85, "dog-walk": 86}
+                           "humanoid-stand": 85, "dog-walk": 86, "dog-stand": 86}
 SEED56_TASKS = ("dog-run", "humanoid-run", "humanoid-stand", "humanoid-walk")
-SEED57_TASKS = ("dog-walk", "dog-trot", "humanoid-stand", "dog-run")
+SEED57_TASKS = ("dog-walk", "dog-trot", "humanoid-stand", "dog-run",
+                "dog-stand", "humanoid-walk", "humanoid-run")
 MAX_SECONDS_PER_DECISION = 0.38
 TIMING_MARGIN = 0.15
 STARTUP_ALLOWANCE_HOURS = 0.5

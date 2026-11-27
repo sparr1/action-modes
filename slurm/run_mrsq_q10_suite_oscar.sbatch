@@ -20,10 +20,11 @@ mode="${1:?Use benchmark or train}"
 task="${2:?Set task}"
 seed="${AMBI_Q10_SEED:-55}"
 [[ "$mode" == benchmark || "$mode" == train ]]
-case "$task" in humanoid-walk|humanoid-run|dog-trot|dog-run|humanoid-stand|dog-walk) ;; *) exit 2 ;; esac
+case "$task" in humanoid-walk|humanoid-run|dog-trot|dog-run|humanoid-stand|dog-walk|dog-stand) ;; *) exit 2 ;; esac
 case "$seed:$task" in
+    55:dog-stand) exit 2 ;;
     55:*|56:dog-run|56:humanoid-run|56:humanoid-stand|56:humanoid-walk) ;;
-    57:dog-walk|57:dog-trot|57:humanoid-stand|57:dog-run) ;;
+    57:dog-walk|57:dog-trot|57:humanoid-stand|57:dog-run|57:dog-stand|57:humanoid-walk|57:humanoid-run) ;;
     *) exit 2 ;;
 esac
 [[ "$AMBI_Q10_CAMPAIGN" == /oscar/scratch/rgao48/ambi/mrsq-q10-suite-20261122 ]]
@@ -31,6 +32,10 @@ cd "${SLURM_SUBMIT_DIR:?}"
 [[ "$(git rev-parse --show-toplevel)" == "$PWD" ]]
 [[ "$(git rev-parse HEAD)" == "$AMBI_EXPECTED_COMMIT" ]]
 [[ -z "$(git status --porcelain --untracked-files=all)" ]]
+[[ "${AMBI_Q10_SCRATCH_GRACE:-0}" =~ ^[01]$ ]]
+if [[ "${AMBI_Q10_SCRATCH_GRACE:-0}" == 1 ]]; then
+    "$AMBI_PYTHON" -B slurm/queue_mrsq_q10_suite.py check-scratch-grace --task "$task" --seed "$seed"
+fi
 restart="${SLURM_RESTART_COUNT:-0}"
 [[ "$restart" =~ ^[0-9]+$ ]]
 task_root="$AMBI_Q10_CAMPAIGN/$task"
@@ -63,8 +68,10 @@ fi
 walltime="$("$AMBI_PYTHON" "$helper" allocation "$task" --seed "$seed")"
 (( walltime > 3600 ))
 lineage="$task_root/lineage"
-checkquota | "$AMBI_PYTHON" -m utils.oscar_resume_launcher quota \
-    --allocation rgao48 --filesystem-path /oscar/scratch
+if [[ "${AMBI_Q10_SCRATCH_GRACE:-0}" == 0 ]]; then
+    checkquota | "$AMBI_PYTHON" -m utils.oscar_resume_launcher quota \
+        --allocation rgao48 --filesystem-path /oscar/scratch
+fi
 "$AMBI_PYTHON" -m utils.oscar_resume_launcher storage \
     --durable-root "$task_root" --lineage-dir "$lineage"
 if [[ -e "$lineage/DONE" ]]; then

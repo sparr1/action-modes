@@ -394,7 +394,15 @@ seed-55 resource measurements after checking the recipe and source, then checks
 the assigned GPU at startup. Each seed-56 job uses its own `<task>-s56/lineage`
 and tests save-and-resume on its first trained checkpoint before continuing.
 
-Oscar seed 57 supports Dog Walk, Dog Trot, Humanoid Stand, and Dog Run.
+Oscar seed 57 supports Dog Stand, Walk, Trot, and Run plus Humanoid Stand,
+Walk, and Run. Humanoid Walk and Run use their matching Oscar seed-55 sizing
+receipts. Dog Stand uses verified L40S timings from the same task and takes
+the largest applicable memory and storage bounds from the Dog suite. These
+three cells also accept an explicit `queue --allow-scratch-grace` flag. The
+flag requires a fresh Oscar scratch quota observation below the soft limit,
+keeps a measured reserve below the hard limit, and pins a conservative grace
+deadline that startup and requeue must recheck. The default queue continues to
+require enough projected room below the soft limit.
 The dispatcher uses each task's verified seed-55 timing and checks storage
 capacity across the prepared and released runs. To stage a job, use
 `queue --task <task> --seed 57 --hold`. Use `release --task <task> --seed 57`
