@@ -217,8 +217,10 @@ _TRAINING_PROTOCOL = "isolated_cuda_graph_with_native_diagnostics_v1"
 def validate_training_graph(engine):
     """Keep the first training mode limited to the validated fresh K1 recipe."""
     validate_graph_workload(engine)
+    if engine.cfg.obs not in {"state", "rgb"}:
+        raise ValueError("Training CUDA graph requires state or RGB observations.")
     for key, expected in {
-        "obs": "state", "inner_solve_interval": 1,
+        "inner_solve_interval": 1,
         "inner_execution_action": "policy_sample",
         "inner_execution_policy_source": "primary",
         "outer_behavior_policy_kl_schedule": "none",

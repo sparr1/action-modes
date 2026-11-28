@@ -115,6 +115,13 @@ Random-shift augmentation remains active during RGB acting and evaluation to
 match TD-MPC2. A deterministic evaluation request selects the deterministic
 policy action; it does not freeze the image crop.
 
+For a compatible fresh action-local AMBI SAC recipe on CUDA, set
+`compile: true`, `compile_strict: true`, and `inner_cuda_graph: true` in
+`alg_params` to capture the inner solve with RGB. The encoder applies the
+random shift and produces a new latent root before every solve. The graph
+replays the latent solve, and the outer learner still updates the image encoder
+from replay. Exact replay resume is available for state observations only.
+
 ## Updating the lock
 
 Dependency changes are deliberate compatibility work. Edit `pyproject.toml`,

@@ -1344,6 +1344,8 @@ def _validate_split_value_config(cfg):
 class AMBITDMPC2(TDMPC2Baseline):
     """TOLD learning with canonical cloned inner SAC and optional ablations."""
 
+    _supports_strict_rgb_compile = True
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if self.cfg.inner_outer_replay_fraction > 0.0:

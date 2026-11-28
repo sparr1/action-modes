@@ -97,9 +97,11 @@ def outer_snapshot(agent):
 
 @pytest.mark.parametrize("entropy", ENTROPIES)
 @pytest.mark.parametrize("scope,update", MODES)
-def test_graph_validation_accepts_six_normalization_contracts(entropy, scope, update):
+@pytest.mark.parametrize("obs", ("state", "rgb"))
+def test_graph_validation_accepts_six_normalization_contracts(entropy, scope, update, obs):
     agent = make_agent(entropy, scope, update)
     agent.cfg.compile = agent.cfg.compile_strict = True
+    agent.cfg.obs = obs
     agent.inner_engine.device = torch.device("cuda")
     validate_training_graph(agent.inner_engine)
 

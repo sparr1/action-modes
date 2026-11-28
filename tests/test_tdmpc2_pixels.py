@@ -188,10 +188,24 @@ def test_rgb_encoder_contract_and_strict_compilation_fail_early():
 
     with pytest.raises(ValueError, match="compile_strict=True"):
         _make_model(
-            AMBITDMPC2,
+            TDMPC2Baseline,
             PixelEnv(),
             _tiny_params(compile_strict=True),
         )
+
+
+def test_ambi_rgb_enables_strict_compilation_for_outer_and_inner_regions():
+    model = _make_model(
+        AMBITDMPC2,
+        PixelEnv(),
+        _tiny_params(compile=True, compile_strict=True),
+    )
+    assert model.agent._outer_update_region.strict
+    assert model.agent._outer_update_region.enabled
+    assert all(
+        region.strict and region.enabled
+        for region in model.agent.inner_engine._compile_regions.values()
+    )
 
 
 def test_large_rgb_replay_footprint_warns_without_changing_capacity():
@@ -363,3 +377,67 @@ def test_ambi_pixel_action_saves_default_rng_state_only_once(monkeypatch):
     monkeypatch.setattr(torch.random, "fork_rng", counted_fork_rng)
     model.agent.act(observation, t0=True, eval_mode=True)
     assert calls == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a CUDA GPU.")
+def test_ambi_rgb_training_replays_the_latent_cuda_graph():
+    model = _make_model(
+        AMBITDMPC2,
+        PixelEnv(),
+        _tiny_params(
+            device="cuda",
+            compile=True,
+            compile_strict=True,
+            inner_cuda_graph=True,
+            inner_operator="sac",
+            inner_rounds=1,
+            inner_rollouts_per_round=4,
+            inner_critic_updates_per_round=2,
+            inner_actor_updates_per_round=1,
+            inner_batch_size=4,
+            inner_replay_capacity=8,
+            inner_root_entropy_samples=0,
+            outer_critic_target="reward_only",
+            inner_sac_critic_target="reward_only",
+            wandb=False,
+        ),
+    )
+    agent = model.agent
+    engine = agent.inner_engine
+    _populate_pixel_replay(model)
+    observations = torch.randint(0, 256, (2, 9, 64, 64), dtype=torch.uint8)
+    observation_rng = engine.rng.phase_generators["observation"]
+    encoder_weight = next(agent.model._encoder["rgb"].parameters())
+
+    def act_without_advancing_learner_rng(observation, *, t0=False):
+        cpu_rng = torch.random.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state(agent.device)
+        observation_rng_before = observation_rng.get_state()
+        action = agent.act(observation, t0=t0, collect_diagnostics=False)
+        assert torch.isfinite(action).all()
+        assert torch.equal(torch.random.get_rng_state(), cpu_rng)
+        assert torch.equal(torch.cuda.get_rng_state(agent.device), cuda_rng)
+        assert not torch.equal(observation_rng.get_state(), observation_rng_before)
+        assert agent.last_inner_metrics["inner_cuda_graph_used"] == 1.0
+        assert agent.last_inner_metrics["inner_critic_optimizer_steps"] == 2
+        assert agent.last_inner_metrics["inner_actor_optimizer_steps"] == 1
+
+    act_without_advancing_learner_rng(observations[0], t0=True)
+    runner = engine._whole_graph_runner
+    assert runner.graph is not None
+    assert runner.calls == 1
+    root_before = runner.root.detach().clone()
+    graph_rng_before = runner.rng_state.clone()
+
+    weight_before = encoder_weight.detach().clone()
+    metrics = agent.update(model.buffer)
+    assert all(torch.isfinite(torch.as_tensor(value)).all() for value in metrics.values())
+    assert not torch.equal(encoder_weight, weight_before)
+    assert agent._outer_update_region._compiled is not None
+    assert not agent._outer_update_region.failed
+
+    act_without_advancing_learner_rng(observations[1])
+    assert engine._whole_graph_runner is runner
+    assert runner.calls == 2
+    assert not torch.equal(runner.root, root_before)
+    assert not torch.equal(runner.rng_state, graph_rng_before)

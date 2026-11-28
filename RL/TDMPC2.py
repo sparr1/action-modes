@@ -577,6 +577,7 @@ class TDMPC2Baseline(Algorithm):
 
     supports_composable_checkpointing = True
     supports_checkpoint_replay = True
+    _supports_strict_rgb_compile = False
 
     def __init__(self, name, env, custom_params=None, run_params=None, experiment_params=None):
         super().__init__(name, env, custom_params)
@@ -876,8 +877,10 @@ class TDMPC2Baseline(Algorithm):
                 f"got latent_dim={cfg['latent_dim']} and "
                 f"num_channels={cfg['num_channels']}."
             )
-        if observation_type == "rgb" and bool(
-            cfg.get("compile_strict", False)
+        if (
+            observation_type == "rgb"
+            and cfg.get("compile_strict", False)
+            and not self._supports_strict_rgb_compile
         ):
             raise ValueError(
                 "RGB observations with compile_strict=True are not supported; "
