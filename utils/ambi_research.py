@@ -13,6 +13,8 @@ import json
 import re
 from pathlib import Path
 
+from utils.frozen_pathwise_settings import PROTOCOL as PATHWISE_EXECUTION_BACKEND
+
 
 _NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _MAX_NUMPY_SEED = 2**32 - 1
@@ -24,6 +26,26 @@ _CHECKPOINT_INNER_PARAMS = {"tdambi_scale_initialization"}
 
 class PresetMatrixError(ValueError):
     """Raised when a research preset matrix is malformed or ambiguous."""
+
+
+def pathwise_evaluation_options(evaluation):
+    """Validate the execution backend and return the pathwise options, if active."""
+    backend = evaluation.get("execution_backend", "native")
+    if backend != PATHWISE_EXECUTION_BACKEND:
+        if backend not in ("native", "frozen_mean_cuda_graph_v1"):
+            raise PresetMatrixError("Unsupported frozen evaluation execution_backend.")
+        if "pathwise" in evaluation:
+            raise PresetMatrixError(f"evaluation.pathwise requires {PATHWISE_EXECUTION_BACKEND}.")
+        return None
+
+    options = evaluation.get("pathwise")
+    if not isinstance(options, dict) or set(options) != {"rollouts_per_update", "detach_dynamics"}:
+        raise PresetMatrixError("evaluation.pathwise requires rollouts_per_update and detach_dynamics.")
+    if type(options["rollouts_per_update"]) is not int or options["rollouts_per_update"] <= 0:
+        raise PresetMatrixError("evaluation.pathwise.rollouts_per_update must be a positive integer.")
+    if not isinstance(options["detach_dynamics"], bool):
+        raise PresetMatrixError("evaluation.pathwise.detach_dynamics must be boolean.")
+    return options
 
 
 def _reject_nonfinite_constant(value):
@@ -191,15 +213,23 @@ def validate_preset_matrix(matrix):
                 variant.get("evaluation", {}),
                 f"comparisons.{comparison_name}.variants.{variant_name}.evaluation",
             )
-            if set(variant_evaluation) - {"execution_action", "execution_backend"}:
+            if set(variant_evaluation) - {"execution_action", "execution_backend", "pathwise"}:
                 raise PresetMatrixError(
-                    "Variant evaluation overrides support only execution_action and execution_backend; "
+                    "Variant evaluation overrides support only execution_action, execution_backend, and pathwise; "
                     "episode seeds and budgets must remain paired."
                 )
-            if variant_evaluation.get("execution_action", "mean") not in {"mean", "sample"}:
+            effective_evaluation = {**evaluation, **variant_evaluation}
+            if effective_evaluation.get("execution_action", "mean") not in {"mean", "sample"}:
                 raise PresetMatrixError("Variant evaluation.execution_action must be 'mean' or 'sample'.")
-            if variant_evaluation.get("execution_backend", "native") not in {"native", "frozen_mean_cuda_graph_v1"}:
-                raise PresetMatrixError("Unsupported frozen evaluation execution_backend.")
+            if pathwise_evaluation_options(effective_evaluation) is not None and (
+                not checkpoint_base or effective_evaluation.get("execution_action", "mean") != "mean"
+                or effective_evaluation.get("recording") != "returns"
+                or consecutive_protocol(effective_evaluation) is None
+            ):
+                raise PresetMatrixError(
+                    "Pathwise evaluation requires a checkpoint-derived, return-only, "
+                    "mean-action consecutive preset."
+                )
             if "alg_params" in variant.get("run_params", {}):
                 raise PresetMatrixError(
                     f"{comparison_name}/{variant_name}.run_params cannot replace alg_params; "

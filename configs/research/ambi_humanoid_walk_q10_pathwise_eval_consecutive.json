@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "base_alg_config": "checkpoint",
+  "source_run": "rwgao_b-brown-university/ambi/646ddfe402214fe3ae21a906e3672bbb",
+  "description": "Fresh actor refinement with and without gradients through the frozen dynamics on Q10 Humanoid Walk seed 55 at 1M training decisions.",
+  "checkpoint_contract": {
+    "step": 1000000,
+    "sha256": "c02a5948ce9e84269d05dab647936b94238896cdc6a74026455ec76aa1c2ea45",
+    "alg_params": {
+      "num_q": 10,
+      "outer_q_actor_reduction": "mean_all",
+      "outer_q_target_reduction": "min_all",
+      "inner_q_actor_reduction": "mean_all",
+      "inner_q_target_reduction": "min_all",
+      "mppi_terminal_q_reduction": "min_all",
+      "critic_ensemble_backend": "vmap",
+      "inner_rounds": 8,
+      "inner_rollout_horizon": 3,
+      "inner_actor_updates_per_round": 4
+    }
+  },
+  "shared_alg_params": {
+    "wandb": false,
+    "wandb_mode": "disabled",
+    "compile": false,
+    "compile_strict": false,
+    "inner_cuda_graph": false,
+    "inner_diagnostic_rollouts": 0,
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_critic_updates_per_round": 0
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "environment_seed": 55,
+    "max_steps": 500,
+    "num_episodes": 10,
+    "episode_sampling": "consecutive",
+    "execution_action": "mean",
+    "execution_backend": "frozen_pathwise_v1",
+    "recording": "returns",
+    "default_presets": [
+      "controller/pathwise",
+      "controller/detached"
+    ]
+  },
+  "comparisons": {
+    "controller": {
+      "reference": "detached",
+      "variants": {
+        "pathwise": {
+          "description": "Differentiate the imagined return through every latent transition.",
+          "evaluation": {
+            "pathwise": {
+              "rollouts_per_update": 32,
+              "detach_dynamics": false
+            }
+          }
+        },
+        "detached": {
+          "description": "Use the same imagined objective with latent transitions detached.",
+          "evaluation": {
+            "pathwise": {
+              "rollouts_per_update": 32,
+              "detach_dynamics": true
+            }
+          }
+        }
+      }
+    }
+  }
+}

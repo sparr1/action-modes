@@ -26,6 +26,7 @@ from utils.ensemble_identity import normalize_critic_ensemble_backend
 from utils.evaluation_episodes import (
     episode_key, validate_consecutive_protocol, validate_consecutive_episodes, validate_paired_starts,
 )
+from utils.frozen_pathwise_settings import PROTOCOL as PATHWISE_EXECUTION_BACKEND, pathwise_settings
 
 
 def _require(condition, message):
@@ -206,6 +207,9 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
     if return_estimator == "retrace":
         _require("AMBI" in algorithm and controller == "sac",
                  "Retrace scientific identity requires the AMBI SAC controller")
+    if execution_backend == PATHWISE_EXECUTION_BACKEND:
+        _require(algorithm == "AMBITDMPC2/AMBITDMPC2" and controller == "pathwise",
+                 "Frozen pathwise scientific identity requires the AMBI pathwise controller")
     if dirty:
         _require(bool(source_sha256), "Dirty results lack saved source fingerprint")
         return {"version": 1, "algorithm": algorithm, "dirty_source_sha256": source_sha256}
@@ -229,7 +233,10 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
     else:
         paths = ["RL/TDMPC2.py", "RL/tdmpc2_core/agent.py", "RL/tdmpc2_core/mppi.py"]
     paths += ["RL/tdmpc2_core/common", "domains", "environments/dmcontrol/uv.lock"]
-    if execution_backend != "native":
+    if execution_backend == PATHWISE_EXECUTION_BACKEND:
+        paths += ["RL/tdmpc2_core/frozen_pathwise.py", "utils/frozen_pathwise_settings.py",
+                  "utils/ambi_research.py"]
+    elif execution_backend != "native":
         _require(execution_backend == "frozen_mean_cuda_graph_v1", "Unknown frozen execution backend")
         paths += ["RL/tdmpc2_core/whole_inner_graph.py", "RL/tdmpc2_core/frozen_graph.py"]
     if return_estimator == "retrace":
@@ -252,6 +259,10 @@ def scientific_identity(algorithm, controller, commit, dirty=False, source_sha25
         entries = _git_output(root, "ls-tree", "-rz", commit, "--", *paths)
         names = sorted(entry.split(b"\t", 1)[1].decode() for entry in entries.split(b"\0") if entry)
         _require(paths[0] in names, "Pinned algorithm source is incomplete")
+        if execution_backend == PATHWISE_EXECUTION_BACKEND:
+            _require("RL/tdmpc2_core/frozen_pathwise.py" in names
+                     and "utils/frozen_pathwise_settings.py" in names,
+                     "Pinned pathwise implementation is unavailable")
         if return_estimator == "retrace":
             _require("RL/tdmpc2_core/inner_retrace.py" in names,
                      "Pinned Retrace implementation is unavailable")
@@ -376,6 +387,18 @@ def _tdambi_planner(config, algorithm, action_rule):
 
 def planner_identity(config, result, algorithm, action_rule):
     """Canonicalize active resolved settings; learned checkpoint values stay out."""
+    if result.get("execution_backend") == PATHWISE_EXECUTION_BACKEND:
+        _require(algorithm == "AMBITDMPC2/AMBITDMPC2" and config.get("inner_operator") == "sac"
+                 and action_rule == "tanh_mean" and not result.get("evaluation_controller"),
+                 "Invalid frozen pathwise result")
+        actual = result.get("pathwise")
+        _require(isinstance(actual, dict), "Missing frozen pathwise settings")
+        settings = pathwise_settings(config, rollouts_per_update=actual.get("rollouts_per_update"),
+                                     detach_dynamics=actual.get("detach_dynamics"))
+        _require(settings == actual, "Frozen pathwise settings differ from the resolved configuration")
+        return {"type": "pathwise", "backend": algorithm, "action_rule": action_rule,
+                "settings": {**settings, **_critic_ensemble_identity(config, algorithm),
+                             "evaluation_execution_backend": PATHWISE_EXECUTION_BACKEND}}
     evaluation = result.get("evaluation_controller")
     if evaluation:
         _require(evaluation.get("type") == "mppi", "Unsupported evaluation controller")
@@ -616,7 +639,11 @@ def identity_for_ambi_checkpoint(checkpoint, resolved, protocol, seeds, code, *,
                                                                    action_dim=config["action_dim"])}
         action_rule = description.protocol["action_rule"]
     result = {"evaluation_controller": evaluation_controller} if evaluation_controller else {}
-    result["execution_backend"] = resolved.get("evaluation", {}).get("execution_backend", "native")
+    evaluation_options = resolved.get("evaluation", {})
+    result["execution_backend"] = evaluation_options.get("execution_backend", "native")
+    if result["execution_backend"] == PATHWISE_EXECUTION_BACKEND:
+        from utils.ambi_research import pathwise_evaluation_options
+        result["pathwise"] = pathwise_settings(config, **pathwise_evaluation_options(evaluation_options))
     action = action_rule or protocol["action_rule"]
     planner = planner_identity(config, result, algorithm, action)
     controller = "prior" if planner["type"] == "prior" else (
@@ -657,6 +684,10 @@ def descriptive_label(identity, selector=None):
     if planner["type"] == "prior":
         return prefix + "Policy prior"
     settings = planner.get("settings", {})
+    if planner["type"] == "pathwise":
+        title = "Pathwise actor with detached dynamics" if settings["detach_dynamics"] else "Pathwise actor"
+        return (f"{prefix}{title} J{settings['rounds']}/H{settings['horizon']}"
+                f"/A{settings['actor_updates_per_round']}/N{settings['rollouts_per_update']}")
     if planner["type"] == "tdambi":
         backbone = "TD-MPC2" if source == "xq3zva9u" else f"TD-MPC2 {source}"
         return (f"{backbone} · TDAMBI G{settings.get('inner_updates_per_round')} "
@@ -944,6 +975,10 @@ def normalize_bundle(path, *, checkpoint_inventory=None, source_run=None):
         maximum = protocol["max_steps"]
         _require(isinstance(maximum, int) and maximum > 0, "Missing episode decision limit")
         episodes = _episodes(run.get("episodes") or result.get("episodes", []), seeds, maximum, protocol)
+        if result.get("execution_backend") == PATHWISE_EXECUTION_BACKEND:
+            _require("episode_sampling" in protocol and type(result.get("pathwise_solves")) is int
+                     and result["pathwise_solves"] == sum(episode["length"] for episode in episodes),
+                     "Pathwise result lacks a fresh solve per consecutive environment decision")
         expected_keys = {episode_key(ep) for ep in episodes}
         if "episode_sampling" in protocol:
             prior_episodes = manifest.get("reference", {}).get("episodes")

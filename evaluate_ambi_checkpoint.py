@@ -34,6 +34,7 @@ from utils.ambi_research import (
     load_preset_matrix,
     materialize_presets,
     normalize_selectors,
+    pathwise_evaluation_options,
     resolve_preset,
 )
 
@@ -757,14 +758,17 @@ def evaluate_preset(
     evaluation_options = resolved.get("evaluation", {})
     execution_backend = evaluation_options.get("execution_backend", "native")
     return_only = evaluation_options.get("recording", "full") == "returns"
-    if execution_backend not in {"native", "frozen_mean_cuda_graph_v1"}:
-        raise ValueError("Unsupported frozen evaluation execution_backend.")
+    pathwise_options = pathwise_evaluation_options(evaluation_options)
     graph_evaluation = execution_backend == "frozen_mean_cuda_graph_v1"
     if return_only and (root_bank is not None or bank_only or captured_roots is not None or togo_return_rollouts):
         raise ValueError("Return-only evaluation cannot request banks or model-return probes.")
     if graph_evaluation and (not deterministic or not return_only or temperature_chain
                              or params.get("inner_operator") != "sac"):
         raise ValueError("Frozen mean CUDA graphs require return-only deterministic fresh SAC episodes.")
+    if pathwise_options is not None and (
+        sampling is None or not deterministic or not return_only or params.get("inner_operator") != "sac"
+    ):
+        raise ValueError("Pathwise evaluation requires consecutive mean-action episodes and a fresh actor solve.")
     if sampling is not None and (
         not deterministic or not return_only or temperature_chain or root_bank is not None
         or bank_only or captured_roots is not None or togo_return_rollouts
@@ -779,6 +783,7 @@ def evaluate_preset(
     env = _make_env(resolved)
     model = None
     graph_controller = None
+    pathwise_controller = None
     graph_setup_seconds = 0.0
     primary_error = None
     pending_events = []
@@ -829,8 +834,9 @@ def evaluate_preset(
                 for root in root_bank["roots"]:
                     if tuple(root["shape"]) != tuple(env.observation_space.shape):
                         raise ValueError("Bank observation shape does not match checkpoint environment.")
-            # One unscored action pays lazy compilation before the measured
-            # solves. Reset RNG afterwards; warmup never enters return statistics.
+        if bundle is not None and pathwise_options is None:
+            # One unscored action pays lazy compilation. The RNG is reset
+            # before scored episodes begin.
             if sampling is not None:
                 warm_observation = first_observation
             elif root_bank is not None:
@@ -926,6 +932,10 @@ def evaluate_preset(
                         bundle_run["warmup_including_compile_seconds"] = graph_setup_seconds
                 if sampling is None or chain_episode_index == 0:
                     graph_controller.reset_episode(episode_seed)
+            if pathwise_options is not None and pathwise_controller is None:
+                from RL.tdmpc2_core.frozen_pathwise import FrozenPathwiseController
+                pathwise_controller = FrozenPathwiseController(model, **pathwise_options)
+                pathwise_controller.reset_episode(episode_seed)
             terminated = truncated = False
             episode_return = 0.0
             episode_steps = 0
@@ -1066,6 +1076,10 @@ def evaluate_preset(
 
         returns = [episode["return"] for episode in episodes]
         lengths = [episode["length"] for episode in episodes]
+        if pathwise_options is not None and (
+            pathwise_controller is None or pathwise_controller.calls != sum(lengths)
+        ):
+            raise RuntimeError("Pathwise evaluation requires one fresh solve per environment decision.")
         return {
             "selector": resolved["selector"],
             "comparison": resolved["comparison"],
@@ -1090,6 +1104,10 @@ def evaluate_preset(
                 "graph_setup_seconds": graph_setup_seconds,
                 "graph_replays": graph_controller.runner.calls}
                if graph_evaluation else {}),
+            **({"execution_backend": execution_backend,
+                "pathwise": pathwise_controller.settings,
+                "pathwise_solves": pathwise_controller.calls}
+               if pathwise_controller is not None else {}),
             "outer_updates_before": updates_before,
             "outer_updates_after": updates_after,
             "outer_state_unchanged": True,
@@ -1136,6 +1154,8 @@ def evaluate_preset(
                 add_cleanup_notes(primary_error, [exc])
         if graph_controller is not None:
             graph_controller.close()
+        if pathwise_controller is not None:
+            pathwise_controller.close()
         _close_resources(model, env, primary_error=primary_error)
 
 

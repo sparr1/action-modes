@@ -89,6 +89,54 @@ reward-Q gradients, differentiable model gradients, and paired real-simulator
 action interventions at common states across backbones. It supports the
 auxiliary SAC-return critic and complements full-episode refinement evaluation.
 
+## Frozen pathwise actor refinement
+
+The Humanoid Walk pathwise matrix uses the Post-tanh sampled seed-55 checkpoint
+at 1M training decisions. It evaluates two controllers on ten consecutive
+500-decision episodes each with seed 55 for both the environment and controller.
+The adapted actor executes its mean action. Every decision starts a fresh copy
+of the checkpoint actor and a fresh Adam optimizer.
+[Matrix](ambi_checkpoint_pathwise_eval_consecutive.json)
+
+Each update maximizes the estimated discounted sum of decoded model rewards
+and the frozen outer online critic's terminal value at a sampled outer-prior
+action. It keeps the checkpoint's terminal critic reduction and divides the
+imagined return by an action-local scale initialized from the checkpoint and
+updated using the current batch's P95–P5 range, floored at one. The update also
+uses the inherited coefficient on sampled post-tanh root entropy. The
+checkpoint's encoder, dynamics, reward predictor, outer actor and critics stay
+fixed. The controller performs 32 actor updates with 32 imagined trajectories
+of horizon three per update, for 3,072 forward transitions per real decision.
+
+`controller/pathwise` differentiates through the latent dynamics.
+`controller/detached` stops gradients at each predicted next latent. Both use
+the same forward objective and sampling protocol. The comparison measures the
+effect of the dynamics gradient in this actor objective. Comparing either arm
+with inner SAC also tests the effect of changing the critic update and replay
+scheme.
+
+```bash
+python evaluate_ambi_checkpoint.py \
+  --matrix configs/research/ambi_checkpoint_pathwise_eval_consecutive.json \
+  --checkpoint /path/to/model --device cuda \
+  --bundle-dir /path/to/new-pathwise-evaluation \
+  --output /path/to/new-pathwise-evaluation.json
+```
+
+Use the existing prior and inner-SAC evaluations from the same checkpoint and
+episode protocol for the behavioral comparison. The pathwise variants run
+without compilation or CUDA graph capture. A latency comparison should
+identify each controller's runtime and use the same hardware.
+
+The [Q10 Humanoid Walk matrix](ambi_humanoid_walk_q10_pathwise_eval_consecutive.json)
+pins the seed-55 actor-mean / target-min checkpoint at 1M decisions and uses
+its saved minimum-over-all-ten terminal critic reduction. The
+[Hydra launcher](../../slurm/run_humanoid_walk_q10_pathwise_hydra.sbatch) runs
+the two controllers as independent tasks with separate result bundles.
+Set `AMBI_EXPECTED_COMMIT`, `AMBI_DMCONTROL_PYTHON`, `AMBI_EVAL_ROOT`, and
+`AMBI_EVAL_CHECKPOINT` and submit from the matching clean checkout.
+`AMBI_EVAL_SMOKE=1` selects a one-episode, eight-decision CUDA smoke run.
+
 The frozen evaluator supports finite-horizon inner SAC and transition-based
 update counts. It rejects `inner_outer_replay_fraction > 0` because these model
 snapshots do not include real replay. Test replay mixing through a populated

@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "base_alg_config": "checkpoint",
+  "source_run": "rwgao_b-brown-university/ambi/fc7c433ab4734a5aa7eb1717e2165969",
+  "description": "Paired fresh actor refinement with and without gradients through the frozen dynamics, using the Humanoid Walk seed-55 1M checkpoint.",
+  "checkpoint_contract": {
+    "step": 1000000,
+    "sha256": "9ad07194115f4b2102b255cff6b1a966e31b23648117c0aa745ca62998d4d8ac",
+    "alg_params": {
+      "inner_rounds": 8,
+      "inner_rollout_horizon": 3,
+      "inner_actor_updates_per_round": 4
+    }
+  },
+  "shared_alg_params": {
+    "wandb": false,
+    "wandb_mode": "disabled",
+    "compile": false,
+    "compile_strict": false,
+    "inner_cuda_graph": false,
+    "inner_diagnostic_rollouts": 0,
+    "inner_actor_writeback_coef": 0.0,
+    "inner_critic_writeback_coef": 0.0,
+    "inner_critic_updates_per_round": 0
+  },
+  "evaluation": {
+    "controller_seed": 55,
+    "environment_seed": 55,
+    "max_steps": 500,
+    "num_episodes": 10,
+    "episode_sampling": "consecutive",
+    "execution_action": "mean",
+    "execution_backend": "frozen_pathwise_v1",
+    "recording": "returns",
+    "default_presets": [
+      "controller/pathwise",
+      "controller/detached"
+    ]
+  },
+  "comparisons": {
+    "controller": {
+      "reference": "detached",
+      "variants": {
+        "pathwise": {
+          "description": "Differentiate the imagined return through every latent transition.",
+          "evaluation": {
+            "pathwise": {
+              "rollouts_per_update": 32,
+              "detach_dynamics": false
+            }
+          }
+        },
+        "detached": {
+          "description": "Use the same imagined objective with latent transitions detached.",
+          "evaluation": {
+            "pathwise": {
+              "rollouts_per_update": 32,
+              "detach_dynamics": true
+            }
+          }
+        }
+      }
+    }
+  }
+}
